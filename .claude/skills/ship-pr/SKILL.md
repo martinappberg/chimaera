@@ -80,5 +80,7 @@ Claude Code uses its corresponding Claude Code trailer instead.
 Watch that the intended workflow ran: for a normal PR, `release.yml` should
 publish a release with the bumped version; for a `[skip release]` PR, the
 `version` job should report `release=false`, all build/publish jobs should be
-skipped, and no release should be cut. If it cut one you didn't intend, the
-marker didn't make it into the squash message.
+skipped, and no release should be cut — unless an earlier merge since the last
+tag still wants one: the decision reads every merge since that tag, so a
+`[skip release]` or `docs:` merge then ships the pending release. If it cut one
+nothing asked for, the marker didn't make it into the squash message.

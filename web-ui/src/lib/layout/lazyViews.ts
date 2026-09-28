@@ -10,6 +10,9 @@ export type PaneViewKind =
   | "git"
   | "changes"
   | "dashboard"
+  | "timeline"
+  | "knowledge"
+  | "plugins"
   | "browser"
   | "settings";
 
@@ -33,6 +36,9 @@ const loaders: Record<PaneViewKind, () => Promise<PaneViewModule>> = {
   git: () => import("../workspace/GitView.svelte"),
   changes: () => import("../workspace/SessionChangesView.svelte"),
   dashboard: () => import("../dashboard/DashboardView.svelte"),
+  timeline: () => import("../workspace/TimelineView.svelte"),
+  knowledge: () => import("../knowledge/KnowledgeView.svelte"),
+  plugins: () => import("../plugins/PluginsView.svelte"),
   browser: () => import("../browser/BrowserView.svelte"),
   settings: () => import("../settings/SettingsView.svelte"),
 };
@@ -48,6 +54,9 @@ const viewChunkPrefixes: Record<PaneViewKind, string> = {
   git: "GitView-",
   changes: "SessionChangesView-",
   dashboard: "DashboardView-",
+  timeline: "TimelineView-",
+  knowledge: "KnowledgeView-",
+  plugins: "PluginsView-",
   browser: "BrowserView-",
   settings: "SettingsView-",
 };

@@ -124,6 +124,12 @@ export const ACTIONS = [
     def: "Mod+b",
   },
   {
+    id: "mastermind",
+    label: "Mastermind",
+    description: "Open or close this window's Mastermind panel.",
+    def: "Mod+j",
+  },
+  {
     id: "cyclePrev",
     label: "Previous Tab",
     description: "Activate the previous tab in the focused pane.",

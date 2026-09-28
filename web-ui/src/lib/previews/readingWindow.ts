@@ -5,8 +5,21 @@
  * Exact, same-tag placeholders preserve block geometry and scroll position.
  * Only noninteractive prose paragraphs are windowed: keyboard targets,
  * lists/tables, and asynchronous image/math content stay connected.
+ *
+ * Two hosts: the `readingWindow` action over the daemon-rendered fallback
+ * (`{@html}`), and the client renderer, which drives `createReadingWindow`
+ * itself — every windowed node must be back in place (`restore`) before it
+ * reconciles the article, and `schedule` re-windows once it has.
  */
-export function readingWindow(root: HTMLElement, _metrics?: unknown) {
+export interface ReadingWindow {
+  /** Put every windowed block back and stop windowing until `schedule`. */
+  restore(): void;
+  /** Re-measure and window the article on the next frame. */
+  schedule(): void;
+  destroy(): void;
+}
+
+export function createReadingWindow(root: HTMLElement): ReadingWindow {
   interface Block {
     node: HTMLElement;
     placeholder: HTMLElement;
@@ -55,17 +68,22 @@ export function readingWindow(root: HTMLElement, _metrics?: unknown) {
     }
   }, { root: scroll, rootMargin: "1000px 0px" });
 
-  function restore(): void {
+  function restoreAll(): void {
     for (const block of blocks) show(block);
   }
 
-  function schedule(): void {
+  function restore(): void {
     cancelAnimationFrame(frame);
+    frame = 0;
     observer.disconnect();
-    restore();
-    observer.disconnect();
+    restoreAll();
+    observer.disconnect(); // showing re-observes
     blocks = [];
     targets = new WeakMap();
+  }
+
+  function schedule(): void {
+    restore();
     frame = requestAnimationFrame(() => {
       frame = 0;
       // Small documents need no window. An individual giant paragraph stays
@@ -105,7 +123,7 @@ export function readingWindow(root: HTMLElement, _metrics?: unknown) {
     if (event.key.toLowerCase() === "a" && (!(event.target instanceof Node) || !scroll?.contains(event.target))) return;
     finding = event.key.toLowerCase() !== "a";
     selecting = !finding;
-    restore();
+    restoreAll();
   }
   function onSelection(): void {
     const selection = document.getSelection();
@@ -114,7 +132,7 @@ export function readingWindow(root: HTMLElement, _metrics?: unknown) {
        (selection.focusNode !== null && root.contains(selection.focusNode)) || selection.containsNode(root, true));
     if (next === selecting) return;
     selecting = next;
-    if (next) restore();
+    if (next) restoreAll();
     else schedule();
   }
   function resume(): void {
@@ -142,7 +160,7 @@ export function readingWindow(root: HTMLElement, _metrics?: unknown) {
   resize.observe(root);
   function beforePrint(): void {
     printing = true;
-    restore();
+    restoreAll();
   }
   function afterPrint(): void {
     printing = false;
@@ -154,7 +172,8 @@ export function readingWindow(root: HTMLElement, _metrics?: unknown) {
   document.addEventListener("selectionchange", onSelection);
   schedule();
   return {
-    update: schedule,
+    restore,
+    schedule,
     destroy() {
       cancelAnimationFrame(frame);
       resize.disconnect();
@@ -166,4 +185,11 @@ export function readingWindow(root: HTMLElement, _metrics?: unknown) {
       document.removeEventListener("selectionchange", onSelection);
     },
   };
+}
+
+/** The action form, for the `{@html}` fallback: any parameter change (a new
+ *  render, a text-size step) re-windows. */
+export function readingWindow(root: HTMLElement, _metrics?: unknown) {
+  const win = createReadingWindow(root);
+  return { update: win.schedule, destroy: win.destroy };
 }

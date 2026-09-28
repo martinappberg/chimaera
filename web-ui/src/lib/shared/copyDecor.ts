@@ -46,6 +46,8 @@ export function makeCopyButton(className: string, label: string): HTMLButtonElem
  *  one. Idempotent per host; safe to re-run after every `{@html}` flush. */
 export function decorateCopyTargets(root: HTMLElement): void {
   for (const host of root.querySelectorAll("pre, blockquote")) {
+    // An embed card's excerpt is the card's to present.
+    if (host.closest(".embed-card") !== null) continue;
     if (host.querySelector(":scope > button.md-copy") !== null) continue;
     host.appendChild(makeCopyButton("md-copy", copyLabel(host)));
   }

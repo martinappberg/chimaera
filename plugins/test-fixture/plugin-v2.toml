@@ -1,0 +1,15 @@
+# Test-only: the fixture's "next release" — the same crate built with the
+# `v2` feature (one more tool), laid out by scripts/build-plugins.sh as
+# plugins/dist-test/test-fixture-v2/. The daemon's update tests serve it
+# from a fake releases server (crates/chimaera-server/src/tests/plugin_updates.rs).
+id = "test-fixture"
+name = "Test fixture"
+version = "0.2.0"
+summary = "Pokes the plugin host's limits in the daemon's tests."
+api = "0.1"
+
+[provides]
+mcp_tools = ["echo", "loop", "allocate", "panic", "read", "state", "append", "recent", "version"]
+
+[adds]
+agents = ["9 test tools: echo · loop · allocate · panic · read · state · append · recent · version"]

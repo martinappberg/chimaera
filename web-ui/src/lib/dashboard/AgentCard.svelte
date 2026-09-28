@@ -257,6 +257,9 @@
     />
     <span class="dot {dotState(session)}" title={dotTitle(session)}></span>
     <span class="name" title={name}>{name}</span>
+    {#if isUnread(session.id)}
+      <span class="unread-dot" aria-hidden="true"></span>
+    {/if}
     {#if compact && isStalled}
       <!-- Compact rows carry no now-line, but the stall warning is built for
            exactly this density (a wedged agent in a fan-out must not look
@@ -437,6 +440,22 @@
   .card.unread .name {
     font-weight: 600;
     color: var(--fg);
+  }
+  /* The rail's scannable unread dot, beside the name (kept in step with
+     App.svelte's .unread-dot — Svelte scopes styles per component). */
+  .unread-dot {
+    flex: none;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: unread-in 0.28s ease-out;
+  }
+  @keyframes unread-in {
+    from {
+      opacity: 0;
+      transform: scale(0.3);
+    }
   }
   .card.dead {
     opacity: 0.75;

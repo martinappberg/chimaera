@@ -26,18 +26,26 @@ pub fn install(app: &App) -> tauri::Result<()> {
         .enabled(false)
         .build(handle)?;
 
-    // A custom Quit (not the predefined one) so it routes through
-    // `request_quit`, which flags the intent — otherwise the shell can't tell
-    // an explicit quit from closing the last window (which drops to home).
+    // A custom Quit (not the predefined one, which quits without the shell
+    // deciding anything) so it routes through `request_quit`: windows with
+    // unsaved edits are asked first (shell/unsaved.rs), and the quit intent is
+    // flagged so the window set survives for the next launch.
     let quit = MenuItemBuilder::with_id("quit", "Quit Chimaera")
         .accelerator("CmdOrCtrl+Q")
         .build(handle)?;
+
+    // The platform convention beside About: an explicit ask that always
+    // answers — the page checks the app and its daemon and shows the result,
+    // "up to date" included.
+    let check_updates =
+        MenuItemBuilder::with_id("check-updates", "Check for Updates…").build(handle)?;
 
     // The application menu (services/hide/show) is a macOS concept; Windows
     // and Linux menubars start at File, where Quit must live instead.
     #[cfg(target_os = "macos")]
     let app_menu = SubmenuBuilder::new(handle, "Chimaera")
         .item(&PredefinedMenuItem::about(handle, None, None)?)
+        .item(&check_updates)
         .separator()
         .item(&settings)
         .separator()
@@ -97,14 +105,20 @@ pub fn install(app: &App) -> tauri::Result<()> {
 
     let window = SubmenuBuilder::new(handle, "Window")
         .item(&PredefinedMenuItem::minimize(handle, None)?)
-        .item(&PredefinedMenuItem::maximize(handle, None)?)
-        .build()?;
+        .item(&PredefinedMenuItem::maximize(handle, None)?);
+    #[cfg(target_os = "macos")]
+    let window = window
+        .separator()
+        .item(&PredefinedMenuItem::bring_all_to_front(handle, None)?);
+    let window = window.build()?;
 
     // macOS carries About in the application submenu; Windows/Linux lost it
     // with that submenu, so give them the conventional Help menu — About is
     // the only in-app version display, which bug triage depends on.
     #[cfg(not(target_os = "macos"))]
     let help = SubmenuBuilder::new(handle, "Help")
+        .item(&check_updates)
+        .separator()
         .item(&PredefinedMenuItem::about(handle, None, None)?)
         .build()?;
 
@@ -115,6 +129,11 @@ pub fn install(app: &App) -> tauri::Result<()> {
     let menu = menu.items(&[&file, &edit, &view, &window, &help]);
     let menu = menu.build()?;
     app.set_menu(menu)?;
+    // AppKit appends the live window list (titles carry the "(N)" needs-you
+    // prefix) to whichever submenu is registered as the app's Windows menu —
+    // the conventional way back to one specific, possibly minimized, window.
+    #[cfg(target_os = "macos")]
+    window.set_as_windows_menu_for_nsapp()?;
     app.manage(MenuState { settings });
 
     app.on_menu_event(|app: &AppHandle, event| {
@@ -124,6 +143,27 @@ pub fn install(app: &App) -> tauri::Result<()> {
                 let _ = crate::shell::show_local_home(app, None);
             }
             "quit" => crate::shell::request_quit(app),
+            "check-updates" => {
+                // Any window can answer (home or workspace — the toast lives
+                // in both); prefer the focused one. With none open, Home opens
+                // and shows an available app update from its own mount-time
+                // check; an "up to date" answer needs a window already loaded
+                // to land in (events aren't queued for a page still booting).
+                let windows = app.webview_windows();
+                let target = windows
+                    .values()
+                    .find(|w| w.is_focused().unwrap_or(false))
+                    .or_else(|| windows.values().next());
+                match target {
+                    Some(window) => {
+                        let _ = window.set_focus();
+                        let _ = app.emit_to(window.label(), "menu", id);
+                    }
+                    None => {
+                        let _ = crate::shell::show_local_home(app, None);
+                    }
+                }
+            }
             "close-view" | "new-terminal" | "new-agent" | "settings" => {
                 // The page knows what "close the focused view" / "open settings"
                 // means; the shell only knows which window is focused. emit_to,

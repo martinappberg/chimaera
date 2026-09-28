@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::{
-    agent_updates, agents, chat, compute, environment, fs, git, launcher, ledger, proxy, quickopen,
-    recents, settings, update, view_state, workspaces,
+    agent_probe, agent_updates, agents, chat, compute, environment, episodes, fs, git, knowledge,
+    launcher, ledger, notes, plugins, proxy, quickopen, recents, settings, timeline, update,
+    view_state, workspaces,
 };
 
 /// Upper bound on how long a sessions snapshot waits for ledger restore.
@@ -46,6 +47,9 @@ pub(crate) struct AppState {
     pub(crate) agent_updates: Mutex<HashMap<agents::AgentKind, agent_updates::AgentLatest>>,
     /// Bumped when the update status changes; drives the `update` ws frame.
     pub(crate) update_epoch: std::sync::atomic::AtomicU64,
+    /// Serializes release checks (the periodic one and any "check now"), so
+    /// concurrent asks share one fetch — see `update::check_now`.
+    pub(crate) update_check: tokio::sync::Mutex<()>,
     /// User settings (the settings.json ground truth), stored in the config
     /// dir; mtime-checked on read so hand-edits surface without a restart.
     pub(crate) settings: Mutex<settings::SettingsStore>,
@@ -133,6 +137,12 @@ pub(crate) struct AppState {
     /// only non-signal way to stop the daemon). Awaited alongside SIGINT/
     /// SIGTERM by the server's graceful-shutdown future.
     pub(crate) shutdown: tokio::sync::Notify,
+    /// Set once the shutdown signal has fired (any source), so long-held
+    /// requests — the notices long-poll — return instead of stalling the
+    /// graceful drain.
+    pub(crate) stopping: std::sync::atomic::AtomicBool,
+    /// The notice feed (agent finished / needs you / agent `notify`).
+    pub(crate) notices: crate::notices::Notices,
     /// Agent binaries resolved via the login shell (with `--version`),
     /// cached per agent for the daemon's lifetime;
     /// `GET /api/v1/agents?refresh=true` bypasses and refills it.
@@ -160,6 +170,15 @@ pub(crate) struct AppState {
     /// night-scrubbed on HPC. Size-capped per file and per session (`upload`),
     /// pruned when the session ends and at boot.
     pub(crate) uploads_root: PathBuf,
+    /// Draft mirror (`~/.chimaera/drafts/`): unsaved editor text mirrored by
+    /// the client so a window on another origin can recover it. Capped and
+    /// evicted in `drafts`.
+    pub(crate) drafts_root: PathBuf,
+    /// Paths an agent or a save just wrote (`git::mark_path_dirty`). Every
+    /// `/ws/events` client subscribes and re-stats the ones it watches right
+    /// away instead of on its next poll. Bounded; a lagging receiver just
+    /// falls back to that poll. See `fs_watch::TOUCHED_CAPACITY`.
+    pub(crate) fs_touched: tokio::sync::broadcast::Sender<crate::fs_watch::Touched>,
     /// Live install sessions, one per agent (POST /agents/{id}/install
     /// answers 409 while one runs): session id + reservation time. The id
     /// registers in `SessionManager` only after spawn, so a reservation
@@ -172,6 +191,47 @@ pub(crate) struct AppState {
     pub(crate) claude_settings_path: PathBuf,
     /// The user's codex config (`~/.codex/config.toml`); same respect rule.
     pub(crate) codex_config_path: PathBuf,
+    /// The per-workspace Timeline (`<data_dir>/workspace/<ws>/timeline.jsonl`):
+    /// what happened, written from signals the daemon already receives. Its
+    /// per-workspace epochs drive the `/ws/events` timeline frame.
+    pub(crate) timeline: timeline::TimelineService,
+    /// The plugin catalog (see `plugins::Catalog`): the embedded plugins
+    /// merged with the installed copies under `<data_dir>/plugins`, reloaded
+    /// after every install, update, rollback or remove.
+    pub(crate) plugin_catalog: plugins::Catalog,
+    /// Plugin release knowledge (see `plugins::releases`): the newer
+    /// versions a check found, and the one-change-at-a-time lock. Hot state.
+    pub(crate) plugin_releases: plugins::releases::Releases,
+    /// Per-workspace plugin footprint detection (see `plugins`): refreshed
+    /// off the reactor, read-only on the MCP hot path.
+    pub(crate) plugin_detect: Mutex<plugins::DetectCache>,
+    /// The plugin host's per-daemon half (see `plugins::runtime`): live
+    /// WASM instances (≤ 64, idle-evicted), fault counts, what each plugin
+    /// offers, the `emit` ring. Hot state; nothing persisted.
+    pub(crate) plugin_runtime: plugins::runtime::PluginRuntime,
+    /// What plugins keep per workspace through the host (`state-put`):
+    /// 64 KiB per (plugin, workspace), in memory.
+    pub(crate) plugin_state: Mutex<plugins::hostfns::PluginStates>,
+    /// Hook-driven turns of claude TUIs in flight (the Timeline's hooks
+    /// tier; see `episodes`). Bounded by live sessions.
+    pub(crate) tui_episodes: Mutex<episodes::TuiEpisodes>,
+    /// The Timeline's Slurm job task is running (idempotent start: tests
+    /// build several routers over one state).
+    pub(crate) timeline_jobs_started: std::sync::atomic::AtomicBool,
+    /// Cached answers from the agents' own CLIs (plugins, skills, hooks) —
+    /// see `agent_probe`.
+    pub(crate) probes: agent_probe::ProbeState,
+    /// Live claude chat sessions' slash/skill catalogs (from their handshake
+    /// Init), for the Skills view's "built into the agent" group. Bounded by
+    /// live sessions; dropped on exit.
+    pub(crate) chat_catalogs: Mutex<HashMap<String, Vec<(String, String)>>>,
+    /// Notes in core: per-session post rate windows (shared by
+    /// `tell_mastermind` and plugins' Timeline appends) and the Mastermind
+    /// wake caps (in memory; notes themselves live on the Timeline).
+    pub(crate) notes: Mutex<notes::NotesState>,
+    /// Knowledge-provider cache, the Timeline's diff baseline, and who
+    /// recorded what (see `knowledge`). Hot state; rebuilt from the files.
+    pub(crate) knowledge: Mutex<knowledge::KnowledgeState>,
 }
 
 impl AppState {
@@ -205,6 +265,7 @@ impl AppState {
             session_themes: Mutex::new(HashMap::new()),
             update: Mutex::new(update::UpdateStatus::default()),
             update_epoch: std::sync::atomic::AtomicU64::new(0),
+            update_check: tokio::sync::Mutex::new(()),
             agent_updates: Mutex::new(HashMap::new()),
             settings: Mutex::new(settings::SettingsStore::load(
                 config_dir.join("settings.json"),
@@ -234,15 +295,31 @@ impl AppState {
             sessions_snapshot: crate::session_view::SnapshotCache::new(),
             restored: tokio::sync::watch::channel(true).0,
             shutdown: tokio::sync::Notify::new(),
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            notices: crate::notices::Notices::new(),
             agent_bins: Mutex::new(HashMap::new()),
             claude_projects_dir: home.join(".claude").join("projects"),
             managed_root: data_dir.join("agents"),
             worktrees_root: data_dir.join("worktrees"),
             shims_dir: data_dir.join("shims"),
             uploads_root: data_dir.join("uploads"),
+            drafts_root: data_dir.join("drafts"),
+            fs_touched: tokio::sync::broadcast::channel(crate::fs_watch::TOUCHED_CAPACITY).0,
             installs: Mutex::new(HashMap::new()),
             claude_settings_path: home.join(".claude").join("settings.json"),
             codex_config_path: home.join(".codex").join("config.toml"),
+            timeline: timeline::TimelineService::new(data_dir.join("workspace")),
+            plugin_catalog: plugins::Catalog::load(data_dir.join("plugins")),
+            plugin_releases: plugins::releases::Releases::default(),
+            plugin_detect: Mutex::new(plugins::DetectCache::default()),
+            plugin_runtime: plugins::runtime::PluginRuntime::default(),
+            plugin_state: Mutex::new(plugins::hostfns::PluginStates::default()),
+            tui_episodes: Mutex::new(episodes::TuiEpisodes::default()),
+            timeline_jobs_started: std::sync::atomic::AtomicBool::new(false),
+            probes: agent_probe::ProbeState::default(),
+            chat_catalogs: Mutex::new(HashMap::new()),
+            notes: Mutex::new(notes::NotesState::default()),
+            knowledge: Mutex::new(knowledge::KnowledgeState::default()),
         }
     }
 

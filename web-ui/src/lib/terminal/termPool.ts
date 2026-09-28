@@ -6,6 +6,7 @@
  */
 
 import type { LinkContext, PathKind } from "./links";
+import type { Reveal } from "../shared/reveal";
 import type { UrlTarget } from "./urlLinks";
 import { baseFontSize, estimateSize } from "./terminalMetrics";
 
@@ -18,7 +19,9 @@ export interface PoolHandlers {
   onSelection(id: string, text: string): void;
   onPaste(id: string, text: string): void;
   linkContext(id: string): LinkContext;
-  onOpenPath(id: string, path: string, kind: PathKind, newSplit: boolean): void;
+  /** A confirmed path link was activated: `split` = Cmd/Ctrl held; `reveal`
+   *  = the line the reference named. */
+  onOpenPath(id: string, path: string, kind: PathKind, opts: { split: boolean; reveal?: Reveal }): void;
   /** A proxyable URL link was activated: open it in a browser pane. */
   onOpenUrl(id: string, target: UrlTarget, newSplit: boolean): void;
   /** Right-click on a URL link: the shared Chimaera/Browser/Copy menu. */

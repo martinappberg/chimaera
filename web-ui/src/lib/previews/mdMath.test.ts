@@ -1,12 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { markdownLanguage } from "@codemirror/lang-markdown";
-import type { MarkdownParser } from "@lezer/markdown";
-import { countDollarPairs, isMath, mathDelimiters, mathExtension } from "./mdMath";
+import { countDollarPairs, isMath, mathDelimiters } from "./mdMath";
+import { docParser as mathParser } from "./doc/parser";
 import fixture from "./mathBlocks.fixture.json";
 
-// The APP's parser configuration (GFM + sub/superscript + emoji), not bare
-// CommonMark: extension ORDER is part of what these pins protect.
-const mathParser = (markdownLanguage.parser as MarkdownParser).configure(mathExtension);
+// The APP's parser configuration (doc/parser.ts: GFM + superscript + emoji +
+// every document extension), not bare CommonMark: extension ORDER is part of
+// what these pins protect.
 
 /** Every math node as `containers/Name:source` — the enclosing block-context
  *  nodes first, none at top level; an unclosed block as `MathBlock(unclosed)`

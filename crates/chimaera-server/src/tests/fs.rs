@@ -445,6 +445,8 @@ async fn fs_endpoints_without_token_are_401() {
         "/api/v1/fs/markdown?path=/x.md",
         "/api/v1/fs/table?path=/x.csv",
         "/api/v1/fs/quickopen?workspace_id=w-x&q=main",
+        "/api/v1/fs/check_document?path=/x.md",
+        "/api/v1/agent-docs",
     ] {
         let res = app(test_state())
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -463,6 +465,7 @@ async fn fs_endpoints_without_token_are_401() {
         ("/api/v1/fs/create", r#"{"path":"/tmp/x","kind":"file"}"#),
         ("/api/v1/fs/rename", r#"{"from":"/tmp/x","to":"/tmp/y"}"#),
         ("/api/v1/fs/delete", r#"{"path":"/tmp/x"}"#),
+        ("/api/v1/agent-docs/install", r#"{"target":"claude_skill"}"#),
     ] {
         let res = app(test_state())
             .oneshot(
@@ -989,16 +992,25 @@ async fn fs_markdown_renders_gfm_and_sanitizes() {
     let (status, json) = request(&state, Method::GET, &uri, None).await;
     assert_eq!(status, StatusCode::OK);
     let html = json["html"].as_str().unwrap();
+    // No frontmatter block: an explicit null, never absent.
+    assert_eq!(json["frontmatter"], serde_json::Value::Null, "{json}");
 
-    // GFM features render.
-    assert!(html.contains("<h1>Title</h1>"), "no heading in {html}");
+    // GFM features render; every element carries its source lines, headings
+    // a namespaced slug id.
     assert!(
-        html.contains("<del>old</del>"),
+        html.contains("<h1 id=\"user-content-title\" data-sourcepos=\"1:1-1:7\">Title"),
+        "no heading in {html}"
+    );
+    assert!(
+        html.contains("<del data-sourcepos=\"3:1-3:7\">old</del>"),
         "no strikethrough in {html}"
     );
-    assert!(html.contains("<table>"), "no table in {html}");
     assert!(
-        html.contains("<a href=\"https://example.com\""),
+        html.contains("<table data-sourcepos=\"5:1-7:9\">"),
+        "no table in {html}"
+    );
+    assert!(
+        html.contains("<a data-sourcepos=\"3:18-3:36\" href=\"https://example.com\""),
         "no autolink in {html}"
     );
     // Sanitization strips script tags and event handlers but keeps the img.
@@ -1009,6 +1021,56 @@ async fn fs_markdown_renders_gfm_and_sanitizes() {
         html.contains("<img src=\"x.png\""),
         "img stripped in {html}"
     );
+}
+
+/// The reading render's document features over the real route: frontmatter
+/// answered raw beside the HTML (and kept out of it, line numbers intact),
+/// alerts, namespaced heading/footnote ids, task spans.
+#[tokio::test]
+async fn fs_markdown_reports_frontmatter_alerts_ids_and_tasks() {
+    let state = test_state();
+    let root = test_dir("fs-md-features");
+    let path = root.join("doc.md");
+    std::fs::write(
+        &path,
+        concat!(
+            "---\n",            // 1
+            "title: Notes\n",   // 2
+            "tags: [a, b]\n",   // 3
+            "---\n",            // 4
+            "\n",               // 5
+            "# Plan\n",         // 6
+            "\n",               // 7
+            "> [!WARNING]\n",   // 8
+            "> Careful[^1].\n", // 9
+            "\n",               // 10
+            "- [x] shipped\n",  // 11
+            "- [ ] pending\n",  // 12
+            "\n",               // 13
+            "[^1]: Really.\n",  // 14
+        ),
+    )
+    .unwrap();
+
+    let uri = format!("/api/v1/fs/markdown?path={}", path.to_string_lossy());
+    let (status, json) = request(&state, Method::GET, &uri, None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["frontmatter"], "title: Notes\ntags: [a, b]");
+    let html = json["html"].as_str().unwrap();
+    for want in [
+        "<h1 id=\"user-content-plan\" data-sourcepos=\"6:1-6:6\">",
+        "<div class=\"markdown-alert markdown-alert-warning\" data-sourcepos=\"8:1-9:14\">",
+        "<p class=\"markdown-alert-title\">Warning</p>",
+        "<a href=\"#fn-1\" id=\"user-content-fnref-1\"",
+        "<li data-sourcepos=\"14:1-14:13\" id=\"user-content-fn-1\">",
+        "<span class=\"md-task\" data-task=\"done\"></span> shipped",
+        "<span class=\"md-task\" data-task=\"todo\"></span> pending",
+    ] {
+        assert!(html.contains(want), "missing {want} in {html}");
+    }
+    assert!(!html.contains("title:"), "frontmatter leaked into {html}");
+    assert!(!html.contains("<hr"), "{html}");
+    assert!(!html.contains("<input"), "{html}");
 }
 
 /// `fs/xlsx` parses a spreadsheet into the same paged `TablePage` shape the CSV
@@ -1034,6 +1096,7 @@ async fn fs_xlsx_pages_sheets_of_a_workbook() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["sheets"], serde_json::json!(["Alpha", "Beta"]));
     assert_eq!(json["sheet"], "Alpha");
+    assert_eq!(json["origin"], serde_json::json!([0, 0]));
     assert_eq!(json["columns"], serde_json::json!(["id", "value"]));
     assert_eq!(json["rows"], serde_json::json!([["a", "1"], ["b", "2"]]));
     assert_eq!(json["truncated"], false);
@@ -1303,6 +1366,178 @@ async fn fs_table_gz_sniffs_inner_name() {
     assert_eq!(json["columns"], serde_json::json!(["x", "y"]));
 }
 
+/// The additive `comment` / `header=false` / `names` / `quote=false` options
+/// read the bioinformatics formats the UI routes to the table view.
+#[tokio::test]
+async fn fs_table_comment_and_headerless_options_read_bio_formats() {
+    let state = test_state();
+    let root = test_dir("fs-table-bio");
+    let get = |path: &std::path::Path, query: &str| {
+        format!("/api/v1/fs/table?path={}&{query}", path.to_string_lossy())
+    };
+
+    // VCF: `##` meta lines skipped (one quotes a description), `#CHROM` is
+    // the header, and a field opening with `"` stays one field.
+    let vcf = root.join("calls.vcf");
+    std::fs::write(
+        &vcf,
+        "##fileformat=VCFv4.2\n\
+         ##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Total Depth\">\n\
+         #CHROM\tPOS\tID\tREF\tALT\n\
+         chr1\t100\t\"q\tA\tG\n\
+         chr1\t200\t.\tC\tT\n",
+    )
+    .unwrap();
+    let (status, json) = request(
+        &state,
+        Method::GET,
+        &get(&vcf, "comment=%23%23&quote=false"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        json["columns"],
+        serde_json::json!(["#CHROM", "POS", "ID", "REF", "ALT"])
+    );
+    assert_eq!(
+        json["rows"],
+        serde_json::json!([
+            ["chr1", "100", "\"q", "A", "G"],
+            ["chr1", "200", ".", "C", "T"]
+        ])
+    );
+    // Auto-delimiter sniffs the first non-comment line (tabs), not the
+    // comma-laden meta line.
+    assert_eq!(json["total_rows"], 2);
+
+    // The same file gzipped pages through the sequential decoder.
+    let vcf_gz = root.join("calls.vcf.gz");
+    std::fs::write(&vcf_gz, gzip_bytes(&std::fs::read(&vcf).unwrap(), None)).unwrap();
+    let (status, json) = request(
+        &state,
+        Method::GET,
+        &get(&vcf_gz, "comment=%23%23&quote=false&delim=tab"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["columns"][0], "#CHROM");
+    assert_eq!(json["rows"].as_array().unwrap().len(), 2);
+
+    // SAM: `@` header lines skipped, no header row, the mandatory names,
+    // then `colN` for the optional tags.
+    let sam = root.join("reads.sam");
+    std::fs::write(
+        &sam,
+        "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:1000\n\
+         r1\t0\tchr1\t5\t60\t4M\t*\t0\t0\tACGT\t\"#$%\tNM:i:0\n\
+         r2\t16\tchr1\t9\t60\t4M\t*\t0\t0\tTTGA\tIIII\n",
+    )
+    .unwrap();
+    let names = "QNAME,FLAG,RNAME,POS,MAPQ,CIGAR,RNEXT,PNEXT,TLEN,SEQ,QUAL";
+    let (status, json) = request(
+        &state,
+        Method::GET,
+        &get(
+            &sam,
+            &format!("comment=%40&header=false&quote=false&delim=tab&names={names}"),
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let columns = json["columns"].as_array().unwrap();
+    assert_eq!(columns.len(), 12);
+    assert_eq!(columns[0], "QNAME");
+    assert_eq!(columns[10], "QUAL");
+    assert_eq!(columns[11], "col12");
+    assert_eq!(json["rows"][0][10], "\"#$%");
+    assert_eq!(json["rows"][1][0], "r2");
+
+    // BED: several prefixes (`#`, `track`, `browser`), fewer names than
+    // fields, and a comment line between records.
+    let bed = root.join("peaks.bed");
+    std::fs::write(
+        &bed,
+        "browser position chr1:1-100\ntrack name=peaks\n# note\n\
+         chr1\t10\t20\tp1\nchr1\t30\t40\tp2\n# mid\nchr2\t5\t9\tp3\n",
+    )
+    .unwrap();
+    let (status, json) = request(
+        &state,
+        Method::GET,
+        &get(
+            &bed,
+            "comment=%23,track,browser&header=false&delim=tab&names=chrom,chromStart,chromEnd",
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        json["columns"],
+        serde_json::json!(["chrom", "chromStart", "chromEnd", "col4"])
+    );
+    assert_eq!(json["rows"].as_array().unwrap().len(), 3);
+    assert_eq!(json["rows"][2][3], "p3");
+    // Paging counts data rows only: the skipped lines never shift offsets.
+    let (_, json) = request(
+        &state,
+        Method::GET,
+        &get(
+            &bed,
+            "comment=%23,track,browser&header=false&delim=tab&offset_rows=2&limit_rows=1",
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(json["rows"], serde_json::json!([["chr2", "5", "9", "p3"]]));
+    assert_eq!(json["columns"][0], "col1");
+
+    // Option ceilings are a clean 400.
+    let (status, err) = request(&state, Method::GET, &get(&bed, "comment=a,b,c,d,e"), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(err["error"].as_str().unwrap().contains("comment"));
+}
+
+/// Deep pages of a plain file land on the right rows through the row index,
+/// and the answer says how big the file is (estimated, then exact).
+#[tokio::test]
+async fn fs_table_deep_pages_report_totals() {
+    let state = test_state();
+    let root = test_dir("fs-table-deep");
+    let path = root.join("deep.csv");
+    let mut csv = String::from("id,label\n");
+    for i in 0..5_000 {
+        csv.push_str(&format!("{i},\"row, {i}\"\n"));
+    }
+    std::fs::write(&path, csv).unwrap();
+    let path = path.to_string_lossy();
+
+    let uri = format!("/api/v1/fs/table?path={path}&limit_rows=10");
+    let (_, json) = request(&state, Method::GET, &uri, None).await;
+    assert!(json["total_rows"].is_null());
+    let est = json["est_rows"].as_u64().unwrap();
+    // A byte-rate estimate from the first page: the right magnitude, not exact
+    // (early ids are shorter than late ones).
+    assert!((2_500..10_000).contains(&est), "estimate {est}");
+
+    for offset in [4_321usize, 1_000, 2_999, 4_321] {
+        let uri = format!("/api/v1/fs/table?path={path}&offset_rows={offset}&limit_rows=2");
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["rows"][0][0], offset.to_string());
+        assert_eq!(json["rows"][1][1], format!("row, {}", offset + 1));
+        assert_eq!(json["scan_limited"], false);
+    }
+
+    let uri = format!("/api/v1/fs/table?path={path}&offset_rows=4999&limit_rows=5");
+    let (_, json) = request(&state, Method::GET, &uri, None).await;
+    assert_eq!(json["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(json["truncated"], false);
+    assert_eq!(json["total_rows"], 5_000);
+}
 #[tokio::test]
 async fn fs_file_gz_serves_decompressed_slices() {
     let state = test_state();

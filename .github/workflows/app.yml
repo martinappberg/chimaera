@@ -18,6 +18,10 @@ on:
     paths:
       - "crates/chimaera-app/**"
       - "web-ui/**"
+      - "crates/chimaera-server/**"
+      - "plugins/**"
+      - "scripts/build-plugins.sh"
+      - "scripts/smoke-macos-plugins.mjs"
       - ".github/workflows/app.yml"
   workflow_dispatch:
 
@@ -101,6 +105,13 @@ jobs:
       # beforeBuildCommand has created that directory on a clean runner.
       - run: cargo test
         working-directory: crates/chimaera-app
+      # Plugin execution must also work inside the hardened, signed executable;
+      # cargo test runs an ordinary test binary and cannot catch macOS kills.
+      - name: Exercise plugins in the signed macOS bundle
+        if: runner.os == 'macOS'
+        run: |
+          bash scripts/build-plugins.sh
+          node scripts/smoke-macos-plugins.mjs
       # The bundle is the shippable artifact; the raw .app is a directory
       # with symlinks that artifact-zipping would flatten.
       #

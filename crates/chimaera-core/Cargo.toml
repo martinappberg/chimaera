@@ -12,6 +12,7 @@ serde_json.workspace = true
 tracing.workspace = true
 rand.workspace = true
 dirs.workspace = true
+hostname.workspace = true
 
 # Unix-only: uid/passwd lookups and the signal-0 liveness probe. The Windows
 # build of the app workspace never touches processes by pid directly (the WSL

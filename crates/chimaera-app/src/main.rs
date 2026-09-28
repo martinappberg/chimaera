@@ -12,6 +12,7 @@ mod command_manifest;
 mod daemon;
 mod http;
 mod menu;
+mod notify;
 mod shell;
 mod tray;
 mod update;

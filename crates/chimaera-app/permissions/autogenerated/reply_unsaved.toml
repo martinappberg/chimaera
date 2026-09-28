@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-reply-unsaved"
+description = "Enables the reply_unsaved command without any pre-configured scope."
+commands.allow = ["reply_unsaved"]
+
+[[permission]]
+identifier = "deny-reply-unsaved"
+description = "Denies the reply_unsaved command without any pre-configured scope."
+commands.deny = ["reply_unsaved"]

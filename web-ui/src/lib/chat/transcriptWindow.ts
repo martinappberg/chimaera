@@ -168,3 +168,73 @@ export function pageLater(current: TranscriptWindow, total: number): PagePlan {
     end - start > TRANSCRIPT_WINDOW ? { start: end - TRANSCRIPT_WINDOW, end } : expanded;
   return { expanded, settled };
 }
+
+/**
+ * How far ahead of the viewport, in viewport heights, the next page mounts
+ * while the reader scrolls through history — far enough that a fling never
+ * reaches the rendered edge (and stops dead against it) before the page exists.
+ */
+export const PREFETCH_VIEWPORTS = 2;
+
+/**
+ * Which page, if any, a reader scrolling in `direction` (-1 up, +1 down)
+ * needs next. `above` is how far the rendered rows extend above the viewport
+ * top (negative once the viewport is inside the spacer), `below` how far they
+ * extend past its bottom. Only the direction of travel prefetches: a window
+ * short enough to sit within reach of both edges must not ping-pong.
+ */
+export function prefetchPage(
+  edges: { above: number; below: number; viewport: number },
+  current: TranscriptWindow,
+  total: number,
+  direction: -1 | 1,
+): "earlier" | "later" | null {
+  const reach = Math.max(0, edges.viewport) * PREFETCH_VIEWPORTS;
+  if (direction < 0 && current.start > 0 && edges.above < reach) return "earlier";
+  if (direction > 0 && current.end < boundedTotal(total) && edges.below < reach) return "later";
+  return null;
+}
+
+/*
+ * The history spacer. WebKit has no native scroll anchoring, and its
+ * scrolling thread owns the position during a gesture: a `scrollTop` write
+ * that corrects for rows mounted above the viewport lands behind the
+ * fling's own updates and snaps back for a frame or two (measured with real
+ * momentum wheel events — any main-thread render during the fling is enough).
+ * So above-viewport height changes are absorbed by a blank spacer ahead of
+ * the window instead: it shrinks by exactly what was mounted, the content
+ * above the reader keeps its total height, and the scroll position never
+ * needs rewriting mid-gesture. It stands in for all the unmounted earlier
+ * history, so continuous flinging never runs it dry, and it may go NEGATIVE
+ * when an estimate falls short (the column is pulled up past the scroll
+ * origin; those rows are unreachable, like the old rendered edge, until the
+ * next idle moment re-sizes it with one compensating write).
+ */
+
+/** Hard ceiling on the estimate, far below any engine's layout limit. */
+const SPACER_MAX_PX = 4_000_000;
+
+/** The spacer height standing in for the unmounted earlier history: its
+ *  modelled weight (heightModel.ts) at the rendered window's measured px per
+ *  unit. */
+export function spacerTarget(earlierWeight: number, pxPerWeight: number): number {
+  if (!(earlierWeight > 0) || !(pxPerWeight > 0)) return 0;
+  return Math.min(SPACER_MAX_PX, Math.round(earlierWeight * pxPerWeight));
+}
+
+/** The one-page window a far jump (a scrollbar drag deep into the spacer)
+ *  mounts around `index`, with a little context above it. */
+export function pageAround(index: number, total: number): TranscriptWindow {
+  const bounded = boundedTotal(total);
+  const start = Math.max(0, Math.min(Math.floor(index) - 16, bounded - TRANSCRIPT_PAGE));
+  return { start, end: Math.min(bounded, start + TRANSCRIPT_PAGE) };
+}
+
+/** Whether an idle moment should re-size the spacer: blank space left above
+ *  a fully mounted history, rows pulled past the scroll origin, or an
+ *  estimate that has drifted far enough to starve (or bloat) the next page. */
+export function spacerNeedsRebalance(current: number, target: number): boolean {
+  if (current < 0) return true;
+  if (target <= 0) return current > 0;
+  return current < target * 0.75 || current > target * 1.5;
+}

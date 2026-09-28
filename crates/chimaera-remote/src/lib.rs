@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context};
-use chimaera_core::Manifest;
+use chimaera_core::{same_node, Manifest};
 use tokio::process::{Child, Command};
 
 /// Per-child context inherited by the native app's SSH_ASKPASS helper. This
@@ -310,10 +310,18 @@ fn ssh_opts() -> [String; 16] {
 
 /// An `ssh` command pre-loaded with the shared options, no host yet. For
 /// flag-heavy invocations where the destination must come last
-/// (`-O cancel -L …`, `-N -L …`); otherwise prefer [`ssh_cmd`].
+/// (`-O cancel -L …`, `-N -L …`); otherwise prefer [`ssh_cmd`]. Follows
+/// `host`'s current [`Route`].
 fn ssh_base(host: &str) -> Command {
+    ssh_base_via(host, &route_of(host))
+}
+
+/// [`ssh_base`] along an explicit route (a tunnel tearing down the forward it
+/// registered, a wedge check of one particular master).
+fn ssh_base_via(host: &str, route: &Route) -> Command {
     let mut c = transport_command("ssh");
     c.env(ASKPASS_ALIAS_ENV, host);
+    c.args(route_opts(host, route));
     c.args(ssh_opts());
     c
 }
@@ -334,8 +342,133 @@ fn ssh_cmd(host: &str) -> Command {
 fn scp_cmd(host: &str) -> Command {
     let mut c = transport_command("scp");
     c.env(ASKPASS_ALIAS_ENV, host);
+    c.args(route_opts(host, &route_of(host)));
     c.args(ssh_opts());
     c
+}
+
+// --- Round-robin login nodes --------------------------------------------------
+//
+// An HPC alias often names a POOL of login nodes (one DNS name, rotated per
+// lookup), and every login node mounts the same `$HOME`. The daemon runs on
+// ONE of them: its manifest on the shared home is visible from every node, but
+// its pid and loopback port mean something only on the node that wrote it. A
+// ControlMaster keeps every command on the node it landed on — until a new
+// master dials (after sleep, a `ControlPersist` expiry, an app relaunch) and
+// lands on another node, where `kill -0 <pid>` answers for an unrelated process
+// table. So the probe reports which node it ran on, a manifest written
+// elsewhere is never judged from the wrong node, and every later ssh call for
+// the alias is routed to the daemon's node.
+
+/// Which node an ssh/scp call for a host alias lands on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Route {
+    /// Wherever the alias's own ssh config sends a new connection.
+    #[default]
+    Alias,
+    /// One named node, dialed with the alias's own config and only its
+    /// `HostName` replaced: user, keys, ProxyJump and 2FA carry over, and the
+    /// node gets its own ControlMaster (`%C` hashes the host name). One
+    /// authentication, no dependency on another connection — but the name is
+    /// resolved and dialed from THIS machine.
+    Node(String),
+    /// One named node reached through the alias's own ControlMaster (a `-W`
+    /// first leg): the name is resolved and dialed from inside the cluster,
+    /// for names this machine can't resolve or login nodes it can't reach.
+    NodeViaAlias(String),
+}
+
+impl Route {
+    /// The node this route pins, if any.
+    pub fn node(&self) -> Option<&str> {
+        match self {
+            Route::Alias => None,
+            Route::Node(node) | Route::NodeViaAlias(node) => Some(node),
+        }
+    }
+}
+
+/// The learned route per alias, process-wide: a connect records where the
+/// daemon lives and every later call for that alias — the tunnel, stops,
+/// session counts, compute tunnels, wedge checks — follows it, the way they
+/// all share one ControlMaster. Absent = [`Route::Alias`].
+static ROUTES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Route>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The route every ssh/scp call for `host` currently takes.
+pub fn route_of(host: &str) -> Route {
+    ROUTES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(host)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn set_route(host: &str, route: Route) {
+    let mut routes = ROUTES.lock().unwrap_or_else(|p| p.into_inner());
+    match route {
+        Route::Alias => routes.remove(host),
+        route => routes.insert(host.to_string(), route),
+    };
+}
+
+/// The `-o` options that send a call for `host` along `route`. Placed before
+/// [`ssh_opts`] and the destination: OpenSSH keeps the first value it sees,
+/// so these override the alias's own `HostName` (and, for the via-alias
+/// route, its `ProxyJump`/`ProxyCommand`) from `~/.ssh/config`.
+fn route_opts(host: &str, route: &Route) -> Vec<String> {
+    match route {
+        Route::Alias => Vec::new(),
+        Route::Node(node) => vec!["-o".into(), format!("HostName={node}")],
+        Route::NodeViaAlias(node) => vec![
+            "-o".into(),
+            format!("HostName={node}"),
+            "-o".into(),
+            format!("ProxyCommand={}", master_proxy_command(host, None)),
+        ],
+    }
+}
+
+/// Whether a node name from a manifest is safe to put in ssh's argv and in a
+/// `ProxyCommand` (whose `%h` a local shell expands): letters, digits, `-`,
+/// `_`, `.`, no leading `-`/`.`. The manifest is data on a remote disk, never
+/// trusted syntax.
+fn valid_node_name(node: &str) -> bool {
+    !node.is_empty()
+        && node.len() <= 253
+        && !node.starts_with(['-', '.'])
+        && node
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// The routes to try, in order, for reaching `node`. The direct dial goes
+/// first — one prompt, no second connection to keep up — but only when THIS
+/// machine resolves the name to an address the cluster resolves it to
+/// (`cluster` from the landed node, `local` here). Otherwise the name may
+/// reach an unrelated host through this machine's search domains, which the
+/// trust-on-first-use host-key policy would accept and the password prompt
+/// would then be answered to; such a name only ever travels inside the
+/// cluster.
+fn routes_to(node: &str, cluster: &[std::net::IpAddr], local: &[std::net::IpAddr]) -> Vec<Route> {
+    let via = Route::NodeViaAlias(node.to_string());
+    if cluster.iter().any(|addr| local.contains(addr)) {
+        vec![Route::Node(node.to_string()), via]
+    } else {
+        vec![via]
+    }
+}
+
+/// Where THIS machine resolves `node` (its sshd port), bounded so a slow
+/// resolver can't stall a connect. Empty on failure — the direct rung is then
+/// skipped, never guessed.
+async fn local_addrs(node: &str) -> Vec<std::net::IpAddr> {
+    let lookup = tokio::net::lookup_host((node, 22));
+    match tokio::time::timeout(Duration::from_secs(5), lookup).await {
+        Ok(Ok(addrs)) => addrs.map(|addr| addr.ip()).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Where the connect flow currently is; consumers surface these however
@@ -344,6 +477,10 @@ fn scp_cmd(host: &str) -> Command {
 pub enum Phase {
     /// Probing the host for a running daemon.
     Probing,
+    /// The daemon runs on another node of the alias's login-node pool than
+    /// the one this connection landed on; reaching `node` (which may ask the
+    /// user to authenticate to it).
+    Routing { node: String },
     /// Replacing an outdated remote daemon (graceful stop, then redeploy).
     Updating,
     /// Fetching the matching daemon binary from the GitHub release this build
@@ -534,6 +671,10 @@ pub struct Tunnel {
     /// Live sessions counted on the remote daemon when the update decision
     /// was made; `None` when unneeded (builds matched) or undeterminable.
     pub live_sessions: Option<usize>,
+    /// How the forward reaches the daemon's node: [`Route::Alias`] unless the
+    /// alias is a login-node pool and the daemon runs on a node other than
+    /// the one a new connection lands on.
+    pub route: Route,
     child: Child,
 }
 
@@ -562,6 +703,7 @@ impl Tunnel {
         let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
         cancel_master_forward(
             &self.host,
+            &self.route,
             &format!("{}:127.0.0.1:{}", self.local_port, self.manifest.port),
         )
         .await;
@@ -572,9 +714,10 @@ impl Tunnel {
 /// holds. A forward registered by a mux client belongs to the MASTER, not
 /// the client — killing (or outliving) the client leaves the local listener
 /// bound until the master expires, so every path that abandons such a
-/// forward must cancel it by the exact spec it was opened with.
-async fn cancel_master_forward(host: &str, spec: &str) {
-    if bounded_mux_ssh(host, &["-O", "cancel", "-L", spec], &[], 10)
+/// forward must cancel it by the exact spec it was opened with, on the
+/// master (the `route`) it was registered with.
+async fn cancel_master_forward(host: &str, route: &Route, spec: &str) {
+    if bounded_mux_ssh(host, route, &["-O", "cancel", "-L", spec], &[], 10)
         .await
         .is_none()
     {
@@ -605,8 +748,22 @@ async fn cancel_master_forward(host: &str, spec: &str) {
 /// longer when there is no verdict at all — a launch-time restore or a click
 /// on a host whose warm master merely sits on a loaded node must not lose
 /// its master (and its Duo session) to a slow `true`.
+///
+/// A host routed to its daemon's node ([`Route`]) has two masters — the
+/// node's, and the alias's own (the via-alias route's first leg, or the one
+/// the connect first landed through) — and both are checked, the node's first
+/// so its `-W` leg is gone before the master it rides.
 pub async fn clear_wedged_master(host: &str, session_bound_secs: u64) -> bool {
-    match bounded_mux_ssh(host, &["-O", "check"], &[], 10).await {
+    let route = route_of(host);
+    let mut cleared = clear_wedged_master_via(host, &route, session_bound_secs).await;
+    if route != Route::Alias {
+        cleared |= clear_wedged_master_via(host, &Route::Alias, session_bound_secs).await;
+    }
+    cleared
+}
+
+async fn clear_wedged_master_via(host: &str, route: &Route, session_bound_secs: u64) -> bool {
+    match bounded_mux_ssh(host, route, &["-O", "check"], &[], 10).await {
         // No master (or ssh cannot even run): nothing to clear.
         Some(false) => return false,
         Some(true) => {}
@@ -622,10 +779,10 @@ pub async fn clear_wedged_master(host: &str, session_bound_secs: u64) -> bool {
     // either way — a stall (dead link) or a fast failure ("read from master
     // failed" from one mid-teardown) — and the flight would otherwise dial
     // it under 240 s bounds.
-    if bounded_mux_ssh(host, &[], &["true"], session_bound_secs).await == Some(true) {
+    if bounded_mux_ssh(host, route, &[], &["true"], session_bound_secs).await == Some(true) {
         return false;
     }
-    match bounded_mux_ssh(host, &["-O", "exit"], &[], 5).await {
+    match bounded_mux_ssh(host, route, &["-O", "exit"], &[], 5).await {
         Some(_) => tracing::info!(
             "ControlMaster to {host} was wedged after a link loss; terminated so the reconnect dials fresh"
         ),
@@ -637,16 +794,17 @@ pub async fn clear_wedged_master(host: &str, session_bound_secs: u64) -> bool {
     true
 }
 
-/// A non-interactive ssh at `host`'s ControlMaster: `BatchMode` (no prompt,
-/// ever) and a tight `ConnectTimeout` placed BEFORE [`ssh_opts`] — OpenSSH
-/// takes the first value it sees for most options, so one appended after
-/// the shared set would look effective and be silently ignored. Every mux
-/// control request and teardown probe starts here.
-fn mux_prologue(host: &str) -> Command {
+/// A non-interactive ssh at `host`'s ControlMaster along `route`: `BatchMode`
+/// (no prompt, ever) and a tight `ConnectTimeout` placed BEFORE [`ssh_opts`] —
+/// OpenSSH takes the first value it sees for most options, so one appended
+/// after the shared set would look effective and be silently ignored. Every
+/// mux control request and teardown probe starts here.
+fn mux_prologue(host: &str, route: &Route) -> Command {
     let mut command = transport_command("ssh");
     command
         .env(ASKPASS_ALIAS_ENV, host)
         .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
+        .args(route_opts(host, route))
         .args(ssh_opts());
     command
 }
@@ -654,10 +812,16 @@ fn mux_prologue(host: &str) -> Command {
 /// `ssh <prologue> <opts> host <remote>` under a hard wall-clock bound:
 /// `Some(exit-success)` when it finished, `None` when it was still running
 /// at the deadline (then killed). A spawn failure counts as `Some(false)`.
-async fn bounded_mux_ssh(host: &str, opts: &[&str], remote: &[&str], secs: u64) -> Option<bool> {
+async fn bounded_mux_ssh(
+    host: &str,
+    route: &Route,
+    opts: &[&str],
+    remote: &[&str],
+    secs: u64,
+) -> Option<bool> {
     let label = format!("ssh {} {host} {}", opts.join(" "), remote.join(" "));
     let what = label.trim();
-    let mut command = mux_prologue(host);
+    let mut command = mux_prologue(host, route);
     command
         .args(opts)
         .arg(host)
@@ -776,8 +940,15 @@ pub async fn http_alive_authed(port: u16, token: &str) -> bool {
 /// `connect` future `!Send` and break the Tauri app's `spawn` of it — keeping
 /// the concrete closure type lets `Send` flow through exactly as it did before
 /// this seam existed.
+///
+/// Every op runs along `host`'s current [`Route`]; [`locate`] is the only
+/// place that changes it.
 trait RemoteOps {
-    async fn remote_probe(&self, host: &str) -> anyhow::Result<Option<(Manifest, bool)>>;
+    fn route(&self, host: &str) -> Route;
+    fn set_route(&self, host: &str, route: Route);
+    /// Where THIS machine resolves `node` (see [`routes_to`]).
+    async fn local_addrs(&self, node: &str) -> Vec<std::net::IpAddr>;
+    async fn remote_probe(&self, host: &str) -> anyhow::Result<ProbeRun>;
     async fn remote_sessions_count(
         &self,
         host: &str,
@@ -814,8 +985,17 @@ struct SshOps {
 }
 
 impl RemoteOps for SshOps {
-    async fn remote_probe(&self, host: &str) -> anyhow::Result<Option<(Manifest, bool)>> {
-        remote_probe(host, self.home).await
+    fn route(&self, host: &str) -> Route {
+        route_of(host)
+    }
+    fn set_route(&self, host: &str, route: Route) {
+        set_route(host, route)
+    }
+    async fn local_addrs(&self, node: &str) -> Vec<std::net::IpAddr> {
+        local_addrs(node).await
+    }
+    async fn remote_probe(&self, host: &str) -> anyhow::Result<ProbeRun> {
+        probe_run(host, self.home).await
     }
     async fn remote_sessions_count(
         &self,
@@ -856,6 +1036,150 @@ impl RemoteOps for SshOps {
     }
 }
 
+/// Find `host`'s daemon and leave `host`'s route pointing at the node it runs
+/// on — or at the node a fresh start belongs on. `Ok(None)` = nothing to
+/// attach to (no manifest, or its node provably gone); `Ok(Some((manifest,
+/// alive)))` carries a verdict taken ON the manifest's node, so `alive ==
+/// false` means provably dead there. A manifest another node wrote whose node
+/// can't be reached is an error — never "dead": starting a second daemon over
+/// the same shared state would resume every session next to the running one.
+async fn locate(
+    ops: &impl RemoteOps,
+    host: &str,
+    progress: &impl Fn(Phase),
+) -> anyhow::Result<Option<(Manifest, bool)>> {
+    // A route an earlier connect learned goes first: it lands straight on the
+    // daemon's node (one dial, one prompt) instead of wherever the pool sends
+    // a new master. Anything but a verdict from that node starts over.
+    let learned = ops.route(host);
+    if learned != Route::Alias {
+        let why = match ops.remote_probe(host).await {
+            // Stopped since (a graceful stop removes the manifest): a fresh
+            // start there keeps the alias on the node it was routed to.
+            Ok(ProbeRun::Ran(None)) => return Ok(None),
+            Ok(ProbeRun::Ran(Some(p))) if p.here() => return Ok(Some((p.manifest, p.alive))),
+            Ok(ProbeRun::Ran(Some(p))) => format!("registered on {} now", p.manifest.hostname),
+            Ok(ProbeRun::Failed(f)) => f.to_string(),
+            Err(e) => format!("{e:#}"),
+        };
+        tracing::info!(
+            "{host}: no verdict from {} ({why}); probing afresh",
+            learned.node().unwrap_or_default()
+        );
+        ops.set_route(host, Route::Alias);
+    }
+
+    let landed = match ops.remote_probe(host).await? {
+        // An unreachable host reads as nothing running, as it always has:
+        // the start path then surfaces ssh's own error.
+        ProbeRun::Failed(_) | ProbeRun::Ran(None) => return Ok(None),
+        ProbeRun::Ran(Some(p)) if p.here() => return Ok(Some((p.manifest, p.alive))),
+        ProbeRun::Ran(Some(p)) => p,
+    };
+    let node = landed.manifest.hostname.clone();
+    if landed.manifest_node_resolves == Some(false) {
+        tracing::warn!(
+            "{host}: the daemon registered on {node} (pid {}) is gone with its node — the name no \
+             longer resolves on {}; starting a fresh daemon there",
+            landed.manifest.pid,
+            landed.node
+        );
+        return Ok(None);
+    }
+    if !valid_node_name(&node) {
+        bail!(unreachable_node_error(
+            host,
+            &landed,
+            "its name is not a plain host name"
+        ));
+    }
+    tracing::info!(
+        "{host}: this connection landed on {} but the daemon is registered on {node}; routing there",
+        landed.node
+    );
+    progress(Phase::Routing { node: node.clone() });
+    let local = ops.local_addrs(&node).await;
+    let mut why = String::new();
+    for route in routes_to(&node, &landed.manifest_node_addrs, &local) {
+        ops.set_route(host, route.clone());
+        match ops.remote_probe(host).await {
+            // The verdict now comes from the node that wrote the manifest.
+            Ok(ProbeRun::Ran(Some(p))) if p.here() && same_node(&p.node, &node) => {
+                tracing::info!("{host}: reached {node} ({route:?})");
+                return Ok(Some((p.manifest, p.alive)));
+            }
+            // Inside the cluster the name leads back to the node we landed
+            // on: a renamed host, whose own verdict is the local one. Only
+            // the `-W` route proves that — the user's ssh config can send
+            // the direct dial anywhere (a ProxyCommand with a fixed target
+            // ignores `HostName`), so a direct dial landing back here says
+            // nothing about the name.
+            Ok(ProbeRun::Ran(Some(p)))
+                if matches!(route, Route::NodeViaAlias(_)) && same_node(&p.node, &landed.node) =>
+            {
+                ops.set_route(host, Route::Alias);
+                return Ok(Some((p.manifest, p.alive)));
+            }
+            // No manifest over this route: either that node's daemon just
+            // stopped (a graceful stop removes it), or the dial reached a
+            // machine that doesn't share this home. Only the node we landed
+            // on — which just read the manifest — can tell them apart.
+            Ok(ProbeRun::Ran(None)) => {
+                ops.set_route(host, Route::Alias);
+                match ops.remote_probe(host).await? {
+                    ProbeRun::Ran(None) => return Ok(None),
+                    _ => {
+                        why = format!(
+                            "dialing {node} reached a machine that doesn't see {host}'s manifest"
+                        );
+                        break;
+                    }
+                }
+            }
+            Ok(ProbeRun::Ran(Some(p))) => {
+                why = if same_node(&p.node, &node) {
+                    format!(
+                        "the manifest changed while connecting (now {})",
+                        p.manifest.hostname
+                    )
+                } else {
+                    format!("dialing {node} reached a machine calling itself {}", p.node)
+                };
+            }
+            Ok(ProbeRun::Failed(f)) => {
+                let network = f.network_level();
+                why = f.to_string();
+                // An auth failure or a cancelled prompt must not raise a
+                // second prompt along another route.
+                if !network {
+                    break;
+                }
+            }
+            Err(e) => {
+                why = format!("{e:#}");
+                break;
+            }
+        }
+    }
+    ops.set_route(host, Route::Alias);
+    bail!(unreachable_node_error(host, &landed, &why))
+}
+
+/// The honest failure for a daemon registered on a node this connect could
+/// not reach: what is where, why nothing was started, and the way out.
+fn unreachable_node_error(host: &str, landed: &Probe, why: &str) -> String {
+    let m = &landed.manifest;
+    // ssh ends its own complaint with a period.
+    let why = why.trim_end_matches('.');
+    format!(
+        "{host}'s daemon runs on login node {} (pid {}), but this connection landed on {} and \
+         could not reach {}: {why}. Nothing was started: a second daemon would resume the same \
+         sessions next to the running one. Reconnect once {} is reachable — or, if that node is \
+         gone for good, remove the daemon's manifest.json on {host} and reconnect.",
+        m.hostname, m.pid, landed.node, m.hostname, m.hostname
+    )
+}
+
 /// The DECISION phase of [`connect`]: probe the host's daemon and decide
 /// whether to reuse, replace, attach-outdated, or fresh-start it — returning
 /// `(manifest, outdated, live_sessions)` for the tunnel-attach phase to forward
@@ -872,11 +1196,12 @@ async fn resolve_daemon(
     let local_build = chimaera_core::BUILD_ID;
     let mut outdated = false;
     let mut live_sessions = None;
-    // One remote exec answers both "is there a manifest" and "is its pid
-    // alive" (`remote_probe`): every ssh exec through the ControlMaster costs
-    // a channel-open RTT plus a fork on a loaded login node, so the probe
-    // pays that once, not twice.
-    let manifest = match ops.remote_probe(host).await? {
+    // One remote exec answers "is there a manifest", "is its pid alive", and
+    // "was it written on this node" (`probe_run`): every ssh exec through the
+    // ControlMaster costs a channel-open RTT plus a fork on a loaded login
+    // node. `locate` adds execs only for a manifest another node wrote, and
+    // leaves every op below routed to the daemon's node.
+    let manifest = match locate(ops, host, progress).await? {
         Some((m, true)) => {
             // Only pay for the session-count round trip when it can change
             // the decision (build mismatch, or an explicit update request).
@@ -975,6 +1300,9 @@ pub async fn connect(
         home: RemoteHome::current(),
     };
     let (manifest, outdated, live_sessions) = resolve_daemon(&ops, host, &opts, &progress).await?;
+    // Where `locate` left the alias: the forward must end on the daemon's
+    // node, the only one whose loopback it listens on.
+    let route = route_of(host);
 
     let mut local_port = pick_local_port(opts.local_port, manifest.port)?;
     progress(Phase::Tunneling { local_port });
@@ -996,10 +1324,16 @@ pub async fn connect(
         }
         Err(e) => return Err(e),
     };
-    tracing::info!(
-        "tunnel up: 127.0.0.1:{local_port} -> {host}:{}",
-        manifest.port
-    );
+    match route.node() {
+        Some(node) => tracing::info!(
+            "tunnel up: 127.0.0.1:{local_port} -> {host} (login node {node}):{}",
+            manifest.port
+        ),
+        None => tracing::info!(
+            "tunnel up: 127.0.0.1:{local_port} -> {host}:{}",
+            manifest.port
+        ),
+    }
 
     Ok(Tunnel {
         host: host.to_string(),
@@ -1009,21 +1343,22 @@ pub async fn connect(
         mux_delegated,
         outdated,
         live_sessions,
+        route,
         child,
     })
 }
 
-/// Fetch and parse the remote manifest from `home`, if any.
-pub async fn remote_manifest(host: &str, home: RemoteHome) -> anyhow::Result<Option<Manifest>> {
-    // SSH_ONESHOT_SECS, not shorter: the first call to a host raises the
-    // ControlMaster and may sit in an askpass password/Duo prompt.
-    let cmd = sh_wrap(&format!("cat {} 2>/dev/null", home.manifest_path()));
-    let output = output_bounded(ssh_cmd(host).arg(cmd), SSH_ONESHOT_SECS, "ssh").await?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    Ok(serde_json::from_str(text.trim()).ok())
+/// Find `host`'s daemon under `home` and route every later ssh call for
+/// `host` to the node it runs on — what a caller that talks to the daemon
+/// over ssh (curl against its loopback port) must do first. `Ok(None)` =
+/// nothing registered; otherwise the manifest and a liveness verdict taken on
+/// its own node. May ask to authenticate to that node. The route is keyed by
+/// `host` exactly as given, so later calls must pass the same string.
+pub async fn locate_daemon(
+    host: &str,
+    home: RemoteHome,
+) -> anyhow::Result<Option<(Manifest, bool)>> {
+    locate(&SshOps { home }, host, &|_| {}).await
 }
 
 /// Frame the manifest in [`remote_probe`] / [`start_remote`] output on BOTH
@@ -1082,41 +1417,143 @@ fn sh_wrap(script: &str) -> String {
     format!("sh -c '{body}'")
 }
 
-/// Fetch the manifest under `home` AND whether its recorded pid answers
-/// `kill -0`, in ONE remote exec — the decision phase's whole probe.
-/// [`remote_manifest`] + a `kill -0` exec cost two serial round trips, and every
-/// exec through the ControlMaster is a channel-open RTT plus a remote fork
-/// (~300-500 ms on a loaded login node at WAN latency); computing the alive
-/// flag remotely halves the probe's wall time. `None` = no readable manifest
-/// (or ssh itself failed — the same "nothing running" the two-exec probe
-/// reported); `Some((manifest, alive))` otherwise.
-pub async fn remote_probe(
-    host: &str,
-    home: RemoteHome,
-) -> anyhow::Result<Option<(Manifest, bool)>> {
+/// POSIX-sh fragment printing the node name recorded in the manifest at `$f`
+/// — the same flat-JSON `sed` discipline as [`SH_MANIFEST_PID`].
+const SH_MANIFEST_HOSTNAME: &str =
+    r#"sed -n 's/.*"hostname"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n 1"#;
+
+/// POSIX-sh fragment setting `$d` to whether node name `$h` exists in the
+/// name service of the node the script runs on (`$n`): `found <addr>…` (its
+/// addresses, for the direct-route check), `gone` (the resolver answered "no
+/// such name", `EAI_NONAME`), or `unknown` (no perl, no clear answer, or a
+/// resolver that can't even resolve `$n` itself — one that knows no node
+/// names must never declare a node gone). Not `getent`: it exits the same for
+/// "no such name" and "the DNS server is down", and an outage must never read
+/// as "that node is gone". The verdict rides stdout, not an exit code — perl
+/// dying at compile time exits with whatever `errno` held.
+const SH_NODE_RESOLVES: &str = r#"d=unknown; if command -v perl >/dev/null 2>&1; then r=$(perl -MSocket=:addrinfo,SOCK_STREAM -e 'use strict; my ($h, $n) = @ARGV; my ($own) = getaddrinfo($n, "22"); if ($own) { print STDOUT "unknown"; exit 0 } my ($e, @r) = getaddrinfo($h, "22", {socktype => SOCK_STREAM()}); if ($e) { print STDOUT ($e == EAI_NONAME() ? "gone" : "unknown"); exit 0 } my %s; print STDOUT join(" ", "found", grep { defined $_ and not $s{$_}++ } map { (getnameinfo($_->{addr}, NI_NUMERICHOST()))[1] } @r)' "$h" "$n" 2>/dev/null); case "$r" in found*|gone) d=$r;; esac; fi;"#;
+
+/// What one probe exec found, seen from the node it ran on.
+#[derive(Clone, Debug)]
+pub struct Probe {
+    pub manifest: Manifest,
+    /// The node the probe ran on (`uname -n`); empty if the host didn't say.
+    pub node: String,
+    /// `kill -0` of the manifest's pid on `node` — the daemon's liveness only
+    /// when [`Probe::here`]; anywhere else it tested an unrelated process
+    /// table.
+    pub alive: bool,
+    /// For a manifest another node wrote: whether that node's name still
+    /// resolves on `node`. `Some(false)` is the cluster's name service saying
+    /// the node no longer exists; `None` = not asked, or no clear answer.
+    pub manifest_node_resolves: Option<bool>,
+    /// The addresses `node` resolves that name to (when it does).
+    pub manifest_node_addrs: Vec<std::net::IpAddr>,
+}
+
+impl Probe {
+    /// Whether the manifest was written on the node the probe ran on — the
+    /// only node where its pid and loopback port mean anything. A host that
+    /// doesn't report its node name is taken at its word, as before nodes
+    /// were compared.
+    pub fn here(&self) -> bool {
+        self.node.is_empty() || same_node(&self.node, &self.manifest.hostname)
+    }
+}
+
+/// One probe exec over a host's current [`Route`].
+#[derive(Debug)]
+enum ProbeRun {
+    /// The script ran; `None` = no readable manifest.
+    Ran(Option<Probe>),
+    /// ssh (or the remote shell) failed before the script could answer.
+    Failed(ProbeFailure),
+}
+
+#[derive(Debug)]
+struct ProbeFailure {
+    /// The exit status, as ssh's caller would print it.
+    status: String,
+    stderr: String,
+}
+
+impl ProbeFailure {
+    /// Whether the dial never reached an sshd that could have authenticated
+    /// us — name resolution, TCP connect, or the banner exchange failed — the
+    /// one case where another route to the same node is worth a try. An auth
+    /// failure or a cancelled prompt is not: retrying would prompt again.
+    /// OpenSSH's own client messages, stable across releases.
+    fn network_level(&self) -> bool {
+        [
+            "Could not resolve hostname",
+            "connect to host",
+            "kex_exchange_identification",
+            "banner exchange",
+        ]
+        .iter()
+        .any(|marker| self.stderr.contains(marker))
+    }
+}
+
+impl std::fmt::Display for ProbeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // ssh's own complaint is its last line; a chatty login banner
+        // printed to stderr sits before it.
+        match self.stderr.lines().rev().find(|l| !l.trim().is_empty()) {
+            Some(line) => write!(f, "{}", line.trim()),
+            None => write!(f, "ssh exited {}", self.status),
+        }
+    }
+}
+
+/// Fetch the manifest under `home`, whether its recorded pid answers
+/// `kill -0`, and which node answered, in ONE remote exec — the decision
+/// phase's whole probe. A manifest + a `kill -0` exec cost two serial round
+/// trips, and every exec through the ControlMaster is a channel-open RTT plus
+/// a remote fork (~300-500 ms on a loaded login node at WAN latency). `None`
+/// = no readable manifest (or ssh itself failed — "nothing running", as the
+/// connect flow has always read an unreachable host).
+pub async fn remote_probe(host: &str, home: RemoteHome) -> anyhow::Result<Option<Probe>> {
+    match probe_run(host, home).await? {
+        ProbeRun::Ran(probe) => Ok(probe),
+        ProbeRun::Failed(_) => Ok(None),
+    }
+}
+
+async fn probe_run(host: &str, home: RemoteHome) -> anyhow::Result<ProbeRun> {
     let cmd = sh_wrap(&probe_script(&home.manifest_path()));
     // SSH_ONESHOT_SECS, not shorter: the first call to a host raises the
     // ControlMaster and may sit in an askpass password/Duo prompt.
     let output = output_bounded(ssh_cmd(host).arg(cmd), SSH_ONESHOT_SECS, "ssh").await?;
     if !output.status.success() {
-        return Ok(None);
+        return Ok(ProbeRun::Failed(ProbeFailure {
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }));
     }
-    parse_probe_output(&String::from_utf8_lossy(&output.stdout))
-        .with_context(|| format!("probing the daemon on {host}"))
+    let probe = parse_probe_output(&String::from_utf8_lossy(&output.stdout))
+        .with_context(|| format!("probing the daemon on {host}"))?;
+    Ok(ProbeRun::Ran(probe))
 }
 
 /// The POSIX-sh script [`remote_probe`] runs on the host: the manifest at
 /// `manifest_path` (if readable) framed between [`MANIFEST_BEGIN`] and
-/// [`MANIFEST_END`], then a trailer with the pid it tested and an
-/// `alive`/`dead` verdict. `$HOME` in the path is expanded by the remote
-/// shell (as an assignment RHS it is never word-split). A missing or
-/// unreadable manifest prints nothing and exits 0. Pure so the tests can
-/// run it under real shells.
+/// [`MANIFEST_END`], then a trailer: the pid it tested, the node it ran on,
+/// the node the manifest names and — only when those two differ — whether
+/// that name still resolves here, and an `alive`/`dead` verdict. `$HOME` in
+/// the path is expanded by the remote shell (as an assignment RHS it is never
+/// word-split). A missing or unreadable manifest prints nothing and exits 0.
+/// Pure so the tests can run it under real shells.
 fn probe_script(manifest_path: &str) -> String {
     format!(
         "f={manifest_path}; [ -r \"$f\" ] || exit 0; if {alive}; then a=alive; else a=dead; fi; \
-         printf '\\n{begin}\\n'; cat \"$f\"; printf '\\n{end}\\npid=%s\\n%s\\n' \"$p\" \"$a\"",
+         n=$(uname -n 2>/dev/null); h=$({hostname}); d=same; \
+         if [ \"$h\" != \"$n\" ]; then {resolves} fi; \
+         printf '\\n{begin}\\n'; cat \"$f\"; \
+         printf '\\n{end}\\npid=%s\\nnode=%s\\nhost=%s\\ndns=%s\\n%s\\n' \"$p\" \"$n\" \"$h\" \"$d\" \"$a\"",
         alive = sh_manifest_alive(),
+        hostname = SH_MANIFEST_HOSTNAME,
+        resolves = SH_NODE_RESOLVES,
         begin = MANIFEST_BEGIN,
         end = MANIFEST_END,
     )
@@ -1147,6 +1584,14 @@ fn trailer_pid(trailer: &str) -> Option<u32> {
         .and_then(|p| p.trim().parse().ok())
 }
 
+/// A `key=value` trailer line's value.
+fn trailer_field<'a>(trailer: &'a str, key: &str) -> Option<&'a str> {
+    trailer
+        .lines()
+        .find_map(|l| l.trim().strip_prefix(key)?.strip_prefix('='))
+        .map(str::trim)
+}
+
 fn trailer_verdict(trailer: &str) -> Option<bool> {
     trailer.lines().find_map(|l| match l.trim() {
         "alive" => Some(true),
@@ -1166,27 +1611,64 @@ fn check_trailer_pid(manifest: &Manifest, trailer: &str, what: &str) -> anyhow::
     }
 }
 
-/// [`remote_probe`]'s stdout → `(manifest, alive)`. No framed manifest =
-/// `None`; an unparsable one with nothing alive counts as none (as
-/// [`remote_manifest`] treats a corrupt file: a fresh start) — but never
-/// when the remote found a LIVE pid in it; a pid mismatch or a missing
-/// verdict is an `Err`.
-fn parse_probe_output(stdout: &str) -> anyhow::Result<Option<(Manifest, bool)>> {
+/// [`remote_probe`]'s stdout → a [`Probe`]. No framed manifest = `None`; an
+/// unparsable one counts as none (a corrupt file: a fresh start) — but never
+/// when the remote found a LIVE pid in it, or when the remote read it as
+/// another node's record (whose daemon can't be judged from here); a pid
+/// mismatch or a missing verdict is an `Err`. The trailer's node fields are
+/// optional so a host that can't name itself degrades to the pre-node probe.
+fn parse_probe_output(stdout: &str) -> anyhow::Result<Option<Probe>> {
     let Some((json, trailer)) = framed_manifest(stdout)? else {
         return Ok(None);
     };
+    let node = trailer_field(trailer, "node")
+        .unwrap_or_default()
+        .to_string();
     let manifest = match serde_json::from_str::<Manifest>(json) {
         Ok(manifest) => manifest,
         Err(err) => {
             if trailer_pid(trailer).is_some() && trailer_verdict(trailer) == Some(true) {
                 bail!("the manifest is unparsable ({err}) yet its pid is alive; refusing to start a second daemon");
             }
+            let written_on = trailer_field(trailer, "host").unwrap_or_default();
+            if !written_on.is_empty() && !node.is_empty() && !same_node(written_on, &node) {
+                bail!("the manifest is unparsable ({err}) and names node {written_on}, not {node}; refusing to start a second daemon");
+            }
             return Ok(None);
         }
     };
     check_trailer_pid(&manifest, trailer, "probe")?;
     let alive = trailer_verdict(trailer).context("probe output carried no alive/dead verdict")?;
-    Ok(Some((manifest, alive)))
+    let mut dns = trailer_field(trailer, "dns")
+        .unwrap_or_default()
+        .split_whitespace();
+    let manifest_node_resolves = match dns.next() {
+        Some("found") => Some(true),
+        Some("gone") => Some(false),
+        _ => None,
+    };
+    let manifest_node_addrs = match manifest_node_resolves {
+        Some(true) => dns.filter_map(|addr| addr.parse().ok()).collect(),
+        _ => Vec::new(),
+    };
+    // The resolver was asked about the name the remote `sed` read: the same
+    // cross-check as the pid, so a sed/serde disagreement can never turn into
+    // "gone" for the wrong name — which would start a second daemon.
+    if manifest_node_resolves.is_some() {
+        let resolved = trailer_field(trailer, "host").unwrap_or_default();
+        anyhow::ensure!(
+            resolved == manifest.hostname,
+            "probe: the remote resolved node {resolved:?} but the manifest names {:?}",
+            manifest.hostname
+        );
+    }
+    Ok(Some(Probe {
+        manifest,
+        node,
+        alive,
+        manifest_node_resolves,
+        manifest_node_addrs,
+    }))
 }
 
 /// [`start_remote`]'s wait output → the manifest of the daemon that came up.
@@ -1296,7 +1778,7 @@ pub async fn stop_remote(host: &str, pid: u32) -> anyhow::Result<()> {
     // SIGTERM was dispatched, then ssh itself ended (255: the link dropped
     // mid-wait). One non-interactive re-check: `kill -0` exits 1 once the
     // pid is gone.
-    let mut check = mux_prologue(host);
+    let mut check = mux_prologue(host, &route_of(host));
     check
         .arg(host)
         .arg(sh_wrap(&format!("kill -0 {pid} 2>/dev/null")));
@@ -1896,16 +2378,20 @@ const START_WAIT_TICKS: u32 = 30;
 
 /// The POSIX-sh script [`start_remote`] runs after the start line: up to
 /// `ticks` half-second waits for a readable manifest at `manifest_path`
-/// whose pid answers `kill -0`, then print it framed (with the tested pid)
-/// and exit 0; exit 1 at the deadline. Pure so tests can run it under real
-/// shells.
+/// written on THIS node whose pid answers `kill -0`, then print it framed
+/// (with the tested pid) and exit 0; exit 1 at the deadline. The node check
+/// matters on a home shared across nodes: until the new daemon writes its own
+/// record the file may still hold another node's, whose pid can be alive
+/// here as an unrelated process. Pure so tests can run it under real shells.
 fn start_wait_script(manifest_path: &str, ticks: u32) -> String {
     format!(
-        "f={manifest_path}; {probe} while :; do \
-         if [ -r \"$f\" ]; then if {alive}; then printf '\\n{begin}\\n'; cat \"$f\"; \
+        "f={manifest_path}; n=$(uname -n 2>/dev/null); {probe} while :; do \
+         if [ -r \"$f\" ]; then h=$({hostname}); \
+         if {{ [ -z \"$n\" ] || [ \"$h\" = \"$n\" ]; }} && {alive}; then printf '\\n{begin}\\n'; cat \"$f\"; \
          printf '\\n{end}\\npid=%s\\n' \"$p\"; exit 0; fi; fi; \
          [ $i -lt {ticks} ] || exit 1; {tick} done",
         probe = SH_SLEEP_PROBE,
+        hostname = SH_MANIFEST_HOSTNAME,
         alive = sh_manifest_alive(),
         begin = MANIFEST_BEGIN,
         end = MANIFEST_END,
@@ -2001,7 +2487,12 @@ async fn abandon_tunnel_attempt(
     let _ = child.start_kill();
     let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
     if cancel_master {
-        cancel_master_forward(host, &format!("{local}:127.0.0.1:{remote}")).await;
+        cancel_master_forward(
+            host,
+            &route_of(host),
+            &format!("{local}:127.0.0.1:{remote}"),
+        )
+        .await;
     }
 }
 
@@ -2117,6 +2608,9 @@ pub struct ComputeTunnel {
     /// `None` for rung B1 — `node_ssh_base` pins `ControlPath=none`, so
     /// that child owns its forward end-to-end and dies with it.
     master_forward: Option<String>,
+    /// The login alias's [`Route`] when the tunnel opened — which master
+    /// holds `master_forward`.
+    route: Route,
     child: Child,
 }
 
@@ -2142,31 +2636,56 @@ impl ComputeTunnel {
         let _ = self.child.start_kill();
         let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
         if let Some(spec) = &self.master_forward {
-            cancel_master_forward(&self.host, spec).await;
+            cancel_master_forward(&self.host, &self.route, spec).await;
         }
     }
 }
 
 /// The `-W`-relay ProxyCommand that carries a node-bound ssh's first leg
 /// over the login host's existing ControlMaster — no re-auth, no ProxyJump
-/// entry required in the user's ssh config. Quoted so a spacey ControlPath
-/// survives the shell that runs ProxyCommand; every `%` in the path is
-/// doubled because the OUTER ssh percent-expands the ProxyCommand string
-/// (a bare `%C` dies with "unknown key %C" — found live on the first
-/// rung-B attempt) and the INNER ssh must receive it intact.
-fn node_proxy_command(host: &str) -> String {
-    format!(
-        "ssh -o ControlMaster=auto -o \"ControlPath={}\" -o ControlPersist=10m \
-         -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -W %h:%p {host}",
-        control_path().replace('%', "%%")
-    )
+/// entry required in the user's ssh config. `pin` rides the master of one
+/// login node ([`Route::Node`]); `None` the alias's own. The full shared
+/// option set, so a first leg that has to dial the master gets the same
+/// keepalives and compression as every other. Quoted so a spacey ControlPath
+/// survives the shell that runs ProxyCommand; every `%` is doubled because
+/// the OUTER ssh percent-expands the ProxyCommand string (a bare `%C` dies
+/// with "unknown key %C" — found live on the first rung-B attempt) and the
+/// INNER ssh must receive it intact.
+fn master_proxy_command(host: &str, pin: Option<&str>) -> String {
+    let mut words = vec!["ssh".to_string()];
+    if let Some(node) = pin {
+        words.push(format!("-o HostName={node}"));
+    }
+    words.extend(
+        ssh_opts()
+            .iter()
+            .map(|opt| format!("\"{}\"", opt.replace('%', "%%"))),
+    );
+    // The alias is user input that reaches a shell: single-quoted, with `%`
+    // doubled for the outer ssh's own token expansion.
+    words.push(format!(
+        "-W %h:%p '{}'",
+        host.replace('%', "%%").replace('\'', r"'\''")
+    ));
+    words.join(" ")
+}
+
+/// [`master_proxy_command`] over whichever master the login alias's `route`
+/// rides: a login node's own for [`Route::Node`]; the alias's for
+/// [`Route::NodeViaAlias`] too, since that node's master is itself carried
+/// over it.
+fn node_proxy_command(host: &str, route: &Route) -> String {
+    match route {
+        Route::Node(node) => master_proxy_command(host, Some(node)),
+        Route::Alias | Route::NodeViaAlias(_) => master_proxy_command(host, None),
+    }
 }
 
 /// The ssh options for the node leg itself: NO ControlMaster (the child
 /// owns its connection; a per-node master would leak sockets per job), fail
 /// fast instead of prompting (a rung probe must never hang on interactive
 /// auth — a cluster that needs it reads as "rung unavailable" for now).
-fn node_ssh_base(host: &str) -> Command {
+fn node_ssh_base(host: &str, route: &Route) -> Command {
     let mut c = transport_command("ssh");
     c.env(ASKPASS_ALIAS_ENV, host);
     c.args([
@@ -2184,7 +2703,7 @@ fn node_ssh_base(host: &str) -> Command {
         "ServerAliveCountMax=3",
         "-o",
     ]);
-    c.arg(format!("ProxyCommand={}", node_proxy_command(host)));
+    c.arg(format!("ProxyCommand={}", node_proxy_command(host, route)));
     c
 }
 
@@ -2209,11 +2728,12 @@ async fn node_target(host: &str, node: &str) -> String {
 
 fn spawn_node_tunnel(
     host: &str,
+    route: &Route,
     node_target: &str,
     local: u16,
     remote: u16,
 ) -> anyhow::Result<Child> {
-    node_ssh_base(host)
+    node_ssh_base(host, route)
         .args(["-o", "ExitOnForwardFailure=yes"])
         .arg("-N")
         .arg("-L")
@@ -2232,12 +2752,13 @@ fn spawn_node_tunnel(
 /// login node.
 fn spawn_chained_node_tunnel(
     host: &str,
+    route: &Route,
     node: &str,
     local: u16,
     relay_port: u16,
     remote: u16,
 ) -> anyhow::Result<Child> {
-    ssh_base(host)
+    ssh_base_via(host, route)
         .args(["-o", "ExitOnForwardFailure=yes"])
         .arg("-L")
         .arg(format!("{local}:127.0.0.1:{relay_port}"))
@@ -2259,11 +2780,12 @@ fn spawn_chained_node_tunnel(
 
 fn spawn_direct_node_tunnel(
     host: &str,
+    route: &Route,
     node: &str,
     local: u16,
     remote: u16,
 ) -> anyhow::Result<Child> {
-    ssh_base(host)
+    ssh_base_via(host, route)
         .args(["-o", "ExitOnForwardFailure=yes"])
         .arg("-N")
         .arg("-L")
@@ -2291,6 +2813,11 @@ pub async fn connect_compute_node(
     routable: bool,
 ) -> anyhow::Result<ComputeTunnel> {
     anyhow::ensure!(!node.is_empty(), "job {job_id} has no node yet (queued?)");
+    // One read of the login alias's route for the whole ladder: every rung's
+    // forward registers on that master, and every cancel (and the tunnel's
+    // own close) must reach the same one even if a login reconnect re-routes
+    // the alias meanwhile.
+    let route = route_of(host);
     let mk = |local_port, rung, master_forward, child| ComputeTunnel {
         host: host.to_string(),
         node: node.to_string(),
@@ -2300,13 +2827,14 @@ pub async fn connect_compute_node(
         token: token.to_string(),
         rung,
         master_forward,
+        route: route.clone(),
         child,
     };
 
     // Rung B1 — laptop ssh end-to-end to the node; daemon stays loopback.
     let target = node_target(host, node).await;
     let local = pick_local_port(None, port)?;
-    match spawn_node_tunnel(host, &target, local, port) {
+    match spawn_node_tunnel(host, &route, &target, local, port) {
         Ok(mut child) => match wait_for_port(local, &mut child).await {
             Ok(mux) => {
                 if tunnel_proven(local, token, 10, mux, &mut child)
@@ -2333,7 +2861,8 @@ pub async fn connect_compute_node(
     // early-exit branch or by tunnel_proven's still-running check.
     for relay_port in [fastrand_port(), fastrand_port(), fastrand_port()] {
         let local = pick_local_port(None, port)?;
-        let Ok(mut child) = spawn_chained_node_tunnel(host, node, local, relay_port, port) else {
+        let Ok(mut child) = spawn_chained_node_tunnel(host, &route, node, local, relay_port, port)
+        else {
             break;
         };
         // The outer `-L` rides `ssh_base`, so the login master holds the
@@ -2353,12 +2882,12 @@ pub async fn connect_compute_node(
             }
             Ok(_) => {
                 child.kill().await.ok();
-                cancel_master_forward(host, &outer_spec).await;
+                cancel_master_forward(host, &route, &outer_spec).await;
                 tracing::info!(%node, relay_port, "chained rung forwarded but the job daemon did not answer");
             }
             Err(err) => {
                 child.kill().await.ok();
-                cancel_master_forward(host, &outer_spec).await;
+                cancel_master_forward(host, &route, &outer_spec).await;
                 tracing::info!(%node, relay_port, %err, "chained rung attempt failed");
             }
         }
@@ -2368,7 +2897,7 @@ pub async fn connect_compute_node(
     if routable {
         let local = pick_local_port(None, port)?;
         let spec = format!("{local}:{node}:{port}");
-        if let Ok(mut child) = spawn_direct_node_tunnel(host, node, local, port) {
+        if let Ok(mut child) = spawn_direct_node_tunnel(host, &route, node, local, port) {
             match wait_for_port(local, &mut child).await {
                 Ok(mux) => {
                     if let Some(mux) = tunnel_proven(local, token, 10, mux, &mut child).await {
@@ -2387,7 +2916,7 @@ pub async fn connect_compute_node(
                     let cancel_master = forward_delegated(mux, &mut child);
                     child.kill().await.ok();
                     if cancel_master {
-                        cancel_master_forward(host, &spec).await;
+                        cancel_master_forward(host, &route, &spec).await;
                     }
                 }
                 Err(err) => tracing::info!(%node, %err, "rung A unavailable"),
@@ -2585,15 +3114,53 @@ mod tests {
                 "noise from ~/.bashrc\n{MANIFEST_BEGIN}\n{manifest}\n{MANIFEST_END}\n{trailer}more noise\n"
             )
         };
-        let (m, alive) = parse_probe_output(&framed("pid=42\nalive\n"))
+        let p = parse_probe_output(&framed("pid=42\nalive\n"))
             .unwrap()
             .expect("manifest");
-        assert_eq!(m.pid, 42);
-        assert!(alive);
-        let (_, alive) = parse_probe_output(&framed("pid=42\ndead\n"))
+        assert_eq!(p.manifest.pid, 42);
+        assert!(p.alive);
+        assert!(
+            p.here(),
+            "a host that doesn't name its node is taken at its word"
+        );
+        let p = parse_probe_output(&framed("pid=42\ndead\n"))
             .unwrap()
             .expect("manifest");
-        assert!(!alive);
+        assert!(!p.alive);
+        // The node trailer: the fake manifest was written on "host".
+        let p = parse_probe_output(&framed("pid=42\nnode=HOST\nhost=host\ndns=same\nalive\n"))
+            .unwrap()
+            .expect("manifest");
+        assert!(p.here(), "node names are case-insensitive");
+        assert_eq!(p.manifest_node_resolves, None);
+        let p = parse_probe_output(&framed("pid=42\nnode=ln02\nhost=host\ndns=gone\ndead\n"))
+            .unwrap()
+            .expect("manifest");
+        assert!(!p.here(), "written on another node");
+        assert_eq!(p.node, "ln02");
+        assert_eq!(p.manifest_node_resolves, Some(false));
+        let p = parse_probe_output(&framed(
+            "pid=42\nnode=ln02\nhost=host\ndns=found 10.0.0.1 fe80::1%eth0 ::1\ndead\n",
+        ))
+        .unwrap()
+        .expect("manifest");
+        assert_eq!(p.manifest_node_resolves, Some(true));
+        assert_eq!(
+            p.manifest_node_addrs,
+            vec![
+                "10.0.0.1".parse::<std::net::IpAddr>().unwrap(),
+                "::1".parse().unwrap()
+            ],
+            "numeric addresses; a scoped link-local is skipped"
+        );
+        let p = parse_probe_output(&framed("pid=42\nnode=ln02\nhost=host\ndns=unknown\ndead\n"))
+            .unwrap()
+            .expect("manifest");
+        assert_eq!(p.manifest_node_resolves, None);
+        assert!(
+            parse_probe_output(&framed("pid=42\nnode=ln02\nhost=other\ndns=gone\ndead\n")).is_err(),
+            "the resolver was asked about a name serde doesn't see — never a \"gone\" for it"
+        );
         assert!(
             parse_probe_output("only noise\n").unwrap().is_none(),
             "no begin marker = no manifest"
@@ -2626,6 +3193,17 @@ mod tests {
             parse_probe_output(&corrupt("pid=42\nalive\n")).is_err(),
             "a corrupt manifest with a live pid is never a fresh start"
         );
+        assert!(
+            parse_probe_output(&corrupt("pid=42\nnode=ln02\nhost=ln01\ndns=found\ndead\n"))
+                .is_err(),
+            "nor one another node wrote — its pid was never tested there"
+        );
+        assert!(
+            parse_probe_output(&corrupt("pid=42\nnode=ln01\nhost=ln01\ndns=same\ndead\n"))
+                .unwrap()
+                .is_none(),
+            "a corrupt manifest this node wrote, nothing alive: a fresh start"
+        );
         assert_eq!(
             parse_start_wait_output(&framed("pid=42\n")).unwrap().pid,
             42
@@ -2634,10 +3212,11 @@ mod tests {
         assert!(parse_start_wait_output(&framed("pid=7\n")).is_err());
     }
 
-    /// The remote pid extraction is a `sed` over the manifest; pin its
-    /// pattern against serde's real pretty AND compact renderings with the
-    /// host's own sed (BSD on macOS, GNU on Linux — both POSIX), so a
-    /// renderer change can never silently make every daemon look dead.
+    /// The remote pid and node-name extraction is a `sed` over the manifest;
+    /// pin both patterns against serde's real pretty AND compact renderings
+    /// with the host's own sed (BSD on macOS, GNU on Linux — both POSIX), so
+    /// a renderer change can never silently make every daemon look dead, or
+    /// every manifest look like another node's.
     #[cfg(unix)]
     #[test]
     fn manifest_pid_sed_matches_serde_pretty_and_compact() {
@@ -2670,6 +3249,17 @@ mod tests {
             assert_eq!(
                 String::from_utf8_lossy(&out.stdout).trim(),
                 "4242",
+                "{name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("f={}; {SH_MANIFEST_HOSTNAME}", path.display()))
+                .output()
+                .expect("run sh");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                manifest.hostname,
                 "{name}: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
@@ -2761,10 +3351,53 @@ mod tests {
             .expect("pid")
     }
 
+    /// A manifest written on THIS machine, as the daemon here would.
     #[cfg(unix)]
     fn write_manifest(path: &Path, pid: u32) {
-        let json = serde_json::to_vec_pretty(&fake_manifest(Some("b.1"), pid)).unwrap();
-        std::fs::write(path, json).unwrap();
+        write_manifest_on(path, pid, &uname_n());
+    }
+
+    /// A manifest as the daemon on `node` would have written it.
+    #[cfg(unix)]
+    fn write_manifest_on(path: &Path, pid: u32, node: &str) {
+        let manifest = Manifest {
+            hostname: node.to_string(),
+            ..fake_manifest(Some("b.1"), pid)
+        };
+        std::fs::write(path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    }
+
+    /// `uname -n` — what the remote scripts compare a manifest against. The
+    /// daemon records `gethostname(2)`; the two must agree on one machine.
+    #[cfg(unix)]
+    fn uname_n() -> String {
+        let out = std::process::Command::new("uname")
+            .arg("-n")
+            .output()
+            .unwrap();
+        let node = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            Some(node.clone()),
+            chimaera_core::this_node(),
+            "uname -n vs gethostname"
+        );
+        node
+    }
+
+    /// The resolver control in the probe: a node that can't resolve its own
+    /// name never answers `found`/`gone` (CI sandboxes may lack a self entry).
+    #[cfg(unix)]
+    fn own_name_resolves() -> bool {
+        use std::net::ToSocketAddrs;
+        (uname_n().as_str(), 22).to_socket_addrs().is_ok()
+    }
+
+    #[cfg(unix)]
+    fn perl_available() -> bool {
+        std::process::Command::new("perl")
+            .args(["-MSocket=:addrinfo", "-e", "exit 0"])
+            .output()
+            .is_ok_and(|out| out.status.success())
     }
 
     /// The one-exec probe command through every login shell, against real
@@ -2786,18 +3419,53 @@ mod tests {
                 "{shell}: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            let (m, alive) = parse_probe_output(&String::from_utf8_lossy(&out.stdout))
+            let p = parse_probe_output(&String::from_utf8_lossy(&out.stdout))
                 .unwrap()
                 .expect("manifest");
-            assert_eq!(m.pid, std::process::id());
-            assert!(alive, "{shell}: this process is alive");
+            assert_eq!(p.manifest.pid, std::process::id());
+            assert!(p.alive, "{shell}: this process is alive");
+            assert_eq!(p.node, uname_n(), "{shell}: the probe names its node");
+            assert!(p.here(), "{shell}: written on this node");
+            assert_eq!(
+                p.manifest_node_resolves, None,
+                "{shell}: no lookup when local"
+            );
 
             write_manifest(&path, dead_pid());
             let out = run_script(shell, &script);
-            let (_, alive) = parse_probe_output(&String::from_utf8_lossy(&out.stdout))
+            let p = parse_probe_output(&String::from_utf8_lossy(&out.stdout))
                 .unwrap()
                 .expect("manifest");
-            assert!(!alive, "{shell}: a reaped pid is dead");
+            assert!(!p.alive, "{shell}: a reaped pid is dead");
+
+            // Another node's record: its pid (alive HERE — this process) is
+            // not the daemon's liveness, and its name is looked up.
+            write_manifest_on(&path, std::process::id(), "localhost");
+            let out = run_script(shell, &script);
+            let p = parse_probe_output(&String::from_utf8_lossy(&out.stdout))
+                .unwrap()
+                .expect("manifest");
+            assert!(!p.here(), "{shell}: written on another node");
+            if perl_available() && own_name_resolves() {
+                assert_eq!(
+                    p.manifest_node_resolves,
+                    Some(true),
+                    "{shell}: localhost resolves"
+                );
+                assert!(
+                    !p.manifest_node_addrs.is_empty(),
+                    "{shell}: with its addresses"
+                );
+            }
+            write_manifest_on(&path, dead_pid(), "chimaera-gone-node.invalid");
+            let out = run_script(shell, &script);
+            let p = parse_probe_output(&String::from_utf8_lossy(&out.stdout))
+                .unwrap()
+                .expect("manifest");
+            assert!(!p.here());
+            // `.invalid` never resolves (RFC 2606); only a resolver that
+            // couldn't answer at all may leave it unknown — never "found".
+            assert_ne!(p.manifest_node_resolves, Some(true), "{shell}");
 
             std::fs::remove_file(&path).unwrap();
             let out = run_script(shell, &script);
@@ -2843,6 +3511,17 @@ mod tests {
                 out.status.code(),
                 Some(1),
                 "{shell}: a dead pid must time out"
+            );
+
+            // Nor does another node's record, even when its pid happens to
+            // be alive here: that is the file a fresh start replaces, not
+            // the daemon it started.
+            write_manifest_on(&path, std::process::id(), "other-login-node");
+            let out = run_script(shell, &start_wait_script(&path.display().to_string(), 2));
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "{shell}: another node's manifest must time out"
             );
         }
         std::fs::remove_dir_all(&dir).ok();
@@ -3053,7 +3732,7 @@ mod tests {
         assert_eq!(alias(&ssh_cmd("Sherlock")), Some("Sherlock".into()));
         assert_eq!(alias(&scp_cmd("remote-2")), Some("remote-2".into()));
         assert_eq!(
-            alias(&node_ssh_base("login.example.edu")),
+            alias(&node_ssh_base("login.example.edu", &Route::Alias)),
             Some("login.example.edu".into())
         );
     }
@@ -3406,34 +4085,82 @@ mod tests {
         EnsureRemoteBinary,
     }
 
-    /// A scripted [`RemoteOps`] that records its ordered call log and returns
-    /// canned outcomes — no ssh, no host, no real binary.
+    /// What a scripted probe answers along one route.
+    type ProbeScript = Box<dyn Fn(&Route) -> anyhow::Result<ProbeRun>>;
+
+    /// A scripted [`RemoteOps`] that records its ordered call log — each call
+    /// with the route it ran along — and returns canned outcomes: no ssh, no
+    /// host, no real binary.
     struct FakeOps {
-        calls: RefCell<Vec<Call>>,
+        log: RefCell<Vec<(Call, Route)>>,
+        route: RefCell<Route>,
         probe_manifest: Option<Manifest>,
         alive: bool,
         sessions: Option<usize>,
         resolved_bin: PathBuf,
         start_manifest: Manifest,
+        /// Overrides the default probe (the manifest, written on the node
+        /// the probe lands on) — for multi-node scenarios.
+        probe: Option<ProbeScript>,
+        /// Where "this machine" resolves any node name.
+        local: Vec<std::net::IpAddr>,
     }
 
     impl FakeOps {
-        fn log(&self, c: Call) {
-            self.calls.borrow_mut().push(c);
+        fn base() -> Self {
+            FakeOps {
+                log: RefCell::new(Vec::new()),
+                route: RefCell::new(Route::Alias),
+                probe_manifest: None,
+                alive: false,
+                sessions: None,
+                resolved_bin: PathBuf::from("/unused"),
+                start_manifest: fake_manifest(Some(chimaera_core::BUILD_ID), 999),
+                probe: None,
+                local: vec![CLUSTER_ADDR],
+            }
+        }
+        fn record(&self, c: Call) {
+            let route = self.route.borrow().clone();
+            self.log.borrow_mut().push((c, route));
+        }
+        fn calls(&self) -> Vec<Call> {
+            self.log.borrow().iter().map(|(c, _)| *c).collect()
+        }
+        fn routed(&self) -> Vec<(Call, Route)> {
+            self.log.borrow().clone()
         }
     }
 
     impl RemoteOps for FakeOps {
-        async fn remote_probe(&self, _host: &str) -> anyhow::Result<Option<(Manifest, bool)>> {
-            self.log(Call::RemoteProbe);
-            Ok(self.probe_manifest.clone().map(|m| (m, self.alive)))
+        fn route(&self, _host: &str) -> Route {
+            self.route.borrow().clone()
+        }
+        fn set_route(&self, _host: &str, route: Route) {
+            *self.route.borrow_mut() = route;
+        }
+        async fn local_addrs(&self, _node: &str) -> Vec<std::net::IpAddr> {
+            self.local.clone()
+        }
+        async fn remote_probe(&self, _host: &str) -> anyhow::Result<ProbeRun> {
+            self.record(Call::RemoteProbe);
+            if let Some(probe) = &self.probe {
+                return probe(&self.route.borrow());
+            }
+            Ok(ProbeRun::Ran(self.probe_manifest.clone().map(|m| Probe {
+                node: m.hostname.clone(),
+                manifest: m,
+                alive: self.alive,
+                manifest_node_resolves: None,
+                manifest_node_addrs: Vec::new(),
+            })))
         }
         async fn remote_sessions_count(
             &self,
             _host: &str,
             _manifest: &Manifest,
         ) -> anyhow::Result<Option<usize>> {
-            self.log(Call::RemoteSessionsCount);
+            self.record(Call::RemoteSessionsCount);
             Ok(self.sessions)
         }
         async fn resolve_local_binary(
@@ -3442,11 +4169,11 @@ mod tests {
             _binary: Option<&Path>,
             _progress: &impl Fn(Phase),
         ) -> anyhow::Result<PathBuf> {
-            self.log(Call::ResolveLocalBinary);
+            self.record(Call::ResolveLocalBinary);
             Ok(self.resolved_bin.clone())
         }
         async fn stop_remote(&self, _host: &str, _pid: u32) -> anyhow::Result<()> {
-            self.log(Call::StopRemote);
+            self.record(Call::StopRemote);
             Ok(())
         }
         async fn deploy_binary(
@@ -3455,11 +4182,11 @@ mod tests {
             _path: &Path,
             _progress: &impl Fn(Phase),
         ) -> anyhow::Result<()> {
-            self.log(Call::DeployBinary);
+            self.record(Call::DeployBinary);
             Ok(())
         }
         async fn start_remote(&self, _host: &str) -> anyhow::Result<Manifest> {
-            self.log(Call::StartRemote);
+            self.record(Call::StartRemote);
             Ok(self.start_manifest.clone())
         }
         async fn ensure_remote_binary(
@@ -3468,7 +4195,7 @@ mod tests {
             _binary: Option<&Path>,
             _progress: &impl Fn(Phase),
         ) -> anyhow::Result<()> {
-            self.log(Call::EnsureRemoteBinary);
+            self.record(Call::EnsureRemoteBinary);
             Ok(())
         }
     }
@@ -3491,10 +4218,22 @@ mod tests {
         fake: &FakeOps,
         update_daemon: bool,
     ) -> ((Manifest, bool, Option<usize>), Vec<&'static str>) {
+        let (out, phases) = try_resolve(fake, update_daemon).await;
+        (out.expect("resolve_daemon"), phases)
+    }
+
+    async fn try_resolve(
+        fake: &FakeOps,
+        update_daemon: bool,
+    ) -> (
+        anyhow::Result<(Manifest, bool, Option<usize>)>,
+        Vec<&'static str>,
+    ) {
         let phases = RefCell::new(Vec::<&'static str>::new());
         let progress = |p: Phase| {
             phases.borrow_mut().push(match p {
                 Phase::Probing => "probing",
+                Phase::Routing { .. } => "routing",
                 Phase::Updating => "updating",
                 Phase::Downloading { .. } => "downloading",
                 Phase::Installing { .. } => "installing",
@@ -3506,9 +4245,7 @@ mod tests {
             update_daemon,
             ..Default::default()
         };
-        let out = resolve_daemon(fake, "host", &opts, &progress)
-            .await
-            .expect("resolve_daemon");
+        let out = resolve_daemon(fake, "host", &opts, &progress).await;
         (out, phases.into_inner())
     }
 
@@ -3519,18 +4256,18 @@ mod tests {
     #[tokio::test]
     async fn resolve_daemon_reuses_matching_build() {
         let fake = FakeOps {
-            calls: RefCell::new(Vec::new()),
             probe_manifest: Some(fake_manifest(Some(chimaera_core::BUILD_ID), 42)),
             alive: true,
             sessions: Some(3),
             resolved_bin: PathBuf::from("/unused"),
             start_manifest: fake_manifest(Some(chimaera_core::BUILD_ID), 999),
+            ..FakeOps::base()
         };
         let ((manifest, outdated, live), phases) = run_resolve(&fake, false).await;
         assert_eq!(manifest.pid, 42, "returns the probed daemon");
         assert!(!outdated);
         assert_eq!(live, None);
-        assert_eq!(*fake.calls.borrow(), vec![Call::RemoteProbe]);
+        assert_eq!(fake.calls(), vec![Call::RemoteProbe]);
         assert_eq!(phases, vec!["probing"]);
     }
 
@@ -3541,20 +4278,20 @@ mod tests {
     #[tokio::test]
     async fn resolve_daemon_update_resolves_binary_before_stop() {
         let fake = FakeOps {
-            calls: RefCell::new(Vec::new()),
             // No build id = ancient = mismatch against any real BUILD_ID.
             probe_manifest: Some(fake_manifest(None, 42)),
             alive: true,
             sessions: Some(0),
             resolved_bin: PathBuf::from("/tmp/chimaera"),
             start_manifest: fake_manifest(Some(chimaera_core::BUILD_ID), 999),
+            ..FakeOps::base()
         };
         let ((manifest, outdated, live), phases) = run_resolve(&fake, false).await;
         assert_eq!(manifest.pid, 999, "returns the freshly started daemon");
         assert!(!outdated);
         assert_eq!(live, None);
         assert_eq!(
-            *fake.calls.borrow(),
+            fake.calls(),
             vec![
                 Call::RemoteProbe,
                 Call::RemoteSessionsCount,
@@ -3574,18 +4311,18 @@ mod tests {
     #[tokio::test]
     async fn resolve_daemon_force_update_ignores_live_sessions() {
         let fake = FakeOps {
-            calls: RefCell::new(Vec::new()),
             probe_manifest: Some(fake_manifest(Some(chimaera_core::BUILD_ID), 42)),
             alive: true,
             sessions: Some(5),
             resolved_bin: PathBuf::from("/tmp/chimaera"),
             start_manifest: fake_manifest(Some(chimaera_core::BUILD_ID), 999),
+            ..FakeOps::base()
         };
         let ((manifest, outdated, _live), phases) = run_resolve(&fake, true).await;
         assert_eq!(manifest.pid, 999);
         assert!(!outdated);
         assert_eq!(
-            *fake.calls.borrow(),
+            fake.calls(),
             vec![
                 Call::RemoteProbe,
                 Call::RemoteSessionsCount,
@@ -3605,12 +4342,12 @@ mod tests {
     #[tokio::test]
     async fn resolve_daemon_update_that_did_not_replace_reports_outdated() {
         let fake = FakeOps {
-            calls: RefCell::new(Vec::new()),
             probe_manifest: Some(fake_manifest(Some("old.1"), 42)),
             alive: true,
             sessions: Some(0),
             resolved_bin: PathBuf::from("/tmp/chimaera"),
             start_manifest: fake_manifest(Some("old.1"), 42),
+            ..FakeOps::base()
         };
         let ((manifest, outdated, live), phases) = run_resolve(&fake, false).await;
         assert_eq!(
@@ -3631,19 +4368,19 @@ mod tests {
     #[tokio::test]
     async fn resolve_daemon_connects_outdated_with_live_sessions() {
         let fake = FakeOps {
-            calls: RefCell::new(Vec::new()),
             probe_manifest: Some(fake_manifest(None, 42)),
             alive: true,
             sessions: Some(2),
             resolved_bin: PathBuf::from("/unused"),
             start_manifest: fake_manifest(Some(chimaera_core::BUILD_ID), 999),
+            ..FakeOps::base()
         };
         let ((manifest, outdated, live), phases) = run_resolve(&fake, false).await;
         assert_eq!(manifest.pid, 42, "attaches to the old daemon");
         assert!(outdated);
         assert_eq!(live, Some(2));
         assert_eq!(
-            *fake.calls.borrow(),
+            fake.calls(),
             vec![Call::RemoteProbe, Call::RemoteSessionsCount]
         );
         assert_eq!(phases, vec!["probing"]);
@@ -3654,20 +4391,20 @@ mod tests {
     #[tokio::test]
     async fn resolve_daemon_fresh_start_when_no_manifest() {
         let fake = FakeOps {
-            calls: RefCell::new(Vec::new()),
             probe_manifest: None,
             // Unused here: with no manifest the fake probe reports nothing.
             alive: false,
             sessions: None,
             resolved_bin: PathBuf::from("/unused"),
             start_manifest: fake_manifest(Some(chimaera_core::BUILD_ID), 999),
+            ..FakeOps::base()
         };
         let ((manifest, outdated, live), phases) = run_resolve(&fake, false).await;
         assert_eq!(manifest.pid, 999);
         assert!(!outdated);
         assert_eq!(live, None);
         assert_eq!(
-            *fake.calls.borrow(),
+            fake.calls(),
             vec![
                 Call::RemoteProbe,
                 Call::EnsureRemoteBinary,
@@ -3682,17 +4419,17 @@ mod tests {
     #[tokio::test]
     async fn resolve_daemon_fresh_start_when_manifest_pid_dead() {
         let fake = FakeOps {
-            calls: RefCell::new(Vec::new()),
             probe_manifest: Some(fake_manifest(Some(chimaera_core::BUILD_ID), 42)),
             alive: false,
             sessions: None,
             resolved_bin: PathBuf::from("/unused"),
             start_manifest: fake_manifest(Some(chimaera_core::BUILD_ID), 999),
+            ..FakeOps::base()
         };
         let ((manifest, _outdated, _live), phases) = run_resolve(&fake, false).await;
         assert_eq!(manifest.pid, 999);
         assert_eq!(
-            *fake.calls.borrow(),
+            fake.calls(),
             vec![
                 Call::RemoteProbe,
                 Call::EnsureRemoteBinary,
@@ -3700,5 +4437,567 @@ mod tests {
             ]
         );
         assert_eq!(phases, vec!["probing", "starting"]);
+    }
+
+    // --- round-robin login nodes ------------------------------------------
+    //
+    // A pool alias ("login.cluster.edu" → ln01..lnNN) over one shared $HOME:
+    // the daemon runs on ln01, a fresh ControlMaster landed on ln02. Before
+    // the node was compared, the ln02 probe's `kill -0` (an unrelated process
+    // table) read "dead" and connect started a second daemon on ln02 — over
+    // the same manifest and session ledger, orphaning ln01's daemon and
+    // resuming its sessions a second time.
+
+    const LN01: &str = "ln01.cluster.edu";
+    const LN02: &str = "ln02.cluster.edu";
+    /// Where the cluster resolves a routed node's name; the fake's "this
+    /// machine" agrees unless a test says otherwise.
+    const CLUSTER_ADDR: std::net::IpAddr =
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
+
+    /// The daemon's manifest, written on `node`.
+    fn manifest_on(node: &str, build: Option<&str>, pid: u32) -> Manifest {
+        Manifest {
+            hostname: node.to_string(),
+            ..fake_manifest(build, pid)
+        }
+    }
+
+    /// `manifest` as seen by a probe that ran on `node`.
+    fn seen_from(
+        node: &str,
+        manifest: &Manifest,
+        alive: bool,
+        resolves: Option<bool>,
+    ) -> anyhow::Result<ProbeRun> {
+        Ok(ProbeRun::Ran(Some(Probe {
+            manifest: manifest.clone(),
+            node: node.to_string(),
+            alive,
+            manifest_node_resolves: resolves,
+            manifest_node_addrs: match resolves {
+                Some(true) => vec![CLUSTER_ADDR],
+                _ => Vec::new(),
+            },
+        })))
+    }
+
+    fn ssh_failed(stderr: &str) -> anyhow::Result<ProbeRun> {
+        Ok(ProbeRun::Failed(ProbeFailure {
+            status: "exit status: 255".to_string(),
+            stderr: stderr.to_string(),
+        }))
+    }
+
+    /// The pool alias lands on ln02; `node_route` answers for every routed
+    /// probe.
+    fn pool(
+        daemon: Manifest,
+        landed_kill0: bool,
+        resolves: Option<bool>,
+        node_route: impl Fn(&Route, &Manifest) -> anyhow::Result<ProbeRun> + 'static,
+    ) -> FakeOps {
+        FakeOps {
+            probe: Some(Box::new(move |route| match route {
+                Route::Alias => seen_from(LN02, &daemon, landed_kill0, resolves),
+                route => node_route(route, &daemon),
+            })),
+            ..FakeOps::base()
+        }
+    }
+
+    /// THE bug: a manifest from another login node is never judged dead by
+    /// the node the connection landed on. The routed probe on ln01 finds the
+    /// daemon alive, so connect attaches to it — every later op (here none;
+    /// see the update case) runs along the ln01 route, and nothing starts.
+    #[tokio::test]
+    async fn a_manifest_from_another_login_node_is_not_judged_from_this_one() {
+        let fake = pool(
+            manifest_on(LN01, Some(chimaera_core::BUILD_ID), 42),
+            // ln02 has no pid 42 (or an unrelated one): the old verdict.
+            false,
+            Some(true),
+            |route, m| match route {
+                Route::Node(n) if n == LN01 => seen_from(LN01, m, true, None),
+                other => panic!("unexpected route {other:?}"),
+            },
+        );
+        let ((manifest, outdated, _), phases) = run_resolve(&fake, false).await;
+        assert_eq!(manifest.pid, 42, "attaches to ln01's daemon");
+        assert!(!outdated);
+        assert_eq!(
+            fake.routed(),
+            vec![
+                (Call::RemoteProbe, Route::Alias),
+                (Call::RemoteProbe, Route::Node(LN01.into())),
+            ],
+            "no fresh start"
+        );
+        assert_eq!(
+            *fake.route.borrow(),
+            Route::Node(LN01.into()),
+            "left routed"
+        );
+        assert_eq!(phases, vec!["probing", "routing"]);
+    }
+
+    /// Every op after the routing decision runs on the daemon's node: an
+    /// idle outdated daemon on ln01 is counted, stopped, and restarted THERE.
+    #[tokio::test]
+    async fn a_routed_update_counts_stops_and_restarts_on_the_daemons_node() {
+        let fake = FakeOps {
+            sessions: Some(0),
+            resolved_bin: PathBuf::from("/tmp/chimaera"),
+            start_manifest: manifest_on(LN01, Some(chimaera_core::BUILD_ID), 999),
+            ..pool(
+                manifest_on(LN01, Some("old.1"), 42),
+                false,
+                Some(true),
+                |_, m| seen_from(LN01, m, true, None),
+            )
+        };
+        let ((manifest, outdated, _), phases) = run_resolve(&fake, false).await;
+        assert_eq!(manifest.pid, 999);
+        assert!(!outdated);
+        let ln01 = Route::Node(LN01.into());
+        assert_eq!(
+            fake.routed(),
+            vec![
+                (Call::RemoteProbe, Route::Alias),
+                (Call::RemoteProbe, ln01.clone()),
+                (Call::RemoteSessionsCount, ln01.clone()),
+                (Call::ResolveLocalBinary, ln01.clone()),
+                (Call::StopRemote, ln01.clone()),
+                (Call::DeployBinary, ln01.clone()),
+                (Call::StartRemote, ln01),
+            ]
+        );
+        assert_eq!(phases, vec!["probing", "routing", "updating", "starting"]);
+    }
+
+    /// Provably dead ON its own node: the verdict now counts, and the fresh
+    /// daemon starts on that node (the route stays there).
+    #[tokio::test]
+    async fn a_daemon_dead_on_its_own_node_is_replaced_there() {
+        let fake = pool(
+            manifest_on(LN01, Some(chimaera_core::BUILD_ID), 42),
+            true, // ln02 has an unrelated pid 42 alive — irrelevant
+            Some(true),
+            |_, m| seen_from(LN01, m, false, None),
+        );
+        let ((manifest, ..), _) = run_resolve(&fake, false).await;
+        assert_eq!(manifest.pid, 999);
+        let ln01 = Route::Node(LN01.into());
+        assert_eq!(
+            fake.routed(),
+            vec![
+                (Call::RemoteProbe, Route::Alias),
+                (Call::RemoteProbe, ln01.clone()),
+                (Call::EnsureRemoteBinary, ln01.clone()),
+                (Call::StartRemote, ln01),
+            ]
+        );
+    }
+
+    /// Unreachable is not dead: when ln01 can't be reached (here: the auth
+    /// prompt was refused) nothing is started, the error says what is where
+    /// and why, and no second route is tried — it would prompt again.
+    #[tokio::test]
+    async fn an_unreachable_daemon_node_is_an_error_never_a_fresh_start() {
+        let fake = pool(
+            manifest_on(LN01, Some(chimaera_core::BUILD_ID), 42),
+            false,
+            Some(true),
+            |_, _| {
+                ssh_failed(
+                    "mkjellbe@ln01.cluster.edu: Permission denied (gssapi-with-mic,password).",
+                )
+            },
+        );
+        let (out, phases) = try_resolve(&fake, false).await;
+        let err = format!("{:#}", out.expect_err("must not resolve"));
+        assert!(
+            err.contains("runs on login node ln01.cluster.edu (pid 42)"),
+            "{err}"
+        );
+        assert!(err.contains("landed on ln02.cluster.edu"), "{err}");
+        assert!(err.contains("Permission denied"), "{err}");
+        assert!(err.contains("Nothing was started"), "{err}");
+        assert!(
+            !err.contains(".."),
+            "ssh's own period is not doubled: {err}"
+        );
+        assert_eq!(
+            fake.routed(),
+            vec![
+                (Call::RemoteProbe, Route::Alias),
+                (Call::RemoteProbe, Route::Node(LN01.into())),
+            ]
+        );
+        assert_eq!(*fake.route.borrow(), Route::Alias, "no half-learned route");
+        assert_eq!(phases, vec!["probing", "routing"]);
+    }
+
+    /// A direct dial that never reached ln01's sshd (the name doesn't
+    /// resolve here, a firewall) falls back to reaching it from inside the
+    /// cluster, through the alias's own master.
+    #[tokio::test]
+    async fn a_node_this_machine_cannot_dial_is_reached_through_the_alias() {
+        let fake = pool(
+            manifest_on(LN01, Some(chimaera_core::BUILD_ID), 42),
+            false,
+            Some(true),
+            |route, m| match route {
+                Route::Node(_) => {
+                    ssh_failed("ssh: connect to host ln01.cluster.edu port 22: Operation timed out")
+                }
+                Route::NodeViaAlias(_) => seen_from(LN01, m, true, None),
+                Route::Alias => unreachable!(),
+            },
+        );
+        let ((manifest, ..), _) = run_resolve(&fake, false).await;
+        assert_eq!(manifest.pid, 42);
+        assert_eq!(
+            fake.routed(),
+            vec![
+                (Call::RemoteProbe, Route::Alias),
+                (Call::RemoteProbe, Route::Node(LN01.into())),
+                (Call::RemoteProbe, Route::NodeViaAlias(LN01.into())),
+            ]
+        );
+        assert_eq!(*fake.route.borrow(), Route::NodeViaAlias(LN01.into()));
+    }
+
+    /// Both routes failing is the same honest error.
+    #[tokio::test]
+    async fn no_route_to_the_daemons_node_is_an_error() {
+        let fake = pool(
+            manifest_on(LN01, Some(chimaera_core::BUILD_ID), 42),
+            false,
+            Some(true),
+            |_, _| {
+                ssh_failed("ssh: Could not resolve hostname ln01.cluster.edu: nodename nor servname provided")
+            },
+        );
+        let (out, _) = try_resolve(&fake, false).await;
+        assert!(format!("{:#}", out.unwrap_err()).contains("could not reach ln01.cluster.edu"));
+        assert_eq!(
+            fake.calls(),
+            vec![Call::RemoteProbe; 3],
+            "alias + both routes, no start"
+        );
+        assert_eq!(*fake.route.borrow(), Route::Alias);
+    }
+
+    /// A routed probe that finds no manifest is confirmed from the node we
+    /// landed on: really gone → a fresh start there; still there → the dial
+    /// reached a machine that doesn't share this home, and nothing starts.
+    #[tokio::test]
+    async fn a_manifest_missing_over_the_route_is_confirmed_where_we_landed() {
+        let gone = FakeOps {
+            probe: Some(Box::new({
+                let seen = std::cell::Cell::new(0);
+                move |route| {
+                    seen.set(seen.get() + 1);
+                    match (route, seen.get()) {
+                        (Route::Alias, 1) => seen_from(
+                            LN02,
+                            &manifest_on(LN01, Some(chimaera_core::BUILD_ID), 42),
+                            false,
+                            Some(true),
+                        ),
+                        (Route::Node(_), _) | (Route::Alias, _) => Ok(ProbeRun::Ran(None)),
+                        (other, _) => panic!("dialed {other:?}"),
+                    }
+                }
+            })),
+            ..FakeOps::base()
+        };
+        let ((manifest, ..), _) = run_resolve(&gone, false).await;
+        assert_eq!(manifest.pid, 999, "stopped meanwhile: a fresh start");
+        assert_eq!(
+            gone.routed(),
+            vec![
+                (Call::RemoteProbe, Route::Alias),
+                (Call::RemoteProbe, Route::Node(LN01.into())),
+                (Call::RemoteProbe, Route::Alias),
+                (Call::EnsureRemoteBinary, Route::Alias),
+                (Call::StartRemote, Route::Alias),
+            ]
+        );
+
+        let elsewhere = pool(
+            manifest_on(LN01, Some(chimaera_core::BUILD_ID), 42),
+            false,
+            Some(true),
+            |_, _| Ok(ProbeRun::Ran(None)),
+        );
+        let (out, _) = try_resolve(&elsewhere, false).await;
+        assert!(
+            format!("{:#}", out.unwrap_err()).contains("doesn't see host's manifest"),
+            "a machine without the shared home is never where a daemon starts"
+        );
+        assert_eq!(elsewhere.calls(), vec![Call::RemoteProbe; 3]);
+    }
+
+    /// A name this machine resolves somewhere else than the cluster does is
+    /// never dialed from here (a search domain can turn it into an unrelated
+    /// host — and hand that host the password); it only travels inside the
+    /// cluster.
+    #[tokio::test]
+    async fn a_node_this_machine_resolves_elsewhere_is_only_reached_inside_the_cluster() {
+        let fake = FakeOps {
+            local: vec!["203.0.113.9".parse().unwrap()],
+            ..pool(
+                manifest_on("login1", Some(chimaera_core::BUILD_ID), 42),
+                false,
+                Some(true),
+                |route, m| match route {
+                    Route::NodeViaAlias(n) if n == "login1" => seen_from("login1", m, true, None),
+                    other => panic!("dialed {other:?}"),
+                },
+            )
+        };
+        let ((manifest, ..), _) = run_resolve(&fake, false).await;
+        assert_eq!(manifest.pid, 42);
+        assert_eq!(*fake.route.borrow(), Route::NodeViaAlias("login1".into()));
+    }
+
+    /// The user's ssh config can send the direct dial anywhere (a
+    /// ProxyCommand with a fixed target ignores `HostName`). Landing back on
+    /// the node we started from proves nothing about the name there — the
+    /// in-cluster route decides, and here finds the daemon alive on ln01.
+    #[tokio::test]
+    async fn a_direct_dial_redirected_back_here_is_not_a_renamed_host() {
+        let fake = pool(
+            manifest_on(LN01, Some(chimaera_core::BUILD_ID), 42),
+            false,
+            Some(true),
+            |route, m| match route {
+                Route::Node(_) => seen_from(LN02, m, false, Some(true)),
+                Route::NodeViaAlias(_) => seen_from(LN01, m, true, None),
+                Route::Alias => unreachable!(),
+            },
+        );
+        let ((manifest, ..), _) = run_resolve(&fake, false).await;
+        assert_eq!(manifest.pid, 42, "attaches to ln01's live daemon");
+        assert_eq!(
+            fake.calls(),
+            vec![Call::RemoteProbe; 3],
+            "no fresh start from ln02's verdict"
+        );
+        assert_eq!(*fake.route.borrow(), Route::NodeViaAlias(LN01.into()));
+    }
+
+    /// The node's name no longer exists in the cluster (decommissioned or
+    /// renamed): its daemon went with it, so a fresh start on the landed node
+    /// is safe — and the only case a foreign manifest yields one unrouted.
+    #[tokio::test]
+    async fn a_daemon_whose_node_no_longer_exists_is_replaced_where_we_landed() {
+        let fake = pool(
+            manifest_on(LN01, Some(chimaera_core::BUILD_ID), 42),
+            false,
+            Some(false),
+            |route, _| panic!("dialed {route:?} for a node that doesn't resolve"),
+        );
+        let ((manifest, ..), phases) = run_resolve(&fake, false).await;
+        assert_eq!(manifest.pid, 999);
+        assert_eq!(
+            fake.routed(),
+            vec![
+                (Call::RemoteProbe, Route::Alias),
+                (Call::EnsureRemoteBinary, Route::Alias),
+                (Call::StartRemote, Route::Alias),
+            ]
+        );
+        assert_eq!(phases, vec!["probing", "starting"]);
+    }
+
+    /// A renamed host: the manifest's old name still leads to the node we
+    /// landed on, so the landed probe's verdict was local after all.
+    #[tokio::test]
+    async fn a_renamed_host_keeps_its_local_verdict() {
+        let fake = pool(
+            manifest_on("old-name.cluster.edu", Some(chimaera_core::BUILD_ID), 42),
+            true,
+            Some(true),
+            |_, m| seen_from(LN02, m, true, None),
+        );
+        let ((manifest, ..), _) = run_resolve(&fake, false).await;
+        assert_eq!(manifest.pid, 42);
+        assert_eq!(*fake.route.borrow(), Route::Alias, "one node — no route");
+        assert_eq!(
+            fake.routed().last().map(|(_, route)| route.clone()),
+            Some(Route::NodeViaAlias("old-name.cluster.edu".into())),
+            "only the in-cluster route may prove a rename"
+        );
+    }
+
+    /// A manifest's node name is data from a remote disk: anything but a
+    /// plain host name is refused before it reaches ssh's argv or a
+    /// ProxyCommand's shell.
+    #[tokio::test]
+    async fn a_hostile_node_name_is_never_dialed() {
+        let fake = pool(
+            manifest_on("ln01;touch${IFS}/tmp/x", Some(chimaera_core::BUILD_ID), 42),
+            false,
+            Some(true),
+            |route, _| panic!("dialed {route:?}"),
+        );
+        let (out, _) = try_resolve(&fake, false).await;
+        assert!(format!("{:#}", out.unwrap_err()).contains("not a plain host name"));
+        assert_eq!(fake.calls(), vec![Call::RemoteProbe]);
+    }
+
+    /// A route learned by an earlier connect goes first — straight to the
+    /// daemon's node, no detour through wherever the pool lands.
+    #[tokio::test]
+    async fn a_learned_route_is_probed_first() {
+        let fake = pool(
+            manifest_on(LN01, Some(chimaera_core::BUILD_ID), 42),
+            false,
+            Some(true),
+            |_, m| seen_from(LN01, m, true, None),
+        );
+        *fake.route.borrow_mut() = Route::Node(LN01.into());
+        let ((manifest, ..), phases) = run_resolve(&fake, false).await;
+        assert_eq!(manifest.pid, 42);
+        assert_eq!(
+            fake.routed(),
+            vec![(Call::RemoteProbe, Route::Node(LN01.into()))]
+        );
+        assert_eq!(phases, vec!["probing"]);
+    }
+
+    /// A learned route that no longer answers starts over from the alias —
+    /// here the daemon has since been started on the node the alias lands on.
+    #[tokio::test]
+    async fn a_stale_learned_route_starts_over() {
+        let fake = FakeOps {
+            probe: Some(Box::new(|route| match route {
+                Route::Node(_) => {
+                    ssh_failed("ssh: connect to host ln01.cluster.edu port 22: No route to host")
+                }
+                _ => seen_from(
+                    LN02,
+                    &manifest_on(LN02, Some(chimaera_core::BUILD_ID), 77),
+                    true,
+                    None,
+                ),
+            })),
+            ..FakeOps::base()
+        };
+        *fake.route.borrow_mut() = Route::Node(LN01.into());
+        let ((manifest, ..), _) = run_resolve(&fake, false).await;
+        assert_eq!(manifest.pid, 77);
+        assert_eq!(
+            fake.routed(),
+            vec![
+                (Call::RemoteProbe, Route::Node(LN01.into())),
+                (Call::RemoteProbe, Route::Alias),
+            ]
+        );
+        assert_eq!(*fake.route.borrow(), Route::Alias);
+    }
+
+    /// The route's ssh options: a node route overrides only `HostName`; the
+    /// via-alias route adds a `-W` first leg over the alias's own master,
+    /// with its `%` escaped for the outer ssh's expansion.
+    #[test]
+    fn route_options_pin_the_node() {
+        assert!(route_opts("pool", &Route::Alias).is_empty());
+        assert_eq!(
+            route_opts("pool", &Route::Node(LN01.into())),
+            vec!["-o".to_string(), format!("HostName={LN01}")]
+        );
+        let via = route_opts("pool", &Route::NodeViaAlias(LN01.into()));
+        assert_eq!(via[..2], ["-o".to_string(), format!("HostName={LN01}")]);
+        assert_eq!(via[2], "-o");
+        let proxy = via[3]
+            .strip_prefix("ProxyCommand=")
+            .expect("a ProxyCommand");
+        assert!(proxy.starts_with("ssh "), "{proxy}");
+        assert!(proxy.ends_with(" -W %h:%p 'pool'"), "{proxy}");
+        assert!(
+            proxy.contains("%%C"),
+            "ControlPath token survives the outer expansion: {proxy}"
+        );
+        assert!(
+            !proxy.contains("HostName"),
+            "the first leg is the alias's own master: {proxy}"
+        );
+        assert!(master_proxy_command("pool", Some(LN01)).contains(&format!("-o HostName={LN01}")));
+        // The alias reaches a local shell and ssh's own `%` expansion.
+        assert!(master_proxy_command("a;b%h'c", None).ends_with(r"-W %h:%p 'a;b%%h'\''c'"));
+    }
+
+    #[test]
+    fn node_names_are_validated_before_ssh_sees_them() {
+        for ok in [LN01, "login1", "sh03-ln06.stanford.edu", "node_7"] {
+            assert!(valid_node_name(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "-oProxyCommand=x",
+            ".hidden",
+            "a b",
+            "a;b",
+            "$(id)",
+            "a%C",
+            "a\"b",
+        ] {
+            assert!(!valid_node_name(bad), "{bad}");
+        }
+        let (a, b): (std::net::IpAddr, std::net::IpAddr) = (
+            "10.0.0.1".parse().unwrap(),
+            "171.67.99.169".parse().unwrap(),
+        );
+        assert_eq!(
+            routes_to(LN01, &[a, b], &[b]),
+            vec![Route::Node(LN01.into()), Route::NodeViaAlias(LN01.into())],
+            "the direct dial reaches an address the cluster means"
+        );
+        assert_eq!(
+            routes_to("sh04-ln03", &[a], &[b]),
+            vec![Route::NodeViaAlias("sh04-ln03".into())],
+            "resolved elsewhere here (Sherlock's bare names: 10.x inside, public outside)"
+        );
+        assert_eq!(
+            routes_to(LN01, &[a], &[]),
+            vec![Route::NodeViaAlias(LN01.into())]
+        );
+        assert_eq!(
+            routes_to(LN01, &[], &[a]),
+            vec![Route::NodeViaAlias(LN01.into())]
+        );
+    }
+
+    #[test]
+    fn only_network_level_failures_try_another_route() {
+        let failure = |stderr: &str| ProbeFailure {
+            status: "exit status: 255".to_string(),
+            stderr: stderr.to_string(),
+        };
+        for net in [
+            "ssh: Could not resolve hostname ln01: Name or service not known",
+            "ssh: connect to host ln01 port 22: Connection timed out",
+            "ssh: connect to host ln01 port 22: Connection refused",
+            "kex_exchange_identification: read: Connection reset by peer",
+            "Connection timed out during banner exchange",
+        ] {
+            assert!(failure(net).network_level(), "{net}");
+        }
+        for auth in [
+            "u@ln01: Permission denied (gssapi-with-mic,password).",
+            "Host key verification failed.",
+            "Received disconnect from 1.2.3.4 port 22:2: Too many authentication failures",
+        ] {
+            assert!(!failure(auth).network_level(), "{auth}");
+        }
+        assert_eq!(
+            failure("Welcome to the cluster\nu@ln01: Permission denied (password).\n").to_string(),
+            "u@ln01: Permission denied (password).",
+            "ssh's own last line, not the banner"
+        );
     }
 }

@@ -107,6 +107,9 @@ struct TunnelEndpoint {
     port: u16,
     token: String,
     is_compute: bool,
+    /// The login node a pool alias's tunnel is pinned to: a recovery's
+    /// `connected` carries it like every other, so the row never loses it.
+    node: Option<String>,
 }
 
 /// Open a UI window on a daemon: local (`record.alias` None) or a connected
@@ -393,6 +396,7 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
                         port: tunnel.local_port,
                         token: tunnel.manifest.token.clone(),
                         is_compute: false,
+                        node: tunnel.route.node().map(str::to_string),
                     })
                     .collect()
             };
@@ -403,6 +407,7 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
                     port: tunnel.local_port,
                     token: tunnel.token.clone(),
                     is_compute: true,
+                    node: None,
                 }));
             }
             tracing::trace!(tunnels = snap.len(), "ssh health monitor snapshot");
@@ -503,6 +508,7 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
                                 .to_string()
                         }),
                         build: None,
+                        node: endpoint.node.filter(|_| recovered),
                     },
                 );
             }

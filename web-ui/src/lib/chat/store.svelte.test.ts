@@ -320,6 +320,23 @@ describe("ChatStore pending-send ordering", () => {
     expect(store.blocks[2]).toMatchObject({ kind: "user", id: "q1" });
   });
 
+  it("image attachments keep their saved copies from the queue into the transcript", () => {
+    const shot = "/home/u/.chimaera/uploads/s-1/image-ab12cd34.png";
+    const store = fold([
+      // A turn-opening send whose second image failed to save: one path, two images.
+      { type: "user_message", text: "look", attachments: 2, attachment_paths: [shot], id: "u1" },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "user_message", text: "", attachments: 1, attachment_paths: [shot], id: "q1", queued: true },
+    ]);
+    expect(store.blocks[0]).toMatchObject({ kind: "user", attachments: 2, attachmentPaths: [shot] });
+    expect(store.pendingSends[0]).toMatchObject({ id: "q1", attachmentPaths: [shot] });
+    store.apply({ seq: 4, ts: 4, ev: { type: "user_message_update", id: "q1", state: "sent" } } as SeqEvent);
+    expect(store.blocks.at(-1)).toMatchObject({ kind: "user", id: "q1", attachmentPaths: [shot] });
+    // An old journal (count only) carries no paths.
+    const old = fold([{ type: "user_message", text: "old", attachments: 1 }]);
+    expect(old.blocks[0]).toMatchObject({ attachments: 1, attachmentPaths: [] });
+  });
+
   it("the ✕ tombstone dismisses a dropped bubble and no-ops for a delivered one", () => {
     // Dismiss: dropped → cancelled removes it from the stack (replay-stable).
     const dismissed = fold([
@@ -1631,5 +1648,156 @@ describe("ChatStore wake markers (turns nobody typed)", () => {
       { type: "turn_started", turn_id: "t2" },
     ]);
     expect(store.blocks.find((b) => b.kind === "wake")).toMatchObject({ cause: "self", label: null });
+  });
+});
+
+describe("ChatStore turn artifacts (the made-this-turn gallery)", () => {
+  /** Fold with explicit journal timestamps: `[ts, event]`. */
+  function foldAt(events: [number, Record<string, unknown>][]): ChatStore {
+    const store = new ChatStore();
+    events.forEach(([ts, ev], i) => store.apply({ seq: i + 1, ts, ev } as SeqEvent));
+    return store;
+  }
+
+  const TURN: [number, Record<string, unknown>][] = [
+    [1000, { type: "user_message", text: "make me a report", attachments: 0 }],
+    [1010, { type: "turn_started", turn_id: "t1" }],
+    [1020, { type: "tool_call", id: "w1", kind: "edit", title: "Write notes.md", locations: ["/p/notes.md"], status: "in_progress" }],
+    [1030, { type: "tool_call_update", id: "w1", status: "completed" }],
+    [1040, { type: "tool_call", id: "e1", kind: "edit", title: "Edit main.rs", locations: ["/p/src/main.rs"], status: "in_progress" }],
+    [1050, { type: "tool_call_update", id: "e1", status: "completed" }],
+    [1060, { type: "tool_call", id: "b1", kind: "execute", title: "python plot.py --out figs/umap.png", status: "in_progress" }],
+    [1070, { type: "tool_call_update", id: "b1", status: "completed", content: { kind: "output", text: "wrote report/index.html\n" } }],
+    [1080, { type: "message_chunk", turn_id: "t1", text: "Done — see `figs/umap.png` and report/index.html." }],
+    [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+  ];
+
+  it("collects written artifacts, shell-mentioned candidates and the turn's window", () => {
+    const store = foldAt(TURN);
+    const end = store.blocks.find((b) => b.kind === "turn_end");
+    expect(end).toMatchObject({
+      kind: "turn_end",
+      // Source code an edit tool touched is not an artifact.
+      artifacts: ["/p/notes.md"],
+      startedAtMs: 1010,
+      endedAtMs: 2000,
+      aborted: false,
+    });
+    expect(end?.kind === "turn_end" ? end.mentioned : []).toEqual(
+      expect.arrayContaining(["figs/umap.png", "report/index.html"]),
+    );
+    // Replay rebuilds the identical blocks (pure over the journal).
+    expect(foldAt(TURN).blocks).toEqual(store.blocks);
+  });
+
+  it("a stopped turn keeps what it made; a plain stop adds nothing", () => {
+    const stopped = foldAt([
+      ...TURN.slice(0, -1),
+      [1500, { type: "turn_aborted", turn_id: "t1", reason: "interrupted", interrupted: true }],
+    ]);
+    const kinds = stopped.blocks.map((b) => b.kind);
+    expect(kinds.slice(-2)).toEqual(["turn_end", "notice"]);
+    expect(stopped.blocks.find((b) => b.kind === "turn_end")).toMatchObject({
+      artifacts: ["/p/notes.md"],
+      startedAtMs: 1010,
+      endedAtMs: 1500,
+      aborted: true,
+    });
+
+    const plain = foldAt([
+      [1, { type: "turn_started", turn_id: "t1" }],
+      [2, { type: "message_chunk", turn_id: "t1", text: "thinking out loud" }],
+      [3, { type: "turn_aborted", turn_id: "t1", reason: "interrupted", interrupted: true }],
+    ]);
+    expect(plain.blocks.map((b) => b.kind)).toEqual(["message", "notice"]);
+  });
+
+  it("shows only what the prose did not: an embedded figure and a linked document are covered", () => {
+    const store = foldAt([
+      ...TURN.slice(0, -2),
+      [1080, { type: "message_chunk", turn_id: "t1", text: "Done:\n\n![umap](figs/umap.png)\n\nNotes are in notes.md; the report is report/index.html." }],
+      [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+    ]);
+    const end = store.blocks.find((b) => b.kind === "turn_end");
+    // notes.md is linked by the prose; the figure is embedded; the report is
+    // only named, and a link is not a picture.
+    expect(end).toMatchObject({ kind: "turn_end", artifacts: [], covered: ["/p/notes.md", "figs/umap.png"] });
+    const mentioned = end?.kind === "turn_end" ? end.mentioned : [];
+    expect(mentioned).toContain("report/index.html");
+    expect(mentioned).not.toContain("figs/umap.png");
+    expect(mentioned).not.toContain("notes.md");
+  });
+
+  it("a name covers the shallowest file only, and silence covers nothing", () => {
+    const quiet = foldAt([
+      ...TURN.slice(0, 4),
+      [1042, { type: "tool_call", id: "w2", kind: "edit", title: "Write docs/notes.md", locations: ["/p/docs/notes.md"], status: "in_progress" }],
+      [1044, { type: "tool_call_update", id: "w2", status: "completed" }],
+      [1080, { type: "message_chunk", turn_id: "t1", text: "Updated the notes." }],
+      [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+    ]);
+    expect(quiet.blocks.find((b) => b.kind === "turn_end")).toMatchObject({
+      artifacts: ["/p/notes.md", "/p/docs/notes.md"],
+      covered: [],
+    });
+    const named = foldAt([
+      ...TURN.slice(0, 4),
+      [1042, { type: "tool_call", id: "w2", kind: "edit", title: "Write docs/notes.md", locations: ["/p/docs/notes.md"], status: "in_progress" }],
+      [1044, { type: "tool_call_update", id: "w2", status: "completed" }],
+      [1080, { type: "message_chunk", turn_id: "t1", text: "Updated notes.md." }],
+      [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+    ]);
+    expect(named.blocks.find((b) => b.kind === "turn_end")).toMatchObject({
+      artifacts: ["/p/docs/notes.md"],
+      covered: ["/p/notes.md"],
+    });
+  });
+
+  it("every name in a long reply covers its file", () => {
+    const n = 40;
+    const tools: [number, Record<string, unknown>][] = [];
+    for (let i = 0; i < n; i++) {
+      tools.push([1020 + i * 2, { type: "tool_call", id: `w${i}`, kind: "edit", title: `Write out/t${i}.csv`, locations: [`/p/out/t${i}.csv`], status: "in_progress" }]);
+      tools.push([1021 + i * 2, { type: "tool_call_update", id: `w${i}`, status: "completed" }]);
+    }
+    const names = Array.from({ length: n }, (_, i) => `out/t${i}.csv`).join(", ");
+    const store = foldAt([
+      [1000, { type: "user_message", text: "split the table", attachments: 0 }],
+      [1010, { type: "turn_started", turn_id: "t1" }],
+      ...tools,
+      [1900, { type: "message_chunk", turn_id: "t1", text: `Wrote ${names}.` }],
+      [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+    ]);
+    // Everything was named, so nothing is left for the gallery to show.
+    const end = store.blocks.find((b) => b.kind === "turn_end");
+    expect(end).toMatchObject({ artifacts: [], mentioned: [] });
+    expect(end?.kind === "turn_end" ? end.covered : []).toHaveLength(n);
+  });
+
+  it("scans the whole command, not the truncated title", () => {
+    const store = foldAt([
+      [1000, { type: "user_message", text: "make me a table", attachments: 0 }],
+      [1010, { type: "turn_started", turn_id: "t1" }],
+      [1020, { type: "tool_call", id: "b1", kind: "execute", title: "Bash: cd \"/very/long/absolute/path/that/eats/the/whole/title/budget/before/anything/useful/appears…", status: "in_progress",
+               command: "cd \"/very/long/absolute/path/that/eats/the/whole/title/budget/before/anything/useful/appears/at/all\" && python3 -c 'open(\"out/summary.csv\",\"w\").write(\"a,b\\n\")'" }],
+      [1030, { type: "tool_call_update", id: "b1", status: "completed", content: { kind: "output", text: "" } }],
+      [1040, { type: "message_chunk", turn_id: "t1", text: "Done." }],
+      [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+    ]);
+    const end = store.blocks.find((b) => b.kind === "turn_end");
+    expect(end?.kind === "turn_end" ? end.mentioned : []).toEqual(["out/summary.csv"]);
+  });
+
+  it("each turn scans only itself", () => {
+    const store = foldAt([
+      ...TURN,
+      [3000, { type: "user_message", text: "thanks", attachments: 0 }],
+      [3010, { type: "turn_started", turn_id: "t2" }],
+      [3020, { type: "message_chunk", turn_id: "t2", text: "You're welcome." }],
+      [3030, { type: "turn_completed", turn_id: "t2", usage: {} }],
+    ]);
+    const ends = store.blocks.filter((b) => b.kind === "turn_end");
+    expect(ends).toHaveLength(2);
+    expect(ends[1]).toMatchObject({ artifacts: [], mentioned: [], startedAtMs: 3010, endedAtMs: 3030 });
   });
 });

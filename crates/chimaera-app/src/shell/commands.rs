@@ -705,6 +705,7 @@ pub(super) async fn connect_compute_session(
             error: None,
             reason: None,
             build: None,
+            node: None,
         },
     );
     Ok(())
@@ -1263,26 +1264,29 @@ pub(super) fn adopt_tab(
 /// updater work runs in Rust; the web UI can only ask, never drive the
 /// download — and the download is verified against the embedded minisign
 /// pubkey regardless, so only a validly-signed release can ever install.
+/// A dev build answers `None` without asking: offering a release to it would
+/// swap the build under test (and the daemon it spawns) for a download.
 #[tauri::command]
 pub(super) async fn check_app_update(app: AppHandle) -> Result<Option<String>, String> {
-    use tauri_plugin_updater::UpdaterExt;
-    // Dev is dev: offering a release to a dev build would swap the build
-    // under test (and the daemon it spawns) for a download — never an
-    // "update". The signed-release channel is for stamped builds only.
-    if chimaera_core::is_dev_build() {
-        return Ok(None);
-    }
-    let updater = app.updater().map_err(|e| e.to_string())?;
-    match updater.check().await {
-        Ok(Some(update)) => Ok(Some(update.version)),
-        Ok(None) => Ok(None),
-        // A missing/unreachable endpoint (no releases yet) is "no update",
-        // not an error the user should see on every launch.
-        Err(e) => {
-            tracing::debug!("update check unavailable: {e}");
-            Ok(None)
-        }
-    }
+    // An unreachable endpoint is "no update" here (the home screen's quiet
+    // line); `app_update_status` is where a failure is reported as one.
+    Ok(crate::update::check(&app).await.available)
+}
+
+/// "Is there an app update?" with the whole answer: this version, what the
+/// last check found, when, and why it failed if it did. `refresh` checks
+/// first (a "check now"); otherwise the cached outcome answers instantly —
+/// how a window opened after the periodic `app-update` broadcast learns of it.
+#[tauri::command]
+pub(super) async fn app_update_status(
+    app: AppHandle,
+    refresh: bool,
+) -> Result<crate::update::AppUpdateStatus, String> {
+    Ok(if refresh {
+        crate::update::check(&app).await
+    } else {
+        crate::update::status(&app)
+    })
 }
 
 /// Answer an in-flight SSH auth prompt (see `askpass`): `secret` None means
@@ -1484,6 +1488,8 @@ pub(super) fn report_window_scope(
             }
         }
     }
+    // A notification click that opened this window is owed a focus.
+    super::notices::window_scoped(webview.app_handle(), webview.label(), &alias, &ws);
     if (!home_hub || reclaimed_home) && !stable_id.is_empty() {
         let mut registry = lock(&state.registry);
         registry.set_scope(&stable_id, registered_alias, ws);
@@ -1510,6 +1516,99 @@ pub(super) fn report_window_scope(
     // Its workspace also decides whether Settings applies (home screen = no).
     crate::menu::sync_settings_enabled(webview.app_handle());
     Ok(())
+}
+
+/// What this window shows right now: the session in each pane's active tab.
+/// The notifier drops a notice about one of these while the window has
+/// focus, and a focused window's report clears their delivered alerts.
+#[tauri::command]
+pub(super) fn report_window_view(
+    webview: tauri::WebviewWindow,
+    state: State<'_, Shell>,
+    visible: Vec<String>,
+) -> Result<(), String> {
+    // A page shows a handful of panes; anything longer is not a view.
+    const MAX_VISIBLE: usize = 32;
+    let visible: Vec<String> = visible.into_iter().take(MAX_VISIBLE).collect();
+    let alias = {
+        let mut windows = lock(&state.windows);
+        let scope = windows
+            .get_mut(webview.label())
+            .ok_or_else(|| "this window is not registered".to_string())?;
+        scope.visible.clone_from(&visible);
+        scope.alias.clone()
+    };
+    if webview.is_focused().unwrap_or(false) {
+        super::notices::mark_seen(webview.app_handle(), &alias, &visible);
+    }
+    Ok(())
+}
+
+/// How many files hold unsaved edits in this window, pushed by the page
+/// whenever that changes, so a close or quit decides without asking the page
+/// first (see `unsaved`). Keyed by the calling window: a page can only speak
+/// for itself.
+#[tauri::command]
+pub(super) fn report_unsaved(
+    webview: tauri::WebviewWindow,
+    state: State<'_, Shell>,
+    count: u32,
+) -> Result<(), String> {
+    if state.window_scope(webview.label()).is_none() {
+        return Err("this window is not registered".to_string());
+    }
+    super::unsaved::report(webview.app_handle(), webview.label(), count);
+    Ok(())
+}
+
+/// This window's answer to an `unsaved-prompt`: `shown` (the dialog is up),
+/// `proceed` (saved all, or don't save) or `cancel`. A reply to anything but
+/// the window's current prompt is ignored.
+#[tauri::command]
+pub(super) fn reply_unsaved(webview: tauri::WebviewWindow, id: u64, reply: super::unsaved::Reply) {
+    super::unsaved::reply(webview.app_handle(), webview.label(), id, reply);
+}
+
+/// The session a notification click opened this window for (see
+/// `notices::take_pending_focus`); `None` once taken or when nothing is owed.
+#[tauri::command]
+pub(super) fn take_pending_focus(webview: tauri::WebviewWindow) -> Option<String> {
+    super::notices::take_pending_focus(webview.app_handle(), webview.label())
+}
+
+/// Whether the OS lets Chimaera post notifications (for the settings page).
+#[tauri::command]
+pub(super) async fn notification_permission() -> crate::notify::Permission {
+    crate::notify::permission().await
+}
+
+/// Ask the OS for notification permission now (the settings page's button;
+/// otherwise the first notification asks).
+#[tauri::command]
+pub(super) async fn request_notification_permission() -> crate::notify::Permission {
+    crate::notify::request_permission().await
+}
+
+/// Post a sample notification (the settings page's "Send test"), so the user
+/// can see what alerts look like — and trigger the OS permission prompt — on
+/// demand. Clicking it just brings the app forward.
+#[tauri::command]
+pub(super) fn test_notification() {
+    crate::notify::post(crate::notify::Toast {
+        id: format!("chimaera-test-{}", super::next_test_notification_id()),
+        thread: "chimaera-test".to_string(),
+        title: "Chimaera".to_string(),
+        subtitle: "Notifications are on".to_string(),
+        body: "You'll hear from agents here when they finish or need you.".to_string(),
+        sound: true,
+    });
+}
+
+/// Open the OS's notification settings for Chimaera (macOS: System Settings
+/// → Notifications → Chimaera) — the only place a denial can be undone.
+#[tauri::command]
+pub(super) fn open_notification_settings() {
+    crate::notify::open_settings();
 }
 
 /// The UI's caffeinate toggle. The real work — and the same `caffeinate-changed`
@@ -1593,6 +1692,17 @@ pub(super) fn open_external(url: String) -> Result<(), String> {
 pub(super) async fn begin_update(app: AppHandle) -> Result<(), String> {
     use tauri_plugin_updater::UpdaterExt;
     tracing::info!("ipc: begin_update");
+    // The relaunch at the end is a restart, which Tauri will not let the
+    // unsaved-edits guard hold, so refuse up front instead of dropping them.
+    match super::unsaved::windows_with_unsaved(&app) {
+        0 => {}
+        1 => return Err("A window has unsaved edits — save or discard them, then update.".into()),
+        n => {
+            return Err(format!(
+                "{n} windows have unsaved edits — save or discard them, then update."
+            ))
+        }
+    }
     let updater = app.updater().map_err(|e| e.to_string())?;
     let update = updater
         .check()

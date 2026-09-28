@@ -417,7 +417,7 @@ async fn open_zip_entry(
 /// Open `relative` by walking from an already-open root descriptor. Every
 /// intermediate and final component is `O_NOFOLLOW`; no path lookup is ever
 /// restarted from the process cwd after the root is anchored.
-fn open_beneath(
+pub(crate) fn open_beneath(
     root: &File,
     relative: &FsPath,
     final_flags: rustix::fs::OFlags,

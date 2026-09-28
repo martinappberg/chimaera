@@ -24,7 +24,9 @@ use crate::windows::{WindowRecord, WindowRegistry};
 mod commands;
 mod connect;
 mod drag;
+pub(crate) mod notices;
 mod restore;
+mod unsaved;
 
 pub use restore::open_ui_window;
 
@@ -39,6 +41,13 @@ const DAEMON_UI_CORE_PERMISSIONS: &[&str] = &[
 ];
 
 static DAEMON_CAPABILITY_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Unique ids for test notifications (each must be a new alert, not a
+/// replacement of the last one).
+static TEST_NOTIFICATION_SEQ: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn next_test_notification_id() -> u64 {
+    TEST_NOTIFICATION_SEQ.fetch_add(1, Ordering::Relaxed)
+}
 /// Forces same-origin Home re-homes to be full document navigations instead
 /// of hash-only changes (which do not rerun the SPA's scope bootstrap).
 static HOME_NAV_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -118,9 +127,16 @@ pub struct Shell {
     /// Last confirmed first-paint palette per host. Unlike web storage this
     /// survives volatile daemon/tunnel ports and app restarts.
     appearance: Mutex<crate::appearance::AppearanceCache>,
-    /// Set on ExitRequested: window teardown during quit must NOT remove
-    /// records from the registry, or quitting would forget every window.
+    /// Set once a quit is going ahead (after the unsaved-edits guard let it
+    /// through): window teardown during quit must NOT remove records from the
+    /// registry, or quitting would forget every window.
     quitting: AtomicBool,
+    /// The last destroyed workbench needs a local Home before automatic exit.
+    /// Consumed only by the runtime's last-window exit, never explicit Quit.
+    last_close_needs_home: AtomicBool,
+    /// Each window's unsaved-file count and the close/quit prompts it is
+    /// answering (see `unsaved`).
+    unsaved: Mutex<unsaved::Guard>,
     /// The held power assertion for the "caffeinate" toggle — Some = armed
     /// (this machine won't idle/display/system-sleep). Dropped to disarm; the
     /// guard drops on quit, so the assertion never outlives the app.
@@ -189,6 +205,10 @@ pub struct WindowScope {
     /// creation, the SPA may re-assert it after a restart restore, and
     /// nothing clears it.
     pub detached: bool,
+    /// Session ids on screen in this window (each pane's active tab),
+    /// reported by the page. A notice about one of these is not posted while
+    /// this window has focus — the user is already looking at it.
+    pub(crate) visible: Vec<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -226,6 +246,7 @@ impl WindowScope {
             label: String::new(),
             navigation_pending: false,
             detached: false,
+            visible: Vec::new(),
         }
     }
 
@@ -260,6 +281,7 @@ impl WindowScope {
             label: String::new(),
             navigation_pending: false,
             detached: false,
+            visible: Vec::new(),
         }
     }
 
@@ -480,15 +502,29 @@ pub(crate) fn tray_windows(app: &AppHandle) -> Vec<(String, String)> {
     out
 }
 
-/// Explicit quit (menu / tray / ⌘Q): flag `quitting` BEFORE exiting so the
-/// last window's `CloseRequested` skips the drop-to-home reopen, and its
-/// `Destroyed` keeps the window in the registry for next launch. Distinguishes
-/// "the user asked to quit" from "the user closed the last window".
+/// Explicit quit (menu / tray / ⌘Q). Windows with unsaved edits are asked
+/// first (`unsaved`); a quit they hold is finished by `finish_quit` once the
+/// last of them lets go, or dropped when one cancels.
 pub(crate) fn request_quit(app: &AppHandle) {
     if let Some(shell) = app.try_state::<Shell>() {
-        // Idempotent: Tauri delivers a tray menu event to BOTH the tray's own
-        // handler and the global app handler, so "quit" can arrive twice — do
-        // the exit once.
+        // An exit is already under way (Tauri delivers a tray menu event to
+        // BOTH the tray's own handler and the global app handler).
+        if shell.quitting.load(Ordering::Relaxed) {
+            return;
+        }
+        if !unsaved::quit_may_proceed(app) {
+            return;
+        }
+    }
+    finish_quit(app);
+}
+
+/// Exit now, nothing left to ask: flag `quitting` BEFORE exiting so each
+/// window's `Destroyed` keeps it in the registry for the next launch (the
+/// flag is what tells "the user quit" from "the user closed the last window").
+pub(crate) fn finish_quit(app: &AppHandle) {
+    if let Some(shell) = app.try_state::<Shell>() {
+        // Idempotent: do the exit once however many paths arrive here.
         if shell.quitting.swap(true, Ordering::Relaxed) {
             return;
         }
@@ -497,51 +533,79 @@ pub(crate) fn request_quit(app: &AppHandle) {
     app.exit(0);
 }
 
-/// Bring every native window into the app's foreground, preserving the
-/// currently focused window as the frontmost one. macOS emits `Reopen` when
-/// the Dock icon is clicked; the single-instance callback uses the same path
-/// for a repeated launch. Focusing each window once raises the whole window
-/// set above other applications (only one OS window can remain focused).
-pub(crate) fn raise_all_windows(app: &AppHandle) {
+/// Activate the app the way a macOS app conventionally answers a Dock click
+/// or a repeated launch — never by un-minimizing the whole window set:
+///
+/// - some window is on screen → leave the set alone. A Dock click's own
+///   AppKit activation already brings every visible window forward
+///   (`dock_click`); a repeated launch gets no such activation, so it focuses
+///   the most recently used on-screen window.
+/// - every window is minimized or hidden → restore ONLY the most recently
+///   used one; the rest stay in the Dock where the user put them.
+/// - no window at all (a repeated launch racing startup; closing the last
+///   Home window quits the app) → open Home.
+pub(crate) fn activate_app(app: &AppHandle, dock_click: bool) {
+    let windows: Vec<_> = app
+        .webview_windows()
+        .into_values()
+        // The WSL wizard is its own flow; never count or raise it here.
+        .filter(|w| !w.label().starts_with("wsl-setup"))
+        .collect();
+    let on_screen = |w: &tauri::WebviewWindow| {
+        w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false)
+    };
+    let any_on_screen = windows.iter().any(on_screen);
+    if any_on_screen && dock_click {
+        return;
+    }
+    // A ⌘H-hidden app has no window on screen: unhide it as a whole (the
+    // way the user hid it) before picking a window to restore.
     #[cfg(target_os = "macos")]
-    let _ = app.show();
-
-    let mut windows: Vec<_> = app.webview_windows().into_values().collect();
-    windows.sort_by(|a, b| a.label().cmp(b.label()));
-    let front = windows
-        .iter()
-        .find(|window| window.is_focused().unwrap_or(false))
-        .map(|window| window.label().to_string())
-        .or_else(|| {
-            app.try_state::<Shell>()
-                .and_then(|shell| lock(&shell.last_focused_window).clone())
-                .filter(|label| app.get_webview_window(label).is_some())
-        })
-        .or_else(|| {
-            app.try_state::<Shell>().and_then(|shell| {
-                lock(&shell.windows)
-                    .iter()
-                    .find(|(_, scope)| scope.home_hub)
-                    .map(|(label, _)| label.clone())
-            })
-        })
-        .or_else(|| windows.last().map(|window| window.label().to_string()));
-
-    for window in windows
-        .iter()
-        .filter(|window| Some(window.label()) != front.as_deref())
-    {
+    if !any_on_screen {
+        let _ = app.show();
+    }
+    if windows.is_empty() {
+        if app.try_state::<Shell>().is_some() {
+            if let Err(e) = show_local_home(app, None) {
+                tracing::warn!("could not open Home on activation: {e}");
+            }
+        }
+        return;
+    }
+    let recent = most_recent_window(app, &windows, |w| !any_on_screen || on_screen(w));
+    if let Some(window) = recent {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
-    if let Some(label) = front {
-        if let Some(window) = app.get_webview_window(&label) {
-            let _ = window.unminimize();
-            let _ = window.show();
-            let _ = window.set_focus();
+}
+
+/// The most recently focused window among `windows` that passes `eligible`,
+/// by the shell's focus-recency order; unfocused-since-launch windows fall
+/// back to the Home launcher, then label order.
+fn most_recent_window<'a>(
+    app: &AppHandle,
+    windows: &'a [tauri::WebviewWindow],
+    eligible: impl Fn(&tauri::WebviewWindow) -> bool,
+) -> Option<&'a tauri::WebviewWindow> {
+    let by_label = |label: &str| windows.iter().find(|w| w.label() == label && eligible(w));
+    if let Some(shell) = app.try_state::<Shell>() {
+        let order = lock(&shell.focus_order).clone();
+        if let Some(w) = order.iter().find_map(|label| by_label(label)) {
+            return Some(w);
+        }
+        let hub = lock(&shell.windows)
+            .iter()
+            .find(|(_, scope)| scope.home_hub)
+            .map(|(label, _)| label.clone());
+        if let Some(w) = hub.as_deref().and_then(by_label) {
+            return Some(w);
         }
     }
+    windows
+        .iter()
+        .filter(|w| eligible(w))
+        .max_by(|a, b| a.label().cmp(b.label()))
 }
 
 /// Re-home the singleton navigation window onto the local daemon or one live
@@ -895,6 +959,8 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             registry: Mutex::new(WindowRegistry::load_default()),
             appearance: Mutex::new(crate::appearance::AppearanceCache::load_default()),
             quitting: AtomicBool::new(false),
+            last_close_needs_home: AtomicBool::new(false),
+            unsaved: Mutex::new(unsaved::Guard::default()),
             caffeinate: Mutex::new(None),
             drags: Mutex::new(HashMap::new()),
             done_drags: Mutex::new(HashMap::new()),
@@ -903,6 +969,11 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
         });
     } else {
         *lock(&handle.state::<Shell>().local) = local;
+    }
+    if fresh {
+        // Before any window opens: the watchers start polling right away,
+        // and a window's first scope report may already owe it a focus.
+        notices::start(handle);
     }
     // Reopen last session's windows. Restore itself registers a home surface
     // before launching any remote ssh that may need askpass, and also covers
@@ -951,10 +1022,10 @@ pub fn run() {
         // Must be registered first: the plugin intercepts a second launch
         // before any other plugin or process-global shell resource starts.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // Bring the existing instance's complete window set forward.
-            // During early daemon startup there may not be a window yet; the
-            // normal startup path opens Home as soon as the daemon is ready.
-            raise_all_windows(app);
+            // A repeated launch activates the running instance like a Dock
+            // click would. During early daemon startup there may not be a
+            // window yet (and no Shell); startup opens Home on its own then.
+            activate_app(app, false);
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -983,6 +1054,7 @@ pub fn run() {
             commands::adopt_tab,
             commands::list_scope_windows,
             commands::check_app_update,
+            commands::app_update_status,
             commands::begin_update,
             commands::shell_build,
             commands::write_clipboard,
@@ -993,6 +1065,14 @@ pub fn run() {
             commands::list_askpass,
             commands::cache_appearance,
             commands::report_window_scope,
+            commands::report_window_view,
+            commands::report_unsaved,
+            commands::reply_unsaved,
+            commands::take_pending_focus,
+            commands::notification_permission,
+            commands::request_notification_permission,
+            commands::open_notification_settings,
+            commands::test_notification,
             commands::wsl_status,
             commands::wsl_install,
             commands::wsl_update,
@@ -1004,6 +1084,14 @@ pub fn run() {
                 return;
             };
             match event {
+                // A window holding unsaved edits asks its page before it
+                // goes (Save all / Don't save / Cancel); one with nothing
+                // unsaved closes as it always has.
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    if unsaved::hold_window_close(window.app_handle(), window.label()) {
+                        api.prevent_close();
+                    }
+                }
                 // Forget a window's scope once it's gone, so focus-existing
                 // never raises a dead label. Destroyed (not CloseRequested,
                 // which can be vetoed) fires after teardown completes. The
@@ -1030,11 +1118,24 @@ pub fn run() {
                     lock(&shell.transfers)
                         .retain(|_, t| t.source != window.label() && t.target != window.label());
                     lock(&shell.focus_order).retain(|l| l != window.label());
+                    notices::window_gone(window.app_handle(), window.label());
                     let scope = lock(&shell.windows).remove(window.label());
+                    // After the scope and focus entries are gone: a quit this
+                    // window was holding moves on to the next one.
+                    unsaved::window_destroyed(window.app_handle(), window.label());
                     if !shell.quitting.load(Ordering::Relaxed) {
-                        if let Some(scope) = scope {
+                        if let Some(scope) = &scope {
                             lock(&shell.registry).remove(&scope.stable_id);
                         }
+                        // Only local Home ends the close-to-Home flow. Record
+                        // the actual destroyed scope, after any unsaved prompt,
+                        // and let ExitRequested decide whether it was the last.
+                        shell.last_close_needs_home.store(
+                            scope.as_ref().is_some_and(|scope| {
+                                scope.alias.is_some() || scope.ws.is_some() || scope.detached
+                            }),
+                            Ordering::Relaxed,
+                        );
                         // The tray lists open windows; drop the closed one, and
                         // resync Settings for whatever window is focused now
                         // (or none). Skipped during quit (all windows tear down).
@@ -1053,6 +1154,7 @@ pub fn run() {
                         order.insert(0, window.label().to_string());
                     }
                     crate::menu::sync_settings_enabled(window.app_handle());
+                    notices::window_focused(window.app_handle(), window.label());
                 }
                 // Track geometry in memory on every move/resize; a slow tick
                 // (and exit) persists — never a file write per drag event.
@@ -1081,7 +1183,14 @@ pub fn run() {
         })
         .setup(|app| {
             let handle = app.handle().clone();
+            // The notification click delegate must be in place before launch
+            // completes, so a click that launched the app is delivered.
+            crate::notify::init(&handle);
             crate::menu::install(app)?;
+            // Dock › Quit and logout reach the unsaved-edits guard only
+            // through this AppKit delegate hook (see `unsaved`).
+            #[cfg(target_os = "macos")]
+            unsaved::install_os_quit_hook(&handle);
             // The menu-bar / system-tray status item. Installed before the
             // daemon is up (its click handlers read Shell.local, populated by
             // runtime); non-fatal if the platform tray is unavailable.
@@ -1148,15 +1257,55 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building chimaera")
         .run(|app, event| match event {
-            // Clicking the macOS Dock icon activates the whole workbench, not
-            // an arbitrary single window. Raise every Chimaera window and
-            // restore focus to whichever one was active before the click.
+            // A Dock click: AppKit's activation already raises every visible
+            // window; the shell only steps in when nothing is on screen.
             #[cfg(target_os = "macos")]
-            tauri::RunEvent::Reopen { .. } => raise_all_windows(app),
+            tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } => {
+                if !has_visible_windows {
+                    activate_app(app, true);
+                }
+            }
             // Quit teardown destroys every window; flag it FIRST so those
             // Destroyed events keep the registry intact for the next launch.
-            tauri::RunEvent::ExitRequested { .. } => {
+            // A programmatic exit that did not come through `request_quit`
+            // asks windows with unsaved edits first, like any quit.
+            tauri::RunEvent::ExitRequested { code, api, .. } => {
                 if let Some(state) = app.try_state::<Shell>() {
+                    if code.is_none()
+                        && !state.quitting.load(Ordering::Relaxed)
+                        && state.last_close_needs_home.swap(false, Ordering::Relaxed)
+                    {
+                        api.prevent_exit();
+                        let app = app.clone();
+                        // WebView2 cannot create a window inside a synchronous
+                        // event handler. Hold automatic exit while a worker
+                        // opens Home; explicit Quit still takes precedence.
+                        tauri::async_runtime::spawn_blocking(move || {
+                            if app.state::<Shell>().quitting.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            if let Err(error) = show_local_home(&app, None) {
+                                tracing::error!(
+                                    "could not open Home after last window closed: {error}"
+                                );
+                                // A failed replacement must not leave an
+                                // invisible app running with no way to close it.
+                                if app.webview_windows().is_empty() {
+                                    request_quit(&app);
+                                }
+                            }
+                        });
+                        return;
+                    }
+                    if unsaved::exit_may_hold(code, state.quitting.load(Ordering::Relaxed))
+                        && !unsaved::quit_may_proceed(app)
+                    {
+                        api.prevent_exit();
+                        return;
+                    }
                     state.quitting.store(true, Ordering::Relaxed);
                     lock(&state.registry).save_if_dirty();
                 }

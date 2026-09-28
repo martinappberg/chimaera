@@ -26,6 +26,10 @@ pub async fn run(
     };
     let mut tunnel = connect(host, opts, |phase| match phase {
         Phase::Probing => tracing::info!("probing {host} for a running daemon"),
+        Phase::Routing { node } => tracing::info!(
+            "{host}'s daemon runs on login node {node}, not the one this connection landed on; \
+             reaching {node} (it may ask you to authenticate there)"
+        ),
         Phase::Updating => tracing::info!("updating the daemon on {host}"),
         Phase::Downloading { target } => {
             tracing::info!("downloading the {target} daemon for {host}");

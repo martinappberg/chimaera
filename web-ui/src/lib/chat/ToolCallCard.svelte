@@ -1,11 +1,16 @@
 <script lang="ts">
   import { copyText } from "../shared/clipboard";
+  import { contextMenu } from "../shared/contextMenu.svelte";
+  import { menuPoint, resolveAndOpen, type OpenPathFn, type PathResolver } from "./paths";
   import type { ChatBlock, ToolContent } from "./store.svelte";
 
   interface Props {
     block: Extract<ChatBlock, { kind: "tool" }>;
-    /** Open a touched file in an adjacent pane (existing path-click flow). */
-    onOpenFile?: (path: string) => void;
+    /** Open a touched path: a file in a pane, a directory in the Finder. */
+    onOpenPath?: OpenPathFn;
+    /** Resolves a relative location (a Grep/Glob `path`, a Codex change)
+     *  against the session before it opens. */
+    resolvePaths?: PathResolver;
     /** Move this running tool to the background (claude background_tasks —
      *  the TUI's Ctrl-B). Provided only when the agent supports it. */
     onBackground?: () => void;
@@ -15,7 +20,7 @@
     visible?: boolean;
   }
 
-  let { block, onOpenFile, onBackground, onStop, visible = true }: Props = $props();
+  let { block, onOpenPath, resolvePaths, onBackground, onStop, visible = true }: Props = $props();
 
   const running = $derived(block.status === "in_progress" || block.status === "pending");
 
@@ -89,12 +94,50 @@
   $effect(() => () => {
     if (copiedTimer !== null) clearTimeout(copiedTimer);
   });
+
+  /** A location as the menu names it: workspace-relative when it can be. */
+  function locLabel(loc: string): string {
+    return resolvePaths?.label(loc) ?? loc;
+  }
+
+  /** Open one location, resolved first (it may be relative, or a
+   *  directory). Cmd/Ctrl: in a split. */
+  function openLoc(loc: string, e: MouseEvent, anchor: Element) {
+    if (onOpenPath === undefined || loc === "") return;
+    void resolveAndOpen(resolvePaths, loc, onOpenPath, {
+      split: e.metaKey || e.ctrlKey,
+      at: menuPoint(e, anchor),
+    });
+  }
+
+  /** The head's open button: the one location, or a compact list of all. */
+  function onLocations(e: MouseEvent) {
+    const btn = e.currentTarget as Element;
+    const locs = block.locations;
+    if (locs.length === 1) {
+      openLoc(locs[0], e, btn);
+      return;
+    }
+    const r = btn.getBoundingClientRect();
+    contextMenu.openAtPoint(
+      r.left,
+      r.bottom,
+      locs.map((loc) => ({ label: locLabel(loc), onSelect: () => openLoc(loc, e, btn) })),
+    );
+  }
+  const locTitle = $derived(
+    block.locations.length === 1
+      ? `open ${locLabel(block.locations[0])}`
+      : `open one of ${block.locations.length} paths`,
+  );
 </script>
 
 {#snippet diff(d: ToolContent, showPath = true)}
   <div class="diff">
     {#if d.path && showPath}
-      <button class="diff-path" onclick={() => onOpenFile?.(d.path ?? "")}>{d.path}</button>
+      <button class="diff-path" onclick={(e) => openLoc(d.path ?? "", e, e.currentTarget)}
+        >{d.path}</button
+      >
     {/if}
     {#if d.old_text}
       <pre class="old">{d.old_text}</pre>
@@ -154,13 +197,15 @@
         </svg>
       </button>
     {/if}
-    {#if block.locations.length > 0 && onOpenFile !== undefined}
-      <!-- The workbench is right there: every located tool opens its file
-           (image/markdown/csv/pdf land in their native previews). -->
+    {#if block.locations.length > 0 && onOpenPath !== undefined}
+      <!-- The workbench is right there: every located tool opens what it
+           touched (image/markdown/csv/pdf land in their native previews, a
+           directory in the Finder); several locations open from a list. -->
       <button
         class="loc"
-        title="open {block.locations[0]} in a pane"
-        onclick={() => onOpenFile?.(block.locations[0])}
+        title={locTitle}
+        aria-haspopup={block.locations.length > 1 ? "menu" : undefined}
+        onclick={onLocations}
       >
         <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
           <path
@@ -172,6 +217,9 @@
             stroke-linejoin="round"
           />
         </svg>
+        {#if block.locations.length > 1}
+          <span class="loc-count">{block.locations.length}</span>
+        {/if}
       </button>
     {/if}
     {#if allowed}
@@ -341,6 +389,15 @@
   .loc:hover,
   .act:hover {
     color: var(--accent);
+  }
+  .loc {
+    align-items: center;
+    gap: 2px;
+  }
+  .loc-count {
+    font-family: var(--mono, monospace);
+    font-size: var(--text-xs);
+    line-height: 1;
   }
   .glyph {
     color: var(--muted);

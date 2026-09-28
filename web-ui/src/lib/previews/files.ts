@@ -2,8 +2,11 @@
  * Client for the daemon's file service (M3 wave 1):
  *   GET  /fs/list?path=&hidden=      directory listing (dirs first, sorted)
  *   GET  /fs/file?path=&offset=&limit=   raw bytes + X-File-Size/X-Truncated
+ *                                    (+ X-Content-Hash on a complete raw read)
+ *   PUT  /fs/file?path=&expect_hash= content-hash-guarded write
+ *   /fs/drafts, /fs/draft            the unsaved-edit journal mirror
  *   GET  /fs/markdown?path=          server-rendered, sanitized GFM HTML
- *   GET  /fs/table?path=&offset_rows=&limit_rows=   paged CSV/TSV
+ *   GET  /fs/table?path=&offset_rows=&limit_rows=   paged CSV/TSV/VCF/BED/GFF/SAM
  *   POST /fs/ticket {path}           short-lived unauthenticated /raw/ URL
  * plus the pure helpers that decide how a path is displayed (extension →
  * view kind, basename/parent, human sizes). Bearer auth rides on api().
@@ -49,6 +52,14 @@ export interface FileChunk {
    * conflict check. Null on an older daemon that omits the header.
    */
   mtime: string | null;
+  /**
+   * SHA-256 (hex) of the whole file (`X-Content-Hash`). The daemon sends it
+   * only when the body IS the complete raw file — offset 0, not truncated, not
+   * a decompressed gzip — so a partial read can never pose as a version, and
+   * only when no write raced the read (so it always names `mtime`'s version).
+   * Null otherwise, and from older daemons (callers fall back to `mtime`).
+   */
+  hash: string | null;
 }
 
 export interface TablePage {
@@ -56,6 +67,16 @@ export interface TablePage {
   rows: string[][];
   offset: number;
   truncated: boolean;
+  /** Exact data-row count, once the daemon has read to the end (fs/table;
+   *  absent from older daemons and from fs/xlsx). */
+  total_rows?: number | null;
+  /** A byte-rate row estimate while the total is unknown (plain files). */
+  est_rows?: number | null;
+  /** The daemon's per-request scan budget ran out before `offset`: the page
+   *  is empty and asking again resumes from `scanned_to`. */
+  scan_limited?: boolean;
+  /** The data-row number the daemon's scan stopped at. */
+  scanned_to?: number;
 }
 
 /** Server cap for one /fs/file read; also the code view's chunk size. */
@@ -81,9 +102,14 @@ export async function fsList(path: string, hidden = false): Promise<FsListing> {
   return json(await api(`/fs/list?${q.toString()}`));
 }
 
-export async function fsFile(path: string, offset = 0, limit = FILE_CHUNK): Promise<FileChunk> {
+export async function fsFile(
+  path: string,
+  offset = 0,
+  limit = FILE_CHUNK,
+  signal?: AbortSignal,
+): Promise<FileChunk> {
   const q = new URLSearchParams({ path, offset: String(offset), limit: String(limit) });
-  const res = await api(`/fs/file?${q.toString()}`);
+  const res = await api(`/fs/file?${q.toString()}`, signal !== undefined ? { signal } : {});
   if (!res.ok) {
     let message = `request failed with status ${res.status}`;
     try {
@@ -98,31 +124,59 @@ export async function fsFile(path: string, offset = 0, limit = FILE_CHUNK): Prom
   const size = Number(res.headers.get("X-File-Size") ?? bytes.length);
   const truncated = res.headers.get("X-Truncated") === "true";
   const mtime = res.headers.get("X-Mtime");
-  return { bytes, size: Number.isFinite(size) ? size : bytes.length, truncated, mtime };
+  const hash = res.headers.get("X-Content-Hash");
+  return { bytes, size: Number.isFinite(size) ? size : bytes.length, truncated, mtime, hash };
 }
 
 /** A concurrent-modification conflict raised by PUT /fs/file (HTTP 409). */
 export class FileConflictError extends Error {
-  constructor(message = "file changed on disk") {
+  /** The current disk version, when the daemon reports it (409 headers). */
+  readonly hash: string | null;
+  readonly mtime: string | null;
+  constructor(
+    message = "file changed on disk",
+    hash: string | null = null,
+    mtime: string | null = null,
+  ) {
     super(message);
     this.name = "FileConflictError";
+    this.hash = hash;
+    this.mtime = mtime;
   }
 }
 
+export interface WriteOptions {
+  /** Refuse (409) unless the file on disk hashes to this — the preferred,
+   *  content-verified precondition. */
+  expectHash?: string | null;
+  /** Metadata precondition, for a daemon that never sent a content hash. */
+  expectMtime?: string | null;
+  signal?: AbortSignal;
+}
+
+export interface WriteResult {
+  mtime: string | null;
+  /** SHA-256 of what is now on disk; null from older daemons. */
+  hash: string | null;
+}
+
 /**
- * Write `bytes` to `path` via PUT /fs/file. When `expectMtime` is given the
- * daemon refuses (409 → FileConflictError) if the file changed on disk since
- * that mtime — the caller offers reload/overwrite. Other failures surface as
- * ApiError (400 dir/missing-parent, 413 over the 1MB cap). Resolves to the
- * new mtime (X-Mtime on the 204) so the editor can keep tracking edits.
+ * Write `bytes` to `path` via PUT /fs/file. With a precondition the daemon
+ * refuses (409 → FileConflictError) when the disk moved on. Only one is sent,
+ * the hash when known: a daemon new enough to report hashes checks them, and
+ * one that already holds exactly these bytes answers success without writing,
+ * so a retry after a lost reply is safe. Other failures surface as ApiError
+ * (400 dir/missing-parent, 413 over the 1MB cap); a dead link or an abort
+ * rejects with the fetch's own error.
  */
 export async function fsWrite(
   path: string,
   bytes: Uint8Array,
-  expectMtime: string | null = null,
-): Promise<string | null> {
+  opts: WriteOptions = {},
+): Promise<WriteResult> {
   const q = new URLSearchParams({ path });
-  if (expectMtime !== null) q.set("expect_mtime", expectMtime);
+  if (opts.expectHash != null) q.set("expect_hash", opts.expectHash);
+  else if (opts.expectMtime != null) q.set("expect_mtime", opts.expectMtime);
   // Copy into a fresh ArrayBuffer-backed view so the body is a plain
   // BodyInit (Uint8Array over SharedArrayBuffer is not).
   const body = bytes.slice();
@@ -130,8 +184,15 @@ export async function fsWrite(
     method: "PUT",
     headers: { "Content-Type": "application/octet-stream" },
     body,
+    ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
   });
-  if (res.status === 409) throw new FileConflictError();
+  if (res.status === 409) {
+    throw new FileConflictError(
+      "file changed on disk",
+      res.headers.get("X-Content-Hash"),
+      res.headers.get("X-Mtime"),
+    );
+  }
   if (!res.ok) {
     let message = `save failed with status ${res.status}`;
     try {
@@ -142,7 +203,134 @@ export async function fsWrite(
     }
     throw new ApiError(res.status, message);
   }
-  return res.headers.get("X-Mtime");
+  return { mtime: res.headers.get("X-Mtime"), hash: res.headers.get("X-Content-Hash") };
+}
+
+// --- the unsaved-edit journal's daemon mirror -------------------------------
+// A new tunnel port is a new browser origin with an empty IndexedDB, so dirty
+// text is mirrored to the daemon (~/.chimaera/drafts). Older daemons lack the
+// routes: every helper degrades to "unsupported"/null rather than an error.
+
+export interface DraftBody {
+  path: string;
+  base_hash: string;
+  text: string;
+  /** When the daemon stored it, by the DAEMON's clock. */
+  updated_ms: number;
+  /** When the writer's text last changed, by the WRITER's clock (what it sent
+   *  as `updated_ms`); null from an older writer or daemon. */
+  client_updated_ms: number | null;
+  /** The window that wrote it (drafts.ts `WRITER`); null from an older one. */
+  writer: string | null;
+}
+
+export type DraftPutResult = "ok" | "too-large" | "unsupported";
+
+/** Statuses meaning "this daemon has no drafts route". */
+function draftsUnsupported(status: number): boolean {
+  return status === 404 || status === 405 || status === 501;
+}
+
+/** The JSON body of a draft PUT (drafts.ts weighs it against the browser's
+ *  keepalive quota before asking for `keepalive`). */
+export function draftPutBody(
+  path: string,
+  baseHash: string,
+  text: string,
+  updatedMs: number,
+  writer: string,
+): string {
+  return JSON.stringify({ path, base_hash: baseHash, text, updated_ms: updatedMs, writer });
+}
+
+/** Mirror a draft; `updatedMs` is this client's time for the text and
+ *  `writer` this window's id (an older daemon ignores both). `keepalive` lets
+ *  a small body outlive a closing page. */
+export async function fsDraftPut(
+  path: string,
+  baseHash: string,
+  text: string,
+  updatedMs: number,
+  writer: string,
+  keepalive = false,
+): Promise<DraftPutResult> {
+  const res = await api("/fs/drafts", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: draftPutBody(path, baseHash, text, updatedMs, writer),
+    keepalive,
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (res.ok) return "ok";
+  if (res.status === 413) return "too-large";
+  if (draftsUnsupported(res.status)) return "unsupported";
+  throw new ApiError(res.status, `draft mirror failed with status ${res.status}`);
+}
+
+/** The daemon's draft for `path`, or null (none, or an older daemon). */
+export async function fsDraftGet(path: string): Promise<DraftBody | null> {
+  const q = new URLSearchParams({ path });
+  const res = await api(`/fs/draft?${q.toString()}`, { signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) {
+    if (draftsUnsupported(res.status) || res.status === 400) return null;
+    throw new ApiError(res.status, `draft read failed with status ${res.status}`);
+  }
+  try {
+    const body = (await res.json()) as Partial<DraftBody>;
+    if (typeof body.text !== "string" || typeof body.path !== "string") return null;
+    return {
+      path: body.path,
+      base_hash: typeof body.base_hash === "string" ? body.base_hash : "",
+      text: body.text,
+      updated_ms: typeof body.updated_ms === "number" ? body.updated_ms : 0,
+      client_updated_ms: typeof body.client_updated_ms === "number" ? body.client_updated_ms : null,
+      writer: typeof body.writer === "string" ? body.writer : null,
+    };
+  } catch {
+    return null; // not JSON (an older daemon's fallback), so not a draft
+  }
+}
+
+export interface DraftSummary {
+  path: string;
+  base_hash: string;
+  updated_ms: number;
+  client_updated_ms?: number | null;
+  bytes: number;
+}
+
+/**
+ * Every mirrored draft (summaries only), or null from a daemon without the
+ * route. Cheaper to consult on open than fetching one draft, which answers a
+ * plain "none" with a 404 the browser logs as a failed resource.
+ */
+export async function fsDraftList(): Promise<DraftSummary[] | null> {
+  const res = await api("/fs/drafts", { signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) {
+    if (draftsUnsupported(res.status)) return null;
+    throw new ApiError(res.status, `draft list failed with status ${res.status}`);
+  }
+  try {
+    const body = (await res.json()) as { drafts?: DraftSummary[] };
+    return Array.isArray(body.drafts) ? body.drafts : null;
+  } catch {
+    return null; // not JSON (an older daemon's fallback)
+  }
+}
+
+/** Drop the daemon's draft for `path` (a no-op on an older daemon) — only
+ *  when `writer` wrote it, if given (an older daemon drops it regardless). */
+export async function fsDraftDelete(path: string, writer: string | null, keepalive = false): Promise<void> {
+  const q = new URLSearchParams({ path });
+  if (writer !== null) q.set("writer", writer);
+  const res = await api(`/fs/draft?${q.toString()}`, {
+    method: "DELETE",
+    keepalive,
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok && !draftsUnsupported(res.status)) {
+    throw new ApiError(res.status, `draft delete failed with status ${res.status}`);
+  }
 }
 
 export interface QuickOpenEntry {
@@ -184,6 +372,19 @@ export interface ValidatedPath {
   kind: "file" | "dir";
 }
 
+/** A /fs/validate answer, merged across batches. */
+export interface ValidateResult {
+  /** Candidate (as sent) → its one resolution. */
+  valid: Record<string, ValidatedPath>;
+  /** Candidate → the (at most five) files it could mean, when the
+   *  workspace-index fallback found several. Empty from older daemons. */
+  ambiguous: Record<string, ValidatedPath[]>;
+  /** Candidates that were never answered: past VALIDATE_CAP, or in a batch
+   *  that failed after an earlier one succeeded. Unknown, NOT misses —
+   *  callers must not cache them as such. */
+  unchecked: string[];
+}
+
 /** Server cap on candidates per /fs/validate request. */
 export const VALIDATE_MAX = 50;
 
@@ -192,61 +393,190 @@ export const VALIDATE_MAX = 50;
  *  VALIDATE_MAX requests, currently 4). */
 export const VALIDATE_CAP = 200;
 
+/** Server cap on extra `bases` per request. */
+export const VALIDATE_BASES_MAX = 8;
+
+/** Server cap on one candidate's length, in UTF-8 bytes. */
+const CANDIDATE_MAX_BYTES = 1024;
+
 /**
- * Batch existence check behind the terminal link provider, per the
- * /fs/validate contract: candidates resolve absolutely or against the
- * absolute `base`, `~` expands, and only hits come back (keyed by the
- * candidate as sent). Misses are simply absent — never errors.
+ * Batch existence check behind every path link (terminal, chat, tool
+ * cards), per the /fs/validate contract. Each candidate must be a clean path
+ * (no `:12` suffix, `#L` anchor or wrapper — `shared/fileRef.ts` makes
+ * them). The daemon's ladder: absolute / `~` → `base`, then each of `bases`
+ * in order → the same without a leading `a/` / `b/` diff prefix → with
+ * `workspaceId`, a unique basename or unique path suffix in that
+ * workspace's index (`figs/plot.png` → `results/figs/plot.png`), or up to
+ * five `ambiguous` matches. A miss is simply absent, never an error.
+ * `strict` (document links) keeps only the exact join onto each base — no
+ * prefix strip, no index fallback — so a broken `b/spec.md` link stays
+ * broken. `workspaceId`, `bases` and `strict` are additive: older daemons
+ * ignore them.
  *
- * `workspaceId` (additive — older daemons ignore it) enables the daemon's
- * bare-basename fallback: a slash-less `name.ext` candidate that misses the
- * base also resolves when exactly ONE file in that workspace's index bears
- * the name ("FIGURE_PLAN.md" mentioned bare, living at paper/FIGURE_PLAN.md).
- *
- * The server caps each request at VALIDATE_MAX; callers cache the FULL sent
- * list as resolved, so anything past that cap would otherwise stick as a
- * permanent miss. Loop in VALIDATE_MAX-sized batches (bounded by VALIDATE_CAP)
- * so every candidate is actually validated. Batches run sequentially to keep
- * the daemon's concurrent load low.
+ * The server caps each request at VALIDATE_MAX; loop in VALIDATE_MAX-sized
+ * batches (bounded by VALIDATE_CAP), sequentially to keep the daemon's
+ * concurrent load low. A candidate over the byte cap can never validate
+ * and is dropped (a miss). Throws only when nothing was answered.
  */
 export async function fsValidate(
   candidates: string[],
   base: string,
   workspaceId: string | null = null,
-): Promise<Record<string, ValidatedPath>> {
-  const capped = candidates.slice(0, VALIDATE_CAP);
-  const out: Record<string, ValidatedPath> = {};
+  bases: string[] = [],
+  opts: { strict?: boolean } = {},
+): Promise<ValidateResult> {
+  const out: ValidateResult = { valid: {}, ambiguous: {}, unchecked: [] };
+  const sendable = [...new Set(candidates)].filter(
+    (c) => c.length > 0 && new TextEncoder().encode(c).length <= CANDIDATE_MAX_BYTES,
+  );
+  const capped = sendable.slice(0, VALIDATE_CAP);
+  out.unchecked.push(...sendable.slice(VALIDATE_CAP));
+  const extra = [...new Set(bases)].filter((b) => b !== base).slice(0, VALIDATE_BASES_MAX);
   for (let i = 0; i < capped.length; i += VALIDATE_MAX) {
     const batch = capped.slice(i, i + VALIDATE_MAX);
-    const body = await json<{ valid: Record<string, ValidatedPath> }>(
-      await api("/fs/validate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          candidates: batch,
-          base,
-          ...(workspaceId !== null ? { workspace_id: workspaceId } : {}),
+    type Body = { valid?: Record<string, ValidatedPath>; ambiguous?: Record<string, ValidatedPath[]> };
+    let body: Body;
+    try {
+      body = await json<Body>(
+        await api("/fs/validate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            candidates: batch,
+            base,
+            ...(workspaceId !== null ? { workspace_id: workspaceId } : {}),
+            ...(extra.length > 0 ? { bases: extra } : {}),
+            ...(opts.strict === true ? { strict: true } : {}),
+          }),
         }),
-      }),
-    );
-    Object.assign(out, body.valid);
+      );
+    } catch (err) {
+      if (i === 0) throw err;
+      out.unchecked.push(...capped.slice(i));
+      break;
+    }
+    Object.assign(out.valid, body.valid ?? {});
+    for (const [cand, matches] of Object.entries(body.ambiguous ?? {})) {
+      if (Array.isArray(matches) && matches.length > 0) out.ambiguous[cand] = matches;
+    }
   }
   return out;
 }
 
-export async function fsMarkdown(path: string): Promise<string> {
-  const q = new URLSearchParams({ path });
-  const body = await json<{ html: string }>(await api(`/fs/markdown?${q.toString()}`));
-  return body.html;
+/** A server-rendered markdown document (GET /fs/markdown). */
+export interface MarkdownDoc {
+  /** Sanitized comrak HTML; block elements carry `data-sourcepos`. */
+  html: string;
+  /** Raw YAML text of a leading `---` block (no longer part of `html`), or
+   *  null. Older daemons omit the field and render the block into `html`. */
+  frontmatter: string | null;
 }
 
-export async function fsTable(path: string, offsetRows = 0, limitRows = 200): Promise<TablePage> {
+export async function fsMarkdown(path: string): Promise<MarkdownDoc> {
+  const q = new URLSearchParams({ path });
+  const body = await json<{ html: string; frontmatter?: string | null }>(
+    await api(`/fs/markdown?${q.toString()}`),
+  );
+  return {
+    html: body.html,
+    frontmatter: typeof body.frontmatter === "string" ? body.frontmatter : null,
+  };
+}
+
+/**
+ * How fs/table reads a bioinformatics text format: which lines are comments,
+ * whether a header row exists (else the format's standard column names), and
+ * that fields are never quoted (a SAM quality or VCF text may open with `"`).
+ */
+export interface TablePreset {
+  /** Line prefixes the daemon skips wherever they appear. */
+  comment: string[];
+  /** The file carries its own header row (after the comments). */
+  header: boolean;
+  /** Column names for a header-less file; further fields are `colN`. */
+  names?: string[];
+  /** Strip a leading `#` from the first header cell (VCF's `#CHROM`). */
+  stripHash?: boolean;
+}
+
+const BED_NAMES = ["chrom", "chromStart", "chromEnd", "name", "score", "strand"];
+const PEAK_NAMES = [...BED_NAMES, "signalValue", "pValue", "qValue"];
+const BED_COMMENTS = ["#", "track", "browser"];
+const GFF: TablePreset = {
+  comment: ["#"],
+  header: false,
+  names: ["seqid", "source", "type", "start", "end", "score", "strand", "phase", "attributes"],
+};
+
+const TABLE_PRESETS: Record<string, TablePreset> = {
+  vcf: { comment: ["##"], header: true, stripHash: true },
+  bed: {
+    comment: BED_COMMENTS,
+    header: false,
+    names: [...BED_NAMES, "thickStart", "thickEnd", "itemRgb", "blockCount", "blockSizes", "blockStarts"],
+  },
+  bedgraph: { comment: BED_COMMENTS, header: false, names: ["chrom", "chromStart", "chromEnd", "dataValue"] },
+  narrowpeak: { comment: BED_COMMENTS, header: false, names: [...PEAK_NAMES, "peak"] },
+  broadpeak: { comment: BED_COMMENTS, header: false, names: PEAK_NAMES },
+  gff: GFF,
+  gff3: GFF,
+  gtf: {
+    comment: ["#"],
+    header: false,
+    names: ["seqname", "source", "feature", "start", "end", "score", "strand", "frame", "attribute"],
+  },
+  sam: {
+    comment: ["@"],
+    header: false,
+    names: ["QNAME", "FLAG", "RNAME", "POS", "MAPQ", "CIGAR", "RNEXT", "PNEXT", "TLEN", "SEQ", "QUAL"],
+  },
+};
+
+/** The bioinformatics preset for `path` (gzip wrappers by their inner
+ *  extension), or null for plain CSV/TSV. */
+export function tablePreset(path: string): TablePreset | null {
+  return TABLE_PRESETS[innerExtension(path)] ?? null;
+}
+
+/** Whether `path`'s first line is a header the grid does not number (CSV,
+ *  spreadsheets and most presets; not BED). */
+export function tableHeaderRow(path: string): boolean {
+  return tablePreset(path)?.header ?? true;
+}
+
+/** The fs/table query for one page of `path`, preset options included. */
+export function tableQuery(path: string, offsetRows: number, limitRows: number): URLSearchParams {
   const q = new URLSearchParams({
     path,
     offset_rows: String(offsetRows),
     limit_rows: String(limitRows),
   });
-  return json(await api(`/fs/table?${q.toString()}`));
+  const preset = tablePreset(path);
+  if (preset !== null) {
+    // Every preset format is tab-separated; the daemon's name sniff knows
+    // only .csv/.tsv.
+    q.set("delim", "tab");
+    q.set("quote", "false");
+    q.set("comment", preset.comment.join(","));
+    if (!preset.header) {
+      q.set("header", "false");
+      if (preset.names !== undefined) q.set("names", preset.names.join(","));
+    }
+  }
+  return q;
+}
+
+/** A page's column names as the grid shows them (VCF's `#CHROM` → `CHROM`). */
+export function presetColumns(path: string, columns: string[]): string[] {
+  if (tablePreset(path)?.stripHash !== true || !columns[0]?.startsWith("#")) return columns;
+  return [columns[0].slice(1), ...columns.slice(1)];
+}
+
+export async function fsTable(path: string, offsetRows = 0, limitRows = 200): Promise<TablePage> {
+  const page = await json<TablePage>(
+    await api(`/fs/table?${tableQuery(path, offsetRows, limitRows).toString()}`),
+  );
+  return { ...page, columns: presetColumns(path, page.columns) };
 }
 
 /** One page of a spreadsheet sheet: the CSV `TablePage` shape plus the
@@ -254,6 +584,9 @@ export async function fsTable(path: string, offsetRows = 0, limitRows = 200): Pr
 export interface XlsxPage extends TablePage {
   sheets: string[];
   sheet: string;
+  /** The used range's first cell, 0-based [row, column]: where the header
+   *  row sits in A1 terms. Null for an empty sheet; absent from older daemons. */
+  origin?: [number, number] | null;
 }
 
 /** A page of a spreadsheet (xlsx/xls/xlsm/ods). `sheet` null = the first sheet. */
@@ -276,36 +609,86 @@ export async function fsXlsx(
  * Mint a single-path ticket and return the unauthenticated /raw/ URL for it
  * (iframes and <img> cannot send Authorization headers; the bearer token must
  * never appear in such a URL). Tickets expire server-side after ~10 minutes.
+ * The daemon answers the SAME ticket for a file it already ticketed at the
+ * same version (renewing it), and a new one once the file changed.
  */
 export async function fsRawUrl(path: string): Promise<string> {
-  const body = await json<{ ticket: string }>(
+  return (await fsRawTicket(path)).url;
+}
+
+/**
+ * `fsRawUrl` plus the file name of the canonical path the ticket is bound
+ * to (null from a daemon that doesn't say). An HTML frame addresses its page
+ * by that name under the ticket (`/raw/{ticket}/{name}`): the name in the
+ * pane's path is a symlink's (`latest.html -> runs/42/report.html`) or can
+ * be hidden, and the daemon serves the ticket's own file only by its name.
+ */
+export async function fsRawTicket(path: string): Promise<{ url: string; name: string | null }> {
+  const body = await json<{ ticket: string; name?: string | null }>(
     await api("/fs/ticket", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path }),
     }),
   );
-  return `/raw/${body.ticket}`;
+  return { url: `/raw/${body.ticket}`, name: typeof body.name === "string" ? body.name : null };
 }
 
 /**
- * Per-path `/raw/` URL memo (write-once artifacts). A ticket is valid ~10 min;
- * re-minting one on every mount — as the chat artifact cards did — spends a
- * round-trip AND changes the `<img>` src, forcing the browser to re-fetch and
- * re-decode an image it already has (the flash). Memoizing the URL per path
- * keeps the src STABLE across re-renders/remounts, so a cached image just shows.
- * Safe for write-once outputs (plots, result tables) whose bytes don't change;
- * live-updating previews mint their own fresh tickets on change (see fileStore).
+ * `/raw/` URLs for files a surface draws by path alone — a document's
+ * images (reading view, live mode, a deck, a notebook's markdown). Because
+ * the daemon keeps a file's ticket while the file is unchanged, the URL (and
+ * the browser's cached copy behind it) lasts exactly as long as the bytes:
+ * asking again never makes an unchanged image flash, and an overwritten one
+ * gets a new URL rather than the cached old bytes. So nothing here may hold
+ * an answer for long — an 8-minute memo per path once kept showing a file's
+ * previous version.
+ *
+ * What the memo still saves is round trips: asks for a path while one is on
+ * the wire share it, and an answer is reused for RAW_REUSE_MS (a render's
+ * burst, an editor re-rendering the block it edits), after which the next
+ * ask goes to the daemon again. None of these callers knows the file's
+ * version to key by; a pane's own file rides the file store's version-aware
+ * `ensureRawUrl` instead.
  */
-const ticketUrls = new Map<string, { url: string; at: number }>();
-const TICKET_MEMO_MS = 8 * 60 * 1000;
+const RAW_REUSE_MS = 2_000;
+/** The daemon's tickets live ~10 min from the last ask; stop well short. */
+const RAW_TICKET_MS = 8 * 60 * 1000;
+const RAW_MEMO_MAX = 256;
+const rawAnswers = new Map<string, { url: string; at: number }>();
+const rawAsking = new Map<string, Promise<string>>();
 
-export async function rawTicketUrl(path: string): Promise<string> {
-  const hit = ticketUrls.get(path);
-  if (hit !== undefined && Date.now() - hit.at < TICKET_MEMO_MS) return hit.url;
-  const url = await fsRawUrl(path);
-  ticketUrls.set(path, { url, at: Date.now() });
-  return url;
+/** The current `/raw/` URL for `path` (see above). */
+export function rawTicketUrl(path: string): Promise<string> {
+  const hit = rawAnswers.get(path);
+  if (hit !== undefined && Date.now() - hit.at < RAW_REUSE_MS) return Promise.resolve(hit.url);
+  let asking = rawAsking.get(path);
+  if (asking === undefined) {
+    asking = fsRawUrl(path)
+      .then((url) => {
+        rawAnswers.delete(path);
+        rawAnswers.set(path, { url, at: Date.now() });
+        if (rawAnswers.size > RAW_MEMO_MAX) {
+          const oldest = rawAnswers.keys().next().value;
+          if (oldest !== undefined) rawAnswers.delete(oldest);
+        }
+        return url;
+      })
+      .finally(() => rawAsking.delete(path));
+    rawAsking.set(path, asking);
+  }
+  return asking;
+}
+
+/**
+ * The last URL answered for `path` while its ticket is surely alive, else
+ * null: for a re-render that must set an `<img>` src at once (no flash).
+ * It may predate an overwrite, so follow it with `rawTicketUrl` and switch
+ * when that answers a different URL.
+ */
+export function lastRawTicketUrl(path: string): string | null {
+  const hit = rawAnswers.get(path);
+  return hit !== undefined && Date.now() - hit.at < RAW_TICKET_MS ? hit.url : null;
 }
 
 /**
@@ -555,10 +938,25 @@ export type FileViewKind =
   | "table"
   | "xlsx"
   | "pdf"
+  | "video"
+  | "audio"
+  | "notebook"
+  | "log"
+  | "mermaid"
+  | "docx"
+  | "pptx"
+  | "board"
+  | "parquet"
   | "binary"
   | "text";
 
-const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg"]);
+/** Formats every supported webview decodes natively (WebKit included). */
+const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "avif"]);
+/** Played by the native <video>/<audio> element over ranged /raw reads. The
+ *  container is no promise of a codec (an HEVC .mov, a Vorbis .ogg on
+ *  WebKit): MediaView owns the "can't play this here" fallback. */
+const VIDEO_EXTS = new Set(["mp4", "webm", "m4v", "ogv", "mov"]);
+const AUDIO_EXTS = new Set(["mp3", "wav", "m4a", "flac", "ogg", "oga", "opus", "aac"]);
 
 /** Whether a path renders as an image (chat cards inline-preview these). */
 export function isImagePath(path: string): boolean {
@@ -566,9 +964,28 @@ export function isImagePath(path: string): boolean {
 }
 const MARKDOWN_EXTS = new Set(["md", "markdown"]);
 const HTML_EXTS = new Set(["html", "htm"]);
-const TABLE_EXTS = new Set(["csv", "tsv"]);
+/** Paged by fs/table: delimited text, including the bioinformatics formats
+ *  `tablePreset` knows how to read. */
+const TABLE_EXTS = new Set([
+  "csv", "tsv",
+  "vcf", "bed", "bedgraph", "narrowpeak", "broadpeak", "gff", "gff3", "gtf", "sam",
+]);
 /** Spreadsheets parsed server-side (calamine) into the same paged table grid. */
 const SPREADSHEET_EXTS = new Set(["xlsx", "xls", "xlsm", "ods"]);
+/** Program output read tail-first (slurm-*.out, *.stderr, .nextflow.log…).
+ *  A gzipped log stays text: it has no known size to read a tail from. */
+const LOG_EXTS = new Set(["log", "out", "err", "stdout", "stderr"]);
+const MERMAID_EXTS = new Set(["mmd", "mermaid"]);
+/** Word documents drawn in the browser (docx-preview); legacy binary .doc is
+ *  not this format and stays on the info card. */
+const DOCX_EXTS = new Set(["docx", "docm", "dotx"]);
+/** PowerPoint decks (pptx-renderer); legacy binary .ppt stays on the card. */
+const PPTX_EXTS = new Set(["pptx", "pptm", "ppsx", "potx"]);
+/** Diagram boards: JSON Canvas, Excalidraw, draw.io. `.excalidraw.json` is
+ *  matched by name in viewKindFor; `.drawio.svg`/`.drawio.png` stay images. */
+const BOARD_EXTS = new Set(["canvas", "excalidraw", "drawio", "dio"]);
+/** Columnar data read over ranged `/raw` requests (hyparquet). */
+const PARQUET_EXTS = new Set(["parquet"]);
 /**
  * Extensions we know are binary up front — straight to the info card, no
  * fetch. Everything not listed anywhere goes down the text path, which
@@ -580,11 +997,11 @@ const BINARY_EXTS = new Set([
   "zip", "tar", "7z", "rar", "xz", "zst", "bz2",
   "exe", "dll", "so", "dylib", "o", "a", "class", "jar", "pyc", "wasm",
   "iso", "dmg",
-  "mp3", "mp4", "m4a", "wav", "flac", "ogg", "mov", "avi", "mkv", "webm",
+  "avi", "mkv",
   "woff", "woff2", "ttf", "otf", "eot",
-  "ico", "bmp", "tif", "tiff", "heic", "psd",
-  "sqlite", "db", "parquet", "feather", "h5", "hdf5",
-  "docx", "doc", "pptx", "ppt",
+  "tif", "tiff", "heic", "psd",
+  "sqlite", "db", "feather", "h5", "hdf5",
+  "doc", "ppt",
   "bam", "bai", "cram", "crai", "bcf", "csi", "tbi", "bigwig", "bw", "bigbed", "bb",
 ]);
 
@@ -607,17 +1024,17 @@ export function viewKindFor(path: string): FileViewKind {
   if (TABLE_EXTS.has(ext)) return "table";
   if (SPREADSHEET_EXTS.has(ext)) return "xlsx";
   if (ext === "pdf") return "pdf";
+  if (VIDEO_EXTS.has(ext)) return "video";
+  if (AUDIO_EXTS.has(ext)) return "audio";
+  if (ext === "ipynb") return "notebook";
+  if (LOG_EXTS.has(ext)) return "log";
+  if (MERMAID_EXTS.has(ext)) return "mermaid";
+  if (DOCX_EXTS.has(ext)) return "docx";
+  if (PPTX_EXTS.has(ext)) return "pptx";
+  if (BOARD_EXTS.has(ext) || basename(path).toLowerCase().endsWith(".excalidraw.json")) return "board";
+  if (PARQUET_EXTS.has(ext)) return "parquet";
   if (BINARY_EXTS.has(ext)) return "binary";
   return "text";
-}
-
-/** View kinds the chat renders inline under tool cards (images, tabular
- *  data, PDFs — the "job output" formats worth seeing without a click). */
-const INLINE_PREVIEW_KINDS = new Set<FileViewKind>(["image", "table", "pdf"]);
-
-/** True when the chat can inline-preview this path's kind. */
-export function canInlinePreview(path: string): boolean {
-  return INLINE_PREVIEW_KINDS.has(viewKindFor(path));
 }
 
 /** Largest file the daemon accepts for an in-place edit (PUT /fs/file). */

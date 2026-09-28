@@ -119,6 +119,19 @@ where
 /// Spawn a real shell session tagged as an agent (synthetic record with a
 /// known hook key), without needing a claude binary.
 pub(super) fn inject_agent(state: &Arc<AppState>, key: &str) -> String {
+    inject_agent_running(state, key, None)
+}
+
+/// `inject_agent`, but its PTY runs a process that never writes. A live
+/// terminal title outranks the first prompt in `display_name`, and a login
+/// shell's rc (Ubuntu's sets `user@host: dir` with every prompt) writes one
+/// whenever the shell gets there, so a test reading the name must not have
+/// a shell underneath.
+pub(super) fn inject_silent_agent(state: &Arc<AppState>, key: &str) -> String {
+    inject_agent_running(state, key, Some(vec!["sleep".into(), "600".into()]))
+}
+
+fn inject_agent_running(state: &Arc<AppState>, key: &str, command: Option<Vec<String>>) -> String {
     let info = state
         .sessions
         .spawn(chimaera_pty::SpawnOpts {
@@ -126,7 +139,7 @@ pub(super) fn inject_agent(state: &Arc<AppState>, key: &str) -> String {
             name: None,
             cols: 80,
             rows: 24,
-            command: None,
+            command,
             id: None,
             env: Vec::new(),
             env_remove: Vec::new(),
@@ -177,6 +190,26 @@ pub(super) async fn session_entry(state: &Arc<AppState>, id: &str) -> serde_json
         .find(|s| s["id"] == id)
         .cloned()
         .unwrap_or_else(|| panic!("session {id} not listed in {list}"))
+}
+
+/// Install a first-party plugin as `chimaera plugin add --path` would: the
+/// release the lock pins, which `scripts/build-plugins.sh` laid out in
+/// `plugins/dist-test/<id>` (its SHA256SUMS included, so the copy is
+/// verified). The daemon carries no plugin of its own. Already installed:
+/// nothing to do.
+pub(super) async fn install_first_party(state: &Arc<AppState>, id: &str) {
+    if state.plugin_catalog.installed_copy(id).is_some() {
+        return;
+    }
+    let dir = crate::plugins::test_catalog::dist_test_dir(id);
+    let (status, body) = request(
+        state,
+        Method::POST,
+        "/api/v1/plugins/install",
+        Some(serde_json::json!({"path": dir})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{id}: {body}");
 }
 
 /// Register a workspace and return its id.

@@ -125,7 +125,7 @@ pub(crate) const AGY_MANIFEST_BASE: &str =
 /// Single-quote `s` for sh (`'` becomes `'\''`): every path interpolated
 /// into a generated script or shim lands inside one of these — a quote in
 /// the prefix must not terminate the quoting context.
-fn sq(s: &str) -> String {
+pub(crate) fn sq(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 

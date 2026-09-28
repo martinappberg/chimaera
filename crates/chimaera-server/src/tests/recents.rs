@@ -193,7 +193,7 @@ async fn recents_hide_live_conversations_and_dedupe_resumes() {
     assert_eq!(entries.len(), 1, "{entries:?}");
     assert_eq!(entries[0]["title"], "hooks online v2");
 
-    // Resumed live again: claude forks a NEW session id on --resume, so
+    // Resumed live again: older claude CLIs fork a NEW session id on --resume, so
     // until hooks report the new transcript the live record knows only
     // what it resumed from — that alone must hide the ancestor entry.
     plant_agent_record(&state, "s-c", &ws, agents::AgentKind::Claude, None, None);
@@ -335,7 +335,7 @@ async fn recents_merge_daemon_history_with_transcript_store() {
     );
     crate::lock(&state.agents).remove("s-live");
 
-    // Resume-then-end: claude forks a new session id and the ANCESTOR
+    // Resume-then-end on an older claude CLI: a new session id, and the ANCESTOR
     // transcript stays on disk in the scanned dir. The superseded
     // ancestor must NOT resurrect from the scan — clicking it would
     // fork the conversation from its pre-resume state (review blocker).

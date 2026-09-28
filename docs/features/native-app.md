@@ -9,7 +9,7 @@ it talks to is a separate, longer-lived process (see
 
 **Where it lives:** `crates/chimaera-app/src/` — its own **standalone cargo workspace** (Tauri is
 kept out of the daemon workspace so musl/HPC builds stay lean). `main.rs` (three-role argv
-dispatch), `shell.rs` + `shell/{commands,connect,restore}.rs`, `daemon.rs`, `windows.rs`,
+dispatch), `shell.rs` + `shell/{commands,connect,restore,unsaved}.rs`, `daemon.rs`, `windows.rs`,
 `update.rs`, `askpass.rs`, `appearance.rs`, `menu.rs`. UI bridge `web-ui/src/lib/net/native.ts`; toast
 `web-ui/src/lib/workspace/{UpdateToast.svelte,update.svelte.ts}`. Rules:
 [rules/native-app.md](../../.claude/rules/native-app.md); map:
@@ -55,8 +55,13 @@ app-build` (never the root `cargo`).
   coordinate math in `shell/drag.rs` — logical space on macOS, physical elsewhere).
   Closing a window removes its record (macOS convention) **except during quit** (guarded by an
   `AtomicBool quitting` so teardown doesn't forget every window). Geometry is stored in logical pixels
-  (correct across scale factors) on a slow 2s tick. Closing the final window exits directly; the shell
-  never inserts an extra Home that needs a second close. **Home is the New Window launcher**: File/tray
+  (correct across scale factors) on a slow 2s tick. Closing the final workspace, detached pane,
+  or remote-host detail window opens local Home. Closing local Home as the final window exits the
+  app on every platform. This fallback runs only after the unsaved-edits guard permits the close;
+  explicit Quit still exits directly and preserves the open window set for restore. The transition
+  lives in `shell.rs`'s `Destroyed` and `ExitRequested` handlers; automatic exit waits while
+  a worker opens Home (WebView2 cannot create it inside a synchronous window event).
+  **Home is the New Window launcher**: File/tray
   New Window creates a Home window when no unused launcher exists, otherwise it raises that singleton
   launcher. Browsing a connected host navigates the launcher to its detail page and Back re-homes it
   onto the local daemon. Selecting a local or remote workspace consumes the launcher and promotes that
@@ -68,23 +73,69 @@ app-build` (never the root `cargo`).
   daemon and tunnel ports (with origin-local storage retained for browser tabs); system light/dark is
   only the first-visit fallback, so new and re-homed webviews do not expose WebKit's unthemed white canvas.
   The shell is process-singleton because its registry, tunnels, and askpass endpoint are process-global;
-  launching the app again raises the complete existing window set rather than starting a competing
-  owner. On macOS, clicking the Dock icon likewise brings every Chimaera window forward while keeping
-  the previously active one frontmost.
+  launching the app again activates the existing instance rather than starting a competing owner.
+  **Activation follows macOS conventions** (`shell::activate_app`): a Dock click with any window on
+  screen leaves the set to AppKit (which raises the visible windows); with every window minimized or
+  hidden it restores ONLY the most recently used one (the rest stay in the Dock); with no window (only
+  during startup) it opens Home. A repeated launch focuses the most recent on-screen window the same way. Minimized
+  windows are never mass-restored.
+
+## Unsaved edits on close and quit
+
+- **What & when.** A webview gets no `beforeunload` when its native window closes or the app
+  quits, so the shell guards both. Each page pushes its unsaved-file count whenever it changes;
+  a close or quit with nothing unsaved goes through exactly as before — no prompt, no round
+  trip. Closing a window that holds unsaved edits is held, and that window shows the tab
+  close's **Save all / Don't save / Cancel** over every unsaved file in it: Save waits for the
+  saves (the 15 s deadline, then "not saved" and control back), Don't save discards (drafts
+  too), Cancel keeps the window. Quitting — ⌘Q, the menu, the tray, a programmatic exit, and on
+  macOS Dock › Quit or logging out — asks each window with unsaved edits in turn, most recently
+  focused first, raising it; Cancel in any of them abandons the quit, and a quit every one lets
+  go of keeps the window set for the next launch as usual.
+- **Where it lives.** `shell/unsaved.rs` (the pure `Guard` state machine + its glue; commands
+  `report_unsaved(count)` and `reply_unsaved(id, "shown" | "proceed" | "cancel")`, the
+  window-scoped `unsaved-prompt` event `{id, reason: "close" | "quit"}`), `shell.rs`
+  (`CloseRequested`, `ExitRequested`, `request_quit` / `finish_quit`); UI
+  `layout/windowClose.svelte.ts` + `layout/CloseDirtyDialog.svelte`, bridge `net/native.ts`.
+- **Key behaviors.** **Never a trap:** a prompted page must reply `shown` within 4 s or the shell
+  proceeds anyway (a hung webview) — the draft journal still holds the text, and reopening the
+  file offers it back; asking again (another close click or ⌘Q) re-pings a shown prompt, and
+  the third ask of one prompt proceeds outright. The updater's relaunch is a restart Tauri will
+  not let the guard hold, so **update refuses while any window has unsaved edits** (the toast
+  says so). macOS OS-level quits never become Tauri's `ExitRequested`; the shell adds
+  `applicationShouldTerminate:` to tao's app delegate, and a held one answers
+  `NSTerminateCancel` (macOS reports that Chimaera stopped the logout). On Linux and Windows a
+  logout ends the process without asking (tao has no end-session hook there); the journal
+  covers it. Remote-host windows behave the same — the commands are granted per window like
+  every daemon-window command — and a window whose UI predates the guard never reports, so it
+  closes as it always did.
+
+## Notifications
+
+- Native OS notifications (agent finished / awaiting approval / error / an agent's own `notify`),
+  the Dock badge + bounce, and click-to-session routing live in the shell (`shell/notices.rs` over
+  `notify.rs`) — see [notifications.md](notifications.md) for the whole feature.
 
 ## Signed self-update (app + daemon)
 
 - **What & when.** One-click update: download/verify/install the signed app bundle (it relaunches),
   then — in the new process's startup — replace the local daemon. Because the daemon binary *is* the
   app binary, the daemon must go second.
-- **Where it lives.** `update.rs` (`begin_update`/`consume_intent`/`spawn_update_watch`, `CHECK_INTERVAL
-  6h`, `INTENT_MAX_AGE 10m`), `commands.rs` (`check_app_update`), `daemon.rs::update_local_daemon`.
+- **Where it lives.** `update.rs` (`begin_update`/`consume_intent`/`spawn_update_watch`, `check`/`status`,
+  `CHECK_INTERVAL 6h`, `INTENT_MAX_AGE 10m`), `commands.rs` (`check_app_update`, `app_update_status`),
+  `daemon.rs::update_local_daemon`, `menu.rs` ("Check for Updates…").
 - **Key behaviors.** The download is verified against the embedded **minisign** pubkey regardless — only
   a validly-signed release installs; the web UI can only *ask*, never drive. `begin_update` writes a
   consume-once intent file (10-min expiry) so the new process finishes the daemon swap without a second
   ask. The daemon's restart handoff + session ledger make that swap state-safe — windows/tabs/sessions
   survive. Version stamping matches the literal `0.0.1` sentinel via `sed`; a pre-bumped value silently
   no-ops and ships the wrong version. Signing is release-only.
+- **Every check's outcome is kept** (`update::status`: this version, `checked_at`, `available`, the
+  failure's `error`, `dev`): `app_update_status(refresh)` answers from it instantly, so a window opened
+  after the 6-hourly `app-update` broadcast still learns of the update, and `refresh` is the explicit
+  check. A dev build never polls and answers `dev` (its "update" would swap the build under test).
+- **"Check for Updates…"** — the app menu (macOS, under About) / Help menu (Windows/Linux) forwards
+  `check-updates` to the focused window (else any window), whose toast answers it.
 
 ## Update toast
 
@@ -97,6 +148,11 @@ app-build` (never the root `cargo`).
   here (full app+daemon chain > daemon-only restart > "a release exists" notice — a browser window can't
   self-apply). Body copy states the consequence plainly (layouts/tabs/sessions come back; running terminal
   programs restart). "later" snoozes ~20h; "skip this version" mutes it — both origin-wide in localStorage.
+- **An explicit check always answers** (`checkForUpdates(true)`: the menu item, the home screen's version
+  stamp): "Checking for updates…", then the offer (snooze/skip don't hide what you asked for), "You're up
+  to date" (fades after ~6s unless hovered), "Development build", or "Couldn't check for updates" with the
+  reason and "try again". The deciding source is what can update this window: the app's signed channel in
+  the native shell, the daemon's release check in a browser.
 
 ## Windows: the WSL2 engine (beta)
 
@@ -137,15 +193,17 @@ app-build` (never the root `cargo`).
 - **Menu bar** (`menu.rs`): the macOS **Chimaera** submenu (About · **Settings…** ⌘, · Services ·
   Hide/Hide Others/Show All · Quit), **File** (New Window ⇧⌘N · New Terminal ⌘T · New Agent ⇧⌘T ·
   Close View ⌘W · Close Window; +Settings…/Quit on Windows/Linux, which have no app submenu),
-  **Edit**, **View** (fullscreen), **Window**, and **Help** (About, non-macOS only). Items the page
+  **Edit**, **View** (fullscreen), **Window** (Minimize · Zoom · on macOS Bring All to Front, and —
+  registered as the app's Windows menu — AppKit's live list of every window by title, so any one,
+  minimized or not, is a click away), and **Help** (About, non-macOS only). Items the page
   owns — `close-view`/`new-terminal`/`new-agent`/`settings` — are `emit_to`'d as a `menu` event to the
   focused window (`onMenu` in `App.svelte`, via `native.ts`); New Window is handled shell-side.
   **Settings** is daemon-scoped: it opens the settings surface for the focused window's daemon (a
   remote window → the remote daemon's settings), same as the in-UI gear.
 - **System tray / menu-bar status item** (`tray.rs`, `tray-icon` feature): a persistent icon whose
-  menu lists the **open workspace windows** (click one to raise it), then New Window and Quit — the
-  tray stays available while any app window is open, but closing the final window exits the app
-  directly rather than leaving a windowless tray process. The icon is a real **brand-mark template**
+  menu lists the **open workspace windows** (click one to raise it) — each with its count of agents
+  awaiting approval ("crc_finish — 2 awaiting approval"; the tooltip totals them) — then New Window
+  and Quit. Closing the final window exits the app rather than leaving a windowless tray process. The icon is a real **brand-mark template**
   (a C-in-hexagon monogram, black on transparent) that macOS tints to the menu-bar theme
   (`icon_as_template`) — not the full app icon, which the template mask would render as a solid blob.
   On macOS the menu also carries the **Keep Awake** check item (see Caffeinate). The menu is rebuilt
@@ -173,6 +231,9 @@ app-build` (never the root `cargo`).
 - **Windows is beta**: engine + connect transport + askpass relay are implemented and
   CI-smoked; the wizard flow and the interop askpass chain have not yet been hand-driven on
   retail Windows hardware.
+- **The unsaved-edits guard on close and quit** has unit-tested decisions (the shell's `Guard`,
+  the page's dialog controller) and CI's bundle builds, but has not yet been hand-driven in the
+  app; the macOS `applicationShouldTerminate:` hook (Dock › Quit, logout) is compile-checked only.
 
 ---
 
@@ -197,6 +258,16 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
   itself and its teardown UX are additions that can be improved.
 - **Do not change:** the disconnect vs end-sessions vs shut-down distinction; detached daemon
   outlives the app; human host labels.
+
+### Dock activation and closing the last window
+_Captured 2026-09-25 (from the maintainer)._
+
+- **Dock / relaunch behavior** should follow macOS conventions — the maintainer found "clicking the
+  icon opens all windows" weird and asked for standard behavior (restore only what's needed,
+  never mass-un-minimize). An addition: improvable.
+- **Closing the last window exits the app** — offered the Mac convention (stay alive in the Dock,
+  keep notifying), the maintainer chose to keep exiting ("I think exit on last close"). Consequence
+  accepted: notifications stop once no window is open. Open to revisiting; not a core bet.
 
 ### Linux + Windows(WSL2) apps — why they exist
 _Captured 2026-07-11 (from the maintainer, confirming a draft read from the #44 commit body + code)._

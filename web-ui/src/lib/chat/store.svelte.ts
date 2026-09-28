@@ -5,8 +5,16 @@
  * construction — there is no separate "catch up" code to get wrong.
  */
 
-import { canInlinePreview, isImagePath } from "../previews/files";
+import { isImagePath } from "../previews/files";
+import { artifactMentions, artifactShape, isArtifactPath, proseCovered, proseEmbedTargets } from "./artifacts";
 import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
+
+/** Names a reply may use that still cover their files (a reply listing
+ *  thirty outputs covers thirty); resolve candidates from shell text and
+ *  un-embedded figures stay capped at `MENTIONS_MAX` (one daemon round trip
+ *  per gallery, `RESOLVE_MAX` server-side). */
+const PROSE_NAMES_MAX = 512;
+const MENTIONS_MAX = 24;
 
 /** The single leading notice a client-side transcript trim leaves behind. */
 const TRIM_NOTICE = "earlier history trimmed";
@@ -203,6 +211,8 @@ export interface PendingSend {
   id: string;
   text: string;
   attachments: number;
+  /** The daemon's saved copies of the images (see the user block). */
+  attachmentPaths: string[];
   /** Its checkpoint anchor arrives (claude) right after the queued echo; kept
    *  here so it rides along when the send is promoted into `blocks`. */
   checkpoint: CheckpointRef | null;
@@ -239,6 +249,11 @@ export type ChatBlock = BlockIdentity &
       kind: "user";
       text: string;
       attachments: number;
+      /** The daemon's saved copies of the image attachments (absolute paths
+       *  on the session's host, in order) — the bubble's thumbnails. Can be
+       *  shorter than `attachments` (a failed save; old journals, Remote
+       *  Control and seeded history carry none), and the rest stay a count. */
+      attachmentPaths: string[];
       checkpoint: CheckpointRef | null;
       /** Delivery key (the wire's client-minted uuid); null on old journals,
        *  transcript-seeded messages, and permission-feedback echoes. */
@@ -300,6 +315,10 @@ export type ChatBlock = BlockIdentity &
        *  (claude `tool_use_summary`, "Listed files in directory") — the tool
        *  group's title once it lands, a model round after the batch. */
       summary: string | null;
+      /** The whole command an execute tool ran (the title keeps ~120 chars,
+       *  and claude's `cd "…/abs/path" && …` prefix eats them): what the
+       *  turn-end gallery scans for the files a script wrote. */
+      command: string | null;
     }
   | { kind: "notice"; text: string; tone: "info" | "error" }
   | {
@@ -336,9 +355,27 @@ export type ChatBlock = BlockIdentity &
       costUsd: number | null;
       outputTokens: number;
       durationMs: number;
-      /** Previewable files this turn produced (absolute paths) — rendered as
-       *  a small gallery after the closing prose. */
+      /** Files this turn's edit tools wrote (absolute paths, the tools' own
+       *  locations) that the prose did not already show — the "written this
+       *  turn" gallery after the closing prose. */
       artifacts: string[];
+      /** Artifact-shaped paths the turn's commands and outputs MENTION (as
+       *  written), plus figures the prose names without embedding:
+       *  candidates for files written by shell commands. The gallery keeps
+       *  those the daemon confirms were modified between `startedAtMs` and
+       *  `endedAtMs` (artifacts.ts). */
+      mentioned: string[];
+      /** What the turn wrote that the prose already showed (an embedded
+       *  figure, a linked document; tool paths absolute, shell names as
+       *  written): the gallery is the remainder — it says "also", and widens
+       *  a chip's name against these too (`docs/notes.md` beside a linked
+       *  `notes.md`). */
+      covered: string[];
+      /** Journal timestamps of the turn's start and end (daemon clock). */
+      startedAtMs: number | null;
+      endedAtMs: number | null;
+      /** The turn was stopped or failed; its files still show. */
+      aborted: boolean;
     }
   | { kind: "usage"; windows: UsageWindow[] });
 
@@ -648,6 +685,9 @@ export class ChatStore {
   private userIndex = new Map<string, number>();
   /** question request_id -> index into blocks, for the resolution fold. */
   private questionIndex = new Map<string, number>();
+  /** Journal time of the running turn's `turn_started` — the lower bound of
+   *  the "made this turn" window. */
+  private turnStartedAt: number | null = null;
 
   onReady(session: ChatSessionInfo, _replayFrom: number, head: number | undefined): void {
     this.connected = true;
@@ -718,6 +758,7 @@ export class ChatStore {
     this.userIndex.clear();
     this.questionIndex.clear();
     this.outputClip.clear();
+    this.turnStartedAt = null;
     this.activeAgents = [];
     // Pending asks and sends belong to the journal being rebuilt; the fresh
     // replay re-delivers any that are still live.
@@ -824,12 +865,22 @@ export class ChatStore {
         const id = (ev.id as string) ?? null;
         const text = ev.text as string;
         const attachments = (ev.attachments as number) ?? 0;
+        const attachmentPaths = Array.isArray(ev.attachment_paths)
+          ? (ev.attachment_paths as unknown[]).filter((p): p is string => typeof p === "string")
+          : [];
         const origin = typeof ev.origin === "string" ? ev.origin : null;
         if (ev.queued === true && id !== null) {
           // Queued: park it in the pending stack, NOT in the transcript at its
           // mid-turn send position (that splice would split the agent's live
           // message in two). It enters `blocks` only once delivery resolves.
-          this.pendingSends.push({ id, text, attachments, checkpoint: null, state: "queued" });
+          this.pendingSends.push({
+            id,
+            text,
+            attachments,
+            attachmentPaths,
+            checkpoint: null,
+            state: "queued",
+          });
         } else {
           // A fresh (turn-opening) send, or a permission-feedback echo — it was
           // received, so it goes straight into history.
@@ -838,6 +889,7 @@ export class ChatStore {
               kind: "user",
               text,
               attachments,
+              attachmentPaths,
               checkpoint: null,
               id,
               origin,
@@ -943,6 +995,7 @@ export class ChatStore {
               kind: "user",
               text: pending.text,
               attachments: pending.attachments,
+              attachmentPaths: pending.attachmentPaths,
               origin: null,
               checkpoint: pending.checkpoint,
               id: pending.id,
@@ -1004,6 +1057,7 @@ export class ChatStore {
         break;
       }
       case "turn_started":
+        this.turnStartedAt = entry.ts;
         this.running = true;
         this.activity = { kind: "waiting", detail: "starting" };
         this.turnTokens = 0;
@@ -1066,6 +1120,7 @@ export class ChatStore {
         if (row !== undefined && row.kind === "tool") {
           row.title = ev.title as string;
           row.locations = (ev.locations as string[]) ?? [];
+          if (typeof ev.command === "string") row.command = ev.command;
           // A late enriching re-emit must never walk a finished tool back to
           // pending/in_progress — the authoritative result already landed.
           if (row.status !== "completed" && row.status !== "failed") {
@@ -1088,6 +1143,7 @@ export class ChatStore {
               streaming: false,
               crossTurn: ev.cross_turn === true,
               summary: null,
+              command: typeof ev.command === "string" ? ev.command : null,
             }),
           );
           this.toolIndex.set(ev.id as string, this.blocks.length - 1);
@@ -1414,9 +1470,13 @@ export class ChatStore {
             costUsd: usage.cost_usd ?? null,
             outputTokens: usage.output_tokens ?? 0,
             durationMs: usage.duration_ms ?? 0,
-            artifacts: this.collectTurnArtifacts(),
+            ...this.collectTurnArtifacts(),
+            startedAtMs: this.turnStartedAt,
+            endedAtMs: entry.ts,
+            aborted: false,
           }),
         );
+        this.turnStartedAt = null;
         break;
       }
       case "turn_aborted": {
@@ -1425,6 +1485,25 @@ export class ChatStore {
         this.activity = null;
         this.activityLine = null;
         this.reconcileOpenTools(true);
+        // A stopped turn keeps what it made: its gallery lands before the
+        // notice, closing the turn like a completed one would. Only when it
+        // has something to show, so a plain stop reads as before.
+        const made = this.collectTurnArtifacts();
+        if (made.artifacts.length > 0 || made.mentioned.length > 0) {
+          this.blocks.push(
+            this.stamp({
+              kind: "turn_end",
+              costUsd: null,
+              outputTokens: 0,
+              durationMs: 0,
+              ...made,
+              startedAtMs: this.turnStartedAt,
+              endedAtMs: entry.ts,
+              aborted: true,
+            }),
+          );
+        }
+        this.turnStartedAt = null;
         // A deliberate stop (Esc / stop chip) is not an error state: the
         // wire's `interrupted` flag is the drivers' structural signal
         // (claude's free-text result string never reliably said so); the
@@ -1801,31 +1880,86 @@ export class ChatStore {
     }
   }
 
-  /** The previewable files THIS turn produced, for the end-of-turn gallery.
-   *  Scans back to the turn boundary (previous user message / turn_end) and
-   *  keeps previewable locations from writes (edit kind) plus any image a
-   *  tool touched — a CSV the agent merely READ is not an artifact. Absolute
-   *  paths from the tool itself, so the gallery is always openable regardless
-   *  of how the prose spelled the name. */
-  private collectTurnArtifacts(): string[] {
+  /** What THIS turn wrote, for the end-of-turn gallery — minus what its
+   *  prose already showed. Scans back to the turn's opening user block:
+   *  - `artifacts`: artifact-kind files an edit tool wrote, plus any image a
+   *    tool touched — absolute paths from the tools themselves, so a tile
+   *    always opens whatever the prose called it. A CSV the agent merely
+   *    READ is not an artifact.
+   *  - `mentioned`: artifact-shaped paths the turn's commands and outputs
+   *    name (newest first) — a plot a script saved, a report a shell command
+   *    rendered — and figures the prose names without embedding. The
+   *    gallery confirms each against the daemon and the turn's time window
+   *    before showing it (artifacts.ts).
+   *  The prose is the reader's first view of the turn: a figure it embeds
+   *  (`![](figs/plot.png)`) is not tiled again, and a document it names
+   *  (rendered as a path link) is not chipped again — a name claims the
+   *  shallowest match, so `notes.md` covers the one at the base, not
+   *  `docs/notes.md`. A named figure still tiles: a link is not a picture.
+   *  `covered` lists what the prose showed, so the gallery knows it is the
+   *  remainder. */
+  private collectTurnArtifacts(): { artifacts: string[]; mentioned: string[]; covered: string[] } {
     const out: string[] = [];
     const seen = new Set<string>();
+    const prose: string[] = [];
+    const shell: string[] = [];
     for (let i = this.blocks.length - 1; i >= 0; i--) {
       const b = this.blocks[i];
       // Every user block here is delivered (queued sends live in pendingSends),
       // so a user block IS this turn's opening boundary — stop the scan.
       if (b.kind === "user" || b.kind === "turn_end") break;
-      if (b.kind !== "tool" || b.status !== "completed" || b.denied) continue;
+      if (b.kind === "message") {
+        prose.push(b.text);
+        continue;
+      }
+      if (b.kind !== "tool" || b.denied) continue;
+      if (b.tool === "execute" || b.tool === "other") {
+        if (b.content?.text !== undefined) shell.push(b.content.text);
+        // The whole command when the wire carries it; the title otherwise.
+        shell.push(b.command ?? b.title);
+      }
+      if (b.status !== "completed") continue;
       for (const loc of b.locations) {
-        if (seen.has(loc) || !canInlinePreview(loc)) continue;
-        if (b.tool === "edit" || isImagePath(loc)) {
+        if (seen.has(loc)) continue;
+        if ((b.tool === "edit" && isArtifactPath(loc)) || isImagePath(loc)) {
           seen.add(loc);
           out.push(loc);
         }
       }
     }
     out.reverse(); // chronological
-    return out.slice(0, 8);
+    const embedded = proseEmbedTargets(prose);
+    // A reply is short and cheap to scan whole, and a name it uses must
+    // cover its file whatever its position — only resolve candidates
+    // (shell names, un-embedded figures) keep the small cap.
+    const named = artifactMentions(prose, PROSE_NAMES_MAX);
+    // A set: a shell-named figure the prose embeds is met twice.
+    const covered = new Set<string>();
+    /** The remainder of `candidates` once the prose's embeds (any shape) and
+     *  names (documents only) have claimed theirs. */
+    const remainder = (candidates: string[]): string[] => {
+      const byEmbed = proseCovered(candidates, embedded);
+      const byName = proseCovered(candidates, named);
+      const kept: string[] = [];
+      for (const c of candidates) {
+        if (byEmbed.has(c) || (byName.has(c) && artifactShape(c) === "document")) covered.add(c);
+        else kept.push(c);
+      }
+      return kept;
+    };
+    const artifacts = remainder(out).slice(0, 8);
+    const mentioned = remainder(artifactMentions(shell).filter((m) => !seen.has(m)));
+    const taken = new Set(mentioned);
+    // Figures the prose names but does not embed: a link is not a picture.
+    const namedFigures = named.filter(
+      (m) => artifactShape(m) === "visual" && !seen.has(m) && !taken.has(m) && !covered.has(m),
+    );
+    const figuresEmbedded = proseCovered(namedFigures, embedded);
+    for (const m of namedFigures) {
+      if (figuresEmbedded.has(m)) covered.add(m);
+      else if (mentioned.length < MENTIONS_MAX) mentioned.push(m);
+    }
+    return { artifacts, mentioned, covered: [...covered] };
   }
 
   /** Rebuild every id→index map from `blocks` after a non-tail splice

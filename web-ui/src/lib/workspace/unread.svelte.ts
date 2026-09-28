@@ -49,7 +49,10 @@ export function foldUnread(
   const ids = new Set(next.map((s) => s.id));
   for (const id of unread) if (ids.has(id)) out.add(id);
   for (const s of next) {
-    if (s.kind !== "agent" || s.id === focusedId || s.mastermind === true) continue;
+    // The Mastermind counts too: a reply that lands while its window panel
+    // is closed is what the corner icon's dot reports (App clears the mark
+    // whenever the panel is open).
+    if (s.kind !== "agent" || s.id === focusedId) continue;
     const before = prev.get(s.id);
     if (before === undefined) continue;
     // The one trigger: the main turn transitioned from running to a

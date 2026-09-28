@@ -66,12 +66,27 @@ export interface HostState {
   remote_build: string | null;
   /** Live sessions counted when the update decision was made. */
   live_sessions: number | null;
+  /**
+   * The login node the daemon runs on when the alias names a pool of login
+   * nodes and the connection is pinned to one other than where a new ssh
+   * connection lands (null = wherever the alias lands).
+   */
+  node: string | null;
 }
 
 /** Progress of an in-flight connect, mirrored from chimaera-remote phases. */
 export interface ConnectProgress {
   alias: string;
-  phase: "probing" | "updating" | "downloading" | "installing" | "starting" | "tunneling";
+  phase:
+    | "probing"
+    | "routing"
+    | "updating"
+    | "downloading"
+    | "installing"
+    | "starting"
+    | "tunneling";
+  /** The login node a `routing` phase is reaching (it may ask to authenticate). */
+  node?: string;
 }
 
 /** Build parity of the local daemon, as decided at app startup. */
@@ -180,6 +195,31 @@ export async function checkAppUpdate(): Promise<string | null> {
   const t = tauri();
   if (t === null) return null;
   return t.core.invoke<string | null>("check_app_update");
+}
+
+/** The shell's signed-update knowledge (`app_update_status`). */
+export interface AppUpdateStatus {
+  /** This app's own version. */
+  current: string;
+  /** A dev build never checks (an "update" would swap the build under test). */
+  dev: boolean;
+  /** Last check attempt, unix seconds (null = never). */
+  checked_at: number | null;
+  /** A newer signed version, when the last good answer had one. */
+  available: string | null;
+  /** Why the last attempt failed; null after a success. */
+  error: string | null;
+  interval_secs: number;
+}
+
+/**
+ * The shell's answer to "is there an app update?" — cached instantly, or
+ * `refresh` to check first. Null in a browser.
+ */
+export async function appUpdateStatus(refresh: boolean): Promise<AppUpdateStatus | null> {
+  const t = tauri();
+  if (t === null) return null;
+  return t.core.invoke<AppUpdateStatus>("app_update_status", { refresh });
 }
 
 /**
@@ -377,6 +417,9 @@ export interface HostStatusEvent {
   reason?: string;
   /** Source build now served through this tunnel. */
   build?: string;
+  /** On "connected": the login node the tunnel is pinned to (absent = wherever
+   *  the alias lands). Every connected event carries it. */
+  node?: string;
 }
 
 /**
@@ -407,6 +450,115 @@ export async function reportWindowScope(
   // `detached` is set-only shell-side: true re-asserts a restored detached
   // window's flag (its blob carries dt:1); false never clears anything.
   await tauri()?.core.invoke<void>("report_window_scope", { alias, ws, label, detached });
+}
+
+/**
+ * Tell the shell which sessions this window has on screen (each pane's
+ * active tab). The shell drops a notification about one of them while this
+ * window has focus — the user is already looking — and clears their
+ * delivered alerts. No-op in a browser.
+ */
+export async function reportWindowView(visible: string[]): Promise<void> {
+  await tauri()?.core.invoke<void>("report_window_view", { visible });
+}
+
+/**
+ * Tell the shell how many files hold unsaved edits in this window, whenever
+ * that changes. The shell decides a window close or the app's quit from this
+ * count without asking the page first, so a window with nothing unsaved
+ * closes with no prompt. No-op in a browser (beforeunload guards there).
+ */
+export async function reportUnsaved(count: number): Promise<void> {
+  await tauri()?.core.invoke<void>("report_unsaved", { count });
+}
+
+/** Why the shell is asking this window about its unsaved edits. */
+export type UnsavedReason = "close" | "quit";
+
+/**
+ * The shell held this window's close, or the app's quit, because this window
+ * reported unsaved edits. `id` is stable across repeated asks of one prompt;
+ * every reply carries it.
+ */
+export interface UnsavedPrompt {
+  id: number;
+  reason: UnsavedReason;
+}
+
+/**
+ * - `shown`: the dialog is up — the page is alive, so the shell waits for the
+ *   user instead of treating the window as hung (it proceeds anyway after a
+ *   few seconds without this).
+ * - `proceed`: every file saved, or Don't save — the close or quit goes ahead.
+ * - `cancel`: keep the window; a quit is abandoned.
+ */
+export type UnsavedReply = "shown" | "proceed" | "cancel";
+
+/** The shell asks about this window's unsaved edits (window-scoped, like onMenu). */
+export function onUnsavedPrompt(handler: (p: UnsavedPrompt) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.webviewWindow
+    .getCurrentWebviewWindow()
+    .listen<UnsavedPrompt>("unsaved-prompt", (e) => handler(e.payload));
+}
+
+export async function replyUnsaved(id: number, reply: UnsavedReply): Promise<void> {
+  await tauri()?.core.invoke<void>("reply_unsaved", { id, reply });
+}
+
+/**
+ * A notification was clicked and this window should show `sessionId`.
+ * Window-scoped: the shell emits to the chosen window's label. No-op
+ * unsubscriber in the browser.
+ */
+export function onFocusSession(handler: (sessionId: string) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.webviewWindow
+    .getCurrentWebviewWindow()
+    .listen<string>("focus-session", (e) => handler(e.payload));
+}
+
+/**
+ * The session a notification click opened this window for, if any — asked
+ * once the `focus-session` listener is live, in case the shell's event beat
+ * it. Null in a browser.
+ */
+export async function takePendingFocus(): Promise<string | null> {
+  const t = tauri();
+  if (t === null) return null;
+  return (await t.core.invoke<string | null>("take_pending_focus")) ?? null;
+}
+
+/** OS notification permission as the shell sees it. */
+export type NativeNotificationPermission =
+  | "granted"
+  | "denied"
+  | "not_determined"
+  | "unsupported";
+
+export async function notificationPermission(): Promise<NativeNotificationPermission> {
+  const t = tauri();
+  if (t === null) return "unsupported";
+  return t.core.invoke<NativeNotificationPermission>("notification_permission");
+}
+
+/** Ask the OS for notification permission now (its one-time prompt). */
+export async function requestNotificationPermission(): Promise<NativeNotificationPermission> {
+  const t = tauri();
+  if (t === null) return "unsupported";
+  return t.core.invoke<NativeNotificationPermission>("request_notification_permission");
+}
+
+/** Open the OS's notification settings for Chimaera (macOS System Settings). */
+export async function openNotificationSettings(): Promise<void> {
+  await tauri()?.core.invoke<void>("open_notification_settings");
+}
+
+/** Post a sample notification (the settings page's "Send test"). */
+export async function testNotification(): Promise<void> {
+  await tauri()?.core.invoke<void>("test_notification");
 }
 
 /**

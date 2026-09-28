@@ -93,27 +93,44 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
 
 ## Clickable path links
 
-- **What & when.** File/dir paths printed by any process become underlined links: click a file
-  to open it in a pane, a directory to reveal it in the Finder + file tree.
+- **What & when.** File/dir references printed by any process become underlined links: click a
+  file to open it at the referenced line, a directory to reveal it in the Finder + file tree.
 - **How it's used.** Hover a path; if the daemon confirms it exists, it underlines. A file opens
-  in the **active pane** (reusing an already-open tab); a directory opens/reuses the Finder beside
-  the terminal. Cmd/Ctrl+click forces a new split. A trailing `:42` line suffix is carried.
-- **Where it lives.** `web-ui/src/lib/terminal/links.ts` (`PathLinkProvider`), validation via
+  in the **active pane** (reusing an already-open tab) at the line the reference names —
+  `src/x.rs:42`, `:42:7`, `:42-60`, `#L42`, `#L42-L60`, `#L42C7`, tsc's `x.ts(42,7)`, a Python
+  traceback's `File "x.py", line 42` — which the file view scrolls to; a locator lands on its spot
+  (`paper.pdf#page=3&xywh=72,272,320,220`, `de.tsv#row=40-42`, `book.xlsx#sheet=S&range=D6:E7`,
+  `talk.wav#t=12`, `nb.ipynb#cell=7`, `deck.md#slide=3`; see
+  [pointing at part of a file](files-and-previews.md#pointing-at-part-of-a-file)). A directory opens/reuses the
+  Finder beside the terminal. Cmd/Ctrl+click forces a new split. Clicking a name several files
+  answer to opens a menu of the matches.
+- **Where it lives.** `web-ui/src/lib/terminal/links.ts` (`PathLinkProvider`), the parser it
+  shares with chat `web-ui/src/lib/shared/fileRef.ts` (cases in `fileRefs.fixture.json`), the
+  opener `shared/openPath.ts` (registered by `App.svelte`), validation via
   `POST /api/v1/fs/validate` (`fsValidate` in `web-ui/src/lib/previews/files.ts`).
 - **Key behaviors.** **Arbitrary web URLs are still deliberately *not* linkified** (no
   `web-links` addon loaded) — only *proxyable* ones are, by a separate provider
   (`urlLinks.ts`): loopback hosts, or any host with an explicit port, i.e. the address a
   local web app prints. `https://github.com/…` stays plain text. See
   [browser-pane.md](browser-pane.md).
+  The parser strips wrappers and trailing punctuation (quotes, brackets, backticks, `**`,
+  full-width `（）「」。，`) but keeps a bracket balanced inside a name, drops a leading `@` and a
+  `file://` prefix, reads Unicode names (`résumé.pdf`), sends `a/`/`b/` diff sides as written (the
+  daemon strips the prefix when the path misses) and the tail of a `…/` abbreviation, and unwraps
+  tool-call lines (`⏺ Update(src/x.ts)`). A path a TUI hard-wrapped onto the next row (Ink breaks a
+  long token at its box width and indents the rest) is re-joined across up to four rows. Versions
+  (`1.2.3`), web URLs, globs and bare words stay plain.
   Bare single-segment names (`crates`, `justfile`) link only on hover and only on a line shape
   prose never has (a full `ls`/`ls -l` line) — because the daemon runs on shared login nodes and
   prose must never be mass-validated. Verdicts cached 15s; requests batched + deduped; a
-  whole-viewport prefetch keeps hovers instant. Relative paths resolve against the session's live
-  cwd first, then the workspace root; a bare `name.ext` that misses both also links when exactly
-  one file in the workspace bears that name (an agent saying `FIGURE_PLAN.md` about
-  `paper/FIGURE_PLAN.md`) — the daemon answers from the bounded quickopen index and refuses on
-  ambiguity, so links stay existence-verified. Chat prose paths share the same endpoint and
-  fallback.
+  whole-viewport prefetch, throttled to one pass per 300 ms (a debounce never fired under a TUI
+  that animates every frame), keeps hovers instant. One request per candidate carries the
+  session's base ladder — live cwd, then the spawn directory (scrollback printed before a `cd`),
+  then the workspace root; `./` and `../` resolve against the live cwd only. When those miss, the
+  daemon strips a diff prefix and falls back to the bounded quickopen index: a unique basename
+  (`FIGURE_PLAN.md` about `paper/FIGURE_PLAN.md`) or a unique path suffix (`figs/plot.png` about
+  `results/figs/plot.png`), and several matches come back as the pick list — so links stay
+  existence-verified. Chat links share the parser, the endpoint and the fallbacks.
 
 ## Clipboard, selection & copy provenance
 

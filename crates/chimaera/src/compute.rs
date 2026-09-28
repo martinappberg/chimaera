@@ -7,12 +7,14 @@
 use anyhow::Context;
 use chimaera_remote::RemoteHome;
 
+/// The login daemon's manifest, with `host` routed to the login node it runs
+/// on — the curl-over-ssh calls below reach its LOOPBACK port, which exists
+/// only there (a pool alias would otherwise land them on any login node).
 async fn login_manifest(host: &str) -> anyhow::Result<chimaera_core::Manifest> {
-    chimaera_remote::remote_manifest(host, RemoteHome::current())
-        .await?
-        .with_context(|| {
-            format!("no chimaera daemon on {host} — run `chimaera connect {host}` first")
-        })
+    match chimaera_remote::locate_daemon(host, RemoteHome::current()).await? {
+        Some((manifest, true)) => Ok(manifest),
+        _ => anyhow::bail!("no chimaera daemon on {host} — run `chimaera connect {host}` first"),
+    }
 }
 
 pub async fn list(host: &str) -> anyhow::Result<()> {

@@ -1,143 +1,88 @@
 /**
  * Clickable paths in terminals — the context bridge's return direction.
  *
- * An xterm link provider scans rendered lines (wrapped rows joined) for
- * path-like candidates: absolute, ~/, ./ and ../, workspace-relative like
- * results/qc/report.html, bare filenames with an extension, all with an
- * optional :line suffix. Candidates are batch-validated against the daemon
- * (POST /fs/validate — relative candidates resolve against the session's
- * live cwd, then the workspace root, and a bare `name.ext` additionally via
- * the daemon's unique-basename workspace fallback) so ONLY real files and
- * dirs ever underline; results are cached with a short TTL and prefetched per
- * viewport change, so hovering is instant. Click opens the file in an
- * adjacent pane (Cmd/Ctrl+click = new split); dirs reveal in the file tree.
- * Works identically in every session — agents and shells.
+ * An xterm link provider scans rendered lines (soft-wrapped rows joined) for
+ * file references with `shared/fileRef.ts`, the parser chat uses too:
+ * absolute, ~/, ./ and ../, workspace-relative, bare filenames with an
+ * extension, `@mentions`, `a/`/`b/` diff sides, `…/` abbreviations, Unicode
+ * names, with an optional `:12` / `:12:3` / `#L12-L20` / `(12,3)` line
+ * suffix. A path a TUI hard-wrapped onto the next row is re-joined. Candidates
+ * are batch-validated against the daemon (POST /fs/validate with the
+ * session's base ladder — live cwd, spawn cwd, workspace root — plus the
+ * workspace index fallbacks) so ONLY real files and dirs ever underline;
+ * verdicts are cached with a short TTL and prefetched per viewport change, so
+ * hovering is instant. Click opens the file in the active pane at the
+ * referenced line (Cmd/Ctrl+click = new split); dirs open in the Finder; a
+ * name several files answer to asks which in the shared context menu. Works
+ * identically in every session — agents and shells.
  */
 
 import type { ILink, ILinkProvider, Terminal } from "@xterm/xterm";
 import { fsValidate, VALIDATE_MAX, type ValidatedPath } from "../previews/files";
+import { contextMenu } from "../shared/contextMenu.svelte";
+import {
+  extractFileRefs,
+  findFileRef,
+  resolveBases,
+  revealOf,
+  type FileRef,
+  type LinkContext,
+} from "../shared/fileRef";
+import type { PathKind } from "../shared/openPath";
+import { workspaceRelative } from "../shared/reference";
+import type { Reveal } from "../shared/reveal";
 
-/** What a confirmed path candidate resolved to. */
-export type PathKind = "file" | "dir";
-
-/** Per-session context the provider resolves relative candidates with. */
-export interface LinkContext {
-  /** The session's live working directory (cwd_current, else spawn cwd). */
-  cwd: string | null;
-  /** The active workspace root (second base for workspace-relative paths). */
-  root: string | null;
-  /**
-   * The session's workspace id — sent with /fs/validate so the daemon's
-   * bare-basename fallback can resolve a lone `name.ext` mentioned about a
-   * file living in a subdirectory. Null degrades to base-only resolution.
-   */
-  workspaceId: string | null;
-}
+export type { LinkContext, PathKind };
 
 /** App-level wiring for the pooled terminals' link providers. */
 export interface LinkHost {
   context(sessionId: string): LinkContext;
-  /** A confirmed link was activated. `newSplit` = Cmd/Ctrl held. */
-  open(sessionId: string, path: string, kind: PathKind, newSplit: boolean): void;
+  /** A confirmed link was activated. `split` = Cmd/Ctrl held. */
+  open(sessionId: string, path: string, kind: PathKind, opts: { split: boolean; reveal?: Reveal }): void;
 }
 
 // --- candidate extraction (pure) ---------------------------------------------
 
 /** One path-like candidate found in a line of terminal text. */
 export interface Candidate {
-  /** The candidate as written (what gets validated / resolved). */
+  /** The clean path candidate (what gets validated / resolved). */
   raw: string;
   /** 0-based start index into the scanned string. */
   start: number;
-  /** Length in the scanned string INCLUDING any :line suffix. */
+  /** Length in the scanned string INCLUDING any line suffix. */
   length: number;
-  /** 1-based line number from a `:42` suffix, if present. */
+  /** 1-based line number from a `:42` / `#L42` suffix, if present. */
   line: number | null;
-}
-
-/** Longest candidate worth validating. */
-const CANDIDATE_MAX_LEN = 512;
-
-/** Path-ish token: the conservative charset real workspace paths use. */
-const TOKEN_RE = /[A-Za-z0-9._+@%#$~/-]+/g;
-/** Bare filename qualifier: an extension that starts with a letter. */
-const BARE_EXT_RE = /\.[A-Za-z][A-Za-z0-9]{0,7}$/;
-
-/**
- * True when `t` looks like a path worth validating: absolute, ~/, ./, ../,
- * relative-with-slash, or a bare filename with an extension. URL tails
- * ("//host/…") and flag-like tokens never qualify — and everything that does
- * still only links if the daemon confirms it exists.
- *
- * `bare` additionally admits a single-segment name with no slash and no
- * extension — a directory like `crates` or an extensionless file like
- * `justfile`. That is offered ONLY on hover (`extractCandidates(text, true)`),
- * never in the whole-screen prefetch, so agent/terminal prose is never
- * mass-validated on the daemon (it lives on shared login nodes). Whether such
- * a name actually becomes a link is then decided per line by [`bareLinkable`].
- */
-function qualifies(t: string, bare: boolean): boolean {
-  if (t.length < 2 || t.length > CANDIDATE_MAX_LEN) return false;
-  if (!/[A-Za-z0-9]/.test(t)) return false;
-  if (t.startsWith("//") || t.startsWith("-")) return false;
-  if (t.startsWith("/") || t.startsWith("~/") || t.startsWith("./") || t.startsWith("../")) {
-    return true;
-  }
-  if (t.includes("/")) return true;
-  if (BARE_EXT_RE.test(t)) return true;
-  // A bare name resolved against the session cwd. Requires a letter, so
-  // version numbers (1.2.3, 4.8) stay out; the daemon still decides existence.
-  return bare && /[A-Za-z]/.test(t);
+  ref: FileRef;
 }
 
 /**
- * Scan `text` for path-like candidates (line indexes into that string). With
+ * Scan `text` for path-like candidates (indexes into that string). With
  * `bare`, also emit single-segment names (bare directories / extensionless
- * files) — reserved for the on-hover path, never the prefetch.
+ * files like `crates`, `justfile`) — reserved for the on-hover path, never
+ * the prefetch, so agent/terminal prose is never mass-validated on the
+ * daemon (it lives on shared login nodes). Whether such a name actually
+ * becomes a link is then decided per line by [`bareLinkable`].
  */
 export function extractCandidates(text: string, bare = false): Candidate[] {
-  const out: Candidate[] = [];
-  TOKEN_RE.lastIndex = 0;
-  for (let m = TOKEN_RE.exec(text); m !== null; m = TOKEN_RE.exec(text)) {
-    let raw = m[0];
-    let start = m.index;
-    // Sentence punctuation is never part of a candidate: trim trailing
-    // dots/commas ("see main.rs.") and stray leading dots (ellipses). But keep
-    // a single leading dot that begins a dotfile/dotfolder — `.claude`, `.env` —
-    // (a `.` immediately followed by a letter); `./` and `../` keep both dots.
-    while (raw.endsWith(".") || raw.endsWith(",")) raw = raw.slice(0, -1);
-    while (
-      raw.startsWith(".") &&
-      !raw.startsWith("./") &&
-      !raw.startsWith("../") &&
-      !/^\.[A-Za-z]/.test(raw)
-    ) {
-      raw = raw.slice(1);
-      start += 1;
-    }
-    if (!qualifies(raw, bare)) continue;
-    // Optional :line suffix directly after the path (underline covers it).
-    const after = /^:(\d{1,7})/.exec(text.slice(start + raw.length));
-    out.push({
-      raw,
-      start,
-      length: raw.length + (after !== null ? after[0].length : 0),
-      line: after !== null ? Number.parseInt(after[1], 10) : null,
-    });
-  }
-  return out;
+  return extractFileRefs(text, { bare }).map((f) => ({
+    raw: f.ref.path,
+    start: f.start,
+    length: f.end - f.start,
+    line: f.ref.line ?? null,
+    ref: f.ref,
+  }));
 }
 
 /** The permissions column that opens every `ls -l` entry line. */
 const LS_LONG_PERMS_RE = /^[bcdlps-][rwxsStT-]{9}[@+.]?$/;
 
-/** Whitespace words of a line, trimmed of sentence punctuation like candidates. */
+/** Whitespace words of a line, as the candidates they would be. */
 function lineWords(text: string): string[] {
   const out: string[] = [];
   for (const w of text.trim().split(/\s+/)) {
-    let x = w;
-    while (x.endsWith(".") || x.endsWith(",")) x = x.slice(0, -1);
-    if (x.length > 0) out.push(x);
+    if (w.length === 0) continue;
+    out.push(findFileRef(w, { bare: true })?.ref.path ?? w);
   }
   return out;
 }
@@ -158,7 +103,10 @@ function lineWords(text: string): string[] {
  * Any other line contributes no bare links. Slashed and extensioned paths on
  * the line still link exactly as before, wherever they appear.
  */
-function bareLinkable(text: string, resolves: (word: string) => boolean): ReadonlySet<string> {
+export function bareLinkable(
+  text: string,
+  resolves: (word: string) => boolean,
+): ReadonlySet<string> {
   const words = lineWords(text);
   if (words.length === 0) return new Set();
   if (words.every(resolves)) return new Set(words);
@@ -169,50 +117,131 @@ function bareLinkable(text: string, resolves: (word: string) => boolean): Readon
   return new Set();
 }
 
+/** One row's part of a token a TUI hard-wrapped: [start, end) in that row. */
+export interface WrapPiece {
+  row: number;
+  start: number;
+  end: number;
+}
+
+/** Most rows one hard-wrapped path is followed across. */
+const WRAP_MAX_ROWS = 4;
+/** A hard wrap breaks at the TUI's box width, so a wrapped piece ends near
+ *  its row's right edge (terminal rows are padded to the full width); a
+ *  token that ends earlier was not wrapped. Keeps ordinary line pairs out of
+ *  the daemon's batches. */
+const WRAP_EDGE_SLACK = 20;
+
+/**
+ * Tokens a TUI hard-wrapped across rows. Ink (Claude Code, Codex) breaks a
+ * long unbroken token at its box width and indents the continuation, so the
+ * pieces sit on separate rows that xterm does not mark as soft-wrapped. For
+ * each row that ends in a token, glue on the first token of the next row
+ * (after its indentation) — and of the row after that while each
+ * continuation fills its row. Every glued prefix of two or more pieces is a
+ * candidate; the daemon decides which one is real.
+ */
+export function wrappedTokens(rows: string[]): { text: string; pieces: WrapPiece[] }[] {
+  const out: { text: string; pieces: WrapPiece[] }[] = [];
+  for (let i = 0; i + 1 < rows.length; i++) {
+    const last = /(\S+)\s*$/.exec(rows[i]);
+    if (last === null) continue;
+    const lastEnd = last.index + last[1].length;
+    if (rows[i].length - lastEnd > WRAP_EDGE_SLACK) continue;
+    const pieces: WrapPiece[] = [{ row: i, start: last.index, end: lastEnd }];
+    let text = last[1];
+    for (let j = i + 1; j < rows.length && pieces.length < WRAP_MAX_ROWS; j++) {
+      const lead = /^(\s*)(\S+)/.exec(rows[j]);
+      if (lead === null) break;
+      const start = lead[1].length;
+      const end = start + lead[2].length;
+      pieces.push({ row: j, start, end });
+      text += lead[2];
+      out.push({ text, pieces: [...pieces] });
+      // Only a continuation that fills its row continues onto the next.
+      if (rows[j].slice(end).trim() !== "" || rows[j].length - end > WRAP_EDGE_SLACK) break;
+    }
+  }
+  return out;
+}
+
+/** A reference re-joined across hard-wrapped rows, with where each end sits. */
+export interface WrappedRef {
+  ref: FileRef;
+  /** Row + offset of the first and last character the link covers. */
+  first: { row: number; index: number };
+  last: { row: number; index: number };
+}
+
+/** Parse `wrappedTokens` into references that genuinely cross a row break. */
+export function wrappedRefs(rows: string[]): WrappedRef[] {
+  const out: WrappedRef[] = [];
+  for (const w of wrappedTokens(rows)) {
+    const f = findFileRef(w.text);
+    if (f === null) continue;
+    // Map joined-string offsets back onto the pieces.
+    const locate = (k: number): { row: number; index: number } | null => {
+      let base = 0;
+      for (const p of w.pieces) {
+        const len = p.end - p.start;
+        if (k < base + len) return { row: p.row, index: p.start + (k - base) };
+        base += len;
+      }
+      return null;
+    };
+    const first = locate(f.start);
+    const last = locate(f.end - 1);
+    if (first === null || last === null || first.row === last.row) continue;
+    // The reference must end in the LAST piece, or a shorter prefix already
+    // covers it.
+    if (last.row !== w.pieces[w.pieces.length - 1].row) continue;
+    out.push({ ref: f.ref, first, last });
+  }
+  return out;
+}
+
 // --- validation cache ---------------------------------------------------------
 
 /** How long a validation verdict stays fresh (files appear and vanish). */
 const CACHE_TTL_MS = 15_000;
 const CACHE_CAP = 5000;
 
+/** A hit, the matches of an ambiguous name, or a miss. */
+type Verdict = ValidatedPath | ValidatedPath[] | null;
+
 interface CacheEntry {
-  hit: ValidatedPath | null;
+  v: Verdict;
   at: number;
 }
 
-/** candidate resolved per base+workspace: see [`cacheKey`]. */
+/** candidate resolved per base ladder + workspace: see [`cacheKey`]. */
 const cache = new Map<string, CacheEntry>();
 const inflight = new Map<string, Promise<void>>();
 
-function cacheKey(base: string, ws: string | null, candidate: string): string {
+function cacheKey(bases: string[], ws: string | null, candidate: string): string {
   // Absolute and ~ candidates resolve the same under any base or workspace.
-  // Relative verdicts key on the workspace too: the daemon's bare-basename
-  // fallback makes the answer depend on it, not just on the base.
+  // Relative verdicts key on the workspace too: the daemon's index
+  // fallbacks make the answer depend on it, not just on the bases.
   const abs = candidate.startsWith("/") || candidate.startsWith("~");
-  return abs ? `\u0000${candidate}` : `${base}\u0000${ws ?? ""}\u0000${candidate}`;
+  return abs ? `\u0000${candidate}` : `${bases.join("\u0001")}\u0000${ws ?? ""}\u0000${candidate}`;
 }
 
-function cacheGet(base: string, ws: string | null, candidate: string): CacheEntry | undefined {
-  const e = cache.get(cacheKey(base, ws, candidate));
+function cacheGet(key: string): CacheEntry | undefined {
+  const e = cache.get(key);
   if (e !== undefined && Date.now() - e.at > CACHE_TTL_MS) {
-    cache.delete(cacheKey(base, ws, candidate));
+    cache.delete(key);
     return undefined;
   }
   return e;
 }
 
-function cachePut(
-  base: string,
-  ws: string | null,
-  candidate: string,
-  hit: ValidatedPath | null,
-): void {
+function cachePut(key: string, v: Verdict): void {
   if (cache.size >= CACHE_CAP) {
     // Drop the stalest half; simple and rare.
     const entries = [...cache.entries()].sort((a, b) => a[1].at - b[1].at);
     for (const [k] of entries.slice(0, CACHE_CAP / 2)) cache.delete(k);
   }
-  cache.set(cacheKey(base, ws, candidate), { hit, at: Date.now() });
+  cache.set(key, { v, at: Date.now() });
 }
 
 /** Test/HMR hook. */
@@ -222,84 +251,65 @@ export function clearLinkCache(): void {
 }
 
 /**
- * Ensure every candidate has a fresh verdict under `base` (plus the
- * workspace's bare-basename fallback when `ws` is set): one batched
- * /fs/validate call per miss set, deduped against in-flight requests.
- * Network failures resolve to nothing cached — retried on the next pass.
+ * Ensure every candidate has a fresh verdict under this base ladder: one
+ * batched /fs/validate call per miss set, deduped against in-flight
+ * requests. Network failures and unanswered candidates cache nothing —
+ * retried on the next pass.
  */
-async function ensureValidated(
-  base: string,
-  ws: string | null,
-  candidates: string[],
-): Promise<void> {
-  const missing = [...new Set(candidates)].filter(
-    (c) => cacheGet(base, ws, c) === undefined && !inflight.has(cacheKey(base, ws, c)),
-  );
+async function ensureValidated(bases: string[], ws: string | null, candidates: string[]): Promise<void> {
   const waits: Promise<void>[] = [];
-  for (const c of candidates) {
-    const w = inflight.get(cacheKey(base, ws, c));
+  const missing: string[] = [];
+  for (const c of new Set(candidates)) {
+    const key = cacheKey(bases, ws, c);
+    const w = inflight.get(key);
     if (w !== undefined) waits.push(w);
+    else if (cacheGet(key) === undefined) missing.push(c);
   }
-  if (missing.length > 0) {
-    // The server caps candidates per request; chunk to stay within it.
-    for (let i = 0; i < missing.length; i += VALIDATE_MAX) {
-      const chunk = missing.slice(i, i + VALIDATE_MAX);
-      const p = fsValidate(chunk, base, ws)
-        .then((valid) => {
-          for (const c of chunk) cachePut(base, ws, c, valid[c] ?? null);
-        })
-        .catch(() => {
-          // daemon unreachable / older daemon: leave uncached, retry later
-        })
-        .finally(() => {
-          for (const c of chunk) inflight.delete(cacheKey(base, ws, c));
-        });
-      for (const c of chunk) inflight.set(cacheKey(base, ws, c), p);
-      waits.push(p);
-    }
+  // The server caps candidates per request; chunk to stay within it.
+  for (let i = 0; i < missing.length; i += VALIDATE_MAX) {
+    const chunk = missing.slice(i, i + VALIDATE_MAX);
+    const p = fsValidate(chunk, bases[0], ws, bases.slice(1))
+      .then((res) => {
+        const unchecked = new Set(res.unchecked);
+        for (const c of chunk) {
+          if (unchecked.has(c)) continue;
+          const many = res.ambiguous[c];
+          const v: Verdict =
+            res.valid[c] ?? (many === undefined ? null : many.length === 1 ? many[0] : many);
+          cachePut(cacheKey(bases, ws, c), v);
+        }
+      })
+      .catch(() => {
+        // daemon unreachable: leave uncached, retry later
+      })
+      .finally(() => {
+        for (const c of chunk) inflight.delete(cacheKey(bases, ws, c));
+      });
+    for (const c of chunk) inflight.set(cacheKey(bases, ws, c), p);
+    waits.push(p);
   }
   await Promise.all(waits);
 }
 
-/**
- * The confirmed hit for `raw` under this context: the session cwd wins,
- * the workspace root is the fallback base for workspace-relative paths.
- */
-function lookup(raw: string, ctx: LinkContext): ValidatedPath | null {
-  const bases = basesFor(raw, ctx);
-  for (const b of bases) {
-    const e = cacheGet(b, ctx.workspaceId, raw);
-    if (e?.hit != null) return e.hit;
-  }
-  return null;
+/** The cached verdict for `raw` under this context (null: miss or unknown). */
+function lookup(raw: string, ctx: LinkContext): Verdict {
+  const bases = resolveBases(ctx, raw);
+  if (bases.length === 0) return null;
+  return cacheGet(cacheKey(bases, ctx.workspaceId, raw))?.v ?? null;
 }
 
-/** Resolution bases to try for a candidate, in priority order. */
-function basesFor(raw: string, ctx: LinkContext): string[] {
-  if (raw.startsWith("/") || raw.startsWith("~")) {
-    // Base is irrelevant but the API requires one.
-    return [ctx.cwd ?? ctx.root ?? "/"];
-  }
-  if (raw.startsWith("./") || raw.startsWith("../")) {
-    return ctx.cwd !== null ? [ctx.cwd] : [];
-  }
-  const bases: string[] = [];
-  if (ctx.cwd !== null) bases.push(ctx.cwd);
-  if (ctx.root !== null && ctx.root !== ctx.cwd) bases.push(ctx.root);
-  return bases;
-}
-
-async function validateAll(candidates: Candidate[], ctx: LinkContext): Promise<void> {
-  const byBase = new Map<string, string[]>();
-  for (const c of candidates) {
-    for (const b of basesFor(c.raw, ctx)) {
-      const list = byBase.get(b);
-      if (list === undefined) byBase.set(b, [c.raw]);
-      else list.push(c.raw);
-    }
+async function validateAll(raws: string[], ctx: LinkContext): Promise<void> {
+  const byBases = new Map<string, { bases: string[]; raws: string[] }>();
+  for (const raw of raws) {
+    const bases = resolveBases(ctx, raw);
+    if (bases.length === 0) continue;
+    const key = bases.join("\u0001");
+    const g = byBases.get(key);
+    if (g === undefined) byBases.set(key, { bases, raws: [raw] });
+    else g.raws.push(raw);
   }
   await Promise.all(
-    [...byBase].map(([base, raws]) => ensureValidated(base, ctx.workspaceId, raws)),
+    [...byBases.values()].map((g) => ensureValidated(g.bases, ctx.workspaceId, g.raws)),
   );
 }
 
@@ -313,16 +323,20 @@ export interface GroupText {
   rowOf: number[];
 }
 
+/** A soft-wrapped run of buffer rows, joined. */
+export interface GroupRun {
+  start: number;
+  end: number;
+  g: GroupText;
+}
+
 /**
  * Join the wrapped-line group containing 0-based buffer row `row` into one
  * string, with an exact string-index → (row, cell) mapping (wide chars and
  * combined graphemes shift string indexes; the map absorbs that).
  * Shared with the URL link provider (`urlLinks.ts`).
  */
-export function groupText(
-  term: Terminal,
-  row: number,
-): { start: number; end: number; g: GroupText } | null {
+export function groupText(term: Terminal, row: number): GroupRun | null {
   const buf = term.buffer.active;
   if (row < 0 || row >= buf.length) return null;
   let start = row;
@@ -349,6 +363,31 @@ export function groupText(
   return { start, end, g };
 }
 
+/** The groups around `grp` a hard-wrapped path could span: up to
+ *  WRAP_MAX_ROWS - 1 on either side, in buffer order. */
+function neighbourGroups(term: Terminal, grp: GroupRun): { groups: GroupRun[]; self: number } {
+  const before: GroupRun[] = [];
+  for (let s = grp.start; before.length < WRAP_MAX_ROWS - 1 && s > 0; ) {
+    const g = groupText(term, s - 1);
+    if (g === null) break;
+    before.unshift(g);
+    s = g.start;
+  }
+  const after: GroupRun[] = [];
+  for (let e = grp.end; after.length < WRAP_MAX_ROWS - 1; ) {
+    const g = groupText(term, e + 1);
+    if (g === null) break;
+    after.push(g);
+    e = g.end;
+  }
+  return { groups: [...before, grp, ...after], self: before.length };
+}
+
+/** Inclusive 1-based cell position (Linkifier hit-test semantics). */
+function cellAt(g: GroupText, index: number): { x: number; y: number } {
+  return { x: g.cellOf[index] + 1, y: g.rowOf[index] + 1 };
+}
+
 // --- the provider ---------------------------------------------------------------
 
 /**
@@ -369,79 +408,134 @@ class PathLinkProvider implements ILinkProvider {
       callback(undefined);
       return;
     }
+    const text = grp.g.text;
     // Hover path: one line group at a time, so bare directory names are worth
     // resolving here (the prefetch below never does this over whole screens).
-    const candidates = extractCandidates(grp.g.text, true);
-    if (candidates.length === 0) {
+    const candidates = extractCandidates(text, true);
+    const strict = new Set(extractCandidates(text).map((c) => c.start));
+    // Paths a TUI hard-wrapped across this row and its neighbours.
+    const { groups, self } = neighbourGroups(this.term, grp);
+    const joined = wrappedRefs(groups.map((x) => x.g.text)).filter(
+      (w) => w.first.row <= self && w.last.row >= self,
+    );
+    if (candidates.length === 0 && joined.length === 0) {
       callback(undefined);
       return;
     }
     const ctx = this.host.context(this.sessionId);
-    void validateAll(candidates, ctx).then(() => {
-      // Bare names link only on a listing / `ls -l` line, never in prose.
-      const bareOk = bareLinkable(grp.g.text, (w) => lookup(w, ctx) !== null);
+    const raws = [...candidates.map((c) => c.raw), ...joined.map((w) => w.ref.path)];
+    void validateAll(raws, ctx).then(() => {
       const links: ILink[] = [];
+      // A re-joined path wins over the fragments of it on this row.
+      const claimed: [number, number][] = [];
+      for (const w of joined) {
+        const v = lookup(w.ref.path, ctx);
+        if (v === null) continue;
+        const a = groups[w.first.row].g;
+        const b = groups[w.last.row].g;
+        links.push(
+          this.link(
+            w.ref.path,
+            { start: cellAt(a, w.first.index), end: cellAt(b, w.last.index) },
+            v,
+            w.ref,
+            ctx,
+          ),
+        );
+        claimed.push([
+          w.first.row === self ? w.first.index : 0,
+          w.last.row === self ? w.last.index + 1 : text.length,
+        ]);
+      }
+      // Bare names link only on a listing / `ls -l` line, never in prose.
+      const bareOk = bareLinkable(text, (word) => lookup(word, ctx) !== null);
       for (const c of candidates) {
-        if (!qualifies(c.raw, false) && !bareOk.has(c.raw)) continue;
-        const hit = lookup(c.raw, ctx);
-        if (hit === null) continue;
+        if (!strict.has(c.start) && !bareOk.has(c.raw)) continue;
         const endIdx = c.start + c.length - 1;
         if (endIdx >= grp.g.cellOf.length) continue;
-        links.push({
-          text: grp.g.text.slice(c.start, c.start + c.length),
-          // Inclusive 1-based cell range (Linkifier hit-test semantics).
-          range: {
-            start: { x: grp.g.cellOf[c.start] + 1, y: grp.g.rowOf[c.start] + 1 },
-            end: { x: grp.g.cellOf[endIdx] + 1, y: grp.g.rowOf[endIdx] + 1 },
-          },
-          activate: (event: MouseEvent) => {
-            this.host.open(
-              this.sessionId,
-              hit.path,
-              hit.kind,
-              event.metaKey || event.ctrlKey,
-            );
-          },
-        });
+        if (claimed.some(([from, to]) => c.start < to && endIdx >= from)) continue;
+        const v = lookup(c.raw, ctx);
+        if (v === null) continue;
+        links.push(
+          this.link(
+            text.slice(c.start, c.start + c.length),
+            { start: cellAt(grp.g, c.start), end: cellAt(grp.g, endIdx) },
+            v,
+            c.ref,
+            ctx,
+          ),
+        );
       }
       callback(links.length > 0 ? links : undefined);
     });
   }
+
+  private link(
+    text: string,
+    range: ILink["range"],
+    v: ValidatedPath | ValidatedPath[],
+    ref: FileRef,
+    ctx: LinkContext,
+  ): ILink {
+    return {
+      text,
+      range,
+      activate: (event: MouseEvent) => {
+        const split = event.metaKey || event.ctrlKey;
+        const reveal = revealOf(ref);
+        const open = (hit: ValidatedPath) =>
+          this.host.open(this.sessionId, hit.path, hit.kind, {
+            split,
+            reveal: hit.kind === "file" ? reveal : undefined,
+          });
+        if (!Array.isArray(v)) {
+          open(v);
+          return;
+        }
+        // Several files answer to this name: ask which.
+        contextMenu.openAt(
+          event,
+          v.map((hit) => ({
+            label: ctx.root !== null ? workspaceRelative(hit.path, ctx.root) : hit.path,
+            onSelect: () => open(hit),
+          })),
+        );
+      },
+    };
+  }
 }
 
-const PREFETCH_DEBOUNCE_MS = 250;
+/** A constantly animating TUI renders every frame; a debounce would never
+ *  fire under it, so the prefetch runs at most this often instead. */
+const PREFETCH_INTERVAL_MS = 300;
 
 /**
- * Wire path links into a pooled terminal: the link provider plus a debounced
+ * Wire path links into a pooled terminal: the link provider plus a throttled
  * viewport prefetch (fired on render, i.e. output/scroll/resize) that batch-
  * validates every candidate on screen so hover never waits on the network.
  * Returns a dispose function.
  */
-export function registerPathLinks(
-  term: Terminal,
-  sessionId: string,
-  host: LinkHost,
-): () => void {
+export function registerPathLinks(term: Terminal, sessionId: string, host: LinkHost): () => void {
   const provider = term.registerLinkProvider(new PathLinkProvider(term, sessionId, host));
 
   let timer: ReturnType<typeof setTimeout> | null = null;
   const prefetch = () => {
     timer = null;
     const buf = term.buffer.active;
-    const seen = new Set<number>();
-    const all: Candidate[] = [];
-    for (let r = 0; r < term.rows; r++) {
-      const row = buf.viewportY + r;
-      const grp = groupText(term, row);
-      if (grp === null || seen.has(grp.start)) continue;
-      seen.add(grp.start);
-      all.push(...extractCandidates(grp.g.text));
+    const groups: GroupRun[] = [];
+    const last = buf.viewportY + term.rows - 1;
+    for (let row = buf.viewportY; row <= last; ) {
+      const g = groupText(term, row);
+      if (g === null) break;
+      groups.push(g);
+      row = g.end + 1;
     }
-    if (all.length > 0) void validateAll(all, host.context(sessionId));
+    const raws = groups.flatMap((g) => extractCandidates(g.g.text).map((c) => c.raw));
+    for (const w of wrappedRefs(groups.map((g) => g.g.text))) raws.push(w.ref.path);
+    if (raws.length > 0) void validateAll(raws, host.context(sessionId));
   };
   const schedule = () => {
-    if (timer !== null) clearTimeout(timer);
-    timer = setTimeout(prefetch, PREFETCH_DEBOUNCE_MS);
+    if (timer === null) timer = setTimeout(prefetch, PREFETCH_INTERVAL_MS);
   };
   const render = term.onRender(schedule);
   schedule();
@@ -451,65 +545,4 @@ export function registerPathLinks(
     render.dispose();
     provider.dispose();
   };
-}
-
-// --- dev-only self-checks -----------------------------------------------------
-if (import.meta.env.DEV) {
-  const ok = (cond: boolean, msg: string) => console.assert(cond, `links.ts self-check: ${msg}`);
-  const raws = (s: string) => extractCandidates(s).map((c) => c.raw);
-
-  ok(raws("see results/qc/report.html now").join() === "results/qc/report.html", "relative w/ slash");
-  ok(raws("cat /etc/hosts").join() === "/etc/hosts", "absolute");
-  ok(raws("ls ~/data and ./main.rs and ../up.txt").join() === "~/data,./main.rs,../up.txt", "~ ./ ../ forms");
-  ok(raws("plain words never qualify").length === 0, "bare words don't qualify");
-  ok(raws("open haiku.txt please").join() === "haiku.txt", "bare filename with extension");
-  ok(raws("versions 1.2.3 and 4.8 skip").length === 0, "version numbers don't qualify");
-  ok(raws("https://support.claude.com/en/a-b").length === 0, "URLs never qualify");
-  ok(raws("see main.rs.").join() === "main.rs", "trailing sentence dot trims");
-  ok(raws("ls -la .claude .env here").join() === ".claude,.env", "dotfolders keep their leading dot");
-  ok(raws("cat .config/nvim/init.lua").join() === ".config/nvim/init.lua", "dotfolder path keeps the dot");
-  ok(raws("wait... then go").length === 0, "leading ellipsis is not a candidate");
-  ok(raws("--color=always -la").length === 0, "flags don't qualify");
-  const withLine = extractCandidates("err at src/lib.rs:42 here")[0];
-  ok(withLine.raw === "src/lib.rs" && withLine.line === 42, "line suffix parses");
-  ok(withLine.length === "src/lib.rs:42".length, "underline covers the :line suffix");
-  ok(raws("dir results/ listed").join() === "results/", "trailing slash survives");
-
-  // Bare mode (hover only): single-segment names — a directory like `crates`,
-  // an extensionless file like `justfile` — become candidates. The prefetch
-  // never uses it, so whole screens of prose are never mass-validated.
-  const bareRaws = (s: string) => extractCandidates(s, true).map((c) => c.raw);
-  ok(bareRaws("cd crates").join() === "cd,crates", "bare names qualify on hover");
-  ok(bareRaws("run justfile").join() === "run,justfile", "extensionless files qualify on hover");
-  ok(bareRaws("bump to 1.2.3 or 4.8").join() === "bump,to,or", "bare mode still skips version numbers");
-  ok(bareRaws("-la --color").length === 0, "bare mode still skips flags");
-  // The contrast that keeps the daemon cheap: prose is candidate-rich on hover
-  // (one line), and candidate-free in the whole-screen prefetch.
-  ok(bareRaws("plain words here").length === 3, "prose words are candidates on hover");
-  ok(raws("plain words here").length === 0, "…but never in the prefetch");
-
-  // Being a candidate is not enough: a bare name only LINKS on a line shape
-  // prose never has. `has(...)` stands in for "the daemon confirmed this path".
-  const has =
-    (...names: string[]) =>
-    (w: string) =>
-      names.includes(w);
-  const bare = (s: string, r: (w: string) => boolean) => [...bareLinkable(s, r)].join();
-  ok(
-    bare("Cargo.lock  crates  target", has("Cargo.lock", "crates", "target")) ===
-      "Cargo.lock,crates,target",
-    "listing line: every word resolves, so bare names link",
-  );
-  ok(bare("update the docs now", has("docs")) === "", "prose never yields bare links");
-  ok(bare("cd crates", has("crates")) === "", "a command word breaks the listing shape");
-  ok(
-    bare("drwxr-xr-x 5 me staff 160 Jul 7 18:04 crates", has("crates")) === "crates",
-    "ls -l entry: the trailing name links",
-  );
-  ok(
-    bare("drwxr-xr-x 5 me staff 160 Jul 7 18:04 gone", has("crates")) === "",
-    "ls -l entry: an unresolved name does not link",
-  );
-  ok(bare("me@host chimaera % ls", has("chimaera")) === "", "prompt line yields no bare links");
-  ok(bare("crates", has("crates")) === "crates", "a lone resolving name links (ls -1)");
 }

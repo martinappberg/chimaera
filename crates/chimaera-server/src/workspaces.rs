@@ -47,6 +47,11 @@ pub(crate) struct Workspace {
     /// absent for unbound workspaces (and for every pre-upgrade record).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) mastermind: Option<MastermindCfg>,
+    /// Workbench plugins the user switched on for THIS workspace (`plugins`)
+    /// — the per-workspace Plugins page is where the switch lives, so the
+    /// switch is per workspace. Additive wire field: absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) plugins_on: Vec<String>,
 }
 
 /// In-memory workspace list backed by a JSON file (save-on-change).
@@ -101,6 +106,7 @@ impl WorkspaceStore {
             name,
             last_opened_at: unix_now(),
             mastermind: None,
+            plugins_on: Vec::new(),
         };
         self.items.push(workspace.clone());
         self.save()?;
@@ -138,6 +144,35 @@ impl WorkspaceStore {
         entry.mastermind = cfg;
         let workspace = entry.clone();
         self.save()?;
+        Ok(Some(workspace))
+    }
+
+    /// Switch plugin `pid` on or off for workspace `id`. Same durability
+    /// contract as [`Self::set_mastermind`], with the rollback done here: an
+    /// agent-visible toggle the next restart forgets is worse than a refused
+    /// one.
+    pub(crate) fn set_plugin_on(
+        &mut self,
+        id: &str,
+        pid: &str,
+        on: bool,
+    ) -> anyhow::Result<Option<Workspace>> {
+        let Some(entry) = self.items.iter_mut().find(|w| w.id == id) else {
+            return Ok(None);
+        };
+        let before = entry.plugins_on.clone();
+        entry.plugins_on.retain(|p| p != pid);
+        if on {
+            entry.plugins_on.push(pid.to_string());
+            entry.plugins_on.sort();
+        }
+        let workspace = entry.clone();
+        if let Err(err) = self.save() {
+            if let Some(entry) = self.items.iter_mut().find(|w| w.id == id) {
+                entry.plugins_on = before;
+            }
+            return Err(err);
+        }
         Ok(Some(workspace))
     }
 

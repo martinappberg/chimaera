@@ -86,6 +86,25 @@ impl ViewStateStore {
         }
     }
 
+    /// The `surfaces` lists (what each window shows) of every window
+    /// currently showing workspace `ws`, WITHOUT touching recency (a status
+    /// read must not keep a dead tab's blob alive). Keys are `<win>_<ws>`;
+    /// the `ws_<ws>` mirror is skipped (it duplicates a window).
+    pub(crate) fn surfaces_for(&self, ws: &str) -> Vec<(String, serde_json::Value)> {
+        let suffix = format!("_{ws}");
+        self.items
+            .iter()
+            .filter(|(k, _)| k.ends_with(&suffix) && !k.starts_with("ws_"))
+            .filter_map(|(k, v)| {
+                let surfaces = v.get("surfaces")?;
+                surfaces
+                    .is_array()
+                    .then(|| (k.trim_end_matches(&suffix).to_string(), surfaces.clone()))
+            })
+            .take(8)
+            .collect()
+    }
+
     /// A read counts as use: a window that boots or switches workspace
     /// reads its blob, and that must keep it out of the eviction queue's
     /// front even when it never edits its layout afterwards.

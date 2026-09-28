@@ -3,7 +3,7 @@
   import BrandMark from "../shared/BrandMark.svelte";
   import ComputeLaunchDialog from "./ComputeLaunchDialog.svelte";
   import { keyHint } from "../shared/keybindings";
-  import { isBusy, needsAttention, type Session, type Workspace } from "./sessions";
+  import { isBusy, needsApproval, type Session, type Workspace } from "./sessions";
   import {
     addHost,
     beginUpdate,
@@ -45,6 +45,8 @@
   import ComputeBanner from "./ComputeBanner.svelte";
   import { getJobContext, isHomeHub, type Health } from "../net/api";
   import { asyncDisposer } from "../shared/asyncDisposer";
+  import { relativeAge } from "./launcher";
+  import { checkForUpdates, updateState } from "./update.svelte";
 
   interface Props {
     workspaces: Workspace[];
@@ -100,10 +102,11 @@
     for (const s of sessions) {
       const entry = map.get(s.workspace_id) ?? { live: 0, attn: 0 };
       if (s.alive) entry.live += 1;
-      // A crashed chat driver stays registered (alive:false, errored) until
-      // deleted; only a LIVE ask is something the user can act on — the same
-      // gate as App's needsYou and the dashboard lane.
-      if (s.alive && needsAttention(s)) entry.attn += 1;
+      // Counts are approvals only (needsApproval — the same predicate as
+      // App's needsYou pill/title and the Dock badge). Alive-gated: a crashed
+      // chat driver stays registered (alive:false) until deleted, and only a
+      // LIVE ask is something the user can act on.
+      if (s.alive && needsApproval(s)) entry.attn += 1;
       map.set(s.workspace_id, entry);
     }
     return map;
@@ -202,6 +205,38 @@
   let localUpdating = $state(false);
   let localError = $state<string | null>(null);
 
+  // --- the version stamp: which daemon, and is it current? --------------------
+
+  /** A newer release the daemon knows of (its own check), shown on the stamp. */
+  const stampNewer = $derived(
+    updateState.daemon?.state === "available" ? (updateState.daemon.latest?.version ?? null) : null,
+  );
+  /** Read when the pointer arrives, so "checked 2h ago" is true on hover
+   *  without a ticking clock on the home screen. */
+  let stampNow = $state(Date.now());
+
+  const stampTitle = $derived.by(() => {
+    const v =
+      health?.version === "0.0.1"
+        ? `development daemon (build ${health.build ?? "unknown"})`
+        : `daemon v${health?.version ?? "?"}`;
+    const d = updateState.daemon;
+    if (d === null) return `${v}. Click to check for updates.`;
+    if (d.dev) return `${v}: release updates don't apply. Click to check anyway.`;
+    const checked = d.checked_at === null ? null : relativeAge(d.checked_at, stampNow);
+    const when = checked === null ? "" : checked === "now" ? " (checked just now)" : ` (checked ${checked} ago)`;
+    switch (d.state) {
+      case "available":
+        return `${v}: ${d.latest?.version ?? "a newer release"} is available. Click for details.`;
+      case "failed":
+        return `${v}: couldn't check for updates${when}: ${d.error ?? "unknown error"}. Click to try again.`;
+      case "unchecked":
+        return `${v}: not checked for updates yet. Click to check.`;
+      case "current":
+        return `${v}: up to date${when}. Click to check again.`;
+    }
+  });
+
   // --- app self-update (native shell only) -----------------------------------
 
   /** A newer signed app build is available on GitHub (its version), or null. */
@@ -230,6 +265,7 @@
 
   const PHASE_LABEL: Record<ConnectProgress["phase"], string> = {
     probing: "probing for a running daemon…",
+    routing: "reaching the daemon's login node…",
     updating: "updating the daemon…",
     downloading: "downloading chimaera…",
     installing: "installing chimaera…",
@@ -282,7 +318,11 @@
     unlisteners.push(
       asyncDisposer(
         onConnectProgress((p) => {
-          phases = new Map(phases).set(p.alias, PHASE_LABEL[p.phase] ?? p.phase);
+          const label =
+            p.phase === "routing" && p.node !== undefined
+              ? `reaching the daemon on ${p.node}…`
+              : (PHASE_LABEL[p.phase] ?? p.phase);
+          phases = new Map(phases).set(p.alias, label);
         }),
       ),
     );
@@ -299,6 +339,9 @@
                   ...h,
                   status: e.status === "connected" ? "connected" : "disconnected",
                   local_port: e.status === "connected" ? (e.local_port ?? h.local_port) : null,
+                  // Authoritative on every connected event: a reconnect this
+                  // window didn't start may have re-routed the alias.
+                  node: e.status === "connected" ? (e.node ?? null) : h.node,
                 }
               : h,
           );
@@ -731,6 +774,11 @@
     return new Date(unixSecs * 1000).toISOString().slice(0, 10);
   }
 
+  /** A login node's first label — "sh03-ln06" for "sh03-ln06.stanford.edu". */
+  function shortNode(node: string): string {
+    return node.split(".")[0] || node;
+  }
+
   /** Shorten an absolute path with ~ for scanability. */
   function tildify(path: string): string {
     const m = path.match(/^\/(?:home|Users)\/[^/]+(\/.*)?$/);
@@ -778,16 +826,19 @@
     <!-- The mark identifies the DAEMON serving this window (the daemon
          outlives app reinstalls by design, so this is the version that
          actually matters — and a dev daemon must say so instead of posing
-         as an ordinary "v0.0.1"). -->
-    {#if health.version === "0.0.1"}
-      <span
-        class="version-mark"
-        title="this window is served by a development daemon (build {health.build ?? 'unknown'})"
-        >daemon dev·{(health.build ?? "unknown").split(".")[0]}</span
-      >
-    {:else}
-      <span class="version-mark" title="daemon version">v{health.version}</span>
-    {/if}
+         as an ordinary "v0.0.1"). A click is an explicit update check: the
+         toast answers it, "up to date" or "development build" included. -->
+    <button
+      class="version-mark"
+      class:newer={stampNewer !== null}
+      title={stampTitle}
+      onpointerenter={() => (stampNow = Date.now())}
+      onclick={() => void checkForUpdates(true)}
+    >
+      {#if health.version === "0.0.1"}daemon dev·{(health.build ?? "unknown").split(".")[0]}{:else}v{health.version}{/if}{#if stampNewer !== null}<span class="newer-tag"
+          >{` · ${stampNewer} available`}</span
+        >{/if}
+    </button>
   {/if}
   <div class="inner">
     <header class="masthead">
@@ -921,7 +972,7 @@
                   <span
                     class="dot {wsState}"
                     title={wsState === "attn"
-                      ? `${live?.attn} need${live?.attn === 1 ? "s" : ""} you`
+                      ? `${live?.attn} awaiting approval`
                       : wsState === "alive"
                         ? `${live?.live} live session${live?.live === 1 ? "" : "s"}`
                         : "no live sessions"}
@@ -929,7 +980,7 @@
                   <span class="name">{w.name}</span>
                   <span class="path">{tildify(w.root)}</span>
                   {#if live !== undefined && live.attn > 0}
-                    <span class="badge attn" title="{live.attn} need{live.attn === 1 ? 's' : ''} you">
+                    <span class="badge attn" title="{live.attn} awaiting approval">
                       <span class="dot attn"></span>{live.attn}
                     </span>
                   {/if}
@@ -1249,6 +1300,12 @@
                       {/if}
                       {#if phase !== undefined}
                         <span class="phase">{phase}</span>
+                      {:else if h.status === "connected" && h.node}
+                        <span
+                          class="phase quiet"
+                          title="{h.alias} spans several login nodes; its daemon runs on {h.node}, so this connection is pinned there"
+                          >online · {shortNode(h.node)} · 127.0.0.1:{h.local_port}</span
+                        >
                       {:else if h.status === "connected"}
                         <span class="phase quiet">online · 127.0.0.1:{h.local_port}</span>
                       {:else}
@@ -1498,8 +1555,14 @@
     gap: 9px;
   }
 
-  /* Quiet running-version stamp, pinned to the home screen's corner. */
+  /* Quiet running-version stamp, pinned to the home screen's corner — a
+     button (a click checks for updates) reset to plain text. */
   .version-mark {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0;
+    cursor: pointer;
     position: fixed;
     bottom: 12px;
     right: 16px;
@@ -1514,6 +1577,15 @@
 
   .version-mark:hover {
     opacity: 0.9;
+  }
+
+  /* A known newer release lifts the stamp out of its whisper. */
+  .version-mark.newer {
+    opacity: 0.85;
+  }
+
+  .newer-tag {
+    color: var(--accent);
   }
 
   h1 {

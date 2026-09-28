@@ -63,7 +63,8 @@ should come with tests at that level.
 ## Releases and update signing
 
 **A releasing merge to `main` cuts a published release.** `.github/workflows/release.yml`
-derives the next version from the last git tag, bumped from the squash-merge **subject**
+derives the next version from the last git tag, bumped by the largest bump the squash-merge
+**subjects** since that tag ask for
 (`feat:` → minor, `fix:`/`perf:` → patch, `!` → major; `refactor:`/`chore:`/`docs:`/… and
 `[skip release]` cut **no** release), builds the static musl daemon binaries and the signed
 macOS app, and **publishes** (not drafts) the GitHub Release. Publishing directly is safe

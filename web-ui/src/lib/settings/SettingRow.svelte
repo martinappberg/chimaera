@@ -10,6 +10,8 @@
   import { isNativeShell } from "../net/native";
   import type { SettingDef, SettingId, SettingValue } from "./schema";
   import { activeTheme, getSetting, isModified, resetSetting, setSetting } from "./store.svelte";
+  import Segmented from "../shared/Segmented.svelte";
+  import Switch from "../shared/Switch.svelte";
 
   interface Props {
     def: SettingDef;
@@ -153,16 +155,7 @@
 
   <div class="control">
     {#if def.type === "boolean"}
-      <button
-        class="toggle"
-        class:on={value === true}
-        role="switch"
-        aria-checked={value === true}
-        aria-label={def.title}
-        onclick={() => set(!(value as boolean))}
-      >
-        <span class="knob"></span>
-      </button>
+      <Switch on={value === true} label={def.title} onToggle={(next) => set(next)} />
     {:else if def.type === "number" || def.type === "integer"}
       <div class="num">
         {#if def.min !== undefined && def.max !== undefined}
@@ -219,19 +212,12 @@
       </div>
     {:else if def.type === "enum"}
       {#if (def.options ?? []).length <= 4}
-        <div class="seg" role="radiogroup" aria-label={def.title}>
-          {#each def.options ?? [] as opt (opt.value)}
-            <button
-              class="seg-btn"
-              class:on={value === opt.value}
-              role="radio"
-              aria-checked={value === opt.value}
-              onclick={() => set(opt.value)}
-            >
-              {opt.label}
-            </button>
-          {/each}
-        </div>
+        <Segmented
+          options={def.options ?? []}
+          value={value as string}
+          label={def.title}
+          onChange={(v) => set(v)}
+        />
       {:else}
         <select
           class="select"
@@ -462,44 +448,8 @@
     padding-top: 2px;
   }
 
-  /* --- toggle --- */
-  .toggle {
-    appearance: none;
-    border: 1px solid var(--edge);
-    background: var(--row-hover);
-    width: 34px;
-    height: 19px;
-    border-radius: 10px;
-    padding: 0;
-    cursor: pointer;
-    position: relative;
-    transition:
-      background-color 0.14s ease,
-      border-color 0.14s ease;
-  }
-
-  .toggle .knob {
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    width: 13px;
-    height: 13px;
-    border-radius: 50%;
-    background: var(--muted);
-    transition:
-      transform 0.14s ease,
-      background-color 0.14s ease;
-  }
-
-  .toggle.on {
-    background: color-mix(in srgb, var(--accent) 28%, var(--row-hover));
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-  }
-
-  .toggle.on .knob {
-    transform: translateX(15px);
-    background: var(--accent);
-  }
+  /* The toggle and the segmented bar are the shared primitives
+     (shared/Switch.svelte, shared/Segmented.svelte) — their recipes live there. */
 
   /* --- number --- */
   .num {
@@ -673,42 +623,6 @@
   }
 
   /* --- enum --- */
-  .seg {
-    display: flex;
-    border: 1px solid var(--edge);
-    border-radius: 7px;
-    overflow: hidden;
-  }
-
-  .seg-btn {
-    appearance: none;
-    border: none;
-    background: none;
-    font: inherit;
-    font-size: var(--text-sm);
-    color: var(--muted);
-    padding: 3px 11px;
-    cursor: pointer;
-    transition:
-      background-color 0.12s ease,
-      color 0.12s ease;
-  }
-
-  .seg-btn + .seg-btn {
-    border-left: 1px solid var(--edge);
-  }
-
-  .seg-btn:hover {
-    color: var(--fg);
-    background: var(--row-hover);
-  }
-
-  .seg-btn.on {
-    color: var(--fg);
-    font-weight: 600;
-    background: color-mix(in srgb, var(--accent) 16%, transparent);
-  }
-
   .select {
     font: inherit;
     font-size: var(--text-sm);
@@ -938,7 +852,9 @@
      the hex field shrinks to fit, and the segmented bar — which can't shrink —
      wraps as separated pills. */
   @container settings (max-width: 360px) {
-    .seg {
+    /* The shared Segmented's own `wrap` look, reached through the scope
+       boundary — the query lives here because the container is this row's. */
+    .control :global(.seg) {
       flex-wrap: wrap;
       gap: 5px;
       border: none;
@@ -946,7 +862,7 @@
       overflow: visible;
     }
 
-    .seg-btn {
+    .control :global(.seg-btn) {
       border: 1px solid var(--edge);
       border-radius: 6px;
     }

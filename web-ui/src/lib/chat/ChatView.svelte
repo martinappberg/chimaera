@@ -2,9 +2,19 @@
   import { onDestroy, tick, untrack } from "svelte";
   import { displayName, forkSession, rewindSession, renameSession, type Session } from "../workspace/sessions";
   import { fsValidate } from "../previews/files";
+  import { openPath, type OpenPathOptions, type PathKind } from "../shared/openPath";
+  import type { LinkContext } from "../shared/fileRef";
+  import {
+    chatLinkContext,
+    groupByBases,
+    PathResolver,
+    resolveAndOpen,
+    resolveScope,
+    type ValidateAnswer,
+  } from "./paths";
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { insertIntoComposer } from "./composerBus";
+  import { insertIntoComposer, registerFollow } from "./composerBus";
   import {
     acquireChat,
     releaseChat,
@@ -31,12 +41,14 @@
   import WorkTray from "../shared/WorkTray.svelte";
   import Chevron from "../shared/Chevron.svelte";
   import ArtifactGallery from "./ArtifactGallery.svelte";
+  import { EmbedResolver } from "./embeds";
   import PermissionCard from "./PermissionCard.svelte";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
   import QuestionCard from "./QuestionCard.svelte";
   import UsagePanel from "./UsagePanel.svelte";
   import McpPanel from "./McpPanel.svelte";
   import RewindDialog from "./RewindDialog.svelte";
+  import AttachmentStrip from "./AttachmentStrip.svelte";
   import ForkDialog from "./ForkDialog.svelte";
   import AgentMessageMeta from "./AgentMessageMeta.svelte";
   import Composer from "./Composer.svelte";
@@ -53,14 +65,21 @@
   import {
     advanceTailWindow,
     autoPageEarlier,
+    pageAround,
     pageEarlier,
     pageLater,
+    PREFETCH_VIEWPORTS,
+    prefetchPage,
     restoreVirtualWindow,
     restoreWindow,
+    spacerNeedsRebalance,
+    spacerTarget,
     tailWindow,
     trimShift,
     type PagePlan,
   } from "./transcriptWindow";
+  import { measureShift, selectAnchor, type ReadingAnchor } from "./readingAnchor";
+  import { blockWeight, HistoryWeights } from "./heightModel";
   import { getSetting } from "../settings/store.svelte";
 
   interface Props {
@@ -73,7 +92,9 @@
     terminals?: { id: string; name: string }[];
     /** Open a file path in an adjacent pane (the workbench path-click flow). */
     onOpenFile?: (path: string) => void;
-    /** Kind-aware open: files → viewer pane, dirs → the Finder. */
+    /** Kind-aware open: files → viewer pane, dirs → the Finder. A fallback:
+     *  path links open through the workbench opener (`shared/openPath.ts`)
+     *  whenever App has registered one. */
     onOpenPath?: (path: string, kind: "file" | "dir") => void;
     /** Flip this session to its real TUI (the pane-bar view toggle). Used for
      *  interactive CLI flows the `-p` stream-json mode can't run — `/login`
@@ -106,7 +127,11 @@
   onDestroy(() => releaseChat(session.id));
   onDestroy(() => {
     if (followFrame !== null) cancelAnimationFrame(followFrame);
+    if (prefetchFrame !== null) cancelAnimationFrame(prefetchFrame);
+    if (idleTimer !== null) clearTimeout(idleTimer);
   });
+  onDestroy(() => prosePaths.dispose());
+  onDestroy(() => proseEmbeds.dispose());
 
   // Curated model choices for this agent's picker (daemon-cached catalog).
   let models = $state<{ id: string; label: string }[]>([]);
@@ -135,7 +160,9 @@
 
   let transcriptEl = $state<HTMLElement | null>(null);
   let columnEl = $state<HTMLElement | null>(null);
+  let spacerEl = $state<HTMLElement | null>(null);
   let historySentinelEl = $state<HTMLElement | null>(null);
+  let laterSentinelEl = $state<HTMLElement | null>(null);
   const canAutoLoadHistory = typeof IntersectionObserver !== "undefined";
   // Seed scroll intent from the pool so a remount restores the reading
   // position instead of snapping to the bottom.
@@ -161,8 +188,8 @@
   let renderEnd = $state(0);
   let renderReady = $state(false);
   let renderedVersion = $state(-1);
-  // Plain (non-reactive) bookkeeping, like tracksTail/rendersLive: only ever
-  // read inside the windowing effect's untracked body or handlers.
+  // Plain (non-reactive) bookkeeping, like rendersLive: only ever read
+  // inside the windowing effect's untracked body or handlers.
   /** store.structuralVersion at the last range write. "Did the row set
    *  change" keys on this, never on lengths: at cap append+trim nets the
    *  length out, and a retracted-then-reappended tail nets even the virtual
@@ -185,13 +212,19 @@
   /** A non-empty draft pauses bottom-following, never transcript rendering. */
   let composerEngaged = $state(false);
   /** An explicit history page is stable. Ordinary scrolling inside a tail page
-   *  keeps streaming until retaining the reader would exceed the DOM cap. */
-  let tracksTail = false;
+   *  keeps streaming until retaining the reader would exceed the DOM cap.
+   *  Reactive for the template only (the windowing effect reads it
+   *  untracked): a row appended to a tail window lags renderEnd by one flush,
+   *  and reading that lag as "newer rows omitted" tore the live chrome out
+   *  and back in — a layout forced in between shrank the transcript under a
+   *  pinned reader, and WebKit's scrollTop clamp there read as scrolling up. */
+  let tracksTail = $state(false);
+  const atLiveEdge = $derived(tracksTail || renderEnd >= store.blocks.length);
   let rendersLive = false;
   let wasVisible = false;
   let pagingTranscript = false;
   const hasDeferredActivity = $derived(
-    followedVersion !== store.transcriptVersion || renderEnd < store.blocks.length,
+    followedVersion !== store.transcriptVersion || !atLiveEdge,
   );
 
   function markFollowed(version = store.transcriptVersion): void {
@@ -259,41 +292,10 @@
     anchorRevision += 1;
   }
 
-  interface TranscriptAnchor {
-    node: HTMLElement;
-    /** The anchored row's block uid (a group's first tool) — trim-proof
-     *  identity, unlike the index label which goes stale by the trim delta
-     *  the moment a reducer trim outruns the last render. */
-    uid: number | null;
-    index: number | null;
-    top: number;
-    scrollTop: number;
-  }
-
-  function readTranscriptAnchor(): TranscriptAnchor | null {
-    const el = transcriptEl;
-    const column = columnEl;
-    if (el === null || column === null) return null;
-    const viewportTop = el.getBoundingClientRect().top;
-    const node = Array.from(column.querySelectorAll<HTMLElement>("[data-block-index]")).find(
-      (candidate) => candidate.getBoundingClientRect().bottom > viewportTop,
-    );
-    if (node === undefined) return null;
-    const parsed = Number(node.dataset.blockIndex);
-    const uidParsed = Number(node.dataset.blockUid);
-    return {
-      node,
-      uid: Number.isFinite(uidParsed) ? uidParsed : null,
-      index: Number.isFinite(parsed) ? parsed : null,
-      top: node.getBoundingClientRect().top,
-      scrollTop: el.scrollTop,
-    };
-  }
-
   /** The anchored row's CURRENT absolute index, resolved by uid identity
    *  against the rendered slice (immune to stale DOM labels after a trim
    *  shift); the parsed label is the fallback for a row already dropped. */
-  function anchorArrayIndex(anchor: TranscriptAnchor): number | null {
+  function anchorArrayIndex(anchor: ReadingAnchor): number | null {
     if (anchor.uid !== null) {
       const offset = renderBlocks.findIndex((b) => b.uid === anchor.uid);
       if (offset !== -1) return renderStart + offset;
@@ -303,57 +305,258 @@
 
   function canDiscardBefore(start: number): boolean {
     if (start <= renderStart) return true;
-    const anchor = readTranscriptAnchor();
+    const anchor =
+      transcriptEl === null || columnEl === null ? null : selectAnchor(transcriptEl, columnEl);
     if (anchor === null) return false;
     const index = anchorArrayIndex(anchor);
     return index !== null && index >= start;
   }
 
-  /** Replace a range while keeping the same source row at the same screen
-   *  coordinate. The source index also survives a keyed group replacement. */
+  // --- reading position -----------------------------------------------------
+  // A reader who scrolled away from the tail keeps the text under them fixed
+  // through every layout change above it — a page mounted or trimmed, a
+  // preview decoding, a fold regrouping. The shift is measured on the row at
+  // the viewport's top edge (readingAnchor.ts) and absorbed by the history
+  // spacer ahead of the column, NOT by rewriting scrollTop: WebKit has no
+  // native scroll anchoring, and its scrolling thread snaps a mid-fling
+  // scrollTop write back for a frame or two (why transcriptWindow.ts owns the
+  // spacer policy). The spacer is only resized — with one compensating write —
+  // at scroll idle or where the follow writer already owns the position.
+  /** Spacer height in px, written straight to the element: absorption runs
+   *  inside scroll/resize callbacks and must land before this frame paints.
+   *  Negative when an estimate fell short (rendered as a negative margin). */
+  let spacerPx = 0;
+  /** The row the reader is on while not following the tail. */
+  let readingAnchor: ReadingAnchor | null = null;
+  /** Direction of travel, so prefetch only pages the way the reader goes. */
+  let lastScrollTop = 0;
+  let scrollDirection: -1 | 1 = -1;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  let prefetchFrame: number | null = null;
+  /** No scroll event for this long means no gesture or momentum is in flight. */
+  const SCROLL_IDLE_MS = 160;
+
+  function setSpacer(px: number): void {
+    spacerPx = Math.round(px);
+    if (spacerEl === null) return;
+    spacerEl.style.height = `${Math.max(0, spacerPx)}px`;
+    spacerEl.style.marginBottom = `${Math.min(0, spacerPx)}px`;
+  }
+
+  /** Persist the reading position relative to the rendered rows — the spacer
+   *  is re-derived on remount, so an absolute scrollTop would drift. */
+  function saveReadingPosition(bottom: boolean): void {
+    const el = transcriptEl;
+    if (el === null) return;
+    saveChatScroll(session.id, Math.max(0, el.scrollTop - spacerPx), bottom);
+  }
+
+  function pinReadingAnchor(): void {
+    readingAnchor =
+      transcriptEl === null || columnEl === null ? null : selectAnchor(transcriptEl, columnEl);
+  }
+
+  /** Give back any shift of the anchored row through the spacer — never a
+   *  scroll write, which a gesture in flight would snap back. */
+  function holdReadingAnchor(): void {
+    const el = transcriptEl;
+    const column = columnEl;
+    if (el === null || column === null || readingAnchor === null) return;
+    const measured = measureShift(readingAnchor, column);
+    if (measured === null) {
+      pinReadingAnchor();
+      return;
+    }
+    readingAnchor = measured.anchor;
+    if (Math.abs(measured.shift) >= 1) setSpacer(spacerPx - measured.shift);
+  }
+
+  /** Modelled weight of the unmounted history (heightModel.ts), and the px
+   *  one unit of it renders at, calibrated on the mounted window. */
+  const historyWeights = new HistoryWeights();
+
+  function charsPerLine(): number {
+    const width = columnEl?.clientWidth ?? 0;
+    return width > 0 ? width / (chatFontSize * 0.55) : 80;
+  }
+
+  function historyGeneration(): string {
+    return `${store.epoch}|${store.trimmedCount}`;
+  }
+
+  /** Rendered px per model unit across the mounted window, clamped so one
+   *  odd window (an expanded tool card, a gallery) cannot skew it wildly. */
+  function windowPxPerWeight(): number {
+    const column = columnEl;
+    const nominal = chatFontSize * chatLineHeight;
+    if (column === null) return nominal;
+    const children = column.children;
+    let first: HTMLElement | null = null;
+    let last: HTMLElement | null = null;
+    for (let i = 0; i < children.length && first === null; i++) {
+      if (children[i].hasAttribute("data-block-uid")) first = children[i] as HTMLElement;
+    }
+    for (let i = children.length - 1; i >= 0 && last === null; i--) {
+      if (children[i].hasAttribute("data-block-uid")) last = children[i] as HTMLElement;
+    }
+    const cpl = charsPerLine();
+    let weight = 0;
+    // Bounded by the live array: a reset or tail splice can shrink it before
+    // the windowing effect repairs renderEnd.
+    const end = Math.min(renderEnd, store.blocks.length);
+    for (let i = renderStart; i < end; i++) {
+      weight += blockWeight(store.blocks[i], i > 0 ? store.blocks[i - 1] : null, cpl);
+    }
+    if (first === null || last === null || weight <= 0) return nominal;
+    const measured = (last.offsetTop + last.offsetHeight - first.offsetTop) / weight;
+    return Math.min(nominal * 2.5, Math.max(nominal * 0.4, measured));
+  }
+
+  /** The window start + history generation the spacer was last sized for;
+   *  the bottom-follow writer re-sizes only when it moved (it runs per
+   *  streamed frame, and sizing walks the window's text). */
+  let spacerSizedFor = "";
+
+  /** Resize the spacer to its target with one compensating scroll write.
+   *  Only called where no gesture can be in flight (scroll idle) or where a
+   *  scroll write happens anyway (the bottom-follow writer, a restore). */
+  function rebalanceSpacer(onlyIfMoved = false): void {
+    const el = transcriptEl;
+    const column = columnEl;
+    if (el === null || column === null) return;
+    const sizedFor = `${renderStart}|${historyGeneration()}`;
+    if (onlyIfMoved && sizedFor === spacerSizedFor) return;
+    spacerSizedFor = sizedFor;
+    // A followed tail shorter than the viewport is still filling from the
+    // sentinel; blank space above it would only push the rows down. A short
+    // history page keeps its room, or the next page could not be absorbed.
+    const target =
+      atBottom && column.offsetHeight < el.clientHeight
+        ? 0
+        : spacerTarget(
+            historyWeights.upTo(store.blocks, renderStart, charsPerLine(), historyGeneration()),
+            windowPxPerWeight(),
+          );
+    if (!spacerNeedsRebalance(spacerPx, target)) return;
+    const delta = target - spacerPx;
+    setSpacer(target);
+    el.scrollTop += delta;
+    lastScrollTop = el.scrollTop;
+  }
+
+  function scheduleScrollIdle(): void {
+    if (idleTimer !== null) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      if (!visible || pagingTranscript || store.hydrating) return;
+      rebalanceSpacer();
+      if (!atBottom) pinReadingAnchor();
+      saveReadingPosition(atBottom);
+    }, SCROLL_IDLE_MS);
+  }
+
+  $effect(() => {
+    if (visible) return;
+    untrack(() => {
+      if (idleTimer !== null) clearTimeout(idleTimer);
+      idleTimer = null;
+    });
+  });
+
+  // A re-hydrating transcript (a journal reset) shows only its loading line;
+  // room held for the old history would push that line out of view. The
+  // re-mounted tail sizes the spacer afresh.
+  $effect(() => {
+    if (!store.hydrating) return;
+    untrack(() => {
+      setSpacer(0);
+      spacerSizedFor = "";
+      readingAnchor = null;
+    });
+  });
+
+  /** Mount the next page in the reader's direction of travel once it is
+   *  within reach, so a fling never stops dead at the rendered edge. */
+  function maybePrefetch(): void {
+    const el = transcriptEl;
+    const column = columnEl;
+    if (el === null || column === null || atBottom || pagingTranscript) return;
+    if (!visible || store.hydrating) return;
+    const view = el.getBoundingClientRect();
+    const rows = column.getBoundingClientRect();
+    if (farJump(el, view, rows)) return;
+    const next = prefetchPage(
+      { above: view.top - rows.top, below: rows.bottom - view.bottom, viewport: el.clientHeight },
+      { start: renderStart, end: renderEnd },
+      store.blocks.length,
+      scrollDirection,
+    );
+    if (next === "earlier") revealEarlier();
+    else if (next === "later") revealLater();
+  }
+
+  /** The viewport landed deep inside the spacer (a scrollbar drag): mount the
+   *  page the modelled history puts there instead of paging toward it. The
+   *  reader sees only blank space, so moving the spacer to put that page
+   *  under them moves nothing they could be reading. */
+  function farJump(el: HTMLElement, view: DOMRect, rows: DOMRect): boolean {
+    if (renderStart === 0 || spacerPx <= 0) return false;
+    if (rows.top - view.bottom < el.clientHeight * PREFETCH_VIEWPORTS) return false;
+    const earlier = historyWeights.upTo(
+      store.blocks,
+      renderStart,
+      charsPerLine(),
+      historyGeneration(),
+    );
+    // Map by the spacer's own proportion, not the model's px scale: it has
+    // absorbed real page heights since it was sized, and its two ends must
+    // still mean block 0 and the window's first block.
+    const spacerTop = rows.top - spacerPx;
+    const fraction = Math.min(1, Math.max(0, (view.top - spacerTop) / spacerPx));
+    const index = Math.min(renderStart - 1, historyWeights.indexAt(fraction * earlier));
+    const page = pageAround(index, store.blocks.length);
+    pagingTranscript = true;
+    setRange(page.start, page.end, { live: false, tail: false });
+    void tick().then(() => {
+      const column = columnEl;
+      const current = transcriptEl;
+      if (column !== null && current !== null) {
+        const row = Array.from(column.children).find((child) => {
+          const start = Number(child.getAttribute("data-block-index"));
+          const end = Number(child.getAttribute("data-block-end") ?? start);
+          return child.hasAttribute("data-block-index") && start <= index && end >= index;
+        });
+        if (row !== undefined) {
+          const offset = row.getBoundingClientRect().top - current.getBoundingClientRect().top;
+          setSpacer(spacerPx - offset);
+        }
+      }
+      pinReadingAnchor();
+      afterPaging();
+    });
+    return true;
+  }
+
+  /** Replace a range while keeping the row under the reader where it is. */
   function setRangeAnchored(
     start: number,
     end: number,
     options: { live: boolean; tail: boolean },
   ): void {
-    const anchor = readTranscriptAnchor();
+    // Settle any shift still pending, then pin the row at the viewport.
+    holdReadingAnchor();
+    pinReadingAnchor();
     setRange(start, end, options);
     const revision = anchorRevision;
     anchorSettled = false;
     void tick().then(() => {
-      // A cancelled correction (a freeze bumped the revision before this ran)
+      // A cancelled hold (a freeze bumped the revision before this ran)
       // leaves anchorSettled false, so the next activation reconciles instead
-      // of early-outing on an uncorrected scroll position.
+      // of early-outing on an unabsorbed shift.
       if (revision !== anchorRevision) return;
-      const current = transcriptEl;
-      if (current === null) return;
-      // Node identity first: uid-keyed rows survive a range replacement.
-      // Then the anchor's block uid (trim-proof — a cap trim can shift every
-      // index label between the anchor read and this tick); the index-range
-      // match is the last resort for a row whose uid left the window.
-      let after: HTMLElement | null = anchor?.node.isConnected === true ? anchor.node : null;
-      if (after === null && anchor !== null) {
-        const candidates = Array.from(
-          columnEl?.querySelectorAll<HTMLElement>("[data-block-index]") ?? [],
-        );
-        if (anchor.uid !== null) {
-          after = candidates.find((c) => Number(c.dataset.blockUid) === anchor.uid) ?? null;
-        }
-        if (after === null && anchor.index !== null) {
-          after =
-            candidates.find((candidate) => {
-              const start = Number(candidate.dataset.blockIndex);
-              const end = Number(candidate.dataset.blockEnd ?? candidate.dataset.blockIndex);
-              return Number.isFinite(start) && start <= anchor.index! && end >= anchor.index!;
-            }) ?? null;
-        }
-      }
-      current.scrollTop =
-        anchor !== null && after !== null
-          ? anchor.scrollTop + after.getBoundingClientRect().top - anchor.top
-          : (anchor?.scrollTop ?? current.scrollTop);
+      holdReadingAnchor();
       anchorSettled = true;
-      saveChatScroll(session.id, current.scrollTop, false);
+      saveReadingPosition(false);
     });
   }
 
@@ -442,12 +645,11 @@
       } else if (activating) {
         if (!tracksTail) {
           if (!anchorSettled) {
-            // The pending scroll correction died with a freeze and its
-            // pre-change geometry is gone — re-pin: the current position
-            // becomes the saved reading position.
+            // The pending hold died with a freeze; the anchor it pinned is
+            // still the pre-change one, so absorb the shift now.
             anchorSettled = true;
-            const el = transcriptEl;
-            if (el !== null) saveChatScroll(session.id, el.scrollTop, false);
+            holdReadingAnchor();
+            saveReadingPosition(false);
           }
           return;
         }
@@ -564,22 +766,67 @@
     getSetting("chat.fontFamily").trim() || "var(--ui-font)",
   );
 
+  /** When the reader last did something that scrolls. WebKit dispatches the
+   *  wheel (momentum included), pointer (the scrollbar too), touch, or key
+   *  input ahead of the scroll it causes; a scroll chained to one stays the
+   *  reader's, so a track-click animation or fling tail outlives the input. */
+  let scrollIntentAt = -Infinity;
+  const SCROLL_INTENT_MS = 300;
+  function noteScrollIntent(): void {
+    scrollIntentAt = performance.now();
+  }
+  // Passive by hand: Svelte attaches `onwheel` non-passive, which would pull
+  // WebKit's wheel scrolling off its scrolling thread.
+  $effect(() => {
+    const el = transcriptEl;
+    if (el === null) return;
+    el.addEventListener("wheel", noteScrollIntent, { passive: true });
+    return () => el.removeEventListener("wheel", noteScrollIntent);
+  });
+
   function onScroll() {
     const el = transcriptEl;
     if (el === null) return;
-    atBottom =
-      renderEnd >= store.blocks.length && el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    const top = el.scrollTop;
+    const moved = top !== lastScrollTop;
+    const up = top < lastScrollTop;
+    if (moved) scrollDirection = up ? -1 : 1;
+    lastScrollTop = top;
+    const now = performance.now();
+    const byReader = now - scrollIntentAt < SCROLL_INTENT_MS;
+    // Only a real move carries the reader's gesture on: the follow writer's
+    // own (non-moving) echoes must not keep a stale intent alive all stream.
+    if (byReader && moved) scrollIntentAt = now;
+    const nearEnd = el.scrollHeight - top - el.clientHeight < 40;
+    // A pinned follower leaves the live edge only by its own hand. WebKit
+    // dispatches the follow writer's scroll event a frame late, after rows
+    // that landed in between already grew the transcript (a follower who
+    // never moved), and it clamps scrollTop wherever a streamed re-render
+    // momentarily shrinks the content under the reader (an up-move nobody
+    // made). Idle, geometry alone decides, so a find or focus scroll holds.
+    const held =
+      atBottom && !nearEnd && (!moved || (up && !byReader && store.running));
+    atBottom = renderEnd >= store.blocks.length && (nearEnd || held);
+    if (held && atBottom) queueBottomScroll();
     if (atBottom) {
       // Reaching the actual live edge is an explicit resume signal even after
       // paging history: keep the current range, rebind its live proxies, and
       // let future rows append normally.
+      readingAnchor = null;
       if (!tracksTail || !rendersLive) {
         setRange(renderStart, renderEnd, { live: true, tail: true });
       }
       markFollowed();
+    } else {
+      // A shift that landed between frames (a preview decoding above the
+      // reader) is absorbed before the anchor moves to the new top row.
+      holdReadingAnchor();
+      pinReadingAnchor();
+      maybePrefetch();
     }
     // Persist into the pool so the next remount restores this position.
-    saveChatScroll(session.id, el.scrollTop, atBottom);
+    saveReadingPosition(atBottom);
+    scheduleScrollIdle();
   }
 
   // Every source of bottom-following funnels through one coalesced writer.
@@ -601,9 +848,14 @@
         followFrame = null;
         const el = transcriptEl;
         if (el === null || (!forced && (!atBottom || composerEngaged))) return;
+        // This writer owns the position anyway, so it keeps the spacer sized
+        // for the reader's first scroll up into history.
+        rebalanceSpacer(true);
         el.scrollTop = el.scrollHeight;
+        lastScrollTop = el.scrollTop;
+        readingAnchor = null;
         markFollowed();
-        saveChatScroll(session.id, el.scrollTop, true);
+        saveReadingPosition(true);
       });
     });
   }
@@ -624,14 +876,32 @@
       queueBottomScroll();
     } else {
       atBottom = false;
+      // Prepending to a window that still ends at the live edge is scrolling
+      // within the tail, not paging away from it: keep it live until the cap
+      // drops the newest page (then it is an explicit history page).
+      const keepsTail = tracksTail && plan.settled.end >= store.blocks.length;
       setRangeAnchored(plan.settled.start, plan.settled.end, {
-        live: false,
-        tail: false,
+        live: keepsTail,
+        tail: keepsTail,
       });
     }
-    void tick().then(() => {
-      pagingTranscript = false;
-    });
+    void tick().then(afterPaging);
+  }
+
+  /** A page landed: keep going while the reader is still within reach of an
+   *  edge (a fast fling, or a scrollbar drag into the spacer), and let the
+   *  spacer settle once scrolling stops. */
+  function afterPaging(): void {
+    pagingTranscript = false;
+    // One page per frame: a chain of microtask pages would render the whole
+    // run in one blocking task.
+    if (prefetchFrame === null) {
+      prefetchFrame = requestAnimationFrame(() => {
+        prefetchFrame = null;
+        maybePrefetch();
+      });
+    }
+    scheduleScrollIdle();
   }
 
   function revealEarlier() {
@@ -658,9 +928,7 @@
       live: reachesTail,
       tail: reachesTail,
     });
-    void tick().then(() => {
-      pagingTranscript = false;
-    });
+    void tick().then(afterPaging);
   }
 
   // Earlier pages should feel like ordinary transcript scrolling, not a
@@ -697,6 +965,36 @@
     return () => observer.disconnect();
   });
 
+  // The forward twin: scroll-driven prefetch (maybePrefetch) usually mounts
+  // the next page long before the reader gets here, but a window that already
+  // ends inside the viewport produces no scroll event to drive it. Re-created
+  // per page (it reads renderEnd), so a sentinel still in view keeps paging;
+  // `hasLaterRows` is derived so a live turn's appends don't rebuild it.
+  const hasLaterRows = $derived(!atLiveEdge);
+  $effect(() => {
+    const root = transcriptEl;
+    const sentinel = laterSentinelEl;
+    void renderEnd;
+    if (
+      !canAutoLoadHistory ||
+      !visible ||
+      !hasLaterRows ||
+      store.hydrating ||
+      root === null ||
+      sentinel === null
+    ) {
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) revealLater();
+      },
+      { root, rootMargin: "0px 0px 96px" },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  });
+
   // On (re)mount, restore the saved reading position ONCE: bottom-pinned
   // sessions stick to the bottom, otherwise jump back to where the user was
   // reading. Guarded so it never re-fires mid-stream and fights the autoscroll.
@@ -708,8 +1006,16 @@
     const saved = chatScroll(session.id);
     void tick().then(() => {
       if (transcriptEl === null) return;
-      if (saved.atBottom) scrollToBottom();
-      else transcriptEl.scrollTop = saved.scrollTop;
+      if (saved.atBottom) {
+        scrollToBottom();
+        return;
+      }
+      // The saved offset is relative to the rendered rows (see
+      // saveReadingPosition); size the spacer first, then land past it.
+      rebalanceSpacer();
+      transcriptEl.scrollTop = spacerPx + saved.scrollTop;
+      lastScrollTop = transcriptEl.scrollTop;
+      pinReadingAnchor();
     });
   });
 
@@ -810,8 +1116,10 @@
   // a pinned work tray or the composer can change the transcript's viewport
   // height without changing its content. Observe both surfaces so the same
   // coalesced scroll owner keeps the live edge anchored. A reader who scrolled
-  // up is deliberately left untouched (native scroll anchoring handles
-  // changes around their viewport).
+  // up keeps the row under them instead: resize callbacks run after layout and
+  // before paint, so a preview decoding above them is absorbed by the spacer
+  // in the frame it lands (the column is observed, the spacer beside it is
+  // not, so absorbing never re-triggers this observer).
   $effect(() => {
     const column = columnEl;
     const transcript = transcriptEl;
@@ -824,12 +1132,28 @@
       return;
     }
     const observer = new ResizeObserver(() => {
-      if (atBottom && !composerEngaged) queueBottomScroll();
+      if (atBottom) {
+        if (!composerEngaged) queueBottomScroll();
+      } else if (readingAnchor === null) {
+        pinReadingAnchor();
+      } else {
+        holdReadingAnchor();
+      }
     });
     observer.observe(column);
     observer.observe(transcript);
     return () => observer.disconnect();
   });
+
+  /** The images a message shows only as a count: all of them when none has
+   *  a saved copy (old journals, Remote Control), else the ones whose save
+   *  failed. Empty when every picture is shown. */
+  function unsavedImages(m: { attachments: number; attachmentPaths: string[] }): string {
+    const n = m.attachments - m.attachmentPaths.length;
+    if (n <= 0) return "";
+    const noun = `image${n > 1 ? "s" : ""}`;
+    return m.attachmentPaths.length > 0 ? `+${n} ${noun}` : `${n} ${noun}`;
+  }
 
   function sendNow(text: string, images: ImageAttachment[]): boolean {
     const blocks: Record<string, unknown>[] = [];
@@ -844,6 +1168,15 @@
     }
     return socket.send({ type: "send", blocks });
   }
+
+  // A send made outside the composer (the Mastermind panel's one-click
+  // prompts) follows exactly like onSubmit below.
+  $effect(() =>
+    registerFollow(session.id, () => {
+      atBottom = true;
+      queueBottomScroll(true);
+    }),
+  );
 
   function onSubmit(text: string, images: ImageAttachment[]): boolean {
     // The daemon owns delivery semantics so reconnect/replay stay exact:
@@ -1044,29 +1377,77 @@
     return setUltracode(!store.ultracode);
   }
 
-  /** Prose path candidates validate against the daemon relative to the
-   *  session cwd (the terminal-link mechanism) — only real paths become
-   *  clickable, and dirs route to the Finder. The workspace id enables the
-   *  daemon's unique-basename fallback, keeping chat links and terminal
-   *  links in parity for a bare "FIGURE_PLAN.md" living in a subdirectory. */
-  async function resolveProsePaths(
-    candidates: string[],
-  ): Promise<Map<string, { path: string; kind: "file" | "dir" }>> {
-    const out = new Map<string, { path: string; kind: "file" | "dir" }>();
-    try {
-      const valid = await fsValidate(candidates, session.cwd, session.workspace_id ?? null);
-      for (const [cand, hit] of Object.entries(valid)) {
-        out.set(cand, { path: hit.path, kind: hit.kind });
+  /** Where this chat's relative references resolve: App's context for the
+   *  session (live cwd, spawn cwd, workspace root — the terminal's answer
+   *  too), else what the session row itself knows. */
+  function linkContext(): LinkContext {
+    return (
+      chatLinkContext(session.id) ?? {
+        cwd: session.cwd_current ?? session.cwd,
+        spawnCwd: session.cwd,
+        root: null,
+        workspaceId: session.workspace_id ?? null,
       }
-    } catch {
-      // Unreachable daemon: nothing becomes clickable this round.
-    }
-    return out;
+    );
   }
 
-  function openProsePath(path: string, kind: "file" | "dir") {
+  /** Every path candidate in this chat (prose, code spans, links, user
+   *  messages, tool locations) resolves through one batched, cached
+   *  resolver: one request per base ladder per batch, the workspace id
+   *  enabling the daemon's unique-basename / path-suffix fallbacks. */
+  async function validateProse(candidates: string[]): Promise<ValidateAnswer> {
+    const ctx = linkContext();
+    const answer: Required<ValidateAnswer> = { valid: {}, ambiguous: {}, unchecked: [] };
+    const groups = groupByBases(candidates, ctx);
+    const results = await Promise.allSettled(
+      groups.map((g) => fsValidate(g.candidates, g.bases[0], ctx.workspaceId, g.bases.slice(1))),
+    );
+    if (results.length > 0 && results.every((r) => r.status === "rejected")) {
+      throw (results[0] as PromiseRejectedResult).reason;
+    }
+    results.forEach((r, i) => {
+      if (r.status === "rejected") {
+        answer.unchecked.push(...groups[i].candidates);
+        return;
+      }
+      Object.assign(answer.valid, r.value.valid);
+      Object.assign(answer.ambiguous, r.value.ambiguous);
+      answer.unchecked.push(...r.value.unchecked);
+    });
+    return answer;
+  }
+  // The scope reads the session and workspace untracked: a template that
+  // peeks must not re-render on every session update, only on answers.
+  const prosePaths = new PathResolver(validateProse, {
+    root: () => linkContext().root,
+    scope: (c) => untrack(() => resolveScope(linkContext(), c)),
+  });
+  /** Files the chat shows as embed cards (prose `![](…)`, the turn
+   *  gallery's shell-written files) resolve against the same directories,
+   *  strictly: an embed names one file. */
+  const proseEmbeds = new EmbedResolver(() => untrack(() => linkContext()));
+
+  // A turn end is when files the agent mentioned have come to exist: drop
+  // the misses so the renderers holding them ask again.
+  let wasRunning = false;
+  $effect(() => {
+    const running = store.running;
+    if (wasRunning && !running) prosePaths.expireMisses();
+    wasRunning = running;
+  });
+
+  /** Open a resolved path through the workbench opener (shared/openPath.ts):
+   *  files at their line, Cmd/Ctrl-click in a split, dirs in the Finder. */
+  function openProsePath(path: string, kind: PathKind, opts: OpenPathOptions = {}) {
+    if (openPath(path, kind, opts)) return;
     if (onOpenPath !== undefined) onOpenPath(path, kind);
     else if (kind === "file") onOpenFile?.(path);
+  }
+
+  /** A path from structured data (a tool location, an artifact tile) that
+   *  may be relative: resolve it against the session first. */
+  function openLocation(path: string) {
+    void resolveAndOpen(prosePaths, path, openProsePath, { at: { x: 0, y: 0 } });
   }
 
   /** The composer's palette: chimaera-native pickers first (they don't
@@ -1690,8 +2071,9 @@
   />
 
   <!-- Focusable so keyboard scrolling works in WKWebView (Safari never
-       auto-focuses scrollers); role="log" announces new agent output. -->
-  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+       auto-focuses scrollers); role="log" announces new agent output. The
+       input listeners only note that the reader is scrolling (onScroll). -->
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
   <div
     class="transcript"
     role="log"
@@ -1699,7 +2081,14 @@
     tabindex="0"
     bind:this={transcriptEl}
     onscroll={onScroll}
+    ontouchmove={noteScrollIntent}
+    onpointerdown={noteScrollIntent}
+    onkeydown={noteScrollIntent}
   >
+    <!-- Room for earlier history ahead of the rendered window: it absorbs
+         every height change above a scrolled-up reader (see "reading
+         position" in the script). Height is written directly, never bound. -->
+    <div class="history-spacer" bind:this={spacerEl} aria-hidden="true"></div>
     <!-- One real reading column (the Claude Desktop measure): agent prose
          fills it from the left, user bubbles right-align inside it. -->
     <div class="column" bind:this={columnEl}>
@@ -1728,6 +2117,14 @@
         </button>
       {/if}
     {/if}
+    {#snippet sentImages(paths: string[])}
+      <div class="sent-images">
+        <AttachmentStrip
+          {paths}
+          onOpen={(path, e) => openProsePath(path, "file", { split: e.metaKey || e.ctrlKey })}
+        />
+      </div>
+    {/snippet}
     {#snippet activityRow(item: ActivityRow)}
       {#if item.t === "group"}
         <ToolGroup
@@ -1736,7 +2133,8 @@
           sourceEnd={item.endIndex}
           sourceUid={item.tools[0]?.uid}
           {visible}
-          {onOpenFile}
+          onOpenPath={openProsePath}
+          resolvePaths={prosePaths}
           onBackground={agentKind === "claude" ? backgroundTool : undefined}
           onStopTask={agentKind === "claude" ? stopTask : undefined}
         />
@@ -1773,7 +2171,11 @@
         {@const block = item.block}
         <!-- Only delivered (sent) user messages render inline; queued/dropped
              ones live in the pending tail below. -->
+        {@const pictureOnly = block.text.length === 0 && block.attachmentPaths.length > 0}
         <div class="msg user" data-block-index={item.index} data-block-uid={block.uid}>
+          {#if block.attachmentPaths.length > 0 && !pictureOnly}
+            {@render sentImages(block.attachmentPaths)}
+          {/if}
           <div class="bubble-row">
             <button
               class="message-action fork-btn"
@@ -1797,21 +2199,29 @@
                 ↺
               </button>
             {/if}
-            <div class="bubble">
-              <UserText
-                text={block.text}
-                onOpenPath={openProsePath}
-                resolvePaths={resolveProsePaths}
-              />
-            </div>
+            {#if pictureOnly}
+              {@render sentImages(block.attachmentPaths)}
+            {:else}
+              <div class="bubble">
+                <UserText
+                  text={block.text}
+                  onOpenPath={openProsePath}
+                  resolvePaths={prosePaths}
+                />
+              </div>
+            {/if}
           </div>
-          {#if block.attachments > 0 || block.origin === "remote"}
+          {#if unsavedImages(block) !== "" || block.origin === "remote" || block.origin === "restart" || block.origin === "worker"}
             <span class="bubble-meta">
               {#if block.origin === "remote"}
                 <span class="origin" title="sent from a Remote Control client (the Claude app or claude.ai/code)">via Remote Control</span>
+              {:else if block.origin === "restart"}
+                <span class="origin auto" title="chimaera sent this itself: the daemon restarted while this chat had work running, so it asked the resumed agent to pick that work back up (setting: Pick Up Interrupted Work After a Restart)">sent by chimaera after a restart</span>
+              {:else if block.origin === "worker"}
+                <span class="origin auto" title="a worker in this workspace sent this with tell_mastermind; chimaera delivered it because the Mastermind acts on its own (auto)">from a worker</span>
               {/if}
-              {#if block.attachments > 0}
-                <span class="attach">{block.attachments} image{block.attachments > 1 ? "s" : ""}</span>
+              {#if unsavedImages(block) !== ""}
+                <span class="attach">{unsavedImages(block)}</span>
               {/if}
             </span>
           {/if}
@@ -1833,7 +2243,8 @@
             streaming={store.running && item.block.uid === lastInlineUid}
             {visible}
             onOpenPath={openProsePath}
-            resolvePaths={resolveProsePaths}
+            resolvePaths={prosePaths}
+            embeds={proseEmbeds}
             onReveal={() => {
               if (visible && atBottom && !composerEngaged) queueBottomScroll();
             }}
@@ -1863,9 +2274,10 @@
         <FinishedRow
           block={item.block}
           {visible}
-          {onOpenFile}
+          onOpenFile={openLocation}
           onOpenPath={openProsePath}
-          resolvePaths={resolveProsePaths}
+          resolvePaths={prosePaths}
+          embeds={proseEmbeds}
           sourceIndex={item.index}
           sourceUid={item.block.uid}
         />
@@ -1899,9 +2311,17 @@
       {:else if item.block.kind === "turn_end"}
         {@const block = item.block}
         <div class="source-block" data-block-index={item.index} data-block-uid={item.block.uid}>
-          <!-- The turn's artifacts preview here, after the closing prose. -->
-          {#if block.artifacts.length > 0}
-            <ArtifactGallery paths={block.artifacts} onOpen={onOpenFile} />
+          <!-- What the turn made previews here, after the closing prose. -->
+          {#if block.artifacts.length > 0 || block.mentioned.length > 0}
+            <ArtifactGallery
+              paths={block.artifacts}
+              mentioned={block.mentioned}
+              covered={block.covered}
+              startedAtMs={block.startedAtMs}
+              endedAtMs={block.endedAtMs}
+              resolver={proseEmbeds}
+              onOpenPath={openProsePath}
+            />
           {/if}
 
         </div>
@@ -1912,20 +2332,24 @@
       {/if}
     {/each}
 
-    {#if renderEnd < store.blocks.length}
-      <button
-        class="history-more history-later"
-        title="Continue forward without jumping over the conversation"
-        onclick={revealLater}
-      >
-        ↓ show {Math.min(64, store.blocks.length - renderEnd).toLocaleString()} later conversation item{Math.min(64, store.blocks.length - renderEnd) === 1 ? "" : "s"}
-      </button>
+    {#if !atLiveEdge}
+      {#if canAutoLoadHistory}
+        <span class="history-sentinel" bind:this={laterSentinelEl} aria-hidden="true"></span>
+      {:else}
+        <button
+          class="history-more history-later"
+          title="Automatic history loading is unavailable in this browser"
+          onclick={revealLater}
+        >
+          ↓ show {Math.min(64, store.blocks.length - renderEnd).toLocaleString()} later conversation item{Math.min(64, store.blocks.length - renderEnd) === 1 ? "" : "s"}
+        </button>
+      {/if}
     {/if}
 
     <!-- Live-tail chrome must never be spliced directly after a historical
          page with newer transcript rows omitted in between. Page forward or
          jump first, so chronology remains visually honest. -->
-    {#if !visible || renderEnd >= store.blocks.length}
+    {#if !visible || atLiveEdge}
     {#each pinnedPermissions as request (request.requestId)}
       {#if request.plan !== null}
         <PlanApprovalCard
@@ -1933,7 +2357,7 @@
           {visible}
           onDecide={(opt, feedback) => decide(request.requestId, opt, undefined, feedback)}
           onOpenPath={openProsePath}
-          resolvePaths={resolveProsePaths}
+          resolvePaths={prosePaths}
         />
       {:else}
         <PermissionCard
@@ -1993,15 +2417,23 @@
     {#if pinnedSends.length > 0}
       <div class="pending" aria-label="queued messages" aria-live={visible ? "polite" : "off"}>
         {#each pinnedSends as send (send.id)}
+          {@const pictureOnly = send.text.length === 0 && send.attachmentPaths.length > 0}
           <div class="msg user pending-msg" class:dropped={send.state === "dropped"}>
+            {#if send.attachmentPaths.length > 0 && !pictureOnly}
+              {@render sentImages(send.attachmentPaths)}
+            {/if}
             <div class="bubble-row">
-              <div class="bubble">
-                <UserText
-                  text={send.text}
-                  onOpenPath={openProsePath}
-                  resolvePaths={resolveProsePaths}
-                />
-              </div>
+              {#if pictureOnly}
+                {@render sentImages(send.attachmentPaths)}
+              {:else}
+                <div class="bubble">
+                  <UserText
+                    text={send.text}
+                    onOpenPath={openProsePath}
+                    resolvePaths={prosePaths}
+                  />
+                </div>
+              {/if}
               {#if agentKind === "codex" && send.state === "queued" && store.running}
                 <button
                   class="steer-btn"
@@ -2026,10 +2458,8 @@
             <span class="delivery" class:dropped={send.state === "dropped"}>
               {send.state === "dropped" ? "not delivered" : "queued"}
             </span>
-            {#if send.attachments > 0}
-              <span class="attach"
-                >{send.attachments} image{send.attachments > 1 ? "s" : ""}</span
-              >
+            {#if unsavedImages(send) !== ""}
+              <span class="attach">{unsavedImages(send)}</span>
             {/if}
           </div>
         {/each}
@@ -2194,9 +2624,12 @@
     --text-xs: max(9px, calc(var(--chat-font-size) - 2px));
     --text-sm: max(10px, calc(var(--chat-font-size) - 1px));
     --text-md: var(--chat-font-size);
+    /* The transcript's column: 48em of the message text — Claude.ai's
+       reading measure, ~100 characters — so a bigger font keeps its line
+       length, capped by the Reading Width setting (--chat-measure). The
+       document views use the same rule (previews/MarkdownView). */
+    --chat-column: min(calc(48 * var(--chat-font-size)), var(--chat-measure));
     --text-lg: calc(var(--chat-font-size) + 2px);
-    /* The reading measure (the Claude Desktop proportion) shared by the
-       transcript column, the composer, and their satellites. */
   }
   .chat:not(.visible) .status-spark,
   .chat:not(.visible) .status-label,
@@ -2207,6 +2640,10 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
+    /* The reading anchor + history spacer are the one anchoring mechanism on
+       every engine; Chromium's native anchoring would correct the same shift
+       a second time. */
+    overflow-anchor: none;
     scrollbar-width: thin;
     scrollbar-color: color-mix(in srgb, var(--fg) 22%, transparent) transparent;
     padding: 14px 18px;
@@ -2231,7 +2668,7 @@
     flex-direction: column;
     gap: 3px;
     width: 100%;
-    max-width: var(--chat-measure);
+    max-width: var(--chat-column);
     margin: 0 auto;
   }
   /* Activity lines (tool runs, thoughts, finished work, wakes) are the
@@ -2270,7 +2707,7 @@
      while the plan alone was inset, so the group never lined up. */
   .chat > :global(.tray) {
     width: 100%;
-    max-width: calc(var(--chat-measure) + 36px);
+    max-width: calc(var(--chat-column) + 36px);
     margin-left: auto;
     margin-right: auto;
     box-sizing: border-box;
@@ -2312,6 +2749,10 @@
     height: 1px;
     pointer-events: none;
   }
+  .history-spacer {
+    flex: none;
+    height: 0;
+  }
   .history-later {
     margin-top: 10px;
   }
@@ -2349,6 +2790,17 @@
     font-size: var(--text-sm);
     margin-top: 2px;
   }
+  /* The message's pictures sit above its bubble, on the user's side. */
+  .sent-images {
+    max-width: 100%;
+    margin-bottom: 6px;
+  }
+  .bubble-row > .sent-images {
+    margin-bottom: 0;
+  }
+  .pending-msg .sent-images {
+    opacity: 0.55;
+  }
   .bubble-meta {
     display: inline-flex;
     align-items: center;
@@ -2365,6 +2817,12 @@
     border-radius: 999px;
     padding: 0 6px;
     line-height: 1.5;
+  }
+  /* The daemon's own message (a restart pick-up), not a feature: muted, so
+     it reads as provenance rather than as another chip to act on. */
+  .origin.auto {
+    color: var(--muted);
+    border-color: var(--edge);
   }
   /* Undelivered messages occupy the transcript tail, not fixed composer
      chrome. The transcript's own scrollbar can therefore move a large queue

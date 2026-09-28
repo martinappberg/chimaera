@@ -2,7 +2,8 @@ import { getToken } from "./api";
 import { nudgeReconnectors, retryDelayMs } from "./reconnect";
 import type { Link } from "../workspace/agentLinks";
 import type { Session } from "../workspace/sessions";
-import type { UpdateStatus } from "../workspace/update.svelte";
+import type { Notice } from "../workspace/notices";
+import { parseUpdateStatus, type UpdateStatus } from "../workspace/update.svelte";
 
 const INITIAL_BACKOFF_MS = 500;
 const MAX_BACKOFF_MS = 10_000;
@@ -26,6 +27,13 @@ export interface EventsSocketHandlers {
    */
   onGit?(epochs: Record<string, number>): void;
   /**
+   * Per-workspace Timeline epoch map (the git idiom): fired after auth and
+   * whenever a workspace's timeline gained an entry. The caller refetches
+   * `GET /workspaces/{id}/timeline?since=` for its active workspace iff that
+   * workspace's epoch moved.
+   */
+  onTimeline?(epochs: Record<string, number>): void;
+  /**
    * The daemon's release knowledge (same shape as GET /api/v1/update),
    * pushed after auth and whenever it changes.
    */
@@ -36,6 +44,8 @@ export interface EventsSocketHandlers {
    * its own workspace iff the epoch moved.
    */
   onRecents?(epoch: number): void;
+  /** An agent-plugin install or hook-trust write invalidated the reports. */
+  onAgentPlugins?(epoch: number): void;
   /** Exact mounted paths whose disk metadata/listing changed. */
   onFs?(change: {
     files: string[];
@@ -43,6 +53,12 @@ export interface EventsSocketHandlers {
     dirs: string[];
     removedDirs: string[];
   }): void;
+  /**
+   * Discrete alerts (an agent finished, needs you, or sent a message) since
+   * this socket connected — the browser's notification source. Never
+   * replayed across reconnects: a reload must not re-alert old news.
+   */
+  onNotices?(notices: Notice[]): void;
   /**
    * Connection state. While false the caller should fall back to polling;
    * fired only on transitions.
@@ -63,15 +79,14 @@ interface ServerEventFrame {
   settings?: Record<string, unknown>;
   epochs?: Record<string, number>;
   epoch?: number;
+  /** An `update` frame's discriminator; the rest is `parseUpdateStatus`'s. */
   available?: boolean;
-  current?: string;
-  build?: string;
-  latest?: UpdateStatus["latest"];
   message?: string;
   files?: string[];
   removed?: string[];
   dirs?: string[];
   removed_dirs?: string[];
+  notices?: Notice[];
 }
 
 /**
@@ -212,17 +227,23 @@ export class EventsSocket {
       ) {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.handlers.onGit?.(msg.epochs);
+      } else if (
+        msg.type === "timeline" &&
+        typeof msg.epochs === "object" &&
+        msg.epochs !== null
+      ) {
+        this.backoffMs = INITIAL_BACKOFF_MS;
+        this.handlers.onTimeline?.(msg.epochs);
       } else if (msg.type === "update" && typeof msg.available === "boolean") {
         this.backoffMs = INITIAL_BACKOFF_MS;
-        this.handlers.onUpdate?.({
-          current: msg.current ?? "",
-          build: msg.build ?? null,
-          available: msg.available,
-          latest: msg.latest ?? null,
-        });
+        const status = parseUpdateStatus(msg);
+        if (status !== null) this.handlers.onUpdate?.(status);
       } else if (msg.type === "recents" && typeof msg.epoch === "number") {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.handlers.onRecents?.(msg.epoch);
+      } else if (msg.type === "agent_plugins" && typeof msg.epoch === "number") {
+        this.backoffMs = INITIAL_BACKOFF_MS;
+        this.handlers.onAgentPlugins?.(msg.epoch);
       } else if (msg.type === "fs") {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.handlers.onFs?.({
@@ -233,6 +254,9 @@ export class EventsSocket {
             ? msg.removed_dirs.filter(isString)
             : [],
         });
+      } else if (msg.type === "notices" && Array.isArray(msg.notices)) {
+        this.backoffMs = INITIAL_BACKOFF_MS;
+        this.handlers.onNotices?.(msg.notices);
       } else if (msg.type === "error") {
         // Bad auth or a server-side failure; give up and surface it (the
         // app shows the blocking re-auth overlay on "unauthorized").

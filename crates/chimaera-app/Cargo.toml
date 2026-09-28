@@ -63,6 +63,24 @@ chimaera-remote = { path = "../chimaera-remote" }
 nix = { version = "0.31", features = ["signal"] }
 chimaera-server = { path = "../chimaera-server" }
 
+# macOS notifications: UNUserNotificationCenter (the modern API — click
+# responses, foreground presentation, per-workspace grouping, removal of
+# stale alerts) plus the Dock tile badge/bounce, which must work with zero
+# windows open. Same objc2 generation tao/wry already link, so no new
+# framework stack enters the build.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray", "NSError", "NSBundle", "NSObject", "NSDictionary"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSResponder"] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "bitflags", "block2", "UNUserNotificationCenter", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSound", "UNNotificationSettings", "UNNotificationTrigger"] }
+
+# Linux/Windows notifications (freedesktop D-Bus / WinRT toasts). macOS goes
+# through UserNotifications above instead: this crate's macOS backend is the
+# deprecated NSUserNotification API with no click routing.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+notify-rust = "4.18"
+
 # Windows-only: registry-first WSL detection (never poke wsl.exe blind — the
 # 24H2 stub can block 60s interactively when WSL is absent).
 [target.'cfg(windows)'.dependencies]

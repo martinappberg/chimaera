@@ -6,7 +6,7 @@ the shell prompt or agent takes over. The daemon never parses the text: it is op
 shell run in the user's own login shell, which is why every env tool (lmod, conda, spack,
 venv, nix) works with zero tool-specific code. Slice 1 of the M5 HPC layer's *environment
 axis* — deep design in the
-[architecture guide](../agent-guides/architecture.md#environment-prelude-compute-node-sessions).
+[architecture guide](../agent-guides/architecture.md#environment-prelude--compute-node-sessions).
 
 **Where it lives (shared):** daemon `crates/chimaera-server/src/environment.rs` (store +
 route + per-session materialization) and `crates/chimaera-core/src/shellint.rs`
@@ -34,7 +34,9 @@ route + per-session materialization) and `crates/chimaera-core/src/shellint.rs`
   shim) sources it after the user's rc, and the agent login-wrapper
   (`launcher::wrap_login_shell`) sources it before `exec`ing the agent. All spawn surfaces
   funnel through it: PTY shells and agent TUIs (`spawn.rs`), chat drivers + the
-  degrade-to-PTY respawn (`chat.rs`), each via `api::session_env`.
+  degrade-to-PTY respawn (`chat.rs`), and agent-plugin installs (`plugins/mod.rs`),
+  each via `api::session_env`. Runtime bootstrap installers deliberately skip the
+  prelude so a broken environment cannot prevent installing the agent itself.
 - **Key behaviors / constraints.**
   - **Once per real spawn, never on reconnect** — reattach reuses the live PTY; the
     `CHIMAERA_PRELUDE_DONE` guard additionally stops nested shells from re-running it.

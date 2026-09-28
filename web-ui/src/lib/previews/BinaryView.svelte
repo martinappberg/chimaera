@@ -2,23 +2,29 @@
   /**
    * Quiet info card for files with no preview (binary). Size comes from the
    * probe FileView already ran when available; size+mtime are otherwise
-   * looked up from the parent directory's listing.
+   * looked up from the parent directory's listing. Offers "open as text"
+   * (a per-tab override the host applies) and, on a remote host, a download
+   * so an app on this computer can open it.
    */
   import {
     basename,
     formatMtime,
+    fsDownload,
     fsList,
     humanSize,
     type FsEntry,
   } from "./files";
+  import { isRemoteHost } from "../net/api";
 
   interface Props {
     path: string;
     /** Size already known from a fetched chunk's X-File-Size, if any. */
     knownSize?: number | null;
+    /** Show the file as text anyway (the host swaps the view). */
+    onText?: () => void;
   }
 
-  let { path, knownSize = null }: Props = $props();
+  let { path, knownSize = null, onText }: Props = $props();
 
   let entry = $state<FsEntry | null>(null);
 
@@ -41,6 +47,20 @@
   });
 
   const size = $derived(entry?.size ?? knownSize);
+
+  // Same rule as the media player's card: on the laptop the file is already
+  // here (a desktop app can open it from its folder); on a remote host the
+  // download is the way to get it to one.
+  const remote = isRemoteHost();
+  let downloadError = $state<string | null>(null);
+  async function download(): Promise<void> {
+    downloadError = null;
+    try {
+      await fsDownload(path);
+    } catch (e) {
+      downloadError = e instanceof Error ? e.message : "download failed";
+    }
+  }
 </script>
 
 <div class="binary-view">
@@ -63,6 +83,17 @@
       <dd>{entry !== null ? formatMtime(entry.mtime) : "—"}</dd>
     </dl>
     <span class="note">binary file — no preview</span>
+    {#if onText !== undefined || remote}
+      <div class="actions">
+        {#if onText !== undefined}
+          <button class="opt" onclick={() => onText?.()} title="show the bytes as text">open as text</button>
+        {/if}
+        {#if remote}
+          <button class="opt primary" onclick={() => void download()} title="download to this computer">download</button>
+        {/if}
+      </div>
+    {/if}
+    {#if downloadError !== null}<span class="err" role="alert">{downloadError}</span>{/if}
   </div>
 </div>
 
@@ -121,5 +152,46 @@
     margin-top: 0.35rem;
     font-size: var(--text-xs);
     opacity: 0.75;
+  }
+
+  .actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.35rem;
+  }
+
+  .opt {
+    appearance: none;
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    background: var(--term-bg);
+    color: var(--fg);
+    font: inherit;
+    font-size: var(--text-sm);
+    padding: 0.25rem 0.8rem;
+    cursor: pointer;
+    transition:
+      background-color 0.12s ease,
+      border-color 0.12s ease;
+  }
+
+  .opt:hover {
+    background: var(--row-hover);
+  }
+
+  .opt.primary {
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--edge));
+    color: var(--accent);
+  }
+
+  .err {
+    font-size: var(--text-xs);
+    color: var(--err);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .opt {
+      transition: none;
+    }
   }
 </style>

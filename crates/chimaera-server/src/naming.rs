@@ -42,6 +42,13 @@ fn poll_interval() -> Duration {
 /// session is gone.
 pub(crate) fn spawn_shell_watch(state: Arc<AppState>, session_id: String) {
     tokio::spawn(async move {
+        // The Timeline's command cursor starts at "now": history from before
+        // the watch (a resurrected session's ring) is never replayed as news.
+        let mut cmd_cursor = state
+            .sessions
+            .marks(&session_id)
+            .map(|m| m.last_finished_seq())
+            .unwrap_or(0);
         loop {
             let Some(info) = state.sessions.get(&session_id) else {
                 let named = crate::lock(&state.display_names)
@@ -99,6 +106,18 @@ pub(crate) fn spawn_shell_watch(state: Arc<AppState>, session_id: String) {
 
             if changed {
                 state.changes.notify_waiters();
+            }
+
+            // Finished commands since the last tick, metadata only (no
+            // output clone) — the notable ones become Timeline entries.
+            if let Some(marks) = state.sessions.marks(&session_id) {
+                let finished = marks.finished_since(cmd_cursor, 16);
+                if let Some(last) = finished.last() {
+                    cmd_cursor = last.seq;
+                }
+                for meta in &finished {
+                    crate::episodes::record_command(&state, &session_id, meta).await;
+                }
             }
 
             tokio::time::sleep(poll_interval()).await;

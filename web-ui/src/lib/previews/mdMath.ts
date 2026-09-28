@@ -303,7 +303,7 @@ export const mathExtension: MarkdownConfig = {
  *  `$…$` that crosses a soft line break gets its newlines folded to spaces,
  *  as comrak does before it emits the literal the reading view typesets —
  *  a `%` comment inside the formula must end at the same place in both. */
-export function mathSource(node: SyntaxNode, doc: Text): string | null {
+export function mathSource(node: SyntaxNode, doc: Pick<Text, "sliceString">): string | null {
   const marks = mathDelimiters(node);
   if (marks === null) return null; // an unclosed `$$` block: nothing to typeset yet
   let src = "";

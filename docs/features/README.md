@@ -42,22 +42,25 @@ core; an addition can change when there's a clear improvement. Don't be too stri
 | Page | What it covers |
 |---|---|
 | [workbench.md](workbench.md) | Workspaces, home screen, the pane/tab/split workbench, drag-and-drop, zoom, focus mode, quick-open, folder picker, layout persistence, keybindings |
-| [dashboard.md](dashboard.md) | The workspace dashboard (landing surface): the attention lane with inline permission answering, density-adaptive agent cards with provenance tiers, subagent drop-down, changed-file attribution, recents & git summary |
+| [dashboard.md](dashboard.md) | The workspace dashboard (landing surface), re-centred on questions: the attention lane with inline permission answering, Since you left, Where things stand, the one-line Now (or density-adaptive agent cards with provenance tiers), and the Mastermind dock with Brief me |
+| [timeline-and-knowledge.md](timeline-and-knowledge.md) | The per-workspace Timeline the daemon writes (agent turns, notable commands, ended Slurm jobs, crashes, knowledge changes, agent notes) and the read-only Knowledge view over what agents recorded (mycelium's `.living/`, guidance files, claude memory) |
+| [plugins.md](plugins.md) | The Extensions tab (Plugins · Skills · Browse): opt-in workbench plugins as sandboxed WASM components (manifests, per-workspace switch, requires / recommends, install/setup, plugin MCP tools, the plugin host and its limits), the plugins lock and the three install kinds (first-party at the pinned release, a repository's release, a local build), `SHA256SUMS` verification, updates and rollback (`chimaera plugin`), agent plugins + the Skills view (asked of claude/codex themselves), in-app codex hook trust, the Agent notes plugin |
 | [terminals.md](terminals.md) | Persistent daemon-owned terminals, reconnect/resize/resync, clickable path links, clipboard & provenance, live theming, the exec engine, the command journal |
 | [agents.md](agents.md) | Launching coding agents (real TUI + structured chat), the launcher, managed install/update, agent detection, the session rail & attention state, rename/kill, recents & resume |
 | [chat-mode.md](chat-mode.md) | Structured chat mode (Tier B): the composer, model/effort/mode/thinking/ultracode controls, tool cards, permission & question prompts, rewind, MCP panel, usage, inline artifacts, the seq journal & gap-replay, view-switch |
-| [files-and-previews.md](files-and-previews.md) | The file tree with git decorations, file previews (code, markdown, CSV/TSV incl. gzip, PDF, image, sandboxed HTML, binary, Finder), lightweight editing, raw tickets |
+| [files-and-previews.md](files-and-previews.md) | The file tree with git decorations, file previews (code, markdown, CSV/TSV incl. gzip, PDF, image, sandboxed HTML, binary, Finder), lightweight editing, raw tickets, pointing an agent at part of any file (lines, PDF areas, image regions, table cells, media moments, notebook cells, slides) |
 | [browser-pane.md](browser-pane.md) | Live web apps (Jupyter, marimo, Streamlit) as panes — the daemon's ticketed reverse proxy (HTTP+WS, remote-transparent, compute-node second hop), terminal URL detection, the iframe pane |
 | [drag-drop-and-uploads.md](drag-drop-and-uploads.md) | Drag a file/folder from the tree to reference it in a session, OS-desktop file drops + screenshot paste that stream to the session's owning host (remote-transparent), the size-capped session-scoped upload route, the native-shell drop handler |
 | [git.md](git.md) | Source-control panel (status/diff), worktree create/remove, the session-scoped changes view, git-binary remediation |
-| [linked-terminals.md](linked-terminals.md) | Granting an agent access to specific terminals (the "leash") and the daemon's MCP server (`list_terminals` / `run_in_terminal` / `read_terminal`) |
+| [linked-terminals.md](linked-terminals.md) | Granting an agent access to specific terminals (the "leash") and the daemon's MCP server (`list_terminals` / `run_in_terminal` / `read_terminal`; `notify` lives in [notifications.md](notifications.md)) |
 | [remote-connect.md](remote-connect.md) | `chimaera connect` — SSH orchestration, daemon auto-deploy, tunnels, in-app SSH/2FA auth, remote host management |
+| [notifications.md](notifications.md) | The notice feed (agent finished / awaiting approval / error / agent `notify`), native OS + browser notifications with click-to-session, the approval-only counts and the unread mark |
 | [native-app.md](native-app.md) | The Tauri shell: real OS windows, window restore, the signed app+daemon self-updater, the update toast |
 | [lifecycle-and-persistence.md](lifecycle-and-persistence.md) | "Close the laptop, nothing dies" — daemon-owned sessions, the session ledger + restart handoff, graceful shutdown, update awareness |
 | [environment.md](environment.md) | Environment preludes — per-host/workspace/launch startup commands (`module load`, `conda activate`) run once per session before the shell or agent |
 | [compute.md](compute.md) | Slurm awareness — daemon-side scheduler detection, the user's queue snapshot, the rail compute chip + popover (hidden off-cluster) |
 | [settings.md](settings.md) | The dotted-key `settings.json` model (hand-edit-aware), the settings UI, theme palettes |
-| [cli.md](cli.md) | The `chimaera` binary: `serve`, `connect`, `status`, `kill`, `doctor`, `shell-integration` |
+| [cli.md](cli.md) | The `chimaera` binary: `serve`, `connect`, `status`, `kill`, `doctor`, `shell-integration`, `plugin` |
 
 ## Not in this catalog (on purpose)
 

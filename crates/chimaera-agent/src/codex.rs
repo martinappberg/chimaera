@@ -29,8 +29,9 @@ use serde_json::{json, Value};
 
 use crate::ndjson::JsonlChild;
 
-/// CLI version these frame shapes were verified against (2026-09-23).
-pub const TESTED_CODEX_VERSION: &str = "0.156.1";
+/// CLI version these frame shapes were verified against (2026-09-25,
+/// full chat-smoke 23/23 + generated-schema diff; PROTOCOL.md Pass 33).
+pub const TESTED_CODEX_VERSION: &str = "0.157.1";
 
 /// The `initialize` request both the probe client and the driver handshake
 /// send. Declares `experimentalApi` so `thread/settings/update` is available
@@ -207,11 +208,12 @@ use crate::driver::{
     SpawnSpec, IDLE_FLUSH_GRACE_TICKS, INTERRUPT_GRACE_TICKS,
 };
 use crate::model::{
-    cap_output, fmt_elapsed_secs, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer,
-    CompactionPhase, ContentBlock, PermissionOption, PermissionOptionKind, RemoteControlSnapshot,
-    RemoteControlState, SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UserMessageState,
-    BG_LABEL_MAX, SKILL_PATH_MAX, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
-    SUBAGENT_RESULT_MAX,
+    cap_output, clip_command, fmt_elapsed_secs, truncate_label, AgentCommand, AgentEvent,
+    ChunkKind, Coalescer, CompactionPhase, ContentBlock, PermissionOption, PermissionOptionKind,
+    RemoteControlSnapshot, RemoteControlState, SlashCommand, ToolContent, ToolKind, ToolStatus,
+    Usage, UserMessageState, BG_LABEL_MAX, SKILL_PATH_MAX, SLASH_COMMANDS_CAP,
+    SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX, SUBAGENT_RESULT_MAX, UNHANDLED_REQUESTS_CAP,
+    UNHANDLED_REQUEST_NAME_MAX,
 };
 use crate::ndjson::{JsonlSink, JsonlStream};
 
@@ -287,6 +289,9 @@ impl Driver for CodexDriver {
         if let Some(frame) = hs.remote_control_status {
             initial.push(mapper.on_frame(&frame));
         }
+        for frame in &hs.server_requests {
+            initial.push(mapper.on_frame(frame));
+        }
         // The remembered approval mode (Auto review / Read only / …), applied
         // like a header pick when it differs from the thread's opening mode.
         mapper.bootstrapping = true;
@@ -326,6 +331,9 @@ struct CodexHandshake {
     /// The Remote Control status the app-server announced during the
     /// handshake (see `HandshakeSideband`), replayed through the mapper.
     remote_control_status: Option<Value>,
+    /// Server requests that arrived during the handshake, in order, replayed
+    /// through the mapper so each is answered (see `HandshakeSideband`).
+    server_requests: Vec<Value>,
     /// The user's config names a `model_reasoning_summary`, so turns must
     /// not override it (see `CodexMapper::reasoning_summary`).
     summary_configured: bool,
@@ -569,6 +577,7 @@ async fn codex_handshake(
         next_id,
         rollback_error,
         remote_control_status: side.remote_control_status,
+        server_requests: side.server_requests,
         summary_configured,
     })
 }
@@ -700,15 +709,32 @@ const NOTICED_DEPRECATIONS_CAP: usize = 32;
 /// one response id. The app-server announces its Remote Control status right
 /// after `initialize` (live 0.153.0) — i.e. INSIDE the handshake — so the
 /// newest such frame is kept and replayed through the mapper afterwards.
+/// Server REQUESTS (id + method) are kept too: dropping one would leave the
+/// app-server waiting on a reply that never comes, so each is replayed into
+/// `on_server_request` (a card, an answer, or a refusal) once the mapper
+/// exists.
 #[derive(Default)]
 struct HandshakeSideband {
     remote_control_status: Option<Value>,
+    server_requests: Vec<Value>,
 }
+
+/// Server requests held across the handshake. None is expected there; the
+/// cap only stops a hostile stream from growing the buffer (past it a
+/// request is dropped with a warning, as every one was before).
+const HANDSHAKE_REQUESTS_CAP: usize = 16;
 
 impl HandshakeSideband {
     fn note(&mut self, frame: &Value) {
-        if frame["method"] == "remoteControl/status/changed" {
+        let method = frame["method"].as_str().unwrap_or_default();
+        if method == "remoteControl/status/changed" {
             self.remote_control_status = Some(frame.clone());
+        } else if frame.get("id").is_some() && !method.is_empty() {
+            if self.server_requests.len() < HANDSHAKE_REQUESTS_CAP {
+                self.server_requests.push(frame.clone());
+            } else {
+                tracing::warn!(method = ?method, "codex server request during the handshake dropped (buffer full)");
+            }
         }
     }
 }
@@ -1115,6 +1141,10 @@ struct CodexMapper {
     /// Outstanding item/tool/requestUserInput prompts by request_id.
     /// Answers go back as {answers:{questionId:{answers:[label,…]}}}.
     pending_questions: HashMap<String, PendingQuestion>,
+    /// Server-request methods this driver has no handler for and has already
+    /// said so about — the notice fires once per method, not per request
+    /// (claude's `noticed_controls` twin).
+    noticed_requests: HashSet<String>,
     /// One safety-buffering notice per turn (the frame repeats).
     safety_notified: bool,
     /// A terminal (non-retrying) `error` already put this turn's failure in
@@ -1230,6 +1260,7 @@ impl CodexMapper {
             last_thought_item: None,
             pending_approvals: HashMap::new(),
             pending_questions: HashMap::new(),
+            noticed_requests: HashSet::new(),
             safety_notified: false,
             turn_error_shown: false,
             turn_output_base: None,
@@ -1345,7 +1376,8 @@ impl CodexMapper {
         let mut step = DriverStep::default();
         let method = frame["method"].as_str().unwrap_or_default();
 
-        // Server→client REQUEST (id + method): approvals.
+        // Server→client REQUEST (id + method): questions, approvals, the
+        // clock; anything else is refused (`on_server_request`).
         if frame.get("id").is_some() && !method.is_empty() {
             self.on_server_request(frame, &mut step);
             return step;
@@ -2255,6 +2287,7 @@ impl CodexMapper {
             locations,
             status: ToolStatus::InProgress,
             cross_turn: false,
+            command: None,
         });
     }
 
@@ -2289,6 +2322,11 @@ impl CodexMapper {
                     }
                     let (kind, title, locations) = command_exploration(item)
                         .unwrap_or_else(|| (ToolKind::Execute, command_title(item), Vec::new()));
+                    // Every command execution carries its command, an
+                    // exploration row included: `cat > out.csv <<EOF` reads
+                    // as a `cat`, and the gallery's mtime check already keeps
+                    // a merely-read file out.
+                    let command = command_text(item).map(clip_command);
                     step.events.push(AgentEvent::ToolCall {
                         id,
                         kind,
@@ -2296,6 +2334,7 @@ impl CodexMapper {
                         locations,
                         status: ToolStatus::InProgress,
                         cross_turn: false,
+                        command,
                     });
                 } else {
                     let failed =
@@ -2398,6 +2437,7 @@ impl CodexMapper {
                         locations: Vec::new(),
                         status: ToolStatus::InProgress,
                         cross_turn: false,
+                        command: None,
                     });
                 } else {
                     let failed = item["error"].is_object()
@@ -2447,6 +2487,7 @@ impl CodexMapper {
                         locations: Vec::new(),
                         status: ToolStatus::InProgress,
                         cross_turn: false,
+                        command: None,
                     });
                 } else {
                     // Honor the item status like every other item type — a
@@ -2480,6 +2521,7 @@ impl CodexMapper {
                         locations: Vec::new(),
                         status: ToolStatus::InProgress,
                         cross_turn: false,
+                        command: None,
                     });
                 } else {
                     // Re-emit with the saved path so the open affordance
@@ -2500,6 +2542,7 @@ impl CodexMapper {
                         },
                         status: ToolStatus::InProgress,
                         cross_turn: false,
+                        command: None,
                     });
                     step.events.push(AgentEvent::ToolCallUpdate {
                         id,
@@ -2537,6 +2580,7 @@ impl CodexMapper {
                     locations: Vec::new(),
                     status: ToolStatus::InProgress,
                     cross_turn: false,
+                    command: None,
                 });
                 if completed {
                     let failed =
@@ -2660,6 +2704,7 @@ impl CodexMapper {
                         ToolStatus::InProgress
                     },
                     cross_turn: false,
+                    command: None,
                 });
             }
             // A client-registered dynamic tool ran (0.153.0). Chimaera
@@ -2691,6 +2736,7 @@ impl CodexMapper {
                     locations: Vec::new(),
                     status,
                     cross_turn: false,
+                    command: None,
                 });
             }
             // A hook injected prompt text into the conversation (0.153.0
@@ -2762,6 +2808,7 @@ impl CodexMapper {
             locations,
             status: ToolStatus::InProgress,
             cross_turn: false,
+            command: None,
         });
         if !completed {
             return;
@@ -2948,6 +2995,7 @@ impl CodexMapper {
                     locations: Vec::new(),
                     status: ToolStatus::InProgress,
                     cross_turn: true,
+                    command: None,
                 });
             }
             let agent = &mut self.collab_agents[idx];
@@ -2992,6 +3040,7 @@ impl CodexMapper {
             locations: Vec::new(),
             status: ToolStatus::InProgress,
             cross_turn: true,
+            command: None,
         });
         let mut agent = CollabAgent::new(thread, row_id, name, note);
         if !note.is_empty() {
@@ -3384,11 +3433,14 @@ impl CodexMapper {
         events
     }
 
-    /// Server→client approval requests. Decision payloads are prebuilt per
-    /// option here (string or object union — snake_case inside the object
-    /// variants); the Permission command just looks its option up. Unknown
-    /// decision strings are silently treated as decline by the server, so
-    /// only mined/verified shapes are ever offered.
+    /// Server→client JSON-RPC requests: questions, approvals, and the clock.
+    /// Approval decision payloads are prebuilt per option here (string or
+    /// object union — snake_case inside the object variants); the Permission
+    /// command just looks its option up. Unknown decision strings are
+    /// silently treated as decline by the server, so only mined/verified
+    /// shapes are ever offered. Every other method is refused with an error
+    /// (`reject_server_request`) — never a card, whose `{decision}` reply
+    /// would be the wrong shape for it.
     fn on_server_request(&mut self, frame: &Value, step: &mut DriverStep) {
         let rpc_id = frame["id"].clone();
         let params = &frame["params"];
@@ -3444,6 +3496,22 @@ impl CodexMapper {
                 step.outbound
                     .push(json!({ "id": rpc_id, "result": { "answers": {} } }));
             }
+            return;
+        }
+
+        // The app-server asking the client's clock (0.156.1+ schema:
+        // `currentTime/read {threadId}` → `{currentTimeAt}`, whole Unix
+        // seconds), for the under-development `current_time_reminder`
+        // feature. Unprompted by the user, so answered here, never parked.
+        if method == "currentTime/read" {
+            let reply = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(now) => json!({ "id": rpc_id, "result": { "currentTimeAt": now.as_secs() } }),
+                Err(_) => json!({
+                    "id": rpc_id,
+                    "error": { "code": -32603, "message": "system clock is before the Unix epoch" },
+                }),
+            };
+            step.outbound.push(reply);
             return;
         }
 
@@ -3688,7 +3756,7 @@ impl CodexMapper {
                     json!({ "decision": "acceptForSession" }),
                 );
             }
-            _ if network_host.is_some() => {
+            "item/commandExecution/requestApproval" if network_host.is_some() => {
                 let host = network_host.unwrap_or_default().to_string();
                 title = format!("network access to {host}");
                 input_preview = json!({
@@ -3732,7 +3800,7 @@ impl CodexMapper {
                     );
                 }
             }
-            _ => {
+            "item/commandExecution/requestApproval" => {
                 // Cap both the title and the previewed command: an approval
                 // request can carry a multi-megabyte inline script, and every
                 // byte here is journaled, ring-held, and replayed to clients
@@ -3790,6 +3858,15 @@ impl CodexMapper {
                     );
                 }
             }
+            // Includes the legacy v1 `execCommandApproval`/`applyPatchApproval`:
+            // their params (`command: string[]`, `callId`, `fileChanges`) and
+            // `ReviewDecision` answers (`approved`, `denied`, …) are not the
+            // v2 shapes above, and the app-server sends them only on v1-API
+            // conversations, which chimaera never opens.
+            _ => {
+                self.reject_server_request(rpc_id, method, step);
+                return;
+            }
         }
         opt(
             &mut options,
@@ -3810,6 +3887,33 @@ impl CodexMapper {
             input_preview,
             plan: None,
         });
+    }
+
+    /// Refuse a server request this driver has no handler for (0.157.1's
+    /// union also holds `item/tool/call` for client-registered dynamic tools,
+    /// `account/chatgptAuthTokens/refresh` for externally managed auth and
+    /// the opt-in `attestation/generate`; chimaera uses none of them) with
+    /// JSON-RPC "method not found", the code the app-server itself uses. A
+    /// request has no other settler, so parking it (claude's policy for its
+    /// control requests) would stall the agent instead of failing fast. Like
+    /// claude, the user hears once per method, never silently.
+    fn reject_server_request(&mut self, rpc_id: Value, method: &str, step: &mut DriverStep) {
+        let method = truncate_label(method, UNHANDLED_REQUEST_NAME_MAX);
+        step.outbound.push(json!({
+            "id": rpc_id,
+            "error": { "code": -32601, "message": format!("chimaera does not handle {method}") },
+        }));
+        let fresh = self.noticed_requests.len() < UNHANDLED_REQUESTS_CAP
+            && self.noticed_requests.insert(method.clone());
+        if fresh {
+            tracing::warn!(method = ?method, "codex sent a server request chimaera does not handle");
+            step.events.push(AgentEvent::Notice {
+                text: format!(
+                    "codex sent a request chimaera doesn't handle yet ({method}) — \
+                     answered as unsupported, so that step fails"
+                ),
+            });
+        }
     }
 
     /// Inject a send into the running turn (type-through). A stale
@@ -3947,7 +4051,9 @@ impl CodexMapper {
         let mut attachments = 0u32;
         for b in &blocks {
             match b {
-                ContentBlock::Image { media_type, data } => {
+                ContentBlock::Image {
+                    media_type, data, ..
+                } => {
                     attachments += 1;
                     input.push(json!({
                         "type": "image",
@@ -3981,6 +4087,7 @@ impl CodexMapper {
         step.events.push(AgentEvent::UserMessage {
             text,
             attachments,
+            attachment_paths: crate::model::image_paths(&blocks),
             id: Some(client_msg_id.clone()),
             queued,
             origin: None,
@@ -4061,6 +4168,7 @@ impl CodexMapper {
                         step.events.push(AgentEvent::UserMessage {
                             text: fb.clone(),
                             attachments: 0,
+                            attachment_paths: Vec::new(),
                             id: None,
                             queued: false,
                             origin: None,
@@ -4544,12 +4652,15 @@ fn command_exploration(item: &Value) -> Option<(ToolKind, String, Vec<String>)> 
 
 /// `commandActions[0].command` is the bare command; the raw `command` field
 /// carries the `/bin/zsh -lc '…'` wrapper.
-fn command_title(item: &Value) -> String {
-    let raw = item["commandActions"][0]["command"]
+/// The command text a command-execution item carries, as codex wrote it.
+fn command_text(item: &Value) -> Option<&str> {
+    item["commandActions"][0]["command"]
         .as_str()
         .or(item["command"].as_str())
-        .unwrap_or("command");
-    truncate_label(raw, 120)
+}
+
+fn command_title(item: &Value) -> String {
+    truncate_label(command_text(item).unwrap_or("command"), 120)
 }
 
 /// The extension's exact steer-retry extraction: the live turn id sits in
@@ -5619,6 +5730,7 @@ mod tests {
                 ContentBlock::Image {
                     media_type: "image/png".into(),
                     data: "QUJD".into(),
+                    path: Some("/uploads/s-1/image-ab12cd34.png".into()),
                 },
                 ContentBlock::Skill {
                     name: "review".into(),
@@ -5638,12 +5750,18 @@ mod tests {
             AgentEvent::UserMessage {
                 text,
                 attachments,
+                attachment_paths,
                 id,
                 queued,
                 origin: _,
             } => {
                 assert_eq!(text, "see");
                 assert_eq!(*attachments, 1);
+                assert_eq!(
+                    attachment_paths,
+                    &vec!["/uploads/s-1/image-ab12cd34.png".to_string()],
+                    "the echo carries the daemon's saved copy"
+                );
                 assert!(id.is_some(), "sends carry a delivery id");
                 assert!(!queued, "a fresh-turn send is not queued");
             }
@@ -5653,6 +5771,10 @@ mod tests {
         assert_eq!(input[0]["type"], "text");
         assert_eq!(input[1]["type"], "image");
         assert_eq!(input[1]["url"], "data:image/png;base64,QUJD");
+        assert!(
+            input[1].get("path").is_none(),
+            "the saved copy is display metadata, never agent input"
+        );
         assert_eq!(input[2]["type"], "skill");
         assert_eq!(input[2]["name"], "review");
         assert_eq!(input[2]["path"], "/skills/review/SKILL.md");
@@ -6421,6 +6543,151 @@ mod tests {
         assert_eq!(amendment["action"], "allow");
     }
 
+    /// `currentTime/read` (0.156.1+ schema) is answered at once from the
+    /// clock in whole Unix seconds — no card, no parking.
+    #[test]
+    fn current_time_read_is_answered_from_the_clock() {
+        let mut m = mapper();
+        let now = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        let before = now();
+        let step = m.on_frame(&json!({
+            "id": 90,
+            "method": "currentTime/read",
+            "params": { "threadId": "t-1" },
+        }));
+        let after = now();
+        assert!(step.events.is_empty(), "nothing for the user to see");
+        assert_eq!(step.outbound.len(), 1);
+        assert_eq!(step.outbound[0]["id"], 90);
+        let at = step.outbound[0]["result"]["currentTimeAt"]
+            .as_u64()
+            .expect("whole seconds");
+        assert!(
+            (before..=after).contains(&at),
+            "{at} not in {before}..={after}"
+        );
+        assert!(m.pending_approvals.is_empty());
+    }
+
+    /// Every server request without a handler — the rest of the 0.157.1
+    /// union, the legacy v1 approvals (a different decision vocabulary), and
+    /// anything newer — is refused with JSON-RPC "method not found" instead
+    /// of becoming a command card whose `{decision}` reply is the wrong
+    /// shape. One notice per method.
+    #[test]
+    fn unhandled_server_requests_are_refused_not_carded() {
+        let mut m = mapper();
+        let requests = [
+            (
+                "item/tool/call",
+                json!({ "threadId": "t", "turnId": "u", "callId": "c",
+                                         "namespace": null, "tool": "x", "arguments": {} }),
+            ),
+            (
+                "account/chatgptAuthTokens/refresh",
+                json!({ "reason": "unauthorized" }),
+            ),
+            ("attestation/generate", json!({})),
+            (
+                "execCommandApproval",
+                json!({ "conversationId": "t", "callId": "c",
+                                            "approvalId": null, "command": ["ls"], "cwd": "/",
+                                            "reason": null, "parsedCmd": [] }),
+            ),
+            (
+                "applyPatchApproval",
+                json!({ "conversationId": "t", "callId": "c",
+                                           "fileChanges": {}, "reason": null, "grantRoot": null }),
+            ),
+            // A method-agnostic field must not pull an unknown request into
+            // the network-approval card either.
+            (
+                "future/requestApproval",
+                json!({ "networkApprovalContext": { "host": "x.io" } }),
+            ),
+        ];
+        for (i, (method, params)) in requests.iter().enumerate() {
+            let step = m.on_frame(&json!({ "id": 100 + i, "method": method, "params": params }));
+            assert_eq!(step.outbound.len(), 1, "{method}: exactly one reply");
+            let reply = &step.outbound[0];
+            assert_eq!(reply["id"], 100 + i, "{method}");
+            assert!(reply.get("result").is_none(), "{method}: no result");
+            assert_eq!(reply["error"]["code"], -32601, "{method}");
+            assert!(
+                reply["error"]["message"].as_str().unwrap().contains(method),
+                "{method}: the error names the method"
+            );
+            match &step.events[..] {
+                [AgentEvent::Notice { text }] => assert!(text.contains(method), "{text}"),
+                other => panic!("{method}: expected one Notice, got {other:?}"),
+            }
+        }
+        assert!(m.pending_approvals.is_empty(), "no card was parked");
+
+        // The same method again: refused again, but noticed only once.
+        let step = m.on_frame(&json!({ "id": 200, "method": "item/tool/call", "params": {} }));
+        assert_eq!(step.outbound[0]["error"]["code"], -32601);
+        assert!(step.events.is_empty(), "one notice per method");
+    }
+
+    /// The method name is agent-influenced: capped in the reply and the
+    /// notice, and the once-per-method set is bounded (claude's
+    /// `noticed_controls` shares both caps).
+    #[test]
+    fn unhandled_server_request_notices_are_bounded() {
+        let mut m = mapper();
+        let long = "m".repeat(UNHANDLED_REQUEST_NAME_MAX * 4);
+        let step = m.on_frame(&json!({ "id": 1, "method": long, "params": {} }));
+        let message = step.outbound[0]["error"]["message"].as_str().unwrap();
+        assert!(!message.contains(&long) && message.len() < UNHANDLED_REQUEST_NAME_MAX * 2);
+        match &step.events[..] {
+            [AgentEvent::Notice { text }] => {
+                assert!(!text.contains(&long) && text.len() < UNHANDLED_REQUEST_NAME_MAX * 3)
+            }
+            other => panic!("expected one Notice, got {other:?}"),
+        }
+        for i in 0..UNHANDLED_REQUESTS_CAP * 2 {
+            let step = m.on_frame(&json!({ "id": 10 + i, "method": format!("future/{i}") }));
+            assert_eq!(step.outbound[0]["error"]["code"], -32601, "always refused");
+        }
+        assert_eq!(m.noticed_requests.len(), UNHANDLED_REQUESTS_CAP);
+    }
+
+    /// A server request that lands while the handshake awaits a response is
+    /// kept (in order, bounded) instead of dropped, and its post-handshake
+    /// replay through the mapper answers it like a live one.
+    #[test]
+    fn handshake_sideband_keeps_server_requests_for_replay() {
+        let mut side = HandshakeSideband::default();
+        side.note(&json!({ "id": 3, "result": {} }));
+        side.note(&json!({ "method": "thread/started", "params": {} }));
+        side.note(&json!({ "method": "remoteControl/status/changed", "params": {} }));
+        side.note(&json!({ "id": 7, "method": "currentTime/read", "params": {} }));
+        side.note(&json!({ "id": 8, "method": "item/tool/call", "params": {} }));
+        assert!(side.remote_control_status.is_some());
+        let ids: Vec<_> = side
+            .server_requests
+            .iter()
+            .map(|f| f["id"].clone())
+            .collect();
+        assert_eq!(ids, [json!(7), json!(8)], "only requests, in arrival order");
+
+        let mut m = mapper();
+        let steps: Vec<_> = side.server_requests.iter().map(|f| m.on_frame(f)).collect();
+        assert!(steps[0].outbound[0]["result"]["currentTimeAt"].is_u64());
+        assert_eq!(steps[1].outbound[0]["error"]["code"], -32601);
+
+        for i in 0..HANDSHAKE_REQUESTS_CAP * 2 {
+            side.note(&json!({ "id": 100 + i, "method": "item/tool/call", "params": {} }));
+        }
+        assert_eq!(side.server_requests.len(), HANDSHAKE_REQUESTS_CAP);
+    }
+
     #[test]
     fn decline_with_feedback_steers_the_reason_into_the_turn() {
         let mut m = mapper();
@@ -7105,6 +7372,7 @@ mod tests {
                 locations: Vec::new(),
                 status: ToolStatus::InProgress,
                 cross_turn: true,
+                command: None,
             }]
         );
 
@@ -7193,6 +7461,7 @@ mod tests {
                     locations: Vec::new(),
                     status: ToolStatus::InProgress,
                     cross_turn: true,
+                    command: None,
                 },
                 AgentEvent::ToolCallUpdate {
                     id: "agent:sub-1#2".into(),
@@ -7480,6 +7749,7 @@ mod tests {
                     locations: Vec::new(),
                     status: ToolStatus::InProgress,
                     cross_turn: false,
+                    command: None,
                 },
                 AgentEvent::ToolCallUpdate {
                     id: "call_w1".into(),
@@ -8244,6 +8514,7 @@ mod tests {
                 locations: vec!["/repo/shot.png".into()],
                 status: ToolStatus::Completed,
                 cross_turn: false,
+                command: None,
             }
         );
         let step = m.on_frame(&json!({

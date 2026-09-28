@@ -32,8 +32,10 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   cannot corrupt it) plus the pid it tested and a `kill -0` verdict; the client cross-checks that
   pid against the manifest, and a disagreement is an error, never "dead" (every separate exec
   through the ControlMaster costs a channel-open RTT and a remote fork — ~300-500 ms on a loaded
-  login node) → *Reuse* if a matching-build daemon runs; if builds differ, count live sessions and
-  *Update* if provably idle (or `--update-daemon`), else *ConnectOutdated*; no daemon → *fresh start*.
+  login node). The same exec reports the node it ran on; a manifest written on another node is
+  located there first (see *Login-node pools* below) → *Reuse* if a matching-build daemon runs;
+  if builds differ, count live sessions and *Update* if provably idle (or `--update-daemon`), else
+  *ConnectOutdated*; no daemon → *fresh start*.
   (3) **Resolve the binary** to deploy — explicit `--binary`, else auto-fetch the matching
   musl/darwin release build (sha256-verified); the `~/.chimaera/dist/` stash feeds **dev connects
   only** (a stash build is the `0.0.1` sentinel, which relocates its state to `~/.chimaera-dev` and
@@ -98,6 +100,34 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   and navigation remain readable during a confirmed outage so a network blip does not blank the
   user's work. The reconnect status says that explicitly; remote reads/writes resume only after the
   authenticated tunnel is back, and an actual reconnect failure surfaces Retry.
+- **Login-node pools: the daemon's node wins.** An alias like `login.cluster.edu` often names a
+  pool of login nodes (rotated per DNS lookup) that share `$HOME`. The ControlMaster keeps every
+  command on the node it landed on, but a new master (after sleep, a `ControlPersist` expiry, an
+  app relaunch) can land elsewhere — where the shared manifest's pid is meaningless. So the probe
+  reports its node (`uname -n`), and when the manifest names another node, `locate` never judges
+  it from the wrong one: it routes the alias to the manifest's node (the row shows "reaching the
+  daemon on <node>…"; that node is a fresh ssh login, so a Duo cluster prompts once more) and
+  takes the liveness verdict there. The learned `Route` is per alias and lives in the running
+  app/CLI process — the tunnel, stops, session counts, compute tunnels, and wedge checks all
+  follow it, and later reconnects in that process dial that node first; a relaunch relearns it
+  (one more prompt on a Duo cluster). The node is dialed directly with the alias's own ssh config
+  (`-o HostName=<node>`: user, keys, ProxyJump carry over) only when the laptop resolves its name
+  to an address the cluster resolves it to — otherwise a search domain could reach, and send the
+  password to, an unrelated host (Sherlock's bare `sh04-ln03` is `10.20.0.63` inside and public
+  outside). Else, or if the direct dial never reaches an sshd, it goes through the alias's master
+  as a `-W` leg, resolved inside the cluster. Only that in-cluster route can show a renamed host
+  (the manifest's old name leading back to the node we landed on) — the user's ssh config may
+  point the direct dial anywhere. A fresh start happens only when the daemon is provably dead
+  **on its node**, or the node's name no longer resolves on the node we landed on (perl's
+  `getaddrinfo` answering `EAI_NONAME` — not `getent`, which can't tell "no such name" from "DNS
+  is down" — and only from a resolver that can resolve its own node's name). Anything else —
+  auth refused, node down, firewalled (a RHEL `icmp-host-prohibited` reject reads as "No route to
+  host", so that is not proof either) — is an error naming both nodes, and nothing starts: a
+  second daemon would resume the same ledger's sessions next to the running one. A connected row
+  routed this way reads `online · <node> · 127.0.0.1:<port>` (every `connected` event carries the
+  node). The start-wait accepts only a manifest written on its own node, the daemon removes the
+  manifest on shutdown only while it is still its own record, and `chimaera kill`/`status` on a
+  node refuse to judge another node's record.
 - **TOFU host keys.** `StrictHostKeyChecking=accept-new` lets a windowed app with no tty reach a
   never-seen host (it still refuses a *changed* key). `ServerAliveInterval/CountMax` notice a dead
   link within ~45s.
@@ -116,7 +146,8 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   `ssh -O exit`, so the connect dials a fresh master (one prompt, like a first connect), and that
   alias's compute-job tunnels — their forwards rode the same master — are dropped and told `down`
   at once. A link that answers → left alone; a user-initiated connect over a healthy tunnel never
-  pays this. **The false-positive cost is real**, which is why the bound is not tighter: a merely
+  pays this. An alias routed to its daemon's login node (below) has two masters — the node's and
+  the alias's own — and both get the ladder, the node's first (its `-W` leg rides the other). **The false-positive cost is real**, which is why the bound is not tighter: a merely
   *loaded* login node (bash sourcing an NFS-backed module init under sshd — load 20 on 64 cores
   observed) can take seconds to run `true`, and that same load is what makes `/health` miss three
   times, i.e. a confirmed down. Misjudging a healthy master kills it: the next connect re-prompts

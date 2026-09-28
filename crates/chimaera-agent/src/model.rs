@@ -32,6 +32,18 @@ pub const BG_LABEL_MAX: usize = 200;
 pub const BG_PATH_MAX: usize = 1024;
 /// One-line cap for the `SessionStatus` fields (a status line, not prose).
 pub const STATUS_DETAIL_MAX: usize = 256;
+/// Distinct unhandled agent→client request kinds (claude control subtypes,
+/// codex server-request methods) a session remembers having announced. Each
+/// kind is noticed once; the name is agent-influenced, so the set is bounded.
+pub const UNHANDLED_REQUESTS_CAP: usize = 64;
+/// Cap for an unhandled request's name in a notice or error reply.
+pub const UNHANDLED_REQUEST_NAME_MAX: usize = 80;
+/// `UserMessage.origin` for the message the daemon sends a resurrected
+/// session when a restart cut its work off (see `ChatManager::command_as`).
+pub const ORIGIN_RESTART: &str = "restart";
+/// `UserMessage.origin` for a worker's `tell_mastermind` message the daemon
+/// delivers to an auto-mode Mastermind (a wake the user didn't type).
+pub const ORIGIN_WORKER: &str = "worker";
 /// One-line cap for a `ToolSummary` label (live ones are ~30 chars).
 pub const TOOL_SUMMARY_MAX: usize = 200;
 /// Tool ids one `ToolSummary` may name (a batch is a single model reply).
@@ -99,6 +111,9 @@ pub const COMMAND_TEXT_TOTAL_MAX: usize = 256 * 1024;
 pub const COMMAND_IMAGE_BASE64_MAX: usize = 2 * 1024 * 1024;
 pub const COMMAND_IMAGE_BASE64_TOTAL_MAX: usize = 8 * 1024 * 1024;
 pub const COMMAND_MEDIA_TYPE_MAX: usize = 64;
+/// An image block's saved-copy path (daemon-stamped; bounded for callers
+/// that build commands programmatically).
+pub const COMMAND_PATH_MAX: usize = 4096;
 pub const COMMAND_ID_MAX: usize = 1024;
 pub const COMMAND_SELECTOR_MAX: usize = 256;
 pub const COMMAND_DESTINATION_MAX: usize = 64;
@@ -188,6 +203,13 @@ pub enum AgentEvent {
         text: String,
         #[serde(default, skip_serializing_if = "is_zero")]
         attachments: u32,
+        /// The daemon's saved copies of the image attachments (absolute paths
+        /// on the session's host, in attachment order) — what a client draws
+        /// as the message's thumbnails. May be shorter than `attachments`: a
+        /// save can fail, and old journals, Remote Control messages and
+        /// transcript-seeded history carry none. Additive.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachment_paths: Vec<String>,
         /// Client-minted delivery key (claude checkpoint uuid / codex
         /// clientUserMessageId) — what a later `UserMessageUpdate` resolves.
         /// Absent on pre-upgrade journals and transcript-seeded messages.
@@ -198,10 +220,13 @@ pub enum AgentEvent {
         /// Resolved by a `UserMessageUpdate`; default false = delivered.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         queued: bool,
-        /// Where a message the driver did NOT mint came from: `"remote"` =
-        /// a Remote Control client (phone / claude.ai) injected it through
-        /// the agent's own bridge, so it never crossed chimaera's composer.
-        /// Absent = this workbench sent it. Additive.
+        /// Where a message the user did NOT type in this workbench came from:
+        /// `"remote"` = a Remote Control client (phone / claude.ai) injected
+        /// it through the agent's own bridge, so it never crossed chimaera's
+        /// composer; [`ORIGIN_RESTART`] = the daemon sent it itself after a
+        /// restart cut work off; [`ORIGIN_WORKER`] = a worker's message the
+        /// daemon delivered to the Mastermind. Absent = this workbench's
+        /// composer. Additive.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<String>,
     },
@@ -219,6 +244,14 @@ pub enum AgentEvent {
         /// old journals and ordinary tools keep their existing semantics.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         cross_turn: bool,
+        /// The full command an execute tool ran (claude Bash/PowerShell,
+        /// codex command executions), clipped to `COMMAND_CAP`. The `title`
+        /// is a one-line label and truncates early; clients that scan the
+        /// command — the turn-end gallery finds the files a script wrote in
+        /// it — need the whole thing, `cd "…/long/path" && …` prefix and
+        /// all. Additive: absent for every other tool and on old journals.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
     },
     ToolCallUpdate {
         id: String,
@@ -855,8 +888,15 @@ impl AgentCommand {
                             check_command_len("text block", text.len(), COMMAND_TEXT_BLOCK_MAX)?;
                             text_total = text_total.saturating_add(text.len());
                         }
-                        ContentBlock::Image { media_type, data } => {
+                        ContentBlock::Image {
+                            media_type,
+                            data,
+                            path,
+                        } => {
                             images = images.saturating_add(1);
+                            if let Some(path) = path {
+                                check_command_len("image path", path.len(), COMMAND_PATH_MAX)?;
+                            }
                             check_command_len(
                                 "image media_type",
                                 media_type.len(),
@@ -978,9 +1018,14 @@ impl AgentCommand {
         for block in blocks {
             bytes = bytes.saturating_add(match block {
                 ContentBlock::Text { text } => text.len(),
-                ContentBlock::Image { media_type, data } => {
-                    media_type.len().saturating_add(data.len())
-                }
+                ContentBlock::Image {
+                    media_type,
+                    data,
+                    path,
+                } => media_type
+                    .len()
+                    .saturating_add(data.len())
+                    .saturating_add(path.as_ref().map_or(0, String::len)),
                 ContentBlock::Skill { name, path } => name.len().saturating_add(path.len()),
             });
         }
@@ -1008,6 +1053,13 @@ pub enum ContentBlock {
     Image {
         media_type: String,
         data: String,
+        /// Where the daemon saved a copy of this image on the session's host
+        /// (its uploads landing pad), so the echoed `UserMessage` can show the
+        /// picture after replay. Display metadata only: drivers never hand it
+        /// to the agent, and the daemon's WebSocket ingress replaces whatever
+        /// a client put here with its own save (or nothing).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
     },
     /// Codex `skills/list` selection. The text block retains the user's
     /// visible `/skill-name` token; this companion block is the app-server's
@@ -1030,6 +1082,19 @@ pub fn blocks_text(blocks: &[ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The saved copies of a send's images, in order — what the `UserMessage`
+/// echo carries as `attachment_paths`. Shared so the two `Send` handlers
+/// can't drift.
+pub fn image_paths(blocks: &[ContentBlock]) -> Vec<String> {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Image { path, .. } => path.clone(),
+            _ => None,
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1182,6 +1247,29 @@ pub enum ToolContent {
     },
     /// Codex-style per-turn aggregated changes (one card, many files).
     Batch { diffs: Vec<ToolContent> },
+}
+
+/// Bytes of an execute tool's `command` kept on the wire: head and tail,
+/// so a pathological one-liner (a heredoc, an inlined script) stays bounded
+/// while the paths it names up front and at the end survive.
+pub const COMMAND_CAP: usize = 8 * 1024;
+
+/// `cmd` within `COMMAND_CAP`: whole when it fits, else its head and tail
+/// around an elision marker, cut on char boundaries.
+pub fn clip_command(cmd: &str) -> String {
+    if cmd.len() <= COMMAND_CAP {
+        return cmd.to_string();
+    }
+    let half = COMMAND_CAP / 2;
+    let mut head_end = half;
+    while !cmd.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = cmd.len() - half;
+    while !cmd.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!("{}\n…\n{}", &cmd[..head_end], &cmd[tail_start..])
 }
 
 /// One plan row. `content` is the display text every source fills (claude's
@@ -1556,6 +1644,20 @@ mod tests {
     }
 
     #[test]
+    fn clip_command_keeps_head_and_tail_on_char_boundaries() {
+        assert_eq!(clip_command("ls -la"), "ls -la");
+        // A multi-byte char straddles both cut points: neither is split.
+        let long = "é".repeat(COMMAND_CAP);
+        let clipped = clip_command(&long);
+        assert!(clipped.starts_with("éé") && clipped.ends_with("éé"));
+        assert!(clipped.contains("\n…\n"));
+        assert!(clipped.len() <= COMMAND_CAP + "\n…\n".len());
+        let ascii = format!("{}{}", "a".repeat(COMMAND_CAP), "z".repeat(10));
+        let clipped = clip_command(&ascii);
+        assert!(clipped.starts_with("aaaa") && clipped.ends_with("zzzz"));
+    }
+
+    #[test]
     fn event_serde_round_trips_with_stable_tags() {
         let ev = AgentEvent::ToolCall {
             id: "t1".into(),
@@ -1564,6 +1666,7 @@ mod tests {
             locations: vec![],
             status: ToolStatus::InProgress,
             cross_turn: false,
+            command: None,
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["type"], "tool_call");
@@ -1572,6 +1675,10 @@ mod tests {
         assert!(
             json.get("cross_turn").is_none(),
             "the additive false default stays off old wire shapes"
+        );
+        assert!(
+            json.get("command").is_none(),
+            "no command, no key — old wire shapes are byte-identical"
         );
         let back: AgentEvent = serde_json::from_value(json).unwrap();
         assert_eq!(back, ev);
@@ -1583,8 +1690,77 @@ mod tests {
             locations: vec![],
             status: ToolStatus::InProgress,
             cross_turn: true,
+            command: None,
         };
         assert_eq!(serde_json::to_value(&detached).unwrap()["cross_turn"], true);
+    }
+
+    #[test]
+    fn saved_image_paths_are_additive_on_both_wire_directions() {
+        // An old client's image block (no path) still deserializes, and a
+        // pathless block serializes exactly as before.
+        let cmd: AgentCommand = serde_json::from_str(
+            r#"{"type":"send","blocks":[{"type":"image","media_type":"image/png","data":"QUJD"}]}"#,
+        )
+        .unwrap();
+        let AgentCommand::Send { blocks } = &cmd else {
+            panic!("expected Send, got {cmd:?}");
+        };
+        assert_eq!(
+            blocks[0],
+            ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+                path: None,
+            }
+        );
+        assert!(serde_json::to_value(&blocks[0])
+            .unwrap()
+            .get("path")
+            .is_none());
+
+        // An old journal's user message replays with no paths, and a message
+        // without them keeps its old shape.
+        let old: AgentEvent =
+            serde_json::from_str(r#"{"type":"user_message","text":"hi","attachments":1}"#).unwrap();
+        let AgentEvent::UserMessage {
+            attachment_paths, ..
+        } = &old
+        else {
+            panic!("expected UserMessage, got {old:?}");
+        };
+        assert!(attachment_paths.is_empty());
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("attachment_paths")
+            .is_none());
+
+        let with = AgentEvent::UserMessage {
+            text: "hi".into(),
+            attachments: 1,
+            attachment_paths: vec!["/u/image-1.png".into()],
+            id: None,
+            queued: false,
+            origin: None,
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(
+            json["attachment_paths"],
+            serde_json::json!(["/u/image-1.png"])
+        );
+        assert_eq!(serde_json::from_value::<AgentEvent>(json).unwrap(), with);
+    }
+
+    #[test]
+    fn image_path_counts_against_the_ingress_budget() {
+        let cmd = AgentCommand::Send {
+            blocks: vec![ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+                path: Some("p".repeat(COMMAND_PATH_MAX + 1)),
+            }],
+        };
+        assert!(cmd.validate_ingress().is_err());
     }
 
     #[test]
@@ -1633,6 +1809,7 @@ mod tests {
         blocks.extend((0..COMMAND_IMAGES_MAX).map(|_| ContentBlock::Image {
             media_type: "image/png".to_string(),
             data: "x".repeat(COMMAND_IMAGE_BASE64_MAX),
+            path: None,
         }));
         blocks.extend((0..COMMAND_SKILLS_MAX).map(|i| ContentBlock::Skill {
             name: format!("skill-{i}"),
@@ -1647,6 +1824,7 @@ mod tests {
             blocks: vec![ContentBlock::Image {
                 media_type: "image/png".to_string(),
                 data: "x".repeat(COMMAND_IMAGE_BASE64_MAX + 1),
+                path: None,
             }],
         };
         assert!(oversized_image.validate_ingress().is_err());
@@ -1718,6 +1896,7 @@ mod tests {
                 ContentBlock::Image {
                     media_type: "image/png".to_string(),
                     data: "base64".to_string(),
+                    path: None,
                 },
                 ContentBlock::Skill {
                     name: "review".to_string(),

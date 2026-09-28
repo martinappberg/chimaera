@@ -14,7 +14,7 @@ mod session;
 mod snapshot;
 
 pub use exec::{ExecError, ExecMode, ExecOptions, ExecOutcome, ExecStage};
-pub use marks::{CommandSource, CommandView, Marks, ShellPhase};
+pub use marks::{CommandMeta, CommandSource, CommandView, Marks, ShellPhase};
 pub use session::KILL_ESCALATION_GRACE;
 
 #[cfg(test)]

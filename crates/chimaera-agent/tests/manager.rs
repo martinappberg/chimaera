@@ -1920,6 +1920,107 @@ async fn stale_attach_reports_the_clamped_replay_cursor() {
     assert!(fx.manager.kill("s-stale"));
 }
 
+/// Set a file's mtime to `secs_ago` seconds in the past.
+fn backdate(path: &Path, secs_ago: u64) {
+    let mtime = std::time::SystemTime::now() - Duration::from_secs(secs_ago);
+    std::fs::File::open(path)
+        .expect("open to backdate")
+        .set_times(std::fs::FileTimes::new().set_modified(mtime))
+        .expect("set mtime");
+}
+
+/// Highest seq in a journal file (0 when empty / missing).
+fn file_head(path: &Path) -> u64 {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<SeqEvent>(l).ok())
+        .map(|e| e.seq)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Chats outlive the daemon now (ledger resurrection), so an idle-but-live
+/// session's journal is routinely the OLDEST file in the dir. The budget
+/// prune must evict history around it, never the journal a reconnect's gap
+/// replay (and the next restart's resurrection) reads from.
+#[tokio::test]
+async fn journal_prune_never_evicts_a_live_session() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-idle", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-idle", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+    wait_for(&mut rx, &mut seen, "Init", |ev| {
+        matches!(ev, AgentEvent::Init { .. })
+    })
+    .await;
+
+    // Let the writer settle so the backdated mtime below sticks: the file
+    // holds everything the session has journaled so far.
+    let dir = fx.manager.journal_dir().clone();
+    let live = dir.join("s-idle.jsonl");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let head = fx
+            .manager
+            .attach("s-idle", u64::MAX)
+            .expect("head")
+            .head_seq;
+        if head > 0 && file_head(&live) == head {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "journal never caught up"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Idle for a day: older than every history journal below.
+    backdate(&live, 86_400);
+
+    let budget = chimaera_agent::journal::DIR_MAX_FILES;
+    for i in 0..budget + 5 {
+        let path = dir.join(format!("h-{i:03}.jsonl"));
+        std::fs::write(&path, b"{\"seq\":1,\"ts\":0}\n").expect("seed history");
+        // Oldest history = lowest index, all newer than the live journal.
+        backdate(&path, 3_600 - i as u64);
+    }
+
+    fx.manager
+        .prune_journal_dir(std::collections::HashSet::new());
+
+    assert!(live.exists(), "the live session's journal was pruned");
+    // mtime only moves forward, so still being a day old now means it was the
+    // oldest file when the prune ran — a late driver write would otherwise
+    // make this test pass vacuously.
+    let age = std::fs::metadata(&live)
+        .and_then(|m| m.modified())
+        .map(|t| t.elapsed().unwrap_or_default())
+        .expect("live mtime");
+    assert!(
+        age >= Duration::from_secs(80_000),
+        "precondition: the live journal was the oldest"
+    );
+    let remaining: Vec<String> = std::fs::read_dir(&dir)
+        .expect("read dir")
+        .flatten()
+        .map(|e| e.file_name().into_string().expect("utf-8 name"))
+        .filter(|n| n.ends_with(".jsonl"))
+        .collect();
+    assert_eq!(remaining.len(), budget, "the budget still holds");
+    assert!(
+        !remaining.iter().any(|n| n == "h-000.jsonl"),
+        "history is still evicted oldest-first"
+    );
+    let newest = format!("h-{:03}.jsonl", budget + 4);
+    assert!(remaining.contains(&newest), "newest kept");
+
+    assert!(fx.manager.kill("s-idle"));
+}
+
 /// Remote Control end to end through the registry: the toggle command rides
 /// the command channel, the fake's live-shaped round-trip (ready → ack →
 /// connected) journals the level-set states, a fresh attach replays them,
@@ -2198,6 +2299,101 @@ async fn remote_control_at_start_enables_after_the_handshake() {
     )
     .await;
     assert!(fx2.manager.kill("s-rcu"));
+}
+
+/// What a daemon restart would cut off is readable off the live session
+/// (the ledger snapshots it): the bridge, ultracode, background work, a
+/// running turn. The resurrection side round-trips too — ultracode comes
+/// back through the handshake without reading as a pick, and a daemon-sent
+/// message journals with its origin.
+#[tokio::test]
+async fn carryover_reports_process_state_and_ultracode_restores() {
+    let fx = fixture();
+    let mut s = spec("s-carry", &fx.cwd, "background");
+    s.remote_control = Some("carry".into());
+    s.initial_ultracode = true;
+    fx.manager.spawn(&ClaudeAdapter, s).expect("spawn");
+    let att = fx.manager.attach("s-carry", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+    wait_for(&mut rx, &mut seen, "ultracode read-back", |ev| {
+        matches!(
+            ev,
+            AgentEvent::EffortState {
+                ultracode: true,
+                chosen: false,
+                ..
+            }
+        )
+    })
+    .await;
+    // The bridge and the ultracode read-back race after the handshake.
+    let connected = |ev: &AgentEvent| {
+        matches!(
+            ev,
+            AgentEvent::RemoteControl {
+                state: RemoteControlState::Connected,
+                ..
+            }
+        )
+    };
+    if !seen.iter().any(|e| connected(&e.ev)) {
+        wait_for(&mut rx, &mut seen, "RemoteControl connected", connected).await;
+    }
+
+    fx.manager
+        .command_as(
+            "s-carry",
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "pick your work back up".into(),
+                }],
+            },
+            Some(chimaera_agent::model::ORIGIN_RESTART),
+        )
+        .await
+        .expect("send");
+    wait_for(&mut rx, &mut seen, "tagged echo", |ev| {
+        matches!(
+            ev,
+            AgentEvent::UserMessage { origin: Some(o), .. } if o == "restart"
+        )
+    })
+    .await;
+    wait_for(&mut rx, &mut seen, "TurnStarted", |ev| {
+        matches!(ev, AgentEvent::TurnStarted { .. })
+    })
+    .await;
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "BackgroundTasks",
+        |ev| matches!(ev, AgentEvent::BackgroundTasks { tasks, .. } if tasks.len() == 1),
+    )
+    .await;
+    wait_for(&mut rx, &mut seen, "TurnCompleted", |ev| {
+        matches!(ev, AgentEvent::TurnCompleted { .. })
+    })
+    .await;
+
+    let carry = fx.manager.carryover("s-carry").expect("live session");
+    assert!(carry.remote_control, "{carry:?}");
+    assert!(carry.ultracode, "{carry:?}");
+    assert!(!carry.turn_in_flight, "the turn ended: {carry:?}");
+    assert_eq!(carry.background.len(), 1, "{carry:?}");
+    assert_eq!(carry.background[0].task_type, "local_bash");
+    assert!(carry.interrupted_work());
+
+    assert!(fx.manager.kill("s-carry"));
+    wait_for(&mut rx, &mut seen, "Exited", |ev| {
+        matches!(ev, AgentEvent::Exited { .. })
+    })
+    .await;
+    assert_eq!(
+        fx.manager.carryover("s-carry"),
+        Some(chimaera_agent::Carryover::default()),
+        "nothing outlives the process"
+    );
 }
 
 /// A user's model pick is remembered per agent kind (the daemon's prefs) so

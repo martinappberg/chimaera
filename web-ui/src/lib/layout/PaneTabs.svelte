@@ -12,6 +12,7 @@
    */
   import { untrack } from "svelte";
   import { tabKey, type PaneNode, type Tab } from "./layout";
+  import { TAB_FADE_PX, revealTabScrollLeft, tabFadeWidths, tabInView, type TabBounds } from "./tabScroll";
   import type { Session } from "../workspace/sessions";
   import {
     dotState,
@@ -32,14 +33,18 @@
   import { dirtyFiles } from "../shared/editing";
   import { volatileChatDrafts } from "../chat/drafts";
   import { gitIndex } from "../workspace/git";
+  import { isUnread } from "../workspace/unread.svelte";
   import { decoFor } from "../workspace/gitDeco";
   import { PINNED } from "../shared/keys";
-  import { keyHint } from "../shared/keybindings";
+  import { keyHint, keyHintSuffix } from "../shared/keybindings";
+  import BrandMark from "../shared/BrandMark.svelte";
+  import { mastermindPanel, setMastermindPanelOpen } from "../dashboard/mastermindPanelState.svelte";
   import { activeSelection, referenceTarget, requestReference } from "../shared/reference";
   import { dismiss } from "../shared/dismiss";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import { browserTitles, targetLabel } from "../browser/proxy";
+  import ExtensionsGlyph from "../plugins/ExtensionsGlyph.svelte";
 
   interface Props {
     node: PaneNode;
@@ -190,16 +195,18 @@
     right: boolean;
     over: boolean;
     hidden: number;
+    leftFade: number;
+    rightFade: number;
   }
-  let clip = $state.raw<Clip>({ left: false, right: false, over: false, hidden: 0 });
-  /** Whether the active tab was fully in view at the last measure: a strip
-   *  resize re-reveals it only then — a user who scrolled away to read
-   *  hidden tabs is not snapped back by an unrelated layout change. */
+  let clip = $state.raw<Clip>({
+    left: false, right: false, over: false, hidden: 0,
+    leftFade: TAB_FADE_PX, rightFade: TAB_FADE_PX,
+  });
+  /** Only scrolling in a settled layout can opt out of following the active
+   *  tab. A resize can emit a scroll before its observer runs (notably when
+   *  the dropdown appears); that is not the user scrolling away. */
   let activeVisible = true;
-
-  /** Fade width; the reveal keeps the active tab this far inside the edge so
-   *  the fade never sits on it. */
-  const FADE_PX = 24;
+  let measuredWidth = 0;
 
   /** Reads only (scroll metrics + tab offsets), then one state write — no
    *  interleaved layout so a scroll event never thrashes. */
@@ -213,18 +220,35 @@
     // strip narrower than a tab's floor — nothing to list there, no control.
     const over = sw > cw + 1 && node.tabs.length > 1;
     let hidden = 0;
-    activeVisible = true;
+    let active: TabBounds | null = null;
     for (const t of strip.querySelectorAll<HTMLElement>("[data-tab-index]")) {
-      const l = t.offsetLeft;
-      const clipped = l < sl - 2 || l + t.offsetWidth > sl + cw + 2;
+      const bounds = { left: t.offsetLeft, width: t.offsetWidth };
+      const clipped = !tabInView(sl, cw, bounds);
       if (clipped && over) hidden++;
-      if (clipped && Number(t.dataset.tabIndex) === node.active) activeVisible = false;
+      if (Number(t.dataset.tabIndex) === node.active) active = bounds;
     }
-    const next: Clip = { left: sl > 1, right: sl + cw < sw - 1, over, hidden };
+    const fades = tabFadeWidths(sl, cw, active);
+    const next: Clip = {
+      left: sl > 1, right: sl + cw < sw - 1, over, hidden,
+      leftFade: fades.left, rightFade: fades.right,
+    };
     const p = untrack(() => clip);
-    if (next.left !== p.left || next.right !== p.right || next.over !== p.over || next.hidden !== p.hidden) {
+    if (next.left !== p.left || next.right !== p.right || next.over !== p.over ||
+        next.hidden !== p.hidden || next.leftFade !== p.leftFade || next.rightFade !== p.rightFade) {
       clip = next;
     }
+  }
+
+  function onStripScroll(): void {
+    const strip = tabsEl;
+    if (strip === null) return;
+    const tab = strip.querySelector<HTMLElement>(`[data-tab-index="${node.active}"]`);
+    if (tab !== null && strip.clientWidth === measuredWidth) {
+      activeVisible = tabInView(strip.scrollLeft, strip.clientWidth, {
+        left: tab.offsetLeft, width: tab.offsetWidth,
+      });
+    }
+    measure();
   }
 
   /** Scroll tab `i` into the strip's view (own scrollLeft math — never
@@ -235,15 +259,10 @@
     const tab = strip.querySelector<HTMLElement>(`[data-tab-index="${i}"]`);
     if (tab === null) return;
     // offsetLeft is relative to .tabs (position: relative) and ignores scroll.
-    const left = tab.offsetLeft;
-    const right = left + tab.offsetWidth;
-    const view = strip.clientWidth;
-    if (strip.scrollWidth <= view) return;
-    if (left < strip.scrollLeft + FADE_PX) {
-      strip.scrollLeft = Math.max(0, left - FADE_PX);
-    } else if (right > strip.scrollLeft + view - FADE_PX) {
-      strip.scrollLeft = right - view + FADE_PX;
-    }
+    strip.scrollLeft = revealTabScrollLeft(strip.scrollLeft, strip.clientWidth, strip.scrollWidth, {
+      left: tab.offsetLeft,
+      width: tab.offsetWidth,
+    });
   }
 
   // Active tab changed (click, Mod+Alt+[/], open, restore, a preview slot
@@ -255,6 +274,8 @@
     void (t === undefined ? null : tabKey(t));
     if (tabsEl === null) return;
     revealTab(i);
+    activeVisible = true;
+    measuredWidth = tabsEl.clientWidth;
     measure();
   });
 
@@ -273,6 +294,7 @@
       raf = requestAnimationFrame(() => {
         raf = 0;
         if (activeVisible) revealTab(node.active);
+        measuredWidth = strip.clientWidth;
         measure();
       });
     });
@@ -336,7 +358,7 @@
     };
     const onMove = (e: PointerEvent) => {
       const r = strip.getBoundingClientRect();
-      dir = e.clientX < r.left + FADE_PX ? -1 : e.clientX > r.right - FADE_PX ? 1 : 0;
+      dir = e.clientX < r.left + TAB_FADE_PX ? -1 : e.clientX > r.right - TAB_FADE_PX ? 1 : 0;
       if (dir !== 0 && raf === 0) raf = requestAnimationFrame(step);
     };
     window.addEventListener("pointermove", onMove);
@@ -367,6 +389,9 @@
     if (tab.surface === "terminal") return sessionLabel(tab.sessionId);
     if (tab.surface === "settings") return "Settings";
     if (tab.surface === "dashboard") return "Dashboard";
+    if (tab.surface === "timeline") return "Timeline";
+    if (tab.surface === "knowledge") return "Knowledge";
+    if (tab.surface === "plugins") return "Extensions";
     if (tab.surface === "finder") return basename(tab.path) || "Finder";
     if (tab.surface === "git") return "Source Control";
     if (tab.surface === "diff") return `${basename(tab.path)} (diff)`;
@@ -563,18 +588,29 @@
     return rows;
   }
 
+  /** Close every tab of this pane except `keep` (or all), from the right so
+   *  the indices still to visit never shift. A file with unsaved edits asks
+   *  first — App gathers them into one "save changes?" dialog. */
+  function closeMany(keep: number | null): void {
+    for (let j = node.tabs.length - 1; j >= 0; j--) {
+      if (j !== keep) ctrl.closeTab(node.id, j);
+    }
+  }
+
   function tabMenu(tab: Tab, i: number): ContextMenuEntry[] {
-    const close: ContextMenuEntry = {
-      label: "Close",
-      onSelect: () => ctrl.closeTab(node.id, i),
-    };
+    const others = node.tabs.length > 1;
+    const close: ContextMenuEntry[] = [
+      { label: "Close", onSelect: () => ctrl.closeTab(node.id, i) },
+      { label: "Close Others", disabled: !others, onSelect: () => closeMany(i) },
+      { label: "Close All", onSelect: () => closeMany(null) },
+    ];
     const move = moveEntries(tab, i);
     if (tab.surface === "terminal") {
       return [
         { label: "Rename…", onSelect: () => beginTabRename(tab) },
         "separator",
         ...move,
-        close,
+        ...close,
       ];
     }
     if (tab.surface === "browser") {
@@ -590,21 +626,17 @@
             ]
           : []),
         ...move,
-        close,
+        ...close,
       ];
     }
     if (tab.surface === "file") {
-      const dirty = $dirtyFiles.has(tab.path);
+      // Renaming a file with unsaved edits is safe: its buffer follows the
+      // rename (previews/buffers re-keys on the fs mutation).
       return [
         ...(tab.preview === true
           ? [{ label: "Keep Open", onSelect: () => ctrl.pinTab(node.id, i) } as ContextMenuEntry, "separator" as const]
           : []),
-        {
-          label: "Rename…",
-          disabled: dirty,
-          hint: dirty ? "save the file first — renaming would drop unsaved edits" : undefined,
-          onSelect: () => beginTabRename(tab),
-        },
+        { label: "Rename…", onSelect: () => beginTabRename(tab) },
         { label: "Reveal in File Tree", onSelect: () => ctrl.revealPathInTree(tab.path) },
         "separator",
         ...(isRemoteHost()
@@ -613,10 +645,10 @@
         { label: "Copy Path", onSelect: () => void copyPath(tab.path) },
         "separator",
         ...move,
-        close,
+        ...close,
       ];
     }
-    return [...move, close];
+    return [...move, ...close];
   }
 </script>
 
@@ -639,16 +671,19 @@
   {/if}
   <!-- .strip owns the edge fades + the "more" control; .tabs is the
        scroller (hidden scrollbar, wheel → sideways). -->
-  <div class="strip" class:clip-left={clip.left} class:clip-right={clip.right} class:over={clip.over}>
-    <div class="tabs" role="tablist" bind:this={tabsEl} onscroll={measure} onwheel={onStripWheel}>
+  <div class="strip" class:clip-left={clip.left} class:clip-right={clip.right} class:over={clip.over}
+    style:--left-fade="{clip.leftFade}px" style:--right-fade="{clip.rightFade}px">
+    <div class="tabs" role="tablist" bind:this={tabsEl} onscroll={onStripScroll} onwheel={onStripWheel}>
       {#each node.tabs as tab, i (tabKey(tab))}
         {@const sid = tab.surface === "terminal" ? tab.sessionId : null}
         {@const ts = sid !== null ? (sessions.get(sid) ?? null) : null}
         {@const fEntry = tab.surface === "file" ? $gitIndex.files.get(tab.path) : undefined}
         {@const fDeco = fEntry ? decoFor(fEntry) : null}
+        {@const unread = sid !== null && i !== node.active && isUnread(sid)}
         <div
           class="tab"
           class:active={i === node.active}
+          class:unread
           class:insert={insertIndex === i}
           class:link-target={dropSpot?.kind === "linktab" &&
             dropSpot.paneId === node.id &&
@@ -705,14 +740,15 @@
           {:else if tab.surface === "settings"}
             <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
               <title>settings</title>
-              <circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <!-- A cog: settings. -->
               <path
-                d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6L11 5M5 11l-1.4 1.4"
+                d="M6.77 3.05L6.98 1.18A6.9 6.9 0 0 1 9.02 1.18L9.23 3.05A5.1 5.1 0 0 1 10.63 3.63L12.10 2.45A6.9 6.9 0 0 1 13.55 3.90L12.37 5.37A5.1 5.1 0 0 1 12.95 6.77L14.82 6.98A6.9 6.9 0 0 1 14.82 9.02L12.95 9.23A5.1 5.1 0 0 1 12.37 10.63L13.55 12.10A6.9 6.9 0 0 1 12.10 13.55L10.63 12.37A5.1 5.1 0 0 1 9.23 12.95L9.02 14.82A6.9 6.9 0 0 1 6.98 14.82L6.77 12.95A5.1 5.1 0 0 1 5.37 12.37L3.90 13.55A6.9 6.9 0 0 1 2.45 12.10L3.63 10.63A5.1 5.1 0 0 1 3.05 9.23L1.18 9.02A6.9 6.9 0 0 1 1.18 6.98L3.05 6.77A5.1 5.1 0 0 1 3.63 5.37L2.45 3.90A6.9 6.9 0 0 1 3.90 2.45L5.37 3.63A5.1 5.1 0 0 1 6.77 3.05Z"
                 fill="none"
                 stroke="currentColor"
-                stroke-width="1.4"
-                stroke-linecap="round"
+                stroke-width="1.3"
+                stroke-linejoin="round"
               />
+              <circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.3" />
             </svg>
           {:else if tab.surface === "finder"}
             <span class="tab-glyph" class:on={i === node.active}>
@@ -767,6 +803,29 @@
                 stroke-linejoin="round"
               />
             </svg>
+          {:else if tab.surface === "timeline"}
+            <!-- A clock face: what happened, when. -->
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>timeline</title>
+              <circle cx="8" cy="8" r="5.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <path d="M8 4.8V8l2.4 1.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          {:else if tab.surface === "knowledge"}
+            <!-- An open notebook: what the project knows. -->
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>knowledge</title>
+              <path
+                d="M2.5 3.2c1.8-.7 3.6-.6 5.5.5v9c-1.9-1.1-3.7-1.2-5.5-.5zM13.5 3.2c-1.8-.7-3.6-.6-5.5.5v9c1.9-1.1 3.7-1.2 5.5-.5z"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linejoin="round"
+              />
+            </svg>
+          {:else if tab.surface === "plugins"}
+            <!-- Extensions: three cells and a plus (plugins/glyph.ts), at its
+                 own 12px pixel grid. -->
+            <ExtensionsGlyph class="glyph" title="extensions" />
           {:else if tab.surface === "browser"}
             <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
               <title>browser</title>
@@ -803,6 +862,7 @@
             <span
               class="tab-name"
               class:preview={tab.surface === "file" && tab.preview === true}
+              class:unread
               data-label={label(tab)}
               style:color={fDeco ? fDeco.color : undefined}>{label(tab)}</span
             >
@@ -1074,6 +1134,27 @@
         </svg>
       </button>
     </div>
+    {#if mastermindPanel.available && !mastermindPanel.open && mastermindPanel.cornerPaneId === node.id}
+      <!-- The window's ONE way into its Mastermind panel: only in the pane
+           whose bar touches the window's top-right corner, where the panel
+           opens. Persistent but quiet; the dot is the only signal it ever
+           gives (it needs you, or answered while the panel was closed). -->
+      <button
+        class="mm-toggle"
+        class:attn={mastermindPanel.attention}
+        title="Mastermind{keyHintSuffix('mastermind')}{mastermindPanel.attention
+          ? ' — needs you or has a new reply'
+          : ''}"
+        aria-label="open the Mastermind"
+        onclick={(e) => {
+          e.stopPropagation();
+          setMastermindPanelOpen(true);
+        }}
+      >
+        <BrandMark size={13} title="Mastermind" />
+        {#if mastermindPanel.attention}<span class="mm-dot" aria-hidden="true"></span>{/if}
+      </button>
+    {/if}
 
     {#if linkMenuOpen}
       <div class="overlay-surface link-menu" role="menu" aria-label="link to agent">
@@ -1142,7 +1223,6 @@
     position: absolute;
     top: 0;
     bottom: 0;
-    width: 24px;
     z-index: 2;
     pointer-events: none;
     opacity: 0;
@@ -1153,11 +1233,13 @@
      hint, not as legible text (dark ground otherwise let it read through). */
   .strip::before {
     left: 0;
+    width: var(--left-fade);
     background: linear-gradient(to right, var(--term-bg) 30%, transparent);
   }
 
   .strip::after {
     right: 0;
+    width: var(--right-fade);
     background: linear-gradient(to left, var(--term-bg) 30%, transparent);
   }
 
@@ -1280,6 +1362,13 @@
     color: var(--fg);
   }
 
+  /* The Extensions glyph is drawn for whole pixels at 12px; centred in the
+     25px tab it would sit on a half pixel. One pixel down lands it on the
+     grid, level with the 11px glyphs beside it. */
+  .tab :global(.ext-glyph) {
+    margin-top: 1px;
+  }
+
   /* Active-tab emphasis via weight, not color — the bar stays quiet; a thin
      accent underline (inset shadow, above the bar's edge line) confirms it
      without adding a fill. */
@@ -1377,6 +1466,15 @@
     font-style: normal;
   }
 
+  /* Unread: an agent in a background tab finished work you haven't looked
+     at — the rail row's cue (a bolder, full-ink name), so the tab that needs
+     a look reads at a glance. The ::after reserve already sizes the name at
+     this weight, so marking never shifts the strip. */
+  .tab-name.unread {
+    color: var(--fg);
+    font-weight: 600;
+  }
+
   /* A VS Code preview tab: italic until it is pinned (dbl-click / edit). */
   .tab-name.preview {
     font-style: italic;
@@ -1400,6 +1498,8 @@
   }
 
   .tab-close {
+    /* Anchors the unread dot drawn in this slot (see .tab.unread below). */
+    position: relative;
     appearance: none;
     border: none;
     background: none;
@@ -1425,6 +1525,26 @@
   .tab-close:hover {
     opacity: 1;
     color: var(--fg);
+  }
+
+  /* Unread's scannable half: an accent dot in the close button's slot that
+     turns back into × under the pointer (the editor "dirty dot" gesture,
+     here meaning "finished — not looked at yet"). No reflow either way. */
+  .tab.unread:not(:hover) .tab-close {
+    opacity: 1;
+    color: transparent;
+  }
+
+  .tab.unread:not(:hover) .tab-close::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 6px;
+    height: 6px;
+    margin: -3px 0 0 -3px;
+    border-radius: 50%;
+    background: var(--accent);
   }
 
   /* --- linked-terminal chips ------------------------------------------- */
@@ -1627,6 +1747,48 @@
     align-items: center;
     gap: 4px;
     padding-left: 4px;
+  }
+
+  .mm-toggle {
+    position: relative;
+    flex: none;
+    appearance: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 22px;
+    margin-right: 2px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: none;
+    color: var(--muted);
+    opacity: 0.7;
+    cursor: pointer;
+    transition:
+      opacity 0.12s ease,
+      background-color 0.12s ease,
+      border-color 0.12s ease;
+  }
+  .mm-toggle:hover,
+  .mm-toggle:focus-visible,
+  .mm-toggle.attn {
+    opacity: 1;
+  }
+  .mm-toggle:hover {
+    background: var(--row-hover);
+    border-color: var(--edge);
+  }
+  .mm-dot {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 1.5px var(--bg);
   }
 
   .controls {

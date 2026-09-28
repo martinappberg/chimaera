@@ -1,0 +1,15 @@
+[package]
+name = "chimaera-plugin-api"
+# Tracks the WIT package (chimaera:plugin@0.1.0), not the daemon release.
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The chimaera:plugin WIT world and the Rust side of it: what a Chimaera plugin implements and may ask the host."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# The guest bindings for `wit/chimaera.wit`. Plugins build for wasm32-wasip2;
+# natively (tests, clippy) every host import is a stub that aborts.
+wit-bindgen = "0.62"

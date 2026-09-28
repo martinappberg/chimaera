@@ -20,10 +20,27 @@ export interface FileSelection {
   kind: "file";
   /** Absolute path on the daemon's filesystem. */
   path: string;
-  /** 1-based line range; null when the view has no line mapping (md preview). */
+  /** 1-based line range; null when the view has no line mapping. */
   startLine: number | null;
   endLine: number | null;
+  /** The selected text (copy provenance matches on it; the default quote). */
   text: string;
+  /** A viewer locator without its `#` (`page=3&xywh=72,90,200,120`,
+   *  `row=5-9`, `t=12.5,20`, `cell=7`; `shared/locator.ts`). Replaces the
+   *  `#L` range when set. */
+  fragment?: string;
+  /** The quote to send instead of an excerpt of `text` (a table block as
+   *  one-line TSV). Already capped by its producer; "" sends no quote. */
+  quote?: string;
+  /** Where the selection sits, typed in parentheses after the locator: the
+   *  enclosing heading of a markdown selection (`§ Results`). */
+  context?: string;
+  /** The pointed-at pixels (an image or PDF region) as a PNG: attached in
+   *  chat, uploaded to the session's landing pad for a terminal agent. */
+  crop?: Blob;
+  /** Words for what is pointed at ("p. 3 region", "rows 5–9", "0:12"):
+   *  affordance tooltips and the attachment's label, never typed. */
+  label?: string;
 }
 
 export interface TerminalSelection {
@@ -75,6 +92,18 @@ export function setReferenceHandler(fn: ReferenceHandler | null): void {
 /** Invoked by every affordance (buttons and the chord alike). */
 export function requestReference(): void {
   handler?.();
+}
+
+/**
+ * A one-click affordance (a notebook cell's or a slide's `@`, "reference
+ * this moment"): publish `sel`, reference it through the same handler as
+ * the chord, then drop it again, so a later chord never re-sends a spot the
+ * user has moved on from. The handler reads the selection synchronously.
+ */
+export function referenceNow(owner: unknown, sel: SelectionSource): void {
+  setSelection(owner, sel);
+  requestReference();
+  clearSelection(owner);
 }
 
 // --- pure composers -----------------------------------------------------------
@@ -132,6 +161,21 @@ export function shellEscapePath(path: string): string {
 }
 
 /**
+ * An agent's `@mention` of `path` (with an optional `#` locator). Claude
+ * reads a bare `@path` up to whitespace and then back to an ASCII word
+ * boundary (`@([^\s]+)\b`), so anything that would not survive that is
+ * written in its quoted form `@"…"` — what claude's own completion writes
+ * for a spaced path; the locator parses inside the quotes. A trailing `/`
+ * stays bare (claude resolves the folder either way). Its grammar has no
+ * escape, so a path holding `"` stays bare.
+ */
+export function agentMention(path: string, locator = ""): string {
+  const target = locator === "" ? path : `${path}#${locator}`;
+  const bare = !/\s/.test(target) && /[A-Za-z0-9_/]$/.test(target);
+  return bare || target.includes('"') ? `@${target}` : `@"${target}"`;
+}
+
+/**
  * A file-selection reference for a claude agent:
  * `@<rel-path>#L<start>-L<end> "<excerpt>" ` — trailing space, no newline
  * (NEVER submits). The `#L` range is omitted when the view has no line
@@ -143,8 +187,8 @@ export function composeFileReference(
   endLine: number | null,
   selection: string,
 ): string {
-  const lines = startLine !== null && endLine !== null ? `#L${startLine}-L${endLine}` : "";
-  return `@${relPath}${lines} "${truncateSelection(selection)}" `;
+  const lines = startLine !== null && endLine !== null ? `L${startLine}-L${endLine}` : "";
+  return `${agentMention(relPath, lines)} "${truncateSelection(selection)}" `;
 }
 
 /**
@@ -155,9 +199,68 @@ export function composeTerminalReference(displayName: string, selection: string)
   return `${displayName} output: "${truncateSelection(selection)}" `;
 }
 
-/** A bare path mention for a claude agent (drag-to-reference): `@<rel-path> `. */
+/** The most a producer-built quote may carry (the table TSV budget, 8 KB). */
+export const QUOTE_MAX = 8 * 1024;
+
+/** A producer-built quote kept as built (its spacing is data), except that
+ *  a control character can never reach the input and the length is capped. */
+function oneLine(text: string, max: number): string {
+  // eslint-disable-next-line no-control-regex
+  const flat = text.replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+  return flat.length <= max ? flat : `${flat.slice(0, max).trimEnd()}…`;
+}
+
+/** The locator of a file selection without its `#`: the view's fragment,
+ *  else its line range, else "" (a whole-file mention). */
+export function selectionLocator(sel: FileSelection): string {
+  if (sel.fragment !== undefined && sel.fragment !== "") return sel.fragment;
+  return sel.startLine !== null && sel.endLine !== null ? `L${sel.startLine}-L${sel.endLine}` : "";
+}
+
+/** Where a reference is delivered: a chat composer or a terminal agent's input. */
+export type ReferenceTargetKind = "chat" | "terminal";
+
+/**
+ * A file-selection reference, for any agent:
+ * `@<rel-path>#<locator> (<context>) "<quote>" (region image: <path>) ` —
+ * trailing space, never a newline (NEVER submits). Every part but the path
+ * is optional. The region-image path is typed for a terminal agent only (a
+ * chat target gets the crop as an attachment instead), and only once the
+ * crop reached the session's landing pad (`cropPath`).
+ */
+export function composeSelectionReference(
+  relPath: string,
+  sel: FileSelection,
+  target: ReferenceTargetKind,
+  cropPath: string | null = null,
+): string {
+  const loc = selectionLocator(sel);
+  let out = agentMention(relPath, loc);
+  const context = sel.context !== undefined ? truncateSelection(sel.context, 80) : "";
+  if (context !== "") out += ` (${context})`;
+  const quote = sel.quote !== undefined ? oneLine(sel.quote, QUOTE_MAX) : truncateSelection(sel.text);
+  if (quote !== "") out += ` "${quote}"`;
+  if (target === "terminal" && cropPath !== null) {
+    out += ` (region image: ${truncateSelection(cropPath, 1024)})`;
+  }
+  return `${out} `;
+}
+
+/** Whether delivering `sel` to `target` first uploads its crop (a terminal
+ *  agent reads pixels from a file; chat attaches them). */
+export function needsCropUpload(sel: SelectionSource, target: ReferenceTargetKind): boolean {
+  return sel.kind === "file" && sel.crop !== undefined && target === "terminal";
+}
+
+/**
+ * A path mention for an agent (drag-to-reference, an uploaded file):
+ * `@<rel-path> `, quoted when a bare mention would not read the whole path
+ * (`agentMention`). Uploads land under space-free names; the quoting covers
+ * a spaced directory above them, a non-ASCII name ending, and workspace
+ * files.
+ */
 export function composeAgentPathReference(relPath: string): string {
-  return `@${relPath} `;
+  return `${agentMention(relPath)} `;
 }
 
 /**
@@ -173,11 +276,8 @@ export function composeProvenanceSuffix(
 ): string {
   if (source.kind === "file") {
     const path = relPath ?? source.path;
-    const lines =
-      source.startLine !== null && source.endLine !== null
-        ? `#L${source.startLine}-L${source.endLine}`
-        : "";
-    return ` [from @${path}${lines}] `;
+    const loc = selectionLocator(source);
+    return ` [from ${agentMention(path, loc)}] `;
   }
   return ` [from ${terminalName ?? "terminal"} output] `;
 }
@@ -239,6 +339,7 @@ if (import.meta.env.DEV) {
     "terminal reference format",
   );
   ok(composeAgentPathReference("src/a.ts") === "@src/a.ts ", "agent path mention");
+  ok(composeAgentPathReference("my dir/a.ts") === '@"my dir/a.ts" ', "a spaced path mention quotes");
   ok(
     composeProvenanceSuffix(
       { kind: "file", path: "/w/src/a.ts", startLine: 3, endLine: 9, text: "" },

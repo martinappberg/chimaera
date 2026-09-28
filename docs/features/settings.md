@@ -22,7 +22,7 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   `web-ui/src/lib/settings/schema.ts` (where defaults live).
 - **Key behaviors.** Reads **re-stat the file** so external edits surface without a restart, bumping a
   content generation that `/ws/events` diffs against. Only a handful of keys are daemon-consumed
-  (`git.path`, `agents.*.path`, `daemon.scrollbackLines`, `daemon.restoreSessions`, `chat.remoteControlAtStart`, `chat.toolSummaries`, `update.autoCheck`,
+  (`git.path`, `agents.*.path`, `daemon.scrollbackLines`, `daemon.restoreSessions`, `chat.remoteControlAtStart`, `chat.toolSummaries`, `chat.resumeAfterRestart`, `update.autoCheck`,
   `quickOpen.ignoreDirs`); everything else is opaque and preserved verbatim (forward-compat — a newer
   UI's keys survive an older daemon). A corrupt/oversized/non-object file degrades to an empty map with
   a warning — settings must never brick the daemon. A changed `agents.*.path` triggers shim regeneration
@@ -34,7 +34,10 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   validation message derives from `schema.ts`; default values remain sparse (choosing a default
   deletes that key). The UI covers Appearance, Agents, Environment, Dashboard, Chat, Terminal,
   Editor, Files, Quick Open, Git, Daemon, Updates, and Keyboard. Environment is the deliberate
-  exception: its multiline preludes use `/api/v1/environment` and `env-profiles.json`.
+  exception: its multiline preludes use `/api/v1/environment` and `env-profiles.json`. Documents
+  is the other: opt-in writes of the documents dialect into the workspace's `AGENTS.md` or a
+  Claude Code skill over `/api/v1/agent-docs`
+  ([agents.md](agents.md#documents-the-portable-dialect-check_document-and-the-issues-chip)).
 - **Interface typography applies app-wide.** `appearance.interfaceFontSize` (13 px by default)
   rebuilds the shared `--text-xs`/`--text-sm`/`--text-md`/`--text-lg` scale live, so the rail,
   file tree, pane tabs, dashboard, settings, dialogs, Git, and preview chrome move together.
@@ -51,6 +54,15 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   `dashboard.cardDensity` selects automatic, comfortable, or compact agent cards. Mastermind's
   agent/mode are workspace state edited in its setup card, while Environment preludes remain scoped
   records rather than being flattened into global preferences.
+
+## Updates status
+
+- **Updates section** (`UpdatesStatus.svelte`, above the `update.autoCheck` switch) — the one place that
+  answers "is there an update?": a line each for the app (native), the daemon serving this window
+  ("chimaera" in a browser, "local daemon" / "daemon on \<host\>" in the app) and the agent CLIs (one
+  summary line, "Agents ↓" jumps there). Each says up to date / \<new\> available / couldn't check (with
+  the reason) / not checked yet, plus when it last checked and the cadence; "check now" asks every source
+  at once. Agents read "up to date" only when every installed agent's version and latest are both known.
 
 ## Agents settings & themes
 

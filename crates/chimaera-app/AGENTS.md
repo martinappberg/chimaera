@@ -33,10 +33,11 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | File | What it owns |
 |---|---|
 | `main.rs` | The 3-role argv dispatch (order is load-bearing). |
+| `Entitlements.plist` | macOS hardened-runtime exception for Wasmtime's executable plugin memory, applied by `tauri.conf.json` to the binary that also runs `--daemon`. |
 | `command_manifest.rs` | Shared daemon/wizard command vocabulary for build-time permission generation and exact runtime daemon grants. |
-| `shell.rs` | Module root: app-global `Shell` state, `WindowScope`, `lock`, and the Tauri `Builder` assembly (`run`). Re-exports `open_ui_window`. |
+| `shell.rs` | Module root: app-global `Shell` state, `WindowScope`, `lock`, and the Tauri `Builder` assembly (`run`). Closing the last non-Home window opens local Home; closing the last local Home exits, while explicit Quit preserves restore state. Re-exports `open_ui_window`. |
 | `shell/commands.rs` | The IPC command surface (`#[tauri::command]` fns wired into `generate_handler!`) — thin delegators. |
-| `shell/connect.rs` | The `connect` flight state machine (one coalesced ssh attempt per host; a flight for a wedge suspect — or with no live tunnel — first clears a wedged ControlMaster, before the old tunnel's teardown) + the host-row wire vocabulary (`HostState`/`HostStatus`) + `with_hosts`, the app's single path to hosts.json (serialized, off the reactor via `spawn_blocking`; the CLI writes it directly in crates/chimaera/src/connect.rs). |
+| `shell/connect.rs` | The `connect` flight state machine (one coalesced ssh attempt per host; a flight for a wedge suspect — or with no live tunnel — first clears a wedged ControlMaster, before the old tunnel's teardown — both masters for an alias routed to its daemon's login node) + the host-row wire vocabulary (`HostState` — incl. `node`, the login node a pool alias is pinned to — /`HostStatus`, and the `routing` progress phase) + `with_hosts`, the app's single path to hosts.json (serialized, off the reactor via `spawn_blocking`; the CLI writes it directly in crates/chimaera/src/connect.rs). |
 | `shell/restore.rs` | `open_ui_window`, the tunnel health monitor (a 3 s `interval` tick — a down host's probe burns its 2 s timeout inside it; 3-miss hysteresis; confirmed-down keys back off per miss up to 10 ticks, compute keys 2; a `down` edge files a wedge suspect), and launch-time window restore. |
 | `daemon.rs` | Launch/adopt the local daemon; version/parity policy (unix: spawn-self; windows: delegates to `wsl.rs`). |
 | `wsl.rs` | The WSL2 engine: registry-first detection + version gate, hardened wsl.exe spawns, the persisted target (distro + PINNED `-u` user — wsl.json), provision/replace/spawn/probe/stop, connect wiring (pure parts unit-tested on any host; e2e via wsl-smoke). Startup only ADOPTS; anything that provisions runs in the wizard, visibly. |
@@ -44,8 +45,11 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `askpass.rs` | The `SSH_ASKPASS` ↔ shell wire protocol (in-app password/Duo prompts). Transport: unix socket (unix) / token-gated loopback TCP fed through a WSL-interop wrapper (windows, installed by `wsl::wire_connect`). |
 | `appearance.rs` | Bounded per-host first-paint palette cache outside volatile daemon origins; persisted atomically and carried in native window URLs. |
 | `shell/commands.rs::open_external` | The ONLY route a rendered link has to the user's real browser: the navigation guard admits just the daemon origin and nothing receives a `target="_blank"`, so an external link is otherwise swallowed. **http/https only** — hrefs are agent-authored and the platform opener would act on `file:`/app schemes. |
+| `shell/unsaved.rs` | Window close / app quit never drop unsaved editor text: the page pushes its unsaved count (`report_unsaved`), so `CloseRequested`/quit decide synchronously; a held one asks the window (`unsaved-prompt` → `reply_unsaved`). Pure `Guard` (unit-tested) + glue; a 4 s hung-page timeout and a third-ask escape keep it from ever trapping the user. Also the macOS `applicationShouldTerminate:` hook (Dock › Quit, logout never reach `ExitRequested`). |
+| `shell/notices.rs` | Notices → OS notifications: one long-poll watcher per open daemon (`GET /api/v1/notices`), suppression for what the focused window shows (`report_window_view`), one-alert-per-session supersede/withdraw, click routing (`focus-session` + `take_pending_focus`), the Dock badge/bounce and tray counts. Feature: [notifications.md](../../docs/features/notifications.md). |
+| `notify.rs` | The platform notifier: macOS `UNUserNotificationCenter` + click delegate + dock tile (needs a signed `.app` — unbundled dev builds degrade to none), `notify-rust` on Linux/Windows. Identifiers encode the click route. |
 | `windows.rs` | The per-window registry (round-trips window↔workspace). |
-| `update.rs` | The auto-updater intent chain (consume-once, expiry). |
+| `update.rs` | The auto-updater intent chain (consume-once, expiry) + the kept outcome of every signed-update check (`status`/`check`, behind `app_update_status`). |
 | `menu.rs` | The menu bar. |
 | `tray.rs` | The menu-bar / system-tray status item (`tray-icon` feature). |
 
@@ -73,5 +77,14 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   `tauri.conf.json` + `crates/chimaera-app/Cargo.toml` + root `Cargo.toml` (release
   reads `chimaera-core::VERSION` to fetch the matching remote daemon). If any of
   those holds a non-`0.0.1` value, the sed silently no-ops → ships the wrong version.
-- Signing is a release-only concern (`TAURI_SIGNING_PRIVATE_KEY*`); the PR build
-  (`app.yml`) needs no key.
+- Updater signing is release-only (`TAURI_SIGNING_PRIVATE_KEY*`); the PR build
+  (`app.yml`) needs no key. macOS code signing still runs on PRs (ad hoc today)
+  with the hardened runtime. Keep `Entitlements.plist` wired into the bundle:
+  Wasmtime 49 uses mmap/mprotect, so `allow-jit` alone cannot authorize its code
+  pages. Missing `allow-unsigned-executable-memory` kills the daemon with
+  `CODESIGNING / Invalid Page` on the first plugin call, even when compilation
+  succeeds. Verify plugin execution in the signed bundle with
+  `node scripts/smoke-macos-plugins.mjs` after `bash scripts/build-plugins.sh`.
+  Both app PR CI and the macOS release job run it before publishing artifacts.
+  Ordinary `cargo test` binaries cannot catch hardened-runtime kills of the
+  app's `--daemon` process.

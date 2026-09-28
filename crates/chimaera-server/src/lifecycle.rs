@@ -18,6 +18,19 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // must not block startup. Best-effort (not a lock) — it closes the retry
     // pile-up, not a deliberate simultaneous double-start race.
     if let Ok(Some(m)) = chimaera_core::Manifest::load() {
+        // On a home shared across nodes the record may be another node's,
+        // whose pid and port can't be checked from here. Not refused: a
+        // renamed host (a laptop's DHCP-assigned name) looks the same and must
+        // still start. `chimaera connect` only lands here after proving that
+        // node's daemon gone — by probing it there, or because the node's
+        // name no longer resolves on this one.
+        if !m.written_here() {
+            tracing::warn!(
+                node = %m.hostname,
+                pid = m.pid,
+                "the manifest was written on another node; this daemon takes over the registry — a daemon still running there is no longer reachable through it"
+            );
+        }
         if m.is_alive() && port_answers_http(m.port).await {
             anyhow::bail!(
                 "a chimaera daemon for {} is already running (pid {}, \
@@ -113,6 +126,9 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // Idle sweep for browser-pane proxy sessions (kills their relay children).
     tokio::spawn(proxy::sweeper(state.clone()));
 
+    // The notice feed's edge detector (agent finished / needs you).
+    tokio::spawn(crate::notices::run(state.clone()));
+
     // Uploads left by sessions that ended while no daemon was watching
     // (crashes, unclean stops) — swept once restore has decided which
     // sessions still exist.
@@ -160,11 +176,24 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         }
     }
 
+    // Only now, with the ledger flushed and the dead chats settled, end the
+    // live chat agents cleanly so their own teardown stops their background
+    // work (see `chat::stop_all_for_exit`); they resurrect from the ledger.
+    crate::chat::stop_all_for_exit(&state).await;
+
     if let Err(err) = chimaera_core::Handoff::new(port, state.token.clone()).write() {
         tracing::warn!(%err, "failed to write restart handoff");
     }
 
-    chimaera_core::Manifest::remove().context("failed to remove manifest")?;
+    // Only our own record: on a home shared across nodes a daemon on another
+    // node may own the file by now, and unlinking it would hide that live
+    // daemon from every client.
+    if !manifest
+        .remove_if_owned()
+        .context("failed to remove manifest")?
+    {
+        tracing::warn!("the manifest now belongs to another daemon; left in place");
+    }
     tracing::info!("chimaera daemon stopped");
     Ok(())
 }
@@ -280,6 +309,11 @@ async fn shutdown_signal(state: Arc<AppState>) {
         _ = state.shutdown.notified() => {},
     }
     tracing::info!("shutdown signal received");
+    // Release long-held requests before axum starts draining them.
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    state.changes.notify_waiters();
 }
 
 #[cfg(test)]

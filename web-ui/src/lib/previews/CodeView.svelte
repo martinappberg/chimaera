@@ -1,67 +1,59 @@
 <script lang="ts">
   /**
-   * CodeMirror 6 view for code/text files. Read-only for oversized/truncated
-   * files (the "load more" tail); editable for text files < 1MB. Cmd/Ctrl+S
-   * saves through the daemon with an mtime precondition — a concurrent
-   * on-disk change surfaces a quiet reload/overwrite conflict bar. Dirty state
-   * lives in the editing store (drives the tab dot + the beforeunload guard).
+   * CodeMirror 6 view onto a file's buffer (`buffers.svelte.ts`). The buffer —
+   * text, undo history, cursor, dirty/conflict/save state — lives in the store
+   * and outlives this component, so unmounting (close, keep-alive eviction,
+   * split, zoom, a drag to another pane, a workspace switch) never loses an
+   * edit; a remount re-attaches to the same state. This view owns only what is
+   * about display: theme/settings, the host's `extra` extensions, the language
+   * pack, the selection reference chip, reveal-at-line, and the bars that
+   * surface the buffer's state (conflict, merge notice, recovered draft,
+   * another window's edits, save status).
    *
+   * Editable for whole text files under the 1MB cap; view-only (with a
+   * "load more" tail past the cap) otherwise. Cmd/Ctrl+S saves; Mod-f searches.
    * The editor instance is plain module-ish state, never $state (same rule as
-   * xterm instances in termPool).
+   * xterm instances in termPool). `path` is fixed for this instance's life —
+   * every host remounts per path.
    */
-  import { onMount } from "svelte";
-  import { Compartment, EditorState, StateEffect, type Extension } from "@codemirror/state";
-  import {
-    EditorView,
-    lineNumbers,
-    highlightSpecialChars,
-    keymap,
-    drawSelection,
-  } from "@codemirror/view";
+  import { onMount, untrack, type Component } from "svelte";
+  import { Compartment, EditorState, type Extension } from "@codemirror/state";
+  import { EditorView, lineNumbers, highlightSpecialChars, drawSelection } from "@codemirror/view";
   import {
     LanguageDescription,
     syntaxHighlighting,
     bracketMatching,
-    indentOnInput,
     indentUnit,
   } from "@codemirror/language";
   import { languages } from "@codemirror/language-data";
   import {
-    defaultKeymap,
-    history,
-    historyKeymap,
-    indentWithTab,
-  } from "@codemirror/commands";
-  import { codeHighlight as highlight, makeCodeTheme as makeTheme } from "./cm";
-  import {
-    basename,
-    fsFile,
-    fsWrite,
-    humanSize,
-    looksBinary,
-    FileConflictError,
-    EDIT_MAX_BYTES,
-    FILE_CHUNK,
-    type FileChunk,
-  } from "./files";
-  import { ApiError } from "../net/api";
-  import { retain, release, noteWrite, type FileEntry } from "./fileStore.svelte";
-  import { setDirty, forgetDirty } from "../shared/editing";
+    codeHighlight as highlight,
+    makeCodeTheme as makeTheme,
+    codeSearchTheme,
+    revealFlash,
+    revealLines,
+    clearRevealFlash,
+    REVEAL_FLASH_MS,
+  } from "./cm";
+  import { basename, humanSize, type FileChunk } from "./files";
+  import { openBuffer, releaseBuffer, presence } from "./buffers.svelte";
   import { getSetting } from "../settings/store.svelte";
   import { isMac } from "../shared/keys";
   import { clearSelection, setSelection } from "../shared/reference";
+  import { revealRequest, takeReveal } from "../shared/reveal";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
 
   const SAVE_HINT = isMac ? "⌘S to save" : "Ctrl+S to save";
 
   interface Props {
     path: string;
-    /** First chunk, already fetched (and sniffed as text) by FileView. */
+    /** First chunk, already fetched (and sniffed as text) by the host. Seeds
+     *  a NEW buffer only; an existing buffer for this path is re-attached. */
     first: FileChunk;
     /** Live buffer sink: called with the current editor text on mount and on
-     *  every change (a keystroke, a background fill, a reload). The split
+     *  every change (a keystroke, a load, a reload, a merge). The split
      *  edit|preview shell uses it to re-render the preview as you type — the
-     *  file is still only written on Cmd/Ctrl+S. */
+     *  file is still only written on save. */
     onDoc?: (text: string) => void;
     /** Host-supplied surface extensions, swapped live in their own compartment
      *  (the markdown live preview rides here). Reconfigured only when the
@@ -72,36 +64,40 @@
      *  filename-matched pack, which would otherwise load a second, permanently
      *  inert language instance into the config. */
     autoLanguage?: boolean;
+    /** Consume "open at this line" requests (shared/reveal) for this path. A
+     *  host that shows another surface for the same path (markdown reading)
+     *  passes false while that surface handles reveals itself. */
+    acceptReveal?: boolean;
   }
 
-  let { path, first, onDoc = undefined, extra = [], autoLanguage = true }: Props = $props();
+  let {
+    path,
+    first,
+    onDoc = undefined,
+    extra = [],
+    autoLanguage = true,
+    acceptReveal = true,
+  }: Props = $props();
+
+  const buf = openBuffer(
+    untrack(() => path),
+    untrack(() => first),
+  );
 
   let host = $state<HTMLDivElement | null>(null);
-  let loadedBytes = $state(0);
-  let totalBytes = $state(0);
-  let truncated = $state(false);
-  let loadingMore = $state(false);
-  let loadError = $state<string | null>(null);
-  // Bumped whenever the doc is authoritatively replaced (a reload). A
-  // background `fillToEnd`/`loadMore` captures it before its await and bails if
-  // it changed, so an external-change reload can't interleave appended chunks
-  // (fetched at a now-stale offset) into the freshly replaced document.
-  let loadGen = 0;
-
-  // Editing state.
-  let editable = $state(false);
-  let dirty = $state(false);
-  let savedMtime = $state<string | null>(null);
-  let saving = $state(false);
-  let saveError = $state<string | null>(null);
-  let conflict = $state(false);
-  let savedFlash = $state(false);
-  let flashTimer: ReturnType<typeof setTimeout> | null = null;
-
   let view: EditorView | null = null;
-  const editCompartment = new Compartment();
+  /** The view exists (reveal and other view-bound effects wait for it). */
+  let ready = $state(false);
+  /** Another view of this buffer took over (a transient overlap while a tab
+   *  moves between panes): this one must not accept keystrokes. It resumes
+   *  if that view unmounts first. */
+  let superseded = $state(false);
+  /** The filename-matched language pack, once loaded (a resumed view's
+   *  fresh state must carry it again). */
+  let langSupport: Extension = [];
   const settingsCompartment = new Compartment();
   const extraCompartment = new Compartment();
+  const langCompartment = new Compartment();
 
   // Context bridge: this view's selection, published for the reference
   // affordance + chord. The chip floats near the selection's end.
@@ -123,7 +119,7 @@
     const endLine = endAt.number > startLine && endAt.from === sel.to ? endAt.number - 1 : endAt.number;
     setSelection(selOwner, {
       kind: "file",
-      path,
+      path: buf.path,
       startLine,
       endLine,
       text: v.state.sliceDoc(sel.from, sel.to),
@@ -151,9 +147,6 @@
       y: clamp(coords.bottom - rect.top + 6, 4, rect.height - 58),
     };
   }
-  // Streaming decoder: chunk boundaries may split a UTF-8 sequence; the
-  // decoder carries the partial bytes across load-more calls.
-  const decoder = new TextDecoder("utf-8", { fatal: false });
 
   /** Settings-driven extensions (swapped live via settingsCompartment). */
   function settingsExtensions() {
@@ -188,128 +181,72 @@
     }
   });
 
-  /** The editable/read-only extension set for the compartment. */
-  function editExtensions(canEdit: boolean) {
-    return canEdit
-      ? [
-          history(),
-          keymap.of([
-            { key: "Mod-s", run: () => (triggerSave(), true), preventDefault: true },
-            indentWithTab,
-            ...defaultKeymap,
-            ...historyKeymap,
-          ]),
-          indentOnInput(),
-          EditorView.editable.of(true),
-          EditorView.updateListener.of((u) => {
-            if (u.docChanged) markDirty();
-          }),
-        ]
-      : [EditorState.readOnly.of(true), EditorView.editable.of(false)];
+  /** This view's own extensions; the buffer adds history, keymaps, search. */
+  function viewExtensions(): Extension {
+    return [
+      settingsCompartment.of(settingsExtensions()),
+      // Before the filename-matched language pack, so a host language in
+      // `extra` (markdown live) wins the language facet.
+      extraCompartment.of((lastExtra = extra)),
+      langCompartment.of(langSupport),
+      highlightSpecialChars(),
+      drawSelection(),
+      bracketMatching(),
+      syntaxHighlighting(highlight, { fallback: true }),
+      codeSearchTheme,
+      revealFlash,
+      // Context bridge + live-buffer sink + autosave-on-blur, in both
+      // read-only and editable modes.
+      EditorView.updateListener.of((u) => {
+        if (u.view !== view) return;
+        if (u.selectionSet || u.docChanged) syncSelection(u.view);
+        else if (u.geometryChanged) placeChip(u.view);
+        if (u.docChanged) onDoc?.(u.state.doc.toString());
+        if (u.focusChanged && !u.view.hasFocus) buf.flushAutosave();
+      }),
+    ];
   }
-
-  function markDirty(): void {
-    if (!editable) return;
-    if (!dirty) {
-      dirty = true;
-      setDirty(path, true);
-    }
-    // A fresh edit invalidates the "saved" flash and any stale conflict/error.
-    savedFlash = false;
-  }
-
-  function clearDirty(): void {
-    dirty = false;
-    setDirty(path, false);
-  }
-
-  // Live disk-change awareness. The shared file store re-probes this path's
-  // mtime whenever the fs/git bus signals a change; when the on-disk version
-  // moves past what we last saved/loaded, adopt it if the buffer is clean, or
-  // raise the conflict bar (never clobber unsaved edits) if it is dirty. This
-  // turns save-time-only conflict detection into a live one. Retaining pins the
-  // shared entry so it is revalidated while this editor is on screen.
-  let entry = $state<FileEntry | null>(null);
-  $effect(() => {
-    entry = retain(path);
-    return () => release(path);
-  });
-  $effect(() => {
-    const e = entry;
-    if (e === null || savedMtime === null) return; // not yet initialized
-    if (e.missing) {
-      // App preserves dirty tabs when an external actor deletes the path. Keep
-      // the buffer mounted and let overwrite recreate the file; a clean tab is
-      // pruned before this transient state matters.
-      conflict = true;
-      return;
-    }
-    const diskMtime = e.mtime;
-    if (diskMtime === null || diskMtime === savedMtime) return; // our version, or unknown
-    if (dirty || saving) conflict = true;
-    else void reloadFromDisk();
-  });
-  const conflictMessage = $derived(
-    entry?.missing === true ? "deleted on disk" : "changed on disk",
-  );
 
   onMount(() => {
     const el = host;
-    if (el === null) return;
-    const text = decoder.decode(first.bytes, { stream: true });
-    loadedBytes = first.bytes.length;
-    totalBytes = first.size;
-    truncated = first.truncated;
-    savedMtime = first.mtime;
-    // Editable when the whole file fits under the 1MB cap and is text. Large
-    // truncated files stay read-only with the load-more tail.
-    editable = totalBytes <= EDIT_MAX_BYTES && !truncated;
-
-    const state = EditorState.create({
-      doc: text,
-      extensions: [
-        settingsCompartment.of(settingsExtensions()),
-        // Before the appended filename-matched language pack, so a host
-        // language in `extra` (markdown live) wins the language facet.
-        extraCompartment.of((lastExtra = extra)),
-        highlightSpecialChars(),
-        drawSelection(),
-        bracketMatching(),
-        syntaxHighlighting(highlight, { fallback: true }),
-        // Context bridge: track the selection in both read-only and editable
-        // modes (this listener lives outside the edit compartment). It also
-        // feeds the live-buffer sink (split preview) on every doc change.
-        EditorView.updateListener.of((u) => {
-          if (u.selectionSet || u.docChanged) syncSelection(u.view);
-          else if (u.geometryChanged) placeChip(u.view);
-          if (u.docChanged) onDoc?.(u.state.doc.toString());
-        }),
-        editCompartment.of(editExtensions(editable)),
-      ],
-    });
-    const v = new EditorView({ state, parent: el });
+    if (el === null) return () => releaseBuffer(buf);
+    const v = new EditorView({ state: buf.stateFor(viewExtensions()), parent: el });
     view = v;
-    // Seed the live-buffer sink with the initial text (the split preview shows
-    // current content before the first keystroke).
-    onDoc?.(text);
+    const onSuperseded = () => {
+      superseded = true;
+      view = null;
+    };
+    // The view that superseded this one unmounted first: take over again
+    // from the buffer's current state (its text and undo moved on here).
+    const onResume = () => {
+      v.setState(buf.stateFor(viewExtensions()));
+      view = v;
+      superseded = false;
+      buf.attach(v, onSuperseded, onResume);
+      onDoc?.(v.state.doc.toString());
+    };
+    buf.attach(v, onSuperseded, onResume);
+    ready = true;
+    // Seed the live-buffer sink with the current text (the split preview shows
+    // it before the first keystroke — or a re-attached buffer's unsaved text).
+    onDoc?.(v.state.doc.toString());
 
     // Keep the chip pinned to the selection end while the code scrolls.
     const onScroll = () => placeChip(v);
     v.scrollDOM.addEventListener("scroll", onScroll, { passive: true });
+    // Autosave on window blur too (the editor keeps DOM focus when the whole
+    // window loses it, so its own focus change never fires).
+    const onWindowBlur = () => buf.flushAutosave();
+    window.addEventListener("blur", onWindowBlur);
 
-    // Under-cap files that came back truncated (256KB < size ≤ 1MB): pull the
-    // rest in the background so the editor holds the full document and can save.
-    if (totalBytes <= EDIT_MAX_BYTES && truncated) {
-      void fillToEnd(v);
-    }
-
-    // Language by filename, loaded lazily; appended once ready.
-    const desc = autoLanguage ? LanguageDescription.matchFilename(languages, basename(path)) : null;
+    // Language by filename, loaded lazily into its compartment.
+    const desc = autoLanguage ? LanguageDescription.matchFilename(languages, basename(buf.path)) : null;
     if (desc !== null) {
       void desc
         .load()
         .then((support) => {
-          if (view === v) v.dispatch({ effects: StateEffect.appendConfig.of(support) });
+          langSupport = support;
+          if (view === v) v.dispatch({ effects: langCompartment.reconfigure(support) });
         })
         .catch(() => {
           // language pack failed to load; plain text is fine
@@ -317,185 +254,282 @@
     }
 
     return () => {
-      view = null;
+      ready = false;
+      if (view === v) view = null;
       if (flashTimer !== null) clearTimeout(flashTimer);
-      forgetDirty(path);
+      if (savedTimer !== null) clearTimeout(savedTimer);
+      if (nudgeTimer !== null) clearTimeout(nudgeTimer);
       clearSelection(selOwner);
       v.scrollDOM.removeEventListener("scroll", onScroll);
+      window.removeEventListener("blur", onWindowBlur);
+      buf.detach(v);
+      releaseBuffer(buf);
       v.destroy();
     };
   });
 
-  /** Load remaining chunks (silently) so an under-cap file becomes editable. */
-  async function fillToEnd(v: EditorView): Promise<void> {
-    const gen = loadGen;
-    while (view === v && gen === loadGen && truncated) {
-      try {
-        const chunk = await fsFile(path, loadedBytes, FILE_CHUNK);
-        if (view !== v || gen !== loadGen) return; // a reload superseded us
-        const text = decoder.decode(chunk.bytes, { stream: true });
-        v.dispatch({ changes: { from: v.state.doc.length, insert: text } });
-        loadedBytes += chunk.bytes.length;
-        totalBytes = chunk.size;
-        truncated = chunk.truncated;
-        if (chunk.bytes.length === 0) break;
-      } catch {
-        return; // leave it read-only-ish; user can still view
-      }
-    }
-    if (view === v && gen === loadGen && !truncated && totalBytes <= EDIT_MAX_BYTES && !editable) {
-      editable = true;
-      // The background fill shouldn't leave the doc marked dirty.
-      v.dispatch({ effects: editCompartment.reconfigure(editExtensions(true)) });
-      clearDirty();
-    }
-  }
+  // --- reveal: "open this file at line N" ----------------------------------
+  let flashTimer: ReturnType<typeof setTimeout> | null = null;
+  $effect(() => {
+    void $revealRequest;
+    if (!acceptReveal || !ready || buf.loading) return;
+    untrack(() => {
+      const v = view;
+      if (v === null) return;
+      const r = takeReveal(buf.path);
+      if (r === null) return;
+      revealLines(v, r);
+      if (flashTimer !== null) clearTimeout(flashTimer);
+      flashTimer = setTimeout(() => {
+        flashTimer = null;
+        if (view === v) clearRevealFlash(v);
+      }, REVEAL_FLASH_MS);
+    });
+  });
 
-  async function loadMore(): Promise<void> {
-    const v = view;
-    if (v === null || loadingMore) return;
-    loadingMore = true;
-    loadError = null;
-    const gen = loadGen;
-    try {
-      const chunk = await fsFile(path, loadedBytes, FILE_CHUNK);
-      if (view !== v || gen !== loadGen) return; // a reload superseded us
-      const text = decoder.decode(chunk.bytes, { stream: true });
-      v.dispatch({ changes: { from: v.state.doc.length, insert: text } });
-      loadedBytes += chunk.bytes.length;
-      totalBytes = chunk.size;
-      truncated = chunk.truncated;
-    } catch (e) {
-      loadError = e instanceof Error ? e.message : "failed to load more";
-    } finally {
-      loadingMore = false;
-    }
-  }
-
-  function triggerSave(): void {
-    void save(false);
-  }
-
-  async function save(force: boolean): Promise<void> {
-    const v = view;
-    if (v === null || !editable || saving) return;
-    if (!dirty && !force) return;
-    saving = true;
-    saveError = null;
-    const text = v.state.doc.toString();
-    const bytes = new TextEncoder().encode(text);
-    try {
-      const mtime = await fsWrite(path, bytes, force ? null : savedMtime);
-      if (view !== v) return;
-      savedMtime = mtime;
-      noteWrite(path, mtime); // keep the shared entry coherent (and self-quiet)
-      conflict = false;
-      saveError = null;
-      clearDirty();
-      flashSaved();
-    } catch (e) {
-      if (view !== v) return;
-      if (e instanceof FileConflictError) {
-        conflict = true;
-      } else if (e instanceof ApiError) {
-        saveError = e.message;
-      } else {
-        saveError = e instanceof Error ? e.message : "save failed";
-      }
-    } finally {
-      if (view === v) saving = false;
-    }
-  }
-
-  function flashSaved(): void {
+  // --- status chrome ----------------------------------------------------------
+  let savedFlash = $state(false);
+  let savedTimer: ReturnType<typeof setTimeout> | null = null;
+  let seenSaved = untrack(() => buf.savedCount);
+  $effect(() => {
+    const n = buf.savedCount;
+    if (n === seenSaved) return;
+    seenSaved = n;
     savedFlash = true;
-    if (flashTimer !== null) clearTimeout(flashTimer);
-    flashTimer = setTimeout(() => (savedFlash = false), 1600);
+    if (savedTimer !== null) clearTimeout(savedTimer);
+    savedTimer = setTimeout(() => {
+      savedTimer = null;
+      savedFlash = false;
+    }, 1600);
+  });
+  // A typed key retires the "saved" flash.
+  $effect(() => {
+    if (buf.dirty) savedFlash = false;
+  });
+
+  // Cmd+S refused because a conflict is open: pulse the bar that explains why.
+  let nudging = $state(false);
+  let nudgeTimer: ReturnType<typeof setTimeout> | null = null;
+  let seenNudge = untrack(() => buf.conflictNudge);
+  $effect(() => {
+    const n = buf.conflictNudge;
+    if (n === seenNudge) return;
+    seenNudge = n;
+    nudging = true;
+    if (nudgeTimer !== null) clearTimeout(nudgeTimer);
+    nudgeTimer = setTimeout(() => {
+      nudgeTimer = null;
+      nudging = false;
+    }, 700);
+  });
+
+  const status = $derived.by((): { text: string; tone: "" | "warn" | "err" } => {
+    switch (buf.saveState) {
+      case "saving":
+        return { text: "saving…", tone: "" };
+      case "retrying":
+        return { text: "not saved, retrying…", tone: "warn" };
+      case "offline":
+        return { text: "offline — not saved, will retry", tone: "warn" };
+      case "failed":
+        return { text: "not saved", tone: "err" };
+    }
+    if (buf.dirty) return { text: "unsaved", tone: "" };
+    if (savedFlash) return { text: "saved", tone: "" };
+    return { text: "editable", tone: "" };
+  });
+
+  const elsewhere = $derived(presence.elsewhere.has(buf.path));
+
+  function recoveredWhen(ms: number): string {
+    if (!Number.isFinite(ms) || ms <= 0) return "an earlier session";
+    const d = new Date(ms);
+    const sameDay = d.toDateString() === new Date().toDateString();
+    const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return sameDay ? time : `${d.toLocaleDateString()} ${time}`;
   }
 
-  /**
-   * Take the on-disk version. `force` = the user pressed "reload" and accepts
-   * losing local edits; without it (the live-watch auto-reload) an edit typed
-   * DURING the fetch must not be clobbered — re-check dirty after the await and
-   * fall back to the conflict bar instead.
-   */
-  async function reloadFromDisk(force = false): Promise<void> {
-    const v = view;
-    if (v === null) return;
-    const gen = ++loadGen; // supersede any in-flight fillToEnd/loadMore
-    try {
-      const chunk = await fsFile(path, 0, EDIT_MAX_BYTES);
-      if (view !== v || gen !== loadGen) return;
-      // Adopt the on-disk mtime regardless of the branches below, so the
-      // live-watch doesn't re-fire for the same version on every fs bump.
-      savedMtime = chunk.mtime;
-      // A keystroke landed while we were fetching: don't discard it silently.
-      if (!force && dirty) {
-        conflict = true;
+  // --- compare overlay (loaded on demand) ------------------------------------
+  type Compare = {
+    title: string;
+    a: string;
+    b: string;
+    aLabel: string;
+    bLabel: string;
+    conflict: boolean;
+  };
+  let compare = $state<Compare | null>(null);
+  let CompareView = $state<Component<any> | null>(null);
+  let compareError = $state<string | null>(null);
+
+  async function openCompare(c: Compare): Promise<void> {
+    compareError = null;
+    if (CompareView === null) {
+      try {
+        CompareView = (await import("./CompareView.svelte")).default;
+      } catch {
+        compareError = "failed to load the comparison";
         return;
       }
-      if (looksBinary(chunk.bytes)) return;
-      const fresh = new TextDecoder("utf-8", { fatal: false }).decode(chunk.bytes);
-      v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: fresh } });
-      loadedBytes = chunk.bytes.length;
-      totalBytes = chunk.size;
-      truncated = chunk.truncated;
-      conflict = false;
-      saveError = null;
-      clearDirty();
-      // Editability can flip when the file crosses the 1MB cap on disk (an
-      // external rewrite): recompute it (mirror onMount) so a now-oversized
-      // file drops to read-only — otherwise a later save would write only the
-      // truncated 1MB buffer over the full file — and a now-small file becomes
-      // editable, with the same background fill for an under-cap truncated tail.
-      const canEdit = totalBytes <= EDIT_MAX_BYTES && !truncated;
-      if (canEdit !== editable) {
-        editable = canEdit;
-        v.dispatch({ effects: editCompartment.reconfigure(editExtensions(canEdit)) });
-      }
-      if (totalBytes <= EDIT_MAX_BYTES && truncated) void fillToEnd(v);
-    } catch (e) {
-      saveError = e instanceof Error ? e.message : "reload failed";
     }
+    compare = c;
   }
+
+  function compareConflict(): void {
+    const c = buf.conflict;
+    if (c === null || c.kind !== "changed" || c.disk.text === null) return;
+    void openCompare({
+      title: "Your edits vs. the file on disk",
+      a: buf.current.doc.toString(),
+      b: c.disk.text,
+      aLabel: "your edits",
+      bLabel: "on disk",
+      conflict: true,
+    });
+  }
+
+  function viewMergeDiff(): void {
+    const n = buf.notice;
+    if (n === null) return;
+    void openCompare({
+      title: "Merged changes from disk",
+      a: n.before,
+      b: n.after,
+      aLabel: "before the merge",
+      bLabel: "after",
+      conflict: false,
+    });
+  }
+
+  function closeCompare(): void {
+    compare = null;
+    view?.focus();
+  }
+
+  // A resolved conflict retires a comparison opened from it.
+  $effect(() => {
+    if (buf.conflict === null && compare?.conflict === true) compare = null;
+  });
+
+  function keepMine(): void {
+    buf.keepMine();
+    compare = null;
+  }
+
+  function takeDisk(): void {
+    buf.takeDiskVersion();
+    compare = null;
+  }
+
+  function recreate(): void {
+    buf.keepMine();
+    void buf.save();
+  }
+
+  const conflictText = $derived.by(() => {
+    const c = buf.conflict;
+    if (c === null) return "";
+    if (c.kind === "deleted") return buf.dirty ? "deleted on disk — your edits are kept here" : "deleted on disk";
+    if (c.disk.note !== null) return `changed on disk (${c.disk.note.replace(/ — .*$/, "")}) — can't merge`;
+    return "changed on disk — your edits overlap";
+  });
 </script>
+
+{#snippet conflictActions()}
+  <button class="bar-btn" onclick={keepMine} title="keep your text; the next save replaces the disk version">keep mine</button>
+  <button class="bar-btn danger" onclick={takeDisk} title="discard your edits for the disk version (undo brings them back)">take disk</button>
+{/snippet}
 
 <div class="code-view" bind:this={wrapEl}>
   {#if chipPos !== null}
     <ReferenceChip x={chipPos.x} y={chipPos.y} />
   {/if}
-  {#if conflict}
-    <!-- Quiet concurrent-modification bar: the file changed on disk under us. -->
-    <div class="conflict" role="alert">
-      <span class="conflict-msg">{conflictMessage}</span>
-      <button class="conflict-btn" onclick={() => void reloadFromDisk(true)}>reload</button>
-      <button class="conflict-btn danger" onclick={() => void save(true)}>overwrite</button>
+  {#if buf.recovered !== null}
+    <div class="strip recover" role="status">
+      <span class="strip-msg">Recovered unsaved changes from {recoveredWhen(buf.recovered.updatedMs)}</span>
+      <button class="bar-btn" onclick={() => buf.restoreDraft()}>restore</button>
+      <button class="bar-btn" onclick={() => buf.discardDraft()}>discard</button>
     </div>
   {/if}
-  <div class="editor" bind:this={host}></div>
-  <footer class="bar">
-    {#if editable}
-      <span class="status">
-        {#if saving}saving…{:else if dirty}unsaved{:else if savedFlash}saved{:else}editable{/if}
-      </span>
-      {#if saveError !== null}
-        <span class="bar-err">{saveError}</span>
+  {#if buf.conflict !== null}
+    <!-- The file changed on disk under unsaved edits and could not be merged,
+         or vanished. Saving waits until this is resolved. -->
+    <div class="strip conflict" class:nudge={nudging} role="alert">
+      <span class="strip-msg">{conflictText}</span>
+      {#if buf.conflict.kind === "deleted"}
+        <button class="bar-btn" onclick={recreate}>recreate</button>
+        {#if buf.dirty}
+          <button class="bar-btn danger" onclick={takeDisk}>discard edits</button>
+        {/if}
+      {:else}
+        {#if buf.conflict.disk.text !== null}
+          <button class="bar-btn" onclick={compareConflict}>compare</button>
+        {/if}
+        {@render conflictActions()}
       {/if}
+    </div>
+  {:else if buf.notice !== null}
+    <div class="strip notice" role="status">
+      <span class="strip-msg">Merged changes from disk</span>
+      <button class="bar-btn" onclick={viewMergeDiff}>view diff</button>
+      <button class="bar-btn" onclick={() => buf.undoMerge()}>undo</button>
+      <span class="spacer"></span>
+      <button class="strip-close" aria-label="dismiss" onclick={() => buf.clearNotice()}>&times;</button>
+    </div>
+  {/if}
+  {#if elsewhere}
+    <div class="strip subtle" role="status">
+      <span class="strip-msg">Unsaved edits in another window</span>
+    </div>
+  {/if}
+  <div class="editor" class:superseded bind:this={host}></div>
+  {#if superseded}
+    <div class="superseded-note">open in another pane</div>
+  {/if}
+  {#if compare !== null && CompareView !== null}
+    <CompareView
+      path={buf.path}
+      title={compare.title}
+      a={compare.a}
+      b={compare.b}
+      aLabel={compare.aLabel}
+      bLabel={compare.bLabel}
+      onClose={closeCompare}
+      actions={compare.conflict && buf.conflict !== null ? conflictActions : undefined}
+    />
+  {/if}
+  <footer class="bar">
+    {#if buf.editable}
+      <span class="status" class:warn={status.tone === "warn"} class:err={status.tone === "err"}>{status.text}</span>
+      {#if buf.saveError !== null}
+        <span class="bar-err" title={buf.saveError}>{buf.saveError}</span>
+      {/if}
+      {#if buf.journalFailed}
+        <span
+          class="bar-warn"
+          title="The unsaved text could not be written to the browser's storage or to the daemon — save when you can."
+          >draft not backed up</span
+        >
+      {/if}
+      {#if compareError !== null}<span class="bar-err">{compareError}</span>{/if}
       <span class="spacer"></span>
       <span class="hint">{SAVE_HINT}</span>
+    {:else if buf.loading}
+      <span class="status">loading…</span>
+      <span class="spacer"></span>
+    {:else if buf.truncated}
+      <span class="status">showing {humanSize(buf.loadedBytes)} of {humanSize(buf.totalBytes)}</span>
+      {#if buf.loadError !== null}<span class="bar-err">{buf.loadError}</span>{/if}
+      <span class="spacer"></span>
+      {#if buf.note !== null}<span class="hint">{buf.note}</span>{/if}
+      <button class="more-btn" disabled={buf.loadingMore} onclick={() => void buf.loadMore()}>
+        {buf.loadingMore ? "loading…" : "load more"}
+      </button>
     {:else}
-      {#if truncated}
-        <span class="status">showing {humanSize(loadedBytes)} of {humanSize(totalBytes)}</span>
-        {#if loadError !== null}<span class="bar-err">{loadError}</span>{/if}
-        <span class="spacer"></span>
-        <button class="more-btn" disabled={loadingMore} onclick={() => void loadMore()}>
-          {loadingMore ? "loading…" : "load more"}
-        </button>
-      {:else}
-        <span class="status">read-only</span>
-        <span class="spacer"></span>
-        {#if totalBytes > EDIT_MAX_BYTES}<span class="hint">over 1 MB — view only</span>{/if}
-      {/if}
+      <span class="status">read-only</span>
+      {#if buf.loadError !== null}<span class="bar-err">{buf.loadError}</span>{/if}
+      <span class="spacer"></span>
+      {#if buf.note !== null}<span class="hint">{buf.note}</span>{/if}
     {/if}
   </footer>
 </div>
@@ -513,29 +547,103 @@
     min-height: 0;
   }
 
+  .editor.superseded {
+    display: none;
+  }
+
+  .superseded-note {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    font-size: var(--text-sm);
+  }
+
   .editor :global(.cm-editor) {
     height: 100%;
   }
 
-  .conflict {
+  /* One quiet strip per concern, stacked above the editor. */
+  .strip {
     flex: none;
     display: flex;
     align-items: center;
     gap: 0.6rem;
-    height: 28px;
+    min-height: 28px;
     padding: 0 0.7rem;
-    background: color-mix(in srgb, var(--warn) 12%, var(--term-bg));
-    border-bottom: 1px solid color-mix(in srgb, var(--warn) 40%, var(--edge));
     font-size: var(--text-sm);
+    color: var(--fg);
+    border-bottom: 1px solid var(--edge);
+  }
+
+  .strip-msg {
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .strip.conflict {
+    background: color-mix(in srgb, var(--warn) 12%, var(--term-bg));
+    border-bottom-color: color-mix(in srgb, var(--warn) 40%, var(--edge));
+  }
+
+  .strip.conflict .strip-msg {
+    color: var(--warn);
+  }
+
+  .strip.conflict.nudge {
+    animation: conflict-nudge 0.7s ease-out;
+  }
+
+  @keyframes conflict-nudge {
+    0%,
+    100% {
+      background: color-mix(in srgb, var(--warn) 12%, var(--term-bg));
+    }
+    30% {
+      background: color-mix(in srgb, var(--warn) 30%, var(--term-bg));
+    }
+  }
+
+  .strip.recover {
+    background: color-mix(in srgb, var(--accent) 9%, var(--term-bg));
+    border-bottom-color: color-mix(in srgb, var(--accent) 35%, var(--edge));
+  }
+
+  .strip.notice {
+    background: color-mix(in srgb, var(--accent) 6%, var(--term-bg));
+  }
+
+  .strip.notice .strip-msg,
+  .strip.subtle .strip-msg {
+    font-weight: 400;
+    color: var(--muted);
+  }
+
+  .strip.subtle {
+    min-height: 24px;
+    font-size: var(--text-xs);
+  }
+
+  .strip-close {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    font-size: var(--text-md);
+    color: var(--muted);
+    cursor: pointer;
+    padding: 0 0.2rem;
+    line-height: 1;
+  }
+
+  .strip-close:hover {
     color: var(--fg);
   }
 
-  .conflict-msg {
-    color: var(--warn);
-    font-weight: 500;
-  }
-
-  .conflict-btn {
+  .bar-btn {
     appearance: none;
     border: 1px solid var(--edge);
     background: var(--term-bg);
@@ -545,16 +653,17 @@
     cursor: pointer;
     padding: 0.1rem 0.5rem;
     border-radius: 4px;
+    white-space: nowrap;
     transition:
       background-color 0.12s ease,
       color 0.12s ease;
   }
 
-  .conflict-btn:hover {
+  .bar-btn:hover {
     background: var(--row-hover);
   }
 
-  .conflict-btn.danger:hover {
+  .bar-btn.danger:hover {
     color: var(--err);
     border-color: color-mix(in srgb, var(--err) 45%, var(--edge));
   }
@@ -570,14 +679,30 @@
     font-size: var(--text-xs);
     color: var(--muted);
     font-variant-numeric: tabular-nums;
+    min-width: 0;
   }
 
   .status {
     color: var(--muted);
+    white-space: nowrap;
+  }
+
+  .status.warn,
+  .bar-warn {
+    color: var(--warn);
+    white-space: nowrap;
+  }
+
+  .status.err,
+  .bar-err {
+    color: var(--err);
   }
 
   .bar-err {
-    color: var(--err);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
   }
 
   .spacer {
@@ -587,6 +712,7 @@
   .hint {
     font-family: var(--mono);
     opacity: 0.7;
+    white-space: nowrap;
   }
 
   .more-btn {

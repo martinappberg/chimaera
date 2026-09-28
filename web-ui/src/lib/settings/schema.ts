@@ -86,6 +86,13 @@ export type SettingsMap = {
   "agents.defaultView": "chat" | "terminal";
   "dashboard.landing": "auto" | "never";
   "dashboard.cardDensity": "auto" | "comfortable" | "compact";
+  "dashboard.roster": "line" | "cards";
+  "notifications.turnFinished": boolean;
+  "notifications.needsYou": boolean;
+  "notifications.agentMessages": boolean;
+  "notifications.sound": boolean;
+  "notifications.whileFocused": boolean;
+  "notifications.dockBadge": boolean;
   "chat.fontSize": number;
   "chat.fontFamily": string;
   "chat.lineHeight": number;
@@ -104,9 +111,12 @@ export type SettingsMap = {
   "editor.lineHeight": number;
   "editor.markdownFontSize": number;
   "editor.markdownLineHeight": number;
+  "editor.markdownDefaultMode": "reading" | "live" | "source";
   "editor.lineNumbers": boolean;
   "editor.wordWrap": boolean;
   "editor.tabSize": number;
+  "editor.autosave": "off" | "afterDelay";
+  "editor.autosaveDelay": number;
   "files.showHidden": boolean;
   "files.tableRowsPerPage": number;
   "quickOpen.maxResults": number;
@@ -120,6 +130,7 @@ export type SettingsMap = {
   "daemon.restoreSessions": boolean;
   "chat.remoteControlAtStart": boolean;
   "chat.toolSummaries": boolean;
+  "chat.resumeAfterRestart": boolean;
   "update.autoCheck": boolean;
   "keys.modifier": "auto" | "cmd" | "ctrl-shift" | "alt";
 } & Record<KeyBindingId, string>;
@@ -246,6 +257,77 @@ const DEFS = {
     ],
     scope: "client",
   },
+  "dashboard.roster": {
+    title: "Now",
+    category: "Dashboard",
+    description:
+      "How the dashboard shows who is running. One line keeps the rail as the place with the detail; Cards shows today's roster as agent cards (the dashboard's \"show cards\" link flips this too).",
+    type: "enum",
+    default: "line",
+    options: [
+      { value: "line", label: "One line" },
+      { value: "cards", label: "Cards" },
+    ],
+    scope: "client",
+  },
+
+  // --- Notifications -----------------------------------------------------------
+  // Daemon-scoped: the daemon decides which notices exist at all (so every
+  // consumer — the native shell, each browser tab — agrees), and hands the
+  // presentation keys to the native shell alongside them.
+  "notifications.turnFinished": {
+    title: "When an Agent Finishes",
+    category: "Notifications",
+    description:
+      "Notify when an agent ends its turn and hands the floor back, quoting how its reply starts. Nothing is sent for the session you're looking at.",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
+  },
+  "notifications.needsYou": {
+    title: "When an Agent Needs You",
+    category: "Notifications",
+    description:
+      "Notify when an agent is blocked on you — a permission to approve, a question to answer, waiting for input — or stops on an error or a usage limit.",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
+  },
+  "notifications.agentMessages": {
+    title: "Messages from Agents",
+    category: "Notifications",
+    description:
+      "Let agents notify you themselves — ask one to \"ping me when the job finishes\" and it can. Agents also see this switch: when it's off, their notify tool tells them so.",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
+  },
+  "notifications.sound": {
+    title: "Play a Sound",
+    category: "Notifications",
+    description: "Notifications play the system notification sound.",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
+  },
+  "notifications.whileFocused": {
+    title: "Notify While Chimaera Is in Front",
+    category: "Notifications",
+    description:
+      "Also show notifications while you're working in Chimaera, for sessions in other tabs or windows. Off: only when Chimaera is in the background.",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
+  },
+  "notifications.dockBadge": {
+    title: "Dock Badge",
+    category: "Notifications",
+    description:
+      "Show how many agents are waiting on you on the app icon, and bounce it once when one gets blocked while Chimaera is in the background (native app).",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
+  },
 
   // --- Chat ------------------------------------------------------------------
   "chat.fontSize": {
@@ -281,11 +363,14 @@ const DEFS = {
     step: 0.05,
     scope: "client",
   },
+  // Keyed `chat.*` from when only the transcript read it; it now caps every
+  // reading column, so it sits with the window-wide Appearance choices. The
+  // key stays: stored values and the wire never see the category.
   "chat.contentWidth": {
-    title: "Content Width",
-    category: "Chat",
+    title: "Reading Width",
+    category: "Appearance",
     description:
-      "Maximum width in pixels of the transcript, composer, and live work trays. Narrower panes still fit their available space.",
+      "The widest a reading column gets, in pixels: the chat transcript (with its composer and live work trays) and a Markdown document alike. Each column is 48em of its own text — about a hundred characters, so a bigger font keeps its line length — and never wider than this. Narrower panes still fit their available space.",
     type: "integer",
     default: 832,
     min: 480,
@@ -448,6 +533,21 @@ const DEFS = {
     step: 0.05,
     scope: "client",
   },
+  "editor.markdownDefaultMode": {
+    title: "Markdown Default Mode",
+    category: "Editor",
+    description:
+      "How a Markdown file opens the first time: live (the rendered document; double-click a block to edit it in place — only that block shows as source — and Esc returns to the page), the read-only reading view, or raw source. After that, each file reopens in the mode you last picked.",
+    type: "enum",
+    default: "live",
+    options: [
+      { value: "reading", label: "Reading" },
+      { value: "live", label: "Live" },
+      { value: "source", label: "Source" },
+    ],
+    note: "Files over 1 MB and binary content always open in reading.",
+    scope: "client",
+  },
   "editor.lineNumbers": {
     title: "Line Numbers",
     category: "Editor",
@@ -473,6 +573,30 @@ const DEFS = {
     min: 1,
     max: 8,
     step: 1,
+    scope: "client",
+  },
+  "editor.autosave": {
+    title: "Autosave",
+    category: "Editor",
+    description:
+      "Save edited files on their own: after a pause in typing, and when the editor loses focus or you switch tabs. Agents only see what is saved to disk. Never saves over a file that changed on disk until you resolve it.",
+    type: "enum",
+    default: "off",
+    options: [
+      { value: "off", label: "Off" },
+      { value: "afterDelay", label: "After a delay" },
+    ],
+    scope: "client",
+  },
+  "editor.autosaveDelay": {
+    title: "Autosave Delay",
+    category: "Editor",
+    description: "Milliseconds of idle typing before an autosave (when Autosave is on).",
+    type: "integer",
+    default: 1000,
+    min: 200,
+    max: 60000,
+    step: 100,
     scope: "client",
   },
 
@@ -616,6 +740,15 @@ const DEFS = {
     default: true,
     scope: "daemon",
     note: "Applies to chat sessions started after the change.",
+  },
+  "chat.resumeAfterRestart": {
+    title: "Pick Up Interrupted Work After a Restart",
+    category: "Chat",
+    description:
+      "When the daemon restarts (an update, a crash) while a chat was mid-turn or had background commands, monitors or workflows running, send the resumed agent one message listing what stopped, so it restarts what it still needs and finishes its turn. The message shows in the transcript and starts a turn on your account. Off: those chats come back idle. Remote Control, model, effort, mode and ultracode come back either way.",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
   },
   "daemon.restoreSessions": {
     title: "Restore Sessions on Restart",

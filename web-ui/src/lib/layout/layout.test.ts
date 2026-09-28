@@ -9,6 +9,7 @@ import {
   panes,
   tabCount,
   allSessionIds,
+  visibleSessionIds,
   allFilePaths,
   focusedSession,
   focusedFile,
@@ -16,6 +17,10 @@ import {
   openFile,
   openGit,
   openDashboard,
+  openTimeline,
+  openKnowledge,
+  openPlugins,
+  openSettings,
   openChanges,
   openBrowser,
   freshBrowserTab,
@@ -67,6 +72,11 @@ describe("tabKey", () => {
     expect(tabKey({ surface: "git" })).toBe("v:git");
     expect(tabKey({ surface: "changes", sessionId: "s1" })).toBe("changes:s1");
     expect(tabKey({ surface: "settings" })).toBe("v:settings");
+    // The three workspace singletons have their own keys — the trailing
+    // fallthrough belongs to settings, and aliasing it would dedupe them away.
+    expect(tabKey({ surface: "timeline" })).toBe("v:timeline");
+    expect(tabKey({ surface: "knowledge" })).toBe("v:knowledge");
+    expect(tabKey({ surface: "plugins" })).toBe("v:plugins");
     // diff uses `g:` (NOT `d:`) so it can't alias a Finder in the dedupe set.
     expect(tabKey({ surface: "diff", path: "/a", mode: "head" } as unknown as Tab)).toBe(
       "g:head:/a",
@@ -128,6 +138,26 @@ describe("opening surfaces", () => {
     expect(restored).not.toBeNull();
     const pane = panes(restored!.root)[0];
     expect(pane.tabs[0]).toEqual({ surface: "dashboard" });
+  });
+
+  it("timeline, knowledge and plugins are singletons that coexist with settings and round-trip", () => {
+    let l = openTimeline(defaultLayout());
+    l = openTimeline(l);
+    l = openKnowledge(l);
+    l = openKnowledge(l);
+    l = openPlugins(l);
+    l = openPlugins(l);
+    l = openSettings(l);
+    expect(tabCount(l)).toBe(4);
+    const restored = deserializeLayout(serializeLayout(l));
+    expect(restored).not.toBeNull();
+    const pane = panes(restored!.root)[0];
+    expect(pane.tabs).toEqual([
+      { surface: "timeline" },
+      { surface: "knowledge" },
+      { surface: "plugins" },
+      { surface: "settings" },
+    ]);
   });
 });
 
@@ -493,5 +523,21 @@ describe("moveTabDirection (shift+cmd+arrow)", () => {
   it("is a no-op when the focused pane is empty", () => {
     const l = defaultLayout(); // one empty pane
     expect(moveTabDirection(l, "right")).toBe(l);
+  });
+});
+
+describe("visibleSessionIds", () => {
+  it("is each pane's active terminal tab, and only the zoomed pane's", () => {
+    let l = openSession(openSession(defaultLayout(), "s-a"), "s-b");
+    // One pane, two tabs: only the active one is on screen.
+    expect(visibleSessionIds(l)).toEqual(["s-b"]);
+    l = splitPane(l, l.focusedPaneId, "row");
+    l = openSession(l, "s-c");
+    expect(visibleSessionIds(l).sort()).toEqual(["s-b", "s-c"]);
+    // Zoomed: the other pane is hidden behind it.
+    l = toggleZoom(l);
+    expect(visibleSessionIds(l)).toEqual(["s-c"]);
+    // A non-session tab on top hides the session under it.
+    expect(visibleSessionIds(openDashboard(defaultLayout()))).toEqual([]);
   });
 });

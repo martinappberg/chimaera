@@ -11,8 +11,10 @@ nice-to-haves. Depth + module map: [chimaera-server/AGENTS.md](../../crates/chim
 - **Bounded resources.** Target ~150 MB RSS, <1 core steady-state. No unbounded
   buffers, no busy loops, hard ceilings on preview/extraction. A change that works
   but leaks or busy-loops is not done.
-- **No SQLite anywhere near NFS/Lustre.** Durable state is append-only, size-capped
-  JSONL under `~/.chimaera`. Hot state (`$XDG_RUNTIME_DIR`/`/tmp`) is
+- **No SQLite anywhere near NFS/Lustre.** Durable logs and history are append-only,
+  size-capped JSONL under `~/.chimaera`; small whole-file state (settings, env
+  profiles, the editor draft mirror) is capped JSON rewritten atomically (temp +
+  rename), never edited in place. Hot state (`$XDG_RUNTIME_DIR`/`/tmp`) is
   reconstructible — it gets night-scrubbed; never assume it survives.
 - **No blocking fs on the async reactor.** Wrap journal reads/copies/canonicalize in
   `spawn_blocking`. Never hold a `std::sync::Mutex` guard across an `.await`.

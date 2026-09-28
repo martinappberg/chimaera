@@ -177,12 +177,20 @@ fn agy_platform() -> &'static str {
     }
 }
 
-/// One bounded fetch: 10s wall clock, 1MB body, kill_on_drop. Shared with
-/// `update::fetch_latest` (the daemon's own release check) — one fence for
-/// every phone-home the daemon makes.
-pub(crate) async fn curl(url: &str, headers: &[&str]) -> anyhow::Result<Vec<u8>> {
+/// The one `curl` invocation every phone-home shares: fail on HTTP errors,
+/// follow redirects (release assets live behind one), a wall clock and a
+/// size cap, chimaera's User-Agent.
+fn curl_command(
+    url: &str,
+    headers: &[&str],
+    max_bytes: u64,
+    timeout_secs: u64,
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("curl");
-    cmd.args(["-fsSL", "-m", "10", "--max-filesize", "1048576"]);
+    // -S keeps curl's own one-line diagnosis on stderr under -s: it is the
+    // part of a failed check a user can act on ("Could not resolve host").
+    cmd.args(["-fsSL", "-S", "-m", &timeout_secs.to_string()]);
+    cmd.args(["--max-filesize", &max_bytes.to_string()]);
     for header in headers {
         cmd.args(["-H", header]);
     }
@@ -191,11 +199,87 @@ pub(crate) async fn curl(url: &str, headers: &[&str]) -> anyhow::Result<Vec<u8>>
         concat!("User-Agent: chimaera/", env!("CARGO_PKG_VERSION")),
         url,
     ]);
-    let output = cmd
-        .kill_on_drop(true)
-        .output()
-        .await
+    cmd.kill_on_drop(true);
+    cmd
+}
+
+/// One bounded fetch: 10s wall clock, 1MB body, kill_on_drop. Shared with
+/// `update::fetch_latest` (the daemon's own release check) and the plugin
+/// release checker — one fence for every phone-home the daemon makes.
+pub(crate) async fn curl(url: &str, headers: &[&str]) -> anyhow::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    const CAP: u64 = 1 << 20;
+    let mut child = curl_command(url, headers, CAP, 10)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .context("failed to run curl")?;
+    // Older curl versions don't enforce max-filesize for chunked bodies.
+    // Bound the pipe before allocating, just as curl_file counts its bytes.
+    let mut body = Vec::new();
+    child
+        .stdout
+        .take()
+        .context("curl has no stdout")?
+        .take(CAP + 1)
+        .read_to_end(&mut body)
+        .await
+        .context("reading from curl")?;
+    if body.len() as u64 > CAP {
+        anyhow::bail!("the download is larger than its {CAP}-byte cap");
+    }
+    let output = child.wait_with_output().await.context("waiting for curl")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match stderr.lines().rev().map(str::trim).find(|l| !l.is_empty()) {
+            Some(line) => anyhow::bail!("{line}"),
+            None => anyhow::bail!("curl exited {}", output.status),
+        }
+    }
+    Ok(body)
+}
+
+/// One bounded download into `dest` (created or truncated): at most
+/// `max_bytes` — curl's own cap, and counted here too, since an old curl
+/// only enforces it when the server announces a length — within
+/// `timeout_secs`, kill_on_drop. The bytes stream to disk, never to memory;
+/// the caller owns `dest`, including removing it after a failure.
+pub(crate) async fn curl_file(
+    url: &str,
+    headers: &[&str],
+    dest: &std::path::Path,
+    max_bytes: u64,
+    timeout_secs: u64,
+) -> anyhow::Result<u64> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut cmd = curl_command(url, headers, max_bytes, timeout_secs);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().context("failed to run curl")?;
+    let mut out = child.stdout.take().context("curl has no stdout")?;
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .with_context(|| format!("could not create {}", dest.display()))?;
+    let mut buf = vec![0u8; 64 << 10];
+    let mut total: u64 = 0;
+    loop {
+        let n = out.read(&mut buf).await.context("reading from curl")?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > max_bytes {
+            // Dropping the child kills curl.
+            anyhow::bail!("the download is larger than its {max_bytes}-byte cap");
+        }
+        file.write_all(&buf[..n])
+            .await
+            .context("writing the download")?;
+    }
+    file.sync_all().await.context("flushing the download")?;
+    let output = child.wait_with_output().await.context("waiting for curl")?;
     if !output.status.success() {
         anyhow::bail!(
             "curl exited {}: {}",
@@ -203,7 +287,7 @@ pub(crate) async fn curl(url: &str, headers: &[&str]) -> anyhow::Result<Vec<u8>>
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(output.stdout)
+    Ok(total)
 }
 
 /// The gate every probed version passes before it is stored: digit-leading,
@@ -263,6 +347,26 @@ fn parse_npm_latest(body: &[u8]) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn downloads_without_a_content_length_still_have_a_body_cap() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let serving = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            // The client may close as soon as it reads past the cap.
+            let _ = socket.write_all(&vec![b'x'; (1 << 20) + 1]).await;
+        });
+        assert!(curl(&url, &[]).await.is_err());
+        serving.await.unwrap();
+    }
 
     #[test]
     fn parses_the_official_payload_shapes() {

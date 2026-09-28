@@ -795,7 +795,7 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(text))) => {
                     match serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text) {
-                        Ok(cmd) => {
+                        Ok(mut cmd) => {
                             if let Err(err) = cmd.validate_ingress() {
                                 tracing::debug!(%id, %err, "chat command exceeds ingress budget");
                                 // Reject only this command. The authenticated
@@ -809,7 +809,12 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                                 .await;
                                 continue;
                             }
+                            // A send's images get a saved copy the echoed
+                            // message can show after replay.
+                            let saved = crate::upload::save_send_images(&state, &id, &mut cmd).await;
                             if let Err(err) = state.chat.command(&id, cmd).await {
+                                // The send never happened: neither do its copies.
+                                crate::upload::discard_saved_images(saved);
                                 tracing::debug!(%id, %err, "chat command failed");
                                 // code=command_failed: one refused command is
                                 // NOT a dead socket — without the code the
@@ -952,12 +957,24 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     // Per-client, bounded mounted-path monitor. Dropping the socket drops every
     // registration, so a closed window costs zero filesystem work.
     let mut fs_watch = crate::fs_watch::FsWatch::new();
+    // Writes the daemon heard about, re-stated at once for watched paths.
+    // Subscribed before the first snapshot so no write between the two is
+    // missed (the poll would still catch it, just later).
+    let mut touched = state.fs_touched.subscribe();
+    let mut touched_open = true;
 
     let mut last_sent: Option<Arc<String>> = None;
     let mut last_settings_gen: Option<u64> = None;
     let mut last_git: Option<String> = None;
     let mut last_update_epoch: Option<u64> = None;
     let mut last_recents_epoch: Option<u64> = None;
+    let mut last_agent_plugins_epoch: Option<u64> = None;
+    let mut last_timeline: Option<String> = None;
+    // Notices start at the head: a (re)connecting window is told about what
+    // happens from now on, never handed old alerts as new.
+    let mut last_notice = state.notices.head();
+    // Plugin `emit` frames, same rule: from now on, never a replay.
+    let mut last_plugin_event = state.plugin_runtime.events_head();
     // A new window's FIRST settings frame gets one fresh disk read (off the
     // reactor): a hand-edit inside the watcher's poll window must not greet
     // a fresh window with stale settings. Steady-state sends stay cached.
@@ -1002,11 +1019,52 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     {
         return;
     }
+    if send_timeline_snapshot(&mut socket, &state, &mut last_timeline)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    if send_agent_plugins_snapshot(&mut socket, &state, &mut last_agent_plugins_epoch)
+        .await
+        .is_err()
+    {
+        return;
+    }
 
     loop {
         tokio::select! {
             _ = state.changes.notified() => {}
             _ = tokio::time::sleep(EVENTS_TICK) => {}
+            first = touched.recv(), if touched_open => {
+                let mut paths: Vec<std::path::PathBuf> = Vec::new();
+                match first {
+                    Ok(batch) => paths.extend(batch.iter().cloned()),
+                    // Skipped writes are the poll's to find; no fast path now.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        touched_open = false;
+                    }
+                }
+                // Everything queued since coalesces into this one stat pass
+                // (bounded by the channel's capacity).
+                loop {
+                    match touched.try_recv() {
+                        Ok(batch) => paths.extend(batch.iter().cloned()),
+                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                        Err(_) => break,
+                    }
+                }
+                let changes = fs_watch.poll_touched(&paths).await;
+                if send_fs_changes(&mut socket, changes).await.is_err() {
+                    return;
+                }
+                // Fall through to the regular sends: a steady stream of
+                // writes must neither starve them (the tick restarts every
+                // iteration) nor outrun the throttle below, which bounds
+                // these passes to four a second per window.
+            }
             msg = socket.recv() => match msg {
                 // The only client frame on this bus: which workspace this window
                 // shows + the exact mounted paths whose disk state it renders.
@@ -1061,12 +1119,56 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         {
             return;
         }
+        if send_timeline_snapshot(&mut socket, &state, &mut last_timeline)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if send_agent_plugins_snapshot(&mut socket, &state, &mut last_agent_plugins_epoch)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if let Some(frame) = crate::notices::frame_since(&state, &mut last_notice) {
+            if socket.send(Message::Text(frame.into())).await.is_err() {
+                return;
+            }
+        }
+        // `{"type":"plugin", ...}` — additive; a client ignores types it
+        // doesn't know.
+        for frame in state.plugin_runtime.events_since(&mut last_plugin_event) {
+            if socket
+                .send(Message::Text(frame.as_ref().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
         let fs_changes = fs_watch.poll(false).await;
         if send_fs_changes(&mut socket, fs_changes).await.is_err() {
             return;
         }
         tokio::time::sleep(EVENTS_THROTTLE).await;
     }
+}
+
+/// Installs and hook trust affect every workspace on this host. Push only
+/// an invalidation; visible Extensions views pull the agents' own reports.
+async fn send_agent_plugins_snapshot(
+    socket: &mut WebSocket,
+    state: &AppState,
+    last_epoch: &mut Option<u64>,
+) -> Result<(), axum::Error> {
+    let epoch = state.probes.changed_epoch();
+    if *last_epoch == Some(epoch) {
+        return Ok(());
+    }
+    send_json(socket, &json!({"type": "agent_plugins", "epoch": epoch})).await?;
+    *last_epoch = Some(epoch);
+    Ok(())
 }
 
 /// Send a path-only filesystem invalidation. File contents/listings remain
@@ -1127,6 +1229,26 @@ async fn send_recents_snapshot(
     let frame = json!({"type": "recents", "epoch": epoch}).to_string();
     socket.send(Message::Text(frame.into())).await?;
     *last_epoch = Some(epoch);
+    Ok(())
+}
+
+/// Send a `{"type":"timeline","epochs":{workspace_id:epoch}}` invalidate
+/// frame when any workspace's Timeline grew — the git frame's shape and
+/// dedupe: entries never ride the bus; the client pulls its own workspace's
+/// page (`GET /workspaces/{id}/timeline?since=`).
+async fn send_timeline_snapshot(
+    socket: &mut WebSocket,
+    state: &AppState,
+    last: &mut Option<String>,
+) -> Result<(), axum::Error> {
+    let epochs: std::collections::BTreeMap<String, u64> =
+        state.timeline.epochs_snapshot().into_iter().collect();
+    let frame = json!({"type": "timeline", "epochs": epochs}).to_string();
+    if last.as_deref() == Some(frame.as_str()) {
+        return Ok(());
+    }
+    socket.send(Message::Text(frame.clone().into())).await?;
+    *last = Some(frame);
     Ok(())
 }
 
@@ -1238,7 +1360,7 @@ mod tests {
     use chimaera_agent::journal::SeqEvent;
     use chimaera_agent::model::{
         AgentCommand, AgentEvent, ContentBlock, COMMAND_IMAGES_MAX, COMMAND_IMAGE_BASE64_MAX,
-        COMMAND_TEXT_TOTAL_MAX,
+        COMMAND_PATH_MAX, COMMAND_TEXT_TOTAL_MAX,
     };
 
     fn replay_entry(seq: u64, text: &str) -> Arc<SeqEvent> {
@@ -1325,6 +1447,7 @@ mod tests {
         blocks.extend((0..COMMAND_IMAGES_MAX).map(|_| ContentBlock::Image {
             media_type: "image/png".to_string(),
             data: "x".repeat(COMMAND_IMAGE_BASE64_MAX),
+            path: Some("p".repeat(COMMAND_PATH_MAX)),
         }));
         let encoded = serde_json::to_vec(&AgentCommand::Send { blocks }).unwrap();
         assert!(encoded.len() <= MAX_CHAT_COMMAND_MESSAGE);
