@@ -639,8 +639,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   - **Routes** (bearer-authed): `GET /plugins/{pid}/tools`, `POST
     /plugins/{pid}/tools/{tool}/install`, `DELETE /plugins/{pid}/tools/{tool}`, `GET` / `DELETE
     /workspaces/{id}/jobs/{job}`. `/ws/events` carries `job` frames to that workspace's windows.
-  - **UI**: `PluginTools.svelte` (the Tools section), the card's Downloads line
-    (`platform.ts`'s `downloadWords`).
+  - **UI**: `PluginTools.svelte` (the Tools section, with a progress bar while one
+    installs), the card's Downloads line (`platform.ts`'s `downloadWords`), and a
+    screen's `install-tool` button (the same install, its progress at the top of the
+    screen).
 - **Rules.**
   - **Only declared programs, by name.** No path to a binary, no shell between the plugin and
     the program; a URL that moves (`/latest/`) doesn't validate.
@@ -657,6 +659,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     download's sha256, and the lock bump fetches every download and compares.
   - **The honest limit:** a program can do whatever its arguments allow. That is why programs
     make a plugin privileged and why its card names each one.
+  - A switched-on plugin is compiled in the background when the daemon starts, when
+    it is installed or updated, and when it is switched on, so opening a file never
+    waits on it.
   - Every job and install is in the plugin's **Activity** log. The author's side:
     [docs/agent-guides/plugins.md](../agent-guides/plugins.md#programs-jobs-and-tools).
 

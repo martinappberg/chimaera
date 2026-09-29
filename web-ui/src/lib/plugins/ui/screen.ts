@@ -17,9 +17,9 @@ export function tone(v: unknown): Tone {
  *  else a quiet placeholder with its children. */
 export const KNOWN_NODES: ReadonlySet<string> = new Set([
   "stack", "row", "grid", "split", "tabs", "section", "card", "divider",
-  "text", "heading", "markdown", "code", "keyvalue", "badge", "icon", "progress", "empty", "callout",
+  "text", "heading", "markdown", "code", "keyvalue", "badge", "status", "icon", "progress", "empty", "callout",
   "list", "table", "file", "link", "image",
-  "button", "toggle", "select", "textfield", "form",
+  "button", "toggle", "select", "segmented", "textfield", "form",
   "editor", "pdf", "diagnostics", "diff", "log",
 ]);
 

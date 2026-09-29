@@ -137,6 +137,8 @@ pub(crate) struct Job {
     pub(crate) plugin: String,
     pub(crate) workspace: String,
     program: String,
+    /// `path` or `tool:<id>`: which copy of the program it runs.
+    from: String,
     label: String,
     priority: Priority,
     seq: u64,
@@ -190,6 +192,10 @@ impl Job {
                 State::Done => "done",
             },
             "program": self.program,
+            // Which copy runs it: the user's (`path`) or a tool of the
+            // plugin's (`tool:<id>`), e.g. whether a missing TeX package
+            // may be installed into it.
+            "from": self.from,
             "label": self.label,
             "exit": s.exit,
             "timed_out": s.timed_out,
@@ -463,14 +469,15 @@ fn on_path(name: &str, path: &str) -> Option<PathBuf> {
 
 /// Where `program` runs from: the user's copy on the login PATH, unless
 /// `prefer` names one of the plugin's tools; else the plugin's installed
-/// tool that provides it. With the folder to put first on the job's PATH.
+/// tool that provides it. With that tool's id and the folder to put first
+/// on the job's PATH.
 async fn resolve(
     state: &Arc<AppState>,
     m: &Manifest,
     program: &str,
     prefer: Option<&str>,
     path: &str,
-) -> Result<(PathBuf, Option<PathBuf>), String> {
+) -> Result<(PathBuf, Option<(String, PathBuf)>), String> {
     let providers: Vec<&super::platform::ToolDecl> = m
         .tools
         .iter()
@@ -484,7 +491,7 @@ async fn resolve(
             .await
             .ok_or_else(|| format!("{tool} is not installed: install it first"))?;
         let exe = bin.join(program);
-        return Ok((exe, Some(bin)));
+        return Ok((exe, Some((tool.to_string(), bin))));
     }
     let name = program.to_string();
     let path = path.to_string();
@@ -499,7 +506,7 @@ async fn resolve(
         if let Some(bin) = super::toolchain::installed_bin(state, &m.id, &t.id).await {
             let exe = bin.join(program);
             if tokio::fs::metadata(&exe).await.is_ok() {
-                return Ok((exe, Some(bin)));
+                return Ok((exe, Some((t.id.clone(), bin))));
             }
         }
     }
@@ -612,9 +619,12 @@ pub(crate) async fn start(
     let mut job_env: Vec<(String, String)> =
         env.iter().filter(|(k, _)| k != "PATH").cloned().collect();
     let job_path = match &tool_bin {
-        Some(bin) => format!("{}:{path}", bin.display()),
+        Some((_, bin)) => format!("{}:{path}", bin.display()),
         None => path,
     };
+    let from = tool_bin
+        .as_ref()
+        .map_or_else(|| "path".to_string(), |(id, _)| format!("tool:{id}"));
     job_env.push(("PATH".into(), job_path));
     job_env.push(("TERM".into(), "dumb".into()));
     for (k, v) in spec.env {
@@ -646,6 +656,7 @@ pub(crate) async fn start(
             plugin: m.id.clone(),
             workspace: ws.to_string(),
             program: spec.program.clone(),
+            from,
             label,
             priority,
             seq: inner.seq,

@@ -251,6 +251,34 @@ async fn component(m: &Manifest) -> Result<Pre, String> {
     result
 }
 
+/// Compile, in the background, the builds of plugins switched on in some
+/// workspace (or just `only`), so a window's first render or an agent's
+/// first tool call never waits on Cranelift: seconds for a large component
+/// on a slow login node. One at a time, after a short delay at boot; a build
+/// already compiled is a cache hit. Faulted and held plugins are skipped
+/// (they never run here).
+pub(crate) fn warm(state: &Arc<AppState>, only: Option<String>, delay: Duration) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let on: std::collections::HashSet<String> = crate::lock(&state.workspaces)
+            .list()
+            .into_iter()
+            .flat_map(|w| w.plugins_on)
+            .collect();
+        for m in super::catalog(&state).iter() {
+            if only.as_ref().is_some_and(|id| id != &m.id)
+                || !on.contains(&m.id)
+                || m.origin.fault.is_some()
+                || super::trust::hold(&state, m).is_some()
+            {
+                continue;
+            }
+            let _ = component(m).await;
+        }
+    });
+}
+
 /// A component can contain several core memories and tables. Account for
 /// their combined allocations; wasmtime's StoreLimits caps each separately.
 #[derive(Default)]

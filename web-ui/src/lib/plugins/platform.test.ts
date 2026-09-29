@@ -4,6 +4,7 @@ import {
   actionsFor,
   claimsFor,
   downloadWords,
+  progressWords,
   EMPTY_PLATFORM,
   matchesPattern,
   normalizePlatform,
@@ -145,5 +146,16 @@ describe("what a plugin draws where", () => {
     expect(sizeWords(512)).toBe("512 B");
     expect(sizeWords(1536)).toBe("1.5 KB");
     expect(sizeWords(12 * 1024 * 1024)).toBe("12 MB");
+  });
+});
+
+describe("install progress in words", () => {
+  it("says the stage, and the bytes while downloading", () => {
+    expect(progressWords({ stage: "downloading", done: 50 * 1024 * 1024, total: 150 * 1024 * 1024 })).toEqual({
+      text: "Downloading · 50 MB of 150 MB",
+      fraction: 1 / 3,
+    });
+    expect(progressWords({ stage: "unpacking", done: 0, total: 0 })).toEqual({ text: "Unpacking", fraction: null });
+    expect(progressWords(null)).toEqual({ text: "Starting", fraction: null });
   });
 });

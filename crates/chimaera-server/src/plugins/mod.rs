@@ -1409,6 +1409,7 @@ pub(crate) async fn put_workspace_plugin(
     // next connect answers from a fresh footprint.
     refresh_detect(&state, &id).await;
     if body.on {
+        runtime::warm(&state, Some(pid.clone()), std::time::Duration::ZERO);
         if let Some(m) = heard(EventKind::SwitchedOn) {
             let (state, id) = (state.clone(), id.clone());
             // Off the request: the switch answers at once. Delivered only

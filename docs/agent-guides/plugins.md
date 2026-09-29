@@ -619,7 +619,7 @@ has what 0.2 adds:
 | `state_keep(cx, key, &value)` | durable state, read back with `host::state_get`; within the same 64 KiB. `state_put` stays memory-only (and makes a kept key memory-only again) |
 | `roots(cx)` | the absolute workspace root and output folder (for arguments a program will need, and for mapping printed paths back) |
 | `job_start(cx, &spec)` · `job_status` · `job_cancel` | run a declared program as a job ([below](#programs-jobs-and-tools)) |
-| `tool_state(cx, tool)` | a declared tool: its version, whether (and which version) is installed here, what Install would download |
+| `tool_state(cx, tool)` | a declared tool: its version, whether (and which version) is installed here, what Install would download, `installing` and its `progress` (`{stage, done, total}`) while it installs |
 
 ### Screens: `ui/1`
 
@@ -644,24 +644,26 @@ daemon log).
 | `code` | **`text`**, `language` |
 | `keyvalue` | **`items`**: `[{key, value, tone?}]` |
 | `badge` | **`text`**, `tone` |
+| `status` | **`text`**, `state` (`idle busy ok warn bad`: a spinner for busy, a check for ok), `detail` (muted, beside it) — one pill for a process's state, a build's |
 | `icon` | **`name`** (`check x alert info clock file folder play stop refresh download external grid list book bolt settings search`), `label`, `tone` |
 | `progress` | `value` (0–1; absent: indeterminate), `label` |
 | `empty` | **`title`**, `text`, `action` `{label, action, payload}` |
-| `callout` | **`text`**, `title`, `tone` |
+| `callout` | **`text`**, `title`, `tone`, `actions` (buttons beside it: a notice with its fix) |
 | `list` | **`items`**: `[{title, subtitle?, badges?, actions?: [nodes], action?, payload?, file?, line?}]`; `more` `{query, args}` pages through `query` (it answers `{items, more?}`) |
 | `table` | **`columns`** `[{key, title, align?}]`, **`rows`** `[{<key>: text}]`; `more` as for a list (`{rows, more?}`) |
 | `file` | **`path`** (a workspace path or `output:<path>`), `label`, `line` — a card that opens it |
 | `link` | **`text`**; `href` (http/https, opens outside) or `file` + `line` |
 | `image` | **`src`**, **`alt`** |
-| `button` | **`label`**, **`action`**, `payload`, `tone`, `icon`, `disabled` |
+| `button` | **`label`**, **`action`**, `payload`, `tone`, `icon`, `disabled`, `title` (its tooltip) |
 | `toggle` | **`label`**, **`name`**, `value`, `action` (sends `{value}` beside the payload) |
 | `select` | **`label`**, **`name`**, **`options`** (`[{value, label}]` or strings), `value`, `action` |
+| `segmented` | **`name`**, **`options`** (`[{value, label, icon?, title?}]` or strings), `value`, `action` (sends `{value}` beside the payload), `label` — the app's own switch (Split · Source · PDF) |
 | `textfield` | **`label`**, **`name`**, `value`, `placeholder`, `multiline` |
 | `form` | **`action`**, `children` (its fields), `submit`; sends `{form: {name: value}}` beside the payload |
 | `editor` | **`path`** — the file in the app's own editor (saves, merges) |
 | `pdf` | **`src`** — the app's PDF viewer |
 | `log` | **`src`** — the app's viewer for that file (a `.log` streams from its tail) |
-| `diagnostics` | `file` — the problems list from every active plugin's `diagnostics/1`, with **Go to** and **Ask agent** |
+| `diagnostics` | `file`; `key` (one of your surface keys only: a document's problems); `mine` (only yours); `quiet` (draws nothing while there is nothing to say); `compact` (a shorter list); `title` — the problems list from every active plugin's `diagnostics/1`: counts in its head, each row opens its place (**Go to**) with **Ask agent**, `info`/`hint` items (a LaTeX box) behind a "Show N layout notes" toggle |
 | `diff` | `before` + `after`, or `path` + `base` (`head`, `index`, `rev:<ref>`, `output:<path>`); `mode` `prose` (default: words within a changed line) or `code` |
 
 A node this chimaera doesn't know draws its `fallback` (a node, or `"drop"`),
@@ -670,12 +672,16 @@ but never handles (the app carries them out): `open-file {file, line?}`,
 `open-view {view}`, `open-url {url}`, `copy {text}`, `save-to-workspace {from,
 to}` (the user's click copies an output file into the workspace; asks before
 replacing), `ask-agent {file?, line?, text}`, `install-tool {tool}` (the user's
-click installs one of your `[[tools]]`, as the card's Install does, then the view
-draws again).
+click installs one of your `[[tools]]`, as the card's Install does: a progress
+bar with its stage and megabytes sits at the top of your screen meanwhile, the
+view draws again at once — `tool_state` then says `installing` — and when it is
+done).
 
 Where a view draws: `tab` (its own tab: the card's **Open**, `open-view`, a file
 action's `open`), `panel` (the dashboard, after core's sections), `file` (a
-claimed file), `status` (a chip in a claimed file's bar), `card` (inside its
+claimed file; the view owns the pane: the root stack's last child grows to its
+height, and an `editor` or `pdf` first in a split pane, a stack or a tab fills
+it — an embedded viewer shows no path bar), `status` (a chip in a claimed file's bar), `card` (inside its
 Extensions card). The UI renders only on open, on an action, and on
 `invalidate`; nothing polls.
 
@@ -765,7 +771,7 @@ the job's id at once; the host runs it:
 | Switched off, blocked | its jobs are cancelled |
 
 `job_status(cx, id)` answers `{id, state (queued running done), program,
-label, exit, timed_out, cancelled, error, queued_ms, started_ms, finished_ms,
+from (`path`: the user's copy; `tool:<id>`: one of yours), label, exit, timed_out, cancelled, error, queued_ms, started_ms, finished_ms,
 duration_ms, stdout, stderr}` for this plugin's jobs in this workspace. When
 one ends the plugin hears `job-finished {id, exit, timed_out, duration_ms}`
 (with the 30 s budget, so it can digest a large output), and windows get a

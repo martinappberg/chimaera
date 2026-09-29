@@ -20,8 +20,10 @@
   import { openInSystemBrowser } from "../../shared/urlOpen";
   import {
     fetchQuery,
+    fetchTools,
     fetchView,
     installTool,
+    progressWords,
     onPlatformFrame,
     openPluginView,
     postViewAction,
@@ -54,6 +56,9 @@
   let replace = $state<{ from: string; to: string } | null>(null);
   let width = $state<"narrow" | "wide">("wide");
   let host: HTMLDivElement | undefined = $state();
+  /** A long built-in action in flight (a tool install): its progress. */
+  let task = $state<{ title: string; text: string; fraction: number | null } | null>(null);
+  let taskPoll: ReturnType<typeof setInterval> | null = null;
 
   let seq = 0;
   let again = false;
@@ -117,13 +122,33 @@
         return;
       case "install-tool": {
         // The user's click, as on the card's Tools section: the daemon
-        // downloads, checks, unpacks and sets it up; then the view draws
-        // again with the tool in place.
+        // downloads, checks, unpacks and sets it up (a minute or more for a
+        // TeX Live). Its progress shows at the top meanwhile; the view draws
+        // again at once (it may say it is installing) and when it is done.
         const tool = str(payload.tool);
         if (tool === "") return;
-        say("Installing… (downloading, checking, unpacking)", "neutral");
-        await installTool(plugin, tool);
-        say("Installed.");
+        const known = (await fetchTools(plugin).catch(() => [])).find((t) => t.tool === tool);
+        const name = known?.name ?? tool;
+        const title = `Installing ${name}`;
+        task = { title, text: "Starting", fraction: null };
+        const running = installTool(plugin, tool);
+        void load();
+        taskPoll = setInterval(() => {
+          void fetchTools(plugin)
+            .then((all) => {
+              const t = all.find((x) => x.tool === tool);
+              if (t?.installing && task !== null) task = { title, ...progressWords(t.progress) };
+            })
+            .catch(() => {});
+        }, 1000);
+        try {
+          await running;
+          say(`${name} is installed.`);
+        } finally {
+          if (taskPoll !== null) clearInterval(taskPoll);
+          taskPoll = null;
+          task = null;
+        }
         await load();
         return;
       }
@@ -225,10 +250,23 @@
     stop?.();
     observer?.disconnect();
     clearTimeout(noteTimer);
+    if (taskPoll !== null) clearInterval(taskPoll);
   });
 </script>
 
 <div class="screen" class:compact class:fill bind:this={host} aria-busy={busy}>
+  {#if task !== null}
+    <div class="task" role="status" aria-live="polite">
+      <div class="task-head">
+        <span class="task-spin" aria-hidden="true"></span>
+        <span class="task-title">{task.title}</span>
+        <span class="task-text">{task.text}</span>
+      </div>
+      <div class="task-bar" class:indeterminate={task.fraction === null}>
+        <span style:width={task.fraction === null ? undefined : `${Math.round(task.fraction * 100)}%`}></span>
+      </div>
+    </div>
+  {/if}
   {#if loadError !== null}
     <p class="failed">{loadError}</p>
   {:else if result === null}
@@ -273,6 +311,78 @@
   .screen:not(.compact) {
     padding: 14px 16px;
   }
+  .task {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 9px 12px;
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--edge));
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--accent) 6%, var(--bg));
+    flex: none;
+  }
+  .task-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: var(--text-sm);
+    min-width: 0;
+  }
+  .task-title {
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .task-text {
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .task-spin {
+    width: 11px;
+    height: 11px;
+    flex: none;
+    border-radius: 50%;
+    border: 1.6px solid var(--accent);
+    border-right-color: transparent;
+    animation: task-spin 0.8s linear infinite;
+  }
+  @keyframes task-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  .task-bar {
+    height: 4px;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    overflow: hidden;
+  }
+  .task-bar span {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+    border-radius: 2px;
+    transition: width 0.4s ease;
+  }
+  .task-bar.indeterminate span {
+    width: 30%;
+    animation: task-slide 1.4s ease-in-out infinite;
+  }
+  @keyframes task-slide {
+    from {
+      transform: translateX(-100%);
+    }
+    to {
+      transform: translateX(340%);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .task-spin,
+    .task-bar.indeterminate span {
+      animation: none;
+    }
+  }
   .screen.fill {
     box-sizing: border-box;
     min-height: 100%;
@@ -281,10 +391,40 @@
     flex: 1;
     min-height: 0;
   }
-  .screen.fill > :global(.stack > .split:last-child) {
+  /* The root's last child is the body (a split, or one side alone): it
+     grows, and a viewer atop a stack in it (the editor, the PDF) fills. */
+  .screen.fill > :global(.stack > :last-child) {
+    flex: 1;
+    min-height: 0;
+  }
+  .screen.fill > :global(.stack > .rich.tall:last-child) {
+    height: auto;
+    min-height: 240px;
+  }
+  .screen.fill :global(.split .pane > .stack > .rich:first-child),
+  .screen.fill > :global(.stack > .stack:last-child > .rich:first-child) {
+    flex: 1;
+    height: auto;
+    min-height: 240px;
+  }
+  /* Narrow: the same body in tabs; the open tab fills. */
+  .screen.fill > :global(.stack > .tabs:last-child),
+  .screen.fill > :global(.stack > .tabs:last-child > .tabpanel) {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .screen.fill > :global(.stack > .tabs:last-child > .tabpanel) {
     flex: 1;
   }
-  .screen.fill :global(.split .pane > .stack > .rich:first-child) {
+  .screen.fill > :global(.stack > .tabs:last-child > .tabpanel > *) {
+    flex: 1;
+    min-height: 0;
+  }
+  .screen.fill > :global(.stack > .tabs:last-child > .tabpanel > .rich) {
+    height: auto;
+  }
+  .screen.fill > :global(.stack > .tabs:last-child > .tabpanel > .stack > .rich:first-child) {
     flex: 1;
     height: auto;
     min-height: 240px;

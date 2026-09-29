@@ -451,6 +451,8 @@ async fn after_change(state: &Arc<AppState>, id: &str) {
     state.plugin_runtime.forget_plugin(id);
     crate::lock(&state.knowledge).forget_provider(id, None);
     crate::lock(&state.plugin_detect).clear();
+    // The new build compiled before a window asks for it.
+    super::runtime::warm(state, Some(id.to_string()), std::time::Duration::ZERO);
     state.changes.notify_waiters();
 }
 

@@ -850,6 +850,18 @@ kills a running job. Live on a real login node.
 The first privileged plugins, in their own repositories
 ([latex-reports-plan.md](latex-reports-plan.md)).
 
+**Status (2026-09-29).** Their L1 is built as two crates laid out like the other
+first-party plugins (`chimaera-plugin-latex`, `chimaera-plugin-typst`: CI and release
+workflows, native tests, pinned to this repository's API by commit) and verified
+live here, including TinyTeX 2026.09 and Typst 0.15.1 installed from their pinned
+downloads. Their GitHub repositories, first releases and lock entries come next.
+What they needed from the platform landed with them: the `status` and `segmented`
+nodes, a callout's `actions`, the `diagnostics` node's `key` / `quiet` / layout
+notes, editor marks from `diagnostics/1`, full-height file views, the `install-tool`
+action with install progress, a job's `from` (whose copy ran), lowercase job
+variables (TeX's own), a program's `network` line, and plugins compiled ahead of
+their first use.
+
 ### P10: today's plugins adopt, and core stops naming them
 
 Agent notes and Mycelium on 0.2 with the pieces in [section 12](#12-todays-plugins-inherit-it);

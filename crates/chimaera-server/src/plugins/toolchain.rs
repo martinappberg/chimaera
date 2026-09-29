@@ -20,7 +20,7 @@
 //!   atomic `current` link; two versions kept. `setup` steps run once after
 //!   unpacking, as jobs of the tool's own programs, before `current` moves.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -46,10 +46,27 @@ const DOWNLOAD_TIMEOUT_S: u64 = 3600;
 /// The small record beside an unpacked tool.
 const RECORD: &str = ".chimaera-tool.json";
 
-/// (plugin, tool) pairs installing now: one at a time each.
+/// (plugin, tool) pairs installing now: one at a time each, and how far
+/// each has got (the card and a screen show it while it runs).
 #[derive(Default)]
 pub(crate) struct Installs {
     busy: Mutex<HashSet<(String, String)>>,
+    progress: Mutex<HashMap<(String, String), Progress>>,
+}
+
+/// An install's stage (`downloading`, `unpacking`, `setting up`) and, while
+/// downloading, the bytes so far of the declared size.
+#[derive(Clone, Copy)]
+struct Progress {
+    stage: &'static str,
+    done: u64,
+    total: u64,
+}
+
+impl Installs {
+    fn set(&self, key: &(String, String), stage: &'static str, done: u64, total: u64) {
+        crate::lock(&self.progress).insert(key.clone(), Progress { stage, done, total });
+    }
 }
 
 /// Tests only: `https://example.invalid/…` downloads go to a local server.
@@ -150,8 +167,11 @@ pub(crate) async fn tool_json(state: &AppState, m: &Manifest, tool: &ToolDecl) -
         .await
         .ok()
         .flatten();
-    let busy = crate::lock(&state.plugin_platform.installs.busy)
-        .contains(&(m.id.clone(), tool.id.clone()));
+    let key = (m.id.clone(), tool.id.clone());
+    let busy = crate::lock(&state.plugin_platform.installs.busy).contains(&key);
+    let progress = crate::lock(&state.plugin_platform.installs.progress)
+        .get(&key)
+        .copied();
     json!({
         "tool": tool.id,
         "declared": true,
@@ -159,6 +179,7 @@ pub(crate) async fn tool_json(state: &AppState, m: &Manifest, tool: &ToolDecl) -
         "version": tool.version,
         "programs": tool.programs,
         "installing": busy,
+        "progress": progress.map(|p| json!({"stage": p.stage, "done": p.done, "total": p.total})),
         "installed": installed.as_ref().map(|(_, r)| json!({
             "version": r.version,
             "bytes": r.bytes,
@@ -538,7 +559,11 @@ impl<W: Write> Write for CappedWriter<W> {
 
 /// Fetch `a` into `dest`, hashing as it streams; refuse a size or sha256
 /// that isn't the declared one.
-async fn download(a: &ArtifactDecl, dest: &Path) -> Result<u64, String> {
+async fn download(
+    a: &ArtifactDecl,
+    dest: &Path,
+    on_bytes: &(dyn Fn(u64) + Send + Sync),
+) -> Result<u64, String> {
     use sha2::{Digest, Sha256};
     use tokio::io::AsyncWriteExt;
     let (url, local) = download_url(&a.url);
@@ -574,6 +599,7 @@ async fn download(a: &ArtifactDecl, dest: &Path) -> Result<u64, String> {
             break;
         }
         total += n as u64;
+        on_bytes(total);
         if total > cap {
             return Err(format!(
                 "the download is larger than the {} bytes its plugin declared",
@@ -656,6 +682,7 @@ pub(crate) async fn install(
     }
     let result = install_inner(state, m, tool, artifact).await;
     crate::lock(&state.plugin_platform.installs.busy).remove(&key);
+    crate::lock(&state.plugin_platform.installs.progress).remove(&key);
     // What was fetched, from where, and the digest it was held to.
     let mut entry = json!({
         "kind": "tool-install",
@@ -693,7 +720,11 @@ async fn install_inner(
         }
     };
     tracing::info!(plugin = %m.id, tool = %tool.id, url = %artifact.url, "plugin tool download started");
-    let bytes = match download(artifact, &archive).await {
+    let key = (m.id.clone(), tool.id.clone());
+    let installs = &state.plugin_platform.installs;
+    installs.set(&key, "downloading", 0, artifact.size);
+    let on_bytes = |done: u64| installs.set(&key, "downloading", done, artifact.size);
+    let bytes = match download(artifact, &archive, &on_bytes).await {
         Ok(b) => b,
         Err(err) => {
             cleanup(vec![archive]).await;
@@ -703,6 +734,7 @@ async fn install_inner(
     // `unpack = "none"`: the file is the program, so it takes the program's
     // name (a release names it `jq-linux-amd64`; jobs ask for `jq`).
     let name = tool.programs.first().unwrap_or(&tool.id).clone();
+    installs.set(&key, "unpacking", 0, 0);
     let unpacked = {
         let (archive, staging, kind) = (archive.clone(), staging.clone(), artifact.unpack.clone());
         tokio::task::spawn_blocking(move || {
@@ -762,6 +794,9 @@ async fn install_inner(
         Some(b) => version_dir.join(b),
         None => version_dir.clone(),
     };
+    if !tool.setup.is_empty() {
+        installs.set(&key, "setting up", 0, 0);
+    }
     for step in &tool.setup {
         if let Err(err) =
             super::jobs::run_setup(state, m, &bin, &version_dir, &step.program, &step.args).await

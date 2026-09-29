@@ -392,8 +392,11 @@ export interface SurfaceItem {
 
 /** Every active plugin's published data of one surface here (`file`
  *  narrows diagnostics to a file and outputs to a source). */
-export async function fetchSurface(ws: string, surface: string, file?: string): Promise<SurfaceItem[]> {
-  const q = file !== undefined ? `?file=${encodeURIComponent(file)}` : "";
+export async function fetchSurface(ws: string, surface: string, file?: string, key?: string): Promise<SurfaceItem[]> {
+  const params = new URLSearchParams();
+  if (file !== undefined) params.set("file", file);
+  if (key !== undefined) params.set("key", key);
+  const q = params.size > 0 ? `?${params}` : "";
   const b = await body<{ items?: SurfaceItem[] }>(
     await api(`/workspaces/${encodeURIComponent(ws)}/surfaces/${surface}${q}`),
   );
@@ -413,10 +416,10 @@ export interface Diagnostic {
   plugin: string;
 }
 
-/** The `diagnostics/1` items for `file` (every file when omitted), errors
- *  first, then by line. */
-export async function fetchDiagnostics(ws: string, file?: string): Promise<Diagnostic[]> {
-  const items = await fetchSurface(ws, "diagnostics/1", file);
+/** The `diagnostics/1` items for `file` (every file when omitted; one
+ *  surface key only when `key` is given), errors first, then by line. */
+export async function fetchDiagnostics(ws: string, file?: string, key?: string): Promise<Diagnostic[]> {
+  const items = await fetchSurface(ws, "diagnostics/1", file, key);
   const out: Diagnostic[] = [];
   for (const it of items) {
     const data = it.data as { items?: unknown };
@@ -492,6 +495,9 @@ export interface ToolState {
   version: string;
   programs: string[];
   installing: boolean;
+  /** While installing: the stage (`downloading`, `unpacking`, `setting
+   *  up`) and, downloading, the bytes so far of the declared size. */
+  progress: { stage: string; done: number; total: number } | null;
   installed: { version: string; bytes: number; installed_ms: number } | null;
   current: boolean;
   download: { host: string; size: number | null } | null;
@@ -507,12 +513,15 @@ function toolState(raw: unknown): ToolState | null {
   const iv = text(i?.version);
   const d = o.download as Record<string, unknown> | null | undefined;
   const host = text(d?.host);
+  const pr = o.progress as Record<string, unknown> | null | undefined;
+  const stage = text(pr?.stage);
   return {
     tool,
     name,
     version,
     programs: strings(o.programs),
     installing: o.installing === true,
+    progress: stage !== null ? { stage, done: num(pr?.done) ?? 0, total: num(pr?.total) ?? 0 } : null,
     installed: iv !== null ? { version: iv, bytes: num(i?.bytes) ?? 0, installed_ms: num(i?.installed_ms) ?? 0 } : null,
     current: o.current === true,
     download: host !== null ? { host, size: num(d?.size) } : null,
@@ -536,6 +545,17 @@ export async function installTool(pid: string, tool: string): Promise<void> {
 
 export async function removeTool(pid: string, tool: string): Promise<void> {
   await body<unknown>(await api(`${toolsBase(pid)}/${encodeURIComponent(tool)}`, { method: "DELETE" }));
+}
+
+/** An install's progress in words: "Downloading · 84 of 152 MB",
+ *  "Unpacking", "Setting up"; and its fraction when it has one. */
+export function progressWords(p: ToolState["progress"]): { text: string; fraction: number | null } {
+  if (p === null) return { text: "Starting", fraction: null };
+  const stage = p.stage.charAt(0).toUpperCase() + p.stage.slice(1);
+  if (p.stage === "downloading" && p.total > 0) {
+    return { text: `${stage} · ${sizeWords(p.done)} of ${sizeWords(p.total)}`, fraction: Math.min(1, p.done / p.total) };
+  }
+  return { text: stage, fraction: null };
 }
 
 /** A tool's one line before install: "TeX Live 2026.09 · 152 MB from

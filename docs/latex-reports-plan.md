@@ -888,6 +888,24 @@ programs and tools (its P8). Their own work:
 
 ### L1: build, errors, agents
 
+**Built (2026-09-29), not yet released.** Both plugins as crates of their own
+(`chimaera-plugin-latex`, `chimaera-plugin-typst`), verified live against a
+headless daemon and in the browser, light and dark: the view (a status pill,
+Split / Source / PDF, Build, Save PDF, Log, **Ask agent to fix**; a notice bar only
+when something needs the user; the PDF kept through a rebuild and refreshed in
+place; the problems list for this document only), builds on open, save and agent
+edits, the LaTeX log parser against real TeX Live 2026 logs (pdfLaTeX, XeLaTeX,
+LuaLaTeX, biber) with the failing control sequence marked, Typst's diagnostics,
+parts found by `% !TEX root`, the recorder file or Typst's deps, TinyTeX and Typst
+installed on one click with progress, a missing package looked up and installed
+with `tlmgr` (the lookup needs the network, which this sandbox blocks: the notice
+says so), `compile_latex` / `compile_typst` and the guides. Where it differs: a
+failed build shows the partial PDF LaTeX left (no `prev/` copy yet); the user's
+`~/.latexmkrc` isn't read (`-norc` only); the old-LuaTeX gate is not built; Typst
+has no editor highlighting yet (`codemirror-lang-typst` is the next core asset).
+Not yet verified on a login node, nor by a claude and a codex session running the
+compile-and-fix loop.
+
 Both plugins with the file view, building on open, save and agent writes, the output
 folder, both log parsers and their corpus, the `diagnostics` and `output` surfaces,
 **Ask agent**, `compile_latex` / `compile_typst` and the guides, TinyTeX and Typst as

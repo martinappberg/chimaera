@@ -20,6 +20,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
     crate::episodes::spawn_jobs_task(state.clone());
     // Plugins' file events and watch sweep (idle without listeners).
     plugins::files::spawn_worker(state.clone());
+    // Switched-on plugins compiled ahead of their first use.
+    plugins::runtime::warm(&state, None, std::time::Duration::from_secs(3));
     let api = Router::new()
         .route("/health", get(api::health))
         .route(

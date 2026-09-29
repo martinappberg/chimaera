@@ -23,7 +23,7 @@
   import FileIcon from "../../shared/FileIcon.svelte";
   import Markdown from "../../chat/Markdown.svelte";
   import { openInSystemBrowser } from "../../shared/urlOpen";
-  import { fetchDiagnostics, onPlatformFrame, type Diagnostic } from "../platform";
+  import { fetchDiagnostics, onPlatformFrame, type Diagnostic, type UiNodeData } from "../platform";
   import { fsFile } from "../../previews/files";
   import { fetchGitDiff, fetchGitDiffAt } from "../../workspace/git";
   import {
@@ -164,7 +164,7 @@
 
   // Rich nodes: the app's own viewers, loaded on first use, on a path
   // resolved from `output:` or the workspace.
-  let FileView = $state<Component<{ path: string; wsRoot?: string | null; plugins?: boolean }> | null>(null);
+  let FileView = $state<Component<{ path: string; wsRoot?: string | null; plugins?: boolean; pathBar?: boolean }> | null>(null);
   let ImageView = $state<Component<{ path: string }> | null>(null);
   let resolved = $state<string | null>(null);
   let resolveError = $state<string | null>(null);
@@ -193,19 +193,50 @@
     }
   });
 
+  // `status`: idle | busy | ok | warn | bad.
+  const statusState = $derived(
+    ["idle", "busy", "ok", "warn", "bad"].includes(str(node.state)) ? str(node.state) : "idle",
+  );
+  // `segmented`: its options, `[{value, label, icon?, title?}]` or strings.
+  const segOptions = $derived(
+    (Array.isArray(node.options) ? (node.options as unknown[]) : []).map((o) => {
+      const r = (typeof o === "object" && o !== null ? o : { value: o }) as Record<string, unknown>;
+      const value = str(r.value);
+      return { value, label: str(r.label, value), icon: typeof r.icon === "string" ? r.icon : null, title: str(r.title, "") || undefined };
+    }),
+  );
+  // A callout's buttons.
+  const calloutActions = $derived(
+    kind === "callout" && Array.isArray(node.actions)
+      ? (node.actions as unknown[]).filter((a): a is UiNodeData => typeof a === "object" && a !== null && typeof (a as { type?: unknown }).type === "string")
+      : [],
+  );
+
   // `diagnostics`: the problems list, from every active plugin's
-  // `diagnostics/1`, again whenever one is published.
+  // `diagnostics/1` (or one key of this plugin's: `key`), again whenever one
+  // is published. Layout notes (`info`, `hint`: a LaTeX box) wait behind a
+  // toggle; `quiet` draws nothing while there is nothing to say.
   let problems = $state<Diagnostic[] | null>(null);
   let problemsError = $state<string | null>(null);
   async function loadProblems(): Promise<void> {
     try {
       const file = typeof node.file === "string" ? node.file : undefined;
-      problems = await fetchDiagnostics(screen.ws, file);
+      const key = typeof node.key === "string" ? node.key : undefined;
+      const all = await fetchDiagnostics(screen.ws, file, key);
+      problems = key !== undefined || node.mine === true ? all.filter((d) => d.plugin === screen.plugin) : all;
       problemsError = null;
     } catch (e) {
       problemsError = e instanceof Error ? e.message : String(e);
     }
   }
+  let showNotes = $state(false);
+  const notes = $derived((problems ?? []).filter((d) => d.severity === "info" || d.severity === "hint"));
+  const shownProblems = $derived((problems ?? []).filter((d) => d.severity === "error" || d.severity === "warning"));
+  const visibleProblems = $derived(showNotes ? [...shownProblems, ...notes] : shownProblems);
+  const counts = $derived({
+    error: shownProblems.filter((d) => d.severity === "error").length,
+    warning: shownProblems.filter((d) => d.severity === "warning").length,
+  });
   let stopFrames: (() => void) | null = null;
   onMount(() => {
     if (node.type !== "diagnostics") return;
@@ -293,6 +324,7 @@
     class:primary={b.tone === "accent"}
     class:danger={b.tone === "bad"}
     disabled={b.disabled === true || screen.busy}
+    title={typeof b.title === "string" ? b.title : undefined}
     onclick={() => run(b.action, b.payload)}
   >
     {#if b.icon !== undefined}{@render icon(b.icon, undefined, 13)}{/if}
@@ -389,6 +421,35 @@
   </dl>
 {:else if kind === "badge"}
   <span class="badge tone-{t}">{str(node.text)}</span>
+{:else if kind === "status"}
+  <!-- A process's state as one pill (a build: building, built, errors),
+       an optional muted detail beside it. -->
+  <span class="status-wrap">
+    <span class="status st-{statusState}" role="status">
+      {#if statusState === "busy"}<span class="spin" aria-hidden="true"></span>{:else}{@render icon(
+          statusState === "ok" ? "check" : statusState === "idle" ? "clock" : "alert",
+          undefined,
+          13,
+        )}{/if}
+      <span>{str(node.text)}</span>
+    </span>
+    {#if typeof node.detail === "string" && node.detail !== ""}<span class="status-detail">{node.detail}</span>{/if}
+  </span>
+{:else if kind === "segmented"}
+  <div class="segmented" role="radiogroup" aria-label={str(node.label, str(node.name))}>
+    {#each segOptions as o (o.value)}
+      <button
+        role="radio"
+        class="seg"
+        class:on={o.value === str(inputValue)}
+        aria-checked={o.value === str(inputValue)}
+        title={o.title}
+        disabled={node.disabled === true || screen.busy}
+        onclick={() => o.value !== str(inputValue) && setInput(o.value)}
+        >{#if o.icon !== null}{@render icon(o.icon, undefined, 13)}{/if}{o.label}</button
+      >
+    {/each}
+  </div>
 {:else if kind === "icon"}
   <span class="icon-node tone-{t}">{@render icon(node.name, str(node.label, str(node.name)), 16)}</span>
 {:else if kind === "progress"}
@@ -408,8 +469,16 @@
   </div>
 {:else if kind === "callout"}
   <div class="callout tone-{t}" role={t === "bad" || t === "warn" ? "alert" : "note"}>
-    {#if typeof node.title === "string"}<div class="callout-title">{node.title}</div>{/if}
-    <div>{str(node.text)}</div>
+    <span class="callout-icon">{@render icon(t === "bad" || t === "warn" ? "alert" : "info", undefined, 15)}</span>
+    <div class="callout-body">
+      {#if typeof node.title === "string"}<div class="callout-title">{node.title}</div>{/if}
+      <div class="callout-text">{str(node.text)}</div>
+    </div>
+    {#if calloutActions.length > 0}
+      <div class="callout-actions">
+        {#each calloutActions as a, i (i)}<UiNode node={a} depth={depth + 1} />{/each}
+      </div>
+    {/if}
   </div>
 {:else if kind === "list"}
   <div class="list-wrap">
@@ -553,39 +622,51 @@
     {#if resolveError !== null}
       <p class="text tone-bad small">{resolveError}</p>
     {:else if resolved !== null && FileView !== null}
-      <FileView path={resolved} wsRoot={screen.wsRoot} plugins={false} />
+      <FileView path={resolved} wsRoot={screen.wsRoot} plugins={false} pathBar={false} />
     {/if}
   </div>
 {:else if kind === "diagnostics"}
-  <div class="problems">
-    {#if problemsError !== null}
-      <p class="text tone-bad small">{problemsError}</p>
-    {:else if problems === null}
-      <p class="text small tone-neutral">looking for problems…</p>
-    {:else if problems.length === 0}
-      <p class="text small tone-good">No problems.</p>
-    {:else}
-      <ul class="list">
-        {#each problems as d, i (i)}
-          <li class="item problem">
-            <span class="badge tone-{d.severity === 'error' ? 'bad' : d.severity === 'warning' ? 'warn' : 'neutral'}"
-              >{severityWord[d.severity]}</span
-            >
-            <div class="item-main">
-              <span class="item-title">{d.message}</span>
-              <span class="item-sub">{d.file}:{d.line}{d.source ? ` · ${d.source}` : ""}</span>
-            </div>
-            <button class="opt small quiet" onclick={() => run("open-file", { file: d.file, line: d.line })}>Go to</button>
-            <button
-              class="opt small quiet"
-              title="Put this problem in front of an agent, as a reference to its line"
-              onclick={() => run("ask-agent", { file: d.file, line: d.line, text: d.message })}>Ask agent</button
-            >
-          </li>
-        {/each}
-      </ul>
-    {/if}
-  </div>
+  {#if problemsError !== null}
+    <p class="text tone-bad small">{problemsError}</p>
+  {:else if problems !== null && (shownProblems.length > 0 || notes.length > 0 || node.quiet !== true)}
+    <div class="problems" class:compact={node.compact === true}>
+      <div class="problems-head">
+        <span class="problems-title">{str(node.title, "Problems")}</span>
+        {#if counts.error > 0}<span class="count tone-bad">{counts.error} error{counts.error === 1 ? "" : "s"}</span>{/if}
+        {#if counts.warning > 0}<span class="count tone-warn">{counts.warning} warning{counts.warning === 1 ? "" : "s"}</span>{/if}
+        {#if shownProblems.length === 0 && notes.length === 0}<span class="count tone-good">none</span>{/if}
+        <span class="spacer"></span>
+        {#if notes.length > 0}
+          <button class="link-btn" onclick={() => (showNotes = !showNotes)}>
+            {showNotes ? "Hide" : "Show"} {notes.length} layout note{notes.length === 1 ? "" : "s"}
+          </button>
+        {/if}
+      </div>
+      {#if visibleProblems.length > 0}
+        <ul class="plist">
+          {#each visibleProblems as d, i (i)}
+            <li class="prow sev-{d.severity}">
+              <span class="sev" aria-label={severityWord[d.severity]}
+                >{@render icon(d.severity === "error" || d.severity === "warning" ? "alert" : "info", undefined, 14)}</span
+              >
+              <button class="pmain" title="Go to {d.file}:{d.line}" onclick={() => run("open-file", { file: d.file, line: d.line })}>
+                <span class="pmsg">{d.message}</span>
+                <span class="ploc"
+                  >{d.file}:{d.line}{#if typeof d.context === "string" && d.context !== ""}<code class="pctx">{d.context}</code>{/if}</span
+                >
+              </button>
+              <button
+                class="opt small quiet ask"
+                title="Put this problem in front of an agent, as a reference to its line"
+                onclick={() => run("ask-agent", { file: d.file, line: d.line, text: `${d.message}${d.context ? ` at "${d.context}"` : ""}` })}
+                >Ask agent</button
+              >
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
+  {/if}
 {:else if kind === "diff"}
   <div class="diff" role="group" aria-label="changes">
     {#if baseError !== null}<p class="text tone-bad small">{baseError}</p>{/if}
@@ -860,21 +941,135 @@
     font-size: var(--text-sm);
   }
   .callout {
-    border: 1px solid currentColor;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    border: 1px solid color-mix(in srgb, currentColor 45%, transparent);
     border-radius: 8px;
-    padding: 8px 12px;
+    padding: 8px 10px 8px 12px;
     font-size: var(--text-sm);
-    background: color-mix(in srgb, currentColor 6%, transparent);
-  }
-  .callout > div:last-child {
-    color: var(--fg);
+    background: color-mix(in srgb, currentColor 7%, var(--bg));
   }
   .callout.tone-neutral {
-    color: var(--edge);
+    color: var(--muted);
+  }
+  .callout-icon {
+    flex: none;
+    display: inline-flex;
+    padding-top: 1px;
+  }
+  .callout-body {
+    flex: 1;
+    min-width: 0;
+    color: var(--fg);
+    line-height: 1.45;
   }
   .callout-title {
     font-weight: 600;
     margin-bottom: 2px;
+  }
+  .callout-text {
+    overflow-wrap: anywhere;
+  }
+  .callout-actions {
+    flex: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-self: center;
+  }
+  /* --- status: one pill for a process's state --------------------------- */
+  .status-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 9px 2px 7px;
+    border-radius: 999px;
+    font-size: var(--text-sm);
+    font-weight: 500;
+    line-height: 1.5;
+    white-space: nowrap;
+    background: color-mix(in srgb, currentColor 12%, transparent);
+  }
+  .status.st-idle {
+    color: var(--muted);
+  }
+  .status.st-busy {
+    color: var(--accent);
+  }
+  .status.st-ok {
+    color: var(--git-added);
+  }
+  .status.st-warn {
+    color: var(--warn);
+  }
+  .status.st-bad {
+    color: var(--err);
+  }
+  .status-detail {
+    font-size: var(--text-sm);
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+  .spin {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    border: 1.6px solid currentColor;
+    border-right-color: transparent;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .spin {
+      animation: none;
+      border-right-color: currentColor;
+      opacity: 0.6;
+    }
+  }
+  /* --- segmented: the app's own switch (FileView's Text | view) ---------- */
+  .segmented {
+    display: inline-flex;
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    overflow: hidden;
+    flex: none;
+  }
+  .segmented .seg {
+    appearance: none;
+    border: none;
+    background: none;
+    color: var(--muted);
+    font: inherit;
+    font-size: var(--text-xs);
+    padding: 3px 10px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+  }
+  .segmented .seg + .seg {
+    border-left: 1px solid var(--edge);
+  }
+  .segmented .seg:hover:not(:disabled) {
+    color: var(--fg);
+  }
+  .segmented .seg.on {
+    background: var(--row-active);
+    color: var(--fg);
   }
   .list {
     list-style: none;
@@ -1073,9 +1268,133 @@
     font-size: var(--text-xs);
     color: var(--muted);
   }
-  .problems .problem .badge {
-    min-width: 52px;
-    justify-content: center;
+  /* --- the problems list ------------------------------------------------ */
+  .problems {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    min-height: 0;
+    overflow: hidden;
+    background: var(--bg);
+  }
+  .problems-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    font-size: var(--text-xs);
+    border-bottom: 1px solid var(--edge);
+    flex: none;
+  }
+  .problems-title {
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .problems-head .count {
+    font-weight: 500;
+  }
+  .problems-head .spacer {
+    flex: 1;
+  }
+  .link-btn {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0;
+    font: inherit;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .link-btn:hover {
+    color: var(--accent);
+  }
+  .problems:has(.plist) .problems-head:only-child {
+    border-bottom: none;
+  }
+  .problems:not(:has(.plist)) .problems-head {
+    border-bottom: none;
+  }
+  .plist {
+    list-style: none;
+    margin: 0;
+    padding: 2px 0;
+    overflow: auto;
+    max-height: 240px;
+  }
+  .problems.compact .plist {
+    max-height: 168px;
+  }
+  .prow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 8px 3px 10px;
+    min-width: 0;
+  }
+  .prow:hover {
+    background: var(--row-hover);
+  }
+  .sev {
+    flex: none;
+    display: inline-flex;
+    color: var(--muted);
+  }
+  .sev-error .sev {
+    color: var(--err);
+  }
+  .sev-warning .sev {
+    color: var(--warn);
+  }
+  .pmain {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 2px 0;
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .pmsg {
+    font-size: var(--text-sm);
+    color: var(--fg);
+    overflow-wrap: anywhere;
+  }
+  .ploc {
+    font-size: var(--text-xs);
+    color: var(--muted);
+    display: flex;
+    gap: 8px;
+    min-width: 0;
+    white-space: nowrap;
+  }
+  .pctx {
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+  .prow .ask {
+    flex: none;
+    opacity: 0;
+  }
+  .prow:hover .ask,
+  .prow .ask:focus-visible {
+    opacity: 1;
+  }
+  @media (hover: none) {
+    .prow .ask {
+      opacity: 1;
+    }
   }
   .diff {
     font-family: var(--mono);

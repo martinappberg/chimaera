@@ -66,7 +66,9 @@ fn required(node: &str) -> Option<&'static [(&'static str, Kind)]> {
         "tabs" => &[("tabs", Array)],
         "section" => &[("title", Str)],
         "divider" => &[],
-        "text" | "heading" | "markdown" | "code" | "badge" | "callout" => &[("text", Str)],
+        "text" | "heading" | "markdown" | "code" | "badge" | "callout" | "status" => {
+            &[("text", Str)]
+        }
         "keyvalue" => &[("items", Array)],
         "icon" => &[("name", Str)],
         "progress" => &[],
@@ -79,6 +81,7 @@ fn required(node: &str) -> Option<&'static [(&'static str, Kind)]> {
         "button" => &[("label", Str), ("action", Str)],
         "toggle" => &[("label", Str), ("name", Str)],
         "select" => &[("label", Str), ("name", Str), ("options", Array)],
+        "segmented" => &[("name", Str), ("options", Array)],
         "textfield" => &[("label", Str), ("name", Str)],
         "form" => &[("action", Str)],
         "editor" => &[("path", Str)],
@@ -157,7 +160,9 @@ impl Walk {
         }
         match kind {
             "button" | "form" => self.action(&format!("{at}.action"), fields.get("action")),
-            "toggle" | "select" => self.action(&format!("{at}.action"), fields.get("action")),
+            "toggle" | "select" | "segmented" => {
+                self.action(&format!("{at}.action"), fields.get("action"))
+            }
             "list" | "table" => {
                 let rows = if kind == "list" { "items" } else { "rows" };
                 if fields
@@ -231,6 +236,18 @@ impl Walk {
                 {
                     self.node(a, &format!("{iat}.actions[{j}]"), depth + 1);
                 }
+            }
+        }
+        // A callout's own buttons (a notice with its fix beside it).
+        if kind == "callout" {
+            for (j, a) in fields
+                .get("actions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                self.node(a, &format!("{at}.actions[{j}]"), depth + 1);
             }
         }
         if let Some(fallback) = fields.get("fallback") {
@@ -651,8 +668,23 @@ mod tests {
             {"type": "button", "label": "Build", "action": "build"},
             {"type": "shiny-new-node", "fallback": {"type": "text", "text": "old"}},
             {"type": "tabs", "tabs": [{"title": "Log", "children": [{"type": "log", "src": "output:build.log"}]}]},
+            {"type": "status", "state": "busy", "text": "Building"},
+            {"type": "segmented", "name": "layout", "value": "split", "action": "layout",
+             "options": [{"value": "split", "label": "Split"}, {"value": "pdf", "label": "PDF"}]},
+            {"type": "callout", "text": "siunitx is missing", "actions": [
+                {"type": "button", "label": "Install", "action": "install-package"}]},
         ]}});
         check_tree(&good.to_string()).unwrap();
+        // A callout's buttons are checked like any other.
+        let bad_action = json!({"ui": "1", "root": {"type": "callout", "text": "x", "actions": [
+            {"type": "button", "label": "Go"}]}});
+        let problems = check_tree(&bad_action.to_string()).unwrap_err();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.starts_with("root.actions[0].action")),
+            "{problems:?}"
+        );
 
         let bad = json!({"ui": "1", "root": {"type": "stack", "children": [
             {"type": "button", "action": "go"},

@@ -127,6 +127,7 @@ async fn a_declared_program_runs_as_a_job_and_the_plugin_hears_it_end() {
     let status = query(&state, &ws, "status", json!({"id": id})).await;
     assert_eq!(status["state"], "done");
     assert_eq!(status["stdout"], format!("output:.jobs/{id}/stdout.log"));
+    assert_eq!(status["from"], "path");
     let (code, route) = request(
         &state,
         Method::GET,
@@ -359,6 +360,10 @@ async fn a_tool_downloads_checks_unpacks_sets_up_and_runs() {
     let id = act(&state, &ws, "tool", Value::Null).await.unwrap();
     let line = finished(&state, &ws, &id, Duration::from_secs(20)).await;
     assert!(line.contains("out=fixture-tool hello"), "{line}");
+    assert_eq!(
+        query(&state, &ws, "status", json!({"id": id})).await["from"],
+        "tool:fixture-tool"
+    );
     // Remove.
     let (status, _) = request(
         &state,

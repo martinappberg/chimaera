@@ -8,7 +8,8 @@
    * asks and shows the answer. A tool with no build for this computer says
    * so instead of offering Install.
    */
-  import { fetchTools, installTool, removeTool, sizeWords, type ToolState } from "./platform";
+  import { onDestroy } from "svelte";
+  import { fetchTools, installTool, progressWords, removeTool, sizeWords, type ToolState } from "./platform";
 
   interface Props {
     plugin: string;
@@ -38,15 +39,24 @@
     void load();
   });
 
+  // While one installs, its progress is read every second.
+  let poll: ReturnType<typeof setInterval> | null = null;
+  onDestroy(() => {
+    if (poll !== null) clearInterval(poll);
+  });
+
   async function run(t: ToolState, what: "install" | "remove"): Promise<void> {
     working = { tool: t.tool, what };
     rowError = null;
+    if (what === "install") poll = setInterval(() => void load(), 1000);
     try {
       if (what === "install") await installTool(plugin, t.tool);
       else await removeTool(plugin, t.tool);
     } catch (e) {
       rowError = { tool: t.tool, text: e instanceof Error ? e.message : String(e) };
     } finally {
+      if (poll !== null) clearInterval(poll);
+      poll = null;
       working = null;
       await load();
     }
@@ -77,6 +87,13 @@
                 ? `${sizeWords(t.download.size)} from `
                 : "from "}{t.download.host}
             </span>
+          {/if}
+          {#if t.installing}
+            {@const p = progressWords(t.progress)}
+            <span class="state">{p.text}</span>
+            <span class="bar" class:indeterminate={p.fraction === null}
+              ><span style:width={p.fraction === null ? undefined : `${Math.round(p.fraction * 100)}%`}></span></span
+            >
           {/if}
           {#if rowError?.tool === t.tool}<span class="err">{rowError.text}</span>{/if}
         </div>
@@ -147,6 +164,38 @@
     flex: none;
     display: flex;
     gap: 6px;
+  }
+  .bar {
+    display: block;
+    height: 3px;
+    margin-top: 3px;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    overflow: hidden;
+    max-width: 260px;
+  }
+  .bar > span {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+    transition: width 0.4s ease;
+  }
+  .bar.indeterminate > span {
+    width: 30%;
+    animation: tool-slide 1.4s ease-in-out infinite;
+  }
+  @keyframes tool-slide {
+    from {
+      transform: translateX(-100%);
+    }
+    to {
+      transform: translateX(340%);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .bar.indeterminate > span {
+      animation: none;
+    }
   }
   .err {
     color: var(--err);

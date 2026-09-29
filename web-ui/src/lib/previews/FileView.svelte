@@ -34,9 +34,12 @@
     /** Let active plugins claim the file (false inside a plugin's own
      *  screen, which shows the file itself). */
     plugins?: boolean;
+    /** Show where an out-of-workspace file lives (off inside a plugin's
+     *  screen, which names what it shows). */
+    pathBar?: boolean;
   }
 
-  let { path, wsRoot = null, fontSize = undefined, plugins = true }: Props = $props();
+  let { path, wsRoot = null, fontSize = undefined, plugins = true, pathBar = true }: Props = $props();
 
   const kind = $derived(viewKindFor(path));
 
@@ -312,7 +315,7 @@
 {#snippet fileBody()}
 {#key path}
   <div class="file-view">
-    {#if external}
+    {#if external && pathBar}
       <!-- Full path for an out-of-workspace file: where is this coming from? -->
       <div class="ext-path" title={path}>
         <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
