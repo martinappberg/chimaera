@@ -1858,7 +1858,7 @@
       // on screen (the selection is in it, maybe in the Mastermind panel
       // rather than a pane), so nothing is split open or activated.
       const quote = composeChatQuote(sel.text);
-      if (targetId === sel.sessionId && quote !== "") insertIntoComposer(targetId, quote, "block");
+      if (targetId === sel.sessionId && quote !== "") insertIntoComposer(targetId, quote, "block", sel.view);
       return;
     }
     const kind = target.ui === "chat" ? "chat" : "terminal";

@@ -270,14 +270,15 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   reply, a few table rows, a line of tool output — and a quiet **`>` quote in reply** chip appears at
   the selection's end (the context bridge's chip; the chord `⇧⌘R` / `Ctrl+Shift+R` does the same).
   It quotes the selection into **this chat's own** composer as a Markdown blockquote — lines kept,
-  so a table stays rows of cells; control characters dropped, blank-line runs folded, capped at
-  8 KB — on its own paragraph after anything already drafted, with the caret below it for the
-  question. Never sent by itself, and never to another agent: while the chat's agent isn't running
-  the chip is disabled. A sent message shows its quoted lines (`>`-led) muted, markers kept, so the
+  so a table stays rows of cells; control characters become spaces, blank-line runs fold, capped
+  at 8 KB — on its own paragraph after anything already drafted, with the caret below it for the
+  question. Never sent by itself, and never to another agent: a chat that can't take a message
+  (exited, degraded) offers no chip, and one whose agent stopped shows it disabled. A chat mounted
+  twice (the Mastermind dock and a pane) quotes into the composer under the selection. A sent message shows its quoted lines (`>`-led) muted, markers kept, so the
   question stands apart. Copying a passage and pasting it into a *terminal* agent tags it
   ` [from <chat> reply] ` (copy provenance). Where: `ChatView.svelte` (publishes the selection,
   floats `shared/ReferenceChip.svelte` on the chat root — not in the column, whose children the
-  reading anchor walks as a stack), `shared/reference.ts` (`ChatSelection`, `composeChatQuote`,
+  reading anchor walks as a stack; the DOM helpers are `quoteSelection.ts`), `shared/reference.ts` (`ChatSelection`, `composeChatQuote`,
   `quoteRuns`), `App.svelte` (`refTargetSession`, `referenceSelection`), `composerBus.ts` (the
   `block` placement) + `composer.ts` (`draftWithInsert`), `UserText.svelte`.
 - **Hydration + history window.** A fresh attach folds replay into the reducer behind one quiet
@@ -658,6 +659,13 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 > skill when a `feat:` ships in this area. **Never** inferred from code. Everything above
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
+
+### Quoting part of a reply back to the agent — why it exists
+_Captured 2026-09-28 from the maintainer's own words in the session that built it; the settled/open questions are still pending._
+
+- **Why (maintainer, verbatim):** "Can we make it so even in the chat one can refer certain parts of a response (to the current agent)" — asked over a screenshot of part of a reply's table selected in the transcript. "Even in the chat": file views and terminals already had the context bridge's "reference in agent"; the transcript did not.
+- **What the request fixed in scope:** the reference goes to the current agent — the chat the passage was selected in — never to another one.
+- _Settled vs. free-to-change, and what must not be "fixed": pending — not yet asked._
 
 ### The turn-end block — "Written this turn" / "Also written" — why it exists
 _Captured 2026-09-26 from the maintainer's own words in the session that shipped it (PR #171); the settled/open questions are still pending._

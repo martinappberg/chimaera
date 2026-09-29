@@ -63,7 +63,7 @@ hard-resets and rebuilds.
 | `UserText.svelte` | User-message bubble: plain text (never Markdown), validated path/mention affordances (a mention of an upload-landing-pad file reads as its name — `paths.ts::uploadMentionLabel`), recognized LaTeX spans delegated to `MathText`, `>`-led quoted lines muted with their markers kept (`shared/reference.ts::quoteRuns`). |
 | `AttachmentStrip.svelte` / `ImagePreview.svelte` | A message's images as picture tiles (one row height, width from the picture's aspect via `images.ts::tileBox`, no hover effects): `drafts` in the composer (in-memory pixels, ✕ to remove, click → `ImagePreview`, a fixed overlay like the plan card's) and `paths` on sent/queued bubbles (the daemon's saved copies from `user_message.attachment_paths`, resolved near the viewport through `resolveFile`, click → open in a pane, a gone copy a dashed tile). A picture-only message puts the strip where the bubble would be. |
 | `paths.ts` | The chat half of path links: which candidates a code span / link target offers (parsing is `../shared/fileRef.ts`, shared with the terminal), and `PathResolver` — one per ChatView, batching every renderer's candidates into `fsValidate` calls grouped by base ladder (live cwd, spawn cwd, workspace root from App's `setChatLinkContext`), caching hits/ambiguous/misses keyed by candidate + base ladder + workspace (`resolveScope`; misses expire after 15 s and at every turn end, hits after 60 s; failures are never cached). A click re-checks before opening (`resolveNow` / `reopenResolution`), so a stale hit never opens a moved or deleted file. Opening goes through `../shared/openPath.ts` (reveal at the line, Cmd/Ctrl split); ambiguous names open a context-menu pick list. Own vitest suite (`paths.test.ts`). |
-| `composerBus.ts` | Cross-component channel to insert text/attachments into the active composer (e.g. `@term:` grants, references, dropped-file paths, a quoted transcript passage). An insert is `inline` (joins the draft after a space) or `block` (its own paragraph, so a quote's `>` starts a line); `composer.ts::draftWithInsert` is the pure join. |
+| `composerBus.ts` | Cross-component channel to insert text/attachments into the active composer (e.g. `@term:` grants, references, dropped-file paths, a quoted transcript passage). An insert is `inline` (joins the draft after a space) or `block` (its own paragraph, so a quote's `>` starts a line); `composer.ts::draftWithInsert` is the pure join. An insert may name the mounting view's token (`view`): one chat can be mounted twice (the Mastermind dock and a pane), and a quote belongs in the composer under its selection. Own vitest suite (`composerBus.test.ts`). |
 | `composerHeight.ts` | Pure height policy for content-fit growth plus manual resize baselines; covered by `composerHeight.test.ts`. |
 | `drafts.ts` | Per-session composer draft persistence (survives the per-session ChatView remount + a page reload) — text layers into sessionStorage, images stay in-memory; both bounded. It also publishes which drafts remain memory-only so an interface-build transition cannot silently reload over them. |
 | `images.ts` | Pasted/dropped image → downscale + base64 encode into an `ImageAttachment` (the canonical home of that type, with its encoded size); size-bounded. Also the tile geometry (`tileBox`) and draft `<img>` source (`attachmentSrc`); own vitest suite. |
@@ -77,9 +77,10 @@ with a hard newline at every visual wrap point.
 
 A selection in the transcript joins the workbench's context bridge
 (`../shared/reference.ts`): `ChatView` publishes it as a `chat` selection and
-floats the shared `ReferenceChip` ("quote in reply") on the chat root; App
-resolves its target to this same chat only and inserts `composeChatQuote`'s
-blockquote as a `block`. Keep that chip (and any other floating chrome) OFF the
+floats the shared `ReferenceChip` ("quote in reply") on the chat root
+(`quoteSelection.ts` holds the DOM helpers); App resolves its target to this
+same chat only and inserts `composeChatQuote`'s blockquote as a `block` into
+the publishing view's composer. A chat whose composer is disabled offers none. Keep that chip (and any other floating chrome) OFF the
 `.column`: `readingAnchor.ts` binary-searches the column's children as a
 vertical stack of rows, which an absolutely positioned child would break.
 

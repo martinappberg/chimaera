@@ -28,7 +28,7 @@
     if (quote) {
       return target === null
         ? "this chat's agent isn't running — nothing to reply to"
-        : `quote the selection in your reply to ${target.name} (${PINNED.reference})`;
+        : `quote the selection in your reply (${PINNED.reference})`;
     }
     return target === null
       ? "no agent session in this workspace — start one to reference"

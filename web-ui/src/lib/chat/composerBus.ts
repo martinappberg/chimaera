@@ -15,16 +15,21 @@ export type InsertPlacement = "inline" | "block";
 type InsertFn = (text: string, placement: InsertPlacement) => void;
 
 const registry = new Map<string, InsertFn>();
+/** The same composers by the view that mounted them (ChatView's token), for
+ *  an insert that belongs to one of two mounted views of a chat. */
+const byView = new WeakMap<object, InsertFn>();
 /** Text queued for a session whose composer hasn't mounted yet (bounded per
  *  session) — a reference dropped onto a chat pane that is still opening must
  *  not be lost to a mount race. */
 const pending = new Map<string, { text: string; placement: InsertPlacement }[]>();
 const MAX_PENDING = 8;
 
-/** Register a mounted composer's insert function; drains anything buffered
- *  before it mounted. Returns the unregister. */
-export function registerComposer(sessionId: string, insert: InsertFn): () => void {
+/** Register a mounted composer's insert function (and, when given, the view
+ *  it belongs to); drains anything buffered before it mounted. Returns the
+ *  unregister. */
+export function registerComposer(sessionId: string, insert: InsertFn, view?: object): () => void {
   registry.set(sessionId, insert);
+  if (view !== undefined) byView.set(view, insert);
   const queued = pending.get(sessionId);
   if (queued !== undefined) {
     pending.delete(sessionId);
@@ -32,19 +37,22 @@ export function registerComposer(sessionId: string, insert: InsertFn): () => voi
   }
   return () => {
     if (registry.get(sessionId) === insert) registry.delete(sessionId);
+    if (view !== undefined && byView.get(view) === insert) byView.delete(view);
   };
 }
 
-/** Insert text into a session's composer, buffering until one mounts. Always
- *  accepted: a not-yet-mounted composer keeps the text and drains it on
- *  registration, so a reference/@term grant onto a slow-to-open chat pane is
- *  never dropped. */
+/** Insert text into a session's composer — the one in `view` when that view
+ *  is mounted, else the session's latest — buffering until one mounts.
+ *  Always accepted: a not-yet-mounted composer keeps the text and drains it
+ *  on registration, so a reference/@term grant onto a slow-to-open chat pane
+ *  is never dropped. */
 export function insertIntoComposer(
   sessionId: string,
   text: string,
   placement: InsertPlacement = "inline",
+  view?: object,
 ): boolean {
-  const insert = registry.get(sessionId);
+  const insert = (view !== undefined ? byView.get(view) : undefined) ?? registry.get(sessionId);
   if (insert !== undefined) {
     insert(text, placement);
     return true;

@@ -57,6 +57,10 @@ export interface ChatSelection {
   kind: "chat";
   sessionId: string;
   text: string;
+  /** The transcript view it was made in (an opaque token): one chat can be
+   *  mounted twice (the Mastermind dock and a pane), and the quote belongs
+   *  in the composer under the selection. */
+  view?: object;
 }
 
 export type SelectionSource = FileSelection | TerminalSelection | ChatSelection;
@@ -121,6 +125,14 @@ export function referenceNow(owner: unknown, sel: SelectionSource): void {
 /** Selection excerpt budget (~200 chars, per the bridge spec). */
 export const SELECTION_MAX = 200;
 
+/** `text`'s first `max` UTF-16 units, never ending in half a surrogate pair:
+ *  a lone surrogate would be JSON-escaped on send and refused by the
+ *  daemon's parser. */
+export function cutAt(text: string, max: number): string {
+  const code = text.charCodeAt(max - 1);
+  return text.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max);
+}
+
 /**
  * One-line excerpt of a selection: control characters (including newlines —
  * a typed "\n" would submit) collapse into spaces, runs of whitespace fold,
@@ -130,7 +142,7 @@ export function truncateSelection(text: string, max = SELECTION_MAX): string {
   // eslint-disable-next-line no-control-regex
   const flat = text.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
   if (flat.length <= max) return flat;
-  return `${flat.slice(0, max).trimEnd()}…`;
+  return `${cutAt(flat, max).trimEnd()}…`;
 }
 
 /** Root without its trailing slash ("/" stays "/"). */
@@ -217,7 +229,7 @@ export const QUOTE_MAX = 8 * 1024;
 function oneLine(text: string, max: number): string {
   // eslint-disable-next-line no-control-regex
   const flat = text.replace(/[\u0000-\u001f\u007f]/g, " ").trim();
-  return flat.length <= max ? flat : `${flat.slice(0, max).trimEnd()}…`;
+  return flat.length <= max ? flat : `${cutAt(flat, max).trimEnd()}…`;
 }
 
 /** The locator of a file selection without its `#`: the view's fragment,
@@ -281,7 +293,7 @@ export function composeChatQuote(text: string, max = QUOTE_MAX): string {
   while (kept.length > 0 && kept[kept.length - 1] === "") kept.pop();
   let body = kept.join("\n");
   if (body.trim() === "") return "";
-  if (body.length > max) body = `${body.slice(0, max).trimEnd()}…`;
+  if (body.length > max) body = `${cutAt(body, max).trimEnd()}…`;
   return `${body
     .split("\n")
     .map((line) => (line === "" ? ">" : `> ${line}`))

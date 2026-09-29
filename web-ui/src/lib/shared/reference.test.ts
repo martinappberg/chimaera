@@ -7,6 +7,7 @@ import {
   composeChatQuote,
   composeProvenanceSuffix,
   composeSelectionReference,
+  cutAt,
   needsCropUpload,
   quoteRuns,
   referenceNow,
@@ -165,6 +166,12 @@ describe("composeChatQuote: a transcript passage quoted into the reply", () => {
   });
   it("turns control characters into spaces", () => {
     expect(composeChatQuote("a\u0007b\u001bc")).toBe("> a b c\n\n");
+  });
+  it("never cuts an emoji in half at the cap", () => {
+    const quoted = composeChatQuote(`${"x".repeat(9)}😀tail`, 10);
+    expect(quoted).toBe(`> ${"x".repeat(9)}…\n\n`);
+    expect(cutAt("ab😀", 3)).toBe("ab");
+    expect(cutAt("ab😀", 4)).toBe("ab😀");
   });
   it("caps a long passage with an ellipsis", () => {
     const quoted = composeChatQuote(`${"x".repeat(50)}\n${"y".repeat(50)}`, 60);
