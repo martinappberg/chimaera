@@ -1110,6 +1110,9 @@ export async function proCloudRequest(request: CloudSetupRequest): Promise<Cloud
 
 export interface MirrorProfile {
   setup_command: string | null;
+  /** Additive: a setup command an agent proposed. It never runs until the
+   * user confirms it (`pro/profile.ts`), which makes it `setup_command`. */
+  pending_setup_command?: string | null;
   laptop_only: string[];
   deferred: string[];
   missing_environment: string[];
