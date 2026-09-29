@@ -28,6 +28,7 @@
  */
 
 import { isWatching } from "./viewerMode.svelte";
+import { refuse } from "./refusals.svelte";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -482,6 +483,9 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
       // the app (which shows the re-auth overlay on "unauthorized").
       handlers?.onSocketError(id, message);
     },
+    // Refused typing is said inline over the pane (Terminal.svelte), in
+    // plain words, instead of vanishing into the console.
+    onRefused: (reason, message) => refuse(id, reason, message),
     parked: () => entry.buf.isParked(),
     onParkedReady: () => {
       // A parked (re)connect carries no snapshot, and pre-drop buffered

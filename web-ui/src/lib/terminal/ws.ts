@@ -28,6 +28,9 @@ export interface SessionSocketHandlers {
   onExited(status: number | null): void;
   /** Server-side error, surfaced quietly. The socket will not reconnect. */
   onError(message: string): void;
+  /** Input the daemon refused (watching, busy, running elsewhere). The socket
+   *  stays; the refusal is said inline, never in the scrollback. */
+  onRefused?(reason: string | null, message: string | null): void;
   /**
    * Whether the terminal is currently parked (hidden pooled instance). Read
    * at every (re)connect: a parked attach tells the server to withhold
@@ -59,6 +62,7 @@ interface ServerTextFrame {
   status?: number | null;
   message?: string;
   code?: string;
+  reason?: string;
 }
 
 /**
@@ -220,7 +224,14 @@ export class SessionSocket {
         // daemon closes this socket and the ordinary reconnect follows it.
         break;
       case "error":
-        if (msg.code === "read_only") { this.handlers.onError(msg.message ?? "Just watching"); break; }
+        if (msg.code === "read_only") {
+          if (this.handlers.onRefused !== undefined) {
+            this.handlers.onRefused(msg.reason ?? null, msg.message ?? null);
+          } else {
+            this.handlers.onError(msg.message ?? "Just watching");
+          }
+          break;
+        }
         if (msg.code === "remote_unavailable" || msg.code === "worker_asleep" || msg.code === "workspace_scope_changed") { break; }
         if (msg.code === "unknown_session") {
           // After a witnessed exit, "unknown" means even the session's

@@ -269,6 +269,19 @@ fn moved_frame(state: &AppState, id: &str) -> Option<serde_json::Value> {
     })
 }
 
+/// Input this socket may not deliver. The additive `reason` lets a client say
+/// why in its own words (`watching`: the viewer chose to watch; `elsewhere`:
+/// the project runs on another device right now); `message` stays plain.
+fn refusal(watching: bool) -> serde_json::Value {
+    if watching {
+        json!({"type":"error","code":"read_only","reason":"watching",
+               "message":"You're watching. Take control to type."})
+    } else {
+        json!({"type":"error","code":"read_only","reason":"elsewhere",
+               "message":"This project is running on another device right now. That was not sent."})
+    }
+}
+
 pub(crate) fn session_writable(state: &AppState, id: &str) -> bool {
     let workspace = crate::lock(&state.session_workspaces).get(id).cloned();
     workspace.is_none_or(|workspace| crate::pro::may_execute(state, &workspace))
@@ -642,7 +655,7 @@ async fn handle(
                 Some(Ok(Message::Binary(bytes))) => {
                     if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
                     if options.read_only || !session_writable(&state, &id) {
-                        let _ = send_ordered_json(&mut socket, &mut batch, &json!({"type":"error","code":"read_only","message":"This session is read only on this host"})).await;
+                        let _ = send_ordered_json(&mut socket, &mut batch, &refusal(options.read_only)).await;
                         continue;
                     }
                     let mut interacted = false;
@@ -654,7 +667,7 @@ async fn handle(
                                 return;
                             }
                             if matches!(error, chimaera_pty::ExecError::Busy(_)) {
-                                let _ = send_ordered_json(&mut socket, &mut batch, &json!({"type":"error","code":"read_only","message":"Your project is busy. Wait a moment before typing again."})).await;
+                                let _ = send_ordered_json(&mut socket, &mut batch, &json!({"type":"error","code":"read_only","reason":"busy","message":"Your project is busy. Wait a moment before typing again."})).await;
                                 break;
                             }
                             // Session is gone; flush the batched tail (its
@@ -1059,7 +1072,7 @@ async fn handle_chat(
                     match serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text) {
                         Ok(mut cmd) => {
                             if options.read_only || !session_writable(&state, &id) {
-                                let _ = send_json(&mut socket, &json!({"type":"error","code":"read_only","message":"This session is read only"})).await;
+                                let _ = send_json(&mut socket, &refusal(options.read_only)).await;
                                 continue;
                             }
                             if let Err(err) = cmd.validate_ingress() {

@@ -22,6 +22,15 @@ export function parsePlacement(value: unknown, workspace: string): WorkspacePlac
   return row as unknown as WorkspacePlacement;
 }
 
+/** Where a routed session runs, in plain words; null for a session here.
+ *  `available: false` means its owner cannot be reached right now. */
+export function placementLabel(placement: unknown, available: boolean | undefined): string | null {
+  if (typeof placement !== "object" || placement === null) return null;
+  const remote = (placement as { remote?: unknown }).remote;
+  const where = typeof remote === "string" && remote.startsWith("device-") ? "On another computer" : "In the cloud";
+  return available === false ? `${where} · reconnecting` : where;
+}
+
 export class PlacementError extends Error {
   constructor(readonly status: number) { super("Your project is reconnecting. This action was not sent."); }
 }

@@ -16,6 +16,7 @@
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { insertIntoComposer, registerFollow } from "./composerBus";
   import { isBrowserGateway } from "../net/base";
+  import { placementLabel } from "../net/placement";
   import {
     acquireChat,
     releaseChat,
@@ -1764,6 +1765,8 @@
    *  running tools → working (between steps). */
   const agentBusy = $derived(store.running || store.compacting);
   const RECONNECTING_GRACE_MS = 2000;
+  /** "In the cloud" / "On another computer" for a routed conversation. */
+  const runsElsewhere = $derived(placementLabel(session.placement, session.placement_available));
   /** The conversation is moving between this computer and the cloud: its
    *  row is paused here, or its socket said it moved and it has not been
    *  reached where it runs now. Not an exit — the transcript stays mounted. */
@@ -2130,8 +2133,8 @@
     keepOpenWithin: ".menu-host",
   }}
 >
-  {#if typeof session.placement === "object"}
-    <div class="placement-note">Cloud{session.placement_available === false ? " · host unavailable" : ""}</div>
+  {#if runsElsewhere !== null}
+    <div class="placement-note">{runsElsewhere}</div>
   {/if}
   <ChatHeader
     {store}
@@ -2305,7 +2308,7 @@
               {:else if block.origin === "restart"}
                 <span class="origin auto" title="chimaera sent this itself: the daemon restarted while this chat had work running, so it asked the resumed agent to pick that work back up (setting: Pick Up Interrupted Work After a Restart)">sent by chimaera after a restart</span>
               {:else if block.origin === "moved" || block.origin === "home"}
-                <span class="origin auto" title="chimaera sent this context after transferring the session between hosts">{block.origin === "home" ? "back on your laptop" : "session moved to another host"}</span>
+                <span class="origin auto" title="chimaera sent this so the agent picks up where it left off after the conversation moved">{block.origin === "home" ? "back on your computer" : "continued in the cloud"}</span>
               {:else if block.origin === "worker"}
                 <span class="origin auto" title="a worker in this workspace sent this with tell_mastermind; chimaera delivered it because the Mastermind acts on its own (auto)">from a worker</span>
               {/if}
@@ -2712,7 +2715,7 @@
 </div>
 
 <style>
-  .placement-note { color: var(--accent); font-size: 11px; padding: 5px 12px; border-bottom: 1px solid var(--edge); }
+  .placement-note { color: var(--accent); font-size: var(--text-xs); padding: 5px 12px; border-bottom: 1px solid var(--edge); }
   .connection-status { padding: 8px 12px; color: var(--muted); font-size: 12px; text-align: center; }
   .chat {
     position: relative; /* anchors the rewind dialog + /mcp panel overlays */

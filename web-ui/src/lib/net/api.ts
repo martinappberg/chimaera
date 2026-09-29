@@ -198,7 +198,18 @@ export function refreshTokenFromHash(): boolean {
  * reached without a tunnel. The raw hostname stays available as hover detail.
  */
 export function getHostLabel(): string {
-  return sessionStorage.getItem(HOST_KEY) ?? (isBrowserGateway() ? "connected host" : "local");
+  return sessionStorage.getItem(HOST_KEY) ?? (isBrowserGateway() ? gatewayHostLabel() : "local");
+}
+
+/** A browser view's machine in plain words: a project view follows the
+ *  project wherever it runs; an explicit host names the computer, the cloud
+ *  or the cluster alias. Never "local" (that key means this very machine). */
+function gatewayHostLabel(): string {
+  const host = /^\/app\/([A-Za-z0-9_-]{1,128})(?:\/|$)/.exec(location.pathname)?.[1];
+  if (host === undefined) return "This project";
+  if (host.startsWith("device-")) return "Your computer";
+  if (host.startsWith("worker-")) return "Cloud";
+  return host === "local" ? "Your computer" : host;
 }
 
 /**
@@ -243,13 +254,33 @@ export function setActiveWorkspaceId(id: string | null): void {
   }
 }
 
+/** Plain words for the daemon's project-connection codes, which are wire
+ *  identifiers and must never reach the screen as-is. */
+const PLAIN_ERRORS: Record<string, string> = {
+  project_unavailable: "This project isn't reachable right now.",
+  workspace_owned_elsewhere: "This project is running on another device right now.",
+  read_only: "This project is running on another device right now.",
+  remote_unavailable: "Your project is reconnecting.",
+  workspace_scope_changed: "Your project is reconnecting.",
+  workspace_unavailable: "Your project is reconnecting.",
+  worker_asleep: "Your project is paused.",
+};
+
+/** A daemon error message in plain words (known codes mapped, else as-is). */
+export function plainError(message: string): string {
+  return PLAIN_ERRORS[message] ?? message;
+}
+
 export class ApiError extends Error {
   readonly status: number;
+  /** The daemon's code when it sent one this module knows (additive). */
+  readonly code: string | null;
 
   constructor(status: number, message: string) {
-    super(message);
+    super(plainError(message));
     this.name = "ApiError";
     this.status = status;
+    this.code = message in PLAIN_ERRORS ? message : null;
   }
 }
 

@@ -7,6 +7,7 @@
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { registerPane, unregisterPane, zoneWord } from "./dnd";
   import { dirLabel } from "../previews/files";
+  import { placementLabel } from "../net/placement";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
   import { activeModLabel, keyHint } from "../shared/keybindings";
   import PaneTabs from "./PaneTabs.svelte";
@@ -394,7 +395,12 @@
     {:else}
       {@const TerminalView = views.terminal}
       {#if TerminalView !== undefined}
-        <TerminalView sessionId={tab.sessionId} focused={focused && active} fontSize={node.fontSize} remote={typeof s.placement === "object"} available={s.placement_available !== false} />
+        <TerminalView
+          sessionId={tab.sessionId}
+          focused={focused && active}
+          fontSize={node.fontSize}
+          placement={placementLabel(s.placement, s.placement_available)}
+        />
       {:else if viewErrors.terminal}
         {@render loadFailure("terminal", "terminal view")}
       {:else}

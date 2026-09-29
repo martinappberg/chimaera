@@ -52,6 +52,17 @@ it("a moved terminal is not exited: it keeps reconnecting to follow the session"
   session.close();
 });
 
+it("refused typing is reported as a refusal, not a fatal error", () => {
+  const refused = vi.fn();
+  const error = vi.fn();
+  const session = new SessionSocket("s-fixture", { ...quiet, onError: error, onRefused: refused });
+  Socket.all[0].onopen?.();
+  Socket.all[0].onmessage?.({ data: JSON.stringify({ type: "error", code: "read_only", reason: "busy", message: "busy" }) });
+  expect(refused).toHaveBeenCalledWith("busy", "busy");
+  expect(error).not.toHaveBeenCalled();
+  session.close();
+});
+
 it("opening a terminal is passive everywhere", () => {
   const session = new SessionSocket("s-fixture", quiet);
   expect(Socket.all[0].url).not.toContain("wake=");
