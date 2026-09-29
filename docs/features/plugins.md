@@ -187,9 +187,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     carrying plugin bytes: the lock is the curated list, and first-party plugins install from
     their releases like any plugin. Later: Browse renders disabled, "later"; the `switched-on` /
     `switched-off` events (declarable, never delivered); the UI-facing `query` route (the export
-    exists, no route calls it); the `exec` and `watch` host imports (WIT 0.2), once a plugin
-    needs them. (LaTeX and Typst, first planned as plugins on them, became core document
-    support on 2026-09-28: [plan](../latex-reports-plan.md#decisions-maintainer-2026-09-28).)
+    exists, no route calls it); screens, programs, side-program installs and trust by
+    capability (WIT 0.2), planned in the [plugin platform plan](../plugin-platform-plan.md),
+    with LaTeX and Typst as its first plugins ([plan](../latex-reports-plan.md)).
 
 ## The plugin host
 

@@ -30,8 +30,9 @@ plugins, each its own repository and the worked examples here: [chimaera-plugin-
   provides the six exports of the `plugin` interface (the `Plugin` trait
   gives each a default). Removing or changing an export, or a record a
   plugin returns, breaks every built plugin. A new host import does not: a
-  host may offer more than a component uses, so WIT 0.2 adds `exec` and
-  `watch` without breaking a 0.1 plugin.
+  host may offer more than a component uses, so the planned WIT 0.2 (jobs,
+  a watch set, screens: the [platform plan](../plugin-platform-plan.md)) adds
+  imports without breaking a 0.1 plugin.
 - **No host call in a native test.** Built natively (tests, clippy), every
   host import is a wit-bindgen stub that aborts the whole test binary. Keep
   pure logic in functions that take data (Agent notes' `src/notes.rs`) or
@@ -511,17 +512,20 @@ host:
   every installed version; a first-party plugin is then listed as available
   again.
 - **Changing the interface.** The WIT package version is the contract. Adding
-  a host import is a minor bump (0.2 adds `exec` and `watch`); changing or
+  a host import is a minor bump (0.2 is planned in the
+  [platform plan](../plugin-platform-plan.md#11-the-interface-wit-02)); changing or
   removing an export is a new major with a new world, served beside the old
   one for a transition. With any WIT change, bump the package version, the
   API crate's version with it, and the host's `plugins::API`, adding the new
   version to `plugins::SERVED_APIS` beside those it still serves.
 
-## LaTeX and Typst are not plugins
+## What comes next: the platform
 
-LaTeX and Typst were planned as the first new plugins on this host; on
-2026-09-28 the maintainer made them core document support instead, kept lean
-([LaTeX and Typst plan](../latex-reports-plan.md#decisions-maintainer-2026-09-28)).
-File formats are core; plugins are for someone else's framework on its own
-cadence, or for optional capabilities. Nothing is waiting on `exec` or `watch`
-any more: they arrive with the first plugin that needs them.
+The host grows into a platform (planned 2026-09-29, nothing built yet): plugins
+draw screens in Chimaera's own format, run the programs they declare, install the
+side programs they need, and are trusted in proportion to what they can do
+(verified at a pinned version, or explicitly trusted by the user). LaTeX and Typst
+are the first plugins planned on it, and Agent notes and Mycelium inherit it without
+a change. Read the [plugin platform plan](../plugin-platform-plan.md) before adding
+a host import, a manifest key or anything a plugin can show; the
+[LaTeX and Typst plan](../latex-reports-plan.md) is its first worked example.
