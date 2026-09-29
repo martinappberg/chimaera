@@ -24,7 +24,7 @@ has subtle repaint invariants — read the architecture guide before touching th
 | `managed.rs` | Opt-in owned-process fencing, closed input, bounded signal escalation and non-reaping exit observation; ordinary terminal lifecycle remains unchanged. |
 | `snapshot.rs` | `render_snapshot` — rebuilds the terminal as an escape stream (SGR minimization + private-mode/cursor/title restoration). `screen_text` for text scrapes. |
 | `marks.rs` | The OSC 133/633/7 marks scanner → shell phase + a bounded command journal. Most methods are exec-internal correlation; the server uses `phase()`/`journal()`. |
-| `exec.rs` | The exec engine that types agent commands into a live shell (integrated or sentinel mode) and correlates completion via marks. |
+| `exec.rs` | The exec engine that types agent commands into a live shell (integrated or sentinel mode) and correlates completion via marks. One exec at a time per session: a queued exec waits its turn, unless its caller acts under workspace authority (`ExecOptions::bounded_lock_wait`: a forwarded viewer or managed Pro project), where the queue budget also bounds the wait behind a previous exec. |
 | `input.rs` | One bounded input queue for ordinary bytes and guarded exec envelopes. Exec authority is checked in the blocking writer after every queue wait; its owned reservation survives caller cancellation until write/flush finishes. No wire changes or external-effect replay guarantee. |
 | `tests.rs` | PTY + snapshot-replay tests (feed a synthetic `Term` via the vte processor). Extend these when you touch screen state. |
 

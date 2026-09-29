@@ -119,6 +119,7 @@ pub(crate) async fn run_exec_scoped(
 
     let dispatch_state = state.clone();
     let dispatch_id = id.to_owned();
+    let bounded_lock_wait = admission.is_some();
     let outcome = state
         .sessions
         .exec_guarded(
@@ -133,6 +134,7 @@ pub(crate) async fn run_exec_scoped(
                 ),
                 allow_sentinel_over_running,
                 stage: Some(stage_tx),
+                bounded_lock_wait,
             },
             move || {
                 if crate::lock(&dispatch_state.session_workspaces).get(&dispatch_id)
