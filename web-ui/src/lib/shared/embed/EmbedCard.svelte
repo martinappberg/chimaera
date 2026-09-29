@@ -54,7 +54,7 @@
     alt?: string;
     /** The author's width hint in px (`![x|400](…)`). */
     width?: number | null;
-    /** Gallery tile: a fixed, shorter body. */
+    /** A glance (the hover preview): a fixed, shorter body. */
     compact?: boolean;
     /** How to resolve when no `info` came with the card (chat prose embeds
      *  resolve against the session's directories). Default: `path` as an

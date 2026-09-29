@@ -88,8 +88,9 @@ export function blockWeight(
     case "question":
       return block.resolved ? 2 + 2 * block.questions.length : 0;
     case "turn_end":
-      // The artifact gallery; a bare turn end renders nothing.
-      return block.artifacts.length > 0 ? 12 : 0;
+      // The written-files line (a chip per file, wrapping to a second line
+      // past a handful); a bare turn end renders nothing.
+      return block.artifacts.length > 0 || block.mentioned.length > 0 ? 2 : 0;
     case "usage":
       return 4;
     case "notice":

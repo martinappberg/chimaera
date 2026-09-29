@@ -583,25 +583,26 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 - **Written this turn.** After a turn's closing prose, the files the turn wrote — created or
   changed, by its edit tools or by **shell commands** (a plot saved by a script, a rendered
   report); never source code (its diff is in the tool card). The block **adds, never repeats**:
-  the prose is the reader's first view of the turn, so a figure it embeds inline
-  (`![](figs/plot.png)`) is not tiled again and a document it links is not chipped again (a name
-  claims the shallowest match, so `notes.md` covers the one at the base, not `docs/notes.md`); a
-  figure the prose only names still shows, because a link is not a picture. The heading says
-  "Written this turn" when the prose named none of it and "Also written" when it named some; a
-  turn whose prose covers everything ends with no block. Two shapes by what a file is *for*: a
-  **visual** (a figure, an HTML report, a PDF, a clip) is something to look at, so it shows as a
-  compact tile; a **document** (markdown, docx/pptx, tables and spreadsheets, notebooks) is
-  something to open, so it shows as one chip on a quiet line — click to open in a pane, rest on
-  it to preview that one file, "+n more" past six; with no tiles the heading sits on the chip
-  line, so a turn costs one line. Two files sharing a name show their folders (against
-  everything the turn wrote, linked in the prose or not). A chip knows
-  its file: gone (struck, not clickable) or changed after this turn (its preview says so), kept
-  current by the disk monitor while on screen. A stopped or failed turn keeps its block. Tiles
-  stay fresh when a file is overwritten, and say so when one is gone.
+  the prose is the reader's first view of the turn, so a file it embeds inline
+  (`![](figs/plot.png)`) or names (a path link, which previews on a rest just as a chip would)
+  is not listed again (a name claims the shallowest match, so `notes.md` covers the one at the
+  base, not `docs/notes.md`). The heading says "Written this turn" when the prose named none of
+  it and "Also written" when it named some; a turn whose prose covers everything ends with no
+  block. **Every file is a chip** on one quiet line after the heading — figures, HTML reports,
+  PDFs and clips as much as markdown, docx/pptx, tables and notebooks — in the order the turn
+  wrote them: click to open in a pane, rest on it to preview that one file (a picture, a PDF
+  page, a document's opening). Nothing draws inline, so a turn that saves twenty plots costs a
+  line or two; figures the agent wants seen it embeds in its prose. Past seven files, six show
+  — one of each kind before a second of any, so the report and the notes beside fourteen panels
+  are never the ones folded — and "+n more" unfolds the rest ("fewer" folds them again). Two
+  files sharing a name show their folders (against everything the turn wrote, linked in the
+  prose or not). A chip knows its file: gone (struck, not clickable) or changed after this turn
+  (its preview says so), kept current by the disk monitor while on screen. A stopped or failed
+  turn keeps its block.
 - **How the gallery finds shell-written files.** No structured event names them, so the reducer
-  lists the artifact-shaped paths the turn's commands and command outputs *mention*, plus figures
-  the prose names without embedding (`artifacts.ts`), and the gallery keeps those the daemon
-  confirms exist and were **modified inside the turn**. A command is scanned whole: an execute
+  lists the artifact-shaped paths the turn's commands and command outputs *mention*
+  (`artifacts.ts`), and the gallery keeps those the daemon confirms exist and were **modified
+  inside the turn**. A command is scanned whole: an execute
   `tool_call` carries its full text in the additive `command` field (8 KiB head+tail), because
   the ~120-char `title` is spent on claude's `cd "…/absolute/path" && …` prefix before any file
   name appears — between its journal-stamped start and end (daemon clock on both sides, a few
@@ -728,6 +729,7 @@ _Captured 2026-09-26 from the maintainer's own words in the session that shipped
 - **Why (maintainer, verbatim):** "'Made this turn · 3 files' — is this really even only when just files have been changed? Should this really be expanded? I know when agents want to show images figures etc. that is good, but just like this? I feel maybe collapsed by default or something, and in a better way." Later: "when the agent links to files here there is a lot of information on what was written that turn? like is that how we want it. Can we think about this so it becomes optimal experience for the user. And also think about the wording. If a file is only changed, is it really made that turn?" And: "can we make the tiles etc. prettier? so that it actually looks nice for the user? Still with our own touch but so that one actually wants to use this app."
 - **Decisions the maintainer took in that session:** ~~no hover-peek on chips ("too cluttered")~~ — retracted 2026-09-28, see below; one heading, not two; chips must know their file's state; same-named files must be told apart; billed CLI runs are fine for verifying this.
 - **What this fixed in the design:** the block now adds what the prose did not already show (an embedded figure is not tiled again, a linked document is not chipped again), the heading is precise ("Written", never "made", for an edited document; "Also written" when the prose showed a share), figures are a strip of captioned tiles, documents one line of chips.
+- **Figures became chips too (2026-09-28, maintainer verbatim):** "'Written this turn' images should also just be hoverable chips I feel! If a turn makes a lot of images that looks terrible. This should be default for all of those." The figure strip is gone: every written file is a chip that previews on a rest, and a figure the prose names (not only one it embeds) is no longer listed again, since its path link previews the same way.
 - _Settled vs. free-to-change, and what must not be "fixed": pending — not yet asked._
 
 ### Document chips and hover previews in chat — why they exist

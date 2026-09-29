@@ -17,10 +17,10 @@
 import { viewKindFor } from "../previews/files";
 import { isMissing, splitTarget, type TargetResult } from "../shared/embed/embed";
 
-/** What a turn's file is FOR, which decides how the gallery shows it:
- *  a `visual` is looked at (a figure, a rendered report, a PDF, a clip) and
- *  gets a tile up front; a `document` is opened (a markdown note, a table,
- *  a notebook, a deck) and gets a one-line chip — its tile only on request. */
+/** What a turn's file is FOR: a `visual` is looked at (a figure, a
+ *  rendered report, a PDF, a clip), a `document` is opened (a markdown
+ *  note, a table, a notebook, a deck). The turn's gallery line shows both
+ *  as chips; a prose embed draws a visual as a card. */
 export type ArtifactShape = "visual" | "document";
 
 /** The shape of a path's file, or null when it is not an artifact. Decided
@@ -214,6 +214,36 @@ export function fileStateAfter(r: TargetResult, endedAtMs: number | null): FileS
     return "changed";
   }
   return "present";
+}
+
+/**
+ * The files a folded chip line shows, in their own order: at most `max`,
+ * taken one kind at a time (a figure, a report, a note, a table…), so the
+ * report and the notes written beside fourteen panels show before a fifth
+ * panel does — the fold hides the tail of a family, never the odd one out.
+ */
+export function foldedChips<T extends { path: string }>(files: readonly T[], max: number): T[] {
+  if (files.length <= max) return [...files];
+  const families = new Map<string, T[]>();
+  for (const f of files) {
+    const kind = viewKindFor(f.path);
+    const family = families.get(kind);
+    if (family === undefined) families.set(kind, [f]);
+    else family.push(f);
+  }
+  const shown = new Set<T>();
+  for (let i = 0; shown.size < max; i++) {
+    let took = false;
+    for (const family of families.values()) {
+      if (shown.size >= max) break;
+      const f = family[i];
+      if (f === undefined) continue;
+      shown.add(f);
+      took = true;
+    }
+    if (!took) break;
+  }
+  return files.filter((f) => shown.has(f));
 }
 
 /**

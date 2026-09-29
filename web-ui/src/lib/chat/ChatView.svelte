@@ -2730,7 +2730,7 @@
       {:else if item.block.kind === "turn_end"}
         {@const block = item.block}
         <div class="source-block" data-block-index={item.index} data-block-uid={item.block.uid}>
-          <!-- What the turn made previews here, after the closing prose. -->
+          <!-- What the turn wrote, as one chip line after the closing prose. -->
           {#if block.artifacts.length > 0 || block.mentioned.length > 0}
             <ArtifactGallery
               paths={block.artifacts}

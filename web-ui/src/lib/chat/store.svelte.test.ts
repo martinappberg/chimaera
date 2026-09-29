@@ -1668,7 +1668,7 @@ describe("ChatStore turn artifacts (the made-this-turn gallery)", () => {
     [1050, { type: "tool_call_update", id: "e1", status: "completed" }],
     [1060, { type: "tool_call", id: "b1", kind: "execute", title: "python plot.py --out figs/umap.png", status: "in_progress" }],
     [1070, { type: "tool_call_update", id: "b1", status: "completed", content: { kind: "output", text: "wrote report/index.html\n" } }],
-    [1080, { type: "message_chunk", turn_id: "t1", text: "Done — see `figs/umap.png` and report/index.html." }],
+    [1080, { type: "message_chunk", turn_id: "t1", text: "Done — the plot and the report are ready." }],
     [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
   ];
 
@@ -1712,20 +1712,31 @@ describe("ChatStore turn artifacts (the made-this-turn gallery)", () => {
     expect(plain.blocks.map((b) => b.kind)).toEqual(["message", "notice"]);
   });
 
-  it("shows only what the prose did not: an embedded figure and a linked document are covered", () => {
+  it("shows only what the prose did not: an embedded figure and named files are covered", () => {
     const store = foldAt([
       ...TURN.slice(0, -2),
       [1080, { type: "message_chunk", turn_id: "t1", text: "Done:\n\n![umap](figs/umap.png)\n\nNotes are in notes.md; the report is report/index.html." }],
       [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
     ]);
     const end = store.blocks.find((b) => b.kind === "turn_end");
-    // notes.md is linked by the prose; the figure is embedded; the report is
-    // only named, and a link is not a picture.
-    expect(end).toMatchObject({ kind: "turn_end", artifacts: [], covered: ["/p/notes.md", "figs/umap.png"] });
-    const mentioned = end?.kind === "turn_end" ? end.mentioned : [];
-    expect(mentioned).toContain("report/index.html");
-    expect(mentioned).not.toContain("figs/umap.png");
-    expect(mentioned).not.toContain("notes.md");
+    // The figure is embedded; notes.md and the report are named, and a named
+    // file previews on a rest in the prose as its chip would.
+    expect(end).toMatchObject({
+      kind: "turn_end",
+      artifacts: [],
+      mentioned: [],
+      covered: ["/p/notes.md", "report/index.html", "figs/umap.png"],
+    });
+  });
+
+  it("a named figure is covered, an unnamed one stays", () => {
+    const store = foldAt([
+      ...TURN.slice(0, -2),
+      [1080, { type: "message_chunk", turn_id: "t1", text: "The UMAP is in figs/umap.png." }],
+      [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+    ]);
+    const end = store.blocks.find((b) => b.kind === "turn_end");
+    expect(end).toMatchObject({ artifacts: ["/p/notes.md"], mentioned: ["report/index.html"], covered: ["figs/umap.png"] });
   });
 
   it("a name covers the shallowest file only, and silence covers nothing", () => {

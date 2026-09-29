@@ -6,8 +6,8 @@ const message = (text: string, uid = 1): ChatBlock =>
   ({ uid, kind: "message", text, turnId: "t", sentAtMs: 0, forkSeq: 0, nativeTurnComplete: false }) as ChatBlock;
 const tool = (uid = 1): ChatBlock =>
   ({ uid, kind: "tool", id: `t${uid}`, tool: "Bash", title: "", locations: [], status: "completed", content: null, denied: false, allowed: false, streaming: false, crossTurn: false, summary: null, command: null }) as ChatBlock;
-const turnEnd = (artifacts: string[]): ChatBlock =>
-  ({ uid: 9, kind: "turn_end", costUsd: null, outputTokens: 0, durationMs: 0, artifacts }) as ChatBlock;
+const turnEnd = (artifacts: string[], mentioned: string[] = []): ChatBlock =>
+  ({ uid: 9, kind: "turn_end", costUsd: null, outputTokens: 0, durationMs: 0, artifacts, mentioned }) as ChatBlock;
 
 describe("block height model", () => {
   it("weighs prose by wrapped length and hard breaks", () => {
@@ -37,7 +37,8 @@ describe("block height model", () => {
     expect(blockWeight(tool(), null, 100)).toBe(1);
     expect(blockWeight(tool(2), tool(1), 100)).toBe(0);
     expect(blockWeight(turnEnd([]), null, 100)).toBe(0);
-    expect(blockWeight(turnEnd(["/a.png"]), null, 100)).toBe(12);
+    expect(blockWeight(turnEnd(["/a.png"]), null, 100)).toBe(2);
+    expect(blockWeight(turnEnd([], ["figs/a.png"]), null, 100)).toBe(2);
   });
 
   it("puts a run of thoughts and tool calls on the one line its fold renders", () => {
