@@ -67,7 +67,9 @@ describe("upload short forms", () => {
     expect(expandUploadMentions("see @plot.png.\nnext", tokens)).toBe(`see @${PAD}/plot.png.\nnext`);
     expect(expandUploadMentions("(see @plot.png)", tokens)).toBe(`(see @${PAD}/plot.png)`);
     // Some other file, typed: never rewritten.
-    expect(expandUploadMentions("@plot.png.bak @plot.pngs", tokens)).toBe("@plot.png.bak @plot.pngs");
+    expect(expandUploadMentions("@plot.png.bak @plot.pngs @plot.png/x", tokens)).toBe(
+      "@plot.png.bak @plot.pngs @plot.png/x",
+    );
     // Written against a word (its space deleted): still the file, and the
     // agent gets the space claude needs to read it.
     expect(expandUploadMentions("x@plot.png", tokens)).toBe(`x @${PAD}/plot.png`);
@@ -105,8 +107,11 @@ describe("a short form is one unit", () => {
     expect(keepsTokens("see @plot.png", 13, 13, " x", tokens)).toBe(true);
     expect(keepsTokens("see @plot.png.", 14, 14, "x", tokens)).toBe(false);
     expect(keepsTokens("see @plot.png.", 14, 14, " x", tokens)).toBe(true);
-    // Punctuation after it is fine.
+    // Punctuation after it is fine; a new mention or a path step is not.
     expect(keepsTokens("see @plot.png", 13, 13, ",", tokens)).toBe(true);
+    expect(keepsTokens("see @plot.png", 13, 13, "@", tokens)).toBe(false);
+    expect(keepsTokens("see @plot.png", 13, 13, " @", tokens)).toBe(true);
+    expect(keepsTokens("see @plot.png", 13, 13, "/", tokens)).toBe(false);
     // Deleting the space before the next word glues; a trailing one is free.
     expect(keepsTokens("@plot.png x", 9, 10, "", tokens)).toBe(false);
     expect(keepsTokens("@plot.png ", 9, 10, "", tokens)).toBe(true);

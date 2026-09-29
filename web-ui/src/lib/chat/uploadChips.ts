@@ -103,6 +103,9 @@ export function uploadChips(tokens: UploadTokens, moved: () => void): Attachment
     }
 
     function onKeydown(e: KeyboardEvent): void {
+      // A key means no pointer drag is selecting any more, even one released
+      // outside the window (whose pointerup this field never saw).
+      pointerDown = false;
       if (e.isComposing || e.keyCode === 229 || e.metaKey || e.ctrlKey || tokens.size === 0) return;
       const key = e.key;
       if (key !== "ArrowLeft" && key !== "ArrowRight" && key !== "Backspace" && key !== "Delete") return;
@@ -224,7 +227,8 @@ export function uploadChips(tokens: UploadTokens, moved: () => void): Attachment
     }
 
     function onSelectionChange(): void {
-      if (document.activeElement === el && !pointerDown) snap();
+      // Moving the selection mid-composition would commit or drop it.
+      if (document.activeElement === el && !pointerDown && !composing) snap();
     }
 
     function onPointerDown(): void {
@@ -234,7 +238,7 @@ export function uploadChips(tokens: UploadTokens, moved: () => void): Attachment
     function onPointerUp(): void {
       if (!pointerDown) return;
       pointerDown = false;
-      if (document.activeElement === el) snap();
+      if (document.activeElement === el && !composing) snap();
     }
 
     const copy = (e: ClipboardEvent) => onCopy(e, false);

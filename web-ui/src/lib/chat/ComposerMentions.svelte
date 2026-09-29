@@ -111,18 +111,23 @@
     };
   });
 
-  // Every re-render re-aligns the scroll (a paste scrolls the field before
-  // its scroll event lands).
+  // Every re-render re-copies the layout (a font or padding change that
+  // leaves the field's box alone reaches no ResizeObserver) and re-aligns
+  // the scroll (a paste scrolls the field before its scroll event lands).
   $effect(() => {
-    void runs;
-    if (field !== null && mirror !== null) mirror.scrollTop = field.scrollTop;
+    if (runs.length === 0 || field === null || mirror === null) return;
+    copyLayout(field, mirror);
+    mirror.scrollTop = field.scrollTop;
   });
 
   interface Hover {
     index: number;
     name: string;
     path: string;
-    left: number;
+    /** Anchored under the pill's left edge, or — for a pill in the field's
+     *  right half — its right edge, so the tip never runs off the pane. */
+    side: "left" | "right";
+    x: number;
     bottom: number;
   }
   let hovered = $state<Hover | null>(null);
@@ -140,6 +145,10 @@
     const m = mirror;
     if (t === null || m === null) return;
     const move = (e: PointerEvent) => {
+      if (tokens.size === 0) {
+        if (hovered !== null) hovered = null;
+        return;
+      }
       const row = m.parentElement?.getBoundingClientRect();
       if (row === undefined) return;
       for (const mark of m.querySelectorAll<HTMLElement>("mark[data-upload]")) {
@@ -151,11 +160,13 @@
           if (hovered?.index === index) return;
           const run = runs[index];
           if (run?.upload == null || run.upload === "") return;
+          const right = r.left - row.left > row.width / 2;
           hovered = {
             index,
             name: pathOf(run.text),
             path: pathOf(run.upload),
-            left: Math.max(0, r.left - row.left),
+            side: right ? "right" : "left",
+            x: right ? Math.max(0, row.right - r.right) : Math.max(0, r.left - row.left),
             bottom: row.bottom - r.top + 6,
           };
           return;
@@ -191,7 +202,13 @@
         data-index={i}>{run.text}</mark>{/if}{/each}</div>
 {#if hovered !== null && !quiet}
   {#key hovered.index}
-    <div class="tip" aria-hidden="true" style:left="{hovered.left}px" style:bottom="{hovered.bottom}px">
+    <div
+      class="tip"
+      aria-hidden="true"
+      style:left={hovered.side === "left" ? `${hovered.x}px` : undefined}
+      style:right={hovered.side === "right" ? `${hovered.x}px` : undefined}
+      style:bottom="{hovered.bottom}px"
+    >
       <span class="tip-name"><FileIcon path={hovered.name} size={12} />{hovered.name}</span>
       <span class="tip-path">{hovered.path}</span>
     </div>

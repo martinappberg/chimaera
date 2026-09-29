@@ -481,7 +481,12 @@
     // Directories mention with a trailing slash (the TUI's own convention —
     // it also reads unambiguously as "this folder" in the prompt); a spaced
     // path takes claude's quoted form, like a drag-to-reference drop.
-    replaceToken(composeAgentPathReference(entry.kind === "dir" ? `${entry.rel}/` : entry.rel));
+    const rel = entry.kind === "dir" ? `${entry.rel}/` : entry.rel;
+    const mention = composeAgentPathReference(rel);
+    // A workspace file written exactly like a dropped file's short form
+    // (`@data.csv` beside a dropped data.csv) would be taken for the drop:
+    // name it from the workspace root instead.
+    replaceToken(uploadTokens.has(mention.trim()) ? composeAgentPathReference(`./${rel}`) : mention);
   }
 
   function pickTerm(t: TerminalOption) {

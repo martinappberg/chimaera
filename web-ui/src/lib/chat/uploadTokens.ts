@@ -21,6 +21,7 @@
 
 import { extractFileRefs } from "../shared/fileRef";
 import { agentMention } from "../shared/reference";
+import { regexEscape } from "./composer";
 import { uploadName } from "./paths";
 
 /** Short form → the whole mention it stands for. */
@@ -32,25 +33,33 @@ export interface TokenSpan {
   token: string;
 }
 
-function escape(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/** A short form, unless letters or digits continue it before the next
- *  whitespace (`@plot.png.bak` is some other file, not `@plot.png` + text).
- *  Whatever precedes it is fine: the send separates it (`expandUploadMentions`). */
+/** A short form, unless a name continues it before the next whitespace —
+ *  a letter, a digit, `_`, or the `@` / `/` that start or extend a path
+ *  (`@plot.png.bak` and `@plot.png/x` are other files, not `@plot.png` +
+ *  text). Whatever precedes it is fine: the send separates it
+ *  (`expandUploadMentions`). */
 function tokenRe(tokens: Iterable<string>): RegExp {
   const alternatives = [...tokens]
     .sort((a, b) => b.length - a.length)
-    .map(escape)
+    .map(regexEscape)
     .join("|");
-  return new RegExp(`(?:${alternatives})(?=[^\\s\\p{L}\\p{N}_]*(?:\\s|$))`, "gu");
+  return new RegExp(`(?:${alternatives})(?=[^\\s\\p{L}\\p{N}_@/]*(?:\\s|$))`, "gu");
 }
+
+/** Each map's compiled pattern. A map only ever gains short forms, so its
+ *  size says whether the pattern is current. (`matchAll` copies the
+ *  pattern, so the shared `g` state is never touched.) */
+const compiled = new WeakMap<UploadTokens, { size: number; re: RegExp }>();
 
 /** Every short form in `text`, in order. */
 export function tokenSpans(text: string, tokens: UploadTokens): TokenSpan[] {
   if (tokens.size === 0 || !text.includes("@")) return [];
-  return [...text.matchAll(tokenRe(tokens.keys()))].map((m) => ({
+  let hit = compiled.get(tokens);
+  if (hit === undefined || hit.size !== tokens.size) {
+    hit = { size: tokens.size, re: tokenRe(tokens.keys()) };
+    compiled.set(tokens, hit);
+  }
+  return [...text.matchAll(hit.re)].map((m) => ({
     start: m.index,
     end: m.index + m[0].length,
     token: m[0],
@@ -131,12 +140,31 @@ export function snapRange(spans: TokenSpan[], start: number, end: number): [numb
  * apart from the next word), so it can shape the edit instead of fixing it.
  */
 export function keepsTokens(text: string, from: number, to: number, insert: string, tokens: UploadTokens): boolean {
-  const spans = tokenSpans(text, tokens).filter((s) => s.end <= from || s.start >= to);
-  if (spans.length === 0) return true;
   const next = text.slice(0, from) + insert + text.slice(to);
-  const shift = insert.length - (to - from);
-  const now = new Set(tokenSpans(next, tokens).map((s) => `${s.start}:${s.token}`));
-  return spans.every((s) => now.has(`${s.start >= to ? s.start + shift : s.start}:${s.token}`));
+  return lostTokens(tokenSpans(text, tokens), next, from, to, insert.length, tokens).length === 0;
+}
+
+/**
+ * The short forms of `old` (spans in a text before an edit replaced its
+ * `[from, to)` with `inserted` characters) that the edit left alone but that
+ * no longer read as one in `text`, the text after it — at their positions
+ * there.
+ */
+function lostTokens(
+  old: TokenSpan[],
+  text: string,
+  from: number,
+  to: number,
+  inserted: number,
+  tokens: UploadTokens,
+): TokenSpan[] {
+  const kept = old.filter((s) => s.end <= from || s.start >= to);
+  if (kept.length === 0) return [];
+  const shift = inserted - (to - from);
+  const now = new Set(tokenSpans(text, tokens).map((s) => `${s.start}:${s.token}`));
+  return kept
+    .map((s) => (s.start >= to ? { ...s, start: s.start + shift, end: s.end + shift } : s))
+    .filter((s) => !now.has(`${s.start}:${s.token}`));
 }
 
 /**
@@ -181,14 +209,9 @@ export function settleEdit(
   let changed = cutFrom !== from || cutTo !== oldEnd;
 
   // A surviving short form that no longer reads as one had text glued to its
-  // end: part them with a space (the caret stays after what was typed).
-  const shift = inserted.length - (cutTo - cutFrom);
-  const now = new Set(tokenSpans(text, tokens).map((s) => `${s.start}:${s.token}`));
-  for (const span of [...old].reverse()) {
-    if (span.end > cutFrom && span.start < cutTo) continue;
-    const start = span.start >= cutTo ? span.start + shift : span.start;
-    if (now.has(`${start}:${span.token}`)) continue;
-    const end = start + span.token.length;
+  // end: part them with a space (the caret stays after what was typed). Last
+  // first, so each space leaves the earlier positions standing.
+  for (const { end } of lostTokens(old, text, cutFrom, cutTo, inserted.length, tokens).reverse()) {
     text = `${text.slice(0, end)} ${text.slice(end)}`;
     // A caret right at the seam (a deleted space) stays where it was.
     if (at > end) at += 1;
