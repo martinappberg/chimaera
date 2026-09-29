@@ -10,7 +10,7 @@
    */
   import { fsTable, fsXlsx, tableHeaderRow, type TablePage, type XlsxPage } from "../../previews/files";
   import { a1Column } from "../locator";
-  import { rangeLabel, rangeOutside, tableSlice, tableWindow, type EmbedFragment } from "./fragment";
+  import { rangeLabel, rangeOutside, tableCounts, tableSlice, tableWindow, type EmbedFragment } from "./fragment";
 
   interface Props {
     path: string;
@@ -112,20 +112,9 @@
       : null,
   );
 
-  const footer = $derived.by(() => {
-    if (page === null) return "";
-    const total = page.total_rows ?? null;
-    const est = page.est_rows ?? null;
-    const of =
-      total !== null
-        ? `${total.toLocaleString()} rows`
-        : est !== null
-          ? `~${Math.round(est).toLocaleString()} rows`
-          : page.truncated
-            ? "more rows"
-            : `${page.rows.length} rows`;
-    return numbered ? `${page.rows.length} shown · ${of}` : `first ${page.rows.length} · ${of}`;
-  });
+  const counts = $derived(
+    page === null ? null : tableCounts(page, { numbered, first: firstNumber, hasHeader, sheet: kind === "xlsx" }),
+  );
 </script>
 
 <div class="table-body" class:tile={compact} style:--rows={visibleRows} style:--row-h="{ROW_H}px">
@@ -160,12 +149,18 @@
         </table>
       {/if}
     </div>
-    <div class="foot">{footer}</div>
+    {#if counts?.empty}
+      <div class="empty">{counts.empty}</div>
+    {/if}
+    <div class="foot">{counts?.foot ?? ""}</div>
   {/if}
 </div>
 
 <style>
   .table-body {
+    /* The grid's top inset, which the empty note sits below the header by. */
+    --pad-y: 4px;
+    position: relative;
     display: flex;
     flex-direction: column;
   }
@@ -179,7 +174,7 @@
     height: calc((var(--rows) + 1) * (var(--row-h) + 1px) + 10px);
     overflow: auto;
     scrollbar-width: thin;
-    padding: 4px 8px;
+    padding: var(--pad-y) 8px;
   }
   .tile .scroll {
     flex: 1;
@@ -228,6 +223,18 @@
     color: var(--muted);
     font-size: var(--text-xs);
     min-height: 1.6em;
+  }
+  /* Where the first row would be, under the header, and still there when
+     the (wider) header is scrolled sideways. */
+  .empty {
+    position: absolute;
+    top: calc(var(--pad-y) + var(--row-h) + 1px);
+    left: 0;
+    right: 0;
+    padding: 8px 16px;
+    color: var(--muted);
+    font-size: var(--text-xs);
+    pointer-events: none;
   }
   .note {
     padding: 12px;
