@@ -246,6 +246,17 @@ pub(crate) fn retire_with_resume(
         return;
     };
     let workspace_id = crate::lock(&state.session_workspaces).remove(session_id);
+    // Its history record closes here too — every session, Masterminds and
+    // untitled boots included (Recents skips those below; history doesn't).
+    crate::history::close(
+        state,
+        session_id,
+        &record,
+        pinned,
+        osc,
+        ui,
+        resume_hint.as_deref(),
+    );
     // The session's identity ends here, so its respawn recipe must too: a
     // chat toggled to the terminal keeps its ChatRecipe (the view-switch
     // exit paths deliberately preserve it for the successor), and the PTY

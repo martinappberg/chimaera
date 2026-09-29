@@ -195,6 +195,10 @@ pub(crate) struct AppState {
     /// what happened, written from signals the daemon already receives. Its
     /// per-workspace epochs drive the `/ws/events` timeline frame.
     pub(crate) timeline: timeline::TimelineService,
+    /// Session history (`<data_dir>/workspace/<ws>/sessions.jsonl`): one
+    /// record per agent session, opened at start and closed at end; only
+    /// the open ones live here. See `history`.
+    pub(crate) history: crate::history::HistoryService,
     /// The plugin catalog (see `plugins::Catalog`): the embedded plugins
     /// merged with the installed copies under `<data_dir>/plugins`, reloaded
     /// after every install, update, rollback or remove.
@@ -312,6 +316,7 @@ impl AppState {
             claude_settings_path: home.join(".claude").join("settings.json"),
             codex_config_path: home.join(".codex").join("config.toml"),
             timeline: timeline::TimelineService::new(data_dir.join("workspace")),
+            history: crate::history::HistoryService::new(&data_dir),
             plugin_catalog: plugins::Catalog::load(data_dir.join("plugins")),
             plugin_releases: plugins::releases::Releases::default(),
             plugin_detect: Mutex::new(plugins::DetectCache::default()),

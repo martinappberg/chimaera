@@ -208,6 +208,7 @@ pub(crate) async fn create_session(
             .map(crate::agents::truncate_prompt),
         prelude: body.prelude.filter(|p| !p.trim().is_empty()),
         kind,
+        started_by: crate::history::StartedBy::You,
     };
     match crate::spawn::spawn_session(&state, spec).await {
         Ok(session) => Json(session).into_response(),
@@ -296,6 +297,7 @@ async fn spawn_chat_ui(
                 prelude: body.prelude.filter(|p| !p.trim().is_empty()),
                 mastermind: None,
                 fork: None,
+                started_by: crate::history::StartedBy::You,
             },
         )
         .await
@@ -444,6 +446,7 @@ async fn spawn_chat_ui(
                 model: body.model,
                 resume: body.resume,
             },
+            started_by: crate::history::StartedBy::You,
         };
         return match crate::spawn::spawn_session(state, spec).await {
             Ok(session) => Json(session).into_response(),
@@ -456,7 +459,11 @@ async fn spawn_chat_ui(
 
     match crate::chat::spawn_chat_session(state, id.clone(), recipe, None).await {
         Ok(info) => {
-            crate::agents::spawn_agent_watch(state.clone(), id.clone());
+            crate::agents::spawn_agent_watch(
+                state.clone(),
+                id.clone(),
+                crate::history::StartedBy::You,
+            );
             state.changes.notify_waiters();
             Json(crate::chat::chat_session_json(
                 &info,

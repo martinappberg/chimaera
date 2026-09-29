@@ -356,14 +356,15 @@ fn mastermind_tool_defs() -> Vec<Value> {
             "description": "Read what a session in this workspace is doing: terminal \
                             sessions (shells and agent TUIs) return the visible screen \
                             text; chat sessions return a compact tail of the conversation \
-                            (messages, tool titles). Read-only.",
+                            (messages, tool titles); a session that has ended returns its \
+                            record (who started it, files written, cost). Read-only.",
             "inputSchema": {
                 "type": "object",
                 "required": ["session"],
                 "properties": {
                     "session": {
                         "type": "string",
-                        "description": "Session id (from workspace_status)",
+                        "description": "Session id (from workspace_status, or an ended session's id from read_timeline)",
                     },
                     "lines": {
                         "type": "integer",
@@ -1001,7 +1002,17 @@ async fn read_session(
 ) -> Value {
     let sid = match resolve_workspace_session(state, workspace, args) {
         Ok(sid) => sid,
-        Err(err) => return tool_error(err),
+        Err(err) => {
+            // An ended session: its history record, when there is one.
+            if let Some(sid) = args.get("session").and_then(|s| s.as_str()) {
+                if let Some(text) =
+                    crate::history::routes::ended_session_text(state, &workspace.id, sid).await
+                {
+                    return tool_text(text);
+                }
+            }
+            return tool_error(err);
+        }
     };
     let lines = args
         .get("lines")
@@ -1466,6 +1477,7 @@ async fn spawn_agent(
     };
     tracing::info!(mastermind = %agent_id, workspace = %workspace.id, agent = %kind.as_str(),
         "mastermind act: spawn_agent");
+    let workspace_id = workspace.id.clone();
     match crate::chat::spawn_fresh_chat(
         state,
         workspace,
@@ -1479,17 +1491,28 @@ async fn spawn_agent(
             prelude: None,
             mastermind: None,
             fork: None,
+            started_by: crate::history::StartedBy::Mastermind,
         },
     )
     .await
     {
-        Ok(row) => tool_text(format!(
-            "spawned {} chat session {} [{}] at the workspace root — send it work \
-             with message_agent",
-            kind.as_str(),
-            row["display_name"],
-            row["id"].as_str().unwrap_or("?"),
-        )),
+        Ok(row) => {
+            crate::history::act(
+                state,
+                &workspace_id,
+                agent_id,
+                "spawn_agent",
+                row["id"].as_str(),
+                Some(kind.as_str()),
+            );
+            tool_text(format!(
+                "spawned {} chat session {} [{}] at the workspace root — send it work \
+                 with message_agent",
+                kind.as_str(),
+                row["display_name"],
+                row["id"].as_str().unwrap_or("?"),
+            ))
+        }
         Err(crate::chat::ChatSpawnFailure::AgentUnavailable(msg)) => tool_error(msg),
         Err(crate::chat::ChatSpawnFailure::Internal(err)) => {
             tool_error(format!("spawn failed: {err}"))
@@ -1516,6 +1539,7 @@ async fn spawn_terminal(
     };
     tracing::info!(mastermind = %agent_id, workspace = %workspace.id,
         "mastermind act: spawn_terminal");
+    let workspace_id = workspace.id.clone();
     let spec = crate::spawn::SpawnSpec {
         workspace,
         id: None,
@@ -1527,14 +1551,25 @@ async fn spawn_terminal(
         title_hint: None,
         prelude: None,
         kind: crate::spawn::SpawnKind::Shell,
+        started_by: crate::history::StartedBy::Mastermind,
     };
     match crate::spawn::spawn_session(state, spec).await {
-        Ok(row) => tool_text(format!(
-            "spawned terminal {} [{}] at the workspace root (link it to an agent \
-             to reach it with run_in_terminal — only the user can link)",
-            row["display_name"],
-            row["id"].as_str().unwrap_or("?"),
-        )),
+        Ok(row) => {
+            crate::history::act(
+                state,
+                &workspace_id,
+                agent_id,
+                "spawn_terminal",
+                row["id"].as_str(),
+                None,
+            );
+            tool_text(format!(
+                "spawned terminal {} [{}] at the workspace root (link it to an agent \
+                 to reach it with run_in_terminal — only the user can link)",
+                row["display_name"],
+                row["id"].as_str().unwrap_or("?"),
+            ))
+        }
         Err(crate::spawn::SpawnFailure::AgentUnavailable(msg)) => tool_error(msg),
         Err(crate::spawn::SpawnFailure::Internal(err)) => {
             tool_error(format!("spawn failed: {err}"))
@@ -1578,6 +1613,14 @@ async fn message_agent(
         }
         tracing::info!(mastermind = %agent_id, target = %sid, bytes = text.len(),
             "mastermind act: message_agent");
+        crate::history::act(
+            state,
+            &workspace.id,
+            agent_id,
+            "message_agent",
+            Some(&sid),
+            Some(text),
+        );
         // Attribution first: the worker AND the human watching its pane both
         // see who spoke (threat-model mitigation 2 — provenance stamping).
         // The chain of authority is spelled out so workers treat the relay as
@@ -1633,6 +1676,14 @@ async fn interrupt_agent(
             return tool_error(format!("chat session {sid} has exited"));
         }
         tracing::info!(mastermind = %agent_id, target = %sid, "mastermind act: interrupt_agent");
+        crate::history::act(
+            state,
+            &workspace.id,
+            agent_id,
+            "interrupt_agent",
+            Some(&sid),
+            None,
+        );
         return match state
             .chat
             .command(&sid, chimaera_agent::model::AgentCommand::Interrupt)

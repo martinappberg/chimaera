@@ -18,6 +18,7 @@ mod exec;
 mod fs;
 mod fs_watch;
 mod git;
+mod history;
 mod knowledge;
 mod launcher;
 mod ledger;

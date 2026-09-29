@@ -116,6 +116,11 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // may not have run yet when the first client connects, and that client's
     // sessions snapshot must wait out the resurrection (see AppState).
     state.restored.send_replace(false);
+    // Session history: close what a daemon that died without a graceful stop
+    // left open — BEFORE the ledger resurrects those sessions under new
+    // records — then keep checkpointing and sweeping.
+    crate::history::boot_close(&state).await;
+    crate::history::spawn_task(state.clone());
     tokio::spawn(ledger::run(state.clone()));
 
     // Release awareness (GET /api/v1/update + the `update` ws frame), and
@@ -174,6 +179,15 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
                 info.native_session_id,
             );
         }
+    }
+
+    // Every open history record closes as `retired` (the daemon ended it; a
+    // resurrected session continues under a new record), and the writes
+    // land before the process goes.
+    {
+        let state = state.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || crate::history::close_all_for_exit(&state)).await;
     }
 
     // Only now, with the ledger flushed and the dead chats settled, end the

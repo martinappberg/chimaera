@@ -242,6 +242,7 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
             match signal {
                 ChatSignal::Event(id, entry) => {
                     apply_chat_event(&state, &id, &entry.ev);
+                    crate::history::observe_chat(&state, &id, &entry.ev);
                     // @term: grants ride the protocol input in chat mode —
                     // the UserPromptSubmit hook (the TUI's autolink path)
                     // does not fire under -p stream-json. Runs outside
@@ -287,6 +288,7 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
                     state.changes.notify_waiters();
                 }
                 ChatSignal::Exit(id, exit) => {
+                    crate::history::observe_exit(&state, &id, &exit);
                     // A view switch / rewind respawns under the same id, and a
                     // slow driver's reap can land after the successor is up
                     // (see handle_chat_exit): that exit is the deliberate
@@ -2703,6 +2705,7 @@ pub(crate) async fn fork_session(
             prelude: None,
             mastermind: None,
             fork: Some(bootstrap),
+            started_by: crate::history::StartedBy::Session(id.clone()),
         },
     )
     .await
@@ -2836,6 +2839,8 @@ pub(crate) struct FreshChat {
     /// initializes the fresh destination with quiet native or portable context.
     /// Normal creates leave this absent.
     pub(crate) fork: Option<ForkBootstrap>,
+    /// Who started it, for the session's history record.
+    pub(crate) started_by: crate::history::StartedBy,
 }
 
 pub(crate) struct ForkBootstrap {
@@ -3011,7 +3016,7 @@ pub(crate) async fn spawn_fresh_chat(
     crate::lock(&state.session_workspaces).insert(id.clone(), workspace.id.clone());
     match spawn_chat_session(state, id.clone(), recipe, None).await {
         Ok(info) => {
-            crate::agents::spawn_agent_watch(state.clone(), id.clone());
+            crate::agents::spawn_agent_watch(state.clone(), id.clone(), spec.started_by);
             state.changes.notify_waiters();
             Ok(chat_session_json(
                 &info,
@@ -3479,7 +3484,11 @@ pub(crate) async fn resurrect_chat(
             // the death → Recents backstop once the session finally goes (e.g.
             // a degrade-to-TUI that then exits). Without it a resurrected chat
             // would diverge from a created one.
-            crate::agents::spawn_agent_watch(state.clone(), entry.id.clone());
+            crate::agents::spawn_agent_watch(
+                state.clone(),
+                entry.id.clone(),
+                crate::history::StartedBy::Restart,
+            );
             // The restart ended the process that was running the turn and
             // the background work, and neither agent restarts them on resume
             // (the conversation survives, its processes do not). Tell the

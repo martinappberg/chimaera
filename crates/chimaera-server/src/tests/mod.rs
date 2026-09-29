@@ -10,6 +10,7 @@ mod environment;
 mod exec;
 mod fs;
 mod git;
+mod history;
 mod knowledge;
 mod ledger;
 mod links;
