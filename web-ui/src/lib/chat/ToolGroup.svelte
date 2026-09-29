@@ -4,7 +4,7 @@
   import type { OpenPathFn, PathResolver } from "./paths";
   import type { ChatBlock } from "./store.svelte";
   import ToolCallCard from "./ToolCallCard.svelte";
-  import { isLive, toolGroupTitle, toolRunHealth } from "./toolLabels";
+  import { isLive, toolGroupTitle, toolRunHealth, type TurnTail } from "./toolLabels";
 
   /**
    * A run of consecutive tool calls, condensed. Collapsed it is one quiet
@@ -16,6 +16,8 @@
    */
   interface Props {
     tools: Extract<ChatBlock, { kind: "tool" }>[];
+    /** The turn's later calls, where a retry clears a failure here. */
+    tail?: TurnTail;
     /** Open a tool's locations (resolved against the session first). */
     onOpenPath?: OpenPathFn;
     resolvePaths?: PathResolver;
@@ -37,6 +39,7 @@
 
   let {
     tools,
+    tail,
     onOpenPath,
     resolvePaths,
     onBackground,
@@ -49,7 +52,7 @@
 
   const running = $derived(tools.some(isLive));
   /** Failed / recovered badge — see toolLabels.ts. */
-  const health = $derived(toolRunHealth(tools));
+  const health = $derived(toolRunHealth(tools, tail));
 
   /** Tool history is opt-in detail. Running and failure state remain visible
    *  in the summary badge, while an explicit user toggle persists as rows
