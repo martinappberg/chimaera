@@ -28,6 +28,10 @@ pub(crate) const MAX_REPOS: usize = 32;
 /// `.git` checks the open-time probe makes (children + grandchildren).
 pub(super) const PROBE_CHECKS: usize = 2000;
 
+/// Entries read from one directory during the probe: a folder of thousands
+/// of files costs at most this much, whatever it holds.
+const PROBE_ENTRIES_PER_DIR: usize = 5000;
+
 /// `.gitmodules` is small; a bigger one is not read.
 const GITMODULES_CAP: u64 = 64 * 1024;
 
@@ -144,6 +148,7 @@ pub(super) fn probe_two_levels_blocking(root: &Path, ignore: &[String]) -> (Vec<
         };
         let mut dirs: Vec<PathBuf> = read
             .flatten()
+            .take(PROBE_ENTRIES_PER_DIR)
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .filter(|e| {
                 let name = e.file_name();

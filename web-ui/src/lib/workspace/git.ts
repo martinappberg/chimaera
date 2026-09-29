@@ -228,6 +228,12 @@ export async function fetchGitDiff(
   );
 }
 
+/** A double-click keeps the tab a single click previews: spread into a
+ *  diff or git view tab opened from a row's click. */
+export function keepOf(e: MouseEvent): { preview?: false } {
+  return e.detail >= 2 ? { preview: false } : {};
+}
+
 /** Where a session's repository stood (`GET /sessions/{id}/git`). */
 export interface SessionGitAnchor {
   repo: string;

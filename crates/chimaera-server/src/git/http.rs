@@ -363,12 +363,24 @@ pub(crate) async fn worktrees(
                 },
                 None => None,
             };
+            // The main checkout's HEAD is the tip of `base_ref`: with the
+            // worktree's sha it keys the cache (two commits never change
+            // their distance).
+            let base_sha = list.first().and_then(|m| m.sha.clone());
             let mut vs_main: Vec<Option<(u64, u64)>> = vec![None; list.len()];
             for (i, w) in list.iter().enumerate().take(MAX_MERGE_CHECKS + 1).skip(1) {
                 let (Some(base), Some(sha)) = (&base_ref, &w.sha) else {
                     continue;
                 };
                 if !super::anchor::is_sha(sha) {
+                    continue;
+                }
+                let key = base_sha.clone().map(|b| (b, sha.clone()));
+                if let Some(hit) = key
+                    .as_ref()
+                    .and_then(|k| crate::lock(&state.git.vs_main).get(k).copied())
+                {
+                    vs_main[i] = Some(hit);
                     continue;
                 }
                 let range = format!("{base}...{sha}");
@@ -383,6 +395,13 @@ pub(crate) async fn worktrees(
                 {
                     if out.success {
                         vs_main[i] = parse_left_right(&String::from_utf8_lossy(&out.stdout));
+                        if let (Some(k), Some(counts)) = (key, vs_main[i]) {
+                            let mut cache = crate::lock(&state.git.vs_main);
+                            if cache.len() >= super::service::VS_MAIN_CAP {
+                                cache.clear();
+                            }
+                            cache.insert(k, counts);
+                        }
                     }
                 }
             }

@@ -751,7 +751,14 @@ pub(crate) async fn session_git_value(
             body["branch_changed"] = json!(start.branch != current.branch);
             if let (Some(old), Some(new), Some(dir)) = (&start.head, &current.head, &dir) {
                 if let Some(between) = commits_between(state, dir, old, new).await {
-                    body["commits"] = between.commits.iter().map(|c| c.json()).collect();
+                    // Only commits made since the session started are its
+                    // own: a `git pull` moves HEAD over other people's
+                    // commits too, and those keep their own (older) commit
+                    // times. A minute of grace covers clock skew.
+                    let since = (start.at_ms / 1000) as i64 - 60;
+                    let own: Vec<&super::anchor::AnchorCommit> =
+                        between.commits.iter().filter(|c| c.time >= since).collect();
+                    body["commits"] = own.iter().map(|c| c.json()).collect();
                     body["truncated"] = json!(between.truncated);
                     // A branch switch is not a rewrite: only a same-branch
                     // HEAD that no longer descends is.

@@ -399,6 +399,11 @@ fn copy_matching(
         if std::fs::symlink_metadata(&to).is_ok() {
             continue;
         }
+        // Never write through a symlink: the new worktree is checked out at
+        // its base, where a folder on the way may be a link pointing out.
+        if !no_symlink_on_the_way(dest, &rel) {
+            continue;
+        }
         if let Some(parent) = to.parent() {
             if std::fs::create_dir_all(parent).is_err() {
                 continue;
@@ -418,6 +423,27 @@ fn copy_matching(
         }
     }
     report
+}
+
+/// Whether every existing folder between `root` and `rel`'s parent is a
+/// real directory (none is a symlink), so creating and writing there stays
+/// inside `root`.
+fn no_symlink_on_the_way(root: &Path, rel: &Path) -> bool {
+    let Some(parent) = rel.parent() else {
+        return true;
+    };
+    let mut cur = root.to_path_buf();
+    for comp in parent.components() {
+        cur.push(comp);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => return false,
+            Ok(meta) if !meta.is_dir() => return false,
+            Ok(_) => {}
+            // Missing from here on: create_dir_all makes real folders.
+            Err(_) => return true,
+        }
+    }
+    true
 }
 
 /// Collect files under an ignored directory the patterns reach: all of it
@@ -464,6 +490,32 @@ fn walk_ignored_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn never_writes_through_a_symlinked_folder() {
+        let base = std::env::temp_dir().join(format!(
+            "chimaera-include-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let dest = base.join("wt");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(dest.join("real")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dest.join("config")).unwrap();
+        assert!(no_symlink_on_the_way(&dest, Path::new(".env")));
+        assert!(no_symlink_on_the_way(&dest, Path::new("real/.env")));
+        assert!(no_symlink_on_the_way(&dest, Path::new("new/dir/.env")));
+        assert!(!no_symlink_on_the_way(
+            &dest,
+            Path::new("config/local.yaml")
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn gitignore_style_matching() {

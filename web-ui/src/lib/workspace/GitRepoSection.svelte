@@ -12,6 +12,7 @@
   import type { LayoutCtrl } from "../layout/dnd";
   import {
     createWorktree,
+    keepOf,
     fetchGitBranches,
     fetchGitWorktrees,
     gitSectionOpen,
@@ -197,10 +198,6 @@
     return wt.detached ? `No branch (at ${wt.head ?? "?"})` : "No commits yet";
   }
 
-  /** A double-click keeps the tab a single click previews. */
-  function keepOf(e: MouseEvent): { preview?: false } {
-    return e.detail >= 2 ? { preview: false } : {};
-  }
 
   function openDiff(e: MouseEvent, entry: GitEntry, mode: DiffMode): void {
     ctrl.openDiffFrom(paneId, entry.path, mode, e.metaKey || e.ctrlKey, e.detail >= 2);

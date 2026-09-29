@@ -17,6 +17,7 @@
   import type { GitDetailTab } from "../layout/layout";
   import {
     fetchGitCompare,
+    keepOf,
     fetchGitShow,
     gitRepoStatuses,
     gitRepos,
@@ -103,10 +104,6 @@
     };
   });
 
-  /** A double-click keeps the tab a single click previews. */
-  function keepOf(e: MouseEvent): { preview?: false } {
-    return e.detail >= 2 ? { preview: false } : {};
-  }
 
   function openFileDiff(e: MouseEvent, f: GitChangedFile): void {
     const split = e.metaKey || e.ctrlKey;

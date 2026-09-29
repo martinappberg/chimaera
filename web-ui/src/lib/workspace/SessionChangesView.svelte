@@ -146,8 +146,42 @@
     };
   });
 
+  /** An agent started on a new branch works in that branch's worktree —
+   *  a checkout of one of these repositories, but not one of them (it lives
+   *  under chimaera's managed root). Its files take that worktree's status,
+   *  and their diffs open against it. */
+  const ownWorktree = $derived.by(() => {
+    const wt = session.git?.worktree ?? null;
+    if (wt === null || repos.some((r) => r.path === wt)) return null;
+    return wt;
+  });
+  let worktreeStatus = $state<GitStatus | null>(null);
+  $effect(() => {
+    const wsId = session.workspace_id;
+    const wt = ownWorktree;
+    void session.files_touched?.length;
+    void status?.repo_epoch;
+    if (wt === null) {
+      worktreeStatus = null;
+      return;
+    }
+    let cancelled = false;
+    void fetchGitStatus(wsId, wt).then(
+      (st) => {
+        if (!cancelled) worktreeStatus = st.repo ? st : null;
+      },
+      () => {
+        if (!cancelled) worktreeStatus = null;
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  });
+
   /** Absolute path -> its git entry, for the touched files: the primary
-   *  repository's entries, then each nested one's (innermost wins). */
+   *  repository's entries, then each nested one's (innermost wins), then
+   *  the session's own worktree's. */
   const byPath = $derived.by(() => {
     const m = new Map<string, GitEntry>();
     for (const e of status?.entries ?? []) m.set(e.path, e);
@@ -155,9 +189,26 @@
       const st = (sameWs ? $gitRepoStatuses.get(top) : undefined) ?? fetchedStatuses.get(top);
       for (const e of st?.entries ?? []) m.set(e.path, e);
     }
+    for (const e of worktreeStatus?.entries ?? []) m.set(e.path, e);
     return m;
   });
-  const inRepo = $derived(status !== null || nestedWithFiles.length > 0);
+  const inRepo = $derived(status !== null || nestedWithFiles.length > 0 || worktreeStatus !== null);
+
+  /** Open a touched file's git diff — against the session's own worktree
+   *  when the file lives there. */
+  function openEntryDiff(path: string, entry: GitEntry, e: MouseEvent): void {
+    const wt = ownWorktree;
+    const newSplit = e.metaKey || e.ctrlKey;
+    if (wt !== null && (path === wt || path.startsWith(`${wt}/`))) {
+      ctrl.openGitFrom(
+        paneId,
+        { surface: "diff", path, mode: modeFor(entry), repo: wt, ...(e.detail >= 2 ? { preview: false } : {}) },
+        newSplit,
+      );
+      return;
+    }
+    ctrl.openDiffFrom(paneId, path, modeFor(entry), newSplit, e.detail >= 2);
+  }
 
   /** The commits this session made (its git story), refetched as it writes
    *  and as its repository moves. Nothing is asked outside a repository. */
@@ -254,7 +305,7 @@
       onOpenDiff={(p, e) => {
         const entry = byPath.get(p);
         if (entry === undefined) return false;
-        ctrl.openDiffFrom(paneId, p, modeFor(entry), e.metaKey || e.ctrlKey, e.detail >= 2);
+        openEntryDiff(p, entry, e);
         return true;
       }}
       onOpenFile={(p, e) => ctrl.openFileFrom(paneId, p, e.metaKey || e.ctrlKey)}

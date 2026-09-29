@@ -190,6 +190,42 @@ async fn session_git_route_lists_commits_made_during_the_session() {
     assert_eq!(commits[0]["subject"], "add c", "newest first");
     assert_eq!(body["rewritten"], false);
 
+    // A commit that arrives with an old commit time — what a `git pull`
+    // brings in from other people — moves HEAD but is not the session's.
+    std::fs::write(repo.join("pulled.txt"), "theirs\n").unwrap();
+    git_in(&repo, &["add", "pulled.txt"]);
+    let pulled = std::process::Command::new("git")
+        .current_dir(&repo)
+        .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+        .args([
+            "-c",
+            "user.name=Someone Else",
+            "-c",
+            "user.email=else@example.org",
+            "commit",
+            "-q",
+            "-m",
+            "their older work",
+        ])
+        .status()
+        .unwrap();
+    assert!(pulled.success());
+    let (_, body) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/sessions/{id}/git"),
+        None,
+    )
+    .await;
+    let subjects: Vec<&str> = body["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["subject"].as_str())
+        .collect();
+    assert_eq!(subjects, vec!["add c", "add b"], "{body}");
+
     // Rewrite under it: back to the start, then a different commit.
     git_in(&repo, &["reset", "-q", "--hard", &start_sha]);
     commit_file(&repo, "d.txt", "d\n", "other history");

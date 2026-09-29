@@ -100,7 +100,14 @@ pub(crate) struct GitService {
     /// Which repository and branch each live session is in, its anchors,
     /// and the managed-worktree locks held for agents (see `session`).
     pub(crate) sessions: super::session::SessionGits,
+    /// (base sha, worktree sha) -> (behind, ahead): the Branches rows' counts
+    /// against the main checkout's branch. Two commits never change their
+    /// distance, so a refresh re-runs `rev-list` only when one of them moved.
+    pub(super) vs_main: Mutex<HashMap<(String, String), (u64, u64)>>,
 }
+
+/// Entries the ahead/behind cache keeps before it starts over.
+pub(super) const VS_MAIN_CAP: usize = 256;
 
 /// A status result from the share: the data, plus whether the run that
 /// produced it was invalidated mid-flight. A flushed result is a valid
@@ -297,6 +304,7 @@ impl GitService {
             procs: Arc::new(Semaphore::new(MAX_CONCURRENT_GIT)),
             status_share: StatusShare::new(),
             sessions: Default::default(),
+            vs_main: Mutex::new(HashMap::new()),
         }
     }
 

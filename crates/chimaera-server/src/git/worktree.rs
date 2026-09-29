@@ -561,6 +561,10 @@ pub(crate) async fn remove_worktree(
         state.plugin_runtime.forget_workspace(&id);
         crate::lock(&state.plugin_state).forget_workspace(&id);
         crate::lock(&state.knowledge).forget_workspace(&id);
+        state.history.remove_workspace(&id);
+        if crate::lock(&state.recents_archive).forget_workspace(&id) {
+            crate::recents_archive::persist(&state).await;
+        }
     }
 
     // Bump + invalidate, same pairing as the add path: the triggered
