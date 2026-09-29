@@ -2476,12 +2476,13 @@
       if (detachedWindow && !layout.focusMode) layout = { ...layout, focusMode: true };
     }
     // A phone opens the work itself; the bottom strip can reveal navigation.
-    // Only browsers are forced, by width alone when the layout loads (any
-    // daemon, signed in or not); a native window never is, whatever its width.
-    // The forced value is never saved, so the layout other windows restore
-    // keeps the user's own choice (net/AGENTS.md).
+    // Only a phone-width account-gateway view is forced when the layout loads:
+    // a plain daemon in a browser and a native window of any width keep the
+    // layout main gives them, so free users see no change. The forced value
+    // is never saved, so the layout other windows restore keeps the user's
+    // own choice (net/AGENTS.md).
     forcedFocusRestore = null;
-    if (!isNativeShell() && matchMedia("(max-width: 700px)").matches && !layout.focusMode) {
+    if (isBrowserGateway() && matchMedia("(max-width: 700px)").matches && !layout.focusMode) {
       forcedFocusRestore = layout.focusMode;
       layout = { ...layout, focusMode: true };
     }
