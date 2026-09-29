@@ -304,3 +304,57 @@ async fn journal_budget_spares_chats_the_ledger_resurrects() {
     state.chat.kill("s-chat-a");
     state.chat.kill("s-chat-b");
 }
+
+/// Laptop first across a restart: a Pro-managed project's previous sessions
+/// wait for this daemon life to verify ownership (so a project the cloud took
+/// over never resumes a stale turn here), then resume anyway when the account
+/// cannot confirm in time. A verified other owner keeps them suspended.
+#[tokio::test]
+async fn restart_deferred_sessions_resume_unless_another_owner_is_verified() {
+    for remote in [false, true] {
+        let data = test_dir("ledger-verification");
+        let state = test_state_with_data_dir(0, data.clone());
+        let root = std::fs::canonicalize(test_dir("ledger-verification-root")).unwrap();
+        let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
+        // Enrolled earlier; this life has not renewed its lease yet.
+        pro::install_execution_fixture(&state, &workspace.id, 3).unwrap();
+        pro::expire_execution_fixture(&state, &workspace.id);
+        let boot = ledger::BootLedger {
+            sessions: vec![ledger::LedgerEntry {
+                suspended: false,
+                handoff: None,
+                id: "s-restart-shell".to_string(),
+                workspace_id: workspace.id.clone(),
+                cwd: root.clone(),
+                pinned_name: None,
+                cols: 80,
+                rows: 24,
+                theme: "dark".to_string(),
+                created_at: 0,
+                agent: None,
+            }],
+            links: std::collections::HashMap::new(),
+            written_at: 1_750_000_000,
+        };
+        ledger::restore(&state, boot).await;
+        assert!(state.sessions.list().is_empty(), "waits for verification");
+        assert!(lock(&state.deferred_sessions).contains_key("s-restart-shell"));
+        if remote {
+            pro::install_remote_owner_fixture(&state, &workspace.id, 4);
+        }
+        pro::resume_unverified(&state).await;
+        assert_eq!(
+            state.sessions.get("s-restart-shell").is_some(),
+            !remote,
+            "remote={remote}"
+        );
+        assert_eq!(
+            lock(&state.deferred_sessions).contains_key("s-restart-shell"),
+            remote
+        );
+        let _ = state.sessions.kill("s-restart-shell");
+        state
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}

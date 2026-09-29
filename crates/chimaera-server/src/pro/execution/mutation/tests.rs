@@ -94,6 +94,9 @@ async fn queued_real_shell_command_keeps_original_generation_and_epoch() {
     use std::time::Duration;
     for epoch in [4, 5] {
         let (state, root) = fixture();
+        // A worker's queued command keeps its lease epoch; a device's local
+        // commands are admitted by ownership alone (laptop first).
+        super::super::worker_fixture(&state);
         let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
         install_fixture(&state, &workspace.id, 4).unwrap();
         let session = state

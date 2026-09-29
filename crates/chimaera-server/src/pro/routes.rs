@@ -198,15 +198,26 @@ async fn configure_inner(
     *lock(&state.pro.project_cache) = Default::default();
     let response = configure_ack(&config, accepted.as_ref().map(|v| v.ack()));
     let managed = config.execution.is_some();
+    if config.role == super::protocol::Role::Worker
+        && !state.pro.worker.swap(true, Ordering::AcqRel)
+    {
+        if let Err(error) = super::persist(&state).await {
+            return failure(error);
+        }
+    }
     *lock(&state.pro.runtime) = Some(config);
     state.pro.configured.store(true, Ordering::Release);
     engine::start(state.clone());
-    if managed {
+    // Only a worker is fenced by lease expiry; a device has nothing to watch.
+    if managed && execution::worker(&state) {
         execution::start(&state);
     }
     response
 }
 async fn stop_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
+    // Captured before the runtime changes: replacing or removing a device's
+    // configuration never stops its local work (laptop first).
+    let worker = execution::worker(state);
     let stopping = execution::invalidate(state);
     state.pro.configured.store(false, Ordering::Release);
     state.pro.generation.fetch_add(1, Ordering::AcqRel);
@@ -218,7 +229,9 @@ async fn stop_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
     for task in [lease_task, mirror_task].into_iter().flatten() {
         let _ = task.await;
     }
-    execution::stop(state, &stopping).await?;
+    if worker {
+        execution::stop(state, &stopping).await?;
+    }
     execution::clear_stopped(state);
     Ok(())
 }
@@ -230,8 +243,15 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     *lock(&state.pro.project_cache) = Default::default();
     *lock(&state.pro.runtime) = None;
     state.pro.configured.store(false, Ordering::Release);
-    // Known remote ownership remains fenced across sign-out and restart.
+    // Known remote ownership remains fenced across sign-out and restart. A
+    // local or interrupted local transfer becomes ordinary local work: signing
+    // out publishes nothing more, but never stops this computer's agents.
     lock(&state.pro.ownership).retain(|_, owner| !matches!(owner, Ownership::Local { .. }));
+    for owner in lock(&state.pro.ownership).values_mut() {
+        if let Ownership::Transferring { epoch } = owner {
+            *owner = Ownership::AwaitingVerification { epoch: *epoch };
+        }
+    }
     match super::persist(&state).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => failure(error),

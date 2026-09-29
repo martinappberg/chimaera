@@ -322,10 +322,15 @@ pub(crate) async fn spawn_session(
             "project execution authority changed during launch"
         )));
     }
-    crate::pro::prepare_managed_launch(state, &workspace.id)
-        .await
-        .map_err(SpawnFailure::Internal)?;
-    let spawned = if crate::pro::managed_execution(state, &workspace.id) {
+    // Plain shells are never managed: no fence signals them and no stop
+    // waits for them. Only agents carry the project's execution evidence.
+    let managed = spawned_agent.is_some() && crate::pro::managed_execution(state, &workspace.id);
+    if managed {
+        crate::pro::prepare_managed_launch(state, &workspace.id)
+            .await
+            .map_err(SpawnFailure::Internal)?;
+    }
+    let spawned = if managed {
         state.sessions.spawn_managed(opts)
     } else {
         state.sessions.spawn(opts)

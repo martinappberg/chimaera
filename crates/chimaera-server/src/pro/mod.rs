@@ -32,6 +32,7 @@ use tokio::sync::Mutex as AsyncMutex;
 pub(crate) struct ProState {
     root: PathBuf,
     configured: AtomicBool,
+    worker: AtomicBool,
     generation: AtomicU64,
     runtime: Mutex<Option<protocol::Configure>>,
     authority: Mutex<authority::Authority>,
@@ -51,6 +52,8 @@ pub(crate) struct ProState {
     persistence: AsyncMutex<()>,
     configuration: Arc<AsyncMutex<()>>,
     caches: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+    boot_deferred: Mutex<std::collections::HashSet<String>>,
+    remote_since: Mutex<HashMap<String, u64>>,
     awake_since: AtomicU64,
     power_suitable: AtomicBool,
 }
@@ -114,6 +117,10 @@ struct DiskState {
     import_roots: HashMap<String, PathBuf>,
     #[serde(default)]
     keep_running: std::collections::HashSet<String>,
+    /// Once configured as a cloud worker, this installation stays strict
+    /// across restarts even before its supervisor configures it again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    worker: bool,
     ownership: HashMap<String, Ownership>,
     preferences: HashMap<String, Preference>,
 }
@@ -191,6 +198,7 @@ impl ProState {
         Self {
             root,
             configured: AtomicBool::new(false),
+            worker: AtomicBool::new(disk.worker),
             generation: AtomicU64::new(0),
             runtime: Mutex::new(None),
             authority: Mutex::new(authority),
@@ -210,14 +218,17 @@ impl ProState {
             persistence: AsyncMutex::new(()),
             configuration: Arc::new(AsyncMutex::new(())),
             caches: Mutex::new(HashMap::new()),
+            boot_deferred: Mutex::new(Default::default()),
+            remote_since: Mutex::new(HashMap::new()),
             awake_since: AtomicU64::new(now()),
             power_suitable: AtomicBool::new(false),
         }
     }
 }
 
-/// Only a verified ownership transition, restart verification, or explicit
-/// clean handoff fences a writer. Connectivity loss never pauses local work.
+/// Only a verified ownership transition or an explicit clean handoff fences a
+/// device's writer; a cloud worker additionally waits for restart
+/// verification. Connectivity loss never pauses local work.
 pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
     if authority::workspace(state, workspace).is_err()
         || (crate::lock(&state.pro.authority).restricted()
@@ -243,30 +254,81 @@ pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
             })
             .unwrap_or(false);
     }
-    !crate::lock(&state.pro.legacy_pending).contains(workspace)
-        && !matches!(
-            crate::lock(&state.pro.ownership).get(workspace),
-            Some(
-                Ownership::Remote { .. }
-                    | Ownership::PrivacyDisabled { .. }
-                    | Ownership::Hydrating { .. }
-                    | Ownership::SettingUp { .. }
-                    | Ownership::Transferring { .. }
-                    | Ownership::AwaitingVerification { .. }
-            )
-        )
+    if crate::lock(&state.pro.legacy_pending).contains(workspace) {
+        return false;
+    }
+    match crate::lock(&state.pro.ownership).get(workspace) {
+        Some(
+            Ownership::Remote { .. }
+            | Ownership::PrivacyDisabled { .. }
+            | Ownership::Hydrating { .. }
+            | Ownership::SettingUp { .. }
+            | Ownership::Transferring { .. },
+        ) => false,
+        // Unverified after a restart, wake or failed flush: a device keeps
+        // working until an authenticated read shows another owner.
+        Some(Ownership::AwaitingVerification { .. }) => !execution::worker(state),
+        _ => true,
+    }
 }
+#[cfg(test)]
+pub(crate) use execution::expired_lease_fixture as expire_execution_fixture;
 /// Execution has a stricter lease boundary than local file editing.
 #[cfg(test)]
 pub(crate) use execution::install_fixture as install_execution_fixture;
 pub(crate) use execution::mutation;
 pub(crate) use execution::prepare_launch as prepare_managed_launch;
 pub(crate) use execution::recovery_context as checkpoint_recovery_context;
+#[cfg(test)]
+pub(crate) use execution::remote_owner_fixture as install_remote_owner_fixture;
 pub(crate) fn managed_execution(state: &crate::AppState, workspace: &str) -> bool {
     execution::managed(state, workspace)
 }
 pub(crate) fn may_execute(state: &crate::AppState, workspace: &str) -> bool {
     may_write(state, workspace) && execution::allows(state, workspace)
+}
+/// Sessions left by a previous daemon wait for this life's ownership proof, so
+/// a project the cloud took over while this computer was off never resumes a
+/// stale turn here. New work is not held back (`may_execute`).
+pub(crate) fn may_restore(state: &crate::AppState, workspace: &str) -> bool {
+    may_execute(state, workspace)
+        && (!execution::managed(state, workspace) || execution::restorable(state, workspace))
+}
+/// How long a personal device waits for the account to confirm ownership
+/// before resuming its own interrupted sessions anyway (laptop first).
+pub(crate) const BOOT_VERIFICATION_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) fn defer_boot_session(state: &crate::AppState, session: &str) {
+    let mut deferred = crate::lock(&state.pro.boot_deferred);
+    if deferred.len() < 512 {
+        deferred.insert(session.to_owned());
+    }
+}
+/// Restart-deferred sessions on a device resume when ownership was not
+/// verified in time, unless another owner was verified meanwhile or old
+/// processes may still be running. Sessions a clean handoff suspended stay
+/// suspended; they belong to whoever now owns the project.
+pub(crate) async fn resume_unverified(state: &std::sync::Arc<crate::AppState>) {
+    if execution::worker(state) {
+        return;
+    }
+    let pending: Vec<String> = crate::lock(&state.pro.boot_deferred).drain().collect();
+    let mut workspaces: HashMap<String, Vec<String>> = HashMap::new();
+    for id in pending {
+        let workspace = crate::lock(&state.deferred_sessions)
+            .get(&id)
+            .map(|entry| entry.workspace_id.clone());
+        if let Some(workspace) = workspace {
+            workspaces.entry(workspace).or_default().push(id);
+        }
+    }
+    for (workspace, ids) in workspaces {
+        if !may_execute(state, &workspace) || execution::unclean(state, &workspace) {
+            continue;
+        }
+        if let Err(error) = crate::ledger::resume_deferred_sessions(state, &workspace, &ids).await {
+            tracing::warn!(%error, "Interrupted sessions could not resume");
+        }
+    }
 }
 pub(crate) fn validate_execution_scope(
     state: &crate::AppState,
@@ -323,6 +385,7 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
         adoptions,
         projects_root,
         keep_running,
+        worker: state.pro.worker.load(std::sync::atomic::Ordering::Acquire),
         ownership,
         preferences,
     })?;
@@ -578,6 +641,8 @@ mod tests {
                 scope: vec!["baton".into(), "mirror".into()],
             },
         });
+        // Configuring a worker records its strict role (routes::configure_inner).
+        execution::worker_fixture(&old);
         set_keep_running(&old, "s-pinned", true).await.unwrap();
         persist(&old).await.unwrap();
         let text = std::fs::read_to_string(root.join("pro/state.json")).unwrap();
@@ -593,6 +658,34 @@ mod tests {
             .insert("w-owned".into(), Ownership::Local { epoch: 9 });
         assert!(may_write(&restored, "w-owned"));
         assert_eq!(owned_epoch(&restored, "w-owned"), Some(9));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn a_restarted_device_keeps_working_until_another_owner_is_verified() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-pro-device-{}",
+            chimaera_core::generate_token()
+        ));
+        let old = state(&root);
+        crate::lock(&old.pro.ownership).insert("w-owned".into(), Ownership::Local { epoch: 7 });
+        crate::lock(&old.pro.ownership)
+            .insert("w-flushing".into(), Ownership::Transferring { epoch: 3 });
+        crate::lock(&old.pro.ownership).insert(
+            "w-cloud".into(),
+            Ownership::Remote {
+                epoch: 4,
+                holder: "worker-a".into(),
+            },
+        );
+        persist(&old).await.unwrap();
+        let restored = state(&root);
+        // Laptop first: an unverified restart never locks the user out.
+        assert!(may_write(&restored, "w-owned"));
+        assert!(may_write(&restored, "w-flushing"));
+        // A verified other owner remains fenced across restart.
+        assert!(!may_write(&restored, "w-cloud"));
+        // Publication still needs this life's verified epoch.
+        assert_eq!(owned_epoch(&restored, "w-owned"), None);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -14,7 +14,10 @@ fn signal(state: &AppState, workspace: &str) {
         .collect();
     // Process registries are visited completely: truncating this list would leave
     // the tail executing forever after the one authority transition.
-    for id in ids {
+    for id in ids
+        .into_iter()
+        .filter(|id| super::managed_session(state, id))
+    {
         if state.chat.get(&id).is_some_and(|s| s.alive) {
             state.chat.fence(&id);
         } else if state.sessions.get(&id).is_some_and(|s| s.alive) {

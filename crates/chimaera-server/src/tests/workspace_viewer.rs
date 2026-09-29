@@ -609,6 +609,13 @@ async fn established_scoped_sockets_cannot_rejoin_a_replacement_account_at_the_s
             }
         }
         assert!(!project.root.join("STALE_WS_INPUT").exists());
+        // Refusal is the socket's retirement, never the process's death:
+        // signing out does not stop this computer's own work (laptop first).
+        assert!(
+            state.chat.get(&id).is_some_and(|s| s.alive)
+                || state.sessions.get(&id).is_some_and(|s| s.alive),
+            "{surface}: sign-out must not stop the session"
+        );
         if surface == "resize" {
             assert_eq!(state.sessions.get(&id).unwrap().cols, 80);
             assert_eq!(state.sessions.get(&id).unwrap().rows, 24);
@@ -622,11 +629,130 @@ async fn established_scoped_sockets_cannot_rejoin_a_replacement_account_at_the_s
         if surface == "chat" {
             state.chat.kill(&id);
         } else {
-            state.sessions.kill(&id).unwrap();
+            let _ = state.sessions.kill(&id);
         }
         server.abort();
         let _ = server.await;
     }
+}
+
+#[tokio::test]
+async fn laptop_first_sign_out_and_unreachable_account_keep_local_work_running() {
+    let (state, project, _) = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    // A plain shell through the ordinary spawn route, and a managed chat agent.
+    let (status, shell) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(json!({"workspace_id":project.id,"kind":"shell","command":"/bin/sh"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{shell}");
+    let shell = shell["id"].as_str().unwrap().to_owned();
+    let captured = project.root.join("chat-input.txt");
+    let fake = write_fake_claude("laptop-first-agent");
+    let script = std::fs::read_to_string(&fake).unwrap();
+    std::fs::write(
+        &fake,
+        script.replace("cat >/dev/null", "cat > \"$CHIMAERA_TEST_CAPTURE\""),
+    )
+    .unwrap();
+    let mut spec = chimaera_agent::driver::SpawnSpec::new(
+        "s-laptop-chat",
+        vec![fake.to_string_lossy().into_owned()],
+        project.root.clone(),
+    );
+    spec.managed_execution = true;
+    spec.env.push((
+        "CHIMAERA_TEST_CAPTURE".into(),
+        captured.to_string_lossy().into_owned(),
+    ));
+    state
+        .chat
+        .spawn(&chimaera_agent::claude::ClaudeAdapter, spec)
+        .unwrap();
+    lock(&state.session_workspaces).insert("s-laptop-chat".into(), project.id.clone());
+
+    // The account stops answering: the lease lapses without another owner.
+    assert!(pro::expire_execution_fixture(&state, &project.id).is_empty());
+    assert!(pro::may_execute(&state, &project.id));
+    // Then the user signs out (or the plan lapses).
+    assert_eq!(
+        request(&state, Method::DELETE, "/api/v1/pro/configure", None)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(state.sessions.get(&shell).is_some_and(|s| s.alive));
+    assert!(state.chat.get("s-laptop-chat").is_some_and(|s| s.alive));
+
+    let (mut terminal, _) =
+        tokio_tungstenite::connect_async(format!("ws://{address}/ws/sessions/{shell}"))
+            .await
+            .unwrap();
+    terminal
+        .send(Message::Text(
+            json!({"type":"auth","token":"test-token"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let ready: Value =
+        serde_json::from_str(next_ws_frame(&mut terminal).await.to_text().unwrap()).unwrap();
+    assert_eq!(ready["type"], "ready");
+    terminal
+        .send(Message::Binary(bytes::Bytes::from_static(
+            b"touch LOCAL_AFTER_SIGN_OUT\n",
+        )))
+        .await
+        .unwrap();
+    let (mut chat, _) =
+        tokio_tungstenite::connect_async(format!("ws://{address}/ws/chat/s-laptop-chat"))
+            .await
+            .unwrap();
+    chat.send(Message::Text(
+        json!({"type":"auth","token":"test-token"})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    chat.send(Message::Text(
+        json!({"type":"send","blocks":[{"type":"text","text":"LOCAL_CHAT_AFTER_SIGN_OUT"}]})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !project.root.join("LOCAL_AFTER_SIGN_OUT").exists()
+            || !std::fs::read_to_string(&captured)
+                .unwrap_or_default()
+                .contains("LOCAL_CHAT_AFTER_SIGN_OUT")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("local terminal and chat input must still be accepted");
+
+    // A verified other owner is the one fence: input stops, nothing is killed.
+    pro::install_remote_owner_fixture(&state, &project.id, 5);
+    assert!(!pro::may_execute(&state, &project.id));
+    assert!(state.sessions.get(&shell).is_some_and(|s| s.alive));
+
+    state.chat.kill("s-laptop-chat");
+    let _ = state.sessions.kill(&shell);
+    server.abort();
+    let _ = server.await;
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
 }
 
 #[tokio::test]

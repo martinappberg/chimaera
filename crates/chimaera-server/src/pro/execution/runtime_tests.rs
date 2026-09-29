@@ -118,7 +118,10 @@ async fn real_http_negotiation_status_and_restart_cannot_downgrade_enrolled_work
         root.join("config"),
     ));
     restored.stopping.store(true, Ordering::Release);
-    assert!(!crate::pro::may_execute(&restored, "w-a"));
+    // A restarted device keeps working, but its previous sessions wait for
+    // this life's verified ownership before resuming.
+    assert!(crate::pro::may_execute(&restored, "w-a"));
+    assert!(!crate::pro::may_restore(&restored, "w-a"));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let app = crate::app(restored.clone());
@@ -146,8 +149,8 @@ async fn real_http_negotiation_status_and_restart_cannot_downgrade_enrolled_work
     .unwrap();
     assert_eq!(reply.status, 200);
     assert!(
-        !crate::pro::may_execute(&restored, "w-a"),
-        "configure does not grant execution"
+        !crate::pro::may_restore(&restored, "w-a"),
+        "configure does not verify ownership"
     );
     let reply =
         crate::pro::transport::request(&endpoint, "/api/v1/pro/status", "GET", "fixture", None)

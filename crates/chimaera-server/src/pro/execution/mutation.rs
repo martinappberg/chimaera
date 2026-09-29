@@ -55,7 +55,9 @@ pub(crate) fn generation(state: &AppState) -> u64 {
     state.pro.generation.load(Ordering::Acquire)
 }
 pub(crate) fn capture(state: &AppState, workspace: &str) -> anyhow::Result<Option<(u64, u64)>> {
-    if !super::managed(state, workspace) {
+    // A device's own local commands are admitted by ownership alone (laptop
+    // first); only a worker ties them to its live lease epoch.
+    if !super::managed(state, workspace) || !super::worker(state) {
         return Ok(None);
     }
     let generation = generation(state);

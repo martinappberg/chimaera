@@ -194,7 +194,10 @@ pub(super) fn start(state: Arc<AppState>) {
                         if generation != owner.pro.generation.load(Ordering::Acquire) {
                             return;
                         }
+                        // An unrenewed lease stops publication, never local work;
+                        // the lease loop re-establishes it quietly.
                         if super::owned_epoch(&owner, &workspace.id).is_none()
+                            || !execution::lease_valid(&owner, &workspace.id)
                             || lock(&owner.pro.preferences)
                                 .get(&workspace.id)
                                 .is_some_and(|p| p.never_mirror)
@@ -297,9 +300,7 @@ async fn reconcile_generation(
             },
         );
         super::persist(state).await?;
-        if matches!(previous, Some(Ownership::Local { .. })) {
-            suspend_workspace(state, workspace).await?;
-        }
+        stop_after_verified_owner(state, config, workspace).await?;
         return Ok(None);
     }
     // A worker may sleep through an entire device tenure without ever observing
@@ -484,6 +485,42 @@ async fn reconcile_generation(
     }
     Ok(Some(grant.epoch))
 }
+/// Upper bound on how long a device's agent may finish its turn after another
+/// owner was verified. Its input is already refused (`may_write`).
+const VERIFIED_OWNER_PAUSE_WAIT: u64 = 300;
+
+/// A verified other owner fences input at once. A device's agents then stop at
+/// their next safe pause (or after a bounded wait) and are preserved for the
+/// return; a worker stops immediately. Plain shells are never stopped.
+async fn stop_after_verified_owner(
+    state: &Arc<AppState>,
+    config: &Configure,
+    workspace: &str,
+) -> Result<()> {
+    let live = sessions(state, workspace).into_iter().any(|id| {
+        state.chat.get(&id).is_some_and(|s| s.alive)
+            || state.sessions.get(&id).is_some_and(|s| s.alive)
+    });
+    if !live {
+        lock(&state.pro.remote_since).remove(workspace);
+        return Ok(());
+    }
+    if config.role == Role::Device && !at_pause(state, workspace) {
+        let since = {
+            let mut waiting = lock(&state.pro.remote_since);
+            if waiting.len() >= 128 && !waiting.contains_key(workspace) {
+                waiting.clear();
+            }
+            *waiting.entry(workspace.into()).or_insert_with(super::now)
+        };
+        if super::now().saturating_sub(since) < VERIFIED_OWNER_PAUSE_WAIT {
+            return Ok(());
+        }
+    }
+    lock(&state.pro.remote_since).remove(workspace);
+    suspend_workspace(state, workspace).await
+}
+
 async fn suspend_workspace(state: &Arc<AppState>, workspace: &str) -> Result<()> {
     for id in sessions(state, workspace) {
         match crate::bundle::export(state.clone(), &id, crate::bundle::ExportMode::Stop).await {
@@ -587,7 +624,7 @@ async fn snapshot_inner_scoped(
     let effective = execution::effective(state, config, workspace)?;
     let config = &effective;
     ensure!(
-        config.recovery || execution::allows(state, workspace),
+        config.recovery || execution::lease_valid(state, workspace),
         "execution authority expired before publication"
     );
     if config.recovery {

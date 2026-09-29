@@ -473,6 +473,15 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
 /// it resumes from.
 pub(crate) async fn consume_boot(state: &Arc<AppState>, boot: BootLedger) {
     restore(state, boot).await;
+    // Laptop first: restart-deferred work resumes even when the account never
+    // answers. A verified grant usually resumes it well before this.
+    let owner = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(crate::pro::BOOT_VERIFICATION_GRACE).await;
+        if !owner.stopping.load(std::sync::atomic::Ordering::Acquire) {
+            crate::pro::resume_unverified(&owner).await;
+        }
+    });
     // Serving started concurrently; sessions snapshots held back by
     // `wait_restored` may flow now that the roster is whole.
     state.restored.send_replace(true);
@@ -492,11 +501,13 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
     let mut respawned = 0usize;
     let mut retired = 0usize;
     for entry in &boot.sessions {
-        if entry.suspended || !crate::pro::may_execute(state, &entry.workspace_id) {
+        if entry.suspended || !crate::pro::may_restore(state, &entry.workspace_id) {
             let mut deferred = entry.clone();
             deferred.suspended = true;
             if let Err(error) = defer(state, deferred) {
                 tracing::error!(session=%entry.id,%error,"deferred ledger capacity reached");
+            } else if !entry.suspended {
+                crate::pro::defer_boot_session(state, &entry.id);
             }
             continue;
         }
@@ -818,6 +829,38 @@ pub(crate) async fn resume_deferred_workspace(
         }
         respawn(state, &entry, workspace.clone()).await?;
         crate::lock(&state.deferred_sessions).remove(&entry.id);
+    }
+    state.changes.notify_waiters();
+    Ok(())
+}
+
+/// Resume only the named restart-deferred sessions of one workspace.
+pub(crate) async fn resume_deferred_sessions(
+    state: &Arc<AppState>,
+    workspace_id: &str,
+    ids: &[String],
+) -> anyhow::Result<()> {
+    if !crate::pro::may_execute(state, workspace_id) {
+        anyhow::bail!("workspace is owned elsewhere");
+    }
+    let workspace = crate::lock(&state.workspaces)
+        .get(workspace_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown workspace"))?;
+    for id in ids {
+        let Some(entry) = crate::lock(&state.deferred_sessions)
+            .get(id)
+            .filter(|entry| entry.workspace_id == workspace_id)
+            .cloned()
+        else {
+            continue;
+        };
+        if state.chat.get(id).is_some_and(|s| s.alive)
+            || state.sessions.get(id).is_some_and(|s| s.alive)
+        {
+            continue;
+        }
+        respawn(state, &entry, workspace.clone()).await?;
+        crate::lock(&state.deferred_sessions).remove(id);
     }
     state.changes.notify_waiters();
     Ok(())

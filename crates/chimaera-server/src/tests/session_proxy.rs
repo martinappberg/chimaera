@@ -443,12 +443,16 @@ async fn unavailable_logical_project_never_falls_back_to_stale_local_files() {
         "ordinary non-Pro local file access stays unchanged"
     );
     pro::install_execution_fixture(&local, &workspace.id, 9).unwrap();
+    // Signing out keeps the laptop's own copy usable (laptop first).
     assert_eq!(
         request(&local, Method::DELETE, "/api/v1/pro/configure", None)
             .await
             .0,
         StatusCode::NO_CONTENT
     );
+    assert!(pro::may_execute(&local, &workspace.id));
+    // Once another owner is verified, the local copy is stale.
+    pro::install_remote_owner_fixture(&local, &workspace.id, 10);
     assert!(!pro::may_execute(&local, &workspace.id));
     assert_eq!(
         app(local.clone()).oneshot(read()).await.unwrap().status(),

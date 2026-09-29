@@ -74,6 +74,18 @@ pub(super) fn validate_configuration(config: &Configure) -> Result<()> {
     Ok(())
 }
 
+/// A cloud worker executes only under a fresh lease. A personal device is
+/// never fenced by account reachability, sign-out, plan changes or a daemon
+/// restart (laptop first): only a verified other owner or its own in-progress
+/// transfer stops it, through the ownership fences in `may_write`.
+pub(super) fn worker(state: &AppState) -> bool {
+    crate::cloud::enabled()
+        || state.pro.worker.load(Ordering::Acquire)
+        || lock(&state.pro.runtime)
+            .as_ref()
+            .is_some_and(|config| config.role == Role::Worker)
+}
+
 pub(super) fn managed(state: &AppState, workspace: &str) -> bool {
     let latched = lock(&state.pro.execution.latched).contains(workspace);
     state.pro.execution.invalid
@@ -221,8 +233,12 @@ pub(super) fn accept(
         generation == state.pro.generation.load(Ordering::Acquire),
         "stale execution generation"
     );
+    // A worker cannot accept (or keep) a lease while it cannot prove old
+    // processes stopped. A device keeps running regardless (laptop first).
     ensure!(
-        !state.pro.execution.invalid && !state.pro.execution.unclean.contains(&baton.workspace_id),
+        config.role == Role::Device
+            || (!state.pro.execution.invalid
+                && !state.pro.execution.unclean.contains(&baton.workspace_id)),
         "previous managed processes require supervisor cleanup"
     );
     observe(state, config, baton)?;
@@ -334,6 +350,8 @@ pub(super) fn accept(
     );
     Ok(())
 }
+/// Local execution admission. Ownership transitions (another verified owner,
+/// an in-progress transfer) are fenced separately by `may_write`.
 pub(super) fn allows(state: &AppState, workspace: &str) -> bool {
     if !managed(state, workspace) {
         return true;
@@ -344,12 +362,26 @@ pub(super) fn allows(state: &AppState, workspace: &str) -> bool {
     {
         return false;
     }
+    !worker(state) || lease_valid(state, workspace)
+}
+/// Sessions a previous daemon left running resume only once this life has
+/// verified ownership; `resume_unverified` applies the device fallback.
+pub(super) fn restorable(state: &AppState, workspace: &str) -> bool {
+    lease_valid(state, workspace) && !state.pro.execution.unclean.contains(workspace)
+}
+/// A fresh, unexpired acquire/renew proof for the current local epoch. It
+/// gates publication and forwarded viewers on every host, and all execution
+/// on a worker.
+pub(super) fn lease_valid(state: &AppState, workspace: &str) -> bool {
+    if !managed(state, workspace) {
+        return true;
+    }
     let generation = state.pro.generation.load(Ordering::Acquire);
     lock(&state.pro.execution.proofs).get(workspace).is_some_and(|proof| !proof.stopped && proof.generation==generation && proof.deadline.valid()
         && matches!(lock(&state.pro.ownership).get(workspace),Some(Ownership::Local{epoch}|Ownership::SettingUp{epoch}|Ownership::Hydrating{epoch}|Ownership::Transferring{epoch}) if *epoch==proof.epoch))
 }
 pub(super) fn epoch(state: &AppState, workspace: &str) -> Option<u64> {
-    if !allows(state, workspace) {
+    if !allows(state, workspace) || !lease_valid(state, workspace) {
         return None;
     }
     super::owned_epoch(state, workspace)
@@ -391,8 +423,17 @@ pub(super) fn fence_workspace(state: &AppState, workspace: &str) {
     }
 }
 
+/// Processes from a previous daemon life that were not proven gone.
+pub(super) fn unclean(state: &AppState, workspace: &str) -> bool {
+    state.pro.execution.unclean.contains(workspace)
+}
+/// Agents are the managed workload. Plain shells are never managed: they are
+/// neither signalled by a fence nor awaited by a stop.
+pub(super) fn managed_session(state: &AppState, id: &str) -> bool {
+    state.chat.get(id).is_some() || lock(&state.agents).contains_key(id)
+}
 pub(super) fn quiescent(state: &AppState, workspace: &str) -> bool {
-    if state.pro.execution.invalid
+    if (state.pro.execution.invalid && worker(state))
         || state.pro.execution.unclean.contains(workspace)
         || !mutation::idle(state, workspace)
     {
@@ -403,14 +444,20 @@ pub(super) fn quiescent(state: &AppState, workspace: &str) -> bool {
         .filter(|(_, w)| w.as_str() == workspace)
         .map(|(id, _)| id.clone())
         .collect();
-    ids.into_iter().all(|id| {
-        !state.chat.get(&id).is_some_and(|s| s.alive)
-            && !state.sessions.get(&id).is_some_and(|s| s.alive)
-    })
+    ids.into_iter()
+        .filter(|id| managed_session(state, id))
+        .all(|id| {
+            !state.chat.get(&id).is_some_and(|s| s.alive)
+                && !state.sessions.get(&id).is_some_and(|s| s.alive)
+        })
 }
 /// Close ingress before signalling. Return each stopped workspace repeatedly
 /// until all registered children are gone, including a concurrent in-flight spawn.
 pub(super) fn expire(state: &AppState, generation: u64) -> Vec<String> {
+    // Lease expiry without a verified other owner never stops a device.
+    if !worker(state) {
+        return Vec::new();
+    }
     let mut proofs = lock(&state.pro.execution.proofs);
     let mut expired = Vec::new();
     for (workspace, proof) in proofs.iter_mut() {
@@ -492,6 +539,31 @@ pub(crate) async fn prepare_launch(
     Ok(())
 }
 
+/// Account unreachability as the lease watchdog sees it: the proof expired
+/// and no renewal arrived. Returns what the watchdog would fence.
+#[cfg(test)]
+pub(crate) fn expired_lease_fixture(state: &AppState, workspace: &str) -> Vec<String> {
+    if let Some(proof) = lock(&state.pro.execution.proofs).get_mut(workspace) {
+        proof.deadline = lease::Deadline::expired_fixture();
+    }
+    expire(state, state.pro.generation.load(Ordering::Acquire))
+}
+/// A verified other owner, as an authenticated baton read records it.
+#[cfg(test)]
+pub(crate) fn remote_owner_fixture(state: &AppState, workspace: &str, epoch: u64) {
+    lock(&state.pro.ownership).insert(
+        workspace.into(),
+        Ownership::Remote {
+            epoch,
+            holder: "worker-fixture".into(),
+        },
+    );
+}
+/// Strict worker semantics for fixtures that exercise lease fencing.
+#[cfg(test)]
+pub(crate) fn worker_fixture(state: &AppState) {
+    state.pro.worker.store(true, Ordering::Release);
+}
 /// Shared HTTP/scope fixtures install a normally validated synthetic grant;
 /// production validation has no test-only permissive branch.
 #[cfg(test)]

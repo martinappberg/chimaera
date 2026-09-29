@@ -92,24 +92,35 @@ async fn strict_worker_polling_fences_released_work_until_hydration() {
 }
 #[tokio::test]
 async fn passive_observation_and_restart_never_install_execution_authority() {
-    let (state, config, root) = fixture();
-    let grant = baton();
-    observe(&state, &config, &grant).unwrap();
-    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
-    assert!(!crate::pro::may_execute(&state, "w-a"));
-    assert!(crate::pro::may_execute(&state, "w-free"));
-    accept(&state, &config, &grant, 0, RequestStart::now()).unwrap();
-    assert!(crate::pro::may_execute(&state, "w-a"));
-    crate::pro::ensure_root(&state.pro.root).await.unwrap();
-    crate::pro::persist(&state).await.unwrap();
-    let restored = crate::pro::ProState::new(state.pro.root.clone());
-    assert!(restored.execution.proofs.lock().unwrap().is_empty());
-    assert!(lock(&restored.preferences)["w-a"].continuity.is_some());
-    assert!(matches!(
-        lock(&restored.ownership)["w-a"],
-        Ownership::AwaitingVerification { epoch: 2 }
-    ));
-    std::fs::remove_dir_all(root).unwrap();
+    for strict in [false, true] {
+        let (state, config, root) = fixture();
+        if strict {
+            worker_fixture(&state);
+        }
+        let grant = baton();
+        observe(&state, &config, &grant).unwrap();
+        lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
+        // A passive read never creates a lease: a worker cannot execute, and
+        // a device publishes nothing, but keeps its own work (laptop first).
+        assert_eq!(crate::pro::may_execute(&state, "w-a"), !strict);
+        assert!(!lease_valid(&state, "w-a"));
+        assert!(!crate::pro::may_restore(&state, "w-a"));
+        assert!(crate::pro::may_execute(&state, "w-free"));
+        accept(&state, &config, &grant, 0, RequestStart::now()).unwrap();
+        assert!(crate::pro::may_execute(&state, "w-a"));
+        assert!(crate::pro::may_restore(&state, "w-a"));
+        crate::pro::ensure_root(&state.pro.root).await.unwrap();
+        crate::pro::persist(&state).await.unwrap();
+        let restored = crate::pro::ProState::new(state.pro.root.clone());
+        assert!(restored.execution.proofs.lock().unwrap().is_empty());
+        assert!(lock(&restored.preferences)["w-a"].continuity.is_some());
+        assert_eq!(restored.worker.load(Ordering::Acquire), strict);
+        assert!(matches!(
+            lock(&restored.ownership)["w-a"],
+            Ownership::AwaitingVerification { epoch: 2 }
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 #[test]
 fn grant_replay_stale_generation_and_capability_downgrade_do_not_extend_deadline() {
@@ -131,8 +142,34 @@ fn grant_replay_stale_generation_and_capability_downgrade_do_not_extend_deadline
     std::fs::remove_dir_all(root).unwrap();
 }
 #[test]
+fn device_lease_expiry_stops_publication_but_never_local_work() {
+    let (state, _config, root) = fixture();
+    crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
+    lock(&state.pro.execution.proofs)
+        .get_mut("w-a")
+        .unwrap()
+        .deadline = lease::Deadline::expired_fixture();
+    assert!(expire(&state, 0).is_empty());
+    assert!(crate::pro::may_execute(&state, "w-a"));
+    assert!(!lease_valid(&state, "w-a"), "publication waits for renewal");
+    assert!(!lock(&state.pro.preferences)["w-a"].execution_uncertain);
+    // Forwarded viewers act only under a live lease.
+    assert!(crate::pro::validate_execution_scope(&state, "w-a", 2).is_err());
+    // A verified other owner is the one fence on a device.
+    lock(&state.pro.ownership).insert(
+        "w-a".into(),
+        Ownership::Remote {
+            epoch: 3,
+            holder: "worker-a".into(),
+        },
+    );
+    assert!(!crate::pro::may_execute(&state, "w-a"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+#[test]
 fn expiry_closes_ingress_and_marks_uncertain_without_a_network_round_trip() {
     let (state, _config, root) = fixture();
+    worker_fixture(&state);
     crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
     {
         let mut proofs = lock(&state.pro.execution.proofs);
@@ -199,6 +236,7 @@ mod runtime;
 #[test]
 fn canonical_recovery_has_a_distinct_exact_capability_and_keeps_expired_input_closed() {
     let (state, mut config, root) = fixture();
+    worker_fixture(&state);
     let mut grant = baton();
     config.execution.as_mut().unwrap().capability = wire::ExecutionCapability::checkpoint_fork();
     grant.execution_capability = Some(wire::ExecutionCapability::checkpoint_fork());
