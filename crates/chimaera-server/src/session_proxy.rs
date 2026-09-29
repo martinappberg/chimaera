@@ -1368,6 +1368,35 @@ const HELD_TERMINAL_BYTES: usize = 64 * 1024;
 /// structured command is ~10 MiB (images), so the byte bound admits one.
 const HELD_CHAT_COMMANDS: usize = 4;
 const HELD_CHAT_BYTES: usize = 11 * 1024 * 1024;
+/// Input held across every relay at once. Per-socket caps alone let a window
+/// full of chats to a sleeping owner pin gigabytes (128 sockets × 11 MiB);
+/// past this, new input is refused visibly instead of held.
+const HELD_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+static HELD_BUDGET: HeldBudget = HeldBudget::new(HELD_TOTAL_BYTES);
+
+/// Bytes held by every relay's [`Held`], against one daemon-wide limit.
+struct HeldBudget {
+    used: std::sync::atomic::AtomicUsize,
+    limit: usize,
+}
+impl HeldBudget {
+    const fn new(limit: usize) -> Self {
+        Self {
+            used: std::sync::atomic::AtomicUsize::new(0),
+            limit,
+        }
+    }
+    fn reserve(&self, bytes: usize) -> bool {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|total| *total <= self.limit)
+            })
+            .is_ok()
+    }
+    fn release(&self, bytes: usize) {
+        self.used.fetch_sub(bytes, Ordering::AcqRel);
+    }
+}
 /// Owner-socket retry pacing while nobody is typing.
 const RETRY_MIN: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(30);
@@ -1567,13 +1596,20 @@ impl Link<'_> {
     }
 }
 
-/// Input held until the owner's socket is ready. Bounded per socket.
-struct Held {
+/// Input held until the owner's socket is ready. Bounded per socket and,
+/// through `budget`, across the daemon.
+struct Held<'b> {
     chat: bool,
     frames: std::collections::VecDeque<Down>,
     bytes: usize,
+    budget: &'b HeldBudget,
 }
-impl Held {
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+impl Held<'_> {
     /// Hold `frame`, or hand it back when it does not fit.
     fn push(&mut self, frame: Down) -> std::result::Result<(), Down> {
         let size = match &frame {
@@ -1586,7 +1622,7 @@ impl Held {
         } else {
             self.bytes + size <= HELD_TERMINAL_BYTES
         };
-        if !fits {
+        if !fits || !self.budget.reserve(size) {
             return Err(frame);
         }
         self.bytes += size;
@@ -1594,7 +1630,7 @@ impl Held {
         Ok(())
     }
     fn take(&mut self) -> std::collections::VecDeque<Down> {
-        self.bytes = 0;
+        self.budget.release(std::mem::take(&mut self.bytes));
         std::mem::take(&mut self.frames)
     }
 }
@@ -1646,6 +1682,7 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
         chat: link.chat,
         frames: Default::default(),
         bytes: 0,
+        budget: &HELD_BUDGET,
     };
     let mut upstream: Option<Box<Upstream>> = None;
     let mut ready = false;
@@ -2148,6 +2185,33 @@ mod tests {
         // An upload's body keeps the link alive; only a silent stall ends it.
         assert!(Budget::UPLOAD.quiet < Budget::UPLOAD.head);
         assert!(Budget::EXEC.quiet >= Budget::EXEC.head);
+    }
+
+    #[test]
+    fn held_input_shares_one_daemon_wide_budget() {
+        let budget = HeldBudget::new(10 * 1024);
+        let frame = |size: usize| Down::Binary(vec![b'x'; size].into());
+        let mut first = Held {
+            chat: false,
+            frames: Default::default(),
+            bytes: 0,
+            budget: &budget,
+        };
+        let mut second = Held {
+            chat: false,
+            frames: Default::default(),
+            bytes: 0,
+            budget: &budget,
+        };
+        assert!(first.push(frame(6 * 1024)).is_ok());
+        // Within its own cap, but not within what is left daemon-wide.
+        assert!(second.push(frame(6 * 1024)).is_err());
+        assert!(second.push(frame(4 * 1024)).is_ok());
+        // Delivering (or dropping) held input gives its bytes back.
+        assert_eq!(first.take().len(), 1);
+        assert!(second.push(frame(6 * 1024)).is_ok());
+        drop(second);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
     }
 
     #[test]
