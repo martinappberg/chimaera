@@ -1129,6 +1129,12 @@ struct CodexMapper {
     /// entry leaves on its answer, so this never outgrows the in-flight
     /// steers; teardown clears it.
     read_before_answer: HashSet<String>,
+    /// Steers carrying decline feedback (`dispatch_input`), which have no
+    /// bubble of their own (their echo has no id): fire-and-forget as
+    /// before — never parked as unread or re-driven after a stop, so a Stop
+    /// right after a deny-with-feedback does not start a new turn. Each entry
+    /// leaves on its steer's answer; teardown clears it.
+    feedback_steers: HashSet<String>,
     /// Interrupt watchdog: ticks remaining before we synthesize the abort the
     /// app-server never sent. Armed on `Interrupt`, counted down in `tick`,
     /// disarmed when a turn ends (`reset_turn_state`) or a fresh turn opens.
@@ -1271,6 +1277,7 @@ impl CodexMapper {
             deferred_steer_redrives: BTreeMap::new(),
             unread_steers: BTreeMap::new(),
             read_before_answer: HashSet::new(),
+            feedback_steers: HashSet::new(),
             interrupt_grace: None,
             idle_flush_grace: None,
             coalescer: Coalescer::new(),
@@ -2040,6 +2047,11 @@ impl CodexMapper {
                 // The extension's retry dance: parse the live turn id out of
                 // the error text and steer again, once.
                 let msg = err["message"].as_str().unwrap_or_default();
+                if parse_expected_turn_id(msg).is_none()
+                    && self.refused_feedback(&client_msg_id, msg, step)
+                {
+                    return;
+                }
                 match parse_expected_turn_id(msg) {
                     Some(live_turn) => {
                         self.turn_id = live_turn.clone();
@@ -2084,11 +2096,15 @@ impl CodexMapper {
                     retried: true,
                     order,
                 },
-                Some(_),
+                Some(err),
             ) => {
                 // Refused again after the turn-id retry: the turn keeps moving
                 // under it. Deliver it with the next turn rather than drop it.
                 self.read_before_answer.remove(&client_msg_id);
+                let msg = err["message"].as_str().unwrap_or_default();
+                if self.refused_feedback(&client_msg_id, msg, step) {
+                    return;
+                }
                 self.defer_steer_redrive(order, input, client_msg_id, step);
             }
             (PendingRpc::Interrupt, Some(err)) => {
@@ -2218,8 +2234,10 @@ impl CodexMapper {
             ) => {
                 // Accepted is not read: the bubble resolves `sent` when its
                 // `userMessage` item lands (`on_user_message_item`), at the
-                // agent's next step.
-                if !self.read_before_answer.remove(&client_msg_id) {
+                // agent's next step. Decline feedback has no bubble: its ack
+                // is final.
+                let feedback = self.feedback_steers.remove(&client_msg_id);
+                if !feedback && !self.read_before_answer.remove(&client_msg_id) {
                     let joined = frame["result"]["turnId"].as_str();
                     let running = self.turn_active && joined.is_none_or(|t| t == self.turn_id);
                     let send = QueuedSend {
@@ -3353,6 +3371,21 @@ impl CodexMapper {
         });
     }
 
+    /// A refused steer that carried decline feedback: while its turn still
+    /// runs, say so (it has no bubble to leave pending) and let it go — the
+    /// behavior before steers were re-driven. True = handled. A turn that
+    /// already ended re-drives it like any steer that missed its turn.
+    fn refused_feedback(&mut self, id: &str, msg: &str, step: &mut DriverStep) -> bool {
+        if !self.feedback_steers.remove(id) || !self.turn_active {
+            return false;
+        }
+        step.events.push(AgentEvent::Error {
+            message: format!("steer failed: {msg}"),
+            fatal: false,
+        });
+        true
+    }
+
     /// A `turn/steer` for this message is still awaiting its answer.
     fn steer_pending_for(&self, id: &str) -> bool {
         self.pending_rpcs
@@ -3436,6 +3469,7 @@ impl CodexMapper {
     fn drain_queued_sends(&mut self) -> Vec<AgentEvent> {
         let mut events = Vec::new();
         self.read_before_answer.clear();
+        self.feedback_steers.clear();
         for (_, steered) in std::mem::take(&mut self.unread_steers) {
             events.push(AgentEvent::UserMessageUpdate {
                 id: steered.client_msg_id,
@@ -4133,6 +4167,7 @@ impl CodexMapper {
         });
         let mut input: Vec<Value> = Vec::new();
         for send in batch {
+            self.feedback_steers.remove(&send.client_msg_id);
             match send.input {
                 Value::Array(items) => input.extend(items),
                 other => input.push(other),
@@ -4152,6 +4187,9 @@ impl CodexMapper {
     /// own untracked id since the feedback text is not a queued user bubble.)
     fn dispatch_input(&mut self, input: Value, step: &mut DriverStep) {
         let client_msg_id = crate::model::fresh_uuid();
+        if self.turn_active || self.turn_pending {
+            self.feedback_steers.insert(client_msg_id.clone());
+        }
         if self.turn_active && !self.turn_id.is_empty() {
             // Type-through: inject into the RUNNING turn (steer).
             self.emit_steer(input, client_msg_id, step);
@@ -4538,7 +4576,13 @@ impl CodexMapper {
                         let send = self.queued_sends.remove(pos).expect("position exists");
                         self.redrive_as_fresh_turn(send.input, send.client_msg_id, &mut step);
                     }
-                } else if running && self.is_steered(&id) {
+                } else if running
+                    && (self.is_steered(&id)
+                        || self
+                            .deferred_steer_redrives
+                            .values()
+                            .any(|send| send.client_msg_id == id))
+                {
                     self.interrupt(&mut step);
                 }
             }
@@ -5230,6 +5274,57 @@ mod tests {
         // Already read: Send now does nothing.
         let step = m.on_command(AgentCommand::SendNow { id: b });
         assert!(step.outbound.is_empty() && step.events.is_empty());
+    }
+
+    /// Decline feedback steered into the running turn has no bubble: its ack
+    /// is final, so a Stop before the next step does not re-drive it as a
+    /// new turn (and no checkpoint names its bubble-less id).
+    #[test]
+    fn decline_feedback_steer_is_not_redriven_after_a_stop() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let mut step = DriverStep::default();
+        m.dispatch_input(
+            json!([{ "type": "text", "text": "use the other file" }]),
+            &mut step,
+        );
+        assert_eq!(step.outbound[0]["method"], "turn/steer");
+        let rpc = step.outbound[0]["id"].as_u64().unwrap();
+        m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+        assert!(
+            m.unread_steers.is_empty(),
+            "feedback is not tracked as unread"
+        );
+        m.on_command(AgentCommand::Interrupt);
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "interrupted" } },
+        }));
+        assert!(
+            !step.outbound.iter().any(|o| o["method"] == "turn/start"),
+            "a stop stays a stop: {:?}",
+            step.outbound
+        );
+        assert!(m.feedback_steers.is_empty());
+    }
+
+    /// Send now on a message the running turn refused to steer (it waits in
+    /// the re-drive set) interrupts, like any other waiting message.
+    #[test]
+    fn send_now_reaches_a_refused_steer() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "B".into() }],
+        });
+        let AgentEvent::UserMessage { id: Some(b), .. } = &step.events[0] else {
+            panic!("expected UserMessage");
+        };
+        let b = b.clone();
+        let rpc = step.outbound[0]["id"].as_u64().unwrap();
+        m.on_frame(&json!({ "id": rpc, "error": { "message": "cannot steer a compact turn" } }));
+        let step = m.on_command(AgentCommand::SendNow { id: b });
+        assert_eq!(step.outbound[0]["method"], "turn/interrupt");
     }
 
     #[test]

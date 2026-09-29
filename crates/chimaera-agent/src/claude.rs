@@ -3111,6 +3111,21 @@ impl ClaudeMapper {
         if let Some(flushed) = self.coalescer.flush() {
             step.events.push(flushed);
         }
+        // Backstop for a `started` frame that never came: the result lists
+        // every message the turn consumed (`user_message_uuids`), so one still
+        // marked waiting was read after all — inside this turn, so it resolves
+        // before the turn's end event.
+        if let Some(consumed) = frame["user_message_uuids"].as_array() {
+            for id in consumed.iter().filter_map(Value::as_str) {
+                if let Some(pos) = self.awaiting_read.iter().position(|q| q == id) {
+                    let id = self.awaiting_read.remove(pos).expect("position exists");
+                    step.events.push(AgentEvent::UserMessageUpdate {
+                        id,
+                        state: UserMessageState::Sent,
+                    });
+                }
+            }
+        }
         let turn_id = self.turn_id();
         // Capture BEFORE clearing. A result can arrive with NO turn open: the
         // real CLI coalesces rapid queued sends (live-verified: 3 sends → 2
@@ -3191,20 +3206,6 @@ impl ClaudeMapper {
             self.refresh_context_usage(step);
         }
         self.turn_starting = false;
-        // Backstop for a `started` frame that never came: the result lists
-        // every message the turn consumed (`user_message_uuids`), so one still
-        // marked waiting was read after all.
-        if let Some(consumed) = frame["user_message_uuids"].as_array() {
-            for id in consumed.iter().filter_map(Value::as_str) {
-                if let Some(pos) = self.awaiting_read.iter().position(|q| q == id) {
-                    let id = self.awaiting_read.remove(pos).expect("position exists");
-                    step.events.push(AgentEvent::UserMessageUpdate {
-                        id,
-                        state: UserMessageState::Sent,
-                    });
-                }
-            }
-        }
         // The running turn has ended — however it ended — so NOW flush
         // everything held behind it (the fallback path; see `queued_sends`).
         // Messages already in the CLI's own queue need nothing here: the CLI
@@ -3826,7 +3827,10 @@ impl ClaudeMapper {
             AgentCommand::SendNow { id } => {
                 let waiting = self.awaiting_read.contains(&id)
                     || self.queued_sends.iter().any(|(q, _, _)| *q == id);
-                if waiting && self.turn_active {
+                // A turn that is starting (a waiting batch was just read) is
+                // interrupted the same way: the CLI aborts it and runs what
+                // is still queued.
+                if waiting && (self.turn_active || self.turn_starting) {
                     self.interrupt(&mut step);
                 }
             }
@@ -5700,10 +5704,22 @@ pub(crate) mod tests {
             "usage": { "output_tokens": 1 }, "duration_ms": 10,
             "user_message_uuids": [b, c],
         }));
-        assert!(step.events.iter().any(|e| matches!(
-            e,
-            AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == c
-        )));
+        let sent = step
+            .events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == c
+                )
+            })
+            .expect("the backstop resolves C");
+        let ended = step
+            .events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::TurnCompleted { .. }))
+            .expect("the turn ends");
+        assert!(sent < ended, "read inside the turn, so before its end");
         assert!(m.awaiting_read.is_empty());
         // Idle again: a send opens a fresh turn.
         let (_, step) = send_text(&mut m, "D", false);
@@ -5711,6 +5727,22 @@ pub(crate) mod tests {
             &step.events[0],
             AgentEvent::UserMessage { queued: false, .. }
         ));
+    }
+
+    /// Send now in the gap before a starting turn's first frame interrupts
+    /// that turn; the CLI then runs what is still queued.
+    #[test]
+    fn native_queue_send_now_reaches_a_starting_turn() {
+        let mut m = native_mapper_mid_turn();
+        let (b, _) = send_text(&mut m, "B", true);
+        m.on_frame(&json!({
+            "type": "result", "is_error": false,
+            "usage": { "output_tokens": 1 }, "duration_ms": 10,
+        }));
+        m.on_frame(&lifecycle(&b, "started"));
+        let (c, _) = send_text(&mut m, "C", false);
+        let step = m.on_command(AgentCommand::SendNow { id: c });
+        assert_eq!(step.outbound[0]["request"]["subtype"], "interrupt");
     }
 
     /// The process died with messages in its queue: they were never read.

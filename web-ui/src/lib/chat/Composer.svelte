@@ -460,7 +460,9 @@
     }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      if (dictation.state !== "finishing") void finishDictation(true);
+      // The after-turn chord keeps its meaning through the stop.
+      const afterTurn = matchChord(e, AFTER_TURN_CHORD) !== null && matchAction(e) === null;
+      if (dictation.state !== "finishing") void finishDictation(true, afterTurn);
       return true;
     }
     return false;

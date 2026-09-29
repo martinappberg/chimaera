@@ -2613,7 +2613,7 @@ The maintainer noticed that Claude Code reads queued messages inside a running t
   - `cancelled` (never started) → `Cancelled` only while our own `cancel_async_message` for it is in flight (the frame lands before the answer). A cancel we did not ask for — the CLI sweeping its queue — is `dropped`, never a silent vanish. `discarded`/`refused` → `dropped`. Teardown drops what was never read.
   - A turn opener's `started` sets `turn_starting` until that turn's first frame. Model latency makes this gap seconds long, right after Send now especially, and a send inside it waits instead of opening a turn of its own (codex's `turn_pending`). The fallback's flush sets it too.
   - Backstop for a `started` that never arrives: a `result`'s `user_message_uuids` resolves any listed message still waiting.
-  - ✕ → `cancel_async_message`. Send now → interrupt.
+  - ✕ → `cancel_async_message`. Send now → interrupt, including in the `turn_starting` gap.
   - A send made before the first init is held and handed over when init advertises the queue. A CLI without the capability keeps Pass 13's hold-until-flush, whose flushed messages now take their `Checkpoint` at the flush.
 - **codex**:
   - A mid-turn send steers at once (in the `turn/start` window: once `turn/started` lands).
@@ -2625,6 +2625,7 @@ The maintainer noticed that Claude Code reads queued messages inside a running t
   - `SendAfterTurn` → the next-run FIFO (one per turn, as Pass 21).
   - Send now → `turn/interrupt`; an after-turn entry joins the re-driven batch.
   - ✕ on a steered message is a Notice (it can't be withdrawn).
+  - Decline feedback (`dispatch_input`) also rides `turn/steer`, but it has no bubble (its echo has no id). Its ack stays final, as before: it is never parked as unread or re-driven, so a Stop right after a deny-with-feedback does not start a new turn. A refusal while the turn runs is an Error notice.
 - **UI**:
   - Plain Enter reads at the next step. ⌥↩ / Alt+Enter sends after the turn (⇧⌘↩ is Zoom Pane).
   - Captions read "next step" / "after this turn". Send now and ✕ are on every waiting bubble.
