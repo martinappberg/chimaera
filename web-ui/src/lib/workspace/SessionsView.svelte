@@ -36,6 +36,7 @@
     type HistoryRecord,
   } from "./history";
   import SessionEdits from "./SessionEdits.svelte";
+  import { openGitView } from "./git";
 
   interface Props {
     dash: DashCtx;
@@ -358,7 +359,9 @@
                     {#if r.files.n > 0}
                       <button class="files" aria-expanded={isOpen} title="what this session changed" onclick={() => toggle(r)}>{r.files.n} file{r.files.n === 1 ? "" : "s"}</button>
                     {/if}
-                    {#if commits !== null}<span>{commits} commit{commits === 1 ? "" : "s"}</span>{/if}
+                    {#if commits !== null && commits > 0}
+                      <button class="files" aria-expanded={isOpen} title="the commits this session made" onclick={() => toggle(r)}>{commits} commit{commits === 1 ? "" : "s"}</button>
+                    {/if}
                     {#if r.usage.tokens_in !== null || r.usage.tokens_out !== null}
                       <span class="tok">{formatTokens((r.usage.tokens_in ?? 0) + (r.usage.tokens_out ?? 0))} tokens</span>
                     {/if}
@@ -369,6 +372,23 @@
                     <p class="facts">
                       {new Date(r.started).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}{r.ended !== undefined ? ` – ${clock(r.ended)}` : ""}{(r.models ?? []).length > 0 ? ` · ${(r.models ?? []).join(", ")}` : ""}{r.usage.turns !== null ? ` · ${r.usage.turns} turn${r.usage.turns === 1 ? "" : "s"}` : ""}{r.usage.tokens_in !== null || r.usage.tokens_out !== null ? ` · ${formatTokens((r.usage.tokens_in ?? 0) + (r.usage.tokens_out ?? 0))} tokens` : ""}
                     </p>
+                    {#if (r.git?.commits ?? []).length > 0}
+                      {@const repo = r.git?.end?.worktree ?? r.git?.start?.worktree ?? null}
+                      <ul class="commits" aria-label="Commits this session made">
+                        {#each r.git?.commits ?? [] as c (c.sha)}
+                          <li>
+                            <button
+                              class="commit"
+                              title="open this commit"
+                              onclick={() => openGitView({ surface: "gitx", view: "commit", repo, sha: c.sha, title: c.subject })}
+                            >
+                              <span class="csubj">{c.subject || "(no message)"}</span>
+                              <span class="csha">{c.sha.slice(0, 7)}</span>
+                            </button>
+                          </li>
+                        {/each}
+                      </ul>
+                    {/if}
                     {#if wsId !== null}
                       <SessionEdits
                         sessionId={r.id}
@@ -627,6 +647,45 @@
     margin: 0;
     font-size: var(--text-xs);
     color: var(--muted);
+  }
+  .commits {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .commit {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    color: var(--fg);
+    width: 100%;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 3px 6px;
+    border-radius: 4px;
+    text-align: left;
+    cursor: pointer;
+    font-size: var(--text-sm);
+  }
+  .commit:hover {
+    background: var(--row-hover);
+  }
+  .csubj {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .csha {
+    flex: none;
+    color: var(--muted);
+    font-family: var(--mono, monospace);
+    font-size: var(--text-xs);
   }
   .acts {
     list-style: none;
