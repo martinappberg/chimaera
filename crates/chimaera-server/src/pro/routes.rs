@@ -17,20 +17,30 @@ use std::sync::{atomic::Ordering, Arc};
 pub(super) fn failure(error: anyhow::Error) -> Response {
     outcome(error).into_response()
 }
+/// `failure` plus a route-specific stable `error_code` (additive: `code` stays
+/// the shared diagnostic category, and clients that ignore it are unaffected).
+pub(super) fn failure_with_code(error: anyhow::Error, route_code: &'static str) -> Response {
+    outcome_with(error, Some(route_code)).into_response()
+}
 fn outcome(error: anyhow::Error) -> detached::Outcome {
+    outcome_with(error, None)
+}
+fn outcome_with(error: anyhow::Error, route_code: Option<&'static str>) -> detached::Outcome {
     if let Some(blocked) = error.downcast_ref::<super::provider_gate::Blocked>() {
-        return detached::Outcome::refused(
-            StatusCode::CONFLICT,
-            Some(json!({"error":"cloud_provider_not_ready","blocked_providers":blocked.0})),
-        );
+        let mut body = json!({"error":"cloud_provider_not_ready","blocked_providers":blocked.0});
+        if let Some(route_code) = route_code {
+            body["error_code"] = route_code.into();
+        }
+        return detached::Outcome::refused(StatusCode::CONFLICT, Some(body));
     }
-    detached::Outcome::refused(
-        StatusCode::BAD_REQUEST,
-        Some(json!({
-            "error": error.to_string().chars().take(256).collect::<String>(),
-            "code": error_code(&error),
-        })),
-    )
+    let mut body = json!({
+        "error": error.to_string().chars().take(256).collect::<String>(),
+        "code": error_code(&error),
+    });
+    if let Some(route_code) = route_code {
+        body["error_code"] = route_code.into();
+    }
+    detached::Outcome::refused(StatusCode::BAD_REQUEST, Some(body))
 }
 /// Stable codes a client maps to its own plain words (additive `code`); the
 /// English `error` text remains only for older clients and is not a contract.

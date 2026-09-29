@@ -30,22 +30,34 @@ fn destination_rejects_nonempty_git_nested_symlink_and_replaced_folders() {
     std::fs::create_dir(&chosen).unwrap();
     let destination = reserve(&chosen, &[], &[]).unwrap();
     std::fs::write(chosen.join("personal.txt"), "keep").unwrap();
-    assert!(reserve(&chosen, &[], &[]).is_err());
-    assert!(verify(&destination, true).is_err());
+    // Each refusal names its stable code (`error_code` on the route's failure).
+    let code = |error: Option<anyhow::Error>| open_error_code(&error.unwrap());
+    assert_eq!(code(reserve(&chosen, &[], &[]).err()), "folder_not_empty");
+    assert_eq!(code(verify(&destination, true).err()), "folder_not_empty");
     std::fs::remove_file(chosen.join("personal.txt")).unwrap();
     std::fs::create_dir(root.join(".git")).unwrap();
-    assert!(reserve(&chosen, &[], &[]).is_err());
+    assert_eq!(code(reserve(&chosen, &[], &[]).err()), "folder_nested");
     std::fs::remove_dir(root.join(".git")).unwrap();
+    assert_eq!(
+        code(reserve(&chosen, &[], std::slice::from_ref(&chosen)).err()),
+        "folder_nested"
+    );
     std::fs::rename(&chosen, root.join("moved")).unwrap();
-    assert!(verify(&destination, false).is_err());
+    assert_eq!(code(verify(&destination, false).err()), "folder_missing");
     std::fs::create_dir(&chosen).unwrap();
-    assert!(verify(&destination, false).is_err());
+    assert_eq!(code(verify(&destination, false).err()), "folder_moved");
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(&chosen, root.join("alias")).unwrap();
-        assert!(reserve(&root.join("alias"), &[], &[]).is_err());
+        assert_eq!(
+            code(reserve(&root.join("alias"), &[], &[]).err()),
+            "folder_unusable"
+        );
     }
-    assert!(reserve(&root.join("missing"), &[], &[]).is_err());
+    assert_eq!(
+        code(reserve(&root.join("missing"), &[], &[]).err()),
+        "folder_missing"
+    );
     assert!(!root.join("missing").exists());
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -208,17 +220,21 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
     let chosen = root.join("chosen");
     std::fs::create_dir(&chosen).unwrap();
     std::fs::write(chosen.join("personal.txt"), "untouched").unwrap();
-    assert!(open(
-        &laptop,
-        Open {
-            expected_account_id: "account-fixture".into(),
-            expected_endpoint: origin.clone(),
-            workspace_id: "w-cloud".into(),
-            destination_root: Some(chosen.clone())
-        }
-    )
-    .await
-    .is_err());
+    assert_eq!(
+        open(
+            &laptop,
+            Open {
+                expected_account_id: "account-fixture".into(),
+                expected_endpoint: origin.clone(),
+                workspace_id: "w-cloud".into(),
+                destination_root: Some(chosen.clone())
+            }
+        )
+        .await
+        .err()
+        .map(|error| open_error_code(&error)),
+        Some("folder_not_empty")
+    );
     assert_eq!(fixture.handoffs.load(Ordering::Relaxed), 0);
     assert_eq!(
         std::fs::read_to_string(chosen.join("personal.txt")).unwrap(),
@@ -368,6 +384,66 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
     let _ = server.await;
     drop(restarted);
     drop(laptop);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A failed open answers with its message and, beside it, the stable code the
+/// native app maps to its own words (additive: `error` and `code` are as before).
+#[tokio::test]
+async fn a_failed_open_carries_a_stable_error_code_beside_its_message() {
+    let root = temp();
+    let laptop = state(&root.join("daemon"));
+    let failure = |workspace_id: &'static str| {
+        let laptop = laptop.clone();
+        async move {
+            let response = open_project(
+                State(laptop),
+                Json(Open {
+                    expected_account_id: "account-fixture".into(),
+                    expected_endpoint: "http://127.0.0.1:1".into(),
+                    workspace_id: workspace_id.into(),
+                    destination_root: None,
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        }
+    };
+    let invalid = failure("not a project id").await;
+    assert_eq!(invalid["error_code"], "not_a_project");
+    assert_eq!(invalid["error"], "Invalid project identity");
+    assert!(invalid["code"].is_string(), "the diagnostic category stays");
+    let signed_out = failure("w-cloud").await;
+    assert_eq!(signed_out["error_code"], "signed_out");
+    assert_eq!(signed_out["error"], "Sign in to open a cloud project");
+    // Failures raised by the transfer engine fall back to its category.
+    assert_eq!(
+        open_error_code(&anyhow::anyhow!("Account changed during project transfer")),
+        "account_changed"
+    );
+    assert_eq!(
+        open_error_code(&anyhow::anyhow!("ownership changed before release")),
+        "owned_elsewhere"
+    );
+    assert_eq!(
+        open_error_code(&anyhow::anyhow!(
+            "previous managed processes are still stopping"
+        )),
+        "busy"
+    );
+    assert_eq!(
+        open_error_code(&anyhow::anyhow!("mirror Git operation failed")),
+        "failed"
+    );
+    // A code survives added context.
+    assert_eq!(
+        open_error_code(&refuse("privacy", "kept on its device").context("while opening")),
+        "privacy"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 

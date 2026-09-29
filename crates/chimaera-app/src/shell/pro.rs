@@ -2054,11 +2054,7 @@ pub(super) async fn daemon_request(
         );
         if !response.status().is_success() {
             if suffix == "/pro/projects/open" {
-                let detail = serde_json::from_slice::<serde_json::Value>(&bytes)
-                    .ok()
-                    .and_then(|v| v["error"].as_str().map(str::to_owned))
-                    .unwrap_or_default();
-                anyhow::bail!(project_failure(&detail));
+                anyhow::bail!(open_failure(&bytes));
             }
             anyhow::bail!("The Pro operation couldn't finish. Try again shortly.");
         }
@@ -2071,9 +2067,36 @@ pub(super) async fn daemon_request(
     .await?
 }
 
-/// The daemon answers an open with diagnostic text only; it is classified
-/// here, once, into the fixed codes the page maps to sentences
-/// (`projects::open_code`). Raw text never reaches the page.
+/// The fixed code (`projects::open_code`) for a failed open, from the daemon's
+/// failure body. Its stable `error_code` decides; the sentence is classified
+/// only when the body has none (a daemon that predates the code). Raw text
+/// never reaches the page.
+fn open_failure(body: &[u8]) -> &'static str {
+    let body = serde_json::from_slice::<serde_json::Value>(body).unwrap_or_default();
+    match body["error_code"].as_str() {
+        Some(code) => project_failure_code(code),
+        None => project_failure(body["error"].as_str().unwrap_or_default()),
+    }
+}
+/// The daemon's stable open codes (its pro map lists them). A reason with no
+/// sentence of its own yet (`not_a_project`, `signed_out`, `owned_elsewhere`,
+/// `privacy`, `other_account`, `timed_out`, ...) and any code a newer daemon
+/// adds read as the generic line: never guessed from the sentence.
+fn project_failure_code(code: &str) -> &'static str {
+    use projects::open_code;
+    match code {
+        "folder_not_empty" => open_code::FOLDER_NOT_EMPTY,
+        "folder_missing" | "folder_moved" => open_code::FOLDER_MISSING,
+        "folder_nested" => open_code::FOLDER_NESTED,
+        "busy" => open_code::BUSY,
+        "account_changed" => open_code::ACCOUNT_CHANGED,
+        "unavailable" => open_code::UNAVAILABLE,
+        "return_window_ended" => open_code::RETURN_WINDOW_ENDED,
+        _ => open_code::FAILED,
+    }
+}
+/// Fallback for a daemon that predates `error_code`: its diagnostic text,
+/// classified once into the same fixed codes.
 fn project_failure(detail: &str) -> &'static str {
     use projects::open_code;
     let text = detail.to_ascii_lowercase();

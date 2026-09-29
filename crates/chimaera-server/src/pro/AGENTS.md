@@ -165,7 +165,16 @@ mkdir, Git fetch, workspace registration or baton mutation. The worker's explici
 from both discovery and automatic mirroring.
 
 `POST /api/v1/pro/projects/open` accepts `{workspace_id,destination_root?,expected_account_id,expected_endpoint}` and
-returns `{workspace_id,root,name}`. The native shell supplies the chosen final
+returns `{workspace_id,root,name}`. A failure answers 400 `{error,code,error_code}`: `error` is diagnostic text
+(not a contract), `code` the shared transfer category (`routes::error_code`), and `error_code` the additive stable
+reason the native app maps to its own words (a timeout is 504 `{error,error_code:"timed_out"}`). The codes are
+`folder_not_empty`, `folder_nested` (inside another project or Git repository), `folder_missing`, `folder_moved`
+(the saved folder was replaced), `folder_unusable` (not an absolute real, writable directory), `folder_required`
+(a folder must be chosen first), `folder_mismatch` (differs from the saved folder), `busy` (mid-step in the cloud),
+`owned_elsewhere`, `privacy` (the project stays on its device), `account_changed`, `other_account`, `signed_out`,
+`unavailable`, `not_a_project`, `limit_reached`, `return_window_ended` (the plan ended and the time to bring its
+work home has passed) and `failed` (anything else). Each is tagged where it is raised (`projects.rs` `Refused`);
+an engine failure falls back to its category (`open_error_code`). The native shell supplies the chosen final
 folder; webview arguments contain only a workspace ID. A fresh folder must
 already exist, be writable and empty, and lie outside another project/repository.
 The selection is checked before cloud hand-back and immediately before install.
