@@ -46,12 +46,22 @@
    *  file version is a new URL, and reopens). */
   let opened: { url: string; pdf: OpenedPdf } | null = null;
   let gen = 0;
+  /** The render in flight: pdf.js refuses a second render() on a canvas
+   *  still in use, so a newer draw (another page, a sharper width) cancels
+   *  it first — cancelling frees the canvas at once. */
+  let rendering: { cancel(): void } | null = null;
+
+  function stopRendering(): void {
+    rendering?.cancel();
+    rendering = null;
+  }
   /** What the last draw was asked for (not what finished): a redraw is
    *  only worth a new URL, a new page, or a much wider card. */
   let asked: { url: string; page: number; width: number } | null = null;
 
   async function draw(u: string, p: number, width: number): Promise<void> {
     const mine = ++gen;
+    stopRendering();
     error = null;
     try {
       if (opened?.url !== u) {
@@ -81,7 +91,13 @@
       target.height = Math.floor(vp.height);
       const ctx = target.getContext("2d");
       if (ctx === null) return;
-      await pg.render({ canvas: target, canvasContext: ctx, viewport: vp }).promise;
+      const task = pg.render({ canvas: target, canvasContext: ctx, viewport: vp });
+      rendering = task;
+      try {
+        await task.promise;
+      } finally {
+        if (rendering === task) rendering = null;
+      }
     } catch (e) {
       if (mine !== gen) return;
       asked = null;
@@ -103,6 +119,7 @@
 
   $effect(() => () => {
     gen += 1;
+    stopRendering();
     opened?.pdf.destroy();
     opened = null;
   });

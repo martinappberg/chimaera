@@ -10,7 +10,8 @@
  * GitHub do: a leading `---` block is frontmatter (the daemon's shape: `---`
  * alone on line 1, a closer exactly `---` within 200 lines, a `key:` line
  * inside) and never body; GitHub alerts (`> [!NOTE]`, the marker right after
- * the quote's `> `, an optional title after it); heading ids are GitHub
+ * the quote's `> `, an optional title after it), read with Obsidian's
+ * callouts as one construct (`callouts.ts`); heading ids are GitHub
  * slugs, numbered `-1`, `-2` on repeats; footnotes number in the order they
  * are first referenced, and a definition nobody references is dropped;
  * lists are tight unless a blank line separates items or an item's blocks.
@@ -34,8 +35,7 @@ import {
 import { mathDelimiters, mathSource } from "../mdMath";
 import { decodeEntities, unescapeBackslashes } from "./entities";
 import { docParser } from "./parser";
-
-export type AlertType = "note" | "tip" | "important" | "warning" | "caution";
+import { CALLOUT_MARKER, calloutLook, defaultCalloutTitle, type CalloutLook } from "./callouts";
 
 interface Span {
   /** Source offsets of the block (lines come from the LineIndex). */
@@ -49,7 +49,15 @@ export type Block = Span &
     | { kind: "heading"; level: number; inline: Inline[]; id: string }
     | { kind: "rule" }
     | { kind: "quote"; children: Block[] }
-    | { kind: "alert"; type: AlertType; title: string; children: Block[] }
+    | {
+        kind: "alert";
+        type: CalloutLook;
+        /** The title as written (markdown), else the type's default. */
+        title: Inline[];
+        /** Obsidian's fold mark: `-` starts folded, `+` open, "" not foldable. */
+        fold: "" | "+" | "-";
+        children: Block[];
+      }
     | { kind: "list"; ordered: boolean; start: number; tight: boolean; items: Item[] }
     | { kind: "code"; lang: string; text: string }
     | { kind: "math"; source: string }
@@ -506,14 +514,22 @@ function blankBetween(cx: DocContext, a: number, b: number): boolean {
   return false;
 }
 
-const ALERT = /^> \[!(note|tip|important|warning|caution)\][ \t]*([^\n]*)/i;
-const ALERT_TITLES: Record<AlertType, string> = {
-  note: "Note",
-  tip: "Tip",
-  important: "Important",
-  warning: "Warning",
-  caution: "Caution",
-};
+/** A callout's title: the marker line after the marker, as markdown.
+ *  As plain text when a node begins inside the marker (`[!note](x)` reads
+ *  as a link to lezer, as a title `(x)` to comrak); a break ending the
+ *  line is the line's, not the title's. */
+function calloutTitle(para: SyntaxNode, from: number, to: number, cx: DocContext): Inline[] {
+  for (let k = para.firstChild; k !== null && k.from < from; k = k.nextSibling) {
+    if (k.to > from) {
+      const text = decodeEntities(unescapeBackslashes(cx.doc.sliceString(from, to).trim()));
+      return text === "" ? [] : [{ kind: "text", text }];
+    }
+  }
+  const title = inlineOf(para, from, to, cx.doc, cx.inline);
+  while (title.length > 0 && title[title.length - 1].kind === "break") title.pop();
+  trimEdges(title);
+  return title;
+}
 
 /** The blocks of a container node (its children minus markers). */
 function children(node: SyntaxNode, cx: DocContext): Block[] {
@@ -631,19 +647,24 @@ export function blockOf(node: SyntaxNode, cx: DocContext): Block | null {
       return { kind: "rule", from, to };
     case "Blockquote": {
       const markerLine = cx.lines.lineOf(from);
-      const m = ALERT.exec(cx.doc.sliceString(from, cx.lines.lineStart(markerLine + 1)));
-      if (m === null) return { kind: "quote", from, to, children: children(node, cx) };
-      // The marker line is the alert's; its content starts on the next line
-      // (a paragraph lezer began on the marker line keeps only its rest).
-      const type = m[1].toLowerCase() as AlertType;
-      const title = decodeEntities(unescapeBackslashes(m[2].trim()));
       const markerEnd = cx.lines.lineStart(markerLine + 1);
+      const m = CALLOUT_MARKER.exec(cx.doc.sliceString(from, markerEnd));
+      if (m === null) return { kind: "quote", from, to, children: children(node, cx) };
+      // The marker line is the callout's; its content starts on the next
+      // line (a paragraph lezer began on the marker line keeps only its
+      // rest, and lends the title its inline nodes).
+      const titleFrom = from + m[0].length;
+      const lineEnd = Math.min(markerEnd, cx.lines.lineStart(markerLine) + cx.lines.lineText(markerLine).length);
+      let title: Inline[] = [];
       const blocks: Block[] = [];
       for (let c = node.firstChild; c !== null; c = c.nextSibling) {
         if (c.from < markerEnd) {
-          if (c.name === "Paragraph" && c.to > markerEnd) {
-            const p = paragraph(c, markerEnd, cx);
-            if (p.kind === "paragraph" && p.inline.length > 0) blocks.push(p);
+          if (c.name === "Paragraph") {
+            if (lineEnd > titleFrom) title = calloutTitle(c, titleFrom, lineEnd, cx);
+            if (c.to > markerEnd) {
+              const p = paragraph(c, markerEnd, cx);
+              if (p.kind === "paragraph" && p.inline.length > 0) blocks.push(p);
+            }
           }
           continue;
         }
@@ -654,8 +675,9 @@ export function blockOf(node: SyntaxNode, cx: DocContext): Block | null {
         kind: "alert",
         from,
         to,
-        type,
-        title: title === "" ? ALERT_TITLES[type] : title,
+        type: calloutLook(m[1]),
+        title: title.length > 0 ? title : [{ kind: "text", text: defaultCalloutTitle(m[1]) }],
+        fold: m[2] as "" | "+" | "-",
         children: blocks,
       };
     }

@@ -16,6 +16,7 @@
 import type { SyntaxNode, Tree, TreeFragment } from "@lezer/common";
 import { htmlRuns, type LinedText } from "./model";
 import { docParser } from "./parser";
+import { CALLOUT_MARKER, calloutLook } from "./callouts";
 import type { DocText } from "../mdTable";
 
 /** What the segment code reads from a document (CodeMirror's `Text`). */
@@ -212,7 +213,6 @@ export interface Shape {
   cls: string;
 }
 
-const ALERT = /^> \[!(note|tip|important|warning|caution)\]/i;
 /** Tags raw HTML may open that keep their margins in the document CSS. */
 const HTML_BLOCK_TAGS = new Set([
   "p", "div", "details", "table", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote",
@@ -270,8 +270,9 @@ export function edgeChain(node: SyntaxNode, doc: LiveDoc, edge: "head" | "tail")
     case "HorizontalRule":
       return [shape("hr")];
     case "Blockquote": {
-      const m = ALERT.exec(doc.sliceString(node.from, Math.min(node.to, node.from + 32)));
-      return [m === null ? shape("blockquote") : shape("div", `markdown-alert markdown-alert-${m[1].toLowerCase()}`)];
+      const m = CALLOUT_MARKER.exec(doc.sliceString(node.from, Math.min(node.to, doc.lineAt(node.from).to)));
+      if (m === null) return [shape("blockquote")];
+      return [shape(m[2] === "" ? "div" : "details", `markdown-alert markdown-alert-${calloutLook(m[1])}`)];
     }
     case "FencedCode": {
       const info = node.getChild("CodeInfo");

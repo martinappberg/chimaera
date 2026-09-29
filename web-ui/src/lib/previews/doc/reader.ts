@@ -41,6 +41,7 @@ import {
   type OutlineEntry,
 } from "./model";
 import { DomTarget, renderFootnotes, renderRun, topLevel, type DomHooks, type EmbedRef, type EmbedSpec } from "./render";
+import { installCalloutStyle, type CalloutFolds } from "./callouts";
 import { DocEmbeds, embedTargets, refKey } from "./embeds";
 
 export type ReaderOptions = HydratorOptions;
@@ -346,6 +347,9 @@ export interface HydratorOptions {
   /** The document's embed answers, shared with its other view so one round
    *  trip serves both; this hydrator's own when absent. */
   embeds?: DocEmbeds;
+  /** The document's callout folds, shared with its other view; folds are
+   *  not remembered when absent (a hover preview's glance). */
+  folds?: CalloutFolds;
 }
 
 /**
@@ -390,6 +394,7 @@ export class Hydrator {
   private readonly nearing: IntersectionObserver | null;
 
   constructor(private readonly opts: HydratorOptions) {
+    installCalloutStyle();
     this.theme = opts.theme;
     this.ownsEmbeds = opts.embeds === undefined;
     this.embeds = opts.embeds ?? new DocEmbeds(opts.docPath, opts.links);
@@ -427,6 +432,13 @@ export class Hydrator {
   settle(fresh: readonly Node[]): void {
     this.highlighter.add(this.fences.splice(0));
     this.math.add(mathSpans(fresh));
+    this.adoptFolds(fresh);
+  }
+
+  /** Give the foldable callouts in freshly drawn `nodes` the document's
+   *  remembered folds — in or out of the page (idempotent). */
+  adoptFolds(nodes: readonly Node[]): void {
+    this.opts.folds?.adopt(nodes);
   }
 
   /** Re-lay out every diagram under `root` for a theme change. */

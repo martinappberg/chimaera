@@ -76,6 +76,7 @@ import {
 import { renderFootnotes, renderRun, topLevel } from "./doc/render";
 import { Hydrator, markTasks } from "./doc/reader";
 import type { DocEmbeds } from "./doc/embeds";
+import type { CalloutFolds } from "./doc/callouts";
 import {
   HeightCache,
   SILENT,
@@ -129,6 +130,8 @@ export interface LiveHost {
   /** The document's embed answers, shared with its reading view (one round
    *  trip serves both); the view keeps its own without. */
   embeds?(): DocEmbeds | null;
+  /** The document's callout folds, shared with its reading view. */
+  folds?(): CalloutFolds | null;
 }
 const defaultHost: LiveHost = { theme: () => "light" };
 export const liveHost = Facet.define<LiveHost, LiveHost>({ combine: (v) => v[0] ?? defaultHost });
@@ -915,12 +918,14 @@ function hydratorFor(view: EditorView): Hydrator {
   if (h === undefined) {
     const host = view.state.facet(liveHost);
     const embeds = host.embeds?.() ?? null;
+    const folds = host.folds?.() ?? null;
     h = new Hydrator({
       docPath: view.state.facet(docPath),
       links: view.state.facet(linkContext),
       theme: host.theme(),
       onLayout: () => view.requestMeasure(),
       ...(embeds !== null ? { embeds } : {}),
+      ...(folds !== null ? { folds } : {}),
     });
     hydrators.set(view, h);
   }
@@ -1058,6 +1063,8 @@ function finish(view: EditorView, root: HTMLElement): void {
   decorateCopyTargets(root);
   for (const img of root.querySelectorAll("img")) img.addEventListener("load", () => view.requestMeasure());
   const h = hydratorFor(view);
+  // Folds now, attached or not: the block's height is its reader twin's.
+  h.adoptFolds([root]);
   // Fences paint and equations typeset once the node is in the page (a
   // detached node is skipped), before CodeMirror measures it.
   queueMicrotask(() => {

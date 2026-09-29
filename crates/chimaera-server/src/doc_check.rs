@@ -788,7 +788,7 @@ impl Checker<'_> {
                 "alert-type",
                 format!(
                     "Alert type [!{name}] is not one GitHub renders (NOTE, TIP, IMPORTANT, \
-                     WARNING, CAUTION); it shows as a plain quote."
+                     WARNING, CAUTION); GitHub shows it as a plain quote."
                 ),
                 format!("Use `> [!{standard}]`."),
             );

@@ -217,7 +217,11 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 - **Content.** User bubbles (right), agent prose (left, markdown), plan/todo panel, permission/
   question cards, inline artifacts — and, between the prose, one family of quiet 12px **activity
   lines** that cluster tight so messages stay the page's voice:
-  - **Thought** — a collapsed reasoning block: "Thought" + a faded first line; click for the text.
+  - **Thought** — a collapsed reasoning block: "Thought" + a faded first line read as plain text
+    (Codex titles each reasoning section in bold — `**Checking the screen**` — so the line is the
+    newest title, the way Codex's own status line reads, and stays put when the row settles); click
+    for the text, rendered as sanitized markdown (paths, hover previews and embeds as in a reply)
+    and mounted only while open.
   - **Tool groups** — a run of tool calls as one line, titled by the agent's own past-tense batch
     label when it offers one (Claude `tool_use_summary`: "Listed files in the workspace"; on by
     default, `chat.toolSummaries`), else readable counts ("Ran 2 commands, read a file"); calls
@@ -313,6 +317,21 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   reveal spans shortly after its fade), because span-fragmented text copies with a hard newline
   at every visual wrap point. Blockquotes render as a quiet accent-washed quote card, distinct
   from code chrome.
+- **Quote part of a reply back to the agent.** Select any text in the transcript — a sentence of a
+  reply, a few table rows, a line of tool output — and a quiet **`>` quote in reply** chip appears at
+  the selection's end (the context bridge's chip; the chord `⇧⌘R` / `Ctrl+Shift+R` does the same).
+  It quotes the selection into **this chat's own** composer as a Markdown blockquote — lines kept,
+  so a table stays rows of cells; control characters become spaces, blank-line runs fold, capped
+  at 8 KB — on its own paragraph after anything already drafted, with the caret below it for the
+  question. Never sent by itself, and never to another agent: a chat that can't take a message
+  (exited, degraded) offers no chip, and one whose agent stopped shows it disabled. A chat mounted
+  twice (the Mastermind dock and a pane) quotes into the composer under the selection. A sent message shows its quoted lines (`>`-led) muted, markers kept, so the
+  question stands apart. Copying a passage and pasting it into a *terminal* agent tags it
+  ` [from <chat> reply] ` (copy provenance). Where: `ChatView.svelte` (publishes the selection,
+  floats `shared/ReferenceChip.svelte` on the chat root — not in the column, whose children the
+  reading anchor walks as a stack; the DOM helpers are `quoteSelection.ts`), `shared/reference.ts` (`ChatSelection`, `composeChatQuote`,
+  `quoteRuns`), `App.svelte` (`refTargetSession`, `referenceSelection`), `composerBus.ts` (the
+  `block` placement) + `composer.ts` (`draftWithInsert`), `UserText.svelte`.
 - **Hydration + history window.** A fresh attach folds replay into the reducer behind one quiet
   "loading recent conversation" state until the advertised journal `head` arrives; it then mounts
   the newest 64 blocks bottom-anchored in one paint, rather than visibly growing from the oldest
@@ -371,7 +390,11 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   Codex change opens, and a directory opens in the Finder). Consecutive calls condense into a
   group ("6 commands · 2 files"). Groups are collapsed by default, including while work is running, and remain
   expandable on demand; the summary badge (`running…` / `failed` / `recovered`) carries the verdict
-  without turning live activity or history into a wall of command rows.
+  without turning live activity or history into a wall of command rows. A failure is `recovered`
+  once a later call in the same turn made up for it — any later successful command for a failed
+  command (a retry rarely repeats the exact line), the same file (else the same title) for other
+  tools — even when reasoning lines split that turn into several groups. Denials never recover;
+  a fold shows only the hard `failed`.
   Tool calls upsert by id (a late enriching re-emit never walks a finished tool back to
   pending); `tool_output_delta` streams live output ahead of the authoritative result, but a late
   delta may only enrich terminal text — it cannot revive the streaming cursor. **Dangling
@@ -691,6 +714,13 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 > skill when a `feat:` ships in this area. **Never** inferred from code. Everything above
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
+
+### Quoting part of a reply back to the agent — why it exists
+_Captured 2026-09-28 from the maintainer, in the session that built it._
+
+- **Why (maintainer, verbatim):** "Can we make it so even in the chat one can refer certain parts of a response (to the current agent)" — asked over a screenshot of part of a reply's table selected in the transcript. "Even in the chat": file views and terminals already had the context bridge's "reference in agent"; the transcript did not.
+- **What the request fixed in scope:** the reference goes to the current agent — the chat the passage was selected in — never to another one.
+- **How settled it is (addition, not a core bet):** "This is just nice UI / UX open to change." The chip, its wording, the blockquote format, the muted quote in sent bubbles and where the quote lands in the draft are all free to improve; nothing here is a do-not-change.
 
 ### The turn-end block — "Written this turn" / "Also written" — why it exists
 _Captured 2026-09-26 from the maintainer's own words in the session that shipped it (PR #171); the settled/open questions are still pending._

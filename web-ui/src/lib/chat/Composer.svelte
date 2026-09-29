@@ -9,6 +9,7 @@
     type ManualComposerHeight,
   } from "./composerHeight";
   import AttachmentStrip from "./AttachmentStrip.svelte";
+  import ComposerMentions from "./ComposerMentions.svelte";
   import ImagePreview from "./ImagePreview.svelte";
   import { registerComposer, registerComposerAttach } from "./composerBus";
   import {
@@ -24,7 +25,15 @@
   import { Dictation, dictationParts, hostCanDictate, joinParts } from "./voice.svelte";
   import { CaptureError, listMicrophones } from "./voiceCapture";
   import VoiceMeter from "./VoiceMeter.svelte";
+  import { uploadChips } from "./uploadChips";
   import {
+    collapseUploadMentions,
+    expandUploadMentions,
+    tokenSpans,
+    type UploadTokens,
+  } from "./uploadTokens";
+  import {
+    draftWithInsert,
     slashChoices as choicesForSlash,
     slashContextAt,
     type ComposerCommand,
@@ -40,6 +49,9 @@
     /** Registers this composer for workbench insert flows (references,
      *  provenance tags) when set. */
     sessionId: string | null;
+    /** The mounting view's token, so an insert meant for this view (a quote
+     *  of its own transcript) finds it when the chat is mounted twice. */
+    view?: object;
     running: boolean;
     disabled: boolean;
     slashCommands: ComposerCommand[];
@@ -69,6 +81,7 @@
 
   let {
     sessionId,
+    view,
     running,
     disabled,
     slashCommands,
@@ -93,7 +106,12 @@
   // it, so the draft must live in the session-keyed module store, not here.
   // svelte-ignore state_referenced_locally
   const savedDraft = sessionId !== null ? loadDraft(sessionId) : { text: "", images: [] };
-  let draft = $state(savedDraft.text);
+  /** A dropped file's mention reads as its name here, where it sits in the
+   *  sentence, and edits as one unit (`uploadTokens.ts`, `uploadChips.ts`);
+   *  the whole mention goes back into every text that leaves the composer —
+   *  the send, a copy, and the saved draft. */
+  const uploadTokens: UploadTokens = new Map();
+  let draft = $state(collapseUploadMentions(savedDraft.text, uploadTokens));
   let images = $state<ImageAttachment[]>(savedDraft.images.slice(0, IMAGE_MAX_ATTACHMENTS));
   let attachmentError = $state<string | null>(null);
 
@@ -127,13 +145,14 @@
   // stores plain data. Reads $state, writes the module map — no read+write
   // loop, no timer.
   $effect(() => {
-    const text = draft;
+    const text = expandUploadMentions(draft, uploadTokens);
     const imgs = $state.snapshot(images);
     if (sessionId === null) return;
     saveDraft(sessionId, text, imgs);
   });
   let el = $state<HTMLTextAreaElement | null>(null);
-  let caret = $state(savedDraft.text.length);
+  // svelte-ignore state_referenced_locally
+  let caret = $state(draft.length);
   let paneHeight = $state(0);
   /** Null follows content; an object remembers the height chosen with the
    *  top-edge grip and how much content it held at that moment. */
@@ -292,15 +311,20 @@
     }
   }
 
-  // Workbench insert flows (selection references, provenance tags) land in
-  // the draft exactly like they would type into a PTY's input — appended,
-  // never submitted.
+  // Workbench insert flows (selection references, provenance tags, quoted
+  // passages) land in the draft exactly like they would type into a PTY's
+  // input — appended, never submitted.
   $effect(() => {
     if (sessionId === null) return;
-    return registerComposer(sessionId, (text) => {
-      draft = draft.length > 0 && !draft.endsWith(" ") ? `${draft} ${text}` : draft + text;
-      focusAt(draft.length);
-    });
+    return registerComposer(
+      sessionId,
+      (inserted, placement) => {
+        const text = collapseUploadMentions(inserted, uploadTokens, draft);
+        draft = draftWithInsert(draft, text, placement);
+        focusAt(draft.length);
+      },
+      view,
+    );
   });
 
   // Workbench attach flow (an image dropped from the OS desktop onto this
@@ -544,8 +568,10 @@
   });
 
   /** The @token under the caret, if any (mention autocomplete). ":" admits
-   *  @term:NAME (linked-terminal grants) alongside file paths. */
+   *  @term:NAME (linked-terminal grants) alongside file paths. A dropped
+   *  file's short form is already a finished mention: nothing to complete. */
   function atToken(): { start: number; text: string } | null {
+    if (tokenSpans(draft, uploadTokens).some((s) => s.end === caret)) return null;
     return caretToken(/(^|\s)(@[\w./:-]*)$/);
   }
 
@@ -650,7 +676,12 @@
     // Directories mention with a trailing slash (the TUI's own convention —
     // it also reads unambiguously as "this folder" in the prompt); a spaced
     // path takes claude's quoted form, like a drag-to-reference drop.
-    replaceToken(composeAgentPathReference(entry.kind === "dir" ? `${entry.rel}/` : entry.rel));
+    const rel = entry.kind === "dir" ? `${entry.rel}/` : entry.rel;
+    const mention = composeAgentPathReference(rel);
+    // A workspace file written exactly like a dropped file's short form
+    // (`@data.csv` beside a dropped data.csv) would be taken for the drop:
+    // name it from the workspace root instead.
+    replaceToken(uploadTokens.has(mention.trim()) ? composeAgentPathReference(`./${rel}`) : mention);
   }
 
   function pickTerm(t: TerminalOption) {
@@ -682,7 +713,7 @@
       if (dictation.state !== "finishing") void finishDictation(true);
       return;
     }
-    const text = draft.trim();
+    const text = expandUploadMentions(draft, uploadTokens).trim();
     if (text.length === 0 && images.length === 0) return;
     // Dialog-only slash commands get native UI, not a dead-end CLI reply;
     // arguments ride along ("/effort high"). Unhandled names fall through
@@ -885,9 +916,11 @@
       onkeydown={resizeWithKeyboard}
       onclick={toggleComposerHeight}
     ></button>
+    <ComposerMentions text={draft} tokens={uploadTokens} field={el} quiet={popover !== null} />
     <textarea
       bind:this={el}
       bind:value={draft}
+      {@attach uploadChips(uploadTokens, trackCaret)}
       onkeydown={onKeydown}
       onkeyup={trackCaret}
       onselect={trackCaret}
@@ -1060,6 +1093,9 @@
   .input-row {
     position: relative;
     display: flex;
+    /* The mention highlights sit under the textarea's (translucent) fill:
+       their layer goes negative inside this row, not under the page. */
+    isolation: isolate;
   }
   /* A top-edge grip is the natural geometry for a bottom-anchored composer:
      dragging up makes room, while click toggles expanded/content-fit.
