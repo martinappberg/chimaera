@@ -494,6 +494,15 @@
     {:else}
       <Spinner />
     {/if}
+  {:else if tab.surface === "sessions"}
+    {@const SessionsView = views.sessions}
+    {#if SessionsView !== undefined}
+      <SessionsView {dash} {sessions} {names} {wsId} {wsRoot} paneId={node.id} {ctrl} visible={active} />
+    {:else if viewErrors.sessions}
+      {@render loadFailure("sessions", "all sessions")}
+    {:else}
+      <Spinner />
+    {/if}
   {:else if tab.surface === "browser"}
     {@const BrowserView = views.browser}
     {#if BrowserView !== undefined}

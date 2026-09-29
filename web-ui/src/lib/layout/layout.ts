@@ -81,6 +81,11 @@ export interface KnowledgeTab {
 export interface PluginsTab {
   surface: "plugins";
 }
+/** All sessions: every past session of the workspace (its history), opened
+ *  from the rail's Recents — a singleton view. */
+export interface SessionsTab {
+  surface: "sessions";
+}
 /**
  * A review of the files ONE session changed — a session-scoped changes list
  * built on the same git status/diff APIs as the source-control panel. Keyed by
@@ -119,6 +124,7 @@ export type Tab =
   | TimelineTab
   | KnowledgeTab
   | PluginsTab
+  | SessionsTab
   | BrowserTab;
 
 /** Identity key for the no-duplicates invariant (one tab per surface). */
@@ -136,6 +142,7 @@ export function tabKey(t: Tab): string {
   if (t.surface === "timeline") return "v:timeline";
   if (t.surface === "knowledge") return "v:knowledge";
   if (t.surface === "plugins") return "v:plugins";
+  if (t.surface === "sessions") return "v:sessions";
   if (t.surface === "changes") return `changes:${t.sessionId}`;
   // `w:` (web) — its own namespace beside the Finder's `d:` and diff's `g:`.
   if (t.surface === "browser") return `w:${t.id}`;
@@ -578,6 +585,11 @@ export function openKnowledge(l: Layout): Layout {
 /** Open (or focus) the Plugins tab. */
 export function openPlugins(l: Layout): Layout {
   return openTab(l, { surface: "plugins" });
+}
+
+/** Open (or focus) All sessions. */
+export function openSessionsList(l: Layout): Layout {
+  return openTab(l, { surface: "sessions" });
 }
 
 /** Open (or focus) the session-scoped changes review. */
@@ -1327,6 +1339,7 @@ function serNode(node: LayoutNode): SNode {
         if (t.surface === "timeline") return { v: "timeline" };
         if (t.surface === "knowledge") return { v: "knowledge" };
         if (t.surface === "plugins") return { v: "plugins" };
+        if (t.surface === "sessions") return { v: "sessions" };
         if (t.surface === "changes") return { cs: t.sessionId };
         if (t.surface === "browser") return { w: t.host, wo: t.port, wi: t.id, wp: t.path };
         return { v: "settings" };
@@ -1392,6 +1405,8 @@ function deserNode(
         tab = { surface: "knowledge" };
       } else if (t.v === "plugins") {
         tab = { surface: "plugins" };
+      } else if (t.v === "sessions") {
+        tab = { surface: "sessions" };
       } else if (typeof t.cs === "string" && t.cs.length > 0) {
         tab = { surface: "changes", sessionId: t.cs };
       } else if (

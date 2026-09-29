@@ -157,6 +157,7 @@
     openTimeline,
     openKnowledge,
     openPlugins,
+    openSessionsList,
     openGit,
     openSession,
     openSettings,
@@ -356,6 +357,8 @@
   import { focusOnMount } from "./lib/shared/focusOnMount";
   import Launcher from "./lib/workspace/Launcher.svelte";
   import SessionGlyph from "./lib/shared/SessionGlyph.svelte";
+  import SameFileChip from "./lib/workspace/SameFileChip.svelte";
+  import { nudgeHistory, sameFileOverlaps } from "./lib/workspace/history";
   import QuickOpen from "./lib/workspace/QuickOpen.svelte";
   import FileTree from "./lib/workspace/FileTree.svelte";
   import SplitTree from "./lib/layout/SplitNode.svelte";
@@ -403,6 +406,9 @@
   let lastRecentsEpoch: number | null = null;
   let workspaces = $state<Workspace[]>([]);
   let sessions = $state<Session[]>([]);
+  /** Live agent sessions that wrote a file another live session also wrote
+   *  (the rail's quiet "same file" chip). */
+  const sameFile = $derived(sameFileOverlaps(sessions));
   /** Sessions whose shell provably sits at its OSC 133 prompt AND isn't
    *  running anything via the exec engine — the set predictive local echo
    *  may arm for. Recomputed per sessions snapshot (a few times a minute)
@@ -1236,6 +1242,7 @@
     onOpenTimeline: openTimelineSurface,
     onOpenKnowledge: openKnowledgeSurface,
     onOpenExtensions: openPluginsSurface,
+    onOpenSessions: openSessionsSurface,
   });
 
   /**
@@ -1598,6 +1605,8 @@
         if (lastRecentsEpoch !== epoch) {
           lastRecentsEpoch = epoch;
           refreshRecents();
+          // A session ended: the history surfaces refetch while visible.
+          nudgeHistory();
         }
       },
       onFs: notifyDiskChange,
@@ -3211,6 +3220,14 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
+  /** Open/focus All sessions (the Recents header, the dashboard's usage
+   *  line, quick-open). */
+  function openSessionsSurface(): void {
+    if (activeWsId === null || !layoutReady) return;
+    layout = openSessionsList(layout);
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
   /** Open/focus the workspace Timeline (dashboard link, quick-open). */
   function openTimelineSurface(): void {
     if (activeWsId === null || !layoutReady) return;
@@ -3239,6 +3256,13 @@
    *  "skills" still find). */
   const quickOpenCommands = [
     { id: "timeline", label: "Timeline", hint: "what happened", run: openTimelineSurface },
+    {
+      id: "sessions",
+      label: "All sessions",
+      aliases: ["history", "cost", "usage"],
+      hint: "every past session",
+      run: openSessionsSurface,
+    },
     { id: "knowledge", label: "Knowledge", hint: "what we know", run: openKnowledgeSurface },
     {
       id: "plugins",
@@ -4861,6 +4885,13 @@
                            the chat header owns the controls. -->
                       <span class="remote-badge" title="Remote Control on — pick this session up in the Claude app or at claude.ai/code">remote</span>
                     {/if}
+                    {#if s.kind === "agent" && sameFile.has(s.id)}
+                      <SameFileChip
+                        overlaps={sameFile.get(s.id) ?? []}
+                        nameOf={(id) => displayNames.get(id) ?? sessionsById.get(id)?.name ?? id}
+                        wsRoot={workspace?.root ?? null}
+                      />
+                    {/if}
                   </span>
                   <!-- Second line only when it adds something over the name.
                        Shells never do: the name already resolves to the title
@@ -5035,6 +5066,8 @@
           <div class="recents" class:expanded={recentsExpanded}>
             <div class="recents-head">
               <span>recent</span>
+              <!-- Every past session (history), beside the last 20. -->
+              <button class="recents-more recents-all" title="every past session in this workspace — date, cost, what changed" onclick={openSessionsSurface}>all sessions</button>
               {#if recentsExpanded || visibleRecents.length > recentsFit}
                 <!-- In the header, not below the rows: on a short column the
                      rows may sit under the fold, the header never does. -->
@@ -6558,6 +6591,13 @@
     transition:
       color 0.12s ease,
       background-color 0.12s ease;
+  }
+
+  .recents-all {
+    margin-left: auto;
+  }
+  .recents-all + .recents-more {
+    margin-left: 8px;
   }
 
   .recents-more:hover {

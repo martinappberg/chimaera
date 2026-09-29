@@ -412,8 +412,13 @@ pub(crate) async fn get_usage_csv(
     }
 }
 
+/// Dollars as the UI writes them: unknown is "—", a sub-cent spend "<$0.01".
 fn money(v: Option<f64>) -> String {
-    v.map_or("—".to_string(), |c| format!("${c:.2}"))
+    match v {
+        None => "—".to_string(),
+        Some(c) if c > 0.0 && c < 0.01 => "<$0.01".to_string(),
+        Some(c) => format!("${c:.2}"),
+    }
 }
 
 fn count(v: Option<u64>) -> String {

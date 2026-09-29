@@ -37,6 +37,8 @@ export interface DashCtx {
   onOpenTimeline: () => void;
   onOpenKnowledge: () => void;
   onOpenExtensions: () => void;
+  /** Open/focus All sessions (the usage line's way in). */
+  onOpenSessions?: () => void;
 }
 
 /**

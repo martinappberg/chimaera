@@ -12,6 +12,7 @@
   import { displayName, type Session } from "./sessions";
   import type { LayoutCtrl } from "../layout/dnd";
   import FileIcon from "../shared/FileIcon.svelte";
+  import SessionEdits from "./SessionEdits.svelte";
 
   /**
    * Session-scoped changes review: the files THIS agent touched (its
@@ -125,13 +126,27 @@
           <span class="name">{rel(path)}</span>
           {#if deco !== null}
             <span class="badge" style:color={deco.color} title={deco.label}>{deco.letter}</span>
-          {:else}
+          {:else if status !== null}
             <span class="badge quiet" title="no current git change">·</span>
           {/if}
         </button>
       {/each}
     </div>
   {/if}
+
+  <!-- The session's commits ("N commits") land here once Part 1's
+       GET /api/v1/sessions/{id}/git is wired in. -->
+
+  <!-- Its own edits, per file, in order — with or without git. -->
+  <div class="edits-wrap">
+    <SessionEdits
+      sessionId={session.id}
+      wsId={session.workspace_id}
+      {wsRoot}
+      refreshKey={session.files_touched?.length ?? 0}
+      onOpenFile={(p, e) => ctrl.openFileFrom(paneId, p, e.metaKey || e.ctrlKey)}
+    />
+  </div>
 </div>
 
 <style>
@@ -140,6 +155,8 @@
     display: flex;
     flex-direction: column;
     min-height: 0;
+    overflow-y: auto;
+    scrollbar-width: thin;
     background: var(--bg);
     color: var(--fg);
   }
@@ -150,6 +167,10 @@
     gap: 10px;
     padding: 8px 14px;
     border-bottom: 1px solid var(--edge);
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--bg);
   }
   .title {
     font-weight: 600;
@@ -179,11 +200,11 @@
     font-size: var(--text-sm);
   }
   .list {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-    scrollbar-width: thin;
     padding: 6px 8px;
+  }
+  .edits-wrap {
+    padding: 10px 14px 18px;
+    border-top: 1px solid var(--edge);
   }
   .row {
     display: flex;
