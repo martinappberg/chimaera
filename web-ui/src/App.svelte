@@ -373,6 +373,7 @@
   import { focusOnMount } from "./lib/shared/focusOnMount";
   import Launcher from "./lib/workspace/Launcher.svelte";
   import SessionGlyph from "./lib/shared/SessionGlyph.svelte";
+  import BranchChip from "./lib/shared/BranchChip.svelte";
   import { archiveRecents, nudgeHistory, unarchiveRecents } from "./lib/workspace/history";
   import { sameFile, setSameFileOpener } from "./lib/workspace/sameFile.svelte";
   import { requestSettingsSection } from "./lib/settings/jump";
@@ -727,8 +728,7 @@
     if (pitch <= 0) return;
     // The last row needs no trailing gap: a box exactly N rows tall fits N.
     const gap = pitch - first.offsetHeight;
-    // One row of the box is the "All sessions" link at the list's end.
-    const fit = Math.max(RECENTS_MIN_ROWS, Math.floor((el.clientHeight + gap) / pitch)) - 1;
+    const fit = Math.max(RECENTS_MIN_ROWS, Math.floor((el.clientHeight + gap) / pitch));
     if (fit !== recentsFit) recentsFit = fit;
   }
   $effect(() => {
@@ -5119,6 +5119,12 @@
                 >
                   <span class="name">
                     {displayNames.get(s.id) ?? displayName(s)}
+                    {#if s.kind === "agent" && s.git && s.git.worktree !== s.git.repo}
+                      <!-- Only an agent working in a separate worktree gets a
+                           mark: its branch, quiet, after the name (the name
+                           keeps the width). The main checkout shows nothing. -->
+                      <span class="wt-mark"><BranchChip git={s.git} /></span>
+                    {/if}
                     {#if s.kind === "agent" && s.remote_control_url}
                       <!-- Remote Control is on: this session is reachable from
                            the Claude app / claude.ai/code. Quiet accent pill;
@@ -5309,6 +5315,7 @@
               }}
             >
               <span>recent</span>
+              <span class="recents-actions">
               {#if recentsExpanded || visibleRecents.length > recentsFit}
                 <!-- In the header, not below the rows: on a short column the
                      rows may sit under the fold, the header never does. -->
@@ -5322,6 +5329,41 @@
                   {recentsExpanded ? "show less" : `all ${visibleRecents.length}`}
                 </button>
               {/if}
+              <!-- Every past session, beyond these: revealed while the
+                   pointer is over Recents (always on touch), and in ⌘P. -->
+              <button
+                class="recents-history"
+                title="All sessions — every past session in this workspace"
+                aria-label="All sessions"
+                onclick={openSessionsSurface}
+              >
+                <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+                  <path
+                    d="M2.6 8a5.4 5.4 0 1 0 1.6-3.85"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linecap="round"
+                  />
+                  <path
+                    d="M2.2 2.6v2.6h2.6"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                  <path
+                    d="M8 5.2v3l2 1.3"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </button>
+              </span>
             </div>
             <div class="recents-list" class:expanded={recentsExpanded} bind:this={recentsListEl}>
               {#each recentsExpanded ? visibleRecents : visibleRecents.slice(0, recentsFit) as r (r.key)}
@@ -5347,10 +5389,6 @@
               {:else if visibleRecents.length === 0}
                 <div class="recents-note">No recent conversations</div>
               {/if}
-              <!-- Every past session (history), beyond the last 20: a quiet
-                   link at the end of the list, one row tall (the fit
-                   reserves it — measureRecents). -->
-              <button class="recents-all" title="every past session in this workspace" onclick={openSessionsSurface}>All sessions</button>
             </div>
           </div>
         {/if}
@@ -6502,6 +6540,11 @@
     font-family: var(--mono);
     font-size: var(--text-sm);
   }
+  /* An agent in a separate worktree: its branch after the name, quiet. */
+  .wt-mark {
+    margin-left: 0.4rem;
+    opacity: 0.85;
+  }
 
   .title {
     font-size: var(--text-xs);
@@ -6901,24 +6944,46 @@
     text-underline-offset: 2px;
   }
 
-  .recents-all {
-    flex: none;
+  .recents-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  /* All sessions: a quiet history mark, shown while the pointer is over
+     Recents or a key focuses it, and always where there is no hover. */
+  .recents-history {
     appearance: none;
     border: none;
     background: none;
-    display: flex;
+    display: inline-flex;
     align-items: center;
-    height: var(--recent-row-h);
-    padding: 0 8px;
-    border-radius: 5px;
-    font: inherit;
-    font-size: var(--text-xs);
+    justify-content: center;
+    margin: -2px -4px -2px 0;
+    padding: 2px 4px;
+    border-radius: 4px;
     color: var(--muted);
     cursor: pointer;
-    transition: color 0.12s ease;
+    opacity: 0;
+    transition:
+      opacity 0.12s ease,
+      color 0.12s ease;
   }
-  .recents-all:hover {
+  .recents:hover .recents-history,
+  .recents-history:focus-visible {
+    opacity: 0.9;
+  }
+  .recents-history:hover {
+    opacity: 1;
     color: var(--fg);
+    background: var(--row-hover);
+  }
+  .recents-history:focus-visible {
+    outline: 1px solid var(--focus-ring);
+  }
+  @media (hover: none) {
+    .recents-history {
+      opacity: 0.9;
+    }
   }
 
   .recents-more:hover {

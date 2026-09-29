@@ -310,24 +310,37 @@
     }
   }
 
+  /** The worktree whose removal is being confirmed inline (its path). The
+   *  confirmation lives in the row itself: the native app's web view has no
+   *  `window.confirm` (it silently answers "no"), and an inline question is
+   *  quieter than a dialog anyway. */
+  let confirmingRemove = $state<string | null>(null);
+
   async function remove(wt: GitWorktree): Promise<void> {
     if (busy || wsId === null) return;
-    // Removal deletes a working tree — a real confirm, with the branch named.
-    if (!confirm(`Remove the worktree for "${wt.branch ?? wt.path}"?\n\nThe branch is kept; only this checkout is deleted.`)) {
-      return;
-    }
     busy = true;
     actionError = null;
     try {
       await removeWorktree(wsId, wt.path, false, repo ?? undefined);
+      confirmingRemove = null;
       notifyWorkspacesChanged();
       refreshGit();
     } catch (e) {
+      confirmingRemove = null;
       actionError = e instanceof Error ? e.message : "failed to remove the worktree";
     } finally {
       busy = false;
     }
   }
+
+  /** A worktree's folder name, only when it says something the branch name
+   *  doesn't (chimaera names its worktrees after their branch). */
+  function folderIfDifferent(wt: GitWorktree): string | null {
+    const branch = wt.branch ?? "";
+    if (branch !== "" && (wt.path === branch || wt.path.endsWith(`/${branch}`))) return null;
+    return baseName(wt.path);
+  }
+
 </script>
 
 {#if dubiousPath}
@@ -467,11 +480,14 @@
             onclick={(e) => openBranch(e, b.wt, b.main)}
           >
             <span class="wt-branch" class:detached={b.wt.detached}>{branchName(b.wt)}</span>
-            {#if !b.main}<span class="wt-folder">{baseName(b.wt.path)}</span>{/if}
+            {#if !b.main}
+              {@const folder = folderIfDifferent(b.wt)}
+              {#if folder !== null}<span class="wt-folder">{folder}</span>{/if}
+            {/if}
             {#if !b.main && ahead > 0 && mainBranch}
               <span class="wt-note">{ahead} ahead of {mainBranch}</span>
             {/if}
-            {#if removable && b.wt.merged}<span class="wt-note">merged</span>{/if}
+            {#if removable && b.wt.merged && confirmingRemove !== b.wt.path}<span class="wt-note">merged</span>{/if}
           </button>
           {#each b.sessions as s (s.id)}
             <button
@@ -486,12 +502,27 @@
                that is neither the current one nor holding sessions. A merged
                one keeps the action visible — it's done. -->
           {#if removable}
-            <button
-              class="wt-remove"
-              class:offered={b.wt.merged === true}
-              title="remove this worktree (the branch is kept)"
-              disabled={busy}
-              onclick={() => void remove(b.wt)}>Remove worktree</button>
+            {#if confirmingRemove === b.wt.path}
+              <span class="wt-confirm" role="group" aria-label="Remove this worktree? The branch stays.">
+                <span class="wt-confirm-q">Remove?</span>
+                <button
+                  class="wt-remove offered strong"
+                  title="delete this worktree's folder — the branch stays"
+                  disabled={busy}
+                  onclick={() => void remove(b.wt)}>Remove</button>
+                <button class="wt-remove offered" disabled={busy} onclick={() => (confirmingRemove = null)}>Keep</button>
+              </span>
+            {:else}
+              <button
+                class="wt-remove"
+                class:offered={b.wt.merged === true}
+                title="remove this worktree's folder (the branch is kept)"
+                disabled={busy}
+                onclick={() => {
+                  actionError = null;
+                  confirmingRemove = b.wt.path;
+                }}>Remove worktree</button>
+            {/if}
           {/if}
         </div>
       {/each}
@@ -762,6 +793,19 @@
   .wt-remove:focus-visible {
     opacity: 1;
     outline: 1px solid var(--focus-ring);
+  }
+  .wt-remove.strong {
+    color: var(--fg);
+  }
+  .wt-confirm {
+    flex: none;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.35rem;
+    font-size: var(--text-xs);
+  }
+  .wt-confirm-q {
+    color: var(--muted);
   }
 
   .wt-more,

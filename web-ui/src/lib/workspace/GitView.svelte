@@ -17,6 +17,7 @@
     gitRevealRepo,
     repoForPath,
     gitRepoError,
+    gitLoaded,
     gitRepos,
     gitReposCapped,
     gitRepoStatuses,
@@ -424,11 +425,15 @@
         <div class="trunc">More repositories than listed — the rest appear as you open their folders.</div>
       {/if}
     {:else if status === null}
-      <div class="empty">
-        {wsId === null
-          ? "Open a workspace to see its git state."
-          : "This folder isn’t a git repository."}
-      </div>
+      <!-- Calm loading: nothing until the first answer arrives, so a repo
+           never flashes "isn't a git repository" while it loads. -->
+      {#if wsId === null || $gitLoaded}
+        <div class="empty">
+          {wsId === null
+            ? "Open a workspace to see its git state."
+            : "This folder isn’t a git repository."}
+        </div>
+      {/if}
     {:else}
       <GitRepoSection
         {wsId}

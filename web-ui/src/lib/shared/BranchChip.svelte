@@ -15,7 +15,14 @@
   let { git, onOpen }: Props = $props();
 
   const label = $derived(branchLabel(git));
-  const folder = $derived(git.worktree !== git.repo ? baseName(git.worktree) : null);
+  /** The worktree's folder, only when it says something the branch name
+   *  doesn't (chimaera names its worktrees after their branch). */
+  const folder = $derived(
+    git.worktree === git.repo ||
+      (git.branch !== null && git.branch !== "" && git.worktree.endsWith(`/${git.branch}`))
+      ? null
+      : baseName(git.worktree),
+  );
   const tip = $derived(
     git.worktree === git.repo
       ? git.repo

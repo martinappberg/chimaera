@@ -467,6 +467,11 @@ const repoStatusesStore = writable<Map<string, GitStatus>>(new Map());
  *  is `gitStatus`). */
 export const gitRepoStatuses: Readable<Map<string, GitStatus>> = repoStatusesStore;
 
+const loadedStore = writable(false);
+/** The active workspace's first git answer has arrived: until then a null
+ *  status means "not loaded yet", never "not a repository". */
+export const gitLoaded: Readable<boolean> = loadedStore;
+
 const gitEnvStore = writable<GitEnv | null>(null);
 /**
  * The daemon's resolved git binary + version. Tracked independently of `repo`
@@ -551,6 +556,7 @@ let primaryTop: string | null = null;
 export async function activateGitWorkspace(wsId: string | null): Promise<void> {
   if (wsId === currentWs) return;
   currentWs = wsId;
+  loadedStore.set(false);
   statusStore.set(null);
   worktreesStore.set([]);
   reposStore.set([]);
@@ -590,10 +596,12 @@ async function refresh(wsId: string, probe = false): Promise<void> {
       lastRepoEpochs.set(primaryTop, status.repo_epoch);
     }
     if (repos !== null) applyRepos(wsId, repos);
+    loadedStore.set(true);
   } catch {
     if (currentWs === wsId && seq === refreshSeq) {
       statusStore.set(null);
       worktreesStore.set([]);
+      loadedStore.set(true);
     }
   }
 }
