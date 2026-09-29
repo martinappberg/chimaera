@@ -1487,8 +1487,10 @@ async fn scoped_events(mut socket: WebSocket, state: Arc<AppState>, scope: Socke
                     if let Ok(ClientMessage::Watch {workspace_id, files: mut wanted_files, mut dirs}) = serde_json::from_str(&text) {
                         if workspace_id.as_deref().is_some_and(|id| id != scope.workspace_id) { return; }
                         if let Some(alias)=&alias { for path in wanted_files.iter_mut().chain(dirs.iter_mut()) { *path=alias.input(path); } }
-                        let paths = wanted_files.iter().chain(dirs.iter()).cloned().collect();
-                        if scope.paths(&state,paths).await.is_err() || scope.validate(&state).is_err() { return; }
+                        // A path this viewer may not read is dropped, never a
+                        // reason to close: its window watches that one itself.
+                        let (wanted_files, dirs) = readable_watch(&state, &scope, wanted_files, dirs).await;
+                        if scope.validate(&state).is_err() { scope_changed(&mut socket).await; return; }
                         files.set(wanted_files,dirs);
                         tokio::time::sleep(EVENTS_THROTTLE).await;
                     }
@@ -1499,6 +1501,32 @@ async fn scoped_events(mut socket: WebSocket, state: Arc<AppState>, scope: Socke
             },
         }
     }
+}
+
+/// The part of a scoped window's watch registration its viewer may read.
+async fn readable_watch(
+    state: &AppState,
+    scope: &SocketScope,
+    files: Vec<String>,
+    dirs: Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    let split = files.len();
+    let paths: Vec<String> = files.into_iter().chain(dirs).collect();
+    let readable = scope
+        .readable(state, paths.clone())
+        .await
+        .unwrap_or_default();
+    let mut kept = (Vec::new(), Vec::new());
+    for (index, path) in paths.into_iter().enumerate() {
+        if readable.get(index) == Some(&true) {
+            if index < split {
+                kept.0.push(path);
+            } else {
+                kept.1.push(path);
+            }
+        }
+    }
+    kept
 }
 
 /// Minimum gap between snapshot frames (<= 4/s). Also the reuse window of
@@ -1515,8 +1543,9 @@ const FEED_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// How the local watchers must change for the watched project.
 enum LocalWatch {
-    /// The project runs elsewhere: its owner's feed replaces local watching.
-    Park,
+    /// The project runs elsewhere: its owner's feed replaces local watching
+    /// of the project's own paths; the window's other paths stay watched here.
+    Park(Vec<String>, Vec<String>),
     /// The project is local again: resume watching it here.
     Restore(String, Vec<String>, Vec<String>),
 }
@@ -1586,6 +1615,12 @@ impl ProjectView {
             return Some(restore);
         }
         let parked = !std::mem::replace(&mut self.remote, true);
+        let park = parked.then(|| {
+            LocalWatch::Park(
+                state.session_proxy.outside_project(workspace, files),
+                state.session_proxy.outside_project(workspace, dirs),
+            )
+        });
         if self.feed.is_none()
             && self
                 .retry_at
@@ -1599,7 +1634,7 @@ impl ProjectView {
                 dirs.clone(),
             ));
         }
-        parked.then_some(LocalWatch::Park)
+        park
     }
     async fn next(&mut self) -> Option<crate::session_proxy::FeedFrame> {
         match self.feed.as_mut() {
@@ -1773,11 +1808,21 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
                             .as_deref()
                             .is_some_and(|w| state.session_proxy.routed(w));
                         if routed {
-                            // The owner's feed replaces local watching for a
-                            // project that runs elsewhere.
+                            // The owner's feed replaces local watching of a
+                            // project that runs elsewhere; this computer's own
+                            // files outside it (an upload, a note in the home
+                            // folder) are still watched here.
                             let _ = project.reconcile(&state);
                             watch.set(None);
-                            fs_watch.set(Vec::new(), Vec::new());
+                            let workspace = workspace_id.as_deref().unwrap_or_default();
+                            let outside_files = state.session_proxy.outside_project(workspace, &files);
+                            let outside_dirs = state.session_proxy.outside_project(workspace, &dirs);
+                            if fs_watch.set(outside_files, outside_dirs) {
+                                let changes = fs_watch.poll(false).await;
+                                if send_fs_changes(&mut socket, changes).await.is_err() {
+                                    return;
+                                }
+                            }
                         } else {
                             project.stop_feed();
                             project.remote = false;
@@ -1802,9 +1847,9 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         // A registration or an owner change may have moved the watched project
         // between this daemon and another machine.
         match project.reconcile(&state) {
-            Some(LocalWatch::Park) => {
+            Some(LocalWatch::Park(files, dirs)) => {
                 watch.set(None);
-                fs_watch.set(Vec::new(), Vec::new());
+                fs_watch.set(files, dirs);
             }
             Some(LocalWatch::Restore(workspace, files, dirs)) => {
                 watch.set(Some(workspace));

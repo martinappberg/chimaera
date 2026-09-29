@@ -911,6 +911,107 @@ async fn events_for_a_routed_project_merge_only_its_frames_and_survive_an_owner_
     }
 }
 
+/// A routed window with one tab outside the project (an upload, a note in the
+/// home folder) keeps hearing about both: the project's file from its owner,
+/// the outside file from this computer. The owner never sees the outside
+/// path, and never closes the feed over it.
+#[tokio::test]
+async fn a_routed_window_with_an_outside_tab_hears_owner_and_local_changes() {
+    let remote = test_state();
+    let local = test_state();
+    let workspace = lock(&remote.workspaces)
+        .add(test_dir("mixed-remote").canonicalize().unwrap())
+        .unwrap();
+    let mut viewing = workspace.clone();
+    viewing.root = test_dir("mixed-local").canonicalize().unwrap();
+    lock(&local.workspaces)
+        .import_exact(viewing.clone())
+        .unwrap();
+    let note = workspace.root.join("note.txt");
+    std::fs::write(&note, "v0").unwrap();
+    let outside = test_dir("mixed-outside")
+        .canonicalize()
+        .unwrap()
+        .join("mine.txt");
+    std::fs::write(&outside, "v0").unwrap();
+    pro::install_execution_fixture(&remote, &workspace.id, 4).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = listener.local_addr().unwrap();
+    let router = app(remote.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    assert_eq!(
+        request(
+            &local,
+            Method::POST,
+            "/api/v1/pro/placements",
+            Some(serde_json::json!({
+                "host_id":"worker-mixed","endpoint":format!("http://{remote_addr}"),
+                "token":"test-token","workspace_id":workspace.id,"epoch":4
+            })),
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    let router = app(local.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{local_addr}/ws/events"))
+        .await
+        .unwrap();
+    socket
+        .send(Message::Text(
+            serde_json::json!({"type":"auth","token":"test-token"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let viewer_note = viewing.root.join("note.txt").to_string_lossy().into_owned();
+    let outside_path = outside.to_string_lossy().into_owned();
+    socket
+        .send(Message::Text(
+            serde_json::json!({"type":"watch","workspace_id":workspace.id,
+                "files":[viewer_note, outside_path],"dirs":[]})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let (mut owner_seen, mut local_seen) = (false, false);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut writes = 0;
+    while !(owner_seen && local_seen) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "owner change seen: {owner_seen}, local change seen: {local_seen}"
+        );
+        writes += 1;
+        std::fs::write(&note, format!("v{writes}")).unwrap();
+        std::fs::write(&outside, format!("v{writes}")).unwrap();
+        let wait = tokio::time::Instant::now() + std::time::Duration::from_millis(700);
+        while let Ok(Some(Ok(Message::Text(text)))) =
+            tokio::time::timeout_at(wait, futures::StreamExt::next(&mut socket)).await
+        {
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_ne!(frame["type"], "error", "{frame}");
+            if frame["type"] != "fs" {
+                continue;
+            }
+            for path in frame["files"].as_array().unwrap() {
+                owner_seen |= path == viewer_note.as_str();
+                local_seen |= path == outside_path.as_str();
+            }
+        }
+    }
+    for state in [&remote, &local] {
+        state
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// An in-process stand-in for the account transport in front of a real
 /// daemon: while "asleep" it answers health for the owner (marked sleeping)
 /// and refuses socket upgrades that carry no interaction, exactly as the

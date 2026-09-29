@@ -141,6 +141,10 @@ pub(crate) struct SocketOptions {
     #[serde(default)]
     pub wake: Option<String>,
 }
+/// Whether `path` names the project folder `root` or something in it.
+fn inside(root: &std::path::Path, path: &str) -> bool {
+    std::path::Path::new(path).starts_with(root)
+}
 fn valid_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -316,6 +320,22 @@ impl Store {
             .routes
             .values()
             .any(|route| route.workspaces.contains_key(workspace))
+    }
+    /// The paths of a window watching `workspace` that its owner cannot see:
+    /// everything outside the project's folder on this computer (a pasted
+    /// upload, a note in the home folder, a download). This computer keeps
+    /// watching those itself while the project's own paths come from the
+    /// owner. Every path when the project is not routed.
+    pub(crate) fn outside_project(&self, workspace: &str, paths: &[String]) -> Vec<String> {
+        let root = crate::lock(&self.inner)
+            .routes
+            .values()
+            .find_map(|route| route.roots.get(workspace).cloned());
+        paths
+            .iter()
+            .filter(|path| root.as_ref().is_none_or(|root| !inside(root, path)))
+            .cloned()
+            .collect()
     }
     fn for_workspace(&self, workspace: &str) -> Option<Route> {
         crate::lock(&self.inner)
@@ -1788,8 +1808,16 @@ async fn feed(
     let auth = json!({"type":"auth","token":route.token,"workspace_id":workspace,
         "epoch":epoch,"viewer_root":"L3Byb2plY3Q"});
     bounded_send(&mut upstream, Up::Text(auth.to_string().into())).await?;
+    // Only the project's own paths go to its owner; the window's daemon
+    // watches the rest (see `Store::outside_project`).
     let registration = |(files, dirs): &(Vec<String>, Vec<String>)| {
-        let map = |paths: &[String]| paths.iter().map(|p| alias.input(p)).collect::<Vec<_>>();
+        let map = |paths: &[String]| {
+            paths
+                .iter()
+                .filter(|path| inside(&alias.viewer, path))
+                .map(|path| alias.input(path))
+                .collect::<Vec<_>>()
+        };
         json!({"type":"watch","workspace_id":workspace,"files":map(files),"dirs":map(dirs)})
     };
     let initial = registration(&paths.borrow_and_update());
@@ -2214,6 +2242,36 @@ mod tests {
         assert!(!store.current(&store.for_workspace("w-b").unwrap(), "w-z"));
     }
 
+    #[test]
+    fn only_a_routed_projects_own_paths_leave_this_computer() {
+        let store = Store::default();
+        let paths = vec![
+            "/Users/me/project".to_owned(),
+            "/Users/me/project/src/a.rs".to_owned(),
+            "/Users/me/project-notes/b.md".to_owned(),
+            "/tmp/upload.png".to_owned(),
+        ];
+        assert_eq!(store.outside_project("w-split", &paths), paths);
+        store
+            .register(
+                Registration {
+                    host_id: "worker-split".into(),
+                    endpoint: "http://127.0.0.1:1234".into(),
+                    token: "fixture".into(),
+                    workspace_id: "w-split".into(),
+                    epoch: 1,
+                },
+                "/Users/me/project".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.outside_project("w-split", &paths),
+            vec![
+                "/Users/me/project-notes/b.md".to_owned(),
+                "/tmp/upload.png".to_owned()
+            ]
+        );
+    }
     #[test]
     fn a_tunnel_rebind_is_not_a_move_but_a_new_owner_is() {
         let store = Store::default();
