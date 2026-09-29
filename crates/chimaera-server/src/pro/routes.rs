@@ -302,9 +302,16 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     // stay fenced. Sessions a transfer stopped continue here.
     let device = !execution::worker(&state);
     lock(&state.pro.release_pending).clear();
-    let returned: Vec<String> = {
+    let mut dropped = Vec::new();
+    let mut returned: Vec<String> = {
         let mut ownership = lock(&state.pro.ownership);
-        ownership.retain(|_, owner| !matches!(owner, Ownership::Local { .. }));
+        ownership.retain(|id, owner| {
+            let local = matches!(owner, Ownership::Local { .. });
+            if local {
+                dropped.push(id.clone());
+            }
+            !local
+        });
         let mut returned = Vec::new();
         for (id, owner) in ownership.iter_mut() {
             match owner {
@@ -323,6 +330,23 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     };
     if let Err(error) = super::persist(&state).await {
         return failure(error);
+    }
+    if device {
+        // A project this computer owned can still hold sessions that were
+        // due to resume: a return's resume still in flight (one resumer per
+        // session, `ledger::resume_one`), or a verified grant's that
+        // `stop_tasks` just aborted. No owner is left to resume them, so they
+        // resume here now, as that resume would have (an uncertain
+        // continuation stays deferred, as it would there).
+        let waiting: std::collections::HashSet<String> = lock(&state.deferred_sessions)
+            .values()
+            .map(|entry| entry.workspace_id.clone())
+            .collect();
+        returned.extend(
+            dropped
+                .into_iter()
+                .filter(|id| waiting.contains(id) && execution::resume_allowed(&state, id)),
+        );
     }
     if device && !returned.is_empty() {
         let owner = state.clone();

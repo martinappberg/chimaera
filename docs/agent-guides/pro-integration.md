@@ -26,7 +26,11 @@ violates one is a defect regardless of tests.
   because the privacy switch was used, or because the daemon restarted. Local
   execution is fenced only after a *verified* newer owner exists, and then at a
   safe pause. Publication (mirror writes) is what an unreachable account fences.
-  Plain shells are never managed processes.
+  Plain shells are never managed processes. Sign-out and boot never leave a
+  returned session deferred: a sign-out that cuts a return's resume short
+  resumes it at once (the resume runs as its own task, one resumer per
+  session), and a daemon restarted over one resumes it like any session the
+  previous daemon left, unless another machine holds the project.
 - **Nothing changes for free users.** No endpoint means no Pro chrome anywhere
   (one line on the Pro page); a native window showing another host's daemon has
   no account bridge; the terminal toolbar, chat reconnect rows, watch-by-default
