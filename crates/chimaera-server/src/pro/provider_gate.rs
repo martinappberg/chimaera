@@ -120,10 +120,12 @@ pub(super) fn record(
     if blocked.is_empty() {
         if status.error.as_deref() == Some("cloud_provider_not_ready") {
             status.error = None;
+            status.error_code = None;
         }
         Ok(())
     } else {
         status.error = Some("cloud_provider_not_ready".into());
+        status.error_code = Some("cloud_provider_not_ready");
         state.changes.notify_waiters();
         Err(Blocked(blocked).into())
     }

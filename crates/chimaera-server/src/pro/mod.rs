@@ -119,6 +119,9 @@ struct WorkspaceStatus {
     last_mirrored_at: Option<u64>,
     storage_limit_bytes: u64,
     error: Option<String>,
+    /// Additive: a stable code for `error` (see `routes::error_code`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<&'static str>,
     /// Additive: files the last return kept in both versions, and up to 32
     /// of their project-relative paths.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,6 +229,7 @@ impl ProState {
                     WorkspaceStatus {
                         blocked_providers,
                         error: Some("cloud_provider_not_ready".into()),
+                        error_code: Some("cloud_provider_not_ready"),
                         ..Default::default()
                     },
                 ))
@@ -573,6 +577,26 @@ pub(crate) fn sweep_leftovers(state: &std::sync::Arc<crate::AppState>) {
         }
         crate::bundle::sweep_temporary(&owner).await;
     });
+}
+
+/// A paused row's name where nothing better exists, in words for where it is
+/// shown: a cloud machine holds terminals that stay with your computer; a
+/// computer shows work the cloud is continuing, or work about to resume.
+pub(crate) fn paused_label(
+    state: &crate::AppState,
+    entry: &crate::ledger::LedgerEntry,
+) -> &'static str {
+    if execution::worker(state) {
+        return if entry.agent.is_some() {
+            "Starting here"
+        } else {
+            "Terminal on your computer"
+        };
+    }
+    match crate::lock(&state.pro.ownership).get(&entry.workspace_id) {
+        Some(Ownership::Remote { .. }) => "Continuing in the cloud",
+        _ => "Paused",
+    }
 }
 
 /// Graceful daemon stop: clear managed-execution evidence once this life's

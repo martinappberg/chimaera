@@ -26,8 +26,48 @@ fn outcome(error: anyhow::Error) -> detached::Outcome {
     }
     detached::Outcome::refused(
         StatusCode::BAD_REQUEST,
-        Some(json!({"error":error.to_string().chars().take(256).collect::<String>()})),
+        Some(json!({
+            "error": error.to_string().chars().take(256).collect::<String>(),
+            "code": error_code(&error),
+        })),
     )
+}
+/// Stable codes a client maps to its own plain words (additive `code`); the
+/// English `error` text remains only for older clients and is not a contract.
+pub(super) fn error_code(error: &anyhow::Error) -> &'static str {
+    let text = error.to_string();
+    let has = |needle: &str| text.contains(needle);
+    if error
+        .downcast_ref::<super::provider_gate::Blocked>()
+        .is_some()
+    {
+        "cloud_provider_not_ready"
+    } else if has("Account changed") || has("account changed") {
+        "account_changed"
+    } else if has("previous managed processes") || has("previous execution is stopping") {
+        "previous_processes_running"
+    } else if has("execution authority") || has("ownership has not been verified") {
+        "ownership_unverified"
+    } else if has("ownership changed") || has("names another owner") || has("owned elsewhere") {
+        "ownership_changed"
+    } else if has("checkpoint") && (has("not available") || has("required") || has("pending")) {
+        "checkpoint_pending"
+    } else if has("needs Git 2.36") {
+        "git_too_old"
+    } else if has("credential path") {
+        "credential_in_history"
+    } else if has("root_setup_required") {
+        "root_setup_required"
+    } else if has("Mirror helper cleanup could not be verified") {
+        "cache_recovery_needed"
+    } else if has("session archive")
+        || has("transcript is unavailable")
+        || has("rollout is unavailable")
+    {
+        "conversation_not_saved"
+    } else {
+        engine::failure_code(error)
+    }
 }
 fn result(result: anyhow::Result<()>) -> detached::Outcome {
     match result {

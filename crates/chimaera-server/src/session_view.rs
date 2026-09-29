@@ -283,9 +283,14 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     drop(names);
     drop(agents);
     drop(workspaces);
-    for entry in crate::lock(&state.deferred_sessions).values() {
+    let deferred: Vec<_> = crate::lock(&state.deferred_sessions)
+        .values()
+        .cloned()
+        .collect();
+    for entry in &deferred {
         if !rows.iter().any(|(_, row)| row["id"] == entry.id) {
-            let mut row = crate::bundle::paused_row(entry);
+            let label = crate::pro::paused_label(state, entry);
+            let mut row = crate::bundle::paused_row(entry, label);
             row["keep_running"] = json!(crate::pro::keep_running(state, &entry.id));
             rows.push((entry.created_at, row));
         }

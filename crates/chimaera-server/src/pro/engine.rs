@@ -228,10 +228,10 @@ pub(super) fn start(state: Arc<AppState>) {
 }
 fn record_error(state: &AppState, workspace: &str, error: &anyhow::Error) {
     let message: String = error.to_string().chars().take(256).collect();
-    lock(&state.pro.status)
-        .entry(workspace.into())
-        .or_default()
-        .error = Some(message);
+    let mut statuses = lock(&state.pro.status);
+    let status = statuses.entry(workspace.into()).or_default();
+    status.error = Some(message);
+    status.error_code = Some(super::routes::error_code(error));
 }
 pub(super) async fn reconcile(
     state: &Arc<AppState>,
@@ -885,7 +885,7 @@ async fn snapshot_inner_scoped(
             // The last return's report stays until the next return replaces it.
             let mut statuses = lock(&state.pro.status);
             let previous = statuses.remove(&workspace.id).unwrap_or_default();
-            statuses.insert(workspace.id.clone(), WorkspaceStatus {report,last_mirrored_at:Some(super::now()),storage_limit_bytes:budget,error:None,kept_both:previous.kept_both,kept_paths:previous.kept_paths,blocked_providers:Vec::new()});
+            statuses.insert(workspace.id.clone(), WorkspaceStatus {report,last_mirrored_at:Some(super::now()),storage_limit_bytes:budget,error:None,error_code:None,kept_both:previous.kept_both,kept_paths:previous.kept_paths,blocked_providers:Vec::new()});
         }
         *phase = "persist_snapshot";
         super::persist(state).await?;
@@ -1795,6 +1795,7 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
                 .context("Could not restore your saved work on this computer")?;
             if let Some(status) = lock(&state.pro.status).get_mut(&workspace) {
                 status.error = None;
+                status.error_code = None;
             }
             Ok(())
         }
@@ -1929,6 +1930,7 @@ async fn finish_hydration_checked(
     super::persist(state).await?;
     if let Some(status) = lock(&state.pro.status).get_mut(workspace) {
         status.error = None;
+        status.error_code = None;
     }
     // Each managed child takes this lock for durable launch admission. Release
     // it before restoring sessions; their admission rechecks the current grant.

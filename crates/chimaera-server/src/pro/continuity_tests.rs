@@ -654,3 +654,30 @@ async fn a_drain_waits_for_running_work_then_refuses_new_transfers_until_release
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn transfer_failures_carry_stable_codes_not_just_words() {
+    use super::super::routes::error_code;
+    for (text, code) in [
+        ("Account changed during project transfer", "account_changed"),
+        (
+            "execution authority expired before publication",
+            "ownership_unverified",
+        ),
+        (
+            "Project ownership changed during return",
+            "ownership_changed",
+        ),
+        (
+            "a durable project checkpoint is not available yet",
+            "checkpoint_pending",
+        ),
+        (
+            "previous managed processes are still stopping",
+            "previous_processes_running",
+        ),
+        ("mirror Git operation failed", "git"),
+    ] {
+        assert_eq!(error_code(&anyhow::anyhow!(text)), code, "{text}");
+    }
+}
