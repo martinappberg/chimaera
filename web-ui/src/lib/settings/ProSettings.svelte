@@ -5,7 +5,7 @@
   import PlanBadge from "../shared/PlanBadge.svelte";
   import ProWalkthrough from "../pro/ProWalkthrough.svelte";
   import AccountUsage from "../pro/AccountUsage.svelte";
-  import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling } from "../pro/billing";
+  import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling, planPrice } from "../pro/billing";
   import { onMount, tick, untrack } from "svelte";
   import MirrorSettings from "./MirrorSettings.svelte";
   import { asyncDisposer } from "../shared/asyncDisposer";
@@ -21,9 +21,6 @@
 
   let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady }: { visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void } = $props();
   const intentKey = "chimaera.pro.purchase";
-  const prices: Record<PaidPlan, Record<BillingInterval, number>> = {
-    pro: { month: 8, year: 80 }, max: { month: 30, year: 300 },
-  };
   const planChoices = [
     { plan: "pro" as PaidPlan, name: "Pro", purpose: "For your everyday projects", detail: "Keep your projects in sync, and let agent work continue in the cloud while you're away.", capacity: "The complete Pro workflow." },
     { plan: "max" as PaidPlan, name: "Max", purpose: "For more cloud work", detail: "The same Pro workflow, with more capacity for longer cloud runs and more mirrored projects.", capacity: "More capacity. All the same features." },
@@ -73,6 +70,9 @@
   const billingMessage = $derived(billing && !(openingBillingAfter !== null && billing.id <= openingBillingAfter) ? billingCopy(billing, status?.plan ?? null) : null);
   const billingRecovery = $derived(billingNeedsReview(billing, subscribed));
   const offerPlans = $derived(panel === "plans");
+  // Amounts come only from the account; without them the cards name the plans.
+  const price = (plan: PaidPlan, every: BillingInterval): string | null => planPrice(status?.plans, plan, every);
+  const priced = $derived(planChoices.every(choice => price(choice.plan, interval) !== null));
   const canReturnToPlans = $derived(billingRecovery && confirmedFree && reviewed !== null && reviewed === reviewKey(status));
 
   function showPlans(): void {
@@ -324,8 +324,8 @@
     {#if panel === "plans"}
       <section class="plans" aria-labelledby="plans-title" tabindex="-1" bind:this={plansElement}>
         <div class="section-heading plan-heading">
-          <div><h2 id="plans-title">Choose your plan</h2><p class="muted small">The same features in both. More cloud capacity with Max.</p></div>
-          <div class="interval" role="group" aria-label="Billing interval"><button class:chosen={interval === "month"} aria-pressed={interval === "month"} onclick={() => selectPlan(selected, "month")}>Monthly</button><button class:chosen={interval === "year"} aria-pressed={interval === "year"} onclick={() => selectPlan(selected, "year")}>Yearly <span>2 months free</span></button></div>
+          <div><h2 id="plans-title">Choose your plan</h2><p class="muted small">The same features in both. More cloud capacity with Max.{#if !priced} Prices are shown at checkout.{/if}</p></div>
+          <div class="interval" role="group" aria-label="Billing interval"><button class:chosen={interval === "month"} aria-pressed={interval === "month"} onclick={() => selectPlan(selected, "month")}>Monthly</button><button class:chosen={interval === "year"} aria-pressed={interval === "year"} onclick={() => selectPlan(selected, "year")}>Yearly</button></div>
         </div>
         <div class="plan-options" role="group" aria-label="Choose Pro or Max">
           {#each planChoices as choice (choice.plan)}
@@ -333,13 +333,13 @@
               <span class="plan-top"><span class="plan-name">{choice.name}</span><span class="selection-mark" aria-hidden="true"></span></span>
               <span class="plan-purpose">{choice.purpose}</span>
               <span class="plan-detail">{choice.detail}</span>
-              <span class="plan-price"><span class="price">${prices[choice.plan][interval]}</span><span class="price-period">/ {interval === "year" ? "year" : "month"}</span></span>
+              {#if priced}<span class="plan-price"><span class="price">{price(choice.plan, interval)}</span><span class="price-period">/ {interval === "year" ? "year" : "month"}</span></span>{/if}
               <span class="plan-note">{choice.capacity}</span>
             </button>
           {/each}
         </div>
         <div class="included"><span class="section-label">Included with both</span><ul><li>Project mirrors and agent handoff</li><li>Persistent remote connections</li><li>Browser access to your work</li><li>Project-by-project privacy controls</li></ul></div>
-        <div class="purchase"><button disabled={busy !== null || signInPhase !== null || billingActive} onclick={() => status?.signed_in ? void checkout() : void authenticate("sign-up")}>{busy === "checkout" ? "Opening checkout…" : status.signed_in ? "Continue to checkout" : "Sign up"}</button><p class="small muted">{#if status.signed_in}Billed ${prices[selected][interval]} {interval === "year" ? "yearly" : "monthly"}. Cloud work and mirrored storage have plan limits. Review billing details in secure checkout before subscribing.{:else}Create your account first. You can review your plan before checkout.{/if}</p></div>
+        <div class="purchase"><button disabled={busy !== null || signInPhase !== null || billingActive} onclick={() => status?.signed_in ? void checkout() : void authenticate("sign-up")}>{busy === "checkout" ? "Opening checkout…" : status.signed_in ? "Continue to checkout" : "Sign up"}</button><p class="small muted">{#if status.signed_in}{#if price(selected, interval)}Billed {price(selected, interval)} {interval === "year" ? "yearly" : "monthly"}. {/if}Cloud time and project storage have monthly limits. Review billing details in secure checkout before subscribing.{:else}Create your account first. You can review your plan before checkout.{/if}</p></div>
         {#if !status.signed_in}<p class="signin-alternative small muted">Already have an account? <button class="text-button" disabled={busy !== null || signInPhase !== null || billingActive} onclick={() => void authenticate("sign-in")}>Sign in</button></p>{/if}
         <p class="free-note"><strong>Your local workbench stays free.</strong> Local projects, agents and ordinary SSH work without a Pro account.</p>
       </section>
@@ -358,7 +358,7 @@
             <div class="upgrade-review" aria-label="Review Max upgrade">
               <h3>Review Chimaera Max</h3>
               <div class="interval" role="group" aria-label="Upgrade billing interval"><button class:chosen={upgradeInterval === "month"} aria-pressed={upgradeInterval === "month"} onclick={() => (upgradeInterval = "month")}>Monthly</button><button class:chosen={upgradeInterval === "year"} aria-pressed={upgradeInterval === "year"} onclick={() => (upgradeInterval = "year")}>Yearly</button></div>
-              <p class="upgrade-price">${prices.max[upgradeInterval]} <span class="small muted">/ {upgradeInterval === "year" ? "year" : "month"}</span></p>
+              {#if price("max", upgradeInterval)}<p class="upgrade-price">{price("max", upgradeInterval)} <span class="small muted">/ {upgradeInterval === "year" ? "year" : "month"}</span></p>{/if}
               <p class="small muted">Your current plan stays active. Review the final amount, any prorated charge, and when the change takes effect before confirming in secure billing. Any remaining trial time is kept.</p>
               <div class="actions"><button disabled={busy !== null || !canReviewUpgrade(status, true)} onclick={() => void openBilling({ plan: "max", interval: upgradeInterval })}>{busy === "upgrade" ? "Opening review…" : "Review upgrade in browser"}</button><button class="text-button" disabled={busy !== null} onclick={() => (upgradeOpen = false)}>Keep current plan</button></div>
             </div>
@@ -423,7 +423,6 @@
   .interval { display: flex; flex: none; gap: 3px; padding: 3px; border: 1px solid var(--edge); border-radius: 8px; }
   .interval button { padding: 7px 10px; background: transparent; color: var(--muted); font-size: var(--text-sm); }
   .interval .chosen { background: var(--row-hover); color: var(--fg); }
-  .interval span { margin-left: 2px; color: var(--muted); font-size: var(--text-xs); font-weight: 400; }
   .plan-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 24px; }
   .plan-card { display: flex; align-items: flex-start; flex-direction: column; gap: 0; padding: 24px; border-color: var(--edge); border-radius: 10px; background: transparent; color: var(--fg); text-align: left; }
   .plan-card:hover:not(:disabled) { opacity: 1; background: var(--row-hover); }

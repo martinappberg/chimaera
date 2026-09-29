@@ -877,6 +877,14 @@ export interface ProBillingAttempt {
   error: string | null;
 }
 
+/** One price from the account service; `amount_cents` is in the currency's minor unit. */
+export interface ProPlanPrice {
+  plan: "pro" | "max";
+  interval: "month" | "year";
+  amount_cents: number;
+  currency: string;
+}
+
 /** Account controls are native-shell state, separate from daemon settings. */
 export interface ProStatus {
   initializing?: boolean;
@@ -894,6 +902,9 @@ export interface ProStatus {
   /** Optional: the subscription's payment failed and needs the customer's
    * attention (billing portal). Checkout must never start a second plan. */
   payment_due?: boolean;
+  /** Optional: the account's current prices. Absent or null means the page
+   * names the plans only; amounts are never built into the app. */
+  plans?: ProPlanPrice[] | null;
   /** Optional when connected to an older native shell. */
   sign_in?: { phase: "waiting" | "finishing"; expires_at: number } | null;
   /** Native owns verification even when this page is closed. Older shells omit it. */

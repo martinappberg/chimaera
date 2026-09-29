@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ProBillingAttempt, ProStatus } from "../net/native";
-import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling } from "./billing";
+import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling, planPrice } from "./billing";
 const attempt = (phase: ProBillingAttempt["phase"], kind: ProBillingAttempt["kind"] = "checkout"): ProBillingAttempt => ({ id: 7, kind, phase, expires_at: 123, error: "private failure token=never-render-this" });
 
 describe("native billing presentation", () => {
@@ -99,6 +99,35 @@ describe("subscriber upgrade review", () => {
     expect(copy.detail).toContain("doesn't close the billing page");
     expect(billingCopy(attempt("opening", "portal"), "pro").title).toBe("Opening billing");
     expect(billingCopy(attempt("waiting", "portal"), "pro").title).toBe("Billing is open in your browser");
+  });
+});
+
+describe("plan prices", () => {
+  const plans = [
+    { plan: "pro" as const, interval: "month" as const, amount_cents: 1250, currency: "usd" },
+    { plan: "pro" as const, interval: "year" as const, amount_cents: 12000, currency: "USD" },
+    { plan: "max" as const, interval: "month" as const, amount_cents: 1500, currency: "JPY" },
+  ];
+  it("shows an amount only when the account supplies one", () => {
+    expect(planPrice(plans, "pro", "month", "en-US")).toBe("$12.50");
+    expect(planPrice(plans, "pro", "year", "en-US")).toBe("$120");
+    for (const absent of [undefined, null, []]) expect(planPrice(absent, "pro", "month", "en-US")).toBeNull();
+    expect(planPrice(plans, "max", "year", "en-US")).toBeNull();
+  });
+  it("reads minor units per currency", () => {
+    expect(planPrice(plans, "max", "month", "en-US")).toBe("¥1,500");
+  });
+  it("shows nothing for a malformed entry rather than a guessed amount", () => {
+    for (const entry of [
+      { amount_cents: -1, currency: "USD" },
+      { amount_cents: 1.5, currency: "USD" },
+      { amount_cents: 100, currency: "US" },
+      { amount_cents: 100, currency: "ZZZ" },
+      { amount_cents: 100, currency: 5 },
+    ]) {
+      const value = [{ plan: "pro", interval: "month", ...entry }] as unknown as Parameters<typeof planPrice>[0];
+      expect(planPrice(value, "pro", "month", "en-US")).toBeNull();
+    }
   });
 });
 

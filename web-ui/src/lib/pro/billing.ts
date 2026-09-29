@@ -1,4 +1,4 @@
-import type { ProBillingAttempt, ProStatus } from "../net/native";
+import type { ProBillingAttempt, ProPlanPrice, ProStatus } from "../net/native";
 
 import type { PlanChoice } from "./presentation";
 import { accountFailure, paymentDue } from "./status";
@@ -63,6 +63,23 @@ export function billingCopy(attempt: ProBillingAttempt, plan: ProStatus["plan"])
 export function canReviewUpgrade(status: ProStatus | null, fresh: boolean): boolean {
   return fresh && status?.available === true && status.signed_in && !status.initializing
     && accountFailure(status) === null && status.sign_in == null && status.plan === "pro" && !billingPending(status.billing);
+}
+
+/** A display price from the account's own list. Prices are never built into
+ * the app: an absent, malformed or unknown-currency entry shows no amount. */
+export function planPrice(plans: ProPlanPrice[] | null | undefined, plan: "pro" | "max", interval: "month" | "year", locale?: string): string | null {
+  const entry = Array.isArray(plans) ? plans.find(value => value?.plan === plan && value.interval === interval) : undefined;
+  if (!entry || !Number.isSafeInteger(entry.amount_cents) || entry.amount_cents < 0
+    || typeof entry.currency !== "string" || !/^[A-Za-z]{3}$/.test(entry.currency)) return null;
+  try {
+    const currency = entry.currency.toUpperCase();
+    // Intl formats any well-formed code; show only currencies it knows.
+    if (typeof Intl.supportedValuesOf === "function" && !Intl.supportedValuesOf("currency").includes(currency)) return null;
+    // Minor units follow the currency (cents for USD, none for JPY).
+    const digits = new Intl.NumberFormat("en", { style: "currency", currency }).resolvedOptions().maximumFractionDigits ?? 2;
+    const amount = entry.amount_cents / Math.pow(10, digits);
+    return new Intl.NumberFormat(locale, { style: "currency", currency, minimumFractionDigits: Number.isInteger(amount) ? 0 : digits, maximumFractionDigits: digits }).format(amount);
+  } catch { return null; }
 }
 
 /** Delayed snapshots cannot roll a newer attempt or its terminal result backward. */
