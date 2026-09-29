@@ -173,6 +173,7 @@ async fn cloud_context_real_http_is_scoped_revisioned_and_never_executes_on_save
     )
     .await;
     assert_eq!(content(&saved)["executed"], false);
+    assert_eq!(content(&saved)["awaiting_confirmation"], true);
     assert!(!root.join("forbidden-auto-execution").exists());
     assert!(state.sessions.list().is_empty() && state.chat.list().is_empty());
     let (_, next) = rpc(
@@ -183,7 +184,34 @@ async fn cloud_context_real_http_is_scoped_revisioned_and_never_executes_on_save
         json!({"name":"read_cloud_profile","arguments":{}}),
     )
     .await;
-    assert_eq!(content(&next)["profile"], profile);
+    // An agent's setup command is only a proposal until the user confirms it.
+    let mut proposed = profile.clone();
+    proposed["setup_command"] = Value::Null;
+    proposed["pending_setup_command"] = json!("touch forbidden-auto-execution");
+    assert_eq!(content(&next)["profile"], proposed);
+    let stored = crate::pro::workspace_profile(&state, &workspace.id).unwrap();
+    assert_eq!(stored.setup_command, None);
+    // An edit that leaves the setup command alone keeps the proposal waiting.
+    let (_, kept) = rpc(port,"s-cloud","cloud-fixture","tools/call",json!({"name":"update_cloud_profile","arguments":{"expected_revision":content(&next)["revision"],"profile":{"setup_command":null,"laptop_only":["xcodebuild test"],"deferred":["xcodebuild test"],"missing_environment":["PROJECT_API_TOKEN"]}}})).await;
+    assert_eq!(content(&kept)["awaiting_confirmation"], true);
+    let stored = crate::pro::workspace_profile(&state, &workspace.id).unwrap();
+    assert_eq!(stored.setup_command, None);
+    assert_eq!(
+        stored.pending_setup_command.as_deref(),
+        Some("touch forbidden-auto-execution")
+    );
+    let (_, next) = rpc(
+        port,
+        "s-cloud",
+        "cloud-fixture",
+        "tools/call",
+        json!({"name":"read_cloud_profile","arguments":{}}),
+    )
+    .await;
+    assert!(content(&next)["context"]
+        .as_str()
+        .unwrap()
+        .contains("\"proposed_setup_command_awaiting_user\":true"));
     let (_, unrelated) = rpc(
         port,
         "s-other",
@@ -225,6 +253,13 @@ async fn cloud_context_real_http_is_scoped_revisioned_and_never_executes_on_save
     tui_mcp(&state, &workspace, true).await;
     let (status,_) = request(&state,Method::POST,"/api/v1/pro/configure",Some(json!({"endpoint":format!("http://127.0.0.1:{port}"),"keeper_url":"","account_id":"fixture-account","role":"device","delegation":{"access_token":"synthetic-return","expires_at":"2099-01-01T00:00:00Z","scope":["baton","mirror"],"device_id":"device-fixture"},"hours_exhausted":false}))).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+    // On the user's own computer an agent gets no brief about where it runs...
+    let (_, home) = rpc(port, "s-cloud", "cloud-fixture", "initialize", json!({})).await;
+    let text = home["result"]["instructions"].as_str().unwrap_or_default();
+    assert!(!text.contains("work-capabilities") && !text.contains("cloud-profile-data"));
+    // ...unless its project came back from the cloud, when the old cloud
+    // assumptions must be replaced.
+    lock(&state.pro.returned).insert(workspace.id.clone());
     let (_, returned) = rpc(port, "s-cloud", "cloud-fixture", "initialize", json!({})).await;
     let text = returned["result"]["instructions"].as_str().unwrap();
     assert!(

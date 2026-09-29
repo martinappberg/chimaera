@@ -339,8 +339,16 @@ fn note_missing(missing: &mut Vec<String>, name: &str) {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CloudProfile {
+    /// Runs before conversations continue on a cloud machine. Only the user
+    /// sets it (Chimaera Pro, `PUT /pro/profile`).
     #[serde(default)]
     pub setup_command: Option<String>,
+    /// Additive: a setup command an agent proposed (`update_cloud_profile`).
+    /// It never runs until the user confirms it, which moves it into
+    /// `setup_command`; injected repository text cannot schedule execution
+    /// on the credentialed cloud machine by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_setup_command: Option<String>,
     #[serde(default)]
     pub laptop_only: Vec<String>,
     #[serde(default)]
@@ -368,8 +376,9 @@ impl CloudProfile {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.setup_command
-                .as_ref()
-                .is_none_or(|s| s.len() <= 16 * 1024 && !contains_credential(s.as_bytes()))
+                .iter()
+                .chain(&self.pending_setup_command)
+                .all(|s| s.len() <= 16 * 1024 && !contains_credential(s.as_bytes()))
                 && self.laptop_only.len() <= 64
                 && self.deferred.len() <= 64
                 && self.missing_environment.len() <= 128,

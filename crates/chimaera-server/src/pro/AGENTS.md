@@ -218,7 +218,8 @@ Required worker setup runs before any imported agent resumes. Persisted
 `SettingUp` ownership fences ordinary writers and ledger restore while its
 explicit daemon setup task alone runs the setup command (a background login-shell
 child in the project root, 10-minute bound, output tail in `<pro root>/<ws>/setup.log`;
-no terminal session). Failure (`cloud_setup_failed`)
+no terminal session). Only the user-confirmed `setup_command` runs; an agent's
+proposal (`pending_setup_command`) never does. Failure (`cloud_setup_failed`)
 keeps that fence and exposes an attention error; a hydrate retry runs the updated
 setup against already installed files. Laptop-only deferred steps stay in the
 profile as instructions for the returning agent under its usual permissions;

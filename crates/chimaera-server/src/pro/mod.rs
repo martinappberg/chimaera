@@ -72,6 +72,9 @@ pub(crate) struct ProState {
     /// Projects the account answered for since this daemon started; the
     /// unverified-resume fallback leaves those to the verified path.
     answered: Mutex<std::collections::HashSet<String>>,
+    /// Projects that came back to this computer from the cloud during this
+    /// daemon's life (their agents get a fresh where-it-runs brief).
+    pub(crate) returned: Mutex<std::collections::HashSet<String>>,
     operations: detached::Operations,
     drain: Mutex<Option<drain::Drain>>,
     /// Serializes drain requests; see `drain::start`.
@@ -313,6 +316,7 @@ impl ProState {
             boot_deferred: Mutex::new(Default::default()),
             installing: Mutex::new(Default::default()),
             answered: Mutex::new(Default::default()),
+            returned: Mutex::new(Default::default()),
             operations: Default::default(),
             drain: Mutex::new(None),
             drain_gate: AsyncMutex::new(()),
@@ -799,6 +803,11 @@ pub(crate) fn cloud_hours_exhausted(state: &crate::AppState) -> Option<bool> {
     crate::lock(&state.pro.runtime)
         .as_ref()
         .map(|config| config.hours_exhausted)
+}
+/// Whether this project came back to this computer from the cloud during this
+/// daemon's life.
+pub(crate) fn returned_here(state: &crate::AppState, workspace: &str) -> bool {
+    crate::lock(&state.pro.returned).contains(workspace)
 }
 /// Whether the native app configured this daemon for Pro at all.
 pub(crate) fn configured(state: &crate::AppState) -> bool {

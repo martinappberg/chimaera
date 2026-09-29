@@ -1378,6 +1378,12 @@ async fn hydrate_scoped(
     current()?;
     execution::accept(state, config, &grant, generation, request_start)?;
     install_epoch.store(grant.epoch, Ordering::Release);
+    if config.role == Role::Device {
+        let mut returned = lock(&state.pro.returned);
+        if returned.len() < 128 || returned.contains(workspace) {
+            returned.insert(workspace.to_owned());
+        }
+    }
     let receipt = if config.execution.is_some() {
         let receipt = grant
             .checkpoint
