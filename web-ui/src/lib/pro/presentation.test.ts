@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { paid, readIntent, cloudCopy, cloudPollDelay, cloudProjectStatus, friendlyError, projectCopyError, alreadySubscribed } from "./presentation";
+import type { MirrorStatus, MirrorWorkspace } from "../net/native";
+import { paid, readIntent, cloudCopy, cloudPollDelay, cloudProjectStatus, friendlyError, projectCopyError, alreadySubscribed, recoverableAccountRestore } from "./presentation";
+
+// Copy is free to change; these tests pin which states read alike or apart,
+// what takes precedence, and that nothing from a raw error reaches the page.
 
 describe("purchase intent", () => {
   const intent = { plan: "max", interval: "year", stage: "sign_in", created: 1000 };
@@ -20,24 +24,27 @@ describe("purchase intent", () => {
     for (const value of [null, undefined, "none", "trial", "preparing"]) expect(paid(value)).toBe(false);
   });
 });
+
 describe("honest cloud state", () => {
-  it("distinguishes disabled service from preparing and sleeping", () => {
-    expect(cloudCopy("unavailable", "provisioning_disabled").title).toContain("unavailable");
-    expect(cloudCopy("preparing", null).title).toBe("Getting things ready");
-    expect(cloudCopy("sleeping", null).title).toBe("Available when you need it");
+  it("distinguishes a disabled service, preparation and an unknown answer; idle reads as ready", () => {
+    const disabled = cloudCopy("unavailable", "provisioning_disabled");
+    const preparing = cloudCopy("preparing", null);
+    const unknown = cloudCopy("unknown", null);
+    expect(new Set([disabled.title, preparing.title, unknown.title, cloudCopy("ready", null).title]).size).toBe(4);
     expect(cloudCopy("ready", null)).toEqual(cloudCopy("sleeping", null));
-    expect(cloudCopy("unknown", null).title).toContain("unavailable");
+    for (const copy of [disabled, preparing, unknown]) { expect(copy.title).not.toBe(""); expect(copy.detail).not.toBe(""); }
   });
-  it("explains quota recovery without converting it into an infrastructure setup task", () => {
-    expect(cloudCopy("limited", "hours_exhausted").detail).toContain("resets next month");
-    expect(cloudCopy("limited", "storage_exhausted").detail).toContain("local projects remain available");
+  it("explains each limit separately instead of as a generic pause or a setup task", () => {
+    const generic = cloudCopy("limited", null);
+    const hours = cloudCopy("limited", "hours_exhausted");
+    const storage = cloudCopy("limited", "storage_exhausted");
+    expect(new Set([generic.detail, hours.detail, storage.detail]).size).toBe(3);
+    expect(hours).not.toEqual(cloudCopy("preparing", null));
   });
-  it("explains a credential save failure without claiming authentication expired", () => {
-    const copy = friendlyError("account_credentials_unsaved", "fallback");
-    expect(copy).toContain("You’re signed in");
-    expect(copy).toContain("Check again");
-    expect(copy).toContain("after restarting");
-    expect(copy).not.toContain("expired");
+  it("explains a credential save failure apart from an expired sign-in", () => {
+    const unsaved = friendlyError("account_credentials_unsaved", "fallback");
+    expect(unsaved).not.toBe("fallback");
+    expect(unsaved).not.toBe(friendlyError("sign in required", "fallback"));
     expect(friendlyError("account_credentials_unsaved private-details", "fallback")).toBe("fallback");
   });
   it("never renders arbitrary service errors", () => {
@@ -47,13 +54,13 @@ describe("honest cloud state", () => {
     expect(alreadySubscribed(new Error("use_billing_portal"))).toBe(true);
     expect(alreadySubscribed("account request rejected (503)")).toBe(false);
   });
-  it("explains known copy blockers without raw diagnostics or false retry promises", () => {
-    expect(projectCopyError("workspace exceeds mirror storage quota")).toContain("cloud allowance");
-    expect(projectCopyError("Claude transcript is unavailable")).toContain("conversation");
-    expect(projectCopyError("project setup needs attention in its terminal")).toContain("setup didn’t finish");
+  it("explains known copy blockers without raw diagnostics", () => {
     const unknown = projectCopyError("private path=/sensitive token=example");
-    expect(unknown).toContain("incomplete");
     expect(unknown).not.toMatch(/private|sensitive|token|retry/i);
+    for (const known of ["workspace exceeds mirror storage quota", "Claude transcript is unavailable", "project setup needs attention in its terminal", "session archive exceeds mirror file limit"]) {
+      expect(projectCopyError(known)).not.toBe(unknown);
+    }
+    expect(projectCopyError("Claude transcript is unavailable")).toBe(projectCopyError("Codex rollout is unavailable"));
   });
 });
 
@@ -63,11 +70,11 @@ describe("cloud preparation progress", () => {
     for (const phase of ["keeper", "worker", "connecting"] as const) {
       expect(cloudCopy("preparing", null, phase)).toEqual(cloudCopy("preparing", null));
     }
-    expect(cloudCopy("sleeping", null, "worker").title).toBe("Available when you need it");
-    expect(cloudCopy("preparing", "hours_exhausted", "worker").title).toContain("allowance used");
+    expect(cloudCopy("sleeping", null, "worker")).toEqual(cloudCopy("ready", null));
+    expect(cloudCopy("preparing", "hours_exhausted", "worker")).toEqual(cloudCopy("limited", "hours_exhausted"));
   });
-  const mirror = (workspaces: import("../net/native").MirrorWorkspace[]): import("../net/native").MirrorStatus => ({ configured: true, projects_root: "", projects_root_confirmed: false, workspaces, sessions: [] });
-  const row = (id: string, at: number | null): import("../net/native").MirrorWorkspace => ({ workspace_id: id, name: id, root: "/fixture", never_mirror: false, ownership: {state: "local", epoch: 1}, profile: null, mirror: { files: 4, bytes: 4096, excluded: 0, too_large: 0, last_mirrored_at: at, storage_limit_bytes: 10000, error: null } });
+  const mirror = (workspaces: MirrorWorkspace[]): MirrorStatus => ({ configured: true, projects_root: "", projects_root_confirmed: false, workspaces, sessions: [] });
+  const row = (id: string, at: number | null): MirrorWorkspace => ({ workspace_id: id, name: id, root: "/fixture", never_mirror: false, ownership: {state: "local", epoch: 1}, profile: null, mirror: { files: 4, bytes: 4096, excluded: 0, too_large: 0, last_mirrored_at: at, storage_limit_bytes: 10000, error: null } });
   it("does not invent syncing, completion or a task when no project status exists", () => {
     expect(cloudProjectStatus(null)).toBeNull();
     expect(cloudProjectStatus(mirror([]))).toBeNull();
@@ -75,26 +82,31 @@ describe("cloud preparation progress", () => {
     expect(cloudProjectStatus(mirror([row("saved", 123)]), "other")).toBeNull();
   });
   it("reports completed copies as history, excludes private projects and scopes handoffs", () => {
-    expect(cloudProjectStatus(mirror([row("new", null)]))).toMatchObject({title: "Project copy status", state: "quiet"});
-    expect(cloudProjectStatus(mirror([row("saved", 123)]))).toMatchObject({ title: "Cloud copies saved", state: "quiet" });
-    expect(cloudProjectStatus(mirror([{...row("remote", null), checkpoint_id:"c-confirmed"}]))).toMatchObject({title:"Cloud copies saved",state:"quiet"});
-    expect(cloudProjectStatus(mirror([row("unknown", null)]))?.detail).not.toContain("No completed");
+    const saved = cloudProjectStatus(mirror([row("saved", 123)]));
+    const unknown = cloudProjectStatus(mirror([row("new", null)]));
+    expect(saved?.state).toBe("quiet");
+    expect(unknown?.state).toBe("quiet");
+    expect(unknown?.title).not.toBe(saved?.title);
+    expect(cloudProjectStatus(mirror([{...row("remote", null), checkpoint_id:"c-confirmed"}]))).toEqual(saved);
     const privateProject = {...row("private", null), never_mirror: true};
-    expect(cloudProjectStatus(mirror([row("saved", 123), privateProject]))?.detail).toContain("1 project has");
-    const both = mirror([row("saved", 123), row("new", null)]);
-    expect(cloudProjectStatus(both)?.detail).toContain("Copy status for other projects");
-    expect(cloudProjectStatus(both, "new")?.title).toBe("Project copy status");
+    expect(cloudProjectStatus(mirror([row("saved", 123), privateProject]))).toEqual(saved);
+    // Projects without a recorded copy yet add nothing to the saved summary.
+    expect(cloudProjectStatus(mirror([row("saved", 123), row("new", null)]))).toEqual(saved);
+    expect(cloudProjectStatus(mirror([row("saved", 123), row("new", null)]), "new")).toEqual(unknown);
+    expect(cloudProjectStatus(mirror([row("a", 1), row("b", 2)]))?.detail).not.toBe(saved?.detail);
   });
   it("uses actual ownership for active progress and keeps privacy/configuration failures ahead of saved counts", () => {
-    const paused = {...mirror([row("saved", 123)]), configured: false};
-    expect(cloudProjectStatus(paused)).toMatchObject({title: "Project connection pending", state: "attention"});
+    const starting = cloudProjectStatus({...mirror([row("saved", 123)]), configured: false});
+    expect(starting?.state).toBe("active");
     const checking = {...row("saved", 123), ownership: {state: "awaiting_verification" as const, epoch: 2}};
-    expect(cloudProjectStatus(mirror([checking]))).toMatchObject({title: "Checking your project", state: "active"});
+    expect(cloudProjectStatus(mirror([checking]))?.state).toBe("active");
     const moving = {...row("saved", 123), ownership: {state: "transferring" as const, epoch: 2}};
-    expect(cloudProjectStatus(mirror([moving]))?.detail).toContain("files and conversation");
+    expect(cloudProjectStatus(mirror([moving]))?.state).toBe("active");
     const restoring = {...row("restore", 123), ownership: {state: "hydrating" as const, epoch: 2}};
-    expect(cloudProjectStatus(mirror([restoring]))).toMatchObject({title: "Restoring your project", state: "active"});
-    expect(cloudProjectStatus({...mirror([restoring]), configured: false})?.title).toBe("Project connection pending");
+    const restoringStatus = cloudProjectStatus(mirror([restoring]));
+    expect(restoringStatus?.state).toBe("active");
+    expect(new Set([starting?.title, restoringStatus?.title, cloudProjectStatus(mirror([moving]))?.title, cloudProjectStatus(mirror([checking]))?.title]).size).toBe(4);
+    expect(cloudProjectStatus({...mirror([restoring]), configured: false})).toEqual(starting);
     const privacy = {...row("saved", 123), privacy_pending: true};
     expect(cloudProjectStatus(mirror([privacy]))?.state).toBe("attention");
     const failed = row("saved", 123); failed.mirror!.error = "private diagnostic";
@@ -109,7 +121,6 @@ describe("cloud preparation progress", () => {
   });
 });
 
-import { recoverableAccountRestore } from "./presentation";
 describe("saved account recovery", () => {
   it("offers retry only for the two native restore outcomes", () => {
     expect(recoverableAccountRestore("account_restore_locked")).toBe(true);

@@ -62,7 +62,7 @@
       case "privacy_disabled": return "Automatic copying is off";
       case "setting_up": return workspace.blocked_providers?.length ? "Waiting for cloud agent sign-in" : "Cloud project setup needs attention";
       case "hydrating": return "Restoring files and conversations…";
-      case "awaiting_verification": return "Checking where this project is running…";
+      case "awaiting_verification": return "Checking for recent changes…";
       default: return "Waiting for the first copy";
     }
   }

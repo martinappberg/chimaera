@@ -949,7 +949,7 @@
       {#if sorted.length === 0}
         <div class="blank">
           <h3>A folder is your workspace.</h3>
-          <p>Open a project to start terminals and agents together. Your files stay where they are.</p>
+          <p>Open a folder to start terminals and agents together. Your files stay where they are.</p>
           <button class="cta" onclick={onOpenFolder}>Open folder</button>
         </div>
       {:else}

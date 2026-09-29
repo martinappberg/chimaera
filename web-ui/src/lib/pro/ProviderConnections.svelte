@@ -3,7 +3,7 @@
   import { pageVisible } from "../shared/visibility";
   import { isNativeShell, writeClipboard, type CloudProviderConnection, type CloudProviderStatus, type CloudSetupInfo } from "../net/native";
   import { cloudRequest } from "./cloudTransport";
-  import { canDisconnect, canStartConnection, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, nextReadyHandoff, pendingConnection, providerLoginUrl, providersReady, providerStateLabel, recoverDisconnect, sameConnection } from "./providers";
+  import { canDisconnect, canStartConnection, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, nextReadyHandoff, pendingConnection, providerLabel, providerLoginUrl, providersReady, providerStateLabel, recoverDisconnect, sameConnection } from "./providers";
 
   let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady, onReadiness, compact = false }: {
     visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void; onReadiness?: (ready: boolean | null) => void; compact?: boolean;
@@ -281,7 +281,7 @@
       </article>
     {/each}
   </div>
-  {#each required.filter(id => !agents.some(p => p.id === id)) as id}<p class="error">Chimaera cloud doesn't offer the required provider “{id}” yet. This project will wait until that provider is supported.</p>{/each}
+  {#each required.filter(id => !agents.some(p => p.id === id)) as id (id)}<p class="error">{providerLabel(id)} isn’t available in the cloud yet. This project waits on your computer.</p>{/each}
 
   {/if}
 
@@ -316,12 +316,13 @@
         {#if native}<button class="button" disabled={busy !== null} onclick={() => void openSignIn()}>Open sign-in page</button>{:else if loginUrl}<a class="button" href={loginUrl} target="_blank" rel="noopener noreferrer">Open sign-in page</a>{:else}<p class="error">The provider's sign-in link couldn't be verified.</p>{/if}
         <p class="muted small">Leave this view open while you finish. We'll confirm the connection here.</p>
       {:else if action?.type === "browser"}
-        <p class="muted">Sign in securely with {connectingLabel} in your browser.</p>
+        <p class="muted">Sign in to {connectingLabel} in your browser.{#if action.input === "authorization_code"} It then shows a code — copy it and paste it here.{/if}</p>
         {#if native}<button class="button" disabled={busy !== null} onclick={() => void openSignIn()}>Continue in browser</button>{:else if loginUrl}<a class="button" href={loginUrl} target="_blank" rel="noopener noreferrer">Continue in browser</a>{:else}<p class="error">The provider's sign-in link couldn't be verified.</p>{/if}
         {#if action.input === "authorization_code"}
           <form class="authorization" onsubmit={(event) => { event.preventDefault(); void submitCode(); }}>
-            <label for={`provider-code-${connection.id}`}>Paste the one-time code from {connectingLabel}</label>
-            <div class="authorization-row"><input id={`provider-code-${connection.id}`} type="password" bind:value={authorizationCode} autocomplete="off" autocapitalize="off" spellcheck={false} maxlength="4096" placeholder="One-time authorization code" disabled={busy !== null} /><button class="button" type="submit" disabled={busy !== null || !authorizationCode.trim()}>{busy === "submit" ? "Confirming…" : "Connect"}</button></div>
+            <label for={`provider-code-${connection.id}`}>Code from {connectingLabel}</label>
+            <!-- Visible so a paste can be checked; still cleared on submit, cancel, hide and teardown. -->
+            <div class="authorization-row"><input id={`provider-code-${connection.id}`} type="text" bind:value={authorizationCode} autocomplete="off" autocapitalize="off" spellcheck={false} maxlength="4096" placeholder="Paste the code here" disabled={busy !== null} /><button class="button" type="submit" disabled={busy !== null || !authorizationCode.trim()}>{busy === "submit" ? "Confirming…" : "Connect"}</button></div>
             <p class="muted small">The code goes directly to the provider’s sign-in process. It isn’t saved in Chimaera.</p>
           </form>
         {/if}

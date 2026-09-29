@@ -23,7 +23,7 @@
   const intentKey = "chimaera.pro.purchase";
   const planChoices = [
     { plan: "pro" as PaidPlan, name: "Pro", purpose: "For your everyday projects", detail: "Keep your projects in sync, and let agent work continue in the cloud while you're away.", capacity: "The complete Pro workflow." },
-    { plan: "max" as PaidPlan, name: "Max", purpose: "For more cloud work", detail: "The same Pro workflow, with more capacity for longer cloud runs and more mirrored projects.", capacity: "More capacity. All the same features." },
+    { plan: "max" as PaidPlan, name: "Max", purpose: "For more cloud work", detail: "The same Pro workflow, with more capacity for longer cloud runs and more room for your projects.", capacity: "More capacity. All the same features." },
   ];
   function savedIntent(): PurchaseIntent | null { try { return readIntent(sessionStorage.getItem(intentKey)); } catch { return null; } }
   const initialIntent = savedIntent();
@@ -175,7 +175,7 @@
     await act("checkout", async () => {
       try { await proBillingCheckout(choice.plan, choice.interval); }
       catch (reason) { planExists = alreadySubscribed(reason); throw reason; }
-      if (status?.billing === undefined) notice = "Checkout opened in your browser. Return here to check your account when you're done.";
+      if (status?.billing === undefined) notice = "Checkout opened in your browser. This page updates when you're done.";
     }, "Checkout couldn't open. Please try again.");
     // The account already has a plan: show it rather than asking for a refresh.
     if (planExists && alive) await load(true);
@@ -206,7 +206,7 @@
     await act(target ? "upgrade" : "billing", async () => {
       await proBillingPortal(target);
       upgradeOpen = false;
-      if (status?.billing === undefined) notice = "Billing opened in your browser. Return here to check your account when you're done.";
+      if (status?.billing === undefined) notice = "Billing opened in your browser. This page updates when you're done.";
     }, "Billing couldn't open. Please try again in a moment.");
     openingBillingAfter = null;
   }
@@ -296,8 +296,8 @@
     <div class="panel notice" role="status">
       <h2>{status.initialization_phase === "keychain" ? "Opening your saved sign-in" : "Connecting your account"}</h2>
       <p>{status.initialization_phase === "keychain"
-        ? "Your system keychain is checking access to your saved account. Respond to any keychain prompt for chimaera to continue. Your workspaces remain available while you do."
-        : "We're checking your saved account and restoring its connections. Your workspaces remain available."}</p>
+        ? "Allow Chimaera in the keychain prompt to finish signing in. Your projects stay available."
+        : "We're checking your saved account. Your projects stay available."}</p>
     </div>
   {:else if offerPlans}<ProWalkthrough />{/if}
 
@@ -340,7 +340,7 @@
             </button>
           {/each}
         </div>
-        <div class="included"><span class="section-label">Included with both</span><ul><li>Project mirrors and agent handoff</li><li>Persistent remote connections</li><li>Browser access to your work</li><li>Project-by-project privacy controls</li></ul></div>
+        <div class="included"><span class="section-label">Included with both</span><ul><li>Projects stay in sync across devices</li><li>Cluster logins that stay connected</li><li>Browser access to your work</li><li>Project-by-project privacy controls</li></ul></div>
         <div class="purchase"><button disabled={busy !== null || signInPhase !== null || billingActive} onclick={() => status?.signed_in ? void checkout() : void authenticate("sign-up")}>{busy === "checkout" ? "Opening checkout…" : status.signed_in ? "Continue to checkout" : "Sign up"}</button><p class="small muted">{#if status.signed_in}{#if price(selected, interval)}Billed {price(selected, interval)} {interval === "year" ? "yearly" : "monthly"}. {/if}Cloud time and project storage have monthly limits. Review billing details in secure checkout before subscribing.{:else}Create your account first. You can review your plan before checkout.{/if}</p></div>
         {#if !status.signed_in}<p class="signin-alternative small muted">Already have an account? <button class="text-button" disabled={busy !== null || signInPhase !== null || billingActive} onclick={() => void authenticate("sign-in")}>Sign in</button></p>{/if}
         <p class="free-note"><strong>Your local workbench stays free.</strong> Local projects, agents and ordinary SSH work without a Pro account.</p>
@@ -353,7 +353,7 @@
         {@render billingNotice()}
         {#if status.plan === "pro" && !paymentNeeded && nearLimit(status)}
           <div class="upgrade-entry">
-            <div><h3>More room for your work</h3><p class="small muted">Max includes more cloud time and mirrored storage, with the same workflow.</p></div>
+            <div><h3>More room for your work</h3><p class="small muted">Max includes more cloud time and project storage, with the same workflow.</p></div>
             <button class="secondary" aria-expanded={upgradeOpen} disabled={busy !== null || billingActive || !canReviewUpgrade(status, true)} onclick={() => (upgradeOpen = !upgradeOpen)}>{billing?.kind === "plan_change" && billing.phase === "unconfirmed" ? "Review upgrade again" : "Upgrade to Max"}</button>
           </div>
           {#if upgradeOpen}
@@ -368,7 +368,7 @@
         {/if}
         <AccountUsage usage={status.usage} limits={status.limits} />
       </section>
-      <details class="section" ontoggle={(event) => (connectionsOpen = event.currentTarget.open)}><summary>Connected machines</summary>{#if connectionsOpen}<div class="section-body"><p class="muted small">Add your remote hosts on Home. Keep a connection available through Pro here.</p>{#if hosts.length === 0}<p class="muted">No machines to show yet.</p>{/if}{#each hosts as host (host.alias)}<div class="row"><div><span>{host.alias}</span><span class="muted small">{host.status === "prompting" ? "Waiting for authentication" : host.status === "connecting" ? "Connecting…" : host.status === "connected" ? "Connected" : "Offline"}</span></div>{#if host.kind === "ssh"}<label class="keep"><input type="checkbox" checked={host.kept} disabled={busy !== null} onchange={(event) => setKept(host, event.currentTarget)} />Keep connected</label>{/if}</div>{/each}</div>{/if}</details>
+      <details class="section" ontoggle={(event) => (connectionsOpen = event.currentTarget.open)}><summary>Connected machines</summary>{#if connectionsOpen}<div class="section-body"><p class="muted small">Add remote machines on Home. Choose which cluster logins stay connected here.</p>{#if hosts.length === 0}<p class="muted">No machines to show yet.</p>{/if}{#each hosts as host (host.alias)}<div class="row"><div><span>{host.alias}</span><span class="muted small">{host.status === "prompting" ? "Waiting for authentication" : host.status === "connecting" ? "Connecting…" : host.status === "connected" ? "Connected" : "Offline"}</span></div>{#if host.kind === "ssh"}<label class="keep"><input type="checkbox" checked={host.kept} disabled={busy !== null} onchange={(event) => setKept(host, event.currentTarget)} />Keep connected</label>{/if}</div>{/each}</div>{/if}</details>
       <details class="section" ontoggle={(event) => (mirrorsOpen = event.currentTarget.open)}><summary>Projects and privacy</summary>{#if mirrorsOpen}<MirrorSettings visible={visible && mirrorsOpen} />{/if}</details>
     {:else if panel === "payment"}
       {@render paymentNotice(true)}
@@ -381,8 +381,8 @@
     {/if}
 
     {#if status.signed_in}
-      {#if !subscribed}<details class="section" ontoggle={(event) => (recoveryOpen = event.currentTarget.open)}><summary>Existing project privacy</summary>{#if recoveryOpen}<MirrorSettings visible={visible && recoveryOpen} recoveryOnly />{/if}</details>{/if}
-      <details class="section" ontoggle={(event) => (securityOpen = event.currentTarget.open)}><summary>Account and devices</summary>{#if securityOpen}<div class="section-body"><AccountDevices {devices} busy={busy !== null} onrevoke={removeSignIn} /><div class="actions"><button class="secondary" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out", proSignOut, "Sign-out couldn't finish. Please try again."); }}>Sign out</button><button class="text-button" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out-all", proSignOutEverywhere, "Sign-out couldn't finish. Please try again."); }}>Sign out everywhere</button></div><p class="muted small">Signing out everywhere also closes the SSH logins held by Pro.</p></div>{/if}</details>
+      {#if !subscribed}<details class="section" ontoggle={(event) => (recoveryOpen = event.currentTarget.open)}><summary>Project privacy</summary>{#if recoveryOpen}<MirrorSettings visible={visible && recoveryOpen} recoveryOnly />{/if}</details>{/if}
+      <details class="section" ontoggle={(event) => (securityOpen = event.currentTarget.open)}><summary>Account and devices</summary>{#if securityOpen}<div class="section-body"><AccountDevices {devices} busy={busy !== null} onrevoke={removeSignIn} /><div class="actions"><button class="secondary" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out", proSignOut, "Sign-out couldn't finish. Please try again."); }}>Sign out</button><button class="text-button" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out-all", proSignOutEverywhere, "Sign-out couldn't finish. Please try again."); }}>Sign out everywhere</button></div><p class="muted small">Signing out everywhere also closes the cluster logins Pro keeps connected.</p></div>{/if}</details>
     {/if}
   {/if}
   {#if (error || failure) && !accountNeedsAttention && !billingRecovery}<div class="error" role="alert"><span>{error ?? friendlyError(failure, "Part of your account couldn't refresh. Your local work remains available.")}</span><button class="secondary" disabled={busy !== null} onclick={() => void load(true)}>Try again</button></div>{/if}

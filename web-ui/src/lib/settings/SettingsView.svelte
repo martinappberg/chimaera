@@ -257,7 +257,7 @@
                     <span>Pick up your agent sessions and project files on another device.</span>
                   {:else if paid}
                     <strong>Your Chimaera {$accountPlan === "max" ? "Max" : "Pro"}</strong>
-                    <span>Your plan, cloud connections and project mirrors.</span>
+                    <span>Your plan, cloud agents and project sync.</span>
                   {:else}
                     <strong>Your Chimaera account</strong>
                     <span>{$accountPlan === "loading" ? "Checking your plan…" : "View your account to check your plan and cloud access."}</span>
