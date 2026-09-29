@@ -138,8 +138,10 @@
   });
 
   /** A view switch for the active session is in flight (its POST hasn't
-   *  resolved): the toggle disables itself so a second click can't fire a
-   *  concurrent switch. */
+   *  resolved, or a mid-task agent's question is open): the toggle reads as
+   *  pending, and switchView drops a second click. aria-disabled, not
+   *  disabled — a disabled button drops focus, so the question's dialog
+   *  couldn't hand it back when it closes. */
   const switchPending = $derived(
     activeSession !== null && $switchingViews.has(activeSession.id),
   );
@@ -1014,7 +1016,7 @@
         <button
           class="ctl"
           class:pending={switchPending}
-          disabled={switchPending}
+          aria-disabled={switchPending}
           title={switchPending
             ? "switching…"
             : viewToggle === "chat"
@@ -1843,6 +1845,7 @@
 
   .ctl.pending {
     opacity: 0.5;
+    cursor: default;
   }
 
   .ctl.pending:hover {

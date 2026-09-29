@@ -117,7 +117,7 @@
   } from "./lib/shared/reference";
   import { provenanceFor, rememberCopy } from "./lib/shared/provenance";
   import { asyncDisposer } from "./lib/shared/asyncDisposer";
-  import { modalFocus } from "./lib/shared/modalFocus";
+  import { modalFocus, modalOpen } from "./lib/shared/modalFocus";
   import {
     activateTab,
     adjacentPane,
@@ -1720,6 +1720,8 @@
       readAppStatus();
       unlistenMenu = asyncDisposer(
         onMenu((action) => {
+          // Workbench commands wait while a modal asks something.
+          if (modalOpen() && action !== "check-updates") return;
           switch (action) {
             case "close-view":
               if (activeWsId === null) closeThisWindow();
@@ -2564,6 +2566,9 @@
   function onKeydown(e: KeyboardEvent): void {
     // A settings row is recording a chord — the press is the recorder's.
     if (isCapturing()) return;
+    // A shown modal owns the keyboard: workbench chords stand down behind it
+    // (the picker and Quick Open handle their own chords below).
+    if (modalOpen() && !pickerOpen && !quickOpenOpen) return;
     // Per-pane text size (Cmd/Ctrl +/−/0, spec-pinned chords): intercepted
     // ONLY while the focused pane shows a font-sizable surface (a terminal or
     // a rendered markdown document), so browser zoom keeps working elsewhere.
@@ -3988,6 +3993,16 @@
     answer(go: boolean): void;
   } | null>(null);
 
+  // A question that no longer applies closes itself: the agent is gone, or
+  // another window already switched it. (Answering clears `switchAsk`, so
+  // this settles on the re-run.)
+  $effect(() => {
+    const ask = switchAsk;
+    if (ask === null) return;
+    const s = sessionsById.get(ask.sessionId);
+    if (s === undefined || !s.alive || s.ui === ask.target) ask.answer(false);
+  });
+
   function askForcedSwitch(sessionId: string, target: "chat" | "term"): Promise<boolean> {
     switchAsk?.answer(false);
     return new Promise((resolve) => {
@@ -4010,7 +4025,7 @@
    *
    * Guarded against double-fire: the toggle button and its ⌘-chord both call
    * here, so a switch already in flight for this id is ignored, and the button
-   * disables itself via the `switchingViews` store meanwhile. The server's own
+   * reads as pending via the `switchingViews` store meanwhile. The server's own
    * concurrent-switch 409 (without `busy`) is the backstop, dropped silently.
    */
   async function switchView(sessionId: string, target: "chat" | "term"): Promise<void> {
