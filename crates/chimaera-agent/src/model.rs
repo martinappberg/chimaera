@@ -41,9 +41,25 @@ pub const UNHANDLED_REQUEST_NAME_MAX: usize = 80;
 /// `UserMessage.origin` for the message the daemon sends a resurrected
 /// session when a restart cut its work off (see `ChatManager::command_as`).
 pub const ORIGIN_RESTART: &str = "restart";
-/// Host transfer context is a visible, daemon-authored message.
+/// `UserMessage.origin` for the pick-up message the daemon sends a
+/// conversation a Chimaera Pro transfer interrupted: [`ORIGIN_MOVED`] when it
+/// arrives in the cloud, [`ORIGIN_HOME`] when it is back on the user's
+/// computer, and [`ORIGIN_RECOVERED`] (either direction) when the other
+/// machine stopped responding and the conversation continues from the last
+/// saved point (often in a forked copy). The UI keys its divider on these
+/// exact strings; they are a stable public wire value.
 pub const ORIGIN_MOVED: &str = "moved";
 pub const ORIGIN_HOME: &str = "home";
+pub const ORIGIN_RECOVERED: &str = "recovered";
+
+/// Whether `origin` tags a pick-up the daemon itself sent (after a restart
+/// or a transfer): each one resets the carryover's pick-up clock.
+pub fn is_pickup_origin(origin: &str) -> bool {
+    matches!(
+        origin,
+        ORIGIN_RESTART | ORIGIN_MOVED | ORIGIN_HOME | ORIGIN_RECOVERED
+    )
+}
 /// `UserMessage.origin` for a worker's `tell_mastermind` message the daemon
 /// delivers to an auto-mode Mastermind (a wake the user didn't type).
 pub const ORIGIN_WORKER: &str = "worker";
@@ -233,9 +249,10 @@ pub enum AgentEvent {
         /// `"remote"` = a Remote Control client (phone / claude.ai) injected
         /// it through the agent's own bridge, so it never crossed chimaera's
         /// composer; [`ORIGIN_RESTART`] = the daemon sent it itself after a
-        /// restart cut work off; [`ORIGIN_WORKER`] = a worker's message the
-        /// daemon delivered to the Mastermind. Absent = this workbench's
-        /// composer. Additive.
+        /// restart cut work off; [`ORIGIN_MOVED`] / [`ORIGIN_HOME`] /
+        /// [`ORIGIN_RECOVERED`] = the daemon's pick-up after a Pro transfer;
+        /// [`ORIGIN_WORKER`] = a worker's message the daemon delivered to the
+        /// Mastermind. Absent = this workbench's composer. Additive.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<String>,
     },

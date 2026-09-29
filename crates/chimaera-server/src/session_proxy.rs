@@ -370,6 +370,21 @@ impl Store {
     pub(crate) fn rows(&self) -> Vec<Value> {
         crate::lock(&self.inner).rows.values().cloned().collect()
     }
+    /// Routed conversations blocked on the user's decision (a permission, a
+    /// plan approval or a question), as `(session, workspace)`: the same
+    /// rule the UI's `awaitsDecision` applies to these rows. A row whose
+    /// owner is unreachable still counts — the request is still open.
+    pub(crate) fn awaiting_decision(&self) -> Vec<(String, String)> {
+        let data = crate::lock(&self.inner);
+        data.rows
+            .iter()
+            .filter(|(_, row)| {
+                row["alive"] != false
+                    && (row["agent_state"] == "needs_permission" || row["needs_permission"] == true)
+            })
+            .filter_map(|(id, row)| Some((id.clone(), row["workspace_id"].as_str()?.to_owned())))
+            .collect()
+    }
     pub(crate) fn clear_workspace(&self, workspace: &str) {
         let mut data = crate::lock(&self.inner);
         data.rows
@@ -965,9 +980,10 @@ pub(crate) async fn api_proxy(
         if incoming.method() != axum::http::Method::GET
             && id.is_some_and(|id| !crate::ws::session_writable(&state, id))
         {
+            let owner = crate::ws::session_owner(&state, id.unwrap_or_default());
             return (
                 StatusCode::CONFLICT,
-                Json(json!({"error":"workspace_owned_elsewhere"})),
+                Json(json!({"error":"workspace_owned_elsewhere","owner":owner})),
             )
                 .into_response();
         }
@@ -1595,6 +1611,15 @@ impl Link<'_> {
         }
         (text.to_owned(), false)
     }
+    /// Where this socket's owner is: a cloud machine (`worker-` route) or a
+    /// computer — the additive `owner` of this relay's `read_only` refusals.
+    fn owner(&self) -> &'static str {
+        if self.route.host_id.starts_with("worker-") {
+            "cloud"
+        } else {
+            "computer"
+        }
+    }
     /// Where the session continues after its project changed owner.
     fn moved(&self) -> Value {
         let to = match self.state.session_proxy.for_session(&self.session) {
@@ -1620,7 +1645,7 @@ impl Link<'_> {
                 refused,
             )
         } else {
-            json!({"type":"error","code":"read_only","reason":"waking",
+            json!({"type":"error","code":"read_only","reason":"waking","owner":self.owner(),
                 "message":"Waking the cloud machine… That input was not sent."})
         };
         bounded_send(downstream, Down::Text(frame.to_string().into())).await
@@ -1640,7 +1665,7 @@ impl Link<'_> {
                 bounded_send(downstream, Down::Text(answer.to_string().into())).await?;
             }
         } else if refused.peek().is_some() {
-            let frame = json!({"type":"error","code":"read_only","reason":"reconnecting",
+            let frame = json!({"type":"error","code":"read_only","reason":"reconnecting","owner":self.owner(),
                 "message":"Your project is reconnecting. That input was not sent."});
             bounded_send(downstream, Down::Text(frame.to_string().into())).await?;
         }
@@ -1896,10 +1921,13 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
 }
 /// One project's live frames from its current owner, merged into a window's
 /// own `/ws/events` loop. The window's daemon stays authoritative for
-/// everything else: the owner's settings, recents, notices, updates and
-/// plugin frames describe the owner's machine and are never forwarded, and
-/// the feed ending (an owner change, a sleeping owner) never closes the
-/// window's socket — its loop simply starts another feed.
+/// everything else: the owner's settings, recents, updates and plugin frames
+/// describe the owner's machine and are never forwarded, and the feed ending
+/// (an owner change, a sleeping owner) never closes the window's socket — its
+/// loop simply starts another feed. The owner's notices about the project's
+/// conversations are not forwarded as frames either: they are relayed into
+/// this daemon's own notice feed (`notices::relay`), which the window's loop
+/// already sends and the native app already polls.
 pub(crate) enum FeedFrame {
     /// A path-only invalidation, already in this window's paths.
     Fs(Value),
@@ -2079,11 +2107,21 @@ async fn feed(
                                 frames.send(FeedFrame::Timeline(routed_epoch(project_generation, epoch))).await?;
                             }
                         }
+                        // The owner's notices about this project's own
+                        // conversations (it scopes them to the project) go
+                        // into this daemon's feed, so this computer alerts
+                        // about work running elsewhere; `relay` keeps the
+                        // first of each across windows and reconnects.
+                        Some("notices") => {
+                            for row in value["notices"].as_array().into_iter().flatten().take(64) {
+                                crate::notices::relay(state, workspace, row);
+                            }
+                        }
                         // The owner's connection for this project changed:
                         // end, and let the window's loop start afresh.
                         Some("error") => return Ok(()),
-                        // Settings, recents, notices, updates and plugin
-                        // frames describe the owner's machine, not this window.
+                        // Settings, recents, updates and plugin frames
+                        // describe the owner's machine, not this window.
                         _ => {}
                     }
                 }

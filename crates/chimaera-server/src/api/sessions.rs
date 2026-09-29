@@ -92,9 +92,10 @@ pub(crate) async fn create_session(
     Json(body): Json<CreateSession>,
 ) -> Response {
     if !crate::pro::may_execute(&state, &body.workspace_id) {
+        let owner = crate::pro::owner_kind(&state, &body.workspace_id);
         return (
             StatusCode::CONFLICT,
-            Json(json!({"error":"workspace_owned_elsewhere"})),
+            Json(json!({"error":"workspace_owned_elsewhere","owner":owner})),
         )
             .into_response();
     }

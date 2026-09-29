@@ -444,6 +444,15 @@ historical recovery context directing the agent to inspect files and external
 state before repeating effects, using existing permissions without a routine
 human-review gate. Timeout alone is never proof that the old OS process stopped.
 
+That context is one visible pick-up message the receiving daemon sends a
+structured conversation, in plain words (where it now runs, same conversation
+or a copy, files installed and may differ, re-check tools and paths). Its
+`UserMessage.origin` is a stable tag clients key on: `moved` (a clean move, now
+in the cloud), `home` (a clean return, back on the user's computer) and
+`recovered` (either direction, continuing from the last saved point because
+the other machine stopped responding). A terminal agent gets one neutral
+positional prompt instead, and only for a turn that was cut off.
+
 Lease expiry fences execution only on a cloud worker, and a resumed worker
 renews before fencing: after a suspension (seen as a clock discontinuity) its
 daemon first renews the recorded epoch, which the account grants to a suspended

@@ -926,6 +926,42 @@ async fn laptop_first_sign_out_and_unreachable_account_keep_local_work_running()
     pro::install_remote_owner_fixture(&state, &project.id, 5);
     assert!(!pro::may_execute(&state, &project.id));
     assert!(state.sessions.get(&shell).is_some_and(|s| s.alive));
+    // Refused typing and a refused new session both say where the project
+    // runs now (additive `owner`), in the UI's words.
+    terminal
+        .send(Message::Binary(bytes::Bytes::from_static(
+            b"touch REFUSED_ELSEWHERE\n",
+        )))
+        .await
+        .unwrap();
+    let refused = loop {
+        if let Message::Text(text) = next_ws_frame(&mut terminal).await {
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            if frame["type"] == "error" {
+                break frame;
+            }
+        }
+    };
+    assert_eq!(refused["code"], "read_only", "{refused}");
+    assert_eq!(refused["reason"], "elsewhere", "{refused}");
+    assert_eq!(refused["owner"], "cloud", "{refused}");
+    assert_eq!(
+        refused["message"],
+        "This project is running in the cloud right now. That was not sent."
+    );
+    let (status, body) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(json!({"workspace_id":project.id,"kind":"shell","command":"/bin/sh"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body,
+        json!({"error":"workspace_owned_elsewhere","owner":"cloud"})
+    );
+    assert!(!project.root.join("REFUSED_ELSEWHERE").exists());
 
     state.chat.kill("s-laptop-chat");
     let _ = state.sessions.kill(&shell);
@@ -1010,6 +1046,9 @@ async fn scoped_connection_reads_remain_valid_while_mutation_capacity_is_full() 
                     frame["code"], "read_only",
                     "busy input must not report session exit"
                 );
+                assert_eq!(frame["reason"], "busy", "{frame}");
+                // The phone's view of a project running on the user's computer.
+                assert_eq!(frame["owner"], "computer", "{frame}");
                 break;
             }
             assert_ne!(frame["type"], "exited");

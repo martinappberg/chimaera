@@ -376,13 +376,7 @@ impl Carryover {
             AgentEvent::UserMessage {
                 origin: Some(origin),
                 ..
-            } if matches!(
-                origin.as_str(),
-                model::ORIGIN_RESTART | model::ORIGIN_MOVED | model::ORIGIN_HOME
-            ) =>
-            {
-                self.pickup_at_ms = now_ms()
-            }
+            } if model::is_pickup_origin(origin) => self.pickup_at_ms = now_ms(),
             AgentEvent::TurnStarted { .. } => self.turn_in_flight = true,
             AgentEvent::TurnCompleted { .. } | AgentEvent::TurnAborted { .. } => {
                 self.turn_in_flight = false;
@@ -1570,5 +1564,36 @@ mod tests {
 
         carry.observe(&AgentEvent::Exited { status: Some(0) });
         assert_eq!(carry, Carryover::default(), "nothing outlives the process");
+    }
+
+    /// Every daemon pick-up (restart, move, return, and the recovery after
+    /// the other machine stopped responding) stamps the pick-up clock; a
+    /// phone's message or a worker's does not.
+    #[test]
+    fn every_daemon_pickup_origin_stamps_the_pickup_clock() {
+        let user = |origin: &str| AgentEvent::UserMessage {
+            text: "pick up".into(),
+            attachments: 0,
+            attachment_paths: Vec::new(),
+            id: Some("m1".into()),
+            queued: false,
+            after_turn: false,
+            origin: Some(origin.into()),
+        };
+        for origin in [
+            model::ORIGIN_RESTART,
+            model::ORIGIN_MOVED,
+            model::ORIGIN_HOME,
+            model::ORIGIN_RECOVERED,
+        ] {
+            let mut carry = Carryover::default();
+            carry.observe(&user(origin));
+            assert!(carry.pickup_at_ms > 0, "{origin} stamps the clock");
+        }
+        for origin in ["remote", model::ORIGIN_WORKER] {
+            let mut carry = Carryover::default();
+            carry.observe(&user(origin));
+            assert_eq!(carry.pickup_at_ms, 0, "{origin} is not a pick-up");
+        }
     }
 }

@@ -472,15 +472,33 @@ fn command_refusal(mut answer: serde_json::Value, text: &str) -> serde_json::Val
 
 /// Input this socket may not deliver. The additive `reason` lets a client say
 /// why in its own words (`watching`: the viewer chose to watch; `elsewhere`:
-/// the project runs on another device right now); `message` stays plain.
-fn refusal(watching: bool) -> serde_json::Value {
+/// the project runs on the other machine right now), and the additive
+/// `owner` (`"cloud"` | `"computer"`, [`session_owner`]) where it runs, so the
+/// words need no guess; `message` stays plain.
+fn refusal(state: &AppState, id: &str, watching: bool) -> serde_json::Value {
+    let owner = session_owner(state, id);
     if watching {
-        json!({"type":"error","code":"read_only","reason":"watching",
+        json!({"type":"error","code":"read_only","reason":"watching","owner":owner,
                "message":"You're watching. Take control to type."})
     } else {
-        json!({"type":"error","code":"read_only","reason":"elsewhere",
-               "message":"This project is running on another device right now. That was not sent."})
+        let place = if owner == "cloud" {
+            "in the cloud"
+        } else {
+            "on your computer"
+        };
+        json!({"type":"error","code":"read_only","reason":"elsewhere","owner":owner,
+               "message":format!("This project is running {place} right now. That was not sent.")})
     }
+}
+
+/// Where the project of session `id` runs now: `"cloud"` or `"computer"`
+/// (`pro::owner_kind`; a session with no project runs where this daemon is).
+pub(crate) fn session_owner(state: &AppState, id: &str) -> &'static str {
+    let workspace = crate::lock(&state.session_workspaces)
+        .get(id)
+        .cloned()
+        .unwrap_or_default();
+    crate::pro::owner_kind(state, &workspace)
 }
 
 pub(crate) fn session_writable(state: &AppState, id: &str) -> bool {
@@ -852,7 +870,7 @@ async fn handle(
                 Some(Ok(Message::Binary(bytes))) => {
                     if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
                     if options.read_only || !session_writable(&state, &id) {
-                        let _ = send_ordered_json(&mut socket, &mut batch, &refusal(options.read_only)).await;
+                        let _ = send_ordered_json(&mut socket, &mut batch, &refusal(&state, &id, options.read_only)).await;
                         continue;
                     }
                     let mut interacted = false;
@@ -864,7 +882,7 @@ async fn handle(
                                 return;
                             }
                             if matches!(error, chimaera_pty::ExecError::Busy(_)) {
-                                let _ = send_ordered_json(&mut socket, &mut batch, &json!({"type":"error","code":"read_only","reason":"busy","message":"Your project is busy. Wait a moment before typing again."})).await;
+                                let _ = send_ordered_json(&mut socket, &mut batch, &json!({"type":"error","code":"read_only","reason":"busy","owner":session_owner(&state, &id),"message":"Your project is busy. Wait a moment before typing again."})).await;
                                 break;
                             }
                             // Session is gone; flush the batched tail (its
@@ -1268,7 +1286,7 @@ async fn handle_chat(
                     match serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text) {
                         Ok(mut cmd) => {
                             if options.read_only || !session_writable(&state, &id) {
-                                let _ = send_json(&mut socket, &command_refusal(refusal(options.read_only), &text)).await;
+                                let _ = send_json(&mut socket, &command_refusal(refusal(&state, &id, options.read_only), &text)).await;
                                 continue;
                             }
                             if let Err(err) = cmd.validate_ingress() {

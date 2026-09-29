@@ -131,7 +131,15 @@ cannot be delivered is answered, never dropped: each chat command gets
 composer); typing gets `read_only` with `reason:"reconnecting"`. Every chat
 refusal carries the additive `command` it answers (`send`, `interrupt`,
 `permission`…), and a client restores a draft only for `command:"send"`.
-Nothing is resent automatically.
+Nothing is resent automatically. Every `read_only` refusal (`reason`:
+`watching`, `elsewhere`, `busy`, `waking`, `reconnecting`) and every HTTP
+`409 {"error":"workspace_owned_elsewhere"}` also carry the additive
+`owner: "cloud" | "computer"`: where the project's work runs now, so a client
+can say "running in the cloud" / "running on your computer" without guessing.
+An owning daemon names its recorded owner (the other machine while another
+owner holds the project — a cloud machine's other owner is the user's
+computer, a computer's is the cloud — else itself); a viewing daemon's relay
+names its route's owner (a `worker-` route is the cloud).
 
 A session with no process where a viewer asks is not an exit, and its owning
 daemon says why (additively; older clients ignore both and reconnect):
@@ -157,8 +165,17 @@ intent, and the action is not queued (a terminal says so over the pane).
 **Events.** A window's own `/ws/events` loop stays authoritative. For a routed
 project it runs a bounded feed from the owner that contributes only that
 project's session rows (merged into the local roster), file invalidations (in the
-window's paths) and Git/Timeline epochs; the owner's settings, recents, notices,
-update and plugin frames are never forwarded. Only paths under the project's
+window's paths) and Git/Timeline epochs; the owner's settings, recents, update
+and plugin frames are never forwarded. Nor are its notices, as frames: the
+owner scopes them to the project, and the viewing daemon relays a finished turn
+(`done`/`input`), a permission, a question and the agent's own `notify` message
+into its own notice feed (so the
+native app and browser tabs alert as for local work) — once per notice across
+every window's feed (keyed by session, kind and the owner's `at_ms`, a bounded
+set), never for a session that runs on the viewing computer, and only for kinds
+its own `notifications.*` settings allow. A routed conversation blocked on a
+decision joins the viewing daemon's attention set (the Dock badge), so its
+alert is taken back once answered on either machine. Only paths under the project's
 folder are registered with the owner; the window's daemon keeps watching the
 rest itself (a pasted upload, a note in the home folder), and an owner drops a
 registered path its viewer may not read instead of closing. Local Git watching

@@ -271,6 +271,12 @@ return); a file only one side changed takes that side; if both changed, the
 incoming version takes the path and the user's own version is kept right beside
 it as `<name>.mine-<yyyymmdd-hhmm>` (a name the mirror never publishes), counted
 in the mirror row's additive `kept_both`, with `kept_paths` naming those copies.
+`report_return` records it (persisted in `state.json`'s `kept_both`, a 64 KiB
+share: counts always, names while they fit) and raises one `kept_both` notice
+per return that kept anything (`notices::push_kept_both`). The return's kept
+`@cloud` branches reach that notice only once `engine::hydrate_scoped` passes
+`repository::receive`'s result to `report_return` (today it calls
+`return_report`, files only).
 A baseline file absent from the incoming snapshot is deleted only when the
 manifest's additive `left_out` inventory (≤4096 paths the sender omitted by
 policy, size, symlink, credential content or `.chimaeraignore`) is present and
