@@ -97,11 +97,11 @@
       catalogMutation = operation;
       catalogVisibility = visibility;
       loaded = true;
-      error = current ? null : "Your cloud connections couldn't be checked yet. Check again shortly.";
+      error = current ? null : "We couldn't check your agent sign-ins yet. We'll try again shortly.";
     } catch {
       if (alive && !signal?.aborted && visibility === visibilityGeneration) {
         if (operation !== mutation) catalogAgain = true;
-        else { loaded = true; current = false; error = "Your provider connections couldn't refresh. Check again before changing a connection."; }
+        else { loaded = true; current = false; error = "We couldn't check your agent sign-ins. We'll try again shortly."; }
       }
     } finally {
       catalogFlight = false;
@@ -266,7 +266,7 @@
     <button class="management" aria-expanded={showDetails} onclick={() => (expanded = !expanded)}><span><strong>Agent connections</strong><span class="management-state">{!loaded ? "Checking connections…" : ready ? "Ready for cloud work" : "Checking connection status…"}</span></span><span class="chevron" class:expanded aria-hidden="true">›</span></button>
   {/if}
   {#if showDetails}
-  <div class="heading"><div><span class="eyebrow">Your cloud agents</span><h2>{requestingDisconnect ? `Disconnecting ${connectingLabel}…` : waiting ? disconnecting ? `Disconnecting ${connectingLabel}…` : connection?.phase === "preparing" ? `Preparing ${connectingLabel} sign-in…` : connection?.phase === "verifying" ? `Connecting ${connectingLabel}…` : `Connect ${connectingLabel}` : heading}</h2></div>{#if error || operationError || !current && loaded}<button class="text-button" disabled={catalogFlight || busy !== null} onclick={() => void load()}>Check connections</button>{/if}</div>
+  <div class="heading"><div><span class="eyebrow">Your cloud agents</span><h2>{requestingDisconnect ? `Disconnecting ${connectingLabel}…` : waiting ? disconnecting ? `Disconnecting ${connectingLabel}…` : connection?.phase === "preparing" ? `Preparing ${connectingLabel} sign-in…` : connection?.phase === "verifying" ? `Connecting ${connectingLabel}…` : `Connect ${connectingLabel}` : heading}</h2></div></div>
   <p class="intro">{requestingDisconnect || waiting && disconnecting ? "Chimaera is signing this service out in your personal cloud." : waiting ? connection?.phase === "preparing" ? "Sign-in will appear here when it’s ready." : connection?.phase === "verifying" ? "Chimaera is confirming your sign-in with the provider." : "Finish sign-in below. Chimaera will confirm the connection automatically." : introduction}</p>
   <p class="privacy">Use your own provider account and subscription. Connected services are available across your cloud projects. Signing in or disconnecting here doesn’t change sign-in on your other devices.</p>
   {#if !loaded}<p class="muted" role="status">Checking your cloud connections…</p>{/if}
@@ -328,7 +328,7 @@
       {:else if action?.type === "terminal"}
         <p class="muted">This provider completes sign-in in its own terminal. Open it, follow the provider's instructions, then return here. We'll verify the connection for you.</p><button class="button" disabled={busy !== null} onclick={() => void openSignIn(true)}>Open sign-in terminal</button>
       {:else}<p class="muted">We're preparing this provider's sign-in in Chimaera cloud. This may take a moment.</p>{/if}
-      {#if waiting}<div class="connection-actions"><button class="text-button" disabled={connectionFlight || busy !== null} onclick={() => void checkConnection()}>Check sign-in status</button><button class="text-button" disabled={busy !== null} onclick={() => void cancel()}>{busy === "cancel" ? "Canceling…" : "Cancel sign-in"}</button></div>{/if}
+      {#if waiting}<div class="connection-actions">{#if pollingPaused || connectionNotice}<button class="text-button" disabled={connectionFlight || busy !== null} onclick={() => void checkConnection()}>Check sign-in status</button>{/if}<button class="text-button" disabled={busy !== null} onclick={() => void cancel()}>{busy === "cancel" ? "Canceling…" : "Cancel sign-in"}</button></div>{/if}
       {#if pollingPaused && waiting}<p class="muted small" role="status">Automatic checks have paused after this request's time limit. Check its status or cancel before trying again.</p>{/if}
       {#if connectionNotice}<p class="error" role="status">{connectionNotice}</p>{/if}
     </section>

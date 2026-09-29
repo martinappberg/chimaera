@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ProBillingAttempt, ProStatus } from "../net/native";
-import { accountPanel, completesReview, isConfirmedFree, reviewKey } from "./account";
+import { accountPanel, completesReview, isConfirmedFree, nearLimit, reviewKey } from "./account";
 
 const free: ProStatus = { available: true, signed_in: true, email: "fixture@example.invalid", plan: "none", error: null };
 const attempt = (phase: ProBillingAttempt["phase"], id = 7): ProBillingAttempt => ({ id, kind: "checkout", phase, expires_at: 123, error: null });
@@ -34,6 +34,23 @@ describe("Pro page panel", () => {
     for (const delta of [{ available: false }, { initializing: true }, { error: "failed" }, { plan: null }, { plan: "pro" as const }]) {
       expect(isConfirmedFree({ ...free, ...delta })).toBe(false);
     }
+  });
+});
+
+describe("Max offer", () => {
+  const limits = { cloud_hours: 100, storage_bytes: 1000 };
+  it("appears only near or at a limit", () => {
+    expect(nearLimit(null)).toBe(false);
+    expect(nearLimit({ usage: { cloud_hours: 10, storage_bytes: 100 }, limits })).toBe(false);
+    expect(nearLimit({ usage: null, limits })).toBe(false);
+    expect(nearLimit({ usage: { cloud_hours: 80, storage_bytes: 0 }, limits })).toBe(true);
+    expect(nearLimit({ usage: { cloud_hours: 0, storage_bytes: 950 }, limits })).toBe(true);
+    expect(nearLimit({ usage: { cloud_hours: 0, storage_bytes: 0 }, limits, hours_exhausted: true })).toBe(true);
+  });
+  it("does not treat an unused account or an absent allowance as a limit", () => {
+    expect(nearLimit({ usage: { cloud_hours: 0, storage_bytes: 0 }, limits: { cloud_hours: 0, storage_bytes: 0 } })).toBe(false);
+    expect(nearLimit({ usage: { cloud_hours: 3, storage_bytes: 0 }, limits: { cloud_hours: 0, storage_bytes: 0 } })).toBe(true);
+    expect(nearLimit({ usage: { cloud_hours: Number.NaN, storage_bytes: 0 }, limits })).toBe(false);
   });
 });
 

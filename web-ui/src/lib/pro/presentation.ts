@@ -38,8 +38,15 @@ export function friendlyError(reason: unknown, fallback: string): string {
   if (/expired|sign.in required|sign in first|authorization revoked/i.test(text)) return "Your sign-in has expired. Sign in again to continue.";
   if (/Could not open.*browser/i.test(text)) return "Your browser couldn't open. Please try again.";
   if (/finishing/i.test(text)) return "Sign-in is finishing. Please wait a moment.";
-  if (/409|use_billing_portal/.test(text)) return "Your account already has a plan. Refresh your account, then choose Manage billing.";
+  if (alreadySubscribed(reason)) return "Your account already has a plan.";
   return fallback;
+}
+
+/** Checkout refused because the account already has a plan; the page re-reads
+ * the account itself instead of asking the user to refresh. */
+export function alreadySubscribed(reason: unknown): boolean {
+  const text = reason instanceof Error ? reason.message : String(reason);
+  return /409|use_billing_portal/.test(text);
 }
 
 /** Service diagnostics are neither UI copy nor a promise of automatic recovery. */

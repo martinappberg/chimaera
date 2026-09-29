@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { paid, readIntent, cloudCopy, cloudPollDelay, cloudProjectStatus, friendlyError, projectCopyError } from "./presentation";
+import { paid, readIntent, cloudCopy, cloudPollDelay, cloudProjectStatus, friendlyError, projectCopyError, alreadySubscribed } from "./presentation";
 
 describe("purchase intent", () => {
   const intent = { plan: "max", interval: "year", stage: "sign_in", created: 1000 };
@@ -42,7 +42,10 @@ describe("honest cloud state", () => {
   });
   it("never renders arbitrary service errors", () => {
     expect(friendlyError("account request rejected (503) secret=example", "Please retry.")).toBe("Please retry.");
-    expect(friendlyError("account request rejected (409)", "Please retry.")).toContain("Manage billing");
+    expect(friendlyError("account request rejected (409)", "Please retry.")).not.toBe("Please retry.");
+    expect(alreadySubscribed("account request rejected (409)")).toBe(true);
+    expect(alreadySubscribed(new Error("use_billing_portal"))).toBe(true);
+    expect(alreadySubscribed("account request rejected (503)")).toBe(false);
   });
   it("explains known copy blockers without raw diagnostics or false retry promises", () => {
     expect(projectCopyError("workspace exceeds mirror storage quota")).toContain("cloud allowance");

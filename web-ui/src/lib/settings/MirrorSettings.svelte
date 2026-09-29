@@ -9,10 +9,32 @@
   let error = $state<string | null>(null);
   let busy = $state<string | null>(null);
   let revision = 0;
+  /** Last automatic privacy retry per project. Turning cloud copies off is
+   * idempotent, so a pending one is re-sent quietly at most once a minute
+   * while this view shows, instead of asking the user to retry. */
+  const privacyRetries = new Map<string, number>();
+  let privacyFlight = false;
   async function load(): Promise<void> {
     const current = ++revision;
-    try { const next = await proMirrorStatus(); if (current === revision) { status = next; error = null; } }
+    try {
+      const next = await proMirrorStatus();
+      if (current !== revision) return;
+      status = next; error = null;
+      retryPrivacy(next);
+    }
     catch { if (current === revision) error = "Project status couldn’t refresh. Your saved work and privacy choices haven’t changed."; }
+  }
+  function retryPrivacy(next: MirrorStatus): void {
+    if (privacyFlight || busy !== null) return;
+    const now = Date.now();
+    const pending = next.workspaces.find(workspace => workspace.privacy_pending && workspace.never_mirror
+      && now - (privacyRetries.get(workspace.workspace_id) ?? 0) >= 60_000);
+    if (pending === undefined) return;
+    privacyRetries.set(pending.workspace_id, now);
+    privacyFlight = true;
+    void proSetNeverMirror(pending.workspace_id, true)
+      .then(() => load(), () => { /* The next status read shows it still pending. */ })
+      .finally(() => { privacyFlight = false; });
   }
   $effect(() => {
     if (!visible || !$pageVisible) return;
@@ -58,7 +80,7 @@
         <p class="path">{workspace.root}</p>
         <label class="check"><input type="checkbox" checked={workspace.never_mirror} disabled={busy !== null || (recoveryOnly && workspace.never_mirror)} onchange={(event) => privacy(workspace,event.currentTarget)} />Keep this project on this device</label>
         {#if workspace.never_mirror && !workspace.privacy_pending}<p class="hint">Automatic copying and cloud access are off. Existing saved copies haven’t been deleted.</p>{/if}
-        {#if workspace.privacy_pending}<p class="error" role="status">Copying from this device has stopped. Cloud privacy is still pending; retry to disable it everywhere.</p><button class="btn" disabled={busy !== null} onclick={() => void act(workspace.workspace_id, () => proSetNeverMirror(workspace.workspace_id, true))}>Retry cloud privacy</button>{/if}
+        {#if workspace.privacy_pending}<p class="hint" role="status">Turning off cloud copies for this project… We’ll keep trying.</p>{/if}
         {#if workspace.git_branches?.length}<p class="hint">Cloud changes are saved in {workspace.git_branches.join(", ")} for you to merge.</p>{/if}
         {#if !recoveryOnly && workspace.blocked_providers?.length}
           <div class="connection-needed"><p class="hint">Connect the agents this project uses so it can continue automatically.</p><button class="btn" onclick={() => cloudOnboarding.request({ providerIds: workspace.blocked_providers!.map(provider => provider.id), workspaceId: workspace.workspace_id, workspaceName: workspace.name })}>Connect agents to continue</button></div>

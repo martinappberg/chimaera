@@ -37,6 +37,17 @@ export function reviewKey(status: ProStatus | null): string | null {
   return billing ? `${billing.id}:${billing.phase}:${status?.plan ?? "unknown"}` : null;
 }
 
+/** Max is offered where a limit is near or reached, never as a standing
+ * upsell: 80 % of an allowance, a used-up allowance, or no allowance at all. */
+export function nearLimit(status: Pick<ProStatus, "usage" | "limits" | "hours_exhausted"> | null): boolean {
+  if (status?.hours_exhausted === true) return true;
+  const near = (used: number | undefined, limit: number | undefined): boolean =>
+    typeof used === "number" && typeof limit === "number" && Number.isFinite(used) && Number.isFinite(limit)
+    && used > 0 && (limit <= 0 || used / limit >= 0.8);
+  return near(status?.usage?.cloud_hours, status?.limits?.cloud_hours)
+    || near(status?.usage?.storage_bytes, status?.limits?.storage_bytes);
+}
+
 /** An explicit Check account completes its review only on a read that shows the
  * same checkout attempt still unresolved on a confirmed account with no plan. */
 export function completesReview(status: ProStatus | null, requestedId: number | null): boolean {

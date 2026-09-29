@@ -10,8 +10,8 @@
   import MirrorSettings from "./MirrorSettings.svelte";
   import { asyncDisposer } from "../shared/asyncDisposer";
   import { pageVisible } from "../shared/visibility";
-  import { paid, readIntent, friendlyError, recoverableAccountRestore, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
-  import { accountPanel, completesReview, isConfirmedFree, reviewKey } from "../pro/account";
+  import { paid, readIntent, friendlyError, recoverableAccountRestore, alreadySubscribed, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
+  import { accountPanel, completesReview, isConfirmedFree, nearLimit, reviewKey } from "../pro/account";
   import { accountFailure, connectionWarning, paymentDue } from "../pro/status";
   import {
     onProChanged, proStatus, proSignIn, proCancelSignIn, proSignOut, proSignOutEverywhere,
@@ -171,10 +171,14 @@
     // The shell owns the attempt from here. A view remount must not reopen it.
     remember(null);
     notice = null;
+    let planExists = false;
     await act("checkout", async () => {
-      await proBillingCheckout(choice.plan, choice.interval);
+      try { await proBillingCheckout(choice.plan, choice.interval); }
+      catch (reason) { planExists = alreadySubscribed(reason); throw reason; }
       if (status?.billing === undefined) notice = "Checkout opened in your browser. Return here to check your account when you're done.";
     }, "Checkout couldn't open. Please try again.");
+    // The account already has a plan: show it rather than asking for a refresh.
+    if (planExists && alive) await load(true);
   }
   function selectPlan(plan: PaidPlan, nextInterval = interval): void {
     selected = plan;
@@ -294,7 +298,6 @@
       <p>{status.initialization_phase === "keychain"
         ? "Your system keychain is checking access to your saved account. Respond to any keychain prompt for chimaera to continue. Your workspaces remain available while you do."
         : "We're checking your saved account and restoring its connections. Your workspaces remain available."}</p>
-      <button class="secondary" onclick={() => void load()}>Check again</button>
     </div>
   {:else if offerPlans}<ProWalkthrough />{/if}
 
@@ -307,7 +310,6 @@
       <div class="identity">
         <div><span class="email">{status.email}</span><span class="muted small">{subscribed ? "Your account" : paymentNeeded ? "Signed in · Payment needs attention" : confirmedFree ? "Signed in · No active plan" : "Signed in · Checking your plan"}</span></div>
         <PlanBadge plan={paid(status.plan) ? status.plan : null} />
-        <button class="text-button" disabled={busy !== null} onclick={() => void load(true)}>Refresh</button>
       </div>
       {#if warning}<p class="muted small connection-warning" role="status">Connecting to the cloud… Work on this computer continues as usual.</p>{/if}
     {/if}
@@ -349,7 +351,7 @@
         <div class="section-heading"><div><span class="section-label">Your plan</span><h2>Chimaera {status.plan === "max" ? "Max" : "Pro"}</h2></div><button class="secondary" disabled={busy !== null || billingActive} onclick={() => void openBilling()}>{busy === "billing" ? "Opening billing…" : "Manage billing"}</button></div>
         {#if paymentNeeded}{@render paymentNotice(false)}{/if}
         {@render billingNotice()}
-        {#if status.plan === "pro" && !paymentNeeded}
+        {#if status.plan === "pro" && !paymentNeeded && nearLimit(status)}
           <div class="upgrade-entry">
             <div><h3>More room for your work</h3><p class="small muted">Max includes more cloud time and mirrored storage, with the same workflow.</p></div>
             <button class="secondary" aria-expanded={upgradeOpen} disabled={busy !== null || billingActive || !canReviewUpgrade(status, true)} onclick={() => (upgradeOpen = !upgradeOpen)}>{billing?.kind === "plan_change" && billing.phase === "unconfirmed" ? "Review upgrade again" : "Upgrade to Max"}</button>
