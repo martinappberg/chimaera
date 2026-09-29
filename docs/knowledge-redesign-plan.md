@@ -1,17 +1,19 @@
 # Knowledge redesign — a real UI on top of Mycelium
 
-Status: **plan** (2026-09-28, nothing built). Items marked **[decide]** are
-the maintainer's call. It supersedes the Knowledge parts of
+Status: **plan** (2026-09-28, nothing built). The maintainer's decisions
+from 2026-09-28 are folded in and listed at the end. It supersedes the
+Knowledge parts of
 [timeline-knowledge-plugins-plan.md](timeline-knowledge-plugins-plan.md) §5
 and the Knowledge rows of its §9 experience bar where they conflict (named
 below). It is written to fit the plugin platform plan on
 `origin/claude/brave-hamilton-afhtt3` (`docs/plugin-platform-plan.md`, not
-yet on main) — see [Fit with the plugin platform](#fit-with-the-plugin-platform).
+yet on main) — see [Knowledge belongs to the plugin](#knowledge-belongs-to-the-plugin).
 
 The ask: the Knowledge tab should be a good, intuitive UI on top of *regular*
-Mycelium — it should be obvious where every rating, piece of evidence,
-to-do and question comes from, and it should represent all of Mycelium,
-not a template-shaped subset of it.
+Mycelium — it should be obvious where every status, piece of evidence,
+to-do and question comes from, it should represent all of Mycelium, not a
+template-shaped subset of it, and an id an agent mentions in a chat
+(`F-228`) should be something you can hover and click.
 
 Sources: a read of upstream Mycelium at `arjunrajlaboratory/mycelium`
 `ab270c3` (v0.7.2); a read of `chimaera-plugin-mycelium` 0.1.3 and of
@@ -27,10 +29,10 @@ of the plugin's parser reproduced the UI's numbers exactly.
 On that project the tab shows 293 findings, 263 of them "unrated" and 268
 with "no evidence yet". Four causes stack:
 
-1. **The host runs plugin 0.1.2.** It counts 35 `### F-NNN addendum:` headings as
-   findings of their own — every one unrated and without evidence. 0.1.3
-   (already locked on main) folds them: 258 findings. *Fix: update the
-   plugin on that host from Extensions — no code.*
+1. **The host runs plugin 0.1.2.** It counts 35 `### F-NNN addendum:`
+   headings as findings of their own — every one unrated and without
+   evidence. 0.1.3 (already locked on main) folds them: 258 findings.
+   *Fix: update the plugin on that host from Extensions — no code.*
 2. **The agents stopped writing Mycelium's template around F-050.** The
    template is `**Status:** preliminary | supported | robust | contradicted`
    plus a `### Evidence Ledger` table. Template use by id range:
@@ -51,31 +53,29 @@ with "no evidence yet". Four causes stack:
    30 carry a "Regenerate from …" line.
 3. **19 findings say `**Status:** established …`** — not a Mycelium word,
    so it reads as unknown.
-4. **Status is hand-written by the agent, not derived.** Mycelium states a
-   rule (one ledger row = preliminary; 2+ agreeing = supported; 3+ across
-   datasets or projects = robust; any contradicting row = contradicted), but
-   no Mycelium code applies it — the agent types the word. Of the 30
-   "supported" findings, 10 have no ledger and 12 have one row (the rule
-   says preliminary). Our legend says the rating is "set by mycelium from
-   each finding's evidence, never by hand" — **that is false**, and the §5
+4. **Status is hand-written by the agent, not derived.** Mycelium's
+   template describes a rule (one ledger row = preliminary; 2+ agreeing =
+   supported; 3+ across datasets or projects = robust; any contradicting
+   row = contradicted), but no Mycelium code applies it — the agent types
+   the word. Our legend says the status is "set by mycelium from each
+   finding's evidence, never by hand" — **that is false**, and the §5
    design line "derived by mycelium from the evidence ledger, never by us"
    rests on the same misreading.
 
 Two presentation choices then turn "not stated" into "failed": the plugin
-defaults a missing Status to `unknown` (upstream's own registry builder
-defaults it to `preliminary`), and the UI draws three grey dots plus "no
-evidence yet" for it — a grade against a template nobody follows.
+turns a missing Status into `unknown`, and the UI draws three grey dots plus
+"no evidence yet" for it — a grade against a template nobody follows.
 
 ### Where to-dos, questions and "where we left off" come from today
 
 - **To-dos** are the rows of the table in `todo/TODO_REGISTRY.md` — and only
   those. The project also keeps 16 to-dos as `##` sections *below* the table
-  (`## #50 — … ✅ DONE`, `## T-<Name>`, …),
-  including all six newest; the parser stops at the first heading, so the
-  UI never sees them. The header's "44 to do" counts **every** row,
-  complete and wont-do included; `done 2026-09-23 (…)` isn't recognised as
-  closed. 33 of 44 item cells are whole paragraphs (the squashed layout),
-  and 33 File cells are free text the UI turns into broken `todo/…` links.
+  (`## #50 — … ✅ DONE`, `## T-<Name>`, …), including all six newest; the
+  parser stops at the first heading, so the UI never sees them. The
+  header's "44 to do" counts **every** row, complete and wont-do included;
+  `done 2026-09-23 (…)` isn't recognised as closed. 33 of 44 item cells are
+  whole paragraphs (the squashed layout), and 33 File cells are free text
+  the UI turns into broken `todo/…` links.
 - **Open questions** are only the bullets under findings' `### Open
   Questions` — 22, all from July-era files, several since answered. The
   project's live questions are prose: 26 findings say "Put to the user",
@@ -86,8 +86,7 @@ evidence yet" for it — a grade against a template nobody follows.
   18:29 handoff in `.mycelium/run/claude/<session>/last-session.md` is
   never read (the plugin stops at the shared file), and its numbered
   headings (`## 1. Goal`, `## 2. Done`, `## 3. In flight`, `## 4. Next`)
-  wouldn't match anyway. `.claude/RESUME_STATE.md`, which the project's
-  `MYCELIUM.md` names as the authoritative hand-off, isn't read at all.
+  wouldn't match anyway.
 - **Decisions**: 126 of 169 show undated (the date is `(YYYY-MM-DD)` at the
   end of the heading or a `**Date**:` field), so July sorts first; 94 show
   empty cards (`**Decision.**` / `**Why.**` style); tags after a `·` are
@@ -108,10 +107,12 @@ evidence yet" for it — a grade against a template nobody follows.
 - No open-at-line (the snapshot has `line`; the file opens at the top), no
   link from `recorded_by`, ledger `run` ids or the handoff's session to a
   chat, no links between entries, Timeline and dashboard rows open the tab
-  but not the entry, and 772 entries render at once.
+  but not the entry, ids in chats are plain text, and 772 entries render
+  at once.
 - 15 finding ids are reused across topic files for unrelated findings
   (one id three times; another names two unrelated findings in two topic
-  files), so a bare id anywhere is ambiguous. Six decision ids are duplicated too.
+  files), so a bare id anywhere is ambiguous. Six decision ids are
+  duplicated too.
 
 ## What Mycelium is (the model the UI must respect)
 
@@ -126,14 +127,18 @@ this plan.
   Status, Claim, Implications, Tags, Evidence Ledger, Open Questions);
   decisions and learnings (`### [date] title` in one file each — their
   `D-n`/`L-n` are *positional*, renumbered by inserts and migrations);
-  conventions (`.living/conventions.md`, free-form `##` sections — the reference
-  project numbers them `## C-N`); to-dos (`todo/TODO_REGISTRY.md` + item files, at
-  the repo root); session logs (`.living/log/*.md` + `LOG_REGISTRY.md`) and
-  data lineage (`.living/log/data-lineage/<sid>.json`: scripts, inputs,
-  outputs, sha256s per action); the handoff (`.mycelium/last-session.md`,
-  gitignored — local to one machine); manifests (`data/DATA_MANIFEST.md`,
+  conventions (`.living/conventions.md`, free-form `##` sections — the
+  reference project numbers them `## C-N`); to-dos (`todo/TODO_REGISTRY.md`
+  + item files, at the repo root); session logs (`.living/log/*.md` +
+  `LOG_REGISTRY.md`) and data lineage (`.living/log/data-lineage/<sid>.json`:
+  scripts, inputs, outputs, sha256s per action); the handoff
+  (`.mycelium/last-session.md` and per-session
+  `.mycelium/run/<host>/<sid>/last-session.md`, gitignored — local to one
+  machine); manifests (`data/DATA_MANIFEST.md`,
   `analysis/ANALYSIS_MANIFEST.md`, …); `MYCELIUM.md` and the managed blocks
   in `AGENTS.md`/`CLAUDE.md`.
+- **Status belongs to Mycelium** — in practice, to the agent that writes
+  the finding. Chimaera reports it; it never computes, maps or corrects it.
 - **Links are conventions, not fields.** The ledger's Run/Session cell is
   meant to hold a session id (the key of the log and lineage) — nothing
   enforces it. Upstream has no addenda, no supersession field (the
@@ -141,36 +146,41 @@ this plan.
   markers), no questions file, no finding↔decision link. In practice agents
   cross-reference by writing ids in prose — which is exactly the graph a UI
   can show.
-- **Real projects drift from the templates** (the reference project above), and upstream
-  has legacy shapes a reader must tolerate (`##` entries before 0.7.0,
-  `.claude/last-session.md`, numbered and explicit-id headings).
+- **Real projects drift from the templates** (the reference project above),
+  and upstream has legacy shapes a reader must tolerate (`##` entries before
+  0.7.0, `.claude/last-session.md`, numbered and explicit-id headings).
 
 ## Principles
 
 1. **Parse the envelope, show the body.** The plugin extracts only what
-   the UI navigates by — kind, id, title, date, stated status, tags,
-   state markers, references, and the entry's span in its file. The reader
-   renders the entry's own markdown, as written, with our markdown renderer
-   (math, callouts, tables). A prose finding then reads exactly as the
-   agent wrote it; the template is no longer a precondition for a good
+   the UI navigates by — kind, id, title, date, the status as written,
+   tags, state markers, references, and the entry's span in its file. The
+   reader renders the entry's own markdown, as written, with our markdown
+   renderer (math, callouts, tables). A prose finding then reads exactly as
+   the agent wrote it; the template is no longer a precondition for a good
    view.
-2. **Say where every signal comes from; never fake a rating.** Show the
-   status the agent *stated*, in its own word ("supported",
-   "established"), marked as stated. Where a ledger exists, show what
-   Mycelium's rule gives, and flag it only when it disagrees. No stated
-   status means no ladder — a quiet "not rated" and the *What backs it*
-   line instead. The legend explains both, truthfully.
-3. **Everything is linked.** `F-`/`D-`/`C-`/`L-`/`T-` ids in any text become
-   chips: hover previews the entry, click opens it in the reader (with
-   back/forward). Every entry lists what references it. Paths open the file
-   at the line; a `recorded_by` or session id opens the chat turn that
-   wrote it. Colliding ids are qualified by topic (`F-177 · topic-a`).
+2. **Show what was recorded — never rate.** The status shown is the word
+   the agent wrote, as written ("supported", "established by independent
+   realignment"), with Mycelium's ladder glyph only when it is one of
+   Mycelium's four words. Neither core nor our plugin computes, maps or
+   second-guesses a status. No status means nothing is shown for it — no
+   grey ladder, no "unrated" — and the *What backs it* line carries the
+   entry instead. Where the entry has an evidence ledger, its rows are drawn
+   as written (one mark per row). The legend says who sets the status: the
+   agent that recorded the finding.
+3. **Everything is linked — including in chats.** `F-`/`D-`/`C-`/`L-`/`T-`
+   ids become chips wherever they appear (see
+   [Ids everywhere](#ids-everywhere--hover-and-click-from-a-chat)): hover
+   previews the entry, click opens it in Knowledge. Every entry lists what
+   references it. Paths open the file at the line; a `recorded_by` or
+   session id opens the chat turn that wrote it. Colliding ids are
+   qualified by topic (`F-177 · topic-a`).
 4. **State over status.** Corrected, superseded, retracted and resolved
    come from what agents actually write (`⛔ SUPERSEDED BY D-157`,
    `RETRACTED`, `### F-073 CORRECTION`, `**This CORRECTS F-171.**`,
    `RESOLVED`). A superseded entry dims and points at its replacement; a
    correction threads under its finding. **Bad news leads** — corrections
-   and contradictions head *What changed*.
+   and supersessions head *What changed*.
 5. **The first screen answers "where are we, what needs me, what
    changed".** Everything else is browsing.
 6. **Browse is a list and a reader, not an accordion.** One dense line per
@@ -178,35 +188,98 @@ this plan.
    narrow panes). Keyboard: `j`/`k`, `Enter`, `/`, `[`/`]` back/forward.
 7. **One search, everywhere** — every kind, snippet under each hit, an id
    jumps straight to the entry.
-8. **Health, quietly; action through agents.** Things that look off
-   (colliding ids, a stated status the ledger doesn't support, to-dos
-   another entry says are done, answered questions, a clobbered handoff)
-   collect in one *Tidy up* list; each offers **Ask an agent**, which drafts
-   the request into a chat. Knowledge itself never writes `.living/`.
-9. **All of Mycelium.** Conventions (cited by 52 findings in the reference project) and
-   Sessions (the log registry + handoffs, linked to chats) join the view.
-   Manifests and lineage come later as evidence behind entries, not as
-   their own sections.
-10. **Provider words live in one adapter.** "mycelium", `.living/` and the
-    ladder vocabulary sit in one module; components take semantic props
-    matching the platform plan's `ui/1` (list rows with badges, key–value,
-    callout, empty-with-one-action, file cards, tones neutral / accent /
-    good / warn / bad). The platform plan's P10 then becomes a swap.
+8. **Health, quietly; action through agents.** Factual inconsistencies in
+   the knowledge (colliding ids, to-dos another entry says are done,
+   questions a later entry answers, a clobbered handoff) collect in one
+   *Tidy up* list; each offers **Ask an agent**, which drafts the request
+   into a chat for the user to send. Knowledge itself never writes
+   `.living/`, and Tidy up never judges a status.
+9. **All of Mycelium.** Conventions (cited by 52 findings in the reference
+   project) and Sessions (the log registry + handoffs, linked to chats)
+   join the view. Manifests and lineage come later as evidence behind
+   entries, not as their own sections.
+10. **The plugin owns the words.** Section names, the legend, the status
+    vocabulary and its ladder, the source chip and the attach copy come
+    from the plugin; core keeps none of Mycelium's names. Until the
+    snapshot carries all of them, the leftovers sit in one adapter module.
+    Components take semantic props matching the platform plan's `ui/1`
+    (list rows with badges, key–value, callout, empty-with-one-action, file
+    cards, tones neutral / accent / good / warn / bad).
+
+## Knowledge belongs to the plugin
+
+**Knowledge exists only while a knowledge plugin is on in the workspace.**
+No Mycelium, no Knowledge: no tab, no nav entry, no Knowledge card on the
+dashboard, no id chips in chats. The ways in stay where they are — the
+dashboard's attach line and Extensions. *Guidance & memory* (AGENTS.md,
+CLAUDE.md, claude memory), which today is the whole Knowledge tab when no
+plugin is on, isn't Mycelium's: it moves to the dashboard as one row of
+links (and `MYCELIUM.md` joins that row while Mycelium is on).
+
+**The plugin says what it is and what it knows; core draws it.** The
+plugin declares a knowledge surface (today: `provides.knowledge`), owns its
+content, its words (principle 10) and the id shapes it answers for; core
+owns the renderer for that kind of surface — the list, the reader, the
+chips and previews — the way core owns the PDF viewer a file opens in. A
+plugin-drawn screen (the platform plan's generic `ui/1` node trees) can't
+do what this needs: previews that appear inside a *chat*, a reader with
+history, keyboard navigation, a virtualized list over 800 entries.
+
+This reconciles the two earlier drafts. The 2026-09-28 plugin-views
+direction ("Knowledge becomes Mycelium's declarative view, drawn by core")
+and the platform plan's §4 ("Knowledge is a data surface core draws,
+`knowledge/1`") agree that core draws and the plugin supplies; this plan
+takes the platform plan's name for the contract and the plugin-views
+draft's ownership: the surface, its tab and its words belong to the
+plugin, and switching the plugin off removes all of it. Turn credit stays
+in core, keyed by each entry's `span.path` instead of Mycelium's file names.
+
+Fit with the platform plan's phases: nothing in P6 (trust for existing
+plugins) touches Knowledge; P7's `ui/1` renderer can reuse this plan's row,
+badge, callout and file-card components; P10 ("core stops naming Mycelium")
+shrinks to deleting the adapter. The field table below goes to that plan
+as the `knowledge/1` draft; the id shapes become a generic contribution
+point (`provides.references` or a `references` field on the surface).
+
+## Ids everywhere — hover and click from a chat
+
+When an agent writes "see F-228" in a chat, the id is a chip.
+
+- **Which ids.** The plugin declares the id shapes it answers for (for
+  Mycelium: `F-\d+`, `D-\d+`, `C-\d+`, `T-<Name>`, to-do numbers), carried on
+  the snapshot. A token in chat text becomes a chip **only if the
+  workspace's current snapshot has that id** — so "COVID-19" or a stray
+  "D-1" in prose that means something else stays text.
+- **Where.** Agent prose, code spans and tool output in chat mode, the
+  user's own messages, markdown file previews, Timeline rows and the
+  dashboard. The detection sits beside the path-link layer
+  (`shared/fileRef.ts` proposes candidates, `chat/paths.ts` resolves them)
+  but resolves against the snapshot in the client — no daemon round trip.
+  TUI terminals come later, if at all.
+- **Hover** shows a preview card straight from the snapshot: kind, id,
+  title, date, the status as written, state (*corrected by F-177*), and the
+  first lines of the body (fetched via `span` and cached per file mtime).
+- **Click** opens the entry in Knowledge — beside the chat when there's
+  room (the pane layout's usual "open beside" rules), otherwise in the
+  current pane — with the reader on that entry and back/forward history.
+  An id that names several entries (collisions) previews all of them with
+  their topics; the click picks one.
+- **Off means off.** Plugin off → no chips, no previews.
 
 ## Information architecture
 
 | Section | The question | Source |
 |---|---|---|
 | **Overview** | "Where are we, what needs me, what changed?" | the four cards below |
-| **Findings** | "What do we know — how sure, and on what?" | `.living/findings/*.md` |
+| **Findings** | "What do we know — and on what?" | `.living/findings/*.md` |
 | **Decisions** | "Why did we do X — is it still in force?" | `.living/decisions.md` |
 | **Watch out for** | "What will bite me?" | `.living/learnings.md` |
 | **Conventions** | "What rules do the agents follow here?" | `.living/conventions.md` (+ generated conventions) |
 | **To do** | "What's left, and what's blocked?" | `todo/TODO_REGISTRY.md` table **and** sections, item files |
 | **Sessions** | "What did each session do?" | `.living/log/LOG_REGISTRY.md`, handoffs, the Timeline |
-| **Guidance & memory** | "What are the agents told?" | `MYCELIUM.md`, `AGENTS.md`, `CLAUDE.md`, claude memory |
-| *Tidy up* (muted, with a count) | "Is the knowledge itself healthy?" | derived |
+| *Tidy up* (muted, with a count) | "Is the knowledge itself consistent?" | derived by the plugin |
 
+Section names are the plugin's (principle 10); these are Mycelium's.
 Counts in the nav are live counts (open to-dos, not rows). Empty sections
 don't render (§9's rule stands).
 
@@ -214,11 +287,12 @@ don't render (§9's rule stands).
 
 Four cards, top to bottom; each collapses to one honest line when empty.
 
-1. **Where we left off** — the *newest* handoff among
-   `.mycelium/last-session.md`, `.mycelium/run/*/*/last-session.md` and
-   (**[decide]**) handoff files `MYCELIUM.md` points at. Its own headings,
-   rendered (Goal · Done · In flight · Next), with its age, the session that
-   wrote it (→ chat), and "2 older handoffs" behind a disclosure.
+1. **Where we left off** — the *newest* of Mycelium's handoffs
+   (`.mycelium/last-session.md` and every
+   `.mycelium/run/<host>/<sid>/last-session.md`, by mtime). Its own
+   headings, rendered (Goal · Done · In flight · Next), with its age, the
+   session that wrote it (→ chat), and older handoffs behind a disclosure.
+   Project-named handoff files are not read (decision 4).
 2. **Waiting on you** — decisions put to the user: findings or handoff
    sections that say so ("Put to the user", "PARKED USER DECISION", "Not yet
    decided — options, for the user"), blocked to-dos, and open questions
@@ -226,8 +300,8 @@ Four cards, top to bottom; each collapses to one honest line when empty.
    source chip and age. This is the card a scientist opens the tab for.
 3. **What changed** — the last 7 days, by day: new and edited findings,
    decisions and learnings, with who recorded them (Timeline credit → the
-   chat turn). Corrections, supersessions, retractions and contradictions
-   first, in the err/warn tone *with* the word.
+   chat turn). Corrections, supersessions and retractions first, in the
+   err/warn tone *with* the word.
 4. **Open work** — in progress and blocked, then critical and high open
    to-dos; "23 more" opens To do.
 
@@ -235,32 +309,32 @@ Four cards, top to bottom; each collapses to one honest line when empty.
 
 The list is one line per entry: mono id · title (the heading, one line,
 ellipsized) · state chips (`corrects F-171`, `superseded → D-157`,
-`resolved`) · date · a small *backs* mark (ledger strip when there is a
-ledger; otherwise a count of cited files, scripts and jobs). Findings group
-by topic (topic description as the group's subtitle); decisions and
-learnings are newest first; filter chips above the list (*Changed this
-week*, *Corrected*, *Stated: supported / established / none*, a tag).
+`resolved`) · date · the status word when one was written · a small
+*backs* mark (the ledger's rows when there is a ledger; otherwise a count
+of cited files, scripts and jobs). Findings group by topic (topic
+description as the group's subtitle); decisions and learnings are newest
+first; filter chips above the list (*Changed this week*, *Corrected*, the
+status words that occur, a tag).
 
 The reader shows, in order:
 
 - breadcrumb (`topic-slug › F-228`), the title, and one meta line:
   date · recorded by *Main Agent* (→ chat) · **open at line 4152**;
-- **How sure** — the stated status word and, when there is a ledger, the
-  evidence strip (one mark per row: filled supports, half refines, ring
-  contradicts) and Mycelium's rule result when it differs ("stated
-  *supported* · ledger has 1 run → *preliminary* by Mycelium's rule");
-  omitted entirely when nothing is stated and there's no ledger;
+- **Status** — only when the agent wrote one: the word as written (with
+  the ladder glyph for Mycelium's four words) and, when the entry has an
+  evidence ledger, its rows (one mark per row: filled supports, half
+  refines, ring contradicts), labelled "stated by the agent";
 - **What backs it** — chips for everything the entry cites: data files,
   scripts, jobs, commits, figures (open at the path), and the entries it
   references;
 - the **body**, rendered as written (ids and paths inside it linked);
 - **Follow-ups** — addenda, corrections and resolutions, threaded, newest
-  last, each with its own date and status change;
+  last, each with its own date;
 - **Referenced by** — every decision, finding, to-do, convention and handoff
   that cites it.
 
-Hovering an id chip anywhere shows a preview card (title, state, first
-lines); the reader keeps a back/forward history so following a chain
+Hovering an id chip anywhere shows the same preview card as in chats; the
+reader keeps a back/forward history so following a chain
 (F-171 → F-177 → D-157) is cheap.
 
 ### To do
@@ -275,18 +349,18 @@ while its to-do is still open) goes to *Tidy up*, never silently closed.
 
 ### Tidy up
 
-One list, each row a sentence and an **Ask an agent** button that drafts a
-precise request into the workspace's chat (the user sends it): *"Finding
-ids F-079, F-126–129, F-175–178, … are used twice in different topic files
-— renumber the later ones and update references."* / *"F-007 states
-supported with one ledger row; Mycelium's rule says preliminary."* /
-*"The Stop hook replaced a hand-written handoff with its fallback stub."*
+One list of factual inconsistencies, each row a sentence and an **Ask an
+agent** button that drafts a precise request into the workspace's chat (the
+user reviews and sends it): *"Finding ids F-079, F-126–129, F-175–178, …
+are used twice in different topic files — renumber the later ones and
+update references."* / *"The to-do '…' is open, but F-013 reports it
+complete."* / *"The Stop hook replaced a hand-written handoff with its
+fallback stub."* Never a status judgment.
 
-### Narrow panes and empty states
+### Narrow panes
 
 Below ~820px the reader replaces the list (back returns to the list, at
-the same scroll position). A workspace without Mycelium keeps today's
-behaviour (Guidance & memory + the attach line).
+the same scroll position).
 
 ## Data: the snapshot additions (a draft `knowledge/1`)
 
@@ -296,11 +370,10 @@ stay byte-identical where their inputs don't use the new shapes.
 | Field | On | Meaning |
 |---|---|---|
 | `span {path, line, end}` | every entry, addendum, to-do, handoff | where the entry's markdown lives; the reader fetches the file (`/fs/file`) and renders the slice — bodies never ride the snapshot (the reference project's `.living/` text is ~1.8 MB) |
-| `stated` | finding, decision | the status as written ("established by independent realignment"); `status` stays the normalized word or `unknown` |
-| `rule` | finding | Mycelium's rule applied to the ledger (`preliminary`/`supported`/`robust`/`contradicted`), absent without a ledger |
+| `stated` | finding, decision | the status exactly as written ("established by independent realignment"); `status` stays the matched Mycelium word or `unknown` |
 | `refs[] {kind, id, topic?}` | every entry | ids this entry cites (F/D/C/L/T/to-do), in order |
 | `cites[] {kind, text}` | every entry | data files, scripts, jobs, commits, figures named in the body |
-| `state {kind, by?}` | every entry | `superseded` / `retracted` / `corrected` / `resolved` / `suspect`, with the id that did it |
+| `state {kind, by?}` | every entry | `superseded` / `retracted` / `corrected` / `resolved` / `suspect`, with the id that did it — only from markers the agent wrote |
 | `addenda[].kind` | finding | `addendum` / `correction` / `resolution` / `update` |
 | `key` | finding | `topic/F-NNN` — unique even when ids collide; `id` stays the bare id |
 | `conventions[]` | snapshot | `{id, title, span, refs, cites}` |
@@ -308,15 +381,17 @@ stay byte-identical where their inputs don't use the new shapes.
 | `asks[]` | snapshot | "waiting on you" items: `{text, span, source}` from findings, handoffs, decisions |
 | `todos[]` +`closed`, `refs`, `span`, `title` | to-do | closed by the plugin's rules; `title` = the first sentence |
 | `left_off.sources[]` | handoff | every handoff found, newest first (`{path, written_ms, session_id?, host?}`) |
-| `tidy[]` | snapshot | `{kind, text, refs}` — the Tidy up rows |
+| `tidy[]` | snapshot | `{kind, text, refs, ask}` — the Tidy up rows and the request each drafts |
+| `id_shapes[] {pattern, kind}` | snapshot | the id shapes the plugin answers for — what chats may turn into chips |
+| `labels` | snapshot | the plugin's words: section names, the status vocabulary with its ladder rank, the legend text, the source chip |
 
 Backlinks are computed in the client from `refs` (no extra wire). Deep
-links (Timeline, dashboard, chat mentions) address an entry by `key`.
+links (Timeline, dashboard, chat chips) address an entry by `key`.
 
 ## Plugin work — `chimaera-plugin-mycelium` 0.2.0
 
 Parsing that matches what agents write, all with fixtures cut from real
-shapes (anonymized where needed):
+shapes (anonymized):
 
 - `**Label.**` period-style fields and `·`-joined inline fields
   (`**Date**: … · **Status**: … · **Tags**: …`); multi-line `**Tags**`;
@@ -329,72 +404,46 @@ shapes (anonymized where needed):
 - State markers (`⛔ SUPERSEDED BY`, `RETRACTED`, `⚠️ SUSPECT`,
   `This CORRECTS F-…`), references and citations (paths by extension, Slurm
   job ids, 7–40-hex SHAs, `Regenerate from`).
-- `rule` from the ledger; `refutes` as `contradicts`.
+- Status: `stated` verbatim; no default, no mapping, no rule. Ledger
+  directions kept as written.
 - To-dos: the registry table **and** the `##` to-do sections under it;
   closed when the status *starts with* a closed word (`done 2026-09-23 …`);
   File cells as refs + at most one real link; stop trimming backticks.
-- Handoff: newest by mtime across the shared file and run dirs; numbered
-  headings (`## 1. Goal`) map onto the five slots, unknown sections kept in
-  order.
+- Handoff: newest by mtime across the shared file and every run dir;
+  numbered headings (`## 1. Goal`) map onto the five slots, unknown
+  sections kept in order.
 - Conventions (`## C-N` / `##` sections), sessions (`LOG_REGISTRY.md`),
-  asks, tidy.
+  asks, tidy, `id_shapes`, `labels`.
 - Keys: `topic/F-NNN`; a collision is a `tidy` row, not a warning line
   above the content.
 
 The 4 MiB snapshot cap stays; the 400-per-kind cap should rise to 1,000
-with the snapshot cap as the real bound (the reference project is already at 310
-learnings after three months), measured on the fixture.
+with the snapshot cap as the real bound (the reference project is already
+at 310 learnings after three months), measured on the fixture.
 
 ## Core work
 
+- **Knowledge only with a provider**: the tab, its nav entry and the
+  dashboard card render only while a knowledge plugin is on; *Guidance &
+  memory* moves to the dashboard.
 - **UI** (`web-ui/src/lib/knowledge/`): the new IA and screens above; an
   entry reader that fetches and renders `span` slices (cached per file
-  mtime); `IdChip` with hover preview and history; a virtualized list;
-  search over the envelope and loaded bodies; the provider adapter module;
-  the `WhereThingsStand` dashboard card fed by the same Overview model
-  (and never printing a raw `unknown`).
+  mtime); an `IdChip` + preview card shared with chats; a virtualized
+  list; search over the envelope and loaded bodies; the dashboard's
+  `WhereThingsStand` fed by the same Overview model (never printing a raw
+  `unknown`).
+- **Chat id chips** (`web-ui/src/lib/chat/`, `shared/`): candidates from
+  the snapshot's `id_shapes`, confirmed against the snapshot, rendered as
+  chips in agent prose, code spans, tool output and user messages; hover
+  preview; click opens Knowledge at the entry.
 - **Open at line**: `revealLines` (`previews/cm.ts`) already exists — wire
   the file open to take a line.
 - **Links to chats**: `recorded_by` and session ids resolve through the
   Timeline to a chat and turn; a handoff's `session_id` too. `left_off.by`
   (rendered today, never sent) gets filled or removed.
 - **Server** (`knowledge.rs`): pass the new fields through; `ids_of`
-  switches to the snapshot's per-key `span.path` (the platform plan's P10
-  direction), which also fixes turn credit for colliding ids.
-
-## Fit with the plugin platform
-
-The platform plan (branch only, docs only, nothing shipped) keeps
-**Knowledge as a data surface core draws** (its §4): today's snapshot
-becomes the documented `knowledge/1` schema, the `knowledge` and `query`
-exports are unchanged, and its P10 removes Mycelium's names from core.
-This redesign fits that: it stays core Svelte, keeps the contract additive,
-confines provider words to one adapter (principle 10), and hands the
-field table above to that plan as the `knowledge/1` draft. Nothing in its
-first phase (P6, trust for existing plugins) touches Knowledge; the new
-dashboard `panel` slot sits beside *Where things stand*, so the dashboard
-card must leave room for it.
-
-**[decide] One conflict.** On 2026-09-28 the direction agreed was
-"Knowledge becomes Mycelium's *declarative plugin view*" (a general
-`provides.views`, view documents via `query`, drawn by core), with turn
-credit fed by a provider-neutral entry list. The platform plan instead
-keeps Knowledge a fixed core surface and gives generic plugin screens
-(`ui/1`) to everything else. **Recommendation: take the platform plan's
-route for Knowledge.** A knowledge base with hover previews, backlinks, a
-reader and keyboard history is exactly what that plan calls "too
-important or too interactive to be free-form"; a generic `ui/1` tree would
-cap it. Turn credit stays core either way, now keyed by `span.path`.
-
-## Upstream Mycelium — optional, the maintainer's call
-
-The drift is partly Mycelium's to fix. **[decide]** whether to propose
-upstream (via the `martinappberg` fork): allocate finding ids under a lock
-so parallel agents can't collide; accept the prose finding shape officially
-with a minimal required envelope (Status word, Date, an evidence line) and
-say "established" is not a status; have Stop never replace a hand-written
-handoff with its stub; let a finding say `**Corrects:** F-171` /
-`**Superseded by:** D-157` as fields. The UI must work without any of it.
+  switches to the snapshot's per-key `span.path`, which also fixes turn
+  credit for colliding ids.
 
 ## Phases
 
@@ -402,40 +451,48 @@ handoff with its stub; let a finding say `**Corrects:** F-171` /
    (Extensions): 35 phantom findings disappear.
 1. **Honest data, current UI** (small): plugin 0.1.4 with the parsing
    fixes (fields, dates, follow-ups, to-do sections, closed detection,
-   handoff newest-wins, backticks, `**Claim:**`); UI: truthful legend,
-   no grey ladder for an unstated status ("not rated"), open-only to-do
-   counts, the To-do layout and `.open` collision fixed, decisions sorted
-   by real date. Ships in days and removes most of what looks broken.
+   handoff newest-wins, backticks, `**Claim:**`, `stated` verbatim); UI:
+   the legend says the agent sets the status, nothing drawn for an
+   unstated one, open-only to-do counts, the To-do layout and `.open`
+   collision fixed, decisions sorted by real date. Ships in days and
+   removes most of what looks broken.
 2. **The redesign** — plugin 0.2.0 (`span`, `refs`, `cites`, `state`,
-   `stated`, `rule`, keys, conventions, sessions, asks); core: Overview,
-   list + reader, id chips + backlinks + history, search, open-at-line,
-   chat links.
+   keys, conventions, sessions, asks, `id_shapes`, `labels`); core:
+   Knowledge only with a provider, Overview, list + reader, id chips in
+   Knowledge **and chats** with previews and history, search,
+   open-at-line, links to chats.
 3. **Tidy up + Ask an agent**, Timeline and dashboard deep links, the
-   `knowledge/1` hand-off to the platform plan.
+   `knowledge/1` and `references` hand-off to the platform plan.
 
 ## Verification
 
-- Fixtures: a synthetic `.living/` that reproduces every reference-project shape
-  above (template findings, prose findings, `established`, colliding ids,
-  follow-up headings, both decision eras, to-do table + sections, three
-  handoffs), checked into the plugin repo; the parser's counts on it pinned.
-- Live: the isolated daemon with that fixture as a workspace; then, read
-  only, the real reference project through the app after that host's plugin
-  update — the header counts, the Overview's four cards and ten spot-checked
-  entries compared against the files.
+- Fixtures: a synthetic `.living/` that reproduces every reference-project
+  shape above (template findings, prose findings, `established`, colliding
+  ids, follow-up headings, both decision eras, to-do table + sections,
+  three handoffs), checked into the plugin repo; the parser's counts on it
+  pinned.
+- Live: the isolated daemon with that fixture as a workspace; a chat whose
+  fake agent mentions real, colliding and non-existent ids (chips only on
+  the first two; hover and click land on the entry); the plugin switched
+  off (no tab, no chips). Then, read only, the real reference project
+  through the app after that host's plugin update — the header counts, the
+  Overview's four cards and ten spot-checked entries compared against the
+  files.
 - The UI at 1400 / 960 / 820 / 600 px, light and dark; keyboard-only pass.
 
-## Decisions for the maintainer
+## Decisions (2026-09-28)
 
-1. **Knowledge as a core surface (`knowledge/1`) vs a Mycelium plugin
-   view** — recommend the core surface (above).
-2. **How sure** — recommend: show the agent's stated word, add Mycelium's
-   rule only where a ledger exists and disagrees, never invent a rating.
-   Alternatives: compute from the ledger and ignore the stated word; or
-   show stated only.
-3. **Ask an agent** from *Tidy up* — recommend yes (it drafts, the user
-   sends; Knowledge stays read-only).
-4. **Project-named handoff files** (the reference project's `.claude/RESUME_STATE.md`)
-   — recommend: read handoff files `MYCELIUM.md` names, newest wins, older
-   ones behind a disclosure.
-5. **Upstream proposals** — whether to raise any of them with Mycelium.
+1. **Knowledge belongs to the plugin.** It appears only while Mycelium is
+   on; core draws it; ids an agent mentions in a chat can be hovered and
+   clicked through to the entry.
+2. **No rating by Chimaera.** Status is Mycelium's — shown as the agent
+   wrote it, never computed or mapped, by core or by our plugin.
+3. **Ask an agent** from *Tidy up*: yes.
+4. **Handoffs**: Mycelium's own handoff files only, newest wins, older ones
+   behind a disclosure. Project-named files (the reference project's
+   `.claude/RESUME_STATE.md`) are not read: newest-wins across the run
+   folders already surfaces the hand-written handoff that file was created
+   to protect. If one is still missed, a plugin setting can name extra
+   handoff files later.
+5. **No upstream proposals** to Mycelium; everything here works with
+   Mycelium as it is.
