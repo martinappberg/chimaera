@@ -79,7 +79,6 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             "/pro/cloud/connections/{id}/input",
             post(crate::cloud::providers::submit),
         )
-        .route("/pro/cloud/onboard", post(crate::cloud::onboard))
         .route("/pro/cloud/project", post(crate::cloud::project))
         .route("/pro/bundles/{id}", get(crate::bundle::snapshot_route))
         .route(

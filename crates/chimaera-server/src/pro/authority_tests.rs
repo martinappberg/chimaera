@@ -417,6 +417,17 @@ async fn foreign_registered_workspace_remains_fenced() {
     assert!(code.is_client_error(), "{code}");
     let (_, status) = request(&fixture.state, Method::GET, "/api/v1/pro/status", None).await;
     assert_eq!(status["workspaces"], json!([]));
+    // Agent sign-in is the providers' bounded connection jobs (one credential
+    // writer each); the legacy login-terminal route is gone.
+    let (code, body) = request(
+        &fixture.state,
+        Method::POST,
+        "/api/v1/pro/cloud/onboard",
+        Some(json!({"agent":"claude"})),
+    )
+    .await;
+    assert!(code.is_client_error(), "{code}");
+    assert!(!body.to_string().contains("cloud setup"), "{body}");
 }
 
 #[test]

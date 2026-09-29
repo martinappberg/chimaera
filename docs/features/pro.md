@@ -211,7 +211,9 @@ advanced connections. In an account browser, Settings shows a **Cloud** section
 only on the cloud machine's own page; other daemons have no cloud status to show.
 
 The worker exposes `/api/v1/pro/cloud`, `/api/v1/pro/cloud/providers`, provider
-connect/disconnect routes, connection read/cancel routes, and `/api/v1/pro/cloud/project`.
+connect/disconnect routes, connection read/cancel/input routes, and `/api/v1/pro/cloud/project`.
+Agent sign-in only runs through those provider connection jobs (the older
+login-terminal route `/api/v1/pro/cloud/onboard` is gone).
 The native `pro_cloud_request` command keeps account and daemon credentials out
 of the UI and opens only a server-owned connection's validated browser URL or
 terminal. Browser clients use the same routes through the host-pinned gateway.
