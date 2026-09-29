@@ -304,14 +304,33 @@ fn start_operation(
         }
         if clean {
             attempt.finished.store(true, Ordering::Release);
-        } else {
-            // Never launch a replacement credential writer while cleanup is
-            // uncertain. A daemon restart is safer than racing that process.
+            state.changes.notify_waiters();
+            return;
+        }
+        // Never launch a replacement credential writer while cleanup is
+        // uncertain; keep checking (bounded) and release the provider as soon
+        // as the old process group is really gone, instead of until restart.
+        {
             let mut value = crate::lock(&attempt.value);
             value.error_code = Some("cleanup_failed".into());
             value.action = None;
         }
         state.changes.notify_waiters();
+        for _ in 0..120 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if state.stopping.load(Ordering::Acquire) {
+                return;
+            }
+            let gone = !session
+                .as_ref()
+                .is_some_and(|id| state.sessions.get(id).is_some_and(|s| s.alive))
+                && !process.is_some_and(process::group_alive);
+            if gone {
+                attempt.finished.store(true, Ordering::Release);
+                state.changes.notify_waiters();
+                return;
+            }
+        }
     });
     Ok(value)
 }

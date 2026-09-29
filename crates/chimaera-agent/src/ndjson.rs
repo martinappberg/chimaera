@@ -311,7 +311,17 @@ impl ChildGuard {
     /// and its failure diagnostics read as an empty tail.
     pub async fn shutdown_with_stderr(mut self, grace: Duration) -> (Option<i32>, String) {
         if self.managed_group {
-            tokio::time::sleep(grace.min(Duration::from_secs(2))).await;
+            // Wait for the child to exit or the deadline, whichever comes
+            // first (a clean stop takes ~0.3 s; every stop, view switch and
+            // rewind used to wait the full two seconds), then end whatever
+            // else is left in its process group.
+            // The exit is observed without reaping (WNOWAIT), so the group id
+            // cannot be recycled before the group kill below.
+            let deadline = Instant::now() + grace.min(Duration::from_secs(2));
+            let pid = self.child.lock().expect("child lifecycle lock").id();
+            while Instant::now() < deadline && !pid.is_some_and(exited_unreaped) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
             let child = self.child.lock().expect("child lifecycle lock");
             #[cfg(unix)]
             if let Some(pid) = child.id() {
@@ -352,6 +362,38 @@ impl ChildGuard {
         let tail = self.stderr_tail.lock().expect("stderr tail lock");
         tail.iter().cloned().collect::<Vec<_>>().join("\n")
     }
+}
+
+/// Whether our direct child has exited, without reaping it (its pid, and so
+/// its process-group id, stays reserved until the real wait).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn exited_unreaped(pid: u32) -> bool {
+    let mut info = std::mem::MaybeUninit::<nix::libc::siginfo_t>::zeroed();
+    // SAFETY: waitid writes into `info`; WNOWAIT leaves the child waitable.
+    let result = unsafe {
+        nix::libc::waitid(
+            nix::libc::P_PID,
+            pid,
+            info.as_mut_ptr(),
+            nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        // Already reaped or not our child: nothing left to wait for.
+        return true;
+    }
+    // SAFETY: zero-initialised and possibly written by waitid above.
+    let info = unsafe { info.assume_init() };
+    #[cfg(target_os = "macos")]
+    let observed = info.si_pid;
+    #[cfg(target_os = "linux")]
+    // SAFETY: si_pid is valid for a WEXITED waitid result.
+    let observed = unsafe { info.si_pid() };
+    observed == pid as i32
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn exited_unreaped(_: u32) -> bool {
+    false
 }
 
 fn truncate(s: &str, max: usize) -> &str {
@@ -444,6 +486,47 @@ impl Drop for ChildGuard {
                 nix::unistd::Pid::from_raw(pid as i32),
                 nix::sys::signal::Signal::SIGKILL,
             );
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use super::*;
+    /// A managed child that exits on its own is reaped at once (a stop, view
+    /// switch or rewind no longer waits out a fixed two seconds), and what it
+    /// left running in its process group is still ended.
+    #[tokio::test]
+    async fn a_managed_child_that_exits_is_reaped_at_once_and_its_group_ended() {
+        let control = Arc::new(ProcessControl::default());
+        let child = JsonlChild::spawn_controlled(
+            "/bin/sh",
+            &["-c".into(), "sleep 30 & exit 3".into()],
+            Path::new("/"),
+            &[],
+            &[],
+            Some(&control),
+        )
+        .unwrap();
+        let (_sink, _stream, guard) = child.split();
+        let group = guard
+            .child
+            .lock()
+            .expect("child lifecycle lock")
+            .id()
+            .unwrap() as i32;
+        let started = Instant::now();
+        let status = guard.shutdown(Duration::from_secs(10)).await;
+        assert_eq!(status, Some(3));
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), None).is_ok() {
+            assert!(Instant::now() < deadline, "the background sleep survived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 }

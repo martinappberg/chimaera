@@ -72,21 +72,26 @@ fn signal(pid: u32, master: &Mutex<Box<dyn MasterPty + Send>>, force: bool) {
         unistd::{getsid, Pid},
     };
     let owner = Pid::from_raw(pid as i32);
-    let signal = if force {
-        Signal::SIGKILL
+    // The polite stop is a terminal hangup first (what closing a terminal
+    // means: an interactive shell ignores SIGTERM but saves its history and
+    // exits on SIGHUP, and a TUI gets to save its state), then SIGTERM for
+    // programs that only handle that. The escalation is SIGKILL.
+    let signals: &[Signal] = if force {
+        &[Signal::SIGKILL]
     } else {
-        Signal::SIGTERM
+        &[Signal::SIGHUP, Signal::SIGTERM]
     };
-    if let Some(foreground) = lock_unpoisoned(master)
+    let foreground = lock_unpoisoned(master)
         .process_group_leader()
         .filter(|pid| *pid > 0)
-    {
-        let foreground = Pid::from_raw(foreground);
-        if getsid(Some(foreground)).ok() == Some(owner) {
-            let _ = killpg(foreground, signal);
+        .map(Pid::from_raw)
+        .filter(|foreground| getsid(Some(*foreground)).ok() == Some(owner));
+    for signal in signals {
+        if let Some(foreground) = foreground {
+            let _ = killpg(foreground, *signal);
         }
+        let _ = killpg(owner, *signal);
     }
-    let _ = killpg(owner, signal);
 }
 #[cfg(not(unix))]
 fn signal(_: u32, _: &Mutex<Box<dyn MasterPty + Send>>, _: bool) {}
