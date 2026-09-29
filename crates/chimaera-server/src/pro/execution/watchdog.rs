@@ -8,7 +8,7 @@ use std::{
 
 /// A 100 ms tick that took this long was not scheduled normally: the process
 /// was frozen.
-const FREEZE: Duration = Duration::from_secs(3);
+pub(super) const FREEZE: Duration = Duration::from_secs(3);
 /// Wall and monotonic time disagreeing by this much across one tick is a
 /// clock step (a resumed machine correcting its clock), as the lease sees it.
 const JUMP: Duration = Duration::from_secs(1);
@@ -73,6 +73,7 @@ pub(in crate::pro) fn start(state: &Arc<AppState>) {
             if frozen && super::resumed(&state, generation) {
                 state.pro.renew_now.notify_one();
             }
+            super::ticked(&state, now.0);
             let expired = super::expire(&state, generation);
             // Signal every expired workspace before any durable journal work.
             for workspace in &expired {

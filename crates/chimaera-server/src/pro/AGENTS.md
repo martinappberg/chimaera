@@ -47,7 +47,12 @@ fencing: when the watchdog sees the process was frozen (a 100 ms tick taking
 over 3 s, or wall and monotonic time disagreeing by over 1 s) and a deadline
 lapsed across it, it wakes the lease loop, which renews the recorded epoch
 (the account keeps a suspended owner's lease: same epoch, no fork, never an
-acquire/checkpoint install); input stays admitted meanwhile. A refused renewal
+acquire/checkpoint install); input stays admitted meanwhile. Admission and the
+lease loop notice a freeze themselves when the watchdog has been silent for
+longer than one (`execution::thawed`), so the request that woke the machine is
+never refused before the watchdog's next tick. A worker that re-acquires its own
+held epoch (`held_here`, not mid-arrival) continues its own work like a device:
+no install, no re-import, no second transfer pickup. A refused renewal
 or another verified owner fences at once; no answer within 20 s fences too.
 `lease_valid` gates publication and forwarded viewers on every host. Plain shells are never
 managed: not signalled by fences, not awaited by stops, never evidence. Sessions

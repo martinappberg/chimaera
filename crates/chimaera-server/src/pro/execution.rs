@@ -39,6 +39,8 @@ pub(super) struct State {
     /// policy; a worker also runs nothing there. Bounded to 128.
     pub(super) uncertain: Mutex<std::collections::HashSet<String>>,
     boot: Option<String>,
+    /// The watchdog's latest tick (see `thawed`).
+    tick: Mutex<Option<std::time::Instant>>,
 }
 struct Proof {
     lease: wire::ExecutionLease,
@@ -425,7 +427,28 @@ pub(super) fn allows(state: &AppState, workspace: &str) -> bool {
     }
     // A resumed machine keeps admitting the input that woke it while it renews
     // its own paused lease; a refused renewal fences it at once.
-    !worker(state) || lease_valid(state, workspace) || resuming(state, workspace)
+    !worker(state)
+        || lease_valid(state, workspace)
+        || resuming(state, workspace)
+        || (thawed(state) && resuming(state, workspace))
+}
+/// Notices a freeze before the watchdog does. The request that woke a
+/// suspended machine (and the lease loop) can run in the moments after the
+/// thaw before the watchdog's next tick; they must not see a lapsed lease
+/// as a lost one. A watchdog silent for longer than a freeze is exactly what
+/// its own next tick would report, so this grants the same one bounded
+/// renewal (`resumed`) and wakes the lease loop.
+pub(super) fn thawed(state: &AppState) -> bool {
+    let stale =
+        lock(&state.pro.execution.tick).is_some_and(|tick| tick.elapsed() > watchdog::FREEZE);
+    if stale && resumed(state, state.pro.generation.load(Ordering::Acquire)) {
+        state.pro.renew_now.notify_one();
+    }
+    stale
+}
+/// The watchdog ticked (see `thawed`).
+pub(super) fn ticked(state: &AppState, at: std::time::Instant) {
+    *lock(&state.pro.execution.tick) = Some(at);
 }
 /// This process resumed from a freeze (see `resumed`) and is renewing its own
 /// epoch; the watchdog holds its fence until the renewal answers or the
@@ -711,6 +734,18 @@ pub(crate) fn resumed_fixture(state: &AppState, workspace: &str) -> Vec<String> 
     let generation = state.pro.generation.load(Ordering::Acquire);
     resumed(state, generation);
     expire(state, generation)
+}
+/// A suspended machine just thawed: its lease deadline passed while it was
+/// frozen and its watchdog has not ticked since.
+#[cfg(test)]
+pub(crate) fn thawed_fixture(state: &AppState, workspace: &str) {
+    if let Some(proof) = lock(&state.pro.execution.proofs).get_mut(workspace) {
+        proof.deadline = lease::Deadline::expired_fixture();
+    }
+    ticked(
+        state,
+        std::time::Instant::now() - watchdog::FREEZE - Duration::from_secs(2),
+    );
 }
 /// A verified other owner, as an authenticated baton read records it.
 #[cfg(test)]

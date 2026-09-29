@@ -1441,3 +1441,87 @@ async fn mid_turn_chat(
     };
     (chat, prompts, starts)
 }
+/// A cloud machine thawed from a suspension whose lease loop ran before its
+/// watchdog noticed the freeze (no renewal window) re-acquires its own held
+/// epoch: the account renews the paused owner at the same epoch, and the
+/// machine continues its own conversation on the same process. Nothing is
+/// installed over its newer work and the move's pickup is not sent again.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_thawed_cloud_machine_keeps_its_own_epoch_and_sends_no_second_pickup() {
+    let root = temp("thawed");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let mut config = device(&account.endpoint);
+    config.role = Role::Worker;
+    config.execution.as_mut().unwrap().installation_id = None;
+    let workspace = project(&state, &root, &config, 4);
+    *lock(&state.pro.runtime) = Some(config.clone());
+    let (chat, prompts, starts) = mid_turn_chat(&state, &root, &workspace).await;
+    // The paused owner's lease lapsed while the machine was frozen.
+    let mut paused = owned(&workspace.id, "d-home", 4, "lease-fixture", 1);
+    paused["server_now"] = json!("2026-09-28T00:30:00Z");
+    paused["checkpoint"] = checkpoint(4);
+    *lock(&account.baton) = paused;
+    let mut renewed = owned(&workspace.id, "d-home", 4, "lease-fixture", 2);
+    renewed["checkpoint"] = checkpoint(4);
+    *lock(&account.grant) = Some((200, renewed));
+    assert!(!execution::resuming(&state, &workspace.id));
+    reconcile(&state, &config, &workspace.id).await.unwrap();
+    assert_eq!(
+        account
+            .calls("POST", &format!("/v2/baton/{}/acquire", workspace.id))
+            .len(),
+        1
+    );
+    assert!(matches!(
+        lock(&state.pro.ownership).get(&workspace.id),
+        Some(Ownership::Local { epoch: 4 })
+    ));
+    assert!(!lock(&state.pro.installing).contains(&workspace.id));
+    tokio::time::sleep(StdDuration::from_millis(1500)).await;
+    assert!(
+        account.calls("POST", "/v2/mirror/credentials").is_empty(),
+        "no checkpoint is installed over the machine's own work"
+    );
+    assert!(state.chat.get(&chat).is_some_and(|c| c.alive));
+    assert_eq!(starts(), 1, "the conversation kept its agent process");
+    assert_eq!(prompts(), 1, "no second pickup reached the agent");
+    assert!(execution::lease_valid(&state, &workspace.id));
+    state.chat.kill(&chat);
+    drop(account);
+    drop(state);
+    let _ = std::fs::remove_dir_all(root);
+}
+/// The request that wakes a suspended cloud machine can arrive before the
+/// watchdog's first tick after the thaw. It is admitted while the machine
+/// renews its own paused lease, not refused as an unauthorized connection; a
+/// lease that lapsed while the watchdog kept ticking is still refused.
+#[tokio::test]
+async fn the_request_that_wakes_a_cloud_machine_is_admitted_before_its_watchdog_ticks() {
+    let root = temp("thaw-admit");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let mut config = device(&account.endpoint);
+    config.role = Role::Worker;
+    config.execution.as_mut().unwrap().installation_id = None;
+    let workspace = project(&state, &root, &config, 4);
+    *lock(&state.pro.runtime) = Some(config);
+    execution::thawed_fixture(&state, &workspace.id);
+    execution::ticked(&state, std::time::Instant::now());
+    assert!(
+        !crate::pro::may_execute(&state, &workspace.id),
+        "a lapse the watchdog saw happen is not a freeze"
+    );
+    execution::thawed_fixture(&state, &workspace.id);
+    assert!(crate::pro::may_execute(&state, &workspace.id));
+    assert!(execution::resuming(&state, &workspace.id));
+    let generation = state.pro.generation.load(Ordering::Acquire);
+    assert!(
+        execution::expire(&state, generation).is_empty(),
+        "nothing is fenced while the renewal is out"
+    );
+    drop(account);
+    drop(state);
+    let _ = std::fs::remove_dir_all(root);
+}

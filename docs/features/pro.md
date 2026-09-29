@@ -456,7 +456,10 @@ unchanged; no machine chooser or new secret-sharing capability is introduced.
 A cloud machine suspends only after draining: the supervisor asks the daemon to
 refuse new transfers and wait until every transfer, Git helper and project cache
 is idle and state is on disk (`POST /api/v1/pro/drain`; see
-[HANDOFF](../../crates/chimaera-link/HANDOFF.md)). Ownership state, the
+[HANDOFF](../../crates/chimaera-link/HANDOFF.md)). Waking it keeps everything as it
+was: the request that woke it is admitted at once while it renews its own
+lease, its agents keep their processes, and nothing is reinstalled over its
+work or told again that it moved. Ownership state, the
 execution latch and handoff ledger writes are synced to stable storage, and an
 unreadable ownership state fails closed instead of silently forgetting fences, for
 the affected projects only: they keep running on your computer and resume saving

@@ -438,7 +438,11 @@ async fn reconcile_generation(
     // A cloud machine resuming from suspension renews its own recorded epoch
     // even though the lease reads expired: the account kept it as a paused
     // owner (same epoch, no fork). Acquiring instead would install the
-    // checkpoint over its own newer work. Only a refused renewal fences.
+    // checkpoint over its own newer work. Only a refused renewal fences. The
+    // loop may run before the watchdog noticed the freeze.
+    if config.role == Role::Worker {
+        execution::thawed(state);
+    }
     let resuming = config.role == Role::Worker
         && owned
         && execution::resuming(state, workspace)
@@ -454,10 +458,16 @@ async fn reconcile_generation(
     } else {
         "acquire"
     };
-    // Re-acquiring the epoch this device itself held (its own clean release,
-    // or its own lease that lapsed while it kept working) continues its own
-    // newer files and conversations: no checkpoint install, no fork.
-    let own_epoch = config.role == Role::Device && execution::held_here(state, config, &baton);
+    // Re-acquiring the epoch this installation itself held (its own clean
+    // release, or its own lease that lapsed while it kept working) continues
+    // its own newer files and conversations: no checkpoint install, no fork,
+    // no second transfer pickup. That includes a cloud machine thawed from a
+    // suspension whose renewal window was missed (the lease loop can run
+    // before the watchdog notices the freeze): the account turns a paused
+    // owner's acquire into a renewal of the same epoch. A cloud machine whose
+    // own arrival was interrupted (still installing) installs it again.
+    let own_epoch = execution::held_here(state, config, &baton)
+        && (config.role == Role::Device || !transferring);
     if operation == "acquire" && execution::checkpoint_mode(state, workspace) && !own_epoch {
         ensure!(
             baton.checkpoint.is_some(),

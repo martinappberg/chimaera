@@ -100,6 +100,7 @@ impl State {
             unclean: Mutex::new(unclean),
             uncertain: Mutex::new(uncertain),
             boot,
+            tick: Mutex::default(),
         }
     }
 }
