@@ -82,6 +82,17 @@ export interface PluginsTab {
   surface: "plugins";
 }
 /**
+ * A plugin's own screen: one of its `[[views]]` with `slot = "tab"`, drawn
+ * in the Chimaera format (`plugins/ui/PluginScreen.svelte`). Keyed by
+ * plugin and view, so opening it again focuses the existing tab. A plugin
+ * switched off here leaves the tab saying so (never a blank pane).
+ */
+export interface PluginViewTab {
+  surface: "plugin";
+  plugin: string;
+  view: string;
+}
+/**
  * A review of the files ONE session changed — a session-scoped changes list
  * built on the same git status/diff APIs as the source-control panel. Keyed by
  * session so re-opening focuses the existing tab; it reads the session's live
@@ -119,6 +130,7 @@ export type Tab =
   | TimelineTab
   | KnowledgeTab
   | PluginsTab
+  | PluginViewTab
   | BrowserTab;
 
 /** Identity key for the no-duplicates invariant (one tab per surface). */
@@ -136,6 +148,8 @@ export function tabKey(t: Tab): string {
   if (t.surface === "timeline") return "v:timeline";
   if (t.surface === "knowledge") return "v:knowledge";
   if (t.surface === "plugins") return "v:plugins";
+  // `x:` (extension) — a plugin's view, its own namespace.
+  if (t.surface === "plugin") return `x:${t.plugin}/${t.view}`;
   if (t.surface === "changes") return `changes:${t.sessionId}`;
   // `w:` (web) — its own namespace beside the Finder's `d:` and diff's `g:`.
   if (t.surface === "browser") return `w:${t.id}`;
@@ -578,6 +592,11 @@ export function openKnowledge(l: Layout): Layout {
 /** Open (or focus) the Plugins tab. */
 export function openPlugins(l: Layout): Layout {
   return openTab(l, { surface: "plugins" });
+}
+
+/** Open (or focus) a plugin's tab view. */
+export function openPluginViewTab(l: Layout, plugin: string, view: string): Layout {
+  return openTab(l, { surface: "plugin", plugin, view });
 }
 
 /** Open (or focus) the session-scoped changes review. */
@@ -1288,6 +1307,7 @@ type STab =
   | { d: string; di: string }
   | { gd: string; dm?: string }
   | { cs: string }
+  | { xp: string; xv: string }
   | { w: string; wo: number; wi: string; wp: string };
 
 /** Coerce a persisted diff mode, defaulting to unstaged. */
@@ -1327,6 +1347,7 @@ function serNode(node: LayoutNode): SNode {
         if (t.surface === "timeline") return { v: "timeline" };
         if (t.surface === "knowledge") return { v: "knowledge" };
         if (t.surface === "plugins") return { v: "plugins" };
+        if (t.surface === "plugin") return { xp: t.plugin, xv: t.view };
         if (t.surface === "changes") return { cs: t.sessionId };
         if (t.surface === "browser") return { w: t.host, wo: t.port, wi: t.id, wp: t.path };
         return { v: "settings" };
@@ -1392,6 +1413,13 @@ function deserNode(
         tab = { surface: "knowledge" };
       } else if (t.v === "plugins") {
         tab = { surface: "plugins" };
+      } else if (
+        typeof t.xp === "string" &&
+        /^[a-z0-9][a-z0-9-]{0,63}$/.test(t.xp) &&
+        typeof t.xv === "string" &&
+        /^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$/.test(t.xv)
+      ) {
+        tab = { surface: "plugin", plugin: t.xp, view: t.xv };
       } else if (typeof t.cs === "string" && t.cs.length > 0) {
         tab = { surface: "changes", sessionId: t.cs };
       } else if (

@@ -53,23 +53,30 @@ use crate::AppState;
 
 pub(crate) mod activity;
 pub mod capabilities;
+pub(crate) mod files;
 pub(crate) mod hostfns;
 pub(crate) mod installed;
+pub(crate) mod output;
+pub(crate) mod pdata;
+pub(crate) mod platform;
 pub(crate) mod preview;
 pub(crate) mod releases;
 pub(crate) mod revoke;
 pub(crate) mod runtime;
+pub(crate) mod screens;
+pub(crate) mod surfaces;
 pub(crate) mod tools;
 pub(crate) mod trust;
 
 /// How long a workspace's detect result is trusted before a re-stat.
 const DETECT_TTL: Duration = Duration::from_secs(30);
 
-/// The WIT version (`chimaera:plugin@0.1.x`) first-party plugins target.
-pub(crate) const API: &str = "0.1";
+/// The newest WIT version (`chimaera:plugin@0.2.x`): what a new plugin targets.
+pub(crate) const API: &str = "0.2";
 /// Every WIT version this host serves. A manifest's `api` must be one of
-/// them; an additive WIT bump adds a version here and keeps the old ones.
-pub(crate) const SERVED_APIS: &[&str] = &[API];
+/// them; a WIT bump adds a version here and keeps the old ones (0.1 through
+/// its own bindings, `runtime::v1`).
+pub(crate) const SERVED_APIS: &[&str] = &["0.1", API];
 
 /// The test-only plugins (the host's fixture, and the first-party releases
 /// the lock pins, which tests install by path): embedded by test builds
@@ -210,6 +217,18 @@ pub(crate) struct Manifest {
     /// Where newer versions are published (the release checker's source).
     #[serde(default)]
     pub(crate) release: Option<ReleaseSource>,
+    /// `[[views]]` (0.2): the screens it draws, in the Chimaera format.
+    #[serde(default)]
+    pub(crate) views: Vec<platform::ViewDecl>,
+    /// `[[files]]` (0.2): the file kinds it opens in one of its views.
+    #[serde(default)]
+    pub(crate) files: Vec<platform::FileKind>,
+    /// `[[actions]]` (0.2): items it adds to matching files' menus.
+    #[serde(default)]
+    pub(crate) actions: Vec<platform::FileAction>,
+    /// `[[settings]]` (0.2): its settings, drawn in Settings → Plugins.
+    #[serde(default)]
+    pub(crate) settings: Vec<platform::SettingDecl>,
     /// The behaviour — set by the catalog, never by the TOML.
     #[serde(skip)]
     pub(crate) wasm: Wasm,
@@ -388,6 +407,24 @@ pub(crate) enum EventKind {
     SessionEnded,
     SwitchedOn,
     SwitchedOff,
+    // 0.2 only (`validate`).
+    FileSaved,
+    FileChanged,
+    JobFinished,
+    SettingsChanged,
+}
+
+impl EventKind {
+    /// Whether a 0.1 build could hear it (its WIT's `event` variant).
+    fn in_v1(self) -> bool {
+        matches!(
+            self,
+            EventKind::Hook
+                | EventKind::SessionEnded
+                | EventKind::SwitchedOn
+                | EventKind::SwitchedOff
+        )
+    }
 }
 
 /// The card's "Adds" lines, in words — mandatory honesty, not decoration.
@@ -496,6 +533,23 @@ pub(crate) fn validate(m: &Manifest) -> Result<(), String> {
             ));
         }
     }
+    if m.api == "0.1" {
+        if let Some(e) = m.provides.events.iter().find(|e| !e.in_v1()) {
+            return Err(format!(
+                "the event {e:?} needs api = \"0.2\" (a 0.1 component can't hear it)"
+            ));
+        }
+        if !(m.views.is_empty()
+            && m.files.is_empty()
+            && m.actions.is_empty()
+            && m.settings.is_empty())
+        {
+            return Err(
+                "[[views]], [[files]], [[actions]] and [[settings]] need api = \"0.2\"".into(),
+            );
+        }
+    }
+    platform::validate(m)?;
     if let Some(release) = &m.release {
         if !valid_github(&release.github) {
             return Err(format!(
@@ -579,6 +633,11 @@ fn describe_req(req: &semver::VersionReq) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// A workspace-relative path of plain components (`hostfns`' rule).
+pub(crate) fn hostfns_relative(path: &str) -> Result<PathBuf, String> {
+    hostfns::relative(path)
 }
 
 /// The loadable plugins, one entry per id, sorted by id (the Extensions
@@ -827,6 +886,14 @@ pub(crate) mod test_catalog {
         add(&fixture_manifest(), fixture_wasm())
     }
 
+    /// The 0.2 platform fixture (`plugins/test-platform`).
+    pub(crate) fn platform() -> Arc<Manifest> {
+        add(
+            &dist_test_text("test-platform/plugin.toml"),
+            dist_test_bytes("test-platform/plugin.wasm"),
+        )
+    }
+
     pub(crate) fn fixture_manifest() -> String {
         dist_test_text("test-fixture/plugin.toml")
     }
@@ -1073,6 +1140,9 @@ fn manifest_fields(m: &Manifest) -> Value {
         "tier": m.caps.tier().as_str(),
         "caps": m.caps.digest(),
         "can": m.caps.lines_json(),
+        // The 0.2 tables: its screens, the file kinds it opens, its file
+        // menu items and its settings.
+        "platform": platform::wire(m),
     })
 }
 
@@ -1293,6 +1363,17 @@ pub(crate) async fn put_workspace_plugin(
         crate::lock(&state.workspaces).undo_plugin_on(&id, &pid, undo);
         return save_failed(err);
     }
+    // A plugin that asked to hear it is told it is going (on the instance
+    // it had, so it can let go of what it kept), before it starts over.
+    let heard = |kind| manifest(&state, &pid).filter(|m| m.provides.hears(kind));
+    if !body.on {
+        if let Some(m) = heard(EventKind::SwitchedOff) {
+            state
+                .plugin_runtime
+                .on_event(&state, &m, &id, None, runtime::wit::Event::SwitchedOff)
+                .await;
+        }
+    }
     // Either way the plugin starts over here: a fresh instance on next use,
     // and a fault cleared (switching off and on is how the user retries a
     // faulted plugin).
@@ -1301,6 +1382,21 @@ pub(crate) async fn put_workspace_plugin(
     // The switch is the moment agents' view changes: re-detect now so the
     // next connect answers from a fresh footprint.
     refresh_detect(&state, &id).await;
+    if body.on {
+        if let Some(m) = heard(EventKind::SwitchedOn) {
+            let (state, id) = (state.clone(), id.clone());
+            // Off the request: the switch answers at once. Delivered only
+            // where it is active (its footprint found).
+            tokio::spawn(async move {
+                if active(&state, &id).await.iter().any(|a| a.id == m.id) {
+                    state
+                        .plugin_runtime
+                        .on_event(&state, &m, &id, None, runtime::wit::Event::SwitchedOn)
+                        .await;
+                }
+            });
+        }
+    }
     state.changes.notify_waiters();
     Json(json!({"workspace_id": id, "plugins_on": workspace.plugins_on})).into_response()
 }
@@ -1685,7 +1781,7 @@ mod tests {
                 Some(l.repo.as_str()),
                 "{id}: it updates from the repository the lock pins"
             );
-            assert_eq!(m.api, API);
+            assert!(SERVED_APIS.contains(&m.api.as_str()), "{id}: api {}", m.api);
             assert_eq!(gate(&m, "0.4.1"), None, "{id} runs on a released daemon");
             // What the maintainers approved it to do is what it can do:
             // `chimaera plugin caps` prints both for a release's manifest.
@@ -1924,7 +2020,8 @@ mod tests {
             demo(&format!("version = \"0.1.0\"\napi = \"{api}\"\n{req}")).unwrap()
         };
         assert_eq!(gate(&with("0.1", None), "0.4.1"), None);
-        let newer = gate(&with("0.2", None), "0.4.1").unwrap();
+        assert_eq!(gate(&with("0.2", None), "0.4.1"), None);
+        let newer = gate(&with("0.9", None), "0.4.1").unwrap();
         assert!(newer.starts_with("needs a newer chimaera"), "{newer}");
         let older = gate(&with("0.0", None), "0.4.1").unwrap();
         assert!(older.starts_with("needs a newer plugin"), "{older}");
@@ -1998,7 +2095,7 @@ mod tests {
 
         // A gate fails: listed, with why.
         let mut newer = copy("demo", "0.4.0", None);
-        newer.manifest.api = "0.2".into();
+        newer.manifest.api = "0.9".into();
         let m = &resolve(&[], &[newer], "0.4.1")[0];
         assert!(m
             .origin

@@ -13,6 +13,7 @@ export type PaneViewKind =
   | "timeline"
   | "knowledge"
   | "plugins"
+  | "plugin"
   | "browser"
   | "settings";
 
@@ -39,6 +40,7 @@ const loaders: Record<PaneViewKind, () => Promise<PaneViewModule>> = {
   timeline: () => import("../workspace/TimelineView.svelte"),
   knowledge: () => import("../knowledge/KnowledgeView.svelte"),
   plugins: () => import("../plugins/PluginsView.svelte"),
+  plugin: () => import("../plugins/ui/PluginTab.svelte"),
   browser: () => import("../browser/BrowserView.svelte"),
   settings: () => import("../settings/SettingsView.svelte"),
 };
@@ -57,6 +59,7 @@ const viewChunkPrefixes: Record<PaneViewKind, string> = {
   timeline: "TimelineView-",
   knowledge: "KnowledgeView-",
   plugins: "PluginsView-",
+  plugin: "PluginTab-",
   browser: "BrowserView-",
   settings: "SettingsView-",
 };

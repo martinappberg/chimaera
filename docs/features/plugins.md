@@ -560,6 +560,59 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     capability lines match the pinned release's — otherwise the PR waits for a maintainer, and
     CI (which checks both against the release) stays red until they are set.
 
+## Plugin screens, files and settings (the 0.2 platform)
+
+- **What & when.** A plugin built for plugin API 0.2 can add to the app itself, not only to
+  agents: screens drawn in Chimaera's own format (a tab, a dashboard panel, a file's view, a
+  status chip, a section of its Extensions card), the kinds of files it opens (a `.tex` file
+  opens in the LaTeX plugin's view, **Text** always one click away), items in a file's bar
+  ("Export PDF"), published data core draws (problems in a file, a build's result), its own
+  settings in Settings → Plugins, a folder for what it makes, and state that survives a
+  restart. Shipped as the platform plan's phase P7; 0.1 plugins (Agent notes, Mycelium) run
+  unchanged beside it.
+- **How to use.** Switch the plugin on in a workspace. Its card gains **Open <view>** for each
+  tab it offers, its card sections, and **Settings**. A file it claims opens in its view; the
+  bar above has **Text** (and, when two plugins claim it, each one — the choice is remembered
+  per workspace), its status chips and file actions. The dashboard shows its panels after
+  Chimaera's own. Settings → **Plugins** lists every installed plugin's settings (host-wide or
+  per workspace), with what its output folder uses and **Clear**.
+- **Where it's wired.**
+  - **Daemon** (`crates/chimaera-server/src/plugins/`): `runtime.rs` binds both WIT worlds
+    (`v1`, `v2`) in one linker and picks by the manifest's `api`; `hostfns.rs` serves 0.1's
+    `host` through 0.2's and the new `platform` imports; `platform.rs` (the manifest tables,
+    their checks, the file patterns, the per-daemon `Platform`), `screens.rs` (the `ui/1`
+    check, render / action / file-action / query routes, invalidation at ≤ 4 a second),
+    `surfaces.rs` (`diagnostics/1`, `output/1`, `sourcemap/1`, `knowledge/1`), `output.rs`
+    (output folders under the cache dir, the 1 GiB quota, Save to workspace), `pdata.rs`
+    (durable state and setting values, capped JSON under `<data>/plugins/.data/`), `files.rs`
+    (file events from every write the daemon knows of via `git::mark_path_dirty`, the save
+    mark, per-file debounce, the watch sweep while a view is open, `settings-changed`).
+    `switched-on` / `switched-off` are delivered from the switch route. `GET /git/diff?rev=`
+    and `GET /git/log?path=` give the `diff` node its bases.
+  - **Routes** (bearer-authed): `GET /workspaces/{id}/plugins/{pid}/views/{view}`,
+    `POST …/views/{view}/actions`, `POST …/file-actions/{action}`, `GET …/query/{name}`,
+    `GET …/output`, `POST …/output/save`, `GET /workspaces/{id}/surfaces/{kind}/{version}`,
+    `GET`/`DELETE /plugins/{pid}/output`, `GET`/`PUT /plugins/{pid}/settings`. `/ws/events`
+    carries `view`, `surface` and `plugin` frames, each only to windows on that workspace.
+  - **UI** (`web-ui/src/lib/plugins/`): `platform.ts` (the wire, the pure matching, the
+    fetchers, the frame bus), `ui/UiNode.svelte` (every node), `ui/PluginScreen.svelte` (one
+    view: render, actions, built-in actions, re-render on `view` frames), `ui/PluginTab.svelte`
+    (the `plugin` tab kind, `layout.ts`), `ui/PluginFileGate.svelte` (inside `FileView`),
+    `PluginSettings.svelte` (the card and `settings/PluginsSettings.svelte`),
+    `dashboard/PluginPanels.svelte`.
+- **Rules.**
+  - A screen is data: semantic props only (tone, size, icon names), so light, dark and the
+    brand hold; markdown goes through chat's sanitizer; links open outside; images and files
+    come from the workspace or the plugin's output folder only.
+  - A tree the daemon's check refuses (size, node count, a missing label or alt) is not drawn:
+    the view says so and lists each problem with its JSON path.
+  - A plugin never writes into the workspace itself: **Save to workspace** is the user's click.
+  - Nothing polls: a screen renders on open, on an action and on the plugin's `invalidate`; the
+    watch sweep runs only while one of its views was open in the last 10 minutes.
+  - Claiming a file kind is on the **Can** list, so a release that claims a new one asks again.
+  - The author's guide has every node, prop, surface and limit:
+    [docs/agent-guides/plugins.md](../agent-guides/plugins.md#the-platform-api-02).
+
 ## Agent plugins & the Skills view
 
 - **What & when.** "What can my agents do here?" — answered by asking each agent CLI, never by

@@ -18,6 +18,7 @@ mod mcp;
 mod notebook;
 mod notices;
 mod plugin_host;
+mod plugin_platform;
 mod plugin_trust;
 mod plugin_updates;
 mod plugins;

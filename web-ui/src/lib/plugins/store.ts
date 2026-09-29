@@ -36,6 +36,7 @@ import { derived, get, writable, type Readable } from "svelte/store";
 
 import { api, ApiError } from "../net/api";
 import { refreshKnowledge } from "../workspace/knowledge";
+import { normalizePlatform, type PlatformTables } from "./platform";
 
 export type AgentId = "claude" | "codex";
 
@@ -181,6 +182,9 @@ export interface WorkspacePlugin {
   hold: PluginHold | null;
   /** An update the user skipped (it asked for more). */
   skipped_version: string | null;
+  /** Its screens, file kinds, file menu items and settings (plugin API
+   *  0.2; empty for a 0.1 plugin and an available entry). */
+  platform: PlatformTables;
 }
 
 /** A plugin as its release describes it before install (`/details` of an
@@ -409,6 +413,7 @@ function normalizePlugin(raw: WorkspacePlugin): WorkspacePlugin {
     standing: raw.standing === "untrusted" || raw.standing === "trusted" ? raw.standing : "verified",
     hold: normalizeHold(raw.hold),
     skipped_version: str(raw.skipped_version),
+    platform: normalizePlatform((raw as { platform?: unknown }).platform),
   };
 }
 

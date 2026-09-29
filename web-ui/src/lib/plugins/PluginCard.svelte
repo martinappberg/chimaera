@@ -38,6 +38,9 @@
   import Switch from "../shared/Switch.svelte";
   import ActivityDialog from "./ActivityDialog.svelte";
   import TrustDialog from "./TrustDialog.svelte";
+  import PluginSettings from "./PluginSettings.svelte";
+  import PluginScreen from "./ui/PluginScreen.svelte";
+  import { openPluginView } from "./platform";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
   import { isWebUrl, openInSystemBrowser } from "../shared/urlOpen";
   import {
@@ -78,6 +81,7 @@
     type PluginUpdate,
     type TrustAsk,
     type WorkspacePlugin,
+    workspacePlugins,
   } from "./store";
 
   interface Props {
@@ -501,6 +505,33 @@
 {/snippet}
 
 <!-- What it adds and what it found here: the same list on every card. -->
+<!-- What a 0.2 plugin adds to its card: its tab views to open, its card
+     sections (`slot = "card"`), and its settings. -->
+{#snippet platformBlock()}
+  {@const tabs = p.installed ? p.platform.views.filter((v) => v.slot === "tab") : []}
+  {@const cards = p.installed && p.active ? p.platform.views.filter((v) => v.slot === "card") : []}
+  {#if p.active && wsId !== null && tabs.length > 0}
+    <div class="opens">
+      {#each tabs as v (v.id)}
+        <button class="opt small" onclick={() => openPluginView(p.id, v.id)}>Open {v.title}</button>
+      {/each}
+    </div>
+  {/if}
+  {#if wsId !== null}
+    {#each cards as v (v.id)}
+      <div class="card-section" aria-label={v.title}>
+        <PluginScreen ws={wsId} wsRoot={$workspacePlugins?.root ?? null} plugin={p.id} view={v.id} compact />
+      </div>
+    {/each}
+  {/if}
+  {#if p.installed && p.platform.settings.length > 0}
+    <details class="card-settings">
+      <summary>Settings</summary>
+      <PluginSettings plugin={p.id} name={p.name} {wsId} />
+    </details>
+  {/if}
+{/snippet}
+
 {#snippet facts(x: WorkspacePlugin, found: ReturnType<typeof hereLine>)}
   {#if x.adds.ui.length > 0 || x.adds.agents.length > 0 || x.can.length > 0 || found !== null}
     <dl class="facts">
@@ -730,6 +761,7 @@
       {:else}
         {@render facts(p, here)}
         {@render sides(true)}
+        {@render platformBlock()}
 
         {#if p.installed && p.update !== null}
           {@const u = p.update}
@@ -1003,6 +1035,26 @@
 
   /* What it adds and what it found: labels in the muted label style, the
      values in body text, one column line for all three. */
+  /* --- a 0.2 plugin's own additions -------------------------------------- */
+  .opens {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .card-section {
+    border-top: 1px solid var(--edge);
+    padding-top: 12px;
+  }
+  .card-settings > summary {
+    cursor: pointer;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
+    padding-top: 12px;
+    border-top: 1px solid var(--edge);
+  }
   .facts {
     display: grid;
     grid-template-columns: max-content minmax(0, 1fr);

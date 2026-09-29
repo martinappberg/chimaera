@@ -1155,6 +1155,7 @@ async fn remove(state: &Arc<AppState>, pid: &str) -> Result<(), Refusal> {
     // What it kept in the daemon goes with it; so does the user's trust: a
     // later install of the id is a new question.
     crate::lock(&state.plugin_state).forget_plugin(pid);
+    super::platform::forget_plugin(state, pid).await;
     super::trust::forget(state, pid).await;
     after_change(state, pid).await;
     tracing::info!(plugin = %pid, "plugin removed");

@@ -23,6 +23,7 @@
   import BinaryView from "./BinaryView.svelte";
   import RawTextView from "./RawTextView.svelte";
   import Spinner from "./Spinner.svelte";
+  import PluginFileGate from "../plugins/ui/PluginFileGate.svelte";
 
   interface Props {
     path: string;
@@ -30,9 +31,12 @@
     wsRoot?: string | null;
     /** Per-pane text-size override (px); markdown preview scales to it. */
     fontSize?: number;
+    /** Let active plugins claim the file (false inside a plugin's own
+     *  screen, which shows the file itself). */
+    plugins?: boolean;
   }
 
-  let { path, wsRoot = null, fontSize = undefined }: Props = $props();
+  let { path, wsRoot = null, fontSize = undefined, plugins = true }: Props = $props();
 
   const kind = $derived(viewKindFor(path));
 
@@ -305,6 +309,7 @@
   {/if}
 {/snippet}
 
+{#snippet fileBody()}
 {#key path}
   <div class="file-view">
     {#if external}
@@ -454,8 +459,23 @@
     </div>
   </div>
 {/key}
+{/snippet}
+
+{#if plugins}
+  <!-- A file an active plugin claims opens in its view (Text one click
+       away); its file actions and status chips ride a bar above. -->
+  <div class="file-gate">
+    <PluginFileGate {path} {wsRoot}>{@render fileBody()}</PluginFileGate>
+  </div>
+{:else}
+  {@render fileBody()}
+{/if}
 
 <style>
+  .file-gate {
+    position: absolute;
+    inset: 0;
+  }
   .file-view {
     position: absolute;
     inset: 0;

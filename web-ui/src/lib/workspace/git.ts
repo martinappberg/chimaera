@@ -147,6 +147,27 @@ export async function fetchGitDiff(
   return json(await api(`/git/diff?${q.toString()}`));
 }
 
+/** The working tree against a revision (a branch, tag or commit). */
+export async function fetchGitDiffAt(workspaceId: string, path: string, rev: string): Promise<GitDiff> {
+  const q = new URLSearchParams({ workspace_id: workspaceId, path, rev });
+  return json(await api(`/git/diff?${q.toString()}`));
+}
+
+export interface GitCommit {
+  sha: string;
+  short: string;
+  author: string;
+  time_ms: number;
+  subject: string;
+}
+
+/** The newest commits that changed `path` (at most 50). */
+export async function fetchGitLog(workspaceId: string, path: string, limit = 50): Promise<GitCommit[]> {
+  const q = new URLSearchParams({ workspace_id: workspaceId, path, limit: String(limit) });
+  const body = await json<{ commits?: GitCommit[] }>(await api(`/git/log?${q.toString()}`));
+  return Array.isArray(body.commits) ? body.commits : [];
+}
+
 export async function fetchGitWorktrees(
   workspaceId: string,
 ): Promise<{ repo: boolean; worktrees: GitWorktree[] }> {

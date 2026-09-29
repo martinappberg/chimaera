@@ -22,6 +22,7 @@
   import NowLine from "./NowLine.svelte";
   import SinceYouLeft from "./SinceYouLeft.svelte";
   import WhereThingsStand from "./WhereThingsStand.svelte";
+  import PluginPanels from "./PluginPanels.svelte";
   import { acquireChat, releaseChat } from "../chat/chatPool";
   import type { ChatStore } from "../chat/store.svelte";
   import type { ChatSocket } from "../chat/chatWs";
@@ -467,6 +468,9 @@
             onOpenExtensions={dash.onOpenExtensions}
           />
         {/if}
+
+        <!-- Active plugins' panels (`slot = "panel"`), after core's own. -->
+        <PluginPanels {wsId} {wsRoot} />
 
         {#if !nothingRunning}
           {#if cardsMode}

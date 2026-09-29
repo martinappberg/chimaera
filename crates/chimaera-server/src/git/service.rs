@@ -720,6 +720,9 @@ pub(crate) async fn mark_path_dirty(state: &AppState, path: &str) {
     for ws in workspaces {
         // Component-wise prefix (so `/repo` never matches `/repo2`).
         if target.starts_with(&ws.root) {
+            if let Ok(rel) = target.strip_prefix(&ws.root) {
+                crate::plugins::files::touched(state, &expanded, &ws.id, &rel.to_string_lossy());
+            }
             state.git.bump(&ws.id);
             // We just announced this change; drop the published baseline so the
             // pull it triggers adopts the new status without bumping again.

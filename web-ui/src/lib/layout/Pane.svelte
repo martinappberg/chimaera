@@ -494,6 +494,15 @@
     {:else}
       <Spinner />
     {/if}
+  {:else if tab.surface === "plugin"}
+    {@const PluginTab = views.plugin}
+    {#if PluginTab !== undefined}
+      <PluginTab {wsId} {wsRoot} plugin={tab.plugin} view={tab.view} />
+    {:else if viewErrors.plugin}
+      {@render loadFailure("plugin", "plugin view")}
+    {:else}
+      <Spinner />
+    {/if}
   {:else if tab.surface === "browser"}
     {@const BrowserView = views.browser}
     {#if BrowserView !== undefined}

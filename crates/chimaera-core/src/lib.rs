@@ -130,6 +130,25 @@ pub fn config_dir() -> PathBuf {
     dir
 }
 
+/// Per-user cache directory (`$XDG_CACHE_HOME/chimaera`, else
+/// `~/.cache/chimaera`; `$CHIMAERA_HOME/cache` when isolated), not created
+/// here. For bulky outputs that can be made again (plugins' output folders):
+/// it survives restarts and is never night-scrubbed, unlike [`runtime_dir`].
+pub fn cache_dir() -> PathBuf {
+    match state_home() {
+        Some(home) => home.join("cache"),
+        None => {
+            let base = match std::env::var_os("XDG_CACHE_HOME") {
+                Some(base) if !base.is_empty() => PathBuf::from(base),
+                _ => dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".cache"),
+            };
+            base.join("chimaera")
+        }
+    }
+}
+
 /// Per-user runtime directory: `$XDG_RUNTIME_DIR/chimaera` if set, else
 /// `/tmp/chimaera-$UID` (`$CHIMAERA_HOME/run` when isolated; on Windows
 /// `%LOCALAPPDATA%\chimaera\run` — already per-user, no /tmp analogue).

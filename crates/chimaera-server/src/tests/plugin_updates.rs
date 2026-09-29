@@ -480,7 +480,7 @@ async fn a_newer_compatible_release_is_offered_and_an_older_or_incompatible_one_
     assert!(!plugin_dir(&state, "up-offer").join("0.2.0").exists());
 
     // Newer, but for a plugin API this host doesn't serve: not offered.
-    let api = manifest(true, "up-offer", "0.3.0", "").replace("api = \"0.1\"", "api = \"0.2\"");
+    let api = manifest(true, "up-offer", "0.3.0", "").replace("api = \"0.1\"", "api = \"0.9\"");
     fake.publish(gh, "0.3.0", &api, &v2_wasm());
     assert_eq!(check().await["update"], Value::Null);
     assert!(listed(&state, "up-offer").await.get("update").is_none());
@@ -1145,7 +1145,7 @@ async fn the_gates_refuse_an_install_and_turn_off_an_installed_copy_that_stops_p
     let fake = FakeReleases::start().await;
     let state = state_for(&fake);
 
-    let api = manifest(false, "gate-api", "0.1.0", "").replace("api = \"0.1\"", "api = \"0.2\"");
+    let api = manifest(false, "gate-api", "0.1.0", "").replace("api = \"0.1\"", "api = \"0.9\"");
     fake.publish("acme/gate-api", "0.1.0", &api, &v1_wasm());
     let (status, body) = install(&state, "acme/gate-api", None).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");

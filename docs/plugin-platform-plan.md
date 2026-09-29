@@ -796,6 +796,19 @@ with a locally signed list; watch the card.
 
 ### P7: screens, surfaces, files, settings, outputs (0.2 world)
 
+**Built (2026-09-29).** Where it differs from the text below: the editor's change
+bars against a base are not in the editor's gutter yet — the `diff` node compares a
+file with the same bases (`head`, `index`, `rev:<ref>`, `output:<path>`), and the
+gutter comes with P9, which needs it for review; file actions are in the file's bar,
+not yet in the file tree's context menu; plugin settings live in their own capped
+JSON under `<data dir>/plugins/.data/`, not in `settings.json` (no key can collide
+with a core setting); a `knowledge/1` publish is accepted and served, while the
+Knowledge view still reads the `knowledge` export (the redesign moves it, see
+[coordination](#coordination-the-knowledge-redesign-2026-09-29)). Live: the platform
+fixture's every node, its file view with Text and a file action, the dashboard panel,
+the card section and Settings → Plugins, in light and dark, beside Agent notes and
+Mycelium on 0.1.
+
 The 0.2 world beside 0.1; `ui/1` and its renderer; the five slots; `render`,
 `on-action`, `invalidate` and the query route; the four surfaces; file kinds,
 actions and events; the watch set; output folders; declared settings; `switched-on`

@@ -13,6 +13,8 @@
   import AgentsSettings from "./AgentsSettings.svelte";
   import EnvironmentSettings from "./EnvironmentSettings.svelte";
   import DocumentsSettings from "./DocumentsSettings.svelte";
+  import PluginsSettings from "./PluginsSettings.svelte";
+  import { workspacePlugins } from "../plugins/store";
   import NotificationStatus from "./NotificationStatus.svelte";
   import UpdatesStatus from "./UpdatesStatus.svelte";
   import { APP_MENU, PINNED } from "../shared/keys";
@@ -31,6 +33,9 @@
     const out = [...CATEGORIES];
     const at = out.indexOf("Agents");
     out.splice(at >= 0 ? at + 1 : out.length, 0, "Environment", "Documents");
+    // Plugins' own declared settings, after the Extensions policy.
+    const ext = out.indexOf("Extensions");
+    out.splice(ext >= 0 ? ext + 1 : out.length, 0, "Plugins");
     return out;
   })();
 
@@ -71,6 +76,16 @@
   /** Same idea for the Documents section. */
   const DOC_KEYWORDS = ["documents", "markdown", "agents.md", "skill", "claude", "teach", "check"];
   const docsVisible = $derived(q === "" || DOC_KEYWORDS.some((k) => k.includes(q)));
+  /** Plugins: its own word, or a plugin or setting it names. */
+  const pluginsVisible = $derived(
+    q === "" ||
+      "plugins".includes(q) ||
+      ($workspacePlugins?.plugins ?? []).some(
+        (p) =>
+          p.platform.settings.length > 0 &&
+          (p.name.toLowerCase().includes(q) || p.platform.settings.some((s) => s.label.toLowerCase().includes(q))),
+      ),
+  );
 
   /** Rows grouped by category, registry order, empty groups dropped. */
   const groups = $derived.by(() => {
@@ -82,6 +97,10 @@
       }
       if (cat === "Documents") {
         if (docsVisible) out.push({ category: cat, defs: [] });
+        continue;
+      }
+      if (cat === "Plugins") {
+        if (pluginsVisible) out.push({ category: cat, defs: [] });
         continue;
       }
       const defs = visible.filter((d) => d.category === cat);
@@ -229,6 +248,12 @@
                  /api/v1/agent-docs. It renders its own <h2>. -->
             <section data-section={group.category}>
               <DocumentsSettings />
+            </section>
+          {:else if group.category === "Plugins"}
+            <!-- Bespoke panel: each installed plugin's declared settings,
+                 kept by the daemon per plugin (not settings.json). -->
+            <section data-section={group.category}>
+              <PluginsSettings query={"plugins".includes(q) ? "" : q} />
             </section>
           {:else if group.category === "Notifications"}
             <!-- Generic rows plus a status line: whether the OS/browser will

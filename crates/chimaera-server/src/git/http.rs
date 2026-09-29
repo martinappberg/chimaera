@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::AppState;
 
@@ -213,6 +213,53 @@ pub(crate) struct DiffQuery {
     /// `unstaged` (default), `staged`, or `head`.
     #[serde(default)]
     mode: Option<String>,
+    /// Compare the working tree with this revision instead (a branch, tag
+    /// or commit; `mode` is then `rev`): what a plugin screen's change bars
+    /// may name as their base (`rev:<ref>`).
+    #[serde(default)]
+    rev: Option<String>,
+}
+
+/// A revision a client names: never an option (`-…`), never a path spec
+/// (`:`), no whitespace, bounded — then resolved by git itself.
+fn plausible_rev(rev: &str) -> bool {
+    !rev.is_empty()
+        && rev.len() <= 256
+        && !rev.starts_with('-')
+        && !rev.contains(':')
+        && !rev.contains("..")
+        && rev
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._/~^@{}-+".contains(c))
+}
+
+/// `rev` as a commit id (`git rev-parse --verify <rev>^{commit}`), or why not.
+async fn resolve_rev(
+    git_bin: &Path,
+    git: &GitService,
+    repo: &RepoInfo,
+    rev: &str,
+) -> Result<String, String> {
+    if !plausible_rev(rev) {
+        return Err(format!("{rev:?} is not a revision"));
+    }
+    let spec = format!("{rev}^{{commit}}");
+    let out = run_git(
+        git_bin,
+        &git.procs,
+        &repo.toplevel,
+        // No `--end-of-options` (git ≥ 2.24; the floor is 2.15):
+        // `plausible_rev` already refused anything starting with `-`.
+        &["rev-parse", "--verify", "--quiet", &spec],
+        4096,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.success || sha.len() < 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("no revision {rev} in this repository"));
+    }
+    Ok(sha)
 }
 
 /// GET /api/v1/git/diff?workspace_id=&path=&mode= — the two blob versions for a
@@ -253,8 +300,26 @@ pub(crate) async fn diff(
             .into_response();
     };
 
-    let mode = q.mode.as_deref().unwrap_or("unstaged");
+    let rev_sha = match q.rev.as_deref() {
+        Some(rev) => match resolve_rev(&git.path, &state.git, &repo, rev).await {
+            Ok(sha) => Some(sha),
+            Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+        },
+        None => None,
+    };
+    let mode = if rev_sha.is_some() {
+        "rev"
+    } else {
+        q.mode.as_deref().unwrap_or("unstaged")
+    };
+    let rev_label = q.rev.clone().unwrap_or_default();
     let (a_spec, a_label, b_from_worktree, b_label) = match mode {
+        "rev" => (
+            Some(format!("{}:{rel}", rev_sha.as_deref().unwrap_or_default())),
+            rev_label.as_str(),
+            true,
+            "working tree",
+        ),
         "staged" => (Some(format!("HEAD:{rel}")), "HEAD", false, "staged"),
         "head" => (Some(format!("HEAD:{rel}")), "HEAD", true, "working tree"),
         // "unstaged" (default): index vs working tree.
@@ -306,6 +371,89 @@ pub(crate) async fn diff(
         "b_label": b_label,
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+pub(crate) struct LogQuery {
+    workspace_id: String,
+    path: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Commits a file's history lists at most.
+const LOG_MAX: usize = 50;
+
+/// GET /api/v1/git/log?workspace_id=&path=&limit= — the newest commits that
+/// changed `path` (≤ 50): `{commits: [{sha, short, author, time_ms,
+/// subject}]}`. What a change-bar base picker offers (`rev:<sha>`).
+pub(crate) async fn log(State(state): State<Arc<AppState>>, Query(q): Query<LogQuery>) -> Response {
+    let Some(ws) = crate::lock(&state.workspaces).get(&q.workspace_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown workspace"})),
+        )
+            .into_response();
+    };
+    let git = state.git.resolve_git(configured_git(&state)).await;
+    if !git.adequate {
+        return git_too_old(&git);
+    }
+    let Some(repo) = state
+        .git
+        .discover(&git.path, &q.workspace_id, &ws.root)
+        .await
+        .into_repo()
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "not a git repository"})),
+        )
+            .into_response();
+    };
+    let Some(rel) = repo_relative(&repo.toplevel, &q.path) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "path is not inside the repository"})),
+        )
+            .into_response();
+    };
+    let limit = q.limit.unwrap_or(LOG_MAX).clamp(1, LOG_MAX).to_string();
+    let out = match run_git(
+        &git.path,
+        &state.git.procs,
+        &repo.toplevel,
+        &[
+            "log",
+            "-n",
+            &limit,
+            "--format=%H%x1f%h%x1f%an%x1f%at%x1f%s",
+            "--",
+            &rel,
+        ],
+        256 * 1024,
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(e) => return Json(json!({"error": e.to_string()})).into_response(),
+    };
+    let commits: Vec<Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split('\x1f');
+            let (sha, short, author, at, subject) =
+                (f.next()?, f.next()?, f.next()?, f.next()?, f.next()?);
+            Some(json!({
+                "sha": sha,
+                "short": short,
+                "author": author,
+                "time_ms": at.parse::<u64>().unwrap_or(0) * 1000,
+                "subject": subject,
+            }))
+        })
+        .collect();
+    Json(json!({"path": q.path, "rel": rel, "commits": commits})).into_response()
 }
 
 /// `git show <spec>` → the blob bytes, `None` if the object does not exist, or
@@ -377,6 +525,32 @@ fn repo_relative(toplevel: &Path, abs: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revisions_are_names_not_options() {
+        for ok in [
+            "main",
+            "v1.2.0",
+            "HEAD~3",
+            "origin/main",
+            "abc1234",
+            "HEAD^",
+            "main@{1}",
+        ] {
+            assert!(plausible_rev(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "-p",
+            "--output=/tmp/x",
+            "HEAD:secret",
+            "a..b",
+            "a b",
+            "$(x)",
+        ] {
+            assert!(!plausible_rev(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn repo_relative_rejects_escapes() {

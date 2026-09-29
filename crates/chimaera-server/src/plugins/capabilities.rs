@@ -181,6 +181,12 @@ impl Caps {
         if m.setup.is_some() {
             atoms.insert(atom(&["setup-prompt"]));
         }
+        // Claiming a kind of file changes how the user's files open.
+        for kind in &m.files {
+            for pattern in &kind.patterns {
+                atoms.insert(atom(&["file-kind", pattern]));
+            }
+        }
         for (agent, req) in m
             .requires
             .agent_plugins
@@ -304,6 +310,15 @@ impl Caps {
         if has(&["setup-prompt"]) {
             plain("Has a setup prompt it sends to an agent you choose, shown in full first".into());
         }
+        let kinds: Vec<&str> = of_kind("file-kind")
+            .filter_map(|p| p.get(1).map(String::as_str))
+            .collect();
+        if !kinds.is_empty() {
+            plain(format!(
+                "Opens {} files in its own view (Text is always one click away)",
+                kinds.join(", ")
+            ));
+        }
         // Atoms this daemon has no words for (a newer kind): said plainly
         // rather than left off the list.
         let known = [
@@ -313,6 +328,7 @@ impl Caps {
             "knowledge",
             "agent-plugin",
             "setup-prompt",
+            "file-kind",
         ];
         for p in &parsed {
             let k = p.first().map(String::as_str).unwrap_or("");
@@ -402,6 +418,25 @@ mod tests {
         let later = manifest("api = \"0.2\"\n");
         assert_eq!(Access::of(&later), Access::NONE);
         assert!(later.caps.is_empty());
+    }
+
+    #[test]
+    fn claiming_a_file_kind_is_on_the_can_list() {
+        let m = manifest(
+            "api = \"0.2\"\n[[views]]\nid = \"doc\"\ntitle = \"Doc\"\nslot = \"file\"\n\
+             [[files]]\nmatch = [\"*.tex\", \"*.ltx\"]\nview = \"doc\"\nlabel = \"LaTeX\"\n",
+        );
+        let text: Vec<String> = m.caps.lines().into_iter().map(|l| l.text).collect();
+        assert_eq!(
+            text,
+            ["Opens *.ltx, *.tex files in its own view (Text is always one click away)"]
+        );
+        // Claiming another kind asks again (the digest grows).
+        let more = manifest(
+            "api = \"0.2\"\n[[views]]\nid = \"doc\"\ntitle = \"Doc\"\nslot = \"file\"\n\
+             [[files]]\nmatch = [\"*.tex\", \"*.ltx\", \"*.bib\"]\nview = \"doc\"\nlabel = \"LaTeX\"\n",
+        );
+        assert!(!m.caps.covers(&more.caps));
     }
 
     #[test]

@@ -3,6 +3,7 @@ import { nudgeReconnectors, retryDelayMs } from "./reconnect";
 import type { Link } from "../workspace/agentLinks";
 import type { Session } from "../workspace/sessions";
 import type { Notice } from "../workspace/notices";
+import type { PlatformFrame } from "../plugins/platform";
 import { parseUpdateStatus, type UpdateStatus } from "../workspace/update.svelte";
 
 const INITIAL_BACKOFF_MS = 500;
@@ -59,6 +60,12 @@ export interface EventsSocketHandlers {
    * replayed across reconnects: a reload must not re-alert old news.
    */
   onNotices?(notices: Notice[]): void;
+  /**
+   * A plugin frame for this window's workspace: a view to render again
+   * (`view`), published data to fetch again (`surface`), or a plugin's own
+   * `emit` (`plugin`).
+   */
+  onPlatform?(frame: PlatformFrame): void;
   /**
    * Connection state. While false the caller should fall back to polling;
    * fired only on transitions.
@@ -254,6 +261,11 @@ export class EventsSocket {
             ? msg.removed_dirs.filter(isString)
             : [],
         });
+      } else if (
+        (msg.type === "view" || msg.type === "surface" || msg.type === "plugin") &&
+        typeof (msg as { plugin?: unknown }).plugin === "string"
+      ) {
+        this.handlers.onPlatform?.(msg as unknown as PlatformFrame);
       } else if (msg.type === "notices" && Array.isArray(msg.notices)) {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.handlers.onNotices?.(msg.notices);

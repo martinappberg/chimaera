@@ -21,7 +21,7 @@ mod resolve;
 mod service;
 mod worktree;
 
-pub(crate) use http::{diff, status, worktrees};
+pub(crate) use http::{diff, log, status, worktrees};
 pub(crate) use service::{
     backstop_poll, git_facts, mark_path_dirty, usable_git_dir, GitService, WatchGuard,
 };

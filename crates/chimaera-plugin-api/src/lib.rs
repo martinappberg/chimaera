@@ -1,6 +1,10 @@
-//! The Rust side of the `chimaera:plugin` WIT world (`wit/chimaera.wit`):
-//! what a Chimaera plugin implements ([`Plugin`]) and what it may ask the
-//! host ([`host`]). Design: `docs/plugin-system-plan.md`.
+//! The Rust side of the `chimaera:plugin` WIT world (`wit/chimaera.wit`,
+//! package `chimaera:plugin@0.2.0`): what a Chimaera plugin implements
+//! ([`Plugin`]), what it may ask the host ([`host`], and the platform's
+//! [`platform`]). Design: `docs/plugin-system-plan.md` (the host) and
+//! `docs/plugin-platform-plan.md` (screens, surfaces, files, settings,
+//! output folders, programs). A 0.1 plugin moves to 0.2 by bumping this
+//! dependency and its manifest's `api`: every new export has a default.
 //!
 //! A plugin is a `cdylib` crate built for `wasm32-wasip2`:
 //!
@@ -25,8 +29,8 @@
 //! ```
 //!
 //! Built natively (tests, clippy) every host import is a stub that aborts the
-//! process, so a native test must never reach a [`host`] call: keep pure
-//! logic in functions that take data.
+//! process, so a native test must never reach a [`host`] or [`platform`]
+//! call: keep pure logic in functions that take data.
 
 // The generated guest bindings. `pub_export_macro` + `with_types_in $crate`
 // (see `export!`) let a plugin crate export through this crate's bindings.
@@ -43,10 +47,11 @@ pub use serde_json;
 use serde_json::Value;
 
 pub use chimaera::plugin::types::{
-    Context, Entry, Event, Hook, Level, Session, Snapshot, Stat, ToolDef, ToolResult,
+    Context, Entry, Event, Hook, JobEnd, Level, Session, Snapshot, Stat, ToolDef, ToolResult,
 };
 
 use exports::chimaera::plugin::plugin::Guest;
+use exports::chimaera::plugin::screens::Guest as ScreensGuest;
 
 /// What a plugin provides. Every function has a default, so a plugin
 /// implements only what it offers; the set is the WIT world's complete
@@ -64,7 +69,9 @@ pub trait Plugin {
         None
     }
 
-    /// One tool call. `args` is the call's JSON arguments.
+    /// One tool call. `args` is the call's JSON arguments. A tool that
+    /// started a job answers [`ToolResult::wait`]; the host then calls
+    /// [`Plugin::tool_resume`] once the job ended.
     fn call_tool(cx: Context, name: &str, args: Value) -> ToolResult {
         let _ = (cx, args);
         ToolResult::error(format!("unknown tool {name}"))
@@ -77,7 +84,7 @@ pub trait Plugin {
         Ok(None)
     }
 
-    /// A read the UI makes.
+    /// A read the UI makes (and a long list's next page).
     fn query(cx: Context, name: &str, args: Value) -> Result<Value, String> {
         let _ = (cx, name, args);
         Err("no such query".to_string())
@@ -88,6 +95,33 @@ pub trait Plugin {
     fn on_event(cx: Context, event: Event) -> Option<String> {
         let _ = (cx, event);
         None
+    }
+
+    /// A view's tree in the Chimaera format: `{"ui": "1", "root": <node>}`
+    /// (see [`ui`]). `args`: `{"file": <path>}` for a file view, `"width"`
+    /// (`narrow` or `wide`).
+    fn render(cx: Context, view: &str, args: Value) -> Result<Value, String> {
+        let _ = (cx, args);
+        Err(format!("no such view {view}"))
+    }
+
+    /// A node's action (a button, a form's submit, a file action): the
+    /// view's new tree, or `None` to keep what it shows.
+    fn on_action(
+        cx: Context,
+        view: &str,
+        action: &str,
+        payload: Value,
+    ) -> Result<Option<Value>, String> {
+        let _ = (cx, view, payload);
+        Err(format!("no such action {action}"))
+    }
+
+    /// The final answer of a tool that answered [`ToolResult::wait`], once
+    /// `job` ended.
+    fn tool_resume(cx: Context, name: &str, job: &str) -> ToolResult {
+        let _ = (cx, job);
+        ToolResult::error(format!("{name} has no answer to resume"))
     }
 }
 
@@ -133,6 +167,27 @@ impl<T: Plugin> Guest for T {
     }
 }
 
+impl<T: Plugin> ScreensGuest for T {
+    fn render(cx: Context, view: String, args: String) -> Result<String, String> {
+        let args = serde_json::from_str(&args).unwrap_or(Value::Null);
+        T::render(cx, &view, args).map(|v| v.to_string())
+    }
+
+    fn on_action(
+        cx: Context,
+        view: String,
+        action: String,
+        payload: String,
+    ) -> Result<String, String> {
+        let payload = serde_json::from_str(&payload).unwrap_or(Value::Null);
+        T::on_action(cx, &view, &action, payload).map(|v| v.unwrap_or(Value::Null).to_string())
+    }
+
+    fn tool_resume(cx: Context, name: String, job: String) -> ToolResult {
+        T::tool_resume(cx, &name, &job)
+    }
+}
+
 impl ToolDef {
     /// A tool definition; `input_schema` is the tool's JSON Schema.
     pub fn new(
@@ -154,6 +209,7 @@ impl ToolResult {
         ToolResult {
             text: text.into(),
             is_error: false,
+            wait: None,
         }
     }
 
@@ -162,6 +218,19 @@ impl ToolResult {
         ToolResult {
             text: text.into(),
             is_error: true,
+            wait: None,
+        }
+    }
+
+    /// The answer waits for `job` (one [`platform::job_start`] returned):
+    /// the host holds the agent's call until the job ends, then asks
+    /// [`Plugin::tool_resume`]. `text` is what the agent reads if the job
+    /// outlasts the hold ("still building").
+    pub fn wait(job: impl Into<String>, text: impl Into<String>) -> Self {
+        ToolResult {
+            text: text.into(),
+            is_error: false,
+            wait: Some(job.into()),
         }
     }
 }
@@ -177,8 +246,9 @@ impl Snapshot {
     }
 }
 
-/// What a plugin may ask the host. Every call is bounded by the host (the
-/// limits are in the plan); fallible calls return the host's reason as text.
+/// What a plugin may ask the host (as in 0.1). Every call is bounded by the
+/// host; fallible calls return the host's reason as text. The manifest's
+/// `[access]` decides which reads answer.
 ///
 /// The host serves each call for the workspace and session it made the
 /// call for; the `cx` argument is the one the plugin was handed.
@@ -203,7 +273,8 @@ pub mod host {
         raw::list(cx, path, cap)
     }
 
-    /// A value this plugin stored in this workspace, if any.
+    /// A value this plugin stored in this workspace, if any (in memory or
+    /// kept durably with [`super::platform::state_keep`]).
     pub fn state_get(cx: &Context, key: &str) -> Result<Option<Value>, String> {
         raw::state_get(cx, key)
             .map(|text| serde_json::from_str(&text).map_err(|e| format!("state {key}: {e}")))
@@ -237,8 +308,9 @@ pub mod host {
             .collect()
     }
 
-    /// A frame on the UI's event bus: `{"type":"plugin","plugin":<id>,
-    /// "workspace":<id>, ...event}`. `event` must be a JSON object.
+    /// A frame on the UI's event bus for windows showing this workspace:
+    /// `{"type":"plugin","plugin":<id>,"workspace":<id>, ...event}`. `event`
+    /// must be a JSON object.
     pub fn emit(cx: &Context, event: &Value) {
         raw::emit(cx, &event.to_string())
     }
@@ -251,5 +323,146 @@ pub mod host {
     /// A line in the daemon's log, tagged with the plugin.
     pub fn log(level: Level, message: &str) {
         raw::log(level, message)
+    }
+}
+
+/// What 0.2 adds for a plugin to ask: its output folder, data surfaces,
+/// screens' invalidation, the watch set, declared settings, durable state,
+/// the roots, and programs run as jobs. Bounded by the host like [`host`].
+pub mod platform {
+    use super::chimaera::plugin::platform as raw;
+    use super::{Context, Entry};
+    use serde_json::Value;
+
+    /// Bytes of a file in the plugin's output folder for this workspace,
+    /// from `offset`, at most `cap` (≤ 8 MiB a call).
+    pub fn output_read(cx: &Context, path: &str, offset: u64, cap: u32) -> Result<Vec<u8>, String> {
+        raw::output_read(cx, path, offset, cap)
+    }
+
+    /// A folder of the output folder, at most `cap` entries.
+    pub fn output_list(cx: &Context, path: &str, cap: u32) -> Result<Vec<Entry>, String> {
+        raw::output_list(cx, path, cap)
+    }
+
+    /// Write a file into the output folder (≤ 8 MiB; folders on its path
+    /// are made).
+    pub fn output_write(cx: &Context, path: &str, bytes: &[u8]) -> Result<(), String> {
+        raw::output_write(cx, path, bytes)
+    }
+
+    /// Remove a file or folder of the output folder.
+    pub fn output_remove(cx: &Context, path: &str) -> Result<(), String> {
+        raw::output_remove(cx, path)
+    }
+
+    /// Publish a data surface (`diagnostics/1`, `output/1`, `sourcemap/1`,
+    /// `knowledge/1`) under `key`.
+    pub fn publish(cx: &Context, surface: &str, key: &str, data: &Value) -> Result<(), String> {
+        raw::publish(cx, surface, key, &data.to_string())
+    }
+
+    /// Remove a published surface.
+    pub fn unpublish(cx: &Context, surface: &str, key: &str) -> Result<(), String> {
+        raw::publish(cx, surface, key, "null")
+    }
+
+    /// Tell windows showing `view` to render it again.
+    pub fn invalidate(cx: &Context, view: &str) {
+        raw::invalidate(cx, view)
+    }
+
+    /// The workspace paths (≤ 256) whose changes arrive as `file-changed`;
+    /// replaces the previous set.
+    pub fn watch(cx: &Context, paths: &[String]) -> Result<(), String> {
+        raw::watch(cx, paths)
+    }
+
+    /// A declared setting's value: the user's, else its default.
+    pub fn setting(cx: &Context, key: &str) -> Option<Value> {
+        raw::setting_get(cx, key).and_then(|text| serde_json::from_str(&text).ok())
+    }
+
+    /// Store `value` durably under `key` (survives a restart); `null`
+    /// removes it. Read it back with [`super::host::state_get`].
+    pub fn state_keep(cx: &Context, key: &str, value: &Value) -> Result<(), String> {
+        raw::state_keep(cx, key, &value.to_string())
+    }
+
+    /// The absolute workspace root and output folder.
+    pub struct Roots {
+        pub workspace: String,
+        pub output: String,
+    }
+
+    pub fn roots(cx: &Context) -> Roots {
+        let v: Value = serde_json::from_str(&raw::roots(cx)).unwrap_or(Value::Null);
+        let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        Roots {
+            workspace: s("workspace"),
+            output: s("output"),
+        }
+    }
+
+    /// Run a declared program as a job: `spec` is
+    /// `{"program", "args", "cwd"?, "env"?, "stdin"?, "wall_s"?, "label"?, "priority"?}`.
+    /// The job's id; `job-finished` arrives when it ends.
+    pub fn job_start(cx: &Context, spec: &Value) -> Result<String, String> {
+        raw::job_start(cx, &spec.to_string())
+    }
+
+    /// `{"state": "queued"|"running"|"done", "exit"?, "timed_out"?, ...}`.
+    pub fn job_status(cx: &Context, id: &str) -> Value {
+        serde_json::from_str(&raw::job_status(cx, id)).unwrap_or(Value::Null)
+    }
+
+    pub fn job_cancel(cx: &Context, id: &str) {
+        raw::job_cancel(cx, id)
+    }
+
+    /// A declared side program: `{"installed", "version", "found_on_path", ...}`.
+    pub fn tool_state(cx: &Context, tool: &str) -> Value {
+        serde_json::from_str(&raw::tool_state(cx, tool)).unwrap_or(Value::Null)
+    }
+}
+
+/// Screens in the Chimaera format (`ui/1`): small helpers for the JSON tree
+/// a view returns. Every node is `{"type": …, props…}`; see
+/// `docs/agent-guides/plugins.md` ("Screens") for every node and prop.
+pub mod ui {
+    use serde_json::{json, Value};
+
+    /// A view's tree.
+    pub fn tree(root: Value) -> Value {
+        json!({"ui": "1", "root": root})
+    }
+
+    pub fn stack(children: Vec<Value>) -> Value {
+        json!({"type": "stack", "children": children})
+    }
+
+    pub fn row(children: Vec<Value>) -> Value {
+        json!({"type": "row", "children": children})
+    }
+
+    pub fn section(title: &str, children: Vec<Value>) -> Value {
+        json!({"type": "section", "title": title, "children": children})
+    }
+
+    pub fn text(text: &str) -> Value {
+        json!({"type": "text", "text": text})
+    }
+
+    pub fn heading(text: &str) -> Value {
+        json!({"type": "heading", "text": text})
+    }
+
+    /// A button whose click reaches `on_action(view, action, payload)`.
+    pub fn button(label: &str, action: &str, payload: Value) -> Value {
+        json!({"type": "button", "label": label, "action": action, "payload": payload})
+    }
+
+    pub fn callout(text: &str, tone: &str) -> Value {
+        json!({"type": "callout", "text": text, "tone": tone})
     }
 }

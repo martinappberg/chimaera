@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { WorkspacePlugin } from "./store";
+import { EMPTY_PLATFORM } from "./platform";
 import {
   activityWords,
   approxSize,
@@ -24,6 +25,7 @@ const SHA = "0123456789abcdef".repeat(4);
 
 function available(over: Partial<WorkspacePlugin> = {}): WorkspacePlugin {
   return {
+    platform: EMPTY_PLATFORM,
     id: "agent-notes",
     name: "Agent notes",
     summary: "Notes your agents keep for you.",

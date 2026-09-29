@@ -157,6 +157,7 @@
     openTimeline,
     openKnowledge,
     openPlugins,
+    openPluginViewTab,
     openGit,
     openSession,
     openSettings,
@@ -221,7 +222,9 @@
     closeAttachSheet,
     knowledgeProviderActive,
     onAgentPluginsChanged,
+    workspacePlugins,
   } from "./lib/plugins/store";
+  import { platformFrame, pluginViewTitle, setViewOpener } from "./lib/plugins/platform";
   import ExtensionsGlyph from "./lib/plugins/ExtensionsGlyph.svelte";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import {
@@ -1573,6 +1576,7 @@
     // wherever the link was; chat resolves against the same per-session
     // context as terminal links.
     setPathOpener(openPathInLayout);
+    setViewOpener(openPluginViewSurface);
     setChatLinkContext(linkContext);
     setReferenceHandler(referenceSelection);
     setUploadPathInserter(insertUploadedPath);
@@ -1601,6 +1605,7 @@
         }
       },
       onFs: notifyDiskChange,
+      onPlatform: platformFrame,
       // The browser's notification source. The native app ignores these: its
       // shell consumes the same feed per daemon and posts OS notifications.
       onNotices: (list) => {
@@ -1776,6 +1781,7 @@
       setReferenceHandler(null);
       setUploadPathInserter(null);
       setPathOpener(null);
+      setViewOpener(null);
       setChatLinkContext(null);
       events.close();
       pool.disposePool();
@@ -3234,6 +3240,13 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
+  /** Open/focus a plugin's tab view (its card, a screen's `open-view`, a
+   *  file action's answer). */
+  function openPluginViewSurface(plugin: string, view: string): void {
+    if (activeWsId === null || !layoutReady) return;
+    layout = openPluginViewTab(layout, plugin, view);
+  }
+
   /** Quick-open commands: the workspace surfaces that have no file or session
    *  to match on ("Timeline", "Knowledge", "Extensions" — which "plugins" and
    *  "skills" still find). */
@@ -4384,7 +4397,9 @@
                       ? "Knowledge"
                       : tab.surface === "plugins"
                         ? "Extensions"
-                        : tab.surface === "browser"
+                        : tab.surface === "plugin"
+                          ? pluginViewTitle($workspacePlugins?.plugins, tab.plugin, tab.view)
+                          : tab.surface === "browser"
                           ? (tab.host || "Browser")
                           : "Settings";
   }

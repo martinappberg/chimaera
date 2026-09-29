@@ -74,7 +74,7 @@ version = "0.1.1"               # the plugin's own, MAJOR.MINOR.PATCH; must equa
 summary = "Project memory your agents record as they work — findings, decisions, learnings."
 description = "Mycelium is the Arjun Raj lab's living-repository framework: …"   # optional: a few plain sentences
 homepage = "https://github.com/arjunrajlaboratory/mycelium"   # optional; the card's name links here
-api = "0.1"                     # the chimaera:plugin WIT version it targets (MAJOR.MINOR)
+api = "0.1"                     # the chimaera:plugin WIT version it targets (MAJOR.MINOR): "0.1" or "0.2"
 
 [detect]                        # workspace-relative; ANY present ⇒ detected
 any = [".living/INDEX.md", "MYCELIUM.md"]   # empty/omitted ⇒ always present (on = active)
@@ -551,13 +551,157 @@ host:
   API crate's version with it, and the host's `plugins::API`, adding the new
   version to `plugins::SERVED_APIS` beside those it still serves.
 
-## What comes next: the platform
+## The platform: API 0.2
 
-The host grows into a platform (planned 2026-09-29, nothing built yet): plugins
-draw screens in Chimaera's own format, run the programs they declare, install the
-side programs they need, and are trusted in proportion to what they can do
-(verified at a pinned version, or explicitly trusted by the user). LaTeX and Typst
-are the first plugins planned on it, and Agent notes and Mycelium inherit it without
-a change. Read the [plugin platform plan](../plugin-platform-plan.md) before adding
-a host import, a manifest key or anything a plugin can show; the
-[LaTeX and Typst plan](../latex-reports-plan.md) is its first worked example.
+A plugin that says `api = "0.2"` gets the platform
+([plan](../plugin-platform-plan.md) §3–§9): screens in Chimaera's own format,
+file kinds and file actions, data surfaces core draws, file events, an output
+folder, declared settings and durable state. The host serves 0.1 beside it
+unchanged (its own bindings, `wit-0.1/`), so moving is a choice: bump the
+`chimaera-plugin-api` dependency and `api`, and **declare `[access]`** — in 0.2
+a key left out means none (0.1 implied files, the Timeline with notes, and
+sessions). Every new export has a default, so a 0.1 plugin compiles on 0.2
+unchanged. Programs, side-program downloads and long agent tools (`[[programs]]`,
+`[[tools]]`, `job-*`, `tool-resume`) are the next phase; until then `job-start`
+answers "declares no programs".
+
+```toml
+api = "0.2"
+
+[access]
+files = "read"
+
+[provides]
+events = ["file-saved", "file-changed", "settings-changed", "switched-on", "switched-off"]
+
+[[views]]                  # a screen: slot tab | panel | file | status | card
+id = "document"
+title = "Document"         # required: every view has a name
+slot = "file"
+
+[[files]]                  # files matching `match` open in `view` (Text one click away)
+match = ["*.tex", "*.ltx"] # a pattern without `/` matches the name anywhere; `**` spans folders
+view = "document"          # must be a `slot = "file"` view
+label = "LaTeX"
+debounce_ms = 300          # how long a burst of changes settles (≤ 5000)
+
+[[actions]]                # a file toolbar item; its click calls on_action("", action, {"file"})
+match = ["*.md"]
+label = "Export PDF"
+action = "export-pdf"      # never a built-in action's name (below)
+
+[[settings]]               # drawn in Settings → Plugins and on the card
+key = "engine"
+type = "enum"              # bool | enum | string | number | path
+options = ["pdflatex", "xelatex"]
+default = "pdflatex"
+label = "Engine"
+scope = "workspace"        # workspace (default) | host
+```
+
+Claiming a file kind is on the card's **Can** list ("Opens *.tex files in its own
+view"), so a release that claims a new kind asks its users again.
+
+### The exports and imports
+
+`Plugin` gains `render(cx, view, args)` (the view's tree; `args` carries
+`file` for a file view, `width` `narrow`/`wide`, `slot`), `on_action(cx, view,
+action, payload)` (the new tree, or `None` to keep it) and `tool_resume` (the
+next phase). `platform::` has what 0.2 adds:
+
+| Call | What |
+|---|---|
+| `output_read(cx, path, offset, cap)` · `output_list` · `output_write` · `output_remove` | the plugin's output folder for this workspace (`output:<path>`), outside the repository; reads ≤ 8 MiB a call from an offset, its own writes ≤ 8 MiB a file, 1 GiB per plugin (the oldest top-level entries go past it); never through a link |
+| `publish(cx, surface, key, &data)` · `unpublish` | a data surface (below); checked, kept, announced to this workspace's windows |
+| `invalidate(cx, view)` | windows showing the view render it again (≤ 4 a second; a burst is one) |
+| `watch(cx, &paths)` | up to 256 workspace paths heard as `file-changed`; swept every 5 s only while one of its views was rendered in the last 10 minutes |
+| `setting(cx, key)` | a declared setting: the user's value, else its default |
+| `state_keep(cx, key, &value)` | durable state, read back with `host::state_get`; within the same 64 KiB. `state_put` stays memory-only (and makes a kept key memory-only again) |
+| `roots(cx)` | the absolute workspace root and output folder (for arguments a program will need, and for mapping printed paths back) |
+
+### Screens: `ui/1`
+
+A view's tree is `{"ui": "1", "root": <node>}`; a node is `{"type": …,
+props…, "children": […]}` (`chimaera_plugin_api::ui` has helpers). Props are
+semantic, never visual: `tone` is `neutral | accent | good | warn | bad`, `size`
+`small | large`, `gap` `small | large`. The daemon checks every tree before a
+window sees it (≤ 256 KiB, ≤ 5,000 nodes, ≤ 200 rows a list or table); a bad one
+is not drawn, and the view says so with each problem's JSON path (also in the
+daemon log).
+
+| Node | Props (required in bold) |
+|---|---|
+| `stack`, `row`, `grid`, `card` | `children`; `gap`; row `align` (`center`, `end`, `between`); grid `columns` (1–6); card `title` |
+| `split` | **`children`** (two); `ratio` (0.1–0.9) — stacked in a narrow window |
+| `tabs` | **`tabs`**: `[{title, children}]` |
+| `section` | **`title`**, `children`, `collapsed` |
+| `divider` | — |
+| `text` | **`text`**, `tone`, `size`, `emphasis`, `mono` |
+| `heading` | **`text`**, `level` (1–3) |
+| `markdown` | **`text`** (chat's renderer and its sanitizing) |
+| `code` | **`text`**, `language` |
+| `keyvalue` | **`items`**: `[{key, value, tone?}]` |
+| `badge` | **`text`**, `tone` |
+| `icon` | **`name`** (`check x alert info clock file folder play stop refresh download external grid list book bolt settings search`), `label`, `tone` |
+| `progress` | `value` (0–1; absent: indeterminate), `label` |
+| `empty` | **`title`**, `text`, `action` `{label, action, payload}` |
+| `callout` | **`text`**, `title`, `tone` |
+| `list` | **`items`**: `[{title, subtitle?, badges?, actions?: [nodes], action?, payload?, file?, line?}]`; `more` `{query, args}` pages through `query` (it answers `{items, more?}`) |
+| `table` | **`columns`** `[{key, title, align?}]`, **`rows`** `[{<key>: text}]`; `more` as for a list (`{rows, more?}`) |
+| `file` | **`path`** (a workspace path or `output:<path>`), `label`, `line` — a card that opens it |
+| `link` | **`text`**; `href` (http/https, opens outside) or `file` + `line` |
+| `image` | **`src`**, **`alt`** |
+| `button` | **`label`**, **`action`**, `payload`, `tone`, `icon`, `disabled` |
+| `toggle` | **`label`**, **`name`**, `value`, `action` (sends `{value}` beside the payload) |
+| `select` | **`label`**, **`name`**, **`options`** (`[{value, label}]` or strings), `value`, `action` |
+| `textfield` | **`label`**, **`name`**, `value`, `placeholder`, `multiline` |
+| `form` | **`action`**, `children` (its fields), `submit`; sends `{form: {name: value}}` beside the payload |
+| `editor` | **`path`** — the file in the app's own editor (saves, merges) |
+| `pdf` | **`src`** — the app's PDF viewer |
+| `log` | **`src`** — the app's viewer for that file (a `.log` streams from its tail) |
+| `diagnostics` | `file` — the problems list from every active plugin's `diagnostics/1`, with **Go to** and **Ask agent** |
+| `diff` | `before` + `after`, or `path` + `base` (`head`, `index`, `rev:<ref>`, `output:<path>`); `mode` `prose` (default: words within a changed line) or `code` |
+
+A node this chimaera doesn't know draws its `fallback` (a node, or `"drop"`),
+else a quiet "needs a newer chimaera" with its children. Actions a plugin names
+but never handles (the app carries them out): `open-file {file, line?}`,
+`open-view {view}`, `open-url {url}`, `copy {text}`, `save-to-workspace {from,
+to}` (the user's click copies an output file into the workspace; asks before
+replacing), `ask-agent {file?, line?, text}`.
+
+Where a view draws: `tab` (its own tab: the card's **Open**, `open-view`, a file
+action's `open`), `panel` (the dashboard, after core's sections), `file` (a
+claimed file), `status` (a chip in a claimed file's bar), `card` (inside its
+Extensions card). The UI renders only on open, on an action, and on
+`invalidate`; nothing polls.
+
+### Data surfaces
+
+Data core draws with its own views; `publish` checks the shape:
+
+| Surface | Shape |
+|---|---|
+| `diagnostics/1` | `{items: [{file, severity (error warning info hint), line (from 1), column?, end_line?, end_column?, message, context?, source?}]}`, ≤ 200 per file, ≤ 2,000 per key |
+| `output/1` | `{source, output, state (building ok errors failed), label?, finished_ms?, changed_pages?, log?}` |
+| `sourcemap/1` | `{output, files: [path], records: [[file, line, page, x, y, width, height]]}`, ≤ 4 MiB, kept in the output folder |
+| `knowledge/1` | the Knowledge snapshot (see the [coordination section](../plugin-platform-plan.md#coordination-the-knowledge-redesign-2026-09-29)), ≤ 4 MiB |
+
+Paths are workspace-relative or `output:<path>`. A window asks
+`GET /workspaces/{id}/surfaces/{kind}/{version}?file=` and hears a `surface`
+frame when one changes.
+
+### Events
+
+`file-saved(path)` (the editor saved a file you claim), `file-changed(path)` (a
+claimed or watched file changed: an agent's write, a file operation, or the
+sweep), `settings-changed(key)`, `switched-on`, `switched-off` (on the instance
+it had, before it goes) — each only if declared in `provides.events`, and file
+events debounced per file. Declaring one of the 0.2 events needs `api = "0.2"`.
+
+### Testing a 0.2 plugin
+
+`plugins/test-platform` uses every node, import and event once; the daemon's
+`tests/plugin_platform.rs` drives it through the routes (render, actions, file
+actions, query, settings, output, surfaces, file events, a restart). Copy its
+shape: pure logic in functions that take data, the host calls in the daemon's
+tests.

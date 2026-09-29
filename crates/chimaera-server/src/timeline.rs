@@ -542,7 +542,7 @@ fn read_older(path: &Path, before: u64, need: usize) -> Vec<Entry> {
 
 /// Workspace ids are daemon-minted, but the path component is sanitized
 /// anyway: nothing outside the timeline root can ever be named.
-fn sanitize(ws: &str) -> String {
+pub(crate) fn sanitize(ws: &str) -> String {
     let cleaned: String = ws
         .chars()
         .map(|c| {

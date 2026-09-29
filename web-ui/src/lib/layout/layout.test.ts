@@ -20,6 +20,7 @@ import {
   openTimeline,
   openKnowledge,
   openPlugins,
+  openPluginViewTab,
   openSettings,
   openChanges,
   openBrowser,
@@ -138,6 +139,26 @@ describe("opening surfaces", () => {
     expect(restored).not.toBeNull();
     const pane = panes(restored!.root)[0];
     expect(pane.tabs[0]).toEqual({ surface: "dashboard" });
+  });
+
+  it("a plugin's view is one tab per (plugin, view) and round-trips", () => {
+    let l = openPluginViewTab(defaultLayout(), "test-platform", "board");
+    l = openPluginViewTab(l, "test-platform", "board");
+    l = openPluginViewTab(l, "test-platform", "other");
+    l = openPluginViewTab(l, "latex", "board");
+    expect(tabCount(l)).toBe(3);
+    const restored = deserializeLayout(serializeLayout(l));
+    expect(panes(restored!.root)[0].tabs).toEqual([
+      { surface: "plugin", plugin: "test-platform", view: "board" },
+      { surface: "plugin", plugin: "test-platform", view: "other" },
+      { surface: "plugin", plugin: "latex", view: "board" },
+    ]);
+    // A saved tab naming something that can't be a plugin or view is
+    // skipped, never the whole layout.
+    const raw = serializeLayout(l) as { root: { tabs: Record<string, unknown>[] } };
+    raw.root.tabs[0] = { xp: "../etc", xv: "board" };
+    const kept = deserializeLayout(raw);
+    expect(panes(kept!.root)[0].tabs).toHaveLength(2);
   });
 
   it("timeline, knowledge and plugins are singletons that coexist with settings and round-trip", () => {

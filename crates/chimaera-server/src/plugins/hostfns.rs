@@ -22,15 +22,16 @@
 //!   are refused to a build whose manifest doesn't allow them.
 //! - `log`: ≤ 64 lines per call, each ≤ 2 KiB.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
 use super::capabilities::{FilesAccess, SessionsAccess, TimelineAccess};
-use super::runtime::chimaera::plugin::host;
-use super::runtime::{wit, CallScope, HostState, EVENT_MAX};
+use super::runtime::v2::chimaera::plugin::{host, platform};
+use super::runtime::{v1, wit, CallScope, HostState, EVENT_MAX};
 use crate::timeline;
 
 /// A read's ceiling, whatever `cap` the plugin asks for.
@@ -47,10 +48,21 @@ const SESSIONS_MAX: usize = 256;
 const KINDS_MAX: usize = 16;
 
 /// Small per-(plugin, workspace) state plugins keep in the daemon (read
-/// cursors, caches). In memory: a daemon restart starts it over.
+/// cursors, caches). In memory; the keys a plugin kept with `state-keep`
+/// are also written to disk (`pdata`) and read back on first use after a
+/// restart.
 #[derive(Default)]
 pub(crate) struct PluginStates {
-    by_key: HashMap<(String, String), BTreeMap<String, String>>,
+    by_key: HashMap<(String, String), BTreeMap<String, Stored>>,
+    /// Pairs whose durable keys were read back (`load`).
+    loaded: HashSet<(String, String)>,
+}
+
+#[derive(Clone)]
+struct Stored {
+    value: String,
+    /// Written with `state-keep`: durable.
+    kept: bool,
 }
 
 impl PluginStates {
@@ -65,31 +77,35 @@ impl PluginStates {
         self.by_key
             .get(&(plugin.to_string(), ws.to_string()))?
             .get(key)
-            .cloned()
+            .map(|s| s.value.clone())
     }
 
-    /// Store `value` (JSON text) under `key`; None removes it. Refused past
-    /// `STATE_CAP` for the pair, leaving the old value in place.
+    /// Store `value` (JSON text) under `key`, durably when `kept`; None
+    /// removes it. Refused past `STATE_CAP` for the pair (durable keys
+    /// count), leaving the old value in place. Whether the durable keys
+    /// changed (the caller then writes them).
     fn put(
         &mut self,
         plugin: &str,
         ws: &str,
         key: &str,
         value: Option<String>,
-    ) -> Result<(), String> {
+        kept: bool,
+    ) -> Result<bool, String> {
         let pair = (plugin.to_string(), ws.to_string());
         let map = self.by_key.entry(pair.clone()).or_default();
+        let was_kept = map.get(key).is_some_and(|s| s.kept);
         let Some(value) = value else {
             map.remove(key);
             if map.is_empty() {
                 self.by_key.remove(&pair);
             }
-            return Ok(());
+            return Ok(was_kept);
         };
         let others: usize = map
             .iter()
             .filter(|(k, _)| k.as_str() != key)
-            .map(|(k, v)| k.len() + v.len())
+            .map(|(k, v)| k.len() + v.value.len())
             .sum();
         let total = others + key.len() + value.len();
         if total > STATE_CAP {
@@ -98,18 +114,50 @@ impl PluginStates {
                 STATE_CAP >> 10
             ));
         }
-        map.insert(key.to_string(), value);
-        Ok(())
+        map.insert(key.to_string(), Stored { value, kept });
+        Ok(kept || was_kept)
+    }
+
+    /// The durable keys of `(plugin, ws)`.
+    fn kept(&self, plugin: &str, ws: &str) -> BTreeMap<String, String> {
+        self.by_key
+            .get(&(plugin.to_string(), ws.to_string()))
+            .map(|m| {
+                m.iter()
+                    .filter(|(_, s)| s.kept)
+                    .map(|(k, s)| (k.clone(), s.value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn is_loaded(&self, plugin: &str, ws: &str) -> bool {
+        self.loaded.contains(&(plugin.to_string(), ws.to_string()))
+    }
+
+    /// Take back the durable keys read from disk (what memory already
+    /// holds wins; the cap still applies).
+    fn load(&mut self, plugin: &str, ws: &str, kept: BTreeMap<String, String>) {
+        if !self.loaded.insert((plugin.to_string(), ws.to_string())) {
+            return;
+        }
+        for (key, value) in kept {
+            if self.get(plugin, ws, &key).is_none() {
+                let _ = self.put(plugin, ws, &key, Some(value), true);
+            }
+        }
     }
 
     /// A removed plugin: its state in every workspace.
     pub(crate) fn forget_plugin(&mut self, plugin: &str) {
         self.by_key.retain(|(p, _), _| p != plugin);
+        self.loaded.retain(|(p, _)| p != plugin);
     }
 
     /// A deleted workspace: every plugin's state there.
     pub(crate) fn forget_workspace(&mut self, ws: &str) {
         self.by_key.retain(|(_, w), _| w != ws);
+        self.loaded.retain(|(_, w)| w != ws);
     }
 }
 
@@ -137,9 +185,39 @@ impl HostState {
     }
 }
 
+/// Read back what `plugin` kept durably in `ws`, once per daemon.
+async fn load_kept(app: &Arc<crate::AppState>, plugin: &str, ws: &str) {
+    if crate::lock(&app.plugin_state).is_loaded(plugin, ws) {
+        return;
+    }
+    let kept = super::pdata::kept(app, plugin, ws).await;
+    crate::lock(&app.plugin_state).load(plugin, ws, kept);
+}
+
+impl HostState {
+    /// `state-put` (`kept` false) and `state-keep` (true).
+    async fn put_state(&mut self, key: String, value: String, kept: bool) -> Result<(), String> {
+        let app = self.scope()?.app.clone();
+        load_kept(&app, &self.plugin, &self.workspace).await;
+        if key.is_empty() || key.len() > 256 {
+            return Err("a state key is 1–256 bytes".into());
+        }
+        let parsed: Value =
+            serde_json::from_str(&value).map_err(|e| format!("state {key}: not JSON ({e})"))?;
+        let value = (!parsed.is_null()).then_some(value);
+        let durable_changed =
+            crate::lock(&app.plugin_state).put(&self.plugin, &self.workspace, &key, value, kept)?;
+        if durable_changed {
+            let now = crate::lock(&app.plugin_state).kept(&self.plugin, &self.workspace);
+            super::pdata::save_kept(&app, &self.plugin, &self.workspace, now).await?;
+        }
+        Ok(())
+    }
+}
+
 /// `path` as a relative path of plain components: `..` and absolute paths
 /// are refused, `.` dropped.
-fn relative(path: &str) -> Result<PathBuf, String> {
+pub(super) fn relative(path: &str) -> Result<PathBuf, String> {
     let mut out = PathBuf::new();
     for part in Path::new(path).components() {
         match part {
@@ -319,8 +397,10 @@ impl host::Host for HostState {
     }
 
     async fn state_get(&mut self, _cx: wit::Context, key: String) -> Option<String> {
-        let scope = self.scope().ok()?;
-        crate::lock(&scope.app.plugin_state).get(&self.plugin, &self.workspace, &key)
+        let app = self.scope().ok()?.app.clone();
+        load_kept(&app, &self.plugin, &self.workspace).await;
+        let value = crate::lock(&app.plugin_state).get(&self.plugin, &self.workspace, &key);
+        value
     }
 
     async fn state_put(
@@ -329,11 +409,7 @@ impl host::Host for HostState {
         key: String,
         value: String,
     ) -> Result<(), String> {
-        let scope = self.scope()?;
-        let parsed: Value =
-            serde_json::from_str(&value).map_err(|e| format!("state {key}: not JSON ({e})"))?;
-        let value = (!parsed.is_null()).then_some(value);
-        crate::lock(&scope.app.plugin_state).put(&self.plugin, &self.workspace, &key, value)
+        self.put_state(key, value, false).await
     }
 
     async fn sessions(&mut self, _cx: wit::Context) -> Vec<wit::Session> {
@@ -516,6 +592,263 @@ impl host::Host for HostState {
     }
 }
 
+/// 0.1's `host`: the same functions (the `cx` a guest passes is ignored
+/// either way), its own types.
+mod v1_host {
+    use super::*;
+    use v1::chimaera::plugin::{host as old_host, types as old};
+
+    fn cx(c: old::Context) -> wit::Context {
+        wit::Context {
+            workspace: c.workspace,
+            session: c.session,
+            mastermind: c.mastermind,
+        }
+    }
+
+    impl old::Host for HostState {}
+
+    impl old_host::Host for HostState {
+        async fn read(
+            &mut self,
+            c: old::Context,
+            path: String,
+            cap: u32,
+        ) -> Result<Vec<u8>, String> {
+            host::Host::read(self, cx(c), path, cap).await
+        }
+
+        async fn stat(&mut self, c: old::Context, path: String) -> Result<old::Stat, String> {
+            host::Host::stat(self, cx(c), path)
+                .await
+                .map(|s| old::Stat {
+                    size: s.size,
+                    mtime_ms: s.mtime_ms,
+                    is_dir: s.is_dir,
+                })
+        }
+
+        async fn list(
+            &mut self,
+            c: old::Context,
+            path: String,
+            cap: u32,
+        ) -> Result<Vec<old::Entry>, String> {
+            host::Host::list(self, cx(c), path, cap)
+                .await
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|e| old::Entry {
+                            name: e.name,
+                            is_dir: e.is_dir,
+                            is_symlink: e.is_symlink,
+                        })
+                        .collect()
+                })
+        }
+
+        async fn state_get(&mut self, c: old::Context, key: String) -> Option<String> {
+            host::Host::state_get(self, cx(c), key).await
+        }
+
+        async fn state_put(
+            &mut self,
+            c: old::Context,
+            key: String,
+            value: String,
+        ) -> Result<(), String> {
+            host::Host::state_put(self, cx(c), key, value).await
+        }
+
+        async fn sessions(&mut self, c: old::Context) -> Vec<old::Session> {
+            host::Host::sessions(self, cx(c))
+                .await
+                .into_iter()
+                .map(|s| old::Session {
+                    id: s.id,
+                    kind: s.kind,
+                    name: s.name,
+                    chat: s.chat,
+                    alive: s.alive,
+                    mastermind: s.mastermind,
+                })
+                .collect()
+        }
+
+        async fn timeline_append(&mut self, c: old::Context, entry: String) -> Result<u64, String> {
+            host::Host::timeline_append(self, cx(c), entry).await
+        }
+
+        async fn timeline_recent(
+            &mut self,
+            c: old::Context,
+            kinds: Vec<String>,
+            limit: u32,
+        ) -> Vec<String> {
+            host::Host::timeline_recent(self, cx(c), kinds, limit).await
+        }
+
+        async fn emit(&mut self, c: old::Context, event: String) {
+            host::Host::emit(self, cx(c), event).await
+        }
+
+        async fn now_ms(&mut self) -> u64 {
+            host::Host::now_ms(self).await
+        }
+
+        async fn log(&mut self, level: old::Level, message: String) {
+            let level = match level {
+                old::Level::Debug => wit::Level::Debug,
+                old::Level::Info => wit::Level::Info,
+                old::Level::Warn => wit::Level::Warn,
+                old::Level::Error => wit::Level::Error,
+            };
+            host::Host::log(self, level, message).await
+        }
+    }
+}
+
+impl HostState {
+    /// This instance's output folder, and a checked path in it.
+    fn output(&self, path: &str) -> Result<(PathBuf, PathBuf), String> {
+        let app = &self.scope()?.app;
+        Ok((
+            super::output::folder(
+                &app.plugin_platform.output_root,
+                &self.plugin,
+                &self.workspace,
+            ),
+            super::output::relative(path)?,
+        ))
+    }
+
+    fn manifest(&self) -> Result<&super::Manifest, String> {
+        self.manifest
+            .as_deref()
+            .ok_or_else(|| "no manifest is loaded for this instance".to_string())
+    }
+}
+
+/// The platform: what 0.2 adds for a plugin to ask. Bounded here like
+/// `host`: output files by `output`'s caps, surfaces by `surfaces`', the
+/// watch set by `files::WATCH_MAX`.
+impl platform::Host for HostState {
+    async fn output_read(
+        &mut self,
+        _cx: wit::Context,
+        path: String,
+        offset: u64,
+        cap: u32,
+    ) -> Result<Vec<u8>, String> {
+        let (dir, rel) = self.output(&path)?;
+        blocking(move || super::output::read(&dir, &rel, offset, cap as usize)).await
+    }
+
+    async fn output_list(
+        &mut self,
+        _cx: wit::Context,
+        path: String,
+        cap: u32,
+    ) -> Result<Vec<wit::Entry>, String> {
+        let (dir, rel) = self.output(&path)?;
+        blocking(move || super::output::list(&dir, &rel, cap as usize)).await
+    }
+
+    async fn output_write(
+        &mut self,
+        _cx: wit::Context,
+        path: String,
+        bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        let (dir, rel) = self.output(&path)?;
+        let app = self.scope()?.app.clone();
+        blocking(move || super::output::write(&dir, &rel, &bytes)).await?;
+        // The quota, measured at most once a minute.
+        super::output::usage(&app, &self.plugin, false).await;
+        Ok(())
+    }
+
+    async fn output_remove(&mut self, _cx: wit::Context, path: String) -> Result<(), String> {
+        let (dir, rel) = self.output(&path)?;
+        blocking(move || super::output::remove(&dir, &rel)).await
+    }
+
+    async fn publish(
+        &mut self,
+        _cx: wit::Context,
+        surface: String,
+        key: String,
+        data: String,
+    ) -> Result<(), String> {
+        let app = self.scope()?.app.clone();
+        super::surfaces::publish(&app, &self.plugin, &self.workspace, &surface, &key, &data).await
+    }
+
+    async fn invalidate(&mut self, _cx: wit::Context, view: String) {
+        let Ok(scope) = self.scope() else {
+            return;
+        };
+        let app = scope.app.clone();
+        if let Some(m) = self.manifest.clone() {
+            super::screens::invalidate(&app, &m, &self.workspace, &view);
+        }
+    }
+
+    async fn watch(&mut self, _cx: wit::Context, paths: Vec<String>) -> Result<(), String> {
+        let app = self.scope()?.app.clone();
+        super::files::set_watch(&app, &self.plugin, &self.workspace, paths)
+    }
+
+    async fn setting_get(&mut self, _cx: wit::Context, key: String) -> Option<String> {
+        let app = self.scope().ok()?.app.clone();
+        let m = self.manifest.clone()?;
+        super::pdata::setting(&app, &m, &self.workspace, &key)
+            .await
+            .map(|v| v.to_string())
+    }
+
+    async fn state_keep(
+        &mut self,
+        _cx: wit::Context,
+        key: String,
+        value: String,
+    ) -> Result<(), String> {
+        self.put_state(key, value, true).await
+    }
+
+    async fn roots(&mut self, _cx: wit::Context) -> String {
+        let Ok(scope) = self.scope() else {
+            return "{}".into();
+        };
+        let app = &scope.app;
+        let root = crate::lock(&app.workspaces)
+            .get(&self.workspace)
+            .map(|w| w.root);
+        let output = super::output::folder(
+            &app.plugin_platform.output_root,
+            &self.plugin,
+            &self.workspace,
+        );
+        json!({"workspace": root, "output": output}).to_string()
+    }
+
+    async fn job_start(&mut self, _cx: wit::Context, _spec: String) -> Result<String, String> {
+        let name = self.manifest().map(|m| m.name.clone()).unwrap_or_default();
+        Err(format!("{name} declares no programs ([[programs]])"))
+    }
+
+    async fn job_status(&mut self, _cx: wit::Context, id: String) -> String {
+        json!({"id": id, "state": "unknown"}).to_string()
+    }
+
+    async fn job_cancel(&mut self, _cx: wit::Context, _id: String) {}
+
+    async fn tool_state(&mut self, _cx: wit::Context, tool: String) -> String {
+        json!({"tool": tool, "declared": false, "installed": false}).to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,15 +866,32 @@ mod tests {
     fn state_is_capped_per_plugin_and_workspace() {
         let mut st = PluginStates::default();
         let half = "x".repeat(STATE_CAP / 2);
-        st.put("p", "w", "a", Some(half.clone())).unwrap();
-        assert!(st.put("p", "w", "b", Some(half.clone())).is_err());
-        st.put("p", "other", "b", Some(half.clone())).unwrap();
-        st.put("p", "w", "a", Some("1".into())).unwrap();
-        st.put("p", "w", "b", Some(half)).unwrap();
+        st.put("p", "w", "a", Some(half.clone()), false).unwrap();
+        assert!(st.put("p", "w", "b", Some(half.clone()), false).is_err());
+        st.put("p", "other", "b", Some(half.clone()), false)
+            .unwrap();
+        st.put("p", "w", "a", Some("1".into()), false).unwrap();
+        // A durable key counts against the same cap, and changes the
+        // durable set (the caller then writes it).
+        assert!(st.put("p", "w", "b", Some(half), true).unwrap());
+        assert_eq!(st.kept("p", "w").len(), 1);
         assert!(st.holds("p", "w"));
-        st.put("p", "w", "a", None).unwrap();
-        st.put("p", "w", "b", None).unwrap();
+        assert!(!st.put("p", "w", "a", None, false).unwrap());
+        assert!(st.put("p", "w", "b", None, false).unwrap());
         assert!(!st.holds("p", "w"));
+        // Read back after a restart: memory wins over what was on disk.
+        st.put("p", "w", "a", Some("2".into()), false).unwrap();
+        st.load(
+            "p",
+            "w",
+            [
+                ("a".to_string(), "9".to_string()),
+                ("c".to_string(), "3".to_string()),
+            ]
+            .into(),
+        );
+        assert_eq!(st.get("p", "w", "a").as_deref(), Some("2"));
+        assert_eq!(st.get("p", "w", "c").as_deref(), Some("3"));
         st.forget_workspace("other");
         assert!(!st.holds("p", "other"));
     }

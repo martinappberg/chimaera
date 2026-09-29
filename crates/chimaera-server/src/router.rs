@@ -18,6 +18,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
     chat::spawn_signal_task(state.clone());
     // Finished Slurm jobs → the Timeline (idempotent; idle without a queue).
     crate::episodes::spawn_jobs_task(state.clone());
+    // Plugins' file events and watch sweep (idle without listeners).
+    plugins::files::spawn_worker(state.clone());
     let api = Router::new()
         .route("/health", get(api::health))
         .route(
@@ -96,6 +98,46 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route(
             "/workspaces/{id}/plugins/{pid}/setup",
             post(plugins::setup_workspace),
+        )
+        // The platform (0.2): screens (`plugins::screens`), the UI's reads
+        // (0.1's promised query route), file menu items, data surfaces
+        // (`plugins::surfaces`), output folders (`plugins::output`) and
+        // declared settings (`plugins::pdata`).
+        .route(
+            "/workspaces/{id}/plugins/{pid}/views/{view}",
+            get(plugins::screens::render_route),
+        )
+        .route(
+            "/workspaces/{id}/plugins/{pid}/views/{view}/actions",
+            post(plugins::screens::action_route),
+        )
+        .route(
+            "/workspaces/{id}/plugins/{pid}/file-actions/{action}",
+            post(plugins::screens::file_action_route),
+        )
+        .route(
+            "/workspaces/{id}/plugins/{pid}/query/{name}",
+            get(plugins::screens::query_route),
+        )
+        .route(
+            "/workspaces/{id}/surfaces/{kind}/{version}",
+            get(plugins::surfaces::route),
+        )
+        .route(
+            "/workspaces/{id}/plugins/{pid}/output",
+            get(plugins::output::folder_route),
+        )
+        .route(
+            "/workspaces/{id}/plugins/{pid}/output/save",
+            post(plugins::output::save_route),
+        )
+        .route(
+            "/plugins/{pid}/output",
+            get(plugins::output::usage_route).delete(plugins::output::clear_route),
+        )
+        .route(
+            "/plugins/{pid}/settings",
+            get(plugins::pdata::get_route).put(plugins::pdata::put_route),
         )
         // What each agent CLI reports it has here (asked of the agents).
         .route(
@@ -215,6 +257,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         )
         .route("/git/status", get(git::status))
         .route("/git/diff", get(git::diff))
+        .route("/git/log", get(git::log))
         .route(
             "/git/worktrees",
             get(git::worktrees)
