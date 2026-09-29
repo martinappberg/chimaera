@@ -35,7 +35,6 @@ export async function cloudRequest(request: CloudSetupRequest, signal?: AbortSig
       return result;
     }
     case "open_provider_browser": throw new Error("Use the provider's secure sign-in link.");
-    case "onboard": path = "/pro/cloud/onboard"; method = "POST"; body = request; break;
     case "project": path = "/pro/cloud/project"; method = "POST"; body = request; break;
   }
   const headers: Record<string, string> = {};

@@ -1088,11 +1088,7 @@ export interface CloudPendingHandoff {
 }
 export interface CloudSetupInfo {
   available?: boolean;
-  host_alias?: string;
   ssh_public_key?: string | null;
-  /** Legacy worker fields; installation alone is never provider readiness. */
-  claude_installed?: boolean;
-  codex_installed?: boolean;
   workspace_id?: string;
   session_id?: string;
   providers?: CloudProviderStatus[];
@@ -1100,7 +1096,6 @@ export interface CloudSetupInfo {
   handoffs?: CloudPendingHandoff[];
 }
 export type CloudSetupRequest = { operation: "info" | "start" | "providers" }
-  | { operation: "onboard"; agent: string }
   | { operation: "provider_connect"; provider_id: string }
   | { operation: "provider_disconnect"; provider_id: string; acknowledge_cloud_work: true }
   | { operation: "provider_submit"; connection_id: string; code: string }
@@ -1130,7 +1125,7 @@ export interface MirrorWorkspace {
 }
 export interface MirrorStatus {
   configured: boolean; projects_root: string; projects_root_confirmed: boolean; workspaces: MirrorWorkspace[];
-  sessions: { id: string; workspace_id: string; display_name?: string; name: string; keep_running?: boolean }[];
+  sessions: { id: string; workspace_id: string; display_name?: string; name: string }[];
 }
 export async function proMirrorStatus(): Promise<MirrorStatus> {
   const t = tauri(); if (t === null) throw new Error("Mirror settings require the native app");
@@ -1139,8 +1134,4 @@ export async function proMirrorStatus(): Promise<MirrorStatus> {
 export async function proSetNeverMirror(workspaceId: string, neverMirror: boolean): Promise<void> {
   const t = tauri(); if (t === null) throw new Error("Mirror settings require the native app");
   await t.core.invoke("pro_set_never_mirror", { workspaceId, neverMirror });
-}
-export async function proMirrorPreference(request: { operation: "projects"; root: string } | { operation: "profile"; workspace_id: string; profile: MirrorProfile } | { operation: "pin"; session_id: string; keep_running: boolean }): Promise<void> {
-  const t = tauri(); if (t === null) throw new Error("Mirror settings require the native app");
-  await t.core.invoke("pro_mirror_preference", { request });
 }

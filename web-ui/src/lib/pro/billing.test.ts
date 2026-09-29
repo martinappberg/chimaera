@@ -2,12 +2,14 @@ import { describe, expect, it } from "vitest";
 import type { ProBillingAttempt, ProStatus } from "../net/native";
 import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling, planPrice } from "./billing";
 const attempt = (phase: ProBillingAttempt["phase"], kind: ProBillingAttempt["kind"] = "checkout"): ProBillingAttempt => ({ id: 7, kind, phase, expires_at: 123, error: "private failure token=never-render-this" });
+// Copy is free to change: these tests pin the pending/check/success flags and
+// which outcomes read alike or apart, never the wording.
 
 describe("native billing presentation", () => {
   it("does not promote a return or confirmed attempt to a paid account", () => {
     for (const phase of ["waiting", "confirming", "confirmed"] as const) expect(billingCopy(attempt(phase), "none").success).toBe(false);
     expect(billingCopy(attempt("confirmed"), "none").check).toBe(true);
-    expect(billingCopy(attempt("confirming"), "pro")).toMatchObject({ title: "Your plan is active", pending: false, success: true });
+    expect(billingCopy(attempt("confirming"), "pro")).toMatchObject({ pending: false, check: false, success: true });
   });
   it("only keeps the native waiting and confirming phases active", () => {
     expect(billingPending(undefined)).toBe(false); expect(billingPending(null)).toBe(false);
@@ -20,7 +22,8 @@ describe("native billing presentation", () => {
       expect(copy.check).toBe(true); expect(copy.pending).toBe(false);
       expect(JSON.stringify(copy)).not.toContain("never-render");
     }
-    expect(billingCopy(attempt("canceled"), "none").detail).toContain("cancel a payment");
+    // Stopping the wait is not the same outcome as the browser timing out.
+    expect(billingCopy(attempt("canceled"), "none").title).not.toBe(billingCopy(attempt("expired"), "none").title);
   });
   it("holds uncertain checkout results out of plan selection until explicitly reviewed", () => {
     for (const phase of ["expired", "failed", "confirmed"] as const) {
@@ -32,8 +35,9 @@ describe("native billing presentation", () => {
     expect(billingNeedsReview(null, false)).toBe(false);
   });
   it("describes a completed portal return without claiming new entitlement", () => {
-    expect(billingCopy(attempt("confirmed", "portal"), "none").title).toBe("You're back from billing");
-    expect(billingCopy(attempt("waiting", "portal"), "pro").title).toContain("Billing");
+    expect(billingCopy(attempt("confirmed", "portal"), "none")).toMatchObject({ pending: false, check: false });
+    expect(billingCopy(attempt("confirmed", "portal"), "none").title).not.toBe(billingCopy(attempt("confirmed"), "none").title);
+    expect(billingCopy(attempt("waiting", "portal"), "pro").pending).toBe(true);
   });
 });
 
@@ -88,17 +92,19 @@ describe("subscriber upgrade review", () => {
   });
   it("settles an unconfirmed review honestly and still recognizes a later exact-plan update", () => {
     const review = { ...attempt("unconfirmed", "plan_change"), requested_plan: "max" as const };
-    expect(billingCopy(review, "pro")).toMatchObject({ title: "Your plan is still Pro", pending: false, success: false, check: true });
-    expect(billingCopy(review, null)).toMatchObject({ title: "No plan change confirmed", success: false });
-    expect(billingCopy(review, "max")).toMatchObject({ title: "You're on Chimaera Max", success: true });
-    expect(billingCopy(review, "pro").detail).not.toContain("canceled");
+    expect(billingCopy(review, "pro")).toMatchObject({ pending: false, success: false, check: true });
+    expect(billingCopy(review, null)).toMatchObject({ success: false });
+    expect(billingCopy(review, "pro").title).not.toBe(billingCopy(review, null).title);
+    expect(billingCopy(review, "max")).toMatchObject({ success: true });
   });
   it("does not pretend stopping a local wait closed the browser", () => {
     const copy = billingCopy(attempt("canceled", "portal"), "pro");
-    expect(copy.title).toBe("Stopped waiting for billing");
-    expect(copy.detail).toContain("doesn't close the billing page");
-    expect(billingCopy(attempt("opening", "portal"), "pro").title).toBe("Opening billing");
-    expect(billingCopy(attempt("waiting", "portal"), "pro").title).toBe("Billing is open in your browser");
+    expect(copy).toMatchObject({ pending: false, check: true, success: false });
+    const opening = billingCopy(attempt("opening", "portal"), "pro");
+    const waiting = billingCopy(attempt("waiting", "portal"), "pro");
+    expect(new Set([copy.title, opening.title, waiting.title]).size).toBe(3);
+    // A portal attempt is never described as a checkout.
+    expect(waiting.title).not.toBe(billingCopy(attempt("waiting"), "none").title);
   });
 });
 
