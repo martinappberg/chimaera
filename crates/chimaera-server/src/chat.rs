@@ -3639,15 +3639,13 @@ pub(crate) async fn resurrect_chat_transfer(
             let pick_up = if mastermind_mode.is_some() {
                 None
             } else if let Some(origin) = origin {
-                if let Some(mut text) = handoff_message(
-                    origin,
-                    carry.as_ref(),
-                    crate::pro::checkpoint_recovery_context(state, &entry.workspace_id),
-                ) {
+                let recovery = crate::pro::checkpoint_recovery_context(state, &entry.workspace_id);
+                if let Some(mut text) = handoff_message(origin, carry.as_ref(), recovery, fork_head)
+                {
                     text.push_str(
                         &crate::mcp::cloud_context::arrival(state, &entry.workspace_id).await,
                     );
-                    Some(text)
+                    Some((text, transfer_origin(origin, recovery)))
                 } else {
                     None
                 }
@@ -3660,20 +3658,13 @@ pub(crate) async fn resurrect_chat_transfer(
                     enabled,
                     crate::session_view::now_ms(),
                 )
+                .map(|text| (text, chimaera_agent::model::ORIGIN_RESTART))
             };
-            if let Some(text) = pick_up {
+            if let Some((text, tag)) = pick_up {
                 let send = chimaera_agent::model::AgentCommand::Send {
                     blocks: vec![chimaera_agent::model::ContentBlock::Text { text }],
                 };
-                if let Err(err) = state
-                    .chat
-                    .command_as(
-                        &entry.id,
-                        send,
-                        Some(origin.unwrap_or(chimaera_agent::model::ORIGIN_RESTART)),
-                    )
-                    .await
-                {
+                if let Err(err) = state.chat.command_as(&entry.id, send, Some(tag)).await {
                     tracing::warn!(session = %entry.id, %err,
                         "could not send the restart pick-up message");
                 }
@@ -3855,33 +3846,82 @@ fn handoff_message(
     origin: &str,
     carry: Option<&chimaera_agent::Carryover>,
     recovery: bool,
+    forked: bool,
 ) -> Option<String> {
     if carry.is_some_and(|c| !c.interrupted_work()) || (carry.is_none() && !recovery) {
         return None;
     }
-    Some(transfer_context(origin, carry, recovery))
+    Some(transfer_context(origin, carry, recovery, forked))
 }
 
-/// TUIs do not yet record reliable turn state for every provider. Keep their
-/// existing transfer prompt until that state can distinguish idle from interrupted
-/// work; a missing carryover must not silently suppress an active TUI's pickup.
-pub(crate) fn transfer_context(
+/// The `UserMessage.origin` a transfer pick-up carries. The UI folds these
+/// messages into a divider keyed on the exact tag, so the recovered arrival
+/// (the other machine stopped responding; the conversation continues from
+/// the last saved point) gets its own, whichever way it went: its words
+/// differ, and so does what the user should be told. `origin` is the
+/// bundle's `moved` | `home`.
+fn transfer_origin(origin: &str, recovery: bool) -> &'static str {
+    use chimaera_agent::model::{ORIGIN_HOME, ORIGIN_MOVED, ORIGIN_RECOVERED};
+    match (origin == "home", recovery) {
+        (_, true) => ORIGIN_RECOVERED,
+        (true, false) => ORIGIN_HOME,
+        (false, false) => ORIGIN_MOVED,
+    }
+}
+
+/// The agent-facing pick-up after a move (`moved`: now in the cloud) or a
+/// return (`home`: back on the user's computer). Plain words, and short: the
+/// UI shows it folded behind a divider, but the agent reads every word of it
+/// in its context. It must still say where the agent runs now, whether this
+/// is the same conversation or a copy continuing from the last saved point,
+/// that the project files were installed and may differ, and to re-check
+/// tools and paths. A recovery also carries the rules for work of uncertain
+/// state: neither redo nor claim it blindly, and don't stop to ask merely
+/// because the recovery happened.
+fn transfer_context(
     origin: &str,
     carry: Option<&chimaera_agent::Carryover>,
     recovery: bool,
+    forked: bool,
 ) -> String {
-    let place = if origin == "home" {
-        "back on the laptop"
+    let (moved, runs) = if origin == "home" {
+        ("back to the user's computer", "on the user's computer")
     } else {
-        "on another host"
+        ("to the cloud", "in the cloud")
     };
-    let mut text = format!("This Chimaera session is now {place}. Your native conversation and project files were transferred. Re-check tools and paths before using host-specific resources.");
+    let mut text = if recovery {
+        format!(
+            "Chimaera moved this conversation {moved} because the other machine stopped \
+             responding. You now run {runs}, continuing from the last saved point"
+        )
+    } else {
+        format!("Chimaera moved this conversation {moved}. You now run {runs}")
+    };
+    text.push_str(if forked {
+        " in a copy of this conversation."
+    } else {
+        ", in the same conversation."
+    });
+    text.push_str(
+        " The project files were installed here and may differ from what you last saw. \
+         Re-check tools and paths before relying on anything from the previous machine.",
+    );
     if recovery {
-        text.push_str(" This is an automatic continuation from the last acknowledged checkpoint after the previous host stopped responding. The previous host may still have performed work after that checkpoint. Treat unfinished tool calls and background work in the saved history as uncertain, not failed or safely repeatable. Inspect the current project and relevant external state before repeating effects; continue the user's unfinished task using the existing permissions. Do not require a routine user confirmation solely because this recovery occurred, and do not claim an external action happened exactly once. If the saved task is already complete, leave it complete.");
+        text.push_str(
+            " Work after the saved point may or may not have happened: treat unfinished tool \
+             calls and background work in the history as uncertain, not failed or safe to \
+             repeat. Check the project and any external state before repeating a step, then \
+             continue the user's unfinished task with the permissions you already have. Don't \
+             ask the user to confirm just because of this move, don't claim an external action \
+             happened exactly once, and leave a finished task finished.",
+        );
     }
     if let Some(carry) = carry.filter(|c| c.interrupted_work()) {
         if !recovery {
-            text.push_str(" The previous agent process and its background work stopped during transfer. Continue the interrupted task; recreate needed background processes on this host.");
+            text.push_str(
+                " Your previous process and its background work stopped during the move: \
+                 continue the interrupted task, and restart background work that is still needed.",
+            );
         }
         for task in carry.background.iter().take(32) {
             text.push_str(&format!("\nBackground task: {}", task.description));
@@ -5079,9 +5119,13 @@ mod tests {
         use chimaera_agent::Carryover;
 
         for origin in ["moved", "home"] {
-            assert_eq!(handoff_message(origin, None, false), None, "older ledger");
             assert_eq!(
-                handoff_message(origin, Some(&Carryover::default()), false),
+                handoff_message(origin, None, false, false),
+                None,
+                "older ledger"
+            );
+            assert_eq!(
+                handoff_message(origin, Some(&Carryover::default()), false, false),
                 None
             );
             let idle = Carryover {
@@ -5091,7 +5135,7 @@ mod tests {
                 ..Carryover::default()
             };
             assert_eq!(
-                handoff_message(origin, Some(&idle), false),
+                handoff_message(origin, Some(&idle), false, false),
                 None,
                 "settings and an earlier pickup are not unfinished work"
             );
@@ -5100,17 +5144,27 @@ mod tests {
 
     #[test]
     fn automatic_checkpoint_recovery_inspects_uncertainty_without_waking_known_idle_work() {
-        let text = handoff_message("moved", None, true)
+        let text = handoff_message("moved", None, true, true)
             .expect("unknown saved work is inspected automatically");
-        assert!(text.contains("Inspect the current project and relevant external state"));
-        assert!(!text.contains("background work stopped during transfer"));
-        assert!(text.contains("Do not require a routine user confirmation"));
+        assert!(text.contains("because the other machine stopped responding"));
+        assert!(text.contains("continuing from the last saved point in a copy"));
+        assert!(text.contains("Check the project and any external state"));
+        assert!(text.contains("Don't ask the user to confirm just because of this move"));
+        assert!(!text.contains("stopped during the move"));
         assert_eq!(
-            handoff_message("moved", Some(&chimaera_agent::Carryover::default()), true),
+            handoff_message(
+                "moved",
+                Some(&chimaera_agent::Carryover::default()),
+                true,
+                true
+            ),
             None
         );
     }
 
+    /// The pick-up names where the agent runs now in the UI's words, says
+    /// whether the conversation is the same one or a copy, and keeps the
+    /// instructions the agent needs — without the old jargon.
     #[test]
     fn handoff_message_continues_interrupted_turns_and_background_work() {
         use chimaera_agent::{CarriedTask, Carryover};
@@ -5133,18 +5187,45 @@ mod tests {
             turn_in_flight: true,
             ..background.clone()
         };
-        for (origin, place) in [("moved", "on another host"), ("home", "back on the laptop")] {
+        for (origin, place) in [
+            ("moved", "You now run in the cloud"),
+            ("home", "You now run on the user's computer"),
+        ] {
             for carry in [&turn, &background, &both] {
-                let text = handoff_message(origin, Some(carry), false).expect("interrupted work");
+                let text =
+                    handoff_message(origin, Some(carry), false, false).expect("interrupted work");
                 assert!(text.contains(place), "{text}");
+                assert!(text.contains("in the same conversation"), "{text}");
+                assert!(text.contains("installed here and may differ"), "{text}");
                 assert!(text.contains("Re-check tools and paths"), "{text}");
-                assert!(text.contains("Continue the interrupted task"), "{text}");
+                assert!(text.contains("continue the interrupted task"), "{text}");
+                for jargon in ["host", "laptop", "checkpoint", "acknowledged", "native"] {
+                    assert!(!text.contains(jargon), "{jargon}: {text}");
+                }
                 assert_eq!(
                     text.contains("Background task: Watch CI for PR 158"),
                     !carry.background.is_empty(),
                     "{text}"
                 );
             }
+        }
+        let recovered = handoff_message("home", Some(&both), true, true).expect("recovery");
+        assert!(recovered.contains("back to the user's computer because"));
+        assert!(recovered.contains("Background task: Watch CI for PR 158"));
+    }
+
+    /// The tag the UI keys its divider on: the direction, and whether the
+    /// arrival is a recovery after the other machine stopped responding.
+    #[test]
+    fn transfer_pickups_carry_a_stable_origin_tag() {
+        use chimaera_agent::model::{is_pickup_origin, ORIGIN_RECOVERED};
+        assert_eq!(transfer_origin("moved", false), "moved");
+        assert_eq!(transfer_origin("home", false), "home");
+        assert_eq!(transfer_origin("moved", true), "recovered");
+        assert_eq!(transfer_origin("home", true), "recovered");
+        assert_eq!(ORIGIN_RECOVERED, "recovered");
+        for tag in [true, false].map(|r| transfer_origin("home", r)) {
+            assert!(is_pickup_origin(tag), "{tag} resets the pick-up clock");
         }
     }
 

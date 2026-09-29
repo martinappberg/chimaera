@@ -281,7 +281,9 @@ the lifecycle, keep them consistent:
   agent (`pickup_message`: gated by `chat.resumeAfterRestart`, never to a
   Mastermind, and withheld within 10 min of the chat's last pick-up so a
   crash loop can't bill a turn per crash).
-  Transfer restore similarly sends a `moved`/`home` pickup only for captured
+  Transfer restore similarly sends a `moved`/`home` pickup (`recovered`, either
+  way, when it continues from the last saved point after the other machine
+  stopped responding; `chat::transfer_origin`) only for captured
   interrupted work (a terminal agent: one neutral positional prompt, only when
   its bundle recorded a turn in flight). Finished conversations remain idle; regenerated MCP
   initialization provides current-host context without starting a model turn.

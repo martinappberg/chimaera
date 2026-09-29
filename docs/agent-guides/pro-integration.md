@@ -86,6 +86,41 @@ reviewer can check each stays fixed:
    restarted running agents; a thawed cloud machine re-sent its pickup → all
    fixed (`agent_state.rs::tui_at_pause`, `spawn.rs`, `provider_gate.rs`,
    `execution::adopt_running`, `execution::thawed`).
+8. Nothing told the user: a return that kept both versions only showed up as
+   `.mine-…` files (its count lived in memory), and a cloud conversation
+   waiting on a permission raised no notification on the open laptop →
+   `pro::report_return` persists the report and raises one `kept_both`
+   notice per return; a window's feed relays the owner's turn-end,
+   approval and agent-message notices into the viewer's own feed once each
+   (`notices::relay`), and routed approvals join the viewer's attention set.
+9. The transfer pickup spoke jargon ("host", "acknowledged checkpoint") →
+   plain words (in the cloud / on the user's computer, same conversation or a
+   copy) with a stable `UserMessage.origin` for the chat divider: `moved`,
+   `home`, `recovered` (`chat::transfer_origin`,
+   `chat::transfer_context`).
+
+## The transfer pick-up message
+
+After a move or a return, a structured conversation whose turn or background
+work was cut off gets one visible message from the daemon
+(`chat::transfer_context`; idle conversations get none). It says, in plain
+words, where the agent now runs ("in the cloud" / "on the user's computer"),
+whether it is the same conversation or a copy continuing from the last saved
+point, that the project files were installed and may differ, and to re-check
+tools and paths; a recovery adds how to treat work of uncertain state. The chat
+view folds it into a divider keyed on its `UserMessage.origin`, a stable wire
+value (`chat::transfer_origin`, `chimaera_agent::model`):
+
+| `origin` | When | The divider says |
+| --- | --- | --- |
+| `moved` | a clean move; the conversation now runs in the cloud | Continued in the cloud |
+| `home` | a clean return; back on the user's computer | Back on your computer |
+| `recovered` | either direction, after the other machine stopped responding; continues from the last saved point (usually a forked copy) | the UI's recovery wording |
+
+`restart` (a daemon restart cut the work off) is the other pick-up origin;
+each of the four resets the carryover's ten-minute pick-up clock
+(`model::is_pickup_origin`). `worker` (a Mastermind worker's message) is
+daemon-sent but not a pick-up.
 
 ## The acceptance gate: one flow that runs
 
@@ -159,6 +194,12 @@ Known intermittent tests under a loaded full run (they pass alone):
 - A failed return cannot yet restore the pre-install state (needs a staged
   install); it retries with a short backoff instead.
 - Codex rollout lookups use the daemon's `CODEX_HOME`, not the login shell's.
+- A routed project's conversations notify on the viewing computer only while a
+  window has that project open (the relay rides a window's events feed); its
+  approvals still count on the Dock from the roster poll.
+- The `kept_both` notice names kept `@cloud` branches only once
+  `engine::hydrate_scoped` passes `repository::receive`'s result to
+  `pro::report_return` (it reports files only today).
 - A second computer has no native viewer; adoption of a cloud-created project
   gives it no home, so it never returns automatically after its first cloud stint.
 - The account browser's `HEAD` plan check and the settings gateway view are not

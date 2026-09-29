@@ -135,7 +135,9 @@ gap-replay idea as the PTY transport, realized for structured streams.
 
 Transfer imports set `SpawnSpec.fork_head` only for an offline native head fork.
 Codex omits the rewind boundary for that operation; see PROTOCOL Pass 38. The
-manager stamps `moved`/`home` pick-up origins at the matching Send echo.
+manager stamps `moved`/`home` pick-up origins (and `recovered` after the other
+machine stopped responding; `model::is_pickup_origin` lists every daemon
+pick-up tag) at the matching Send echo.
 
 Managed execution closes command admission before signaling the owned process
 group, retains the unreaped child while escalating, and observes completion.

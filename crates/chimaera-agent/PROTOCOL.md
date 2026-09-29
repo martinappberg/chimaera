@@ -2579,6 +2579,16 @@ The daemon stamps its single visible transfer context message with
 Send echo exactly as for `restart`. These origins update the carryover pick-up
 clock too. Transfer messages name the changed host context and any stopped
 background tasks. Mastermind remains reactive and receives no automatic turn.
+
+Addendum (2026-09-29, daemon-only — no CLI wire change, no smoke needed): a
+recovery arrival (the other machine stopped responding; the conversation
+continues from the last saved point, usually a forked copy) is tagged
+`recovered` instead, in either direction, so the chat view can key a
+different divider; `model::is_pickup_origin` covers all four daemon tags. The
+message itself is plain words (where it runs now: in the cloud / on the user's
+computer; same conversation or a copy; files installed and may differ;
+re-check tools and paths; for a recovery, how to treat work of uncertain
+state).
 Historical journal sequence numbers and public session IDs are not rewritten.
 
 Gate: local CLI help and generated JSON schema; native two-daemon transfers
