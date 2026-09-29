@@ -53,6 +53,17 @@
     const value = checkbox.checked; checkbox.checked = workspace.never_mirror;
     void act(workspace.workspace_id, () => proSetNeverMirror(workspace.workspace_id, value));
   }
+  /** The daemon saves the user's version beside each file and names those
+   * copies in `kept_paths` (at most 32). Without names, such as from an older
+   * daemon that kept them elsewhere, the sentence claims no location. */
+  function keptBoth(mirror: NonNullable<MirrorWorkspace["mirror"]>): string {
+    const count = mirror.kept_both ?? 0;
+    const paths = mirror.kept_paths ?? [];
+    const kept = `Kept both versions of ${count} ${count === 1 ? "file" : "files"} changed here and in the cloud.`;
+    if (paths.length === 0) return kept;
+    const more = count > paths.length ? `, and ${count - paths.length} more` : "";
+    return `${kept} Your version is saved beside ${count === 1 ? "the file" : "each file"}: ${paths.join(", ")}${more}.`;
+  }
   function place(workspace: MirrorWorkspace): string {
     if (workspace.never_mirror) return "Only on this device";
     switch (workspace.ownership?.state) {
@@ -87,7 +98,7 @@
         {/if}
         {#if workspace.mirror}
           {#if workspace.mirror.last_mirrored_at}<p class="hint">Last copied {new Date(workspace.mirror.last_mirrored_at * 1000).toLocaleString()}</p>{/if}
-          {#if workspace.mirror.kept_both}<p class="hint" role="status">Kept both versions of {workspace.mirror.kept_both} {workspace.mirror.kept_both === 1 ? "file" : "files"} changed here and in the cloud{#if workspace.mirror.kept_paths?.length}: {workspace.mirror.kept_paths.join(", ")}{/if}. Your copy is beside the cloud one.</p>{/if}
+          {#if workspace.mirror.kept_both}<p class="hint kept" role="status">{keptBoth(workspace.mirror)}</p>{/if}
           {#if workspace.mirror.too_large}<p class="error" role="status">Some files are too large to include in the cloud copy. They remain available on this device.</p>{/if}
           {#if workspace.mirror.error && workspace.mirror.error !== "cloud_provider_not_ready"}<p class="error" role="status">{projectCopyError(workspace.mirror.error, workspace.mirror.error_code)}</p>{/if}
         {/if}
@@ -99,6 +110,7 @@
   .mirrors { border-top: 1px solid var(--edge); padding: 18px 14px 0; margin-top: 18px; }
   h3 { font-size: var(--text-sm); margin: 0 0 8px; }
   .hint { color: var(--muted); font-size: var(--text-xs); line-height: 1.55; }
+  .kept { overflow-wrap: anywhere; }
   details { border: 1px solid var(--edge); border-radius: 8px; margin: 10px 0; }
   summary { cursor: pointer; padding: 12px; }
   summary:focus-visible, .btn:focus-visible, input:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
