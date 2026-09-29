@@ -222,6 +222,10 @@ pub(crate) struct ProgramDecl {
     /// The arguments that print its version (the card and `tool-state`).
     #[serde(default)]
     pub(crate) version: Vec<String>,
+    /// What it reaches over the network ("CTAN mirrors"): disclosed on the
+    /// card, part of the capability digest, not enforced (plan §1).
+    #[serde(default)]
+    pub(crate) network: Option<String>,
 }
 
 /// Programs that run anything they are given: a plugin declaring one gets
@@ -347,6 +351,14 @@ fn validate_programs(m: &Manifest) -> Result<(), String> {
                 "program {}: `version` is a few short arguments",
                 p.name
             ));
+        }
+        if let Some(net) = &p.network {
+            if net.trim().is_empty() || net.len() > 120 || net.chars().any(char::is_control) {
+                return Err(format!(
+                    "program {}: `network` is one short line saying what it reaches",
+                    p.name
+                ));
+            }
         }
     }
     let mut ids = BTreeSet::new();

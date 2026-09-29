@@ -93,11 +93,26 @@ struct Record {
 }
 
 fn read_record(version_dir: &Path) -> Option<Record> {
-    let text = std::fs::read(version_dir.join(RECORD)).ok()?;
+    let path = version_dir.join(RECORD);
+    // The tool's own setup programs can write in its folder: a record that
+    // became a link, or names a `bin` outside, isn't one this host wrote.
+    if !std::fs::symlink_metadata(&path).ok()?.is_file() {
+        return None;
+    }
+    let text = std::fs::read(&path).ok()?;
     if text.len() > 64 << 10 {
         return None;
     }
-    serde_json::from_slice(&text).ok()
+    let record: Record = serde_json::from_slice(&text).ok()?;
+    if let Some(bin) = &record.bin {
+        if !Path::new(bin)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+        {
+            return None;
+        }
+    }
+    Some(record)
 }
 
 /// The installed version's folder and record (blocking).
@@ -244,6 +259,8 @@ struct Budget {
     entries: usize,
     max_bytes: u64,
     max_entries: usize,
+    /// Every link made, checked once the whole tree is there.
+    links: Vec<PathBuf>,
 }
 
 impl Budget {
@@ -293,7 +310,7 @@ fn write_entry(
     Ok(())
 }
 
-fn link_entry(root: &File, rel: &Path, target: &str) -> Result<(), String> {
+fn link_entry(root: &File, rel: &Path, target: &str, budget: &mut Budget) -> Result<(), String> {
     if !link_stays_inside(rel, target) {
         return Err(format!(
             "{}: a link to {target:?}, which leaves the folder",
@@ -302,7 +319,59 @@ fn link_entry(root: &File, rel: &Path, target: &str) -> Result<(), String> {
     }
     let (parent, name) = parent_beneath(root, rel)?;
     rustix::fs::symlinkat(target, &parent, name.as_os_str())
-        .map_err(|e| format!("{}: {e}", rel.display()))
+        .map_err(|e| format!("{}: {e}", rel.display()))?;
+    budget.links.push(rel.to_path_buf());
+    Ok(())
+}
+
+/// Whether the link at `rel` resolves inside `root` once every link on the
+/// way is followed (blocking; the tree is the finished, private unpack). The
+/// lexical check at creation can't see a chain: `d/e -> ..` is inside, and
+/// so, read alone, is `f -> d/e/../..`, which lands above the folder. A
+/// missing name is walked as written; more than 40 hops is refused.
+fn resolves_inside(root: &Path, rel: &Path) -> bool {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    let mut at: Vec<OsString> = Vec::new();
+    let mut pending: VecDeque<OsString> = rel
+        .components()
+        .map(|c| c.as_os_str().to_os_string())
+        .collect();
+    let mut hops = 0;
+    while let Some(part) = pending.pop_front() {
+        if part == ".." {
+            if at.pop().is_none() {
+                return false;
+            }
+            continue;
+        }
+        if part == "." || part.is_empty() {
+            continue;
+        }
+        at.push(part);
+        let here: PathBuf = at.iter().fold(root.to_path_buf(), |p, c| p.join(c));
+        let Ok(meta) = std::fs::symlink_metadata(&here) else {
+            continue;
+        };
+        if !meta.file_type().is_symlink() {
+            continue;
+        }
+        hops += 1;
+        if hops > 40 {
+            return false;
+        }
+        let Ok(target) = std::fs::read_link(&here) else {
+            return false;
+        };
+        if target.is_absolute() {
+            return false;
+        }
+        at.pop();
+        for c in target.components().rev() {
+            pending.push_front(c.as_os_str().to_os_string());
+        }
+    }
+    true
 }
 
 fn unpack_tar(reader: impl Read, root: &File, budget: &mut Budget) -> Result<(), String> {
@@ -328,7 +397,7 @@ fn unpack_tar(reader: impl Read, root: &File, budget: &mut Budget) -> Result<(),
                     .link_name_bytes()
                     .map(|t| String::from_utf8_lossy(&t).into_owned())
                     .unwrap_or_default();
-                link_entry(root, &rel, &target)?;
+                link_entry(root, &rel, &target, budget)?;
             }
             tar::EntryType::Link => {
                 return Err(format!("{}: a hard link (refused)", rel.display()));
@@ -365,7 +434,7 @@ fn unpack_zip(file: File, root: &File, budget: &mut Budget) -> Result<(), String
                 .take(4096)
                 .read_to_string(&mut target)
                 .map_err(|e| e.to_string())?;
-            link_entry(root, &rel, &target)?;
+            link_entry(root, &rel, &target, budget)?;
         } else if ftype == FileType::RegularFile
             || ftype == FileType::Unknown
             || mode & 0o170000 == 0
@@ -395,6 +464,7 @@ pub(crate) fn unpack(
         entries: 0,
         max_bytes,
         max_entries,
+        links: Vec::new(),
     };
     let file = File::open(archive).map_err(|e| e.to_string())?;
     match kind {
@@ -434,6 +504,14 @@ pub(crate) fn unpack(
             write_entry(&root, &rel, 0o755, &mut BufReader::new(file), &mut budget)?;
         }
         other => return Err(format!("unpack {other:?} is not supported")),
+    }
+    for link in &budget.links {
+        if !resolves_inside(dest, link) {
+            return Err(format!(
+                "{}: a link that leaves the folder through another link",
+                link.display()
+            ));
+        }
     }
     Ok(budget.bytes)
 }
@@ -651,7 +729,6 @@ async fn install_inner(
         cleanup(vec![staging]).await;
         return Err(err.to_string());
     }
-    cleanup(vec![aside]).await;
     let record = Record {
         version: tool.version.clone(),
         platform: artifact.platform.clone(),
@@ -661,9 +738,26 @@ async fn install_inner(
         installed_ms: crate::timeline::now_ms(),
     };
     let text = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
-    tokio::fs::write(version_dir.join(RECORD), text)
-        .await
-        .map_err(|e| e.to_string())?;
+    // An archive entry of the record's name is replaced, never written
+    // through (it could be a link).
+    let record_path = version_dir.join(RECORD);
+    let _ = tokio::fs::remove_file(&record_path).await;
+    let written = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&record_path)
+        .await;
+    let written = match written {
+        Ok(mut f) => {
+            use tokio::io::AsyncWriteExt;
+            f.write_all(&text).await
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(err) = written {
+        restore(&version_dir, &aside).await;
+        return Err(format!("{}: {err}", tool.name));
+    }
     let bin = match &artifact.bin {
         Some(b) => version_dir.join(b),
         None => version_dir.clone(),
@@ -672,13 +766,14 @@ async fn install_inner(
         if let Err(err) =
             super::jobs::run_setup(state, m, &bin, &version_dir, &step.program, &step.args).await
         {
-            let _ = tokio::fs::remove_dir_all(&version_dir).await;
+            restore(&version_dir, &aside).await;
             return Err(format!(
                 "{} was unpacked but its setup failed: {err}",
                 tool.name
             ));
         }
     }
+    cleanup(vec![aside]).await;
     {
         let (dir, version) = (dir.clone(), tool.version.clone());
         tokio::task::spawn_blocking(move || activate(&dir, &version))
@@ -687,6 +782,13 @@ async fn install_inner(
     }
     tracing::info!(plugin = %m.id, tool = %tool.id, version = %tool.version, bytes, unpacked, "plugin tool installed");
     Ok(json!({"tool": tool.id, "version": tool.version, "downloaded": bytes, "bytes": unpacked}))
+}
+
+/// A failed install: the new copy goes and the one it replaced (a
+/// reinstall's) comes back, so `current` never names a missing folder.
+async fn restore(version_dir: &Path, aside: &Path) {
+    let _ = tokio::fs::remove_dir_all(version_dir).await;
+    let _ = tokio::fs::rename(aside, version_dir).await;
 }
 
 /// A removed plugin: all of its tools (blocking).
@@ -907,6 +1009,24 @@ mod tests {
                     ("f", tar::EntryType::Regular, b"x", ""),
                 ]),
                 "exists",
+            ),
+            (
+                // Each link inside when read alone; together, above the folder.
+                "link-chain",
+                tar_of(&[
+                    ("d/", tar::EntryType::Directory, b"", ""),
+                    ("d/e", tar::EntryType::Symlink, b"", ".."),
+                    ("f", tar::EntryType::Symlink, b"", "d/e/../x"),
+                ]),
+                "through another link",
+            ),
+            (
+                "link-loop",
+                tar_of(&[
+                    ("a", tar::EntryType::Symlink, b"", "b"),
+                    ("b", tar::EntryType::Symlink, b"", "a"),
+                ]),
+                "through another link",
             ),
             (
                 "device",

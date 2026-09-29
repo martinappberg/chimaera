@@ -406,6 +406,7 @@ export interface Diagnostic {
   line: number;
   column?: number;
   end_line?: number;
+  end_column?: number;
   message: string;
   context?: string;
   source?: string;

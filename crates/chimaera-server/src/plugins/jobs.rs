@@ -53,6 +53,9 @@ const AS_KB: u64 = 4 << 20;
 const FSIZE_BLOCKS: u64 = (256 << 20) / 512;
 pub(crate) const LOG_MAX: u64 = 16 << 20;
 const STDIN_MAX: usize = 4 << 20;
+/// Input all waiting jobs hold together, daemon-wide: a queue full of
+/// 4 MiB inputs across plugins must not grow the daemon past its budget.
+const STDIN_WAITING_MAX: usize = 16 << 20;
 const ENV_MAX: usize = 64;
 const ARGS_MAX: usize = 256;
 const ARG_LEN_MAX: usize = 16 << 10;
@@ -68,23 +71,26 @@ const ENV_CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
 /// "still running" (under the agents' MCP timeouts).
 pub(crate) const TOOL_WAIT: Duration = Duration::from_secs(45);
 
-/// Variables the host owns: a job's `env` never sets them.
+/// Variables the host owns: a job's `env` never sets them, in any case
+/// (zsh ties `path` to `PATH`).
 fn reserved(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
     matches!(
-        name,
+        name.as_str(),
         "PATH" | "HOME" | "SHELL" | "USER" | "LOGNAME" | "IFS" | "ENV" | "BASH_ENV"
     ) || name.starts_with("LD_")
         || name.starts_with("DYLD_")
         || name.starts_with("CHIMAERA_")
 }
 
+/// A portable variable name, either case: TeX's own settings are lowercase
+/// (`max_print_line`, `openout_any`) and kpathsea reads them from the
+/// environment.
 fn valid_env_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
-        && name.starts_with(|c: char| c.is_ascii_uppercase() || c == '_')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -139,6 +145,8 @@ pub(crate) struct Job {
     done: tokio::sync::watch::Sender<bool>,
     cancel: tokio::sync::Notify,
     launch: Mutex<Option<Launch>>,
+    /// Its `stdin`'s size, held until it starts.
+    stdin_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -439,13 +447,18 @@ async fn capture_env(
 }
 
 /// `name` on `path` (a `PATH` value): the first executable file.
+/// `name` in the first absolute `path` folder holding an executable file.
+/// A relative entry (`.`, `bin`) is skipped: the job starts in the
+/// workspace, so it would run whatever file of that name the project has.
 fn on_path(name: &str, path: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    path.split(':').filter(|d| !d.is_empty()).find_map(|dir| {
-        let candidate = Path::new(dir).join(name);
-        let meta = std::fs::metadata(&candidate).ok()?;
-        (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then_some(candidate)
-    })
+    path.split(':')
+        .filter(|d| d.starts_with('/'))
+        .find_map(|dir| {
+            let candidate = Path::new(dir).join(name);
+            let meta = std::fs::metadata(&candidate).ok()?;
+            (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then_some(candidate)
+        })
 }
 
 /// Where `program` runs from: the user's copy on the login PATH, unless
@@ -620,6 +633,13 @@ pub(crate) async fn start(
                 m.name
             ));
         }
+        let stdin_bytes = stdin.as_ref().map_or(0, Vec::len);
+        let held: usize = inner.waiting.iter().map(|j| j.stdin_bytes).sum();
+        if held + stdin_bytes > STDIN_WAITING_MAX {
+            return Err(
+                "too much input is waiting to run; try again when a job has started".into(),
+            );
+        }
         inner.seq += 1;
         let job = Arc::new(Job {
             id: format!("j-{}", &chimaera_core::generate_token()[..10]),
@@ -652,6 +672,7 @@ pub(crate) async fn start(
                 wall,
                 output,
             })),
+            stdin_bytes,
         });
         inner.live.insert(job.id.clone(), job.clone());
         inner.waiting.push(job.clone());
@@ -1051,18 +1072,46 @@ mod tests {
     #[test]
     fn env_names_and_the_hosts_own() {
         assert!(valid_env_name("TEXINPUTS"));
-        assert!(!valid_env_name("lower"));
+        assert!(valid_env_name("max_print_line"));
         assert!(!valid_env_name("1X"));
+        assert!(!valid_env_name("A-B"));
         for owned in [
             "PATH",
             "HOME",
             "LD_PRELOAD",
             "DYLD_INSERT_LIBRARIES",
             "CHIMAERA_X",
+            "path",
+            "Ld_Preload",
         ] {
             assert!(reserved(owned), "{owned}");
         }
         assert!(!reserved("TEXINPUTS"));
+        assert!(!reserved("max_print_line"));
+    }
+
+    #[test]
+    fn a_relative_path_entry_is_never_searched() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-onpath-{}-{}",
+            std::process::id(),
+            &chimaera_core::generate_token()[..8]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("prog");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let abs = dir.to_string_lossy().into_owned();
+        assert_eq!(on_path("prog", &abs), Some(exe));
+        // The same folder named relatively (never chdir in a test: they
+        // share the process) is not searched.
+        let cwd = std::env::current_dir().unwrap();
+        let up = cwd.components().count();
+        let relative = format!("{}{}", "../".repeat(up), abs.trim_start_matches('/'));
+        assert!(Path::new(&cwd).join(&relative).join("prog").is_file());
+        assert_eq!(on_path("prog", &format!(".:{relative}")), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

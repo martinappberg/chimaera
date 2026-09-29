@@ -714,6 +714,10 @@ every release is reviewed.
 name = "latexmk"
 version = ["-v"]           # the arguments that print its version
 
+[[programs]]
+name = "tlmgr"
+network = "CTAN mirrors (TeX Live packages)"   # what it reaches: said on the card, not enforced
+
 [[tools]]                  # a side program the host downloads on the user's click
 id = "tinytex"
 name = "TeX Live (TinyTeX)"
@@ -742,7 +746,7 @@ validate: the manifest's sha256 must stay true.
 
 **A job** is `platform::job_start(cx, &json!({…}))` with `program` (declared),
 `args` (a list; there is no shell), `cwd` (a workspace path, or `output:` for
-the output folder), `env` (added variables, `UPPER_CASE` names; never `PATH`,
+the output folder), `env` (added variables, portable names in either case; never `PATH`,
 `HOME`, `SHELL`, `USER`, `LD_*`, `DYLD_*`, `CHIMAERA_*`), `stdin` (≤ 4 MiB,
 else closed), `wall_s` (60 by default, ≤ 600), `label` (the UI's words),
 `priority` (`user`, `agent`, `background`) and `prefer` (`"tool:<id>"`: this

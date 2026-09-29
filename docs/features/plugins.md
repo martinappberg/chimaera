@@ -599,7 +599,8 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     view: render, actions, built-in actions, re-render on `view` frames), `ui/PluginTab.svelte`
     (the `plugin` tab kind, `layout.ts`), `ui/PluginFileGate.svelte` (inside `FileView`),
     `PluginSettings.svelte` (the card and `settings/PluginsSettings.svelte`),
-    `dashboard/PluginPanels.svelte`.
+    `dashboard/PluginPanels.svelte`, `editorMarks.ts` (a plugin's `diagnostics/1` as gutter marks
+    and underlines in the editor, errors and warnings only).
 - **Rules.**
   - A screen is data: semantic props only (tone, size, icon names), so light, dark and the
     brand hold; markdown goes through chat's sanitizer; links open outside; images and files
@@ -622,7 +623,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   yet (the LaTeX and Typst plugins will).
 - **How to use.** Such a plugin's card says **runs programs** and lists every program under
   **Can** ("Runs latexmk"; a shell gets "Runs sh: this plugin can run any command on this
-  host"). Before install, **Downloads** says what its tools would fetch and from where ("TeX
+  host"; a program that reaches the network says so: "tlmgr uses the network: CTAN mirrors"). Before install, **Downloads** says what its tools would fetch and from where ("TeX
   Live 2026.09 · 152 MB from github.com"). Once installed, its **Tools** section shows each tool
   with **Install**, **Update** (the plugin names a newer version) and **Remove**. A program you
   already have wins over the plugin's copy unless the plugin offers a setting to prefer its own.

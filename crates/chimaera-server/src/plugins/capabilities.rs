@@ -132,7 +132,7 @@ impl Tier {
 }
 
 /// The atom kinds that make a plugin privileged.
-const PRIVILEGED_KINDS: &[&str] = &["program", "download"];
+const PRIVILEGED_KINDS: &[&str] = &["program", "network", "download"];
 
 /// A plugin's capabilities: a set of atoms.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -184,6 +184,9 @@ impl Caps {
         // Running programs and downloading them: what makes it privileged.
         for program in &m.programs {
             atoms.insert(atom(&["program", &program.name]));
+            if let Some(net) = &program.network {
+                atoms.insert(atom(&["network", &program.name, net.trim()]));
+            }
         }
         for tool in &m.tools {
             // Every platform's download: a release that points one at
@@ -359,6 +362,14 @@ impl Caps {
                 privileged: true,
             });
         }
+        for p in of_kind("network") {
+            if let [_, program, what] = p.as_slice() {
+                lines.push(Line {
+                    text: format!("{program} uses the network: {what}"),
+                    privileged: true,
+                });
+            }
+        }
         // One line per tool (its platforms' atoms name the same download).
         let mut tools_seen: Vec<&str> = Vec::new();
         for p in of_kind("download") {
@@ -402,6 +413,7 @@ impl Caps {
             "setup-prompt",
             "file-kind",
             "program",
+            "network",
             "download",
         ];
         for p in &parsed {
@@ -583,6 +595,21 @@ mod tests {
         assert_eq!(kind(&atom(&["program", "latexmk"])), "program");
         let line = caps.lines().pop().unwrap();
         assert!(line.privileged, "{line:?}");
+    }
+
+    #[test]
+    fn a_programs_network_use_is_said_and_counted() {
+        let quiet = manifest("api = \"0.2\"\n[[programs]]\nname = \"tlmgr\"\n");
+        let loud =
+            manifest("api = \"0.2\"\n[[programs]]\nname = \"tlmgr\"\nnetwork = \"CTAN mirrors\"\n");
+        let text: Vec<String> = loud.caps.lines().into_iter().map(|l| l.text).collect();
+        assert!(
+            text.contains(&"tlmgr uses the network: CTAN mirrors".to_string()),
+            "{text:?}"
+        );
+        // Saying it reaches the network is asking for more.
+        assert_ne!(quiet.caps.digest(), loud.caps.digest());
+        assert!(!loud.caps.beyond(&quiet.caps).is_empty());
     }
 
     #[test]
