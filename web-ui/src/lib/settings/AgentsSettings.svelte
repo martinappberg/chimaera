@@ -310,7 +310,10 @@
     error={uninstallError}
     onConfirm={() => void uninstall(a)}
     onCancel={() => {
-      if (!removing[a.id]) uninstallAsk = null;
+      if (removing[a.id]) return;
+      // A failure the user dismisses stays on the row, as it did before.
+      if (uninstallError !== null) rowError = { ...rowError, [a.id]: uninstallError };
+      uninstallAsk = null;
     }}
   />
 {/if}

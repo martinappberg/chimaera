@@ -33,6 +33,11 @@ KaTeX math policy). The
   `rel="noopener"`.
 - **Canonical agent vocabulary is sacred.** Never relabel agent-native terms — `xhigh`
   stays `xhigh`. The TUI↔chat mapping mirrors what the agent actually calls things.
+- **Never `window.confirm` / `alert` / `prompt`.** The native app's web view doesn't
+  implement them — `confirm()` answers false without showing anything, so the action
+  silently does nothing there while the browser works. Ask with
+  `shared/ConfirmDialog.svelte` or inline; `shared/nativeDialogs.test.ts` fails on a
+  new call.
 - **Theme tokens, not hard-coded colors** (`--fg`, `--accent`, `--edge`, …) so the
   curated light + dark both hold. UI quality is an acceptance criterion.
 - **Runes discipline.** Mutate `$state` only in the owning store's methods; give every

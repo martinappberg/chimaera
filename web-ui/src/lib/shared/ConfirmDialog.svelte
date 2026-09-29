@@ -53,6 +53,10 @@
     if (e.key === "Escape") {
       e.stopPropagation();
       onCancel();
+    } else if (e.key === "Enter" && e.repeat) {
+      // A held Enter that opened this dialog (a keyboard-activated trigger)
+      // auto-repeats into it: never let the repeat answer for the user.
+      e.preventDefault();
     }
   }}
 >
