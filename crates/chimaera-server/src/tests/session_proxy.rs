@@ -924,7 +924,9 @@ async fn an_outside_read_the_owner_cannot_show_never_serves_this_computers_file(
 
 /// A window watching a project that runs on another daemon gets that
 /// project's frames merged into its own events stream — never the owner's
-/// settings, recents or notices — and its socket survives an owner change.
+/// settings or recents, and its notices only as this daemon's own (relayed
+/// once into this daemon's feed: see the next test) — and its socket
+/// survives an owner change.
 #[tokio::test]
 async fn events_for_a_routed_project_merge_only_its_frames_and_survive_an_owner_change() {
     use std::sync::atomic::Ordering;
@@ -1042,10 +1044,14 @@ async fn events_for_a_routed_project_merge_only_its_frames_and_survive_an_owner_
             let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
             seen.push(frame["type"].as_str().unwrap_or_default().to_owned());
             assert_ne!(frame["type"], "error", "{frame}");
-            assert_ne!(
-                frame["type"], "notices",
-                "owner notices never reach this window"
-            );
+            if frame["type"] == "notices" {
+                // Only as this daemon's own relay of it: its ring holds it.
+                let relayed = local.notices.since(0);
+                assert!(
+                    relayed.iter().any(|n| n.session_id == shell),
+                    "{frame} did not come through this daemon's feed"
+                );
+            }
             if frame["type"] == "settings" {
                 assert!(
                     frame["settings"].get("test.owner_marker").is_none(),
@@ -1067,6 +1073,10 @@ async fn events_for_a_routed_project_merge_only_its_frames_and_survive_an_owner_
         }
     }
     assert!(noticed, "the owner raised a notice while viewed");
+    assert!(
+        local.notices.since(0).len() <= 1,
+        "the owner's one notice is taken here at most once"
+    );
 
     // The project changes owner. The window's own socket stays and keeps
     // serving this daemon's frames once its feed for the old owner has ended.
@@ -1094,6 +1104,184 @@ async fn events_for_a_routed_project_merge_only_its_frames_and_survive_an_owner_
         if frame["type"] == "settings" && frame["settings"]["test.viewer_marker"] == "still-here" {
             break;
         }
+    }
+    remote.sessions.kill(&shell).ok();
+    for state in [&remote, &local] {
+        state.stopping.store(true, Ordering::Release);
+    }
+}
+
+/// A conversation running on the project's owner that needs a permission
+/// reaches this computer's own notice feed (so the native app and browser
+/// tabs alert about it) exactly once, however many windows watch the
+/// project; it counts as an approval here while it waits and leaves the
+/// count once answered on the owner.
+#[tokio::test]
+async fn a_routed_conversations_permission_reaches_this_computer_once() {
+    use std::sync::atomic::Ordering;
+    let remote = test_state();
+    let local = test_state();
+    let workspace = lock(&remote.workspaces)
+        .add(test_dir("relay-remote").canonicalize().unwrap())
+        .unwrap();
+    let mut viewing = workspace.clone();
+    viewing.root = test_dir("relay-local").canonicalize().unwrap();
+    lock(&local.workspaces)
+        .import_exact(viewing.clone())
+        .unwrap();
+    pro::install_execution_fixture(&remote, &workspace.id, 4).unwrap();
+    let shell = remote
+        .sessions
+        .spawn(chimaera_pty::SpawnOpts {
+            cwd: workspace.root.clone(),
+            name: None,
+            cols: 80,
+            rows: 24,
+            command: Some(vec!["sleep".into(), "600".into()]),
+            id: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            scrollback: None,
+        })
+        .unwrap()
+        .id;
+    lock(&remote.session_workspaces).insert(shell.clone(), workspace.id.clone());
+    lock(&remote.agents).insert(
+        shell.clone(),
+        agents::AgentRecord::new("key".into(), agents::AgentKind::Claude),
+    );
+    tokio::spawn(crate::notices::run(remote.clone()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = listener.local_addr().unwrap();
+    let router = app(remote.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (status, _) = request(
+        &local,
+        Method::POST,
+        "/api/v1/pro/placements",
+        Some(serde_json::json!({
+            "host_id":"worker-relay","endpoint":format!("http://{remote_addr}"),
+            "token":"test-token","workspace_id":workspace.id,"epoch":4
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    let router = app(local.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    // Two windows on the project: two feeds from the owner.
+    let mut windows = Vec::new();
+    for _ in 0..2 {
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{local_addr}/ws/events"))
+                .await
+                .unwrap();
+        for frame in [
+            serde_json::json!({"type":"auth","token":"test-token"}),
+            serde_json::json!({"type":"watch","workspace_id":workspace.id,"files":[],"dirs":[]}),
+        ] {
+            socket
+                .send(Message::Text(frame.to_string().into()))
+                .await
+                .unwrap();
+        }
+        windows.push(socket);
+    }
+    let (_, body) = request(&local, Method::GET, "/api/v1/notices", None).await;
+    let boot = body["boot"].as_str().unwrap().to_owned();
+    let head = body["head"].as_u64().unwrap();
+    let poll = |after: u64| {
+        let local = local.clone();
+        let boot = boot.clone();
+        async move {
+            request(
+                &local,
+                Method::GET,
+                &format!("/api/v1/notices?after={after}&boot={boot}&wait=0"),
+                None,
+            )
+            .await
+            .1
+        }
+    };
+    // Both feeds are up once the owner's rows arrived here and they had a
+    // moment to register; the watcher on the owner has its baseline.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !local
+        .session_proxy
+        .rows()
+        .iter()
+        .any(|row| row["id"] == shell.as_str())
+    {
+        assert!(tokio::time::Instant::now() < deadline, "no routed rows");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    {
+        let mut agents = lock(&remote.agents);
+        let record = agents.get_mut(&shell).unwrap();
+        record.state = crate::agent_state::AgentState::NeedsPermission;
+        record.notice_note = Some(crate::agent_state::NoticeNote {
+            text: "Bash: cargo publish".into(),
+            question: false,
+        });
+    }
+    remote.changes.notify_waiters();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let notice = loop {
+        let body = poll(head).await;
+        if let Some(notice) = body["notices"].as_array().and_then(|n| n.first()) {
+            break notice.clone();
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no relayed notice");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    assert_eq!(notice["kind"], "permission");
+    assert_eq!(notice["blocking"], true);
+    assert_eq!(notice["session_id"], shell.as_str());
+    assert_eq!(notice["workspace_id"], workspace.id.as_str());
+    assert_eq!(notice["body"], "Bash: cargo publish");
+    assert_eq!(
+        notice["subtitle"],
+        format!("Needs permission · {}", viewing.name).as_str()
+    );
+    // Both windows' feeds carried it; this computer took it once.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let body = poll(head).await;
+    assert_eq!(body["notices"].as_array().unwrap().len(), 1, "{body}");
+    // In-app: a window's own events socket gets it as a notices frame.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    'frame: loop {
+        assert!(tokio::time::Instant::now() < deadline, "no notices frame");
+        let frame = next_json(&mut windows[0]).await;
+        if frame["type"] == "notices" {
+            assert_eq!(frame["notices"][0]["session_id"], shell.as_str());
+            break 'frame;
+        }
+    }
+    // While it waits it is an approval here (the Dock's count); answered
+    // on the owner, it leaves the set, which takes the alert back.
+    let waiting = |body: &serde_json::Value| {
+        body["attention"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == shell.as_str())
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !waiting(&poll(head).await) {
+        assert!(tokio::time::Instant::now() < deadline, "not counted");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    lock(&remote.agents).get_mut(&shell).unwrap().state = crate::agent_state::AgentState::Running;
+    remote.changes.notify_waiters();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while waiting(&poll(head).await) {
+        assert!(tokio::time::Instant::now() < deadline, "still counted");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     remote.sessions.kill(&shell).ok();
     for state in [&remote, &local] {

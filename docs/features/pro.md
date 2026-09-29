@@ -398,7 +398,11 @@ views just reconnect.
 **A window's own daemon stays in charge of the window.** For a project running
 elsewhere, the window's event stream merges only that project's sessions, file
 changes, Git and Timeline updates from the owner; the owner's settings, recents,
-notices and update status never replace this computer's. An owner change never
+notices and update status never replace this computer's. While a window has the
+project open, a conversation there that finishes its turn, waits on a
+permission or a question, or sends you a message notifies on this computer too, once, through this
+computer's own notification settings, and counts as an approval here until it is
+answered on either machine. An owner change never
 closes the window's connection. The project's own paths go to its owner. A
 file outside the project is saved on this computer when its folder exists here.
 Reading one asks the owner first: a conversation's pasted images come from the

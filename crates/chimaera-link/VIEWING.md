@@ -157,8 +157,17 @@ intent, and the action is not queued (a terminal says so over the pane).
 **Events.** A window's own `/ws/events` loop stays authoritative. For a routed
 project it runs a bounded feed from the owner that contributes only that
 project's session rows (merged into the local roster), file invalidations (in the
-window's paths) and Git/Timeline epochs; the owner's settings, recents, notices,
-update and plugin frames are never forwarded. Only paths under the project's
+window's paths) and Git/Timeline epochs; the owner's settings, recents, update
+and plugin frames are never forwarded. Nor are its notices, as frames: the
+owner scopes them to the project, and the viewing daemon relays a finished turn
+(`done`/`input`), a permission, a question and the agent's own `notify` message
+into its own notice feed (so the
+native app and browser tabs alert as for local work) — once per notice across
+every window's feed (keyed by session, kind and the owner's `at_ms`, a bounded
+set), never for a session that runs on the viewing computer, and only for kinds
+its own `notifications.*` settings allow. A routed conversation blocked on a
+decision joins the viewing daemon's attention set (the Dock badge), so its
+alert is taken back once answered on either machine. Only paths under the project's
 folder are registered with the owner; the window's daemon keeps watching the
 rest itself (a pasted upload, a note in the home folder), and an owner drops a
 registered path its viewer may not read instead of closing. Local Git watching

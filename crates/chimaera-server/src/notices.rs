@@ -19,9 +19,12 @@
 //! the instant a turn ends, never flashes a notification, and a turn-end the
 //! agent immediately follows with "waiting on you" arrives as one notice.
 //!
-//! **Not only this computer's sessions.** A Pro return that kept both
-//! versions of changed files feeds the same ring ([`push_kept_both`], a
-//! project event, not a session's).
+//! **Not only this computer's sessions.** Two more sources feed the same
+//! ring: a Pro return that kept both versions of changed files
+//! ([`push_kept_both`], a project event, not a session's), and a project that
+//! runs on another machine — its owner's notices about that project's
+//! conversations arrive on a window's events feed and are relayed here
+//! ([`relay`], de-duplicated, so they reach the OS once like local ones).
 //!
 //! Bounded by construction: a small ring of recent notices ([`RING_CAP`]),
 //! replayed to a reconnecting consumer only while fresh ([`REPLAY_MAX_AGE`]);
@@ -67,8 +70,13 @@ const AGENT_HOURLY_CAP: usize = 20;
 const HOUR: Duration = Duration::from_secs(60 * 60);
 /// Caps on agent-authored text (the tool validates, this bounds the ring).
 pub(crate) const AGENT_TITLE_MAX: usize = 80;
-/// Bounds on words this feed did not write itself (a project's name, a kept
-/// file's name) before they enter the ring.
+/// Relayed notices remembered for de-duplication (every window watching a
+/// routed project runs its own feed, so each owner notice arrives once per
+/// window). Entries also expire after [`REPLAY_MAX_AGE`]: an owner never
+/// replays older notices to a feed (a feed starts at its head).
+const RELAY_SEEN_CAP: usize = 256;
+/// Bounds on words this feed did not write itself (another daemon's, a
+/// project's name, a kept file's name) before they enter the ring.
 const WORDS_MAX: usize = 480;
 const NAME_MAX: usize = 200;
 /// Kept copies a `kept_both` notice names in its body; the full (bounded)
@@ -124,6 +132,24 @@ impl NoticeKind {
             NoticeKind::RateLimited => "Hit a usage limit",
             NoticeKind::Agent => "Message",
             NoticeKind::KeptBoth => "Kept both versions",
+        }
+    }
+
+    /// The owner's wire name, for the kinds a routed project relays: a turn
+    /// that ended (finished, or waiting for the user), a permission or a
+    /// question blocking it, and the agent's own `notify` — which the owner
+    /// lets replace its turn-end notice, so relaying `done` without it would
+    /// lose "ping me when it's done". Errors and usage limits stay with the
+    /// owner: a cloud machine stopping its agents for a hand-back must not
+    /// read as news here.
+    fn relayed(kind: &str) -> Option<Self> {
+        match kind {
+            "done" => Some(NoticeKind::Done),
+            "input" => Some(NoticeKind::Input),
+            "permission" => Some(NoticeKind::Permission),
+            "question" => Some(NoticeKind::Question),
+            "agent" => Some(NoticeKind::Agent),
+            _ => None,
         }
     }
 
@@ -209,7 +235,13 @@ struct Inner {
     ring: VecDeque<Arc<Notice>>,
     /// Per-session agent `notify` send times within the last hour.
     agent_sends: HashMap<String, VecDeque<Instant>>,
+    /// Relayed notices already taken (see [`relay`]), oldest first.
+    relayed: VecDeque<(RelayKey, Instant)>,
 }
+
+/// One owner notice's identity: its session, its kind, and the owner's
+/// timestamp for it (a turn's own). Two windows' feeds deliver the same key.
+type RelayKey = (String, NoticeKind, u64);
 
 impl Notices {
     pub(crate) fn new() -> Self {
@@ -248,6 +280,27 @@ impl Notices {
             .filter(|n| n.id > after && n.created.elapsed() <= REPLAY_MAX_AGE)
             .cloned()
             .collect()
+    }
+
+    /// Whether a relayed notice is new here; remembers it if so. Bounded
+    /// both by count and by age.
+    fn first_relay(&self, key: RelayKey) -> bool {
+        let mut inner = crate::lock(&self.inner);
+        while inner
+            .relayed
+            .front()
+            .is_some_and(|(_, at)| at.elapsed() > REPLAY_MAX_AGE)
+        {
+            inner.relayed.pop_front();
+        }
+        if inner.relayed.iter().any(|(seen, _)| *seen == key) {
+            return false;
+        }
+        if inner.relayed.len() >= RELAY_SEEN_CAP {
+            inner.relayed.pop_front();
+        }
+        inner.relayed.push_back((key, Instant::now()));
+        true
     }
 
     /// When this session last had an agent-sent notice, if within `window`.
@@ -551,6 +604,83 @@ pub(crate) fn push_kept_both(
     Some(notice)
 }
 
+/// A notice the owner of a routed project raised about one of that
+/// project's conversations, as a window's events feed received it
+/// (`session_proxy::Feed`). Taken into this daemon's own feed — so the
+/// native app and browser tabs alert about it like a local one — when:
+///
+/// - it is a relayed kind (a turn that ended; a permission or a question;
+///   the agent's own message), switched on in THIS computer's settings;
+/// - it names this project and a session that does not run here (a live
+///   local session notifies through this daemon's own watcher; relaying the
+///   owner's word too would alert twice);
+/// - it is fresh and new: every window watching the project runs its own
+///   feed, so the same notice arrives once per window, and only the first
+///   (by session, kind and the owner's timestamp) is kept.
+///
+/// Words are the owner's, bounded; the subtitle is recomposed with this
+/// computer's project name. Returns whether it was taken.
+pub(crate) fn relay(state: &AppState, workspace_id: &str, row: &Value) -> bool {
+    let Some(kind) = row["kind"].as_str().and_then(NoticeKind::relayed) else {
+        return false;
+    };
+    let (Some(session_id), Some(at_ms)) = (row["session_id"].as_str(), row["at_ms"].as_u64())
+    else {
+        return false;
+    };
+    let age = Duration::from_millis(row["age_ms"].as_u64().unwrap_or(0));
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || row["workspace_id"].as_str() != Some(workspace_id)
+        || age > REPLAY_MAX_AGE
+        || !kind_enabled(state, kind)
+    {
+        return false;
+    }
+    let local = state.sessions.get(session_id).is_some_and(|s| s.alive)
+        || state.chat.get(session_id).is_some_and(|c| c.alive);
+    if local
+        || !state
+            .notices
+            .first_relay((session_id.to_string(), kind, at_ms))
+    {
+        return false;
+    }
+    let text = |key: &str, max: usize| clip(row[key].as_str().unwrap_or_default(), max);
+    let workspace = crate::lock(&state.workspaces)
+        .get(workspace_id)
+        .map(|w| w.name)
+        .or_else(|| row["workspace"].as_str().map(str::to_string))
+        .map(|name| clip(&name, NAME_MAX));
+    let name = text("name", NAME_MAX);
+    let title = Some(text("title", NAME_MAX))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| name.clone());
+    let phrase = kind.phrase();
+    state.notices.push(Notice {
+        id: 0,
+        kind,
+        session_id: session_id.to_string(),
+        workspace_id: Some(workspace_id.to_string()),
+        subtitle: match &workspace {
+            Some(ws) => format!("{phrase} · {ws}"),
+            None => phrase.to_string(),
+        },
+        workspace,
+        agent: row["agent"].as_str().map(|a| clip(a, 32)),
+        name,
+        title,
+        body: text("body", WORDS_MAX),
+        // The owner's own time for it (what the de-duplication keys on);
+        // its age as the owner measured it carries over.
+        at_ms,
+        kept: None,
+        created: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
+    });
+    state.changes.notify_waiters();
+    true
+}
+
 /// `text` without control characters, at most `max` chars.
 fn clip(text: &str, max: usize) -> String {
     text.chars()
@@ -780,7 +910,13 @@ fn attention(state: &AppState) -> Vec<Attention> {
         .filter(|(_, r)| r.state == AgentState::NeedsPermission)
         .map(|(id, _)| id.clone())
         .collect();
-    if ids.is_empty() {
+    // A project running on another machine: its conversations blocked on an
+    // approval count too, as the in-app count already does from the same
+    // rows. It also keeps a relayed permission alert up until it is answered
+    // (on either machine) — consumers take back a blocking alert whose
+    // session leaves this set.
+    let routed = state.session_proxy.awaiting_decision();
+    if ids.is_empty() && routed.is_empty() {
         return Vec::new();
     }
     ids.retain(|id| {
@@ -795,8 +931,16 @@ fn attention(state: &AppState) -> Vec<Attention> {
     let workspaces = crate::lock(&state.session_workspaces);
     let mut rows: Vec<Attention> = ids
         .into_iter()
-        .filter_map(|id| {
+        .map(|id| {
             let workspace_id = workspaces.get(&id).cloned();
+            (id, workspace_id)
+        })
+        .chain(
+            routed
+                .into_iter()
+                .map(|(id, workspace_id)| (id, Some(workspace_id))),
+        )
+        .filter_map(|(id, workspace_id)| {
             let mastermind = workspace_id
                 .as_ref()
                 .and_then(|ws| masterminds.get(ws))
@@ -809,6 +953,7 @@ fn attention(state: &AppState) -> Vec<Attention> {
         })
         .collect();
     rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows.dedup_by(|a, b| a.id == b.id);
     rows
 }
 
