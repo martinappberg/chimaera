@@ -350,9 +350,10 @@ async fn baton_cas_offline_fork_and_mirror_fencing() {
         )
         .await
         .unwrap_err();
+    // The service answers an occupied v1 baton with `stale_epoch`.
     assert_eq!(
         conflict.downcast_ref::<BatonConflict>().unwrap().error,
-        "held"
+        "stale_epoch"
     );
     assert!(
         second.renew_baton(id, &held).await.is_err(),
@@ -407,9 +408,10 @@ async fn baton_cas_offline_fork_and_mirror_fencing() {
         )
         .await
         .unwrap_err();
+    // An expired lease cannot be renewed; the service says `stale_epoch`.
     assert_eq!(
         expired.downcast_ref::<BatonConflict>().unwrap().error,
-        "expired"
+        "stale_epoch"
     );
     assert_eq!(
         first.baton(id).await.unwrap().holder_id.as_deref(),

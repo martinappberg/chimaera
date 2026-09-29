@@ -42,13 +42,15 @@ fails after expiry; it cannot resurrect an expired lease. Leases last 90 seconds
 clients renew every 5 seconds while active. `server_now` makes expiry interpretable
 without trusting the client wall clock.
 
-A mismatched epoch returns HTTP 409 with
-`{ "error": "stale_epoch", "baton": <current baton> }`. An occupied baton uses
-409 `held`; an expired renewal uses 409 `expired`; forbidden holder identity uses
-403 `forbidden`. Invalid JSON/ids use 400. Epoch arithmetic must reject overflow.
+v1 conflicts return HTTP 409 with `{ "error": "stale_epoch", "baton": <current
+baton> }` for a mismatched epoch, an occupied baton, a caller that is not the
+holder, and an expired lease alike; the returned baton tells them apart. A caller
+naming a holder other than its own credential's gets `400 invalid_request`;
+invalid JSON/ids also use 400. Epoch arithmetic must reject overflow.
 Acquire/release may return 409 `mirror_commit_in_progress` for up to 10 seconds
 while a previously verified push atomically publishes its refs. Retry with jitter
-and the same expected epoch; renew remains available during that fence.
+and the same expected epoch; renew remains available during that fence. The
+loopback fixture uses exactly this vocabulary.
 
 An expired holder remains visible in GET until the next successful acquisition.
 Taking over that expired, unreleased baton increments the epoch and sets
@@ -142,6 +144,11 @@ credential only to its authenticated local daemon; it never persists the value
 in configuration, logs, bundles or mirrors.
 
 ## Workspace-bound worker delegation
+
+**Status: dormant.** Neither the account service nor the worker supervisor uses
+this contract today; the supervisor configures the worker through
+`/api/v1/pro/configure/execution` with an unbound worker grant. The rules below
+stay the requirement for any future scoped grant.
 
 `Delegation` additionally accepts `workspace: {workspace_id, revision}`. Absence
 or `null` retains the existing account-wide semantics. Presence is an immutable
@@ -349,6 +356,30 @@ A known idle conversation remains idle. Interrupted or unknown work gets bounded
 historical recovery context directing the agent to inspect files and external
 state before repeating effects, using existing permissions without a routine
 human-review gate. Timeout alone is never proof that the old OS process stopped.
+
+### v2 refusals
+
+v2 acquire/renew/release and the related routes answer with these stable codes
+(HTTP 409 unless noted). Clients must treat the retryable ones as waits, not as
+permanent refusals:
+
+| Code | Meaning | Client behaviour |
+| --- | --- | --- |
+| `stale_epoch` | Epoch mismatch or not the current holder (carries `baton`) | Re-read and decide; never force |
+| `held` | Another live holder owns the project (carries `baton`) | View it; no takeover |
+| `takeover_grace` | Expired holder still inside the 30 s grace (carries `baton`) | Retry after the grace |
+| `unsafe_takeover` | Expired holder but the project is not in `checkpoint_fork_v1` (carries `baton`) | No automatic takeover |
+| `mirror_commit_in_progress` | A verified push is publishing refs (≤10 s) | Retry with jitter |
+| `checkpoint_required` | No acknowledged checkpoint for this epoch (also on a clean release that has not published) | Publish first, then retry |
+| `clean_release_required` | The caller still owns a legacy (pre-v2) grant, or a rebind while the old holder still owns work | Release cleanly first |
+| `installation_required` | A device acquiring without a bound installation | Bind the installation |
+| `not_preferred_home` | A device that is not the project's preferred installation | Leave it to its home/cloud |
+| `capability_not_supported` | The request's capability differs from the project's mode | Use the recorded mode |
+| `continuity_upgrade_required` | A legacy (v1) route on a v2-enrolled project, or v2 renew/release without a record | Use v2 |
+| `recovery_in_progress` | An installation recovery owns the project | Wait for it |
+| `workspace_limit`, `installation_limit`, `installation_already_bound`, `stale_policy`, `publication_expired`, `checkpoint_mismatch` | Account limits and stale publication/policy state | Surface; no retry loop |
+| 403 `mirror_disabled` | The project is kept on its device (privacy) | Stop publishing |
+| 404 `workspace_not_found` | Placement read for a project with no ownership record | Treat as unowned, epoch 0 |
 
 Returning home installs the canonical receipt only after its own registered
 managed processes are stopped. Unclean same-boot restart remains fenced until

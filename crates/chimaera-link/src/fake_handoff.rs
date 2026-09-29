@@ -126,6 +126,20 @@ fn current(data: &Data, id: &str) -> Baton {
     value.server_now = timestamp(0);
     value
 }
+/// A caller naming a holder other than its own credential's: the service
+/// answers `400 invalid_request`, not 403.
+fn holder_mismatch() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiError {
+            error: "invalid_request".into(),
+        }),
+    )
+        .into_response()
+}
+/// v1 conflicts use exactly the service's vocabulary: `stale_epoch` for a
+/// mismatched epoch, an occupied baton, a non-holder and an expired lease;
+/// `mirror_commit_in_progress` during the publication fence.
 fn conflict(error: &str, baton: Baton) -> Response {
     (
         StatusCode::CONFLICT,
@@ -153,7 +167,7 @@ async fn acquire(
     }
     let mut data = keeper.handoff().state.lock().await;
     if holder(&data, &headers) != request.holder_id {
-        return StatusCode::FORBIDDEN.into_response();
+        return holder_mismatch();
     }
     let mut baton = current(&data, &id);
     if baton.epoch != request.expected_epoch {
@@ -167,7 +181,7 @@ async fn acquire(
         return if baton.holder_id.as_ref() == Some(&request.holder_id) {
             Json(baton).into_response()
         } else {
-            conflict("held", baton)
+            conflict("stale_epoch", baton)
         };
     }
     if !data.batons.contains_key(&id) && data.batons.len() >= 128 {
@@ -217,18 +231,18 @@ async fn update(
     }
     let mut data = keeper.handoff().state.lock().await;
     if holder(&data, headers) != request.holder_id {
-        return StatusCode::FORBIDDEN.into_response();
+        return holder_mismatch();
     }
     let baton = current(&data, id);
     if baton.epoch != request.epoch {
         return conflict("stale_epoch", baton);
     }
     if baton.holder_id.as_ref() != Some(&request.holder_id) {
-        return conflict("held", baton);
+        return conflict("stale_epoch", baton);
     }
     let lease = data.batons.get_mut(id).expect("holder has a lease");
     if lease.deadline <= Instant::now() {
-        return conflict("expired", baton);
+        return conflict("stale_epoch", baton);
     }
     lease.baton.server_now = timestamp(0);
     if release {
