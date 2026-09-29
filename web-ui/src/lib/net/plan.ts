@@ -1,4 +1,5 @@
 import { derived, readable } from "svelte/store";
+import { getHostLabel } from "./api";
 import { asyncDisposer } from "../shared/asyncDisposer";
 import { isBrowserGateway, workbenchPath } from "./base";
 import { isNativeShell, onProChanged, proStatus, type ProStatus } from "./native";
@@ -48,6 +49,9 @@ const account = readable<AccountState>({ plan: "loading", offered: null }, (setS
   const native = isNativeShell();
   const gateway = !native && isBrowserGateway();
   if (!native && !gateway) { offered = false; set("unavailable"); return; }
+  // A native window showing another host's daemon (an SSH remote, another
+  // computer, the cloud) has no account bridge: its `pro_*` calls are refused.
+  if (native && getHostLabel() !== "local") { offered = false; set("unavailable"); return; }
   // An account gateway exists only for Pro; there is nothing to wait for.
   if (gateway) { offered = true; set("loading"); }
 

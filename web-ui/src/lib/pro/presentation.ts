@@ -32,6 +32,7 @@ export function cloudCopy(state: string, reason: string | null, _phase?: CloudPr
 }
 export function friendlyError(reason: unknown, fallback: string): string {
   const text = reason instanceof Error ? reason.message : String(reason);
+  if (text === "service_unsupported") return "Your Pro service doesn’t support this version of Chimaera yet. Cloud features wait until it does; your local work, connections and account are unaffected.";
   if (text === "account_restore_locked") return "Chimaera couldn’t read your saved sign-in. Unlock your computer’s credential store, then choose Check again.";
   if (text === "account_restore_unavailable") return "Chimaera couldn’t confirm your saved sign-in yet. Check your connection, then choose Check again. Your local work remains available.";
   if (text === "account_credentials_unsaved") return "You’re signed in, but Chimaera couldn’t save your session securely. Check your computer’s credential store and free disk space, then choose Check again. You may need to sign in again after restarting the app.";
@@ -50,7 +51,22 @@ export function alreadySubscribed(reason: unknown): boolean {
 }
 
 /** Service diagnostics are neither UI copy nor a promise of automatic recovery. */
-export function projectCopyError(reason: string): string {
+/** Newer daemons send a stable `error_code` beside the text; prefer it. */
+const COPY_ERROR_CODES: Record<string, string> = {
+  credential_in_history: "A file in this project’s Git history looks like a credential, so the project isn’t copied. Remove it from the history to turn copying on.",
+  git_too_old: "Git on this computer is too old for cloud copies. Update Git and the copies resume on their own.",
+  conversation_not_saved: "A conversation couldn’t be included in the latest project copy. Your work remains on this device.",
+  root_setup_required: "Project setup didn’t finish. Your saved work is intact, but this project can’t continue in the cloud yet.",
+  cache_recovery_needed: "The cloud copy needs a repair. Chimaera rebuilds it from the last saved copy on its own.",
+  previous_processes_running: "Waiting for this project’s earlier agents to finish before it continues.",
+  ownership_changed: "This project moved. Chimaera is catching up with where it runs now.",
+  ownership_unverified: "Checking where this project is running…",
+  account_changed: "Your account changed. Open the project again.",
+  pending: "Copying…",
+  checkpoint_pending: "Saving the latest copy…",
+};
+export function projectCopyError(reason: string, code?: string | null): string {
+  if (code && COPY_ERROR_CODES[code]) return COPY_ERROR_CODES[code];
   switch (reason) {
     case "workspace exceeds mirror storage quota":
     case "workspace and conversations exceed mirror storage quota":

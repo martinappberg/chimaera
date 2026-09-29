@@ -1118,7 +1118,9 @@ export interface MirrorWorkspace {
   workspace_id: string; name: string; root: string; never_mirror: boolean; privacy_pending?: boolean;
   checkpoint_id?: string | null;
   ownership: { state: "awaiting_verification" | "local" | "remote" | "transferring" | "hydrating" | "setting_up" | "privacy_disabled"; epoch: number; holder?: string } | null;
-  mirror: { files: number; bytes: number; excluded: number; too_large: number; last_mirrored_at: number | null; storage_limit_bytes: number; error: string | null } | null;
+  mirror: { files: number; bytes: number; excluded: number; too_large: number; last_mirrored_at: number | null; storage_limit_bytes: number; error: string | null;
+    /** Additive (newer daemons): a stable code for `error`, and the files the last return kept in both versions. */
+    error_code?: string | null; kept_both?: number; kept_paths?: string[] } | null;
   profile: MirrorProfile | null;
   git_branches?: string[] | null;
   blocked_providers?: CloudBlockedProvider[];

@@ -10,8 +10,10 @@ const gateway = vi.hoisted(() => ({
   isBrowserGateway: vi.fn(),
   workbenchPath: vi.fn(() => "/app/fixture-host/"),
 }));
+const host = vi.hoisted(() => ({ getHostLabel: vi.fn(() => "local") }));
 vi.mock("./native", () => bridge);
 vi.mock("./base", () => gateway);
+vi.mock("./api", () => host);
 
 import { accountPlan, paidPlan, proOffered, type AccountPlan, type PaidPlan } from "./plan";
 
@@ -410,5 +412,21 @@ describe("shared paid plan", () => {
     expect(bridge.proStatus).not.toHaveBeenCalled();
     expect(bridge.onProChanged).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("never offers Pro in a native window that shows another host", () => {
+    bridge.isNativeShell.mockReturnValue(true);
+    gateway.isBrowserGateway.mockReturnValue(false);
+    host.getHostLabel.mockReturnValue("hpc-login");
+    bridge.proStatus.mockRejectedValue(new Error("command not allowed"));
+    const seen: AccountPlan[] = [];
+    const stop = accountPlan.subscribe((plan) => { seen.push(plan); });
+    let offered: boolean | null = null;
+    const stopOffered = proOffered.subscribe((value) => { offered = value; });
+    expect(seen.at(-1)).toBe("unavailable");
+    expect(offered).toBe(false);
+    expect(bridge.proStatus).not.toHaveBeenCalled();
+    stop(); stopOffered();
+    host.getHostLabel.mockReturnValue("local");
   });
 });
