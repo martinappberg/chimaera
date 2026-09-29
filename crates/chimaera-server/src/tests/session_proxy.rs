@@ -261,6 +261,137 @@ async fn old_target_that_ignores_scope_never_receives_a_mutating_request() {
 }
 
 #[tokio::test]
+async fn a_sleeping_owner_still_receives_mutations_and_passive_reads_never_wake_it() {
+    use std::sync::Mutex;
+    type Seen = Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>;
+    // The transport answers for a suspended owner in both documented ways: a
+    // cached health reply marked sleeping, or 503 worker_asleep.
+    for cached_health in [true, false] {
+        let local = test_state();
+        let workspace = lock(&local.workspaces)
+            .add(test_dir("sleeping-owner").canonicalize().unwrap())
+            .unwrap();
+        let seen: Seen = Arc::default();
+        let record = |seen: Seen| {
+            move |request: Request<Body>| {
+                let seen = seen.clone();
+                async move {
+                    let header = |name: &str| {
+                        request
+                            .headers()
+                            .get(name)
+                            .map(|v| v.to_str().unwrap().to_owned())
+                    };
+                    seen.lock().unwrap().push((
+                        format!("{} {}", request.method(), request.uri().path()),
+                        header("x-chimaera-workspace"),
+                        header("x-chimaera-wake"),
+                    ));
+                    if request.method() == Method::GET {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            axum::Json(serde_json::json!({"error":"worker_asleep"})),
+                        )
+                            .into_response();
+                    }
+                    axum::Json(serde_json::json!({"path":"/project/created.txt"})).into_response()
+                }
+            }
+        };
+        use axum::response::IntoResponse;
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/health",
+                axum::routing::get(move || async move {
+                    if cached_health {
+                        let mut response = axum::Json(serde_json::json!({"pid":1})).into_response();
+                        response
+                            .headers_mut()
+                            .insert("x-chimaera-worker-state", "sleeping".parse().unwrap());
+                        response
+                    } else {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            axum::Json(serde_json::json!({"error":"worker_asleep"})),
+                        )
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/fs/create",
+                axum::routing::post(record(seen.clone())),
+            )
+            .route("/api/v1/fs/file", axum::routing::get(record(seen.clone())));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        assert_eq!(request(&local,Method::POST,"/api/v1/pro/placements",Some(serde_json::json!({"host_id":"worker-asleep","endpoint":format!("http://{addr}"),"token":"synthetic","workspace_id":workspace.id,"epoch":4}))).await.0,StatusCode::NO_CONTENT);
+        let created = workspace.root.join("created.txt");
+        let response = app(local.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/fs/create")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .header("x-chimaera-viewer-workspace", &workspace.id)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::json!({"path":created}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a mutation reaches the owner"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["path"], created.to_string_lossy().as_ref());
+        let query = crate::workspace_scope::paths::encode_query(&[(
+            "path".into(),
+            created.to_string_lossy().into_owned(),
+        )]);
+        let response = app(local.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/fs/file?{query}"))
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .header("x-chimaera-viewer-workspace", &workspace.id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "POST /api/v1/fs/create".into(),
+                    Some(workspace.id.clone()),
+                    None
+                ),
+                (
+                    "GET /api/v1/fs/file".into(),
+                    Some(workspace.id.clone()),
+                    None
+                ),
+            ],
+            "both forwarded with scope; the proxy never adds a wake marker"
+        );
+        assert!(!created.exists(), "nothing is written to the local copy");
+        local
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+        task.abort();
+    }
+}
+
+#[tokio::test]
 async fn retiring_stale_project_preserves_live_sibling_on_shared_host() {
     let remote = test_state();
     let local = test_state();

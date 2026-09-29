@@ -43,6 +43,11 @@ const ACK_TTL: Duration = Duration::from_secs(15);
 const IDLE_TRANSFER: Duration = Duration::from_secs(120);
 /// Reading or rewriting a small JSON request/response around a forward.
 const ADAPTER_DEADLINE: Duration = Duration::from_secs(30);
+/// How long a sleeping owner may take to resume before a request fails.
+const WAKE_DEADLINE: Duration = Duration::from_secs(120);
+/// Set only by the account transport, never by a daemon: `sleeping` while
+/// the owner is suspended and the transport answers for it.
+const WORKER_STATE_HEADER: &str = "x-chimaera-worker-state";
 
 #[derive(Default)]
 pub(crate) struct Store {
@@ -550,6 +555,13 @@ impl Budget {
         head: Duration::from_secs(75 * 60),
         quiet: Duration::from_secs(75 * 60),
     };
+    /// A sleeping owner must resume before it can answer.
+    fn waking(self) -> Self {
+        Self {
+            head: self.head.max(WAKE_DEADLINE),
+            quiet: self.quiet.max(WAKE_DEADLINE),
+        }
+    }
     fn for_request(method: &axum::http::Method, path: &str) -> Self {
         if *method != axum::http::Method::POST {
             return Self::ORDINARY;
@@ -575,14 +587,32 @@ async fn request(
     request: Request<Body>,
     budget: Budget,
 ) -> Result<Response> {
-    verify_scope(store, route, workspace).await?;
+    // A sleeping owner is still forwarded to: the transport answers passive
+    // reads from its cache without waking anything, and wakes the owner for
+    // a mutation (or an explicit interactive request) before delivering it.
+    let budget = match verify_scope(store, route, workspace).await? {
+        Reach::Awake => budget,
+        Reach::Sleeping => budget.waking(),
+    };
     target_request(route, workspace, request, budget).await
 }
-async fn verify_scope(store: &Store, route: &Route, workspace: &str) -> Result<()> {
+
+/// What the scope probe learned about the project's current owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reach {
+    /// The owner answered and acknowledged the exact project scope.
+    Awake,
+    /// The transport reports the owner asleep. The exact-header probe cannot
+    /// be answered by a frozen machine, so it is relaxed: whatever reaches the
+    /// owner after it wakes is checked against scope by the owner itself.
+    Sleeping,
+}
+
+async fn verify_scope(store: &Store, route: &Route, workspace: &str) -> Result<Reach> {
     if store.acknowledged(route, workspace) {
-        return Ok(());
+        return Ok(Reach::Awake);
     }
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let reach = tokio::time::timeout(Duration::from_secs(5), async {
         let response = target_request(
             route,
             workspace,
@@ -597,30 +627,36 @@ async fn verify_scope(store: &Store, route: &Route, workspace: &str) -> Result<(
             .get(workspace)
             .context("workspace route missing")?
             .to_string();
-        anyhow::ensure!(
-            response.status().is_success()
-                && response
-                    .headers()
-                    .get("x-chimaera-scope-version")
-                    .is_some_and(|v| v == "1")
-                && response
-                    .headers()
-                    .get(crate::workspace_scope::WORKSPACE_HEADER)
-                    .and_then(|v| v.to_str().ok())
-                    == Some(workspace)
-                && response
-                    .headers()
-                    .get(crate::workspace_scope::EPOCH_HEADER)
-                    .and_then(|v| v.to_str().ok())
-                    == Some(epoch.as_str()),
-            "target scope acknowledgment missing"
-        );
-        axum::body::to_bytes(response.into_body(), 16 * 1024).await?;
-        Ok::<_, anyhow::Error>(())
+        let status = response.status();
+        let (sleeping, acknowledged) = {
+            let headers = response.headers();
+            let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+            (
+                // Only the transport ever sets this header: a daemon never does.
+                header(WORKER_STATE_HEADER) == Some("sleeping"),
+                status.is_success()
+                    && header("x-chimaera-scope-version") == Some("1")
+                    && header(crate::workspace_scope::WORKSPACE_HEADER) == Some(workspace)
+                    && header(crate::workspace_scope::EPOCH_HEADER) == Some(epoch.as_str()),
+            )
+        };
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024).await?;
+        let asleep = sleeping
+            || status == StatusCode::SERVICE_UNAVAILABLE
+                && serde_json::from_slice::<Value>(&body)
+                    .is_ok_and(|value| value["error"] == "worker_asleep");
+        if asleep {
+            return Ok(Reach::Sleeping);
+        }
+        anyhow::ensure!(acknowledged, "target scope acknowledgment missing");
+        Ok::<_, anyhow::Error>(Reach::Awake)
     })
     .await??;
-    store.acknowledge(route, workspace);
-    Ok(())
+    // Sleeping is never cached: the next request must see the owner wake.
+    if reach == Reach::Awake {
+        store.acknowledge(route, workspace);
+    }
+    Ok(reach)
 }
 
 /// Upstream socket progress: any byte in either direction pushes the idle
@@ -1168,12 +1204,16 @@ async fn socket_route(
     use tokio_tungstenite::tungstenite::Message as Up;
     let result: Result<()> = async {
         let _permit = SOCKETS.try_acquire().context("remote stream limit")?;
-        verify_scope(&state.session_proxy, &route, workspace).await?;
+        let reach = verify_scope(&state.session_proxy, &route, workspace).await?;
+        let wake = !options.read_only && options.wake.as_deref() == Some("interaction");
+        // Viewing never wakes a sleeping owner; only interaction may.
+        if reach == Reach::Sleeping && !wake { bail!("owner asleep"); }
         let address = route.address.context("remote placement unavailable")?;
-        let query = if options.read_only { "?read_only=true" } else if options.wake.as_deref() == Some("interaction") { "?wake=interaction" } else { "" };
+        let query = if options.read_only { "?read_only=true" } else if wake { "?wake=interaction" } else { "" };
         let url = if kind=="events" {format!("ws://{address}/ws/events")} else {format!("ws://{address}/ws/{kind}/{id}{query}")};
         let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default().max_message_size(Some(10 * 1024 * 1024)).max_frame_size(Some(10 * 1024 * 1024));
-        let (mut upstream, _) = tokio::time::timeout(Duration::from_secs(15), tokio_tungstenite::connect_async_with_config(url, Some(config), false)).await??;
+        let connect = if reach == Reach::Sleeping { WAKE_DEADLINE } else { Duration::from_secs(15) };
+        let (mut upstream, _) = tokio::time::timeout(connect, tokio_tungstenite::connect_async_with_config(url, Some(config), false)).await??;
         let epoch=route.workspaces.get(workspace).context("workspace route missing")?;
         auth["workspace_id"]=json!(workspace); auth["epoch"]=json!(epoch); auth["viewer_root"]=json!("L3Byb2plY3Q");
         auth["token"] = json!(route.token);
