@@ -878,25 +878,45 @@ async fn a_drain_waits_for_running_work_then_refuses_new_transfers_until_release
     config.role = Role::Worker;
     config.execution.as_mut().unwrap().installation_id = None;
     *lock(&state.pro.runtime) = Some(config);
-    // A transfer still holds the job reservation: the deadline passes first,
-    // and the drain releases itself rather than wedging the machine.
+    // A transfer still holds the job reservation (held until released, not
+    // for a guessed time): the deadline passes first, and the drain releases
+    // itself rather than wedging the machine.
     let jobs = state.pro.jobs.clone();
+    let (held, holding) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
     let running = tokio::spawn(async move {
         let _guard = jobs.lock_owned().await;
-        tokio::time::sleep(StdDuration::from_millis(1500)).await;
+        let _ = held.send(());
+        let _ = released.await;
     });
-    tokio::time::sleep(StdDuration::from_millis(50)).await;
+    holding.await.unwrap();
     let (status, reply) = post(&state, "/api/v1/pro/drain", r#"{"deadline_ms":1000}"#).await;
     assert_eq!(
         (status, reply["error"].clone()),
         (StatusCode::CONFLICT, json!("transfer_busy"))
     );
     assert!(!super::super::drain::draining(&state));
-    // With a longer deadline the drain waits for that work to finish.
-    // (Git helper slots are process-wide, so other tests' helpers also count.)
-    let (status, reply) = post(&state, "/api/v1/pro/drain", r#"{"deadline_ms":120000}"#).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(reply["token"].is_string());
+    // Two drain requests at once (a retried supervisor call) share one drain
+    // and one token once that work finishes.
+    let (first, second) = {
+        let (a, b) = (state.clone(), state.clone());
+        (
+            tokio::spawn(async move {
+                post(&a, "/api/v1/pro/drain", r#"{"deadline_ms":120000}"#).await
+            }),
+            tokio::spawn(async move {
+                post(&b, "/api/v1/pro/drain", r#"{"deadline_ms":120000}"#).await
+            }),
+        )
+    };
+    tokio::task::yield_now().await;
+    release.send(()).unwrap();
+    let (first, second) = (first.await.unwrap(), second.await.unwrap());
+    assert_eq!((first.0, second.0), (StatusCode::OK, StatusCode::OK));
+    let token = first.1["token"].as_str().unwrap().to_owned();
+    assert_eq!(second.1["token"], token.as_str());
+    // The supervisor's contract: nonempty, at most 256 chars, no control chars.
+    assert!(!token.is_empty() && token.len() <= 256 && !token.chars().any(char::is_control));
     assert!(running.is_finished());
     assert_eq!(
         super::super::project_operations(&state),
@@ -930,6 +950,60 @@ async fn a_drain_waits_for_running_work_then_refuses_new_transfers_until_release
         state.pro.jobs.try_lock().is_ok(),
         "releasing the drain frees the reservation"
     );
+
+    // A transfer admitted just before a drain, still waiting for the job
+    // reservation, refuses itself once the drain takes it (it would otherwise
+    // hold the drain open until its deadline).
+    // (This test's runtime is single-threaded, so the order below is exact:
+    // a spawned task runs until it waits whenever this one yields.)
+    let holder = state.pro.jobs.clone().lock_owned().await;
+    let draining = {
+        let state = state.clone();
+        tokio::spawn(
+            async move { post(&state, "/api/v1/pro/drain", r#"{"deadline_ms":5000}"#).await },
+        )
+    };
+    // Once the drain holds its gate it is queued for the reservation.
+    while state.pro.drain_gate.try_lock().is_ok() {
+        tokio::task::yield_now().await;
+    }
+    let waiting = {
+        let state = state.clone();
+        tokio::spawn(async move { super::super::drain::reserve(&state).await.is_some() })
+    };
+    tokio::task::yield_now().await;
+    drop(holder);
+    let admitted = tokio::time::timeout(StdDuration::from_secs(5), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!admitted, "the waiting transfer refused itself");
+    let (status, _) = draining.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        delete(&state, "/api/v1/pro/drain").await,
+        StatusCode::NO_CONTENT
+    );
+    // A drain request whose caller gives up does not leave the daemon
+    // draining: only a completed drain stays in place.
+    let cache = state.pro.cache("w-busy").unwrap();
+    let abandoned = {
+        let state = state.clone();
+        tokio::spawn(
+            async move { post(&state, "/api/v1/pro/drain", r#"{"deadline_ms":60000}"#).await },
+        )
+    };
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        while !super::super::drain::draining(&state) {
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    abandoned.abort();
+    let _ = abandoned.await;
+    assert!(!super::super::drain::draining(&state));
+    drop(cache);
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }

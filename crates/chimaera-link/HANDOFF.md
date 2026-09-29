@@ -338,7 +338,13 @@ finalizer outliving its caller) and Git helper slot is free and state is synced
 to disk. Past the deadline (default 60 s, at most 600 s) it releases itself and
 answers 409 `{error:"transfer_busy"}`. `DELETE /api/v1/pro/drain` cancels; a drain
 also lapses 15 wall-clock minutes after it began (a machine resumed without a
-cancel). Lease renewals continue while drained. On a cloud machine
+cancel). The token is at most 24 characters with no control characters. Drain
+requests are serialized: a second one waits for the first and returns the same
+token. A request whose caller gives up before it completes leaves nothing
+draining. A transfer admitted just before the drain but still waiting for the
+job reservation refuses itself (409 `draining`) when the drain takes it, rather
+than holding the drain open. After a completed drain, any
+`pro_cloud_operations > 0` counts as activity. Lease renewals continue while drained. On a cloud machine
 `GET /api/v1/health` reports `pro_cloud_operations` (transfer tasks, sleep
 flushes, held project caches and busy Git helpers; a completed drain counts
 zero) and additive `last_activity_ms`, the last user change that is not session

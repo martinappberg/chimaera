@@ -62,6 +62,10 @@ pub(crate) struct ProState {
     boot_deferred: Mutex<std::collections::HashSet<String>>,
     operations: detached::Operations,
     drain: Mutex<Option<drain::Drain>>,
+    /// Serializes drain requests; see `drain::start`.
+    drain_gate: AsyncMutex<()>,
+    /// Wakes transfers waiting for the job reservation when a drain takes it.
+    drain_started: tokio::sync::Notify,
     remote_since: Mutex<HashMap<String, u64>>,
     return_backoff: Mutex<HashMap<String, (u64, u64)>>,
     awake_since: AtomicU64,
@@ -290,6 +294,8 @@ impl ProState {
             boot_deferred: Mutex::new(Default::default()),
             operations: Default::default(),
             drain: Mutex::new(None),
+            drain_gate: AsyncMutex::new(()),
+            drain_started: tokio::sync::Notify::new(),
             remote_since: Mutex::new(HashMap::new()),
             return_backoff: Mutex::new(HashMap::new()),
             awake_since: AtomicU64::new(now()),

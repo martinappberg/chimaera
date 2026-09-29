@@ -621,7 +621,9 @@ pub(crate) async fn hydrate(
     .into_response()
 }
 async fn hydrate_owned(state: Arc<AppState>, mut request: Hydrate) -> detached::Outcome {
-    let _guard = state.pro.jobs.lock().await;
+    let Some(_guard) = super::drain::reserve(&state).await else {
+        return super::drain::refusal();
+    };
     let (config, generation) = {
         let _configuration = state.pro.configuration.lock().await;
         let Some(config) = lock(&state.pro.runtime).clone() else {
@@ -816,7 +818,9 @@ pub(crate) async fn handoff(
         epoch,
         || handoff_refusal(&checked, &key, epoch),
         move || async move {
-            let _guard = owner.pro.jobs.lock().await;
+            let Some(_guard) = super::drain::reserve(&owner).await else {
+                return super::drain::refusal();
+            };
             if let Some(refusal) = handoff_refusal(&owner, &workspace, epoch) {
                 return refusal;
             }
