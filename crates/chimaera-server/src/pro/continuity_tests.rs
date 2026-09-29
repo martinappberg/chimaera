@@ -15,6 +15,7 @@ pub(super) struct FakeAccount {
     pub endpoint: String,
     pub requests: Arc<Mutex<Vec<(String, String, serde_json::Value)>>>,
     pub baton: Arc<Mutex<serde_json::Value>>,
+    pub delays: Arc<Mutex<HashMap<String, StdDuration>>>,
     server: tokio::task::JoinHandle<()>,
 }
 impl Drop for FakeAccount {
@@ -65,6 +66,7 @@ impl FakeAccount {
             endpoint,
             requests,
             baton,
+            delays,
             server,
         }
     }
@@ -222,6 +224,113 @@ async fn negotiated_execution_publishes_handoff_eligibility_before_snapshot_byte
             "a v2-enrolled project must publish its automatic-continuation eligibility"
         );
     }
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Send a request and hang up before the reply, as a relay that timed out.
+async fn abandon(address: std::net::SocketAddr, path: &str, body: serde_json::Value) {
+    use tokio::io::AsyncWriteExt;
+    let body = body.to_string();
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(StdDuration::from_millis(300)).await;
+    drop(stream);
+}
+fn leftovers(project: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![project.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("stage-")
+                || name.starts_with("hydrate-")
+                || name.starts_with("index-")
+                || name.ends_with(".lock")
+            {
+                found.push(name.clone());
+            }
+            if entry.file_type().unwrap().is_dir() && !name.starts_with("stage-") {
+                pending.push(entry.path());
+            }
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn an_abandoned_flush_still_finishes_and_leaves_no_interrupted_git_state() {
+    let root = temp("abandoned");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let config = device(&account.endpoint);
+    let workspace = project(&state, &root, &config, 4);
+    *lock(&account.baton) = owned(&workspace.id, "d-home", 4, "lease-fixture", 1);
+    *lock(&state.pro.runtime) = Some(config.clone());
+    // A previously SIGKILLed helper left locks, a temporary index and a copy.
+    let mirror = state.pro.root.join(&workspace.id);
+    mirror::initialize(&mirror.join("working-tree.git"))
+        .await
+        .unwrap();
+    std::fs::write(mirror.join("working-tree.git/index-interrupted"), b"").unwrap();
+    std::fs::create_dir_all(mirror.join("working-tree.git/refs/heads")).unwrap();
+    std::fs::write(mirror.join("working-tree.git/refs/heads/main.lock"), b"").unwrap();
+    std::fs::create_dir_all(mirror.join("stage-interrupted/tree")).unwrap();
+    // The flush is still running when its caller gives up.
+    lock(&account.delays).insert(
+        format!("/v1/baton/{}/policy", workspace.id),
+        StdDuration::from_secs(2),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = crate::app(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    abandon(
+        address,
+        "/api/v1/pro/handoff",
+        json!({"workspace_id": workspace.id, "expected_epoch": 4}),
+    )
+    .await;
+    assert!(matches!(
+        lock(&state.pro.ownership).get(&workspace.id),
+        Some(Ownership::Transferring { epoch: 4 })
+    ));
+    tokio::time::timeout(StdDuration::from_secs(60), async {
+        while super::super::detached::running(&state) > 0
+            || matches!(
+                lock(&state.pro.ownership).get(&workspace.id),
+                Some(Ownership::Transferring { .. })
+            )
+        {
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the abandoned flush must run to its end");
+    // It reached the account after its caller left, then failed to publish
+    // (the fixture has no Git service) and recovered instead of stranding.
+    assert_eq!(
+        account
+            .calls("PUT", &format!("/v1/baton/{}/policy", workspace.id))
+            .len(),
+        1
+    );
+    assert!(
+        crate::pro::may_write(&state, &workspace.id),
+        "a failed flush returns the project to this computer"
+    );
+    assert_eq!(leftovers(&mirror), Vec::<String>::new());
+    server.abort();
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -2,6 +2,7 @@
 mod authority;
 mod canonical;
 mod config;
+mod detached;
 mod engine;
 mod execution;
 mod mirror;
@@ -53,6 +54,7 @@ pub(crate) struct ProState {
     configuration: Arc<AsyncMutex<()>>,
     caches: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     boot_deferred: Mutex<std::collections::HashSet<String>>,
+    operations: detached::Operations,
     remote_since: Mutex<HashMap<String, u64>>,
     awake_since: AtomicU64,
     power_suitable: AtomicBool,
@@ -227,6 +229,7 @@ impl ProState {
             configuration: Arc::new(AsyncMutex::new(())),
             caches: Mutex::new(HashMap::new()),
             boot_deferred: Mutex::new(Default::default()),
+            operations: Default::default(),
             remote_since: Mutex::new(HashMap::new()),
             awake_since: AtomicU64::new(now()),
             power_suitable: AtomicBool::new(false),
@@ -497,7 +500,7 @@ pub(crate) async fn shutdown(state: &std::sync::Arc<crate::AppState>) {
 }
 
 pub(crate) fn active_operations(state: &crate::AppState) -> usize {
-    usize::from(state.pro.jobs.try_lock().is_err())
+    usize::from(state.pro.jobs.try_lock().is_err()) + detached::running(state)
 }
 
 async fn ensure_root(root: &std::path::Path) -> anyhow::Result<()> {

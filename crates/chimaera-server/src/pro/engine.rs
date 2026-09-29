@@ -657,7 +657,14 @@ async fn snapshot_inner_scoped(
     let root = state.pro.root.join(&workspace.id);
     let shadow = root.join("working-tree.git");
     *phase = "initialize";
+    let interrupted = root.clone();
+    tokio::task::spawn_blocking(move || mirror::clear_interrupted(&interrupted)).await??;
     mirror::initialize(&shadow).await?;
+    if mirror::set_aside_damaged(&shadow).await? {
+        tracing::warn!("Rebuilding a damaged outgoing project mirror from its published copy");
+        mirror::initialize(&shadow).await?;
+        mirror::fetch_published(&shadow, &grant).await?;
+    }
     let staging = root.join(format!("stage-{}", chimaera_core::generate_token()));
     tokio::fs::create_dir_all(&staging).await?;
     let result = async {
@@ -996,6 +1003,8 @@ async fn hydrate_scoped(
         execution::fence_workspace(state, workspace);
         execution::stop(state, &[workspace.to_owned()]).await?;
     }
+    let interrupted = state.pro.root.join(workspace);
+    tokio::task::spawn_blocking(move || mirror::clear_interrupted(&interrupted)).await??;
     let cache = state.pro.root.join(workspace).join("incoming.git");
     let manifest = fetch_snapshot(config, workspace, &cache).await?;
     let destination_root = destination_root

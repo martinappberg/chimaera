@@ -39,6 +39,131 @@ pub(super) async fn initialize(path: &Path) -> Result<()> {
     Ok(())
 }
 
+const REPOSITORIES: [&str; 4] = [
+    "working-tree.git",
+    "repository.git",
+    "incoming.git",
+    "incoming-repository.git",
+];
+
+/// Leftovers of an interrupted helper or transfer (a killed daemon, a
+/// SIGKILLed Git child): ref and index locks, temporary indexes and packs,
+/// and staging copies. Callers hold the project's cache guard with no helper
+/// running, so nothing live can own them; Git refuses to proceed past them.
+pub(super) fn clear_interrupted(project: &Path) -> Result<()> {
+    let entries = match fs::read_dir(project) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries.take(4096) {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if (name.starts_with("stage-") || name.starts_with("hydrate-"))
+            && entry.file_type()?.is_dir()
+        {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    for repository in REPOSITORIES.map(|name| project.join(name)) {
+        let Ok(entries) = fs::read_dir(&repository) else {
+            continue;
+        };
+        for entry in entries.take(4096) {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if entry.file_type()?.is_file()
+                && (name.starts_with("index-") || name.ends_with(".lock"))
+            {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        if let Ok(entries) = fs::read_dir(repository.join("objects/pack")) {
+            for entry in entries.take(4096) {
+                let entry = entry?;
+                if entry.file_name().to_string_lossy().starts_with("tmp_")
+                    && entry.file_type()?.is_file()
+                {
+                    fs::remove_file(entry.path())?;
+                }
+            }
+        }
+        let mut pending = vec![repository.join("refs")];
+        let mut seen = 0;
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries {
+                seen += 1;
+                ensure!(seen <= 16_384, "mirror references exceed limit");
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                if kind.is_dir() {
+                    pending.push(entry.path());
+                } else if kind.is_file() && entry.file_name().to_string_lossy().ends_with(".lock") {
+                    fs::remove_file(entry.path())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every existing outgoing tip must still name a readable tree before a new
+/// snapshot builds on it. On real damage the shadow is set aside (one bounded
+/// slot) and rebuilt from the published remote, the only history that matters
+/// for the next fast-forward push.
+pub(super) async fn set_aside_damaged(shadow: &Path) -> Result<bool> {
+    let mut damaged = false;
+    for branch in ["main", "config", "handoff"] {
+        let reference = format!("refs/heads/{branch}");
+        let mut exists = transport::git(shadow, None).await?;
+        exists.args(["rev-parse", "--verify", "--quiet", &reference]);
+        if !transport::run(exists, vec![], std::time::Duration::from_secs(5), 256)
+            .await?
+            .success
+        {
+            continue;
+        }
+        let mut tree = transport::git(shadow, None).await?;
+        tree.args(["cat-file", "-e", &format!("{reference}^{{tree}}")]);
+        if !transport::run(tree, vec![], std::time::Duration::from_secs(10), 256)
+            .await?
+            .success
+        {
+            damaged = true;
+            break;
+        }
+    }
+    if !damaged {
+        return Ok(false);
+    }
+    let aside = shadow.with_file_name("working-tree.damaged");
+    let shadow = shadow.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        if aside.exists() {
+            fs::remove_dir_all(&aside)?;
+        }
+        fs::rename(&shadow, &aside)?;
+        Ok(())
+    })
+    .await??;
+    Ok(true)
+}
+pub(super) async fn fetch_published(shadow: &Path, credentials: &MirrorCredentials) -> Result<()> {
+    let url = transport::endpoint(&credentials.working_tree_url)?;
+    transport::git_output(
+        transport::git(shadow, Some((&credentials.username, &credentials.password))).await?,
+        &["fetch", "--no-tags", &url, "+refs/heads/*:refs/heads/*"],
+        vec![],
+    )
+    .await?;
+    Ok(())
+}
+
 pub(super) async fn inventory(root: &Path, shadow: &Path) -> Result<Vec<PathBuf>> {
     let mut command = transport::git(root, None).await?;
     command.args(["rev-parse", "--is-inside-work-tree"]);

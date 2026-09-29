@@ -1,5 +1,5 @@
 use super::{
-    authority, engine, execution,
+    authority, detached, engine, execution,
     protocol::{Configure, WorkspaceConfigure},
     transport, Ownership,
 };
@@ -15,18 +15,25 @@ use serde_json::json;
 use std::sync::{atomic::Ordering, Arc};
 
 pub(super) fn failure(error: anyhow::Error) -> Response {
+    outcome(error).into_response()
+}
+fn outcome(error: anyhow::Error) -> detached::Outcome {
     if let Some(blocked) = error.downcast_ref::<super::provider_gate::Blocked>() {
-        return (
+        return detached::Outcome::refused(
             StatusCode::CONFLICT,
-            Json(json!({"error":"cloud_provider_not_ready","blocked_providers":blocked.0})),
-        )
-            .into_response();
+            Some(json!({"error":"cloud_provider_not_ready","blocked_providers":blocked.0})),
+        );
     }
-    (
+    detached::Outcome::refused(
         StatusCode::BAD_REQUEST,
-        Json(json!({"error":error.to_string().chars().take(256).collect::<String>()})),
+        Some(json!({"error":error.to_string().chars().take(256).collect::<String>()})),
     )
-        .into_response()
+}
+fn result(result: anyhow::Result<()>) -> detached::Outcome {
+    match result {
+        Ok(()) => detached::Outcome::done(),
+        Err(error) => outcome(error),
+    }
 }
 #[derive(Deserialize)]
 pub(crate) struct WorkspaceQuery {
@@ -413,7 +420,7 @@ pub(crate) async fn wake(State(state): State<Arc<AppState>>) -> Response {
 }
 pub(crate) async fn hydrate(
     State(state): State<Arc<AppState>>,
-    Json(mut request): Json<Hydrate>,
+    Json(request): Json<Hydrate>,
 ) -> Response {
     if let Err(error) = authority::workspace(&state, &request.workspace_id) {
         return failure(error);
@@ -421,11 +428,26 @@ pub(crate) async fn hydrate(
     if !super::valid_id(&request.workspace_id) {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let workspace = request.workspace_id.clone();
+    let epoch = request.expected_epoch;
+    let owner = state.clone();
+    detached::run(
+        &state,
+        ("hydrate", false),
+        &workspace,
+        epoch,
+        || None,
+        move || hydrate_owned(owner, request),
+    )
+    .await
+    .into_response()
+}
+async fn hydrate_owned(state: Arc<AppState>, mut request: Hydrate) -> detached::Outcome {
     let _guard = state.pro.jobs.lock().await;
     let (config, generation) = {
         let _configuration = state.pro.configuration.lock().await;
         let Some(config) = lock(&state.pro.runtime).clone() else {
-            return StatusCode::PRECONDITION_FAILED.into_response();
+            return detached::Outcome::refused(StatusCode::PRECONDITION_FAILED, None);
         };
         (config, state.pro.generation.load(Ordering::Acquire))
     };
@@ -438,24 +460,22 @@ pub(crate) async fn hydrate(
     .await
     {
         Ok(root) => root,
-        Err(error) => return failure(error),
+        Err(error) => return outcome(error),
     };
     if lock(&state.workspaces).get(&request.workspace_id).is_some()
         && matches!(lock(&state.pro.ownership).get(&request.workspace_id),Some(Ownership::SettingUp{epoch}) if *epoch==request.expected_epoch)
     {
-        return match engine::hydrate(
-            &state,
-            &config,
-            &request.workspace_id,
-            request.expected_epoch,
-            false,
-            None,
-        )
-        .await
-        {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(error) => failure(error),
-        };
+        return result(
+            engine::hydrate(
+                &state,
+                &config,
+                &request.workspace_id,
+                request.expected_epoch,
+                false,
+                None,
+            )
+            .await,
+        );
     }
     if config.role == super::protocol::Role::Worker
         && lock(&state.workspaces).get(&request.workspace_id).is_some()
@@ -464,19 +484,17 @@ pub(crate) async fn hydrate(
         // Only the verified hydration path can prove a same-owner restart.
         // Reconciliation may legitimately do nothing while this route holds
         // the job reservation, so its success alone is not a completed import.
-        return match engine::hydrate(
-            &state,
-            &config,
-            &request.workspace_id,
-            request.expected_epoch,
-            request.requires_fork,
-            request.destination_root.as_deref(),
-        )
-        .await
-        {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(error) => failure(error),
-        };
+        return result(
+            engine::hydrate(
+                &state,
+                &config,
+                &request.workspace_id,
+                request.expected_epoch,
+                request.requires_fork,
+                request.destination_root.as_deref(),
+            )
+            .await,
+        );
     }
     let cache = state
         .pro
@@ -485,16 +503,16 @@ pub(crate) async fn hydrate(
         .join("incoming.git");
     let cache_mutex = match state.pro.cache(&request.workspace_id) {
         Ok(cache) => cache,
-        Err(error) => return failure(error),
+        Err(error) => return outcome(error),
     };
     let cache_guard = Arc::new(cache_mutex.lock_owned().await);
     if generation != state.pro.generation.load(Ordering::Acquire) {
-        return failure(anyhow::anyhow!(
+        return outcome(anyhow::anyhow!(
             "Account changed while waiting for project cache"
         ));
     }
     if let Err(error) = super::transport::cache_quiescent(&request.workspace_id) {
-        return failure(error);
+        return outcome(error);
     }
     let manifest = match super::transport::cache_scope(
         &request.workspace_id,
@@ -504,7 +522,7 @@ pub(crate) async fn hydrate(
     .await
     {
         Ok(value) => value,
-        Err(error) => return failure(error),
+        Err(error) => return outcome(error),
     };
     drop(cache_guard);
     let root = request
@@ -540,24 +558,27 @@ pub(crate) async fn hydrate(
     .await
     .unwrap_or(false);
     if !ready {
-        return (StatusCode::CONFLICT,Json(json!({"error":"root_setup_required","root":required_root,"workspace_id":request.workspace_id}))).into_response();
+        return detached::Outcome::refused(
+            StatusCode::CONFLICT,
+            Some(
+                json!({"error":"root_setup_required","root":required_root,"workspace_id":request.workspace_id}),
+            ),
+        );
     }
     if generation != state.pro.generation.load(Ordering::Acquire) {
-        return failure(anyhow::anyhow!("Account changed during project transfer"));
+        return outcome(anyhow::anyhow!("Account changed during project transfer"));
     }
-    match engine::hydrate(
-        &state,
-        &config,
-        &request.workspace_id,
-        request.expected_epoch,
-        request.requires_fork,
-        request.destination_root.as_deref(),
+    result(
+        engine::hydrate(
+            &state,
+            &config,
+            &request.workspace_id,
+            request.expected_epoch,
+            request.requires_fork,
+            request.destination_root.as_deref(),
+        )
+        .await,
     )
-    .await
-    {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => failure(error),
-    }
 }
 
 #[derive(Deserialize)]
@@ -612,6 +633,10 @@ pub(crate) struct Handoff {
     workspace_id: String,
     expected_epoch: u64,
 }
+/// The clean flush is an owned task: its caller (the keeper relay, a worker
+/// supervisor) may give up, and the flush still completes or recovers. A
+/// repeated request for the same epoch joins it; a completed success answers
+/// 204 again instead of a bare conflict.
 pub(crate) async fn handoff(
     State(state): State<Arc<AppState>>,
     Json(request): Json<Handoff>,
@@ -622,33 +647,44 @@ pub(crate) async fn handoff(
     let Some(config) = lock(&state.pro.runtime).clone() else {
         return StatusCode::PRECONDITION_FAILED.into_response();
     };
-    if super::owned_epoch(&state, &request.workspace_id) != Some(request.expected_epoch) {
-        return StatusCode::CONFLICT.into_response();
+    let workspace = request.workspace_id.clone();
+    let epoch = request.expected_epoch;
+    let owner = state.clone();
+    let checked = state.clone();
+    let key = request.workspace_id;
+    detached::run(
+        &state,
+        ("handoff", true),
+        &key,
+        epoch,
+        || handoff_refusal(&checked, &key, epoch),
+        move || async move {
+            let _guard = owner.pro.jobs.lock().await;
+            if let Some(refusal) = handoff_refusal(&owner, &workspace, epoch) {
+                return refusal;
+            }
+            result(engine::snapshot(&owner, &config, &workspace, true).await)
+        },
+    )
+    .await
+    .into_response()
+}
+fn handoff_refusal(state: &AppState, workspace: &str, epoch: u64) -> Option<detached::Outcome> {
+    if super::owned_epoch(state, workspace) != Some(epoch) {
+        return Some(detached::Outcome::refused(StatusCode::CONFLICT, None));
     }
-    if !engine::at_pause(&state, &request.workspace_id) {
-        return (
+    if !engine::at_pause(state, workspace) {
+        return Some(detached::Outcome::refused(
             StatusCode::CONFLICT,
-            Json(json!({"error":"workspace_busy"})),
-        )
-            .into_response();
+            Some(json!({"error":"workspace_busy"})),
+        ));
     }
-    if execution::managed(&state, &request.workspace_id) {
-        if let Err(error) =
-            super::validate_execution_scope(&state, &request.workspace_id, request.expected_epoch)
-        {
-            return failure(error);
+    if execution::managed(state, workspace) {
+        if let Err(error) = super::validate_execution_scope(state, workspace, epoch) {
+            return Some(outcome(error));
         }
     }
-    let _guard = state.pro.jobs.lock().await;
-    if super::owned_epoch(&state, &request.workspace_id) != Some(request.expected_epoch)
-        || !engine::at_pause(&state, &request.workspace_id)
-    {
-        return StatusCode::CONFLICT.into_response();
-    }
-    match engine::snapshot(&state, &config, &request.workspace_id, true).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => failure(error),
-    }
+    None
 }
 
 #[derive(Deserialize)]
