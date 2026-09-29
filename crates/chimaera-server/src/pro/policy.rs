@@ -35,6 +35,8 @@ pub(super) fn allowed_path(path: &Path) -> bool {
                 | "keychains"
                 | "application_default_credentials.json"
         ) || name.starts_with(crate::persist::PROJECT_STAGING_PREFIX)
+            // A return's kept copy of the user's own version stays here.
+            || super::canonical::kept_copy_name(&name)
             || name == ".env"
             || name.starts_with(".env.")
             || name.starts_with(".env-")

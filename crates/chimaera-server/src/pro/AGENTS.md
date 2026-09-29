@@ -27,7 +27,7 @@ revocable delegation over the authenticated local API.
 | `mirror.rs` | Separate shadow and repository Git directories, incremental transfer and conservative hand-back. |
 | `shadow_cache.rs` | Validated reconstruction of an objectively damaged outgoing shadow, retaining its complete prior store in a bounded no-overwrite quarantine. |
 | `repository.rs` | Portable remote/tracking allowlist; bounded ref import, compare-and-swap adoption and index/ref-lock cancellation cleanup. |
-| `canonical.rs` | Bounded private preservation of unpublished local file conflicts before canonical checkpoint adoption; never overwrites previous conflict copies. |
+| `canonical.rs` | Keeps the user's own version of a conflicting file right beside it (`<name>.mine-<yyyymmdd-hhmm>`) when a return installs the incoming one; bounded per return, never overwrites an earlier copy, never mirrored. |
 | `config.rs` | Portable agent configuration export/import, scoped environment-omission diagnostics and destination connection identity preservation. |
 
 One recorded holder and epoch controls shared writes. **Laptop first (D1):** a
@@ -239,9 +239,10 @@ ordinary SSH/free workspace behavior is unchanged.
 
 Returns merge three ways against `published_tree`, the working-tree commit of
 the last acknowledged publication (advanced to the installed tree after a
-return); a file only one side changed takes that side; both changed keeps the
-local copy (checkpoint mode: private `local-conflicts`; strict mode: sibling
-`.cloud-*`) and counts it in the mirror row's additive `kept_both`/`kept_paths`.
+return); a file only one side changed takes that side; if both changed, the
+incoming version takes the path and the user's own version is kept right beside
+it as `<name>.mine-<yyyymmdd-hhmm>` (a name the mirror never publishes), counted
+in the mirror row's additive `kept_both`, with `kept_paths` naming those copies.
 A baseline file absent from the incoming snapshot is deleted only when the
 manifest's additive `left_out` inventory (≤4096 paths the sender omitted by
 policy, size, symlink, credential content or `.chimaeraignore`) is present and

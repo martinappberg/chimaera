@@ -1451,16 +1451,12 @@ async fn hydrate_scoped(
         authority::destination(state, config, workspace, Some(&destination_root)).await?;
         let tree = stage.join("tree");
         let destination = destination_root.clone();
-        let local_conflicts = (config.role == Role::Device
-            && execution::checkpoint_mode(state, workspace))
-        .then(|| state.pro.root.join(workspace).join("local-conflicts"));
         let left_out = manifest.left_out.clone();
         let kept = tokio::task::spawn_blocking(move || {
             install_tree(
                 &tree,
                 &destination,
                 has_baseline.then_some(baseline).as_deref(),
-                local_conflicts.as_deref(),
                 left_out.as_deref(),
             )
         })
@@ -1607,27 +1603,27 @@ async fn baseline_revision(shadow: &Path, published: Option<String>) -> Result<S
 ///
 /// - incoming == baseline: the other side never touched it; local wins.
 /// - local == baseline: only the other side changed it; incoming wins.
-/// - both changed: incoming takes the path, local is preserved.
+/// - both changed: incoming takes the path, and the user's own version is
+///   kept right beside it (`<name>.mine-<yyyymmdd-hhmm>`, never mirrored).
 /// - absent from incoming: deleted locally only when the incoming snapshot
-///   carries an inventory (`left_out`) that shows it gone, and the local copy
-///   is unchanged since the baseline.
+///   carries an inventory (`left_out`) that shows it gone; a local edit is
+///   kept beside it the same way first.
+///
+/// The report lists the kept copies' own paths (up to 32).
 fn install_tree(
     source: &Path,
     destination: &Path,
     baseline: Option<&Path>,
-    local_conflicts: Option<&Path>,
     left_out: Option<&[PathBuf]>,
 ) -> Result<(usize, Vec<PathBuf>)> {
     let mut kept = (0usize, Vec::new());
-    let mut keep = |relative: &Path| {
+    let mut keep = |copy: PathBuf| {
         kept.0 += 1;
         if kept.1.len() < 32 {
-            kept.1.push(relative.to_path_buf());
+            kept.1.push(copy);
         }
     };
-    let mut conflicts = local_conflicts
-        .map(super::canonical::Conflicts::open)
-        .transpose()?;
+    let mut copies = super::canonical::KeptCopies::new();
     let left_out: Option<std::collections::HashSet<&Path>> =
         left_out.map(|paths| paths.iter().map(PathBuf::as_path).collect());
     if let Some(baseline) = baseline {
@@ -1673,13 +1669,10 @@ fn install_tree(
                 // A deletion is safe only when the local file still equals
                 // the shared baseline. Local edits and symlinks always win.
                 if safe && target.try_exists()? {
-                    if same_file(&target, &entry.path())? {
-                        std::fs::remove_file(target)?;
-                    } else if let Some(conflicts) = conflicts.as_mut() {
-                        conflicts.preserve(&target, &relative)?;
-                        std::fs::remove_file(target)?;
-                        keep(&relative);
+                    if !same_file(&target, &entry.path())? {
+                        keep(copies.keep(&target, &relative)?);
                     }
+                    std::fs::remove_file(target)?;
                 }
             }
         }
@@ -1722,18 +1715,9 @@ fn install_tree(
                         std::fs::copy(entry.path(), target)?;
                     } else if unchanged_remotely {
                         // Only this computer changed it: keep the local edit.
-                    } else if let Some(conflicts) = conflicts.as_mut() {
-                        conflicts.preserve(&target, &relative)?;
-                        std::fs::copy(entry.path(), target)?;
-                        keep(&relative);
                     } else {
-                        let preserved = target.with_file_name(format!(
-                            "{}.cloud-{}",
-                            entry.file_name().to_string_lossy(),
-                            super::now()
-                        ));
-                        std::fs::copy(entry.path(), preserved)?;
-                        keep(&relative);
+                        keep(copies.keep(&target, &relative)?);
+                        std::fs::copy(entry.path(), target)?;
                     }
                 } else if !target.exists() && unchanged_remotely {
                     // Deleted here, untouched there: the local deletion stands.
@@ -2348,30 +2332,37 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(
-            install_tree(&cloud, &local, Some(&base), None, Some(&[]))
-                .unwrap()
-                .0,
-            1
-        );
+        let (count, kept) = install_tree(&cloud, &local, Some(&base), Some(&[])).unwrap();
+        assert_eq!(count, 2);
         assert_eq!(
             std::fs::read_to_string(local.join("same.txt")).unwrap(),
             "cloud"
         );
+        // Both changed: the incoming version takes the path and the user's
+        // own version sits right beside it; the report names the copy.
         assert_eq!(
             std::fs::read_to_string(local.join("conflict.txt")).unwrap(),
-            "local"
+            "cloud"
         );
         assert!(!local.join("removed.txt").exists());
-        assert_eq!(
-            std::fs::read_to_string(local.join("removed-but-edited.txt")).unwrap(),
-            "local"
-        );
-        assert!(std::fs::read_dir(&local).unwrap().any(|entry| entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with("conflict.txt.cloud-")));
+        assert!(!local.join("removed-but-edited.txt").exists());
+        for (original, body) in [
+            ("conflict.txt", "local"),
+            ("removed-but-edited.txt", "local"),
+        ] {
+            let copy = kept
+                .iter()
+                .find(|path| {
+                    path.to_string_lossy()
+                        .starts_with(&format!("{original}.mine-"))
+                })
+                .unwrap_or_else(|| panic!("{original}: {kept:?}"));
+            assert_eq!(std::fs::read_to_string(local.join(copy)).unwrap(), body);
+            assert!(
+                !super::super::policy::allowed_path(copy),
+                "a kept copy stays on this computer"
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -2383,7 +2374,6 @@ mod tests {
         let local = root.join("local");
         let cloud = root.join("cloud");
         let base = root.join("base");
-        let conflicts = root.join("private-conflicts");
         for dir in [&local, &cloud, &base] {
             std::fs::create_dir_all(dir).unwrap();
         }
@@ -2392,24 +2382,25 @@ mod tests {
             std::fs::write(local.join(name), "unpublished local").unwrap();
         }
         std::fs::write(cloud.join("changed"), "canonical cloud").unwrap();
-        let kept = install_tree(&cloud, &local, Some(&base), Some(&conflicts), Some(&[])).unwrap();
+        let kept = install_tree(&cloud, &local, Some(&base), Some(&[])).unwrap();
         assert_eq!(kept.0, 2);
         assert_eq!(
             std::fs::read_to_string(local.join("changed")).unwrap(),
             "canonical cloud"
         );
         assert!(!local.join("deleted").exists());
-        let mut preserved = Vec::new();
-        for dir in std::fs::read_dir(&conflicts).unwrap() {
-            for file in std::fs::read_dir(dir.unwrap().path()).unwrap() {
-                preserved.push(std::fs::read_to_string(file.unwrap().path()).unwrap());
-            }
-        }
+        let mut preserved: Vec<_> = kept
+            .1
+            .iter()
+            .map(|copy| std::fs::read_to_string(local.join(copy)).unwrap())
+            .collect();
+        preserved.sort();
         assert_eq!(preserved, vec!["unpublished local", "unpublished local"]);
-        assert_eq!(
-            std::fs::read_dir(local).unwrap().count(),
-            1,
-            "conflicts are outside the canonical mirror"
+        assert!(
+            kept.1
+                .iter()
+                .all(|copy| !super::super::policy::allowed_path(copy)),
+            "kept copies are never published as canonical project files"
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2443,8 +2434,7 @@ mod return_tests {
             ],
         );
         let cloud = tree(&root.join("cloud"), &[("notes", "t0"), ("report", "cloud")]);
-        let conflicts = root.join("private-conflicts");
-        let kept = install_tree(&cloud, &local, Some(&base), Some(&conflicts), Some(&[])).unwrap();
+        let kept = install_tree(&cloud, &local, Some(&base), Some(&[])).unwrap();
         assert_eq!(kept.0, 0, "no conflict: each side changed different files");
         assert_eq!(
             std::fs::read_to_string(local.join("notes")).unwrap(),
@@ -2484,7 +2474,7 @@ mod return_tests {
                 &[("secret-looking", "same")],
             );
             let cloud = tree(&root.join(label).join("cloud"), &[]);
-            install_tree(&cloud, &local, Some(&base), None, left_out.as_deref()).unwrap();
+            install_tree(&cloud, &local, Some(&base), left_out.as_deref()).unwrap();
             assert_eq!(!local.join("secret-looking").exists(), deleted, "{label}");
         }
         std::fs::remove_dir_all(root).unwrap();
