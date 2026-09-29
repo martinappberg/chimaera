@@ -32,23 +32,23 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 
 | File | What it owns |
 |---|---|
-| `main.rs` | The 3-role argv dispatch (order is load-bearing). |
+| `main.rs` | The 3-role argv dispatch (order is load-bearing). The GUI role raises its open-file soft limit (macOS starts GUI apps at 256; every forwarded view costs two sockets). |
 | `Entitlements.plist` | macOS hardened-runtime exception for Wasmtime's executable plugin memory, applied by `tauri.conf.json` to the binary that also runs `--daemon`. |
 | `command_manifest.rs` | Shared daemon/wizard command vocabulary for build-time permission generation and exact runtime daemon grants. |
 | `shell.rs` | Module root: app-global `Shell` state, `WindowScope`, `lock`, and the Tauri `Builder` assembly (`run`). Closing the last non-Home window opens local Home; closing the last local Home exits, while explicit Quit preserves restore state. Re-exports `open_ui_window`. |
 | `shell/commands.rs` | The IPC command surface (`#[tauri::command]` fns wired into `generate_handler!`) — thin delegators. |
 | `shell/connect.rs` | The `connect` flight state machine (one coalesced ssh attempt per host; a flight for a wedge suspect — or with no live tunnel — first clears a wedged ControlMaster, before the old tunnel's teardown — both masters for an alias routed to its daemon's login node) + the host-row wire vocabulary (`HostState` — incl. `node`, the login node a pool alias is pinned to — /`HostStatus`, and the `routing` progress phase) + `with_hosts`, the app's single path to hosts.json (serialized, off the reactor via `spawn_blocking`; the CLI writes it directly in crates/chimaera/src/connect.rs). |
 | `shell/cloud.rs` | Passive cloud/provider readiness, explicit bounded connection/retry actions, shared-catalog authentication URL validation, memory-only Claude authorization-code submission and explicitly acknowledged cloud-provider disconnection under the account-operation fence, and exact terminal focus only for legacy provider adapters. Account credentials remain in Rust. Polls never wake a worker. `pro_cloud_status` passes through optional account-confirmed preparing phases (`keeper`, `worker`, `connecting`); these are not daemon/provider readiness. |
-| `shell/power.rs` | System sleep/wake notifications (macOS IOKit, Linux logind delay inhibitor, Windows power callbacks), bounded daemon flush, and AC-power gating for delayed hand-back. |
-| `shell/pro.rs` | Optional account runtime: endpoint in app.json, OS-keychain tokens, PKCE loopback sign-in, bounded keeper cache/events, reverse local-daemon sharing, and account IPC. No endpoint means no keychain access or network work. |
+| `shell/power.rs` | System sleep/wake notifications (macOS IOKit, Linux logind delay inhibitor, Windows power callbacks). `/pro/sleep` carries `{deadline_ms}`: the platform's real budget (25 s, logind's `InhibitDelayMaxUSec`, 1.2 s) minus a margin. Reports AC power; the daemon applies the hand-back gate. Never waits for Pro startup. |
+| `shell/pro.rs` | Optional account runtime: endpoint in app.json, OS-keychain tokens, PKCE loopback sign-in, bounded keeper cache/events, reverse local-daemon sharing, daemon setup (`configure_daemon`, `DaemonStamp`), sign-out, the fixed status codes (`code`), and account IPC. No endpoint means no keychain access or network work. |
 | `shell/pro/billing.rs` | Native-owned checkout/portal attempts, exact provider-origin validation, cancellation, and authenticated plan confirmation independent of page visibility. |
 | `shell/pro/billing/callback.rs` | One-use billing return: literal loopback Host, exact nonce/outcome query, bounded request/response and credential-free browser page. |
-| `shell/pro/projects.rs` | Passive cloud project listing and per-project native destination selection; cancellation creates no import request. |
-| `shell/pro/placements.rs` | Workspace-specific reconciliation from the daemon inventory; failed or retired projects do not discard a healthy shared transport. |
+| `shell/pro/projects.rs` | Passive cloud project listing and per-project native destination selection ("Choose where to save …"): an empty pick is the project folder, otherwise a new `<pick>/<name>` folder is made (and removed again if the open fails); cancellation creates no import request. |
+| `shell/pro/placements.rs` | Workspace-specific reconciliation from the daemon inventory. Routes retire only on a definitive answer; a failed check keeps the last verified route for `ROUTE_STALENESS` (150 s) while its transport is open. Retired projects do not discard a healthy shared transport. |
 | `shell/pro/machine.rs` | Friendly device label from macOS ComputerName; never an identity or network-hostname grouping key. |
 | `shell/pro/store.rs` | Credential namespace keys: isolated previews bind session entries to their canonical config directory; legacy unbound entries are never imported or deleted. |
 | `shell/pro/recovery.rs` | Generation-fenced startup candidate retention and coalesced retry ownership; account probe failures do not force new authentication. |
-| `shell/pro/credentials.rs` | Coalesced, generation-fenced credential-store writes with finite retries; persistence failures retain valid memory sessions, and only true revocation signs out. |
+| `shell/pro/credentials.rs` | Coalesced, generation-fenced credential-store writes with finite retries; persistence failures retain valid memory sessions, and only true revocation (the link's `AuthorizationRevoked`: any refresh 4xx except 408/429) signs out. |
 | `shell/pro/auth.rs` | In-memory sign-in attempt lifecycle, cancellation/retry fences and bounded loopback callback parsing. |
 | `assets/sign-in.html` | Credential-free browser return page; success is sent only after native account activation. |
 | `shell/tunnel.rs` | App-only SSH / keeper transport wrapper. Both expose one loopback daemon endpoint; keep chimaera-link out of the daemon dependency graph. |
@@ -72,14 +72,19 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 - Logical project viewing uses passive placement and exact target scope acknowledgment.
   It follows the current owner (home device or worker), including files and watches,
   without acquiring or moving execution. Reconciliation reads the daemon’s redacted
-  placement inventory, retires each no-longer-current workspace (including after
-  native restart), and keeps healthy siblings on shared transports. Native window layouts remain local and
+  placement inventory, retires each workspace only on a definitive answer
+  (including after native restart), keeps the last verified route through a
+  failed check for at most 150 s, and keeps healthy siblings on shared
+  transports. Native window layouts remain local and
   only the fixed `/project` alias crosses hosts. See the
   [viewer contract](../chimaera-link/VIEWING.md).
   `shell/pro/installation.rs` keeps the stable installation proof in an
   endpoint/account/configuration-scoped Keychain entry. It must save before bind;
   clean release/recovery acknowledgment precedes a rebind that revokes the old
-  device. Neither daemon nor webview receives the proof.
+  device. Recovery is attempted only for this installation's old *device*
+  holder (never a cloud machine), and one project's failure is logged rather
+  than aborting the rebind; the final bind decides. Neither daemon nor webview
+  receives the proof.
 - Device rows group only account-verified installation IDs. Legacy sign-ins remain
   individually removable; the native revoke command refreshes the roster under
   the account-operation fence and rejects removal of the current sign-in.
@@ -115,7 +120,37 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   `initializing` and `initialization_phase` (`keychain`, `account`, `connection`)
   let the UI describe startup and withhold account mutations. Dependent commands
   still wait for readiness; keychain writes are not detached or timed out to
-  manufacture UI responsiveness.
+  manufacture UI responsiveness. Startup releases readiness on every exit path
+  (a drop guard), including when a sign-in or sign-out supersedes it.
+  Status never carries raw error text. `error` is a failure needing the user or
+  a fixed code (`account_restore_*`, `account_credentials_unsaved`,
+  `service_unsupported`); additive `connection_warning` is an informational
+  code (`connection_preparing`, `connection_retrying`, `account_unreachable`)
+  cleared by a live keeper host event; additive `payment_due` and `plans` come
+  from the account's optional `/v1/me` fields. IPC errors are fixed sentences.
+  **SSH never hangs on Pro**: routing reads `client_now()` (no installed client
+  means ordinary SSH now); a kept SSH host waits at most `KEPT_STARTUP_WAIT`
+  (10 s) so launch restore still goes through the keeper without a new login;
+  only device aliases wait for readiness unbounded. A kept SSH
+  host whose keeper route fails in transit (`LinkFailure::Transport`) connects
+  directly; keeper-side login failures stay errors so nobody is prompted twice.
+- **Daemon setup is off the activation path.** Activation installs the account,
+  keeper events and the reconcile loop and returns (the browser is answered
+  then); the loop's first pass configures the daemon. `DaemonStamp` includes the
+  daemon token, so a same-port restart is set up again; a matching stamp is
+  confirmed against `/pro/status` `configured`. A daemon that lost its setup gets
+  a freshly minted grant (minting revokes the previous one); an unchanged daemon
+  keeps its grant unless it expires within two hours. `update_local_daemon`
+  reconfigures immediately. A service without v2 (`ServiceUnsupported`) is
+  rechecked at most every ten minutes. **Only sign-out unconfigures**: no plan or
+  no keeper pauses setup and retires keeper-routed views but never sends DELETE
+  `/pro/configure`. Sign-out retries that DELETE, deletes the saved pair before
+  clearing memory, and revokes this device when either fails, so a daemon or a
+  leftover pair can never keep a signed-out account alive. `pro::stop` on quit
+  leaves the daemon configured by design (copying continues), but reverse serve
+  ends with the app: other devices cannot open this computer's projects while
+  it is closed. The keeper events consumer reopens its connection if the
+  channel ever closes.
   Managed workers remain in the routing map but are excluded from `list_hosts`
   and ordinary Settings machine rows; the current physical device is also omitted
   by matching its authenticated daemon token, so it cannot duplicate local work.
@@ -130,7 +165,9 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   PKCE state and Host, bounds requests and allows 15 minutes for sign-in plus
   MFA. Waiting does not hold the account operation lock. Restart/cancel closes
   the old listener and fences its result; finishing credential activation is
-  serialized and cannot be interrupted by UI cancellation. Successful browser
+  serialized and cannot be interrupted by UI cancellation. The browser is
+  answered right after activation; focusing the return window does not take the
+  operation lock (its target is generation-bound). Successful browser
   returns unhide/show/unminimize the originating managed window; if it closed,
   an existing Home (or a new Home while the shell is still alive) receives the
   return. `pro-return` is targeted; `pro_take_return` consumes one generation-
@@ -167,6 +204,16 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   `command_manifest.rs` (consumed by `build.rs` + runtime grants) ↔ committed `permissions/autogenerated/*.toml`
   (plus the `native.ts` wrappers + event-name strings). Add/rename a command in all
   of them, then `npx tauri build` (the app.yml path) to confirm they agree.
+  `command_manifest::tests` fails when the lists overlap or the committed
+  permission files drift; a removed command's `.toml` must be deleted by hand.
+  **Account commands (`pro_*`) are local-only**: they live in
+  `LOCAL_ACCOUNT_COMMANDS` and `authorize_daemon_origin` grants them only to a
+  window whose scope has no host alias (this computer's own daemon). A remote
+  host's, another computer's or the cloud's UI runs code this shell does not
+  control and must never sign out, remove devices, open billing or submit
+  provider codes; its `pro_*` calls are rejected. Runtime grants are additive,
+  so a window that later shows a remote UI on a recycled former local port
+  would keep them; the navigation guard makes that the only residual.
   **Documented exception:** the `wsl_*` commands have NO `native.ts` wrappers on
   purpose — only the shell-local wizard (`assets/setup.html`, direct
   `window.__TAURI__` invokes) may call them, and they are granted by

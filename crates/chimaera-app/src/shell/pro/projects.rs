@@ -3,7 +3,7 @@ use super::{daemon_request, Shell};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::{oneshot, Semaphore};
@@ -38,11 +38,11 @@ async fn list(state: &Shell) -> Result<Vec<CloudProject>> {
         result.projects.len() <= 128,
         "Cloud project list exceeds limit"
     );
-    if result.projects.is_empty() {
-        if let Some(error) = result.error {
-            anyhow::bail!("{error}");
-        }
-    }
+    // The daemon's listing error is diagnostic text, not UI copy.
+    anyhow::ensure!(
+        !result.projects.is_empty() || result.error.is_none(),
+        "Cloud projects are unavailable right now."
+    );
     Ok(result.projects)
 }
 #[tauri::command]
@@ -53,7 +53,9 @@ pub async fn pro_cloud_projects(
     if state.pro.client().await.is_none() {
         return Ok(Vec::new());
     }
-    let rows = list(&state).await.map_err(|error| error.to_string())?;
+    let rows = list(&state)
+        .await
+        .map_err(|_| "Cloud projects are unavailable right now.")?;
     if generation != state.pro.generation() {
         return Ok(Vec::new());
     }
@@ -69,7 +71,7 @@ async fn choose(
     app.dialog()
         .file()
         .set_parent(window)
-        .set_title(format!("Save {} in this folder", project.name))
+        .set_title(format!("Choose where to save {}", project.name))
         .set_can_create_directories(true)
         .pick_folder(move |folder| {
             let _ = send.send(folder);
@@ -81,6 +83,63 @@ async fn choose(
         return Ok(None);
     };
     Ok(Some(folder.into_path().context("Choose a local folder")?))
+}
+
+/// The daemon needs an empty folder for the project itself, but picking a
+/// parent such as ~/Projects is the natural gesture. An empty choice is used
+/// as is; otherwise a new `<chosen>/<name>` folder is made (or an existing
+/// empty one reused), with a numbered suffix if that name is taken.
+/// Returns the destination and whether this call created it.
+fn destination(chosen: &Path, name: &str) -> Result<(PathBuf, bool)> {
+    if std::fs::read_dir(chosen)?.next().is_none() {
+        return Ok((chosen.to_path_buf(), false));
+    }
+    let base = folder_name(name);
+    for attempt in 1..=32 {
+        let candidate = chosen.join(if attempt == 1 {
+            base.clone()
+        } else {
+            format!("{base} {attempt}")
+        });
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok((candidate, true)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = std::fs::symlink_metadata(&candidate)?;
+                if metadata.is_dir() && std::fs::read_dir(&candidate)?.next().is_none() {
+                    return Ok((candidate, false));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::bail!("Choose an empty folder for this project.")
+}
+
+/// A folder name from the project's display name: no separators, control
+/// characters or leading dots, bounded, never empty.
+fn folder_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | ':') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let bounded: String = cleaned
+        .trim()
+        .trim_start_matches('.')
+        .trim()
+        .chars()
+        .take(80)
+        .collect();
+    if bounded.trim().is_empty() {
+        "Project".into()
+    } else {
+        bounded.trim_end().into()
+    }
 }
 
 /// Kept separate from native UI so cancellation is tested at the import boundary.
@@ -142,11 +201,23 @@ pub async fn pro_open_cloud_project(
             "Account changed; open the project again"
         );
         let saved = project.local_root.is_some();
-        let selected = if saved {
+        let chosen = if saved {
             None
         } else {
             choose(&app, &window, &project).await?
         };
+        let (selected, created) = match chosen {
+            Some(chosen) => {
+                let name = project.name.clone();
+                let (path, created) =
+                    tokio::task::spawn_blocking(move || destination(&chosen, &name)).await??;
+                (Some(path), created)
+            }
+            None => (None, false),
+        };
+        // A folder this call made is removed again (only while still empty)
+        // when the project does not open there.
+        let made = created.then(|| selected.clone()).flatten();
         let Some(body) = import_body(&workspace_id, saved, selected, &account, &endpoint) else {
             return Ok(None);
         };
@@ -156,9 +227,17 @@ pub async fn pro_open_cloud_project(
             generation == state.pro.generation() && state.pro.client().await.is_some(),
             "Account changed; open the project again"
         );
-        let imported = serde_json::from_value(
-            daemon_request(&state, "POST", "/pro/projects/open", Some(body)).await?,
-        )?;
+        let opened = daemon_request(&state, "POST", "/pro/projects/open", Some(body)).await;
+        let opened = match opened {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(made) = made {
+                    let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir(made)).await;
+                }
+                return Err(error);
+            }
+        };
+        let imported = serde_json::from_value(opened)?;
         ensure!(
             generation == state.pro.generation(),
             "Account changed while the project was opening"
@@ -173,6 +252,38 @@ pub async fn pro_open_cloud_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_parent_folder_gets_a_new_project_folder_and_an_empty_one_is_used() {
+        let base = std::env::temp_dir().join(format!(
+            "chimaera-picker-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        // An empty choice is the project folder itself.
+        assert_eq!(destination(&base, "Thesis").unwrap(), (base.clone(), false));
+        std::fs::write(base.join("notes.txt"), "existing").unwrap();
+        let (first, created) = destination(&base, "Thesis").unwrap();
+        assert_eq!((first.clone(), created), (base.join("Thesis"), true));
+        // The same name again: the empty folder is reused, not duplicated.
+        assert_eq!(
+            destination(&base, "Thesis").unwrap(),
+            (first.clone(), false)
+        );
+        std::fs::write(first.join("draft.md"), "work").unwrap();
+        assert_eq!(
+            destination(&base, "Thesis").unwrap(),
+            (base.join("Thesis 2"), true)
+        );
+        assert_eq!(
+            destination(&base, "../escape").unwrap().0,
+            base.join("-escape")
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+        assert_eq!(folder_name("  .hidden/name\n "), "hidden-name-");
+        assert_eq!(folder_name("..."), "Project");
+        assert_eq!(folder_name(&"x".repeat(200)).len(), 80);
+    }
+
     #[test]
     fn cancel_never_produces_an_import_request() {
         assert!(

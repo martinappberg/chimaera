@@ -56,13 +56,16 @@ mod platform {
                 let app = context.app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app.state::<super::super::Shell>();
-                    let _ = tokio::time::timeout(Duration::from_secs(25), async {
-                        if state.pro.client().await.is_some() {
+                    // macOS waits up to 30 s for this acknowledgment; keep a
+                    // margin and tell the daemon exactly what it has.
+                    let budget = Duration::from_secs(25);
+                    let _ = tokio::time::timeout(budget, async {
+                        if state.pro.client_now().is_some() {
                             let _ = super::super::pro::daemon_request(
                                 &state,
                                 "POST",
                                 "/pro/sleep",
-                                None,
+                                Some(super::sleep_body(budget)),
                             )
                             .await;
                         }
@@ -77,7 +80,7 @@ mod platform {
                 let app = context.app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app.state::<super::super::Shell>();
-                    if state.pro.client().await.is_some() {
+                    if state.pro.client_now().is_some() {
                         let _ =
                             super::super::pro::daemon_request(&state, "POST", "/pro/wake", None)
                                 .await;
@@ -162,8 +165,22 @@ mod platform {
         )?;
         Ok(fd)
     }
+    /// logind's configured ceiling for delay inhibitors (InhibitDelayMaxSec,
+    /// 5 s by default). The daemon gets exactly this budget, not a guess.
+    fn delay_budget(connection: &Connection) -> Duration {
+        use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
+        let proxy = connection.with_proxy(
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            Duration::from_secs(2),
+        );
+        let micros: Result<u64, dbus::Error> =
+            proxy.get("org.freedesktop.login1.Manager", "InhibitDelayMaxUSec");
+        super::logind_budget(micros.ok())
+    }
     fn watch(app: &tauri::AppHandle) -> Result<(), dbus::Error> {
         let connection = Connection::new_system()?;
+        let budget = delay_budget(&connection);
         // Holding a delay inhibitor before subscribing closes the race where
         // logind suspends before our PrepareForSleep callback can run.
         let mut inhibitor = Some(inhibit(&connection)?);
@@ -181,7 +198,7 @@ mod platform {
                 if sleeping {
                     // logind independently enforces its delay ceiling (normally
                     // five seconds); the app always releases its descriptor.
-                    super::notify(app, "/pro/sleep", Duration::from_secs(4));
+                    super::notify(app, "/pro/sleep", budget);
                     inhibitor.take();
                 } else {
                     inhibitor = Some(inhibit(&connection)?);
@@ -291,8 +308,9 @@ fn notify(app: &tauri::AppHandle, route: &'static str, budget: std::time::Durati
     tauri::async_runtime::spawn(async move {
         let _ = tokio::time::timeout(budget, async {
             let state = app.state::<super::Shell>();
-            if state.pro.client().await.is_some() {
-                let _ = super::pro::daemon_request(&state, "POST", route, None).await;
+            if state.pro.client_now().is_some() {
+                let body = (route == "/pro/sleep").then(|| sleep_body(budget));
+                let _ = super::pro::daemon_request(&state, "POST", route, body).await;
             }
         })
         .await;
@@ -307,9 +325,56 @@ mod platform {
         false
     }
 }
+/// What the daemon may spend before the OS sleeps: the platform's real
+/// budget minus a margin for the answer and the OS acknowledgment, so the
+/// daemon releases its projects cleanly instead of being frozen mid-save.
+/// (Additive: an older daemon ignores the body and uses its own pacing.)
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+    allow(dead_code)
+)]
+fn sleep_body(budget: std::time::Duration) -> serde_json::Value {
+    let margin = std::time::Duration::from_secs(2).min(budget / 4);
+    serde_json::json!({ "deadline_ms": budget.saturating_sub(margin).as_millis() as u64 })
+}
+
+/// logind reports its delay ceiling in microseconds; an unreadable value
+/// falls back to logind's documented default. Never beyond what the shell
+/// itself waits for.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn logind_budget(micros: Option<u64>) -> std::time::Duration {
+    micros
+        .map(std::time::Duration::from_micros)
+        .unwrap_or(std::time::Duration::from_secs(5))
+        .clamp(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(25),
+        )
+}
+
 pub(super) fn install(app: &tauri::AppHandle) {
     platform::install(app);
 }
 pub(super) fn suitable() -> bool {
     platform::suitable()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    #[test]
+    fn the_daemon_is_told_the_real_budget_minus_a_margin() {
+        for (budget, expected) in [
+            (Duration::from_secs(25), 23_000),
+            (Duration::from_secs(5), 3_750),
+            (Duration::from_millis(1200), 900),
+        ] {
+            assert_eq!(sleep_body(budget)["deadline_ms"], expected);
+        }
+        assert_eq!(logind_budget(Some(5_000_000)), Duration::from_secs(5));
+        assert_eq!(logind_budget(None), Duration::from_secs(5));
+        assert_eq!(logind_budget(Some(0)), Duration::from_secs(1));
+        assert_eq!(logind_budget(Some(u64::MAX)), Duration::from_secs(25));
+    }
 }

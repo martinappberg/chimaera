@@ -17,22 +17,37 @@ Clients do not follow HTTP redirects on authenticated requests.
 
 Every request and WebSocket upgrade uses `Authorization: Bearer <access_token>`
 except the OAuth browser and token endpoints. Tokens never appear in URLs. Missing,
-expired or revoked authentication returns `401` before a WebSocket upgrade. A
-client refreshes once and retries; a second `401` requires sign-in. `403` means the
-account lacks authorization or needs fresh multifactor authentication. Services
-must check account and device ownership on every host and reverse stream lookup.
+expired or revoked authentication returns `401` before a WebSocket upgrade. After an
+**account** `401` a client refreshes once and retries; a second `401` requires
+sign-in. A keeper `401` alone does not justify a rotation: keepers also refuse
+during account outages or with a stale revocation cache, so the client first asks
+the account (`GET /v1/devices`, side-effect free) and refreshes only if the
+account also answers `401`. `403` means the account lacks authorization or needs
+fresh multifactor authentication. Services must check account and device
+ownership on every host and reverse stream lookup.
 
 `me.protocol` is an integer major version. A client implementing v0 rejects any
-other value before using the keeper. Unknown additive fields and event types can
-be ignored. Breaking changes require a new major version. JSON uses UTF-8.
-Errors use HTTP status codes and optionally `{ "error": "stable_error_code" }`.
-REST response bodies are limited to 1 MiB; control frames to 128 KiB.
+other value before using the keeper (typed `ServiceUnsupported`). Breaking
+changes require a new major version. JSON uses UTF-8. Errors use HTTP status
+codes and optionally `{ "error": "stable_error_code" }`. REST response bodies are
+limited to 1 MiB; control frames to 128 KiB.
+
+**Additive evolution.** Services may add response fields and new enum values at
+any time. Clients decode service responses without `deny_unknown_fields` and map
+an unknown enum value (plan, worker state/reason/phase, host kind/status,
+placement availability, continuation) to `Unknown`, which they treat as "not
+actionable" rather than failing the whole response. Host rows of an unknown
+kind are dropped; unknown event and reverse-serve message types are ignored. Only
+acknowledgments from the local daemon stay exact (an old daemon that ignores a
+field must never look like it accepted it). A service that lacks a required
+route (404 on `/v2/capabilities`, or a 404 without the documented error code)
+is reported as `ServiceUnsupported`, never as a transient failure.
 
 ## Account routes
 
 | Method and path | Request | Response |
 | --- | --- | --- |
-| `GET /v1/me` | — | Account below |
+| `GET /v1/me` | — | Account below; for a paid account it also marks the keeper as in use (it is not a free status probe) |
 | `GET /v1/devices` | — | Device array below |
 | `DELETE /v1/devices/{id}` | — | `204`; revoke that device and its connections |
 | `POST /v1/sign-out-everywhere` | — | `204`; revoke all devices, close held SSH logins and all link sockets |
@@ -134,7 +149,20 @@ Account example (limits are supplied by the account, never hardcoded by clients)
 ```
 
 `plan` is `none`, `pro` or `max`; cloud-hour usage is a nonnegative number,
-limits and byte counts are nonnegative integers. Device rows are
+limits and byte counts are nonnegative integers.
+
+Optional additive fields, omitted by older services:
+
+- `payment_due` (bool): the subscription needs a payment update. A service may
+  instead send `subscription_status` (the billing provider's status); clients
+  treat `past_due` and `unpaid` as payment due. A lapsed payment otherwise
+  reads as `plan:"none"`.
+- `plans`: the account's current offers,
+  `[{plan:"pro"|"max",interval:"month"|"year",amount_cents,currency}]` with the
+  amount in minor units and `currency` an ISO 4217 code. Clients never hardcode
+  prices; without this list they show plan names only. An entry a client cannot
+  interpret (a new plan or interval, a malformed amount) is dropped, never
+  failing the whole account read. Device rows are
 `{id,name,last_seen,this}` with `last_seen` an RFC 3339 timestamp and `this` true
 only for the requesting device. Device tokens are account credentials; daemon
 tokens below are separate, host-specific credentials.
@@ -181,7 +209,20 @@ persist **every** replacement pair in the OS keychain. Account tokens never go
 into app JSON settings, logs or the host directory. Local sign-out deletes the
 keychain pair and terminates events, tunnels and reverse serve.
 
+Refresh failures (RFC 6749 §5.2): an unknown, expired, revoked or already-used
+refresh token returns `400 {"error":"invalid_grant"}`. The account treats reuse
+of a rotated token as theft (it revokes the device), so a client must never
+present that token again. Clients therefore treat **every 4xx except 408 and 429**
+as final: clear the pair, publish sign-out, stop background work and ask for a
+new sign-in. A transport error, `408` or `5xx` is retried **once with the same
+token** after a short pause (a response lost after the account committed the
+rotation needs a service-side reuse grace to heal); a second failure, or `429`,
+keeps the session and reports a transient error. The typed client error is
+`AuthorizationRevoked`.
+
 ### CLI device sign-in
+
+The service implements this flow; no public client uses it yet.
 
 `POST /v1/oauth/device/code` takes `{client_id:"chimaera",device_name}` and
 returns RFC 8628 fields `device_code`, `user_code`, `verification_uri`,
@@ -231,10 +272,12 @@ containing passwords or key material. Host ids are opaque path segments; clients
 must URL-encode them. Aliases have a maximum of 255 bytes. For `kind: "worker"`,
 the registered route ID is exactly `worker-` followed by the account's worker ID.
 That account worker ID is also the worker delegation's `device_id` and baton
-`holder_id`; the prefix is not part of baton ownership. Clients may compare these
-identities only for typed worker rows and must retain the complete host ID for
-keeper requests, tunnels and placement routing. Device and SSH IDs have no such
-translation.
+`holder_id`; the prefix is not part of baton ownership. A device's reverse-served
+row is likewise `device-` followed by its raw account device ID, and placement
+routes use the same two forms ([VIEWING](VIEWING.md)). Clients may compare these
+identities only for typed worker and device rows and must retain the complete
+host ID for keeper requests, tunnels and placement routing. SSH host IDs are
+opaque and have no such translation.
 
 ## Events
 
@@ -266,6 +309,12 @@ Clients reconnect with jittered exponential backoff from approximately 500 ms to
 10 seconds; reset after a stable connection. Each reconnection authenticates again.
 Do not replay password answers after losing a connection.
 
+Service behaviour clients must expect: the keeper closes every device stream and
+drops every held cluster login when the account's session epoch changes (sign-out
+everywhere, a replayed refresh token) or when it cannot reach the account for
+about 30 seconds. A reconnect then rebuilds the host rows, and SSH logins may
+prompt again.
+
 ## Data plane
 
 `/v1/hosts/{id}/tcp` opens **one TCP connection** to that host's daemon. Unknown
@@ -277,9 +326,13 @@ finishing its sending half must expect the receiving half to close too.
 At most 16 data frames may be queued per direction. Stop reading the source when
 that fills; never add an unbounded channel or accumulate a complete response.
 Enforce transport limits before decoding. Each device has at most 128 concurrent
-streams (including pending reverse opens). A loopback tunnel binds only
-`127.0.0.1`, keeps one stable ephemeral port, and opens a new WebSocket per accepted
-TCP socket. A failed stream must not destroy the listener or other streams.
+streams (including pending reverse opens); the client enforces this per signed-in
+device across all of its forward tunnels and reverse streams together. A loopback
+tunnel binds only `127.0.0.1`, keeps one stable ephemeral port, and opens a new
+WebSocket per accepted TCP socket. A failed stream must not destroy the listener
+or other streams, and neither does a failed `accept()` (descriptor exhaustion,
+a reset before accept): the listener backs off briefly and continues. The native
+app raises its open-file soft limit at startup (macOS starts GUI apps at 256).
 
 Every socket, control and data, sends WebSocket ping at most 20 seconds apart.
 Reply to ping with pong; 60 seconds without a pong makes the link dead. Bound
@@ -306,10 +359,20 @@ The keeper pairs the sockets. A stream id expires after 15 seconds and can be
 consumed once. Bind it to account, device and current control-connection generation;
 knowing another account's id must never authorize a stream. Close notifies with
 `{"type":"close","stream_id":"..."}`. Unknown/expired streams return `404`.
+A control message the device cannot act on affects at most one stream: an
+unknown or malformed message is ignored, a duplicate `open` id is ignored, and
+an `open` beyond the per-device quota is left unanswered (the keeper expires it).
+None of these closes the control connection.
 
-Dropping/replacing the control connection closes its pending and active streams,
-clears the in-memory daemon token and marks the device host offline. Reconnect
-re-registers metadata. Signing out revokes both data and control sockets.
+Dropping/replacing the control connection closes its pending and active streams
+and clears the in-memory daemon token. The service keeper then removes the
+device host (`host_removed`); the loopback fixture marks it offline. Clients
+handle both. Reconnect re-registers metadata. Signing out revokes both data and
+control sockets.
+
+The events connection is kept alive for as long as its consumer exists. A
+consumer that stays full for 10 seconds is not abandoned: the client drops that
+connection and reconnects, and the reconnect snapshot replaces what was missed.
 
 ## Fixture and conformance
 

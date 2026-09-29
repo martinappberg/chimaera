@@ -275,7 +275,7 @@ fn open_shell_window(
         .port()
         .expect("daemon URLs always carry an explicit loopback port");
     let label = format!("win-{}", WINDOW_SEQ.fetch_add(1, Ordering::Relaxed));
-    authorize_daemon_origin(app, &label, port)?;
+    authorize_daemon_origin(app, &label, port, window_scope.alias.is_none())?;
     let navigation_app = app.clone();
     let navigation_label = label.clone();
     let page_load_app = app.clone();

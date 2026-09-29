@@ -290,7 +290,7 @@ pub(super) async fn do_connect(
         let reused = if update_daemon {
             None
         } else {
-            let via_pro = state.pro.client().await.is_some()
+            let via_pro = state.pro.client_now().is_some()
                 && lock(&state.pro.hosts)
                     .values()
                     .any(|host| host.alias == alias);
@@ -363,7 +363,17 @@ async fn run_flight(
     // `connect` re-emits when it starts).
     emit_progress(app, alias, "probing");
     if let Some((client, host, generation)) = super::pro::connection(&state, alias).await? {
-        return run_link_flight(app, client, host, generation, update_daemon).await;
+        let ssh = host.kind == chimaera_link::HostKind::Ssh;
+        match run_link_flight(app, client, host, generation, update_daemon).await {
+            Ok(reply) => return Ok(reply),
+            // A kept SSH host is still an ordinary SSH host: when the account
+            // or keeper route fails in transit, connect directly (the row then
+            // reads as a direct connection) instead of stranding the user.
+            Err(LinkFailure::Transport(error)) if ssh => {
+                tracing::info!("Pro route to {alias} unavailable ({error}); connecting directly");
+            }
+            Err(LinkFailure::Transport(error) | LinkFailure::Final(error)) => return Err(error),
+        }
     }
     // Remove under the map lock, then do process/network teardown without it.
     // `Tunnel::close` is bounded but still asynchronous; holding this lock made
@@ -457,42 +467,63 @@ async fn run_flight(
     Ok(host_state)
 }
 
+/// Why a keeper-routed connect failed. Only `Transport` (the account or
+/// keeper could not be reached, or its route did not answer) may fall back to
+/// direct SSH; a keeper-side login failure must not trigger a second prompt.
+enum LinkFailure {
+    Transport(String),
+    Final(String),
+}
+impl From<String> for LinkFailure {
+    fn from(error: String) -> Self {
+        Self::Final(error)
+    }
+}
+impl From<&str> for LinkFailure {
+    fn from(error: &str) -> Self {
+        Self::Final(error.into())
+    }
+}
+
 async fn run_link_flight(
     app: &AppHandle,
     client: chimaera_link::Client,
     mut host: chimaera_link::Host,
     generation: u64,
     reconnect: bool,
-) -> Result<HostState, String> {
+) -> Result<HostState, LinkFailure> {
     let state = app.state::<Shell>();
     let alias = host.alias.clone();
+    let transport = |_| LinkFailure::Transport("Chimaera Pro is unreachable".into());
     if state.pro.generation() != generation {
         return Err("Account changed while connecting".into());
     }
     if reconnect || host.status != chimaera_link::HostStatus::Connected {
-        client
-            .reconnect_host(&host.id)
-            .await
-            .map_err(|error| error.to_string())?;
+        client.reconnect_host(&host.id).await.map_err(transport)?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
+        // The keeper may wait minutes for a password or Duo answer; poll its
+        // row with backoff instead of twice a second for the whole wait.
+        let mut pause = std::time::Duration::from_millis(500);
         loop {
             if state.pro.generation() != generation {
                 return Err("Account changed while connecting".into());
             }
-            let hosts = client.hosts().await.map_err(|error| error.to_string())?;
+            let hosts = client.hosts().await.map_err(transport)?;
             host = hosts
                 .into_iter()
                 .find(|candidate| candidate.id == host.id)
-                .ok_or("Host is no longer kept connected")?;
+                .ok_or_else(|| LinkFailure::Transport("Host is no longer kept connected".into()))?;
             if host.status == chimaera_link::HostStatus::Connected && host.daemon.is_some() {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(host
                     .error
-                    .unwrap_or_else(|| "Pro connection timed out".into()));
+                    .unwrap_or_else(|| "Pro connection timed out".into())
+                    .into());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(std::time::Duration::from_secs(3));
         }
     }
     let existing = {
@@ -508,7 +539,7 @@ async fn run_link_flight(
     let new = if existing.is_none() {
         let link = chimaera_link::LinkTunnel::bind(client, host.id.clone())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(transport)?;
         Some(Tunnel::link(&host, link).map_err(|error| error.to_string())?)
     } else {
         None
@@ -520,7 +551,9 @@ async fn run_link_flight(
         })
         .ok_or("Host is unavailable")?;
     if !chimaera_remote::http_alive_authed(port, &token).await {
-        return Err("Pro connected, but the host daemon did not answer".into());
+        return Err(LinkFailure::Transport(
+            "Pro connected, but the host daemon did not answer".into(),
+        ));
     }
     authorize_scope_origin(app, Some(&alias), port).map_err(|error| error.to_string())?;
     let old = {

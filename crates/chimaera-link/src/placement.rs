@@ -9,6 +9,9 @@ pub enum PlacementAvailability {
     Unowned,
     Expired,
     PrivacyDisabled,
+    /// A newer availability; never routable by this client.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -33,6 +36,24 @@ pub(crate) fn valid_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
 }
 impl WorkspacePlacement {
+    /// The account's answer for a project it has no ownership record for
+    /// (404 `workspace_not_found`): nobody executes it, epoch 0.
+    pub(crate) fn unowned(workspace: &str) -> Self {
+        Self {
+            workspace_id: workspace.into(),
+            holder_id: None,
+            route_host_id: None,
+            epoch: 0,
+            policy_revision: 0,
+            availability: PlacementAvailability::Unowned,
+            preferred_installation_id: None,
+            checkpoint_id: None,
+            server_now: time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            expires_at: None,
+        }
+    }
     pub fn validate(&self, workspace: &str) -> Result<()> {
         ensure!(
             valid_id(workspace) && self.workspace_id == workspace,
@@ -63,15 +84,16 @@ impl WorkspacePlacement {
                 .holder_id
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("workspace owner missing"))?;
-            let route = self
-                .route_host_id
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("workspace route missing"))?;
-            ensure!(
-                route.strip_prefix("worker-") == Some(holder)
-                    || route.strip_prefix("device-") == Some(holder),
-                "workspace route does not match owner"
-            );
+            // A live lease whose holder has no route (a revoked device, a
+            // removed cloud machine) is a real state: owned but unreachable
+            // until the lease lapses. Callers treat it as not routable now.
+            if let Some(route) = self.route_host_id.as_deref() {
+                ensure!(
+                    route.strip_prefix("worker-") == Some(holder)
+                        || route.strip_prefix("device-") == Some(holder),
+                    "workspace route does not match owner"
+                );
+            }
             let expiry = self
                 .expires_at
                 .as_deref()
@@ -171,6 +193,10 @@ mod tests {
         assert!(value.validate("w-project").is_err());
         value.route_host_id = Some("worker-d-home".into());
         value.validate("w-project").unwrap();
+        // Owned by a holder the account can no longer route to.
+        value.route_host_id = None;
+        value.validate("w-project").unwrap();
+        value.route_host_id = Some("worker-d-home".into());
         value.availability = PlacementAvailability::Expired;
         assert!(value.validate("w-project").is_err());
         value.route_host_id = None;
@@ -191,18 +217,60 @@ mod tests {
     }
 }
 
+/// A capability as the service advertises it. Decoded leniently (a service
+/// may add fields), then compared exactly against what this client
+/// implements; the daemon acknowledgment itself stays exact.
+#[derive(Clone, Debug, Deserialize)]
+pub struct AdvertisedCapability {
+    pub version: u16,
+    pub boundary: String,
+    pub expired_takeover: bool,
+}
+impl AdvertisedCapability {
+    fn exact(&self) -> Option<crate::ExecutionCapability> {
+        let capability = crate::ExecutionCapability {
+            version: self.version,
+            boundary: self.boundary.clone(),
+            expired_takeover: self.expired_takeover,
+        };
+        capability.supported().then_some(capability)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ExecutionCapabilities {
     pub execution_authority: u16,
-    pub execution_capability: crate::ExecutionCapability,
+    pub execution_capability: AdvertisedCapability,
+    /// Every capability the service accepts; older services omit it.
+    #[serde(default)]
+    pub supported_execution_capabilities: Vec<AdvertisedCapability>,
     pub installation_binding: u16,
     pub workspace_placement: u16,
     pub checkpoint_receipts: u16,
 }
 impl ExecutionCapabilities {
+    /// The service's default when this client implements it; otherwise this
+    /// client's preferred capability among those the service also accepts
+    /// (automatic recovery first). `None`: nothing in common.
+    pub fn selected(&self) -> Option<crate::ExecutionCapability> {
+        self.execution_capability.exact().or_else(|| {
+            let offered: Vec<_> = self
+                .supported_execution_capabilities
+                .iter()
+                .take(16)
+                .filter_map(AdvertisedCapability::exact)
+                .collect();
+            [
+                crate::ExecutionCapability::checkpoint_fork(),
+                crate::ExecutionCapability::managed(),
+            ]
+            .into_iter()
+            .find(|preferred| offered.contains(preferred))
+        })
+    }
     pub fn supported(&self) -> bool {
         self.execution_authority == 2
-            && self.execution_capability.supported()
+            && self.selected().is_some()
             && self.installation_binding == 1
             && self.workspace_placement == 2
             && self.checkpoint_receipts == 1

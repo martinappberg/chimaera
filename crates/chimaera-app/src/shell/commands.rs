@@ -305,6 +305,9 @@ pub(super) async fn update_local_daemon(
         .map_err(|e| format!("could not authorize the updated daemon origin: {e}"))?;
     *lock(&state.local) = fresh;
     super::pro::refresh_serve(&state).await;
+    // The replacement daemon starts without Pro setup; restore it now so
+    // project copying and viewing do not pause until the next reconciliation.
+    super::pro::reconfigure(&app);
     let _ = app.emit("local-daemon-updated", moved);
     Ok(())
 }

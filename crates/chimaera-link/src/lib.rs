@@ -2,8 +2,10 @@
 mod bridge;
 mod client;
 mod continuity;
+mod error;
 mod handoff;
 pub use continuity::*;
+pub use error::*;
 mod oauth;
 mod placement;
 pub use handoff::*;

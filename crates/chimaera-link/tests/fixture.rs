@@ -98,7 +98,12 @@ async fn oauth_enforces_pkce_single_use_and_refresh_rotation() {
         .send()
         .await
         .unwrap();
-    assert_eq!(replay.status().as_u16(), 401);
+    // Exactly what the account service answers for a replayed token.
+    assert_eq!(replay.status().as_u16(), 400);
+    assert_eq!(
+        replay.json::<ApiError>().await.unwrap().error,
+        "invalid_grant"
+    );
 }
 #[tokio::test]
 async fn wrong_pkce_cannot_exchange_code() {
@@ -246,6 +251,9 @@ async fn unassigned_keeper_does_not_block_account_and_devices() {
             storage_bytes: 0,
         },
         hours_exhausted: false,
+        payment_due: None,
+        subscription_status: None,
+        plans: None,
     };
     let router = Router::new()
         .route(
@@ -342,9 +350,10 @@ async fn baton_cas_offline_fork_and_mirror_fencing() {
         )
         .await
         .unwrap_err();
+    // The service answers an occupied v1 baton with `stale_epoch`.
     assert_eq!(
         conflict.downcast_ref::<BatonConflict>().unwrap().error,
-        "held"
+        "stale_epoch"
     );
     assert!(
         second.renew_baton(id, &held).await.is_err(),
@@ -399,9 +408,10 @@ async fn baton_cas_offline_fork_and_mirror_fencing() {
         )
         .await
         .unwrap_err();
+    // An expired lease cannot be renewed; the service says `stale_epoch`.
     assert_eq!(
         expired.downcast_ref::<BatonConflict>().unwrap().error,
-        "expired"
+        "stale_epoch"
     );
     assert_eq!(
         first.baton(id).await.unwrap().holder_id.as_deref(),
@@ -460,8 +470,12 @@ async fn revoked_refresh_clears_client_and_publishes_signout() {
     let client = fixture.client();
     let mut watch = client.token_updates();
     fixture.client().sign_out_everywhere().await.unwrap();
-    assert!(client.me().await.is_err());
-    watch.changed().await.unwrap();
+    let error = client.me().await.unwrap_err();
+    assert!(error.is::<AuthorizationRevoked>(), "{error:#}");
+    tokio::time::timeout(Duration::from_secs(5), watch.changed())
+        .await
+        .expect("revocation must publish sign-out")
+        .unwrap();
     assert!(watch.borrow().is_none());
     assert!(client.tokens().await.is_none());
 }

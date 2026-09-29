@@ -5,6 +5,7 @@ use anyhow::{ensure, Context, Result};
 use chimaera_link::{
     Account, Client, ExecutionRecoveryAck, ExecutionRecoveryRequest, InstallationIdentity,
 };
+use std::collections::HashSet;
 
 fn load_or_create(endpoint: &str, account: &str) -> Result<InstallationIdentity> {
     let _serialized = lock(&KEYCHAIN_IO);
@@ -91,38 +92,53 @@ pub(super) async fn bind(
         .as_array()
         .context("project recovery status unavailable")?;
     ensure!(workspaces.len() <= 128, "project recovery limit");
+    let workers: HashSet<String> = lock(&state.pro.hosts)
+        .values()
+        .filter(|host| host.kind == chimaera_link::HostKind::Worker)
+        .filter_map(|host| host.id.strip_prefix("worker-").map(str::to_owned))
+        .collect();
     for workspace in workspaces {
         let Some(id) = workspace["workspace_id"].as_str() else {
             continue;
         };
-        let placement = client.workspace_placement(id).await?;
-        let Some(holder) = placement.holder_id.as_deref() else {
-            continue;
-        };
-        if holder == account.device_id
-            || placement.preferred_installation_id.as_deref() != Some(&identity.installation_id)
-        {
-            continue;
-        }
-        // The account additionally proves this holder belongs to this exact
-        // installation. The local daemon verifies its old account/config too.
-        let grant = client
-            .installation_recovery(&identity, id, holder, placement.epoch)
+        let recovered = async {
+            let placement = client.workspace_placement(id).await?;
+            let Some(holder) = recoverable_holder(
+                &placement,
+                &account.device_id,
+                &identity.installation_id,
+                &workers,
+            ) else {
+                return Ok(());
+            };
+            // The account additionally proves this holder belongs to this exact
+            // installation. The local daemon verifies its old account/config too.
+            let grant = client
+                .installation_recovery(&identity, id, holder, placement.epoch)
+                .await?;
+            let request = ExecutionRecoveryRequest {
+                endpoint: endpoint.to_owned(),
+                account_id: account.account_id.clone(),
+                installation_id: identity.installation_id.clone(),
+                recovery: grant,
+            };
+            let ack = daemon_request(
+                state,
+                "POST",
+                "/pro/execution/recover",
+                Some(serde_json::to_value(&request)?),
+            )
             .await?;
-        let request = ExecutionRecoveryRequest {
-            endpoint: endpoint.to_owned(),
-            account_id: account.account_id.clone(),
-            installation_id: identity.installation_id.clone(),
-            recovery: grant,
-        };
-        let ack = daemon_request(
-            state,
-            "POST",
-            "/pro/execution/recover",
-            Some(serde_json::to_value(&request)?),
-        )
-        .await?;
-        ExecutionRecoveryAck::decode(200, &serde_json::to_vec(&ack)?, &request.recovery)?;
+            ExecutionRecoveryAck::decode(200, &serde_json::to_vec(&ack)?, &request.recovery)
+                .map(|_| ())
+        }
+        .await;
+        // One project that cannot be recovered must not keep every other
+        // project from continuing; the bind below decides whether any
+        // release is still missing.
+        if let Err(error) = recovered {
+            tracing::warn!("project {id} could not be released for sign-in: {error:#}");
+        }
     }
     let binding = client
         .bind_installation_named(&identity, Some(&display_name))
@@ -134,9 +150,63 @@ pub(super) async fn bind(
     Ok(identity)
 }
 
+/// Only this installation's previous *device* sign-in can be recovered with
+/// its proof. A cloud machine holding a project homed here hands it back
+/// through its own release; asking the account to recover it only fails.
+fn recoverable_holder<'a>(
+    placement: &'a chimaera_link::WorkspacePlacement,
+    this_device: &str,
+    installation: &str,
+    workers: &HashSet<String>,
+) -> Option<&'a str> {
+    let holder = placement.holder_id.as_deref()?;
+    let worker = workers.contains(holder)
+        || placement
+            .route_host_id
+            .as_deref()
+            .is_some_and(|route| route.starts_with("worker-"));
+    (holder != this_device
+        && !worker
+        && placement.preferred_installation_id.as_deref() == Some(installation))
+    .then_some(holder)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn placement(
+        holder: &str,
+        route: Option<&str>,
+        home: &str,
+    ) -> chimaera_link::WorkspacePlacement {
+        serde_json::from_value(serde_json::json!({"workspace_id":"w-a","holder_id":holder,"route_host_id":route,"epoch":4,"policy_revision":1,"availability":"owned","preferred_installation_id":home,"checkpoint_id":null,"server_now":"2026-09-28T19:00:00Z","expires_at":"2026-09-28T19:01:30Z"})).unwrap()
+    }
+    #[test]
+    fn only_this_installations_old_device_is_recovered() {
+        let workers = HashSet::from(["m-cloud".to_owned()]);
+        let old = placement("d-old", Some("device-d-old"), "i-home");
+        assert_eq!(
+            recoverable_holder(&old, "d-new", "i-home", &workers),
+            Some("d-old")
+        );
+        // A revoked old device has no route but is still recoverable.
+        let revoked = placement("d-old", None, "i-home");
+        assert_eq!(
+            recoverable_holder(&revoked, "d-new", "i-home", &workers),
+            Some("d-old")
+        );
+        for skipped in [
+            placement("m-cloud", None, "i-home"),
+            placement("m-other", Some("worker-m-other"), "i-home"),
+            placement("d-new", Some("device-d-new"), "i-home"),
+            placement("d-old", Some("device-d-old"), "i-elsewhere"),
+        ] {
+            assert_eq!(
+                recoverable_holder(&skipped, "d-new", "i-home", &workers),
+                None
+            );
+        }
+    }
     #[test]
     fn existing_installation_is_reused_without_rewriting_its_proof() {
         let existing = InstallationIdentity::generate();

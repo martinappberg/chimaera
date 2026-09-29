@@ -26,7 +26,8 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    The app waits up to 15 minutes for sign-in and verification. While waiting,
    **Start again** opens a fresh sign-in and **Cancel sign-in** closes the request.
    An expired or failed request offers **Try again**. The browser confirms success
-   only after the account is active in the app; keeper provisioning can finish later.
+   as soon as the account is active in the app; keeper provisioning and setting up
+   project copying on this computer continue in the background.
    Successful sign-in returns to Pro in the initiating app window, restoring it
    if minimized. A newly opened window consumes its pending return after loading.
    On restart, saved account access shows its current phase immediately. If the
@@ -35,7 +36,12 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    A temporary account check failure retains the saved session, including refresh
    token rotation, and retries after 2, 5 and 15 seconds. **Check again** retries
    after those attempts or a failed credential-store read. A fresh authenticated
-   account check is still required; a revoked session requires a new sign-in.
+   account check is still required. When the account ends the sign-in (revoked,
+   expired, or replaced by **Sign out everywhere**), Pro shows “Your sign-in has
+   expired. Sign in again to continue.” and stops all background retries.
+   SSH hosts never hang on any of this: a saved SSH host connects directly while
+   Pro starts (a host kept connected through Pro waits at most 10 seconds for it)
+   and whenever Pro is unreachable.
 3. Signed-out and confirmed no-plan accounts see an illustrated introduction:
    start a session on your computer, continue a supported agent in the cloud,
    then access the same sessions, files and conversation on another device.
@@ -82,9 +88,12 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    host-scoped prompt, with “Asked by your Pro connection” underneath its title.
 4. Open that host from Home. Its **via Pro** label identifies the connection;
    workspaces still open through a local loopback port with the existing daemon UI.
-5. **Sign out** removes this app's credentials and closes its link connections.
-   **Sign out everywhere** also revokes other devices and closes SSH logins held
-   by the keeper.
+5. **Sign out** removes this app's credentials, removes the local daemon's Pro
+   setup and closes its link connections. If the daemon does not confirm, or the
+   saved sign-in cannot be deleted from the credential store, the app revokes this
+   computer's sign-in on the account instead, so nothing keeps copying projects
+   or signs back in on the next launch. **Sign out everywhere** also revokes other
+   devices and closes SSH logins held by the keeper.
 
 A developer can configure `pro.endpoint` in the native app's `app.json` as
 `{"pro":{"endpoint":"http://127.0.0.1:PORT"}}`. The file is under
@@ -200,31 +209,50 @@ A shared provider catalog bounds external authentication origins in both clients
 | App connections and prompt routing | `crates/chimaera-app/src/shell/connect.rs`, `askpass.rs` |
 | Device transport and wire types | `crates/chimaera-link/src/`, [protocol](../../crates/chimaera-link/PROTOCOL.md) |
 
-Native IPC commands: `pro_status`, `pro_refresh_account`, `pro_billing_checkout`,
-`pro_billing_portal`, `pro_cloud_status`, `pro_cloud_projects`,
-`pro_open_cloud_project`, `pro_sign_in`, `pro_sign_out`,
-`pro_sign_out_everywhere`, `pro_hosts`, `pro_set_host_kept`, `pro_devices`.
-The app broadcasts `pro-changed` when account/host state changes. The panel
-refreshes while visible and catches up when shown again; it does not poll while
-parked. The mirror panel also uses `pro_mirror_status`, `pro_mirror_preference` and
-`pro_set_never_mirror`, backed by authenticated `/api/v1/pro/` daemon routes.
+Native IPC commands (the `LOCAL_ACCOUNT_COMMANDS` list in
+`crates/chimaera-app/src/command_manifest.rs`): `pro_status`,
+`pro_refresh_account`, `pro_sign_in`, `pro_cancel_sign_in`, `pro_sign_out`,
+`pro_sign_out_everywhere`, `pro_take_return`, `pro_billing_checkout`,
+`pro_billing_portal`, `pro_cancel_billing`, `pro_cloud_status`,
+`pro_cloud_request`, `pro_cloud_projects`, `pro_open_cloud_project`,
+`pro_mirror_status`, `pro_set_never_mirror`, `pro_hosts`, `pro_set_host_kept`,
+`pro_devices` and `pro_revoke_device`. They are granted only to windows showing
+this computer's own daemon; a remote host's, another computer's or the cloud's UI
+cannot call them. The app broadcasts `pro-changed` when account/host state
+changes. The panel refreshes while visible and catches up when shown again; it
+does not poll while parked. Project privacy and copy status use authenticated
+`/api/v1/pro/` daemon routes.
+
+`pro_status` carries, additively: `error` (a failure needing the user, or a fixed
+code), `connection_warning` (informational fixed code: `connection_preparing`,
+`connection_retrying`, `account_unreachable`; work continues and Chimaera
+retries), `payment_due` (the account reports a payment problem) and `plans` (the
+account's offers with amounts, when the service supplies them; prices are never
+hardcoded). `error` is `service_unsupported` when the Pro service does not
+support this app version; project continuity then stays off (rechecked every ten
+minutes) while local work, SSH and the account itself are unaffected.
 
 ## Project mirrors and automatic handoff
 
 The signed-in app gives its local daemon a separate, limited account credential.
 That credential stays in memory; the daemon can keep publishing mirrors after
-all app windows close. Signing out stops publishing on that daemon.
+all app windows close. Only signing out removes it (see step 5 above). A lapsed
+payment or a keeper still being assigned pauses new setup but leaves the daemon's
+setup and local work alone; the account refuses cloud copies without a plan. A
+daemon that restarts or loses its setup is set up again with a fresh credential,
+immediately after an in-app daemon update and otherwise within 30 seconds.
+Quitting the app keeps the daemon copying, but other devices cannot open this
+computer's projects while the app is closed: offering the daemon to them belongs
+to the running app.
 
 Pro → **Projects and privacy** shows privacy, the last recorded copy, and actual
 problems such as an incomplete copy or a required provider connection. Healthy
-file counts, storage quotas, generic environment diagnostics, setup commands and
-idle-session pins are not account controls; Chimaera and its agents manage those
-details. Internal setup/profile and session-pin APIs remain available for their
-scoped workflows.
+file counts, storage quotas, generic environment diagnostics and setup commands
+are not account controls; Chimaera and its agents manage those details. There
+is no per-session placement pin: the native shell no longer exposes one.
 **Keep this project on this device** stops local publication and disables account-side
 mirror access. Existing stored data is not silently deleted. Cloud setup commands
-and learned laptop-only commands appear in each project's details. A session's
-**Keep running when idle** pin persists across transfer and daemon restart.
+and learned laptop-only commands appear in each project's details.
 
 Repository history and working files are separate Git mirrors. Snapshot commits
 use an independent index under the daemon's data directory; they never make WIP
@@ -242,7 +270,7 @@ Agents receive a current-host brief through MCP initialization; structured conve
 
 `read_cloud_profile` and `update_cloud_profile` operate only on the authenticated session's registered project. Updates require the current revision, reject unknown fields and credential-shaped content, and are capped at 32 KiB. They keep ordinary agent permissions: saving `setup_command` schedules future cloud setup, while deferred laptop steps remain guidance. Saving a profile never runs a command or wakes a machine. Implementation: [`mcp/cloud_context.rs`](../../crates/chimaera-server/src/mcp/cloud_context.rs).
 
-On macOS, the app's system sleep hook gives publication up to 25 seconds before acknowledging sleep; the daemon's flush fits the deadline it is given. It preempts the periodic mirror pass, stops agents and publishes every project in parallel (projects with running agents first), and never leaves a half transfer: a flush that outlives the deadline finishes or recovers on its own. The publication fence is not waited out past the deadline; an unreleased lease lapses and the cloud continues from the acknowledged checkpoint. Waking before a flush finishes keeps the project on the computer. A failed flush leaves the lease takeover path available.
+The app's system sleep hook tells the daemon how long it has before the computer sleeps (`POST /api/v1/pro/sleep {deadline_ms}`): 23 seconds of macOS's 25-second wait, logind's configured delay minus a margin on Linux, and under a second on Windows. The daemon's flush fits the deadline it is given. It preempts the periodic mirror pass, stops agents and publishes every project in parallel (projects with running agents first), and never leaves a half transfer: a flush that outlives the deadline finishes or recovers on its own. The publication fence is not waited out past the deadline; an unreleased lease lapses and the cloud continues from the acknowledged checkpoint. Waking before a flush finishes keeps the project on the computer. A failed flush leaves the lease takeover path available.
 
 Moving live cloud work home waits until the laptop has been awake on AC power for five minutes (in both protocol versions) and happens at an agent pause; busy or unobservable agent states stay on the cloud. Work the cloud is no longer running returns at once: a project the cloud released, or one whose cloud lease lapsed (the computer takes it from the last acknowledged checkpoint). A return that did not finish is retried with backoff (two minutes, doubling to thirty) rather than every pass. A return attempt follows ownership changes caused by waking an idle worker immediately, and imports its saved conversation before local work can resume. A lost response is checked against current ownership without repeating the same release request; a refusal is final for that pass. Plain shells become paused placeholders in the cloud; arbitrary foreground programs are not automatically relaunched.
 
@@ -254,8 +282,10 @@ remote configuration and `FETCH_HEAD` stay intact. Files merge three ways agains
 a visible **Cloud setup** terminal. Deferred steps remain guidance for the returning agent, which assesses and runs them under its normal permissions; they are never automatically replayed by the daemon.
 
 Projects first created in the cloud appear on Home without being downloaded.
-Opening one on a computer without a local copy asks for an empty destination
-folder through the native picker. Cancellation leaves the cloud copy untouched.
+Opening one on a computer without a local copy asks where to save it through the
+native picker. An empty folder becomes the project folder; choosing a folder
+that already has files (such as `~/Projects`) makes a new folder named after
+the project inside it. Cancellation leaves the cloud copy untouched.
 The confirmed destination is remembered for that project on that computer;
 existing local projects retain their original folders. A missing destination or
 an unrelated nonempty folder fails safely instead of overwriting data. Native
@@ -292,26 +322,47 @@ Passive roster polls, reconnects and watchers carry no cloud wake intent.
   stored pair. A temporary credential-store failure keeps a verified session
   signed in while the app retries saving. After bounded retries, an account notice
   explains how to check the credential store and retry; an unsaved session may
-  require sign-in again after restarting. Actual authentication revocation still
-  signs out. Daemon bearer tokens remain in memory and do not enter `hosts.json`.
+  require sign-in again after restarting. The account answers a revoked, expired
+  or replayed refresh token with `400 invalid_grant`; the app treats that, and
+  any other refresh refusal except a timeout or rate limit, as the end of the
+  sign-in and never presents that token again. A network failure retries the
+  refresh once with the same token and keeps the session. Daemon bearer tokens
+  remain in memory and do not enter `hosts.json`.
+- SSH never hangs on Pro: a saved SSH host connects directly while Pro starts
+  (a kept host waits at most 10 seconds first, so the usual Pro route needs no
+  new login), and a kept host whose Pro route is unreachable falls back to a
+  direct connection (its row then reads as direct). Computers reached only
+  through Pro wait for it.
+- Viewing a project owned elsewhere survives a failed check (account or keeper
+  unreachable, owner asleep or reconnecting) for up to 150 seconds on the last
+  verified route; only a definitive answer (unowned, owned here, private, a newer
+  owner) switches back to the local copy.
 - SSH aliases resolve on the device. Only hostname, username and port are passed
   to the keeper; local private keys and arbitrary SSH configuration are not copied.
 - HTTPS/WSS is required except for literal `127.0.0.1` fixtures. `/v1/me` negotiates
   the supported protocol and keeper origin. A newly signed-in account may still
   be awaiting an assigned keeper; account and device information remains available.
-- Data bridges have bounded queues, 64 KiB frames and at most 128 streams.
-  Closing one stream does not change the tunnel listener's port.
+- Data bridges have bounded queues, 64 KiB frames and at most 128 streams per
+  computer, forward and reverse together. Closing one stream, or a failed
+  accept, does not change the tunnel listener's port. The app raises its
+  open-file limit at startup.
+- Service responses may gain fields and values; the app ignores what it does not
+  know instead of failing (see the protocol's additive rule).
 - Prompt answers remain scoped to the relevant host. Cancellation and expiry
   dismiss prompts in other eligible windows too.
 - The local daemon is reverse-served only while the signed-in app owns that link.
-  Signing out or quitting closes the offer. Device-host rows have no “Keep
-  connected” toggle because their owning device controls availability.
+  Signing out or quitting closes the offer, so a phone or another computer cannot
+  reach this computer's projects while the app is closed. Device-host rows have no
+  “Keep connected” toggle because their owning device controls availability.
+- Pro account commands run only from this computer's own windows.
 
-System sleep hooks give the daemon a bounded chance to flush: macOS uses IOKit,
-Linux uses a logind delay inhibitor, and Windows uses the suspend callback's short
-best-effort window. Wake restores heartbeats. Automatic hand-back waits for AC
-power. Platform compilation and actual physical sleep are separate verification
-gates; Linux and Windows physical sleep still need their own hosts.
+System sleep hooks give the daemon a bounded chance to flush and pass it the
+real budget as `deadline_ms`: macOS uses IOKit (25 s), Linux a logind delay
+inhibitor (logind's `InhibitDelayMaxUSec`, 5 s by default) and Windows the
+suspend callback's short best-effort window (1.2 s). Wake restores heartbeats.
+The app reports AC power to the daemon, which applies the hand-back gate.
+Platform compilation and actual physical sleep are separate verification gates;
+Linux and Windows physical sleep still need their own hosts.
 
 ---
 

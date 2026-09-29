@@ -73,18 +73,39 @@ async fn worker(
     wake: bool,
 ) -> Result<Option<Host>, String> {
     if wake {
-        client.wake_worker().await.map_err(|e| e.to_string())?;
+        client
+            .wake_worker()
+            .await
+            .map_err(|_| "The cloud is unavailable right now. Try again shortly.")?;
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(if wake { 90 } else { 5 });
+    let mut pause = Duration::from_millis(500);
+    let mut reconciled: Option<tokio::time::Instant> = None;
     loop {
         let state = app.state::<Shell>();
         if state.pro.generation() != generation {
             return Err("Account changed during cloud setup".into());
         }
-        if wake {
+        // Only an account without a keeper yet needs the account read: it
+        // starts the keeper's event stream once one is assigned. At most
+        // every 10 s, never a full reconciliation per poll.
+        if wake
+            && !state.pro.has_keeper()
+            && reconciled.is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
+        {
             let _ = pro::reconcile_account(app, client, generation).await;
+            reconciled = Some(tokio::time::Instant::now());
         }
-        let hosts = client.hosts().await;
+        // Keeper events keep these rows current; the REST read covers a
+        // keeper that is still being assigned or an event stream that is down.
+        let cached = super::lock(&state.pro.hosts)
+            .values()
+            .find(|host| host.kind == HostKind::Worker && host.daemon.is_some())
+            .cloned();
+        let hosts = match cached {
+            Some(host) => Ok(vec![host]),
+            None => client.hosts().await,
+        };
         if let Some(host) = hosts
             .as_ref()
             .ok()
@@ -106,13 +127,14 @@ async fn worker(
             }
         }
         if !wake {
-            hosts.map_err(|e| e.to_string())?;
+            hosts.map_err(|_| "Cloud status is unavailable right now.")?;
             return Ok(None);
         }
         if tokio::time::Instant::now() >= deadline {
             return Err("Cloud machine is still starting. Try again shortly.".into());
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(Duration::from_secs(5));
     }
 }
 
@@ -263,7 +285,7 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
     };
     let tunnel = LinkTunnel::bind(client, host.id.clone())
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| SETUP_FAILED)?;
     let url = format!("http://127.0.0.1:{}/api/v1/pro/{route}", tunnel.local_port);
     let token = host
         .daemon
@@ -289,7 +311,7 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
                 .header("Authorization", &format!("Bearer {token}"))
                 .call()
         }
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| SETUP_FAILED)?;
         let status = response.status();
         let mut bytes = Vec::new();
         response
@@ -297,7 +319,7 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
             .as_reader()
             .take(64 * 1024 + 1)
             .read_to_end(&mut bytes)
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| SETUP_FAILED)?;
         if bytes.len() > 64 * 1024 {
             return Err("Cloud setup response exceeds limit".into());
         }
@@ -311,14 +333,14 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
                 // This fixed code is mapped to copy by the typed UI. Never
                 // forward arbitrary provider errors or CLI output.
                 Some("provider_busy") => "provider_busy",
-                _ => "Couldn't complete cloud setup. Try again shortly.",
+                _ => SETUP_FAILED,
             }
             .into());
         }
         Ok(value)
     })
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|_| SETUP_FAILED)?;
     drop(tunnel);
     if state.pro.generation() != generation {
         return Err("Account changed during cloud setup".into());
@@ -369,6 +391,8 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
     value["host_alias"] = Value::String(host.alias);
     Ok(value)
 }
+
+const SETUP_FAILED: &str = "Couldn't complete cloud setup. Try again shortly.";
 
 fn response_value(status: u16, bytes: &[u8]) -> Result<Value, String> {
     if status == 204 && bytes.is_empty() {

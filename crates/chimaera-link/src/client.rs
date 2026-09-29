@@ -38,6 +38,9 @@ struct Inner {
     tls: Arc<rustls::ClientConfig>,
     tokens: Arc<Mutex<Option<Tokens>>>,
     token_updates: watch::Sender<Option<Tokens>>,
+    /// One device's concurrent streams (forward tunnels and reverse serve
+    /// together), matching the keeper's per-device quota.
+    streams: Arc<Semaphore>,
 }
 impl Client {
     /// Does not contact the endpoint. No background work starts before the
@@ -66,6 +69,7 @@ impl Client {
                 tls: Arc::new(tls),
                 tokens: Arc::new(Mutex::new(tokens)),
                 token_updates,
+                streams: Arc::new(Semaphore::new(MAX_STREAMS)),
             }),
         })
     }
@@ -127,18 +131,38 @@ impl Client {
         let refresh_token = old.refresh_token.clone();
         let client = self.clone();
         tokio::spawn(async move {
-            let response = client
-                .inner
-                .http
-                .post(path(&client.inner.account, &["v1", "oauth", "refresh"]))
-                .json(&RefreshRequest { refresh_token })
-                .send()
-                .await?;
-            if matches!(response.status().as_u16(), 401 | 403) {
+            // One retry with the SAME token covers a request that never
+            // reached the account or a transient account failure. The account
+            // treats a later reuse of an already-rotated token as theft, so a
+            // fresh token is never invented here and a definitive refusal is
+            // never retried.
+            let mut retried = false;
+            let response = loop {
+                let sent = client
+                    .inner
+                    .http
+                    .post(path(&client.inner.account, &["v1", "oauth", "refresh"]))
+                    .timeout(REFRESH_TIMEOUT)
+                    .json(&RefreshRequest {
+                        refresh_token: refresh_token.clone(),
+                    })
+                    .send()
+                    .await;
+                let transient = match &sent {
+                    Ok(response) => refresh_retryable(response.status().as_u16()),
+                    Err(_) => true,
+                };
+                if !transient || retried {
+                    break sent?;
+                }
+                retried = true;
+                tokio::time::sleep(REFRESH_RETRY_DELAY).await;
+            };
+            if refresh_revoked(response.status().as_u16()) {
                 *guard = None;
                 client.inner.token_updates.send_replace(None);
                 *client.inner.keeper.write().await = None;
-                bail!("device authorization revoked");
+                return Err(crate::AuthorizationRevoked.into());
             }
             let tokens: Tokens = json_response(response).await?;
             if tokens.token_type != "Bearer"
@@ -153,6 +177,24 @@ impl Client {
         })
         .await
         .context("credential refresh task stopped")?
+    }
+    /// A keeper can refuse a valid access token for its own reasons (account
+    /// outage, stale revocation cache). Rotating the one-use refresh token then
+    /// is pure risk, so ask the account itself. This read has no side effects.
+    async fn account_rejects(&self, token: &str) -> Result<bool> {
+        let response = self
+            .inner
+            .http
+            .get(path(&self.inner.account, &["v1", "devices"]))
+            .bearer_auth(token)
+            .timeout(REFRESH_TIMEOUT)
+            .send()
+            .await?;
+        match response.status().as_u16() {
+            401 => Ok(true),
+            status if (200..300).contains(&status) => Ok(false),
+            status => bail!("account unavailable ({status})"),
+        }
     }
     async fn request_raw(
         &self,
@@ -237,17 +279,23 @@ impl Client {
         )
         .await
     }
+    /// `ServiceUnsupported` when the service lacks the route or shares no
+    /// capability with this client; never a fallback to legacy execution.
     pub async fn execution_capabilities(&self) -> Result<crate::ExecutionCapabilities> {
-        let value: crate::ExecutionCapabilities = json_response(
-            self.request(
+        let response = self
+            .request_raw(
                 Method::GET,
                 path(&self.inner.account, &["v2", "capabilities"]),
                 None,
             )
-            .await?,
-        )
-        .await?;
-        anyhow::ensure!(value.supported(), "managed execution is unavailable");
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(crate::ServiceUnsupported.into());
+        }
+        let value: crate::ExecutionCapabilities = json_response(response).await?;
+        if !value.supported() {
+            return Err(crate::ServiceUnsupported.into());
+        }
         Ok(value)
     }
     pub async fn installation_recovery(
@@ -284,13 +332,14 @@ impl Client {
         Ok(value)
     }
     /// Read the current owner without acquiring, waking or transferring work.
+    /// A project the account has never recorded is simply unowned.
     pub async fn workspace_placement(&self, workspace: &str) -> Result<crate::WorkspacePlacement> {
         anyhow::ensure!(
             crate::placement::valid_id(workspace),
             "invalid workspace identity"
         );
-        let value: crate::WorkspacePlacement = json_response(
-            self.request(
+        let response = self
+            .request_raw(
                 Method::GET,
                 path(
                     &self.inner.account,
@@ -298,9 +347,15 @@ impl Client {
                 ),
                 None,
             )
-            .await?,
-        )
-        .await?;
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            let error: Option<ApiError> = json_response_body(response).await.ok();
+            if error.is_some_and(|error| error.error == "workspace_not_found") {
+                return Ok(crate::WorkspacePlacement::unowned(workspace));
+            }
+            return Err(crate::ServiceUnsupported.into());
+        }
+        let value: crate::WorkspacePlacement = json_response(response).await?;
         value.validate(workspace)?;
         Ok(value)
     }
@@ -440,7 +495,7 @@ impl Client {
         interval: BillingInterval,
         callback: Option<&DesktopBillingCallback>,
     ) -> Result<BillingSession> {
-        if plan == Plan::None {
+        if !matches!(plan, Plan::Pro | Plan::Max) {
             bail!("choose Pro or Max");
         }
         let mut body =
@@ -570,7 +625,7 @@ impl Client {
         )
         .await?;
         if account.protocol != PROTOCOL_VERSION {
-            bail!("unsupported link protocol {}", account.protocol);
+            return Err(crate::ServiceUnsupported.into());
         }
         let keeper = if account.keeper_url.is_empty() {
             None
@@ -600,8 +655,9 @@ impl Client {
             .clone()
             .context("Your connection is being prepared; no keeper is assigned yet")
     }
+    /// Rows of a host kind this client does not know are dropped.
     pub async fn hosts(&self) -> Result<Vec<Host>> {
-        json_response(
+        let hosts: Vec<Host> = json_response(
             self.request(
                 Method::GET,
                 path(&self.keeper().await?, &["v1", "hosts"]),
@@ -609,7 +665,11 @@ impl Client {
             )
             .await?,
         )
-        .await
+        .await?;
+        Ok(hosts
+            .into_iter()
+            .filter(|host| host.kind != HostKind::Unknown)
+            .collect())
     }
     pub async fn add_host(&self, alias: &str) -> Result<Host> {
         self.add_host_with_ssh(alias, None).await
@@ -702,6 +762,9 @@ impl Client {
                 Err(tokio_tungstenite::tungstenite::Error::Http(response))
                     if response.status().as_u16() == 401 && attempt == 0 =>
                 {
+                    if !self.account_rejects(&token).await? {
+                        bail!("websocket upgrade rejected (401)");
+                    }
                     self.refresh_if_current(&token).await?
                 }
                 // Handshake error bodies may include echoed credentials: report
@@ -744,8 +807,18 @@ impl Client {
                             },
                             message = rx.next() => match message {
                                 Some(Ok(Message::Text(text))) => {
-                                    if let Ok(event) = serde_json::from_str::<Event>(&text) {
-                                        tokio::time::timeout(Duration::from_secs(10), out.send(Ok(event))).await?.map_err(|_| anyhow!("events consumer closed"))?;
+                                    let event = match serde_json::from_str::<Event>(&text) {
+                                        Ok(Event::Unknown) | Err(_) => continue,
+                                        Ok(Event::Host { host }) if host.kind == HostKind::Unknown => continue,
+                                        Ok(event) => event,
+                                    };
+                                    match tokio::time::timeout(Duration::from_secs(10), out.send(Ok(event))).await {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(_)) => return Ok(()),
+                                        // Never abandon a slow consumer: drop this
+                                        // connection instead; the reconnect snapshot
+                                        // replaces whatever it missed.
+                                        Err(_) => bail!("events consumer slow"),
                                     }
                                 }
                                 Some(Ok(Message::Ping(data))) => { tokio::time::timeout(Duration::from_secs(10), tx.send(Message::Pong(data))).await??; }
@@ -765,17 +838,10 @@ impl Client {
                 if out.is_closed() {
                     break;
                 }
+                // Only a closed consumer ends this task. A full queue skips the
+                // report; the reconnect snapshot tells the consumer the rest.
                 if let Err(error) = result {
-                    if !matches!(
-                        tokio::time::timeout(
-                            Duration::from_secs(10),
-                            out.send(Err(error.to_string()))
-                        )
-                        .await,
-                        Ok(Ok(()))
-                    ) {
-                        break;
-                    }
+                    let _ = out.try_send(Err(error.to_string()));
                 }
                 // Password answers belong to their connection, never to a later
                 // prompt with a reused identifier after a reconnect.
@@ -824,12 +890,21 @@ impl LinkTunnel {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let local_port = listener.local_addr()?.port();
         let task = tokio::spawn(async move {
-            let limits = Arc::new(Semaphore::new(MAX_STREAMS));
+            let limits = client.inner.streams.clone();
             let mut streams = JoinSet::new();
+            let mut failures = 0_u32;
             loop {
                 tokio::select! {
                     result = listener.accept() => {
-                        let Ok((tcp, _)) = result else { break; };
+                        // Descriptor exhaustion (EMFILE) or a connection reset
+                        // before accept must not close the stable port or its
+                        // other streams; back off so it cannot spin.
+                        let Ok((tcp, _)) = result else {
+                            failures = failures.saturating_add(1);
+                            tokio::time::sleep(Duration::from_millis(25 << failures.min(6))).await;
+                            continue;
+                        };
+                        failures = 0;
                         let Ok(permit) = limits.clone().try_acquire_owned() else { drop(tcp); continue; };
                         let client = client.clone(); let host_id = host_id.clone();
                         streams.spawn(async move {
@@ -893,6 +968,7 @@ async fn serve_connection(client: &Client, port: u16, alias: &str, daemon: &Daem
     .await?;
     let mut streams = JoinSet::new();
     let mut active = std::collections::HashMap::new();
+    let limits = client.inner.streams.clone();
     let mut ping = tokio::time::interval_at(
         Instant::now() + Duration::from_secs(20),
         Duration::from_secs(20),
@@ -901,11 +977,17 @@ async fn serve_connection(client: &Client, port: u16, alias: &str, daemon: &Daem
     loop {
         tokio::select! {
             message = socket.next() => match message {
-                Some(Ok(Message::Text(text))) => match serde_json::from_str::<ServeEvent>(&text)? {
+                // Anything this client cannot act on concerns at most one
+                // stream: an unknown or malformed message, a duplicate id or an
+                // open beyond the per-device quota is ignored (the keeper
+                // expires an unanswered open), never the whole connection.
+                Some(Ok(Message::Text(text))) => match serde_json::from_str::<ServeEvent>(&text).unwrap_or(ServeEvent::Unknown) {
                     ServeEvent::Open { stream_id } => {
-                        if active.len() >= MAX_STREAMS || active.contains_key(&stream_id) { bail!("serve stream limit or duplicate id"); }
+                        if active.contains_key(&stream_id) { continue; }
+                        let Ok(permit) = limits.clone().try_acquire_owned() else { continue; };
                         let client = client.clone(); let key = stream_id.clone();
                         let abort = streams.spawn(async move {
+                            let _permit = permit;
                             let result = async {
                                 let socket = client.open_socket(&["v1", "serve", &stream_id], false).await?;
                                 let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))).await??;
@@ -916,7 +998,7 @@ async fn serve_connection(client: &Client, port: u16, alias: &str, daemon: &Daem
                         active.insert(key, abort);
                     }
                     ServeEvent::Close { stream_id } => { if let Some(task) = active.remove(&stream_id) { task.abort(); } }
-                    ServeEvent::Registered { .. } => {}
+                    ServeEvent::Registered { .. } | ServeEvent::Unknown => {}
                 },
                 Some(Ok(Message::Ping(data))) => { tokio::time::timeout(Duration::from_secs(10), socket.send(Message::Pong(data))).await??; }
                 Some(Ok(Message::Pong(_))) => { last_pong = Instant::now(); }
@@ -932,6 +1014,19 @@ async fn serve_connection(client: &Client, port: u16, alias: &str, daemon: &Daem
             }
         }
     }
+}
+/// Bounds how long the token mutex is held: two attempts plus one pause.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
+const REFRESH_RETRY_DELAY: Duration = Duration::from_millis(500);
+/// Timeouts and server failures say nothing about the token itself.
+fn refresh_retryable(status: u16) -> bool {
+    status == 408 || (500..600).contains(&status)
+}
+/// The account answers revoked, expired and replayed refresh tokens with
+/// 400 `invalid_grant`; 401/403 mean the same. Only request timeouts and
+/// rate limiting are transient client errors.
+fn refresh_revoked(status: u16) -> bool {
+    (400..500).contains(&status) && !matches!(status, 408 | 429)
 }
 fn backoff(attempt: u32) -> Duration {
     let ceiling = (500_u64.saturating_mul(1 << attempt.min(5))).min(10_000);
