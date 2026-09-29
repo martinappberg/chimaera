@@ -774,6 +774,10 @@
   // never flashes through the single-pane default.
   let layout = $state<Layout>(defaultLayout());
   let layoutReady = $state(false);
+  /** The user's own focus-mode value while a phone view forces it on; the
+   *  persisted layout carries this instead. Plain (non-reactive) on purpose:
+   *  the save effect already tracks `layout` and clears it itself. */
+  let forcedFocusRestore: boolean | null = null;
   let gotSessions = $state(false);
   let autoOpened = false;
   // Raw: a spot is an immutable value replaced wholesale (dnd + the OS-drop
@@ -1487,13 +1491,17 @@
   // Persist the layout (debounced in viewState) whenever it changes, keyed
   // by (window, workspace) so each workspace keeps its own tree.
   $effect(() => {
+    // A user who reveals the rail has made their own choice; stop masking.
+    if (forcedFocusRestore !== null && !layout.focusMode) forcedFocusRestore = null;
+    const persisted =
+      forcedFocusRestore !== null ? { ...layout, focusMode: forcedFocusRestore } : layout;
     // `surfaces` is the additive, normalized "what this window shows" list
     // (design §8): the daemon reads only that key and treats `layout` as
     // opaque, so the layout blob itself stays exactly as before.
     const blob: Record<string, unknown> = {
       v: 1,
       ws: activeWsId,
-      layout: serializeLayout(layout),
+      layout: serializeLayout(persisted),
       surfaces: surfacesOf(layout, workspace?.root ?? null),
     };
     if (detachedWindow) {
@@ -2468,7 +2476,14 @@
       if (detachedWindow && !layout.focusMode) layout = { ...layout, focusMode: true };
     }
     // A phone opens the work itself; the bottom strip can reveal navigation.
-    if (matchMedia("(max-width: 700px)").matches) layout = { ...layout, focusMode: true };
+    // Only a phone-width browser view is forced, and the forced value is never
+    // saved: a narrow native window keeps its rail, and the shared layout
+    // other windows restore keeps the user's own choice.
+    forcedFocusRestore = null;
+    if (isBrowserGateway() && matchMedia("(max-width: 700px)").matches && !layout.focusMode) {
+      forcedFocusRestore = layout.focusMode;
+      layout = { ...layout, focusMode: true };
+    }
     layoutReady = true;
     pruneAndAutoOpen();
     pruneDeadFiles();

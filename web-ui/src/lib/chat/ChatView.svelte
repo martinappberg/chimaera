@@ -15,6 +15,7 @@
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { insertIntoComposer, registerFollow } from "./composerBus";
+  import { isBrowserGateway } from "../net/base";
   import {
     acquireChat,
     releaseChat,
@@ -1752,6 +1753,21 @@
    *  "Counting files"), else the phase: starting → thinking / writing /
    *  running tools → working (between steps). */
   const agentBusy = $derived(store.running || store.compacting);
+  const RECONNECTING_GRACE_MS = 2000;
+  /** A project viewed from another device (a routed row, or a browser view of
+   *  a project). An ordinary local chat never grows connection chrome. */
+  const viewed = $derived(typeof session.placement === "object" || isBrowserGateway());
+  /** Name a dropped connection only after a short grace, so the first
+   *  handshake and a quick reconnect never flash a status row. */
+  let reconnectingShown = $state(false);
+  $effect(() => {
+    if (!viewed || store.connected || store.exited !== null || store.degraded) {
+      reconnectingShown = false;
+      return;
+    }
+    const timer = setTimeout(() => (reconnectingShown = true), RECONNECTING_GRACE_MS);
+    return () => clearTimeout(timer);
+  });
   const activityLabel = $derived.by(() => {
     if (store.compacting) return "Compacting context";
     if (store.activityLine !== null) return store.activityLine;
@@ -2649,7 +2665,7 @@
     </div>
   {/if}
 
-  {#if !store.connected && store.exited === null && !store.degraded}
+  {#if reconnectingShown}
     <div class="connection-action"><span>Waiting for this session’s host</span><button type="button" onclick={() => socket.wake()}>Reconnect and wake</button></div>
   {/if}
   <Composer

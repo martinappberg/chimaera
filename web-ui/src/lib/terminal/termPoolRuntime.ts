@@ -245,7 +245,10 @@ function adoptParked(entry: PoolEntry): void {
  * good. A constructor throw marks WebGL unavailable immediately.
  */
 function loadWebgl(entry: PoolEntry): void {
-  if (isWatching(entry.id) || matchMedia("(max-width: 700px)").matches) return;
+  // A watched grid keeps the owner's width; the DOM renderer clips it at
+  // native cell size where WebGL would scale it. Window width alone never
+  // costs anyone the GPU renderer.
+  if (isWatching(entry.id)) return;
   if (entry.webgl !== null || entry.webglFailed || entry.webglLosses >= WEBGL_MAX_LOSSES) {
     return;
   }
