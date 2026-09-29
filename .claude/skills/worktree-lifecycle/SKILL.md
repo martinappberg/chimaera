@@ -20,7 +20,7 @@ group and prints why:
 | Group | Meaning | What `--apply` does |
 |---|---|---|
 | **ACTIVE** | a process has its cwd or an open file inside it, it is `git worktree lock`ed, the script runs from it, or something in it changed in the last 6 h (unless its PR is merged — see REMOVE) | nothing, ever |
-| **REMOVE** | PR merged or closed (or HEAD already in `origin/main`), no uncommitted changes, no unpushed commits. A merged PR skips the 6 h wait when the checkout *is* that PR (HEAD is its head, or its own commits all sit behind it) | `git worktree remove` (never `--force`) + `git worktree prune`; the branch is kept |
+| **REMOVE** | PR merged or closed (or HEAD already in `origin/main`), no uncommitted changes, no unpushed commits. A merged PR skips the 6 h wait when the checkout *is* that PR: its own commits (not in `origin/main`) all sit in the PR's head | `git worktree remove` (never `--force`) + `git worktree prune`; the branch is kept |
 | **TRIM** | not removable, idle for more than 24 h | deletes its git-ignored `target/` and `node_modules/` dirs; source is never touched |
 | **KEEP** | everything else (an open PR idle < 24 h, unpushed commits, uncommitted changes) | nothing |
 
@@ -34,8 +34,10 @@ archiving a session in the Claude app detaches its branch — a fresh `HEAD` and
 reflog write that otherwise reads as "changed 0m ago" and holds the folder for 6 h.
 A detached worktree finds its PR by commit, or through a local branch still pointing
 at its HEAD (the PR's head may have moved on since the checkout last pushed). A
-closed PR (it may be reopened) and a fresh worktree branched from main still wait.
-The cost: a merged session you return to after its folder went has no worktree.
+closed PR (it may be reopened) and a fresh worktree whose HEAD is in main still
+wait — so do merged PRs in a repo that merges with merge commits, where the PR's
+commits land in main. The cost: a merged session you return to after its folder
+went has no worktree.
 
 ## The lifecycle
 

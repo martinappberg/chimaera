@@ -30,9 +30,10 @@
 #           (below). Never touched.
 #   REMOVE  its PR is merged or closed, or its HEAD is already in origin/main;
 #           AND no uncommitted changes AND no unpushed commits AND not ACTIVE.
-#           A merged PR skips the --active-hours wait: merged, clean and pushed
-#           leaves nothing in progress to protect, and archiving a session
-#           (the Claude app detaches its branch) reads as a fresh change.
+#           A merged PR skips the --active-hours wait when the checkout's own
+#           commits (not in origin/main) are all in it: merged, clean and
+#           pushed leaves nothing in progress to protect, and archiving a
+#           session (the Claude app detaches its branch) reads as a fresh change.
 #           `git worktree remove` (never --force), then `git worktree prune`.
 #           The branch is kept.
 #   TRIM    not removable, and idle for more than --idle-hours: its build
@@ -319,7 +320,7 @@ head_state() { # path → HEAD's commit and the branch it names (none when detac
 
 # Writes $TMPD/rows: group \t kb \t branch \t pr \t dirty \t unpushed \t idle \t path \t reason
 # and $TMPD/b.<n> (the build dirs of worktree n) for --apply, plus $TMPD/m.<n>
-# (its HEAD) when a merged PR made it removable despite a recent change.
+# (its HEAD) when a merged PR made it removable.
 classify() {
   local n=0 path rpath head branch locked prunable gd sizekb idle_s mt reason group
   local pr prs prn proid dirty unpushed in_base removable why extra lockpid self_rp
@@ -333,7 +334,6 @@ classify() {
     n=$((n + 1))
     [ "$branch" = "-" ] && branch=""
     : >"$TMPD/b.$n"
-    rm -f "$TMPD/m.$n"
     reason="" recent="" group="" sizekb=0 pr="-" dirty="-" unpushed="-" idle="-"
     if [ ! -d "$path" ]; then
       printf 'REMOVE\t0\t%s\t-\t-\t-\t-\t%s\t%s\t%s\n' "${branch:-(detached)}" "$path" "directory is gone; git worktree prune clears the entry" "$n" >>"$TMPD/rows"
@@ -378,7 +378,7 @@ classify() {
     # Git state (read-only; GIT_OPTIONAL_LOCKS=0).
     dirty=$(git -C "$path" status --porcelain --untracked-files=normal 2>/dev/null | wc -l | tr -d ' ') || dirty="?"
     at_head=""
-    [ -n "$branch" ] || at_head=$(git -C "$path" for-each-ref --points-at HEAD --format='%(refname:short)' refs/heads 2>/dev/null | tr '\n' ' ')
+    [ -n "$branch" ] || at_head=$(git -C "$path" for-each-ref --points-at HEAD --format='%(refname)' refs/heads 2>/dev/null | sed 's|^refs/heads/||' | tr '\n' ' ')
     prs=$(pr_for "$branch" "$head" "$at_head")
     prn="" proid=""
     if [ -n "$prs" ]; then
@@ -402,14 +402,13 @@ classify() {
 
     if [ -z "$group" ]; then
       removable="" why="" merged=0
-      # This checkout IS the merged PR: HEAD is the PR's head, or has commits
-      # of its own that all sit behind the PR's head (the PR moved on after
-      # this checkout last pushed). Not a fresh branch from main that reuses a
-      # merged PR's name, whose HEAD is merely the PR's fork point.
+      # This checkout IS the merged PR: it has commits of its own (not in
+      # main), and they all sit in the PR's head — which may have moved on
+      # after this checkout last pushed. A fresh worktree whose HEAD is in main
+      # (at a PR's fork point, or at a fast-forwarded PR head) is not.
       case "$pr" in
         MERGED*)
-          if [ "$proid" = "$head" ] ||
-            { [ "$in_base" = 0 ] && git -C "$path" merge-base --is-ancestor HEAD "$proid" 2>/dev/null; }; then
+          if [ "$in_base" = 0 ] && git -C "$path" merge-base --is-ancestor HEAD "$proid" 2>/dev/null; then
             merged=1
           fi
           ;;
@@ -451,7 +450,7 @@ classify() {
         group=ACTIVE reason=$recent
       elif [ -n "$removable" ]; then
         group=REMOVE reason="$removable; clean; nothing unpushed"
-        [ -n "$recent" ] && head_state "$path" >"$TMPD/m.$n"
+        [ "$merged" = 1 ] && head_state "$path" >"$TMPD/m.$n"
       elif [ "$idle_s" -ge $((IDLE_HOURS * 3600)) ] && [ -s "$TMPD/b.$n" ]; then
         group=TRIM reason="idle $idle; $why"
       elif [ "$idle_s" -ge $((IDLE_HOURS * 3600)) ]; then
@@ -520,8 +519,9 @@ codex_stubs() {
 # ------------------------------------------------------------------- apply ---
 
 # Re-check right before acting: processes and mtimes move while we work.
-# A merged PR's worktree was already recent, so for it the check is instead
-# that HEAD has not moved (no new commit, no other branch checked out).
+# A merged PR's worktree does not wait on mtimes (archiving a session bumps
+# them), so for it the check is that HEAD has not moved: no new commit, no
+# other branch checked out.
 still_idle() { # n path rpath
   local mt
   scan_processes

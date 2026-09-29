@@ -120,14 +120,19 @@ new_wt inuse
 
 # Recently changed. A merged PR is removable anyway: merged, clean and pushed
 # leaves nothing in progress. A closed PR may be reopened, a fresh worktree
-# from main has its HEAD in main before any work, and a new branch that reuses
-# a merged PR's name is not that PR — all three stay ACTIVE.
+# from main has its HEAD in main before any work, a new branch that reuses a
+# merged PR's name is not that PR, and a fresh detached worktree at a main tip
+# that equals a merged PR's head (a fast-forward merge) has no work of its own
+# — those stay ACTIVE.
 new_wt recent
+commit "$W/recent" re1
+git -C "$W/recent" push -q origin b/recent
 new_wt recentclosed
 commit "$W/recentclosed" rc1
 git -C "$W/recentclosed" push -q origin b/recentclosed
 new_wt recentbase
 new_wt reused
+git -C "$M" worktree add -q --detach "$W/fresh" main
 
 # An archived session: the Claude app detaches its branch (a fresh HEAD and
 # reflog write), and the PR's head moved on after this checkout last pushed,
@@ -156,13 +161,14 @@ printf '%s\t%s\t%s\t%s\n' \
   b/recent MERGED 18 "$(git -C "$W/recent" rev-parse HEAD)" \
   b/recentclosed CLOSED 19 "$(git -C "$W/recentclosed" rev-parse HEAD)" \
   b/reused MERGED 20 "$merged_oid" \
-  b/archived MERGED 21 "$archived_oid" >"$T/prs.tsv"
+  b/archived MERGED 21 "$archived_oid" \
+  b/ff MERGED 22 "$(git -C "$M" rev-parse main)" >"$T/prs.tsv"
 
 # Age everything but the recent ones by months: files, dirs, and git's
 # per-worktree admin files (HEAD, index, reflog).
 export GIT_OPTIONAL_LOCKS=0
 for d in "$W"/*; do
-  case "${d##*/}" in recent | recentclosed | recentbase | reused | archived) continue ;; esac
+  case "${d##*/}" in recent | recentclosed | recentbase | reused | fresh | archived) continue ;; esac
   find "$d" -exec touch -t 202601010000 {} + 2>/dev/null
   find "$M/.git/worktrees/${d##*/}" -exec touch -t 202601010000 {} + 2>/dev/null
 done
@@ -171,22 +177,19 @@ pids="$pids $!"
 disown $! 2>/dev/null
 sleep 1
 
-row() { grep -E "^[A-Z]+ +[^ ]+ +$1 " "$T/out" | head -1; }
-expect() { # branch group [reason-substring]
-  local r
-  r=$(row "$1")
-  case "$r" in
-    "$2 "*) case "$r" in *"${3:-}"*) ok ;; *) no "$1: expected reason '$3' in: $r" ;; esac ;;
-    *) no "$1: expected $2, got: ${r:-<no row>}" ;;
+judge() { # label row group [reason-substring]
+  case "$2" in
+    "$3 "*) case "$2" in *"${4:-}"*) ok ;; *) no "$1: expected reason '$4' in: $2" ;; esac ;;
+    *) no "$1: expected $3, got: ${2:-<no row>}" ;;
   esac
 }
-expect_wt() { # worktree-name group [reason-substring] — for detached rows
-  local r
-  r=$(grep -F "$W/$1 " "$T/out" | head -1)
-  case "$r" in
-    "$2 "*) case "$r" in *"${3:-}"*) ok ;; *) no "$1: expected reason '$3' in: $r" ;; esac ;;
-    *) no "$1: expected $2, got: ${r:-<no row>}" ;;
-  esac
+expect() { # branch group [reason-substring]
+  judge "$1" "$(grep -E "^[A-Z]+ +[^ ]+ +$1 " "$T/out" | head -1)" "$2" "${3:-}"
+}
+# Detached rows share a branch column, so these match the folder name (the
+# path's tail: short_path shows paths under $HOME as ~/…).
+expect_wt() { # worktree-name group [reason-substring]
+  judge "$1" "$(grep -F "/wt/$1 " "$T/out" | head -1)" "$2" "${3:-}"
 }
 
 bash "$GC" >"$T/out" 2>&1
@@ -205,6 +208,7 @@ expect b/recent REMOVE "PR #18 merged"
 expect b/recentclosed ACTIVE "changed"
 expect b/recentbase ACTIVE "changed"
 expect b/reused ACTIVE "changed"
+expect_wt fresh ACTIVE "changed"
 expect_wt archived REMOVE "PR #21 merged"
 expect main ACTIVE "this session runs here"
 expect b/gone REMOVE "directory is gone"
@@ -238,7 +242,7 @@ for b in b/merged b/closed b/contained; do git -C "$M" rev-parse -q --verify "re
 [ ! -e "$W/open/target" ] && [ ! -e "$W/open/crates/app/target" ] && ok || no "open's build output not trimmed"
 [ -f "$W/open/file.txt" ] && ok || no "trim deleted open's source"
 [ ! -e "$W/localonly/target" ] && [ -f "$W/localonly/file.txt" ] && ok || no "localonly trim wrong"
-for n in localbare dirty aftermerge locked inuse recentclosed recentbase reused; do [ -d "$W/$n" ] && ok || no "$n was removed"; done
+for n in localbare dirty aftermerge locked inuse recentclosed recentbase reused fresh; do [ -d "$W/$n" ] && ok || no "$n was removed"; done
 [ -f "$W/dirty/notes.txt" ] && ok || no "dirty lost its uncommitted file"
 [ -z "$(git -C "$M" worktree list --porcelain | grep -F "$W/merged")" ] && ok || no "merged still registered"
 grep -q "df free: " "$T/apply" && ok || no "apply did not report df: $(tail -3 "$T/apply")"
