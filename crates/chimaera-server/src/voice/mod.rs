@@ -66,8 +66,9 @@ const MAX_CLIENT_FRAME: usize = 64 * 1024;
 const MAX_BUFFERED_AUDIO: usize = 1024 * 1024;
 /// A recording that runs this long finishes on its own.
 const MAX_RECORDING: Duration = Duration::from_secs(10 * 60);
-/// Recordings in flight daemon-wide (one person, a few windows).
-const MAX_SESSIONS: usize = 4;
+/// Streams in flight daemon-wide: one person, a few windows, and a dictation
+/// briefly holds two while a paused phrase finalizes beside the next one.
+const MAX_SESSIONS: usize = 8;
 const KEEPALIVE_EVERY: Duration = Duration::from_secs(8);
 /// After `CloseStream`: the longest wait for the last transcript, and the
 /// wait when nothing more arrives at all (claude's 5 s / 1.5 s).

@@ -95,7 +95,13 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   dimmed and the phrase still forming dimmer, the box growing for a long dictation — and a
   five-bar waveform beside the stop button shows the mic hears you (a flat row means it hears
   nothing). Click again and the words turn to ordinary text. Enter stops and sends, Esc restores
-  the draft exactly as it was. The **Dictate** chord (⌃⇧D on macOS, the Codex app's; unbound
+  the draft exactly as it was. **Each phrase corrects itself at the pause after it**: the speech
+  service revises nothing while audio flows — an early wrong guess (the wrong language, a
+  misheard start) stands until its stream is finalized, and only the finalize pass is accurate —
+  so a recording finalizes each phrase at a pause (≥ 0.8 s after ≥ 0.6 s of speech; 0.4 s once a
+  phrase passes 10 s; silence judged against the speaker's own recent loudness) and speaks on
+  into a fresh stream, which also picks its language anew. The corrected phrase lands about a
+  second after you pause, in the settled style. The **Dictate** chord (⌃⇧D on macOS, the Codex app's; unbound
   elsewhere, where `Mod+d` is Split Right) toggles it from a focused composer only. Right-click
   the mic to pick the microphone (`chat.voiceMicrophone`, stored by name — device ids are
   per-origin and a daemon's port changes); a silent recording names the device and says how to

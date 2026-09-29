@@ -139,9 +139,9 @@ export async function voiceProblem(): Promise<string | null> {
 
 export type DictationState = "idle" | "starting" | "listening" | "finishing";
 
-/** Bars in the listening strip's waveform. */
+/** Bars in the waveform beside the stop button. */
 const WAVE_BARS = 5;
-/** Audio held client-side until the relay socket opens: ~30 s at 100 ms. */
+/** Audio held client-side until a phrase's socket opens: ~30 s at 100 ms. */
 const MAX_QUEUED_CHUNKS = 300;
 /** How long `finish()` waits for the daemon's `done` before settling for
  *  what it has (the daemon's own finalize wait is 5 s). */
@@ -153,27 +153,178 @@ const SILENT_RMS = 0.0005;
 /** The relay's error codes that mean the login, not the recording, failed. */
 const LOGIN_CODES = new Set(["no_login", "expired", "unreadable", "auth"]);
 
+/**
+ * Where one spoken phrase ends: enough speech, then a real pause. Fed one
+ * RMS level per ~100 ms chunk. "Silent" is relative to how loud the speaker
+ * has been lately (noise suppression and AGC vary by mic), with a floor.
+ */
+export class PauseDetector {
+  static readonly CHUNK_MS = 100;
+  static readonly MIN_SPEECH_MS = 600;
+  static readonly PAUSE_MS = 800;
+  /** A phrase this long takes a shorter breath as its end, so unbroken
+   *  talking still gets corrected every so often. */
+  static readonly LONG_PHRASE_MS = 10_000;
+  static readonly SHORT_PAUSE_MS = 400;
+  private recent: number[] = [];
+  private speechMs = 0;
+  private silenceMs = 0;
+
+  /** True when this chunk completes a pause after a phrase. */
+  feed(rms: number): boolean {
+    this.recent.push(rms);
+    if (this.recent.length > 30) this.recent.shift();
+    const loudest = Math.max(...this.recent);
+    const silent = rms < Math.max(0.008, loudest * 0.12);
+    if (!silent) {
+      this.speechMs += PauseDetector.CHUNK_MS;
+      this.silenceMs = 0;
+      return false;
+    }
+    this.silenceMs += PauseDetector.CHUNK_MS;
+    const pause =
+      this.speechMs >= PauseDetector.LONG_PHRASE_MS ? PauseDetector.SHORT_PAUSE_MS : PauseDetector.PAUSE_MS;
+    if (this.speechMs >= PauseDetector.MIN_SPEECH_MS && this.silenceMs >= pause) {
+      this.speechMs = 0;
+      this.silenceMs = 0;
+      return true;
+    }
+    return false;
+  }
+}
+
+/**
+ * One spoken phrase: its own `/ws/voice` stream. The speech service revises
+ * nothing while audio flows — a wrong early guess (the wrong language, say)
+ * stands until the stream is finalized — so a recording finalizes each phrase
+ * at the pause after it and speaks on into a fresh one: every phrase is
+ * corrected a moment after it's said, and each fresh stream picks its
+ * language anew.
+ */
+class Phrase {
+  finals = "";
+  interim = "";
+  /** Finalize sent: no more audio; the corrected text is on its way. */
+  closing = false;
+  done = false;
+  private ws: WebSocket;
+  private opened = false;
+  private queue: ArrayBuffer[] = [];
+  private waiters: (() => void)[] = [];
+
+  constructor(
+    keyterms: string[],
+    private readonly onChange: () => void,
+    private readonly onError: (message: string, code: string | undefined) => void,
+  ) {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${proto}://${location.host}/ws/voice`);
+    ws.binaryType = "arraybuffer";
+    this.ws = ws;
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: "auth", token: getToken() ?? "" }));
+      ws.send(JSON.stringify({ type: "start", language: dictationLanguage().code, keyterms }));
+      this.opened = true;
+      for (const chunk of this.queue) ws.send(chunk);
+      this.queue = [];
+      if (this.closing) ws.send(JSON.stringify({ type: "finalize" }));
+    };
+    ws.onmessage = (ev: MessageEvent) => {
+      if (typeof ev.data !== "string") return;
+      let msg: { type?: string; text?: string; message?: string; code?: string };
+      try {
+        msg = JSON.parse(ev.data) as typeof msg;
+      } catch {
+        return;
+      }
+      switch (msg.type) {
+        case "interim":
+          this.interim = msg.text ?? "";
+          this.onChange();
+          break;
+        case "final":
+          this.finals = joinSpoken(this.finals, msg.text ?? "");
+          this.interim = "";
+          this.onChange();
+          break;
+        case "error":
+          this.onError(msg.message ?? "Dictation failed.", msg.code);
+          break;
+        case "done":
+          this.finish();
+          break;
+      }
+    };
+    ws.onclose = () => this.finish();
+  }
+
+  get text(): string {
+    return joinSpoken(this.finals, this.interim);
+  }
+
+  send(pcm: ArrayBuffer): void {
+    if (this.closing) return;
+    if (this.opened && this.ws.readyState === WebSocket.OPEN) this.ws.send(pcm);
+    else if (this.queue.length < MAX_QUEUED_CHUNKS) this.queue.push(pcm);
+  }
+
+  /** No more audio: ask for the corrected text (sent on open if needed). */
+  finalize(): void {
+    if (this.closing) return;
+    this.closing = true;
+    if (this.opened && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "finalize" }));
+    }
+  }
+
+  whenDone(): Promise<void> {
+    return this.done ? Promise.resolve() : new Promise((resolve) => this.waiters.push(resolve));
+  }
+
+  cancel(): void {
+    if (this.opened && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "cancel" }));
+    }
+    this.close();
+  }
+
+  close(): void {
+    this.ws.onclose = null;
+    this.ws.onmessage = null;
+    if (this.ws.readyState !== WebSocket.CLOSED) this.ws.close();
+    this.finish(false);
+  }
+
+  private finish(notify = true): void {
+    if (this.done) return;
+    this.done = true;
+    if (this.ws.readyState !== WebSocket.CLOSED) this.ws.close();
+    for (const resolve of this.waiters.splice(0)) resolve();
+    if (notify) this.onChange();
+  }
+}
+
 export class Dictation {
   state = $state<DictationState>("idle");
   /** The last few 0..1 input levels (one per ~100 ms), oldest first. */
   levels = $state<number[]>(new Array(WAVE_BARS).fill(0));
-  /** Settled utterances, joined. */
+  /** Text the service has corrected: the finished phrases, joined. */
   finals = $state("");
-  /** The utterance being heard now. */
+  /** Text still forming: the phrases after those. */
   interim = $state("");
   /** The last failure, for the composer to show. */
   error = $state<string | null>(null);
   /** The input recording now, as the system names it. */
   device = $state("");
 
-  private ws: WebSocket | null = null;
-  private opened = false;
-  private queue: ArrayBuffer[] = [];
+  /** This recording's phrases in order; the last is the one being spoken
+   *  unless it is closing. */
+  private phrases: Phrase[] = [];
+  private keyterms: string[] = [];
+  private pauses = new PauseDetector();
   private capture: Capture | null = null;
   /** Bumps per recording, so a late event from an old one can't touch this. */
   private generation = 0;
-  /** Resolves a pending `finish()` (done, closed, or cancelled). */
-  private settle: (() => void) | null = null;
   /** Loudest chunk this recording (raw RMS). */
   private peak = 0;
 
@@ -192,9 +343,9 @@ export class Dictation {
     this.levels = new Array(WAVE_BARS).fill(0);
     this.peak = 0;
     this.device = "";
-    this.queue = [];
-    this.opened = false;
-    this.open(generation, opts.keyterms);
+    this.keyterms = opts.keyterms;
+    this.pauses = new PauseDetector();
+    this.phrases = [this.phrase(generation)];
     try {
       const capture = await startCapture(
         (pcm, level) => this.onAudio(generation, pcm, level),
@@ -210,64 +361,50 @@ export class Dictation {
       return true;
     } catch (e) {
       if (generation === this.generation) {
-        this.fail(e instanceof CaptureError ? e.message : String(e));
+        this.error = e instanceof CaptureError ? e.message : String(e);
+        this.end();
       }
       return false;
     }
   }
 
-  private open(generation: number, keyterms: string[]): void {
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/ws/voice`);
-    ws.binaryType = "arraybuffer";
-    this.ws = ws;
-    ws.onopen = () => {
-      if (generation !== this.generation) return;
-      ws.send(JSON.stringify({ type: "auth", token: getToken() ?? "" }));
-      ws.send(
-        JSON.stringify({ type: "start", language: dictationLanguage().code, keyterms }),
-      );
-      this.opened = true;
-      for (const chunk of this.queue) ws.send(chunk);
-      this.queue = [];
-    };
-    ws.onmessage = (ev: MessageEvent) => {
-      if (generation !== this.generation || typeof ev.data !== "string") return;
-      let msg: { type?: string; text?: string; message?: string; code?: string };
-      try {
-        msg = JSON.parse(ev.data) as typeof msg;
-      } catch {
-        return;
+  private phrase(generation: number): Phrase {
+    const phrase: Phrase = new Phrase(
+      this.keyterms,
+      () => {
+        if (generation !== this.generation) return;
+        this.refresh();
+        // The phrase being spoken ended by itself (the relay failed, a
+        // cap): the recording ends with what was heard.
+        if (phrase.done && !phrase.closing && this.state !== "finishing") {
+          this.error ??= "Dictation stopped — lost the connection to chimaera.";
+          this.end();
+        }
+      },
+      (message, code) => {
+        if (generation !== this.generation) return;
+        this.error = message;
+        if (code !== undefined && LOGIN_CODES.has(code)) void recheckHost();
+      },
+    );
+    return phrase;
+  }
+
+  /** Finished phrases lead as corrected text; the first unfinished one and
+   *  everything after it is still forming. */
+  private refresh(): void {
+    let settled = "";
+    let live = "";
+    let leading = true;
+    for (const p of this.phrases) {
+      if (leading && p.done) settled = joinSpoken(settled, p.text);
+      else {
+        leading = false;
+        live = joinSpoken(live, p.text);
       }
-      switch (msg.type) {
-        case "interim":
-          this.interim = msg.text ?? "";
-          break;
-        case "final":
-          this.finals = joinSpoken(this.finals, msg.text ?? "");
-          this.interim = "";
-          break;
-        case "error":
-          this.error = msg.message ?? "Dictation failed.";
-          if (msg.code !== undefined && LOGIN_CODES.has(msg.code)) void recheckHost();
-          break;
-        case "done":
-          this.settle?.();
-          if (this.state !== "finishing") this.end();
-          break;
-      }
-    };
-    ws.onclose = () => {
-      if (generation !== this.generation) return;
-      this.ws = null;
-      if (this.settle !== null) {
-        this.settle();
-      } else if (this.state !== "idle") {
-        // The relay ended the recording itself (an error, the length cap).
-        this.error ??= "Dictation stopped — lost the connection to chimaera.";
-        this.end();
-      }
-    };
+    }
+    this.finals = settled;
+    this.interim = live;
   }
 
   private onAudio(generation: number, pcm: ArrayBuffer, level: number): void {
@@ -276,11 +413,12 @@ export class Dictation {
     // Speech RMS sits well under 0.3; a square-root curve lifts quiet
     // talking into view without pinning loud speech at the top.
     this.levels = [...this.levels.slice(1), Math.min(1, Math.sqrt(level * 6))];
-    const ws = this.ws;
-    if (ws !== null && this.opened && ws.readyState === WebSocket.OPEN) {
-      ws.send(pcm);
-    } else if (this.queue.length < MAX_QUEUED_CHUNKS) {
-      this.queue.push(pcm);
+    const current = this.phrases.at(-1);
+    if (current === undefined) return;
+    current.send(pcm);
+    if (this.pauses.feed(level) && this.state === "listening" && current.text !== "") {
+      current.finalize();
+      this.phrases.push(this.phrase(generation));
     }
   }
 
@@ -296,29 +434,13 @@ export class Dictation {
     this.capture = null;
     await capture?.stop();
     if (generation !== this.generation) return null;
-    const ws = this.ws;
-    if (ws !== null && ws.readyState !== WebSocket.CLOSED) {
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(() => settle(), FINISH_TIMEOUT_MS);
-        const settle = () => {
-          clearTimeout(timer);
-          this.settle = null;
-          resolve();
-        };
-        this.settle = settle;
-        const send = () => ws.send(JSON.stringify({ type: "finalize" }));
-        if (ws.readyState === WebSocket.OPEN && this.opened) {
-          for (const chunk of this.queue) ws.send(chunk);
-          this.queue = [];
-          send();
-        } else {
-          // Still connecting: `onopen` flushes the queue; finalize after it.
-          ws.addEventListener("open", () => queueMicrotask(send), { once: true });
-        }
-      });
-    }
+    this.phrases.at(-1)?.finalize();
+    await Promise.race([
+      Promise.all(this.phrases.map((p) => p.whenDone())),
+      new Promise((resolve) => setTimeout(resolve, FINISH_TIMEOUT_MS)),
+    ]);
     if (generation !== this.generation) return null;
-    const text = joinSpoken(this.finals, this.interim);
+    const text = joinSpoken(...this.phrases.map((p) => p.text));
     // The last words settle here, so what's shown never flickers at the end.
     this.finals = text;
     this.interim = "";
@@ -339,31 +461,18 @@ export class Dictation {
   /** Stop and discard. */
   cancel(): void {
     if (this.state === "idle") return;
-    const ws = this.ws;
-    if (ws !== null && ws.readyState === WebSocket.OPEN && this.opened) {
-      ws.send(JSON.stringify({ type: "cancel" }));
-    }
-    this.settle?.();
+    for (const p of this.phrases) p.cancel();
     this.end();
   }
 
-  private fail(message: string): void {
-    this.error = message;
-    this.end();
-  }
-
-  /** Back to idle: release the mic and the socket, stale events fenced off. */
+  /** Back to idle: release the mic and the sockets, stale events fenced off. */
   private end(): void {
     this.generation++;
     const capture = this.capture;
     this.capture = null;
     void capture?.stop();
-    const ws = this.ws;
-    this.ws = null;
-    if (ws !== null && ws.readyState !== WebSocket.CLOSED) ws.close();
-    this.queue = [];
-    this.opened = false;
-    this.settle = null;
+    for (const p of this.phrases) p.close();
+    this.phrases = [];
     this.state = "idle";
     this.interim = "";
   }
