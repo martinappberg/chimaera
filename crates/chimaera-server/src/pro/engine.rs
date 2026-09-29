@@ -454,7 +454,7 @@ async fn reconcile_generation(
     // one lets the laptop (or a clean worker) continue instead.
     ensure!(
         !execution::worker(state)
-            || (!state.pro.execution.invalid && !execution::unclean(state, workspace)),
+            || (!execution::uncertain(state, workspace) && !execution::unclean(state, workspace)),
         "previous managed processes are still stopping"
     );
     let was_fenced = execution::fenced(state, workspace);

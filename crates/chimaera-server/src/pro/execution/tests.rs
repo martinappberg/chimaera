@@ -272,8 +272,61 @@ async fn same_boot_crash_never_turns_empty_registry_into_stopped_evidence() {
     assert!(lock(&damaged.execution.latched).contains("w-a"));
     assert!(damaged.execution.proofs.lock().unwrap().is_empty());
     // Unreadable ownership state fails closed and keeps the damaged copy.
-    assert!(damaged.execution.invalid);
+    assert!(lock(&damaged.execution.uncertain).contains("w-a"));
     assert!(state.pro.root.join("state.json.damaged").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A lost or partial enrollment record makes only the projects it could have
+/// covered uncertain (they stop publishing until the account confirms their
+/// policy again); every other project keeps its ordinary behavior.
+#[test]
+fn lost_enrollment_records_make_only_those_projects_uncertain() {
+    let restart = |root: &std::path::Path| {
+        Arc::new(AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.to_path_buf(),
+            root.join("config"),
+        ))
+    };
+    let (state, config, root) = fixture();
+    observe(&state, &config, &baton()).unwrap();
+    // The latch names w-a, but its policy record is gone; w-b never enrolled.
+    std::fs::create_dir_all(&state.pro.root).unwrap();
+    std::fs::write(
+        state.pro.root.join("execution-authority.json"),
+        br#"{"version":1,"workspaces":["w-a"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        state.pro.root.join("state.json"),
+        br#"{"ownership":{},"preferences":{"w-b":{}}}"#,
+    )
+    .unwrap();
+    let restarted = restart(&root);
+    assert!(managed(&restarted, "w-a"));
+    assert!(
+        !managed(&restarted, "w-b"),
+        "an unrelated project is unaffected"
+    );
+    // An authoritative read that carries w-a's policy resolves it.
+    observe(&restarted, &config, &baton()).unwrap();
+    assert!(managed(&restarted, "w-a"));
+    assert!(lease_valid(&restarted, "w-b"));
+    drop(restarted);
+
+    // Unreadable state: only projects with local mirror data are uncertain.
+    std::fs::write(state.pro.root.join("state.json"), b"not json").unwrap();
+    std::fs::write(state.pro.root.join("execution-authority.json"), b"not json").unwrap();
+    std::fs::create_dir_all(state.pro.root.join("w-mirrored")).unwrap();
+    let restarted = restart(&root);
+    assert!(managed(&restarted, "w-mirrored"));
+    assert!(!managed(&restarted, "w-never-mirrored"));
+    assert!(lease_valid(&restarted, "w-never-mirrored"));
+    drop(restarted);
     std::fs::remove_dir_all(root).unwrap();
 }
 

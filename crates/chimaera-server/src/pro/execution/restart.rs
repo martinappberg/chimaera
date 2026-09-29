@@ -33,11 +33,31 @@ impl State {
             );
             Ok(latch.workspaces.into_iter().collect())
         })();
-        let mut invalid = loaded.is_err() || damaged;
+        // A project is uncertain when the enrollment record may once have
+        // covered it but its policy is gone: a latched project without a
+        // policy, or, when the latch or the state itself is unreadable, every
+        // project this daemon has local mirror data or preferences for. Only
+        // those projects stop publishing until the account confirms their
+        // policy again; everything else keeps its ordinary behavior.
+        let unknown = loaded.is_err() || damaged;
         let mut latched = loaded.unwrap_or_default();
-        invalid |= latched
-            .iter()
-            .any(|id| preferences.get(id).is_none_or(|p| p.continuity.is_none()));
+        let lacking = |id: &String| preferences.get(id).is_none_or(|p| p.continuity.is_none());
+        let mut uncertain: HashSet<String> =
+            latched.iter().filter(|id| lacking(id)).cloned().collect();
+        if unknown {
+            uncertain.extend(preferences.keys().filter(|id| lacking(id)).cloned());
+            if let Ok(entries) = std::fs::read_dir(root) {
+                uncertain.extend(
+                    entries
+                        .filter_map(std::result::Result::ok)
+                        .take(4096)
+                        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+                        .filter_map(|entry| entry.file_name().into_string().ok())
+                        .filter(|id| crate::pro::valid_id(id) && lacking(id)),
+                );
+            }
+        }
+        let uncertain: HashSet<String> = uncertain.into_iter().take(128).collect();
         latched.extend(
             preferences
                 .iter()
@@ -67,7 +87,7 @@ impl State {
             commits: mutation::Commits::default(),
             latched: Mutex::new(latched),
             unclean: Mutex::new(unclean),
-            invalid,
+            uncertain: Mutex::new(uncertain),
             boot,
         }
     }

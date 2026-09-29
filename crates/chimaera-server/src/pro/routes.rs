@@ -165,7 +165,7 @@ async fn configure_inner(
         let enrolled = !lock(&state.pro.execution.latched).is_empty();
         anyhow::ensure!(
             config.execution.is_some()
-                || (!state.pro.execution.invalid
+                || (!execution::any_uncertain(&state)
                     && !enrolled
                     && !lock(&state.pro.preferences)
                         .values()

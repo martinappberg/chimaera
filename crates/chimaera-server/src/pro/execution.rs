@@ -34,7 +34,10 @@ pub(super) struct State {
     /// Previous-life process groups not yet proven gone, per workspace. An
     /// empty list means no evidence exists (worker only; see `restore`).
     unclean: Mutex<HashMap<String, Vec<u32>>>,
-    pub(super) invalid: bool,
+    /// Projects whose enrollment record was lost (see `restore`). Each stays
+    /// managed and publishes nothing until an authoritative read restores its
+    /// policy; a worker also runs nothing there. Bounded to 128.
+    pub(super) uncertain: Mutex<std::collections::HashSet<String>>,
     boot: Option<String>,
 }
 struct Proof {
@@ -88,9 +91,17 @@ pub(super) fn worker(state: &AppState) -> bool {
             .is_some_and(|config| config.role == Role::Worker)
 }
 
+/// This project's enrollment record was lost; see `State::uncertain`.
+pub(super) fn uncertain(state: &AppState, workspace: &str) -> bool {
+    lock(&state.pro.execution.uncertain).contains(workspace)
+}
+pub(super) fn any_uncertain(state: &AppState) -> bool {
+    !lock(&state.pro.execution.uncertain).is_empty()
+}
+
 pub(super) fn managed(state: &AppState, workspace: &str) -> bool {
     let latched = lock(&state.pro.execution.latched).contains(workspace);
-    state.pro.execution.invalid
+    uncertain(state, workspace)
         || latched
         || lock(&state.pro.preferences)
             .get(workspace)
@@ -153,6 +164,7 @@ pub(super) fn observe(state: &AppState, config: &Configure, baton: &Baton) -> Re
         "invalid continuity workspace"
     );
     let latched = lock(&state.pro.execution.latched).contains(&baton.workspace_id);
+    let lost = uncertain(state, &baton.workspace_id);
     let mut preferences = lock(&state.pro.preferences);
     let previous = preferences
         .get(&baton.workspace_id)
@@ -161,7 +173,7 @@ pub(super) fn observe(state: &AppState, config: &Configure, baton: &Baton) -> Re
         ensure!(
             previous.is_none()
                 && !latched
-                && !state.pro.execution.invalid
+                && !lost
                 && baton.execution_capability.is_none()
                 && baton.execution_lease.is_none(),
             "continuity downgrade denied"
@@ -207,6 +219,8 @@ pub(super) fn observe(state: &AppState, config: &Configure, baton: &Baton) -> Re
         .continuity = Some(policy.clone());
     drop(preferences);
     lock(&state.pro.execution.latched).insert(baton.workspace_id.clone());
+    // The account restored this project's policy: its lost record is resolved.
+    lock(&state.pro.execution.uncertain).remove(&baton.workspace_id);
     Ok(())
 }
 
@@ -276,7 +290,7 @@ pub(super) fn accept(
     // processes stopped. A device keeps running regardless (laptop first).
     ensure!(
         config.role == Role::Device
-            || (!state.pro.execution.invalid && !unclean(state, &baton.workspace_id)),
+            || (!uncertain(state, &baton.workspace_id) && !unclean(state, &baton.workspace_id)),
         "previous managed processes require supervisor cleanup"
     );
     observe(state, config, baton)?;
@@ -471,7 +485,7 @@ pub(super) fn managed_session(state: &AppState, id: &str) -> bool {
     state.chat.get(id).is_some() || lock(&state.agents).contains_key(id)
 }
 pub(super) fn quiescent(state: &AppState, workspace: &str) -> bool {
-    if (state.pro.execution.invalid && worker(state))
+    if (uncertain(state, workspace) && worker(state))
         || unclean(state, workspace)
         || !mutation::idle(state, workspace)
     {

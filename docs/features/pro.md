@@ -457,7 +457,9 @@ refuse new transfers and wait until every transfer, Git helper and project cache
 is idle and state is on disk (`POST /api/v1/pro/drain`; see
 [HANDOFF](../../crates/chimaera-link/HANDOFF.md)). Ownership state, the
 execution latch and handoff ledger writes are synced to stable storage, and an
-unreadable ownership state fails closed instead of silently forgetting fences.
+unreadable ownership state fails closed instead of silently forgetting fences, for
+the affected projects only: they keep running on your computer and resume saving
+cloud copies once the account confirms them again.
 
 ## Project views follow the current owner
 

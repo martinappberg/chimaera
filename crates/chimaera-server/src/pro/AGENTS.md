@@ -58,6 +58,11 @@ proceeds and a worker stays fenced, and a worker never acquires or renews a leas
 it could not accept. A separate enrollment latch rejects lost ordinary state or
 protocol downgrade; an unreadable `state.json` fails closed (kept as
 `state.json.damaged`). `state.json` is written (durably) before the latch.
+Failing closed is per project (`execution::uncertain`): a latched project
+without its policy, or, when the latch or state is unreadable, each project with
+local mirror data or preferences, stays managed and publishes nothing (a worker
+also runs nothing there) until an authoritative read restores its policy. Other
+projects are unaffected, and a device keeps running uncertain projects (D1).
 macOS boot-session UUID and Linux boot ID can distinguish a cold reboot; neither
 authorizes takeover by another device.
 
