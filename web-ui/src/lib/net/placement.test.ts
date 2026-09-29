@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { get } from "svelte/store";
-import { asleepPlacement, parsePause, parsePlacement, pauseLabel, placementLabel, projectWhere, projectWhereLabel, sessionPause } from "./placement";
+import { parsePause, parsePlacement, pauseLabel, placementLabel, projectWhere, projectWhereLabel, sessionPause } from "./placement";
 const live = { workspace_id: "w-one", holder_id: "d-home", route_host_id: "device-d-home", epoch: 4, policy_revision: 1, availability: "owned", server_now: "2026-09-28T19:00:00Z", expires_at: "2026-09-28T19:01:30Z" };
 describe("workspace routing authority", () => {
   it("accepts exact current owner without choosing a home or worker", () => {
@@ -113,9 +113,6 @@ describe("where a routed session runs", () => {
     expect(placementLabel(cloud, false, { owner: "asleep" })).toBe("In the cloud · asleep");
     expect(placementLabel(cloud, true, { owner: "asleep" })).toBe("In the cloud · asleep");
     expect(placementLabel(cloud, false, { owner: "waking" })).not.toContain("reconnecting");
-    expect(asleepPlacement("In the cloud · reconnecting")).toBe("In the cloud · asleep");
-    expect(asleepPlacement("In the cloud")).toBe("In the cloud · asleep");
-    expect(asleepPlacement(null)).toBeNull();
   });
   it("says reconnecting once: not in the label while the view's status line says it", () => {
     expect(placementLabel(cloud, false, { reconnectingShown: true })).toBe("In the cloud");

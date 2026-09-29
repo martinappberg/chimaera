@@ -3,8 +3,7 @@
   import { pastedImageName, uploadAndInsert } from "../net/uploads";
   import { isBrowserGateway } from "../net/base";
   import { isWatching, setWatching } from "./viewerMode.svelte";
-  import { refusalFor, terminalAsleep } from "./refusals.svelte";
-  import { asleepPlacement } from "../net/placement";
+  import { refusalFor } from "./refusals.svelte";
   import { focusTerminal, release, show, refreshAccess } from "./termPool";
 
   interface Props {
@@ -15,7 +14,8 @@
     /** The pane's terminal font-size override (px); undefined = default. */
     fontSize?: number;
     /** Where a routed session runs ("In the cloud", "On another computer",
-     *  with "· reconnecting" while unreachable); null for a session here. */
+     *  with "· reconnecting" while unreachable or "· asleep" once its socket
+     *  heard so); null for a session here. */
     placement?: string | null;
   }
 
@@ -30,9 +30,6 @@
    *  "running elsewhere" there is a route about to change: the text names no
    *  machine rather than a wrong one. */
   const refusal = $derived(refusalFor(sessionId, { where: placement !== null ? null : undefined, watching }));
-  /** The pane's row reads a sleeping owner as unreachable; this socket knows
-   *  better. */
-  const where = $derived(terminalAsleep(sessionId) ? asleepPlacement(placement) : placement);
   function toggleAccess(): void { setWatching(sessionId, !watching); refreshAccess(sessionId); }
 
   let host = $state<HTMLDivElement | null>(null);
@@ -84,7 +81,7 @@
 
 {#if showAccess}
   <div class="terminal-access" role="toolbar" aria-label="Terminal access">
-    {#if where !== null}<span class="where">{where}</span>{/if}
+    {#if placement !== null}<span class="where">{placement}</span>{/if}
     {#if watching}<span>Just watching</span>{/if}
     <button type="button" aria-pressed={!watching} onclick={toggleAccess}>{watching ? "Take control" : "Just watch"}</button>
   </div>

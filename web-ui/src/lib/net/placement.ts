@@ -54,14 +54,6 @@ export function placementLabel(placement: unknown, available: boolean | undefine
   return available === false && note.reconnectingShown !== true ? where + RECONNECTING : where;
 }
 
-/** A {@link placementLabel} for a view whose socket heard the owner is asleep
- *  (a terminal gets only the finished label from its pane). */
-export function asleepPlacement(label: string | null): string | null {
-  if (label === null) return null;
-  const where = label.endsWith(RECONNECTING) ? label.slice(0, -RECONNECTING.length) : label;
-  return where.endsWith(ASLEEP) ? where : where + ASLEEP;
-}
-
 /**
  * Why a session has no process where it is shown, as its socket (`moved` /
  * `paused` frames) and its paused row (`pause`, additive) both say it. Not an

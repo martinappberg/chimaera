@@ -61,10 +61,10 @@ export function setTerminalStatus(id: string, status: TerminalStatus | null): vo
   else statuses[id] = status;
 }
 
-/** The pane's project owner is asleep (its label says so instead of
- *  "reconnecting"). */
-export function terminalAsleep(id: string): boolean {
-  return statuses[id] === "asleep";
+/** What the terminal's socket heard about the owner (asleep, waking), for
+ *  the pane's placement label: it says so instead of "reconnecting". */
+export function terminalStatus(id: string): TerminalStatus | null {
+  return statuses[id] ?? null;
 }
 
 /** What to say over the pane now: a fresh refusal, else a lasting state. */
