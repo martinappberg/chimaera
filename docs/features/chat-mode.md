@@ -129,7 +129,7 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 - **Where.** `Composer.svelte`, `composer.ts`, `ChatView.svelte` (`sendNow`, `onSlash`, `composerCommands`),
   `composerBus.ts` (other surfaces drop references into the draft). Uses `fsValidate`/`fsQuickOpen`.
   Dictation: `voice.svelte.ts` (the `Dictation` controller, `voiceProblem`), `voiceCapture.ts`,
-  `VoiceStrip.svelte`, `voiceLanguages.ts`; the daemon's `crates/chimaera-server/src/voice/`
+  `VoiceMeter.svelte`, `voiceLanguages.ts`; the daemon's `crates/chimaera-server/src/voice/`
   (`mod.rs` the relay, `upstream.rs` the TLS/proxy connector, `login.rs` the login read).
 
 ## Header controls
