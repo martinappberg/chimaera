@@ -3,7 +3,7 @@
   import { cloudOnboarding } from "../pro/onboarding.svelte";
   import { pageVisible } from "../shared/visibility";
   import { copyIssue, projectCopyError } from "../pro/presentation";
-  import { proposedSetup, settleProposal, type ProposalDecision } from "../pro/profile";
+  import { computerSteps, proposedSetup, settleProposal, type ProposalDecision } from "../pro/profile";
   import { proMirrorStatus, proSetNeverMirror, type MirrorStatus, type MirrorWorkspace } from "../net/native";
   let { visible = true, recoveryOnly = false }: { visible?: boolean; recoveryOnly?: boolean } = $props();
   let status = $state<MirrorStatus | null>(null);
@@ -97,6 +97,7 @@
   {#if !recoveryOnly && status && !status.configured}<p class="hint">Automatic project copying is getting ready. You can keep working here.</p>{/if}
   {#if status?.workspaces.length === 0}<p class="hint">No project copies to show yet.</p>{/if}
   {#each status?.workspaces ?? [] as workspace (workspace.workspace_id)}
+    {@const steps = computerSteps(workspace.profile)}
     <details>
       <summary><span class="title">{workspace.name}</span><span class="hint">{place(workspace)}</span></summary>
       <div class="project">
@@ -119,6 +120,13 @@
             </div>
           {/if}
           {#if proposalChanged === workspace.workspace_id}<p class="hint" role="status">Your agent changed this proposal, so nothing was saved.</p>{/if}
+        {/if}
+        {#if steps.length}
+          <div class="steps">
+            <p class="lead">Steps that need your computer</p>
+            <p class="hint">These weren’t run in the cloud because they need this computer.</p>
+            <ul>{#each steps as step, index (index)}<li>{step}</li>{/each}</ul>
+          </div>
         {/if}
         {#if workspace.mirror}
           {#if workspace.mirror.last_mirrored_at}<p class="hint">Last copied {new Date(workspace.mirror.last_mirrored_at * 1000).toLocaleString()}</p>{/if}
@@ -154,5 +162,9 @@
      as markup, wrapped and scrollable rather than truncated. */
   .command { margin: 0; padding: 8px 10px; max-height: 12em; overflow: auto; border: 1px solid var(--edge); border-radius: 6px; font-family: var(--mono); font-size: var(--text-xs); white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
   .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .steps { display: flex; flex-direction: column; gap: 6px; }
+  .steps p { margin: 0; }
+  .steps ul { margin: 0; padding-left: 18px; font-family: var(--mono); font-size: var(--text-xs); overflow-wrap: anywhere; user-select: text; }
+  .steps li + li { margin-top: 4px; }
   @media (pointer: coarse) { summary, .btn, .check { min-height: 40px; } .btn { padding: 9px 12px; } }
 </style>

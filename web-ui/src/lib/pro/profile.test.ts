@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { decideProposal, proposedSetup, settleProposal } from "./profile";
+import { computerSteps, decideProposal, proposedSetup, settleProposal } from "./profile";
 
 const mocks = vi.hoisted(() => ({ api: vi.fn() }));
 vi.mock("../net/api", () => ({ api: mocks.api }));
@@ -35,6 +35,17 @@ describe("a proposed setup command", () => {
       expect(decideProposal(stored, "npm install", decision)).toBeNull();
       expect(decideProposal({ ...stored, pending_setup_command: undefined }, "npm ci", decision)).toBeNull();
     }
+  });
+});
+
+describe("steps that need the computer", () => {
+  const profile = (deferred: unknown) => ({ setup_command: null, laptop_only: [], deferred: deferred as string[], missing_environment: [] });
+  it("lists the kept steps in order and nothing else", () => {
+    expect(computerSteps(profile(["open Simulator.app", "xcodebuild test"]))).toEqual(["open Simulator.app", "xcodebuild test"]);
+    expect(computerSteps(profile(["", "  ", "nvidia-smi", 7, null]))).toEqual(["nvidia-smi"]);
+  });
+  it("is empty without a profile, an older daemon's shape or steps", () => {
+    for (const value of [null, undefined, profile([]), profile(undefined), profile("xcodebuild")]) expect(computerSteps(value)).toEqual([]);
   });
 });
 

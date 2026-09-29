@@ -15,6 +15,14 @@ export function proposedSetup(profile: MirrorProfile | null | undefined): string
   return typeof pending === "string" && pending.trim() !== "" ? pending : null;
 }
 
+/** Commands a cloud machine did not run because they need the user's computer
+ * (`profile.deferred`), in the order they were kept. Nothing runs them by
+ * itself; they are listed for the user, never offered as a button. */
+export function computerSteps(profile: MirrorProfile | null | undefined): string[] {
+  const steps: unknown[] = Array.isArray(profile?.deferred) ? profile.deferred : [];
+  return steps.filter((step): step is string => typeof step === "string" && step.trim() !== "");
+}
+
 export type ProposalDecision = "confirm" | "dismiss";
 
 /**
