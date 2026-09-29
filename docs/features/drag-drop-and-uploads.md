@@ -82,10 +82,22 @@ selection references (see [terminals.md](terminals.md)).
   briefly explain what happened. A two-minute no-progress watchdog turns a dead SSH tunnel or stuck
   destination filesystem into an actionable error instead of an endless spinner. Dropping an **image**
   onto a *chat* pane additionally attaches its pixels to the composer (the model sees it now); the
-  uploaded path stays the durable, host-side artifact the agent can re-read later. In a sent chat
-  bubble a mention of a landing-pad file reads as its name (`@report.pdf`, `paths.ts::uploadName`),
-  the whole path in its tooltip and in the text the agent got. The landing pad also holds the saved
-  copies of images sent in chat (see [chat-mode.md](chat-mode.md)), under the same caps.
+  uploaded path stays the durable, host-side artifact the agent can re-read later.
+- **In a chat, a dropped file reads as its name, where you referenced it.** The composer shows the
+  mention as `@Screenshot-….png` in place of the ~100-character landing-pad path, as a quiet pill
+  (every `@` mention in the draft gets one); resting the pointer on an upload's pill shows the path it
+  landed at. The short form edits as **one unit**, like a chip: a click inside it lands at its
+  nearer edge, the arrow keys step over it, Backspace/Delete at its edge removes all of it, a
+  selection or double-click takes it whole, text typed or pasted against its end gets a space first,
+  and deleting the space that keeps it apart from the next word does nothing. **Copy and cut carry
+  the whole path**, and pasting a whole landing-pad mention shows it short again. The send (and the
+  saved draft) puts the whole `@/…/uploads/<session>/<name>` back, so the agent receives exactly the
+  text a drop always typed — only what the draft shows changed (`chat/uploadTokens.ts`,
+  `chat/uploadChips.ts`, `chat/ComposerMentions.svelte`). Typed and picked mentions stay editable
+  text. In the sent bubble **every** `@` file mention reads as a chip in place — icon + name, like a
+  document the prose names, widened with its folder only where two share a name, a folder's `/` and a
+  `#L…` locator kept — clickable while it resolves, the whole mention in its tooltip, in a copy, and
+  in the text the agent got (`chat/UserText.svelte`, `paths.ts::mentionChipLabel`).
 - **Where it lives.** `App.svelte` registers **window-level** `dragenter/dragover/dragleave/drop`
   in `onMount` (torn down in the returned cleanup — global listeners must not leak). Every
   `dragover`/`drop` `preventDefault`s **unconditionally** — the browser's default for an unhandled
