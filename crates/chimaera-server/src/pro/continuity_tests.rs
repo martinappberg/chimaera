@@ -487,7 +487,30 @@ async fn a_resumed_cloud_machine_renews_its_own_epoch_before_any_fence() {
             crate::pro::may_execute(&state, &workspace.id),
             "the input that woke the machine is admitted"
         );
+        // A viewer waiting on this renewal hears the lease loop's answer.
+        assert!(execution::renewing(&state, &workspace.id, 4));
+        assert!(!execution::renewing(&state, &workspace.id, 5));
+        let waiter = {
+            let state = state.clone();
+            let id = workspace.id.clone();
+            tokio::spawn(async move {
+                execution::await_renewal(&state, &id, 4, StdDuration::from_secs(20)).await
+            })
+        };
+        tokio::task::yield_now().await;
         let result = reconcile(&state, &config, &workspace.id).await;
+        let answered = tokio::time::timeout(StdDuration::from_secs(2), waiter)
+            .await
+            .expect("the renewal's answer wakes the wait")
+            .unwrap();
+        assert_eq!(
+            answered,
+            if refused {
+                execution::Renewal::Refused
+            } else {
+                execution::Renewal::Renewed
+            }
+        );
         assert!(account
             .calls("POST", &format!("/v2/baton/{}/acquire", workspace.id))
             .is_empty());

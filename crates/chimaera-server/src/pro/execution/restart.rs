@@ -101,6 +101,7 @@ impl State {
             uncertain: Mutex::new(uncertain),
             boot,
             tick: Mutex::default(),
+            changed: tokio::sync::Notify::new(),
         }
     }
 }

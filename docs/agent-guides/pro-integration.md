@@ -103,6 +103,11 @@ reviewer can check each stays fixed:
    `home`, `recovered` (`chat::transfer_origin`,
    `chat::transfer_context`).
 
+10. A thawed cloud machine refused the viewer socket that woke it (its lease
+    lapsed while frozen) and dropped it without a close frame → it now waits
+    for its own renewal before admitting or refusing that viewer
+    (`execution::await_renewal`, `ws.rs::SocketScope::admit`).
+
 ## The transfer pick-up message
 
 After a move or a return, a structured conversation whose turn or background

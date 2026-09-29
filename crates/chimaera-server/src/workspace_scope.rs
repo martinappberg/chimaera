@@ -194,6 +194,17 @@ impl Scope {
         self.alias(state)?;
         crate::pro::validate_execution_scope(state, &self.workspace_id, self.epoch)
     }
+    /// A scope this machine cannot admit yet only because it just thawed and
+    /// its own renewal of exactly this epoch is still out (see
+    /// `pro::scope_renewing`): wait for that renewal rather than refusing.
+    pub(crate) fn renewing(&self, state: &AppState) -> bool {
+        crate::pro::scope_renewing(state, &self.workspace_id, self.epoch)
+    }
+    /// Waits (bounded by the resume window) for that renewal; `true` once a
+    /// fresh proof exists. Admits nothing: the caller validates again.
+    pub(crate) async fn await_renewal(&self, state: &AppState) -> bool {
+        crate::pro::await_scope_renewal(state, &self.workspace_id, self.epoch).await
+    }
     pub(crate) fn session(&self, state: &AppState, session: &str) -> Result<()> {
         ensure!(
             crate::lock(&state.session_workspaces).get(session) == Some(&self.workspace_id),
@@ -385,9 +396,17 @@ async fn scoped_request(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    let generation = crate::pro::mutation::generation(&state);
+    let mut generation = crate::pro::mutation::generation(&state);
     if scope.validate(&state).is_err() {
-        return denied(StatusCode::CONFLICT);
+        // The request that woke a suspended owner (or any reaching it while
+        // it renews its own epoch) is answered after that renewal, not 409.
+        if !(scope.renewing(&state) && scope.await_renewal(&state).await) {
+            return denied(StatusCode::CONFLICT);
+        }
+        generation = crate::pro::mutation::generation(&state);
+        if scope.validate(&state).is_err() {
+            return denied(StatusCode::CONFLICT);
+        }
     }
     let path = request
         .uri()

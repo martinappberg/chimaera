@@ -84,9 +84,15 @@ HTTP action and socket authentication (coalescing only concurrent reads). It sen
 `X-Chimaera-Workspace` and `X-Chimaera-Epoch`; WebSocket first-frame authentication
 carries `workspace_id` and `epoch`. Authentication still uses the existing cookie
 or target daemon bearer. Partial, duplicated, malformed or mismatching scopes are
-rejected. On a socket's first frame a scope the target cannot admit yet (an owner that
-just woke and has not renewed, a changed epoch) is answered with the retryable
-`workspace_scope_changed` error; only a wrong bearer token answers `unauthorized`,
+rejected. An owner that just thawed from a suspension and is still renewing its
+own lease for exactly the requested epoch waits for that renewal (never past its
+20 s resume window) before answering a socket's first frame or a scoped request:
+chat and terminal sockets get the additive `{"type":"waking"}` meanwhile, and
+the socket is admitted (or the request served) only once the fresh proof exists.
+A scope the target cannot admit (a refused or unanswered renewal, a changed
+epoch, any epoch other than the one it is renewing) is answered at once with the
+retryable `workspace_scope_changed` error, and a socket then gets a close frame
+(1013, "try again later"); only a wrong bearer token answers `unauthorized`,
 which clients treat as final. No authority comes from a header alone.
 
 Before forwarding HTTP or opening a WebSocket, both gateway and native proxy make
