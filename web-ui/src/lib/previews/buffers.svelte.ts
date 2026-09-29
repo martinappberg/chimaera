@@ -377,11 +377,16 @@ export class Buffer {
   }
 
   private afterChange(ours: boolean): void {
+    const wasDirty = this.dirty;
     this.refreshDirty();
     if (!ours) {
       // The user typed: the merge notice has done its job.
       this.clearNotice();
       this.scheduleAutosave();
+      // Typed or undone back to the disk text: a draft already journaled
+      // holds edits the user took back, and the next open would offer them.
+      // (The buffer's own reload/merge/restore callers clear for themselves.)
+      if (wasDirty && !this.dirty) this.afterClean();
     }
     if (this.dirty) this.scheduleJournal();
   }

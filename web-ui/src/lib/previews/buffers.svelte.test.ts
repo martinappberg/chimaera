@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
-import { EditorState, StateEffect, type TransactionSpec } from "@codemirror/state";
+import { undo } from "@codemirror/commands";
+import { EditorState, StateEffect, Transaction, type TransactionSpec } from "@codemirror/state";
 import { EditorView, type ViewUpdate } from "@codemirror/view";
 
 const mocks = vi.hoisted(() => ({
@@ -29,6 +30,7 @@ vi.mock("../settings/store.svelte", () => ({
 import { FileConflictError, type FileChunk, type WriteResult } from "./files";
 import {
   bufferFor,
+  JOURNAL_DELAY_MS,
   openBuffer,
   Presence,
   PRESENCE_HIDDEN_TTL_MS,
@@ -60,8 +62,8 @@ class FakeView {
   constructor(state: EditorState) {
     this.state = state;
   }
-  dispatch(spec: TransactionSpec): void {
-    const tr = this.state.update(spec);
+  dispatch(spec: TransactionSpec | Transaction): void {
+    const tr = spec instanceof Transaction ? spec : this.state.update(spec);
     this.state = tr.state;
     const u = { view: this, docChanged: tr.docChanged, transactions: [tr], state: tr.state };
     for (const l of this.state.facet(EditorView.updateListener)) l(u as unknown as ViewUpdate);
@@ -460,6 +462,30 @@ describe("the journal", () => {
     buf.discard();
     // A discard drops only this window's record.
     expect(mocks.drafts.clear).toHaveBeenLastCalledWith(path, { writer: "this-window" });
+    close(buf, view);
+  });
+
+  it("drops this window's draft when the user undoes back to the disk text", async () => {
+    vi.useFakeTimers();
+    const path = `/w/undone-${++seq}.py`;
+    const { buf, view } = fresh(path, "x = 1\n");
+    view.type(view.text.length, "y = 2\n");
+    await vi.advanceTimersByTimeAsync(JOURNAL_DELAY_MS);
+    expect(mocks.drafts.journal).toHaveBeenCalledWith(expect.objectContaining({ text: "x = 1\ny = 2\n" }), false);
+
+    undo({ state: view.state, dispatch: (tr) => view.dispatch(tr) });
+    expect(view.text).toBe("x = 1\n");
+    expect(buf.dirty).toBe(false);
+    // This window's record, or anyone's holding exactly the disk text — never
+    // another window's draft of the same file.
+    expect(mocks.drafts.clear).toHaveBeenCalledTimes(1);
+    expect(mocks.drafts.clear).toHaveBeenCalledWith(path, { writer: "this-window", text: "x = 1\n" });
+
+    // Typed again: the same text is journaled afresh, not skipped as written.
+    view.type(view.text.length, "y = 2\n");
+    await vi.advanceTimersByTimeAsync(JOURNAL_DELAY_MS);
+    expect(mocks.drafts.journal).toHaveBeenCalledTimes(2);
+    buf.discard();
     close(buf, view);
   });
 
