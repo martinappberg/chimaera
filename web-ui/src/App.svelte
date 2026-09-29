@@ -28,6 +28,7 @@
   } from "./lib/net/api";
   import { linkRtt, linkRttNow, resetLinkRtt, LINK_RTT_BADGE_MS } from "./lib/net/rtt";
   import { projectWhere, projectWhereLabel } from "./lib/net/placement";
+  import { titleHost, windowTitle } from "./lib/shared/windowTitle";
   import { LOCAL_ECHO_MIN_RTT_MS } from "./lib/terminal/localEcho";
   import { healthPollDelayMs, type PollHandle } from "./lib/net/poll";
   import { pageVisible } from "./lib/shared/visibility";
@@ -3005,31 +3006,30 @@
 
   $effect(() => {
     // The workspace leads; a remote window wears its host so a wall of similar
-    // windows is legible:
-    //   "crc_finish •Sherlock | chimaera"  (remote, in a workspace)
-    //   "crc_finish | chimaera"            (local — the host is implicit)
-    // Home (no workspace) drops the workspace but keeps the host when remote.
-    // A compute-node daemon (the snapshot's `self` — daemon truth, not the
-    // URL hash) appends its node: "crc_finish •Sherlock › sh02-02n44 | …",
-    // so a job window never poses as its login node.
-    const node = $computeStatus?.self?.node;
-    const hostWithNode = node ? `${hostAlias} › ${node}` : hostAlias;
-    const host = isRemoteWindow ? hostWithNode : null;
-    let scope = workspace
-      ? host
-        ? `${workspace.name} •${host}`
-        : workspace.name
-      : (host ?? "");
-    // A detached solo window is named for what it shows: the tab leads, the
-    // workspace scope trails — "claude (2) — crc_finish | chimaera".
+    // windows is legible (a browser view of a project wears where the project
+    // runs, not a host — see windowTitle.ts). A compute-node daemon (the
+    // snapshot's `self` — daemon truth, not the URL hash) appends its node, so
+    // a job window never poses as its login node. A detached solo window is
+    // named for what it shows: the tab leads, the workspace scope trails.
+    let tab: string | null = null;
     if (detachedWindow) {
       const only = tabCount(layout) === 1 ? panesOf(layout.root)[0]?.tabs[0] : undefined;
       const p = findPane(layout.root, layout.focusedPaneId);
       const shown = only ?? p?.tabs[p.active];
-      if (shown !== undefined) scope = scope ? `${tabLabel(shown)} — ${scope}` : tabLabel(shown);
+      if (shown !== undefined) tab = tabLabel(shown);
     }
-    const base = scope ? `${scope} | chimaera` : "chimaera";
-    const title = needsYou > 0 ? `(${needsYou}) ${base}` : base;
+    const title = windowTitle({
+      workspace: workspace?.name ?? null,
+      host: titleHost({
+        projectView,
+        projectLabel: $projectWhere !== null ? projectWhereLabel($projectWhere, { state: true }) : null,
+        hostAlias,
+        remote: isRemoteWindow,
+      }),
+      node: $computeStatus?.self?.node,
+      tab,
+      needsYou,
+    });
     document.title = title;
     // The native window title doesn't follow document.title — push it
     // explicitly. Overlay windows hide the text but keep this OS metadata.
