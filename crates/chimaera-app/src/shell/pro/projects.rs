@@ -10,6 +10,37 @@ use tokio::sync::{oneshot, Semaphore};
 
 static OPEN_PROJECT: Semaphore = Semaphore::const_new(1);
 
+/// Fixed codes for a project that did not open; the page maps each to a
+/// sentence (`CloudProjects.svelte`). Anything unexpected is `FAILED`.
+pub(in crate::shell) mod open_code {
+    /// Still mid-step in the cloud; the page retries on its own.
+    pub const BUSY: &str = "project_busy";
+    pub const FOLDER_NOT_EMPTY: &str = "project_folder_not_empty";
+    pub const FOLDER_MISSING: &str = "project_folder_missing";
+    /// Inside another project or Git repository.
+    pub const FOLDER_NESTED: &str = "project_folder_nested";
+    pub const ACCOUNT_CHANGED: &str = "account_changed";
+    pub const ALREADY_OPENING: &str = "project_already_opening";
+    pub const UNAVAILABLE: &str = "project_unavailable";
+    pub const FAILED: &str = "project_open_failed";
+
+    pub(super) fn of(error: &anyhow::Error) -> &'static str {
+        let text = error.to_string();
+        [
+            BUSY,
+            FOLDER_NOT_EMPTY,
+            FOLDER_MISSING,
+            FOLDER_NESTED,
+            ACCOUNT_CHANGED,
+            ALREADY_OPENING,
+            UNAVAILABLE,
+        ]
+        .into_iter()
+        .find(|code| text == *code)
+        .unwrap_or(FAILED)
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct CloudProject {
     workspace_id: String,
@@ -112,7 +143,7 @@ fn destination(chosen: &Path, name: &str) -> Result<(PathBuf, bool)> {
             Err(error) => return Err(error.into()),
         }
     }
-    anyhow::bail!("Choose an empty folder for this project.")
+    anyhow::bail!(open_code::FOLDER_NOT_EMPTY)
 }
 
 /// A folder name from the project's display name: no separators, control
@@ -168,7 +199,7 @@ pub async fn pro_open_cloud_project(
     async {
         let _operation = OPEN_PROJECT
             .try_acquire()
-            .context("A project is already being opened")?;
+            .context(open_code::ALREADY_OPENING)?;
         ensure!(
             !workspace_id.is_empty()
                 && workspace_id.len() <= 128
@@ -195,10 +226,10 @@ pub async fn pro_open_cloud_project(
             .await?
             .into_iter()
             .find(|row| row.workspace_id == workspace_id)
-            .context("This cloud project is unavailable; refresh the list and try again")?;
+            .context(open_code::UNAVAILABLE)?;
         ensure!(
             generation == state.pro.generation(),
-            "Account changed; open the project again"
+            open_code::ACCOUNT_CHANGED
         );
         let saved = project.local_root.is_some();
         let chosen = if saved {
@@ -225,7 +256,7 @@ pub async fn pro_open_cloud_project(
         // a project under the replacement account's daemon delegation.
         ensure!(
             generation == state.pro.generation() && state.pro.client().await.is_some(),
-            "Account changed; open the project again"
+            open_code::ACCOUNT_CHANGED
         );
         let opened = daemon_request(&state, "POST", "/pro/projects/open", Some(body)).await;
         let opened = match opened {
@@ -240,13 +271,13 @@ pub async fn pro_open_cloud_project(
         let imported = serde_json::from_value(opened)?;
         ensure!(
             generation == state.pro.generation(),
-            "Account changed while the project was opening"
+            open_code::ACCOUNT_CHANGED
         );
         let _ = app.emit("pro-changed", ());
         Ok(Some(imported))
     }
     .await
-    .map_err(|error: anyhow::Error| error.to_string())
+    .map_err(|error: anyhow::Error| open_code::of(&error).to_owned())
 }
 
 #[cfg(test)]
@@ -282,6 +313,44 @@ mod tests {
         assert_eq!(folder_name("  .hidden/name\n "), "hidden-name-");
         assert_eq!(folder_name("..."), "Project");
         assert_eq!(folder_name(&"x".repeat(200)).len(), 80);
+    }
+
+    #[test]
+    fn only_fixed_open_codes_reach_the_page() {
+        assert_eq!(
+            open_code::of(&anyhow::anyhow!(open_code::BUSY)),
+            open_code::BUSY
+        );
+        assert_eq!(
+            open_code::of(&anyhow::anyhow!("Permission denied (os error 13)")),
+            open_code::FAILED
+        );
+        assert_eq!(
+            open_code::of(&anyhow::anyhow!("x").context(open_code::ALREADY_OPENING)),
+            open_code::ALREADY_OPENING
+        );
+        for (detail, code) in [
+            (
+                "The cloud project is busy; wait for a pause and try again",
+                open_code::BUSY,
+            ),
+            (
+                "destination folder is not empty",
+                open_code::FOLDER_NOT_EMPTY,
+            ),
+            ("saved folder is missing", open_code::FOLDER_MISSING),
+            (
+                "folder is inside a Git repository",
+                open_code::FOLDER_NESTED,
+            ),
+            (
+                "Account changed; open the project again",
+                open_code::ACCOUNT_CHANGED,
+            ),
+            ("private path=/sensitive", open_code::FAILED),
+        ] {
+            assert_eq!(super::super::project_failure(detail), code, "{detail}");
+        }
     }
 
     #[test]

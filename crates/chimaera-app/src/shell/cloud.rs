@@ -2,26 +2,44 @@
 use super::{pro, Shell};
 use chimaera_core::cloud_providers::{provider_auth_origins, provider_definition};
 use chimaera_link::{Client, Host, HostKind, LinkTunnel};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{io::Read, time::Duration};
 use tauri::{AppHandle, Manager};
 
+#[derive(Serialize)]
+pub struct CloudStatus {
+    #[serde(flatten)]
+    worker: chimaera_link::WorkerStatus,
+    /// Additive: whether an agent was connected in the cloud at the last
+    /// provider catalog read. Remembered, never probed, so a sleeping cloud
+    /// is not woken to answer it. Absent when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agents_connected: Option<bool>,
+}
+
 #[tauri::command]
-pub async fn pro_cloud_status(app: AppHandle) -> Result<chimaera_link::WorkerStatus, String> {
+pub async fn pro_cloud_status(app: AppHandle) -> Result<CloudStatus, String> {
     let state = app.state::<Shell>();
     let (client, generation) = state
         .pro
         .client_snapshot()
         .await
         .ok_or("Sign in to see your cloud status.")?;
-    let status = client.worker_status().await.map_err(|_| {
+    let worker = client.worker_status().await.map_err(|_| {
         "Couldn't check cloud availability. Check your connection and try again.".to_string()
     })?;
     if state.pro.generation() != generation {
         return Err("Your account changed. Refresh your cloud status.".into());
     }
-    Ok(status)
+    let agents_connected = state
+        .pro
+        .account_id()
+        .and_then(|account| state.pro.agents.get(&account));
+    Ok(CloudStatus {
+        worker,
+        agents_connected,
+    })
 }
 
 #[derive(Deserialize)]
@@ -219,6 +237,7 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
         Request::ProviderSubmit { .. } | Request::ProviderDisconnect { .. }
     );
     let open_browser = matches!(request, Request::OpenProviderBrowser { .. });
+    let catalog = matches!(request, Request::Providers);
     let open_terminal = matches!(request, Request::OpenProviderTerminal { .. });
     let timeout = match &request {
         Request::ResumeHandoff { .. } => 1200,
@@ -363,6 +382,14 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
         return Err("Account changed during cloud setup".into());
     }
     let mut value = result?;
+    if catalog {
+        if let Some(account) = state.pro.account_id() {
+            state
+                .pro
+                .agents
+                .record(&account, pro::agents::from_catalog(&value));
+        }
+    }
     if open_browser || open_terminal {
         let connection = active_connection(&value)?;
         if open_terminal {

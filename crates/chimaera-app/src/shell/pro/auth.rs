@@ -237,9 +237,9 @@ pub(super) async fn wait_callback(
     deadline: tokio::time::Instant,
 ) -> Result<Callback> {
     tokio::select! {
-        _ = attempt.cancelled() => bail!("Sign-in cancelled"),
+        _ = attempt.cancelled() => bail!("Sign-in canceled"),
         result = tokio::time::timeout_at(deadline, callback(listener, redirect, pkce)) => {
-            result.context("Sign-in expired. Choose Try again to open a fresh browser sign-in.")?
+            result.context(super::code::SIGN_IN_TIMED_OUT)?
         }
     }
 }
@@ -248,7 +248,13 @@ async fn reply(mut socket: TcpStream, success: bool) {
     let (status, title, message) = if success {
         ("200 OK", "You're signed in", "Your account is connected. Chimaera is bringing you back to the app. You can close this tab.")
     } else {
-        ("400 Bad Request", "Sign-in wasn't completed", "Return to Chimaera and choose Try again to start a fresh sign-in. You can close this tab.")
+        // Names the app's own button (the Pro page's Sign in) so the next
+        // step reads the same in both places.
+        (
+            "400 Bad Request",
+            "Sign-in wasn't completed",
+            "Return to Chimaera and choose Sign in to start again. You can close this tab.",
+        )
     };
     let body = include_str!("../../../assets/sign-in.html")
         .replace("{{title}}", title)
@@ -360,7 +366,7 @@ mod tests {
                 .unwrap()
                 .0;
             assert!(!main.contains(['{', '}']));
-            assert!(main.contains("<p>Return to Chimaera and choose Try again to start a fresh sign-in. You can close this tab.</p>"));
+            assert!(main.contains("<p>Return to Chimaera and choose Sign in to start again. You can close this tab.</p>"));
             assert!(!response.contains(&state));
         }
         let mut socket = TcpStream::connect(address).await.unwrap();
@@ -398,7 +404,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_and_expired_waits_close_their_loopback_listener() {
+    async fn canceled_and_expired_waits_close_their_loopback_listener() {
         for cancel in [false, true] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -418,7 +424,12 @@ mod tests {
             )
             .await;
             let error = result.err().unwrap().to_string();
-            assert!(error.contains(if cancel { "cancelled" } else { "expired" }));
+            // A timed-out wait is the fixed code the page shows quietly.
+            if cancel {
+                assert!(error.contains("canceled"));
+            } else {
+                assert_eq!(error, super::super::code::SIGN_IN_TIMED_OUT);
+            }
             assert!(TcpStream::connect(address).await.is_err());
             assert_eq!(state.complete(attempt.id), !cancel);
         }
