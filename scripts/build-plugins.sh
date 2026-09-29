@@ -108,9 +108,17 @@ VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
 REPO_RE='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
 SHA_RE='^[0-9a-f]{64}$'
 
+# --retry alone retries only what curl deems transient (timeouts, HTTP
+# 408/429/5xx), not a reset connection (exit 35/56), and one such blip failed
+# a CI run. --retry-all-errors (curl 7.71+) retries every failure, so a
+# missing release takes its three retries (~6 s) to report; an older curl
+# (RHEL 8's 7.61) goes without it.
+RETRY_ALL=
+if curl --retry-all-errors --version >/dev/null 2>&1; then RETRY_ALL=--retry-all-errors; fi
+
 fetch() { # url dest
   curl -fsSL --proto '=https' --proto-redir '=https' --max-filesize "$MAX_BYTES" \
-    --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 2 -o "$2" "$1"
+    --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 2 ${RETRY_ALL:+"$RETRY_ALL"} -o "$2" "$1"
 }
 
 size() { wc -c <"$1" | tr -d ' '; }

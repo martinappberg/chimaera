@@ -188,13 +188,17 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   reuses one for 3 s across opens) — a new tunnel port is a new origin with an empty IndexedDB.
   Opening a file whose draft differs from the disk shows "Recovered unsaved changes from …" with Restore /
   Discard, never a silent restore; a draft typed against an older disk version restores through
-  the merge. When both copies exist with different text the newer wins by the writers' own
+  the merge. Each layer holds one draft per path, so until the open's lookup settles, and while
+  a draft is on offer, the window journals none of its own edits (they would overwrite the
+  offer's only copy): the status bar says "draft not backed up" until restore, discard or a
+  save. When both copies exist with different text the newer wins by the writers' own
   clocks (each PUT carries the client's `updated_ms`, answered back as `client_updated_ms`), not
   the daemon's arrival stamp, which runs on another machine's clock; a mirror copy from an older
-  client falls back to that stamp. A save of exactly that text, or a discard, clears both
-  copies — but only the record this window wrote (each carries a per-page `writer` id; the
-  mirror's `DELETE ?writer=` spares another window's) or one holding exactly the saved or
-  discarded text, so one window's save never drops another window's draft of the same file.
+  client falls back to that stamp. A save of exactly that text, a discard, or an edit (an undo,
+  say) that takes the buffer back to the disk text clears both copies — but only the record this
+  window wrote (each carries a per-page `writer` id; the mirror's `DELETE ?writer=` spares
+  another window's) or one holding exactly the saved or discarded text, so one window's save
+  never drops another window's draft of the same file.
   Mirror writes for a path land in issue order, so a late journal write never re-creates a
   cleared draft. A hide/pagehide flush re-journals every dirty buffer even when its text is
   unchanged (another window may have overwritten the path's one record) and sends drafts as
