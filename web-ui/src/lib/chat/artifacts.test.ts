@@ -5,6 +5,7 @@ import {
   chipLabels,
   embedsAsChip,
   fileStateAfter,
+  foldedChips,
   isArtifactPath,
   namesFile,
   proseCovered,
@@ -152,6 +153,32 @@ describe("fileStateAfter", () => {
     expect(fileStateAfter(info(60_000), 20_000)).toBe("changed");
     expect(fileStateAfter(info(60_000), null)).toBe("present"); // turn still open
     expect(fileStateAfter(info(null), 20_000)).toBe("present");
+  });
+});
+
+describe("foldedChips", () => {
+  const f = (path: string) => ({ path });
+  it("keeps every file when they fit", () => {
+    const files = ["a.png", "b.png", "notes.md"].map(f);
+    expect(foldedChips(files, 6)).toEqual(files);
+  });
+
+  it("hides a family's tail, never the odd one out, in the files' own order", () => {
+    const panels = Array.from({ length: 14 }, (_, i) => f(`figs/p${i}.png`));
+    const files = [...panels, f("report.html"), f("notes.md")];
+    expect(foldedChips(files, 6).map((x) => x.path)).toEqual([
+      "figs/p0.png",
+      "figs/p1.png",
+      "figs/p2.png",
+      "figs/p3.png",
+      "report.html",
+      "notes.md",
+    ]);
+  });
+
+  it("takes one of each kind before a second of any", () => {
+    const files = ["a.png", "b.png", "c.csv", "d.csv", "e.md", "f.md", "g.pdf"].map(f);
+    expect(foldedChips(files, 4).map((x) => x.path)).toEqual(["a.png", "c.csv", "e.md", "g.pdf"]);
   });
 });
 

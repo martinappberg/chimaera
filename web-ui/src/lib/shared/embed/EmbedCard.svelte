@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
    * One card for any embedded file — in a document, in agent prose, in a
-   * turn's "made this turn" gallery. A thin header (file icon, name, the
+   * hover preview (compact). A thin header (file icon, name, the
    * piece shown, open in a pane, download on a remote host) over the file's
    * own compact viewer: an image (a `#xywh=` region cropped), a PDF page, a
    * code excerpt with line numbers, a table slice, a sandboxed HTML report,
@@ -54,7 +54,7 @@
     alt?: string;
     /** The author's width hint in px (`![x|400](…)`). */
     width?: number | null;
-    /** Gallery tile: a fixed, shorter body. */
+    /** A glance (the hover preview): a fixed, shorter body. */
     compact?: boolean;
     /** How to resolve when no `info` came with the card (chat prose embeds
      *  resolve against the session's directories). Default: `path` as an

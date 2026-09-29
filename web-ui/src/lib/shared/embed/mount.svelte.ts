@@ -31,7 +31,7 @@ export interface EmbedProps {
   alt?: string;
   /** Width hint in px (`![x|400](…)`). */
   width?: number | null;
-  /** A gallery tile's fixed, shorter body. */
+  /** A glance's fixed, shorter body (the hover preview). */
   compact?: boolean;
   resolve?: () => Promise<TargetResult | null>;
   /** Open in a pane (default: the workbench opener, `openPath`). */

@@ -2,7 +2,7 @@
   /**
    * What a turn wrote that its prose did not already show, after the
    * closing prose. The files its edit tools wrote (absolute paths from the
-   * tools, so a tile opens whatever the prose called the file), plus the
+   * tools, so a chip opens whatever the prose called the file), plus the
    * files its shell commands wrote — the paths its commands and outputs
    * mention that the daemon confirms exist and were modified during the
    * turn (artifacts.ts). The reducer leaves out what the prose embedded or
@@ -10,29 +10,26 @@
    * written" when the prose showed a share. "Written", not "made": a turn
    * that edits a document wrote it too.
    *
-   * One header, two shapes by what a file is for (artifactShape): a
-   * *visual* — a figure, a rendered report, a PDF, a clip — is looked at,
-   * so it gets an embed tile; a *document* — a markdown note, a table, a
-   * notebook, a deck — is opened, so it gets one chip on a quiet line
-   * (FileChip), and resting the pointer on a chip previews that one file
-   * (the chat's hover preview; `hoverTargets`). With no tiles the header
-   * sits on the chip line, so a turn that only touched documents costs one
-   * line.
+   * One quiet line: the heading, then one chip per file (FileChip) —
+   * figures, reports and clips alike with documents. A click opens the
+   * file; resting the pointer on a chip previews that one file (the chat's
+   * hover preview, `hoverTargets`: a picture, a PDF page, a document's
+   * opening). Nothing draws inline — a turn that saves twenty plots still
+   * costs a line or two, and the prose embeds the figures it talks about.
+   * Past seven files, six show — one of each kind before a second of any
+   * (`foldedChips`) — and the rest wait behind "+n more".
    *
    * A chip knows its file: two files sharing a name show their folders; a
-   * file rewritten after the turn says so in its tooltip; a gone file is
-   * struck and not clickable. States come from one resolve when the gallery
+   * file rewritten after the turn says so in its preview; a gone file is
+   * struck and not clickable. States come from one resolve when the line
    * nears the viewport and follow the daemon's disk monitor while on screen
-   * (the shown chips only — the watch list is small and shared). Tiles load
-   * near the viewport, stay fresh when a file is overwritten, and say so
-   * when one is gone.
+   * (the shown chips only — the watch list is small and shared).
    */
-  import EmbedCard from "../shared/embed/EmbedCard.svelte";
   import FileChip from "./FileChip.svelte";
   import { isMissing, resolveFile, type TargetInfo, type TargetResult } from "../shared/embed/embed";
   import type { OpenPathOptions, PathKind } from "../shared/openPath";
   import { lastDiskChange, releaseDiskFile, retainDiskFile } from "../workspace/diskWatch";
-  import { artifactShape, chipLabels, fileStateAfter, writtenDuring, type FileState } from "./artifacts";
+  import { chipLabels, fileStateAfter, foldedChips, isArtifactPath, writtenDuring, type FileState } from "./artifacts";
   import type { EmbedResolver } from "./embeds";
   import type { HoverTargets } from "./hoverTargets";
 
@@ -69,8 +66,8 @@
    *  is left once the prose has shown its share. */
   const heading = $derived(covered.length > 0 ? "Also written" : "Written this turn");
 
-  /** Tiles per shape: past this the turn wrote a directory's worth. */
-  const MAX_TILES = 8;
+  /** Files listed at most: past this the turn wrote a directory's worth. */
+  const MAX_FILES = 48;
   /** Chips on the line before the rest fold behind "+n more". */
   const MAX_CHIPS = 6;
 
@@ -153,27 +150,31 @@
     };
   });
 
-  type Tile = { path: string; info: TargetInfo | null };
+  type Written = { path: string; info: TargetInfo | null };
 
-  const all = $derived.by((): Tile[] => {
-    const out: Tile[] = paths.map((p) => ({ path: p, info: null }));
-    for (const c of confirmed) out.push({ path: c.path, info: c });
-    return out;
+  /** Every file, in the order the turn reported it: the tools' files, then
+   *  the shell's once confirmed — so the line only grows at its end when
+   *  the confirmations land. */
+  const files = $derived.by((): Written[] => {
+    const all: Written[] = paths.map((p) => ({ path: p, info: null }));
+    for (const c of confirmed) all.push({ path: c.path, info: c });
+    return all.filter((f) => isArtifactPath(f.path)).slice(0, MAX_FILES);
   });
-  const visuals = $derived(all.filter((t) => artifactShape(t.path) === "visual").slice(0, MAX_TILES));
-  const documents = $derived(all.filter((t) => artifactShape(t.path) === "document").slice(0, MAX_TILES * 3));
-  const chips = $derived(allChips || documents.length <= MAX_CHIPS ? documents : documents.slice(0, MAX_CHIPS));
+  /** Folding is only worth it past one extra chip's worth: "+1 more"
+   *  costs the room the chip would. */
+  const folds = $derived(files.length > MAX_CHIPS + 1);
+  const chips = $derived(allChips || !folds ? files : foldedChips(files, MAX_CHIPS));
   /** Names widen against everything the turn wrote, shown here or not:
    *  `docs/notes.md` must not read "notes.md" beside the prose's link to
    *  the root one. */
-  const labels = $derived(chipLabels([...documents.map((d) => d.path), ...covered]));
+  const labels = $derived(chipLabels([...files.map((f) => f.path), ...covered]));
 
   function setState(path: string, state: FileState): void {
     if (states[path] === state) return;
     states = { ...states, [path]: state };
   }
 
-  // Each document's state, asked once when the gallery is near: a confirmed
+  // Each file's state, asked once when the line is near: a confirmed
   // mention was resolved just now (present by construction); a tool-written
   // path gets one coalesced fs/resolve_targets. `asked` is plain, not
   // reactive — reading `states` here would make this effect its own trigger.
@@ -181,16 +182,16 @@
   $effect(() => {
     if (!near) return;
     const end = endedAtMs;
-    for (const doc of documents) {
-      if (asked.has(doc.path)) continue;
-      asked.add(doc.path);
-      if (doc.info !== null) {
-        setState(doc.path, fileStateAfter(doc.info, end));
+    for (const f of files) {
+      if (asked.has(f.path)) continue;
+      asked.add(f.path);
+      if (f.info !== null) {
+        setState(f.path, fileStateAfter(f.info, end));
         continue;
       }
       // Fresh: whether it changed after the turn is the question.
-      void resolveFile(doc.path, { fresh: true }).then((r) => {
-        if (r !== null) setState(doc.path, fileStateAfter(r, end));
+      void resolveFile(f.path, { fresh: true }).then((r) => {
+        if (r !== null) setState(f.path, fileStateAfter(r, end));
       });
     }
   });
@@ -228,10 +229,6 @@
     };
   });
 
-  function open(path: string, kind: "file" | "dir", reveal?: import("../shared/reveal").Reveal): void {
-    onOpenPath?.(path, kind, reveal !== undefined ? { reveal } : {});
-  }
-
   /** A chip's accessible name: what a sighted reader gets from the chip
    *  and its preview. */
   function chipName(path: string, state: FileState): string {
@@ -242,47 +239,33 @@
 </script>
 
 <div class="gallery-host" bind:this={host}>
-  {#if visuals.length > 0}
-    <div class="label">{heading}</div>
-    <div class="gallery" role="group" aria-label={heading.toLowerCase()}>
-      {#each visuals as tile (tile.path)}
-        <div class="tile">
-          <EmbedCard
-            path={tile.path}
-            info={tile.info}
-            compact
-            onOpen={onOpenPath !== undefined ? open : undefined}
-          />
-        </div>
-      {/each}
-    </div>
-  {/if}
-  {#if documents.length > 0}
-    <!-- Documents are opened, not stared at: one chip each, the same quiet
-         voice as a folded activity line; a rest on one previews it. -->
-    <div class="files" role="group" aria-label="documents written this turn">
-      {#if visuals.length === 0}
-        <span class="files-label">{heading}</span>
-      {/if}
-      {#each chips as doc (doc.path)}
-        {@const state = states[doc.path] ?? "present"}
+  {#if files.length > 0}
+    <!-- One quiet line, the voice of a folded activity line: a chip per
+         file, a rest on one previews it. -->
+    <div class="files" role="group" aria-label={heading.toLowerCase()}>
+      <span class="files-label">{heading}</span>
+      {#each chips as f (f.path)}
+        {@const state = states[f.path] ?? "present"}
         <FileChip
-          path={doc.path}
-          label={labels.get(doc.path) ?? doc.path}
+          path={f.path}
+          label={labels.get(f.path) ?? f.path}
           {state}
-          name={chipName(doc.path, state)}
-          title={state === "gone" ? chipName(doc.path, state) : undefined}
-          onOpen={onOpenPath !== undefined ? (e) => onOpenPath(doc.path, "file", { split: e.metaKey || e.ctrlKey }) : undefined}
+          name={chipName(f.path, state)}
+          title={state === "gone" ? chipName(f.path, state) : undefined}
+          onOpen={onOpenPath !== undefined ? (e) => onOpenPath(f.path, "file", { split: e.metaKey || e.ctrlKey }) : undefined}
           hover={hoverTargets !== undefined && state !== "gone"
             ? {
                 targets: hoverTargets,
-                target: { path: doc.path, fragment: null, ...(state === "changed" ? { note: "changed after this turn" } : {}) },
+                target: { path: f.path, fragment: null, ...(state === "changed" ? { note: "changed after this turn" } : {}) },
               }
             : null}
         />
       {/each}
-      {#if chips.length < documents.length}
-        <button class="more" onclick={() => (allChips = true)}>+{documents.length - chips.length} more</button>
+      {#if folds}
+        <!-- One button either way, so a keyboard toggle keeps its focus. -->
+        <button class="more" aria-expanded={allChips} onclick={() => (allChips = !allChips)}>
+          {allChips ? "fewer" : `+${files.length - chips.length} more`}
+        </button>
       {/if}
     </div>
   {/if}
@@ -292,75 +275,6 @@
   .gallery-host {
     min-height: 1px;
     margin-top: 6px;
-  }
-  .label {
-    margin: 8px 0 4px;
-    color: var(--activity-fg, var(--muted));
-    font-size: var(--text-xs);
-  }
-  /* A figure strip, not a grid of boxes: tiles share one row height and
-     take their width from what they show — a picture's own aspect ratio, a
-     report's page width — and wrap like figures laid on a desk. */
-  .gallery {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: flex-start;
-    gap: 10px;
-    margin: 0 0 10px;
-  }
-  .tile {
-    display: flex;
-    flex: none;
-    width: fit-content;
-    min-width: 200px;
-    max-width: 100%;
-    height: 230px;
-    border-radius: 10px;
-  }
-  /* The shared embed card, worn as a tile: the name becomes a caption
-     under the picture, the picture fills the tile to its edges, and the
-     tile's width follows the picture. */
-  .tile > :global(.embed-card) {
-    flex: 1;
-    flex-direction: column-reverse;
-    width: fit-content;
-    min-width: 100%;
-    border-radius: 10px;
-  }
-  .tile > :global(.embed-card > .head) {
-    border-bottom: none;
-    border-top: 1px solid color-mix(in srgb, var(--edge) 55%, transparent);
-  }
-  .tile :global(.image-body.tile) {
-    padding: 0;
-    background: none;
-  }
-  .tile :global(.image-body.tile .frame) {
-    border-radius: 0;
-  }
-  /* A picture's tile hugs the picture (drawn at its own size, never
-     scaled up, at most a row tall): a wide figure is a wide, short tile,
-     not a figure floating in a box. */
-  .tile:has(> :global(.embed-card[data-embed-kind="image"])) {
-    height: auto;
-    max-height: 230px;
-  }
-  .tile > :global(.embed-card[data-embed-kind="image"]) {
-    height: auto;
-  }
-  /* Kinds without a natural width take a page's worth. */
-  .tile > :global(.embed-card[data-embed-kind="html"]),
-  .tile > :global(.embed-card[data-embed-kind="video"]),
-  .tile > :global(.embed-card[data-embed-kind="audio"]) {
-    width: 320px;
-  }
-  .tile > :global(.embed-card[data-embed-kind="pdf"]) {
-    width: 220px;
-  }
-  /* Until it resolves, or when it can't draw: a card's worth. */
-  .tile > :global(.embed-card[data-embed-kind="file"]),
-  .tile > :global(.embed-card[data-embed-kind="pending"]) {
-    width: 280px;
   }
   .files {
     display: flex;
@@ -375,7 +289,7 @@
   .files-label {
     margin-right: 2px;
   }
-  /* "+n more": text-only, no chip edge. */
+  /* "+n more" / "fewer": text-only, no chip edge. */
   .more {
     display: inline-flex;
     align-items: center;

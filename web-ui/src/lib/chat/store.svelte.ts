@@ -6,15 +6,17 @@
  */
 
 import { isImagePath } from "../previews/files";
-import { artifactMentions, artifactShape, isArtifactPath, proseCovered, proseEmbedTargets } from "./artifacts";
+import { artifactMentions, isArtifactPath, proseCovered, proseEmbedTargets } from "./artifacts";
 import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
 
 /** Names a reply may use that still cover their files (a reply listing
- *  thirty outputs covers thirty); resolve candidates from shell text and
- *  un-embedded figures stay capped at `MENTIONS_MAX` (one daemon round trip
- *  per gallery, `RESOLVE_MAX` server-side). */
+ *  thirty outputs covers thirty); resolve candidates from shell text stay
+ *  capped (`artifactMentions`' default: one daemon round trip per gallery,
+ *  `RESOLVE_MAX` server-side). */
 const PROSE_NAMES_MAX = 512;
-const MENTIONS_MAX = 24;
+/** Tool-written files one turn lists: a chip each, so a turn that saved a
+ *  directory's worth still ends in a short line. */
+const ARTIFACTS_MAX = 24;
 
 /** The single leading notice a client-side transcript trim leaves behind. */
 const TRIM_NOTICE = "earlier history trimmed";
@@ -360,13 +362,12 @@ export type ChatBlock = BlockIdentity &
        *  turn" gallery after the closing prose. */
       artifacts: string[];
       /** Artifact-shaped paths the turn's commands and outputs MENTION (as
-       *  written), plus figures the prose names without embedding:
-       *  candidates for files written by shell commands. The gallery keeps
+       *  written): candidates for files written by shell commands. The gallery keeps
        *  those the daemon confirms were modified between `startedAtMs` and
        *  `endedAtMs` (artifacts.ts). */
       mentioned: string[];
       /** What the turn wrote that the prose already showed (an embedded
-       *  figure, a linked document; tool paths absolute, shell names as
+       *  figure, a linked file; tool paths absolute, shell names as
        *  written): the gallery is the remainder — it says "also", and widens
        *  a chip's name against these too (`docs/notes.md` beside a linked
        *  `notes.md`). */
@@ -1883,21 +1884,19 @@ export class ChatStore {
   /** What THIS turn wrote, for the end-of-turn gallery — minus what its
    *  prose already showed. Scans back to the turn's opening user block:
    *  - `artifacts`: artifact-kind files an edit tool wrote, plus any image a
-   *    tool touched — absolute paths from the tools themselves, so a tile
+   *    tool touched — absolute paths from the tools themselves, so a chip
    *    always opens whatever the prose called it. A CSV the agent merely
    *    READ is not an artifact.
    *  - `mentioned`: artifact-shaped paths the turn's commands and outputs
    *    name (newest first) — a plot a script saved, a report a shell command
-   *    rendered — and figures the prose names without embedding. The
-   *    gallery confirms each against the daemon and the turn's time window
-   *    before showing it (artifacts.ts).
-   *  The prose is the reader's first view of the turn: a figure it embeds
-   *  (`![](figs/plot.png)`) is not tiled again, and a document it names
-   *  (rendered as a path link) is not chipped again — a name claims the
+   *    rendered. The gallery confirms each against the daemon and the
+   *    turn's time window before showing it (artifacts.ts).
+   *  The prose is the reader's first view of the turn: a file it embeds
+   *  (`![](figs/plot.png)`) or names (a path link, which previews on a rest
+   *  like the gallery's chip would) is not listed again — a name claims the
    *  shallowest match, so `notes.md` covers the one at the base, not
-   *  `docs/notes.md`. A named figure still tiles: a link is not a picture.
-   *  `covered` lists what the prose showed, so the gallery knows it is the
-   *  remainder. */
+   *  `docs/notes.md`. `covered` lists what the prose showed, so the gallery
+   *  knows it is the remainder. */
   private collectTurnArtifacts(): { artifacts: string[]; mentioned: string[]; covered: string[] } {
     const out: string[] = [];
     const seen = new Set<string>();
@@ -1931,34 +1930,23 @@ export class ChatStore {
     const embedded = proseEmbedTargets(prose);
     // A reply is short and cheap to scan whole, and a name it uses must
     // cover its file whatever its position — only resolve candidates
-    // (shell names, un-embedded figures) keep the small cap.
+    // (shell names) keep the small cap.
     const named = artifactMentions(prose, PROSE_NAMES_MAX);
-    // A set: a shell-named figure the prose embeds is met twice.
     const covered = new Set<string>();
-    /** The remainder of `candidates` once the prose's embeds (any shape) and
-     *  names (documents only) have claimed theirs. */
+    /** The remainder of `candidates` once the prose's embeds and names have
+     *  claimed theirs. */
     const remainder = (candidates: string[]): string[] => {
       const byEmbed = proseCovered(candidates, embedded);
       const byName = proseCovered(candidates, named);
       const kept: string[] = [];
       for (const c of candidates) {
-        if (byEmbed.has(c) || (byName.has(c) && artifactShape(c) === "document")) covered.add(c);
+        if (byEmbed.has(c) || byName.has(c)) covered.add(c);
         else kept.push(c);
       }
       return kept;
     };
-    const artifacts = remainder(out).slice(0, 8);
+    const artifacts = remainder(out).slice(0, ARTIFACTS_MAX);
     const mentioned = remainder(artifactMentions(shell).filter((m) => !seen.has(m)));
-    const taken = new Set(mentioned);
-    // Figures the prose names but does not embed: a link is not a picture.
-    const namedFigures = named.filter(
-      (m) => artifactShape(m) === "visual" && !seen.has(m) && !taken.has(m) && !covered.has(m),
-    );
-    const figuresEmbedded = proseCovered(namedFigures, embedded);
-    for (const m of namedFigures) {
-      if (figuresEmbedded.has(m)) covered.add(m);
-      else if (mentioned.length < MENTIONS_MAX) mentioned.push(m);
-    }
     return { artifacts, mentioned, covered: [...covered] };
   }
 
