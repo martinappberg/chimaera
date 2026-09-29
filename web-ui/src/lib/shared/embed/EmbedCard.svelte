@@ -26,6 +26,7 @@
   import {
     embedKind,
     isMissing,
+    peekFile,
     rawUrl,
     resolveFile,
     type TargetInfo,
@@ -84,7 +85,12 @@
     fetched = null;
     failed = null;
   });
-  const current = $derived<TargetResult | null>(fetched ?? info);
+  /** A card that resolves its own absolute path takes a recent answer at
+   *  mount, so a remount reserves its final box before the first paint. */
+  const recentInfo = $derived(
+    info === null && resolve === undefined && path.startsWith("/") ? peekFile(path) : null,
+  );
+  const current = $derived<TargetResult | null>(fetched ?? info ?? recentInfo);
   const hit = $derived<TargetInfo | null>(current !== null && !isMissing(current) ? current : null);
   const kind = $derived(hit !== null ? embedKind(hit) : null);
   const name = $derived(basename(hit?.path ?? path) || path);
@@ -164,6 +170,18 @@
     void load();
   });
 
+  // A recent answer only reserved the box: the file may have been
+  // rewritten since (an agent re-plotting under the same name), and the
+  // disk watch reports changes from mount on. Ask once more when near.
+  let revalidated = false;
+  $effect(() => {
+    if (!near || revalidated || fetched !== null || info !== null || recentInfo === null) return;
+    revalidated = true;
+    void resolveFile(path, { fresh: true }).then((r) => {
+      if (r !== null && fetched === null) fetched = r;
+    });
+  });
+
   /** A missing file may be written after the prose that embeds it (an
    *  agent announces the plot, then saves it): look again whenever the card
    *  comes back on screen, at most every few seconds. */
@@ -199,7 +217,7 @@
       seen = change.seq;
       if (change.removed.includes(target)) fetched = { missing: true };
       else if (change.files.includes(target)) {
-        void resolveFile(target).then((r) => {
+        void resolveFile(target, { fresh: true }).then((r) => {
           if (r !== null && hit?.path === target) fetched = r;
         });
       }

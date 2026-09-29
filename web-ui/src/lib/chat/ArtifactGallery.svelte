@@ -112,6 +112,30 @@
     };
   });
 
+  /** The mentioned files written during the turn, from their answers. */
+  function confirm(answers: (TargetResult | null)[], start: number, end: number | null): TargetInfo[] {
+    const known = new Set(paths);
+    const out: TargetInfo[] = [];
+    for (const a of answers) {
+      if (a === null || isMissing(a) || a.kind !== "file" || known.has(a.path)) continue;
+      if (!writtenDuring(a.mtime_ms, start, end)) continue;
+      known.add(a.path);
+      out.push(a);
+    }
+    return out;
+  }
+
+  // A gallery remounted by transcript paging rebuilds its tiles from the
+  // resolver's recent answers before the first paint, so its height is
+  // final at once instead of growing a round trip later under the reader.
+  // svelte-ignore state_referenced_locally
+  if (resolver !== undefined && startedAtMs !== null && mentioned.length > 0) {
+    // svelte-ignore state_referenced_locally
+    const answers = mentioned.map((m) => resolver.peek(m));
+    // svelte-ignore state_referenced_locally
+    if (answers.every((a) => a !== null)) confirmed = confirm(answers, startedAtMs, endedAtMs);
+  }
+
   // One resolve round trip for every mention, once the gallery is near.
   $effect(() => {
     const r = resolver;
@@ -122,15 +146,7 @@
     let stale = false;
     void Promise.all(wanted.map((m) => r.resolve(m).catch((): TargetResult | null => null))).then((answers) => {
       if (stale) return;
-      const known = new Set(paths);
-      const out: TargetInfo[] = [];
-      for (const a of answers) {
-        if (a === null || isMissing(a) || a.kind !== "file" || known.has(a.path)) continue;
-        if (!writtenDuring(a.mtime_ms, start, end)) continue;
-        known.add(a.path);
-        out.push(a);
-      }
-      confirmed = out;
+      confirmed = confirm(answers, start, end);
     });
     return () => {
       stale = true;
@@ -172,7 +188,8 @@
         setState(doc.path, fileStateAfter(doc.info, end));
         continue;
       }
-      void resolveFile(doc.path).then((r) => {
+      // Fresh: whether it changed after the turn is the question.
+      void resolveFile(doc.path, { fresh: true }).then((r) => {
         if (r !== null) setState(doc.path, fileStateAfter(r, end));
       });
     }
@@ -199,7 +216,7 @@
       for (const t of targets) {
         if (change.removed.includes(t)) setState(t, "gone");
         else if (change.files.includes(t)) {
-          void resolveFile(t).then((r) => {
+          void resolveFile(t, { fresh: true }).then((r) => {
             if (r !== null) setState(t, fileStateAfter(r, end));
           });
         }

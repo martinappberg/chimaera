@@ -18,16 +18,61 @@ function textLines(text: string, charsPerLine: number): number {
   return Math.ceil(text.length / Math.max(8, charsPerLine)) + breaks * 0.5;
 }
 
+/** An inline embed, `![alt](target)`: the target is its first token. */
+const EMBED = /!\[[^\]]*\]\(\s*<?([^)\s>]*)[^)]*\)/g;
+const PICTURE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
+const CHIP_EXTS = new Set(["md", "markdown", "docx", "pptx"]);
+
+/** What a message's inline embeds add, in lines: a card, not a line of text
+ *  — a figure up to ~420px tall (18), a PDF page up to ~560px (26), an
+ *  excerpt card for a table, code, a report or a notebook (14); a document
+ *  is an inline chip (none). On a figure-heavy reply these are most of its
+ *  height, and weighing them as text left the estimate swinging by tens of
+ *  thousands of px with whichever window calibrated it. */
+function embedLines(text: string): number {
+  if (!text.includes("![")) return 0;
+  let lines = 0;
+  for (const m of text.matchAll(EMBED)) {
+    const target = (m[1] ?? "").split(/[#?]/)[0].toLowerCase();
+    const ext = target.slice(target.lastIndexOf(".") + 1);
+    if (PICTURE_EXTS.has(ext)) lines += 18;
+    else if (ext === "pdf") lines += 26;
+    else if (!CHIP_EXTS.has(ext)) lines += 14;
+  }
+  return lines;
+}
+
+/** Markdown's length as rendered, roughly: a link's target never shows (an
+ *  agent citing files writes `[plan.md](/long/absolute/path/plan.md)`, the
+ *  path often longer than the words), nor does emphasis or code markup. */
+function renderedMarkdown(text: string): string {
+  return text
+    .replace(EMBED, "")
+    .replace(/\]\([^)\s]*\)/g, "]")
+    .replace(/[*`#~[\]]/g, "");
+}
+
+/** Thought and tool rows: a settled run of them folds into one line under
+ *  the reply that followed (activityFold.ts), and a run of tool calls is one
+ *  group line even unfolded. */
+function isActivity(block: ChatBlock | null): boolean {
+  return block?.kind === "tool" || block?.kind === "thought";
+}
+
 /** Rough rendered height of one block, in lines. `previous` matters because
- *  consecutive tool calls share one group line. */
+ *  a settled run of activity rows (thoughts and tool calls) shares one line.
+ *  `settled` is false for the trailing run no reply has followed yet — it
+ *  renders unfolded, a line per thought and per group of tool calls — which
+ *  only the live tail has (its window calibrates the model). */
 export function blockWeight(
   block: ChatBlock,
   previous: ChatBlock | null,
   charsPerLine: number,
+  settled = true,
 ): number {
   switch (block.kind) {
     case "message":
-      return textLines(block.text, charsPerLine) + 1;
+      return textLines(renderedMarkdown(block.text), charsPerLine) + embedLines(block.text) + 1;
     case "user":
       // Bubbles wrap narrower than the column and carry padding; a row of
       // picture tiles (AttachmentStrip, 112px) sits above one with images.
@@ -37,7 +82,9 @@ export function blockWeight(
         (block.attachmentPaths.length > 0 ? 5.5 : 0)
       );
     case "tool":
-      return previous?.kind === "tool" ? 0 : 1;
+      return (settled ? isActivity(previous) : previous?.kind === "tool") ? 0 : 1;
+    case "thought":
+      return settled && isActivity(previous) ? 0 : 1;
     case "question":
       return block.resolved ? 2 + 2 * block.questions.length : 0;
     case "turn_end":
@@ -47,11 +94,40 @@ export function blockWeight(
       return 4;
     case "notice":
       return textLines(block.text, charsPerLine) + 0.5;
-    case "thought":
     case "wake":
     case "finished":
       return 1;
   }
+}
+
+/** Weights of the blocks from `from` to the end, NOT cached: that stretch
+ *  includes the live tail (a reply still streaming, a run not yet folded),
+ *  which the prefix sums below must never freeze. `at` maps a weight into
+ *  the stretch back to its block (the index `from` counts from). */
+export function tailWeights(
+  blocks: readonly ChatBlock[],
+  from: number,
+  charsPerLine: number,
+): { total: number; at(weight: number): number } {
+  const start = Math.max(0, Math.min(from, blocks.length));
+  const prefix = [0];
+  for (let i = start; i < blocks.length; i++) {
+    const weight = blockWeight(blocks[i], i > 0 ? blocks[i - 1] : null, charsPerLine);
+    prefix.push(prefix[prefix.length - 1] + weight);
+  }
+  return {
+    total: prefix[prefix.length - 1],
+    at(weight: number): number {
+      let lo = 0;
+      let hi = prefix.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (prefix[mid] <= weight) lo = mid;
+        else hi = mid - 1;
+      }
+      return start + Math.min(lo, Math.max(0, prefix.length - 2));
+    },
+  };
 }
 
 /** Prefix sums of {@link blockWeight} over the reducer's blocks, extended
