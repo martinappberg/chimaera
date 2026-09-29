@@ -201,11 +201,17 @@ export function getHostLabel(): string {
   return sessionStorage.getItem(HOST_KEY) ?? (isBrowserGateway() ? gatewayHostLabel() : "local");
 }
 
+/** The explicit host of a browser view (`/app/{host}/`); undefined for a
+ *  project view, which follows its project. */
+function gatewayHost(): string | undefined {
+  return /^\/app\/([A-Za-z0-9_-]{1,128})(?:\/|$)/.exec(location.pathname)?.[1];
+}
+
 /** A browser view's machine in plain words: a project view follows the
  *  project wherever it runs; an explicit host names the computer, the cloud
  *  or the cluster alias. Never "local" (that key means this very machine). */
 function gatewayHostLabel(): string {
-  const host = /^\/app\/([A-Za-z0-9_-]{1,128})(?:\/|$)/.exec(location.pathname)?.[1];
+  const host = gatewayHost();
   if (host === undefined) return "This project";
   if (host.startsWith("device-")) return "Your computer";
   if (host.startsWith("worker-")) return "Cloud";
@@ -254,22 +260,69 @@ export function setActiveWorkspaceId(id: string | null): void {
   }
 }
 
+/** Where a project runs when the daemon this window talks to may not run it,
+ *  judged from that daemon: this computer's own (a native window here, or a
+ *  browser view of a computer) hands a project to the cloud, and the cloud
+ *  hands it back to your computer. Null when this window cannot tell (a
+ *  project view follows its project; an SSH host). The refusal itself does
+ *  not name the owner. */
+export function ownerElsewhere(): "cloud" | "computer" | null {
+  if (!isBrowserGateway()) return getHostLabel() === "local" ? "cloud" : null;
+  const host = gatewayHost();
+  if (host === undefined) return null;
+  if (host.startsWith("worker-")) return "computer";
+  return host.startsWith("device-") || host === "local" ? "cloud" : null;
+}
+
+/** "This project is running … right now", naming the machine when known.
+ *  "another computer" is a second computer that holds the project, never a
+ *  device merely viewing it. */
+export function runningElsewhere(where: "cloud" | "computer" | "other" | null): string {
+  switch (where) {
+    case "cloud":
+      return "This project is running in the cloud right now.";
+    case "computer":
+      return "This project is running on your computer right now.";
+    case "other":
+      return "This project is running on another computer right now.";
+    default:
+      return "This project is running somewhere else right now.";
+  }
+}
+
 /** Plain words for the daemon's project-connection codes, which are wire
  *  identifiers and must never reach the screen as-is. */
 const PLAIN_ERRORS: Record<string, string> = {
-  project_unavailable: "This project isn't reachable right now.",
-  workspace_owned_elsewhere: "This project is running on another device right now.",
-  read_only: "This project is running on another device right now.",
+  project_unavailable: "This project isn’t reachable right now.",
   remote_unavailable: "Your project is reconnecting.",
   workspace_scope_changed: "Your project is reconnecting.",
   workspace_unavailable: "Your project is reconnecting.",
-  worker_asleep: "Your project is paused.",
-  on_other_machine: "This file is on the other machine and can't be opened here.",
+  worker_asleep: "The cloud machine is asleep.",
   outside_project: "This file is outside the project.",
 };
+/** Codes meaning "this daemon may not run that project": the sentence names
+ *  where it runs instead ({@link runningElsewhere}). */
+const ELSEWHERE_CODES = new Set(["workspace_owned_elsewhere", "read_only"]);
+/** The project's owner has a different file at that path, which this window
+ *  may not show: the sentence names where the owner is. */
+const OTHER_FILE = "on_other_machine";
 
-/** A daemon error message in plain words (known codes mapped, else as-is). */
-export function plainError(message: string): string {
+function otherFile(where: "cloud" | "computer" | "other" | null): string {
+  switch (where) {
+    case "cloud":
+      return "This file is in the cloud and can’t be opened here.";
+    case "computer":
+      return "This file is on your computer and can’t be opened here.";
+    default:
+      return "This file is on the other machine and can’t be opened here.";
+  }
+}
+
+/** A daemon error message in plain words (known codes mapped, else as-is).
+ *  `where` names the project's owner when the caller knows it. */
+export function plainError(message: string, where: "cloud" | "computer" | "other" | null = ownerElsewhere()): string {
+  if (ELSEWHERE_CODES.has(message)) return runningElsewhere(where);
+  if (message === OTHER_FILE) return otherFile(where);
   return PLAIN_ERRORS[message] ?? message;
 }
 
@@ -282,7 +335,7 @@ export class ApiError extends Error {
     super(plainError(message));
     this.name = "ApiError";
     this.status = status;
-    this.code = message in PLAIN_ERRORS ? message : null;
+    this.code = message in PLAIN_ERRORS || ELSEWHERE_CODES.has(message) || message === OTHER_FILE ? message : null;
   }
 }
 

@@ -23,13 +23,42 @@ export function parsePlacement(value: unknown, workspace: string): WorkspacePlac
   return row as unknown as WorkspacePlacement;
 }
 
+const IN_THE_CLOUD = "In the cloud";
+const ON_ANOTHER_COMPUTER = "On another computer";
+const RECONNECTING = " · reconnecting";
+const ASLEEP = " · asleep";
+const WAKING = " · waking";
+
+/** What a view knows about the owner beyond its row: its socket heard the
+ *  owner is asleep (`worker_asleep`) or waking (`waking`), and whether the
+ *  view already says "Reconnecting…" itself. */
+export interface OwnerNote {
+  owner?: "asleep" | "waking" | null;
+  /** The view's own status line already says it is reconnecting: the label
+   *  must not say it a second time. */
+  reconnectingShown?: boolean;
+}
+
 /** Where a routed session runs, in plain words; null for a session here.
- *  `available: false` means its owner cannot be reached right now. */
-export function placementLabel(placement: unknown, available: boolean | undefined): string | null {
+ *  `available: false` means its owner cannot be reached right now — which is
+ *  also what a sleeping owner looks like to the daemon's passive roster read,
+ *  so a view that heard the owner is asleep (or waking) says that instead of
+ *  "reconnecting". */
+export function placementLabel(placement: unknown, available: boolean | undefined, note: OwnerNote = {}): string | null {
   if (typeof placement !== "object" || placement === null) return null;
   const remote = (placement as { remote?: unknown }).remote;
-  const where = typeof remote === "string" && remote.startsWith("device-") ? "On another computer" : "In the cloud";
-  return available === false ? `${where} · reconnecting` : where;
+  const where = typeof remote === "string" && remote.startsWith("device-") ? ON_ANOTHER_COMPUTER : IN_THE_CLOUD;
+  if (note.owner === "asleep") return where + ASLEEP;
+  if (note.owner === "waking") return where + WAKING;
+  return available === false && note.reconnectingShown !== true ? where + RECONNECTING : where;
+}
+
+/** A {@link placementLabel} for a view whose socket heard the owner is asleep
+ *  (a terminal gets only the finished label from its pane). */
+export function asleepPlacement(label: string | null): string | null {
+  if (label === null) return null;
+  const where = label.endsWith(RECONNECTING) ? label.slice(0, -RECONNECTING.length) : label;
+  return where.endsWith(ASLEEP) ? where : where + ASLEEP;
 }
 
 /**

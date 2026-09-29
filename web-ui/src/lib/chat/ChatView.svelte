@@ -2050,8 +2050,6 @@
    *  running tools → working (between steps). */
   const agentBusy = $derived(store.running || store.compacting);
   const RECONNECTING_GRACE_MS = 2000;
-  /** "In the cloud" / "On another computer" for a routed conversation. */
-  const runsElsewhere = $derived(placementLabel(session.placement, session.placement_available));
   /** The conversation has no process where it is shown, and that is not an
    *  exit: its row is paused, or its socket said it moved or is paused and it
    *  has not been reached since. The transcript stays mounted. */
@@ -2100,6 +2098,17 @@
     const timer = setTimeout(() => (reconnectingShown = true), RECONNECTING_GRACE_MS);
     return () => clearTimeout(timer);
   });
+  /** "In the cloud" / "On another computer" for a routed conversation. A
+   *  sleeping owner fails the daemon's passive roster read like an
+   *  unreachable one, so what this socket heard (asleep, waking) wins over
+   *  the row's "reconnecting"; and the status line under the transcript says
+   *  "Reconnecting…" itself when it is showing, so the header does not. */
+  const runsElsewhere = $derived(
+    placementLabel(session.placement, session.placement_available, {
+      owner: store.asleep ? "asleep" : store.waking && !store.connected ? "waking" : null,
+      reconnectingShown: reconnectingShown && !continuing && !store.waking && !store.asleep,
+    }),
+  );
   const activityLabel = $derived.by(() => {
     if (store.compacting) return "Compacting context";
     if (store.activityLine !== null) return store.activityLine;
@@ -3149,8 +3158,10 @@
     <div class="connection-status"><span role="status">{continuingLabel}</span>{#if connect !== null}<button type="button" class="connect" onclick={() => cloudOnboarding.request({ providerIds: [connect.providerId], workspaceId: connect.workspaceId })}>Connect {connect.label} to continue</button>{/if}</div>
   {:else if store.waking && !store.connected}
     <div class="connection-status" role="status">Waking the cloud machine…</div>
-  {:else if store.asleep && !store.connected}
-    <div class="connection-status" role="status">Send a message to pick this conversation back up.</div>
+  {:else if store.asleep}
+    <!-- Asleep is the owner's state, not this socket's: it holds across a
+         dropped connection and ends with a wake or the next ready. -->
+    <div class="connection-status" role="status">Asleep in the cloud. Send a message to wake it.</div>
   {:else if reconnectingShown}
     <div class="connection-status" role="status">Reconnecting…</div>
   {/if}
@@ -3191,7 +3202,7 @@
 
 <style>
   .placement-note { color: var(--accent); font-size: var(--text-xs); padding: 5px 12px; border-bottom: 1px solid var(--edge); }
-  .connection-status { padding: 8px 12px; color: var(--muted); font-size: 12px; text-align: center; }
+  .connection-status { padding: 8px 12px; color: var(--muted); font-size: var(--text-xs); text-align: center; }
   .connection-status .connect { margin-left: 10px; border: 1px solid var(--edge); border-radius: 6px; padding: 3px 9px; color: var(--fg); background: var(--bg); font: inherit; cursor: pointer; }
   .connection-status .connect:hover { background: var(--row-hover); }
   .connection-status .connect:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }

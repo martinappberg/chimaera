@@ -2044,6 +2044,23 @@ describe("ChatStore unsent text", () => {
     expect(store.pausedFor).toBeNull();
   });
 
+  it("an asleep owner stays asleep across dropped sockets, and a move ends it", () => {
+    const store = new ChatStore();
+    store.onAsleep();
+    // A gateway may close after saying so; each retry must not flicker
+    // through "Reconnecting…".
+    store.onDisconnected();
+    expect(store.asleep).toBe(true);
+    store.onAsleep();
+    store.onDisconnected();
+    expect(store.asleep).toBe(true);
+    store.onMoved("computer");
+    expect(store.asleep).toBe(false);
+    store.onAsleep();
+    store.onWaking();
+    expect(store.asleep).toBe(false);
+  });
+
   it("a paused owner is a state, cleared when the conversation is live again", () => {
     const store = new ChatStore();
     store.onAsleep();

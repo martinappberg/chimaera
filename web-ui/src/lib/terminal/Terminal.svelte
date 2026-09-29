@@ -3,7 +3,8 @@
   import { pastedImageName, uploadAndInsert } from "../net/uploads";
   import { isBrowserGateway } from "../net/base";
   import { isWatching, setWatching } from "./viewerMode.svelte";
-  import { refusalFor } from "./refusals.svelte";
+  import { refusalFor, terminalAsleep } from "./refusals.svelte";
+  import { asleepPlacement } from "../net/placement";
   import { focusTerminal, release, show, refreshAccess } from "./termPool";
 
   interface Props {
@@ -24,8 +25,14 @@
   /** Watch/control only means something for a project viewed from another
    *  device: an ordinary local terminal never grows this strip. */
   const showAccess = $derived(placement !== null || isBrowserGateway());
-  /** Typing the daemon refused, said here instead of in the console. */
-  const refusal = $derived(refusalFor(sessionId));
+  /** Typing the daemon refused, said here instead of in the console. A
+   *  routed terminal's refusal comes from the machine its row points at, so
+   *  "running elsewhere" there is a route about to change: the text names no
+   *  machine rather than a wrong one. */
+  const refusal = $derived(refusalFor(sessionId, { where: placement !== null ? null : undefined, watching }));
+  /** The pane's row reads a sleeping owner as unreachable; this socket knows
+   *  better. */
+  const where = $derived(terminalAsleep(sessionId) ? asleepPlacement(placement) : placement);
   function toggleAccess(): void { setWatching(sessionId, !watching); refreshAccess(sessionId); }
 
   let host = $state<HTMLDivElement | null>(null);
@@ -77,7 +84,7 @@
 
 {#if showAccess}
   <div class="terminal-access" role="toolbar" aria-label="Terminal access">
-    {#if placement !== null}<span class="where">{placement}</span>{/if}
+    {#if where !== null}<span class="where">{where}</span>{/if}
     {#if watching}<span>Just watching</span>{/if}
     <button type="button" aria-pressed={!watching} onclick={toggleAccess}>{watching ? "Take control" : "Just watch"}</button>
   </div>

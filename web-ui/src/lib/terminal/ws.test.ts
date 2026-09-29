@@ -116,3 +116,26 @@ it("a native window never reconnects early on typing: its daemon holds the input
   expect(Socket.all).toHaveLength(1);
   session.close();
 });
+
+it("an asleep owner is a lasting state that outlives a dropped socket", () => {
+  const status = vi.fn();
+  const error = vi.fn();
+  const session = new SessionSocket("s-fixture", { ...quiet, onError: error, onStatus: status });
+  Socket.all[0].onopen?.();
+  Socket.all[0].onmessage?.({ data: JSON.stringify({ type: "error", code: "worker_asleep", message: "asleep" }) });
+  expect(status).toHaveBeenLastCalledWith("asleep");
+  expect(error).not.toHaveBeenCalled();
+  // A gateway may close after saying so: the reconnect must not flicker.
+  Socket.all[0].close();
+  expect(status).toHaveBeenLastCalledWith("asleep");
+  vi.advanceTimersByTime(2000);
+  const next = Socket.all.at(-1)!;
+  next.onopen?.();
+  next.onmessage?.({ data: JSON.stringify({ type: "waking" }) });
+  expect(status).toHaveBeenLastCalledWith("waking");
+  next.onmessage?.({ data: JSON.stringify({ type: "ready", cols: 80, rows: 24 }) });
+  expect(status).toHaveBeenLastCalledWith(null);
+  next.close();
+  expect(status).toHaveBeenLastCalledWith(null);
+  session.close();
+});
