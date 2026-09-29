@@ -219,8 +219,19 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
 
 ## Watching without taking control
 
-The terminal toolbar offers **Just watch** and **Take control**. Narrow screens
-start in **Just watching** mode: they show the daemon’s existing grid and scroll
-horizontally without resizing it or accepting input. Taking control reconnects
-with an explicit interaction and fits the terminal to the current pane. Passive
-reconnects and watchers do not wake a sleeping cloud host.
+A terminal viewed from another device — a session routed to the cloud or
+another computer, or any terminal in a browser view of a project — has a small
+toolbar with **Just watch** and **Take control**, plus where it runs ("In the
+cloud", "On another computer", "· reconnecting"). Ordinary local terminals have
+no toolbar, and a native window of any width keeps full control.
+
+A phone-width browser view starts in **Just watching** mode: it shows the
+daemon’s existing grid and scrolls horizontally without resizing it or
+accepting input. Taking control reconnects and fits the terminal to the current
+pane; it is not itself interaction. Opening, reconnecting and watching never
+wake a paused cloud project — the first keystroke does, and the typing waits
+for it (see [Pro: continuing and viewing](pro.md#continuing-and-viewing-a-remote-session)).
+Typing the daemon refuses (watching, busy, running on another device) is said
+in a short note over the pane, never in the scrollback. A terminal whose session
+moves to another machine keeps its screen and reconnects; it does not show as
+exited.

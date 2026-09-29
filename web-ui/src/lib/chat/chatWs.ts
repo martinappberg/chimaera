@@ -1,4 +1,4 @@
-import { daemonSocketUrl } from "../net/base";
+import { daemonSocketUrl, isBrowserGateway } from "../net/base";
 import { sendSocketAuth } from "../net/placement";
 import { getToken } from "../net/api";
 import { Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
@@ -46,6 +46,11 @@ export interface ChatSocketHandlers {
   /** One command was refused (`command_failed` or `invalid_command`): the
    *  socket stays up and keeps reconnecting — surface it, don't die. */
   onCommandFailed(message: string): void;
+  /** The conversation's project is paused; the next send picks it back up. */
+  onAsleep?(): void;
+  /** The conversation is continuing on another machine: stay mounted and
+   *  keep reconnecting; it did not exit. */
+  onMoved?(to: "cloud" | "computer"): void;
   /** The socket dropped and is reconnecting; the UI is no longer live. */
   onDisconnected(): void;
   /** Highest seq applied so far — sent with auth so reconnects replay only the gap. */
@@ -64,6 +69,8 @@ type ChatDelivery =
   | { kind: "exited"; status: number | null }
   | { kind: "error"; message: string }
   | { kind: "command_failed"; message: string }
+  | { kind: "asleep" }
+  | { kind: "moved"; to: "cloud" | "computer" }
   | { kind: "disconnected" };
 
 /**
@@ -78,6 +85,8 @@ export class ChatSocket {
   private closed = false;
   private fatal = false;
   private ended = false;
+  /** A wake-carrying reconnect is in flight (at most one per drop). */
+  private waking = false;
   private unknownRetries = 0;
   private readonly recon = new Reconnector(() => this.connect());
   /** Replay, live events, and terminal frames share one cooperative FIFO.
@@ -114,6 +123,12 @@ export class ChatSocket {
         case "command_failed":
           this.handlers.onCommandFailed(delivery.message);
           break;
+        case "asleep":
+          this.handlers.onAsleep?.();
+          break;
+        case "moved":
+          this.handlers.onMoved?.(delivery.to);
+          break;
         case "disconnected":
           this.handlers.onDisconnected();
           break;
@@ -124,6 +139,8 @@ export class ChatSocket {
     }
   }
 
+  /** Attaching is passive: only a user action ({@link wakeOnInput}) may ask
+   *  a paused project's owner to wake. */
   private connect(interaction = false): void {
     if (this.closed) return;
     const ws = new WebSocket(daemonSocketUrl(`/ws/chat/${this.sessionId}${interaction ? "?wake=interaction" : ""}`));
@@ -147,6 +164,7 @@ export class ChatSocket {
         case "ready":
           this.recon.succeeded();
           this.unknownRetries = 0;
+          this.waking = false;
           this.deliveries.push({
             kind: "ready",
             session: msg.session as ChatSessionInfo,
@@ -183,8 +201,21 @@ export class ChatSocket {
             status: (msg.status as number | null) ?? null,
           });
           break;
+        case "moved":
+          // Continuing elsewhere: never `ended`. The daemon closes this
+          // socket next and the ordinary reconnect follows the new owner.
+          // Sends stop here, before that close lands.
+          this.authenticatedSocket = null;
+          this.deliveries.push({ kind: "moved", to: msg.to === "computer" ? "computer" : "cloud" });
+          break;
         case "error":
-          if (msg.code === "remote_unavailable" || msg.code === "worker_asleep" || msg.code === "workspace_scope_changed") break;
+          // Connection states, never fatal: the socket stays (or reconnects)
+          // and the next send carries wake intent.
+          if (msg.code === "worker_asleep") {
+            this.deliveries.push({ kind: "asleep" });
+            break;
+          }
+          if (msg.code === "remote_unavailable" || msg.code === "workspace_scope_changed") break;
           // Mid view-switch the driver may not be registered yet — the
           // normal onclose reconnect path retries before this goes fatal.
           if (
@@ -218,6 +249,7 @@ export class ChatSocket {
 
     ws.onclose = () => {
       if (this.ws === ws) this.ws = null;
+      this.waking = false;
       if (this.closed || this.fatal || this.ended) {
         this.recon.clear();
         return;
@@ -241,16 +273,31 @@ export class ChatSocket {
 
   /** Send an AgentCommand frame; false when the socket is not open. */
   send(command: Record<string, unknown>): boolean {
-    if (this.ws?.readyState !== WebSocket.OPEN || this.authenticatedSocket !== this.ws) return false;
+    if (this.ws?.readyState !== WebSocket.OPEN || this.authenticatedSocket !== this.ws) {
+      this.wakeOnInput();
+      return false;
+    }
     this.ws.send(JSON.stringify(command));
     return true;
   }
 
-  /** User-requested reconnect carries wake intent once. Background retry never does. */
-  wake(): void {
-    if (this.closed) return;
-    this.fatal = false; this.ended = false; this.recon.cancel();
-    if (this.ws !== null) { this.ws.onclose = null; this.ws.close(); }
+  /**
+   * A user action on a browser view whose socket is down: reconnect now,
+   * once, carrying wake intent, instead of waiting out the backoff. The
+   * action itself is NOT queued — the caller keeps it (a composer keeps its
+   * draft). Native windows never need this: their daemon keeps the socket
+   * open and holds the first input itself while the owner wakes.
+   */
+  private wakeOnInput(): void {
+    if (!isBrowserGateway() || this.closed || this.fatal || this.ended || this.waking) return;
+    this.waking = true;
+    this.recon.cancel();
+    if (this.ws !== null) {
+      this.ws.onclose = null;
+      this.ws.onmessage = null;
+      this.ws.close();
+      this.ws = null;
+    }
     this.connect(true);
   }
 

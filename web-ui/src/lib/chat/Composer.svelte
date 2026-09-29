@@ -36,6 +36,8 @@
     sessionId: string | null;
     running: boolean;
     disabled: boolean;
+    /** Why the composer is disabled, in plain words; defaults to an ended chat. */
+    disabledReason?: string;
     slashCommands: ComposerCommand[];
     /** Quick-open scope for @-mentions; null disables them. */
     workspaceId: string | null;
@@ -63,6 +65,7 @@
     sessionId,
     running,
     disabled,
+    disabledReason = undefined,
     slashCommands,
     workspaceId,
     terminals,
@@ -694,7 +697,7 @@
       aria-autocomplete="list"
       aria-activedescendant={popover !== null ? `${uid}-opt-${selected}` : undefined}
       placeholder={disabled
-        ? "chat ended"
+        ? (disabledReason ?? "chat ended")
         : running
           ? "queue a follow-up for the next run (Esc to stop)"
           : "message the agent… (Enter to send · / commands · @ files)"}

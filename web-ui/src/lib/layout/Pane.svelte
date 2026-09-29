@@ -7,6 +7,7 @@
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { registerPane, unregisterPane, zoneWord } from "./dnd";
   import { dirLabel } from "../previews/files";
+  import { placementLabel } from "../net/placement";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
   import { activeModLabel, keyHint } from "../shared/keybindings";
   import PaneTabs from "./PaneTabs.svelte";
@@ -361,8 +362,15 @@
       <!-- The session is gone (mid-teardown, before pruneSessions drops the
            tab): render nothing, never a fresh TerminalView against a dead id. -->
       <div class="hint"><span>closing…</span></div>
-    {:else if s.suspended}
-      <div class="hint"><span>{s.kind === "shell" ? "Paused on your laptop" : "Waiting for workspace ownership"}</span><small>{s.kind === "shell" ? "This terminal stays with its original machine. It returns when the workspace is back on your laptop." : "Your session history is saved. It will resume after the workspace is ready on this host."}</small></div>
+    {:else if s.suspended && s.ui !== "chat"}
+      <!-- A paused terminal (its project runs elsewhere right now). A paused
+           chat stays mounted below: its transcript and scroll survive the
+           move and it follows the conversation to where it continues. -->
+      {#if s.kind === "shell"}
+        <div class="hint paused" role="status"><span>This terminal stays on your computer</span><small>It opens again when the project is back on your computer.</small></div>
+      {:else}
+        <div class="hint paused" role="status"><span>Opening this conversation…</span><small>It picks up in a moment.</small></div>
+      {/if}
     {:else if s.ui === "chat"}
       {@const ChatView = views.chat}
       {#if ChatView !== undefined}
@@ -387,7 +395,12 @@
     {:else}
       {@const TerminalView = views.terminal}
       {#if TerminalView !== undefined}
-        <TerminalView sessionId={tab.sessionId} focused={focused && active} fontSize={node.fontSize} remote={typeof s.placement === "object"} available={s.placement_available !== false} />
+        <TerminalView
+          sessionId={tab.sessionId}
+          focused={focused && active}
+          fontSize={node.fontSize}
+          placement={placementLabel(s.placement, s.placement_available)}
+        />
       {:else if viewErrors.terminal}
         {@render loadFailure("terminal", "terminal view")}
       {:else}
@@ -795,6 +808,15 @@
     color: var(--muted);
     font-size: var(--text-sm);
     user-select: none;
+  }
+
+  .hint.paused {
+    flex-direction: column;
+    padding: 0 16px;
+    text-align: center;
+  }
+  .hint.paused small {
+    font-size: var(--text-xs);
   }
 
   .hint kbd {

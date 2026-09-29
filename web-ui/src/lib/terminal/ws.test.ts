@@ -17,6 +17,7 @@ class Socket {
 }
 beforeEach(() => { Socket.all = []; vi.useFakeTimers(); vi.stubGlobal("WebSocket", Socket); });
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
+const quiet = { onBinary() {}, onReset() {}, onTitle() {}, onResized() {}, onExited() {}, onError() {} };
 it("a viewer adopts server dimensions and never sends input, resize or wake intent", () => {
   let watching = true;
   const reset = vi.fn();
@@ -30,10 +31,63 @@ it("a viewer adopts server dimensions and never sends input, resize or wake inte
   expect(reset).toHaveBeenCalledWith(120, 40);
   session.sendInput("danger\n"); session.sendResize(30, 10);
   expect(first.sent).toHaveLength(1);
+  // Taking control is not interaction: only the first keystroke is.
   watching = false; session.accessChanged();
-  const second = Socket.all[1]; expect(second.url).toContain("?wake=interaction");
+  const second = Socket.all[1]; expect(second.url).not.toContain("wake=");
   second.onopen?.(); session.sendInput("ok"); expect(second.sent).toHaveLength(2);
   second.onclose?.(); vi.advanceTimersByTime(601);
   expect(Socket.all[2].url).not.toContain("wake=");
+  session.close();
+});
+
+it("a moved terminal is not exited: it keeps reconnecting to follow the session", () => {
+  const exited = vi.fn();
+  const session = new SessionSocket("s-fixture", { ...quiet, onExited: exited });
+  Socket.all[0].onopen?.();
+  Socket.all[0].onmessage?.({ data: JSON.stringify({ type: "moved", to: "cloud" }) });
+  Socket.all[0].close();
+  vi.advanceTimersByTime(2000);
+  expect(exited).not.toHaveBeenCalled();
+  expect(Socket.all.length).toBeGreaterThan(1);
+  session.close();
+});
+
+it("refused typing is reported as a refusal, not a fatal error", () => {
+  const refused = vi.fn();
+  const error = vi.fn();
+  const session = new SessionSocket("s-fixture", { ...quiet, onError: error, onRefused: refused });
+  Socket.all[0].onopen?.();
+  Socket.all[0].onmessage?.({ data: JSON.stringify({ type: "error", code: "read_only", reason: "busy", message: "busy" }) });
+  expect(refused).toHaveBeenCalledWith("busy", "busy");
+  expect(error).not.toHaveBeenCalled();
+  session.close();
+});
+
+it("opening a terminal is passive everywhere", () => {
+  const session = new SessionSocket("s-fixture", quiet);
+  expect(Socket.all[0].url).not.toContain("wake=");
+  session.close();
+});
+
+it("typing into a browser view with its socket down reconnects once with wake intent", () => {
+  vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-one/"));
+  // Placement never answers: the socket opens but never authenticates.
+  vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => {})));
+  const session = new SessionSocket("s-fixture", quiet);
+  Socket.all[0].onopen?.();
+  session.sendInput("a");
+  session.sendInput("b");
+  expect(Socket.all).toHaveLength(2);
+  expect(Socket.all[1].url).toContain("?wake=interaction");
+  expect(Socket.all[0].sent).toHaveLength(0);
+  expect(Socket.all[1].sent).toHaveLength(0);
+  session.close();
+});
+
+it("a native window never reconnects early on typing: its daemon holds the input", () => {
+  const session = new SessionSocket("s-fixture", quiet);
+  Socket.all[0].readyState = 0;
+  session.sendInput("a");
+  expect(Socket.all).toHaveLength(1);
   session.close();
 });

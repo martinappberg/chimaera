@@ -9,6 +9,9 @@ import { parseUpdateStatus, type UpdateStatus } from "../workspace/update.svelte
 
 const INITIAL_BACKOFF_MS = 500;
 const MAX_BACKOFF_MS = 10_000;
+/** Error codes that describe a project connection in motion, never a
+ *  rejected socket: reconnect instead of giving up. */
+const RECONNECTING_CODES = new Set(["remote_unavailable", "workspace_scope_changed", "worker_asleep"]);
 
 export interface EventsSocketHandlers {
   /**
@@ -84,6 +87,7 @@ interface ServerEventFrame {
   /** An `update` frame's discriminator; the rest is `parseUpdateStatus`'s. */
   available?: boolean;
   message?: string;
+  code?: string;
   files?: string[];
   removed?: string[];
   dirs?: string[];
@@ -263,6 +267,10 @@ export class EventsSocket {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.handlers.onNotices?.(msg.notices);
       } else if (msg.type === "error") {
+        // A project's connection changing (it moved, or its owner is
+        // unreachable) is not a rejection: the daemon closes this socket and
+        // the ordinary reconnect below picks up the new route.
+        if (msg.code !== undefined && RECONNECTING_CODES.has(msg.code)) return;
         // Bad auth or a server-side failure; give up and surface it (the
         // app shows the blocking re-auth overlay on "unauthorized").
         this.fatal = true;

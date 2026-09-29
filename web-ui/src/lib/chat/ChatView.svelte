@@ -15,6 +15,8 @@
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { insertIntoComposer, registerFollow } from "./composerBus";
+  import { isBrowserGateway } from "../net/base";
+  import { placementLabel } from "../net/placement";
   import {
     acquireChat,
     releaseChat,
@@ -1188,6 +1190,9 @@
     // composer keeps the draft.
     const accepted = sendNow(text, images);
     if (accepted) {
+      // Kept until the agent's echo: a send the daemon could not deliver
+      // (the project was reconnecting) comes back into the composer.
+      store.noteSent(text);
       // Submission is stronger intent than merely clearing a draft: the user
       // expects to see the delivered/queued bubble and the reply it starts.
       atBottom = true;
@@ -1195,6 +1200,13 @@
     }
     return accepted;
   }
+
+  // A refused send's text goes back into this chat's composer, once.
+  $effect(() => {
+    if (store.restoredDraft === null) return;
+    const draft = store.takeRestoredDraft();
+    if (draft !== null && draft.length > 0) insertIntoComposer(session.id, draft);
+  });
 
   /** One never-lose-a-click path for every interactive AgentCommand. A closed
    *  socket cannot queue locally (replay would make that ambiguous), so keep
@@ -1752,6 +1764,34 @@
    *  "Counting files"), else the phase: starting → thinking / writing /
    *  running tools → working (between steps). */
   const agentBusy = $derived(store.running || store.compacting);
+  const RECONNECTING_GRACE_MS = 2000;
+  /** "In the cloud" / "On another computer" for a routed conversation. */
+  const runsElsewhere = $derived(placementLabel(session.placement, session.placement_available));
+  /** The conversation is moving between this computer and the cloud: its
+   *  row is paused here, or its socket said it moved and it has not been
+   *  reached where it runs now. Not an exit — the transcript stays mounted. */
+  const continuing = $derived(session.suspended === true || (store.moving !== null && !store.connected));
+  const continuingLabel = $derived(
+    store.moving === "computer"
+      ? "Continuing on your computer…"
+      : store.moving === "cloud"
+        ? "Continuing in the cloud…"
+        : "Opening this conversation…",
+  );
+  /** A project viewed from another device (a routed row, or a browser view of
+   *  a project). An ordinary local chat never grows connection chrome. */
+  const viewed = $derived(typeof session.placement === "object" || isBrowserGateway());
+  /** Name a dropped connection only after a short grace, so the first
+   *  handshake and a quick reconnect never flash a status row. */
+  let reconnectingShown = $state(false);
+  $effect(() => {
+    if (!viewed || store.connected || store.exited !== null || store.degraded) {
+      reconnectingShown = false;
+      return;
+    }
+    const timer = setTimeout(() => (reconnectingShown = true), RECONNECTING_GRACE_MS);
+    return () => clearTimeout(timer);
+  });
   const activityLabel = $derived.by(() => {
     if (store.compacting) return "Compacting context";
     if (store.activityLine !== null) return store.activityLine;
@@ -2093,8 +2133,8 @@
     keepOpenWithin: ".menu-host",
   }}
 >
-  {#if typeof session.placement === "object"}
-    <div class="placement-note">Cloud{session.placement_available === false ? " · host unavailable" : ""}</div>
+  {#if runsElsewhere !== null}
+    <div class="placement-note">{runsElsewhere}</div>
   {/if}
   <ChatHeader
     {store}
@@ -2268,7 +2308,7 @@
               {:else if block.origin === "restart"}
                 <span class="origin auto" title="chimaera sent this itself: the daemon restarted while this chat had work running, so it asked the resumed agent to pick that work back up (setting: Pick Up Interrupted Work After a Restart)">sent by chimaera after a restart</span>
               {:else if block.origin === "moved" || block.origin === "home"}
-                <span class="origin auto" title="chimaera sent this context after transferring the session between hosts">{block.origin === "home" ? "back on your laptop" : "session moved to another host"}</span>
+                <span class="origin auto" title="chimaera sent this so the agent picks up where it left off after the conversation moved">{block.origin === "home" ? "back on your computer" : "continued in the cloud"}</span>
               {:else if block.origin === "worker"}
                 <span class="origin auto" title="a worker in this workspace sent this with tell_mastermind; chimaera delivered it because the Mastermind acts on its own (auto)">from a worker</span>
               {/if}
@@ -2455,7 +2495,7 @@
     {/if}
     {#if store.degraded}
       <div class="notice">continued in terminal — this pane will switch</div>
-    {:else if store.exited !== null}
+    {:else if store.exited !== null && !continuing}
       <div class="notice">
         agent exited{store.exited.status !== null ? ` (status ${store.exited.status})` : ""}
       </div>
@@ -2649,13 +2689,18 @@
     </div>
   {/if}
 
-  {#if !store.connected && store.exited === null && !store.degraded}
-    <div class="connection-action"><span>Waiting for this session’s host</span><button type="button" onclick={() => socket.wake()}>Reconnect and wake</button></div>
+  {#if continuing}
+    <div class="connection-status" role="status">{continuingLabel}</div>
+  {:else if store.asleep && !store.connected}
+    <div class="connection-status" role="status">Send a message to pick this conversation back up.</div>
+  {:else if reconnectingShown}
+    <div class="connection-status" role="status">Reconnecting…</div>
   {/if}
   <Composer
     sessionId={session.id}
     running={agentBusy}
-    disabled={store.exited !== null || store.degraded}
+    disabled={continuing || store.exited !== null || store.degraded}
+    disabledReason={continuing ? continuingLabel : undefined}
     slashCommands={composerCommands}
     workspaceId={session.workspace_id ?? null}
     {terminals}
@@ -2670,9 +2715,8 @@
 </div>
 
 <style>
-  .placement-note { color: var(--accent); font-size: 11px; padding: 5px 12px; border-bottom: 1px solid var(--edge); }
-  .connection-action { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 10px; padding: 8px 12px; color: var(--muted); font-size: 12px; }
-  .connection-action button { min-height: 36px; border: 1px solid var(--edge); border-radius: 6px; background: var(--rail-bg); color: var(--fg); padding: 6px 10px; cursor: pointer; }
+  .placement-note { color: var(--accent); font-size: var(--text-xs); padding: 5px 12px; border-bottom: 1px solid var(--edge); }
+  .connection-status { padding: 8px 12px; color: var(--muted); font-size: 12px; text-align: center; }
   .chat {
     position: relative; /* anchors the rewind dialog + /mcp panel overlays */
     height: 100%;

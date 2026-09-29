@@ -253,6 +253,35 @@ async fn chat_command(
     .await?
 }
 
+/// A session paused for a transfer (or held while its project runs
+/// elsewhere) continues on another machine: it did not exit. The additive
+/// `moved` frame tells the viewer to keep the conversation mounted and follow
+/// it; older clients ignore the frame and simply reconnect. Only Pro transfer
+/// and ownership paths ever populate either registry.
+fn moved_frame(state: &AppState, id: &str) -> Option<serde_json::Value> {
+    let transferring = crate::lock(&state.chat_switching)
+        .get(id)
+        .map(String::as_str)
+        == Some("transfer");
+    let paused = transferring || crate::lock(&state.deferred_sessions).contains_key(id);
+    paused.then(|| {
+        json!({"type":"moved","to": if crate::pro::is_worker(state) { "computer" } else { "cloud" }})
+    })
+}
+
+/// Input this socket may not deliver. The additive `reason` lets a client say
+/// why in its own words (`watching`: the viewer chose to watch; `elsewhere`:
+/// the project runs on another device right now); `message` stays plain.
+fn refusal(watching: bool) -> serde_json::Value {
+    if watching {
+        json!({"type":"error","code":"read_only","reason":"watching",
+               "message":"You're watching. Take control to type."})
+    } else {
+        json!({"type":"error","code":"read_only","reason":"elsewhere",
+               "message":"This project is running on another device right now. That was not sent."})
+    }
+}
+
 pub(crate) fn session_writable(state: &AppState, id: &str) -> bool {
     let workspace = crate::lock(&state.session_workspaces).get(id).cloned();
     workspace.is_none_or(|workspace| crate::pro::may_execute(state, &workspace))
@@ -330,8 +359,22 @@ async fn handle(
         }
     };
     let mut attachment = match attach_res {
+        // A stopped process still registered for a moment after a transfer
+        // stop is not an exit to replay: the viewer follows the session.
+        Ok(attachment) if !attachment.info.alive && moved_frame(&state, &id).is_some() => {
+            if let Some(frame) = moved_frame(&state, &id) {
+                let _ = send_json(&mut socket, &frame).await;
+            }
+            return;
+        }
         Ok(attachment) => attachment,
         Err(err) => {
+            // Paused for a transfer: not an exit, and its last screen is not
+            // its last words. The viewer follows it to its new owner.
+            if let Some(frame) = moved_frame(&state, &id) {
+                let _ = send_json(&mut socket, &frame).await;
+                return;
+            }
             // A session that died before this client could attach (fast
             // agent failures — a missing API key kills codex in ~400ms)
             // still gets an honest pane: replay the final screen once,
@@ -550,6 +593,20 @@ async fn handle(
             },
             event = attachment.events.recv(), if events_open => match event {
                 Ok(event) => {
+                    // Stopped for a transfer: say it moved (after its final
+                    // output), not that it exited. A scoped viewer whose
+                    // project connection changed hears that first: it must
+                    // re-read where the project runs before following it.
+                    if matches!(event, chimaera_pty::SessionEvent::Exited { .. }) {
+                        if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) {
+                            scope_changed(&mut socket).await;
+                            return;
+                        }
+                        if let Some(frame) = moved_frame(&state, &id) {
+                            let _ = send_ordered_json(&mut socket, &mut batch, &frame).await;
+                            return;
+                        }
+                    }
                     let resized_to = match &event {
                         chimaera_pty::SessionEvent::Resized { cols, rows } => Some((*cols, *rows)),
                         _ => None,
@@ -598,7 +655,7 @@ async fn handle(
                 Some(Ok(Message::Binary(bytes))) => {
                     if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
                     if options.read_only || !session_writable(&state, &id) {
-                        let _ = send_ordered_json(&mut socket, &mut batch, &json!({"type":"error","code":"read_only","message":"This session is read only on this host"})).await;
+                        let _ = send_ordered_json(&mut socket, &mut batch, &refusal(options.read_only)).await;
                         continue;
                     }
                     let mut interacted = false;
@@ -610,17 +667,14 @@ async fn handle(
                                 return;
                             }
                             if matches!(error, chimaera_pty::ExecError::Busy(_)) {
-                                let _ = send_ordered_json(&mut socket, &mut batch, &json!({"type":"error","code":"read_only","message":"Your project is busy. Wait a moment before typing again."})).await;
+                                let _ = send_ordered_json(&mut socket, &mut batch, &json!({"type":"error","code":"read_only","reason":"busy","message":"Your project is busy. Wait a moment before typing again."})).await;
                                 break;
                             }
                             // Session is gone; flush the batched tail (its
                             // last words), tell the client, and hang up.
-                            let _ = send_ordered_json(
-                                &mut socket,
-                                &mut batch,
-                                &json!({"type": "exited", "status": null}),
-                            )
-                            .await;
+                            let gone = moved_frame(&state, &id)
+                                .unwrap_or_else(|| json!({"type": "exited", "status": null}));
+                            let _ = send_ordered_json(&mut socket, &mut batch, &gone).await;
                             return;
                         }
                         if !interacted { crate::activity::record(&state, &id); interacted = true; }
@@ -890,6 +944,14 @@ async fn handle_chat(
         return;
     }
 
+    // A conversation paused for a transfer continues elsewhere: never greet
+    // the viewer with its stopped driver (`alive:false` reads as "exited").
+    if !state.chat.get(&id).is_some_and(|chat| chat.alive) {
+        if let Some(frame) = moved_frame(&state, &id) {
+            let _ = send_json(&mut socket, &frame).await;
+            return;
+        }
+    }
     // Replay may read the journal file — keep it off the reactor.
     let attachment = {
         let state = state.clone();
@@ -984,15 +1046,22 @@ async fn handle_chat(
                     // - a PTY already under this id: it degraded/toggled to a
                     //   terminal.
                     // - otherwise: the session genuinely exited.
+                    // - stopped for a transfer: it moved, it did not exit
+                    //   (a scoped viewer whose connection changed hears that
+                    //   first, to re-read where the project runs).
+                    if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) {
+                        scope_changed(&mut socket).await;
+                        return;
+                    }
                     let switching = crate::lock(&state.chat_switching).get(&id).cloned();
-                    let frame = match switching.as_deref() {
+                    let frame = moved_frame(&state, &id).unwrap_or_else(|| match switching.as_deref() {
                         Some("term") => json!({"type": "degraded"}),
                         Some(_) => json!({"type": "error", "code": "unknown_session",
                                           "message": "session switching"}),
                         None if state.sessions.get(&id).is_some() => json!({"type": "degraded"}),
                         None => json!({"type": "exited",
                                        "status": state.chat.get(&id).and_then(|c| c.exit_status)}),
-                    };
+                    });
                     let _ = send_json(&mut socket, &frame).await;
                     return;
                 }
@@ -1003,7 +1072,7 @@ async fn handle_chat(
                     match serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text) {
                         Ok(mut cmd) => {
                             if options.read_only || !session_writable(&state, &id) {
-                                let _ = send_json(&mut socket, &json!({"type":"error","code":"read_only","message":"This session is read only"})).await;
+                                let _ = send_json(&mut socket, &refusal(options.read_only)).await;
                                 continue;
                             }
                             if let Err(err) = cmd.validate_ingress() {
@@ -1287,6 +1356,112 @@ pub(crate) const EVENTS_THROTTLE: Duration = Duration::from_millis(250);
 /// child exiting on its own).
 const EVENTS_TICK: Duration = Duration::from_secs(1);
 
+/// First retry after a project feed ends, doubling up to [`FEED_RETRY_MAX`].
+const FEED_RETRY_MIN: Duration = Duration::from_secs(1);
+const FEED_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// How the local watchers must change for the watched project.
+enum LocalWatch {
+    /// The project runs elsewhere: its owner's feed replaces local watching.
+    Park,
+    /// The project is local again: resume watching it here.
+    Restore(String, Vec<String>, Vec<String>),
+}
+
+/// A window watching a project that currently runs on another machine gets
+/// that project's session, file, Git and Timeline frames from its owner,
+/// merged into this window's own loop; everything else (settings, recents,
+/// notices, updates, plugins) stays this daemon's. When the owner changes or
+/// sleeps the feed ends and restarts; the window's socket never closes for
+/// it. A project with no route (every free user's) stays in local mode.
+struct ProjectView {
+    /// The window's watched project and its mounted/listed paths.
+    watched: Option<(String, Vec<String>, Vec<String>)>,
+    feed: Option<crate::session_proxy::Feed>,
+    /// Local git/fs watching is parked because the project is routed.
+    remote: bool,
+    retry_at: Option<tokio::time::Instant>,
+    backoff: Duration,
+    git: Option<(String, u64)>,
+    timeline: Option<(String, u64)>,
+}
+impl ProjectView {
+    fn new() -> Self {
+        Self {
+            watched: None,
+            feed: None,
+            remote: false,
+            retry_at: None,
+            backoff: FEED_RETRY_MIN,
+            git: None,
+            timeline: None,
+        }
+    }
+    fn stop_feed(&mut self) {
+        self.feed = None;
+        self.git = None;
+        self.timeline = None;
+        self.retry_at = None;
+        self.backoff = FEED_RETRY_MIN;
+    }
+    /// A new watch registration from the window.
+    fn watch(&mut self, workspace: Option<&str>, files: &[String], dirs: &[String]) {
+        match (&self.feed, workspace) {
+            (Some(feed), Some(workspace)) if feed.workspace == workspace => {
+                feed.watch(files.to_vec(), dirs.to_vec());
+            }
+            (Some(_), _) => self.stop_feed(),
+            (None, _) => {}
+        }
+        self.watched = workspace.map(|w| (w.to_owned(), files.to_vec(), dirs.to_vec()));
+    }
+    /// Re-decide local vs routed for the watched project; start (or retry) its
+    /// feed while routed.
+    fn reconcile(&mut self, state: &Arc<AppState>) -> Option<LocalWatch> {
+        let Some((workspace, files, dirs)) = &self.watched else {
+            self.stop_feed();
+            self.remote = false;
+            return None;
+        };
+        if !state.session_proxy.routed(workspace) {
+            if !self.remote {
+                return None;
+            }
+            let restore = LocalWatch::Restore(workspace.clone(), files.clone(), dirs.clone());
+            self.remote = false;
+            self.stop_feed();
+            return Some(restore);
+        }
+        let parked = !std::mem::replace(&mut self.remote, true);
+        if self.feed.is_none()
+            && self
+                .retry_at
+                .is_none_or(|at| tokio::time::Instant::now() >= at)
+        {
+            self.retry_at = None;
+            self.feed = Some(crate::session_proxy::Feed::start(
+                Arc::clone(state),
+                workspace.clone(),
+                files.clone(),
+                dirs.clone(),
+            ));
+        }
+        parked.then_some(LocalWatch::Park)
+    }
+    async fn next(&mut self) -> Option<crate::session_proxy::FeedFrame> {
+        match self.feed.as_mut() {
+            Some(feed) => feed.next().await,
+            None => std::future::pending().await,
+        }
+    }
+    /// The feed ended (owner change, sleeping owner, transient failure).
+    fn ended(&mut self) {
+        self.feed = None;
+        self.retry_at = Some(tokio::time::Instant::now() + self.backoff);
+        self.backoff = (self.backoff * 2).min(FEED_RETRY_MAX);
+    }
+}
+
 async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     let Some(auth) = authenticate(&mut socket, &state).await else {
         let _ = send_json(
@@ -1311,6 +1486,7 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     // missed (the poll would still catch it, just later).
     let mut touched = state.fs_touched.subscribe();
     let mut touched_open = true;
+    let mut project = ProjectView::new();
 
     let mut last_sent: Option<Arc<String>> = None;
     let mut last_settings_gen: Option<u64> = None;
@@ -1350,7 +1526,7 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     {
         return;
     }
-    if send_git_snapshot(&mut socket, &state, &mut last_git)
+    if send_git_snapshot(&mut socket, &state, &mut last_git, None)
         .await
         .is_err()
     {
@@ -1368,7 +1544,7 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     {
         return;
     }
-    if send_timeline_snapshot(&mut socket, &state, &mut last_timeline)
+    if send_timeline_snapshot(&mut socket, &state, &mut last_timeline, None)
         .await
         .is_err()
     {
@@ -1414,6 +1590,24 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
                 // iteration) nor outrun the throttle below, which bounds
                 // these passes to four a second per window.
             }
+            // The watched project's frames from where it runs now.
+            frame = project.next() => match frame {
+                Some(crate::session_proxy::FeedFrame::Fs(value)) => {
+                    project.backoff = FEED_RETRY_MIN;
+                    if send_json(&mut socket, &value).await.is_err() {
+                        return;
+                    }
+                }
+                Some(crate::session_proxy::FeedFrame::Git(epoch)) => {
+                    project.backoff = FEED_RETRY_MIN;
+                    project.git = project.watched.as_ref().map(|(w, ..)| (w.clone(), epoch));
+                }
+                Some(crate::session_proxy::FeedFrame::Timeline(epoch)) => {
+                    project.backoff = FEED_RETRY_MIN;
+                    project.timeline = project.watched.as_ref().map(|(w, ..)| (w.clone(), epoch));
+                }
+                None => project.ended(),
+            },
             msg = socket.recv() => match msg {
                 // The only client frame on this bus: which workspace this window
                 // shows + the exact mounted paths whose disk state it renders.
@@ -1421,18 +1615,28 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
                     if let Ok(ClientMessage::Watch { workspace_id, files, dirs }) =
                         serde_json::from_str::<ClientMessage>(&text)
                     {
-                        if let Some(workspace)=workspace_id.as_deref() {
-                            let registration=json!({"type":"watch","workspace_id":workspace,"files":files,"dirs":dirs});
-                            if crate::session_proxy::events(&state,workspace,registration,&mut socket).await {return;}
-                        }
-                        watch.set(workspace_id);
-                        if fs_watch.set(files, dirs) {
-                            // Establish new metadata baselines immediately when
-                            // the two-second client-I/O ceiling allows it. New
-                            // directory name baselines are separately batched.
-                            let changes = fs_watch.poll(false).await;
-                            if send_fs_changes(&mut socket, changes).await.is_err() {
-                                return;
+                        project.watch(workspace_id.as_deref(), &files, &dirs);
+                        let routed = workspace_id
+                            .as_deref()
+                            .is_some_and(|w| state.session_proxy.routed(w));
+                        if routed {
+                            // The owner's feed replaces local watching for a
+                            // project that runs elsewhere.
+                            let _ = project.reconcile(&state);
+                            watch.set(None);
+                            fs_watch.set(Vec::new(), Vec::new());
+                        } else {
+                            project.stop_feed();
+                            project.remote = false;
+                            watch.set(workspace_id);
+                            if fs_watch.set(files, dirs) {
+                                // Establish new metadata baselines immediately when
+                                // the two-second client-I/O ceiling allows it. New
+                                // directory name baselines are separately batched.
+                                let changes = fs_watch.poll(false).await;
+                                if send_fs_changes(&mut socket, changes).await.is_err() {
+                                    return;
+                                }
                             }
                         }
                     }
@@ -1441,6 +1645,19 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
                 Some(Ok(_)) => continue,
                 Some(Err(_)) | None => return,
             },
+        }
+        // A registration or an owner change may have moved the watched project
+        // between this daemon and another machine.
+        match project.reconcile(&state) {
+            Some(LocalWatch::Park) => {
+                watch.set(None);
+                fs_watch.set(Vec::new(), Vec::new());
+            }
+            Some(LocalWatch::Restore(workspace, files, dirs)) => {
+                watch.set(Some(workspace));
+                fs_watch.set(files, dirs);
+            }
+            None => {}
         }
         if send_settings_snapshot(&mut socket, &state, &mut last_settings_gen)
             .await
@@ -1454,7 +1671,7 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         {
             return;
         }
-        if send_git_snapshot(&mut socket, &state, &mut last_git)
+        if send_git_snapshot(&mut socket, &state, &mut last_git, project.git.as_ref())
             .await
             .is_err()
         {
@@ -1472,9 +1689,14 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         {
             return;
         }
-        if send_timeline_snapshot(&mut socket, &state, &mut last_timeline)
-            .await
-            .is_err()
+        if send_timeline_snapshot(
+            &mut socket,
+            &state,
+            &mut last_timeline,
+            project.timeline.as_ref(),
+        )
+        .await
+        .is_err()
         {
             return;
         }
@@ -1593,9 +1815,14 @@ async fn send_timeline_snapshot(
     socket: &mut WebSocket,
     state: &AppState,
     last: &mut Option<String>,
+    remote: Option<&(String, u64)>,
 ) -> Result<(), axum::Error> {
-    let epochs: std::collections::BTreeMap<String, u64> =
+    let mut epochs: std::collections::BTreeMap<String, u64> =
         state.timeline.epochs_snapshot().into_iter().collect();
+    // A project running elsewhere reports its owner's Timeline epoch.
+    if let Some((workspace, epoch)) = remote {
+        epochs.insert(workspace.clone(), *epoch);
+    }
     let frame = json!({"type": "timeline", "epochs": epochs}).to_string();
     if last.as_deref() == Some(frame.as_str()) {
         return Ok(());
@@ -1640,9 +1867,14 @@ async fn send_git_snapshot(
     socket: &mut WebSocket,
     state: &AppState,
     last: &mut Option<String>,
+    remote: Option<&(String, u64)>,
 ) -> Result<(), axum::Error> {
-    let epochs: std::collections::BTreeMap<String, u64> =
+    let mut epochs: std::collections::BTreeMap<String, u64> =
         state.git.epochs_snapshot().into_iter().collect();
+    // A project running elsewhere reports its owner's Git epoch.
+    if let Some((workspace, epoch)) = remote {
+        epochs.insert(workspace.clone(), *epoch);
+    }
     let frame = json!({"type": "git", "epochs": epochs}).to_string();
     if last.as_deref() == Some(frame.as_str()) {
         return Ok(());

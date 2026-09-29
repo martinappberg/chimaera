@@ -1801,3 +1801,85 @@ describe("ChatStore turn artifacts (the made-this-turn gallery)", () => {
     expect(ends[1]).toMatchObject({ artifacts: [], mentioned: [], startedAtMs: 3010, endedAtMs: 3030 });
   });
 });
+
+describe("ChatStore unsent text", () => {
+  it("a send refused before the agent got it goes back to the composer, once", () => {
+    const store = new ChatStore();
+    store.noteSent("please run the tests");
+    store.onCommandFailed("refused");
+    expect(store.blocks.at(-1)?.kind).toBe("notice");
+    expect(store.takeRestoredDraft()).toBe("please run the tests");
+    expect(store.takeRestoredDraft()).toBeNull();
+    // A later, unrelated refusal has nothing left to hand back.
+    store.onCommandFailed("refused");
+    expect(store.restoredDraft).toBeNull();
+  });
+
+  it("a send the agent echoed is never handed back", () => {
+    const store = new ChatStore();
+    store.noteSent("hello");
+    store.apply({ seq: 1, ts: 0, ev: { type: "user_message", text: "hello", id: "u1" } } as SeqEvent);
+    store.onCommandFailed("refused");
+    expect(store.restoredDraft).toBeNull();
+  });
+
+  it("someone else's message does not confirm this composer's send", () => {
+    const store = new ChatStore();
+    store.noteSent("mine");
+    store.apply({
+      seq: 1,
+      ts: 0,
+      ev: { type: "user_message", text: "from the phone app", origin: "remote" },
+    } as SeqEvent);
+    store.onCommandFailed("refused");
+    expect(store.takeRestoredDraft()).toBe("mine");
+  });
+
+  it("a move keeps the transcript and clears when the conversation is reached again", () => {
+    const store = fold([
+      { type: "user_message", text: "keep me", id: "u1" },
+      { type: "exited", status: null },
+    ]);
+    const before = store.blocks.length;
+    store.onMoved("cloud");
+    expect(store.moving).toBe("cloud");
+    expect(store.connected).toBe(false);
+    expect(store.blocks.length).toBe(before);
+    store.onReady(
+      {
+        id: "s",
+        agent: "claude",
+        alive: true,
+        exit_status: null,
+        native_session_id: null,
+        model: null,
+        current_mode: null,
+        pending_permission: false,
+      },
+      2,
+      2,
+    );
+    expect(store.moving).toBeNull();
+  });
+
+  it("a paused owner is a state, cleared when the conversation is live again", () => {
+    const store = new ChatStore();
+    store.onAsleep();
+    expect(store.asleep).toBe(true);
+    store.onReady(
+      {
+        id: "s",
+        agent: "claude",
+        alive: true,
+        exit_status: null,
+        native_session_id: null,
+        model: null,
+        current_mode: null,
+        pending_permission: false,
+      },
+      0,
+      0,
+    );
+    expect(store.asleep).toBe(false);
+  });
+});

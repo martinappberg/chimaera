@@ -69,8 +69,10 @@ function makeSocket(sessionId: string, store: ChatStore): ChatSocket {
     onExited: (status: number | null) => store.onExited(status),
     onError: (message: string) => store.onFatalError(message),
     // A refused command is a notice, not a dead pane — the socket keeps
-    // reconnecting and the user keeps their transcript.
-    onCommandFailed: (message: string) => store.notice(message, "error"),
+    // reconnecting and the user keeps their transcript and their text.
+    onCommandFailed: (message: string) => store.onCommandFailed(message),
+    onAsleep: () => store.onAsleep(),
+    onMoved: (to: "cloud" | "computer") => store.onMoved(to),
     onDisconnected: () => store.onDisconnected(),
     lastSeq: () => store.lastSeq,
   });

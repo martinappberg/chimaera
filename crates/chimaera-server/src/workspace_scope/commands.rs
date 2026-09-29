@@ -39,14 +39,16 @@ pub(super) async fn run(state: Arc<AppState>, request: Request<Body>, next: Next
         .path()
         .strip_prefix("/api/v1")
         .unwrap_or(parts.uri.path());
-    let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    // Lifecycle routes never narrow their body (only /fs/ resolvers do, and
+    // those are not reserved here), so the forwarded bytes stay as sent.
+    let mut value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     if validate_resource(
         &state,
         &admission.scope,
         &parts.method,
         path,
         &HashMap::new(),
-        &value,
+        &mut value,
     )
     .await
     .is_err()

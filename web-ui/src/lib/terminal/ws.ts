@@ -1,5 +1,5 @@
 import { sendSocketAuth } from "../net/placement";
-import { daemonSocketUrl } from "../net/base";
+import { daemonSocketUrl, isBrowserGateway } from "../net/base";
 import { getToken } from "../net/api";
 import { Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 
@@ -28,6 +28,9 @@ export interface SessionSocketHandlers {
   onExited(status: number | null): void;
   /** Server-side error, surfaced quietly. The socket will not reconnect. */
   onError(message: string): void;
+  /** Input the daemon refused (watching, busy, running elsewhere). The socket
+   *  stays; the refusal is said inline, never in the scrollback. */
+  onRefused?(reason: string | null, message: string | null): void;
   /**
    * Whether the terminal is currently parked (hidden pooled instance). Read
    * at every (re)connect: a parked attach tells the server to withhold
@@ -59,6 +62,7 @@ interface ServerTextFrame {
   status?: number | null;
   message?: string;
   code?: string;
+  reason?: string;
 }
 
 /**
@@ -85,6 +89,8 @@ export class SessionSocket {
   /** The auth frame of the CURRENT connection carried `parked: true`. */
   private sentParkedAuth = false;
   private unknownRetries = 0;
+  /** A wake-carrying reconnect is in flight (at most one per drop). */
+  private waking = false;
   private readonly recon = new Reconnector(() => this.connect());
   private readonly encoder = new TextEncoder();
 
@@ -92,7 +98,9 @@ export class SessionSocket {
     private readonly sessionId: string,
     private readonly handlers: SessionSocketHandlers,
   ) {
-    this.connect(true);
+    // Opening a terminal is viewing, never interaction: it must not wake a
+    // paused project. Typing does ({@link wakeOnInput}).
+    this.connect();
   }
 
   private connect(interaction = false): void {
@@ -125,6 +133,7 @@ export class SessionSocket {
 
     ws.onclose = () => {
       if (this.ws === ws) this.ws = null;
+      this.waking = false;
       if (this.closed || this.fatal || this.exited) {
         this.recon.clear();
         return;
@@ -132,6 +141,21 @@ export class SessionSocket {
       this.handlers.onDrop?.();
       this.recon.schedule();
     };
+  }
+
+  /**
+   * Keystrokes into a browser view whose socket is down: reconnect now, once,
+   * carrying wake intent. The keystrokes themselves are not queued. Native
+   * windows never need this: their daemon keeps the socket open and holds
+   * early typing itself while a paused owner wakes.
+   */
+  private wakeOnInput(): void {
+    if (!isBrowserGateway() || this.closed || this.fatal || this.exited || this.waking) return;
+    if (this.handlers.readOnly?.() ?? false) return;
+    this.waking = true;
+    this.dropSocket();
+    this.recon.cancel();
+    this.connect(true);
   }
 
   private handleTextFrame(raw: string): void {
@@ -145,6 +169,7 @@ export class SessionSocket {
       case "ready": {
         this.recon.succeeded();
         this.unknownRetries = 0;
+        this.waking = false;
         if (this.sentParkedAuth) {
           // No snapshot follows on a parked connection — never reset the
           // grid for it, and skip the dims reconcile (no dims were sent).
@@ -194,8 +219,19 @@ export class SessionSocket {
         this.sawExited = true;
         this.handlers.onExited(msg.status ?? null);
         break;
+      case "moved":
+        // Continuing on another machine: not an exit. Keep the screen; the
+        // daemon closes this socket and the ordinary reconnect follows it.
+        break;
       case "error":
-        if (msg.code === "read_only") { this.handlers.onError(msg.message ?? "Just watching"); break; }
+        if (msg.code === "read_only") {
+          if (this.handlers.onRefused !== undefined) {
+            this.handlers.onRefused(msg.reason ?? null, msg.message ?? null);
+          } else {
+            this.handlers.onError(msg.message ?? "Just watching");
+          }
+          break;
+        }
         if (msg.code === "remote_unavailable" || msg.code === "worker_asleep" || msg.code === "workspace_scope_changed") { break; }
         if (msg.code === "unknown_session") {
           // After a witnessed exit, "unknown" means even the session's
@@ -228,8 +264,11 @@ export class SessionSocket {
 
   /** Send raw keyboard input (from term.onData) as a binary frame. */
   sendInput(data: string): void {
-    if (!this.handlers.readOnly?.() && this.ws?.readyState === WebSocket.OPEN && this.authenticatedSocket === this.ws) {
+    if (this.handlers.readOnly?.()) return;
+    if (this.ws?.readyState === WebSocket.OPEN && this.authenticatedSocket === this.ws) {
       this.ws.send(this.encoder.encode(data));
+    } else {
+      this.wakeOnInput();
     }
   }
 
@@ -282,11 +321,15 @@ export class SessionSocket {
     return true;
   }
 
-  /** A deliberate access-mode change can wake the worker; automatic retries cannot. */
+  /** Switching between watching and control reconnects with the new access.
+   *  Taking control is still not interaction: the first keystroke is. */
   accessChanged(): void {
     if (this.closed) return;
-    this.fatal = false; this.exited = false;
-    this.dropSocket(); this.recon.cancel(); this.connect(true);
+    this.fatal = false;
+    this.exited = false;
+    this.dropSocket();
+    this.recon.cancel();
+    this.connect();
   }
 
   /** Permanently close the socket (no reconnect). */

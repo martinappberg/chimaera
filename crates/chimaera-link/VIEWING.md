@@ -51,6 +51,11 @@ shared transport, so after a native restart a failed check retires it. A shared
 transport stays open while any kept or healthy project still needs it. Failed
 probes do not skip healthy siblings; failed retirements remain reported and
 retry on the next bounded refresh.
+Route currency is stamped **per project**: registering, re-registering or
+retiring one project never closes a sibling's sockets or invalidates its preview
+tickets on the same transport; only a changed endpoint or credential retires
+every project on that host. A project that moves between registered hosts
+re-homes its cached session rows at once.
 The daemon also polls each project roster independently, with at most four requests
 in flight and a ten-second deadline per project. One failure only marks that
 project unavailable; healthy siblings keep updating. Changed results notify views
@@ -80,18 +85,73 @@ Require successful status and the exact response headers:
 This prevents an older daemon that ignores additive fields from receiving a
 write. A failed probe is not retried as an unscoped request. The target checks its
 registered workspace and live execution grant again for each request and socket
-write. Owner changes close stale sockets; the UI reconnects and replays received
-history only. It never queues or automatically resends a message or file mutation.
+write. The native proxy reuses a positive acknowledgment for 15 seconds for the
+same host, project, route stamp and epoch; a "sleeping" answer is never cached.
+
+**Sleeping owner.** A suspended owner cannot echo scope headers: the transport
+answers `/api/v1/health` from cache with `X-Chimaera-Worker-State: sleeping`, or
+503 `{"error":"worker_asleep"}`. Only the transport sets that header. When it
+does, the native proxy relaxes the probe: mutations (and explicitly wake-marked
+requests) are forwarded — the transport wakes the owner, which re-checks scope on
+every write — with a 120 s response budget; passive reads are forwarded with no
+wake marker and are answered from the transport's cache or with `worker_asleep`;
+a socket attach stays passive and does not connect. (The transport half —
+answering the probe from placement state with the scope headers — is a service
+requirement.)
+
+**Reconnects, held input and moves.** Viewing is passive; doing wakes. A native
+window's chat/terminal socket to its own daemon stays open while the owner is
+unreachable or asleep (`remote_unavailable` / `worker_asleep`, both non-fatal);
+the daemon retries the owner on its own (2 s doubling to 30 s). The first real
+input — terminal bytes or any chat command — is held (≤64 KiB of typing, ≤4 chat
+commands), opens the owner's socket with `?wake=interaction`, and is delivered
+exactly once, in order, right after the owner's `ready`. Input that cannot be
+delivered is answered, never dropped: each chat command gets `command_failed`
+(the UI puts its text back into the composer); typing gets `read_only` with
+`reason:"reconnecting"`. Nothing is resent automatically. When the project's
+route changes under an established socket, the viewer receives an additive
+`{"type":"moved","to":"cloud"|"computer"}` and the socket closes so the client
+re-routes; the owning daemon sends the same frame (instead of `exited`) for a
+session paused for a transfer, on the live socket and on every reconnect until
+it runs again. A scoped viewer whose connection changed hears
+`workspace_scope_changed` first. Browser views have no local daemon to hold
+input: a send or keystroke into a dropped socket reconnects once with wake intent
+and the action is not queued.
+
+**Events.** A window's own `/ws/events` loop stays authoritative. For a routed
+project it runs a bounded feed from the owner that contributes only that
+project's session rows (merged into the local roster), file invalidations (in the
+window's paths) and Git/Timeline epochs; the owner's settings, recents, notices,
+update and plugin frames are never forwarded, and local Git/file watching is
+parked until the project is local again. A feed that ends restarts with backoff;
+the window's socket never closes for an owner change. `remote_unavailable` and
+`workspace_scope_changed` on an events socket mean "reconnect", not "rejected".
+
+**Budgets.** Forwarded HTTP (requests, polls, probes) shares 32 permits; long-lived
+sockets have their own 128. Response heads get 30 s (75 min for uploads and exec,
+120 s when waking an owner); after the head, a transfer runs for as long as it
+makes progress and is abandoned after 120 s of silence.
 
 ## Project files and stable tabs
 
 The portable view root is always `/project` (canonical unpadded base64url
 `L3Byb2plY3Q` in `X-Chimaera-Viewer-Root` / socket `viewer_root`). It is presentation
-metadata, never authority. Browser clients do not persist or transmit real
-filesystem roots. Native windows translate their existing local file paths into
-this alias on the local computer, then translate returned metadata back. Their
-window layout stays local. This keeps existing file tabs stable while the project
-runs elsewhere.
+metadata, never authority. Browser clients do not persist real filesystem roots,
+and the metadata fields below are translated; content is never traversed, so
+journals (a conversation's tool paths and saved-image paths), recents, Git
+worktree listings and new-session replies still carry the owner's real paths.
+Native windows translate their existing local file paths into this alias on the
+local computer, then translate returned metadata back. Their window layout stays
+local. This keeps existing file tabs stable while the project runs elsewhere.
+
+A native window's `/fs/*` request goes to the owner only when it belongs there:
+any path under the project's local root (and requests with no path) go to the
+owner; a read naming only paths outside the project asks the owner first (a
+conversation that runs there links its own files) and is answered by this
+computer when the owner declines (403/404) or is unreachable; a write outside
+the project stays on this computer when its folder exists here and otherwise
+goes to the owner. A file tab opened from an owner's real path is not rewritten
+to the local root, so it stops resolving once the project is local again.
 
 Only known path fields are translated: filesystem `path`/`dir`, create/delete
 `path`, rename/copy/move `from`/`to`, resolver `base`/`bases`/`candidates`/`targets`,
@@ -127,10 +187,18 @@ owned enqueue, and clean transitions fence the old driver before activating a
 replacement. Unscoped local and SSH sockets preserve their existing behavior.
 
 The initial forwarded surface is an explicit allowlist: scoped workspace/session
-rosters; current project timeline, plugin, skill and knowledge reads; session
-creation and normal session actions; links between sessions in this project;
-project Git reads and recents; project filesystem reads, edits, draft recovery,
-file tickets/downloads and watches; and workspace-keyed browser layout state.
+rosters; reads of the owner's `/health`, `/settings`, `/agents`, `/plugins`,
+`/compute` and `/update`; current project timeline, plugin, agent-plugin, skill
+and knowledge reads; opening the project, binding or removing its Mastermind and
+delivering a Timeline note; session creation and normal session actions; links
+between sessions in this project; project Git reads and recents; project
+filesystem reads (including the document checker), edits, draft recovery, file
+tickets/downloads and watches; and workspace-keyed browser layout state. Reads —
+file reads, tickets and the compound resolvers, never writes — may also open the
+images this project's own conversations saved in the owner's uploads folder.
+`/fs/validate` and `/fs/resolve_targets` drop the candidates a viewer may not read
+(they resolve as unknown) instead of refusing the whole batch, and never hand the
+resolver a base outside the project.
 Account configuration, environment changes, arbitrary workspace creation, Git
 worktree creation and browser-pane proxy tickets are not admitted through this
 project route. Opaque browser proxy entries currently lack a trustworthy workspace

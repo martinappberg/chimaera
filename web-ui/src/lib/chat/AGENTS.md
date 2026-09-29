@@ -283,6 +283,19 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
   rewind dialog, `/mcp`, usage, effort) are already their own components — add new
   chrome the same way rather than inlining it into the host.
 
-Remote chat reconnects are passive. Only the explicit reconnect/wake action
-adds `wake=interaction`; browser sockets use `net/base` to preserve gateway
-prefixes. Transfer context echoes render the additive `moved` and `home` origins.
+Remote chats (Pro): attaching and reconnecting are passive; there is no wake
+button. In a native window the daemon holds the first command while a paused
+owner wakes and answers anything it cannot deliver with `command_failed`; the
+store keeps the composer's last accepted send (`noteSent`) until its user echo
+and hands it back on a refusal (`restoredDraft` → `insertIntoComposer`). In a
+browser view, `send()` into a dropped socket reconnects once with
+`?wake=interaction` and returns false (the composer keeps the draft). Socket
+states that are not errors: `worker_asleep` → `store.asleep` ("Send a message to
+pick this conversation back up."), and the additive `{"type":"moved","to"}` →
+`store.moving`: the chat is NOT ended, stays mounted (the pane keeps a paused
+chat row's ChatView), hides the replayed "agent exited", disables the composer
+with "Continuing in the cloud…/on your computer…" and reconnects to the new
+owner. The connection row appears only for a viewed project (routed row or
+browser view) after a 2 s grace. Browser sockets use `net/base` to preserve
+gateway prefixes. Transfer context echoes render the additive `moved` and `home`
+origins.
