@@ -1,4 +1,4 @@
-import { writable } from "svelte/store";
+import { get, writable } from "svelte/store";
 
 export const BUILD_META_NAME = "chimaera-build";
 export const BUILD_META_PLACEHOLDER = "__CHIMAERA_BUILD_ID__";
@@ -138,13 +138,14 @@ export function noteChunkFailure(): void {
   });
 }
 
-/** Request the pending reload. `force` is an explicit user choice to cross a
+/** Request the pending reload, or a fresh one (`manual`: a view's crash card)
+ *  when none is pending. `force` is an explicit user choice to cross a
  *  volatile-state guard; the browser's dirty-file confirmation remains too.
  *  A manual re-request keeps the attempt count: it is one more try at the
  *  same transition, not a fresh one. */
 export function requestAssetReload(force = false): void {
   assetTransition.update((current) => ({
-    reason: current?.reason ?? "chunk",
+    reason: current?.reason ?? "manual",
     target: current?.target ?? null,
     requested: true,
     forced: force,
@@ -161,17 +162,8 @@ export function requestAssetReload(force = false): void {
  *  requested mints nothing: a held key or a double press must never re-issue
  *  a navigation in flight (every re-issue cancels the load underway). */
 export function requestWindowReload(): void {
-  assetTransition.update((current) => {
-    if (current?.requested) return current;
-    return {
-      reason: current?.reason ?? "manual",
-      target: current?.target ?? null,
-      requested: true,
-      forced: false,
-      revision: nextRevision(),
-      attempts: current?.attempts ?? 0,
-    };
-  });
+  if (get(assetTransition)?.requested) return;
+  requestAssetReload();
 }
 
 /** Withdraw a Reload Window the user no longer wants (held by unsaved work,

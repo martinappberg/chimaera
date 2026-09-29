@@ -17,6 +17,8 @@ import { installReloadHook } from "./lib/layout/windowReload";
 // fails to boot.
 installReloadHook();
 
+// The native Reload Window (menu.rs RELOAD_WINDOW_JS) reads this mount point
+// to tell a page that never booted from an older UI without the hook.
 const target = document.getElementById("app");
 if (!target) {
   throw new Error("missing #app mount point");

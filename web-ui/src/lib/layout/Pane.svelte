@@ -14,7 +14,7 @@
   import {
     clearChunkFailure,
     noteChunkFailure,
-    requestWindowReload,
+    requestAssetReload,
   } from "./assetTransition";
   import Spinner from "../previews/Spinner.svelte";
   import type { DashCtx } from "../dashboard/dash";
@@ -284,7 +284,7 @@
   }
 
   function reloadWindow() {
-    requestWindowReload();
+    requestAssetReload();
   }
 
   /** Never throws: it renders inside the error card itself. */

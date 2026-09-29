@@ -6,7 +6,7 @@
 //! Window instead runs a fixed script in it (see [`RELOAD_WINDOW_JS`]).
 
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
-use tauri::{App, AppHandle, Emitter, Manager, Wry};
+use tauri::{App, AppHandle, Emitter, Manager, WebviewWindow, Wry};
 
 /// Handles to menu items whose enabled state tracks runtime context, so
 /// [`sync_settings_enabled`] can toggle them. Managed on the app at install.
@@ -199,11 +199,8 @@ pub fn install(app: &App) -> tauri::Result<()> {
             "reload-window" => {
                 // Only the focused window. The WSL wizard is shell-local:
                 // reloading it mid-install would orphan the running step.
-                if let Some(window) = app
-                    .webview_windows()
-                    .into_values()
-                    .find(|w| w.is_focused().unwrap_or(false))
-                    .filter(|w| !w.label().starts_with("wsl-setup"))
+                if let Some(window) =
+                    focused_window(app).filter(|w| !w.label().starts_with("wsl-setup"))
                 {
                     let _ = window.eval(RELOAD_WINDOW_JS);
                 }
@@ -212,11 +209,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
                 // The page knows what "close the focused view" / "open settings"
                 // means; the shell only knows which window is focused. emit_to,
                 // not emit: a broadcast would act in EVERY window.
-                if let Some(window) = app
-                    .webview_windows()
-                    .into_values()
-                    .find(|w| w.is_focused().unwrap_or(false))
-                {
+                if let Some(window) = focused_window(app) {
                     let _ = app.emit_to(window.label(), "menu", id);
                 }
             }
@@ -224,6 +217,13 @@ pub fn install(app: &App) -> tauri::Result<()> {
         }
     });
     Ok(())
+}
+
+/// The window a menu command acts on: the focused one, if any.
+fn focused_window(app: &AppHandle) -> Option<WebviewWindow> {
+    app.webview_windows()
+        .into_values()
+        .find(|w| w.is_focused().unwrap_or(false))
 }
 
 /// Enable the Settings menu item only when the focused window has a workspace

@@ -20,17 +20,12 @@
    *  (or is being retried); the window keeps trying on its own. */
   const retrying = $derived(!held && transition.requested && transition.attempts > 0);
   const manual = $derived(transition.reason === "manual");
-  const title = $derived(
-    transition.reason === "build"
-      ? "this window needs the current interface"
-      : transition.reason === "connection"
-        ? "the remote connection moved"
-        : manual
-          ? held
-            ? "the reload waits for unsaved work"
-            : "reloading this window"
-          : "part of the interface did not load",
-  );
+  const title = $derived.by(() => {
+    if (transition.reason === "build") return "this window needs the current interface";
+    if (transition.reason === "connection") return "the remote connection moved";
+    if (manual) return held ? "the reload waits for unsaved work" : "reloading this window";
+    return "part of the interface did not load";
+  });
   const blockedMessage = $derived.by(() => {
     const drafts = blockedDrafts === 1 ? "chat draft" : "chat drafts";
     if (blockedFiles > 0 && blockedDrafts > 0) {

@@ -230,8 +230,9 @@ app-build` (never the root `cargo`).
   [files-and-previews.md](files-and-previews.md#rendered-previews)), never a native webview reload:
   WKWebView/wry skip the beforeunload prompt, so unsaved file edits and memory-only chat drafts
   **hold** it behind a notice ("the reload waits for unsaved work") offering *reload anyway* and
-  *cancel*; it proceeds on its own once the work is saved. The window URL (`win=`) is kept, so its
-  view-state restores the same tabs and focus. A pending build/connection transition keeps its
+  *cancel*; it proceeds on its own once the work is saved. The window's id survives in
+  sessionStorage (`chimaera.win`, `layout/viewState.ts`), so its view-state restores the same tabs
+  and focus. A pending build/connection transition keeps its
   reason and target. Asking again while a reload is requested is a no-op (a held key must not
   re-issue a navigation in flight); the plain path ignores repeats within a second. The shell
   script calls the hook when it exists; a page with no interface mounted (a failed load, a UI

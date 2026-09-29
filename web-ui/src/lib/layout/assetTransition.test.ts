@@ -179,6 +179,16 @@ describe("asset transition identity", () => {
     expect(get(assetTransition)).toMatchObject({ reason: "build", requested: true });
   });
 
+  it("re-issues a view card's reload even while one is requested", () => {
+    // A crash card with nothing pending asks for a fresh reload of its own.
+    requestAssetReload();
+    const first = get(assetTransition)!;
+    expect(first).toMatchObject({ reason: "manual", requested: true });
+    // Its button during a retry is one more try, unlike the menu's repeat.
+    requestAssetReload();
+    expect(get(assetTransition)!.revision).toBeGreaterThan(first.revision);
+  });
+
   it("cancels only the user's own reload", () => {
     requestWindowReload();
     cancelWindowReload();
