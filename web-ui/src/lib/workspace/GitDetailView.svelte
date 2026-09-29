@@ -103,6 +103,11 @@
     };
   });
 
+  /** A double-click keeps the tab a single click previews. */
+  function keepOf(e: MouseEvent): { preview?: false } {
+    return e.detail >= 2 ? { preview: false } : {};
+  }
+
   function openFileDiff(e: MouseEvent, f: GitChangedFile): void {
     const split = e.metaKey || e.ctrlKey;
     if (tab.view === "commit" && commit !== null) {
@@ -115,6 +120,7 @@
           rev: commit.sha,
           ...(tab.repo !== null ? { repo: tab.repo } : {}),
           ...(f.orig !== null ? { orig: f.orig } : {}),
+          ...keepOf(e),
         },
         split,
       );
@@ -127,6 +133,7 @@
           mode: "rev",
           rev: branch.diff_from,
           ...(tab.repo !== null ? { repo: tab.repo } : {}),
+          ...keepOf(e),
         },
         split,
       );
@@ -136,7 +143,7 @@
   function openCommit(c: GitCommit, e: MouseEvent): void {
     ctrl.openGitFrom(
       paneId,
-      { surface: "gitx", view: "commit", repo: tab.repo, sha: c.sha, title: c.subject },
+      { surface: "gitx", view: "commit", repo: tab.repo, sha: c.sha, title: c.subject, ...keepOf(e) },
       e.metaKey || e.ctrlKey,
     );
   }

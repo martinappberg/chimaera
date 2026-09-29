@@ -142,10 +142,12 @@ export interface LayoutCtrl {
    * `newSplit` (Cmd/Ctrl) is set — so the panel stays visible BESIDE the diff it
    * opened (deliberately unlike `openFileFrom`, which opens in the active pane).
    */
-  openDiffFrom(paneId: string, path: string, mode: DiffMode, newSplit: boolean): void;
+  openDiffFrom(paneId: string, path: string, mode: DiffMode, newSplit: boolean, keep?: boolean): void;
   /**
    * Open a git view surfaced FROM `paneId` beside it (the openDiffFrom rule):
-   * a revision diff, a commit, a history, or "Changes on this branch".
+   * a revision diff, a commit, a history, or "Changes on this branch". It
+   * opens as a preview tab (the next single click replaces it) unless the
+   * tab carries `preview: false` (a double-click keeps it).
    */
   openGitFrom(paneId: string, tab: DiffTab | GitDetailTab, newSplit: boolean): void;
   /** Start dragging a commit (a history row, a commit tab): dropped on an

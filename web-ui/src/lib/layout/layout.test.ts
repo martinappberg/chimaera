@@ -48,6 +48,8 @@ import {
   soloLayout,
   adoptTabs,
   allTabs,
+  openTabAs,
+  isPreviewTab,
 } from "./layout";
 
 // Pure layout-tree logic — the single most refactor-fragile pure module in the
@@ -544,5 +546,46 @@ describe("visibleSessionIds", () => {
     expect(visibleSessionIds(l)).toEqual(["s-c"]);
     // A non-session tab on top hides the session under it.
     expect(visibleSessionIds(openDashboard(defaultLayout()))).toEqual([]);
+  });
+});
+
+describe("git views open as preview tabs", () => {
+  const commit = (sha: string) => ({ surface: "gitx" as const, view: "commit" as const, repo: null, sha, title: sha });
+
+  it("single clicks reuse one slot; a keep opens a second tab", () => {
+    let l = openTabAs(defaultLayout(), commit("aaa"), true);
+    l = openTabAs(l, commit("bbb"), true);
+    expect(tabCount(l)).toBe(1);
+    const only = panes(l.root)[0].tabs[0];
+    expect(only).toMatchObject({ sha: "bbb", preview: true });
+    // Keeping the preview pins it in place; the next preview appends.
+    l = openTabAs(l, commit("bbb"), false);
+    expect(isPreviewTab(panes(l.root)[0].tabs[0])).toBe(false);
+    l = openTabAs(l, commit("ccc"), true);
+    expect(tabCount(l)).toBe(2);
+  });
+
+  it("one preview slot per pane, whatever it previews", () => {
+    let l = openFile(defaultLayout(), "/r/a.txt", true);
+    l = openTabAs(l, { surface: "diff", path: "/r/b.txt", mode: "unstaged" }, true);
+    expect(tabCount(l)).toBe(1);
+    l = openFile(l, "/r/c.txt", true);
+    expect(tabCount(l)).toBe(1);
+    expect(panes(l.root)[0].tabs[0]).toMatchObject({ surface: "file", path: "/r/c.txt", preview: true });
+  });
+
+  it("a preview open never demotes a kept tab", () => {
+    let l = openTabAs(defaultLayout(), commit("aaa"), false);
+    l = openTabAs(l, commit("aaa"), true);
+    expect(isPreviewTab(panes(l.root)[0].tabs[0])).toBe(false);
+  });
+
+  it("the preview flag round-trips serialization", () => {
+    let l = openTabAs(defaultLayout(), commit("aaa"), true);
+    l = openTabAs(l, { surface: "diff", path: "/r/b.txt", mode: "commit", rev: "aaa" }, false);
+    const restored = deserializeLayout(serializeLayout(l));
+    expect(restored).not.toBeNull();
+    const tabs = panes(restored!.root)[0].tabs;
+    expect(tabs.map(isPreviewTab)).toEqual([true, false]);
   });
 });

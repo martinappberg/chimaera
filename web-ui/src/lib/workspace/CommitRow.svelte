@@ -30,6 +30,11 @@
   onpointerdown={(e) => {
     if (e.button === 0 && onDragStart) onDragStart(e);
   }}
+  ondblclick={(e) => {
+    // The first click opened a preview tab; the double-click keeps it
+    // (onOpen reads `e.detail`, 2 here).
+    if (onDragStart) onOpen(e);
+  }}
 >
   <span class="cslot" aria-hidden="true"></span>
   <span class="csubject">{commit.subject || "(no message)"}</span>

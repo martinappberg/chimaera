@@ -145,9 +145,9 @@
     movePaneToIndex,
     movePaneToRootEdge,
     openChanges,
-    openDiff,
     openFile,
     pinTab,
+    openTabAs,
     pinPaths,
     openFinder,
     findFinder,
@@ -191,6 +191,8 @@
     type Layout,
     type SplitDir,
     type Tab,
+    type DiffTab,
+    type GitDetailTab,
   } from "./lib/layout/layout";
   import type { LinkContext } from "./lib/shared/fileRef";
   import { openPath, setPathOpener, type OpenPathOptions, type PathKind } from "./lib/shared/openPath";
@@ -2346,35 +2348,39 @@
   }
 
   /** Same grammar as openFileFromPane, for a diff opened from the git panel. */
-  function openDiffFromPane(paneId: string, path: string, mode: DiffMode, newSplit: boolean): void {
-    const existing = paneForTab(layout.root, { surface: "diff", path, mode });
-    if (existing !== null) {
-      layout = activateTab(layout, existing.paneId, existing.index);
-    } else {
-      const neighbor = newSplit ? null : adjacentPane(layout, paneId);
-      if (neighbor !== null) {
-        layout = openDiff(focusPane(layout, neighbor), path, mode);
-      } else {
-        layout = splitPane(layout, paneId, "row");
-        layout = openDiff(layout, path, mode);
-      }
-    }
-    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  function openDiffFromPane(
+    paneId: string,
+    path: string,
+    mode: DiffMode,
+    newSplit: boolean,
+    keep = false,
+  ): void {
+    openGitFromPane(paneId, { surface: "diff", path, mode }, newSplit, keep);
   }
 
   /** Open (or focus) any git view beside `paneId` — the openDiffFrom rule:
-   *  the adjacent pane, or a fresh split when there is none / `newSplit`. */
-  function openGitFromPane(paneId: string, tab: Tab, newSplit: boolean): void {
-    const existing = paneForTab(layout.root, tab);
+   *  the adjacent pane, or a fresh split when there is none / `newSplit`.
+   *  A single click opens a PREVIEW tab (one slot per pane, like files: the
+   *  next click replaces it); `keep` (a double-click, or a tab carrying
+   *  `preview: false`) keeps it. */
+  function openGitFromPane(paneId: string, tab: Tab, newSplit: boolean, keep = false): void {
+    if (tab.surface !== "diff" && tab.surface !== "gitx") {
+      layout = openTab(layout, tab);
+      return;
+    }
+    const view: DiffTab | GitDetailTab = tab;
+    const kept = keep || view.preview === false;
+    const existing = paneForTab(layout.root, view);
     if (existing !== null) {
       layout = activateTab(layout, existing.paneId, existing.index);
+      if (kept) layout = pinTab(layout, existing.paneId, existing.index);
     } else {
       const neighbor = newSplit ? null : adjacentPane(layout, paneId);
       if (neighbor !== null) {
-        layout = openTab(focusPane(layout, neighbor), tab);
+        layout = openTabAs(focusPane(layout, neighbor), view, !kept);
       } else {
         layout = splitPane(layout, paneId, "row");
-        layout = openTab(layout, tab);
+        layout = openTabAs(layout, view, !kept);
       }
     }
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
@@ -4075,8 +4081,8 @@
     retargetBrowser(id, host, port, path) {
       layout = setBrowserTarget(layout, id, host, port, path);
     },
-    openDiffFrom(paneId, path, mode, newSplit) {
-      openDiffFromPane(paneId, path, mode, newSplit);
+    openDiffFrom(paneId, path, mode, newSplit, keep) {
+      openDiffFromPane(paneId, path, mode, newSplit, keep === true);
     },
     openGitFrom(paneId, tab, newSplit) {
       openGitFromPane(paneId, tab, newSplit);

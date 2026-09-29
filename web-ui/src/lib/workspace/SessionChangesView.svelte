@@ -254,7 +254,7 @@
       onOpenDiff={(p, e) => {
         const entry = byPath.get(p);
         if (entry === undefined) return false;
-        ctrl.openDiffFrom(paneId, p, modeFor(entry), e.metaKey || e.ctrlKey);
+        ctrl.openDiffFrom(paneId, p, modeFor(entry), e.metaKey || e.ctrlKey, e.detail >= 2);
         return true;
       }}
       onOpenFile={(p, e) => ctrl.openFileFrom(paneId, p, e.metaKey || e.ctrlKey)}

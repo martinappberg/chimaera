@@ -12,7 +12,7 @@
    * A terminal's glyph carries its session-state color.
    */
   import { untrack } from "svelte";
-  import { tabKey, type PaneNode, type Tab } from "./layout";
+  import { isPreviewTab, tabKey, type PaneNode, type Tab } from "./layout";
   import { TAB_FADE_PX, revealTabScrollLeft, tabFadeWidths, tabInView, type TabBounds } from "./tabScroll";
   import type { Session } from "../workspace/sessions";
   import {
@@ -661,7 +661,13 @@
         ...close,
       ];
     }
-    return [...move, ...close];
+    return [
+      ...(isPreviewTab(tab)
+        ? [{ label: "Keep Open", onSelect: () => ctrl.pinTab(node.id, i) } as ContextMenuEntry, "separator" as const]
+        : []),
+      ...move,
+      ...close,
+    ];
   }
 </script>
 
@@ -730,9 +736,9 @@
           }}
           ondblclick={() => {
             if (renamingTab === tabKey(tab)) return;
-            // VS Code: double-clicking a PREVIEW (italic) file tab pins it;
+            // VS Code: double-clicking a PREVIEW (italic) tab pins it;
             // otherwise the pane zooms (the long-standing gesture).
-            if (tab.surface === "file" && tab.preview === true) {
+            if (isPreviewTab(tab)) {
               ctrl.pinTab(node.id, i);
             } else {
               ctrl.zoomPane(node.id);
@@ -887,7 +893,7 @@
                  active weight's width, so activation never resizes a tab. -->
             <span
               class="tab-name"
-              class:preview={tab.surface === "file" && tab.preview === true}
+              class:preview={isPreviewTab(tab)}
               class:unread
               data-label={label(tab)}
               style:color={fDeco ? fDeco.color : undefined}>{label(tab)}</span

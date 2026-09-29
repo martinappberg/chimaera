@@ -197,8 +197,13 @@
     return wt.detached ? `No branch (at ${wt.head ?? "?"})` : "No commits yet";
   }
 
+  /** A double-click keeps the tab a single click previews. */
+  function keepOf(e: MouseEvent): { preview?: false } {
+    return e.detail >= 2 ? { preview: false } : {};
+  }
+
   function openDiff(e: MouseEvent, entry: GitEntry, mode: DiffMode): void {
-    ctrl.openDiffFrom(paneId, entry.path, mode, e.metaKey || e.ctrlKey);
+    ctrl.openDiffFrom(paneId, entry.path, mode, e.metaKey || e.ctrlKey, e.detail >= 2);
   }
 
   /** A branch row: "Changes on this branch" beside the panel. */
@@ -212,6 +217,7 @@
         // named by its folder (the daemon validates it as this repo's).
         repo: main ? repo : wt.path,
         title: wt.branch ?? baseName(wt.path),
+        ...keepOf(e),
       },
       e.metaKey || e.ctrlKey,
     );
@@ -221,7 +227,7 @@
   function openBranchHistory(e: MouseEvent, b: GitBranch): void {
     ctrl.openGitFrom(
       paneId,
-      { surface: "gitx", view: "history", repo, rev: b.name, title: b.name },
+      { surface: "gitx", view: "history", repo, rev: b.name, title: b.name, ...keepOf(e) },
       e.metaKey || e.ctrlKey,
     );
   }
@@ -229,7 +235,7 @@
   function openCommit(c: GitCommit, e: MouseEvent): void {
     ctrl.openGitFrom(
       paneId,
-      { surface: "gitx", view: "commit", repo, sha: c.sha, title: c.subject },
+      { surface: "gitx", view: "commit", repo, sha: c.sha, title: c.subject, ...keepOf(e) },
       e.metaKey || e.ctrlKey,
     );
   }
@@ -254,6 +260,13 @@
   let busy = $state(false);
   let actionError = $state<string | null>(null);
   let copiedNote = $state<string | null>(null);
+  // A note answers the action just taken ("Copied .env", "Worktree removed ·
+  // branch kept"); it goes on its own after a few seconds.
+  $effect(() => {
+    if (copiedNote === null) return;
+    const t = setTimeout(() => (copiedNote = null), 8000);
+    return () => clearTimeout(t);
+  });
   let branchInput = $state<HTMLInputElement | null>(null);
   // Where a NEW branch starts: one of the local branches ("" = the current
   // HEAD, what git does by default). Fetched when the composer opens.
@@ -323,6 +336,7 @@
     try {
       await removeWorktree(wsId, wt.path, false, repo ?? undefined);
       confirmingRemove = null;
+      copiedNote = "Worktree removed · branch kept";
       notifyWorkspacesChanged();
       refreshGit();
     } catch (e) {
@@ -504,7 +518,7 @@
           {#if removable}
             {#if confirmingRemove === b.wt.path}
               <span class="wt-confirm" role="group" aria-label="Remove this worktree? The branch stays.">
-                <span class="wt-confirm-q">Remove?</span>
+                <span class="wt-confirm-q">Remove worktree?</span>
                 <button
                   class="wt-remove offered strong"
                   title="delete this worktree's folder — the branch stays"
