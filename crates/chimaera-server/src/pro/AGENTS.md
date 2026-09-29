@@ -249,6 +249,10 @@ cached readiness never grants permission to resume. After sign-in the page's
 `POST /pro/hydrate {workspace_id, expected_epoch}` re-checks (fresh) and
 resumes the now-ready sessions (`provider_gate::resume_ready`); nothing is
 fetched or reinstalled. One session failing to resume never stops the others.
+A worker asked to hydrate the epoch it already verifiably holds (same holder,
+same epoch, managed or not) only re-verifies it with the account: its running
+agents are not stopped and nothing is reinstalled; a managed project with
+uncertain or unproven old processes still installs the checkpoint.
 For a project still in `SettingUp`, an explicit hydrate retry against the
 recorded epoch reuses staged
 files and repeats setup/readiness without fetching another snapshot. It never

@@ -1293,9 +1293,14 @@ async fn hydrate_scoped(
     }
     // Existing durable worker work must never be replaced with an older remote
     // snapshot after a restart. The normal grant path resumes its own ledger.
+    // A managed project whose current epoch this machine verifiably holds is
+    // the same no-op (its running agents are not stopped, nothing is
+    // reinstalled); one with uncertain or unproven old processes still takes
+    // the checkpoint.
     if lock(&state.workspaces).get(workspace).is_some()
         && config.role == Role::Worker
-        && !execution::managed(state, workspace)
+        && (!execution::managed(state, workspace)
+            || (!execution::uncertain(state, workspace) && !execution::unclean(state, workspace)))
         && matches!(lock(&state.pro.ownership).get(workspace),Some(Ownership::Local{epoch}|Ownership::AwaitingVerification{epoch}) if *epoch==expected_epoch)
     {
         let baton: Baton = account(config, &execution::path(config, workspace, ""), "GET", None)

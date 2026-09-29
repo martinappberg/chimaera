@@ -1563,3 +1563,44 @@ async fn a_computer_only_step_on_a_cloud_machine_is_not_run_and_says_so() {
     drop(state);
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// Asked to take a project whose current epoch it already holds, a cloud
+/// machine verifies that with the account and does nothing more: its running
+/// work is not stopped and no checkpoint is reinstalled over it.
+#[tokio::test]
+async fn hydrating_its_own_current_epoch_is_a_verified_no_op() {
+    let root = temp("own-hydrate");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let mut config = device(&account.endpoint);
+    config.role = Role::Worker;
+    config.execution.as_mut().unwrap().installation_id = None;
+    let workspace = project(&state, &root, &config, 4);
+    *lock(&state.pro.runtime) = Some(config.clone());
+    let mut held = owned(&workspace.id, "d-home", 4, "lease-fixture", 1);
+    held["checkpoint"] = checkpoint(4);
+    *lock(&account.baton) = held;
+    let mut renewed = owned(&workspace.id, "d-home", 4, "lease-fixture", 2);
+    renewed["checkpoint"] = checkpoint(4);
+    *lock(&account.grant) = Some((200, renewed));
+    hydrate(&state, &config, &workspace.id, 4, false, None)
+        .await
+        .unwrap();
+    assert!(
+        account.calls("POST", "/v2/mirror/credentials").is_empty(),
+        "nothing is fetched or reinstalled"
+    );
+    assert!(!execution::fenced(&state, &workspace.id));
+    assert!(execution::lease_valid(&state, &workspace.id));
+    assert!(matches!(
+        lock(&state.pro.ownership).get(&workspace.id),
+        Some(Ownership::Local { epoch: 4 })
+    ));
+    assert_eq!(
+        std::fs::read_to_string(root.join("project/notes.txt")).unwrap(),
+        "laptop work\n"
+    );
+    drop(account);
+    drop(state);
+    let _ = std::fs::remove_dir_all(root);
+}
