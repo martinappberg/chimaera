@@ -16,6 +16,12 @@ export function accountFailure(status: StatusFields | null | undefined): string 
   return error !== null && LEGACY_WARNINGS.has(error) ? null : error;
 }
 
+/** A failure the app rechecks on its own, so the page offers no manual check:
+ * a service that doesn't support this version is re-read every ten minutes. */
+export function rechecksItself(failure: string | null | undefined): boolean {
+  return failure === "service_unsupported";
+}
+
 /** A failed or overdue payment. It is resolved in billing, never by checkout. */
 export function paymentDue(status: Pick<ProStatus, "signed_in" | "payment_due"> | null | undefined): boolean {
   return status?.signed_in === true && status.payment_due === true;

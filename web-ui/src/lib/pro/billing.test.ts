@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ProBillingAttempt, ProStatus } from "../net/native";
-import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling, planPrice } from "./billing";
+import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling, planPrice, planPrices } from "./billing";
 const attempt = (phase: ProBillingAttempt["phase"], kind: ProBillingAttempt["kind"] = "checkout"): ProBillingAttempt => ({ id: 7, kind, phase, expires_at: 123, error: "private failure token=never-render-this" });
 // Copy is free to change: these tests pin the pending/check/success flags and
 // which outcomes read alike or apart, never the wording.
@@ -122,6 +122,20 @@ describe("plan prices", () => {
   });
   it("reads minor units per currency", () => {
     expect(planPrice(plans, "max", "month", "en-US")).toBe("¥1,500");
+  });
+  it("shows all four prices or none", () => {
+    const complete = [...plans, { plan: "max" as const, interval: "year" as const, amount_cents: 15000, currency: "JPY" }];
+    expect(planPrices(complete, "en-US")).toEqual({
+      pro: { month: planPrice(complete, "pro", "month", "en-US"), year: planPrice(complete, "pro", "year", "en-US") },
+      max: { month: planPrice(complete, "max", "month", "en-US"), year: planPrice(complete, "max", "year", "en-US") },
+    });
+    // One missing, malformed or unknown-currency entry withholds every amount.
+    expect(planPrices(plans, "en-US")).toBeNull();
+    for (const bad of [{ amount_cents: -1 }, { currency: "ZZZ" }]) {
+      const value = complete.map(entry => entry.plan === "max" && entry.interval === "year" ? { ...entry, ...bad } : entry);
+      expect(planPrices(value, "en-US")).toBeNull();
+    }
+    for (const absent of [undefined, null, []]) expect(planPrices(absent, "en-US")).toBeNull();
   });
   it("shows nothing for a malformed entry rather than a guessed amount", () => {
     for (const entry of [

@@ -270,8 +270,7 @@ file counts, storage quotas, generic environment diagnostics and setup commands
 are not account controls; Chimaera and its agents manage those details. There
 is no per-session placement pin: the native shell no longer exposes one.
 **Keep this project on this device** stops local publication and disables account-side
-mirror access. Existing stored data is not silently deleted. Cloud setup commands
-and learned laptop-only commands appear in each project's details. If the account side
+mirror access. Existing stored data is not silently deleted. If the account side
 has not confirmed a privacy change yet, the project says cloud copies are being turned off
 and the page re-sends the change on its own (at most once a minute while visible).
 

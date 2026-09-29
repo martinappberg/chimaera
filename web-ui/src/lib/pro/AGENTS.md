@@ -16,10 +16,10 @@ enter UI settings or local storage.
 | `onboarding.svelte.ts` | Validated shared intent so a paused project opens the same onboarding flow. |
 | `AccountDevices.svelte` / `devices.ts` | Verified installation grouping, separate older sign-ins and named per-sign-in removal confirmation. Names never identify a computer. |
 | `AccountUsage.svelte` / `usage.ts` | Percentage-first account usage; real limits, bounded accessible bars, neutral unknown/zero allowance. |
-| `billing.ts` | Native billing copy, stale-attempt fencing and explicit upgrade-review eligibility; browser return never grants entitlement and raw errors never render. `planPrice` formats only account-supplied prices. |
-| `presentation.ts` | Account, billing-intent and cloud-state copy; truthful project status and the finite preparation polling cadence. |
-| `account.ts` | The Pro page's panel from the last confirmed status (`accountPanel`), the billing-review key, and when Max is offered (`nearLimit`). |
-| `status.ts` | Reading `ProStatus`: a real `accountFailure` vs an informational `connectionWarning`, and `paymentDue`. |
+| `billing.ts` | Native billing copy, stale-attempt fencing and explicit upgrade-review eligibility; browser return never grants entitlement and raw errors never render. `planPrice` formats only account-supplied prices; `planPrices` is all four or none. |
+| `presentation.ts` | Account, billing-intent and cloud-state copy; truthful project status (`copyIssue`: `pending`, `checkpoint_pending` and `ownership_unverified` are quiet progress, never attention) and the finite preparation polling cadence. |
+| `account.ts` | The Pro page's panel from the last confirmed status (`accountPanel`: background reads never change it; only a check the user asked for shows checking), the error bar and whether it offers a check (`accountErrorBar`, `offersCheck`), the billing-review key, and when Max is offered (`nearLimit`). |
+| `status.ts` | Reading `ProStatus`: a real `accountFailure` vs an informational `connectionWarning`, `paymentDue`, and `rechecksItself` (a failure the app rechecks on its own). |
 
 ## Boundaries
 
@@ -67,11 +67,14 @@ enter UI settings or local storage.
   No status or discovery operation carries wake intent.
 
 - Prices are never built into the UI; they come only from optional
-  `ProStatus.plans`. Without them the plan cards name the plans only.
+  `ProStatus.plans`, and only when all four (Pro/Max, monthly/yearly) are
+  valid. Otherwise no amount shows anywhere: the cards name the plans and the
+  heading and purchase line say prices are shown at checkout.
 - Nothing asks the user to refresh or retry what the page can do itself:
   polls re-check, a pending privacy change is re-sent (≤1/min while visible),
   a refused checkout for an existing plan re-reads the account. A manual check
-  appears only after polling stopped or a real failure.
+  appears only after polling stopped or a real failure, never for
+  `service_unsupported` (the app rechecks it every ten minutes).
 
 Pure readiness/transport/account tests cover these boundaries and pin relations
 (which states read alike or apart, precedence, no raw errors), never wording.

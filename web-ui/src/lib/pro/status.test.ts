@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { accountFailure, connectionWarning } from "./status";
+import { accountFailure, connectionWarning, rechecksItself } from "./status";
 
 const preparing = "You're signed in. Your Pro connection is preparing; Chimaera will reconnect automatically.";
 const retrying = "Your account is up to date. The Pro connection is not ready yet; Chimaera will retry automatically.";
@@ -22,6 +22,12 @@ describe("account status interpretation", () => {
     for (const status of [null, undefined, { error: null }, { error: null, connection_warning: null }, { error: null, connection_warning: "" }]) {
       expect(accountFailure(status)).toBeNull();
       expect(connectionWarning(status)).toBe(false);
+    }
+  });
+  it("recognizes only the unsupported service as rechecked by the app", () => {
+    expect(rechecksItself("service_unsupported")).toBe(true);
+    for (const error of [null, undefined, "", "account_restore_unavailable", "sign in required", "service_unsupported extra"]) {
+      expect(rechecksItself(error)).toBe(false);
     }
   });
 });

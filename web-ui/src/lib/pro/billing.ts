@@ -82,6 +82,23 @@ export function planPrice(plans: ProPlanPrice[] | null | undefined, plan: "pro" 
   } catch { return null; }
 }
 
+/** Every displayed plan price: Pro and Max, monthly and yearly. */
+export type PlanPrices = Record<"pro" | "max", Record<"month" | "year", string>>;
+
+/** All four prices, or null when the account leaves any out or malformed.
+ * Prices are all-or-none: a page showing some amounts and "shown at checkout"
+ * for others would read as a partial or inconsistent offer. */
+export function planPrices(plans: ProPlanPrice[] | null | undefined, locale?: string): PlanPrices | null {
+  const table: Partial<PlanPrices> = {};
+  for (const plan of ["pro", "max"] as const) {
+    const month = planPrice(plans, plan, "month", locale);
+    const year = planPrice(plans, plan, "year", locale);
+    if (month === null || year === null) return null;
+    table[plan] = { month, year };
+  }
+  return table as PlanPrices;
+}
+
 /** Delayed snapshots cannot roll a newer attempt or its terminal result backward. */
 export function latestBilling(previous: ProBillingAttempt | null | undefined, incoming: ProBillingAttempt | null | undefined): ProBillingAttempt | null | undefined {
   if (!previous || !incoming) return incoming;

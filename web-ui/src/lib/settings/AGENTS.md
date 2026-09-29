@@ -57,8 +57,11 @@ Unknown/startup/error account states stay neutral; a connection warning is not a
 error. An overdue payment (`payment_due`) shows Payment needs attention with
 Manage billing and never plans or checkout. The page renders from the last
 confirmed status (`pro/account.ts` `accountPanel`) while background reads run, so
-nothing unmounts on `pro-changed` or focus; checkout and the Max review re-read
-the account first when an event is pending. Prices come only from `ProStatus.plans`.
+nothing unmounts on `pro-changed` or focus; an account needing attention keeps
+that panel too, and only Check again shows checking (the error bar hides
+meanwhile). `service_unsupported` shows its explanation with no manual check,
+since the app rechecks it itself. Checkout and the Max review re-read
+the account first when an event is pending. Prices come only from `ProStatus.plans`, all four or none.
 Neither a remembered selection nor a successful account refresh can trigger checkout. Usage shows percentages
 computed from the account's current allowances, not fixed hour or storage totals. The static introduction shows
 project/conversation continuity; it is not live setup progress or arbitrary
@@ -90,7 +93,7 @@ return reopens Pro, including when a new window needed time to mount.
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
 | `CloudSetup.svelte` | Automatic cloud status, bounded visible polling (no manual check), historical project-copy summaries and contextual provider connections; sleeping workers wake only for explicit connection management/use. Opening a repository exists only on the cloud machine's own page, as navigation; the app has none. See [provider map](../pro/AGENTS.md). |
-| `MirrorSettings.svelte` | Native project-copy status and privacy; visibility-gated 15-second status refresh; a pending privacy change is re-sent quietly (≤1/min); blocked-provider rows open the shared connection flow. Setup and idle-session policy stay agent/internal capabilities. |
+| `MirrorSettings.svelte` | Native project-copy status and privacy; visibility-gated 15-second status refresh; a pending privacy change is re-sent quietly (≤1/min); copy work still under way reads as a muted hint, only real problems in the warning colour; kept-both rows name the user's versions saved beside each file; blocked-provider rows open the shared connection flow. Setup and idle-session policy stay agent/internal capabilities. |
 | `ProSettings.svelte` | Dedicated Pro overview content: account identity, plan choices, browser checkout/portal, usage, and progressive connection/privacy/security sections. |
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
 | `agentDocs.ts` | Wire types + `getAgentDocs`/`installAgentDocs` for `/api/v1/agent-docs`. |
