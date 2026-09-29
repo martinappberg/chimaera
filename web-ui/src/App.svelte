@@ -1484,16 +1484,23 @@
     );
   });
 
+  /** Focus mode a phone-sized browser forced at load, not one the user chose.
+   *  It is saved as the layout it replaced: the workspace mirror below is the
+   *  fallback another device's window restores, which must not come up
+   *  sidebar-less because a phone once viewed it. Revealing the sidebar ends it. */
+  let forcedFocus = false;
+
   // Persist the layout (debounced in viewState) whenever it changes, keyed
   // by (window, workspace) so each workspace keeps its own tree.
   $effect(() => {
+    if (!layout.focusMode) forcedFocus = false;
     // `surfaces` is the additive, normalized "what this window shows" list
     // (design §8): the daemon reads only that key and treats `layout` as
     // opaque, so the layout blob itself stays exactly as before.
     const blob: Record<string, unknown> = {
       v: 1,
       ws: activeWsId,
-      layout: serializeLayout(layout),
+      layout: serializeLayout(forcedFocus ? { ...layout, focusMode: false } : layout),
       surfaces: surfacesOf(layout, workspace?.root ?? null),
     };
     if (detachedWindow) {
@@ -2467,8 +2474,14 @@
       // an old dt window can't come up stranded rail-open, stripless.
       if (detachedWindow && !layout.focusMode) layout = { ...layout, focusMode: true };
     }
-    // A phone opens the work itself; the bottom strip can reveal navigation.
-    if (matchMedia("(max-width: 700px)").matches) layout = { ...layout, focusMode: true };
+    // A phone-sized browser opens the work itself; the bottom strip can reveal
+    // navigation. Never in the native app (a narrow desktop window keeps its
+    // layout), and never persisted — see `forcedFocus`.
+    forcedFocus = false;
+    if (!isNativeShell() && !layout.focusMode && matchMedia("(max-width: 700px)").matches) {
+      layout = { ...layout, focusMode: true };
+      forcedFocus = true;
+    }
     layoutReady = true;
     pruneAndAutoOpen();
     pruneDeadFiles();
