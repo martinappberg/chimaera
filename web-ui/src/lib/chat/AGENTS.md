@@ -342,8 +342,8 @@ agent in `blocked_provider` adds **Connect <agent> to continue**, `pro/providers
 (`ChatSocket.retrySoon`) when its row stops being paused or changes owner. The connection row appears only for a viewed project (routed row or
 browser view) after a 2 s grace; while it says "Reconnecting…" the header does
 not repeat it. Browser sockets use `net/base` to preserve gateway prefixes. The
-daemon's transfer pick-up (a user message with origin `moved` or `home`) renders
+daemon's transfer pick-up (a user message with origin `moved`, `home` or `recovered`) renders
 as `TransferNote.svelte`: one line ("Continued in the cloud · 5m ago", "Back on
-your computer", or "… after this computer stopped responding" when the text
-carries the daemon's recovery paragraph — `transfer.ts`) with the agent-facing
+your computer", or "… after this computer stopped responding" when it
+is tagged `recovered`, its direction read from the daemon's sentence — `transfer.ts`) with the agent-facing
 text behind "Show what the agent was told".
