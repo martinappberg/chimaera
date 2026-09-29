@@ -9,8 +9,9 @@ keep their existing routes.
 
 Full device clients read `GET /v2/capabilities` before enabling the negotiated
 execution protocol. Require `execution_authority:2`, `installation_binding:1`,
-`workspace_placement:2`, `checkpoint_receipts:1`, and an exactly supported
-`execution_capability`. Configure the daemon through the distinct
+`workspace_placement:2`, `checkpoint_receipts:1`, and one execution capability
+both sides implement exactly (the service default when possible, see
+[HANDOFF.md](HANDOFF.md#managed-execution-v2-negotiated-implementation)). Configure the daemon through the distinct
 `/api/v1/pro/configure/execution` endpoint and verify its exact acknowledgment as
 specified in [HANDOFF.md](HANDOFF.md). An old/unknown response is not a fallback
 permission.

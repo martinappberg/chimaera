@@ -11,6 +11,7 @@
 | `src/fake_handoff.rs` | Bounded baton and credential-fencing fixture |
 | `src/protocol.rs` | Serializable wire types and resource ceilings |
 | `src/client.rs` | Account REST, refresh serialization, events reconnect, loopback tunnels, reverse serve |
+| `src/error.rs` | Typed outcomes callers must tell apart from network failures: `AuthorizationRevoked`, `ServiceUnsupported` |
 | `src/oauth.rs` | PKCE and state validation; caller owns system browser and keychain |
 | `src/bridge.rs` | Bounded bidirectional TCP/WebSocket pump and heartbeat |
 | `src/transport.rs` | Origin policy, encoded path building, socket type |
@@ -25,6 +26,22 @@ Invariants:
   failure; an old daemon can silently ignore an additive delegation field.
   Omitted workspace binding retains legacy account-wide semantics. Consumer
   acceptance alone does not prove remote authorization or project isolation.
+  Today neither the account service nor the worker supervisor uses this
+  surface (the supervisor configures `configure/execution` with an unbound
+  worker grant); treat it as a dormant contract, not the worker path.
+- Refresh: every 4xx from `/v1/oauth/refresh` except 408/429 is final
+  (`AuthorizationRevoked`, credentials cleared, `None` published); the service
+  answers `400 invalid_grant` and treats reuse of a rotated token as theft.
+  Transport errors, 408 and 5xx retry once with the same token. A keeper 401
+  rotates only after the account itself rejects the access token.
+- Service responses evolve additively: no `deny_unknown_fields` on
+  service-originated types, `#[serde(other)] Unknown` on service enums, unknown
+  host kinds/events/serve messages ignored. Daemon acknowledgments stay exact.
+  A missing v2 route or another protocol major is `ServiceUnsupported`.
+- One stream quota per client (forward tunnels and reverse serve together). A
+  failed `accept()` backs off and continues; one serve message the client cannot
+  act on never drops the control connection. The events task ends only when its
+  consumer is gone; a slow consumer is resynchronized by reconnecting.
 
 - App-only dependency: the daemon must not depend on this crate. Fixture server
   dependencies are optional and never ship in a release bundle.

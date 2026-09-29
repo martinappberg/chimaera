@@ -47,7 +47,7 @@ is reported as `ServiceUnsupported`, never as a transient failure.
 
 | Method and path | Request | Response |
 | --- | --- | --- |
-| `GET /v1/me` | — | Account below |
+| `GET /v1/me` | — | Account below; for a paid account it also marks the keeper as in use (it is not a free status probe) |
 | `GET /v1/devices` | — | Device array below |
 | `DELETE /v1/devices/{id}` | — | `204`; revoke that device and its connections |
 | `POST /v1/sign-out-everywhere` | — | `204`; revoke all devices, close held SSH logins and all link sockets |
@@ -222,6 +222,8 @@ keeps the session and reports a transient error. The typed client error is
 
 ### CLI device sign-in
 
+The service implements this flow; no public client uses it yet.
+
 `POST /v1/oauth/device/code` takes `{client_id:"chimaera",device_name}` and
 returns RFC 8628 fields `device_code`, `user_code`, `verification_uri`,
 `verification_uri_complete`, `expires_in` (600), `interval` (5).
@@ -270,10 +272,12 @@ containing passwords or key material. Host ids are opaque path segments; clients
 must URL-encode them. Aliases have a maximum of 255 bytes. For `kind: "worker"`,
 the registered route ID is exactly `worker-` followed by the account's worker ID.
 That account worker ID is also the worker delegation's `device_id` and baton
-`holder_id`; the prefix is not part of baton ownership. Clients may compare these
-identities only for typed worker rows and must retain the complete host ID for
-keeper requests, tunnels and placement routing. Device and SSH IDs have no such
-translation.
+`holder_id`; the prefix is not part of baton ownership. A device's reverse-served
+row is likewise `device-` followed by its raw account device ID, and placement
+routes use the same two forms ([VIEWING](VIEWING.md)). Clients may compare these
+identities only for typed worker and device rows and must retain the complete
+host ID for keeper requests, tunnels and placement routing. SSH host IDs are
+opaque and have no such translation.
 
 ## Events
 
@@ -304,6 +308,12 @@ persisted. Keep at most 64 outstanding prompts per account. Text is at most
 Clients reconnect with jittered exponential backoff from approximately 500 ms to
 10 seconds; reset after a stable connection. Each reconnection authenticates again.
 Do not replay password answers after losing a connection.
+
+Service behaviour clients must expect: the keeper closes every device stream and
+drops every held cluster login when the account's session epoch changes (sign-out
+everywhere, a replayed refresh token) or when it cannot reach the account for
+about 30 seconds. A reconnect then rebuilds the host rows, and SSH logins may
+prompt again.
 
 ## Data plane
 
