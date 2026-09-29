@@ -140,3 +140,18 @@ export function skillBlocksForText(
   }
   return out;
 }
+
+/**
+ * The draft after a workbench insert (a reference, a provenance tag, a
+ * quoted passage). Inline text joins the draft after a space; a block starts
+ * its own paragraph, so a quote's `>` begins a line whatever came before it.
+ * Always appended: the caret moves to the end, where the reply is written.
+ */
+export function draftWithInsert(draft: string, text: string, placement: "inline" | "block"): string {
+  if (placement === "block") {
+    if (draft.trim() === "") return text;
+    const body = draft.replace(/[ \t]+$/, "");
+    return body.endsWith("\n\n") ? body + text : body.endsWith("\n") ? `${body}\n${text}` : `${body}\n\n${text}`;
+  }
+  return draft.length > 0 && !draft.endsWith(" ") ? `${draft} ${text}` : draft + text;
+}

@@ -1,10 +1,11 @@
 <script lang="ts">
   /**
    * The floating "reference in agent" affordance shown near a selection's end
-   * in file views (context bridge). Quiet pill; disabled (with an explanatory
-   * tooltip) when the workspace has no agent session to receive the
-   * reference. Clicking never disturbs the selection (pointerdown is eaten)
-   * and funnels through the same handler as the chord (parity principle).
+   * in file views and chat transcripts (context bridge). Quiet pill; disabled
+   * (with an explanatory tooltip) when there is no agent session to receive
+   * the reference. Clicking never disturbs the selection (pointerdown is
+   * eaten) and funnels through the same handler as the chord (parity
+   * principle).
    */
   import { referenceTarget, requestReference } from "./reference";
   import { PINNED } from "./keys";
@@ -15,11 +16,24 @@
     y: number;
     /** What is pointed at ("p. 3 region", "rows 5–9"), for the tooltip. */
     label?: string;
+    /** A chat transcript's selection: quoted into that chat's own reply,
+     *  and worded as such. */
+    quote?: boolean;
   }
 
-  let { x, y, label }: Props = $props();
+  let { x, y, label, quote = false }: Props = $props();
 
   const target = $derived($referenceTarget);
+  const title = $derived.by(() => {
+    if (quote) {
+      return target === null
+        ? "this chat's agent isn't running — nothing to reply to"
+        : `quote the selection in your reply (${PINNED.reference})`;
+    }
+    return target === null
+      ? "no agent session in this workspace — start one to reference"
+      : `reference ${label !== undefined ? `${label} ` : ""}in ${target.name} (${PINNED.reference})`;
+  });
 </script>
 
 <button
@@ -27,9 +41,7 @@
   style:left="{x}px"
   style:top="{y}px"
   disabled={target === null}
-  title={target === null
-    ? "no agent session in this workspace — start one to reference"
-    : `reference ${label !== undefined ? `${label} ` : ""}in ${target.name} (${PINNED.reference})`}
+  {title}
   onpointerdown={(e) => {
     // Keep the selection alive: the press must never collapse it or start
     // a drag; the click alone acts.
@@ -41,8 +53,13 @@
     requestReference();
   }}
 >
-  <span class="at" aria-hidden="true">@</span>
-  reference in agent
+  {#if quote}
+    <span class="at" aria-hidden="true">&gt;</span>
+    quote in reply
+  {:else}
+    <span class="at" aria-hidden="true">@</span>
+    reference in agent
+  {/if}
 </button>
 
 <style>

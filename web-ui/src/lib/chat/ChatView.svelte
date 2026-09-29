@@ -57,6 +57,10 @@
   import ForkDialog from "./ForkDialog.svelte";
   import AgentMessageMeta from "./AgentMessageMeta.svelte";
   import Composer from "./Composer.svelte";
+  import ReferenceChip from "../shared/ReferenceChip.svelte";
+  import { activeSelection, clearSelection, setSelection } from "../shared/reference";
+  import { quotableRange, quoteChipPosition } from "./quoteSelection";
+  import { get } from "svelte/store";
   import { skillBlocksForText, type ComposerCommand } from "./composer";
   import type { ImageAttachment } from "./images";
   import type {
@@ -2079,6 +2083,97 @@
     }, refreshIn);
     return () => clearTimeout(timer);
   });
+
+  // --- context bridge: quoting a passage of this transcript -----------------
+  // A selection here is published like a file view's, and the chip (or the
+  // reference chord) quotes it into THIS view's composer. The chip floats on
+  // the chat root, not in the column: the reading anchor binary-searches the
+  // column's children as a vertical stack, which a floating child would
+  // break. A chat that can't take a message offers no quote.
+  const quoteOwner = {};
+  let quoteChip = $state<{ x: number; y: number } | null>(null);
+  const composerDisabled = $derived(store.exited !== null || store.degraded);
+
+  function dropQuote(): void {
+    quoteChip = null;
+    clearSelection(quoteOwner);
+  }
+
+  /** The chip's rendered box once shown; before that, an estimate from the
+   *  chat font (its label is `--text-xs`, fifteen mono glyphs). */
+  function quoteChipSize(host: HTMLElement): { width: number; height: number } {
+    const chip = host.querySelector<HTMLElement>(":scope > .ref-chip");
+    if (chip !== null) return { width: chip.offsetWidth, height: chip.offsetHeight };
+    const xs = Math.max(9, chatFontSize - 2);
+    return { width: Math.ceil(xs * 0.62 * 15 + 26), height: Math.ceil(xs + 12) };
+  }
+
+  function placeQuoteChip(range: Range): void {
+    const host = chatEl;
+    const scroller = transcriptEl;
+    if (host === null || scroller === null) return;
+    const next = quoteChipPosition(range, host, scroller, quoteChipSize(host));
+    if (quoteChip === null || quoteChip.x !== next.x || quoteChip.y !== next.y) quoteChip = next;
+  }
+
+  /** Geometry only: the selection moved (a scroll, a reflow), not what is
+   *  selected. */
+  function reanchorQuoteChip(): void {
+    const column = columnEl;
+    if (quoteChip === null || column === null) return;
+    const range = quotableRange(column);
+    if (range !== null) placeQuoteChip(range);
+  }
+
+  function syncQuoteSelection(): void {
+    const column = columnEl;
+    const range = column !== null ? quotableRange(column) : null;
+    const text = range !== null ? (document.getSelection()?.toString() ?? "") : "";
+    if (range === null || text.trim() === "") {
+      dropQuote();
+      return;
+    }
+    // A drag fires this per tick: publish only a change, so the app's
+    // target resolution and every selection subscriber stay still.
+    const current = get(activeSelection);
+    if (current?.kind !== "chat" || current.view !== quoteOwner || current.text !== text) {
+      setSelection(quoteOwner, { kind: "chat", sessionId: session.id, text, view: quoteOwner });
+    }
+    const shown = quoteChip !== null;
+    placeQuoteChip(range);
+    // First show places against an estimate; re-place once the chip has a box.
+    if (!shown) void tick().then(reanchorQuoteChip);
+  }
+
+  $effect(() => {
+    const scroller = transcriptEl;
+    const column = columnEl;
+    if (scroller === null || column === null || !visible || composerDisabled) return;
+    // Re-anchor once per frame on a scroll (capturing, so a wide table's own
+    // scroll counts) and on a reflow with none (a pane resize, the column
+    // growing under a streamed reply).
+    let frame = 0;
+    const reanchor = () => {
+      if (frame !== 0 || quoteChip === null) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        reanchorQuoteChip();
+      });
+    };
+    const opts = { capture: true, passive: true } as const;
+    const reflow = new ResizeObserver(reanchor);
+    reflow.observe(scroller);
+    reflow.observe(column);
+    document.addEventListener("selectionchange", syncQuoteSelection);
+    scroller.addEventListener("scroll", reanchor, opts);
+    return () => {
+      document.removeEventListener("selectionchange", syncQuoteSelection);
+      scroller.removeEventListener("scroll", reanchor, opts);
+      reflow.disconnect();
+      if (frame !== 0) cancelAnimationFrame(frame);
+      dropQuote();
+    };
+  });
 </script>
 
 <!-- The outside-dismiss action closes any open header menu / the /mcp panel on
@@ -2541,6 +2636,10 @@
     </div>
   </div>
 
+  {#if quoteChip !== null}
+    <ReferenceChip x={quoteChip.x} y={quoteChip.y} quote />
+  {/if}
+
   {#if pinnedAgents.length > 0}
     <AgentsTray
       agents={pinnedAgents}
@@ -2656,8 +2755,9 @@
 
   <Composer
     sessionId={session.id}
+    view={quoteOwner}
     running={agentBusy}
-    disabled={store.exited !== null || store.degraded}
+    disabled={composerDisabled}
     slashCommands={composerCommands}
     workspaceId={session.workspace_id ?? null}
     {terminals}
