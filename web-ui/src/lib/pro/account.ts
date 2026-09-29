@@ -38,7 +38,7 @@ export function reviewKey(status: ProStatus | null): string | null {
 }
 
 /** Max is offered where a limit is near or reached, never as a standing
- * upsell: 80 % of an allowance, a used-up allowance, or no allowance at all. */
+ * upsell: 80 % of an allowance, a used-up allowance, or use with no allowance. */
 export function nearLimit(status: Pick<ProStatus, "usage" | "limits" | "hours_exhausted"> | null): boolean {
   if (status?.hours_exhausted === true) return true;
   const near = (used: number | undefined, limit: number | undefined): boolean =>
