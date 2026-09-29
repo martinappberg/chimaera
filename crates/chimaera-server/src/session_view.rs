@@ -274,9 +274,6 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
         let at = row["id"].as_str().and_then(|id| activity.get(id)).copied();
         row["last_input_ms"] = json!(at);
         row["placement"] = json!("here");
-        row["keep_running"] = json!(row["id"]
-            .as_str()
-            .is_some_and(|id| crate::pro::keep_running(state, id)));
     }
     drop(execs);
     drop(cwds);
@@ -290,9 +287,7 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     for entry in &deferred {
         if !rows.iter().any(|(_, row)| row["id"] == entry.id) {
             let label = crate::pro::paused_label(state, entry);
-            let mut row = crate::bundle::paused_row(entry, label);
-            row["keep_running"] = json!(crate::pro::keep_running(state, &entry.id));
-            rows.push((entry.created_at, row));
+            rows.push((entry.created_at, crate::bundle::paused_row(entry, label)));
         }
     }
     for remote in state.session_proxy.rows() {

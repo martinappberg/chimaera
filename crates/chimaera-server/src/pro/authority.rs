@@ -363,17 +363,6 @@ pub(super) fn registered_root(state: &AppState, workspace_id: &str, root: &Path)
     Ok(())
 }
 
-pub(super) fn session(state: &AppState, session_id: &str) -> Result<()> {
-    if !lock(&state.pro.authority).restricted() {
-        return Ok(());
-    }
-    let workspace_id = lock(&state.session_workspaces)
-        .get(session_id)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("workspace authority denied"))?;
-    workspace(state, &workspace_id)
-}
-
 #[cfg(all(test, unix))]
 #[path = "authority_tests.rs"]
 mod tests;

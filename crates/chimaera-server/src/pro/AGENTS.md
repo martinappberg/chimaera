@@ -6,7 +6,7 @@ revocable delegation over the authenticated local API.
 
 | File | Responsibility |
 | --- | --- |
-| `mod.rs` | Bounded, credential-free persistent state, ownership/import fences, session pins and deferred-command policy. |
+| `mod.rs` | Bounded, credential-free persistent state, ownership/import fences and deferred-command policy. |
 | `authority.rs` / `authority_tests.rs` | Immutable workspace-bound worker acceptance, credential-free persisted latch, renewal/route/root guards and synthetic side-effect regressions. |
 | `routes.rs` | Authenticated configure/status/privacy/profile/power/hydration HTTP handlers. |
 | `projects.rs` | Passive bounded cloud-project discovery and explicit per-device local adoption; native-picked folder validation, saved directory identity, retry and legacy-import fences. |

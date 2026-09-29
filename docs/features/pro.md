@@ -268,7 +268,7 @@ Pro → **Projects and privacy** shows privacy, the last recorded copy, and actu
 problems such as an incomplete copy or a required provider connection. Healthy
 file counts, storage quotas, generic environment diagnostics and setup commands
 are not account controls; Chimaera and its agents manage those details. There
-is no per-session placement pin: the native shell no longer exposes one.
+is no per-session placement pin: neither the native shell nor the daemon (the old `PUT /pro/keep-running` route is gone) offers one.
 **Keep this project on this device** stops local publication and disables account-side
 mirror access. Existing stored data is not silently deleted. Cloud setup commands
 and learned laptop-only commands appear in each project's details. If the account side

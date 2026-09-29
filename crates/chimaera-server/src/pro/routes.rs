@@ -754,35 +754,6 @@ async fn hydrate_owned(state: Arc<AppState>, mut request: Hydrate) -> detached::
 }
 
 #[derive(Deserialize)]
-pub(crate) struct Pin {
-    session_id: String,
-    keep_running: bool,
-}
-pub(crate) async fn pin(State(state): State<Arc<AppState>>, Json(request): Json<Pin>) -> Response {
-    if lock(&state.pro.authority).restricted() {
-        let workspace = lock(&state.session_workspaces)
-            .get(&request.session_id)
-            .cloned();
-        if workspace
-            .as_ref()
-            .is_none_or(|workspace| authority::workspace(&state, workspace).is_err())
-        {
-            return failure(anyhow::anyhow!("workspace authority denied"));
-        }
-    }
-    if state.sessions.get(&request.session_id).is_none()
-        && state.chat.get(&request.session_id).is_none()
-        && !lock(&state.deferred_sessions).contains_key(&request.session_id)
-    {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    match super::set_keep_running(&state, &request.session_id, request.keep_running).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => failure(error),
-    }
-}
-
-#[derive(Deserialize)]
 pub(crate) struct Power {
     suitable: bool,
 }

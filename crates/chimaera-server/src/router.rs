@@ -38,7 +38,6 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             post(crate::pro::recover_execution),
         )
         .route("/pro/status", get(crate::pro::status))
-        .route("/pro/keep-running", put(crate::pro::pin))
         .route("/pro/privacy", put(crate::pro::privacy))
         .route(
             "/pro/projects",

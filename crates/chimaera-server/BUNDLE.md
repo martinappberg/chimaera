@@ -3,8 +3,9 @@
 A bundle transfers one Chimaera session between authenticated daemons. The
 public session ID, workspace ID, absolute workspace root and cwd, native
 conversation handle, journal sequence numbers, model preferences, pinned title,
-linked terminal edges, workspace fallback layout, keep-running preference,
-and original creation time survive transfer. It contains no process snapshot.
+linked terminal edges, workspace fallback layout and original creation time
+survive transfer. (Placement is the system's decision: there is no per-session
+keep-running pin; a `keep_running` field in an older manifest is ignored.) It contains no process snapshot.
 
 ## HTTP interface
 

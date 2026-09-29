@@ -396,8 +396,7 @@ fn write_archive(
     if let Some(native) = &native {
         members.insert("native.jsonl".into(), digest_file(native, MAX_NATIVE)?);
     }
-    let mut session = entry.to_json();
-    session["keep_running"] = json!(crate::pro::keep_running(state, &entry.id));
+    let session = entry.to_json();
     let manifest = Manifest {
         version: 1,
         workspace,
@@ -791,9 +790,6 @@ async fn import_inner(
             }
         }
     }
-    let keep_running = opened.manifest.session["keep_running"]
-        .as_bool()
-        .unwrap_or(false);
     let paused =
         options.defer_start || (opened.entry.agent.is_none() && options.origin == Origin::Moved);
     opened.entry.handoff = Some(HandoffResume {
@@ -928,7 +924,6 @@ async fn import_inner(
         state.session_proxy.clear_workspace(&workspace_id);
         flush_ledger(&state).await?;
     }
-    crate::pro::set_keep_running(&state, &id, keep_running).await?;
     let imported_root = crate::lock(&state.workspaces)
         .get(&workspace_id)
         .context("workspace disappeared")?

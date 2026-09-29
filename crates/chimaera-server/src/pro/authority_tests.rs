@@ -394,7 +394,7 @@ async fn registered_root_is_fixed_and_replacement_is_not_adopted() {
 }
 
 #[tokio::test]
-async fn foreign_registered_workspace_and_pins_remain_fenced() {
+async fn foreign_registered_workspace_remains_fenced() {
     let fixture = Fixture::new();
     fixture.bind().await;
     let foreign = lock(&fixture.state.workspaces)
@@ -406,11 +406,15 @@ async fn foreign_registered_workspace_and_pins_remain_fenced() {
     assert!(!crate::pro::may_import(&fixture.state, &foreign.id, 2));
     assert!(!engine::eligible(&fixture.state, &foreign));
     assert!(crate::pro::workspace_profile(&fixture.state, &foreign.id).is_none());
-    assert!(
-        crate::pro::set_keep_running(&fixture.state, "s-other", true)
-            .await
-            .is_err()
-    );
+    // Placement is the system's decision: there is no pin route to try.
+    let (code, _) = request(
+        &fixture.state,
+        Method::PUT,
+        "/api/v1/pro/keep-running",
+        Some(json!({"session_id":"s-other","keep_running":true})),
+    )
+    .await;
+    assert!(code.is_client_error(), "{code}");
     let (_, status) = request(&fixture.state, Method::GET, "/api/v1/pro/status", None).await;
     assert_eq!(status["workspaces"], json!([]));
 }

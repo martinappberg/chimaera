@@ -47,7 +47,6 @@ pub(crate) struct ProState {
     legacy_pending: Mutex<std::collections::HashSet<String>>,
     project_cache: Mutex<projects::Cache>,
     discovery: AsyncMutex<()>,
-    keep_running: Mutex<std::collections::HashSet<String>>,
     status: Mutex<HashMap<String, WorkspaceStatus>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     mirror_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -143,8 +142,6 @@ struct DiskState {
     legacy_pending: std::collections::HashSet<String>,
     #[serde(default, skip_serializing)]
     import_roots: HashMap<String, PathBuf>,
-    #[serde(default)]
-    keep_running: std::collections::HashSet<String>,
     /// Once configured as a cloud worker, this installation stays strict
     /// across restarts even before its supervisor configures it again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -257,7 +254,6 @@ impl ProState {
             legacy_pending: Mutex::new(legacy_pending),
             project_cache: Mutex::new(projects::Cache::default()),
             discovery: AsyncMutex::new(()),
-            keep_running: Mutex::new(disk.keep_running.into_iter().take(512).collect()),
             status: Mutex::new(status),
             task: Mutex::new(None),
             mirror_task: Mutex::new(None),
@@ -419,7 +415,6 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
     let mut written = state.pro.persistence.lock().await;
     ensure_root(&state.pro.root).await?;
     execution::record_groups(state);
-    let keep_running = crate::lock(&state.pro.keep_running).clone();
     let ownership = crate::lock(&state.pro.ownership).clone();
     let preferences = crate::lock(&state.pro.preferences).clone();
     let projects_root = crate::lock(&state.pro.projects_root).clone();
@@ -437,7 +432,6 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
         import_roots: HashMap::new(),
         adoptions,
         projects_root,
-        keep_running,
         worker: state.pro.worker.load(std::sync::atomic::Ordering::Acquire),
         ownership,
         preferences,
@@ -455,33 +449,6 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
         .await??;
     execution::persist_latch(state).await?;
     *written = Some(bytes);
-    Ok(())
-}
-
-pub(crate) fn keep_running(state: &crate::AppState, session_id: &str) -> bool {
-    crate::lock(&state.pro.keep_running).contains(session_id)
-}
-pub(crate) async fn set_keep_running(
-    state: &std::sync::Arc<crate::AppState>,
-    session_id: &str,
-    value: bool,
-) -> anyhow::Result<()> {
-    authority::session(state, session_id)?;
-    anyhow::ensure!(valid_id(session_id), "invalid session identity");
-    {
-        let mut pins = crate::lock(&state.pro.keep_running);
-        if value {
-            anyhow::ensure!(
-                pins.len() < 512 || pins.contains(session_id),
-                "session pin limit"
-            );
-            pins.insert(session_id.into());
-        } else {
-            pins.remove(session_id);
-        }
-    }
-    persist(state).await?;
-    state.changes.notify_waiters();
     Ok(())
 }
 
@@ -797,7 +764,6 @@ mod tests {
         });
         // Configuring a worker records its strict role (routes::configure_inner).
         execution::worker_fixture(&old);
-        set_keep_running(&old, "s-pinned", true).await.unwrap();
         persist(&old).await.unwrap();
         let text = std::fs::read_to_string(root.join("pro/state.json")).unwrap();
         assert!(!text.contains("MUST_NEVER_PERSIST"));
@@ -807,7 +773,6 @@ mod tests {
         assert!(!may_import(&restored, "w-owned", 7));
         assert!(may_import(&restored, "w-loading", 8));
         assert!(!may_import(&restored, "w-loading", 7));
-        assert!(keep_running(&restored, "s-pinned"));
         crate::lock(&restored.pro.ownership)
             .insert("w-owned".into(), Ownership::Local { epoch: 9 });
         assert!(may_write(&restored, "w-owned"));
