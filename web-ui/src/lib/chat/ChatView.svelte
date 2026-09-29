@@ -18,7 +18,7 @@
   import { isBrowserGateway } from "../net/base";
   import { pauseLabel, placementLabel, sessionPause } from "../net/placement";
   import { pausedConnect } from "../pro/providers";
-  import { cloudOnboarding } from "../pro/onboarding.svelte";
+  import { canOpenOnboarding, cloudOnboarding } from "../pro/onboarding.svelte";
   import {
     acquireChat,
     releaseChat,
@@ -1789,7 +1789,7 @@
   );
   /** The agent sign-in this paused conversation waits for on the cloud (the
    *  row's additive `blocked_provider`); null otherwise. */
-  const connect = $derived(pausedConnect(session));
+  const connect = $derived(canOpenOnboarding() ? pausedConnect(session) : null);
   /** A paused row coming back (or the project changing where it runs) means
    *  the conversation is reachable now: reconnect at once instead of sitting
    *  out a backoff that grew while it was paused. */

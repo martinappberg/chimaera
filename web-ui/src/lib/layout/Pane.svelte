@@ -9,7 +9,7 @@
   import { dirLabel } from "../previews/files";
   import { pauseLabel, placementLabel, sessionPause } from "../net/placement";
   import { pausedConnect } from "../pro/providers";
-  import { cloudOnboarding } from "../pro/onboarding.svelte";
+  import { canOpenOnboarding, cloudOnboarding } from "../pro/onboarding.svelte";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
   import { activeModLabel, keyHint } from "../shared/keybindings";
   import PaneTabs from "./PaneTabs.svelte";
@@ -377,7 +377,7 @@
       )}
       <!-- Waiting for an agent sign-in on the cloud (the row's additive
            `blocked_provider`): offer the one thing that unblocks it. -->
-      {@const connect = pausedConnect(s)}
+      {@const connect = canOpenOnboarding() ? pausedConnect(s) : null}
       <div class="hint paused"><span role="status">{paused.status}</span>{#if connect !== null}<button type="button" onclick={() => cloudOnboarding.request({ providerIds: [connect.providerId], workspaceId: connect.workspaceId })}>Connect {connect.label} to continue</button>{:else if paused.detail !== null}<small>{paused.detail}</small>{/if}</div>
     {:else if s.ui === "chat"}
       {@const ChatView = views.chat}

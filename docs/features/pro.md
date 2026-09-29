@@ -189,9 +189,10 @@ never reports a completed disconnection. Reconnecting is a separate user action.
 A conversation that waits for an agent sign-in names that agent (its paused row
 carries an additive `blocked_provider`); the project and every other conversation
 and terminal continue meanwhile. The paused conversation or terminal itself offers
-**Connect <agent> to continue** (the name from the provider catalog), and Projects
-and privacy offers **Connect agents to continue**; both open the same flow with
-that project context. Each waiting agent
+**Connect <agent> to continue** (the name from the provider catalog) in the app or
+an account browser view, where Chimaera Pro can open; a plain browser tab on a
+daemon keeps the sign-in hint instead. Projects and privacy offers **Connect agents
+to continue**; both open the same flow with that project context. Each waiting agent
 must be confirmed by a fresh catalog before its conversations continue
 automatically. The UI tries each workspace/epoch once, sequentially, and offers
 **Try again** after a failure. The daemon verifies ownership and provider state

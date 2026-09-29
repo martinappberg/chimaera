@@ -1,3 +1,6 @@
+import { isBrowserGateway } from "../net/base";
+import { isNativeShell } from "../net/native";
+
 /** Shared intent lets a handoff open the same connection flow as first setup. */
 export interface CloudOnboardingContext {
   providerIds: string[];
@@ -35,3 +38,10 @@ class CloudOnboarding {
 }
 
 export const cloudOnboarding = new CloudOnboarding();
+
+/** Whether a request here can open Chimaera Pro: the native app, or an account
+ * browser view. A plain browser tab on a daemon has no Pro page, so it is
+ * offered no connect action (it would do nothing). */
+export function canOpenOnboarding(): boolean {
+  return isNativeShell() || isBrowserGateway();
+}
