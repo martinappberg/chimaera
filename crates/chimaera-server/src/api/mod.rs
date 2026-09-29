@@ -36,6 +36,9 @@ pub(crate) async fn auth(State(state): State<Arc<AppState>>, req: Request, next:
         .is_some_and(|v| v == format!("Bearer {}", state.token));
 
     if authorized {
+        if crate::activity::is_change(req.method(), req.uri().path()) {
+            crate::activity::touch(&state);
+        }
         next.run(req).await
     } else {
         (
@@ -61,6 +64,9 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<serde_jso
     if crate::cloud::enabled() {
         value["pro_cloud_operations"] =
             json!(crate::cloud::active_operations() + crate::pro::active_operations(&state));
+        // Additive: the last user change that is not session input (saves,
+        // uploads, Git operations), for the machine's idle decision.
+        value["last_activity_ms"] = json!(crate::activity::last_change(&state));
     }
     Json(value)
 }

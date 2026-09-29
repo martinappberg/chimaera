@@ -180,6 +180,7 @@ pub(super) fn start(state: Arc<AppState>) {
                 }
             }
             if super::now().saturating_sub(last_mirror) >= 120
+                && !super::drain::draining(&state)
                 && lock(&state.pro.mirror_task)
                     .as_ref()
                     .is_none_or(|task| task.is_finished())

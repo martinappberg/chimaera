@@ -3,6 +3,7 @@ mod authority;
 mod canonical;
 mod config;
 mod detached;
+mod drain;
 mod engine;
 mod execution;
 mod mirror;
@@ -14,6 +15,7 @@ mod repository;
 mod routes;
 mod shadow_cache;
 mod transport;
+pub(crate) use drain::{cancel as cancel_drain, start as drain};
 pub(crate) use policy::CloudProfile;
 pub(crate) use provider_gate::{cloud_provider_blocks, workspace_provider_blocks};
 pub(crate) use routes::*;
@@ -59,6 +61,7 @@ pub(crate) struct ProState {
     caches: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     boot_deferred: Mutex<std::collections::HashSet<String>>,
     operations: detached::Operations,
+    drain: Mutex<Option<drain::Drain>>,
     remote_since: Mutex<HashMap<String, u64>>,
     return_backoff: Mutex<HashMap<String, (u64, u64)>>,
     awake_since: AtomicU64,
@@ -247,6 +250,7 @@ impl ProState {
             caches: Mutex::new(HashMap::new()),
             boot_deferred: Mutex::new(Default::default()),
             operations: Default::default(),
+            drain: Mutex::new(None),
             remote_since: Mutex::new(HashMap::new()),
             return_backoff: Mutex::new(HashMap::new()),
             awake_since: AtomicU64::new(now()),
@@ -529,8 +533,22 @@ fn return_report(state: &crate::AppState, workspace: &str, kept: (usize, Vec<Pat
     state.changes.notify_waiters();
 }
 
+/// Work in flight that an idle decision must wait for: the job reservation
+/// (unless a drain itself holds it), transfer tasks, sleep flushes, held
+/// project caches (finalizers keep theirs past a canceled caller) and Git
+/// helpers. A completed drain reports zero.
 pub(crate) fn active_operations(state: &crate::AppState) -> usize {
-    usize::from(state.pro.jobs.try_lock().is_err()) + detached::running(state)
+    project_operations(state) + transport::helpers_busy()
+}
+fn project_operations(state: &crate::AppState) -> usize {
+    let draining = drain::draining(state);
+    usize::from(!draining && state.pro.jobs.try_lock().is_err())
+        + detached::running(state)
+        + crate::lock(&state.pro.sleeping).len()
+        + crate::lock(&state.pro.caches)
+            .values()
+            .filter(|cache| cache.strong_count() > 0)
+            .count()
 }
 
 async fn ensure_root(root: &std::path::Path) -> anyhow::Result<()> {

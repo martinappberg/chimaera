@@ -295,6 +295,9 @@ pub(crate) async fn privacy(
     {
         return StatusCode::NOT_FOUND.into_response();
     }
+    if super::drain::draining(&state) {
+        return super::drain::refusal().into_response();
+    }
     let _guard = state.pro.jobs.lock().await;
     {
         let mut preferences = lock(&state.pro.preferences);
@@ -404,6 +407,9 @@ pub(crate) async fn sleep(State(state): State<Arc<AppState>>, body: axum::body::
     };
     if config.hours_exhausted {
         return Json(json!({"handoff":false,"reason":"cloud_hours_exhausted"})).into_response();
+    }
+    if super::drain::draining(&state) {
+        return Json(json!({"handoff":false,"reason":"draining","failed":[]})).into_response();
     }
     let budget = std::time::Duration::from_millis(
         request
@@ -556,12 +562,13 @@ pub(crate) async fn hydrate(
     let workspace = request.workspace_id.clone();
     let epoch = request.expected_epoch;
     let owner = state.clone();
+    let checked = state.clone();
     detached::run(
         &state,
         ("hydrate", false),
         &workspace,
         epoch,
-        || None,
+        || super::drain::draining(&checked).then(super::drain::refusal),
         move || hydrate_owned(owner, request),
     )
     .await
@@ -795,6 +802,9 @@ pub(crate) async fn handoff(
     .into_response()
 }
 fn handoff_refusal(state: &AppState, workspace: &str, epoch: u64) -> Option<detached::Outcome> {
+    if super::drain::draining(state) {
+        return Some(super::drain::refusal());
+    }
     if super::owned_epoch(state, workspace) != Some(epoch) {
         return Some(detached::Outcome::refused(StatusCode::CONFLICT, None));
     }

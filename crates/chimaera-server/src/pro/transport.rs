@@ -231,6 +231,14 @@ fn clean_command(binary: &str) -> Command {
     command
 }
 
+/// Git helper slots currently in use (the idle/drain accounting).
+pub(super) fn helpers_busy() -> usize {
+    2usize.saturating_sub(CHILDREN.available_permits())
+}
+pub(super) fn helpers_idle() -> bool {
+    helpers_busy() == 0
+}
+
 pub(super) async fn child_permit() -> Result<tokio::sync::SemaphorePermit<'static>> {
     Ok(CHILDREN.acquire().await?)
 }

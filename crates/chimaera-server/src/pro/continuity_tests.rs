@@ -573,3 +573,84 @@ async fn a_sleep_flush_preempts_the_periodic_pass_and_answers_within_its_deadlin
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+async fn delete(state: &Arc<AppState>, path: &str) -> StatusCode {
+    use tower::ServiceExt;
+    crate::app(state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("DELETE")
+                .uri(path)
+                .header("Authorization", "Bearer fixture")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn a_drain_waits_for_running_work_then_refuses_new_transfers_until_released() {
+    let root = temp("drain");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let mut config = device(&account.endpoint);
+    config.role = Role::Worker;
+    config.execution.as_mut().unwrap().installation_id = None;
+    *lock(&state.pro.runtime) = Some(config);
+    // A transfer still holds the job reservation: the deadline passes first,
+    // and the drain releases itself rather than wedging the machine.
+    let jobs = state.pro.jobs.clone();
+    let running = tokio::spawn(async move {
+        let _guard = jobs.lock_owned().await;
+        tokio::time::sleep(StdDuration::from_millis(1500)).await;
+    });
+    tokio::time::sleep(StdDuration::from_millis(50)).await;
+    let (status, reply) = post(&state, "/api/v1/pro/drain", r#"{"deadline_ms":1000}"#).await;
+    assert_eq!(
+        (status, reply["error"].clone()),
+        (StatusCode::CONFLICT, json!("transfer_busy"))
+    );
+    assert!(!super::super::drain::draining(&state));
+    // With a longer deadline the drain waits for that work to finish.
+    // (Git helper slots are process-wide, so other tests' helpers also count.)
+    let (status, reply) = post(&state, "/api/v1/pro/drain", r#"{"deadline_ms":120000}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(reply["token"].is_string());
+    assert!(running.is_finished());
+    assert_eq!(
+        super::super::project_operations(&state),
+        0,
+        "a completed drain does not count its own reservation"
+    );
+    // New transfers are refused while drained; nothing waits on them.
+    for (path, body) in [
+        (
+            "/api/v1/pro/handoff",
+            r#"{"workspace_id":"w-a","expected_epoch":3}"#,
+        ),
+        (
+            "/api/v1/pro/hydrate",
+            r#"{"workspace_id":"w-a","expected_epoch":3}"#,
+        ),
+    ] {
+        let (status, reply) = post(&state, path, body).await;
+        assert_eq!(
+            (status, reply["error"].clone()),
+            (StatusCode::CONFLICT, json!("draining")),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        delete(&state, "/api/v1/pro/drain").await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(!super::super::drain::draining(&state));
+    assert!(
+        state.pro.jobs.try_lock().is_ok(),
+        "releasing the drain frees the reservation"
+    );
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}

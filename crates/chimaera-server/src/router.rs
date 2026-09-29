@@ -53,6 +53,10 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/pro/wake", post(crate::pro::wake))
         .route("/pro/power", put(crate::pro::power))
         .route("/pro/handoff", post(crate::pro::handoff))
+        .route(
+            "/pro/drain",
+            post(crate::pro::drain).delete(crate::pro::cancel_drain),
+        )
         .route("/pro/hydrate", post(crate::pro::hydrate))
         .route("/pro/cloud", get(crate::cloud::info))
         .route("/pro/cloud/providers", get(crate::cloud::providers::list))
