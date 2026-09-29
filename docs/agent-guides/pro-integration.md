@@ -1,154 +1,175 @@
-# Reviewing the Pro integration
+# Reviewing and verifying the Pro integration
 
-Use one existing checkout of `codex/pro-continuity-integration` and
-[PR #204](https://github.com/martinappberg/chimaera/pull/204) as the review entrypoint.
-Earlier PRs are implementation history, not separate checkouts to run. A fork
-is not required. Do not deploy, install an app or modify real accounts during review.
+[PR #204](https://github.com/martinappberg/chimaera/pull/204) on
+`codex/pro-continuity-integration` is the one public branch for Chimaera Pro:
+the optional account, the always-on connection, project mirroring, and the
+automatic laptop ↔ cloud handoff. Earlier PRs (#178–#198) are history, not
+separate checkouts. The private services that complete the flow (account,
+keeper, cloud machine supervisor, Git storage) live in the maintainer's private
+repository; this guide names what they must provide, never how they are run.
 
-Read [AGENTS.md](../../AGENTS.md), the maps below and matching [path-scoped rules](../../.claude/rules).
-Verify code against the [Pro feature page](../features/pro.md),
-[HANDOFF](../../crates/chimaera-link/HANDOFF.md) and [VIEWING](../../crates/chimaera-link/VIEWING.md).
+Read [AGENTS.md](../../AGENTS.md), the maps in the review map below, and every
+matching [path-scoped rule](../../.claude/rules). The product rules that decide
+review verdicts are in the [Pro feature page](../features/pro.md); the wire
+contracts are [PROTOCOL](../../crates/chimaera-link/PROTOCOL.md),
+[HANDOFF](../../crates/chimaera-link/HANDOFF.md),
+[VIEWING](../../crates/chimaera-link/VIEWING.md) and the
+[session bundle](../../crates/chimaera-server/BUNDLE.md).
 
-## Review boundary
+## The rules a reviewer holds the code to
 
-Record the checkout and PR state before reviewing:
+These are the maintainer's decisions (2026-09-26 to 2026-09-29). A change that
+violates one is a defect regardless of tests.
 
-```sh
-git branch --show-current
-git rev-parse HEAD
-git status --short
-git diff --stat origin/main...HEAD
-gh pr view 204 --repo martinappberg/chimaera \
-  --json url,baseRefName,headRefName,headRefOid
-```
+- **Laptop first.** The laptop never stops its own agents or shells because the
+  account is unreachable, because the user signed out, because the plan lapsed,
+  because the privacy switch was used, or because the daemon restarted. Local
+  execution is fenced only after a *verified* newer owner exists, and then at a
+  safe pause. Publication (mirror writes) is what an unreachable account fences.
+  Plain shells are never managed processes.
+- **Nothing changes for free users.** No endpoint means no Pro chrome anywhere
+  (one line on the Pro page); a native window showing another host's daemon has
+  no account bridge; the terminal toolbar, chat reconnect rows, watch-by-default
+  and forced focus mode exist only for a routed session or an account-gateway
+  browser view. Every Codex terminal keeps its plain argument list unless the
+  project is Pro-configured; no agent brief is injected into a local session
+  unless its project returned from the cloud in this daemon life.
+- **No placement controls.** No "reconnect and wake", no keep-running pin, no
+  "open a repository in the cloud" from the laptop, no visible cloud-setup
+  terminal. Sends and permission answers carry wake intent themselves; opening
+  a view never wakes anything.
+- **Plain words.** User-facing text never says baton, epoch, hydrate, keeper,
+  worker, placement, delegation, canonical, receipt, fence, mirror, publication
+  or host. Errors reach the UI as stable codes with sentences, not raw text.
+- **Prices come from the account service**, never from the public source.
 
-Integration merged main at `f879ac34`; later revisions need their own evidence.
-Verify the intended base before using the diff. Preserve concurrent work. Some
-legacy fixes have adapted counterparts: compare behavior, functions and tests
-before proposing cherry-picks. Do not weaken newer authority/disconnect guards
-to reproduce an older patch. The optional supervisor-cleanup prototype is
-outside this PR's scope and is not validated here.
+## What the 2026-09-28/29 review changed
 
-## Review map
+A nine-part read-only review (native shell, link crate, daemon ownership core,
+mirror/Git/bundles, viewing/proxy, providers and agent context, web UI and copy,
+six end-to-end journeys, private services) found that the branch could not
+complete the round trip and regressed free users. The fixes, all with red/green
+tests, are the commits after `eb4ae26b`. The converged root causes, so a
+reviewer can check each stays fixed:
 
-| Area | Start here | Trace and verify |
-| --- | --- | --- |
-| Account lifecycle | [Native map](../../crates/chimaera-app/AGENTS.md), `shell/pro.rs`, `shell/pro/` | Sign-in → verified client → memory/keychain → generation changes. Transient recovery, stale writes, revocation, installation binding and preview isolation. |
-| Plans and connections | [Pro UI](../../web-ui/src/lib/pro/AGENTS.md), [settings](../../web-ui/src/lib/settings/AGENTS.md), [providers](../../crates/chimaera-server/src/cloud/providers/AGENTS.md) | UI action → transport → job → fresh status → pending continuation. Subscriber/sales state, named disconnect and quiet polling. |
-| Public contracts | [Link map](../../crates/chimaera-link/AGENTS.md), [PROTOCOL](../../crates/chimaera-link/PROTOCOL.md), HANDOFF, VIEWING | Capability negotiation, exact acknowledgment, scoped delegation, recovery, placement and receipts; older peers fail closed. |
-| Execution and return | [Pro daemon map](../../crates/chimaera-server/src/pro/AGENTS.md), `engine.rs`, `execution/`, `canonical.rs`, `handback.rs` | Owner → release/checkpoint recovery → import → continuation → canonical return. Strict mode, logical identity versus native fork, completed versus interrupted work. |
-| Files and durability | [Daemon map](../../crates/chimaera-server/AGENTS.md), `pro/mirror.rs`, `transport.rs`, `bundle.rs`, `ledger.rs` | Snapshot → acknowledged publication → import. Cancellation, temporary/private files, original paths and local conflict preservation. |
-| Logical viewing | VIEWING, `session_proxy.rs`, `workspace_scope/`, native `pro/placements.rs`, UI `net/placement.ts` | Passive owner lookup → scope acknowledgment → registered resource → response/watch. Viewing never moves execution; one failed project does not break siblings. |
-| Mutation boundary | `workspace_scope.rs`, `pro/execution/mutation.rs`, `api/`, `ws.rs`, [PTY](../../crates/chimaera-pty/AGENTS.md), [agent](../../crates/chimaera-agent/AGENTS.md) | Retain admitted account generation/epoch through body reads and queues to the actual file commit or PTY/chat write. |
-| Agent context | `mcp/cloud_context.rs`, [chat protocol](../../crates/chimaera-agent/PROTOCOL.md) | Fresh MCP/profile/arrival context, honest capabilities, internal resource inspection, qualitative capacity answers and no invented allowances. |
+1. Under the negotiated (v2) protocol the daemon never published the handoff
+   policy the account's automatic wake requires → `pro/engine.rs`
+   `publish_policy` runs in both versions before any snapshot bytes move.
+2. The clean flush and hydration ran inside HTTP handlers whose callers time out
+   (keeper 90 s, supervisor 120 s, sleep 25 s), leaving killed Git children,
+   `Transferring` state and a permanent 409 → `pro/detached.rs` owned tasks
+   with drop guards; the sleep flush takes a `deadline_ms`, preempts the
+   periodic pass, publishes projects in parallel and never renews or resumes
+   inside the sleep window.
+3. The execution fence locked users out of their own laptop → fencing follows
+   the rule above; graceful shutdown clears restart evidence; a same-boot
+   restart probes recorded process groups instead of fencing forever; a
+   state-file read error is retried and only a parse failure counts as damage,
+   scoped to enrolled projects.
+4. Refresh-token replay: the service answers `400 invalid_grant` and bumps the
+   account epoch on replay → the link client treats any refresh 4xx other than
+   404/408/429 as final, retries only when the request provably never left, and
+   the keeper's `503 account_unavailable` is a quiet wait.
+5. Return silently lost local edits → the three-way baseline is the last
+   acknowledged publication; a file only this computer changed keeps its edit;
+   the snapshot manifest carries a `left_out` inventory so an excluded file is
+   never treated as deleted; a file changed on both sides keeps the user's
+   version beside it as `<name>.mine-<stamp>` and the row reports `kept_both`.
+6. Viewing: a sleeping owner was unreachable through the native proxy; the
+   events socket was handed to the owner wholesale (settings overwritten, tabs
+   pruned); sends were lost silently; a move said "agent exited" → per-project
+   route generations, a local-authoritative events feed, `moved`/`paused`/
+   `waking` frames, refusals that name their command, held first input with a
+   daemon-wide budget, wake on the first real input.
+7. Agents: a live Codex terminal was never "at pause"; every moved terminal got
+   a billed prompt; one blocked provider paused a whole project; enrollment
+   restarted running agents; a thawed cloud machine re-sent its pickup → all
+   fixed (`agent_state.rs::tui_at_pause`, `spawn.rs`, `provider_gate.rs`,
+   `execution::adopt_running`, `execution::thawed`).
 
-Trace actual callers to side effects and returned UI status, including startup,
-HTTP, established sockets, queues and restore. Include ordinary local/SSH behavior.
+## The acceptance gate: one flow that runs
+
+The private repository carries a loopback end-to-end harness that starts the
+account, keeper and a cloud machine as local processes (no vendors, no cloud)
+against this branch's daemon and plays the app's configure sequence. It proves,
+in one run of about 22 minutes with production timings:
+
+1. Account, keeper and an uncreated cloud machine come up.
+2. A laptop daemon with a Git project, a chat agent mid-turn, and a private
+   project with a plain shell.
+3. Enrollment: policy and checkpoint receipt published; the running chat stays
+   on its process with no new prompt.
+4. Lid close: `/pro/sleep` releases within its deadline; the cloud machine
+   starts, takes the project, and the conversation continues exactly once in
+   the same native conversation with the laptop's files; zero laptop turns.
+5. A phone resolves the project to the cloud machine, reads without waking it,
+   and its message runs in the same agent process.
+6. The cloud machine drains, flushes and suspends while keeping ownership; a
+   passive read does not wake it; a send with wake intent does, into the same
+   conversation, same process, no fork.
+7. The laptop wakes on power; after the settle window the work comes home:
+   same conversation, no fork, zero new turns, both machines' files present,
+   the branch fast-forwarded.
+8. Battery loss mid-turn: the cloud takes over from the last checkpoint with a
+   forked conversation and recovery context; the restarted laptop does not
+   resume its stale turn; the work comes home with `kept_both` for a file
+   edited on both sides.
+9. The private project never reaches the account; signing out leaves the local
+   chat and shell running.
+
+Its last run on this branch is recorded in the PR. Passing it is the bar for
+"the flow works"; unit and integration tests alone are not.
 
 ## Reproducible local checks
 
-Use Node 22 ([.nvmrc](../../.nvmrc)) and Rust 1.96.0 ([toolchain](../../rust-toolchain.toml)).
-Run at repository root; install missing dependencies without changing lockfiles. Coordinate shared targets.
+Node 22 ([.nvmrc](../../.nvmrc)), Rust 1.96.0 ([toolchain](../../rust-toolchain.toml)).
 
 ```sh
-npm --prefix web-ui ci
-npm --prefix web-ui run check
-npm --prefix web-ui run test
-npm --prefix web-ui run build
-just check
+npm --prefix web-ui ci && npm --prefix web-ui run check && npm --prefix web-ui run test && npm --prefix web-ui run build
+bash scripts/build-plugins.sh            # server tests need plugins/dist-test
+just check                               # fmt, clippy -D warnings, tests (root + plugins)
 cargo +1.96.0 test -p chimaera-link --all-features
-just app-check
-node scripts/check-doc-links.mjs
-node scripts/check-agent-assets.mjs
-node scripts/check-workflow-security.mjs
+just app-check                           # the native shell is its own workspace
+node scripts/check-doc-links.mjs && node scripts/check-agent-assets.mjs && node scripts/check-workflow-security.mjs
 ```
 
-`just check` runs [build-plugins.sh](../../scripts/build-plugins.sh), then
-fmt/clippy/tests for **both root and `plugins/` workspaces**. The script builds
-`wasm32-wasip2` fixtures and checksum-verifies locked plugin releases; missing
-artifacts require download. Offline runs need them already present. Before
-running individual server filters, prepare fixtures explicitly:
+Focused suites: `cargo +1.96.0 test -p chimaera-server pro::`, `workspace_viewer`,
+`session_proxy`, `tests::ws`, `cloud_context`. A driver change needs
+`just chat-smoke` (billed; the last pass is recorded in
+[PROTOCOL.md](../../crates/chimaera-agent/PROTOCOL.md)).
 
-```sh
-bash scripts/build-plugins.sh
-cargo +1.96.0 test -p chimaera-server pro::
-cargo +1.96.0 test -p chimaera-server workspace_viewer
-cargo +1.96.0 test -p chimaera-server session_proxy
-cargo +1.96.0 test -p chimaera-server cloud_context
-cargo +1.96.0 test -p chimaera-pty
-cargo +1.96.0 test -p chimaera-agent --test manager
-```
+Known intermittent tests under a loaded full run (they pass alone):
+`previews/mdBlocks.test.ts` (UI), `cloud_context_real_http_…` and
+`pro::repository::tests::cancellation_after_ref_commit_finishes_index_adoption`.
 
-Focused suites do not replace the full gate. Native is a standalone workspace.
-On macOS, build without installing or launching:
+## Review map
 
-```sh
-npm --prefix crates/chimaera-app ci
-npm --prefix crates/chimaera-app run tauri -- build --debug --bundles app \
-  --config '{"bundle":{"createUpdaterArtifacts":false}}'
-```
-
-For isolated runtime work follow [develop](../../.claude/skills/develop/SKILL.md)
-and [verify-app](../../.claude/skills/verify-app/SKILL.md). Check actual build stamp,
-generated command permissions, executable, signature and isolated state. A
-shared cache can reuse another checkout's code generation; stamp alone is not
-proof. CI covers Linux/musl and other native targets that macOS cannot verify.
-
-The [chat-mode workflow](../../.claude/skills/chat-mode/SKILL.md) requires
-`just chat-smoke` for driver/CLI protocol changes. It uses authenticated pinned
-CLIs and bills small turns: use existing task authorization and fresh isolated
-sessions, record versions/results, and never reuse a user's conversation.
-
-## Acceptance matrix
-
-Keep **source checks**, **isolated runtime checks**, and **full user-flow checks**
-separate, with exact build and observations. At `f879ac34`, Svelte had zero
-errors/warnings, 1,413 UI tests passed with three skipped, and production UI build
-passed. Rust/native checks for that merged head were pending when written;
-pre-merge totals are not evidence for it.
-
-| Behavior | Source / isolated evidence | Full-flow gate |
+| Area | Start here | What to trace |
 | --- | --- | --- |
-| Free mode | Endpoint-unset behavior; shared local/SSH routes and UI tests | Local/SSH projects, reconnect, Home/settings and dirty editors work without Pro setup, account traffic or obscured controls. |
-| Account and connections | Recovery races, billing return, fresh provider jobs, light/dark/narrow UI | Signup leaves purchase optional; browser completion returns to native; named connection resumes blocked work automatically; disconnect stays explicit. |
-| View anywhere | Scope/path/session/ticket, delayed body/socket and sibling-route tests; disposable browser files/terminal walkthrough | Another viewer follows the online home owner without moving execution; files, history and tabs survive owner change/reconnect. |
-| Cloud continuation | Real Git import, provider readiness, transcript and completed-idle checks | Verify actual files and substantive conversation events; no duplicate task or new turn merely because completed structured work moved. |
-| Automatic return | Hand-back/canonical-content tests and original-path/conflict checks | **NOT PASSED as a complete automatic user flow.** Normal return must preserve cloud work/history without manual repair. Isolated import success is insufficient. |
-| Sudden loss | Policy/grace, receipt, stale-owner and fork-context tests | Separate from clean release: automatic checkpoint continuation and canonical return. Do not claim unsaved-byte recovery or exactly-once external effects. |
-| Idle preparation | Activity and operation accounting | **Not accepted:** background/cache writers must drain before suspension; sampled activity alone is not proof of quiescence. |
-| Resource guidance | Context tests and corrected synthetic response sample | The sample omitted raw allocations and referred allowance questions to Usage details; it does not prove every model complies or real resource inspection occurred. |
+| Account lifecycle, billing, power | [native map](../../crates/chimaera-app/AGENTS.md), `shell/pro.rs`, `shell/pro/` | sign-in → keychain → daemon setup in the background; billing return; the sleep deadline; placements retire only on definitive answers |
+| Link crate | [link map](../../crates/chimaera-link/AGENTS.md) | refresh semantics, lenient service decoding, exact daemon acks, tunnel and reverse-serve limits |
+| Ownership and transfer | [pro map](../../crates/chimaera-server/src/pro/AGENTS.md), `engine.rs`, `execution/`, `detached.rs`, `drain.rs`, `handback.rs` | laptop-first fence, owned flush/hydrate, sleep deadline, return at a pause, drain for the supervisor |
+| Files and durability | `pro/mirror.rs`, `repository.rs`, `canonical.rs`, `persist.rs`, [BUNDLE](../../crates/chimaera-server/BUNDLE.md) | baseline, `left_out`, kept-both siblings, durable Pro state |
+| Viewing | [VIEWING](../../crates/chimaera-link/VIEWING.md), `session_proxy.rs`, `ws.rs`, `workspace_scope/` | per-project generations, local-authoritative events, `moved`/`paused`/`waking`, wake on input, refusal codes |
+| Agents and context | `agent_state.rs`, `spawn.rs`, `pro/provider_gate.rs`, `mcp/cloud_context.rs`, `codex_notify.rs`, [providers map](../../crates/chimaera-server/src/cloud/providers/AGENTS.md) | pause detection, prompts only for interrupted turns, per-session gate, the shortened brief, notify shim only for Pro projects |
+| Web UI | [pro map](../../web-ui/src/lib/pro/AGENTS.md), [settings map](../../web-ui/src/lib/settings/AGENTS.md), [net map](../../web-ui/src/lib/net/AGENTS.md), [chat map](../../web-ui/src/lib/chat/AGENTS.md) | free-user gating, the account page state machine, copy, paused rows |
 
-Structured and interactive terminal agents need separate acceptance: the feature
-page still documents incomplete reliable active/idle detection for every TUI
-provider. Do not generalize structured-idle results to all terminal transfers.
+## What is still open
 
-## Reporting and safe review
+- A failed return cannot yet restore the pre-install state (needs a staged
+  install); it retries with a short backoff instead.
+- Codex rollout lookups use the daemon's `CODEX_HOME`, not the login shell's.
+- A second computer has no native viewer; adoption of a cloud-created project
+  gives it no home, so it never returns automatically after its first cloud stint.
+- The account browser's `HEAD` plan check and the settings gateway view are not
+  exercised by the loopback harness (they need the private browser gateway).
+- Live acceptance on staging (real sleep, real vendors, two devices) follows a
+  coordinated private deploy: the branch fails closed against a service without
+  the negotiated protocol, so nothing here can be tested against an older
+  staging.
 
-Choose a bounded subsystem in the supplied checkout. Check missing wiring and free-mode
-regressions through cancellation, restart, account replacement and delayed replies.
-Prefer disposable HTTP/WS/PTY or Git fixtures; avoid tests that repeat implementation text.
-Report severity, file/line, failure path, reproduction, tests run and unproved gates.
-Preserve others' edits. Sanitize tokens, account identifiers and unrelated conversations;
-keep operational artifacts outside the public repo. Do not deploy, reset accounts,
-restart working apps or publish review comments simply to complete an audit.
+## Reporting
 
-## Earlier public PRs
-
-Review final behavior in #204 rather than reapplying every historical patch.
-
-| PR | Area |
-| --- | --- |
-| [#178](https://github.com/martinappberg/chimaera/pull/178) | Codex terminal resume |
-| [#179](https://github.com/martinappberg/chimaera/pull/179) | Account link protocol |
-| [#180](https://github.com/martinappberg/chimaera/pull/180) | Native account connections |
-| [#181](https://github.com/martinappberg/chimaera/pull/181) | Handoff/delegation contract |
-| [#182](https://github.com/martinappberg/chimaera/pull/182) | Worker activity |
-| [#183](https://github.com/martinappberg/chimaera/pull/183) | Project mirrors/handoff |
-| [#186](https://github.com/martinappberg/chimaera/pull/186) | Portable Git state |
-| [#187](https://github.com/martinappberg/chimaera/pull/187) | Subscriber branding |
-| [#190](https://github.com/martinappberg/chimaera/pull/190) | Onboarding/account polish |
-| [#192](https://github.com/martinappberg/chimaera/pull/192) | Home/Pro experience |
-| [#193](https://github.com/martinappberg/chimaera/pull/193) | Automatic continuity fixes |
-| [#197](https://github.com/martinappberg/chimaera/pull/197) | Named provider connections |
-| [#198](https://github.com/martinappberg/chimaera/pull/198) | Workspace-bound authority |
-| [#204](https://github.com/martinappberg/chimaera/pull/204) | Combined integration |
+Report severity, `path:line`, the failure path, what you ran and observed, and
+which of the rules above a finding breaks. Do not deploy, reset accounts,
+restart the maintainer's running apps or publish comments to complete a review.
