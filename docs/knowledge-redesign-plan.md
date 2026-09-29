@@ -241,6 +241,31 @@ shrinks to deleting the adapter. The field table below goes to that plan
 as the `knowledge/1` draft; the id shapes become a generic contribution
 point (`provides.references` or a `references` field on the surface).
 
+## Coordination with the plugin platform (2026-09-29)
+
+Agreed with the platform session (its plan's "Coordination: the Knowledge
+redesign" section) and built this way:
+
+- **The provider is "the active plugin with `provides.knowledge`"** —
+  never a plugin id; the attach sheet opens for that plugin.
+- **One span shape**, `{path, line, end_line}`.
+- **Ids to chips go through `shared/references.ts`**: a source is
+  `{shapes, lookup(id) → targets}`, a target `{key, kind, title, span?,
+  open}`. The Knowledge snapshot registers as the first source; chat,
+  markdown previews and the Timeline ask the registry, never the Knowledge
+  store. The platform's `references/1` publishers register later with no
+  change to the chip layer.
+- **Ask an agent is one function**, `shared/askAgent.ts` (`{text, file?,
+  line?, end_line?}` → a draft in the working agent's composer); Tidy up and
+  `ui/1`'s `ask-agent` action both call it.
+- **Rows, badges, key–value, callouts and file cards** live in
+  `web-ui/src/lib/shared/ui/` with `ui/1`'s prop names (`title`,
+  `subtitle`, `badges`, `tone`, `text`).
+- **Dashboard order**: Knowledge's card, then Guidance & memory, then
+  plugin panels.
+- **Mycelium 0.2.0 stays on `api = "0.1"`**; the `knowledge` export is
+  unchanged in WIT 0.2.
+
 ## Ids everywhere — hover and click from a chat
 
 When an agent writes "see F-228" in a chat, the id is a chip.
@@ -369,7 +394,7 @@ stay byte-identical where their inputs don't use the new shapes.
 
 | Field | On | Meaning |
 |---|---|---|
-| `span {path, line, end}` | every entry, addendum, to-do, handoff | where the entry's markdown lives; the reader fetches the file (`/fs/file`) and renders the slice — bodies never ride the snapshot (the reference project's `.living/` text is ~1.8 MB) |
+| `span {path, line, end_line}` | every entry, addendum, to-do, handoff | where the entry's markdown lives; the reader fetches the file (`/fs/file`) and renders the slice — bodies never ride the snapshot (the reference project's `.living/` text is ~1.8 MB) |
 | `stated` | finding, decision | the status exactly as written ("established by independent realignment"); `status` stays the matched Mycelium word or `unknown` |
 | `refs[] {kind, id, topic?}` | every entry | ids this entry cites (F/D/C/L/T/to-do), in order |
 | `cites[] {kind, text}` | every entry | data files, scripts, jobs, commits, figures named in the body |
@@ -395,9 +420,10 @@ Exact shapes, additive to 0.1.3. Omitted means absent-when-empty
 0.1.3 did plus only what it newly has. Line numbers are 1-based and
 inclusive; paths workspace-relative.
 
-- **`Span`** = `{path, line, end}` — the entry's heading line to its last
-  line (trailing blank lines excluded). For a to-do table row, `line ==
-  end` (the row).
+- **`Span`** = `{path, line, end_line}` — the entry's heading line to its
+  last line (trailing blank lines excluded); the one span shape of every
+  surface (the platform plan's `diagnostics/1` too). For a to-do table row,
+  `line == end_line` (the row).
 - **`Ref`** = `{kind, id}` — `kind` ∈ `finding | decision | convention |
   learning | todo`; `id` as written (`F-171`, `D-152`, `C-12`, `L-40`,
   `T-DAChromatin`). An entry never lists its own id; order of first
@@ -466,11 +492,15 @@ Per kind:
 - **`id_shapes[]`** = `{kind, pattern}` — the id shapes this snapshot
   answers for, as JavaScript-compatible regex sources without anchors:
   `F-\d{1,4}`, `D-\d{1,4}`, `C-\d{1,3}`, `L-\d{1,4}`, `T-[A-Za-z][A-Za-z0-9]*`.
-- **`labels`** = `{source, sections: {left_off, asks, changed, open_work,
-  findings, decisions, learnings, conventions, todos, sessions, tidy},
+- **`labels`** = `{source, sections: {overview, left_off, asks, changed,
+  open_work, findings, decisions, learnings, conventions, todos, sessions,
+  tidy}, kinds: {finding, decision, learning, convention, todo, session},
   status_words: [{word, rank, tone}], status_note}` — the plugin's words
-  (principle 10); `rank` 1–3 for the ladder, `0` for none; `tone` ∈
-  `neutral | good | warn | bad`.
+  (principle 10): section names, the singular word per kind, the status
+  vocabulary; `rank` 1–3 for the ladder, `0` for none; `tone` ∈ the `ui/1`
+  set `neutral | accent | good | warn | bad`. Core never names a plugin, its
+  files or its status words; without `labels` it shows the kinds' own names
+  and statuses without a glyph.
 
 The existing fields keep their meaning; values change only where parsing
 improves (more to-dos, real decision dates, the newest handoff).
