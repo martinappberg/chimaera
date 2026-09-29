@@ -1008,6 +1008,7 @@ pub(crate) async fn api_proxy(
         let response = request(&state.session_proxy, &route, &workspace, incoming, budget).await?;
         tokio::time::timeout(ADAPTER_DEADLINE, async {
             let response = alias_response(response, &path, &alias, &target_keys).await?;
+            let response = epoch_response(response, &path, &route, &workspace).await?;
             ticket_response(&state, &route, &workspace, &path, response).await
         })
         .await?
@@ -1244,6 +1245,40 @@ async fn alias_response(
     let mut value: Value = serde_json::from_slice(&bytes)?;
     crate::workspace_scope::paths::Alias::restore_keys(&mut value, target_keys);
     alias.response(path, &mut value);
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Ok(Response::from_parts(
+        parts,
+        Body::from(serde_json::to_vec(&value)?),
+    ))
+}
+
+/// A routed project's Git status and Timeline pages carry the same salted
+/// epoch its events nudges do ([`routed_epoch`]), so a window compares like
+/// with like: it refetches when the owner's epoch moves or the project moves,
+/// and never on every nudge.
+async fn epoch_response(
+    response: Response,
+    path: &str,
+    route: &Route,
+    workspace: &str,
+) -> Result<Response> {
+    let epochs = path == "/git/status"
+        || path
+            .strip_prefix("/workspaces/")
+            .is_some_and(|rest| rest.ends_with("/timeline"));
+    let Some(generation) = route.generations.get(workspace).copied() else {
+        return Ok(response);
+    };
+    if !epochs || !response.status().is_success() {
+        return Ok(response);
+    }
+    let (mut parts, body) = response.into_parts();
+    // Git status is capped at 5000 entries; a Timeline page at its page size.
+    let bytes = axum::body::to_bytes(body, 8 * 1024 * 1024).await?;
+    let mut value: Value = serde_json::from_slice(&bytes)?;
+    if let Some(epoch) = value["epoch"].as_u64() {
+        value["epoch"] = json!(routed_epoch(generation, epoch));
+    }
     parts.headers.remove(header::CONTENT_LENGTH);
     Ok(Response::from_parts(
         parts,
@@ -1856,10 +1891,20 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
 pub(crate) enum FeedFrame {
     /// A path-only invalidation, already in this window's paths.
     Fs(Value),
-    /// The project's Git epoch on its owner.
+    /// The project's Git epoch on its owner, as [`routed_epoch`] reports it.
     Git(u64),
-    /// The project's Timeline epoch on its owner.
+    /// The project's Timeline epoch on its owner, as [`routed_epoch`] reports it.
     Timeline(u64),
+}
+/// An owner's Git or Timeline epoch as a window reports it: in a range of its
+/// own per project registration, above any daemon's own counter. A window
+/// refetches only when an epoch it was sent changes, and this computer's
+/// counter and an owner's (or two owners') can hold the same number: without
+/// the salt a local-to-routed switch (or back) could read as "unchanged" and
+/// leave Git status and the Timeline stale after a move. JS numbers are exact
+/// below 2^53: 20 bits of registration above 32 bits of epoch.
+pub(crate) fn routed_epoch(registration: u64, epoch: u64) -> u64 {
+    (((registration & 0xF_FFFF) + 1) << 32) | (epoch & 0xFFFF_FFFF)
 }
 pub(crate) struct Feed {
     pub(crate) workspace: String,
@@ -1939,6 +1984,10 @@ async fn feed(
         .workspaces
         .get(workspace)
         .context("workspace route missing")?;
+    let project_generation = *route
+        .generations
+        .get(workspace)
+        .context("workspace route missing")?;
     let auth = json!({"type":"auth","token":route.token,"workspace_id":workspace,
         "epoch":epoch,"viewer_root":"L3Byb2plY3Q"});
     bounded_send(&mut upstream, Up::Text(auth.to_string().into())).await?;
@@ -1993,12 +2042,12 @@ async fn feed(
                         }
                         Some("git") => {
                             if let Some(epoch) = value["epochs"][workspace].as_u64() {
-                                frames.send(FeedFrame::Git(epoch)).await?;
+                                frames.send(FeedFrame::Git(routed_epoch(project_generation, epoch))).await?;
                             }
                         }
                         Some("timeline") => {
                             if let Some(epoch) = value["epochs"][workspace].as_u64() {
-                                frames.send(FeedFrame::Timeline(epoch)).await?;
+                                frames.send(FeedFrame::Timeline(routed_epoch(project_generation, epoch))).await?;
                             }
                         }
                         // The owner's connection for this project changed:
@@ -2190,6 +2239,21 @@ mod tests {
         // An upload's body keeps the link alive; only a silent stall ends it.
         assert!(Budget::UPLOAD.quiet < Budget::UPLOAD.head);
         assert!(Budget::EXEC.quiet >= Budget::EXEC.head);
+    }
+
+    #[test]
+    fn an_owners_epochs_never_read_as_unchanged_across_a_move() {
+        const JS_SAFE: u64 = 1 << 53;
+        for epoch in [0, 1, 7, u32::MAX as u64] {
+            // Never equal to any number this computer's own counter holds.
+            assert!(routed_epoch(1, epoch) > u32::MAX as u64);
+            // A new registration (a move to another owner) reads as a change.
+            assert_ne!(routed_epoch(1, epoch), routed_epoch(2, epoch));
+            // And stays exact for the browser.
+            assert!(routed_epoch(u64::MAX, epoch) < JS_SAFE);
+        }
+        // Within one registration, the owner's own changes still move it.
+        assert_ne!(routed_epoch(3, 4), routed_epoch(3, 5));
     }
 
     #[tokio::test]

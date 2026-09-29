@@ -740,6 +740,76 @@ async fn a_routed_window_keeps_this_computers_files_outside_the_project_local() 
     }
 }
 
+/// A routed project's Git status and Timeline pages carry the owner's epoch
+/// in a range of their own (what its events nudges carry too), so switching
+/// between this computer's copy and the owner always reads as a change.
+#[tokio::test]
+async fn a_routed_projects_epochs_never_collide_with_this_computers() {
+    let remote = test_state();
+    let local = test_state();
+    let workspace = lock(&remote.workspaces)
+        .add(test_dir("epochs-remote").canonicalize().unwrap())
+        .unwrap();
+    let mut viewing = workspace.clone();
+    viewing.root = test_dir("epochs-local").canonicalize().unwrap();
+    lock(&local.workspaces).import_exact(viewing).unwrap();
+    pro::install_execution_fixture(&remote, &workspace.id, 4).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = listener.local_addr().unwrap();
+    let router = app(remote.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let routes = [
+        format!("/api/v1/git/status?workspace_id={}", workspace.id),
+        format!("/api/v1/workspaces/{}/timeline", workspace.id),
+    ];
+    let id = workspace.id.clone();
+    let epoch = move |state: Arc<AppState>, uri: String| {
+        let id = id.clone();
+        async move {
+            let request = Request::builder()
+                .uri(uri)
+                .header(header::AUTHORIZATION, "Bearer test-token")
+                .header("x-chimaera-viewer-workspace", &id)
+                .body(Body::empty())
+                .unwrap();
+            let response = app(state).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["epoch"]
+                .as_u64()
+                .unwrap()
+        }
+    };
+    let here: Vec<u64> =
+        futures::future::join_all(routes.iter().map(|uri| epoch(local.clone(), uri.clone()))).await;
+    assert_eq!(
+        request(
+            &local,
+            Method::POST,
+            "/api/v1/pro/placements",
+            Some(serde_json::json!({
+                "host_id":"worker-epochs","endpoint":format!("http://{remote_addr}"),
+                "token":"test-token","workspace_id":workspace.id,"epoch":4
+            })),
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    for (uri, local_epoch) in routes.iter().zip(here) {
+        let owner = epoch(remote.clone(), uri.clone()).await;
+        let routed = epoch(local.clone(), uri.clone()).await;
+        assert_ne!(routed, local_epoch, "{uri}");
+        assert!(routed > u64::from(u32::MAX), "{uri}: {routed}");
+        assert_eq!(routed & 0xFFFF_FFFF, owner, "{uri}");
+    }
+    for state in [&remote, &local] {
+        state
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// A routed window's read of a file outside the project: the owner's copy
 /// when it may show it; this computer's own file when the owner has nothing
 /// there; and when the owner has a different file at that path it may not
