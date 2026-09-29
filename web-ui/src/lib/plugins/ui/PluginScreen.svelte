@@ -21,6 +21,7 @@
   import {
     fetchQuery,
     fetchView,
+    installTool,
     onPlatformFrame,
     openPluginView,
     postViewAction,
@@ -39,9 +40,12 @@
     file?: string;
     /** A chip or card section: no padding, no spinner block. */
     compact?: boolean;
+    /** A file view that owns its pane: the tree's last split grows to the
+     *  pane's height, and a viewer alone in a split pane fills it. */
+    fill?: boolean;
   }
 
-  let { ws, wsRoot, plugin, view, file = undefined, compact = false }: Props = $props();
+  let { ws, wsRoot, plugin, view, file = undefined, compact = false, fill = false }: Props = $props();
 
   let result = $state<RenderResult | null>(null);
   let loadError = $state<string | null>(null);
@@ -111,6 +115,18 @@
       case "save-to-workspace":
         await save(str(payload.from), str(payload.to), false);
         return;
+      case "install-tool": {
+        // The user's click, as on the card's Tools section: the daemon
+        // downloads, checks, unpacks and sets it up; then the view draws
+        // again with the tool in place.
+        const tool = str(payload.tool);
+        if (tool === "") return;
+        say("Installing… (downloading, checking, unpacking)", "neutral");
+        await installTool(plugin, tool);
+        say("Installed.");
+        await load();
+        return;
+      }
       case "ask-agent": {
         const ref = str(payload.file);
         const text = str(payload.text);
@@ -212,7 +228,7 @@
   });
 </script>
 
-<div class="screen" class:compact bind:this={host} aria-busy={busy}>
+<div class="screen" class:compact class:fill bind:this={host} aria-busy={busy}>
   {#if loadError !== null}
     <p class="failed">{loadError}</p>
   {:else if result === null}
@@ -256,6 +272,22 @@
   }
   .screen:not(.compact) {
     padding: 14px 16px;
+  }
+  .screen.fill {
+    box-sizing: border-box;
+    min-height: 100%;
+  }
+  .screen.fill > :global(.stack) {
+    flex: 1;
+    min-height: 0;
+  }
+  .screen.fill > :global(.stack > .split:last-child) {
+    flex: 1;
+  }
+  .screen.fill :global(.split .pane > .stack > .rich:first-child) {
+    flex: 1;
+    height: auto;
+    min-height: 240px;
   }
   .loading {
     display: flex;

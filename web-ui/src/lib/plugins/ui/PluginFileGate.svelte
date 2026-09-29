@@ -123,7 +123,7 @@
       {#if claim !== null}
         <div class="screen-scroll">
           {#key `${claim.plugin.id}/${claim.view.id}/${rel}`}
-            <PluginScreen ws={wsId} {wsRoot} plugin={claim.plugin.id} view={claim.view.id} file={rel} />
+            <PluginScreen ws={wsId} {wsRoot} plugin={claim.plugin.id} view={claim.view.id} file={rel} fill />
           {/key}
         </div>
       {:else}

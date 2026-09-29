@@ -25,7 +25,7 @@ export const KNOWN_NODES: ReadonlySet<string> = new Set([
 
 /** Actions the client carries out itself; a plugin names them on a button. */
 export const BUILTIN_ACTIONS: ReadonlySet<string> = new Set([
-  "save-to-workspace", "open-file", "open-view", "open-url", "copy", "ask-agent",
+  "save-to-workspace", "open-file", "open-view", "open-url", "copy", "ask-agent", "install-tool",
 ]);
 
 /** What a screen's nodes may ask of their host. */

@@ -669,7 +669,9 @@ else a quiet "needs a newer chimaera" with its children. Actions a plugin names
 but never handles (the app carries them out): `open-file {file, line?}`,
 `open-view {view}`, `open-url {url}`, `copy {text}`, `save-to-workspace {from,
 to}` (the user's click copies an output file into the workspace; asks before
-replacing), `ask-agent {file?, line?, text}`.
+replacing), `ask-agent {file?, line?, text}`, `install-tool {tool}` (the user's
+click installs one of your `[[tools]]`, as the card's Install does, then the view
+draws again).
 
 Where a view draws: `tab` (its own tab: the card's **Open**, `open-view`, a file
 action's `open`), `panel` (the dashboard, after core's sections), `file` (a

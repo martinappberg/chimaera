@@ -54,6 +54,7 @@ pub(crate) const BUILTIN_ACTIONS: &[&str] = &[
     "open-url",
     "copy",
     "ask-agent",
+    "install-tool",
 ];
 
 /// The props each known node needs, and their JSON kind.
