@@ -188,6 +188,9 @@ impl FakeKeeper {
         private
             .merge(
                 Router::new()
+                    // Public and credential-free like the service's catalog;
+                    // the fixture has no offers, so it answers `{"plans":null}`.
+                    .route("/v1/plans", get(|| async { Json(PlanCatalog::default()) }))
                     .route("/v1/oauth/authorize", get(authorize))
                     .route("/v1/oauth/token", post(token))
                     .route("/v1/oauth/refresh", post(refresh)),

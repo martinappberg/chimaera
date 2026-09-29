@@ -99,6 +99,22 @@ export function planPrices(plans: ProPlanPrice[] | null | undefined, locale?: st
   return table as PlanPrices;
 }
 
+/** How many times Max costs Pro for one billing interval ("3.75× Pro"), from the
+ * account's own amounts (month against month, year against year); never a
+ * literal. Two decimals at most, trailing zeros trimmed. Null when either
+ * amount is missing, malformed or zero, when the two are in different
+ * currencies, or when Max is not actually more than Pro. */
+export function planMultiple(plans: ProPlanPrice[] | null | undefined, interval: "month" | "year", locale?: string): string | null {
+  const find = (plan: "pro" | "max") => Array.isArray(plans) ? plans.find(value => value?.plan === plan && value.interval === interval) : undefined;
+  const pro = find("pro"), max = find("max");
+  if (!pro || !max || typeof pro.currency !== "string" || typeof max.currency !== "string"
+    || pro.currency.toUpperCase() !== max.currency.toUpperCase()) return null;
+  for (const amount of [pro.amount_cents, max.amount_cents]) if (!Number.isSafeInteger(amount) || amount <= 0) return null;
+  const ratio = Math.round((max.amount_cents / pro.amount_cents) * 100) / 100;
+  if (!Number.isFinite(ratio) || ratio <= 1) return null;
+  try { return `${new Intl.NumberFormat(locale, { minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(ratio)}× Pro`; } catch { return null; }
+}
+
 /** Delayed snapshots cannot roll a newer attempt or its terminal result backward. */
 export function latestBilling(previous: ProBillingAttempt | null | undefined, incoming: ProBillingAttempt | null | undefined): ProBillingAttempt | null | undefined {
   if (!previous || !incoming) return incoming;

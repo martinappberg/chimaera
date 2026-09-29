@@ -36,6 +36,13 @@ async fn executable_conformance_against_real_loopback_sockets() {
     assert!(checks.len() >= 7, "{checks:?}");
 }
 #[tokio::test]
+async fn the_plan_catalog_answers_without_signing_in() {
+    let fixture = Fixture::start().await;
+    let signed_out = Client::new(&fixture.keeper.endpoint, None).unwrap();
+    assert_eq!(signed_out.plans().await.unwrap(), None);
+    assert!(signed_out.tokens().await.is_none());
+}
+#[tokio::test]
 async fn oauth_enforces_pkce_single_use_and_refresh_rotation() {
     let fixture = Fixture::start().await;
     let pkce = Pkce::new();

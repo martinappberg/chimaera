@@ -41,6 +41,10 @@ Invariants:
   service-originated types, `#[serde(other)] Unknown` on service enums, unknown
   host kinds/events/serve messages ignored. Daemon acknowledgments stay exact.
   A missing v2 route or another protocol major is `ServiceUnsupported`.
+- `Client::plans` reads the public catalog (`GET /v1/plans`) with no bearer even
+  when the client holds tokens, so it works signed out and never touches token or
+  keeper state; a 404 (older service) is `Ok(None)`, other failures are ordinary
+  errors, never a sign-in problem. Prices are presentation only.
 - One stream quota per client (forward tunnels and reverse serve together). A
   failed `accept()` backs off and continues; one serve message the client cannot
   act on never drops the control connection. The events task ends only when its

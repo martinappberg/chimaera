@@ -199,6 +199,14 @@ impl PlanPrice {
             && self.currency.bytes().all(|byte| byte.is_ascii_lowercase())
     }
 }
+/// The public catalog, `GET /v1/plans`: the same offers list as
+/// `Account::plans`, read identically, without an account. `plans` is null
+/// before the service has a catalog (or when the body has none).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanCatalog {
+    #[serde(default, deserialize_with = "plan_prices")]
+    pub plans: Option<Vec<PlanPrice>>,
+}
 /// Pricing is presentation only: an entry this client cannot interpret (a new
 /// plan, interval or malformed amount) is dropped instead of failing the
 /// whole account read.
@@ -467,5 +475,29 @@ mod tests {
         );
         assert_eq!(account(serde_json::json!({"plans":{"pro":1}})).plans, None);
         assert_eq!(account(serde_json::json!({"plans":null})).plans, None);
+    }
+    #[test]
+    fn the_public_catalog_reads_exactly_like_the_account_offers() {
+        let rows = serde_json::json!([
+            {"plan":"pro","interval":"month","amount_cents":111,"currency":"USD"},
+            {"plan":"team","interval":"month","amount_cents":1,"currency":"usd"},
+            {"plan":"max","interval":"year","amount_cents":"lots","currency":"usd"}
+        ]);
+        let catalog: PlanCatalog =
+            serde_json::from_value(serde_json::json!({"plans": rows})).unwrap();
+        assert_eq!(
+            catalog.plans,
+            account(serde_json::json!({"plans": rows})).plans
+        );
+        assert_eq!(catalog.plans.as_ref().map(Vec::len), Some(1));
+        // No catalog yet, a missing key and a malformed list are all "no offers".
+        for none in [
+            serde_json::json!({"plans":null}),
+            serde_json::json!({}),
+            serde_json::json!({"plans":{"pro":1}}),
+        ] {
+            let catalog: PlanCatalog = serde_json::from_value(none).unwrap();
+            assert_eq!(catalog.plans, None);
+        }
     }
 }
