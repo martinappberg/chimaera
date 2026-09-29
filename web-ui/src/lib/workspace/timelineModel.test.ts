@@ -120,8 +120,11 @@ describe("bad news leads", () => {
     expect(isBadNews(job(0, "FAILED"))).toBe(true);
     expect(isBadNews(job(0, "CANCELLED by 1234"))).toBe(true);
     expect(isBadNews(job(0, "COMPLETED"))).toBe(false);
-    expect(isBadNews(know(0, "contradicted"))).toBe(true);
-    expect(isBadNews(know(0, "supported"))).toBe(false);
+    // Only the provider calls a status bad (its status words' tone).
+    expect(isBadNews(know(0, "contradicted"))).toBe(false);
+    const bad = (to: string) => to === "contradicted";
+    expect(isBadNews(know(0, "contradicted"), bad)).toBe(true);
+    expect(isBadNews(know(0, "supported"), bad)).toBe(false);
     expect(isBadNews(ep("s1", 0, { end: "errored" }))).toBe(true);
     expect(isBadNews(ep("s1", 0))).toBe(false);
   });
@@ -132,7 +135,7 @@ describe("bad news leads", () => {
     const bad1 = cmd(10, 1);
     const good2 = job(20, "COMPLETED");
     const bad2 = know(30, "contradicted");
-    const ordered = badNewsFirst(groupTimeline([good1, bad1, good2, bad2]));
+    const ordered = badNewsFirst(groupTimeline([good1, bad1, good2, bad2], (to) => to === "contradicted"));
     expect(ordered.map((g) => g.first.seq)).toEqual([bad2.seq, bad1.seq, good2.seq, good1.seq]);
   });
 });

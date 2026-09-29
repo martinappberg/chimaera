@@ -183,10 +183,13 @@ export class Buffer {
   /** Bumped when a save is refused because a conflict is open. */
   conflictNudge = $state(0);
   notice = $state<MergeNotice | null>(null);
-  /** A journaled draft found on open, awaiting Restore / Discard. */
+  /** A journaled draft found on open, awaiting Restore / Discard. While it
+   *  is on offer this buffer journals nothing of its own (see `journal`). */
   recovered = $state<drafts.DraftRecord | null>(null);
   /** The newest dirty text is journaled nowhere (show it, never imply "safe"). */
   journalFailed = $state(false);
+  /** The open's draft lookup has not settled: the record may be one to offer. */
+  lookingForDraft = $state(false);
   /** View-only paging (files past the edit cap, compressed files). */
   loadedBytes = $state(0);
   totalBytes = $state(0);
@@ -377,11 +380,16 @@ export class Buffer {
   }
 
   private afterChange(ours: boolean): void {
+    const wasDirty = this.dirty;
     this.refreshDirty();
     if (!ours) {
       // The user typed: the merge notice has done its job.
       this.clearNotice();
       this.scheduleAutosave();
+      // Typed or undone back to the disk text: a draft already journaled
+      // holds edits the user took back, and the next open would offer them.
+      // (The buffer's own reload/merge/restore callers clear for themselves.)
+      if (wasDirty && !this.dirty) this.afterClean();
     }
     if (this.dirty) this.scheduleJournal();
   }
@@ -726,7 +734,7 @@ export class Buffer {
       state: this.st,
       dispatch: (tr: Transaction) => {
         this.st = tr.state;
-        this.afterChange(true);
+        this.afterChange(false);
       },
     };
     undo(target);
@@ -850,6 +858,11 @@ export class Buffer {
     if (!this.dirty) {
       this.savedCount++;
       this.afterClean();
+    } else if (this.journalTimer === null) {
+      // Taken back to the old text while the save was in flight (keys typed
+      // meanwhile scheduled their own): unsaved against the new base, and
+      // that edit's clean moment cleared the draft.
+      this.scheduleJournal();
     }
   }
 
@@ -909,6 +922,16 @@ export class Buffer {
     if (this.journalTimer !== null) clearTimeout(this.journalTimer);
     this.journalTimer = null;
     if (!this.dirty || this.disposed) return;
+    // The path has ONE record. Until the open's lookup settles (two requests,
+    // up to a timeout each on a dead link), and while the draft it found is
+    // on offer, that record may be the only copy of work this buffer does not
+    // hold: writing these edits over it would leave the offer in memory
+    // alone. Hold them (the lookup's end journals them; a restore or discard
+    // ends the offer), and say they are not backed up.
+    if (this.lookingForDraft || this.recovered !== null) {
+      this.journalFailed = true;
+      return;
+    }
     const text = this.current.doc.toString();
     // The hide/pagehide flush writes even unchanged text: another window of
     // this origin may have overwritten the path's one record since, and this
@@ -935,23 +958,47 @@ export class Buffer {
 
   /** On open: a journaled draft that differs from the disk is offered, never applied. */
   private async lookForDraft(): Promise<void> {
-    const rec = await drafts.find(this.path);
-    if (rec === null || this.disposed) return;
-    if (rec.text === this.baseText) {
+    this.lookingForDraft = true;
+    let rec: drafts.DraftRecord | null;
+    try {
+      rec = await drafts.find(this.path);
+    } finally {
+      this.lookingForDraft = false;
+    }
+    if (this.disposed) return;
+    if (rec !== null && rec.text === this.baseText) {
       // Nothing to recover: drop that record, whoever wrote it.
       this.clearDraft(this.path, { writer: rec.writer, text: rec.text });
-      return;
+    } else if (
+      rec !== null &&
+      // Live in another window of this origin, not lost: that window owns it.
+      !presence.heldElsewhere(this.path) &&
+      rec.text !== this.current.doc.toString()
+    ) {
+      this.recovered = rec;
     }
-    // Live in another window of this origin, not lost: that window owns it.
-    if (presence.heldElsewhere(this.path)) return;
-    if (rec.text === this.current.doc.toString()) return;
-    this.recovered = rec;
+    // Edits typed during the lookup were held back: journal them now, or
+    // mark them held behind the offer.
+    if (this.dirty) void this.journal();
   }
 
   restoreDraft(): void {
     const rec = this.recovered;
     if (rec === null || !this.editable) return;
     this.recovered = null;
+    this.applyDraft(rec);
+    if (this.dirty) {
+      // It is this window's edit now: journal it as ours at once, so an undo
+      // straight back to the disk text drops the record by writer rather
+      // than leaving the old writer's copy to be offered again.
+      void this.journal();
+    } else {
+      // Merged to exactly the disk text: nothing left to recover.
+      this.clearDraft(this.path, { writer: rec.writer, text: rec.text });
+    }
+  }
+
+  private applyDraft(rec: drafts.DraftRecord): void {
     const sameBase =
       (rec.baseHash !== "" && this.baseHash !== null && rec.baseHash === this.baseHash) ||
       (rec.baseText !== null && rec.baseText === this.baseText);
@@ -992,6 +1039,8 @@ export class Buffer {
     if (rec === null) return;
     this.recovered = null;
     this.clearDraft(this.path, { writer: rec.writer, text: rec.text });
+    // Edits held back behind the offer are journaled now, not a delay later.
+    if (this.dirty) void this.journal();
   }
 
   // --- lifecycle ------------------------------------------------------------

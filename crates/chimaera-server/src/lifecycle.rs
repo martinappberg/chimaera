@@ -201,6 +201,9 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // Managed agents are proven stopped here, so a same-boot successor (an
     // update or restart) does not treat their launch evidence as a crash.
     crate::pro::shutdown(&state).await;
+    // Plugins' programs end with the daemon, their whole process groups (a
+    // build is started again on the next save; nothing resumes it).
+    state.plugin_platform.jobs.kill_all();
 
     if let Err(err) = chimaera_core::Handoff::new(port, state.token.clone()).write() {
         tracing::warn!(%err, "failed to write restart handoff");

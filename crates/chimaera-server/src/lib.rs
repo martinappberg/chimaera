@@ -70,6 +70,9 @@ pub struct ServerConfig {
 }
 
 pub use lifecycle::run;
+/// `chimaera plugin caps <plugin.toml>`: a manifest's tier, capability
+/// digest and Can list, as the lock and the card record them.
+pub use plugins::capabilities::describe_manifest as plugin_capabilities;
 pub(crate) use router::app;
 pub(crate) use state::{lock, AppState};
 

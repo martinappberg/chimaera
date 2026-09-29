@@ -5,7 +5,7 @@
  * the quiet "checked 2 hours ago", and when Reinstall applies. Pure;
  * `installCopy.test.ts`.
  */
-import type { PluginChange, WorkspacePlugin } from "./store";
+import type { ActivityEntry, PluginChange, TrustAsk, WorkspacePlugin } from "./store";
 
 /** A one-line outcome. No checksums in it: the daemon verifies every
  *  download, and only a failure is news (the refusal, or the card's fault). */
@@ -55,6 +55,8 @@ export function updatedOutcome(c: PluginChange): Outcome {
 
 /** The words beside the switch: what the switch means in THIS workspace. */
 export function stateWords(p: WorkspacePlugin): string {
+  if (p.hold?.kind === "untrusted") return "waiting for your trust";
+  if (p.hold !== null) return "off on this host";
   if (p.active) return "active here";
   if (p.on) return "on · not set up here yet";
   return "off";
@@ -63,10 +65,19 @@ export function stateWords(p: WorkspacePlugin): string {
 /** The folder or file a plugin's footprint names, as a person would say
  *  it: `.living/INDEX.md` → `.living/`, `MYCELIUM.md` stays. */
 export function footprint(p: WorkspacePlugin): string | null {
-  const first = p.detect[0];
-  if (first === undefined) return null;
-  const slash = first.indexOf("/");
-  return slash > 0 ? first.slice(0, slash + 1) : first;
+  return footprints(p)[0] ?? null;
+}
+
+/** Every folder or file its footprint names, once each, in the manifest's
+ *  order: what its setup leaves in a workspace. */
+export function footprints(p: WorkspacePlugin): string[] {
+  const out: string[] = [];
+  for (const rel of p.detect) {
+    const slash = rel.indexOf("/");
+    const top = slash > 0 ? rel.slice(0, slash + 1) : rel;
+    if (!out.includes(top)) out.push(top);
+  }
+  return out;
 }
 
 const plural = (n: number, one: string): string => `${n} ${one}${n === 1 ? "" : "s"}`;
@@ -113,10 +124,140 @@ export function repoUrl(p: WorkspacePlugin): string | null {
   return p.repo !== null ? `https://github.com/${p.repo}` : null;
 }
 
-/** The two letters (or TeX) on the card's tile. */
-export function tileLetters(id: string): string {
-  if (id === "mycelium") return "my";
-  if (id === "agent-notes") return "an";
-  if (id === "latex") return "TeX";
-  return id.replace(/[^a-z0-9]/g, "").slice(0, 2);
+/** The two letters on the card's tile, from the plugin's name (core names no
+ *  plugin): the first two words' initials ("Agent notes" → "an"), else the
+ *  name's first two letters ("Mycelium" → "my"). */
+export function tileLetters(name: string): string {
+  const words = name.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((w) => w !== "");
+  if (words.length >= 2) return words[0][0] + words[1][0];
+  return (words[0] ?? "").slice(0, 2);
+}
+
+/** Where an installed copy came from, as the trust prompt says it. */
+export function sourceWords(p: WorkspacePlugin): string {
+  if (p.local_path !== null) return `a local build in ${p.local_path}`;
+  if (p.repo !== null) return `github.com/${p.repo}`;
+  return "an unknown source";
+}
+
+/** The trust prompt for an installed build waiting for trust (its card's
+ *  Trust): what the daemon would ask, from the card's own fields. */
+export function trustAskFor(p: WorkspacePlugin): TrustAsk {
+  return {
+    id: p.id,
+    name: p.name,
+    version: p.version,
+    source: sourceWords(p),
+    tier: p.tier,
+    caps: p.caps,
+    can: p.can,
+    grown: null,
+    from_version: null,
+    confirm: p.tier === "privileged" ? p.name : null,
+  };
+}
+
+/** The card's callout for a plugin that can't run on this host: why, in
+ *  plain words, and the one thing the user can do about it (if any). */
+export function holdWords(p: WorkspacePlugin): { text: string; action: "trust" | "allow" | null } | null {
+  const h = p.hold;
+  if (h === null) return null;
+  const who = `${p.name} ${p.version}`.trim();
+  switch (h.kind) {
+    case "untrusted":
+      return {
+        text: `${p.name} waits for your trust: nothing it adds works until you trust what it can do.`,
+        action: "trust",
+      };
+    case "blocked":
+      return h.level === "soft"
+        ? { text: `Chimaera turned ${who} off: ${h.reason}. You can switch it back on anyway.`, action: "allow" }
+        : { text: `Chimaera blocked ${who}: ${h.reason}. Update or remove it.`, action: null };
+    case "policy":
+      return { text: `Off on this host: ${h.reason}.`, action: null };
+  }
+}
+
+/** The trust prompt's title and confirm label, by what it asks for. */
+export function trustWords(ask: TrustAsk, mode: "install" | "update" | "trust"): { title: string; lead: string; confirm: string } {
+  const who = `${ask.name} ${ask.version}`.trim();
+  const grown = ask.grown !== null && ask.grown.length > 0;
+  if (mode === "update" && grown) {
+    return {
+      title: `Allow ${ask.name} to do more?`,
+      lead:
+        ask.from_version !== null
+          ? `${who} would also do things ${ask.from_version} doesn't. ${ask.from_version} keeps running until you decide.`
+          : `${who} would also do things the version you have doesn't. It keeps running until you decide.`,
+      confirm: "Allow update",
+    };
+  }
+  return {
+    title: `Trust ${ask.name}?`,
+    lead: `${who} from ${ask.source}. The Chimaera maintainers haven't verified it, so it runs only if you trust what it can do.`,
+    confirm: mode === "install" ? "Trust and install" : mode === "update" ? "Trust and update" : "Trust it",
+  };
+}
+
+const str = (v: unknown): string => (typeof v === "string" ? v : "");
+
+/** One line of the activity log, in words. */
+export function activityWords(e: ActivityEntry): string {
+  const v = str(e.version);
+  switch (e.kind) {
+    case "install":
+      return `Installed ${v}${str(e.source) !== "" ? ` from ${str(e.source)}` : ""}`;
+    case "update":
+      return `Updated to ${v}${str(e.from) !== "" ? ` (was ${str(e.from)})` : ""}`;
+    case "rollback":
+      return `Went back to ${v}${str(e.from) !== "" ? ` from ${str(e.from)}` : ""}`;
+    case "remove":
+      return "Removed from this host";
+    case "trust":
+      return e.how === "subset"
+        ? `Trusted ${v}: it asked for nothing new`
+        : e.how === "grandfathered"
+          ? "Trusted as already installed"
+          : `You trusted what ${v} can do`;
+    case "untrust":
+      return "You withdrew your trust";
+    case "blocked":
+      return `Chimaera blocked ${v}`;
+    case "allow-block":
+      return `You switched ${v} back on despite a block${str(e.reason) !== "" ? ` (${str(e.reason)})` : ""}`;
+    case "skip":
+      return `You skipped ${v}`;
+    case "job": {
+      const args = Array.isArray(e.args) ? e.args.filter((a): a is string => typeof a === "string") : [];
+      const how =
+        e.cancelled === true
+          ? "stopped"
+          : e.timed_out === true
+            ? "ran out of time"
+            : typeof e.exit === "number"
+              ? `exit ${e.exit}`
+              : "ended by a signal";
+      const secs = typeof e.duration_ms === "number" ? `, ${(e.duration_ms / 1000).toFixed(1)} s` : "";
+      return `Ran ${[str(e.program), ...args].join(" ")} (${how}${secs})`;
+    }
+    case "tool-install":
+      return `Downloaded ${str(e.tool)} ${v}${str(e.url) !== "" ? ` from ${str(e.url)}` : ""}`;
+    case "tool-install-failed":
+      return `Couldn't install ${str(e.tool)} ${v}${str(e.error) !== "" ? `: ${str(e.error)}` : ""}`;
+    case "tool-remove":
+      return `Removed its ${str(e.tool)}`;
+    default:
+      return e.kind;
+  }
+}
+
+/** When an activity entry happened: "29 Sep 2026, 14:03". */
+export function activityTime(ts: number): string {
+  return new Date(ts).toLocaleString(undefined, {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }

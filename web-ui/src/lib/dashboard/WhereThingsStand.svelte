@@ -3,29 +3,36 @@
    * "Where things stand" — the top of Knowledge on the dashboard: what is
    * waiting on the user, what changed recently (corrections and
    * supersessions first), and the handoff's next steps and blockers. Every
-   * row opens its entry in Knowledge. With no knowledge plugin it is one
-   * calm block of plain sentences — what Agent notes and Mycelium would do
-   * here — and one link, Extensions. Never a curated summary, never a
-   * rating: everything here is what the agents recorded, as written.
+   * row opens its entry in Knowledge. With no knowledge plugin active it is
+   * one calm sentence — the installed knowledge plugin's own summary, or
+   * that Extensions lists them — and one link. Core names no plugin; the
+   * words over the lists are the provider's (`labels`). Never a curated
+   * summary, never a rating: everything here is what the agents recorded,
+   * as written.
    */
   import { inlineMarkdown } from "../shared/inlineMarkdown";
   import { focusKnowledgeEntry, type Knowledge } from "../workspace/knowledge";
   import { qualifiedId } from "../knowledge/entries";
-  import { isoDay, stateLabel, waitingOnYou, whatChanged } from "../knowledge/overview";
+  import { isoDay, providerLabels, stateLabel, waitingOnYou, whatChanged } from "../knowledge/overview";
   import { knowledgeLookup } from "../knowledge/store";
+  import type { WorkspacePlugin } from "../plugins/store";
 
   interface Props {
     knowledge: Knowledge | null;
     /** A knowledge plugin is active in this workspace. */
     providerActive: boolean;
-    /** Agent notes is active here (its sentence would be news to no one). */
-    notesActive: boolean;
+    /** The installed knowledge plugin (`knowledgePlugin`), if any. */
+    provider: WorkspacePlugin | null;
     onOpenKnowledge: () => void;
     /** Open the Extensions tab. */
     onOpenExtensions: () => void;
   }
 
-  let { knowledge, providerActive, notesActive, onOpenKnowledge, onOpenExtensions }: Props = $props();
+  let { knowledge, providerActive, provider, onOpenKnowledge, onOpenExtensions }: Props = $props();
+
+  const labels = $derived(knowledge !== null ? providerLabels(knowledge) : null);
+  /** Who the lists come from, in the provider's own word. */
+  const source = $derived(labels?.source || provider?.name || "");
 
   const lookup = $derived($knowledgeLookup);
   const waiting = $derived(lookup !== null ? waitingOnYou(lookup.k, lookup.idx, 2) : null);
@@ -50,27 +57,28 @@
 <section class="stand" aria-labelledby="stand-title">
   <div class="shead">
     <span id="stand-title" class="lbl">Where things stand</span>
-    {#if providerActive && knowledge?.provider}
-      <span class="sub">from {knowledge.provider}</span>
+    {#if providerActive && source}
+      <span class="sub">from {source}</span>
       <button class="link" onclick={onOpenKnowledge}>open knowledge →</button>
     {/if}
   </div>
 
   {#if !providerActive}
     <p class="quiet">
-      {#if !notesActive}Agent notes lets your agents leave each other findings and blockers on the Timeline.{" "}{/if}Mycelium
-      lets this project remember what was learned and why. {notesActive ? "It is" : "Both are"} optional, in
+      {#if provider !== null}{provider.summary}
+        {provider.name} is off in this workspace; switch it on in{:else}A knowledge plugin lets this project remember what
+        your agents learned and why. Find one in{/if}
       <button class="link inline" onclick={onOpenExtensions}>Extensions</button>.
     </p>
   {:else if knowledge === null || lookup === null}
     <p class="empty">loading…</p>
   {:else if !hasContent}
-    <p class="empty">Nothing recorded this week — agents record findings, decisions and learnings as they work.</p>
+    <p class="empty">Nothing recorded this week. Entries appear here as your agents record them.</p>
   {:else}
     <div class="card" class:two={next.length > 0 || blocker !== null}>
       <div class="findings">
         {#if waiting !== null && waiting.items.length > 0}
-          <div class="lbl small">Waiting on you</div>
+          <div class="lbl small">{labels?.sections.asks}</div>
           {#each waiting.items as w, i (i)}
             <button
               class="frow"

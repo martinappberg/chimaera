@@ -1,283 +1,321 @@
-# LaTeX and Typst reports: the plan
+# LaTeX and Typst: the first plugins on the platform
 
-Dated 2026-09-25, revised 2026-09-26. A plan, not a record: nothing here has
-shipped. It covers compiling LaTeX and Typst documents on the host, showing the PDF
-beside the source, jumping between the two, turning compile errors into editor marks
-an agent can fix, teaching agents to write reports here, turning markdown into a
-polished PDF and, later, Word. It was split out of the documents plan
-(`docs/document-workbench-plan.md`, since shipped as martinappberg/chimaera#159; its
-"Out of scope" section hands this effort over) and built from a read of the current
-tree (commit `f44a8b7`, re-checked at `6ae68b9` after the documents work and the
-plugin seam of martinappberg/chimaera#162 landed) plus a survey of Tectonic, TeX
-Live, latexmk, Typst, SyncTeX, pandoc and the tools that already do this (VS Code's
-LaTeX Workshop, texlab, tinymist, Overleaf's compile limits). The revision makes the
-whole effort a pair of [workbench plugins](#the-plugin-shape) on one new
-contribution point, adds [Word](#word-and-editing-what-is-not-markdown), and says
-[how plugins could live in their own
-repositories](#packaging-plugins-in-their-own-repositories). Claims about the
-current code are traced in the [appendix](#appendix-what-the-code-does-today);
+Dated 2026-09-25, revised 2026-09-26, 2026-09-28 and 2026-09-29. A plan, not a
+record: nothing here has shipped. It covers two workbench plugins, **LaTeX** and
+**Typst**: building documents on the host, showing the PDF beside the source,
+jumping between the two, turning compile errors into editor marks an agent can fix,
+showing what changed, installing a TeX Live when the host has none, teaching agents
+to write reports here, and turning markdown into a PDF. They are the first
+privileged plugins on the [plugin platform](plugin-platform-plan.md), which owns
+everything generic (screens, programs, side-program installs, output folders, data
+surfaces, change bars, trust). This plan is what is specific to LaTeX and Typst, and
+which platform pieces they use. It was split out of the documents plan
+(`docs/document-workbench-plan.md`, shipped as martinappberg/chimaera#159) and built
+from reads of the tree (last at `4b2f9a1`) plus a survey of TeX Live, latexmk,
+Tectonic, TinyTeX, Typst, SyncTeX, pandoc and the tools that already do this (VS
+Code's LaTeX Workshop, texlab, tinymist, Overleaf's compile limits). Claims about
+the current code are traced in the [appendix](#appendix-what-the-code-does-today);
 outside facts are in [sources](#sources).
+
+## Decisions
+
+**Current (maintainer, 2026-09-29): the platform route.** LaTeX and Typst are
+plugins, the first on the plugin platform, which lets plugins draw screens in the
+Chimaera format, run declared programs and install the side programs they need, with
+verified plugins installing freely and anything else needing explicit trust
+([platform decisions](plugin-platform-plan.md#decisions-maintainer-2026-09-29)).
+
+How it got here: on 2026-09-26 this plan made them plugins on a `build` contribution
+point; on 2026-09-28 the maintainer made them core document support instead, kept
+lean, because the plugin host then could not run programs, draw screens or wait for a
+build; on 2026-09-29 the maintainer chose to grow the plugin host into a platform that
+can, so the plugins return, now with nothing LaTeX-shaped in core.
+
+Decided along the way, and still in force:
+
+1. **LaTeX builds with TeX Live through latexmk.** The host's own TeX Live always wins.
+2. **No Tectonic** (2026-09-28): a second, older LaTeX would build documents
+   differently than TeX Live does for co-authors and journals
+   ([why](#latex-the-hosts-tex-live-or-tinytex)).
+3. **One-click TeX Live through TinyTeX** (2026-09-29) where the host has none: a real,
+   current TeX Live in the home folder, now declared as the LaTeX plugin's side program
+   ([installs](#tinytex-and-typst-as-side-programs)).
+4. **Build output goes to a folder outside the repository**, capped: now the plugin's
+   output folder under the platform's quota.
+5. **Build on open and when an agent edits a file**, with a per-document switch.
+6. **TeX Live's restricted shell escape stays** as the site configured it.
+7. **Changes compare against the last commit** by default.
+8. **Typst is the recommended format for new agent reports**; LaTeX for a journal
+   template or an existing project.
+9. **Markdown to PDF starts with a small Typst template**, now an action the Typst
+   plugin adds to markdown files.
+10. **The agent tools are pre-allowed** where the plugins are on, like every plugin
+    tool.
+
+Superseded by the platform route: the core build module, `check_document` building
+`.tex` and `.typ` (the plugins bring their own tools), and the reworked Settings →
+Documents panel (each plugin's settings and tools appear in Settings → Plugins).
 
 ## The short version
 
-- **Two plugins on one build point.** LaTeX and Typst ship as workbench plugins
-  ([the plugin shape](#the-plugin-shape)): two TOML manifests on a new `build`
-  contribution point, off by default, saying on their card what they add. The
-  runner, the parsers, SyncTeX and the document view are first-party code the
-  manifests name; markdown to PDF and Word export are the third and fourth manifests
-  on the same point. Nothing changes for an agent in a workspace where neither
-  plugin is on.
-- **Compile on the host, never in the browser.** The files, the figures and the
-  agents all live on the host. The daemon runs the engine there as a small, limited
-  child process. Only the PDF crosses the tunnel, and only the pages you look at.
-- **Use the host's engines, found through the environment prelude.** LaTeX:
-  latexmk from the host's TeX Live if present, else Tectonic. (The request proposed
-  Tectonic first; its bundle is frozen at TeX Live 2022, it is XeTeX only, and its
-  biblatex needs exactly biber 2.17, so the plan
-  [recommends the flip](#the-latex-ladder).) Typst: `typst` if present. Whatever
-  `module load texlive` puts on PATH in a terminal is what compiles here. Chimaera
-  does not bundle an engine; later it offers an opt-in, visible install of Typst and
-  Tectonic, the same way it installs agent CLIs today.
-- **Source and PDF side by side.** `.tex` and `.typ` open as source | split | PDF.
-  Saving compiles (debounced, one job at a time, niced, time-limited, output capped).
-  So does an agent's write to any file of the document while it is open. Build
-  output goes to a cache folder outside the repo; the PDF lands beside the source
-  only when you ask.
-- **Errors become editor marks.** The daemon parses the log into a short list of
-  `file:line: message` diagnostics. They show as marks in the editor and a problems
-  list under the PDF. Each has **Ask agent**, which types one precise reference into
-  the agent's composer.
-- **SyncTeX both ways.** Cmd-click the PDF to open the source line; a shortcut or
-  follow-cursor highlights the source line in the PDF. Selecting PDF text makes a
-  normal `@report.tex#L120-L128 "quote"` reference, so compiled documents speak the
-  documents plan's locator grammar. Typst gets a lighter text-matching version first.
-- **Multi-file projects just work.** The main file comes from a `% !TEX root`
-  comment, a `\documentclass`, or the last build's list of inputs. Editing a chapter,
-  a `.bib` file or a figure recompiles the main document.
-- **Agents check their own work.** The chimaera MCP server every session loads
-  already carries `document_guide` (the portable markdown dialect) and
-  `check_document`. Where a build plugin is on, the guide grows an engines and
-  conventions section and a `compile_document` tool returns the errors. Agents
-  compile, fix and compile again before handing over.
-- **Markdown to PDF through Typst.** The portable markdown dialect becomes a polished
-  report PDF through a Typst template. Pandoc is optional, never required.
-- **Safe on a login node.** No unrestricted shell escape, no project Perl without
-  trust, no network except an engine fetching its own packages, hard limits on time,
-  memory, CPU priority and output size. TeX can still read any file the user can;
-  only the operating system could stop that, so the plan says so plainly.
+- **Two plugins, installed like any verified plugin.** `chimaera-plugin-latex` and
+  `chimaera-plugin-typst`, each its own repository, pinned in `plugins/plugins.lock`.
+  Opening a `.tex` or `.typ` file where the plugin is missing offers "Install the LaTeX
+  plugin (verified)" in one click.
+- **Privileged, and says so.** Both run programs, so their cards list exactly which
+  ("Runs on this host: latexmk, pdflatex, xelatex, lualatex, bibtex, biber, tlmgr"),
+  what reaches the network ("tlmgr: CTAN mirrors") and what they may download
+  ("TinyTeX 2026.09, 152 MB"). The maintainers review every release, and the artifacts
+  it pins, before the lock pins it.
+- **Your engines first, then one click.** LaTeX uses the host's TeX Live (whatever
+  `module load texlive` puts on PATH in a terminal), else the plugin's TinyTeX. Typst
+  uses your `typst`, else the plugin's. The platform resolves programs; the user's copy
+  wins.
+- **Source and PDF side by side.** The plugin's file view is a split of the platform's
+  `editor` and `pdf` components. Saving builds (debounced, one job at a time, niced,
+  time-limited, output capped), and so does an agent's write to any file of the
+  document while it is open.
+- **Errors become editor marks.** The plugin parses the log and publishes
+  diagnostics; the platform draws the marks, the problems list and **Ask agent**.
+- **Missing LaTeX packages install on the spot** into the plugin's TinyTeX.
+- **Jumps both ways.** The plugin turns SyncTeX into a source map; the platform's PDF
+  component jumps with it, and selections become `@report.tex#L120-L128 "quote"`
+  references. Typst gets text matching.
+- **Multi-file projects work**: the main file from a `% !TEX root` comment, a
+  `\documentclass`, or the last build's inputs.
+- **Changes are visible** through the platform's change bars and PDF change marks,
+  against the last commit, a branch or the previous build.
+- **Agents check their own work** with the plugins' own tools, `compile_latex` and
+  `compile_typst`, which wait for the build and return the errors.
+- **Markdown to PDF** is an **Export PDF** action the Typst plugin adds to markdown
+  files.
+- **Safe on a login node**: the platform's job limits, plus the LaTeX rules (no
+  unrestricted shell escape, no project Perl without consent, the old-LuaTeX gate).
 
 ## Principles
 
-1. **Compile where the work is.** Sources, figures, bibliography and agents are on the
-   host. Moving them to the browser to compile costs tunnel bytes and leaves agents
-   unable to compile.
-2. **The host's toolchain is the truth.** The same TeX Live the user gets in a
-   terminal, through the same prelude, so a document that builds here builds for
-   their co-authors and their cluster jobs. The prelude text stays opaque: Chimaera
-   never parses it ([environment](features/environment.md)).
-3. **Never litter the repo.** Aux files, logs and PDFs live in a build cache. The repo
-   only changes when the user or an agent asks for a PDF beside the source.
-4. **The daemon stays small.** Engines are child processes under hard limits. Logs are
-   streamed and capped. SyncTeX is parsed in the browser, not in the daemon
-   ([daemon rules](../.claude/rules/daemon.md)).
+1. **Compile where the work is.** Sources, figures and agents live on the host; the
+   build runs there, and only the pages you look at cross the tunnel.
+2. **The host's toolchain is the truth.** The same TeX Live the user's terminals get,
+   through the same environment prelude, so a document builds here as it does for
+   co-authors and cluster jobs.
+3. **Nothing LaTeX-shaped in core.** Every LaTeX or Typst decision lives in the plugins.
+   Every generic piece they need (a runner, a view, a source map, change bars) is the
+   platform's, available to any plugin.
+4. **Never litter the repository.** Aux files, logs and PDFs stay in the plugin's
+   output folder until the user asks for a PDF beside the source.
 5. **Opening a file never runs project code without consent.** A project `latexmkrc`
-   is Perl; unrestricted shell escape is arbitrary commands. Both need an explicit,
-   per-workspace yes.
-6. **Not an IDE.** No language server, no completion, no refactoring
-   ([DESIGN.md](../DESIGN.md#scope-philosophy-and-non-goals)). Compile, show, jump,
-   point, fix.
-7. **One pipeline for people and agents.** The agent's `compile_document` and the
-   user's save run the same queue, the same limits and the same parser, and update the
-   same preview.
+   is Perl; unrestricted shell escape is arbitrary commands.
+6. **Not an IDE.** No language server, completion or refactoring
+   ([DESIGN.md](../DESIGN.md#scope-philosophy-and-non-goals)).
+7. **One pipeline for people and agents.** A save and an agent's `compile_latex` run
+   the same job and update the same view.
 
-## The plugin shape
+## The two plugins
 
-Since martinappberg/chimaera#162 an opt-in capability is a **workbench plugin**
-([plugins](features/plugins.md)): switched on per workspace, saying on its card in
-words what it adds, with nothing changing for an agent where it is off (pinned by
-the `agent_view` fixtures). The [plugin system plan](plugin-system-plan.md)
-(maintainer decisions of 2026-09-26) makes a plugin a Rust crate compiled to one
-portable `plugin.wasm`, run by a small host in the daemon through a pinned WIT
-interface, with first-party plugins installed from their own releases (pinned by
-`plugins/plugins.lock`) and every host call bounded. LaTeX and Typst are the first
-new plugins on it, after Agent notes and
-Mycelium prove the model. The authoring guide's earlier sketch put LaTeX on
-`commands` and `settings`, where a build is a visible terminal session; this plan
-replaces that: compile-on-save cannot be a terminal per save (a new rail entry every
-time an agent writes a chapter, no time or memory limit, no build folder), and a
-terminal cannot hand back diagnostics, an output file and sync data. So the
-plugin's contribution point is `build`: a manifest section (below) that the host
-reads, plus the LaTeX-specific logic in the plugin's own code, on top of the host's
-`exec` (WIT 0.2). Sections 1 to 7 describe what the point does.
-
-### One point, four manifests
-
-A `build` section names the files a plugin builds, the tools it needs, the command,
-the output and, by name, the first-party pieces that turn a child process into a
-document view. Everything a third party could reasonably vary is data; everything
-that must be careful on a login node is code.
+### LaTeX
 
 ```toml
 id = "latex"
 name = "LaTeX"
-summary = "Build .tex to PDF and read it beside the source, with errors as editor marks."
+version = "0.1.0"
+api = "0.2"
+summary = "Build .tex to PDF beside the source, with errors as editor marks, jumps both ways, and TeX Live on one click."
+homepage = "https://github.com/martinappberg/chimaera-plugin-latex"
 
-[build]
-sources = ["*.tex", "*.ltx"]        # what opens as a document where this plugin is on
-root = "tex"                        # named main-file finder (section 4)
-inputs = "fls"                      # named watch-set source: fls | typst-deps | none
-diagnostics = "latex-log"           # named log parser (section 2)
-sync = "synctex"                    # named source-to-PDF mapping (section 3)
-output = "{build_dir}/{stem}.pdf"
+# latexmk starts the engines and the bibliography tools itself. All are declared, so
+# the card names every program that runs and the platform reads their versions (the
+# old-LuaTeX gate needs lualatex's). The same as a [[programs]] table per entry.
+programs = [
+  { name = "latexmk", version = ["-v"] },
+  { name = "pdflatex" }, { name = "xelatex" }, { name = "lualatex" },
+  { name = "bibtex" }, { name = "biber" },
+  { name = "tlmgr", network = "CTAN mirrors (TeX Live packages)" },  # only on its TinyTeX
+  { name = "latexdiff" },                                            # the changes PDF, later
+]
+
+[access]
+files = "read"
+timeline = "none"
+sessions = "none"
+
+[[tools]]
+id = "tinytex"          # artifacts and setup steps as in the platform plan's example
+programs = ["latexmk", "pdflatex", "xelatex", "lualatex", "bibtex", "biber", "tlmgr"]
+
+[[files]]
+match = ["*.tex", "*.ltx"]
+view = "document"
 debounce_ms = 800
-wall_s = 180
 
-[[build.engines]]                   # the ladder, first found wins (section 1)
-name = "latexmk"
-tools = ["latexmk"]
-run = "latexmk -pdf -interaction=nonstopmode -file-line-error -synctex=1 -recorder -outdir={build_dir} -norc {root}"
-env = { max_print_line = "10000", TEXMFOUTPUT = "{build_dir}" }
+[[views]]
+id = "document"
+slot = "file"
 
-[[build.engines]]
-name = "tectonic"
-tools = ["tectonic"]
-run = "tectonic -X compile {root} --outdir {build_dir} --synctex --keep-logs"
-env = { TECTONIC_UNTRUSTED_MODE = "1" }
+[[views]]
+id = "trusted"          # the card section listing trusted latexmkrc files
+slot = "card"
+
+# [[settings]]: one table per row of section 9
+
+[provides]
+mcp_tools = ["compile_latex", "latex_guide"]
+surfaces = ["diagnostics", "output", "sourcemap"]
+events = ["file-saved", "file-changed", "job-finished", "settings-changed"]
 
 [adds]
-ui = [".tex opens as source | split | PDF · compile on save · errors as editor marks · Cmd-click the PDF to jump to the line"]
-agents = ["1 tool for every agent here: compile_document · document_guide learns this host's engines"]
+ui = [".tex opens as source | split | PDF · builds on save · errors as editor marks · Cmd-click the PDF to jump to the line · TeX Live on one click"]
+agents = ["compile_latex builds a document and returns its errors · latex_guide: how to write LaTeX here"]
+
+[release]
+github = "martinappberg/chimaera-plugin-latex"
 ```
 
-Typst is the same shape with `sources = ["*.typ"]`, `root = "self"`,
-`inputs = "typst-deps"`, `diagnostics = "file-line-col"`, `sync = "text"`, one engine
-(`typst compile {root} {output} --root {workspace} --diagnostic-format short --jobs 2
---deps {build_dir}/deps.json --deps-format json`) and `wall_s = 60`. Markdown to PDF
-(section 6) adds one field, `transform = "md-typst"`, a named first-party step that
-writes the Typst source the engine then builds. Word export
-([below](#word-and-editing-what-is-not-markdown)) is `pandoc {root} -o {output}` with
-`output = "{build_dir}/{stem}.docx"`, `diagnostics = "file-line-col"` and no sync.
-That is the guide's rule of two, met four times over by one point.
+### Typst
 
-| In the manifest (data) | In the plugin (Rust, compiled to WASM) | In the host (first-party, shared by every build plugin) |
-|---|---|---|
-| which files, which tools, the command and its environment, the output path, timeouts, debounce, the Adds lines | the ladder's decisions, the log parser with its fixture corpus, main-file finding, the watch set from `.fls` or Typst's deps, SyncTeX parsing, the guide paragraph, `compile_document` as a tool export | the queue and every limit (section 7), the prelude environment capture and PATH walk, `exec` itself, build folders and eviction, the events frame |
-| the engine ladder as an ordered list | the `md-typst` transform (the markdown-to-PDF plugin) | `DocumentView`, the editor marks, the problems list, **Ask agent**, the PDF swap, the diagnostics and sync JSON shapes |
+The same shape: one program, `typst`, declared with
+`network = "Typst Universe (@preview packages)"` because Typst downloads a package on
+its first import; a `typst` tool (the official static binaries per platform);
+`[[files]] match = ["*.typ"]` with `debounce_ms = 300`; an
+`[[actions]] match = ["*.md"] label = "Export PDF"`; the surfaces `diagnostics` and
+`output` (no source map: the `pdf` component matches text instead); and the tools
+`compile_typst` and `typst_guide`.
 
-The names in the manifest (`diagnostics = "latex-log"`, `sync = "synctex"`) are
-what the plugin's code answers to, not built-in capabilities of the host: the host
-knows only the JSON shapes it renders. Placeholders (`{root}`, `{build_dir}`,
-`{output}`, `{stem}`, `{workspace}`) are substituted by the host and shell-quoted,
-so a file name can never change the command. A project's own config still wins
-over the manifest (a `Tectonic.toml`, a trusted `latexmkrc`), as the guide
-requires.
+### Which platform pieces they use
 
-### What "on" means for a build plugin
-
-- **On is active.** The manifests carry no `detect` footprint, like Agent notes: an
-  agent should get `document_guide`'s engine facts *before* it writes the first
-  `.tex`, and a glob detect would need a walk. The card's **Here** line instead
-  reports what the quick-open index already knows when it is warm ("12 .tex files ·
-  latexmk 4.88 on sherlock") and never starts a walk of its own.
-- **File kinds follow the switch.** `.tex` opens as a `document` only in a workspace
-  where a build plugin claims it; elsewhere it opens as text, exactly as today.
-  `viewKindFor` consults the active plugins' `build.sources` (the plugin store's
-  reactive `workspacePlugins`), so switching the plugin off returns every `.tex` pane
-  to the plain editor.
-- **The agent tools ride only where the plugin is on.** The first draft of this plan
-  appended the documents paragraph and `compile_document` for every session. The
-  plugin rule is stricter and better: the tool and the paragraph join `tools/list`
-  and `initialize` through the existing `plugins::spawn_allow` and `tools.rs` seam
-  only in workspaces where a build plugin is active, and the `agent_view` fixtures
-  stay byte-identical. An agent in a workspace with the plugin off can still run
-  `latexmk` in a terminal; it just gets no compile tool and no engine facts.
-- **`DocumentView` is core, not a plugin view.** It is the generic view for "a file
-  with a build", parameterized by the manifest, so the specified `provides.views`
-  registry stays unbuilt for now.
-
-### What it installs
-
-Nothing silently, and by default nothing at all:
-
-| Where | What | How |
-|---|---|---|
-| Chimaera | the host, `exec`, the build runner and the document view ship in the daemon; the LaTeX logic is the plugin's `plugin.wasm`, installed on the user's click from its own release (a first-party plugin at the version `plugins/plugins.lock` pins) | the host versions with the daemon; a plugin's own version on its card |
-| the host toolchain | nothing by default; whatever the prelude provides (`module load texlive`, a `typst` in `~/.local/bin`) | detection through the prelude (section 1) |
-| managed tools (Phase F) | `typst`, `tectonic`, later `pandoc`: official release artifacts, checksums where the release publishes them, a visible shell session, never sudo, under `~/.chimaera/tools/<tool>/<version>/` | the `runtimes.rs` pattern; **Install** on the empty PDF state |
-| the agents | nothing required: the MCP tool and guide reach every agent without an install. Optional: a `report-writing` skill pack (the guide's conventions as an Agent Skill, for agents that run outside Chimaera) as a claude and codex plugin, installed through the agents' own plugin managers in a visible terminal | a new `recommends.agent_plugins` block, the shape of `requires`, shown as optional on the card, so the plugin works with zero installs |
-| the workspace | nothing: build output lives in the cache folder; the repo changes only on **Save PDF beside source** | section 2 |
+| LaTeX or Typst needs | Platform piece ([plan](plugin-platform-plan.md)) |
+|---|---|
+| run latexmk, typst, tlmgr | programs and jobs (section 6), with their limits |
+| TinyTeX and Typst binaries | tools (section 8) |
+| build folders | output folders (section 7) |
+| `.tex` opens as source and PDF | file kinds and a file view (sections 3 and 5) |
+| editor and PDF side by side | the `split`, `editor` and `pdf` components (section 3) |
+| errors in the editor | the `diagnostics/1` surface (section 4) |
+| the PDF and its status | the `output/1` surface (section 4) |
+| jumps and selections | the `sourcemap/1` surface and the `pdf` component (sections 3 and 4) |
+| build on save and on agent writes | `file-saved`, `file-changed`, host debounce, the watch set (section 5) |
+| a chosen main file, a trusted `latexmkrc` | durable state (section 7) |
+| settings | declared settings (section 9) |
+| `compile_latex` waiting for a build | long agent tools (section 6) |
+| change bars and PDF change marks | the `editor` and `pdf` components (section 3) |
+| reading big logs and SyncTeX files | `output-read` from an offset (section 7) |
+| absolute paths for `-outdir`, and mapping printed paths back | the `roots` import (section 6) |
 
 ## 1. Engines
 
 ### Finding them
 
-Detection runs lazily: the first time a `.tex` or `.typ` opens, or an agent calls a
-document tool. Never at boot, so users who never write a report pay nothing.
+The platform resolves every declared program on the PATH the user's terminals get
+(the host and workspace environment prelude, captured once per prelude change), then
+in the plugin's tools, and reports versions through `tool-state`. The plugin never
+names a path. It decides between the results.
 
-- **Through the prelude.** The daemon composes the host ⊕ workspace prelude (the
-  existing `environment::materialize_prelude` text, no launch scope), runs it once in
-  the user's login shell with stdin closed and a 15 s timeout, and captures the
-  resulting environment (`env -0`, capped at 64 KB). The fish path already does the
-  same one-shot bash capture for fish terminals. The captured environment, minus
-  Chimaera's own session variables, is what every compile runs with.
-- **Why capture instead of a login shell per compile.** A login shell plus
-  `module load texlive` can be slow on a busy login node (Phase A measures it). Paying
-  it once per prelude change, instead of on every save, keeps compile-on-save fast.
-- **Walking PATH, not `command -v`.** Same reason as Slurm detection in `compute.rs`:
-  clusters wrap tools in shell functions, and a PATH walk works the same under bash,
-  zsh and fish. Look for `tectonic`, `latexmk`, `pdflatex`, `xelatex`, `lualatex`,
-  `biber`, `bibtex`, `synctex`, `typst`, `pandoc`, and later `pdftoppm`. Each found
-  tool reports its version (`--version`, 5 s timeout, capped output).
-- **Cached** in memory per prelude text hash. A `PUT /api/v1/environment` or a
-  **Check again** click invalidates it. Nothing is persisted.
-- **Test knob.** `CHIMAERA_DOC_BINDIR` points at stand-in engines, like
-  `CHIMAERA_SLURM_BINDIR`, so the whole flow runs in CI without TeX.
+### LaTeX: the host's TeX Live, or TinyTeX
 
-### The LaTeX ladder
+For a given main file:
 
-For a given main file, first match wins:
+1. **A project `latexmkrc`** is honored, its Perl running only after the user trusts
+   it ([security](#security)).
+2. **The engine** comes from a `% !TEX program = xelatex | lualatex | pdflatex` magic
+   comment, else the workspace's setting, else pdfLaTeX.
+3. **The host's latexmk and that engine** build it. **Yours always wins**, unless the
+   workspace's setting says to use the plugin's TinyTeX (for a cluster whose TeX Live
+   is old or short of packages).
+4. **Else the plugin's TinyTeX**, once installed.
+5. **Otherwise nothing builds yet**, and the view offers the install
+   ([below](#when-there-is-no-engine)).
 
-1. **Workspace override** (`auto | latexmk | tectonic | off`), set from the document's
-   toolbar and remembered per workspace.
-2. **Project signals.** A `Tectonic.toml` at or above the main file means Tectonic's
-   project mode. A project `latexmkrc` means latexmk (its Perl runs only behind the
-   [trust gate](#security)).
-3. **Engine hints.** A `% !TEX program = xelatex | lualatex | pdflatex` magic comment
-   picks latexmk's engine flag.
-4. **latexmk** if on PATH together with the needed engine: the host's TeX Live.
-5. **Tectonic** if on PATH: the user's own, or later a Chimaera-managed one.
-6. **None** (below).
+**Why not Tectonic** (decided 2026-09-28). Tectonic is the one LaTeX small enough to
+install like an agent (a 10 MB binary that downloads packages on demand), but it is
+the wrong second LaTeX:
 
-**Why latexmk first, although the request proposed Tectonic first.** Tectonic is
-maintained (0.17.0 shipped 2026-07-27) but slowly, and its facts decide it:
-
-- Its package bundle was last updated to **TeX Live 2022**. The host's TeX Live is
-  what the user's co-authors, journal templates and cluster jobs use.
+- Its package bundle was last updated to **TeX Live 2022**, so a document can build
+  differently than for co-authors, journals and cluster jobs.
 - It is **XeTeX only**: no pdfTeX, no LuaTeX.
 - Its bundle ships **biblatex 3.17**, which needs exactly **biber 2.17**; any newer
-  biber on PATH fails (Tectonic issue 1267, open).
-- It defaults to **US letter** paper.
+  biber fails (Tectonic issue 1267, open).
+- It defaults to **US letter** paper, and its first build of a document needs the
+  network.
 
-Its advantages mostly vanish here: Chimaera puts every build in a cache folder anyway,
-so "no aux files" no longer matters, and shell escape can be turned off for latexmk
-too. What remains is decisive only where there is **no TeX Live at all**: most
-laptops and fresh cloud machines. There, a 10 MB static Tectonic binary is the best
-LaTeX available, so it is the fallback, not the default. The status chip names the
-engine, explains a failure that the other engine would avoid (a biber mismatch, a
-LuaTeX-only package), and switches in one click. Confirming the flip is
-[open decision 1](#open-decisions).
+A document that builds here should build the same way everywhere else. Where TeX Live
+is missing, TinyTeX is the answer: it *is* TeX Live, current, just trimmed.
 
-The latexmk command, run with the main file's folder as the working directory:
+**Is TeX Live common?** Mostly where LaTeX gets written, and rarely by default:
+
+- **HPC and university clusters:** usually available, as a module or a system
+  package; Settings → Environment is where `module load texlive` goes.
+- **Linux workstations and servers:** only if someone installed it. It is one
+  package-manager command with admin rights (on Debian and Ubuntu `latexmk` is its
+  own package), or TeX Live's own installer into the home folder without them.
+- **Macs:** not by default. People who write LaTeX usually have MacTeX (about 5 GB) or
+  the smaller BasicTeX.
+- **Fresh cloud machines and containers:** usually not.
+
+Hence the one-click TinyTeX: without it, a `.tex` file on a laptop or a fresh
+machine would open but never build.
+
+### When there is no engine
+
+The document still opens and edits; the result pane shows a calm empty state, drawn
+with the platform's `empty` node:
+
+- **No TeX Live on this host.** "No TeX Live on *sherlock*: Chimaera looked on the PATH
+  your terminals get, including your environment prelude." The main button is **Install
+  TeX Live (TinyTeX, about 150 MB)**, which says what it downloads and from where
+  before it runs. Beside it, quietly: "Have your own? On a cluster, load it in
+  **Environment settings**" (with a hint such as `module load texlive`, shown, never
+  written for the user), and **Check again**. When TeX Live is there but latexmk is
+  not, it names the missing package.
+- **No Typst on this host.** **Install Typst (17 MB)**, the same way.
+- **No plugin at all** (the file is `.tex`, the LaTeX plugin is not installed or not on
+  here): the platform's default viewer opens it as text, with one line above it:
+  "Install the LaTeX plugin (verified) to build this" or "Switch LaTeX on here".
+- **A PDF already sits beside the source** (`report.pdf` next to `report.tex`): show it,
+  with "built elsewhere; may be older than the source" when it is older.
+- **Agents** get the same facts from `compile_latex` (`no_engine`, what was searched,
+  how the user can fix it).
+
+### TinyTeX and Typst as side programs
+
+Both are declared downloads in the plugins' manifests, installed by the platform on a
+click ([tools](plugin-platform-plan.md#8-tools-side-programs-a-plugin-installs)).
+
+- **TinyTeX** is TeX Live, current, trimmed to the common packages, portable,
+  maintained by the RStudio (Posit) team and released about monthly. Its default bundle
+  is about 150 MB for Linux x86_64; its release page also lists Linux arm64, a musl
+  build and macOS. The manifest pins one fixed monthly release per platform, never the
+  moving `daily` tag TinyTeX's own installer uses, with a sha256 the reviewer takes from
+  the artifact (the releases publish no checksums). The setup steps add `latexmk` (and
+  biber where TeX Live ships it for the platform) with `tlmgr`. It unpacks under the
+  plugin's tools folder with no admin rights, and nothing outside that folder changes:
+  unlike TinyTeX's installer, the platform never runs `tlmgr path add` or edits PATH.
+- **Typst** is one static binary per platform (16.7 MB for Linux x86_64 at 0.15.1),
+  pinned the same way.
+- **Updates** come with plugin releases: a new TinyTeX month or Typst version is a new
+  plugin version, reviewed before the lock pins it. Within a TeX Live year, `tlmgr`
+  updates packages inside the plugin's TinyTeX; a new TeX Live year is a new bundle,
+  and the plugin re-adds the packages it installed (it keeps their list in durable
+  state).
+- **Why not in the binary:** every host would carry about 170 MB it may never use (the
+  chimaera binary is under 40 MB), and every deploy over ssh would move it. Installing
+  on the host that builds, when a document needs it, gives the same result.
+
+### The LaTeX command
+
+The plugin starts one job per build, with the main file's folder as the working
+directory:
 
 ```
 latexmk -pdf | -xelatex | -lualatex
         -interaction=nonstopmode -file-line-error -synctex=1 -recorder
-        -outdir=<build dir> -norc [-r ~/.latexmkrc] [-r <project rc, if trusted>]
+        -outdir=<out> -norc [-r ~/.latexmkrc] [-r <project rc, if trusted>]
         main.tex
 ```
 
+`<out>` is the document's build folder (`output:<key>/`,
+[below](#where-build-output-goes)) as the absolute path the platform's `roots` gives.
 Plus `max_print_line=10000`, `error_line=254`, `half_error_line=238` and
-`TEXMFOUTPUT=<build dir>` in the environment. Kpathsea lets an environment variable
+`TEXMFOUTPUT=<out>` in the job's environment. Kpathsea lets an environment variable
 override any `texmf.cnf` value, so TeX stops wrapping log lines at 79 characters (the
 main source of log-parser bugs), and `openout_any = p` allows writes into the absolute
 build folder.
@@ -289,175 +327,113 @@ build folder.
   The user's own rc is added back with `-r`; a project rc only after trust.
 - **No `-halt-on-error`** and no `-silent` (which switches to batch mode): nonstop mode
   keeps going and reports several errors, and the parser ranks the first one.
-- **No hand-driven passes.** Chimaera never runs `pdflatex`, `bibtex` or `biber` itself.
+- **No hand-driven passes.** The plugin never runs `pdflatex`, `bibtex` or `biber` itself.
   latexmk already emulates an aux folder on TeX Live (its `$emulate_aux` default),
   knows when to run biber (a `.bcf` exists) or bibtex (`\bibdata` in the `.aux`), and
   handles the output-folder quirks.
 
-Tectonic: `tectonic -X compile main.tex --outdir <build dir> --synctex --keep-logs`
-with `TECTONIC_UNTRUSTED_MODE=1` in the environment, which disables shell escape
-whatever else asks for it. Never `-Z deterministic-mode`, which breaks SyncTeX. A
-`Tectonic.toml` project uses `tectonic -X build`, which writes to the project's own
-`build/` folder (the project chose that) and has no SyncTeX flag, so those projects
-get no sync until that is checked.
+### Typst
 
-### The Typst ladder
+`typst` from the user's PATH, else the plugin's copy (0.15.1 is current):
 
-1. Workspace override.
-2. `typst` on PATH (0.15.1 is current):
+```
+typst compile main.typ <out>/main.pdf --root <workspace> --diagnostic-format short
+      --jobs 2 --deps <out>/deps.json --deps-format json
+```
 
-   ```
-   typst compile main.typ <build dir>/main.pdf --root <root> --diagnostic-format short
-         --jobs 2 --deps <build dir>/deps.json --deps-format json
-   ```
-
-   `--root` is the workspace root when the file is inside it, else the file's folder.
-   `--jobs 2` stops Typst from using every core of a 64-core login node. `--deps`
-   writes the list of files the build read, which becomes the watch set.
-3. None.
+`--root` is the workspace root, so a document can read figures and data anywhere in
+the workspace and, symlinks aside ([security](#security)), nothing outside it.
+`--jobs 2` stops Typst from using every core of a 64-core login node. `--deps` writes
+the list of files the build read, which becomes the watch set. `<out>` is as for
+LaTeX.
 
 A long-lived `typst watch` process would make recompiles near instant, but it is one
 resident process per open document on a shared node, and Typst has no memory limit of
 its own. Start with one-shot `typst compile` per save and measure a real 20-page report
-in Phase A (no published benchmark exists); reach for `watch` only if it takes over a
-second. If font discovery on a network filesystem turns out slow,
+in L1 (no published benchmark exists); reach for `watch` only if it takes over a
+second (the platform's jobs are bounded, not resident, so `watch` would need a platform
+change first). If font discovery on a network filesystem turns out slow,
 `--ignore-system-fonts` plus the project's own fonts is the knob.
 
-### When there is no engine
+### Missing LaTeX packages
 
-The document still opens and edits exactly like any text file today. The PDF side
-shows a calm empty state instead of an error:
+The most common LaTeX error on a small TeX Live is "`siunitx.sty` not found".
 
-- **No LaTeX engine on this host.** "Chimaera compiles with the tools on
-  *sherlock*. It looked for latexmk and Tectonic on the PATH your terminals get,
-  including your environment prelude." Actions: **Open Environment settings** (with a
-  hint such as `module load texlive`, shown, never written for them), **Check again**,
-  and later **Install Typst** / **Install Tectonic**.
-- **A PDF already sits beside the source** (`report.pdf` next to `report.tex`): show
-  it, with a banner "built elsewhere; may be older than the source" when its mtime is
-  older than the source's.
-- **Agents** get the same facts as text from `compile_document`
-  (`status: no_engine`, what was searched, and how the user can fix it), never a
-  failure without words.
+- **With the plugin's TinyTeX**, the build fixes it: the log parser names the missing
+  file, a `tlmgr search --global --file` job finds the package that provides it, a
+  `tlmgr install` job adds it (one package at a time, in the platform's queue, logged in
+  the plugin's activity), and the build reruns once. The status says "installed
+  siunitx". A setting turns this off, and then the error offers an **Install siunitx**
+  button instead. It needs the network; offline, the error says so.
+- **Signed packages.** The plugin asks `tlmgr` to require TeX Live's signature on its
+  package list (`--verify-repo=main`), which needs `gpg` on the host. Without `gpg`,
+  `tlmgr` can check only the packages' hashes from the same mirror, so packages then
+  install only on a click, and the button says the signature could not be checked.
+- **With the user's own TeX Live**, the plugin never changes it. The error names the
+  package and how to get it: ask the admins, load a fuller TeX Live module, or switch
+  this workspace to the plugin's TinyTeX.
+- **Agents** see the same through `compile_latex`.
 
-### Should Chimaera bundle an engine?
-
-**No, not in the binary. Yes, as an opt-in managed install later.**
-
-- **In the binary**: the static musl downloads are 16.7 MB for Typst 0.15.1 and
-  9.7 MB for Tectonic 0.17.0, compressed. Every host would carry them, including hosts
-  that never compile a report, and every deploy and update over ssh would move them.
-  Typst releases every few months, so the bundled one would also lag the user's. TeX
-  Live (several GB) is out of the question.
-- **Managed install** (Phase F): the curated-installer pattern in `runtimes.rs`
-  already installs agent CLIs from official release artifacts with checksums, as a
-  visible shell session, never with sudo. The same pattern installs `typst` and
-  `tectonic` under `~/.chimaera/tools/<tool>/<version>/`, and detection appends
-  `~/.chimaera/tools/bin` to the end of PATH, so the host's own engine always wins.
-  Typst first: one small static binary, no bundle, fast compiles. Tectonic second:
-  its bundle cache (`~/.cache/Tectonic`, moved with `TECTONIC_CACHE_DIR`) grows by
-  tens of MB per family of documents, which matters on quota'd HPC homes.
-- **A WASM engine in the browser**: rejected as the main path.
-  - typst.ts's compiler is 28 MB (11 MB gzipped), and it fetches fonts and packages
-    from the internet on top.
-  - The live LaTeX ports are heavier: TeXlyre's BusyTeX build is about 32 MB of WASM
-    plus 90 to 400 MB of TeX data (and AGPL); LibrePaper's needs an 18 MB core bundle
-    before any package. SwiftLaTeX has had no release since February 2022.
-  - Every byte crosses the tunnel into every browser, then every source file and
-    figure must follow before a cold compile.
-  - Agents on the host could not use it at all, so `compile_document` would be
-    impossible.
-
-  It could make sense for a future local-only, no-host mode; that is out of scope
-  here.
-
-## 2. The editing loop
+## 2. The document view
 
 ### Opening
 
-- `.tex`, `.ltx` and `.typ` get a new view kind, `document`, in `files.ts`
-  (`.sty`, `.cls`, `.bib` and `.bst` stay plain text). `DocumentView.svelte` hosts
-  a **source | split | PDF** toggle, like `HtmlView`'s preview | split | edit.
-- **Split** is the default when the pane is at least about 900 px wide and an engine
-  exists; otherwise **PDF**. The mode is remembered per file.
-- `SplitEditPreview.svelte` gains a three-state `show` (`editor | both | preview`)
-  so both halves stay mounted across every toggle. Today the preview half unmounts
-  when split turns off; for a PDF that means a full pdf.js re-parse.
-- LaTeX highlighting is already in the tree (`@codemirror/language-data` lazily
-  loads the legacy `stex` mode, under 2 KB gzipped). The richer Lezer LaTeX grammar
-  on npm is AGPL, so it stays out. Typst: `codemirror-lang-typst` (Apache-2.0) has a
-  WASM-free Lezer grammar for Typst 0.15 syntax at about 38 KB gzipped, loaded lazily.
-  It calls itself experimental, so pin the version; a small stream tokenizer is the
-  fallback if it breaks.
-- Opening a document with no current build compiles it once, so the PDF side is never
+- The plugin's file view is a platform `split`: the `editor` component (the shared
+  editor, its buffers, saves and merges exactly as for any file) and the `pdf`
+  component, with a **source | split | PDF** toggle, remembered per file. Split is the
+  default when the pane is wide enough and an engine exists; otherwise PDF.
+- LaTeX highlighting is already in the tree (`@codemirror/language-data`'s lazy `stex`
+  legacy mode). Typst highlighting is `codemirror-lang-typst` (Apache-2.0, a WASM-free
+  Lezer grammar, about 38 KB gzipped), loaded lazily by the editor for `.typ`; the
+  richer Lezer LaTeX grammar on npm is AGPL, so it stays out. (A grammar is a core
+  editor asset, like every other language the editor highlights.)
+- Opening a document with no current build builds it once, so the PDF side is never
   empty for long (one exception: LuaLaTeX on an old, vulnerable LuaTeX; see
-  [security](#security)). A current build in the cache is shown straight away.
+  [security](#security)). A current build in the output folder shows at once.
 
-### Compile on save
+### Building on save
 
-- **Triggers.** A save of the main file or any member file from the editor; a disk
-  change to any file in the document's watch set while the document is open (an
-  agent editing a chapter, regenerating a figure, or adding to `refs.bib`); the
-  **Build** button. Closed documents never compile in the background; only an
-  agent's explicit `compile_document` does.
-- **Debounce.** About 300 ms for Typst and 800 ms for LaTeX after the last trigger,
-  because agents often write several files in a burst.
-- **One job at a time.** A daemon-wide queue runs one compile at once. Each document
-  has at most one running job and one pending rerun; triggers during a run just mark
-  the pending flag. At most eight documents wait; beyond that a request is refused
-  with "busy". An agent's request for a document whose inputs have not changed since
-  the running job started joins that job instead of queueing another
-  (single-flight, as `git status` already does).
+- **Triggers:** `file-saved` for a claimed file; `file-changed` for any file in the
+  document's watch set while it is open (an agent editing a chapter, a regenerated
+  figure, a new `refs.bib` entry), debounced by the platform (800 ms for LaTeX, 300 ms
+  for Typst); the **Build** button; an agent's `compile_latex`.
+- **One job at a time per plugin**, in the platform's daemon-wide queue. A trigger
+  during a build sets a pending flag in the plugin's state, and the build reruns once
+  when the job finishes.
 - **No cancel on a newer save.** Killing LaTeX mid-pass leaves half-written aux files
-  and costs more than it saves. The rerun simply follows. Timeouts still kill.
-- **Auto-compile toggle** in the toolbar, on by default, remembered per document.
-- **Status chip**: `compiling…`, `built 1.2 s · 14 pages`, `2 errors · 5 warnings`,
-  `built by <agent name>` when an agent's call produced the PDF.
+  and costs more than it saves; timeouts still kill (the platform's limits: 180 s for
+  LaTeX, 60 s for Typst, both settings).
+- **A per-document switch** turns building off; **Build on open** and **Build when an
+  agent edits** are workspace settings (on).
+- **Status**, through the `output` surface: `building…`, `built 1.2 s · 14 pages`,
+  `2 errors · 5 warnings`, `built by <agent name>`.
 
 ### Where build output goes
 
-- **Default: `$XDG_CACHE_HOME/chimaera/build/<key>/`** (else `~/.cache/…`), where
-  `<key>` is a short hash of the main file's canonical path plus its stem, for
-  example `3f9a2c1e-report/`. It holds the PDF, log, aux, `.fls`, `.synctex.gz`,
-  the parsed diagnostics and the dependency list.
-- **Why not the repo:** aux litter, git noise, and agents reading stale `.aux` and
-  `.log` files as if they were sources.
-- **Why not the runtime directory:** on systemd hosts it is often RAM-backed tmpfs,
-  it is night-scrubbed, and `/tmp` on login nodes is small and node-local. A cache
-  that survives also keeps LaTeX warm: a warm latexmk rerun is often a single pass,
-  a cold one with a bibliography three or four.
-- **Bounded.** 512 MB per document and 1 GB in total by default, evicted by
-  least-recent build after each compile (a bounded walk of one folder). A setting
-  points the build root elsewhere, for example `$SCRATCH`.
-- **Getting the PDF out.** **Save PDF beside source** writes `report.pdf` next to
-  `report.tex` (atomic copy; refuses to overwrite anything that is not a PDF).
-  A per-document **keep a copy beside the source** switch (off by default) does it
-  after every good build. **Download** uses the existing download ticket.
-  `compile_document` has a `copy_to` argument for agents.
+- The plugin's output folder, `output:<key>/`, where `<key>` is a short hash of the main
+  file's path plus its stem (`3f9a2c1e-report/`). It holds the PDF, log, aux, `.fls`,
+  `.synctex.gz`, the dependency list, and a `prev/` copy of the previous good build's
+  PDF, source map and source inputs (up to 8 MB), for changes against the previous
+  build.
+- It survives restarts (a warm latexmk rerun is often a single pass) and never lands
+  in the repository. The platform's quota applies (1 GB by default), with **Clear** in
+  Settings.
+- **Save PDF beside source** is the platform's `save-to-workspace` action, on the user's
+  click; a per-document **keep a copy beside the source** switch does it after every
+  good build. **Download** uses the existing download ticket.
 
-### Refreshing the PDF, over a slow tunnel
+### Refreshing the PDF over a slow tunnel
 
-- A finished compile sends a small `/ws/events` frame
-  (`{"type":"doc","root":…,"state":…,"version":…}`, additive). The view then asks
-  for the status and the new PDF. No polling, and no fs-watch slot is spent on the
-  build folder.
-- **Swap, don't remount.** Today a new file version remounts `PdfView` (a flash,
-  and scroll restored by pixel offset although page heights may have changed).
-  `PdfView` gains an in-place reload: open the new document in the background,
-  render the visible pages offscreen, swap in one frame, keep the scroll anchored to
-  the same page and fraction, then destroy the old document.
-- **Only the pages you look at cross the tunnel.** Since martinappberg/chimaera#159
-  `PdfView` opens every document with `disableAutoFetch` and `disableStream`, so
-  pdf.js fetches byte ranges for visible pages only over `/raw`. A report with heavy
-  figures then costs roughly the visible pages' objects per rebuild instead of the
-  whole file; Phase B measures how much that saves after an in-place swap.
-- **A failed build keeps the last good PDF** with an error bar. LaTeX often produces a
-  partial PDF despite errors; **show partial output** switches to it.
+The platform's `pdf` component swaps a changed output in place (no flash, the scroll
+anchored to the same page and fraction) and loads only the byte ranges visible pages
+need, as `PdfView` already does. A failed build keeps the last good PDF with an error
+bar; **show partial output** switches to the partial PDF LaTeX often leaves.
 
 ### Errors as editor marks
 
-- **The parser is in the daemon** (it also feeds `compile_document`), in Rust,
-  streaming the log line by line with a 16 MB scan cap. It follows the TeX file
+- **The parser is the plugin's** (Rust, compiled into its component), run in the
+  `job-finished` handler. It streams the log through `output-read`, 1 MiB at a time
+  with a 16 MB scan cap, and publishes `diagnostics/1`. It follows the TeX file
   stack through parentheses, reads `-file-line-error` prefixes, and recognizes
   `! LaTeX Error`, `! Undefined control sequence` with its `l.<n>` context line,
   `Missing $ inserted`, `Runaway argument`, `Emergency stop`, missing files and
@@ -465,88 +441,73 @@ shows a calm empty state instead of an error:
   boxes, package warnings, and `biber`/`bibtex` messages from the `.blg`. Typst's
   short diagnostic format (`file:line:col: error: message`) needs almost no parsing
   and carries exact columns.
-- **Output**: at most 200 diagnostics plus counts, each
-  `{severity, file, line, column?, end_line?, message, context, origin, log_line}`,
-  with `file` relative to the main file's folder. An error inside a class or package
-  file maps to the nearest user file on the stack.
+- **Output**: the platform's `diagnostics/1` shape, at most 200 per file plus counts,
+  keyed by workspace path (the plugin maps the log's paths with `roots`). An error
+  inside a class or package file maps to the nearest user file on the stack.
 - **Heuristics are ported, not invented.** LaTeX Workshop's log parser (MIT) has
   years of edge cases: one pattern covers both the `file:line:` and the `!` error
   forms, and it tracks the file stack by counting parentheses. texlab's parser
-  re-joins lines of exactly 79 characters, which is still needed for Tectonic: it does
-  not use kpathsea, so `max_print_line` may not reach it. A shared fixture corpus of
-  real logs (pdflatex, xelatex, lualatex, Tectonic, biber, bibtex, Typst) runs in the
-  Rust suite, like `mathBlocks.fixture.json` does for math.
-- **In the editor**: `@codemirror/lint` (already a dependency, used by the settings
-  JSON editor) shows gutter marks and underlines through `CodeView`'s `extra`
-  compartment. Marks map through later edits automatically and clear on the next
-  build. Overfull and underfull boxes are hidden by default behind a filter; they are
+  re-joins lines of exactly 79 characters, kept as a fallback for a site whose
+  configuration ignores `max_print_line`. A fixture corpus of real logs (pdflatex,
+  xelatex, lualatex, biber, bibtex; Typst's in its own plugin) lives in the plugin's
+  repository and runs as a plain native `cargo test`, since the parser is ordinary
+  Rust.
+- **In the editor**: the platform's `editor` component draws them as gutter marks and
+  underlines (`@codemirror/lint`, already a dependency, used by the settings JSON
+  editor). Marks map through later edits and clear on the next publish. Overfull and
+  underfull boxes are published as `info`, hidden by default behind a filter; they are
   noise until the end.
-- **Problems list** under the PDF, grouped by file. Clicking an entry opens the file at
-  the line (the documents plan's Phase 1 "open at the spot").
-- **Special cases get plain words.** "`siunitx.sty` not found: this TeX Live does not
-  have it; load a fuller TeX Live in your prelude, or ask your admins." "biber 2.19
-  does not match biblatex 3.20; use the biber from the same TeX Live." "Package
+- **Problems list**: the platform's `diagnostics` component under the PDF, grouped by
+  file. Clicking an entry opens the file at the line (the documents plan's Phase 1
+  "open at the spot").
+- **Special cases get plain words.** A missing package is installed or explained
+  ([missing packages](#missing-latex-packages)). "biber 2.19 does not match biblatex
+  3.20; use the biber from the same TeX Live." "Package
   `@preview/cetz:0.3.4` is not cached and this host is offline."
-- **Log text is untrusted.** It contains text from the document. It is shown as text,
-  never as HTML ([web-UI rules](../.claude/rules/web-ui.md)).
+- **Log text is untrusted.** It contains text from the document. The platform's
+  components show it as text, never as HTML ([web-UI rules](../.claude/rules/web-ui.md)).
 
 ### Ask the agent to fix it
 
-- **Ask agent** on each diagnostic (hover card and problems list) types one line into
-  the current reference target, through the existing reference handler. A new pure
-  composer in `shared/reference.ts` builds it; like every composer there, it never
-  adds a newline, so it can never auto-submit:
+The platform's `diagnostics` component carries **Ask agent** on each entry: it types
+one line into the current reference target, never with a newline:
 
-  ```
-  @chapters/intro.tex#L12 LaTeX error: "Undefined control sequence \unit" at "l.12 ...\unit{mg}" (log: ~/.cache/chimaera/build/3f9a2c1e-report/report.log#L345)
-  ```
+```
+@chapters/intro.tex#L12 LaTeX error: "Undefined control sequence \unit" at "l.12 ...\unit{mg}"
+```
 
-- **Ask agent to fix all** on the status chip:
-  `Fix the 3 compile errors in @report.tex (compile_document lists them) `.
-- It works for agents that do not have the chimaera MCP server too: the path, line,
-  message and log location are all plain text any agent on the host can use.
+**Ask agent to fix all** on the status types
+`Fix the 3 compile errors in @report.tex (compile_latex lists them) `. Both work for
+agents without the plugin's tools too: the path, line and message are plain text.
 
 ## 3. Source and PDF: SyncTeX
 
-**Under the plugin model** the SyncTeX parser is the plugin's code, on the daemon,
-not a TypeScript worker in the browser: a plugin contributes no UI code, and a
-LaTeX parser in core is what the model avoids. So the first version answers jumps
-through the plugin (`query("sync", …)`, about two tunnel round trips per click) and
-the browser-side parsing below becomes the later optimisation, as a capped, generic
-sync table the plugin emits per build and the browser queries locally. The data,
-units and paths described here are unchanged either way.
+### A source map per build
 
-### Where the data comes from
+latexmk (`-synctex=1`) writes `main.synctex.gz` into the output folder. When the job
+finishes, the plugin's `job-finished` handler (30 s) streams it through
+`output-read`, decompresses as it goes (a thesis's SyncTeX can be tens of MB
+uncompressed, and the instance has 64 MiB), and reduces it to the platform's
+`sourcemap/1`: per source line, the boxes it produced on each page. It publishes the
+map, and the platform's `pdf` component answers every jump locally, in the browser, so
+a click never waits on the tunnel or on the plugin.
 
-latexmk (`-synctex=1`) and Tectonic (`--synctex`) write `main.synctex.gz` into the
-build folder. It maps typeset boxes to source file and line.
-
-### Parse it in the browser
-
-- A TypeScript SyncTeX parser runs in a Web Worker: LaTeX Workshop's `synctexjs.ts`,
-  an MIT port of synctex-js, is the starting point. It loads `main.synctex.gz` through
-  a `/raw` ticket on the first sync action, decompresses with the browser's own
-  `DecompressionStream`, and is cached per build version. LaTeX Workshop already uses
-  its JS parser alone for inverse search, because the `synctex` binary mishandles
-  some non-ASCII paths.
-- **Why the browser.** Sync must feel instant, and every daemon round trip costs about
-  two tunnel round trips ([remote perf plan](perf-remote-plan.md), F2). Parsing a
-  thesis-sized SyncTeX file would also take tens of MB of daemon memory. The `synctex`
-  command-line tool is not an option either, since Tectonic-only hosts do not have it.
-- **Cap.** Over 16 MB compressed, sync turns off with a note.
-- **Units and paths.** The file stores scaled points plus a unit and offsets from its
-  preamble; there are 65,781.76 scaled points to a PDF point, and SyncTeX measures
-  from the page's top left while PDF measures from the bottom left. Input paths are as
-  the engine saw them (Tectonic writes absolute paths since 0.8.1); they are
-  normalized against the main file's folder and mapped to workspace paths.
+- **The format.** The file stores scaled points plus a unit and offsets from its
+  preamble; there are 65,781.76 scaled points to a PDF point, and SyncTeX measures from
+  the page's top left while PDF measures from the bottom left. Input paths are as the
+  engine saw them, absolute or relative; the plugin maps them to workspace paths.
+  LaTeX Workshop's `synctexjs.ts` (MIT, a port of synctex-js) is the reference for the
+  format.
+- **Cap.** A map over the surface's 4 MiB is dropped: jumps are off for that build,
+  with a note.
 
 ### Forward: source to PDF
 
-- **Mod+J** (a new action in the keybinding registry), a toolbar button, or
-  **follow cursor** (off by default, debounced about 250 ms) takes the cursor's line
-  to its boxes in the PDF.
-- `PdfView` gains `showBoxes(page, boxes)`: scroll so the first box sits a third of the
-  way down if it is not already visible, then draw a translucent accent highlight that
+- **Mod+J** (the platform's jump action, bound wherever an `editor` sits beside a
+  `pdf` with a source map), a toolbar button, or **follow cursor** (off by default,
+  debounced about 250 ms) takes the cursor's line to its boxes in the PDF.
+- The `pdf` component shows the boxes: it scrolls so the first box sits a third of the
+  way down if it is not already visible, then draws a translucent accent highlight that
   fades after about 1.5 s. The page viewport's `convertToViewportPoint` turns box
   corners into screen positions, as LaTeX Workshop's viewer does, which also handles
   zoom and a non-zero MediaBox origin.
@@ -556,8 +517,8 @@ build folder. It maps typeset boxes to source file and line.
 - **Cmd/Ctrl-click** on the PDF (a plain click stays text selection) maps page, x and y
   to file, line and, when SyncTeX knows it, column. The editor half of the split
   jumps there and flashes the line. A line in another member file opens that file at
-  the line (documents plan Phase 1); once the documents plan's buffer store exists,
-  the split's editor can switch to that file in place without losing unsaved text.
+  the line (documents plan Phase 1), or the split's editor switches to it in place
+  without losing unsaved text (the documents plan's buffers outlive views).
 - **Staleness.** SyncTeX describes the last build. The editor keeps the changes made
   since that build and maps line numbers through them, so a jump lands right even
   before the next compile.
@@ -581,27 +542,27 @@ build folder. It maps typeset boxes to source file and line.
 
 Typst writes no SyncTeX, and its PDF carries no source map. The mapping lives inside
 the compiler: the `typst-ide` crate's `jump_from_click` and `jump_from_cursor`, which
-tinymist's preview uses. The `typst` command line does not expose them. Three options:
+tinymist's preview uses. The `typst` command line does not expose them. The lean
+answer is the first of three options:
 
-1. **Text matching (Phase C, recommended first).** Typst prose is very close to its
-   source. Inverse: take the clicked or selected PDF text (pdf.js text layer) and find
+1. **Text matching (L2, recommended first)**, the `pdf` component's mode for an output
+   with no source map. Typst prose is very close to its source. Inverse: take the clicked or selected PDF text (pdf.js text layer) and find
    it in the member files, ignoring markup, whitespace and hyphenation; ties go to the
    file the editor shows. Forward: take the words around the cursor and find them in
    the page texts. Headings and plain paragraphs map well; math, tables and generated
-   text do not. The UI says "approximate" and never pretends otherwise. Phase C also
+   text do not. The UI says "approximate" and never pretends otherwise. L2 also
    tests whether `typst eval` (new in 0.15, replacing the deprecated `typst query`)
    can report heading positions, which would anchor the matching per section.
-2. **A small companion binary (later, decision).** Built from Typst's own crates, it
-   answers exact jump queries. Cost: it pins a Typst version separate from the host's
+2. **A small companion binary (only if text matching disappoints).** Built from
+   Typst's own crates, it answers exact jump queries. Cost: it pins a Typst version separate from the host's
    `typst`, compiles the document a second time itself, and needs updating with every
-   Typst release. Linking the compiler into the daemon instead is ruled out by the
-   memory budget.
+   Typst release. It would be one more declared program and tool of the Typst
+   plugin. Linking the compiler into the plugin's component instead is ruled out by
+   its 64 MiB memory cap.
 3. **tinymist, when the host has it.** Its preview does exact two-way jumps, but it is
    a 32 MB, long-running server with its own web preview and its own data plane. It
-   could open in the browser pane for users who already use it; it does not fit
-   `PdfView`.
-
-See [open decisions](#open-decisions).
+   could open in the browser pane for users who already use it; it does not fit the
+   platform's `pdf` component.
 
 ## 4. Multi-file projects
 
@@ -616,17 +577,16 @@ For a `.tex` file, first match wins:
    `subfiles` class names its main file in `\documentclass[../main.tex]{subfiles}`;
    the main is built by default, with **build this part alone** as an option.
 3. **The last build said so.** latexmk's `-recorder` writes a `.fls` list of every
-   file the build read. The daemon keeps a small in-memory map from file to main,
-   filled from recent builds (capped at 512 entries per workspace).
+   file the build read. The plugin keeps a map from file to main in its durable
+   state, filled from recent builds (at most 256 entries per workspace).
 4. **A bounded search.** `.tex` files with `\documentclass` in the file's folder and up
-   to two parents (at most 200 files, first 8 KB each, under the filesystem semaphore,
-   off the reactor) whose `\input`, `\include`, `\subfile` or `\import` lines name this
-   file. Exactly one match wins.
+   to two parents (at most 200 files, first 8 KB each, through the host's `list` and
+   `read`) whose `\input`, `\include`, `\subfile` or `\import` lines name this file.
+   Exactly one match wins.
 5. **Ask once.** Several candidates, or none: a small picker in the toolbar. The
-   answer is remembered per workspace in a small capped JSON file under
-   `~/.chimaera`.
-6. **Project files.** A trusted `latexmkrc`'s `@default_files`, and `Tectonic.toml`
-   projects, name their own main files.
+   answer is kept in the plugin's durable state (`state-keep`), per workspace.
+6. **Project files.** A trusted `latexmkrc`'s `@default_files` names its own main
+   files.
 
 For a `.typ` file: it is its own main unless a recent build's dependency list
 (`--deps`) or a static scan of `#include`/`#import` in its folder shows another file
@@ -637,27 +597,22 @@ A member file shows its main document's PDF, labelled "part of main.tex".
 ### Includes and figures
 
 - **The watch set** is the main document's inputs inside the workspace: the `.fls`
-  `INPUT` lines minus TeX distribution files, or Typst's dependency list. It is capped
-  at 256 paths. While the document is open, the daemon stats the set every 5 s (a
-  gentler pace than the 2 s view watcher, since the set is larger) and also reacts at
-  once to recognized agent writes (the hooks already call
-  `git::mark_path_dirty`). A change queues a recompile. This is separate from the
-  per-window fs watcher, whose 64-file cap is meant for visible views.
+  `INPUT` lines minus TeX distribution files, or Typst's dependency list. The plugin
+  registers it with the platform's `watch` (at most 256 paths). The platform sweeps it
+  every 5 s while the document is open, delivers an agent's write at once, and
+  debounces both; a change queues a rebuild.
 - **Figures** resolve relative to the main file's folder, which is the working
   directory, plus any `\graphicspath`. EPS figures need `repstopdf` through restricted
   shell escape; agents are told to write PDF or PNG instead.
 - **`\include` with an output folder** needs matching subfolders in it; latexmk
-  handles this, and the runner creates them from the last `.fls` if needed.
+  handles this.
 
 ### Bibliography
 
 - **LaTeX**: latexmk decides between bibtex and biber on its own (from the `.aux` or
-  `.bcf`) and reruns as needed. Chimaera adds only diagnostics from the `.blg`, and the
+  `.bcf`) and reruns as needed. The plugin adds only diagnostics from the `.blg`, and the
   plain-words message for the most common HPC failure: a biber (often from conda)
   that does not match the TeX Live's biblatex.
-- **Tectonic** runs bibtex itself (ported to Rust in 0.15). biblatex documents need an
-  external biber, and its bundled biblatex 3.17 accepts only biber 2.17; with any
-  other biber the chip offers latexmk.
 - **Typst** reads `.bib` (BibLaTeX) or Hayagriva `.yml` natively with
   `#bibliography("refs.bib")`. No extra tool, no extra pass. One more reason to
   recommend Typst for new reports.
@@ -666,183 +621,153 @@ A member file shows its main document's PDF, labelled "part of main.tex".
 
 ## 5. Agent awareness
 
-Every Claude and Codex session Chimaera spawns already loads the chimaera MCP server
-(`mcp.rs`). Since martinappberg/chimaera#159 its `instructions` carry a documents
-paragraph, and every tier has `document_guide` (the portable markdown dialect) and
-`check_document`. It is the one channel that reaches every agent without touching
-the repository. This plan adds to it only where a build plugin is on
-([what "on" means](#what-on-means-for-a-build-plugin)), through the plugin seam
-(the plugin's `instructions` and `tools` exports, served by `plugins/tools.rs`).
+Where a plugin is on, its tools and its instruction paragraph reach every session in
+that workspace through the chimaera MCP server, pre-allowed at spawn, as for any
+plugin. Where it is off, agents see nothing new (the `agent_view` fixtures).
 
-### A short paragraph in the MCP instructions
-
-Appended where a build plugin is active (about 600 characters):
-
-> Chimaera documents: the user reads your reports as PDFs beside their source. For a
-> new polished report, write Typst (.typ) unless LaTeX is required (a journal
-> template, an existing .tex project). After editing a report, call
-> compile_document and fix every error it returns before you hand over. Call
-> document_guide once for this host's engines and the conventions here (main file,
-> figures, bibliography, what is not allowed).
-
-The paragraph is static. The live facts (which engines this host has) come from
-`document_guide`, because `initialize` must not trigger a login-shell detection.
-
-### `document_guide(kind?)`
-
-Extends the tool that exists: with no `kind`, or `markdown`, it returns today's
-guide unchanged; `latex` and `typst` return at most 8 KB of text:
-
-- **This host**: the engines found and their versions, and which one this workspace
-  will use (or why none, and how the user can fix it).
-- **Structure**: one main file per report; included LaTeX files start with
-  `% !TEX root = main.tex`; Typst has one `main.typ` that `#include`s the rest.
-- **Build output**: never write aux files or PDFs into the repo; the build folder is
-  managed; use `copy_to` when the user wants the PDF beside the source.
-- **Figures**: PDF for vector plots, PNG at 300 dpi or more for rasters, relative paths,
-  under `figures/`. No EPS.
-- **Paper size**: set it explicitly (`a4paper` or `letterpaper` in the class options;
-  `#set page(paper: "a4")` in Typst). Tectonic defaults to US letter, TeX Live to its
-  site setting, so leaving it out gives different PDFs on different hosts.
-- **Bibliography**: Typst `#bibliography("refs.bib")`; LaTeX biblatex with biber, or
-  natbib with bibtex, one per project.
-- **Not allowed here**: packages that need unrestricted shell escape (`svg`, TikZ
-  externalization, minted before version 3) unless the user enabled it; `\write18`;
-  absolute paths; fonts that are not on the host (use the engine's defaults); Typst
-  `@preview` packages without a pinned version, and any at all on a host without
-  network.
-- **Skeletons**: a minimal Typst report and a minimal LaTeX report that compile here.
-- **The loop**: compile, fix errors, then undefined references and citations, then
-  check the page count and figures.
-
-### `compile_document(path, engine?, copy_to?, timeout_s?)`
+### `compile_latex(path, timeout_s?)` and `compile_typst(path, timeout_s?)`
 
 - `path` may be any member file; the main file is found as in
-  [section 4](#finding-the-main-file). Relative paths resolve against the agent's
-  working directory, then the workspace root.
-- **Waits for the result**, up to `timeout_s` (default: the engine's wall limit, 180 s
-  for LaTeX and 60 s for Typst; cap 600), joining a running job for the same inputs
-  instead of starting a second one.
-- **Returns text, at most 8 KB**: `status` (`ok`, `errors`, `failed`, `timeout`,
-  `no_engine`, `busy`), engine and version, main file, PDF path, pages, size and
-  duration; up to 20 errors as `file:line: message` plus one context line; undefined
-  references and citations (up to 10); a count of box warnings; the log path.
-- **Updates the user's view.** Same build folder, same events frame: an open PDF
-  refreshes and the chip says which agent built it.
-- **Bounded like everything else.** Same queue, same limits, at most one pending rerun
-  per document, no shell-escape argument. `copy_to` must resolve inside the workspace
-  and may only replace a PDF.
-- **Every tier** where a build plugin is on, not Mastermind-only: every agent writes
-  reports.
+  [section 4](#finding-the-main-file). A path is relative to the workspace root, or
+  absolute inside the workspace.
+- **It runs the same build a save runs** and joins one already running for the same
+  inputs. It is a platform long tool: the plugin starts the job and returns `wait`;
+  the platform holds the agent's call until the job ends (at most about 45 s, under
+  the agents' MCP timeouts) and asks the plugin for the final answer. A longer build
+  answers `still building`, and the next call picks up the same build.
+- **It answers, at most 8 KB:** `status` (`ok`, `errors`, `failed`, `timeout`,
+  `no_engine`, `still building`), the engine and version, the main file, the PDF's
+  path, pages and size, up to 20 errors as `file:line: message` plus one context line,
+  undefined references and citations (up to 10), a count of box warnings, installed
+  packages, the pages that changed since the previous build, and the log's path.
+- **It updates the user's view**: an open PDF refreshes and the status says which agent
+  built it.
 - **Log excerpts are data.** They quote the document, which may come from an untrusted
-  repository; the tool text says so.
+  repository; the answer says so.
+
+### `latex_guide` and `typst_guide`, and the paragraph
+
+- **The paragraph** (short, where the plugin is on): "LaTeX (a plugin the user switched
+  on): the user reads your .tex as a PDF beside it. After editing, call compile_latex
+  and fix every error it returns. Call latex_guide once for this host's engines and the
+  conventions." Typst's says the same, and adds that new reports should be Typst unless
+  LaTeX is required.
+- **The guides** (at most 8 KB each): this host's engines and which one this workspace
+  uses; one main file per report, included LaTeX files starting with
+  `% !TEX root = main.tex`, Typst's one `main.typ` that `#include`s the rest; figures as
+  PDF for vector plots and PNG at 300 dpi or more, relative paths, no EPS; the paper size
+  set explicitly (TeX Live follows its site setting); one bibliography tool per project
+  (Typst's `#bibliography("refs.bib")`, or biblatex with biber, or natbib with bibtex);
+  no packages that need unrestricted shell escape (`svg`, TikZ externalization, minted
+  before version 3), no `\write18`, no absolute paths, no fonts the host lacks, Typst
+  `@preview` packages only with a pinned version; build output never written into the
+  repository; and the loop: compile, fix errors, then undefined references and
+  citations, then the page count.
+- **For agents outside Chimaera**, each plugin recommends an agent-side skill pack
+  (`[recommends.agent_plugins]`, the shipped **Agent-side plugin** box): the guide as an
+  Agent Skill, installed through the agents' own plugin managers, never required.
 
 ### Later: `render_page(path, page)`
 
-Returns one page as a PNG (MCP image content) so multimodal agents can see a figure
-running off the page or a table that overflows. Typst renders PNG itself
-(`--format png --pages N --ppi …`); LaTeX PDFs use `pdftoppm` when the host has
-it, else the tool is not offered. Caps: one page per call, about 1.5 megapixels,
-1 MB.
+One page as a PNG (MCP image content) so multimodal agents can see a figure running
+off the page. Typst renders PNG itself (`--format png --pages N --ppi …`); LaTeX PDFs
+need `pdftoppm`. Only if agents turn out to need it.
 
-## 6. Markdown to PDF
+## 6. Markdown to PDF, and Word (later)
 
-Agents write the portable markdown dialect (the documents plan, Phase 6). Some of it
-should leave as a real report: title block, page numbers, table of contents, numbered
-figures, a bibliography.
+Agents write the portable markdown dialect. Some of it should leave as a real report:
+a title block, page numbers, a table of contents, numbered figures. The answer uses
+what the Typst plugin already has, a Typst build, and adds no converter anywhere.
 
 | Option | Needs on the host | Verdict |
 |---|---|---|
 | Browser print of the reading view | nothing | Keep for "what I see"; not typeset (no running heads, no page-aware floats). |
-| pandoc to LaTeX to PDF | pandoc + TeX Live | Slow, and plain without a custom template. |
-| pandoc to Typst (`--pdf-engine=typst`, since pandoc 3.1.2) | pandoc (3.11, a 33 MB download) + typst | Good output; GitHub alerts are on by default for `gfm` input. But pandoc is rarely on HPC hosts, and its templates are a second language. Offer when present, never require. |
+| **A small Typst template that reads the markdown itself** (`cmarker` 0.1.10 for markdown, `mitex` for math) | typst 0.15 or newer | **Recommended first.** A few KB of template in the Typst plugin, no parser. Typst fetches the two pinned packages on first use and caches them. Gaps: no GitHub alerts (they read as quotes), and cmarker's raw-Typst comments must be turned off in the template. |
+| pandoc to Typst (`--pdf-engine=typst`, since pandoc 3.1.2) | pandoc (3.11, a 33 MB download) + typst | Offered when pandoc is present; GitHub alerts are on by default for `gfm` input. Never required. |
 | Quarto (`format: typst`) | Quarto (140 MB; bundles pandoc, Typst, Deno) | Too heavy to depend on. |
-| A Typst package that parses markdown inside Typst (`cmarker` 0.1.10, with `mitex` for math) | typst 0.15 or newer | Zero daemon code. But it is another parser (pulldown-cmark) with its own gaps, it has no GitHub alerts, and its raw-Typst comments are on by default and must be turned off. Good prototype. |
-| **Chimaera writes Typst from its own markdown tree** | typst | **Recommended.** |
+| A markdown-to-Typst writer in the plugin | typst | Full control and parity with the reading view, but several hundred lines of converter. Only if the template's gaps turn out to matter. |
 
-**The recommendation.** The documents plan keeps comrak (already in the daemon) as
-the reference renderer and the export path. Add a comrak-to-Typst writer for exactly
-the portable dialect:
+**Export PDF**, the Typst plugin's action on markdown files, runs one job in the
+platform's queue (`typst compile -` with the template on standard input, the
+markdown's path passed as `--input src=…`, and the workspace root as `--root`) into
+the plugin's output folder, opens the PDF beside the markdown, and offers **Save
+beside source**. Frontmatter `title`, `summary` and `updated` fill the title block;
+`template: path/to/mine.typ` picks a project's own template. On a host without
+network the first export needs the two packages pre-seeded in Typst's package cache,
+and the error says so.
 
-- Frontmatter `title`, `summary`, `status`, `audience`, `updated` fill the template's
-  title block and abstract.
-- GitHub alerts become styled callouts; tables, footnotes, task lists and code blocks
-  map one to one.
-- Math `$…$` and `$$…$$` goes through `mitex` (LaTeX math inside Typst, a WASM plugin
-  of about 185 KB). Its package files ship inside Chimaera's template bundle and are
-  passed with `--package-path`, so export never needs the network (license to confirm
-  before vendoring).
-- Every piece of text is escaped on the way out, so nothing in a markdown file can
-  inject Typst code into the template.
-- Image embeds become numbered figures with their alt text as the caption; `#page=`
-  and `#xywh=` fragments map to Typst's image options where it has them.
-- Mermaid is rendered to SVG by the browser at export time when a window is open;
-  otherwise it stays a code block with a note. (pandoc's route needs `mmdc`, a
-  headless Chromium; Typst-native Mermaid plugins exist but are not yet evaluated.)
-- Two or three curated templates (report, memo, article) ship in the binary as a few
-  KB of Typst. Frontmatter `template: path/to/mine.typ` picks a project template.
-- **Export PDF** runs through the same queue into the build folder. **Open as Typst**
-  writes the generated `report.typ` beside the markdown so the user or an agent can
-  keep going in Typst.
-- The writer is tested against the documents plan's parity corpus: every construct
-  gets a Typst snapshot.
+**Word, later, as its own plugin.** Word files open read-only today (`DocxView`). A
+small pandoc plugin, privileged like these two, would add **Export to Word**
+(`pandoc report.md -o report.docx`, with a project's `--reference-doc` when it has
+one) and **Open as markdown** for a `.docx`
+(`pandoc report.docx -t gfm --extract-media=figures`) on hosts that have pandoc.
+Editing a `.docx` in place, styles and tracked changes kept, needs an OOXML editor that
+fits neither the licence nor the footprint; it stays out.
 
 ## 7. Limits and security on a login node
 
 ### Running the engine
 
-| Limit | Default | How |
-|---|---|---|
-| Concurrency | 1 compile daemon-wide; 1 pending rerun per document; 8 documents queued | a semaphore and a small queue |
-| Priority | nice 10; idle I/O class where allowed | `setpriority` and `ioprio_set` before exec |
-| Wall time | 180 s LaTeX (Overleaf's self-hosted default), 60 s Typst; a setting, cap 600 s | a timer, then SIGTERM and SIGKILL to the whole process group |
-| CPU time | wall limit plus slack | `RLIMIT_CPU`, a backstop |
-| Memory | 4 GB address space | `RLIMIT_AS`; see below |
-| File size | 256 MB per written file | `RLIMIT_FSIZE` stops a runaway `\write` loop filling the disk |
-| Build folder | 512 MB per document, 1 GB total | checked after each build, least recent evicted |
-| Daemon memory | engine output goes to files, not pipes; the daemon reads a 64 KB tail and streams the log parse | no whole-log reads |
-| Threads | `typst --jobs 2` | leave cores for everyone else |
+Every limit but two is the platform's, the same for any plugin's job
+([programs](plugin-platform-plan.md#6-programs)). The plugins choose the wall time and
+Typst's threads.
 
-Each compile runs in its own process group (so a timeout kills latexmk and every pass
-it started), with stdin closed (so an error prompt can never wait for input), through
-Tokio's async child handling like `compute.rs`'s capped runner, so no reactor thread
-ever blocks on it.
+| Limit | Value | Who |
+|---|---|---|
+| Concurrency | one build at a time per plugin, two jobs daemon-wide; a trigger during a build reruns it once | the platform's queue; the plugin's pending flag |
+| Priority | nice 10; idle I/O class where allowed | the platform |
+| Wall time | 180 s LaTeX (Overleaf's self-hosted default), 60 s Typst; a setting, up to the platform's 600 s | the plugin asks; the platform kills the whole process group |
+| CPU time | wall limit plus slack | the platform (`RLIMIT_CPU`, a backstop) |
+| Memory | 4 GB address space | the platform (`RLIMIT_AS`); see below |
+| File size | 256 MB per written file | the platform (`RLIMIT_FSIZE` stops a runaway `\write` loop filling the disk) |
+| Build folders | 1 GB per plugin, least recently used document evicted | the platform's output quota |
+| Daemon memory | engine output goes to files, not pipes; the plugin streams the log in 1 MiB reads | no whole-log reads |
+| Threads | `typst --jobs 2` | the plugin, leaving cores for everyone else |
+
+The platform runs each job in its own process group (so a timeout kills latexmk and
+every pass it started), with stdin closed (so an error prompt can never wait for
+input), without ever blocking the daemon's reactor.
 
 **Why every limit is needed.** TeX has no time limit of its own: `\def\x{\x}\x` spins
 forever, so only the wall clock stops it. Typst stops a `while` loop after 10,000
 rounds and caps call depth, but it has **no memory limit**: an open issue shows one
 expression eating tens of GB, and another a 300-page document reaching 32 to 41 GB.
-On a shared login node that is an outage, so the memory cap is not optional. Phase A
+On a shared login node that is an outage, so the memory cap is not optional. L1
 checks that 4 GB of address space does not break normal Typst builds (its threads
-reserve address space); if it does, the fallback is a user cgroup
-(`systemd-run --user --scope -p MemoryMax=…`) where the host has user systemd, and a
-plain wall-clock limit where it does not.
+reserve address space); if it does, the job asks for the platform's fallback, a user
+cgroup (`systemd-run --user --scope -p MemoryMax=…`) where the host has user systemd,
+and a plain wall-clock limit where it does not.
 
 ### Security
 
+- **Privileged, and reviewed.** Both plugins run programs, so they are verified only at
+  versions the lock pins, after a person reviewed the release, its provenance and the
+  downloads it pins; an update that asks for more waits for the user
+  ([platform trust](plugin-platform-plan.md#2-trust-and-verification)).
 - **Treat a compile as running code.** Everything below narrows what a document can
   do; none of it makes compiling an untrusted document fully safe.
-- **Shell escape.** Unrestricted shell escape (`-shell-escape`, Tectonic's
-  `-Z shell-escape`) is off and can only be turned on by the user, per project, in the
-  UI; never by an agent and never by a file in the repo. TeX Live's own default,
+- **Shell escape.** Unrestricted shell escape (`-shell-escape`) is off and can only be
+  turned on by the user, per project, in the UI; never by an agent and never by a file
+  in the repo. TeX Live's own default,
   **restricted** shell escape, stays as the site configured it: a short list of helpers
   (`bibtex`, `kpsewhich`, `makeindex`, `repstopdf`, `latexminted` and a few more).
   Documents rely on it for EPS figures and minted code listings. That list has had
   holes (`mpost` allowed arbitrary commands until it was replaced by `r-mpost`,
-  CVE-2016-10243), which is why [open decision 4](#open-decisions) asks whether to
-  pass `-no-shell-escape` instead. Tectonic always runs with
-  `TECTONIC_UNTRUSTED_MODE=1`. Typst has no shell escape at all.
+  CVE-2016-10243); the maintainer kept the restricted default on 2026-09-28 because
+  documents rely on it. Typst has no shell escape at all.
 - **Old LuaTeX can run commands anyway.** LuaTeX 1.04 to 1.16 (TeX Live 2017 to 2022
   and the first TeX Live 2023) could run shell commands even with shell escape off
   (CVE-2023-32700) and open network sockets (CVE-2023-32668). HPC modules are often
-  old. Detection records the LuaTeX version; below 1.17.0, a LuaLaTeX document never
-  compiles on open or on an agent's write, only on the user's own save or **Build**,
-  and the chip says why.
+  old. The platform reports `lualatex`'s version; below 1.17.0, a LuaLaTeX document
+  never compiles on open, on an agent's write or for an agent's `compile_latex`, only
+  on the user's own save or **Build**, and the status (or the tool's answer) says why.
 - **Project code.** A project `latexmkrc` is Perl. It runs only after the user trusts
   it for this workspace, and the trust is tied to the file's content hash, so an edit
-  (by anyone, including an agent) asks again. Until then the build uses `-norc` plus
-  the user's own rc. The environment prelude page already calls a checked-in prelude
-  file a supply-chain vector; this is the same rule.
+  (by anyone, including an agent) asks again. The view shows a callout with the file
+  and a **Trust this latexmkrc** button; the plugin keeps the answer in its durable
+  state, bound to the hash. Until then the build uses `-norc` plus the user's own rc.
+  The environment prelude page already calls a checked-in prelude file a supply-chain
+  vector; this is the same rule.
 - **Writing files.** TeX Live's `openout_any = p` (its default, set explicitly in the
   compile environment) keeps TeX from writing dot files, climbing with `..`, or writing
   to absolute paths outside `TEXMFOUTPUT` (the build folder). Typst writes only the
@@ -853,142 +778,91 @@ plain wall-clock limit where it does not.
   documents from untrusted repositories whose PDFs get shared. Typst cannot read
   outside `--root`, except through a symlink inside the root (an open Typst issue).
   Real read confinement needs the operating system: Landlock (unprivileged, on newer
-  kernels) or bubblewrap where user namespaces work. That is a later, opt-in hardening
-  step, not a default, because many HPC kernels have neither.
+  kernels) or bubblewrap where user namespaces work. That is the platform's later,
+  opt-in hardening step, not a default, because many HPC kernels have neither
+  ([its open decisions](plugin-platform-plan.md#17-open-decisions)).
 - **Network.** TeX Live's pdfTeX and XeTeX never touch the network (old LuaTeX: see
-  above). Tectonic downloads bundle files on a cache miss and Typst downloads `@preview`
-  packages on first import; both are the engine fetching its own packages, allowed. An
-  **offline** setting (for compute nodes) passes Tectonic's `--only-cached`. Typst has
-  no offline switch, but a cached package never touches the network, and a missing one
-  on an offline host becomes a plain-words diagnostic. Chimaera does not sandbox the
-  network itself, for the same reason as reads.
-- **Environment hygiene.** Compiles get the captured prelude environment, minus the
-  daemon's own variables and anything on `api::spawn_env_remove`. No token ever reaches
-  an engine.
-- **Routes.** Every new route is bearer-authed. Build PDFs and SyncTeX files are served
-  through the existing short-lived `/raw` tickets. `copy_to` and **Save PDF beside
-  source** are confined to the workspace.
+  above). Typst downloads `@preview` packages on first import; that is the engine
+  fetching its own packages, allowed. Typst has no offline switch, but a cached package
+  never touches the network, and a missing one on an offline host becomes a
+  plain-words diagnostic. Chimaera does not sandbox the network itself, for the same
+  reason as reads; the cards say what reaches it.
+- **Installs.** TinyTeX and Typst are the plugins' declared tools: fixed releases from
+  their official release pages over HTTPS, each checked against the sha256 in the
+  reviewed manifest (TinyTeX publishes none of its own), unpacked by the platform's
+  safe unpacker under `~/.chimaera/tools/<plugin>/`, on a click, in a visible terminal,
+  never with sudo, never touching PATH. Missing packages come through `tlmgr` from TeX
+  Live's own repository, only into the plugin's TinyTeX, one bounded job per package,
+  signature-checked where the host has `gpg`.
+- **Environment hygiene.** Jobs get the platform's captured prelude environment, minus
+  the daemon's own variables and anything on `api::spawn_env_remove`. No token ever
+  reaches an engine.
+- **Routes.** The plugins add none. The platform's routes are bearer-authed, outputs
+  are served through short-lived `/raw` tickets, and **Save PDF beside source** is the
+  platform's action, confined to the workspace.
 
-## What changes where
+## 8. Changes: git differences in the source and the PDF
 
-### Daemon (`crates/chimaera-server/src/build/`, plus the plugin seam)
+Reports change in two places at once: the source an agent edits and the PDF a person
+reads. The generic machinery is the platform's, because every document plugin (and
+every text file) benefits: the `editor` component's change bars, which compare words
+within paragraphs so a rewrapped paragraph is not marked whole, and the `pdf`
+component's change marks beside the lines the bars mark
+([screens](plugin-platform-plan.md#3-screens-in-the-chimaera-format)). What the plugins
+add:
 
-| File | What |
-|---|---|
-| `plugins/latex/`, `plugins/typst/` | the two plugin crates (Rust, built to WASM), each with its `plugin.toml`; first-party plugins install from their own releases, pinned by `plugins/plugins.lock`, and a build in development installs with `chimaera plugin add --path`; the markdown-to-PDF (Phase E) and Word (Phase G) plugins later |
-| `plugins/mod.rs` | the `[build]` section of `Manifest` (`deny_unknown_fields`), the `recommends` block, the lookups the build module and the UI use |
-| `plugins/tools.rs` | nothing new: `compile_document` and the guide paragraph are the plugins' own `tools` and `instructions` exports, served through this generic seam where a build plugin is active |
-| `build/mod.rs` | routes, the events frame, the module's map line in the server `AGENTS.md` |
-| `build/engines.rs` | prelude environment capture, PATH walk, versions, the ladder from the manifest's engine list |
-| `build/job.rs` | queue, coalescing, single-flight, limits, process groups, build folders and eviction |
-| `build/root.rs` | the named main-file finders, `.fls` and Typst dependency lists, the watch set |
-| `build/latexlog.rs`, `build/typstdiag.rs` | the named parsers, with the fixture corpus |
-| `build/md2typ.rs` | the `md-typst` transform: the comrak-to-Typst writer and the embedded templates (Phase E) |
+- **The base.** A **Changes** toggle in the document's toolbar with a base picker,
+  remembered per document: **last commit** (the default when the document is in git),
+  **staged**, **a branch** (its merge base, for "what this branch changes"), **a
+  commit** from the file's history, or **the previous build**, from the `prev/` copy the
+  plugin keeps (no git needed, so it works for a report nobody has committed). The git
+  bases use the platform's `rev=` diff route and file log.
+- **Marks on the PDF.** LaTeX's source map places them; Typst's come from text
+  matching. Deleted text shows as a small mark in the margin whose hover shows the
+  removed words. The page indicator gains "3 changed pages" and ‹ › buttons.
+- **Where changes show up elsewhere.** The `output` surface carries the pages that
+  changed since the previous build; the platform shows "thesis.pdf · 3 pages changed"
+  on the Timeline turn that wrote the source, and the source-control panel's row for a
+  `.tex` or `.typ` file gains **Changes in PDF**.
+- **Pointing at a change.** Selecting inside a mark makes the usual
+  `@thesis.tex#L120-L128 "…"` reference; the hover's **Ask agent** types one capped
+  line with both sides:
+  `@thesis.tex#L120-L128 changed since HEAD: "the effect held" → "the effect held in 3 of 4 cohorts" `.
 
-New routes, all bearer-authed and additive:
+**Later, if asked for:** a side-by-side before-and-after of two builds (a second build
+of the base revision, whose inputs the platform writes into the output folder with
+`git show`), and a **changes PDF** for co-authors: a `latexdiff --flatten` job writes a
+marked-up `.tex` from the old and new sources and the same pipeline builds
+`thesis-changes.pdf`, insertions underlined and deletions struck (latexdiff stumbles on
+some tables and custom macros, and the status would say so). Typst has no latexdiff.
 
-- `GET /api/v1/doc/engines` (`?refresh=true` re-detects)
-- `POST /api/v1/doc/compile {path, reason}` → `202 {root, version}`
-- `GET /api/v1/doc/status?path=` → engine, state, PDF, SyncTeX path, counts,
-  diagnostics
-- `PUT /api/v1/doc/root {path, root}` (remember a main-file choice)
-- `POST /api/v1/doc/export {path, template?}` (markdown to PDF, Phase E)
-- `/ws/events` frame `{"type":"doc", …}`
-- MCP: `document_guide`, `compile_document`, later `render_page`
+## 9. Settings
 
-### Web UI (`web-ui/src/lib/previews/`)
+Declared in the manifests, drawn by the platform in Settings → Plugins → LaTeX (and
+Typst), searchable, and linked from each card:
 
-| File | What |
-|---|---|
-| `files.ts` | the `document` view kind, chosen from the active plugins' `build.sources` |
-| `../plugins/store.ts` | the `build` section on the wire types, and which sources are claimed in the active workspace |
-| `DocumentView.svelte` | source, split and PDF; toolbar, chip, problems list, empty states; parameterized by the manifest (core, not a plugin view) |
-| `SplitEditPreview.svelte` | the three-state `show`, both halves always mounted |
-| `PdfView.svelte` | in-place reload, ranged loading, `showBoxes`, Cmd-click and selection hooks |
-| `doc/compile.svelte.ts` | per-document status store, the events frame |
-| `doc/diagnostics.ts` | diagnostics to `@codemirror/lint` |
-| `doc/synctex.ts`, `doc/synctex.worker.ts` | the parser and its queries |
-| `doc/typstLang.ts` | lazy `codemirror-lang-typst` (Lezer grammar), stream-tokenizer fallback |
-| `../shared/reference.ts` | the compile-error composer |
-
-## Phases
-
-### Phase A: the compile service and agents (daemon only)
-
-The `build` contribution point in `plugins/mod.rs` and the latex and typst manifests
-(their cards render on the Extensions tab through the generic card, with the Adds
-lines), engine detection through the prelude, the job runner with every limit, build
-folders, main-file detection (magic comment, `\documentclass`, picker route), both
-parsers with the fixture corpus, the routes and events frame, and, where a plugin is
-on, the MCP paragraph, the `document_guide` extension and `compile_document`.
-
-Agents get value before any UI exists: they can build a report and fix it.
-
-**Verification.** Rust tests with stand-in engines (`CHIMAERA_DOC_BINDIR`): the queue,
-coalescing, single-flight, timeouts killing a whole process group, the file-size
-limit, eviction, env scrubbing, the old-LuaTeX gate; the `agent_view` fixtures
-unchanged with both plugins off, and `src/tests/plugins.rs` showing
-`compile_document` offered and callable only where one is on. Live on a real login
-node with `module load texlive` and a real `typst`: an article, a thesis-shaped `\include`
-project with biber, an infinite-loop document (the timeout), a Typst document that
-allocates without bound (the memory cap, and whether 4 GB of address space breaks
-normal Typst builds), and an agent running the compile-fix loop through MCP. Record
-the numbers the research could not find: prelude capture time, Typst time and memory
-for a 20-page report, Tectonic's memory and cache growth.
-
-### Phase B: the document view
-
-`DocumentView`, compile on open, on save, and on agent writes to the open file or
-its main file (Phase D widens this to every input), the in-place PDF swap with
-ranged loading, error marks, the problems list, **Ask agent**, the status chip, empty
-states, **Save PDF beside source**.
-
-**Verification.** Driven live in the isolated preview on Chromium and WebKit, against a
-remote daemon over a real tunnel: type, save, watch the PDF swap without a flash; let
-an agent edit a chapter and watch the PDF follow; break a macro and send the error to
-the agent. A `scripts/perf/` scenario measures bytes per rebuild of a 20 MB report.
-
-### Phase C: SyncTeX and references
-
-Both directions for LaTeX, follow cursor, selections to `@file.tex#Lx-Ly`, the text
-matching version for Typst.
-
-### Phase D: multi-file depth
-
-The watch set from `.fls` and Typst dependencies, remembered main files, the
-bibliography messages, and switching the split's editor between member files (after
-the documents plan's buffer store lands).
-
-### Phase E: markdown to PDF
-
-The comrak-to-Typst writer, the templates, `mitex` vendored after a license check, **Export PDF** and
-**Open as Typst**, pandoc as an option when present.
-
-### Phase F: installs and extras
-
-Managed Typst and Tectonic installs, the optional `report-writing` skill pack behind
-`recommends`, `render_page`, and, if chosen, the Typst jump companion.
-
-### Phase G: Word and other outputs
-
-The `docx` manifest (pandoc when present, later a managed install), **Export to
-Word** on markdown documents, **Open as markdown** for a `.docx`, and later a Marp
-deck to `.pptx` on the same point. See
-[Word](#word-and-editing-what-is-not-markdown).
-
-| Phase | What | Size |
+| Setting | Scope | Default |
 |---|---|---|
-| A | The `build` point, compile service, parsers, MCP tools | medium |
-| B | Document view, compile loop, error marks | large |
-| C | SyncTeX both ways, source references | medium |
-| D | Multi-file depth | medium |
-| E | Markdown to PDF through Typst | medium |
-| F | Managed installs, skill pack, page renders | medium |
-| G | Word export and import through pandoc | small |
+| Build when a document opens | workspace | on |
+| Build when an agent edits a document | workspace | on |
+| Engine (pdfLaTeX, XeLaTeX, LuaLaTeX) when no magic comment says | workspace | pdfLaTeX |
+| TeX Live: **automatic** (yours, else the plugin's TinyTeX) or **the plugin's TinyTeX** | workspace | automatic |
+| Install missing packages automatically (the plugin's TinyTeX only; signature-checked, so it needs `gpg`) | host | on |
+| Unrestricted shell escape (with a plain warning) | workspace | off |
+| Wall time for a build | host | 180 s (Typst 60 s) |
 
-A comes first; B needs A; C and D need B and can run in parallel. E needs only A (the
-queue) and the documents plan's comrak work. F can land any time after A. G needs A
-and B (the output opens in the split) and pandoc on the host.
+Plus the platform's own rows for every plugin: the output folder's use with **Clear**,
+the tools (TinyTeX's version and size, **Update**, **Remove**), and the activity log.
+Trusted `latexmkrc` files are listed in the plugin's card section, each with
+**Revoke**.
+
+## What lives where
+
+| Where | What |
+|---|---|
+| `chimaera-plugin-latex` (its own repository) | `src/plan.rs` (main file, engine choice, the latexmk arguments, the old-LuaTeX gate, the `latexmkrc` consent), `src/log.rs` (the log parser and its fixture corpus under `tests/logs/`, run by plain `cargo test`), `src/fls.rs` (inputs → the watch set), `src/synctex.rs` (the streaming reduction to `sourcemap/1`), `src/packages.rs` (missing packages → `tlmgr` jobs), `src/view.rs` (the file view's tree), `src/tools.rs` (`compile_latex`, `latex_guide`), `plugin.toml` with the TinyTeX artifacts, and the agent-side skill in `.claude-plugin/` and `.codex-plugin/` |
+| `chimaera-plugin-typst` (its own repository) | the same shape: the command, the short diagnostic format, `--deps`, text-matching hints, the markdown **Export PDF** action and its template, `compile_typst`, `typst_guide`, the Typst binaries in `plugin.toml` |
+| this repository | nothing LaTeX- or Typst-specific: the platform ([what changes where](plugin-platform-plan.md#14-what-changes-where)), the `codemirror-lang-typst` grammar as an editor asset, and the lock entries once the first releases are reviewed |
 
 ### How this fits the documents plan
 
@@ -1000,116 +874,134 @@ is there:
 - **Buffers that outlive views** (its Phase 0) let the split switch member files
   without losing an unsaved chapter.
 - **Embeds** (its Phase 4): an embed of `report.typ#page=2` can show the compiled
-  page once the embed card resolves a document to its build PDF (Phase D here).
+  page once the embed card reads the `output` surface to find a document's PDF (a
+  later step).
 - **Point at anything** (its Phase 5): the region box and file references work on
   compiled PDFs, with source lines attached.
-- **The dialect and `check_document`** (its Phase 6): `document_guide` exists, and
-  this plan extends it rather than starting a second guide.
+- **The dialect and `check_document`** (its Phase 6) stay markdown's. The plugins
+  bring their own tools for their formats, so `check_document` is unchanged.
 
-## Word, and editing what is not markdown
+## Phases
 
-Word documents open read-only today (`DocxView`, drawn by docx-preview inside a
-shadow root after sanitizing). "Editable Word, the way markdown works here" can mean
-three things, and only two of them fit Chimaera:
+The plugins need the platform's screens, surfaces and file kinds (its P7) and its
+programs and tools (its P8). Their own work:
 
-1. **Editing a `.docx` in place**, every style, comment and tracked change
-   preserved. That needs an OOXML editor in the browser. None fits: the open-source
-   ones are whole servers to run (ONLYOFFICE's document server, Collabora Online:
-   hundreds of MB and a service beside the daemon) or copyleft editors (SuperDoc,
-   AGPL; licence to confirm), and the permissive libraries only read (`mammoth`,
-   docx-preview) or only write (`docx`). This stays out until a library exists that
-   could ship inside a static binary's web UI.
-2. **Editing the content through markdown.** **Open as markdown** runs
-   `pandoc report.docx -t gfm --extract-media=figures -o report.md` through the same
-   runner, when pandoc is present, and opens the copy in the live markdown editor
-   that exists today, beside the original. The card says what did not survive:
-   tracked changes, comments, headers and footers, most layout. Editing from there
-   is the markdown workbench, with agents, references and embeds.
-3. **Word as an output**, like PDF. A `docx` build manifest turns a markdown
-   document into `report.docx` with pandoc, a `--reference-doc` for the house style
-   when the project has one, opened in `DocxView` beside the source and rebuilt on
-   save. Agents write the portable dialect; the collaborator gets Word.
+### L1: build, errors, agents
 
-The recommendation is 2 and 3, on the `build` point, with pandoc as an optional
-managed install (a 33 MB static binary, the same pattern as Typst). It is the
-agent-first answer: the source of truth stays a text file an agent can write and a
-diff can show, and Word is a view of it. Bringing a collaborator's edits back (their
-`.docx` to markdown, then a three-way merge against the exported version) is a later
-step on the same tools. Marp decks already render here; `marp --pptx` on the same
-point gives PowerPoint the same way, later.
+**Built and released (2026-09-29): 0.1.0 of each, pinned in `plugins/plugins.lock`; LaTeX
+0.1.1 the same day (a rebuild after a failed build runs latexmk with `-g`, so an installed
+missing package builds; the install offer names this host's download size).**
+Both plugins as repositories of their own
+([chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex),
+[chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst)), verified live against a
+headless daemon and in the browser, light and dark: the view (a status pill,
+Split / Source / PDF, Build, Save PDF, Log, **Ask agent to fix**; a notice bar only
+when something needs the user; the PDF kept through a rebuild and refreshed in
+place; the problems list for this document only), builds on open, save and agent
+edits, the LaTeX log parser against real TeX Live 2026 logs (pdfLaTeX, XeLaTeX,
+LuaLaTeX, biber) with the failing control sequence marked, Typst's diagnostics,
+parts found by `% !TEX root`, the recorder file or Typst's deps, TinyTeX and Typst
+installed on one click with progress, a missing package looked up and installed
+with `tlmgr` (verified on macOS with the network: 0.1.1 then rebuilds with `-g`), `compile_latex` / `compile_typst` and the guides. Where it differs: a
+failed build shows the partial PDF LaTeX left (no `prev/` copy yet); the user's
+`~/.latexmkrc` isn't read (`-norc` only); the old-LuaTeX gate is not built. Typst
+highlights in the editor through `codemirror-lang-typst`'s Lezer grammar
+(`web-ui/src/lib/previews/languages.ts`: its parser and editing aids in the app's
+`--syn-*` colors, not its own styles or syntax linter; about 29 KB gzipped, loaded
+for `.typ` only). A file the plugin claims where it is installed but off offers
+**Turn on** in the file bar. Verified on a Sherlock login node (2026-09-29, a musl
+daemon under `$SCRATCH`): with `module load system` and `module load texlive` (TeX Live
+2019, latexmk 4.65; the two must be separate commands there) in the host's Environment
+prelude a build runs the module's TeX Live (`from: path`), and still does once TinyTeX
+is installed; TinyTeX's Linux `.tar.xz` (152 MB, 415 MB unpacked) installed in 59 s with
+the daemon's RSS flat (110 MB before and at its peak); an endless document stopped at a
+15 s limit with nothing of its group left running. A claude and a codex session each ran
+the compile-and-fix loop (macOS, 2026-09-29).
 
-## Packaging: plugins in their own repositories
+Both plugins with the file view, building on open, save and agent writes, the output
+folder, both log parsers and their corpus, the `diagnostics` and `output` surfaces,
+**Ask agent**, `compile_latex` / `compile_typst` and the guides, TinyTeX and Typst as
+tools, missing packages, the settings, **Save PDF beside source**.
 
-Decided in the [plugin system plan](plugin-system-plan.md#packaging-and-third-parties):
-a plugin is a Rust crate in its own repository, built to one portable
-`plugin.wasm` beside its `plugin.toml`, with its agent-side pieces (skills, hooks)
-in the same repository's `.claude-plugin/` and `.codex-plugin/` so they install
-through the agents' own plugin managers. First-party plugins install from their
-own releases at the versions `plugins/plugins.lock` pins, and third-party plugins
-from theirs, into `~/.chimaera/plugins/` through the same host and limits. What
-that means here: the LaTeX and Typst plugins are their own repositories from the
-start (`chimaera-plugin-latex`, `chimaera-plugin-typst`), released like the two
-that exist, listed in `plugins/plugins.lock` so the Extensions tab offers them, and
-installed on a host only when the user asks; while one is being written it runs
-from a local build (`chimaera plugin add --path`). Nothing LaTeX-shaped lives in
-this repository. Still no code in the daemon or the UI that is not the
-host's own: a plugin cannot open a file, run a process or reach the network except
-through host calls the host bounds, and the sandbox, not a manifest review, is what
-makes a third-party plugin safe to switch on.
+**Verification.** In each plugin repository: native tests for the main-file rules, the
+engine choice, the log corpus and the Typst diagnostics. In chimaera's tests, against
+the privileged fixture: the job limits. Live, on the isolated preview over a real
+tunnel, on Chromium and WebKit: install the LaTeX plugin through its verified card;
+open a `.tex` on a machine with no TeX Live and install TinyTeX from the empty state;
+build a document that needs a package TinyTeX lacks and watch it install and rebuild;
+break a macro and send the error to an agent; let a claude and a codex session each
+run the compile-and-fix loop. On a login node with `module load texlive`: the host's
+TeX Live wins over an installed TinyTeX; a thesis-shaped `\include` project with biber
+builds; an infinite-loop document times out; a Typst document that allocates without
+bound hits the memory cap. Record what the research could not find: prelude capture
+time, Typst time and memory for a 20-page report, and both agents' MCP tool-call
+timeouts.
+
+### L2: jumps
+
+The SyncTeX reduction, the `sourcemap` surface, Cmd-click and follow-cursor, selections
+to `@file.tex#Lx-Ly`, and text matching for Typst.
+
+### L3: multi-file depth
+
+The watch set from `.fls` and Typst's deps, remembered main files in durable state, the
+bibliography messages, switching the split's editor between member files.
+
+### L4: changes
+
+The Changes toggle and its bases, the previous-build copy, the changed-pages field for
+the Timeline chip and the source-control action.
+
+### L5: markdown to PDF
+
+The Typst plugin's **Export PDF** action and template.
+
+| Phase | What | Size |
+|---|---|---|
+| L1 | Build, errors, agents, TinyTeX and Typst installs | large |
+| L2 | Jumps both ways, source references | medium |
+| L3 | Multi-file depth | small |
+| L4 | Changes | small (the platform does the heavy part) |
+| L5 | Markdown to PDF | small |
+
+L1 needs the platform's P7 and P8. L2 and L3 need L1 and can run in parallel; L4 needs
+L2 (the source map); L5 needs L1. Later, each only when asked for: before-and-after,
+the changes PDF, `render_page`, Word through a pandoc plugin, a Typst jump companion.
 
 ## Open decisions
 
-1. **Engine order on hosts with both.** The request proposed Tectonic first. The plan
-   recommends latexmk first and Tectonic as the fallback where there is no TeX Live,
-   because Tectonic's bundle is frozen at TeX Live 2022, it is XeTeX only, and it pins
-   biber 2.17 ([the evidence](#the-latex-ladder)). Confirm the flip, or keep Tectonic
-   first with the automatic exceptions and a one-click switch?
-2. **Build folder default.** `~/.cache/chimaera/build` with a 1 GB cap (recommended),
-   the runtime directory, or a scratch path?
-3. **Compile on open and on agent writes.** Recommend on for both, with the per-document
-   toggle. Or only on the user's own saves?
-4. **Restricted shell escape.** Keep TeX Live's restricted default (recommended:
-   documents rely on it for EPS figures and minted, and the site chose it), or pass
-   `-no-shell-escape` everywhere and accept those breakages for a smaller surface?
-5. **Pre-allow the document tools** in the generated agent settings, so the
-   compile-fix loop does not ask permission every time? Recommend yes for
-   `document_guide` and `compile_document`, which are bounded and cannot run shell
-   escape.
-6. **Typst jump precision.** Text matching only (recommended to start), or also build
-   and maintain a companion binary from Typst's crates for exact jumps?
-7. **Typst as the recommended format** for new agent reports in the MCP paragraph. A
-   product stance; recommend yes.
-8. **Managed installs.** Offer Typst and Tectonic installs at all? Recommend Typst yes,
-   Tectonic after measuring its cache growth on a real home quota.
-9. **Markdown to PDF.** Chimaera's own comrak-to-Typst writer (recommended), a
-   `cmarker` template, or pandoc when present?
-10. **Tools only where a build plugin is on** (recommended, the plugin rule), or the
-    documents paragraph and `compile_document` for every session as first drafted?
-11. **On is active** for build plugins (recommended: no footprint, no walk, the guide
-    before the first `.tex`), or a `detect` glob answered from the quick-open index?
-12. **Packaging.** Embedded manifests first and a plugin repository format
-    (`.chimaera-plugin/plugin.toml` beside `.claude-plugin/` and `.codex-plugin/`)
-    when a plugin has a second home (recommended), or start in a separate repository
-    from day one?
-13. **Word.** Export and import through pandoc on the build point (recommended), or
-    look again for an in-browser `.docx` editor first?
+Both were decided on 2026-09-29, as recommended:
+
+1. **The default TinyTeX bundle** (about 150 MB on Linux, the common packages already
+   in): fewer builds wait on a package download. TinyTeX-1 (about 54 MB) was the
+   smaller alternative.
+2. **Missing packages install automatically** into the plugin's TinyTeX (where the host
+   has `gpg`, so TeX Live's signature is checked): a build that fails for a missing
+   `.sty` fixes itself, which is what an agent's compile-and-fix loop needs.
+
+The platform's own open decisions (signing the revocation list, provenance,
+privileged updates only through the lock, how long 0.1 stays served, operating-system
+confinement for jobs) are in its [plan](plugin-platform-plan.md#17-open-decisions).
 
 ## Out of scope
 
-- **A language server, completion or refactoring** for LaTeX or Typst (texlab,
-  tinymist): the DESIGN.md non-goal.
-- **A WASM engine in the browser**, for the reasons above.
-- **Bundling TeX Live** or managing TeX packages (`tlmgr`). The host's admins and the
-  user's prelude own the TeX installation.
-- **Editing a `.docx` in place**, styles and tracked changes preserved: no library
-  with a fitting licence and footprint
-  ([Word](#word-and-editing-what-is-not-markdown)). Word as an output and as an
-  import is in scope (Phase G).
-- **An extension host**, or any third-party code in the daemon or the UI
-  ([packaging](#packaging-plugins-in-their-own-repositories)).
+- **LaTeX or Typst in core.** Everything specific lives in the plugins; core gets only
+  generic platform pieces.
+- **A language server, completion or refactoring** (texlab, tinymist): the DESIGN.md
+  non-goal.
+- **A WASM engine in the browser**, and **bundling** an engine in the binary.
+- **Tectonic** ([why](#latex-the-hosts-tex-live-or-tinytex)).
+- **Changing the user's own TeX Live.** The plugin installs packages only into its own
+  TinyTeX.
+- **Committing, staging or reverting from the changes views.** Git stays read-only
+  here.
+- **Editing a `.docx` in place**; Word as an output is a later pandoc plugin.
 - **Collaborative editing** of a report by several people at once.
 
 ## Appendix: what the code does today
+
+From reads of the tree (last at `4b2f9a1`). The plugin host is traced in more detail
+in the [platform plan's appendix](plugin-platform-plan.md#appendix-what-the-code-does-today).
 
 - **File kinds.** `.tex` and `.typ` fall through `viewKindFor` to `text` and open in
   `CodeView` (`web-ui/src/lib/previews/files.ts:1014`). LaTeX gets highlighting from
@@ -1136,21 +1028,37 @@ makes a third-party plugin safe to switch on.
   tier adds workspace tools. Claude gets the server through a generated
   `--mcp-config` (`agents.rs`), Codex through `-c mcp_servers.chimaera.url`
   (`launcher.rs`).
-- **Plugins.** `plugins/mod.rs` embeds the manifests (`MANIFESTS`, `:42`), parses
-  them with `deny_unknown_fields`, computes `active` (`:212`, on AND footprint
-  present, empty footprint meaning always) and `spawn_allow` (`:244`);
-  `plugins/tools.rs` serves plugin tools and instruction paragraphs where active
-  (`instructions` `:20`, `defs` `:43`, `call` `:108`). Built contribution points:
-  `detect`, `requires.agent_plugins`, `setup.prompt`, `provides.knowledge`,
-  `provides.mcp_tools`; `views`, `settings` and `commands` are specified only.
-  `agent_probe.rs` reads each installed claude plugin's `installPath` (`:310`,
-  `:794`). The UI renders any manifest generically
-  (`web-ui/src/lib/plugins/InstalledView.svelte`). (That was the tree at
-  `6ae68b9`. Since then the plugin system has replaced `MANIFESTS` and the
-  named built-ins with WASM components installed under `~/.chimaera/plugins`
-  (first-party ones from the releases `plugins/plugins.lock` pins), and
-  `plugins/tools.rs` is generic:
-  [plugin-system-plan.md](plugin-system-plan.md#status-2026-09-27).)
+- **Plugins** (at `c91b3ca`). A workbench plugin is a WASM component run by the
+  wasmtime host in `crates/chimaera-server/src/plugins/`: `runtime.rs` (one engine,
+  one instance per plugin and workspace, one call at a time, `CALL_BUDGET` 5 s and
+  `KNOWLEDGE_BUDGET` 30 s, `HOST_GRACE` 2 s, `MEMORY_CAP` 64 MiB, at most 64
+  instances, `RESULT_MAX` 256 KiB), `hostfns.rs` (the bounded imports), `tools.rs`
+  (plugin tools and paragraphs only where active: `owner`, `offered`, `call`),
+  `installed.rs` and `releases.rs` (installs from releases or directories, checksums,
+  updates, rollback). The WIT world is `chimaera:plugin@0.1.0` in
+  `crates/chimaera-plugin-api/wit/chimaera.wit`, with no process or watch import.
+  The daemon embeds `plugins/plugins.lock` and no plugin bytes; the two first-party
+  plugins live in their own repositories. `provides.views` parses and renders
+  nothing; `settings` and `commands` are not manifest keys. The Extensions tab renders
+  any manifest through `web-ui/src/lib/plugins/PluginCard.svelte`. The plugin-free
+  agent view is pinned by `crates/chimaera-server/src/tests/agent_view.rs`.
+- **Core document tools.** `mcp.rs` gives every tier `document_guide` (the fixed text
+  of `doc_guide.md`) and `check_document` (`doc_check.rs`, the same checker as the
+  reading view's issues chip, which checks any path it is given as markdown), both in
+  `ALWAYS_ALLOWED_TOOLS` with `notify`; `DOCUMENTS_INSTRUCTIONS` is the documents
+  paragraph every session gets at `initialize`.
+- **Git.** `GET /api/v1/git/diff?workspace_id=&path=&mode=` returns two full blobs for
+  `unstaged`, `staged` or `head` (each capped at 2 MB; binary detected, never sent);
+  `DiffView.svelte` diffs them in the browser with `@codemirror/merge`'s `MergeView`.
+  The same package exports `unifiedMergeView` (gutter, inline highlights, optional
+  merge controls), `goToNextChunk` and `updateOriginalDoc`. The change colors are the
+  `--git-added`, `--git-modified` and `--git-deleted` tokens. There is no route for an
+  arbitrary revision or a file's log, and a PDF in git shows as "binary".
+- **Timeline and turns.** Each agent turn is a Timeline `episode` entry that knows the
+  files the turn wrote; the chat's turn-end block shows a figure strip and file chips.
+- **PDF find.** `previews/pdfFind.ts` builds a page's text (`pageText`) and maps
+  text offsets to text-layer items (`itemRanges`), which is what the find highlights
+  use.
 - **Quick-open index.** `quickopen.rs` keeps a bounded, cached file index per
   workspace, served stale and refreshed behind, with `workspace_index_if_free` for
   callers that must never start a walk.
@@ -1171,11 +1079,11 @@ makes a third-party plugin safe to switch on.
 
 ## Sources
 
-Checked 2026-09-25. Several official doc sites were unreachable from the research
+Checked 2026-09-25 to 2026-09-29. Several official doc sites were unreachable from the research
 environment, so some facts come from the projects' source files and release pages
 instead; those links are what is cited.
 
-- **Tectonic**: [changelog](https://github.com/tectonic-typesetting/tectonic/blob/release/CHANGELOG.md)
+- **Tectonic** (why it is not supported): [changelog](https://github.com/tectonic-typesetting/tectonic/blob/release/CHANGELOG.md)
   (0.17.0, bundle history, SyncTeX paths),
   [README](https://github.com/tectonic-typesetting/tectonic/blob/master/README.md) (XeTeX
   only), [`-X compile`](https://github.com/tectonic-typesetting/tectonic/blob/master/docs/src/v2cli/compile.md)
@@ -1234,8 +1142,21 @@ instead; those links are what is cited.
   [`codemirror-lang-latex`](https://www.npmjs.com/package/codemirror-lang-latex) (AGPL),
   [`codemirror-lang-typst`](https://www.npmjs.com/package/codemirror-lang-typst).
 
-**Not verified, measured in Phase A instead**: Typst's time and memory for a
-20-page report; Tectonic's memory per compile and its official cache size; whether
-Tectonic honors `max_print_line`; whether Tectonic confines absolute-path reads; how
-long a login shell with `module load texlive` takes on a busy login node; whether
+- **Changes and conversion**: [latexdiff on CTAN](https://ctan.org/pkg/latexdiff)
+  (`--flatten`, the markup options), [mitex](https://github.com/mitex-rs/mitex) (the
+  Rust converter behind the Typst package, Apache-2.0; it converts math and basic text
+  commands, not packages or whole documents).
+- **TinyTeX**: [release repository](https://github.com/rstudio/tinytex-releases) (the
+  bundles and their sizes per platform, the release cadence, `tlmgr` for missing
+  packages; checked 2026-09-29; its homepage was unreachable from the research
+  environment), its [install script](https://github.com/rstudio/tinytex/blob/main/tools/install-bin-unix.sh)
+  (the `daily` tag, no checksum, `tlmgr path add`), and
+  [tlmgr](https://github.com/TeX-Live/installer/blob/master/texmf-dist/scripts/texlive/tlmgr.pl)
+  (package hashes, `--verify-repo`, signatures only with `gpg`).
+- **The platform** these plugins stand on: the [plugin platform plan](plugin-platform-plan.md)
+  and its [sources](plugin-platform-plan.md#sources) (Zed, VS Code, browser extensions,
+  JetBrains, Raycast, Adaptive Cards, attestations, installers).
+
+**Not verified, measured in L1 instead**: Typst's time and memory for a
+20-page report; how long a login shell with `module load texlive` takes on a busy login node; whether
 `typst eval` can report heading positions.

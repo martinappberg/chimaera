@@ -67,8 +67,9 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   [Timeline](timeline-and-knowledge.md#the-timeline) past this viewer's last look.
 - **How it's used.** Rows (the shared `workspace/TimelineRow.svelte` anatomy: the user's
   prompt as headline, the agent's first real sentence as result, evidence) grouped per
-  session, **bad news first** (failed commands and jobs, crashes, errored turns, contradicted
-  findings — `workspace/timelineModel.ts`), ≤8 rows, then "open timeline →" for the rest;
+  session, **bad news first** (failed commands and jobs, crashes, errored turns, and entries
+  whose status the knowledge provider's own words call bad — `workspace/timelineModel.ts`,
+  `knowledgeBadStatus`), ≤8 rows, then "open timeline →" for the rest;
   empty is one line ("Nothing new since 14:02"). A turn the daemon started itself after a
   transfer or a restart shows the short line the chat's divider uses ("Continued in the cloud",
   "Back on your computer") instead of quoting the agent-facing pick-up text, and a project whose
@@ -83,15 +84,14 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
 ## Where things stand
 
 - **What & when.** "Where is the project?" — the top of
-  [Knowledge](timeline-and-knowledge.md#knowledge): contradicted findings first, then the
-  strongest with mycelium's confidence ladder, the next steps and a warn-toned blocker from
-  the handoff; "open knowledge →".
-- **Key behaviors.** Without a structured provider it is one calm block of plain sentences,
-  never in the way: "Agent notes lets your agents leave each other findings and blockers on the
-  Timeline. Mycelium lets this project remember what was learned and why. Both are optional, in
-  Extensions." — the Agent notes sentence left out where Agent notes is already active — with
+  [Knowledge](timeline-and-knowledge.md#knowledge): what is waiting on you, what was
+  recorded recently (corrections and supersessions first), the next steps and a warn-toned
+  blocker from the handoff, headed "from <the provider's own name>"; "open knowledge →".
+- **Key behaviors.** Without an active knowledge provider it is one calm sentence, never in
+  the way: the installed knowledge plugin's own summary and that it is off here, or, with none
+  installed, that a knowledge plugin lets the project remember what its agents learned — with
   one link, **Extensions**, which opens that tab ([plugins.md](plugins.md#workbench-plugins)).
-  Hidden on a daemon without a knowledge route.
+  Core names no plugin here. Hidden on a daemon without a knowledge route.
 
 ## Now (the roster line)
 

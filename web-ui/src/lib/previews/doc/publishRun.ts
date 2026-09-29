@@ -20,7 +20,7 @@ import { daemonPath } from "../../net/base";
  */
 import type { Parser } from "@lezer/common";
 import { LanguageDescription } from "@codemirror/language";
-import { languages } from "@codemirror/language-data";
+import { languages } from "../languages";
 import { highlightCode } from "@lezer/highlight";
 import { codeHighlight } from "../cm";
 import { basename, dirname, humanSize, safeDecodeUri, tableHeaderRow } from "../files";

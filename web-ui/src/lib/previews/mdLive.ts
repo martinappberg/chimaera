@@ -52,7 +52,7 @@ import {
   type Transaction,
 } from "@codemirror/state";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
-import { languages } from "@codemirror/language-data";
+import { languages } from "./languages";
 import type { SyntaxNode, SyntaxNodeRef, Tree } from "@lezer/common";
 import { lastRawTicketUrl, rawTicketUrl, resolveDocPath, safeDecodeUri } from "./files";
 import { placeOffset } from "./mdDoc";

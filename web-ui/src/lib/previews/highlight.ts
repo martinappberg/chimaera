@@ -1,14 +1,14 @@
 /**
  * Static syntax highlighting for read-only code blocks (notebook cells):
- * the language parsers CodeMirror already ships (`@codemirror/language-data`,
- * each loaded on first use) run once over the text, and the result is built
+ * the language parsers CodeMirror already ships, and Typst (`languages.ts`,
+ * each loaded on first use), run once over the text, and the result is built
  * as text nodes and classed spans. The classes map onto the same `--syn-*`
  * tokens and tag groups as the editor's highlight style (`cm.ts`), so a cell
  * reads like the same code opened in a tab.
  */
 
 import { LanguageDescription } from "@codemirror/language";
-import { languages } from "@codemirror/language-data";
+import { languages } from "./languages";
 import { highlightCode, tagHighlighter, tags as t } from "@lezer/highlight";
 import type { Parser } from "@lezer/common";
 

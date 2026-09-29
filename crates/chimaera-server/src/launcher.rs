@@ -855,17 +855,22 @@ fn codex_mcp_overrides(url: &str) -> [String; 4] {
 /// ride per-tool `approval_mode = "approve"` so the user's opt-in isn't
 /// re-asked on every call (the app-server ignores that key, Pass 19; the TUI
 /// is where it applies). Linked-terminal tools keep codex's default prompt.
-/// Names outside `[a-z0-9_]` can't be a bare dotted-key segment and are
-/// skipped. Live (codex 0.153.0, PROTOCOL.md Pass 35): a pre-approved tool runs with no
-/// prompt, while a linked-terminal tool still asks.
+/// A name is one dotted-key segment, so it must be a TOML bare key
+/// (`[A-Za-z0-9_-]`): plugin manifests refuse anything else (a dot would
+/// split the key), so none is skipped silently. Live (codex 0.153.0,
+/// PROTOCOL.md Pass 35): a pre-approved tool runs with no prompt, while a
+/// linked-terminal tool still asks. Codex 0.157.1 reads a capitalized,
+/// dashed segment as that tool's key too (`tools.Post-Note.approval_mode`:
+/// a bad value there is refused by that exact path, 2026-09-29).
 pub(crate) fn codex_tui_mcp_args(url: &str, approve: &[String]) -> Vec<String> {
     let mut args = codex_mcp_overrides(url).to_vec();
     for tool in approve {
         if tool.is_empty()
             || !tool
                 .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         {
+            tracing::warn!(tool = %tool, "a tool name codex can't pre-approve was skipped");
             continue;
         }
         args.push("-c".to_string());
@@ -1653,14 +1658,19 @@ mod tests {
     }
 
     /// Codex TUI plugin injection: endpoint + key-by-env, and a per-tool
-    /// approve for exactly the plugin tools; a name that can't be a bare
-    /// dotted-key segment is dropped rather than mangled into the config.
+    /// approve for exactly the plugin tools (capitals and dashes are bare
+    /// keys too); a name that can't be a bare dotted-key segment is dropped
+    /// rather than mangled into the config (manifests refuse such names).
     #[test]
     fn codex_tui_mcp_args_pre_approve_only_plugin_tools() {
         let url = "http://127.0.0.1:4200/api/v1/mcp/s-1a2b3c4d";
         let args = codex_tui_mcp_args(
             url,
-            &["knowledge_search".to_string(), "bad.name\"x".to_string()],
+            &[
+                "knowledge_search".to_string(),
+                "Post-Note".to_string(),
+                "bad.name\"x".to_string(),
+            ],
         );
         assert_eq!(
             args,
@@ -1671,6 +1681,8 @@ mod tests {
                 "mcp_servers.chimaera.bearer_token_env_var=\"CHIMAERA_MCP_KEY\"",
                 "-c",
                 "mcp_servers.chimaera.tools.knowledge_search.approval_mode=\"approve\"",
+                "-c",
+                "mcp_servers.chimaera.tools.Post-Note.approval_mode=\"approve\"",
             ]
         );
     }

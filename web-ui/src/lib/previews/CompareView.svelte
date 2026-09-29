@@ -14,7 +14,7 @@
   import { EditorView, highlightSpecialChars, lineNumbers } from "@codemirror/view";
   import { MergeView } from "@codemirror/merge";
   import { LanguageDescription, syntaxHighlighting } from "@codemirror/language";
-  import { languages } from "@codemirror/language-data";
+  import { languages } from "./languages";
   import { codeHighlight, makeCodeTheme } from "./cm";
   import { basename } from "./files";
   import { getSetting } from "../settings/store.svelte";

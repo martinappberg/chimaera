@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Exercise WASM inside the signed app's actual --daemon executable. Debug
 // binaries and cargo test don't reproduce hardened-runtime code-signing kills.
-// Requires scripts/build-plugins.sh first, or an explicit Mycelium directory.
+// Requires scripts/build-plugins.sh first, or an explicit Mycelium directory
+// holding the release plugins/plugins.lock pins (the expected answer is that
+// release's, below).
 // Usage: node scripts/smoke-macos-plugins.mjs [chimaera.app] [mycelium-directory]
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
@@ -22,6 +24,16 @@ assert.match(details.stderr, /flags=.*\bruntime\b/, 'bundle must use the hardene
 const verified = spawnSync('/usr/bin/codesign', ['--verify', '--strict', app], { encoding: 'utf8' });
 assert.equal(verified.status, 0, `bundle signature must be valid: ${verified.stderr}`);
 await readFile(join(plugin, 'plugin.wasm')); // Fail before starting a daemon if missing.
+// The Knowledge response the daemon's tests pin for this same fixture tree
+// and locked Mycelium (tests/knowledge.rs). Taking the expectations from it,
+// not from numbers of our own, keeps a fixture change and its re-bless from
+// leaving this gate stale (and every release blocked behind it).
+const pinned = JSON.parse(
+  await readFile(join(root, 'crates/chimaera-server/src/tests/fixtures/knowledge/mycelium.json'), 'utf8'),
+);
+const findings = (snapshot) =>
+  snapshot.topics.flatMap((topic) => topic.findings.map(({ key, span }) => ({ key, span })));
+assert.ok(pinned.counts.findings > 0, 'the pinned response must hold findings');
 
 const scratch = await mkdtemp(join(tmpdir(), 'chimaera-plugin-smoke-'));
 const workspaceRoot = join(scratch, 'workspace');
@@ -77,11 +89,20 @@ try {
   const started = performance.now();
   const knowledge = await api('GET', `/workspaces/${workspace.id}/knowledge`);
   assert.equal(knowledge.provider, 'mycelium');
-  assert.equal(knowledge.counts.findings, 4, 'must execute the reader and return fixture findings');
+  // Only the plugin's reader, run over the files, can produce these: every
+  // section's count, and each finding by its key at its span in its file.
+  // Not the whole response: the fields derived from mtimes (`read`, each
+  // `written_ms`) differ, as the tests pin mtimes and this copy doesn't.
+  assert.deepEqual(knowledge.counts, pinned.counts, 'must execute the reader over the whole fixture');
+  assert.deepEqual(findings(knowledge), findings(pinned), 'must return each fixture finding at its span');
   await api('GET', '/health');
   const warm = await api('GET', `/workspaces/${workspace.id}/knowledge`);
   assert.deepEqual(warm, knowledge);
-  console.log(`PASS: signed app installed Mycelium, returned 4 findings, and remained healthy (${Math.round(performance.now() - started)} ms).`);
+  console.log(
+    `PASS: signed app installed Mycelium; its reader returned the pinned fixture (${knowledge.counts.findings} findings ` +
+      `in ${knowledge.topics.length} topics, every count matching) and the daemon remained healthy ` +
+      `(${Math.round(performance.now() - started)} ms).`,
+  );
 } catch (error) {
   console.error(log.replace(/#token=[^\s]+/g, '#token=<redacted>'));
   if (daemon) console.error(`daemon exit: ${JSON.stringify(await Promise.race([exit, delay(100).then(() => 'still running')]))}`);

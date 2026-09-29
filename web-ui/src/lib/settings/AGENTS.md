@@ -87,6 +87,13 @@ checkout stays neutral until an explicit Check account succeeds with no plan for
 the same attempt; Return to plans then acknowledges and clears that attempt. The
 review is keyed by attempt, phase and plan, so unrelated account events keep it. A targeted native
 return reopens Pro, including when a new window needed time to mount.
+**Exception — Plugins.** A second, declared source beside `schema.ts`:
+`PluginsSettings.svelte` lists each installed plugin's `[[settings]]` (the
+0.2 platform, docs/plugin-platform-plan.md §9) through
+`plugins/PluginSettings.svelte`, the rows its card shows too. The daemon owns
+the values (`GET`/`PUT /api/v1/plugins/{pid}/settings`, kept per plugin
+under `<data dir>/plugins/.data/`, never `settings.json`) and checks each
+against its declaration; search matches plugin names and setting labels.
 
 **Exception — Activity.** Also store-backed and read-only: `ActivitySettings.svelte`
 shows sessions, tokens and time from the session records across every workspace
@@ -110,6 +117,7 @@ section (`requestSettingsSection`).
 | `ProSettings.svelte` | Dedicated Pro overview content: account identity, plan choices, browser checkout/portal, usage, and progressive connection/privacy/security sections; **Sign in** beside **See plans** for signed-out users; a browser sign-in that ended (`status.ts` `signInNote`) keeps the plans with one quiet line; sign-out asks first (ConfirmDialog) for **Sign out everywhere** and when a project is running in the cloud, and `sign_out_pending` reads as a quiet signed-out line. |
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
 | `agentDocs.ts` | Wire types + `getAgentDocs`/`installAgentDocs` for `/api/v1/agent-docs`. |
+| `PluginsSettings.svelte` | Settings → Plugins: every installed plugin's declared settings (see the exception above); slotted after Extensions. |
 | `ActivitySettings.svelte` | The Activity panel (see the exception above): this week's sessions and tokens + time worked, one 14-day sessions chart, by agent and model / by workspace, Export CSV. Fetches while Settings is visible and on the history nudge. |
 | `jump.ts` | `settingsJump` / `requestSettingsSection`: open Settings scrolled to a section (Quick Open "Activity", the dashboard's activity line). |
 | `UpdatesStatus.svelte` | The Updates section's status block: app / daemon / agents, each up to date, available, or couldn't check (with why), plus "check now". Reads `workspace/update.svelte.ts`; the auto-check switch below it is a schema row. |

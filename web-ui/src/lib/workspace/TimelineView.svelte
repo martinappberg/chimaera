@@ -27,6 +27,7 @@
     type TimelineFilter,
   } from "./timelineModel";
   import TimelineRow from "./TimelineRow.svelte";
+  import { knowledgeBadStatus } from "../knowledge/store";
 
   interface Props {
     dash: DashCtx;
@@ -44,7 +45,7 @@
 
   let filter = $state<TimelineFilter>("all");
 
-  const groups = $derived(groupTimeline(timelineStore.entries));
+  const groups = $derived(groupTimeline(timelineStore.entries, $knowledgeBadStatus));
   const filters = $derived(filtersPresent(groups));
   // A filter whose rows vanished (paged away, a new workspace) falls back.
   $effect(() => {

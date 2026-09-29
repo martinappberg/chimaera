@@ -215,6 +215,9 @@ pub(crate) struct AppState {
     /// merged with the installed copies under `<data_dir>/plugins`, reloaded
     /// after every install, update, rollback or remove.
     pub(crate) plugin_catalog: plugins::Catalog,
+    /// Who approved what each plugin can do, the admin policy and the kill
+    /// switch (see `plugins::trust`, `plugins::revoke`).
+    pub(crate) plugin_guard: plugins::trust::Guard,
     /// Plugin release knowledge (see `plugins::releases`): the newer
     /// versions a check found, and the one-change-at-a-time lock. Hot state.
     pub(crate) plugin_releases: plugins::releases::Releases,
@@ -228,6 +231,9 @@ pub(crate) struct AppState {
     /// What plugins keep per workspace through the host (`state-put`):
     /// 64 KiB per (plugin, workspace), in memory.
     pub(crate) plugin_state: Mutex<plugins::hostfns::PluginStates>,
+    /// The plugin platform (see `plugins::platform::Platform`): output
+    /// folders, durable plugin data, surfaces, screens, file events.
+    pub(crate) plugin_platform: plugins::platform::Platform,
     /// Hook-driven turns of claude TUIs in flight (the Timeline's hooks
     /// tier; see `episodes`). Bounded by live sessions.
     pub(crate) tui_episodes: Mutex<episodes::TuiEpisodes>,
@@ -266,6 +272,8 @@ impl AppState {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         let (chat, chat_signals_rx) = chat::new_manager(data_dir.join("chat"));
+        let plugin_catalog = plugins::Catalog::load(data_dir.join("plugins"));
+        let plugin_guard = plugins::trust::Guard::load(&plugin_catalog);
         AppState {
             token,
             started: Instant::now(),
@@ -342,11 +350,13 @@ impl AppState {
                 .join("config.toml"),
             timeline: timeline::TimelineService::new(data_dir.join("workspace")),
             history: crate::history::HistoryService::new(&data_dir),
-            plugin_catalog: plugins::Catalog::load(data_dir.join("plugins")),
+            plugin_catalog,
+            plugin_guard,
             plugin_releases: plugins::releases::Releases::default(),
             plugin_detect: Mutex::new(plugins::DetectCache::default()),
             plugin_runtime: plugins::runtime::PluginRuntime::default(),
             plugin_state: Mutex::new(plugins::hostfns::PluginStates::default()),
+            plugin_platform: plugins::platform::Platform::new(&data_dir),
             tui_episodes: Mutex::new(episodes::TuiEpisodes::default()),
             episode_queue: episodes::EpisodeQueue::default(),
             timeline_jobs_started: std::sync::atomic::AtomicBool::new(false),

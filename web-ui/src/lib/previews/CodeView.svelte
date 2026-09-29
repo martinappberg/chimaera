@@ -25,7 +25,7 @@
     bracketMatching,
     indentUnit,
   } from "@codemirror/language";
-  import { languages } from "@codemirror/language-data";
+  import { languages } from "./languages";
   import {
     codeHighlight as highlight,
     makeCodeTheme as makeTheme,
@@ -42,6 +42,9 @@
   import { clearSelection, setSelection } from "../shared/reference";
   import { revealRequest, takeReveal } from "../shared/reveal";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
+  import { workspacePlugins } from "../plugins/store";
+  import { workspaceRelative } from "../plugins/platform";
+  import { pluginMarks } from "../plugins/editorMarks";
 
   const SAVE_HINT = isMac ? "⌘S to save" : "Ctrl+S to save";
 
@@ -98,6 +101,8 @@
   const settingsCompartment = new Compartment();
   const extraCompartment = new Compartment();
   const langCompartment = new Compartment();
+  /** Active plugins' problems in this file as marks (`plugins/editorMarks`). */
+  const marksCompartment = new Compartment();
 
   // Context bridge: this view's selection, published for the reference
   // affordance + chord. The chip floats near the selection's end.
@@ -181,6 +186,30 @@
     }
   });
 
+  /** Where this file's plugin problems come from: its workspace (when a
+   *  0.2 plugin is active there) and its path in it; null draws none. */
+  const marksKey = $derived.by(() => {
+    const wp = $workspacePlugins;
+    if (wp === null || !wp.plugins.some((p) => p.active && p.api === "0.2")) return null;
+    const rel = workspaceRelative(wp.root, path);
+    return rel === null ? null : `${wp.workspace_id}\n${rel}`;
+  });
+
+  function marksExtension(key: string | null): Extension {
+    if (key === null) return [];
+    const [ws, rel] = key.split("\n");
+    return pluginMarks(ws, rel);
+  }
+
+  let lastMarks: string | null = null;
+  $effect(() => {
+    const key = marksKey;
+    if (view !== null && key !== lastMarks) {
+      lastMarks = key;
+      view.dispatch({ effects: marksCompartment.reconfigure(marksExtension(key)) });
+    }
+  });
+
   /** This view's own extensions; the buffer adds history, keymaps, search. */
   function viewExtensions(): Extension {
     return [
@@ -189,6 +218,7 @@
       // `extra` (markdown live) wins the language facet.
       extraCompartment.of((lastExtra = extra)),
       langCompartment.of(langSupport),
+      marksCompartment.of(marksExtension((lastMarks = untrack(() => marksKey)))),
       highlightSpecialChars(),
       drawSelection(),
       bracketMatching(),
@@ -340,6 +370,15 @@
   });
 
   const elsewhere = $derived(presence.elsewhere.has(buf.path));
+
+  /** Why "draft not backed up": held on purpose, or the journal failed. */
+  const unbackedWhy = $derived(
+    buf.recovered !== null
+      ? "Held back so the recovered draft above stays recoverable — restore or discard it, or save, to protect these edits."
+      : buf.lookingForDraft
+        ? "Held back while checking for an earlier unsaved draft of this file, which these edits would overwrite."
+        : "The unsaved text could not be written to the browser's storage or to the daemon — save when you can.",
+  );
 
   function recoveredWhen(ms: number): string {
     if (!Number.isFinite(ms) || ms <= 0) return "an earlier session";
@@ -507,7 +546,7 @@
       {#if buf.journalFailed}
         <span
           class="bar-warn"
-          title="The unsaved text could not be written to the browser's storage or to the daemon — save when you can."
+          title={unbackedWhy}
           >draft not backed up</span
         >
       {/if}

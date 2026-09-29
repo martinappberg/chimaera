@@ -19,6 +19,15 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
     crate::session_proxy::start(state.clone());
     // Finished Slurm jobs → the Timeline (idempotent; idle without a queue).
     crate::episodes::spawn_jobs_task(state.clone());
+    // Plugins' file events and watch sweep (idle without listeners).
+    plugins::files::spawn_worker(state.clone());
+    // Switched-on plugins compiled ahead of their first use.
+    plugins::runtime::warm(&state, None, std::time::Duration::from_secs(3));
+    // What an install cut short (a stop, a reboot) left in a tool's folder.
+    {
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || plugins::toolchain::sweep_all_leftovers(&state));
+    }
     let api = Router::new()
         .route("/health", get(api::health))
         .route(
@@ -153,6 +162,18 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             post(plugins::installed::rollback_route),
         )
         .route("/plugins/{pid}/check", post(plugins::releases::check_route))
+        // Trust (`plugins::trust`): trust what an installed build can do, or
+        // run a soft-blocked one anyway; withdraw every answer; skip an
+        // update that asks for more. The activity log (`plugins::activity`).
+        .route(
+            "/plugins/{pid}/trust",
+            post(plugins::trust::trust_route).delete(plugins::trust::untrust_route),
+        )
+        .route("/plugins/{pid}/skip", post(plugins::trust::skip_route))
+        .route(
+            "/plugins/{pid}/activity",
+            get(plugins::activity::activity_route),
+        )
         // What a plugin's release says before it is installed
         // (`plugins::preview`): nothing is written.
         .route(
@@ -176,6 +197,61 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route(
             "/workspaces/{id}/plugins/{pid}/setup",
             post(plugins::setup_workspace),
+        )
+        // The platform (0.2): screens (`plugins::screens`), the UI's reads
+        // (0.1's promised query route), file menu items, data surfaces
+        // (`plugins::surfaces`), output folders (`plugins::output`) and
+        // declared settings (`plugins::pdata`).
+        .route(
+            "/workspaces/{id}/plugins/{pid}/views/{view}",
+            get(plugins::screens::render_route),
+        )
+        .route(
+            "/workspaces/{id}/plugins/{pid}/views/{view}/actions",
+            post(plugins::screens::action_route),
+        )
+        .route(
+            "/workspaces/{id}/plugins/{pid}/file-actions/{action}",
+            post(plugins::screens::file_action_route),
+        )
+        .route(
+            "/workspaces/{id}/plugins/{pid}/query/{name}",
+            get(plugins::screens::query_route),
+        )
+        .route(
+            "/workspaces/{id}/surfaces/{kind}/{version}",
+            get(plugins::surfaces::route),
+        )
+        .route(
+            "/workspaces/{id}/plugins/{pid}/output",
+            get(plugins::output::folder_route),
+        )
+        .route(
+            "/workspaces/{id}/plugins/{pid}/output/save",
+            post(plugins::output::save_route),
+        )
+        .route(
+            "/plugins/{pid}/output",
+            get(plugins::output::usage_route).delete(plugins::output::clear_route),
+        )
+        .route(
+            "/plugins/{pid}/settings",
+            get(plugins::pdata::get_route).put(plugins::pdata::put_route),
+        )
+        // Programs and tools (the privileged tier): a plugin's side
+        // programs (`plugins::toolchain`) and its jobs (`plugins::jobs`).
+        .route("/plugins/{pid}/tools", get(plugins::toolchain::list_route))
+        .route(
+            "/plugins/{pid}/tools/{tool}/install",
+            post(plugins::toolchain::install_route),
+        )
+        .route(
+            "/plugins/{pid}/tools/{tool}",
+            delete(plugins::toolchain::remove_route),
+        )
+        .route(
+            "/workspaces/{id}/jobs/{job}",
+            get(plugins::jobs::status_route).delete(plugins::jobs::cancel_route),
         )
         // What each agent CLI reports it has here (asked of the agents).
         .route(

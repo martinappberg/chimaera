@@ -903,6 +903,8 @@ pub(crate) async fn put_file(
     }
     let dirty_path = query.path.clone();
     let owner = state.clone();
+    // A plugin that claims the file hears this write as `file-saved`.
+    crate::plugins::files::mark_saved(&state, &dirty_path);
     let result = tokio::task::spawn_blocking(move || {
         let expect_hash = query.expect_hash.map(|h| h.to_ascii_lowercase());
         let pre = match (expect_hash.as_deref(), query.expect_mtime.as_deref()) {

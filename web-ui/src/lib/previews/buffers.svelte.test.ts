@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
-import { EditorState, StateEffect, type TransactionSpec } from "@codemirror/state";
+import { undo } from "@codemirror/commands";
+import { EditorState, StateEffect, Transaction, type TransactionSpec } from "@codemirror/state";
 import { EditorView, type ViewUpdate } from "@codemirror/view";
 
 const mocks = vi.hoisted(() => ({
@@ -29,6 +30,7 @@ vi.mock("../settings/store.svelte", () => ({
 import { FileConflictError, type FileChunk, type WriteResult } from "./files";
 import {
   bufferFor,
+  JOURNAL_DELAY_MS,
   openBuffer,
   Presence,
   PRESENCE_HIDDEN_TTL_MS,
@@ -60,8 +62,8 @@ class FakeView {
   constructor(state: EditorState) {
     this.state = state;
   }
-  dispatch(spec: TransactionSpec): void {
-    const tr = this.state.update(spec);
+  dispatch(spec: TransactionSpec | Transaction): void {
+    const tr = spec instanceof Transaction ? spec : this.state.update(spec);
     this.state = tr.state;
     const u = { view: this, docChanged: tr.docChanged, transactions: [tr], state: tr.state };
     for (const l of this.state.facet(EditorView.updateListener)) l(u as unknown as ViewUpdate);
@@ -84,6 +86,9 @@ function fresh(path: string, text: string, hash = "h0", mtime = "m0") {
   buf.attach(view as unknown as EditorView, () => {});
   return { buf, view };
 }
+
+/** Let a just-opened buffer's draft lookup settle (real timers only). */
+const lookupSettled = () => new Promise((r) => setTimeout(r, 0));
 
 function close(buf: Buffer, view: FakeView): void {
   buf.detach(view as unknown as EditorView);
@@ -422,6 +427,7 @@ describe("the journal", () => {
   it("never marks text journaled when its write lands after a save cleared the draft", async () => {
     const path = `/w/late-journal-${++seq}.txt`;
     const { buf, view } = fresh(path, "x");
+    await lookupSettled();
     view.type(1, "a"); // "xa"
     type Result = { local: boolean; remote: "ok" };
     let land!: (r: Result) => void;
@@ -451,15 +457,158 @@ describe("the journal", () => {
     const path = `/w/flush-${++seq}.txt`;
     const { buf, view } = fresh(path, "x");
     view.type(1, "y");
-    await buf.journal();
+    await lookupSettled(); // held while it ran, then journaled at its end
+    expect(mocks.drafts.journal).toHaveBeenCalledTimes(1);
     await buf.journal(); // unchanged: the memo skips it
     expect(mocks.drafts.journal).toHaveBeenCalledTimes(1);
     await buf.journal(true); // the flush always writes
     expect(mocks.drafts.journal).toHaveBeenCalledTimes(2);
     expect(mocks.drafts.journal).toHaveBeenLastCalledWith(expect.objectContaining({ text: "xy" }), true);
     buf.discard();
-    // A discard drops only this window's record.
+    // A discard drops only this window's record, once (its own reload to the
+    // disk text is not also cleared as an edit).
+    expect(mocks.drafts.clear).toHaveBeenCalledTimes(1);
     expect(mocks.drafts.clear).toHaveBeenLastCalledWith(path, { writer: "this-window" });
+    close(buf, view);
+  });
+
+  it("drops this window's draft when the user undoes back to the disk text", async () => {
+    vi.useFakeTimers();
+    const path = `/w/undone-${++seq}.py`;
+    const { buf, view } = fresh(path, "x = 1\n");
+    view.type(view.text.length, "y = 2\n");
+    await vi.advanceTimersByTimeAsync(JOURNAL_DELAY_MS);
+    expect(mocks.drafts.journal).toHaveBeenCalledWith(expect.objectContaining({ text: "x = 1\ny = 2\n" }), false);
+
+    undo({ state: view.state, dispatch: (tr) => view.dispatch(tr) });
+    expect(view.text).toBe("x = 1\n");
+    expect(buf.dirty).toBe(false);
+    // This window's record, or anyone's holding exactly the disk text — never
+    // another window's draft of the same file.
+    expect(mocks.drafts.clear).toHaveBeenCalledTimes(1);
+    expect(mocks.drafts.clear).toHaveBeenCalledWith(path, { writer: "this-window", text: "x = 1\n" });
+
+    // Typed again: the same text is journaled afresh, not skipped as written.
+    view.type(view.text.length, "y = 2\n");
+    await vi.advanceTimersByTimeAsync(JOURNAL_DELAY_MS);
+    expect(mocks.drafts.journal).toHaveBeenCalledTimes(2);
+    buf.discard();
+    close(buf, view);
+  });
+
+  it("journals a restored draft as this window's at once, so undoing the restore drops it", async () => {
+    vi.useFakeTimers();
+    const path = `/w/restored-${++seq}.txt`;
+    const found = { path, baseHash: "h0", baseText: "x\n", text: "x\ny\n", updatedMs: 1, writer: "dead-window" };
+    mocks.drafts.find.mockImplementationOnce(async () => found as never);
+    const { buf, view } = fresh(path, "x\n");
+    await vi.waitFor(() => expect(buf.recovered).not.toBeNull());
+    buf.restoreDraft();
+    expect(view.text).toBe("x\ny\n");
+    // Before any journal delay: the one record is this window's now.
+    expect(mocks.drafts.journal).toHaveBeenCalledWith(expect.objectContaining({ text: "x\ny\n" }), false);
+    undo({ state: view.state, dispatch: (tr) => view.dispatch(tr) });
+    expect(buf.dirty).toBe(false);
+    expect(mocks.drafts.clear).toHaveBeenCalledWith(path, { writer: "this-window", text: "x\n" });
+    close(buf, view);
+  });
+
+  it("clears a restored draft that merges to exactly the disk text", async () => {
+    const path = `/w/merged-away-${++seq}.txt`;
+    // Typed against an older base; the disk has since taken the same edit.
+    const found = { path, baseHash: "hOld", baseText: "a\nb\nc\n", text: "a\nc\n", updatedMs: 1, writer: "dead-window" };
+    mocks.drafts.find.mockImplementationOnce(async () => found as never);
+    const { buf, view } = fresh(path, "a\nc\nd\n");
+    await vi.waitFor(() => expect(buf.recovered).not.toBeNull());
+    buf.restoreDraft();
+    expect(view.text).toBe("a\nc\nd\n");
+    expect(buf.dirty).toBe(false);
+    expect(mocks.drafts.journal).not.toHaveBeenCalled();
+    expect(mocks.drafts.clear).toHaveBeenLastCalledWith(path, { writer: "dead-window", text: "a\nc\n" });
+    close(buf, view);
+  });
+
+  it("journals text undone to the old disk version while a save was in flight", async () => {
+    vi.useFakeTimers();
+    const path = `/w/undo-mid-save-${++seq}.txt`;
+    const { buf, view } = fresh(path, "a\n");
+    view.type(0, "b");
+    const w = deferredWrite();
+    const saving = buf.save();
+    await Promise.resolve();
+    undo({ state: view.state, dispatch: (tr) => view.dispatch(tr) });
+    expect(buf.dirty).toBe(false); // clean against the old base: draft cleared
+    w.resolve({ hash: "h1", mtime: "m1" });
+    expect(await saving).toBe(true);
+    expect(buf.dirty).toBe(true); // "a\n" is unsaved against the saved "ba\n"
+    await vi.advanceTimersByTimeAsync(JOURNAL_DELAY_MS);
+    expect(mocks.drafts.journal).toHaveBeenLastCalledWith(expect.objectContaining({ text: "a\n" }), false);
+    buf.discard();
+    close(buf, view);
+  });
+
+  it("never journals over a recovered draft still on offer, until it is discarded", async () => {
+    vi.useFakeTimers();
+    const path = `/w/offered-${++seq}.txt`;
+    const found = { path, baseHash: "h0", baseText: "x\n", text: "x\noffered\n", updatedMs: 1, writer: "dead-window" };
+    mocks.drafts.find.mockImplementationOnce(async () => found as never);
+    const { buf, view } = fresh(path, "x\n");
+    await vi.waitFor(() => expect(buf.recovered).not.toBeNull());
+
+    // Typing instead of restoring: writing it would overwrite the path's one
+    // record — the offer's only copy — so it is held, and shown as such.
+    view.type(0, "typed ");
+    await vi.advanceTimersByTimeAsync(JOURNAL_DELAY_MS);
+    await buf.journal(true); // nor the hide/pagehide flush
+    expect(mocks.drafts.journal).not.toHaveBeenCalled();
+    expect(buf.journalFailed).toBe(true);
+
+    // Discarded: the offer's record goes, and the held edits are journaled at once.
+    buf.discardDraft();
+    expect(mocks.drafts.clear).toHaveBeenLastCalledWith(path, { writer: "dead-window", text: "x\noffered\n" });
+    expect(mocks.drafts.journal).toHaveBeenCalledWith(expect.objectContaining({ text: "typed x\n" }), false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(buf.journalFailed).toBe(false);
+    buf.discard();
+    close(buf, view);
+  });
+
+  it("leaves a draft on offer alone when the held edits are saved", async () => {
+    vi.useFakeTimers();
+    const path = `/w/offered-save-${++seq}.txt`;
+    const found = { path, baseHash: "h0", baseText: "x\n", text: "x\noffered\n", updatedMs: 1, writer: "dead-window" };
+    mocks.drafts.find.mockImplementationOnce(async () => found as never);
+    const { buf, view } = fresh(path, "x\n");
+    await vi.waitFor(() => expect(buf.recovered).not.toBeNull());
+    view.type(0, "typed ");
+    mocks.fsWrite.mockResolvedValueOnce({ hash: "h1", mtime: "m1" });
+    expect(await buf.save()).toBe(true);
+    // Only this window's record, or one holding exactly the saved text.
+    expect(mocks.drafts.clear).toHaveBeenLastCalledWith(path, { writer: "this-window", text: "typed x\n" });
+    expect(buf.recovered).toBe(found);
+    expect(buf.journalFailed).toBe(false);
+    buf.discardDraft();
+    close(buf, view);
+  });
+
+  it("holds edits typed before the open's draft lookup settles", async () => {
+    vi.useFakeTimers();
+    const path = `/w/slow-lookup-${++seq}.txt`;
+    const found = { path, baseHash: "h0", baseText: "x\n", text: "x\noffered\n", updatedMs: 1, writer: "dead-window" };
+    let answer!: (r: typeof found) => void;
+    mocks.drafts.find.mockImplementationOnce(() => new Promise<typeof found>((r) => (answer = r)) as never);
+    const { buf, view } = fresh(path, "x\n");
+    view.type(0, "typed "); // the lookup is still on a slow link
+    await vi.advanceTimersByTimeAsync(JOURNAL_DELAY_MS * 3);
+    expect(mocks.drafts.journal).not.toHaveBeenCalled();
+    expect(buf.journalFailed).toBe(true); // held, and shown as such
+
+    answer(found); // there WAS a draft: offered, and still not overwritten
+    await vi.advanceTimersByTimeAsync(0);
+    expect(buf.recovered).toEqual(found);
+    expect(mocks.drafts.journal).not.toHaveBeenCalled();
+    expect(buf.journalFailed).toBe(true);
+    buf.discard();
     close(buf, view);
   });
 

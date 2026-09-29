@@ -253,5 +253,10 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   succeeds. Verify plugin execution in the signed bundle with
   `node scripts/smoke-macos-plugins.mjs` after `bash scripts/build-plugins.sh`.
   Both app PR CI and the macOS release job run it before publishing artifacts.
+  `app.yml` is not a required check, so a red smoke there does not block a
+  merge; the release job then fails at it and publishes nothing. Its expected
+  answer is the daemon's pinned Knowledge response
+  (`chimaera-server/src/tests/fixtures/knowledge/mycelium.json`), so a fixture
+  change that re-blesses that file needs no edit to the smoke.
   Ordinary `cargo test` binaries cannot catch hardened-runtime kills of the
   app's `--daemon` process.

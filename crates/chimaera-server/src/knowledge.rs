@@ -770,7 +770,9 @@ fn guidance(root: &Path) -> Vec<Value> {
     out
 }
 
-/// The body with no snapshot: guidance only, every list empty.
+/// The body with no snapshot: guidance only, and `knowledge/1`'s every
+/// documented list empty (docs/knowledge-redesign-plan.md, the wire spec) —
+/// no words and no id shapes, which only a provider supplies.
 fn empty_body(provider: Value, guidance: Vec<Value>) -> Value {
     json!({
         "schema": 1,
@@ -781,7 +783,16 @@ fn empty_body(provider: Value, guidance: Vec<Value>) -> Value {
         "learnings": [],
         "todos": [],
         "questions": [],
-        "counts": {"findings": 0, "decisions": 0, "learnings": 0, "open": 0},
+        "conventions": [],
+        "sessions": [],
+        "asks": [],
+        "tidy": [],
+        "id_shapes": [],
+        "labels": Value::Null,
+        "counts": {
+            "findings": 0, "decisions": 0, "learnings": 0, "open": 0,
+            "todos": 0, "questions": 0, "conventions": 0, "sessions": 0,
+        },
         "guidance": guidance,
         "warnings": [],
     })

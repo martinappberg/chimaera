@@ -1,0 +1,17 @@
+# The 0.2 platform fixture: every import, export, event and screen node of
+# chimaera:plugin@0.2.0, driven by the daemon's tests
+# (crates/chimaera-server/src/tests/plugin_platform.rs). Laid out under
+# plugins/dist-test, which only test builds embed: never in a real catalog.
+[package]
+name = "chimaera-plugin-test-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+chimaera-plugin-api.workspace = true

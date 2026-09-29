@@ -13,18 +13,22 @@
   import { knowledge } from "../workspace/knowledge";
   import { installedOutcome, type Outcome } from "./installCopy";
   import PluginCard from "./PluginCard.svelte";
+  import TrustDialog from "./TrustDialog.svelte";
   import type { AgentsState } from "./requirementsModel";
   import {
     changeWorkbenchPlugin,
     checkedAt,
     installWorkbenchPlugin,
     isMissingRoute,
+    pluginPolicy,
     previewPlugin,
+    TrustNeeded,
     type AgentHook,
     type AgentPlugin,
     type AgentPlugins,
     type PluginChange,
     type PluginDetails,
+    type TrustAsk,
     type WorkspacePlugin,
   } from "./store";
 
@@ -45,9 +49,14 @@
   let { plugins: loaded, agentPlugins, agentState, agentError, wsId, visible, onAttach, onOpenSession, onRefresh }: Props =
     $props();
 
+  /** One of Chimaera's own plugins (in the lock, whatever build runs):
+   *  `first_party` is the badge — the build the maintainers approved —
+   *  while `pinned_version` comes with every copy of a locked plugin. */
+  const ours = (p: WorkspacePlugin): boolean => p.first_party || p.pinned_version !== null;
+
   /** Chimaera's own plugins first (the curated list), then the rest, each
    *  in the daemon's order. */
-  const plugins = $derived([...(loaded ?? [])].sort((a, b) => Number(b.first_party) - Number(a.first_party)));
+  const plugins = $derived([...(loaded ?? [])].sort((a, b) => Number(ours(b)) - Number(ours(a))));
 
   const k = $derived($knowledge);
   const counts = $derived(k !== null && k.provider !== null ? k.counts : null);
@@ -72,7 +81,7 @@
   function removeBody(p: WorkspacePlugin): string {
     const versions = [p.version, p.previous].filter((v) => v !== null && v !== "").join(" and ");
     const what = `This deletes ${p.name} ${versions} from this host.`;
-    return p.first_party ? `${what} You can install it again from here.` : `${what} Workspaces where it is on lose what it adds.`;
+    return ours(p) ? `${what} You can install it again from here.` : `${what} Workspaces where it is on lose what it adds.`;
   }
 
   async function confirmRemove(): Promise<void> {
@@ -98,6 +107,14 @@
   /** The repository last previewed (as typed) and what its release says. */
   let previewed = $state<{ github: string; plugin: PluginDetails } | null>(null);
   const formBusy = $derived(adding || looking);
+  /** This host's policy: an admin's file or the Unverified Plugins setting
+   *  may allow only verified plugins (the form says so up front). */
+  const policy = $derived($pluginPolicy);
+
+  /** The trust prompt an install from the form was answered with. */
+  let asking = $state<{ github: string; ask: TrustAsk } | null>(null);
+  let askBusy = $state(false);
+  let askError = $state<string | null>(null);
 
   async function addFromRepository(): Promise<void> {
     const github = repo.trim();
@@ -110,12 +127,37 @@
       repo = "";
       previewed = null;
     } catch (e) {
-      added = {
-        text: isMissingRoute(e) ? "this daemon can't install plugins yet — update chimaera" : e instanceof Error ? e.message : String(e),
-        error: true,
-      };
+      if (e instanceof TrustNeeded) {
+        askError = null;
+        asking = { github, ask: e.ask };
+      } else {
+        added = {
+          text: isMissingRoute(e) ? "this daemon can't install plugins yet — update chimaera" : e instanceof Error ? e.message : String(e),
+          error: true,
+        };
+      }
     } finally {
       adding = false;
+    }
+  }
+
+  /** Trust and install: the same install, with the digest shown. */
+  async function trustAndInstall(): Promise<void> {
+    if (asking === null || askBusy) return;
+    const { github, ask } = asking;
+    askBusy = true;
+    askError = null;
+    try {
+      const res = await installWorkbenchPlugin(github, undefined, ask.caps);
+      added = { ...installedOutcome(res, res.id), error: false };
+      asking = null;
+      if (repo.trim() === github) repo = "";
+      previewed = null;
+    } catch (e) {
+      if (e instanceof TrustNeeded) asking = { github, ask: e.ask };
+      askError = e instanceof Error ? e.message : String(e);
+    } finally {
+      askBusy = false;
     }
   }
 
@@ -142,10 +184,10 @@
   /** The preview's own Install: the repository it previewed. Done, the
    *  preview gives way to the new card and the outcome line; a refusal
    *  stays on the preview (the card shows it). */
-  async function installPreviewed(): Promise<PluginChange> {
+  async function installPreviewed(trust?: string): Promise<PluginChange> {
     if (previewed === null) throw new Error("nothing previewed");
     const github = previewed.github;
-    const res = await installWorkbenchPlugin(github);
+    const res = await installWorkbenchPlugin(github, undefined, trust);
     added = { ...installedOutcome(res, res.id), error: false };
     previewed = null;
     if (repo.trim() === github) repo = "";
@@ -253,9 +295,22 @@
       </button>
     </div>
     <p id="wb-add-help" class="help">
-      The latest release of a plugin's GitHub repository: Preview shows what it adds, Install puts it on this host. It
-      does nothing until you switch it on in a workspace.
+      The latest release of a plugin's GitHub repository: Preview shows what it adds and what it can do, Install puts it
+      on this host. One the Chimaera maintainers haven't verified asks for your trust first. It does nothing until you
+      switch it on in a workspace.
     </p>
+    {#if policy !== null && policy.error !== null}
+      <p class="help warn" role="note">
+        This host's plugin policy couldn't be read, so only verified plugins that run no programs are allowed. Ask
+        whoever manages this machine.
+      </p>
+    {:else if policy !== null && !policy.allow_unverified}
+      <p class="help warn" role="note">
+        This host only allows plugins the Chimaera maintainers verified{policy.managed
+          ? " (set by whoever manages this machine)"
+          : " (the Unverified Plugins setting)"}.
+      </p>
+    {/if}
     {#if added !== null}
       <p class="outcome" class:err={added.error} role={added.error ? "alert" : "status"}>{added.text}</p>
     {/if}
@@ -280,6 +335,19 @@
     {/key}
   {/if}
 </section>
+
+{#if asking !== null}
+  <TrustDialog
+    ask={asking.ask}
+    mode="install"
+    busy={askBusy}
+    error={askError}
+    onConfirm={() => void trustAndInstall()}
+    onCancel={() => {
+      if (!askBusy) asking = null;
+    }}
+  />
+{/if}
 
 {#if removing !== null}
   <ConfirmDialog
@@ -458,6 +526,9 @@
     line-height: 1.5;
     color: var(--muted);
     max-width: 70ch;
+  }
+  .help.warn {
+    color: var(--warn);
   }
   /* A refusal can carry a URL: break it rather than widen the page. */
   .outcome {

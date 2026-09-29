@@ -2003,7 +2003,10 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         }
         // `{"type":"plugin", ...}` — additive; a client ignores types it
         // doesn't know.
-        for frame in state.plugin_runtime.events_since(&mut last_plugin_event) {
+        for frame in state
+            .plugin_runtime
+            .events_since(&mut last_plugin_event, watch.workspace())
+        {
             if socket
                 .send(Message::Text(frame.as_ref().into()))
                 .await

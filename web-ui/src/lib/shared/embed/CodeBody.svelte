@@ -100,7 +100,7 @@
     void (async () => {
       const [{ LanguageDescription }, { languages }, { renderCode }] = await Promise.all([
         import("@codemirror/language"),
-        import("@codemirror/language-data"),
+        import("../../previews/languages"),
         import("../../previews/highlight"),
       ]);
       const name = p.slice(p.lastIndexOf("/") + 1);

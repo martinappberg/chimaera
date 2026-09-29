@@ -46,6 +46,8 @@
   import FolderIcon from "../shared/FolderIcon.svelte";
   import { browserTitles, targetLabel } from "../browser/proxy";
   import ExtensionsGlyph from "../plugins/ExtensionsGlyph.svelte";
+  import { workspacePlugins } from "../plugins/store";
+  import { pluginViewTitle } from "../plugins/platform";
 
   interface Props {
     node: PaneNode;
@@ -396,6 +398,7 @@
     if (tab.surface === "timeline") return "Timeline";
     if (tab.surface === "knowledge") return "Knowledge";
     if (tab.surface === "plugins") return "Extensions";
+    if (tab.surface === "plugin") return pluginViewTitle($workspacePlugins?.plugins, tab.plugin, tab.view);
     if (tab.surface === "sessions") return "All sessions";
     if (tab.surface === "finder") return basename(tab.path) || "Finder";
     if (tab.surface === "git") return "Source Control";
@@ -859,7 +862,7 @@
               <title>all sessions</title>
               <path d="M3 4h10M3 8h10M3 12h6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
             </svg>
-          {:else if tab.surface === "plugins"}
+          {:else if tab.surface === "plugins" || tab.surface === "plugin"}
             <!-- Extensions: three cells and a plus (plugins/glyph.ts), at its
                  own 12px pixel grid. -->
             <ExtensionsGlyph class="glyph" title="extensions" />
