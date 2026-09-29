@@ -23,6 +23,8 @@
   import SinceYouLeft from "./SinceYouLeft.svelte";
   import WhereThingsStand from "./WhereThingsStand.svelte";
   import PluginPanels from "./PluginPanels.svelte";
+  import ActivityLine from "./ActivityLine.svelte";
+  import GuidanceRow from "./GuidanceRow.svelte";
   import { acquireChat, releaseChat } from "../chat/chatPool";
   import type { ChatStore } from "../chat/store.svelte";
   import type { ChatSocket } from "../chat/chatWs";
@@ -469,6 +471,14 @@
           />
         {/if}
 
+        {#if $knowledge !== null && $knowledge.guidance.length > 0}
+          <GuidanceRow
+            guidance={$knowledge.guidance}
+            onOpen={(p) =>
+              ctrl.openFileFrom(paneId, p.startsWith("/") || p.startsWith("~") || wsRoot === null ? p : `${wsRoot}/${p}`, false)}
+          />
+        {/if}
+
         <!-- Active plugins' panels (`slot = "panel"`), after core's own. -->
         <PluginPanels {wsId} {wsRoot} />
 
@@ -530,6 +540,9 @@
             />
           {/if}
         {/if}
+
+        <!-- One quiet line: this workspace's sessions and tokens this week. -->
+        <ActivityLine {wsId} {visible} onOpenActivity={dash.onOpenActivity} />
       </div>
         </div>
       </div>

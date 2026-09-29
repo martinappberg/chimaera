@@ -490,6 +490,8 @@ pub(crate) async fn ingest(
                 false
             }
         };
+        // Key checked above: the record's running totals (history).
+        crate::history::observe_statusline(&state, &id, &payload);
         if changed {
             state.changes.notify_waiters();
         }
@@ -606,9 +608,26 @@ pub(crate) async fn ingest(
         matches!(event, "SessionStart" | "UserPromptSubmit") && !record.compute_ctx_delivered
     };
 
+    // Every hook payload carries claude's current `cwd`: an agent that
+    // enters a worktree mid-session is shown there (git session tracker).
+    if let Some(cwd) = payload.get("cwd").and_then(|c| c.as_str()) {
+        changed |= state.git.sessions.note_hook_cwd(&id, cwd);
+    }
+    if event == "Stop" {
+        crate::git::session_turn_end(&state, &id);
+    }
+
     if changed {
         state.changes.notify_waiters();
     }
+    // The session's record: TUI turns and file-write times (history).
+    crate::history::observe_hook(
+        &state,
+        &id,
+        event,
+        payload.get("transcript_path").and_then(|p| p.as_str()),
+        touched_path.as_deref(),
+    );
 
     // The Timeline's hooks tier: claude TUIs only. Claude CHAT sessions fire
     // the same `--settings` hooks, and the protocol already records their
@@ -702,8 +721,17 @@ pub(crate) async fn ingest(
         context.extend(crate::plugins::runtime::hook(&state, &id, event).await);
     }
 
-    // `context` is only ever non-empty for SessionStart/UserPromptSubmit,
-    // so `event` is always the right hookEventName here.
+    // Two live sessions here wrote the same file: this one hears about the
+    // other, once per file per pair (claude reads PostToolUse and
+    // UserPromptSubmit context alike). Nothing locks; with no overlap this
+    // adds nothing and the answer stays byte-identical.
+    if matches!(event, "PostToolUse" | "UserPromptSubmit") {
+        context.extend(crate::history::same_file_lines(&state, &id));
+    }
+
+    // `context` is only ever non-empty for SessionStart, UserPromptSubmit or
+    // PostToolUse — all carry `additionalContext` — so `event` is always the
+    // right hookEventName here.
     if !context.is_empty() {
         return Json(json!({
             "hookSpecificOutput": {
@@ -729,8 +757,15 @@ pub(crate) fn poll_interval() -> Duration {
 
 /// Watch one agent session for its lifetime: tail-poll the transcript for
 /// title records and retire the agent record into the workspace's recents
-/// (broadcasting a change) once the underlying PTY session is gone.
-pub(crate) fn spawn_agent_watch(state: Arc<AppState>, session_id: String) {
+/// (broadcasting a change) once the underlying PTY session is gone. Every
+/// agent session starts here exactly once (a view switch or rewind keeps its
+/// watcher), so this is also where its history record opens.
+pub(crate) fn spawn_agent_watch(
+    state: Arc<AppState>,
+    session_id: String,
+    started_by: crate::history::StartedBy,
+) {
+    crate::history::open(&state, &session_id, started_by);
     tokio::spawn(async move {
         let mut tailed: Option<PathBuf> = None;
         let mut cursor = TailCursor::default();

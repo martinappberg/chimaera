@@ -158,6 +158,42 @@ export interface Session {
   background_running?: number | null;
   /** Whether this agent can run as a chat session (drives the toggle). */
   chat_capable?: boolean;
+  /**
+   * The repository checkout this session is in, from its current folder (a
+   * shell's cwd, an agent's hook-reported cwd, else its spawn folder). Null
+   * outside a repository; absent on old daemons.
+   */
+  git?: SessionGit | null;
+}
+
+/** Where a session stands in git (the daemon's session tracker). */
+export interface SessionGit {
+  /** The repository (its main checkout), the same for every worktree. */
+  repo: string;
+  /** The checkout (main or linked worktree) the session is in. */
+  worktree: string;
+  /** The branch there; null when detached or unborn. */
+  branch: string | null;
+  detached: boolean;
+  /** Short sha when detached, else null. */
+  head: string | null;
+}
+
+/** A branch as people read it: the name, "No branch (at 3f2a1c9)" for a
+ *  detached HEAD, or "No commits yet" on an unborn branch — plain words, no
+ *  git jargon. */
+export function branchLabel(git: {
+  branch: string | null;
+  detached: boolean;
+  head: string | null;
+}): string {
+  if (git.branch) return git.branch;
+  return git.detached ? `No branch (at ${git.head ?? "?"})` : "No commits yet";
+}
+
+/** The last path component. */
+export function baseName(path: string): string {
+  return path.split("/").filter(Boolean).pop() ?? path;
 }
 
 /** The one display name for a session, used identically everywhere. */
@@ -491,6 +527,10 @@ export interface AgentSpawn {
   /** Explicit surface choice (the launcher's "open" vs its terminal button).
    *  Omitted = the agents.defaultView setting decides. */
   ui?: "chat" | "term";
+  /** Start in this folder instead of the workspace root: one of the
+   *  workspace's worktrees (a branch's own checkout). The session stays in
+   *  its workspace; only where it works changes. */
+  cwd?: string;
 }
 
 export async function createSession(
@@ -535,6 +575,7 @@ export async function createSession(
       extras.ui = "chat";
     }
   }
+  if (spawn.cwd !== undefined && spawn.cwd !== "") extras.cwd = spawn.cwd;
   // Every spawn (shell AND agent) carries the UI's current scheme: the
   // daemon's shims inject it so TUIs boot themed to match. The SETTINGS
   // store resolves it (appearance.theme system|light|dark → mode), so an
@@ -569,9 +610,10 @@ export class ViewSwitchConflict extends ApiError {
   }
 }
 
-/** Session ids with a chat⇄terminal view-switch POST in flight. The pane bar's
- *  toggle disables itself for these (App's switchView owns the set) so a second
- *  click can't fire a concurrent switch the server would only 409. */
+/** Session ids with a chat⇄terminal view-switch POST (or its mid-task
+ *  question) in flight. The pane bar's toggle reads as pending for these and
+ *  App's switchView, which owns the set, drops a second click — a concurrent
+ *  switch the server would only 409. */
 export const switchingViews = writable<ReadonlySet<string>>(new Set());
 
 /**

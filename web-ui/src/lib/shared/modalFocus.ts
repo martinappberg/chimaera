@@ -30,9 +30,17 @@ function focusableWithin(node: HTMLElement): HTMLElement[] {
 let traps: Trap[] = [];
 let nextOrder = 0;
 
+/** A modal parked in a hidden keep-alive layer (`inert`, e.g. a Settings tab
+ *  switched away from with its dialog open) waits there and doesn't own the
+ *  keyboard until its layer shows again. */
+function live(trap: Trap): boolean {
+  return trap.node.closest("[inert]") === null;
+}
+
 function topTrap(): Trap | null {
   let top: Trap | null = null;
   for (const trap of traps) {
+    if (!live(trap)) continue;
     if (
       top === null ||
       trap.priority > top.priority ||
@@ -42,6 +50,12 @@ function topTrap(): Trap | null {
     }
   }
   return top;
+}
+
+/** A shown modal owns the window: workbench chords and menu commands stand
+ *  down behind it. */
+export function modalOpen(): boolean {
+  return topTrap() !== null;
 }
 
 function focusFirst(trap: Trap): void {

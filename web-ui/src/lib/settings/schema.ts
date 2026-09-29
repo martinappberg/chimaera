@@ -15,6 +15,7 @@
 
 import { ACTIONS, parseChord } from "../shared/keys";
 import { themesOfKind, type ThemeDef } from "./themes";
+import { DICTATION_LANGUAGES } from "../chat/voiceLanguages";
 
 /** Value types a setting can carry (mirrors the JSON representation). */
 export type SettingValue = boolean | number | string | string[];
@@ -131,6 +132,9 @@ export type SettingsMap = {
   "chat.remoteControlAtStart": boolean;
   "chat.toolSummaries": boolean;
   "chat.resumeAfterRestart": boolean;
+  "chat.voice": boolean;
+  "chat.voiceMicrophone": string;
+  "chat.voiceLanguage": string;
   "update.autoCheck": boolean;
   "plugins.allowUnverified": boolean;
   "keys.modifier": "auto" | "cmd" | "ctrl-shift" | "alt";
@@ -750,6 +754,38 @@ const DEFS = {
     type: "boolean",
     default: true,
     scope: "daemon",
+  },
+  "chat.voice": {
+    title: "Voice Dictation",
+    category: "Chat",
+    description:
+      "A mic button in every chat composer, Claude or Codex: click it (or press the Dictate shortcut) and speak — the words fill your message as they're heard; click again to keep them, Enter to send, Esc to discard. `/voice on|off` flips this too. Your speech goes to Claude's speech-to-text service (the one Claude Code's own /voice uses) with the claude.ai login on the daemon's host, so the button only shows where that login exists; the microphone is on only while you're dictating.",
+    type: "boolean",
+    default: true,
+    scope: "client",
+  },
+  "chat.voiceMicrophone": {
+    title: "Dictation Microphone",
+    category: "Chat",
+    description:
+      "The input dictation records from, by the name your system gives it. Empty uses the system default input. Right-click the mic button to pick from the microphones this machine has.",
+    type: "string",
+    default: "",
+    placeholder: "system default",
+    scope: "client",
+  },
+  "chat.voiceLanguage": {
+    title: "Dictation Language",
+    category: "Chat",
+    description:
+      "The language you dictate in. Match Browser uses this browser's language when Claude's speech service takes it, else English.",
+    type: "enum",
+    default: "auto",
+    options: [
+      { value: "auto", label: "Match Browser" },
+      ...DICTATION_LANGUAGES.map((l) => ({ value: l.code, label: l.name })),
+    ],
+    scope: "client",
   },
   "daemon.restoreSessions": {
     title: "Restore Sessions on Restart",

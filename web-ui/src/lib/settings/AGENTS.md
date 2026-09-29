@@ -32,6 +32,13 @@ the values (`GET`/`PUT /api/v1/plugins/{pid}/settings`, kept per plugin
 under `<data dir>/plugins/.data/`, never `settings.json`) and checks each
 against its declaration; search matches plugin names and setting labels.
 
+**Exception — Activity.** Also store-backed and read-only: `ActivitySettings.svelte`
+shows sessions, tokens and time from the session records across every workspace
+(`GET /api/v1/activity`, CSV via `/api/v1/activity/csv`, both through
+`../workspace/history.ts`). No dollar figures (cost is only a CSV column); unknown is
+"—" with a tooltip, never zero. `jump.ts` lets another surface open Settings at a
+section (`requestSettingsSection`).
+
 ## File map
 
 | File | What it owns |
@@ -45,6 +52,8 @@ against its declaration; search matches plugin names and setting labels.
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
 | `agentDocs.ts` | Wire types + `getAgentDocs`/`installAgentDocs` for `/api/v1/agent-docs`. |
 | `PluginsSettings.svelte` | Settings → Plugins: every installed plugin's declared settings (see the exception above); slotted after Extensions. |
+| `ActivitySettings.svelte` | The Activity panel (see the exception above): this week's sessions and tokens + time worked, one 14-day sessions chart, by agent and model / by workspace, Export CSV. Fetches while Settings is visible and on the history nudge. |
+| `jump.ts` | `settingsJump` / `requestSettingsSection`: open Settings scrolled to a section (Quick Open "Activity", the dashboard's activity line). |
 | `UpdatesStatus.svelte` | The Updates section's status block: app / daemon / agents, each up to date, available, or couldn't check (with why), plus "check now". Reads `workspace/update.svelte.ts`; the auto-check switch below it is a schema row. |
 | `NotificationStatus.svelte` | The Notifications section's status line: whether the OS (native) or browser will show alerts, with Allow / Open System Settings / Send test. The switches below it are ordinary schema rows. |
 | `SettingRow.svelte` | One schema-driven control. |

@@ -7,6 +7,7 @@ export type PaneViewKind =
   | "file"
   | "finder"
   | "diff"
+  | "gitx"
   | "git"
   | "changes"
   | "dashboard"
@@ -14,6 +15,7 @@ export type PaneViewKind =
   | "knowledge"
   | "plugins"
   | "plugin"
+  | "sessions"
   | "browser"
   | "settings";
 
@@ -34,6 +36,7 @@ const loaders: Record<PaneViewKind, () => Promise<PaneViewModule>> = {
   file: () => import("../previews/FileView.svelte"),
   finder: () => import("../previews/FinderView.svelte"),
   diff: () => import("../previews/DiffView.svelte"),
+  gitx: () => import("../workspace/GitDetailView.svelte"),
   git: () => import("../workspace/GitView.svelte"),
   changes: () => import("../workspace/SessionChangesView.svelte"),
   dashboard: () => import("../dashboard/DashboardView.svelte"),
@@ -41,6 +44,7 @@ const loaders: Record<PaneViewKind, () => Promise<PaneViewModule>> = {
   knowledge: () => import("../knowledge/KnowledgeView.svelte"),
   plugins: () => import("../plugins/PluginsView.svelte"),
   plugin: () => import("../plugins/ui/PluginTab.svelte"),
+  sessions: () => import("../workspace/SessionsView.svelte"),
   browser: () => import("../browser/BrowserView.svelte"),
   settings: () => import("../settings/SettingsView.svelte"),
 };
@@ -53,6 +57,7 @@ const viewChunkPrefixes: Record<PaneViewKind, string> = {
   file: "FileView-",
   finder: "FinderView-",
   diff: "DiffView-",
+  gitx: "GitDetailView-",
   git: "GitView-",
   changes: "SessionChangesView-",
   dashboard: "DashboardView-",
@@ -60,6 +65,7 @@ const viewChunkPrefixes: Record<PaneViewKind, string> = {
   knowledge: "KnowledgeView-",
   plugins: "PluginsView-",
   plugin: "PluginTab-",
+  sessions: "SessionsView-",
   browser: "BrowserView-",
   settings: "SettingsView-",
 };

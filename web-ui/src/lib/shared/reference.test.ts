@@ -5,6 +5,7 @@ import {
   agentMention,
   composeAgentPathReference,
   composeChatQuote,
+  composeCommitReference,
   composeProvenanceSuffix,
   composeSelectionReference,
   cutAt,
@@ -205,5 +206,16 @@ describe("quoteRuns: a sent message's quoted passages", () => {
   it("a message without quotes is one plain run", () => {
     expect(quoteRuns("plain\ntext")).toEqual([{ quote: false, text: "plain\ntext" }]);
     expect(quoteRuns("")).toEqual([{ quote: false, text: "" }]);
+  });
+});
+
+describe("composeCommitReference", () => {
+  it("names the short sha and subject, and a repository other than the root", () => {
+    const sel = { kind: "commit" as const, sha: "3f2a1c9d0e", subject: 'fix: "rounding"', repo: null };
+    expect(composeCommitReference(sel, "/w")).toBe(`commit 3f2a1c9 ("fix: 'rounding'") `);
+    expect(composeCommitReference({ ...sel, repo: "/w/tools/cloned" }, "/w")).toBe(
+      `commit 3f2a1c9 ("fix: 'rounding'") in tools/cloned `,
+    );
+    expect(composeCommitReference({ ...sel, subject: "" }, "/w")).toBe("commit 3f2a1c9 ");
   });
 });

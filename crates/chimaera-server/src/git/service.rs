@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -45,6 +45,17 @@ const BACKSTOP_INTERVAL: Duration = Duration::from_secs(12);
 /// MCP path does not (see [`GitService::status_fresh`]).
 const STATUS_REUSE: Duration = Duration::from_secs(1);
 
+/// The status-share / published-hash key of one repository in one
+/// workspace. The primary repository uses its own top level too, so a
+/// request naming it and one naming nothing share one slot.
+pub(super) fn repo_slot(ws_id: &str, toplevel: &Path) -> String {
+    format!("{ws_id}\u{0}{}", toplevel.display())
+}
+
+fn slot_prefix(ws_id: &str) -> String {
+    format!("{ws_id}\u{0}")
+}
+
 /// The read-only git service: discovery cache, per-workspace nudge epochs, and
 /// the concurrency permit shared by every invocation.
 pub(crate) struct GitService {
@@ -52,10 +63,20 @@ pub(crate) struct GitService {
     /// stable so a `Some` is cached for the daemon's life; a `None` is re-probed
     /// on demand, so `git init` in an already-open workspace eventually surfaces.
     repos: Mutex<HashMap<String, Option<RepoInfo>>>,
+    /// workspace id -> the repositories found BELOW its root (see `repos`).
+    pub(super) repo_sets: Mutex<HashMap<String, super::repos::RepoSet>>,
     /// workspace id -> nudge epoch, bumped whenever that workspace's git state
     /// may have changed. Surfaced on `/ws/events` so the client refetches; the
     /// payload never rides the firehose (invalidate-and-pull).
     epochs: Mutex<HashMap<String, u64>>,
+    /// workspace id -> repository top level -> its own epoch, bumped with the
+    /// workspace's when that repository changed: a window with several
+    /// repositories refetches only the ones that moved.
+    repo_epochs: Mutex<HashMap<String, BTreeMap<PathBuf, u64>>>,
+    /// (workspace id, repository top level) -> how many windows have that
+    /// repository's section open or a file inside it mounted. Nested
+    /// repositories are backstop-polled only while watched this way.
+    repo_watchers: Mutex<HashMap<(String, PathBuf), usize>>,
     /// workspace id -> how many connected clients are LOOKING at it (registered
     /// over `/ws/events`, released on disconnect). This gates the backstop poll.
     ///
@@ -63,8 +84,8 @@ pub(crate) struct GitService {
     /// changed, so a recency window decays to zero on a quiet repo and the
     /// backstop would stop watching exactly when it is needed.
     watchers: Mutex<HashMap<String, usize>>,
-    /// workspace id -> hash of the last computed status, so the backstop only
-    /// bumps the epoch when something actually changed.
+    /// repository slot ([`repo_slot`]) -> hash of the last computed status,
+    /// so the backstop only bumps the epoch when something actually changed.
     hashes: Mutex<HashMap<String, u64>>,
     /// The resolved git binary, cached keyed by the `git.path` setting so an
     /// edit re-resolves. Resolution runs a login shell (to pick up a
@@ -73,9 +94,23 @@ pub(crate) struct GitService {
     resolved_git: Mutex<Option<(Option<String>, Arc<GitBinary>)>>,
     /// Bounds concurrent `git` processes across the whole daemon.
     pub(super) procs: Arc<Semaphore>,
-    /// Per-workspace single-flight + short reuse for status runs.
+    /// Per-repository single-flight + short reuse for status runs, keyed by
+    /// [`repo_slot`].
     status_share: StatusShare,
+    /// Which repository and branch each live session is in, its anchors,
+    /// and the managed-worktree locks held for agents (see `session`).
+    pub(crate) sessions: super::session::SessionGits,
+    /// (base sha, worktree sha) -> (behind, ahead): the Branches rows' counts
+    /// against the main checkout's branch. Two commits never change their
+    /// distance, so a refresh re-runs `rev-list` only when one of them moved.
+    pub(super) vs_main: Mutex<HashMap<(String, String), (u64, u64)>>,
+    /// (branch, sha) -> the branch never moved since it was created (a
+    /// brand-new branch is not "merged", whatever its distance says).
+    pub(super) fresh_branches: Mutex<HashMap<(String, String), bool>>,
 }
+
+/// Entries the ahead/behind cache keeps before it starts over.
+pub(super) const VS_MAIN_CAP: usize = 256;
 
 /// A status result from the share: the data, plus whether the run that
 /// produced it was invalidated mid-flight. A flushed result is a valid
@@ -155,21 +190,38 @@ impl StatusShare {
             .clone()
     }
 
-    /// Invalidate `ws_id`'s share: a change was announced, so the next
+    /// Invalidate `key`'s share: a change was announced, so the next
     /// caller must recompute and any in-flight run must not be shared or
     /// published. Dropping the outcome also unpins its parsed payload.
-    fn flush(&self, ws_id: &str) {
-        let slot = crate::lock(&self.slots).get(ws_id).cloned();
+    fn flush(&self, key: &str) {
+        let slot = crate::lock(&self.slots).get(key).cloned();
         if let Some(slot) = slot {
-            let mut inner = crate::lock(&slot.inner);
-            inner.flushes += 1;
-            inner.outcome = None;
+            Self::flush_slot(&slot);
         }
     }
 
-    /// Drop `ws_id`'s slot entirely (the workspace is gone).
-    fn evict(&self, ws_id: &str) {
-        crate::lock(&self.slots).remove(ws_id);
+    fn flush_slot(slot: &StatusSlot) {
+        let mut inner = crate::lock(&slot.inner);
+        inner.flushes += 1;
+        inner.outcome = None;
+    }
+
+    /// [`Self::flush`] every slot whose key starts with `prefix` (all of one
+    /// workspace's repositories).
+    fn flush_prefix(&self, prefix: &str) {
+        let slots: Vec<Arc<StatusSlot>> = crate::lock(&self.slots)
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(_, v)| v.clone())
+            .collect();
+        for slot in slots {
+            Self::flush_slot(&slot);
+        }
+    }
+
+    /// Drop every slot whose key starts with `prefix` (the workspace is gone).
+    fn evict_prefix(&self, prefix: &str) {
+        crate::lock(&self.slots).retain(|k, _| !k.starts_with(prefix));
     }
 
     /// The single-flight entry: join the run this caller waited out, reuse
@@ -245,12 +297,18 @@ impl GitService {
     pub(crate) fn new() -> Self {
         GitService {
             repos: Mutex::new(HashMap::new()),
+            repo_sets: Mutex::new(HashMap::new()),
             epochs: Mutex::new(HashMap::new()),
+            repo_epochs: Mutex::new(HashMap::new()),
+            repo_watchers: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
             hashes: Mutex::new(HashMap::new()),
             resolved_git: Mutex::new(None),
             procs: Arc::new(Semaphore::new(MAX_CONCURRENT_GIT)),
             status_share: StatusShare::new(),
+            sessions: Default::default(),
+            vs_main: Mutex::new(HashMap::new()),
+            fresh_branches: Mutex::new(HashMap::new()),
         }
     }
 
@@ -287,27 +345,65 @@ impl GitService {
         *epochs.entry(ws_id.to_string()).or_insert(0) += 1;
     }
 
+    /// Bump one repository's epoch, and its workspace's with it (the
+    /// workspace epoch is what single-repository windows follow).
+    pub(super) fn bump_repo(&self, ws_id: &str, toplevel: &Path) {
+        self.bump(ws_id);
+        let mut epochs = crate::lock(&self.repo_epochs);
+        *epochs
+            .entry(ws_id.to_string())
+            .or_default()
+            .entry(toplevel.to_path_buf())
+            .or_insert(0) += 1;
+    }
+
+    /// One repository's epoch (0 until it first moves).
+    pub(super) fn repo_epoch(&self, ws_id: &str, toplevel: &Path) -> u64 {
+        crate::lock(&self.repo_epochs)
+            .get(ws_id)
+            .and_then(|m| m.get(toplevel))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Every repository epoch, for the `/ws/events` git frame's `repos`.
+    pub(crate) fn repo_epochs_snapshot(&self) -> HashMap<String, BTreeMap<PathBuf, u64>> {
+        crate::lock(&self.repo_epochs).clone()
+    }
+
     /// Forget the published hash: the next computed status is accepted as the new
     /// baseline WITHOUT a second epoch bump. Paired with an event-driven bump
     /// (a save / an agent write), whose change we have already announced. Also
     /// flushes the single-flight share — the refetch this announcement
-    /// triggers must recompute, never reuse a pre-change result.
+    /// triggers must recompute, never reuse a pre-change result. Covers every
+    /// repository of the workspace; [`Self::invalidate_repo`] covers one.
     pub(super) fn invalidate(&self, ws_id: &str) {
-        crate::lock(&self.hashes).remove(ws_id);
-        self.status_share.flush(ws_id);
+        let prefix = slot_prefix(ws_id);
+        crate::lock(&self.hashes).retain(|k, _| !k.starts_with(&prefix));
+        self.status_share.flush_prefix(&prefix);
     }
 
-    /// Drop everything held for a deleted workspace: the discovery cache,
-    /// its epoch, the published-status hash, and — the part that actually
-    /// weighs something — the status share's slot with its parsed payload.
-    /// `watchers` is left alone: it is refcounted by connected clients and
-    /// their guards release it (a stale entry there is a usize, and the
-    /// backstop skips unknown workspace ids anyway).
+    /// [`Self::invalidate`] for one repository.
+    pub(super) fn invalidate_repo(&self, ws_id: &str, toplevel: &Path) {
+        let key = repo_slot(ws_id, toplevel);
+        crate::lock(&self.hashes).remove(&key);
+        self.status_share.flush(&key);
+    }
+
+    /// Drop everything held for a deleted workspace: the discovery caches,
+    /// its epochs, the published-status hashes, and — the part that actually
+    /// weighs something — the status share's slots with their parsed
+    /// payloads. `watchers` are left alone: they are refcounted by connected
+    /// clients and their guards release them (a stale entry there is a
+    /// usize, and the backstop skips unknown workspace ids anyway).
     pub(crate) fn forget_workspace(&self, ws_id: &str) {
+        let prefix = slot_prefix(ws_id);
         crate::lock(&self.repos).remove(ws_id);
+        crate::lock(&self.repo_sets).remove(ws_id);
         crate::lock(&self.epochs).remove(ws_id);
-        crate::lock(&self.hashes).remove(ws_id);
-        self.status_share.evict(ws_id);
+        crate::lock(&self.repo_epochs).remove(ws_id);
+        crate::lock(&self.hashes).retain(|k, _| !k.starts_with(&prefix));
+        self.status_share.evict_prefix(&prefix);
     }
 
     /// Record a freshly computed status as the published baseline.
@@ -322,14 +418,15 @@ impl GitService {
     /// This ownership matters: if a plain pull could overwrite the baseline
     /// without announcing, one client's fetch would hide the change from every
     /// other client and from the backstop.
-    pub(super) fn publish(&self, ws_id: &str, data: &StatusData) -> (u64, bool) {
+    pub(super) fn publish(&self, ws_id: &str, repo: &RepoInfo, data: &StatusData) -> (u64, bool) {
         let hash = hash_status(data);
-        let bumped = match crate::lock(&self.hashes).insert(ws_id.to_string(), hash) {
+        let key = repo_slot(ws_id, &repo.toplevel);
+        let bumped = match crate::lock(&self.hashes).insert(key, hash) {
             Some(previous) => previous != hash,
             None => false,
         };
         if bumped {
-            self.bump(ws_id);
+            self.bump_repo(ws_id, &repo.toplevel);
         }
         (self.epoch(ws_id), bumped)
     }
@@ -350,9 +447,39 @@ impl GitService {
         }
     }
 
-    /// Workspaces at least one connected client is currently looking at.
-    fn watched(&self) -> Vec<String> {
-        crate::lock(&self.watchers).keys().cloned().collect()
+    fn watch_repo(&self, ws_id: &str, toplevel: &Path) {
+        *crate::lock(&self.repo_watchers)
+            .entry((ws_id.to_string(), toplevel.to_path_buf()))
+            .or_insert(0) += 1;
+    }
+
+    fn unwatch_repo(&self, ws_id: &str, toplevel: &Path) {
+        let mut watchers = crate::lock(&self.repo_watchers);
+        let key = (ws_id.to_string(), toplevel.to_path_buf());
+        if let Some(count) = watchers.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                watchers.remove(&key);
+            }
+        }
+    }
+
+    /// Workspaces at least one connected client is currently looking at,
+    /// each with the nested repositories some window watches.
+    fn watched(&self) -> Vec<(String, Vec<PathBuf>)> {
+        let workspaces: Vec<String> = crate::lock(&self.watchers).keys().cloned().collect();
+        let repos = crate::lock(&self.repo_watchers);
+        workspaces
+            .into_iter()
+            .map(|ws| {
+                let tops = repos
+                    .keys()
+                    .filter(|(w, _)| *w == ws)
+                    .map(|(_, t)| t.clone())
+                    .collect();
+                (ws, tops)
+            })
+            .collect()
     }
 
     /// Discover the repo for `ws_id` rooted at `root`, caching the result.
@@ -372,6 +499,120 @@ impl GitService {
         outcome
     }
 
+    /// The cached primary repository of a workspace, if discovered.
+    pub(super) fn primary(&self, ws_id: &str) -> Option<RepoInfo> {
+        crate::lock(&self.repos).get(ws_id).cloned().flatten()
+    }
+
+    /// A repository found below a workspace's root, by top level.
+    pub(super) fn found_repo(&self, ws_id: &str, toplevel: &Path) -> Option<RepoInfo> {
+        crate::lock(&self.repo_sets)
+            .get(ws_id)
+            .and_then(|set| set.found.get(toplevel))
+            .map(|f| f.info.clone())
+    }
+
+    /// Every known repository top level of a workspace (primary included).
+    pub(super) fn known_toplevels(&self, ws_id: &str) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = self
+            .primary(ws_id)
+            .map(|r| r.toplevel)
+            .into_iter()
+            .collect();
+        if let Some(set) = crate::lock(&self.repo_sets).get(ws_id) {
+            out.extend(set.found.keys().cloned());
+        }
+        out
+    }
+
+    /// The innermost known repository containing `path` in a workspace, and
+    /// — when it is a submodule — its superproject's top level (whose
+    /// status marks the submodule, so it refreshes too).
+    pub(super) fn innermost(
+        &self,
+        ws_id: &str,
+        path: &Path,
+    ) -> Option<(RepoInfo, Option<PathBuf>)> {
+        let primary = self.primary(ws_id);
+        let sets = crate::lock(&self.repo_sets);
+        let found: Vec<&super::repos::Found> = sets
+            .get(ws_id)
+            .map(|set| set.found.values().collect())
+            .unwrap_or_default();
+        let mut best: Option<(RepoInfo, bool)> = primary
+            .clone()
+            .filter(|p| path.starts_with(&p.toplevel))
+            .map(|p| (p, false));
+        for f in found {
+            if path.starts_with(&f.info.toplevel)
+                && best.as_ref().is_none_or(|(b, _)| {
+                    f.info.toplevel.as_os_str().len() > b.toplevel.as_os_str().len()
+                })
+            {
+                best = Some((f.info.clone(), f.kind == super::repos::RepoKind::Submodule));
+            }
+        }
+        let (repo, submodule) = best?;
+        let parent = if submodule {
+            // The next repository out from the submodule.
+            let outer = repo.toplevel.parent().map(Path::to_path_buf);
+            let mut parent: Option<PathBuf> = primary
+                .filter(|p| outer.as_ref().is_some_and(|o| o.starts_with(&p.toplevel)))
+                .map(|p| p.toplevel);
+            if let Some(set) = sets.get(ws_id) {
+                for top in set.found.keys() {
+                    if *top != repo.toplevel
+                        && outer.as_ref().is_some_and(|o| o.starts_with(top))
+                        && parent
+                            .as_ref()
+                            .is_none_or(|p| top.as_os_str().len() > p.as_os_str().len())
+                    {
+                        parent = Some(top.clone());
+                    }
+                }
+            }
+            parent
+        } else {
+            None
+        };
+        Some((repo, parent))
+    }
+
+    /// Add a repository found below a workspace's root. Returns whether the
+    /// set changed (the caller announces it). Refuses past
+    /// [`super::repos::MAX_REPOS`] (marking the set capped), the primary
+    /// itself, a linked worktree of an already-known repository (a worktree
+    /// is a dimension of its repository, never a peer), and anything outside
+    /// the workspace root.
+    pub(super) fn add_found(&self, ws_id: &str, root: &Path, found: super::repos::Found) -> bool {
+        if !found.info.toplevel.starts_with(root) {
+            return false;
+        }
+        let primary = self.primary(ws_id);
+        if primary.as_ref().is_some_and(|p| {
+            p.toplevel == found.info.toplevel || p.common_dir == found.info.common_dir
+        }) {
+            return false;
+        }
+        let mut sets = crate::lock(&self.repo_sets);
+        let set = sets.entry(ws_id.to_string()).or_default();
+        if set.found.contains_key(&found.info.toplevel)
+            || set
+                .found
+                .values()
+                .any(|f| f.info.common_dir == found.info.common_dir)
+        {
+            return false;
+        }
+        let limit = super::repos::MAX_REPOS - usize::from(primary.is_some());
+        if set.found.len() >= limit {
+            set.capped = true;
+            return false;
+        }
+        set.found.insert(found.info.toplevel.clone(), found);
+        true
+    }
+
     /// The status entry for the repeat-caller pull paths (the HTTP handler
     /// and the backstop poll): single-flighted per workspace — callers that
     /// waited out a run join its result, late arrivals reuse it for
@@ -385,8 +626,9 @@ impl GitService {
         ws_id: &str,
         repo: &RepoInfo,
     ) -> anyhow::Result<SharedStatus> {
+        let key = repo_slot(ws_id, &repo.toplevel);
         self.status_share
-            .get_or_run(ws_id, STATUS_REUSE, || self.status_uncached(git, repo))
+            .get_or_run(&key, STATUS_REUSE, || self.status_uncached(git, repo))
             .await
     }
 
@@ -402,7 +644,7 @@ impl GitService {
         ws_id: &str,
         repo: &RepoInfo,
     ) -> anyhow::Result<Arc<StatusData>> {
-        let slot = self.status_share.slot(ws_id);
+        let slot = self.status_share.slot(&repo_slot(ws_id, &repo.toplevel));
         let _guard = slot.run_lock.lock().await;
         StatusShare::lead(&slot, || self.status_uncached(git, repo))
             .await
@@ -475,7 +717,7 @@ pub(super) enum ProbeOutcome {
 }
 
 impl ProbeOutcome {
-    fn repo(&self) -> Option<&RepoInfo> {
+    pub(super) fn repo(&self) -> Option<&RepoInfo> {
         match self {
             ProbeOutcome::Repo(r) => Some(r),
             _ => None,
@@ -512,13 +754,20 @@ fn classify_probe_failure(stderr: &str) -> ProbeOutcome {
     }
 }
 
-/// Run `git rev-parse` to resolve the working-tree root and common git dir.
-async fn probe_repo(git: &Path, procs: &Semaphore, root: &Path) -> ProbeOutcome {
+/// Run `git rev-parse` to resolve the working-tree root, this checkout's git
+/// dir, and the common git dir. Public to the module: the session tracker
+/// probes an agent's cwd the same way the workspace probe does.
+pub(super) async fn probe_repo(git: &Path, procs: &Semaphore, root: &Path) -> ProbeOutcome {
     let out = match run_git(
         git,
         procs,
         root,
-        &["rev-parse", "--show-toplevel", "--git-common-dir"],
+        &[
+            "rev-parse",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--git-common-dir",
+        ],
         8 * 1024,
     )
     .await
@@ -531,31 +780,58 @@ async fn probe_repo(git: &Path, procs: &Semaphore, root: &Path) -> ProbeOutcome 
     if !out.success {
         return classify_probe_failure(&out.stderr);
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut lines = text.lines();
-    // A success with no toplevel line is pathological; treat as non-repo.
-    let Some(toplevel) = lines.next().map(str::trim).filter(|l| !l.is_empty()) else {
-        return ProbeOutcome::NotARepo;
-    };
-    let toplevel = PathBuf::from(toplevel);
+    match parse_probe(&String::from_utf8_lossy(&out.stdout), root) {
+        Some(repo) => ProbeOutcome::Repo(repo),
+        None => ProbeOutcome::NotARepo,
+    }
+}
+
+/// Parse `rev-parse --show-toplevel --absolute-git-dir --git-common-dir`
+/// run in `ran_in`. A success with no toplevel line is pathological (a bare
+/// repo, or run inside a `.git` dir): treated as no work tree.
+pub(super) fn parse_probe(text: &str, ran_in: &Path) -> Option<RepoInfo> {
+    let mut lines = text.lines().map(str::trim);
+    let toplevel = PathBuf::from(lines.next().filter(|l| !l.is_empty())?);
+    let git_dir = lines
+        .next()
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| toplevel.join(".git"));
     // `--git-common-dir` prints relative to the CWD we ran in unless it is an
     // absolute path into the main checkout (the linked-worktree case).
-    let common = lines.next().map(str::trim).unwrap_or("");
-    let common_dir = match common {
-        "" => toplevel.join(".git"),
+    let common_dir = match lines.next().unwrap_or("") {
+        "" => git_dir.clone(),
         c => {
             let p = PathBuf::from(c);
             if p.is_absolute() {
                 p
             } else {
-                root.join(p)
+                normalize(&ran_in.join(p))
             }
         }
     };
-    ProbeOutcome::Repo(RepoInfo {
+    Some(RepoInfo {
         toplevel,
         common_dir,
+        git_dir,
     })
+}
+
+/// Lexically fold `.`/`..` components (no filesystem access): a relative
+/// `--git-common-dir` such as `../../.git` joined onto the probe dir must
+/// compare equal to the same dir reached another way.
+pub(super) fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// The bounded output of one git invocation.
@@ -642,17 +918,23 @@ async fn read_capped<R: AsyncRead + Unpin>(
     Ok((buf, truncated))
 }
 
-/// One `/ws/events` connection's "I am looking at workspace W" registration.
+/// One `/ws/events` connection's "I am looking at workspace W" registration,
+/// plus the nested repositories it watches (sections open, files mounted).
 /// A guard because that socket has many exit paths (auth failure, send error,
 /// client close) and a leaked watcher would poll git forever.
 pub(crate) struct WatchGuard {
     state: Arc<AppState>,
     ws: Option<String>,
+    repos: Vec<PathBuf>,
 }
 
 impl WatchGuard {
     pub(crate) fn new(state: Arc<AppState>) -> Self {
-        WatchGuard { state, ws: None }
+        WatchGuard {
+            state,
+            ws: None,
+            repos: Vec::new(),
+        }
     }
 
     /// The workspace this connection shows, if any.
@@ -665,6 +947,7 @@ impl WatchGuard {
         if self.ws == ws {
             return;
         }
+        self.release_repos();
         if let Some(previous) = self.ws.take() {
             self.state.git.unwatch(&previous);
         }
@@ -673,10 +956,47 @@ impl WatchGuard {
             self.ws = Some(next);
         }
     }
+
+    /// The nested repositories this window watches, by top level. Only the
+    /// workspace's known repositories count (never an arbitrary path), at
+    /// most [`super::repos::MAX_REPOS`].
+    pub(crate) fn set_repos(&mut self, tops: Vec<String>) {
+        let Some(ws) = self.ws.clone() else {
+            self.release_repos();
+            return;
+        };
+        let known = self.state.git.known_toplevels(&ws);
+        let mut next: Vec<PathBuf> = tops
+            .into_iter()
+            .map(PathBuf::from)
+            .filter(|t| known.contains(t))
+            .take(super::repos::MAX_REPOS)
+            .collect();
+        next.sort();
+        next.dedup();
+        if next == self.repos {
+            return;
+        }
+        self.release_repos();
+        for top in &next {
+            self.state.git.watch_repo(&ws, top);
+        }
+        self.repos = next;
+    }
+
+    fn release_repos(&mut self) {
+        if let Some(ws) = self.ws.as_deref() {
+            for top in self.repos.drain(..) {
+                self.state.git.unwatch_repo(ws, &top);
+            }
+        }
+        self.repos.clear();
+    }
 }
 
 impl Drop for WatchGuard {
     fn drop(&mut self) {
+        self.release_repos();
         if let Some(ws) = self.ws.take() {
             self.state.git.unwatch(&ws);
         }
@@ -719,16 +1039,31 @@ pub(crate) async fn mark_path_dirty(state: &AppState, path: &str) {
     let mut bumped = false;
     for ws in workspaces {
         // Component-wise prefix (so `/repo` never matches `/repo2`).
-        if target.starts_with(&ws.root) {
-            if let Ok(rel) = target.strip_prefix(&ws.root) {
-                crate::plugins::files::touched(state, &expanded, &ws.id, &rel.to_string_lossy());
-            }
-            state.git.bump(&ws.id);
-            // We just announced this change; drop the published baseline so the
-            // pull it triggers adopts the new status without bumping again.
-            state.git.invalidate(&ws.id);
-            bumped = true;
+        if !target.starts_with(&ws.root) {
+            continue;
         }
+        if let Ok(rel) = target.strip_prefix(&ws.root) {
+            crate::plugins::files::touched(state, &expanded, &ws.id, &rel.to_string_lossy());
+        }
+        // Only the repository containing the path refreshes (and a
+        // submodule's superproject, whose status marks it). We just
+        // announced the change, so drop the published baseline: the pull it
+        // triggers adopts the new status without bumping again.
+        match state.git.innermost(&ws.id, &target) {
+            Some((repo, parent)) => {
+                state.git.bump_repo(&ws.id, &repo.toplevel);
+                state.git.invalidate_repo(&ws.id, &repo.toplevel);
+                if let Some(parent) = parent {
+                    state.git.bump_repo(&ws.id, &parent);
+                    state.git.invalidate_repo(&ws.id, &parent);
+                }
+            }
+            None => {
+                state.git.bump(&ws.id);
+                state.git.invalidate(&ws.id);
+            }
+        }
+        bumped = true;
     }
     if bumped {
         state.changes.notify_waiters();
@@ -760,29 +1095,39 @@ pub(crate) async fn backstop_poll(state: Arc<AppState>) {
             continue;
         }
         let mut bumped = false;
-        for ws_id in watched {
+        for (ws_id, nested) in watched {
             let Some(ws) = crate::lock(&state.workspaces).get(&ws_id) else {
                 continue;
             };
-            let Some(repo) = state
+            // The primary repository (as ever), plus the nested ones a
+            // window has open — never every repository of the workspace.
+            let mut repos: Vec<RepoInfo> = state
                 .git
                 .discover(&git.path, &ws_id, &ws.root)
                 .await
                 .into_repo()
-            else {
-                continue;
-            };
-            let Ok(shared) = state.git.status_shared(&git.path, &ws_id, &repo).await else {
-                continue;
-            };
-            if shared.flushed {
-                // Invalidated mid-run: the announced change's own fan-out
-                // publishes the post-change status — don't re-seed pre-change
-                // data as the baseline.
-                continue;
+                .into_iter()
+                .collect();
+            for top in nested {
+                if let Some(found) = state.git.found_repo(&ws_id, &top) {
+                    if !repos.iter().any(|r| r.toplevel == found.toplevel) {
+                        repos.push(found);
+                    }
+                }
             }
-            let (_, changed) = state.git.publish(&ws_id, &shared.data);
-            bumped |= changed;
+            for repo in repos {
+                let Ok(shared) = state.git.status_shared(&git.path, &ws_id, &repo).await else {
+                    continue;
+                };
+                if shared.flushed {
+                    // Invalidated mid-run: the announced change's own fan-out
+                    // publishes the post-change status — don't re-seed
+                    // pre-change data as the baseline.
+                    continue;
+                }
+                let (_, changed) = state.git.publish(&ws_id, &repo, &shared.data);
+                bumped |= changed;
+            }
         }
         if bumped {
             state.changes.notify_waiters();
@@ -897,9 +1242,18 @@ mod tests {
     /// discovers (otherwise one client's fetch hides it from every other client
     /// and from the backstop), but must not double-announce a change an event
     /// trigger already published.
+    fn repo_at(top: &str) -> RepoInfo {
+        RepoInfo {
+            toplevel: PathBuf::from(top),
+            common_dir: PathBuf::from(top).join(".git"),
+            git_dir: PathBuf::from(top).join(".git"),
+        }
+    }
+
     #[test]
     fn publish_announces_each_unannounced_change_exactly_once() {
         let svc = GitService::new();
+        let repo = repo_at("/w");
         let clean = StatusData::default();
         let dirty = StatusData {
             entries: vec![Entry::untracked("new.txt".to_string())],
@@ -907,18 +1261,20 @@ mod tests {
         };
 
         // First observation establishes the baseline silently.
-        assert_eq!(svc.publish("w", &clean), (0, false));
+        assert_eq!(svc.publish("w", &repo, &clean), (0, false));
 
         // An unannounced change (external editor / terminal git) bumps once...
-        assert_eq!(svc.publish("w", &dirty), (1, true));
+        assert_eq!(svc.publish("w", &repo, &dirty), (1, true));
         // ...and re-publishing the same status does not bump again.
-        assert_eq!(svc.publish("w", &dirty), (1, false));
+        assert_eq!(svc.publish("w", &repo, &dirty), (1, false));
 
         // An event-driven bump (a save) announces, then invalidates the baseline;
         // the pull it triggers adopts the new status WITHOUT a second bump.
         svc.bump("w");
         svc.invalidate("w");
-        assert_eq!(svc.publish("w", &clean), (2, false));
+        assert_eq!(svc.publish("w", &repo, &clean), (2, false));
+        // The repository's own epoch moved with the workspace's.
+        assert_eq!(svc.repo_epoch("w", &repo.toplevel), 1);
     }
 
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1161,9 +1517,10 @@ mod tests {
         let svc = GitService::new();
         let runs = AtomicU64::new(0);
         let reuse = Duration::from_secs(60);
+        let key = repo_slot("w", Path::new("/w"));
         for expected in [1u64, 2] {
             svc.status_share
-                .get_or_run("w", reuse, || async {
+                .get_or_run(&key, reuse, || async {
                     runs.fetch_add(1, Ordering::SeqCst);
                     Ok(StatusData::default())
                 })
@@ -1199,13 +1556,14 @@ mod tests {
             base.join("config"),
         );
         let ws = crate::lock(&state.workspaces).add(root.clone()).unwrap();
+        let key = repo_slot(&ws.id, &root);
 
         let runs = AtomicU64::new(0);
         let reuse = Duration::from_secs(60);
         state
             .git
             .status_share
-            .get_or_run(&ws.id, reuse, || async {
+            .get_or_run(&key, reuse, || async {
                 runs.fetch_add(1, Ordering::SeqCst);
                 Ok(StatusData::default())
             })
@@ -1221,7 +1579,7 @@ mod tests {
         state
             .git
             .status_share
-            .get_or_run(&ws.id, reuse, || async {
+            .get_or_run(&key, reuse, || async {
                 runs.fetch_add(1, Ordering::SeqCst);
                 Ok(StatusData::default())
             })
@@ -1238,16 +1596,129 @@ mod tests {
     async fn forget_workspace_evicts_the_share_slot() {
         let svc = GitService::new();
         svc.status_share
-            .get_or_run("w", Duration::from_secs(60), || async {
-                Ok(StatusData::default())
-            })
+            .get_or_run(
+                &repo_slot("w", Path::new("/w")),
+                Duration::from_secs(60),
+                || async { Ok(StatusData::default()) },
+            )
             .await
             .unwrap();
         svc.bump("w");
-        assert_eq!(crate::lock(&svc.status_share.slots).len(), 1);
+        // Another workspace whose id merely starts the same survives.
+        svc.status_share
+            .get_or_run(
+                &repo_slot("w2", Path::new("/w2")),
+                Duration::from_secs(60),
+                || async { Ok(StatusData::default()) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(crate::lock(&svc.status_share.slots).len(), 2);
         svc.forget_workspace("w");
-        assert!(crate::lock(&svc.status_share.slots).is_empty());
+        assert_eq!(crate::lock(&svc.status_share.slots).len(), 1);
         assert_eq!(svc.epoch("w"), 0);
+    }
+
+    /// Several repositories: a change inside one invalidates that one only
+    /// (the others keep serving their shared status), and the innermost
+    /// repository wins a path.
+    #[tokio::test]
+    async fn repositories_invalidate_and_resolve_independently() {
+        use super::super::repos::{Found, RepoKind, Source};
+        let svc = GitService::new();
+        crate::lock(&svc.repos).insert("w".into(), Some(repo_at("/proj")));
+        let nested = Found {
+            info: repo_at("/proj/tools/cloned"),
+            kind: RepoKind::Nested,
+            source: Source::Probe,
+        };
+        assert!(svc.add_found("w", Path::new("/proj"), nested.clone()));
+        assert!(
+            !svc.add_found("w", Path::new("/proj"), nested),
+            "no duplicates"
+        );
+        // A linked worktree of the primary is a dimension of it, not a peer.
+        let linked = Found {
+            info: RepoInfo {
+                toplevel: PathBuf::from("/proj/wt"),
+                common_dir: PathBuf::from("/proj/.git"),
+                git_dir: PathBuf::from("/proj/.git/worktrees/wt"),
+            },
+            kind: RepoKind::Nested,
+            source: Source::Tree,
+        };
+        assert!(!svc.add_found("w", Path::new("/proj"), linked));
+        // Outside the root: never.
+        let outside = Found {
+            info: repo_at("/elsewhere"),
+            kind: RepoKind::Nested,
+            source: Source::Agent,
+        };
+        assert!(!svc.add_found("w", Path::new("/proj"), outside));
+
+        let (inner, parent) = svc
+            .innermost("w", Path::new("/proj/tools/cloned/src/x.rs"))
+            .unwrap();
+        assert_eq!(inner.toplevel, PathBuf::from("/proj/tools/cloned"));
+        assert_eq!(parent, None, "a nested clone is not a submodule");
+        let (outer, _) = svc
+            .innermost("w", Path::new("/proj/tools/other.txt"))
+            .unwrap();
+        assert_eq!(outer.toplevel, PathBuf::from("/proj"));
+
+        let runs = AtomicU64::new(0);
+        let reuse = Duration::from_secs(60);
+        for top in ["/proj", "/proj/tools/cloned"] {
+            svc.status_share
+                .get_or_run(&repo_slot("w", Path::new(top)), reuse, || async {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    Ok(StatusData::default())
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        svc.invalidate_repo("w", Path::new("/proj/tools/cloned"));
+        for top in ["/proj", "/proj/tools/cloned"] {
+            svc.status_share
+                .get_or_run(&repo_slot("w", Path::new(top)), reuse, || async {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    Ok(StatusData::default())
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            3,
+            "only the invalidated repository re-ran"
+        );
+    }
+
+    /// The cap: at most 32 repositories per workspace, the primary included;
+    /// past it the set says so.
+    #[test]
+    fn repository_sets_are_capped() {
+        use super::super::repos::{Found, RepoKind, Source, MAX_REPOS};
+        let svc = GitService::new();
+        crate::lock(&svc.repos).insert("w".into(), Some(repo_at("/p")));
+        let mut added = 0;
+        for i in 0..40 {
+            if svc.add_found(
+                "w",
+                Path::new("/p"),
+                Found {
+                    info: repo_at(&format!("/p/r{i}")),
+                    kind: RepoKind::Nested,
+                    source: Source::Probe,
+                },
+            ) {
+                added += 1;
+            }
+        }
+        assert_eq!(added, MAX_REPOS - 1);
+        assert!(crate::lock(&svc.repo_sets)["w"].capped);
+        assert_eq!(svc.known_toplevels("w").len(), MAX_REPOS);
     }
 
     fn now_nanos() -> u128 {

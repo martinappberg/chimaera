@@ -17,6 +17,9 @@
   import { workspacePlugins } from "../plugins/store";
   import NotificationStatus from "./NotificationStatus.svelte";
   import UpdatesStatus from "./UpdatesStatus.svelte";
+  import ActivitySettings from "./ActivitySettings.svelte";
+  import { settingsJump } from "./jump";
+  import { tick, untrack } from "svelte";
   import { APP_MENU, PINNED } from "../shared/keys";
   import { activeModLabel } from "../shared/keybindings";
 
@@ -36,6 +39,11 @@
     // Plugins' own declared settings, after the Extensions policy.
     const ext = out.indexOf("Extensions");
     out.splice(ext >= 0 ? ext + 1 : out.length, 0, "Plugins");
+    // Activity (sessions and tokens across workspaces) is read-only and
+    // store-backed (/api/v1/activity), like Environment and Documents. Before
+    // Keyboard: the pinned-chords block trails the list and belongs to it.
+    const kb = out.indexOf("Keyboard");
+    out.splice(kb >= 0 ? kb : out.length, 0, "Activity");
     return out;
   })();
 
@@ -86,6 +94,8 @@
           (p.name.toLowerCase().includes(q) || p.platform.settings.some((s) => s.label.toLowerCase().includes(q))),
       ),
   );
+  const ACTIVITY_KEYWORDS = ["activity", "usage", "sessions", "tokens", "csv", "export"];
+  const activityVisible = $derived(q === "" || ACTIVITY_KEYWORDS.some((k) => k.includes(q)));
 
   /** Rows grouped by category, registry order, empty groups dropped. */
   const groups = $derived.by(() => {
@@ -103,6 +113,10 @@
         if (pluginsVisible) out.push({ category: cat, defs: [] });
         continue;
       }
+      if (cat === "Activity") {
+        if (activityVisible) out.push({ category: cat, defs: [] });
+        continue;
+      }
       const defs = visible.filter((d) => d.category === cat);
       if (defs.length > 0) out.push({ category: cat, defs });
     }
@@ -117,6 +131,19 @@
     const el = listEl?.querySelector<HTMLElement>(`[data-section="${section}"]`);
     el?.scrollIntoView({ block: "start", behavior: "instant" as ScrollBehavior });
   }
+
+  // A section asked for from elsewhere (Quick Open "Usage", the dashboard's
+  // cost line): clear any search that hides it, then scroll there once shown.
+  $effect(() => {
+    const want = $settingsJump;
+    if (want === null || !tabVisible) return;
+    untrack(() => {
+      settingsJump.set(null);
+      tab = "ui";
+      query = "";
+      void tick().then(() => jumpTo(want));
+    });
+  });
 
   /** Keep the nav highlight on the topmost visible section while scrolling. */
   function onScroll(): void {
@@ -165,6 +192,7 @@
     { label: "New terminal", chord: APP_MENU.newTerminal },
     { label: "New agent", chord: APP_MENU.newAgent },
     { label: "New window", chord: APP_MENU.newWindow },
+    { label: "Reload window", chord: APP_MENU.reloadWindow },
   ];
 </script>
 
@@ -254,6 +282,12 @@
                  kept by the daemon per plugin (not settings.json). -->
             <section data-section={group.category}>
               <PluginsSettings query={"plugins".includes(q) ? "" : q} />
+            </section>
+          {:else if group.category === "Activity"}
+            <!-- Bespoke panel: sessions, tokens and time from the session
+                 records (/api/v1/activity), every workspace. Its own <h2>. -->
+            <section data-section={group.category}>
+              <ActivitySettings visible={tabVisible} />
             </section>
           {:else if group.category === "Notifications"}
             <!-- Generic rows plus a status line: whether the OS/browser will

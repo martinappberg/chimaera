@@ -209,7 +209,17 @@ pub(crate) async fn tell_mastermind(state: &Arc<AppState>, sid: &str, args: &Val
             )
             .await
         {
-            Ok(()) => true,
+            Ok(()) => {
+                crate::history::act(
+                    state,
+                    &ws,
+                    sid,
+                    "wake_mastermind",
+                    Some(&cfg.session_id),
+                    Some(body),
+                );
+                true
+            }
             Err(err) => {
                 tracing::warn!(%err, from = %sid, "tell_mastermind: wake not delivered");
                 // Undelivered: the caps must not count it.
@@ -315,6 +325,14 @@ pub(crate) async fn deliver(
     match state.chat.command(&target, command).await {
         Ok(()) => {
             tracing::info!(workspace = %id, note = seq, target = %target, "note delivered by the user");
+            crate::history::act(
+                &state,
+                &id,
+                "you",
+                "deliver_note",
+                Some(&target),
+                Some(&note.text),
+            );
             Json(json!({"session_id": target})).into_response()
         }
         Err(err) => fail(StatusCode::BAD_GATEWAY, format!("delivery failed: {err}")),

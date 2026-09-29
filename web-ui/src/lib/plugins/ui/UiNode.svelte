@@ -25,7 +25,7 @@
   import { openInSystemBrowser } from "../../shared/urlOpen";
   import { fetchDiagnostics, onPlatformFrame, type Diagnostic, type UiNodeData } from "../platform";
   import { fsFile } from "../../previews/files";
-  import { fetchGitDiff, fetchGitDiffAt } from "../../workspace/git";
+  import { fetchGitDiff } from "../../workspace/git";
   import {
     KNOWN_NODES,
     diffLines,
@@ -267,7 +267,7 @@
           return;
         }
         const d = base.startsWith("rev:")
-          ? await fetchGitDiffAt(screen.ws, abs, base.slice(4))
+          ? await fetchGitDiff(screen.ws, abs, "rev", { rev: base.slice(4) })
           : await fetchGitDiff(screen.ws, abs, base === "index" ? "unstaged" : "head");
         if (d.error) throw new Error(d.error);
         if (d.binary) throw new Error("a binary file has no text to compare");

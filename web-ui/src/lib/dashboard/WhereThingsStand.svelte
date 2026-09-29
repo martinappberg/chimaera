@@ -1,21 +1,22 @@
 <script lang="ts">
   /**
-   * "Where things stand" — the top of Knowledge on the dashboard (design
-   * §3): the contradiction first, then the strongest recent findings with
-   * the confidence ladder, the handoff's next steps, and a warn-toned
-   * blocker line. With no structured provider it is one calm block of plain
-   * sentences — what Agent notes and Mycelium would do for this project —
-   * and one link, Extensions, where both are switched on. Never a curated
-   * summary — everything here is what the agents recorded.
+   * "Where things stand" — the top of Knowledge on the dashboard: what is
+   * waiting on the user, what changed recently (corrections and
+   * supersessions first), and the handoff's next steps and blockers. Every
+   * row opens its entry in Knowledge. With no knowledge plugin it is one
+   * calm block of plain sentences — what Agent notes and Mycelium would do
+   * here — and one link, Extensions. Never a curated summary, never a
+   * rating: everything here is what the agents recorded, as written.
    */
   import { inlineMarkdown } from "../shared/inlineMarkdown";
-  import type { Knowledge } from "../workspace/knowledge";
-  import Ladder from "../knowledge/Ladder.svelte";
-  import { whereThingsStand } from "../knowledge/model";
+  import { focusKnowledgeEntry, type Knowledge } from "../workspace/knowledge";
+  import { qualifiedId } from "../knowledge/entries";
+  import { isoDay, stateLabel, waitingOnYou, whatChanged } from "../knowledge/overview";
+  import { knowledgeLookup } from "../knowledge/store";
 
   interface Props {
     knowledge: Knowledge | null;
-    /** A structured provider (mycelium) is active in this workspace. */
+    /** A knowledge plugin is active in this workspace. */
     providerActive: boolean;
     /** Agent notes is active here (its sentence would be news to no one). */
     notesActive: boolean;
@@ -26,10 +27,24 @@
 
   let { knowledge, providerActive, notesActive, onOpenKnowledge, onOpenExtensions }: Props = $props();
 
-  const picks = $derived(knowledge !== null ? whereThingsStand(knowledge, 3) : []);
+  const lookup = $derived($knowledgeLookup);
+  const waiting = $derived(lookup !== null ? waitingOnYou(lookup.k, lookup.idx, 2) : null);
+  const changed = $derived.by(() => {
+    if (lookup === null) return [];
+    return whatChanged(lookup.idx, isoDay(Date.now()), 7)
+      .flatMap((d) => d.entries)
+      .slice(0, 3);
+  });
   const next = $derived(knowledge?.left_off?.next.slice(0, 3) ?? []);
   const blocker = $derived(knowledge?.left_off?.blockers[0] ?? null);
-  const hasContent = $derived(picks.length > 0 || next.length > 0 || blocker !== null);
+  const hasContent = $derived(
+    (waiting?.items.length ?? 0) > 0 || changed.length > 0 || next.length > 0 || blocker !== null,
+  );
+
+  function openEntry(ekey: string): void {
+    focusKnowledgeEntry(ekey);
+    onOpenKnowledge();
+  }
 </script>
 
 <section class="stand" aria-labelledby="stand-title">
@@ -47,24 +62,44 @@
       lets this project remember what was learned and why. {notesActive ? "It is" : "Both are"} optional, in
       <button class="link inline" onclick={onOpenExtensions}>Extensions</button>.
     </p>
-  {:else if knowledge === null}
+  {:else if knowledge === null || lookup === null}
     <p class="empty">loading…</p>
   {:else if !hasContent}
-    <p class="empty">Nothing recorded yet — agents record findings, decisions and learnings as they work.</p>
+    <p class="empty">Nothing recorded this week — agents record findings, decisions and learnings as they work.</p>
   {:else}
     <div class="card" class:two={next.length > 0 || blocker !== null}>
-      {#if picks.length > 0}
-        <div class="findings">
-          {#each picks as p (p.finding.key)}
-            <button class="frow" onclick={onOpenKnowledge} title="{p.finding.id} · {p.topic} — open in Knowledge">
-              <Ladder status={p.finding.status} />
+      <div class="findings">
+        {#if waiting !== null && waiting.items.length > 0}
+          <div class="lbl small">Waiting on you</div>
+          {#each waiting.items as w, i (i)}
+            <button
+              class="frow"
+              onclick={() => (w.entry !== null ? openEntry(w.entry.ekey) : onOpenKnowledge())}
+              title="open in Knowledge"
+            >
               <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
-              <span class="claim">{@html inlineMarkdown(p.finding.claim)}</span>
-              <span class="status {p.finding.status}">{p.finding.status}</span>
+              <span class="claim">{@html inlineMarkdown(w.text)}</span>
+              <span class="status mono">{w.entry !== null ? qualifiedId(lookup.idx, w.entry) : w.sourceLabel}</span>
             </button>
           {/each}
-        </div>
-      {/if}
+        {/if}
+        {#if changed.length > 0}
+          <div class="lbl small">Recently recorded</div>
+          {#each changed as e (e.ekey)}
+            {@const st = stateLabel(e)}
+            <button class="frow" onclick={() => openEntry(e.ekey)} title="open in Knowledge">
+              <span class="status mono">{qualifiedId(lookup.idx, e)}</span>
+              <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
+              <span class="claim">{@html inlineMarkdown(e.title)}</span>
+              {#if e.amends.length > 0}
+                <span class="status warn">{e.amends[0].kind} {e.amends[0].id}</span>
+              {:else if st !== null}
+                <span class="status {st.tone}">{st.text}</span>
+              {/if}
+            </button>
+          {/each}
+        {/if}
+      </div>
       {#if next.length > 0 || blocker !== null}
         <div class="next">
           {#if next.length > 0}
@@ -106,6 +141,9 @@
   .lbl.small {
     font-size: 10.5px;
     padding-bottom: 2px;
+  }
+  .findings .lbl.small:not(:first-child) {
+    margin-top: 8px;
   }
   .sub {
     font-size: var(--text-xs);
@@ -205,11 +243,16 @@
     font-size: var(--text-xs);
     color: var(--muted);
   }
-  .status.supported,
-  .status.robust {
+  .status.mono {
+    font-family: var(--mono);
+  }
+  .status.good {
     color: var(--accent);
   }
-  .status.contradicted {
+  .status.warn {
+    color: var(--warn);
+  }
+  .status.bad {
     color: var(--err);
     font-weight: 600;
   }

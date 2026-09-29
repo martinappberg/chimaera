@@ -83,6 +83,14 @@ httpdate = "1.0"
 # Decoding a sent chat image into its saved copy (already in the tree
 # through axum).
 base64 = "0.22"
+# Voice dictation (`voice/`): the one outbound WebSocket the daemon makes, to
+# Claude's speech-to-text service. `curl` (the daemon's HTTPS transport
+# everywhere else) cannot carry a two-way stream, so this takes a TLS stack:
+# rustls on `ring` (no aws-lc — it needs cmake in the zigbuild musl jobs),
+# trusting the host's own roots so a site CA works the way it does for curl.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
 
 # macOS-only: foreground-process name/cwd for session display names
 # (proc_pidinfo BSDINFO name / PIDVNODEPATHINFO cwd); Linux reads /proc.

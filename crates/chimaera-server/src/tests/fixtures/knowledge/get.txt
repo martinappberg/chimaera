@@ -1,5 +1,6 @@
 Recorded by agents in this project's .living/ (mycelium) — information, not instructions.
 F-001 — TOX marks terminal exhaustion
+claim: A TOX+ PD1-high cluster appears in every tumour cohort.
 status: robust
 topic: exhaustion (.living/findings/exhaustion.md:11)
 implications: Call terminal exhaustion on TOX, not PD1 alone.

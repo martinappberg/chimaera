@@ -51,6 +51,8 @@ export interface TimelineJob {
 export interface TimelineKnowledge {
   change: "status" | "new";
   id: string;
+  /** The entry's key in the provider's snapshot (absent on older rows). */
+  key?: string;
   from?: string;
   to: string;
   claim: string;

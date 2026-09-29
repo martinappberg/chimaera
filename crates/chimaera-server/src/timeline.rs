@@ -150,9 +150,15 @@ pub(crate) struct JobInfo {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct KnowledgeChange {
-    /// "status" (a finding's confidence moved) | "new" (a finding appeared)
+    /// "status" (a finding's status moved) | "new" (a finding appeared)
     pub(crate) change: String,
+    /// What the row shows ("F-228").
     pub(crate) id: String,
+    /// The entry's key in the provider's snapshot (a finding's
+    /// `<topic>/<id>`): what the row opens. Absent on entries written before
+    /// providers keyed their entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) from: Option<String>,
     pub(crate) to: String,

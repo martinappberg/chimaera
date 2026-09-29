@@ -738,6 +738,11 @@ world chimaera-plugin {                    // 0.2
 | `MastermindDock.svelte`, `DashboardView.svelte` | the `agent-notes` id | a panel slot and a surface |
 | `agent_probe.rs` hook trust | uses only the first codex agent plugin | every one the manifest names |
 
+After the Knowledge redesign merged (2026-09-29): `ids_of` reads each entry's `key`
+(no `.living/` paths), core no longer lists `MYCELIUM.md` (guidance is the
+dashboard's `GuidanceRow`, from the snapshot), and `store.ts` picks the provider by
+`provides.knowledge` (`knowledgePlugin`). The other rows are P10's.
+
 ## 13. Host limits, new and old
 
 | Limit | Value |

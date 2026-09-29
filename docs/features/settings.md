@@ -64,6 +64,12 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   the reason) / not checked yet, plus when it last checked and the cadence; "check now" asks every source
   at once. Agents read "up to date" only when every installed agent's version and latest are both known.
 
+## Activity
+
+- **Activity section** (`ActivitySettings.svelte`, store-backed like Environment and Documents —
+  no schema rows) — sessions, tokens and time from the session records across every workspace
+  (no dollars), with a CSV export; see [session-history.md](session-history.md#activity).
+
 ## Agents settings & themes
 
 - **Agents panel** (`AgentsSettings.svelte`) — update/uninstall managed agent runtimes and set an

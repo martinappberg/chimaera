@@ -676,8 +676,9 @@ const availableStore = writable<boolean | null>(null);
 /** false = the daemon has no plugin routes (predates the feature). */
 export const pluginsAvailable: Readable<boolean | null> = availableStore;
 
-/** The structured knowledge provider is active here (mycelium on + detected):
- *  the rail's knowledge row and Knowledge's source chip key on this. */
+/** A knowledge provider is active here (a plugin with `provides.knowledge`,
+ *  on and detected): the rail's Knowledge row, the quick-open entry and the
+ *  Knowledge tab itself key on this. */
 export const knowledgeProviderActive: Readable<boolean> = derived(pluginsStore, (p) =>
   p !== null && p.plugins.some((x) => x.active && typeof x.provides.knowledge === "string"),
 );
@@ -685,11 +686,13 @@ export const knowledgeProviderActive: Readable<boolean> = derived(pluginsStore, 
 /** This host's plugin policy (null until loaded, or from an older daemon). */
 export const pluginPolicy: Readable<PluginPolicy | null> = derived(pluginsStore, (p) => p?.policy ?? null);
 
-/** The mycelium plugin's status here, for the attach affordances. */
-export const myceliumPlugin: Readable<WorkspacePlugin | null> = derived(
-  pluginsStore,
-  (p) => p?.plugins.find((x) => x.id === "mycelium") ?? null,
-);
+/** The knowledge provider here, for the attach affordances: the installed
+ *  plugin with `provides.knowledge` (the active one first). Core never picks
+ *  a provider by its id. */
+export const knowledgePlugin: Readable<WorkspacePlugin | null> = derived(pluginsStore, (p) => {
+  const providers = p?.plugins.filter((x) => typeof x.provides.knowledge === "string") ?? [];
+  return providers.find((x) => x.active) ?? providers[0] ?? null;
+});
 
 const checkedStore = writable<ReadonlyMap<string, number>>(new Map());
 /** When this page last asked each plugin's release source (Check for
@@ -852,12 +855,12 @@ export async function setWorkspacePluginOn(pluginId: string, on: boolean): Promi
 
 // ---- the attach sheet request ------------------------------------------------
 
-/** Non-null while the "Use mycelium for Knowledge" sheet should be open; App
+/** Non-null while the "Use <plugin> for Knowledge" sheet should be open; App
  *  hosts the one modal instance so every surface (Knowledge's empty card,
  *  the dashboard line, the plugin card, the dock) opens the same sheet. */
 export const attachRequest = writable<{ pluginId: string } | null>(null);
 
-export function openAttachSheet(pluginId = "mycelium"): void {
+export function openAttachSheet(pluginId: string): void {
   attachRequest.set({ pluginId });
 }
 

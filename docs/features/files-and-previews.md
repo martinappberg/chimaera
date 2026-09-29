@@ -856,7 +856,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   global preload signal catches nested PDF/editor/spreadsheet chunks as well as top-level pane
   surfaces. A pane keeps an in-place retry for ordinary tunnel loss; a shared notice offers reload
   when the current asset graph is unavailable. Reload waits behind unsaved file edits and chat
-  drafts that exist only in memory, with an explicit reload-anyway escape hatch.
+  drafts that exist only in memory, with an explicit reload-anyway escape hatch. The user's own
+  Reload Window rides the same gate (reason `manual`, cancellable; see
+  [native-app.md](native-app.md#reload-window)).
 - **Binary / Finder.** Non-text files get an info card (`BinaryView`: name, size, modified time
   from the parent listing; no hex view yet) with **open as text** — a per-tab override
   (`RawTextView`): the bytes decoded read-only (the editor refuses binary content), control
@@ -866,8 +868,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 
 ## Embed cards
 
-- **What & when.** One card shows any file inside something else — agent prose in chat, a turn's
-  "made this turn" gallery, and markdown documents (reading and live, `doc/reader.ts` `Hydrator`): a thin
+- **What & when.** One card shows any file inside something else — agent prose in chat, the chat's
+  hover preview of a file, and markdown documents (reading and live, `doc/reader.ts` `Hydrator`): a thin
   header (file icon, name, the piece shown, **open in a pane** at that spot, **download** on a
   remote host) over the file's own viewer in a compact mode. The target is standard markdown,
   `![caption](path#fragment)`, with Obsidian's size hint (`![caption|400](plot.png)`).

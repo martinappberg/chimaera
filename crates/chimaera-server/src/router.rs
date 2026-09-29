@@ -8,7 +8,7 @@ use crate::AppState;
 use crate::{
     agent_probe, agents, api, chat, compute, compute_jobs, download, drafts, environment, fs, git,
     launcher, links, mcp, notebook, notices, plugins, proxy, quickopen, recents, runtimes,
-    settings, timeline, update, upload, view_state, ws,
+    settings, timeline, update, upload, view_state, voice, ws,
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
@@ -37,6 +37,21 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             put(api::put_mastermind).delete(api::delete_mastermind),
         )
         .route("/workspaces/{id}/timeline", get(timeline::get_timeline))
+        // Session history: every past session's record, and cost totals
+        // across workspaces (`history`).
+        .route(
+            "/workspaces/{id}/history",
+            get(crate::history::routes::list),
+        )
+        .route(
+            "/workspaces/{id}/same-file",
+            get(crate::history::routes::same_file),
+        )
+        .route("/activity", get(crate::history::routes::get_activity))
+        .route(
+            "/activity/csv",
+            get(crate::history::routes::get_activity_csv),
+        )
         // Agent notes: the USER sends a note to its addressee (their click).
         .route(
             "/workspaces/{id}/timeline/{seq}/deliver",
@@ -191,9 +206,15 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             )),
         )
         .route("/sessions/{id}/journal", get(api::session_journal))
+        // The agent's own edits per file, live or ended (`history::edits`).
+        .route(
+            "/sessions/{id}/edits",
+            get(crate::history::routes::session_edits),
+        )
         .route("/sessions/{id}/view", post(chat::switch_view))
         .route("/sessions/{id}/rewind", post(chat::rewind_session))
         .route("/sessions/{id}/fork", post(chat::fork_session))
+        .route("/sessions/{id}/git", get(git::session_git))
         .route("/links", get(links::list_links).put(links::put_link))
         .route("/links/{terminal_id}", delete(links::delete_link))
         .route("/agents", get(launcher::list_agents))
@@ -204,7 +225,19 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/agents/{id}/update", post(runtimes::update_agent))
         .route("/agents/claude/sessions", get(launcher::claude_resumables))
         .route("/recents", get(recents::list_recents))
+        // Archive hides a conversation from Recents (never deletes it); it
+        // stays in All sessions under "Archived" (`recents_archive`).
+        .route("/recents/archive", post(crate::recents_archive::archive))
+        .route(
+            "/recents/unarchive",
+            post(crate::recents_archive::unarchive),
+        )
+        .route(
+            "/recents/archived",
+            get(crate::recents_archive::list_archived),
+        )
         .route("/update", get(update::get_update))
+        .route("/voice", get(voice::availability))
         // The native shell's notice long-poll (agent finished / needs you).
         .route("/notices", get(notices::get_notices))
         .route(
@@ -274,7 +307,11 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         )
         .route("/git/status", get(git::status))
         .route("/git/diff", get(git::diff))
+        .route("/git/branches", get(git::branches))
+        .route("/git/repos", get(git::repos))
         .route("/git/log", get(git::log))
+        .route("/git/show", get(git::show))
+        .route("/git/compare", get(git::compare))
         .route(
             "/git/worktrees",
             get(git::worktrees)
@@ -311,6 +348,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/ws/sessions/{id}", get(ws::session_ws))
         .route("/ws/chat/{id}", get(ws::chat_ws))
         .route("/ws/events", get(ws::events_ws))
+        .route("/ws/voice", get(voice::voice_ws))
         .route("/raw/{ticket}", get(fs::raw))
         // An HTML report's relative assets, confined to its folder.
         .route("/raw/{ticket}/{*rest}", get(fs::raw_asset))

@@ -23,6 +23,7 @@
     versionNumber,
     type AgentInfo,
   } from "../workspace/launcher";
+  import ConfirmDialog from "../shared/ConfirmDialog.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { flushSettings, getSetting, isModified, setSetting } from "./store.svelte";
 
@@ -162,23 +163,23 @@
     }
   }
 
+  /** The agent whose uninstall is being confirmed (ConfirmDialog — the
+   *  native app's web view has no `window.confirm`). A failure stays in the
+   *  dialog as its inline error. */
+  let uninstallAsk = $state<AgentInfo | null>(null);
+  let uninstallError = $state<string | null>(null);
+
   async function uninstall(a: AgentInfo): Promise<void> {
     if (removing[a.id]) return;
-    if (
-      !confirm(
-        `Uninstall the chimaera-managed ${a.name}?\n\n` +
-          `This removes only chimaera's own copy under ~/.chimaera/agents. ` +
-          `Your own install, if any, is left untouched.`,
-      )
-    )
-      return;
     removing = { ...removing, [a.id]: true };
+    uninstallError = null;
     rowError = { ...rowError, [a.id]: null };
     try {
       await uninstallAgent(a.id);
+      uninstallAsk = null;
       await load();
     } catch (e) {
-      rowError = { ...rowError, [a.id]: e instanceof Error ? e.message : "failed to uninstall" };
+      uninstallError = e instanceof Error ? e.message : "failed to uninstall";
     } finally {
       removing = { ...removing, [a.id]: false };
     }
@@ -285,7 +286,10 @@
             class="btn danger"
             disabled={removing[a.id]}
             title="remove chimaera's managed copy (your own install is untouched)"
-            onclick={() => void uninstall(a)}
+            onclick={() => {
+              uninstallError = null;
+              uninstallAsk = a;
+            }}
           >
             {removing[a.id] ? "removing…" : "uninstall"}
           </button>
@@ -294,6 +298,25 @@
     </div>
   {/each}
 </section>
+
+{#if uninstallAsk !== null}
+  {@const a = uninstallAsk}
+  <ConfirmDialog
+    title="Uninstall the chimaera-managed {a.name}?"
+    body="This removes only chimaera's own copy under ~/.chimaera/agents. Your own install, if any, is left untouched."
+    confirmLabel={removing[a.id] ? "uninstalling…" : "uninstall"}
+    danger
+    enterConfirms
+    error={uninstallError}
+    onConfirm={() => void uninstall(a)}
+    onCancel={() => {
+      if (removing[a.id]) return;
+      // A failure the user dismisses stays on the row, as it did before.
+      if (uninstallError !== null) rowError = { ...rowError, [a.id]: uninstallError };
+      uninstallAsk = null;
+    }}
+  />
+{/if}
 
 <style>
   /* Matches the shared settings grammar: an uppercase category header, then a

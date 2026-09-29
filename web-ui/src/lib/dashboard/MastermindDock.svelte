@@ -25,7 +25,7 @@
   import type { LayoutCtrl } from "../layout/dnd";
   import { inboxSeen, markInboxSeen, timelineStore } from "../workspace/timeline.svelte";
   import { mastermindInbox } from "../workspace/timelineModel";
-  import { myceliumPlugin, openAttachSheet } from "../plugins/store";
+  import { knowledgePlugin, openAttachSheet } from "../plugins/store";
 
   interface Props {
     /** The binding from the workspaces wire; null = unconfigured. */
@@ -251,9 +251,9 @@
     inboxSeenTick += 1;
   }
 
-  /** Mycelium isn't active here: the dock offers the one quiet line that
-   *  gives the Mastermind (and Knowledge) something to read. */
-  const offerMycelium = $derived($myceliumPlugin !== null && !$myceliumPlugin.active);
+  /** The knowledge plugin isn't active here: the dock offers the one quiet
+   *  line that gives the Mastermind (and Knowledge) something to read. */
+  const offerKnowledge = $derived($knowledgePlugin !== null && !$knowledgePlugin.active ? $knowledgePlugin : null);
 
   /** Claude's native permission modes that DON'T raise a prompt for a
    *  non-allowlisted MCP act — the set that makes our ask-first gate moot.
@@ -559,9 +559,10 @@
         {/if}
         {#if emptyChat}
           <button class="sugg" disabled={!canPrompt} onclick={() => sendPrompt(CONFLICT_PROMPT)}>Anything conflicting?</button>
-          {#if offerMycelium}
-            <button class="quietline" onclick={() => openAttachSheet("mycelium")}>
-              Use mycelium for Knowledge → gives the Mastermind your project's findings and decisions to read
+          {#if offerKnowledge !== null}
+            {@const kp = offerKnowledge}
+            <button class="quietline" onclick={() => openAttachSheet(kp.id)}>
+              Use {kp.name} for Knowledge → gives the Mastermind what your agents recorded here to read
             </button>
           {/if}
         {/if}

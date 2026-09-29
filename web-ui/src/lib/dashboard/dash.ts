@@ -37,6 +37,8 @@ export interface DashCtx {
   onOpenTimeline: () => void;
   onOpenKnowledge: () => void;
   onOpenExtensions: () => void;
+  /** Open Settings at Activity (the dashboard's activity line). */
+  onOpenActivity?: () => void;
 }
 
 /**
