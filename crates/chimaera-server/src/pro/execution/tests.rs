@@ -43,6 +43,25 @@ fn baton() -> Baton {
     "continuity":{"version":2,"mode":"managed_v1","policy_revision":1,"preferred_installation_id":"i-home"},"execution_capability":{"version":1,"boundary":"managed_processes","expired_takeover":false},"execution_lease":{"id":"lease-a","sequence":1}})).unwrap()
 }
 
+/// A newer account may add fields to what it sends; the daemon keeps working
+/// (unknown evidence of a turn is uncertain, never a blind replay). The
+/// capability identity stays exact: an unknown field there is a different one.
+#[test]
+fn service_responses_accept_additive_fields() {
+    let mut value = json!({"workspace_id":"w-a","holder_id":"d-home","epoch":2,"requires_fork":false,"server_now":"2026-09-28T00:00:00Z","expires_at":"2026-09-28T00:01:30Z",
+    "continuity":{"version":2,"mode":"managed_v1","policy_revision":1,"preferred_installation_id":"i-home","future":true},"execution_capability":{"version":1,"boundary":"managed_processes","expired_takeover":false},"execution_lease":{"id":"lease-a","sequence":1,"issued_by":"future"},
+    "checkpoint":{"id":"cp-a","sequence":1,"source_holder_id":"d-home","source_epoch":2,"working_tree_oid":"a","config_oid":"b","handoff_oid":"c","continuation":"paused_on_question","signed":"future"},
+    "placement":{"availability":"suspended"}});
+    let baton: Baton = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(baton.execution_lease.unwrap().sequence, 1);
+    assert_eq!(
+        baton.checkpoint.unwrap().continuation,
+        wire::Continuation::Uncertain
+    );
+    value["execution_capability"]["future"] = json!(true);
+    assert!(serde_json::from_value::<Baton>(value).is_err());
+}
+
 #[tokio::test]
 async fn strict_worker_polling_fences_released_work_until_hydration() {
     use axum::{http::StatusCode, response::IntoResponse, routing::any, Json, Router};
@@ -233,12 +252,18 @@ async fn same_boot_crash_never_turns_empty_registry_into_stopped_evidence() {
         .spawn()
         .unwrap();
     let mut preferences = lock(&state.pro.preferences).clone();
+    let started = restart::leader_start(child.id() as i32).unwrap();
     preferences.get_mut("w-a").unwrap().execution_groups = vec![child.id()];
+    preferences.get_mut("w-a").unwrap().execution_starts = vec![started];
     for worker in [false, true] {
         let restored = State::restore(&state.pro.root, &preferences, worker, false);
-        assert_eq!(lock(&restored.unclean)["w-a"], vec![child.id()]);
+        assert_eq!(lock(&restored.unclean)["w-a"], vec![(child.id(), started)]);
     }
-    lock(&state.pro.execution.unclean).insert("w-a".into(), vec![child.id()]);
+    // The same id with another start time is a reused group, not old work.
+    preferences.get_mut("w-a").unwrap().execution_starts = vec![started + 1];
+    let restored = State::restore(&state.pro.root, &preferences, false, false);
+    assert!(!lock(&restored.unclean).contains_key("w-a"));
+    lock(&state.pro.execution.unclean).insert("w-a".into(), vec![(child.id(), started)]);
     reprobe(&state);
     assert!(!quiescent(&state, "w-a"), "a live old group blocks handoff");
     child.kill().unwrap();
@@ -253,8 +278,79 @@ async fn same_boot_crash_never_turns_empty_registry_into_stopped_evidence() {
     assert!(lock(&damaged.execution.latched).contains("w-a"));
     assert!(damaged.execution.proofs.lock().unwrap().is_empty());
     // Unreadable ownership state fails closed and keeps the damaged copy.
-    assert!(damaged.execution.invalid);
+    assert!(lock(&damaged.execution.uncertain).contains("w-a"));
     assert!(state.pro.root.join("state.json.damaged").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A lost or partial enrollment record makes only the projects it could have
+/// covered uncertain (they stop publishing until the account confirms their
+/// policy again); every other project keeps its ordinary behavior.
+#[test]
+fn lost_enrollment_records_make_only_those_projects_uncertain() {
+    let restart = |root: &std::path::Path| {
+        Arc::new(AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.to_path_buf(),
+            root.join("config"),
+        ))
+    };
+    let (state, config, root) = fixture();
+    observe(&state, &config, &baton()).unwrap();
+    // The latch names w-a, but its policy record is gone; w-b never enrolled.
+    std::fs::create_dir_all(&state.pro.root).unwrap();
+    std::fs::write(
+        state.pro.root.join("execution-authority.json"),
+        br#"{"version":1,"workspaces":["w-a"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        state.pro.root.join("state.json"),
+        br#"{"ownership":{},"preferences":{"w-b":{}}}"#,
+    )
+    .unwrap();
+    let restarted = restart(&root);
+    assert!(managed(&restarted, "w-a"));
+    assert!(
+        !managed(&restarted, "w-b"),
+        "an unrelated project is unaffected"
+    );
+    // An authoritative read that carries w-a's policy resolves it.
+    observe(&restarted, &config, &baton()).unwrap();
+    assert!(managed(&restarted, "w-a"));
+    assert!(lease_valid(&restarted, "w-b"));
+    drop(restarted);
+
+    // Nothing readable at all: a computer never makes an unenrolled project
+    // managed (the account refuses an enrolled one's downgrade itself), and
+    // an uncertain project still launches agents there.
+    std::fs::write(state.pro.root.join("state.json"), b"not json").unwrap();
+    std::fs::write(state.pro.root.join("execution-authority.json"), b"not json").unwrap();
+    std::fs::create_dir_all(state.pro.root.join("w-mirrored")).unwrap();
+    let restarted = restart(&root);
+    assert!(!managed(&restarted, "w-mirrored"));
+    assert!(lease_valid(&restarted, "w-never-mirrored"));
+    lock(&restarted.pro.execution.uncertain).insert("w-new".into());
+    lock(&restarted.pro.ownership).insert("w-new".into(), Ownership::Local { epoch: 1 });
+    assert!(crate::pro::may_execute(&restarted, "w-new"));
+    drop(restarted);
+    // A cloud machine cannot tell which of its projects were enrolled: each
+    // one with local mirror data waits for the account.
+    let empty = HashMap::new();
+    let worker = State::restore(&state.pro.root, &empty, true, true);
+    assert!(lock(&worker.uncertain).contains("w-mirrored"));
+    assert!(!lock(&worker.uncertain).contains("w-never-mirrored"));
+    // A read error (here: the path is a directory) is not damage: the file
+    // is not set aside and no unenrolled project becomes managed.
+    let _ = std::fs::remove_file(state.pro.root.join("state.json"));
+    let _ = std::fs::remove_file(state.pro.root.join("state.json.damaged"));
+    std::fs::create_dir_all(state.pro.root.join("state.json")).unwrap();
+    let unreadable = crate::pro::ProState::new(state.pro.root.clone());
+    assert!(!state.pro.root.join("state.json.damaged").exists());
+    assert!(!lock(&unreadable.execution.uncertain).contains("w-mirrored"));
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -351,7 +447,10 @@ async fn graceful_same_boot_restart_does_not_fence_but_a_crash_probes_survivors(
     // A crash here leaves a live recorded group: a successor must wait for it.
     let crashed = crate::pro::ProState::new(state.pro.root.clone());
     assert_eq!(
-        lock(&crashed.execution.unclean)["w-a"],
+        lock(&crashed.execution.unclean)["w-a"]
+            .iter()
+            .map(|(group, _)| *group)
+            .collect::<Vec<_>>(),
         vec![agent.pid.unwrap()]
     );
     // A graceful stop proves the agents exited and clears the evidence.

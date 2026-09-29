@@ -89,6 +89,7 @@ async fn managed_exec_revalidates_after_shell_queue_before_real_pty_write() {
                     timeout: Duration::from_secs(2),
                     allow_sentinel_over_running: false,
                     stage: Some(stage),
+                    bounded_lock_wait: true,
                 },
                 move || {
                     if authority.load(Ordering::Acquire) {
@@ -124,6 +125,7 @@ async fn managed_exec_revalidates_after_shell_queue_before_real_pty_write() {
                 timeout: Duration::from_secs(5),
                 allow_sentinel_over_running: true,
                 stage: None,
+                bounded_lock_wait: true,
             },
             || Ok(()),
         )

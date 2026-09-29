@@ -74,12 +74,6 @@ pub(crate) async fn start(State(state): State<Arc<AppState>>, body: axum::body::
             Err(_) => return StatusCode::BAD_REQUEST.into_response(),
         }
     };
-    if draining(&state) {
-        let token = lock(&state.pro.drain)
-            .as_ref()
-            .map(|drain| drain.token.clone());
-        return Json(json!({"token":token})).into_response();
-    }
     let deadline = tokio::time::Instant::now()
         + Duration::from_millis(
             request
@@ -87,6 +81,17 @@ pub(crate) async fn start(State(state): State<Arc<AppState>>, body: axum::body::
                 .unwrap_or(DEFAULT_DEADLINE_MS)
                 .clamp(1_000, 600_000),
         );
+    // One drain at a time: a second request waits for the first and then
+    // shares its token (or starts afresh if the first gave up).
+    let Ok(_gate) = tokio::time::timeout_at(deadline, state.pro.drain_gate.lock()).await else {
+        return busy();
+    };
+    if draining(&state) {
+        let token = lock(&state.pro.drain)
+            .as_ref()
+            .map(|drain| drain.token.clone());
+        return Json(json!({"token":token})).into_response();
+    }
     // The periodic pass and every transfer hold this reservation; taking it
     // both waits for them and keeps new ones from starting.
     let jobs = match tokio::time::timeout_at(deadline, state.pro.jobs.clone().lock_owned()).await {
@@ -99,6 +104,15 @@ pub(crate) async fn start(State(state): State<Arc<AppState>>, body: axum::body::
         since: SystemTime::now(),
         _jobs: jobs,
     });
+    // A transfer admitted just before this drain, still waiting for the
+    // reservation, now refuses itself instead of holding the drain open.
+    state.pro.drain_started.notify_waiters();
+    // A caller that gives up (its request dropped) must not leave this
+    // daemon draining: only a completed drain stays in place.
+    let mut pending = Pending {
+        state: &state,
+        armed: true,
+    };
     let settled = tokio::time::timeout_at(deadline, async {
         while !quiet(&state) {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -106,17 +120,46 @@ pub(crate) async fn start(State(state): State<Arc<AppState>>, body: axum::body::
     })
     .await;
     if settled.is_err() {
-        *lock(&state.pro.drain) = None;
         return busy();
     }
     if let Err(error) = super::persist(&state).await {
-        *lock(&state.pro.drain) = None;
         return super::routes::failure(error);
     }
     // Everything this daemon wrote reaches the disk before a snapshot of the
-    // machine is taken; the supervisor still syncs the volume itself.
-    let _ = tokio::task::spawn_blocking(nix::unistd::sync).await;
+    // machine is taken; the supervisor still syncs the volume itself, so a
+    // slow sync is not waited for past the caller's deadline.
+    let _ = tokio::time::timeout_at(deadline, tokio::task::spawn_blocking(nix::unistd::sync)).await;
+    pending.armed = false;
     Json(json!({"token":token})).into_response()
+}
+
+struct Pending<'a> {
+    state: &'a AppState,
+    armed: bool,
+}
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            *lock(&self.state.pro.drain) = None;
+            self.state.changes.notify_waiters();
+        }
+    }
+}
+
+/// Takes the job reservation for a transfer, unless a drain starts first:
+/// then the transfer refuses itself (`None`) rather than wait behind the drain
+/// that is waiting for it.
+pub(super) async fn reserve(state: &AppState) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+    let started = state.pro.drain_started.notified();
+    tokio::pin!(started);
+    started.as_mut().enable();
+    if draining(state) {
+        return None;
+    }
+    tokio::select! {
+        guard = state.pro.jobs.lock() => Some(guard),
+        () = started => None,
+    }
 }
 fn busy() -> Response {
     (StatusCode::CONFLICT, Json(json!({"error":"transfer_busy"}))).into_response()

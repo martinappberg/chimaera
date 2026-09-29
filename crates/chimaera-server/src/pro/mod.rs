@@ -17,7 +17,9 @@ mod shadow_cache;
 mod transport;
 pub(crate) use drain::{cancel as cancel_drain, start as drain};
 pub(crate) use policy::CloudProfile;
-pub(crate) use provider_gate::{cloud_provider_blocks, workspace_provider_blocks};
+pub(crate) use provider_gate::{
+    blocking_provider, cloud_provider_blocks, workspace_provider_blocks,
+};
 pub(crate) use routes::*;
 tokio::task_local! { static PROFILE_SETUP: (String, u64); }
 
@@ -47,7 +49,6 @@ pub(crate) struct ProState {
     legacy_pending: Mutex<std::collections::HashSet<String>>,
     project_cache: Mutex<projects::Cache>,
     discovery: AsyncMutex<()>,
-    keep_running: Mutex<std::collections::HashSet<String>>,
     status: Mutex<HashMap<String, WorkspaceStatus>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     mirror_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -56,17 +57,39 @@ pub(crate) struct ProState {
     /// keeps its publication but never releases a project after the wake.
     sleep_generation: AtomicU64,
     sleeping: Mutex<std::collections::HashSet<String>>,
+    /// Projects a sleep flush stopped but did not hand over (its release ran
+    /// out of time, or the flush failed): no renewal or resume happens inside
+    /// the sleep window; the next wake returns them to this computer locally.
+    release_pending: Mutex<std::collections::HashSet<String>>,
     /// The last bytes written, so an unchanged tick costs no disk sync.
     persistence: AsyncMutex<Option<Vec<u8>>>,
     configuration: Arc<AsyncMutex<()>>,
     caches: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     boot_deferred: Mutex<std::collections::HashSet<String>>,
+    /// Projects whose checkpoint install is scheduled or running: fenced from
+    /// the moment it is scheduled, before its own Hydrating fence exists.
+    installing: Mutex<std::collections::HashSet<String>>,
+    /// Projects the account answered for since this daemon started; the
+    /// unverified-resume fallback leaves those to the verified path.
+    answered: Mutex<std::collections::HashSet<String>>,
+    /// Projects that came back to this computer from the cloud during this
+    /// daemon's life (their agents get a fresh where-it-runs brief).
+    pub(crate) returned: Mutex<std::collections::HashSet<String>>,
     operations: detached::Operations,
     drain: Mutex<Option<drain::Drain>>,
+    /// Serializes drain requests; see `drain::start`.
+    drain_gate: AsyncMutex<()>,
+    /// Wakes transfers waiting for the job reservation when a drain takes it.
+    drain_started: tokio::sync::Notify,
     remote_since: Mutex<HashMap<String, u64>>,
     return_backoff: Mutex<HashMap<String, (u64, u64)>>,
     awake_since: AtomicU64,
     power_suitable: AtomicBool,
+    /// Wakes the lease loop at once: a resumed machine renews before fencing.
+    renew_now: tokio::sync::Notify,
+    /// The account refused this daemon's delegation (401/403 on renewal):
+    /// `/pro/status` reports it so the native app mints a new one.
+    delegation_refused: AtomicBool,
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -95,6 +118,10 @@ struct Preference {
     /// probe after a crash (bounded to 64 per workspace).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     execution_groups: Vec<u32>,
+    /// The start time of each recorded group's leader (same order; 0 when
+    /// unknown), so a reused group id is not mistaken for old work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    execution_starts: Vec<u64>,
     #[serde(default)]
     execution_identity: Option<execution::wire::Identity>,
     #[serde(default)]
@@ -143,8 +170,6 @@ struct DiskState {
     legacy_pending: std::collections::HashSet<String>,
     #[serde(default, skip_serializing)]
     import_roots: HashMap<String, PathBuf>,
-    #[serde(default)]
-    keep_running: std::collections::HashSet<String>,
     /// Once configured as a cloud worker, this installation stays strict
     /// across restarts even before its supervisor configures it again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -172,28 +197,47 @@ impl ProState {
         // Construction already happens on the daemon's startup blocking path.
         // A capped record can gate restore without needing an account token.
         let path = root.join("state.json");
-        let loaded = match std::fs::File::open(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Some(DiskState::default())
-            }
-            Err(_) => None,
-            Ok(file) => {
-                use std::io::Read;
-                let mut bytes = Vec::new();
-                file.take(1024 * 1024 + 1)
-                    .read_to_end(&mut bytes)
-                    .ok()
-                    .filter(|_| bytes.len() <= 1024 * 1024)
-                    .and_then(|_| serde_json::from_slice::<DiskState>(&bytes).ok())
+        let read = || -> std::io::Result<Option<Vec<u8>>> {
+            use std::io::Read;
+            let file = match std::fs::File::open(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                other => other?,
+            };
+            let mut bytes = Vec::new();
+            file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+            Ok(Some(bytes))
+        };
+        // Only an existing file that does not parse (or exceeds its cap) is
+        // damage. An I/O error (an NFS home briefly answering EIO/ESTALE) is
+        // retried; if it persists the state is unknown and fails closed, but
+        // the file is left in place.
+        let mut attempts = 0;
+        let bytes = loop {
+            match read() {
+                Err(_) if attempts < 4 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                result => break result,
             }
         };
-        // Unreadable ownership state fails closed: every enrolled project is
-        // verified again rather than silently losing its fences. The damaged
-        // copy is kept (one slot) instead of being overwritten.
-        let damaged = loaded.is_none();
-        if damaged {
-            let _ = std::fs::rename(&path, root.join("state.json.damaged"));
-        }
+        let (loaded, unknown) = match bytes {
+            Ok(None) => (Some(DiskState::default()), false),
+            Ok(Some(bytes)) => {
+                let parsed = (bytes.len() <= 1024 * 1024)
+                    .then(|| serde_json::from_slice::<DiskState>(&bytes).ok())
+                    .flatten();
+                // Unreadable ownership state fails closed: enrolled projects
+                // are verified again rather than silently losing their fences.
+                // The damaged copy is kept (one slot) instead of overwritten.
+                if parsed.is_none() {
+                    let _ = std::fs::rename(&path, root.join("state.json.damaged"));
+                }
+                let damaged = parsed.is_none();
+                (parsed, damaged)
+            }
+            Err(_) => (None, true),
+        };
         let disk = loaded.unwrap_or_default();
         let legacy_pending = disk
             .legacy_pending
@@ -222,8 +266,10 @@ impl ProState {
             .take(128)
             .filter_map(|(id, blocks)| {
                 let blocked_providers = provider_gate::restored(blocks);
-                (matches!(ownership.get(&id), Some(Ownership::SettingUp { .. }))
-                    && !blocked_providers.is_empty())
+                (matches!(
+                    ownership.get(&id),
+                    Some(Ownership::SettingUp { .. } | Ownership::AwaitingVerification { .. })
+                ) && !blocked_providers.is_empty())
                 .then_some((
                     id,
                     WorkspaceStatus {
@@ -240,7 +286,7 @@ impl ProState {
             &root,
             &disk.preferences,
             disk.worker || crate::cloud::enabled(),
-            damaged,
+            unknown,
         );
         Self {
             root,
@@ -257,23 +303,30 @@ impl ProState {
             legacy_pending: Mutex::new(legacy_pending),
             project_cache: Mutex::new(projects::Cache::default()),
             discovery: AsyncMutex::new(()),
-            keep_running: Mutex::new(disk.keep_running.into_iter().take(512).collect()),
             status: Mutex::new(status),
             task: Mutex::new(None),
             mirror_task: Mutex::new(None),
             jobs: Arc::new(AsyncMutex::new(())),
             sleep_generation: AtomicU64::new(0),
             sleeping: Mutex::new(Default::default()),
+            release_pending: Mutex::new(Default::default()),
             persistence: AsyncMutex::new(None),
             configuration: Arc::new(AsyncMutex::new(())),
             caches: Mutex::new(HashMap::new()),
             boot_deferred: Mutex::new(Default::default()),
+            installing: Mutex::new(Default::default()),
+            answered: Mutex::new(Default::default()),
+            returned: Mutex::new(Default::default()),
             operations: Default::default(),
             drain: Mutex::new(None),
+            drain_gate: AsyncMutex::new(()),
+            drain_started: tokio::sync::Notify::new(),
             remote_since: Mutex::new(HashMap::new()),
             return_backoff: Mutex::new(HashMap::new()),
             awake_since: AtomicU64::new(now()),
             power_suitable: AtomicBool::new(false),
+            renew_now: tokio::sync::Notify::new(),
+            delegation_refused: AtomicBool::new(false),
         }
     }
 }
@@ -318,8 +371,11 @@ pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
             | Ownership::Transferring { .. },
         ) => false,
         // Unverified after a restart, wake or failed flush: a device keeps
-        // working until an authenticated read shows another owner.
-        Some(Ownership::AwaitingVerification { .. }) => !execution::worker(state),
+        // working until an authenticated read shows another owner, unless a
+        // checkpoint install is already scheduled (before its own fence).
+        Some(Ownership::AwaitingVerification { .. }) => {
+            !execution::worker(state) && !crate::lock(&state.pro.installing).contains(workspace)
+        }
         _ => true,
     }
 }
@@ -336,6 +392,28 @@ pub(crate) use execution::remote_owner_fixture as install_remote_owner_fixture;
 pub(crate) fn managed_execution(state: &crate::AppState, workspace: &str) -> bool {
     execution::managed(state, workspace)
 }
+/// This daemon's delegation can no longer act: the account refused it, or it
+/// expired without a renewal. Only meaningful while configured.
+pub(super) fn delegation_lapsed(state: &crate::AppState) -> bool {
+    if state
+        .pro
+        .delegation_refused
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return true;
+    }
+    crate::lock(&state.pro.runtime)
+        .as_ref()
+        .and_then(|config| {
+            time::OffsetDateTime::parse(
+                &config.delegation.expires_at,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .ok()
+        })
+        .is_some_and(|expires| expires <= time::OffsetDateTime::now_utc())
+}
+
 pub(crate) fn may_execute(state: &crate::AppState, workspace: &str) -> bool {
     may_write(state, workspace) && execution::allows(state, workspace)
 }
@@ -349,6 +427,37 @@ pub(crate) fn may_restore(state: &crate::AppState, workspace: &str) -> bool {
 /// How long a personal device waits for the account to confirm ownership
 /// before resuming its own interrupted sessions anyway (laptop first).
 pub(crate) const BOOT_VERIFICATION_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+/// Where a project's work stands, from this daemon's recorded ownership, in
+/// the terms a viewer needs (why a paused session is paused). Read-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Consumed by ws.rs `classify_pause` at integration.
+pub(crate) enum Phase {
+    /// Runs here (or no Pro ownership at all).
+    Here,
+    /// Here, waiting for the account to confirm after a restart or wake.
+    Verifying,
+    /// Being handed to another machine.
+    Leaving,
+    /// Another machine runs it.
+    Elsewhere,
+    /// Arriving here from another machine (files installing, setup).
+    Arriving,
+}
+#[allow(dead_code)] // Consumed by ws.rs `classify_pause` at integration.
+pub(crate) fn ownership_phase(state: &crate::AppState, workspace: &str) -> Phase {
+    match crate::lock(&state.pro.ownership).get(workspace) {
+        None | Some(Ownership::Local { .. } | Ownership::PrivacyDisabled { .. }) => Phase::Here,
+        Some(Ownership::AwaitingVerification { .. }) => Phase::Verifying,
+        Some(Ownership::Transferring { .. }) => Phase::Leaving,
+        Some(Ownership::Remote { .. }) => Phase::Elsewhere,
+        Some(Ownership::Hydrating { .. } | Ownership::SettingUp { .. }) => Phase::Arriving,
+    }
+}
+/// Whether this session waits at boot for this life's ownership proof.
+#[allow(dead_code)] // Consumed by ws.rs `classify_pause` at integration.
+pub(crate) fn restart_deferred(state: &crate::AppState, session_id: &str) -> bool {
+    crate::lock(&state.pro.boot_deferred).contains(session_id)
+}
 pub(crate) fn defer_boot_session(state: &crate::AppState, session: &str) {
     let mut deferred = crate::lock(&state.pro.boot_deferred);
     if deferred.len() < 512 {
@@ -363,6 +472,37 @@ pub(crate) async fn resume_unverified(state: &std::sync::Arc<crate::AppState>) {
     if execution::worker(state) {
         return;
     }
+    let waiting = resume_unverified_once(state).await;
+    if waiting.is_empty() {
+        return;
+    }
+    // Re-run the fallback once the recorded groups exit (bounded to 10 min).
+    crate::lock(&state.pro.boot_deferred).extend(waiting);
+    let owner = state.clone();
+    tokio::spawn(async move {
+        for _ in 0..120 {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if owner.stopping.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            execution::reprobe(&owner);
+            let cleared = crate::lock(&owner.pro.boot_deferred).iter().any(|id| {
+                crate::lock(&owner.deferred_sessions)
+                    .get(id)
+                    .is_some_and(|entry| !execution::unclean(&owner, &entry.workspace_id))
+            });
+            if cleared {
+                let left = resume_unverified_once(&owner).await;
+                if left.is_empty() {
+                    return;
+                }
+                crate::lock(&owner.pro.boot_deferred).extend(left);
+            }
+        }
+    });
+}
+/// One fallback pass; returns the sessions still waiting on old processes.
+async fn resume_unverified_once(state: &std::sync::Arc<crate::AppState>) -> Vec<String> {
     let pending: Vec<String> = crate::lock(&state.pro.boot_deferred).drain().collect();
     let mut workspaces: HashMap<String, Vec<String>> = HashMap::new();
     for id in pending {
@@ -373,14 +513,28 @@ pub(crate) async fn resume_unverified(state: &std::sync::Arc<crate::AppState>) {
             workspaces.entry(workspace).or_default().push(id);
         }
     }
+    let mut waiting = Vec::new();
     for (workspace, ids) in workspaces {
-        if !may_execute(state, &workspace) || execution::unclean(state, &workspace) {
+        // The account answered for this project (the verified path decides),
+        // or a checkpoint install is replacing its files: not ours to resume.
+        if crate::lock(&state.pro.answered).contains(&workspace)
+            || crate::lock(&state.pro.installing).contains(&workspace)
+        {
+            continue;
+        }
+        if execution::unclean(state, &workspace) {
+            // Old processes may still run: retry once they are proven gone.
+            waiting.extend(ids);
+            continue;
+        }
+        if !may_execute(state, &workspace) {
             continue;
         }
         if let Err(error) = crate::ledger::resume_deferred_sessions(state, &workspace, &ids).await {
             tracing::warn!(%error, "Interrupted sessions could not resume");
         }
     }
+    waiting
 }
 pub(crate) fn validate_execution_scope(
     state: &crate::AppState,
@@ -419,7 +573,6 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
     let mut written = state.pro.persistence.lock().await;
     ensure_root(&state.pro.root).await?;
     execution::record_groups(state);
-    let keep_running = crate::lock(&state.pro.keep_running).clone();
     let ownership = crate::lock(&state.pro.ownership).clone();
     let preferences = crate::lock(&state.pro.preferences).clone();
     let projects_root = crate::lock(&state.pro.projects_root).clone();
@@ -437,7 +590,6 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
         import_roots: HashMap::new(),
         adoptions,
         projects_root,
-        keep_running,
         worker: state.pro.worker.load(std::sync::atomic::Ordering::Acquire),
         ownership,
         preferences,
@@ -455,33 +607,6 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
         .await??;
     execution::persist_latch(state).await?;
     *written = Some(bytes);
-    Ok(())
-}
-
-pub(crate) fn keep_running(state: &crate::AppState, session_id: &str) -> bool {
-    crate::lock(&state.pro.keep_running).contains(session_id)
-}
-pub(crate) async fn set_keep_running(
-    state: &std::sync::Arc<crate::AppState>,
-    session_id: &str,
-    value: bool,
-) -> anyhow::Result<()> {
-    authority::session(state, session_id)?;
-    anyhow::ensure!(valid_id(session_id), "invalid session identity");
-    {
-        let mut pins = crate::lock(&state.pro.keep_running);
-        if value {
-            anyhow::ensure!(
-                pins.len() < 512 || pins.contains(session_id),
-                "session pin limit"
-            );
-            pins.insert(session_id.into());
-        } else {
-            pins.remove(session_id);
-        }
-    }
-    persist(state).await?;
-    state.changes.notify_waiters();
     Ok(())
 }
 
@@ -679,6 +804,18 @@ pub(crate) fn cloud_hours_exhausted(state: &crate::AppState) -> Option<bool> {
         .as_ref()
         .map(|config| config.hours_exhausted)
 }
+/// Whether this project came back to this computer from the cloud during this
+/// daemon's life.
+pub(crate) fn returned_here(state: &crate::AppState, workspace: &str) -> bool {
+    crate::lock(&state.pro.returned).contains(workspace)
+}
+/// Whether the native app configured this daemon for Pro at all.
+pub(crate) fn configured(state: &crate::AppState) -> bool {
+    state
+        .pro
+        .configured
+        .load(std::sync::atomic::Ordering::Acquire)
+}
 pub(crate) fn is_worker(state: &crate::AppState) -> bool {
     crate::lock(&state.pro.runtime)
         .as_ref()
@@ -768,6 +905,40 @@ mod tests {
             root.join("config"),
         ))
     }
+    #[test]
+    fn ownership_reads_as_a_viewer_phase() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-pro-phase-{}",
+            chimaera_core::generate_token()
+        ));
+        let state = state(&root);
+        assert_eq!(ownership_phase(&state, "w-a"), Phase::Here);
+        for (owner, phase) in [
+            (Ownership::Local { epoch: 1 }, Phase::Here),
+            (Ownership::PrivacyDisabled { epoch: 1 }, Phase::Here),
+            (
+                Ownership::AwaitingVerification { epoch: 1 },
+                Phase::Verifying,
+            ),
+            (Ownership::Transferring { epoch: 1 }, Phase::Leaving),
+            (
+                Ownership::Remote {
+                    epoch: 1,
+                    holder: "worker-a".into(),
+                },
+                Phase::Elsewhere,
+            ),
+            (Ownership::Hydrating { epoch: 1 }, Phase::Arriving),
+            (Ownership::SettingUp { epoch: 1 }, Phase::Arriving),
+        ] {
+            crate::lock(&state.pro.ownership).insert("w-a".into(), owner);
+            assert_eq!(ownership_phase(&state, "w-a"), phase);
+        }
+        assert!(!restart_deferred(&state, "s-a"));
+        defer_boot_session(&state, "s-a");
+        assert!(restart_deferred(&state, "s-a"));
+        let _ = std::fs::remove_dir_all(root);
+    }
     #[tokio::test]
     async fn restart_fences_old_conversations_and_never_persists_tokens() {
         let root = std::env::temp_dir().join(format!(
@@ -797,7 +968,6 @@ mod tests {
         });
         // Configuring a worker records its strict role (routes::configure_inner).
         execution::worker_fixture(&old);
-        set_keep_running(&old, "s-pinned", true).await.unwrap();
         persist(&old).await.unwrap();
         let text = std::fs::read_to_string(root.join("pro/state.json")).unwrap();
         assert!(!text.contains("MUST_NEVER_PERSIST"));
@@ -807,7 +977,6 @@ mod tests {
         assert!(!may_import(&restored, "w-owned", 7));
         assert!(may_import(&restored, "w-loading", 8));
         assert!(!may_import(&restored, "w-loading", 7));
-        assert!(keep_running(&restored, "s-pinned"));
         crate::lock(&restored.pro.ownership)
             .insert("w-owned".into(), Ownership::Local { epoch: 9 });
         assert!(may_write(&restored, "w-owned"));

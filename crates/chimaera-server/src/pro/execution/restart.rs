@@ -13,7 +13,7 @@ impl State {
         root: &Path,
         preferences: &HashMap<String, super::super::Preference>,
         worker: bool,
-        damaged: bool,
+        state_unknown: bool,
     ) -> Self {
         let loaded = (|| -> Result<HashSet<String>> {
             let file = match std::fs::File::open(root.join("execution-authority.json")) {
@@ -33,11 +33,34 @@ impl State {
             );
             Ok(latch.workspaces.into_iter().collect())
         })();
-        let mut invalid = loaded.is_err() || damaged;
+        // A project is uncertain when the enrollment latch names it but its
+        // policy is gone (the ordinary state was lost). Only those projects
+        // stop publishing until the account confirms their policy again; an
+        // unenrolled project never becomes managed. A cloud machine whose
+        // latch or state cannot be read at all cannot tell which of its
+        // projects were enrolled, and it runs only cloud projects, so there
+        // each project with local mirror data or preferences waits too. (A
+        // device needs no such guess: the account itself refuses a legacy
+        // downgrade of an enrolled project.)
+        let unknown = loaded.is_err() || state_unknown;
         let mut latched = loaded.unwrap_or_default();
-        invalid |= latched
-            .iter()
-            .any(|id| preferences.get(id).is_none_or(|p| p.continuity.is_none()));
+        let lacking = |id: &String| preferences.get(id).is_none_or(|p| p.continuity.is_none());
+        let mut uncertain: HashSet<String> =
+            latched.iter().filter(|id| lacking(id)).cloned().collect();
+        if unknown && worker {
+            uncertain.extend(preferences.keys().filter(|id| lacking(id)).cloned());
+            if let Ok(entries) = std::fs::read_dir(root) {
+                uncertain.extend(
+                    entries
+                        .filter_map(std::result::Result::ok)
+                        .take(4096)
+                        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+                        .filter_map(|entry| entry.file_name().into_string().ok())
+                        .filter(|id| crate::pro::valid_id(id) && lacking(id)),
+                );
+            }
+        }
+        let uncertain: HashSet<String> = uncertain.into_iter().take(128).collect();
         latched.extend(
             preferences
                 .iter()
@@ -57,7 +80,15 @@ impl State {
                 // Probe what the previous life recorded instead of fencing
                 // forever. With no recorded group a device proceeds (laptop
                 // first); a worker cannot prove anything and stays strict.
-                let alive = surviving(&p.execution_groups);
+                let recorded: Vec<(u32, u64)> = p
+                    .execution_groups
+                    .iter()
+                    .enumerate()
+                    .map(|(index, group)| {
+                        (*group, p.execution_starts.get(index).copied().unwrap_or(0))
+                    })
+                    .collect();
+                let alive = surviving(&recorded);
                 (!alive.is_empty() || (p.execution_groups.is_empty() && worker))
                     .then(|| (id.clone(), alive))
             })
@@ -67,27 +98,71 @@ impl State {
             commits: mutation::Commits::default(),
             latched: Mutex::new(latched),
             unclean: Mutex::new(unclean),
-            invalid,
+            uncertain: Mutex::new(uncertain),
             boot,
+            tick: Mutex::default(),
         }
     }
 }
-/// Recorded process groups that still exist. A group that has vanished can
-/// never run old work again; a reused group id errs toward waiting.
-fn surviving(groups: &[u32]) -> Vec<u32> {
+/// Recorded process groups that still run the recorded work. A group that
+/// vanished (ESRCH) can never run old work again; one owned by another user
+/// (EPERM) was never ours; one whose leader started at a different time than
+/// recorded is a reused id, not the old group. With no recorded start (0) the
+/// group's existence alone counts; a group whose leader already exited but
+/// whose members live still counts (its id cannot be reused meanwhile).
+fn surviving(groups: &[(u32, u64)]) -> Vec<(u32, u64)> {
     groups
         .iter()
         .copied()
-        .filter(|group| {
-            i32::try_from(*group).is_ok_and(|group| {
-                group > 1
-                    && !matches!(
-                        nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), None),
-                        Err(nix::errno::Errno::ESRCH)
-                    )
-            })
+        .filter(|&(group, start)| {
+            let Ok(id) = i32::try_from(group) else {
+                return false;
+            };
+            if id <= 1 || nix::sys::signal::killpg(nix::unistd::Pid::from_raw(id), None).is_err() {
+                return false;
+            }
+            start == 0 || leader_start(id).is_none_or(|now| now == start)
         })
         .collect()
+}
+/// When a process started, in an OS-specific monotonic unit (Linux: clock
+/// ticks since boot; macOS: microseconds since the epoch). `None` when the
+/// process is gone or unreadable.
+pub(in crate::pro) fn leader_start(pid: i32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // Fields after the parenthesized command: state is the first, the
+        // start time the twentieth.
+        let rest = stat.get(stat.rfind(')')? + 1..)?;
+        rest.split_whitespace().nth(19)?.parse().ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut info = std::mem::MaybeUninit::<nix::libc::proc_bsdinfo>::zeroed();
+        let size = std::mem::size_of::<nix::libc::proc_bsdinfo>() as i32;
+        // SAFETY: the buffer is exactly one `proc_bsdinfo`, as requested.
+        let written = unsafe {
+            nix::libc::proc_pidinfo(
+                pid,
+                nix::libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if written != size {
+            return None;
+        }
+        // SAFETY: fully written by the successful call above.
+        let info = unsafe { info.assume_init() };
+        Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
 }
 /// Re-probe previous-life evidence; a workspace is released as soon as none
 /// of its recorded groups remains. Unprovable (empty) records stay.
@@ -100,14 +175,15 @@ pub(in crate::pro) fn reprobe(state: &AppState) {
         !groups.is_empty()
     });
 }
-/// Process groups of this life's live managed agents, recorded with every
-/// state write so a crash leaves probe-able evidence behind.
+/// Process groups of this life's live managed agents and their leaders'
+/// start times, recorded with every state write (and right after a managed
+/// launch, see `prepare_launch`) so a crash leaves probe-able evidence.
 pub(in crate::pro) fn record_groups(state: &AppState) {
     let sessions: Vec<(String, String)> = lock(&state.session_workspaces)
         .iter()
         .map(|(session, workspace)| (session.clone(), workspace.clone()))
         .collect();
-    let mut by_workspace: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut by_workspace: HashMap<String, Vec<(u32, u64)>> = HashMap::new();
     for (session, workspace) in sessions {
         let agent = lock(&state.agents).contains_key(&session);
         let group = state.chat.process_group(&session).or_else(|| {
@@ -118,7 +194,11 @@ pub(in crate::pro) fn record_groups(state: &AppState) {
         if let Some(group) = group {
             let groups = by_workspace.entry(workspace.clone()).or_default();
             if groups.len() < 64 {
-                groups.push(group);
+                let start = i32::try_from(group)
+                    .ok()
+                    .and_then(leader_start)
+                    .unwrap_or(0);
+                groups.push((group, start));
             }
         }
     }
@@ -127,9 +207,11 @@ pub(in crate::pro) fn record_groups(state: &AppState) {
         if preference.execution_active {
             let mut groups = by_workspace.remove(workspace).unwrap_or_default();
             groups.sort_unstable();
-            preference.execution_groups = groups;
+            preference.execution_groups = groups.iter().map(|(group, _)| *group).collect();
+            preference.execution_starts = groups.iter().map(|(_, start)| *start).collect();
         } else {
             preference.execution_groups.clear();
+            preference.execution_starts.clear();
         }
     }
 }
@@ -187,6 +269,7 @@ pub(in crate::pro) async fn shutdown(state: &std::sync::Arc<AppState>) -> Result
                 if !running.contains(workspace) && !unproven.contains(workspace) {
                     preference.execution_active = false;
                     preference.execution_groups.clear();
+                    preference.execution_starts.clear();
                 }
             }
         }

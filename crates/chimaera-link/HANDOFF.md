@@ -133,6 +133,11 @@ delegation bearer returns the same token with a new expiry under the same cap.
 Renewal never extends the parent device's authorization lifetime. Daemons renew
 hourly with jitter, keep credentials only in memory, and stop authenticated
 background work on definitive 401/403. Network failure preserves local work.
+The daemon also renews at once (then at most once a minute) after any account
+request answered 401. When renewal is refused (401/403) or the delegation has
+expired unrenewed, `GET /api/v1/pro/status` answers `configured: false` with an
+additive `renewal_failed: true`, and the native app mints and configures a new
+delegation; a successful renewal or a new configuration clears it.
 
 The operation-scoped, account-wide token can access only baton, mirror and keeper transport operations,
 plus its own renewal. It cannot read `/v1/me`, enumerate or revoke devices, access
@@ -321,9 +326,16 @@ not wait out the account's publication fence past the deadline (an unreleased
 lease lapses and the cloud continues from the acknowledged checkpoint). The
 reply is `{handoff, failed:[{workspace_id, error:<code>}]}`, plus
 `reason:"deadline", pending:[workspace_id]` when flushes are still finishing on
-their own. `POST /api/v1/pro/wake` advances a sleep generation: a flush still
-running keeps its publication but never releases after the wake and returns the
-project to this computer itself.
+their own. A flush that could not hand its project over (its release ran out
+of time, or publication failed) never renews the lease or resumes agents inside
+the sleep window: an unreleased lease lapses and the cloud continues from the
+acknowledged checkpoint. `POST /api/v1/pro/wake` advances a sleep generation and
+returns every project a sleep flush holds to this computer at once (writable
+immediately): a flush still running keeps its publication, stops no further
+sessions, never releases and resumes the sessions it stopped; one that finished
+without handing over resumes its stopped sessions right away. Neither waits for
+the account. Signing out does the same for any transfer or return this computer
+itself started.
 
 `POST /api/v1/pro/drain {deadline_ms?}` is the public half of a fenced cloud
 suspension. It takes the job reservation, stops new periodic passes, refuses new
@@ -333,11 +345,28 @@ finalizer outliving its caller) and Git helper slot is free and state is synced
 to disk. Past the deadline (default 60 s, at most 600 s) it releases itself and
 answers 409 `{error:"transfer_busy"}`. `DELETE /api/v1/pro/drain` cancels; a drain
 also lapses 15 wall-clock minutes after it began (a machine resumed without a
-cancel). Lease renewals continue while drained. On a cloud machine
+cancel). The token is at most 24 characters with no control characters. Drain
+requests are serialized: a second one waits for the first and returns the same
+token. A request whose caller gives up before it completes leaves nothing
+draining. A transfer admitted just before the drain but still waiting for the
+job reservation refuses itself (409 `draining`) when the drain takes it, rather
+than holding the drain open. After a completed drain, any
+`pro_cloud_operations > 0` counts as activity. Lease renewals continue while drained. On a cloud machine
 `GET /api/v1/health` reports `pro_cloud_operations` (transfer tasks, sleep
 flushes, held project caches and busy Git helpers; a completed drain counts
 zero) and additive `last_activity_ms`, the last user change that is not session
-input (file saves, uploads, Git operations, session lifecycle).
+input (file saves, drafts, uploads, file moves, Git worktrees, session and
+workspace lifecycle; an explicit route list, so read-only POST helpers and
+passive viewing never count).
+
+The supervisor's idle sample reads `GET /api/v1/sessions`. Besides
+`agent_state`, `output_active`, `background_running`, `phase`, `exec_stage` and
+nullable `last_input_ms`, chat rows carry an additive boolean
+`needs_permission`: true while the conversation waits on a permission or a
+question. The supervisor keeps the machine awake on it for a bounded time and
+then suspends with ownership retained, so the question survives in the frozen
+process and its answer wakes it. PTY rows omit the field (a Claude TUI reports
+`agent_state: "needs_permission"` instead).
 
 ## Explicit worker wake
 
@@ -393,7 +422,11 @@ release. Acquire/renew/release add execution_capability and return continuity
 execution_lease (opaque id and increasing sequence), and a checkpoint. Acquiring
 and renewing pin the selected checkpoint; GET reports the latest acknowledged
 publication. Once enrolled, legacy acquisition/renewal/write credentials and
-publication cannot downgrade the workspace.
+publication cannot downgrade the workspace. Both the link client and the daemon
+decode these account responses leniently: unknown fields in the baton,
+continuity, lease and checkpoint are ignored and an unknown `continuation` value
+reads as `uncertain`. The capability object and the daemon's own acknowledgments
+stay exact.
 
 A client deadline starts before the mutating request and uses server-relative
 lease duration (at most 90 seconds), minus a 15-second stop margin. Passive GET,
@@ -411,7 +444,11 @@ historical recovery context directing the agent to inspect files and external
 state before repeating effects, using existing permissions without a routine
 human-review gate. Timeout alone is never proof that the old OS process stopped.
 
-Lease expiry fences execution only on a cloud worker. A personal computer is
+Lease expiry fences execution only on a cloud worker, and a resumed worker
+renews before fencing: after a suspension (seen as a clock discontinuity) its
+daemon first renews the recorded epoch, which the account grants to a suspended
+owner at the same epoch with no fork; only a refused renewal (or no answer within
+20 seconds) fences. A personal computer is
 fenced only by a verified other owner (an authenticated read naming another
 holder) or its own in-progress transfer: account unreachability, sign-out, a
 lapsed plan, the privacy switch or a daemon restart stop publication, never its
@@ -422,6 +459,16 @@ its own lapsed lease) continues local work: no checkpoint install and no fork,
 even though the account marks a lapsed-lease acquisition `requires_fork`. The
 account's `takeover_grace` refusal is a quiet wait. Plain shells are never
 managed processes.
+
+A cloud machine that suspends keeps ownership (placement `suspended`, lease
+expired by design); the account answers anyone else's acquire with 409 `held`
+for as long as it stays paused. A computer that wants the project back reads
+placement (passive, never wakes) and, once settled on power, POSTs the worker's
+`/api/v1/pro/handoff` through the keeper's HTTP adapter with `X-Chimaera-Wake:
+interaction`: the keeper wakes the machine, which renews its own epoch, flushes
+at a safe pause and releases, and the computer then hydrates. A `held` refusal
+is never treated as final, and the computer never fetches or acquires from
+under a suspended owner.
 
 ### v2 refusals
 

@@ -205,10 +205,11 @@ fn provider_commands_bind_auth_storage_to_the_explicit_worker_home() {
         env["CODEX_HOME"],
         "/tmp/chimaera-synthetic-auth-home/.codex"
     );
-    assert_eq!(
-        env["CLAUDE_CONFIG_DIR"],
-        "/tmp/chimaera-synthetic-auth-home/.claude"
-    );
+    // Claude's default layout under HOME, the one its sessions use.
+    assert!(command
+        .as_std()
+        .get_envs()
+        .any(|(key, value)| key == "CLAUDE_CONFIG_DIR" && value.is_none()));
     assert_eq!(
         env["GH_CONFIG_DIR"],
         "/tmp/chimaera-synthetic-auth-home/.config/gh"

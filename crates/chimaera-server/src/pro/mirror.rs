@@ -604,20 +604,84 @@ pub(super) async fn validate_tree(
 }
 
 pub(super) async fn repository_origin(root: &Path) -> Option<String> {
-    let bytes = transport::git_output(
-        transport::git(root, None).await.ok()?,
-        &["config", "--get", "remote.origin.url"],
+    // `git config --get` exits 1 when the key is absent: a project without an
+    // origin is an ordinary empty answer, not a failed Git helper to warn about.
+    let mut command = transport::git(root, None).await.ok()?;
+    command.args(["config", "--get", "remote.origin.url"]);
+    let output = transport::run(
+        command,
         vec![],
+        std::time::Duration::from_secs(15),
+        transport::JSON_CAP,
     )
     .await
     .ok()?;
-    let origin = String::from_utf8(bytes).ok()?.trim().to_string();
+    if !output.success {
+        return None;
+    }
+    let origin = String::from_utf8(output.stdout).ok()?.trim().to_string();
     super::repository::safe_url(&origin).then_some(origin)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Counts WARN events on this thread (the test's current-thread runtime).
+    struct Warnings(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl tracing::Subscriber for Warnings {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A project without an origin has no origin: no failed-helper warning on
+    /// every snapshot.
+    #[tokio::test]
+    async fn a_project_without_an_origin_is_a_quiet_empty_answer() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-mirror-origin-{}",
+            chimaera_core::generate_token()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        transport::git_output(
+            transport::git(&root, None).await.unwrap(),
+            &["init", "-q"],
+            vec![],
+        )
+        .await
+        .unwrap();
+        let warnings = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guard = tracing::subscriber::set_default(Warnings(warnings.clone()));
+        assert_eq!(repository_origin(&root).await, None);
+        drop(guard);
+        assert_eq!(warnings.load(std::sync::atomic::Ordering::SeqCst), 0);
+        transport::git_output(
+            transport::git(&root, None).await.unwrap(),
+            &["config", "remote.origin.url", "https://example.test/repo"],
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repository_origin(&root).await.as_deref(),
+            Some("https://example.test/repo")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn snapshots_preserve_user_history_and_filter_private_paths() {
         let root = std::env::temp_dir().join(format!(

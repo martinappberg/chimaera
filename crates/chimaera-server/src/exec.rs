@@ -87,9 +87,13 @@ pub(crate) async fn run_exec_scoped(
         crate::pro::defer_command(state, id, &command).await
     }
     .map_err(|error| chimaera_pty::ExecError::Busy(error.to_string()))?;
+    // Nothing runs it later on its own: the step is recorded in the project's
+    // cloud profile (`deferred`, shown with the project in Chimaera Pro) and
+    // the user runs it on their computer.
     if deferred {
         return Err(chimaera_pty::ExecError::Busy(
-            "This step needs the laptop and is queued to run when the project returns home.".into(),
+            "This step needs the user's computer, so it was not run here. It is listed as a pending step for this project in Chimaera Pro; ask the user to run it on their computer."
+                .into(),
         ));
     }
     let allow_sentinel_over_running = state
@@ -119,6 +123,7 @@ pub(crate) async fn run_exec_scoped(
 
     let dispatch_state = state.clone();
     let dispatch_id = id.to_owned();
+    let bounded_lock_wait = admission.is_some();
     let outcome = state
         .sessions
         .exec_guarded(
@@ -133,6 +138,7 @@ pub(crate) async fn run_exec_scoped(
                 ),
                 allow_sentinel_over_running,
                 stage: Some(stage_tx),
+                bounded_lock_wait,
             },
             move || {
                 if crate::lock(&dispatch_state.session_workspaces).get(&dispatch_id)

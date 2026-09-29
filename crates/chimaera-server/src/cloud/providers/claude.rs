@@ -134,9 +134,22 @@ pub(super) async fn login(
     Ok(())
 }
 
+/// A pasted Claude authorization is `code#state`, both halves present.
+pub(super) fn complete_code(code: &str) -> bool {
+    code.split_once('#')
+        .is_some_and(|(code, state)| !code.is_empty() && !state.is_empty() && !state.contains('#'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_a_whole_code_and_state_pair_is_submitted() {
+        assert!(complete_code("abc123#state456"));
+        for partial in ["abc123", "abc123#", "#state456", "a#b#c", ""] {
+            assert!(!complete_code(partial), "{partial}");
+        }
+    }
     #[test]
     fn only_complete_known_authorization_urls_are_published() {
         let url = "https://claude.com/cai/oauth/authorize?state=fixture&code_challenge=fixture";

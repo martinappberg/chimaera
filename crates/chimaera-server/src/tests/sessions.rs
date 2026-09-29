@@ -351,3 +351,77 @@ async fn session_spawn_size_is_honored_and_clamped() {
     assert_eq!(session["rows"], 24);
     state.sessions.kill(session["id"].as_str().unwrap()).ok();
 }
+
+/// Session rows carry an additive `needs_permission` while a chat waits on
+/// the user (a cloud machine's supervisor stays awake on it); PTY rows omit it.
+#[tokio::test]
+async fn a_chat_waiting_on_a_permission_says_so_on_its_row() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = test_state();
+    let root = test_dir("needs-permission");
+    let fake = test_dir("needs-permission-agent").join("claude");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\n\
+         printf '%s\\n' '{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"init\",\"response\":{\"commands\":[]}}}'\n\
+         printf '%s\\n' '{\"type\":\"control_request\",\"request_id\":\"ask-1\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"Bash\",\"input\":{\"command\":\"ls\"},\"tool_use_id\":\"tu-1\"}}'\n\
+         cat >/dev/null\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let id = "s-asking".to_string();
+    state
+        .chat
+        .spawn(
+            &chimaera_agent::claude::ClaudeAdapter,
+            chimaera_agent::driver::SpawnSpec::new(
+                id.clone(),
+                vec![fake.to_string_lossy().into_owned()],
+                root.clone(),
+            ),
+        )
+        .unwrap();
+    let (_, workspace) = request(
+        &state,
+        Method::POST,
+        "/api/v1/workspaces",
+        Some(serde_json::json!({"root": root})),
+    )
+    .await;
+    let (status, shell) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(serde_json::json!({"workspace_id": workspace["id"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{shell}");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let rows = loop {
+        let (status, rows) = request(&state, Method::GET, "/api/v1/sessions", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let asking = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id.as_str())
+            .is_some_and(|row| row["needs_permission"] == true);
+        if asking {
+            break rows;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the waiting permission never reached the row: {rows}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let pty = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == shell["id"])
+        .unwrap();
+    assert!(pty.get("needs_permission").is_none(), "{pty}");
+    state.chat.kill(&id);
+    state.sessions.kill(shell["id"].as_str().unwrap()).ok();
+}

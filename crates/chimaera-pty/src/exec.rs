@@ -68,6 +68,11 @@ pub struct ExecOptions {
     pub allow_sentinel_over_running: bool,
     /// Optional stage reporting (queued -> executing) for UI mirroring.
     pub stage: Option<watch::Sender<ExecStage>>,
+    /// Whether `queue_timeout` also bounds the wait behind a previous exec on
+    /// this session. A caller acting under workspace authority (a forwarded
+    /// viewer, a managed Pro project) sets it, so its request never outlives
+    /// its budget; otherwise a queued exec waits its turn, as it always has.
+    pub bounded_lock_wait: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -170,9 +175,12 @@ async fn exec_inner(
     let start = Instant::now();
 
     let queue_deadline = start + opts.queue_timeout;
-    // The existing queue budget covers a previous exec too, not just the
-    // shell's prompt. A zero budget remains an immediate try.
-    let _guard = if opts.queue_timeout.is_zero() {
+    // One exec at a time per session. Under workspace authority the queue
+    // budget covers a previous exec too, not just the shell's prompt (a zero
+    // budget is an immediate try); otherwise queued execs wait here first.
+    let _guard = if !opts.bounded_lock_wait {
+        exec_lock.lock().await
+    } else if opts.queue_timeout.is_zero() {
         exec_lock
             .try_lock()
             .map_err(|_| ExecError::Busy("another exec is queued".into()))?
@@ -372,6 +380,7 @@ mod tests {
             timeout: Duration::from_millis(300),
             allow_sentinel_over_running: false,
             stage: None,
+            bounded_lock_wait: false,
         };
 
         // First exec: integrated (phase ready), types the plain command,
@@ -409,5 +418,48 @@ mod tests {
         assert_eq!(outcome.record.command.as_deref(), Some("echo hi"));
         // The sentinel's own C did not un-degrade the session.
         assert!(marks.integration_start_broken());
+    }
+
+    /// A command queued behind another exec on the same session waits its
+    /// turn; only a caller acting under workspace authority bounds that wait
+    /// by its queue budget.
+    #[tokio::test]
+    async fn a_queued_exec_waits_its_turn_unless_its_caller_bounds_the_wait() {
+        for bounded in [false, true] {
+            let marks = Arc::new(Marks::new());
+            let (tx, mut rx) = crate::input::channel(8);
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            marks.feed(b"\x1b]133;A\x07$ ");
+            let previous = lock.clone().lock_owned().await;
+            let opts = ExecOptions {
+                command: "echo queued".into(),
+                queue_timeout: Duration::from_millis(100),
+                timeout: Duration::from_millis(300),
+                allow_sentinel_over_running: false,
+                stage: None,
+                bounded_lock_wait: bounded,
+            };
+            let task = tokio::spawn(exec(marks.clone(), tx.clone(), lock.clone(), opts));
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            if bounded {
+                assert!(matches!(task.await.unwrap(), Err(ExecError::Busy(_))));
+                continue;
+            }
+            assert!(
+                !task.is_finished(),
+                "a free exec waits for the previous one"
+            );
+            drop(previous);
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .write(|bytes| {
+                    assert_eq!(bytes, b"echo queued\r");
+                    Ok(())
+                })
+                .unwrap();
+            task.abort();
+        }
     }
 }

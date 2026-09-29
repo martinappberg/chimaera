@@ -1,5 +1,6 @@
 //! Worker-only setup through the same authenticated daemon routes on every
-//! client. Agent sign-in runs the vendor CLI itself in an ordinary terminal.
+//! client: machine facts and cloning a project. Agent sign-in is `providers`
+//! (bounded connection jobs with one credential writer per provider).
 pub(crate) mod providers;
 use crate::AppState;
 use axum::{
@@ -73,91 +74,6 @@ pub(crate) async fn info(State(state): State<Arc<AppState>>) -> Response {
         .path
         .is_ok();
     Json(json!({"available":true,"home":home,"ssh_public_key":public_key,"claude_installed":claude,"codex_installed":codex})).into_response()
-}
-#[derive(Deserialize)]
-pub(crate) struct Onboard {
-    agent: String,
-}
-pub(crate) async fn onboard(
-    State(state): State<Arc<AppState>>,
-    Json(input): Json<Onboard>,
-) -> Response {
-    if !enabled() {
-        return unavailable();
-    }
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return error("home directory is unavailable");
-    };
-    let (name, script) = match input.agent.as_str() {
-        "claude" | "codex" => {
-            let kind = if input.agent == "claude" {
-                crate::agents::AgentKind::Claude
-            } else {
-                crate::agents::AgentKind::Codex
-            };
-            let detection = crate::launcher::detect(&state, kind, false).await;
-            let (install, path) = match detection.path {
-                Ok(path) => (String::new(), path),
-                Err(_) => (
-                    crate::runtimes::install_script(kind, &state.managed_root).unwrap_or_default(),
-                    state.managed_root.join("bin").join(kind.as_str()),
-                ),
-            };
-            let arguments = if input.agent == "codex" {
-                " login --device-auth"
-            } else {
-                " auth login --claudeai"
-            };
-            (
-                format!("Sign in to {}", kind.product_name()),
-                format!(
-                    "{install}\nexec {}{arguments}",
-                    quote(&path.to_string_lossy())
-                ),
-            )
-        }
-        "github" => (
-            "Connect GitHub".into(),
-            "gh auth login --hostname github.com --git-protocol https --web && gh auth setup-git"
-                .into(),
-        ),
-        _ => return error("choose claude, codex or github"),
-    };
-    let setup = home.join("projects/.chimaera-setup");
-    if tokio::fs::create_dir_all(&setup).await.is_err() {
-        return error("could not prepare cloud setup directory");
-    }
-    let workspace = match crate::lock(&state.workspaces).add_internal(setup) {
-        Ok(w) => w,
-        Err(_) => return error("could not register cloud setup workspace"),
-    };
-    // Multiple presses focus the existing login instead of issuing duplicate
-    // native login requests or racing a managed installation.
-    if let Some(session) = state.sessions.list().into_iter().find(|s| {
-        s.alive
-            && s.name == name
-            && crate::lock(&state.session_workspaces).get(&s.id) == Some(&workspace.id)
-    }) {
-        return Json(json!({"workspace_id":workspace.id,"session_id":session.id})).into_response();
-    }
-    let body = serde_json::from_value(
-        json!({"workspace_id":workspace.id,"kind":"shell","name":name,"prelude":script}),
-    )
-    .expect("static create-session fields");
-    let response = crate::api::create_session(State(state.clone()), Json(body)).await;
-    if !response.status().is_success() {
-        return response;
-    }
-    let Ok(bytes) = axum::body::to_bytes(response.into_body(), 64 * 1024).await else {
-        return error("cloud setup response unavailable");
-    };
-    let Ok(session) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return error("cloud setup response unavailable");
-    };
-    if let Some(id) = session["id"].as_str() {
-        crate::activity::record(&state, id);
-    }
-    Json(json!({"workspace_id":workspace.id,"session_id":session["id"]})).into_response()
 }
 #[derive(Deserialize)]
 pub(crate) struct Project {

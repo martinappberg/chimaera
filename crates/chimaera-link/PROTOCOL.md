@@ -22,7 +22,11 @@ expired or revoked authentication returns `401` before a WebSocket upgrade. Afte
 sign-in. A keeper `401` alone does not justify a rotation: keepers also refuse
 during account outages or with a stale revocation cache, so the client first asks
 the account (`GET /v1/devices`, side-effect free) and refreshes only if the
-account also answers `401`. `403` means the account lacks authorization or needs
+account also answers `401`; this holds for keeper HTTP routes and WebSocket
+upgrades alike. While its account is unreachable a keeper answers new work with
+`503 {"error":"account_unavailable"}` (existing SSH logins and streams are kept):
+clients treat it as transient, never as a reason to refresh or sign out, and the
+daemon's automatic return waits quietly for the next pass. `403` means the account lacks authorization or needs
 fresh multifactor authentication. Services must check account and device
 ownership on every host and reverse stream lookup.
 

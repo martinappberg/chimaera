@@ -1,5 +1,7 @@
-//! Terminal Codex identity: chain its notify command, then verify the native
-//! rollout before promising a resume. No transcript contents cross the wire.
+//! Terminal Codex identity for Pro-configured projects: chain the user's own
+//! notify command, then verify the native rollout before promising a resume.
+//! No transcript contents cross the wire. Other projects' Codex TUIs keep
+//! their argv unchanged.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -18,15 +20,16 @@ fn quote(value: &str) -> String {
 
 /// A malformed/unreadable notify is an error: callers leave the user's own
 /// hook in place rather than override a command we cannot faithfully chain.
-fn user_notify(config: &Path) -> anyhow::Result<Vec<String>> {
+/// `None` when the file or its `notify` key is absent.
+fn configured_notify(config: &Path) -> anyhow::Result<Option<Vec<String>>> {
     let contents = match crate::doc_check::read_regular(config, CONFIG_CAP) {
         Ok(Some(bytes)) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         result => anyhow::bail!("cannot read bounded Codex config: {result:?}"),
     };
     let config: toml::Value = toml::from_str(std::str::from_utf8(&contents)?)?;
     let Some(notify) = config.get("notify") else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     notify
         .as_array()
@@ -38,7 +41,68 @@ fn user_notify(config: &Path) -> anyhow::Result<Vec<String>> {
                 .map(str::to_string)
                 .context("Codex notify contains an invalid argument")
         })
-        .collect()
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// The notify Codex itself would run for this project: a project's own
+/// `.codex/config.toml` layers over the one in its Codex home.
+fn user_notify(project: &Path, home: &Path) -> anyhow::Result<Vec<String>> {
+    if let Some(notify) = configured_notify(&project.join(".codex").join("config.toml"))? {
+        return Ok(notify);
+    }
+    Ok(configured_notify(&home.join("config.toml"))?.unwrap_or_default())
+}
+
+/// Codex's own config home as a terminal session sees it. Terminal agents
+/// start through the user's login shell, which may export `CODEX_HOME`
+/// (common on HPC) where the daemon's own environment does not; that is
+/// probed once per daemon life, bounded, reading only that one variable.
+pub(crate) async fn codex_home(state: &crate::AppState) -> PathBuf {
+    static LOGIN: tokio::sync::OnceCell<Option<PathBuf>> = tokio::sync::OnceCell::const_new();
+    // Unit tests never run the developer's login shell.
+    let login = if cfg!(test) {
+        None
+    } else {
+        LOGIN.get_or_init(login_codex_home).await.clone()
+    };
+    login.unwrap_or_else(|| {
+        state
+            .codex_config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+    })
+}
+async fn login_codex_home() -> Option<PathBuf> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(6),
+        tokio::process::Command::new(crate::launcher::login_shell())
+            .arg("-ilc")
+            .arg("env")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    env_codex_home(&String::from_utf8_lossy(&output.stdout))
+}
+/// `CODEX_HOME` from `env` output (the last assignment wins; rc banners
+/// before it are ignored). Only an absolute path counts.
+fn env_codex_home(env: &str) -> Option<PathBuf> {
+    env.lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("CODEX_HOME="))
+        .filter(|value| value.starts_with('/'))
+        .map(PathBuf::from)
+}
+/// Under the daemon's data dir (not the runtime dir that HPC hosts scrub
+/// nightly, which would silently stop the chained user notify).
+fn shim_dir(state: &crate::AppState) -> PathBuf {
+    state.shims_dir.join("codex-notify")
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -57,13 +121,13 @@ fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 /// goes through stdin; the user's argv receives the identical final argument.
 pub(crate) fn write_shim(
     dir: &Path,
-    config: &Path,
+    notify: &[String],
     session_id: &str,
     key: &str,
     port: u16,
 ) -> anyhow::Result<PathBuf> {
-    let notify = user_notify(config)?;
     std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     let path = dir.join(format!("{session_id}-codex-notify.sh"));
     let header = dir.join(format!("{session_id}-codex-notify.hdr"));
     write_private(&header, format!("Authorization: Bearer {key}\n").as_bytes())?;
@@ -87,13 +151,42 @@ pub(crate) fn write_shim(
     Ok(path)
 }
 
+/// The notify override for a Codex TUI in a Pro-configured project (its
+/// pause state and restart resume need the turn-complete signal); none
+/// elsewhere, so a free user's Codex argv and notify stay exactly theirs.
 pub(crate) async fn args(state: &crate::AppState, id: &str, key: &str) -> Vec<String> {
-    let config = state.codex_config_path.clone();
-    let dir = chimaera_core::runtime_dir().join("agents");
+    let Some(workspace) = crate::lock(&state.session_workspaces).get(id).cloned() else {
+        return Vec::new();
+    };
+    args_in(state, &workspace, id, key).await
+}
+/// `args` for a session not registered to its workspace yet (a fresh spawn).
+pub(crate) async fn args_in(
+    state: &crate::AppState,
+    workspace: &str,
+    id: &str,
+    key: &str,
+) -> Vec<String> {
+    if crate::pro::workspace_profile(state, workspace).is_none() {
+        return Vec::new();
+    }
+    let Some(project) = crate::lock(&state.workspaces)
+        .get(workspace)
+        .map(|workspace| workspace.root)
+    else {
+        return Vec::new();
+    };
+    let home = codex_home(state).await;
+    let dir = shim_dir(state);
     let id = id.to_string();
     let key = key.to_string();
     let port = state.port;
-    match tokio::task::spawn_blocking(move || write_shim(&dir, &config, &id, &key, port)).await {
+    let written = tokio::task::spawn_blocking(move || {
+        let notify = user_notify(&project, &home)?;
+        write_shim(&dir, &notify, &id, &key, port)
+    })
+    .await;
+    match written {
         Ok(Ok(path)) => crate::launcher::codex_notify_args(&path),
         result => {
             tracing::warn!(
@@ -105,8 +198,8 @@ pub(crate) async fn args(state: &crate::AppState, id: &str, key: &str) -> Vec<St
     }
 }
 
-pub(crate) fn remove_shim(id: &str) {
-    let dir = chimaera_core::runtime_dir().join("agents");
+pub(crate) fn remove_shim(state: &crate::AppState, id: &str) {
+    let dir = shim_dir(state);
     for ext in ["sh", "hdr"] {
         let _ = std::fs::remove_file(dir.join(format!("{id}-codex-notify.{ext}")));
     }
@@ -238,7 +331,8 @@ mod tests {
         let config = dir.join("config.toml");
         let notify = serde_json::json!(["/bin/sh", user, "literal $HOME `false` ' \\"]);
         std::fs::write(&config, format!("notify = {notify}\n")).unwrap();
-        let script = write_shim(&dir, &config, "s-test", "private-key", 1).unwrap();
+        let chained = user_notify(&dir.join("project"), &dir).unwrap();
+        let script = write_shim(&dir, &chained, "s-test", "private-key", 1).unwrap();
         let payload = "{\"thread-id\":\"test\",\"message\":\"$(false) '$HOME'\"}";
         let status = std::process::Command::new("/bin/sh")
             .arg(&script)
@@ -260,6 +354,43 @@ mod tests {
                 & 0o777,
             0o600
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The chained notify is the one Codex itself would run: a project's own
+    /// `.codex/config.toml` wins over its Codex home, and a login shell's
+    /// `CODEX_HOME` names that home.
+    #[test]
+    fn the_chained_notify_is_the_one_codex_would_run() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-codex-effective-{}",
+            chimaera_core::generate_token()
+        ));
+        let (home, project) = (dir.join("home"), dir.join("project"));
+        std::fs::create_dir_all(project.join(".codex")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("config.toml"), "notify = [\"home-hook\"]\n").unwrap();
+        assert_eq!(user_notify(&project, &home).unwrap(), ["home-hook"]);
+        std::fs::write(
+            project.join(".codex/config.toml"),
+            "notify = [\"project-hook\", \"--flag\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            user_notify(&project, &home).unwrap(),
+            ["project-hook", "--flag"]
+        );
+        // A project that turns notify off keeps it off.
+        std::fs::write(project.join(".codex/config.toml"), "notify = []\n").unwrap();
+        assert!(user_notify(&project, &home).unwrap().is_empty());
+        std::fs::write(project.join(".codex/config.toml"), "model = \"x\"\n").unwrap();
+        assert_eq!(user_notify(&project, &home).unwrap(), ["home-hook"]);
+        assert_eq!(
+            env_codex_home("Welcome to the cluster\nPATH=/bin\nCODEX_HOME=/scratch/u/.codex\n"),
+            Some(PathBuf::from("/scratch/u/.codex"))
+        );
+        assert_eq!(env_codex_home("CODEX_HOME=relative\n"), None);
+        assert_eq!(env_codex_home("PATH=/bin\n"), None);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

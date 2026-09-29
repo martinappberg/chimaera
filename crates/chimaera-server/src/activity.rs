@@ -28,17 +28,41 @@ impl Activity {
         self.input.clone()
     }
 }
-/// Whether an authenticated request is the user changing something. Pro
-/// transfer control (the supervisor's own calls) and per-window view state
-/// are not interaction.
+/// Routes whose mutations are the user changing something: files, drafts,
+/// Git worktrees, sessions, workspaces and their links. An explicit list,
+/// because several read-only helpers are POSTs (`/fs/resolve_targets`,
+/// `/fs/ticket`, `/fs/validate`, `/plugins/preview`) and a phone merely
+/// viewing a project must not keep a cloud machine awake. Pro transfer
+/// control and per-window view state are not interaction either.
+const CHANGES: &[&str] = &[
+    "/fs/file",
+    "/fs/drafts",
+    "/fs/draft",
+    "/fs/mkdir",
+    "/fs/create",
+    "/fs/rename",
+    "/fs/copy",
+    "/fs/move",
+    "/fs/delete",
+    "/fs/upload",
+    "/git/worktrees",
+    "/sessions",
+    "/workspaces",
+    "/links",
+];
+/// Whether an authenticated request is the user changing something.
 pub(crate) fn is_change(method: &axum::http::Method, path: &str) -> bool {
     use axum::http::Method;
     let path = path.strip_prefix("/api/v1").unwrap_or(path);
     matches!(
         *method,
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-    ) && !path.starts_with("/pro/")
-        && !path.starts_with("/view-state")
+    ) && CHANGES.iter().any(|route| {
+        path == *route
+            || path
+                .strip_prefix(route)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 pub(crate) fn touch(state: &crate::AppState) {
     crate::lock(&state.activity).changed = crate::session_view::now_ms();
@@ -73,10 +97,21 @@ mod tests {
         use axum::http::Method;
         assert!(is_change(&Method::PUT, "/api/v1/fs/file"));
         assert!(is_change(&Method::POST, "/sessions/s-a/upload"));
-        assert!(is_change(&Method::POST, "/api/v1/git/commit"));
+        assert!(is_change(&Method::POST, "/api/v1/git/worktrees"));
+        assert!(is_change(&Method::DELETE, "/api/v1/sessions/s-a"));
         assert!(!is_change(&Method::GET, "/api/v1/fs/file"));
         assert!(!is_change(&Method::POST, "/api/v1/pro/drain"));
         assert!(!is_change(&Method::PUT, "/view-state/tabs_w"));
+        // Read-only helpers that happen to be POSTs: a viewer is not working.
+        for path in [
+            "/api/v1/fs/resolve_targets",
+            "/api/v1/fs/ticket",
+            "/api/v1/fs/validate",
+            "/api/v1/plugins/preview",
+            "/api/v1/fs/filepath-lookalike",
+        ] {
+            assert!(!is_change(&Method::POST, path), "{path}");
+        }
     }
     #[test]
     fn input_is_monotonic_and_retired_sessions_are_pruned() {

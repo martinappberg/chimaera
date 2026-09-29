@@ -128,7 +128,7 @@ async fn additive_fields_and_unknown_values_never_fail_a_service_response() {
             "/v2/workspaces/{id}/placement",
             get(|Path(id): Path<String>| async move {
                 Json(json!({"workspace_id":id,"holder_id":"m-cloud","route_host_id":null,"epoch":3,
-                    "policy_revision":1,"availability":"suspended","preferred_installation_id":null,
+                    "policy_revision":1,"availability":"archived","preferred_installation_id":null,
                     "checkpoint_id":null,"server_now":"2026-09-28T19:00:00Z","expires_at":null,"wake":"soon"}))
             }),
         );

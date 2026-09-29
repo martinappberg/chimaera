@@ -33,9 +33,14 @@ pub(super) struct State {
     pub(super) latched: Mutex<std::collections::HashSet<String>>,
     /// Previous-life process groups not yet proven gone, per workspace. An
     /// empty list means no evidence exists (worker only; see `restore`).
-    unclean: Mutex<HashMap<String, Vec<u32>>>,
-    pub(super) invalid: bool,
+    unclean: Mutex<HashMap<String, Vec<(u32, u64)>>>,
+    /// Projects whose enrollment record was lost (see `restore`). Each stays
+    /// managed and publishes nothing until an authoritative read restores its
+    /// policy; a worker also runs nothing there. Bounded to 128.
+    pub(super) uncertain: Mutex<std::collections::HashSet<String>>,
     boot: Option<String>,
+    /// The watchdog's latest tick (see `thawed`).
+    tick: Mutex<Option<std::time::Instant>>,
 }
 struct Proof {
     lease: wire::ExecutionLease,
@@ -44,7 +49,15 @@ struct Proof {
     deadline: lease::Deadline,
     server_now: i128,
     stopped: bool,
+    /// Set when this process resumed from a freeze with the deadline lapsed:
+    /// one renewal at the recorded epoch is tried before the watchdog fences.
+    renew_until: Option<std::time::Instant>,
 }
+
+/// How long a resumed cloud machine may take to renew its own epoch before
+/// the watchdog fences it. The account keeps a suspended owner's lease for it
+/// (nobody else can acquire it meanwhile), so this is not a partition window.
+const RESUME_RENEW: Duration = Duration::from_secs(20);
 
 pub(super) fn validate_configuration(config: &Configure) -> Result<()> {
     let Some(execution) = &config.execution else {
@@ -88,9 +101,17 @@ pub(super) fn worker(state: &AppState) -> bool {
             .is_some_and(|config| config.role == Role::Worker)
 }
 
+/// This project's enrollment record was lost; see `State::uncertain`.
+pub(super) fn uncertain(state: &AppState, workspace: &str) -> bool {
+    lock(&state.pro.execution.uncertain).contains(workspace)
+}
+pub(super) fn any_uncertain(state: &AppState) -> bool {
+    !lock(&state.pro.execution.uncertain).is_empty()
+}
+
 pub(super) fn managed(state: &AppState, workspace: &str) -> bool {
     let latched = lock(&state.pro.execution.latched).contains(workspace);
-    state.pro.execution.invalid
+    uncertain(state, workspace)
         || latched
         || lock(&state.pro.preferences)
             .get(workspace)
@@ -153,6 +174,7 @@ pub(super) fn observe(state: &AppState, config: &Configure, baton: &Baton) -> Re
         "invalid continuity workspace"
     );
     let latched = lock(&state.pro.execution.latched).contains(&baton.workspace_id);
+    let lost = uncertain(state, &baton.workspace_id);
     let mut preferences = lock(&state.pro.preferences);
     let previous = preferences
         .get(&baton.workspace_id)
@@ -161,7 +183,7 @@ pub(super) fn observe(state: &AppState, config: &Configure, baton: &Baton) -> Re
         ensure!(
             previous.is_none()
                 && !latched
-                && !state.pro.execution.invalid
+                && !lost
                 && baton.execution_capability.is_none()
                 && baton.execution_lease.is_none(),
             "continuity downgrade denied"
@@ -207,6 +229,8 @@ pub(super) fn observe(state: &AppState, config: &Configure, baton: &Baton) -> Re
         .continuity = Some(policy.clone());
     drop(preferences);
     lock(&state.pro.execution.latched).insert(baton.workspace_id.clone());
+    // The account restored this project's policy: its lost record is resolved.
+    lock(&state.pro.execution.uncertain).remove(&baton.workspace_id);
     Ok(())
 }
 
@@ -276,7 +300,7 @@ pub(super) fn accept(
     // processes stopped. A device keeps running regardless (laptop first).
     ensure!(
         config.role == Role::Device
-            || (!state.pro.execution.invalid && !unclean(state, &baton.workspace_id)),
+            || (!uncertain(state, &baton.workspace_id) && !unclean(state, &baton.workspace_id)),
         "previous managed processes require supervisor cleanup"
     );
     observe(state, config, baton)?;
@@ -384,6 +408,7 @@ pub(super) fn accept(
             deadline,
             server_now,
             stopped: false,
+            renew_until: None,
         },
     );
     Ok(())
@@ -400,7 +425,71 @@ pub(super) fn allows(state: &AppState, workspace: &str) -> bool {
     {
         return false;
     }
-    !worker(state) || lease_valid(state, workspace)
+    // A resumed machine keeps admitting the input that woke it while it renews
+    // its own paused lease; a refused renewal fences it at once.
+    !worker(state)
+        || lease_valid(state, workspace)
+        || resuming(state, workspace)
+        || (thawed(state) && resuming(state, workspace))
+}
+/// Notices a freeze before the watchdog does. The request that woke a
+/// suspended machine (and the lease loop) can run in the moments after the
+/// thaw before the watchdog's next tick; they must not see a lapsed lease
+/// as a lost one. A watchdog silent for longer than a freeze is exactly what
+/// its own next tick would report, so this grants the same one bounded
+/// renewal (`resumed`) and wakes the lease loop.
+pub(super) fn thawed(state: &AppState) -> bool {
+    let stale =
+        lock(&state.pro.execution.tick).is_some_and(|tick| tick.elapsed() > watchdog::FREEZE);
+    if stale && resumed(state, state.pro.generation.load(Ordering::Acquire)) {
+        state.pro.renew_now.notify_one();
+    }
+    stale
+}
+/// The watchdog ticked (see `thawed`).
+pub(super) fn ticked(state: &AppState, at: std::time::Instant) {
+    *lock(&state.pro.execution.tick) = Some(at);
+}
+/// This process resumed from a freeze (see `resumed`) and is renewing its own
+/// epoch; the watchdog holds its fence until the renewal answers or the
+/// bounded window passes.
+pub(super) fn resuming(state: &AppState, workspace: &str) -> bool {
+    let generation = state.pro.generation.load(Ordering::Acquire);
+    lock(&state.pro.execution.proofs)
+        .get(workspace)
+        .is_some_and(|proof| {
+            !proof.stopped
+                && proof.generation == generation
+                && proof
+                    .renew_until
+                    .is_some_and(|until| std::time::Instant::now() < until)
+        })
+}
+/// The epoch of this project's current, unstopped execution proof.
+pub(super) fn proof_epoch(state: &AppState, workspace: &str) -> Option<u64> {
+    lock(&state.pro.execution.proofs)
+        .get(workspace)
+        .filter(|proof| !proof.stopped)
+        .map(|proof| proof.epoch)
+}
+/// The watchdog saw the process frozen: a suspended cloud machine resumed, or
+/// the clock jumped. Each proof whose deadline lapsed across the freeze gets
+/// one bounded renewal at its recorded epoch before any fence (renew before
+/// fencing). Returns whether any renewal is now due.
+pub(super) fn resumed(state: &AppState, generation: u64) -> bool {
+    let until = std::time::Instant::now() + RESUME_RENEW;
+    let mut due = false;
+    for proof in lock(&state.pro.execution.proofs).values_mut() {
+        if proof.generation == generation
+            && !proof.stopped
+            && proof.renew_until.is_none()
+            && !proof.deadline.valid()
+        {
+            proof.renew_until = Some(until);
+            due = true;
+        }
+    }
+    due
 }
 /// Sessions a previous daemon left running resume only once this life has
 /// verified ownership; `resume_unverified` applies the device fallback.
@@ -471,7 +560,7 @@ pub(super) fn managed_session(state: &AppState, id: &str) -> bool {
     state.chat.get(id).is_some() || lock(&state.agents).contains_key(id)
 }
 pub(super) fn quiescent(state: &AppState, workspace: &str) -> bool {
-    if (state.pro.execution.invalid && worker(state))
+    if (uncertain(state, workspace) && worker(state))
         || unclean(state, workspace)
         || !mutation::idle(state, workspace)
     {
@@ -498,8 +587,13 @@ pub(super) fn expire(state: &AppState, generation: u64) -> Vec<String> {
     }
     let mut proofs = lock(&state.pro.execution.proofs);
     let mut expired = Vec::new();
+    let now = std::time::Instant::now();
     for (workspace, proof) in proofs.iter_mut() {
         if proof.generation == generation && (proof.stopped || !proof.deadline.valid()) {
+            // A resumed machine's own renewal is still in flight.
+            if !proof.stopped && proof.renew_until.is_some_and(|until| now < until) {
+                continue;
+            }
             proof.stopped = true;
             lock(&state.pro.preferences)
                 .entry(workspace.clone())
@@ -537,6 +631,36 @@ pub(super) fn valid_grant(state: &AppState, workspace: &str, epoch: u64) -> bool
         })
 }
 
+/// First enrollment around agents already running here: they stay on their
+/// processes and count as this life's managed workload, exactly as if they
+/// had been launched after enrollment. The next state write records their
+/// process groups (crash evidence a successor probes), and a fence reaches
+/// them by session like any other managed agent.
+pub(super) fn adopt_running(state: &AppState, workspace: &str) {
+    let ids: Vec<_> = lock(&state.session_workspaces)
+        .iter()
+        .filter(|(_, w)| w.as_str() == workspace)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let live = ids
+        .into_iter()
+        .filter(|id| managed_session(state, id))
+        .any(|id| {
+            state.chat.get(&id).is_some_and(|s| s.alive)
+                || state.sessions.get(&id).is_some_and(|s| s.alive)
+        });
+    if !live {
+        return;
+    }
+    let mut preferences = lock(&state.pro.preferences);
+    if preferences.len() >= 128 && !preferences.contains_key(workspace) {
+        return;
+    }
+    let preference = preferences.entry(workspace.to_owned()).or_default();
+    preference.execution_active = true;
+    preference.execution_boot = state.pro.execution.boot.clone();
+}
+
 /// Durable admission precedes spawning. On a crash, same-boot execution remains
 /// closed until a trusted process supervisor proves the old workload stopped.
 pub(crate) async fn prepare_launch(
@@ -563,9 +687,13 @@ pub(crate) async fn prepare_launch(
     );
     {
         let mut preferences = lock(&state.pro.preferences);
-        let preference = preferences
-            .get_mut(workspace)
-            .context("managed project identity unavailable")?;
+        // An uncertain project (its record was lost) may have no preference
+        // row yet; its launch still records evidence rather than failing.
+        ensure!(
+            preferences.len() < 128 || preferences.contains_key(workspace),
+            "managed project identity unavailable"
+        );
+        let preference = preferences.entry(workspace.to_owned()).or_default();
         preference.execution_active = true;
         preference.execution_boot = state.pro.execution.boot.clone();
     }
@@ -574,6 +702,16 @@ pub(crate) async fn prepare_launch(
         crate::pro::may_execute(state, workspace),
         "execution authority changed during durable launch admission"
     );
+    // The caller spawns right after this returns; record the new child's
+    // group (and its start time) shortly after instead of at the next state
+    // write, so a crash in between leaves evidence a successor can probe.
+    let owner = state.clone();
+    tokio::spawn(async move {
+        for delay in [250, 2_000] {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            let _ = crate::pro::persist(&owner).await;
+        }
+    });
     Ok(())
 }
 
@@ -585,6 +723,29 @@ pub(crate) fn expired_lease_fixture(state: &AppState, workspace: &str) -> Vec<St
         proof.deadline = lease::Deadline::expired_fixture();
     }
     expire(state, state.pro.generation.load(Ordering::Acquire))
+}
+/// A suspended machine resumed after its lease deadline passed, as the
+/// watchdog's freeze detection sees it. Returns what the watchdog would fence.
+#[cfg(test)]
+pub(crate) fn resumed_fixture(state: &AppState, workspace: &str) -> Vec<String> {
+    if let Some(proof) = lock(&state.pro.execution.proofs).get_mut(workspace) {
+        proof.deadline = lease::Deadline::expired_fixture();
+    }
+    let generation = state.pro.generation.load(Ordering::Acquire);
+    resumed(state, generation);
+    expire(state, generation)
+}
+/// A suspended machine just thawed: its lease deadline passed while it was
+/// frozen and its watchdog has not ticked since.
+#[cfg(test)]
+pub(crate) fn thawed_fixture(state: &AppState, workspace: &str) {
+    if let Some(proof) = lock(&state.pro.execution.proofs).get_mut(workspace) {
+        proof.deadline = lease::Deadline::expired_fixture();
+    }
+    ticked(
+        state,
+        std::time::Instant::now() - watchdog::FREEZE - Duration::from_secs(2),
+    );
 }
 /// A verified other owner, as an authenticated baton read records it.
 #[cfg(test)]

@@ -153,9 +153,86 @@ impl Reconciliation {
     }
 }
 
+/// The scope acknowledgment a suspended owner can give. A frozen machine cannot
+/// answer the full project check, so its transport answers the scoped health
+/// probe itself (marked `sleeping`) from the account's placement, and only for
+/// a daemon that acknowledged scoping while it was awake. Anything else, or an
+/// owner that is actually awake but did not acknowledge, fails.
+pub(super) fn sleeping_acknowledgment(
+    headers: &ureq::http::HeaderMap,
+    workspace: &str,
+    epoch: u64,
+) -> Result<()> {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    anyhow::ensure!(
+        header("x-chimaera-scope-version") == Some("1")
+            && header("x-chimaera-workspace") == Some(workspace)
+            && header("x-chimaera-epoch") == Some(epoch.to_string().as_str())
+            && header("x-chimaera-worker-state") == Some("sleeping"),
+        "suspended project owner not vouched for"
+    );
+    Ok(())
+}
+
+/// Verifies a suspended owner through its transport's scoped health probe
+/// (see [`sleeping_acknowledgment`]). Passive: it never wakes the owner.
+pub(super) async fn verify_sleeping_owner(
+    port: u16,
+    token: &str,
+    workspace: &str,
+    epoch: u64,
+) -> Result<()> {
+    let token = token.to_owned();
+    let workspace = workspace.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let response = crate::http::agent()
+            .get(&format!("http://127.0.0.1:{port}/api/v1/health"))
+            .header("Authorization", &format!("Bearer {token}"))
+            .header("X-Chimaera-Workspace", &workspace)
+            .header("X-Chimaera-Epoch", &epoch.to_string())
+            .config()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .max_redirects(0)
+            .build()
+            .call()?;
+        sleeping_acknowledgment(response.headers(), &workspace, epoch)
+    })
+    .await?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_a_scoped_sleeping_answer_vouches_for_a_suspended_owner() {
+        let headers = |pairs: &[(&'static str, &str)]| {
+            let mut map = ureq::http::HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(*name, value.parse().unwrap());
+            }
+            map
+        };
+        let scoped = [
+            ("x-chimaera-scope-version", "1"),
+            ("x-chimaera-workspace", "w-a"),
+            ("x-chimaera-epoch", "4"),
+        ];
+        let mut sleeping = scoped.to_vec();
+        sleeping.push(("x-chimaera-worker-state", "sleeping"));
+        sleeping_acknowledgment(&headers(&sleeping), "w-a", 4).unwrap();
+        assert!(sleeping_acknowledgment(&headers(&sleeping), "w-a", 5).is_err());
+        assert!(sleeping_acknowledgment(&headers(&sleeping), "w-b", 4).is_err());
+        assert!(
+            sleeping_acknowledgment(&headers(&scoped), "w-a", 4).is_err(),
+            "an awake owner goes through the full check"
+        );
+        assert!(sleeping_acknowledgment(
+            &headers(&[("x-chimaera-worker-state", "sleeping")]),
+            "w-a",
+            4
+        )
+        .is_err());
+    }
     fn snapshot() -> serde_json::Value {
         serde_json::json!([
             {"host_id":"worker-shared","workspace_id":"w-a","epoch":4},

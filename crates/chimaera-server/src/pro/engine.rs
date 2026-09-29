@@ -132,6 +132,8 @@ pub(super) fn start(state: Arc<AppState>) {
         let state = task_state;
         let mut last_mirror = 0;
         let mut renewed = super::now();
+        let mut next_renewal = 0;
+        let mut unauthorized = false;
         loop {
             if state.stopping.load(Ordering::Relaxed)
                 || generation != state.pro.generation.load(Ordering::Acquire)
@@ -141,22 +143,18 @@ pub(super) fn start(state: Arc<AppState>) {
             let Some(config) = lock(&state.pro.runtime).clone() else {
                 return;
             };
-            if super::now().saturating_sub(renewed) >= 3600 {
-                if let Ok(response) =
-                    account(&config, "/v1/delegations/renew", "POST", Some(&json!({}))).await
-                {
-                    if let Ok(delegation) = response.json::<super::protocol::Delegation>() {
-                        if authority::install_renewal(
-                            &state,
-                            generation,
-                            &config.delegation,
-                            delegation,
-                        ) {
-                            renewed = super::now();
-                        }
-                    }
+            // Hourly, and at once after the account refused this credential
+            // (then at most once a minute while it keeps failing).
+            if (super::now().saturating_sub(renewed) >= 3600 || unauthorized)
+                && super::now() >= next_renewal
+            {
+                if renew_delegation(&state, &config, generation).await {
+                    renewed = super::now();
+                } else {
+                    next_renewal = super::now() + 60;
                 }
             }
+            unauthorized = false;
             // Previous-life processes that have exited release their fence.
             execution::reprobe(&state);
             let workspaces = lock(&state.workspaces).list();
@@ -176,6 +174,9 @@ pub(super) fn start(state: Arc<AppState>) {
                     continue;
                 }
                 if let Err(error) = reconcile(&state, &config, &workspace.id).await {
+                    unauthorized |= error
+                        .chain()
+                        .any(|cause| cause.to_string() == transport::UNAUTHORIZED);
                     record_error(&state, &workspace.id, &error);
                 }
             }
@@ -219,13 +220,51 @@ pub(super) fn start(state: Arc<AppState>) {
                 *lock(&state.pro.mirror_task) = Some(task);
                 last_mirror = super::now();
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(5)) => {}
+                () = state.pro.renew_now.notified() => {}
+            }
         }
     });
     if let Some(old) = lock(&state.pro.task).replace(task) {
         old.abort();
     }
 }
+/// Renews this daemon's delegation. A definitive refusal (401/403) marks it
+/// refused so `/pro/status` tells the native app to mint a new one; a
+/// transport failure only retries later.
+pub(super) async fn renew_delegation(
+    state: &AppState,
+    config: &Configure,
+    generation: u64,
+) -> bool {
+    match account(config, "/v1/delegations/renew", "POST", Some(&json!({}))).await {
+        Ok(response) if matches!(response.status, 401 | 403) => {
+            state.pro.delegation_refused.store(true, Ordering::Release);
+            state.changes.notify_waiters();
+            false
+        }
+        Ok(response) => {
+            let installed =
+                response
+                    .json::<super::protocol::Delegation>()
+                    .is_ok_and(|delegation| {
+                        authority::install_renewal(
+                            state,
+                            generation,
+                            &config.delegation,
+                            delegation,
+                        )
+                    });
+            if installed {
+                state.pro.delegation_refused.store(false, Ordering::Release);
+            }
+            installed
+        }
+        Err(_) => false,
+    }
+}
+
 fn record_error(state: &AppState, workspace: &str, error: &anyhow::Error) {
     let message: String = error.to_string().chars().take(256).collect();
     let mut statuses = lock(&state.pro.status);
@@ -258,6 +297,11 @@ async fn reconcile_generation(
         super::projects::account_matches(state, workspace),
         "This project belongs to another account"
     );
+    // Stopped for sleep and not handed over: renewing now would keep the lease
+    // from lapsing (delaying the cloud) and could resume agents before sleep.
+    if lock(&state.pro.release_pending).contains(workspace) {
+        return Ok(None);
+    }
     let baton: Baton = account(config, &execution::path(config, workspace, ""), "GET", None)
         .await?
         .json()?;
@@ -266,6 +310,14 @@ async fn reconcile_generation(
         generation == state.pro.generation.load(Ordering::Acquire),
         "Account changed during project transfer"
     );
+    {
+        // The account answered: from now on the verified path decides what
+        // resumes here, not the unverified boot fallback.
+        let mut answered = lock(&state.pro.answered);
+        if answered.len() < 128 || answered.contains(workspace) {
+            answered.insert(workspace.to_owned());
+        }
+    }
     execution::observe(state, config, &baton)?;
     if baton.continuity.is_some() {
         super::persist(state).await?;
@@ -299,6 +351,10 @@ async fn reconcile_generation(
     if baton.holder_id.as_deref().is_some_and(|id| id != holder) {
         // A worker never steals an active owner. Devices observe remote work
         // immediately; hand-back is a separate coordinated stop/release path.
+        // A resumed machine that finds another owner does not renew: fence.
+        if execution::resuming(state, workspace) {
+            execution::fence_workspace(state, workspace);
+        }
         lock(&state.pro.ownership).insert(
             workspace.into(),
             Ownership::Remote {
@@ -379,20 +435,39 @@ async fn reconcile_generation(
         return Ok(None);
     }
 
-    let operation = if owned
-        && baton
-            .expires_at
-            .as_ref()
-            .is_some_and(|expiry| expiry > &baton.server_now)
+    // A cloud machine resuming from suspension renews its own recorded epoch
+    // even though the lease reads expired: the account kept it as a paused
+    // owner (same epoch, no fork). Acquiring instead would install the
+    // checkpoint over its own newer work. Only a refused renewal fences. The
+    // loop may run before the watchdog noticed the freeze.
+    if config.role == Role::Worker {
+        execution::thawed(state);
+    }
+    let resuming = config.role == Role::Worker
+        && owned
+        && execution::resuming(state, workspace)
+        && execution::proof_epoch(state, workspace) == Some(baton.epoch);
+    let operation = if resuming
+        || (owned
+            && baton
+                .expires_at
+                .as_ref()
+                .is_some_and(|expiry| expiry > &baton.server_now))
     {
         "renew"
     } else {
         "acquire"
     };
-    // Re-acquiring the epoch this device itself held (its own clean release,
-    // or its own lease that lapsed while it kept working) continues its own
-    // newer files and conversations: no checkpoint install, no fork.
-    let own_epoch = config.role == Role::Device && execution::held_here(state, config, &baton);
+    // Re-acquiring the epoch this installation itself held (its own clean
+    // release, or its own lease that lapsed while it kept working) continues
+    // its own newer files and conversations: no checkpoint install, no fork,
+    // no second transfer pickup. That includes a cloud machine thawed from a
+    // suspension whose renewal window was missed (the lease loop can run
+    // before the watchdog notices the freeze): the account turns a paused
+    // owner's acquire into a renewal of the same epoch. A cloud machine whose
+    // own arrival was interrupted (still installing) installs it again.
+    let own_epoch = execution::held_here(state, config, &baton)
+        && (config.role == Role::Device || !transferring);
     if operation == "acquire" && execution::checkpoint_mode(state, workspace) && !own_epoch {
         ensure!(
             baton.checkpoint.is_some(),
@@ -403,11 +478,18 @@ async fn reconcile_generation(
         let Ok(job) = state.pro.jobs.clone().try_lock_owned() else {
             return Ok(None);
         };
+        // Fenced from the moment the install is scheduled: canonical files
+        // are about to replace this project's, so nothing new may start (and
+        // no stale boot-deferred turn may resume) before hydrate's own fence.
+        lock(&state.pro.installing).insert(workspace.to_owned());
         lock(&state.pro.ownership).insert(
             workspace.into(),
             Ownership::AwaitingVerification { epoch: baton.epoch },
         );
-        super::persist(state).await?;
+        if let Err(error) = super::persist(state).await {
+            lock(&state.pro.installing).remove(workspace);
+            return Err(error);
+        }
         // Installing runs as its own owned task: lease renewal for every
         // other project continues meanwhile. The grant's own requires_fork
         // decides; hydrate applies it.
@@ -424,9 +506,9 @@ async fn reconcile_generation(
                 || None,
                 move || async move {
                     let _job = job;
-                    if let Err(error) =
-                        install_owned(owner.clone(), config, key.clone(), epoch).await
-                    {
+                    let result = install_owned(owner.clone(), config, key.clone(), epoch).await;
+                    lock(&owner.pro.installing).remove(&key);
+                    if let Err(error) = result {
                         record_error(&owner, &key, &error);
                         return super::detached::Outcome::refused(
                             axum::http::StatusCode::CONFLICT,
@@ -441,20 +523,19 @@ async fn reconcile_generation(
         return Ok(None);
     }
     let body = execution::body(&operation_config, baton.epoch, operation == "acquire");
+    // First enrollment happens around work already running here: its agents
+    // keep their processes (a stop and restart would resend a billed pickup
+    // turn) and become this life's managed workload, recorded as crash
+    // evidence with the state write below.
     if operation_config.execution.is_some() && baton.continuity.is_none() {
-        lock(&state.pro.ownership).insert(
-            workspace.into(),
-            Ownership::AwaitingVerification { epoch: baton.epoch },
-        );
+        execution::adopt_running(state, workspace);
         super::persist(state).await?;
-        suspend_workspace(state, workspace).await?;
-        execution::stop(state, &[workspace.to_owned()]).await?;
     }
     // Never take or extend a lease this worker could not accept: an expired
     // one lets the laptop (or a clean worker) continue instead.
     ensure!(
         !execution::worker(state)
-            || (!state.pro.execution.invalid && !execution::unclean(state, workspace)),
+            || (!execution::uncertain(state, workspace) && !execution::unclean(state, workspace)),
         "previous managed processes are still stopping"
     );
     let was_fenced = execution::fenced(state, workspace);
@@ -474,6 +555,11 @@ async fn reconcile_generation(
             .is_ok_and(|value| value["error"] == "takeover_grace")
     {
         return Ok(None);
+    }
+    // The account refused this resumed machine's own epoch (someone else
+    // took the project while it slept): fence now, not at the window's end.
+    if resuming && (400..500).contains(&response.status) {
+        execution::fence_workspace(state, workspace);
     }
     let grant: Baton = response
         .json()
@@ -504,10 +590,10 @@ async fn reconcile_generation(
         }
         return Ok(Some(grant.epoch));
     }
-    if config.role == Role::Worker
-        && (!matches!(previous, Some(Ownership::Local { .. }))
-            || !super::provider_gate::required(state, workspace).is_empty())
-    {
+    // A project running here with sessions still waiting for a provider stays
+    // Local; those sessions resume through `provider_gate::resume_ready`
+    // after sign-in, not by re-probing every lease tick.
+    if config.role == Role::Worker && !matches!(previous, Some(Ownership::Local { .. })) {
         ensure!(
             generation == state.pro.generation.load(Ordering::Acquire),
             "Account changed while verifying project ownership"
@@ -615,7 +701,9 @@ async fn stop_after_verified_owner(
 
 async fn suspend_workspace(state: &Arc<AppState>, workspace: &str) -> Result<()> {
     for id in sessions(state, workspace) {
-        match crate::bundle::export(state.clone(), &id, crate::bundle::ExportMode::Stop).await {
+        match crate::bundle::export_durable(state.clone(), &id, crate::bundle::ExportMode::Stop)
+            .await
+        {
             Ok(archive) => {
                 let _ = tokio::fs::remove_file(archive).await;
             }
@@ -624,20 +712,7 @@ async fn suspend_workspace(state: &Arc<AppState>, workspace: &str) -> Result<()>
                 // first native conversation id exists. Preserve its ledger
                 // identity; absence of an exportable handle cannot authorize a
                 // second writer to continue running.
-                if let Some(mut entry) = crate::ledger::snapshot(state)
-                    .0
-                    .into_iter()
-                    .find(|entry| entry.id == id)
-                {
-                    entry.suspended = true;
-                    entry.handoff = None;
-                    lock(&state.deferred_sessions).insert(id.clone(), entry);
-                }
-                if state.chat.get(&id).is_some() {
-                    state.chat.kill(&id);
-                } else {
-                    let _ = state.sessions.kill(&id);
-                }
+                park_here(state, &id).await;
             }
         }
     }
@@ -648,6 +723,29 @@ async fn suspend_workspace(state: &Arc<AppState>, workspace: &str) -> Result<()>
     })
     .await??;
     Ok(())
+}
+
+/// Stops an agent that cannot be exported and keeps it here as a paused row
+/// with its identity (it resumes when the project is this computer's again).
+/// A terminal is never stopped.
+async fn park_here(state: &Arc<AppState>, id: &str) {
+    if !(state.chat.get(id).is_some() || lock(&state.agents).contains_key(id)) {
+        return;
+    }
+    if let Some(mut entry) = crate::ledger::snapshot(state)
+        .0
+        .into_iter()
+        .find(|entry| entry.id == id)
+    {
+        entry.suspended = true;
+        entry.handoff = None;
+        lock(&state.deferred_sessions).insert(id.to_owned(), entry);
+    }
+    if state.chat.get(id).is_some() {
+        state.chat.kill(id);
+    } else {
+        let _ = state.sessions.kill(id);
+    }
 }
 
 /// Running agents make a project worth handing to the cloud before sleep.
@@ -801,6 +899,10 @@ async fn snapshot_inner_scoped(
     }
     let staging = root.join(format!("stage-{}", chimaera_core::generate_token()));
     tokio::fs::create_dir_all(&staging).await?;
+    let woke = || sleep.is_some_and(|sleep| sleep.woke(state));
+    // Sessions this flush stopped; a wake returns them to this computer.
+    let stopped_ids = std::sync::Mutex::new(Vec::<String>::new());
+    let mut published = false;
     let result = async {
         let agent_ids=sessions(state,&workspace.id);
         let continuation=continuation(state,&workspace.id);
@@ -811,12 +913,28 @@ async fn snapshot_inner_scoped(
             *phase = "stop_sessions";
             lock(&state.pro.ownership).insert(workspace.id.clone(),Ownership::Transferring{epoch});super::persist(state).await?;
             for id in &session_ids {
-                let Some(path)=crate::bundle::export_for_mirror(state.clone(),id,crate::bundle::ExportMode::Stop).await? else {continue;};
+                // Woken mid-flush: stop no further sessions.
+                if woke() { break; }
+                let path = match crate::bundle::export_for_mirror(state.clone(),id,crate::bundle::ExportMode::Stop).await {
+                    Ok(Some(path)) => path,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        // One conversation that cannot travel (no transcript
+                        // yet, too large) never fails the project: it stays
+                        // here, stopped and paused with its identity, for
+                        // when the project comes back.
+                        tracing::warn!(category = snapshot_diagnostics::category(&error), "A conversation stays paused here instead of moving");
+                        park_here(state, id).await;
+                        lock(&stopped_ids).push(id.clone());
+                        continue;
+                    }
+                };
+                lock(&stopped_ids).push(id.clone());
                 let target=staging.join(format!("stopped-{id}.zip"));tokio::fs::rename(path,&target).await?;stopped.insert(id.clone(),target);
             }
         }
         *phase = "stop_execution";
-        if clean && config.execution.is_some(){execution::stop(state,std::slice::from_ref(&workspace.id)).await?;}
+        if clean && config.execution.is_some() && !woke() {execution::stop(state,std::slice::from_ref(&workspace.id)).await?;}
         *phase = "inventory";
         let paths = mirror::inventory(&workspace.root, &shadow).await?;
         let project = workspace.root.clone(); let destination = staging.join("tree");
@@ -836,12 +954,27 @@ async fn snapshot_inner_scoped(
         let handoff = staging.join("handoff"); tokio::fs::create_dir_all(handoff.join("bundles")).await?;
         let mut archives = Vec::new(); let mut archive_bytes = 0u64;
         for id in session_ids {
-            let Some(path) = (if clean {stopped.remove(&id)} else {crate::bundle::export_for_mirror(state.clone(), &id, crate::bundle::ExportMode::Snapshot).await?}) else {continue;};
-            has_agents |= agent_ids.contains(&id);
+            let path = if clean {
+                stopped.remove(&id)
+            } else {
+                // A conversation that cannot be saved right now is left out of
+                // this copy (and kept running); the project's files still go.
+                crate::bundle::export_for_mirror(state.clone(), &id, crate::bundle::ExportMode::Snapshot).await.unwrap_or_else(|error| {
+                    tracing::warn!(category = snapshot_diagnostics::category(&error), "A conversation was left out of this project copy");
+                    None
+                })
+            };
+            let Some(path) = path else {continue;};
             let length = tokio::fs::metadata(&path).await?.len();
-            if length > max_file { let _ = tokio::fs::remove_file(path).await; anyhow::bail!("session archive exceeds mirror file limit"); }
+            // Too large for the copy: leave that conversation out (a moved
+            // one stays paused here), never fail the project.
+            if length > max_file || archive_bytes + length + report.bytes + config_report.bytes > budget {
+                let _ = tokio::fs::remove_file(path).await;
+                tracing::warn!("A conversation was too large for the project copy");
+                continue;
+            }
+            has_agents |= agent_ids.contains(&id);
             archive_bytes = archive_bytes.saturating_add(length);
-            ensure!(archive_bytes + report.bytes + config_report.bytes <= budget, "workspace and conversations exceed mirror storage quota");
             let archive = format!("bundles/{id}.zip");
             tokio::fs::rename(path, handoff.join(&archive)).await?;
             archives.push(SessionArchive {id,archive});
@@ -889,7 +1022,8 @@ async fn snapshot_inner_scoped(
         }
         *phase = "persist_snapshot";
         super::persist(state).await?;
-        if clean && !sleep.is_some_and(|sleep| sleep.woke(state)) {
+        published = true;
+        if clean && !woke() {
             *phase = "release";
             // Before sleep, the account's short publication fence is not
             // waited out past the deadline: an unreleased lease simply lapses
@@ -899,13 +1033,43 @@ async fn snapshot_inner_scoped(
             });
             release::after_publication(config, &workspace.id, epoch, budget, || {
                 generation == state.pro.generation.load(Ordering::Acquire)
-                    && !sleep.is_some_and(|sleep| sleep.woke(state))
+                    && !woke()
                     && matches!(lock(&state.pro.ownership).get(&workspace.id), Some(Ownership::Transferring { epoch: current }) if *current == epoch)
             }).await?;
         }
         Ok::<_,anyhow::Error>(())
     }.await;
     let _ = tokio::fs::remove_dir_all(staging).await;
+    let stopped_ids = stopped_ids.into_inner().unwrap_or_default();
+    if clean && woke() {
+        // The computer woke during this flush: whatever publication did, the
+        // project stays here and the sessions it stopped continue locally,
+        // without waiting for the account.
+        if !stopped_ids.is_empty() {
+            if let Err(error) =
+                crate::ledger::resume_deferred_sessions(state, &workspace.id, &stopped_ids).await
+            {
+                tracing::warn!(%error, "Could not resume sessions after waking");
+            }
+        }
+        return result;
+    }
+    if clean && sleep.is_some() && !config.recovery {
+        // Inside the sleep window a flush never renews or resumes (that would
+        // restart agents seconds before sleep and keep the lease from lapsing):
+        // published but unreleased, the cloud continues once the lease lapses;
+        // failed, the project waits. Either way the next wake returns it here.
+        if result.is_err()
+            && matches!(lock(&state.pro.ownership).get(&workspace.id), Some(Ownership::Transferring { epoch: current }) if *current == epoch)
+        {
+            lock(&state.pro.release_pending).insert(workspace.id.clone());
+            if published {
+                tracing::info!("Project published before sleep; its release will lapse");
+                return Ok(());
+            }
+        }
+        return result;
+    }
     if result.is_err() && clean && !config.recovery {
         // A failed flush must not strand a stopped laptop agent, but a changed
         // account must never recover using the previous account's credentials.
@@ -1129,9 +1293,14 @@ async fn hydrate_scoped(
     }
     // Existing durable worker work must never be replaced with an older remote
     // snapshot after a restart. The normal grant path resumes its own ledger.
+    // A managed project whose current epoch this machine verifiably holds is
+    // the same no-op (its running agents are not stopped, nothing is
+    // reinstalled); one with uncertain or unproven old processes still takes
+    // the checkpoint.
     if lock(&state.workspaces).get(workspace).is_some()
         && config.role == Role::Worker
-        && !execution::managed(state, workspace)
+        && (!execution::managed(state, workspace)
+            || (!execution::uncertain(state, workspace) && !execution::unclean(state, workspace)))
         && matches!(lock(&state.pro.ownership).get(workspace),Some(Ownership::Local{epoch}|Ownership::AwaitingVerification{epoch}) if *epoch==expected_epoch)
     {
         let baton: Baton = account(config, &execution::path(config, workspace, ""), "GET", None)
@@ -1223,6 +1392,12 @@ async fn hydrate_scoped(
     current()?;
     execution::accept(state, config, &grant, generation, request_start)?;
     install_epoch.store(grant.epoch, Ordering::Release);
+    if config.role == Role::Device {
+        let mut returned = lock(&state.pro.returned);
+        if returned.len() < 128 || returned.contains(workspace) {
+            returned.insert(workspace.to_owned());
+        }
+    }
     let receipt = if config.execution.is_some() {
         let receipt = grant
             .checkpoint
@@ -1334,16 +1509,12 @@ async fn hydrate_scoped(
         authority::destination(state, config, workspace, Some(&destination_root)).await?;
         let tree = stage.join("tree");
         let destination = destination_root.clone();
-        let local_conflicts = (config.role == Role::Device
-            && execution::checkpoint_mode(state, workspace))
-        .then(|| state.pro.root.join(workspace).join("local-conflicts"));
         let left_out = manifest.left_out.clone();
         let kept = tokio::task::spawn_blocking(move || {
             install_tree(
                 &tree,
                 &destination,
                 has_baseline.then_some(baseline).as_deref(),
-                local_conflicts.as_deref(),
                 left_out.as_deref(),
             )
         })
@@ -1425,7 +1596,7 @@ async fn hydrate_scoped(
             });
         for archive in manifest.sessions {
             current()?;
-            crate::bundle::import(
+            crate::bundle::import_durable(
                 state.clone(),
                 &stage.join("handoff").join(archive.archive),
                 crate::bundle::ImportOptions {
@@ -1490,27 +1661,27 @@ async fn baseline_revision(shadow: &Path, published: Option<String>) -> Result<S
 ///
 /// - incoming == baseline: the other side never touched it; local wins.
 /// - local == baseline: only the other side changed it; incoming wins.
-/// - both changed: incoming takes the path, local is preserved.
+/// - both changed: incoming takes the path, and the user's own version is
+///   kept right beside it (`<name>.mine-<yyyymmdd-hhmm>`, never mirrored).
 /// - absent from incoming: deleted locally only when the incoming snapshot
-///   carries an inventory (`left_out`) that shows it gone, and the local copy
-///   is unchanged since the baseline.
+///   carries an inventory (`left_out`) that shows it gone; a local edit is
+///   kept beside it the same way first.
+///
+/// The report lists the kept copies' own paths (up to 32).
 fn install_tree(
     source: &Path,
     destination: &Path,
     baseline: Option<&Path>,
-    local_conflicts: Option<&Path>,
     left_out: Option<&[PathBuf]>,
 ) -> Result<(usize, Vec<PathBuf>)> {
     let mut kept = (0usize, Vec::new());
-    let mut keep = |relative: &Path| {
+    let mut keep = |copy: PathBuf| {
         kept.0 += 1;
         if kept.1.len() < 32 {
-            kept.1.push(relative.to_path_buf());
+            kept.1.push(copy);
         }
     };
-    let mut conflicts = local_conflicts
-        .map(super::canonical::Conflicts::open)
-        .transpose()?;
+    let mut copies = super::canonical::KeptCopies::new();
     let left_out: Option<std::collections::HashSet<&Path>> =
         left_out.map(|paths| paths.iter().map(PathBuf::as_path).collect());
     if let Some(baseline) = baseline {
@@ -1556,13 +1727,10 @@ fn install_tree(
                 // A deletion is safe only when the local file still equals
                 // the shared baseline. Local edits and symlinks always win.
                 if safe && target.try_exists()? {
-                    if same_file(&target, &entry.path())? {
-                        std::fs::remove_file(target)?;
-                    } else if let Some(conflicts) = conflicts.as_mut() {
-                        conflicts.preserve(&target, &relative)?;
-                        std::fs::remove_file(target)?;
-                        keep(&relative);
+                    if !same_file(&target, &entry.path())? {
+                        keep(copies.keep(&target, &relative)?);
                     }
+                    std::fs::remove_file(target)?;
                 }
             }
         }
@@ -1605,18 +1773,9 @@ fn install_tree(
                         std::fs::copy(entry.path(), target)?;
                     } else if unchanged_remotely {
                         // Only this computer changed it: keep the local edit.
-                    } else if let Some(conflicts) = conflicts.as_mut() {
-                        conflicts.preserve(&target, &relative)?;
-                        std::fs::copy(entry.path(), target)?;
-                        keep(&relative);
                     } else {
-                        let preserved = target.with_file_name(format!(
-                            "{}.cloud-{}",
-                            entry.file_name().to_string_lossy(),
-                            super::now()
-                        ));
-                        std::fs::copy(entry.path(), preserved)?;
-                        keep(&relative);
+                        keep(copies.keep(&target, &relative)?);
+                        std::fs::copy(entry.path(), target)?;
                     }
                 } else if !target.exists() && unchanged_remotely {
                     // Deleted here, untouched there: the local deletion stands.
@@ -1666,20 +1825,70 @@ pub(super) fn at_pause(state: &AppState, workspace: &str) -> bool {
                 agent_state,
             )
         } else {
-            lock(&state.agents).get(&id).is_none_or(|agent| {
-                matches!(
-                    agent.state,
-                    crate::agent_state::AgentState::IdlePrompt
-                        | crate::agent_state::AgentState::Finished
-                        | crate::agent_state::AgentState::NeedsPermission
-                        | crate::agent_state::AgentState::Errored
-                )
-            })
+            // Cloned first: the terminal registry has its own locks.
+            let Some(agent) = lock(&state.agents).get(&id).cloned() else {
+                return true;
+            };
+            let Some(info) = state.sessions.get(&id) else {
+                return true;
+            };
+            crate::agent_state::tui_at_pause(
+                &agent,
+                info.alive,
+                info.last_output_at,
+                info.pid,
+                state.sessions.foreground_pid(&id),
+                crate::session_view::now_ms(),
+            )
         }
     })
 }
 /// A device waits this long between automatic attempts to finish one return.
 const RETURN_BACKOFF_MAX: u64 = 1800;
+
+/// Whether the account reports this project's owner as a cloud machine that
+/// is suspended but keeps ownership (placement availability `suspended`).
+/// Passive: reading placement never wakes anything. Any failure reads as not
+/// suspended, which keeps the earlier behavior.
+async fn owner_suspended(config: &Configure, workspace: &str) -> bool {
+    if config.execution.is_none() {
+        return false;
+    }
+    let Ok(response) = account(
+        config,
+        &format!("/v2/workspaces/{workspace}/placement"),
+        "GET",
+        None,
+    )
+    .await
+    else {
+        return false;
+    };
+    response.json::<serde_json::Value>().is_ok_and(|placement| {
+        placement["workspace_id"] == workspace && placement["availability"] == "suspended"
+    })
+}
+
+/// How long this computer must have been awake on power before live cloud
+/// work moves home: five minutes. A development build (the loopback
+/// end-to-end harness) may shorten it with `CHIMAERA_PRO_SETTLE_SECS`;
+/// release builds ignore the variable.
+fn settle_seconds() -> u64 {
+    static SETTLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SETTLE.get_or_init(|| {
+        settle_override(
+            chimaera_core::is_dev_build(),
+            std::env::var("CHIMAERA_PRO_SETTLE_SECS").ok().as_deref(),
+        )
+    })
+}
+fn settle_override(dev: bool, value: Option<&str>) -> u64 {
+    const SETTLE: u64 = 300;
+    value
+        .filter(|_| dev)
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(SETTLE, |seconds| seconds.min(SETTLE))
+}
 
 pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> Result<()> {
     if config.delegation.workspace.is_some() || config.role != Role::Device {
@@ -1689,7 +1898,8 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
     // and on power for a while (both protocol versions); work the cloud is
     // not running returns at once (laptop first).
     let settled = state.pro.power_suitable.load(Ordering::Acquire)
-        && super::now().saturating_sub(state.pro.awake_since.load(Ordering::Acquire)) >= 300;
+        && super::now().saturating_sub(state.pro.awake_since.load(Ordering::Acquire))
+            >= settle_seconds();
     let candidates: Vec<_> = lock(&state.pro.ownership)
         .iter()
         .filter_map(|(id, owner)| match owner {
@@ -1737,6 +1947,14 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
             ensure!(baton.workspace_id == workspace, "baton workspace mismatch");
             execution::observe(state, config, &baton)?;
             let mine = baton.holder_id.as_deref() == Some(&config.delegation.device_id);
+            // A cloud machine asleep with ownership reads expired too, but the
+            // account refuses to let anyone else acquire it (409 `held`): it
+            // must be woken and asked to hand back, like live cloud work.
+            let suspended = holder.is_some()
+                && baton.holder_id.is_some()
+                && !mine
+                && execution::expired(&baton)
+                && owner_suspended(&operation_config, &workspace).await;
             let target = match (&holder, baton.holder_id.as_deref()) {
                 // Released by the cloud: nothing runs there, hydrate now.
                 (_, None) => Some(baton.epoch),
@@ -1745,21 +1963,29 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
                 (None, _) => None,
                 // The cloud's lease lapsed (it stopped or lost the account):
                 // take the project home from its last acknowledged checkpoint.
-                (Some(_), Some(_)) if !mine && execution::expired(&baton) => Some(baton.epoch),
+                (Some(_), Some(_)) if !mine && execution::expired(&baton) && !suspended => {
+                    Some(baton.epoch)
+                }
                 (Some(recorded), Some(current)) if current == recorded && settled => {
                     if hosts.is_none() {
+                        let response = transport::request(
+                            &config.keeper_url,
+                            "/v1/hosts",
+                            "GET",
+                            &config.delegation.access_token,
+                            None,
+                        )
+                        .await
+                        .context("Could not reconnect to your saved work")?;
+                        // The account is down: the keeper holds on and says
+                        // so. A quiet wait; the next pass asks again.
+                        if transport::account_unavailable(&response) {
+                            return Ok(());
+                        }
                         hosts = Some(
-                            transport::request(
-                                &config.keeper_url,
-                                "/v1/hosts",
-                                "GET",
-                                &config.delegation.access_token,
-                                None,
-                            )
-                            .await
-                            .context("Could not reconnect to your saved work")?
-                            .json()
-                            .context("Could not read your connected workspaces")?,
+                            response
+                                .json()
+                                .context("Could not read your connected workspaces")?,
                         );
                     }
                     let host = hosts.as_ref().and_then(|hosts| {
@@ -1810,9 +2036,17 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
                     if backoff.len() >= 128 && !backoff.contains_key(&workspace) {
                         backoff.clear();
                     }
+                    // This computer's own unfinished return keeps its project
+                    // fenced here, so it retries quickly (15 s doubling to two
+                    // minutes); moving cloud work home can wait longer.
+                    let (first, most) = if holder.is_none() {
+                        (15, 120)
+                    } else {
+                        (120, RETURN_BACKOFF_MAX)
+                    };
                     let delay = backoff
                         .get(&workspace)
-                        .map_or(120, |(_, delay)| (delay * 2).min(RETURN_BACKOFF_MAX));
+                        .map_or(first, |(_, delay)| (delay * 2).min(most));
                     backoff.insert(workspace.clone(), (super::now() + delay, delay));
                 }
                 record_error(state, &workspace, &error);
@@ -1915,10 +2149,9 @@ async fn finish_hydration_checked(
             && matches!(lock(&state.pro.ownership).get(workspace),Some(Ownership::SettingUp {epoch:current}) if *current==epoch),
         "Project ownership changed during setup"
     );
-    if let Err(error) = super::provider_gate::record(state, workspace, blocked) {
-        super::persist(state).await?;
-        return Err(error);
-    }
+    // A provider that is not signed in holds back only its own sessions: the
+    // project and every other conversation continue (paused rows name it).
+    super::provider_gate::record(state, workspace, blocked.clone());
     {
         let mut ownership = lock(&state.pro.ownership);
         ensure!(
@@ -1928,9 +2161,11 @@ async fn finish_hydration_checked(
         ownership.insert(workspace.into(), Ownership::Local { epoch });
     }
     super::persist(state).await?;
-    if let Some(status) = lock(&state.pro.status).get_mut(workspace) {
-        status.error = None;
-        status.error_code = None;
+    if blocked.is_empty() {
+        if let Some(status) = lock(&state.pro.status).get_mut(workspace) {
+            status.error = None;
+            status.error_code = None;
+        }
     }
     // Each managed child takes this lock for durable launch admission. Release
     // it before restoring sessions; their admission rechecks the current grant.
@@ -1940,7 +2175,10 @@ async fn finish_hydration_checked(
         "Account changed before project resume"
     );
     if execution::resume_allowed(state, workspace) {
-        crate::ledger::resume_deferred_workspace(state, workspace).await?;
+        crate::ledger::resume_deferred_filtered(state, workspace, |entry| {
+            !super::provider_gate::waits_for_provider(entry, &blocked)
+        })
+        .await?;
     }
     Ok(())
 }
@@ -1958,55 +2196,102 @@ async fn run_profile_steps(
         .get(workspace)
         .map(|preference| preference.profile.clone())
         .unwrap_or_default();
-    let commands: Vec<String> = profile.setup_command.into_iter().collect();
-    if commands.is_empty() {
+    let Some(command) = profile.setup_command else {
         return Ok(());
-    }
-    let workspace_record = lock(&state.workspaces)
+    };
+    let root = lock(&state.workspaces)
         .get(workspace)
-        .context("unknown workspace")?;
-    let row = crate::spawn::spawn_session(
-        state,
-        crate::spawn::SpawnSpec {
-            native_cwd: None,
-            workspace: workspace_record,
-            id: None,
-            name: Some(
-                if config.role == Role::Worker {
-                    "Cloud setup"
-                } else {
-                    "Deferred laptop steps"
-                }
-                .into(),
-            ),
-            cwd: None,
-            cols: None,
-            rows: None,
-            theme: "dark".into(),
-            title_hint: None,
-            prelude: None,
-            kind: crate::spawn::SpawnKind::Shell,
-            fork_head: false,
-        },
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("could not create project setup terminal"))?;
-    let id = row["id"]
-        .as_str()
-        .context("setup terminal has no identity")?;
-    for command in commands {
-        ensure!(
-            super::may_write(state, workspace),
-            "Account changed before project setup execution"
-        );
-        let outcome =
-            crate::exec::run_exec(state, id, command.clone(), Some(600_000), Some(15_000))
-                .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        if outcome.record.exit_code != Some(0) || outcome.timed_out {
-            anyhow::bail!("project setup needs attention in its terminal");
+        .context("unknown workspace")?
+        .root;
+    ensure!(
+        super::may_write(state, workspace),
+        "Account changed before project setup execution"
+    );
+    // Setup is the system's job, not a terminal the user must watch: it runs
+    // in the background in the user's login shell; a failure leaves one plain
+    // status line and its output tail in the project's setup log.
+    let log = state.pro.root.join(workspace).join("setup.log");
+    // Boxed: this runs inside the hydrate future, which callers hold inline.
+    Box::pin(run_setup_command(&root, &command, &log)).await
+}
+
+/// How long a project's setup may run, and how much of its output is kept.
+const SETUP_DEADLINE: Duration = Duration::from_secs(600);
+const SETUP_LOG_BYTES: usize = 64 * 1024;
+
+async fn run_setup_command(root: &Path, command: &str, log: &Path) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let mut child = tokio::process::Command::new(crate::launcher::login_shell())
+        .args(["-lc", command])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .context("project setup could not start")?;
+    let group = child.id();
+    let tail = std::sync::Mutex::new(Vec::<u8>::new());
+    let keep = |bytes: &[u8]| {
+        let mut tail = lock(&tail);
+        tail.extend_from_slice(bytes);
+        if tail.len() > SETUP_LOG_BYTES {
+            let excess = tail.len() - SETUP_LOG_BYTES;
+            tail.drain(..excess);
         }
-    }
+    };
+    let (mut stdout, mut stderr) = (child.stdout.take(), child.stderr.take());
+    let drain = |stream: Option<tokio::process::ChildStdout>| async {
+        let Some(mut stream) = stream else { return };
+        let mut block = vec![0u8; 8192];
+        while let Ok(count) = stream.read(&mut block).await {
+            if count == 0 {
+                break;
+            }
+            keep(&block[..count]);
+        }
+    };
+    let drain_err = |stream: Option<tokio::process::ChildStderr>| async {
+        let Some(mut stream) = stream else { return };
+        let mut block = vec![0u8; 8192];
+        while let Ok(count) = stream.read(&mut block).await {
+            if count == 0 {
+                break;
+            }
+            keep(&block[..count]);
+        }
+    };
+    let finished = tokio::time::timeout(SETUP_DEADLINE, async {
+        let (_, _, status) =
+            tokio::join!(drain(stdout.take()), drain_err(stderr.take()), child.wait());
+        status
+    })
+    .await;
+    let succeeded = match finished {
+        Ok(Ok(status)) => status.success(),
+        _ => {
+            // Timed out: stop the whole setup process group.
+            if let Some(group) = group.and_then(|id| i32::try_from(id).ok()) {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(group),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            let _ = child.kill().await;
+            false
+        }
+    };
+    let output = std::mem::take(&mut *lock(&tail));
+    let log = log.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Some(parent) = log.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(log, output)
+    })
+    .await;
+    ensure!(succeeded, "project setup did not finish");
     Ok(())
 }
 
@@ -2154,6 +2439,30 @@ mod tests {
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }
+    /// A project's cloud setup runs in the background, never as a terminal
+    /// the user has to watch; a failure leaves a status code and a log.
+    #[tokio::test]
+    async fn cloud_setup_runs_in_the_background_without_a_terminal() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-setup-background-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("setup.log");
+        run_setup_command(&root, "echo installed > marker; echo done", &log)
+            .await
+            .unwrap();
+        assert!(root.join("marker").exists(), "ran in the project root");
+        let error = run_setup_command(&root, "echo broken; exit 3", &log)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            super::super::routes::error_code(&error),
+            "cloud_setup_failed"
+        );
+        assert!(std::fs::read_to_string(&log).unwrap().contains("broken"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn three_way_return_preserves_local_conflicts_and_applies_unmodified_files() {
         let root = std::env::temp_dir().join(format!(
@@ -2184,30 +2493,37 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(
-            install_tree(&cloud, &local, Some(&base), None, Some(&[]))
-                .unwrap()
-                .0,
-            1
-        );
+        let (count, kept) = install_tree(&cloud, &local, Some(&base), Some(&[])).unwrap();
+        assert_eq!(count, 2);
         assert_eq!(
             std::fs::read_to_string(local.join("same.txt")).unwrap(),
             "cloud"
         );
+        // Both changed: the incoming version takes the path and the user's
+        // own version sits right beside it; the report names the copy.
         assert_eq!(
             std::fs::read_to_string(local.join("conflict.txt")).unwrap(),
-            "local"
+            "cloud"
         );
         assert!(!local.join("removed.txt").exists());
-        assert_eq!(
-            std::fs::read_to_string(local.join("removed-but-edited.txt")).unwrap(),
-            "local"
-        );
-        assert!(std::fs::read_dir(&local).unwrap().any(|entry| entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with("conflict.txt.cloud-")));
+        assert!(!local.join("removed-but-edited.txt").exists());
+        for (original, body) in [
+            ("conflict.txt", "local"),
+            ("removed-but-edited.txt", "local"),
+        ] {
+            let copy = kept
+                .iter()
+                .find(|path| {
+                    path.to_string_lossy()
+                        .starts_with(&format!("{original}.mine-"))
+                })
+                .unwrap_or_else(|| panic!("{original}: {kept:?}"));
+            assert_eq!(std::fs::read_to_string(local.join(copy)).unwrap(), body);
+            assert!(
+                !super::super::policy::allowed_path(copy),
+                "a kept copy stays on this computer"
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -2219,7 +2535,6 @@ mod tests {
         let local = root.join("local");
         let cloud = root.join("cloud");
         let base = root.join("base");
-        let conflicts = root.join("private-conflicts");
         for dir in [&local, &cloud, &base] {
             std::fs::create_dir_all(dir).unwrap();
         }
@@ -2228,24 +2543,25 @@ mod tests {
             std::fs::write(local.join(name), "unpublished local").unwrap();
         }
         std::fs::write(cloud.join("changed"), "canonical cloud").unwrap();
-        let kept = install_tree(&cloud, &local, Some(&base), Some(&conflicts), Some(&[])).unwrap();
+        let kept = install_tree(&cloud, &local, Some(&base), Some(&[])).unwrap();
         assert_eq!(kept.0, 2);
         assert_eq!(
             std::fs::read_to_string(local.join("changed")).unwrap(),
             "canonical cloud"
         );
         assert!(!local.join("deleted").exists());
-        let mut preserved = Vec::new();
-        for dir in std::fs::read_dir(&conflicts).unwrap() {
-            for file in std::fs::read_dir(dir.unwrap().path()).unwrap() {
-                preserved.push(std::fs::read_to_string(file.unwrap().path()).unwrap());
-            }
-        }
+        let mut preserved: Vec<_> = kept
+            .1
+            .iter()
+            .map(|copy| std::fs::read_to_string(local.join(copy)).unwrap())
+            .collect();
+        preserved.sort();
         assert_eq!(preserved, vec!["unpublished local", "unpublished local"]);
-        assert_eq!(
-            std::fs::read_dir(local).unwrap().count(),
-            1,
-            "conflicts are outside the canonical mirror"
+        assert!(
+            kept.1
+                .iter()
+                .all(|copy| !super::super::policy::allowed_path(copy)),
+            "kept copies are never published as canonical project files"
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2279,8 +2595,7 @@ mod return_tests {
             ],
         );
         let cloud = tree(&root.join("cloud"), &[("notes", "t0"), ("report", "cloud")]);
-        let conflicts = root.join("private-conflicts");
-        let kept = install_tree(&cloud, &local, Some(&base), Some(&conflicts), Some(&[])).unwrap();
+        let kept = install_tree(&cloud, &local, Some(&base), Some(&[])).unwrap();
         assert_eq!(kept.0, 0, "no conflict: each side changed different files");
         assert_eq!(
             std::fs::read_to_string(local.join("notes")).unwrap(),
@@ -2320,7 +2635,7 @@ mod return_tests {
                 &[("secret-looking", "same")],
             );
             let cloud = tree(&root.join(label).join("cloud"), &[]);
-            install_tree(&cloud, &local, Some(&base), None, left_out.as_deref()).unwrap();
+            install_tree(&cloud, &local, Some(&base), left_out.as_deref()).unwrap();
             assert_eq!(!local.join("secret-looking").exists(), deleted, "{label}");
         }
         std::fs::remove_dir_all(root).unwrap();

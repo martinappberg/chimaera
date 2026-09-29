@@ -2641,3 +2641,39 @@ check. Synthetic subprocess regressions verify code framing, replay rejection,
 completion, cancellation and no workspace/session registration. This replaces
 the terminal-based Claude onboarding in Pass39. Provider authentication is separate
 from model turns; this change does not alter the structured agent driver.
+
+## Pass 41 (2026-09-28 — Codex 0.157.1, Claude 2.1.283): a refused `turn/start` ends the turn; managed shutdown waits for the exit. ADOPTED.
+
+Codex: when `turn/start` answers with an error that does not name a live turn
+(a usage limit, an expired sign-in), the driver already emitted a non-fatal
+`Error` and promoted one queued send. With nothing queued it now also emits
+`TurnAborted { reason: "turn failed", interrupted: false }` (empty turn id: no
+turn ever started), matching the Claude driver's failed-turn abort. Before,
+the echoed send left `awaiting_turn` set until another send succeeded or the
+process exited, so the session never read as idle (and Pro's pause checks
+never saw it at a pause). An error that names the live turn is still adopted
+as before. Unit: `codex::tests::a_refused_turn_start_ends_the_turn_it_never_began`.
+
+Transport (`ndjson.rs`): a managed child's shutdown no longer sleeps a fixed two
+seconds before killing its process group. It polls the exit every 25 ms without
+reaping (`waitid` `WNOWAIT`, so the group id cannot be recycled), up to
+min(grace, 2 s), then kills the group and reaps. A clean stop (~0.3 s) is no
+longer stretched to two seconds for every stop, view switch and rewind in a Pro
+project. Unit: `ndjson::tests::a_managed_child_that_exits_is_reaped_at_once_and_its_group_ended`.
+The PTY engine's managed stop now sends SIGHUP then SIGTERM before the SIGKILL
+escalation (an interactive shell ignores SIGTERM but exits on hangup).
+
+### Gate (Pass 41)
+
+`just chat-smoke` (`cargo +1.96.0 test -p chimaera-agent --test live -- --ignored
+--test-threads=1`), twice. Every Codex live test passed both times (collab
+subagents, echo turn, fork/rollback/compact, handshake, steer/settings/account,
+turn summary, driver stack end to end): 8/8 on the second run with both changes.
+The Claude live tests could not run then: the account hit its session limit
+("You've hit your session limit · resets 11pm"), so every Claude turn aborted
+at the provider (3 non-turn Claude tests passed). After the reset, the Claude
+half ran on its own (`… --ignored --test-threads=1 claude`) against Claude
+2.1.283 with the transport change: 14/14 passed (every `claude_*` protocol
+test, `driver_stack_end_to_end_against_real_claude` and
+`driver_stop_ends_claudes_detached_background_work`), so the gate is complete
+for both drivers.

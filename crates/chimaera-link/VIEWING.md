@@ -22,8 +22,19 @@ permission.
 {"workspace_id":"w-project","holder_id":"d-home","route_host_id":"device-d-home","epoch":4,"policy_revision":1,"availability":"owned","preferred_installation_id":"i-home","checkpoint_id":"cp-saved","server_now":"2026-09-28T19:00:00Z","expires_at":"2026-09-28T19:01:30Z"}
 ```
 
-Availability is `owned`, `unowned`, `expired`, or `privacy_disabled`. Only a live
-owned placement has a route, and even a live one may have none: a holder whose
+Availability is `owned`, `suspended`, `unowned`, `expired`, or `privacy_disabled`
+(clients read any newer value as unknown and never route it). `suspended` is a
+cloud machine that went to sleep keeping ownership: its lease reads expired by
+design, it keeps its `worker-` route, and it is routable like `owned` (the
+account refuses anyone else's acquire with 409 `held`). Viewing it never wakes
+it; a send or a permission answer carries wake intent (`X-Chimaera-Wake:
+interaction` on HTTP, `wake=interaction` on a socket; any non-GET counts) and
+the transport wakes it. A frozen owner cannot answer the native shell's full
+project check, so for a `suspended` placement the shell accepts the transport's
+scoped `/api/v1/health` answer marked `X-Chimaera-Worker-State: sleeping` (the
+transport gives it only for a daemon token that acknowledged scoping while
+awake). Only a live
+owned or suspended placement has a route, and even a live one may have none: a holder whose
 device was revoked or whose cloud machine was removed is owned but unroutable
 until its lease lapses. Keeper device route IDs are `device-` plus the exact
 raw holder; workers use `worker-` plus that holder. Neither fuzzy prefix matching
@@ -41,7 +52,8 @@ The local authenticated `GET /api/v1/pro/placements` returns registered
 or filesystem roots and is not available through a forwarded project scope.
 Native reconciliation uses this daemon inventory even after its own restart.
 A route is retired with `DELETE ...?workspace_id=…` only on a definitive
-answer: the project is gone from this computer, private, unowned, expired,
+answer: the project is gone from this computer, private, unowned, expired (a
+suspended owner is not expired),
 owned here, or owned at a **newer epoch** than the registered route. A check
 that merely fails (account or keeper unreachable, owner connection down or
 asleep, the scope probe timing out) keeps the last verified route for at most

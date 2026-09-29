@@ -58,6 +58,8 @@ pub(super) fn error_code(error: &anyhow::Error) -> &'static str {
         "credential_in_history"
     } else if has("root_setup_required") {
         "root_setup_required"
+    } else if has("project setup") {
+        "cloud_setup_failed"
     } else if has("Mirror helper cleanup could not be verified") {
         "cache_recovery_needed"
     } else if has("session archive")
@@ -165,7 +167,7 @@ async fn configure_inner(
         let enrolled = !lock(&state.pro.execution.latched).is_empty();
         anyhow::ensure!(
             config.execution.is_some()
-                || (!state.pro.execution.invalid
+                || (!execution::any_uncertain(&state)
                     && !enrolled
                     && !lock(&state.pro.preferences)
                         .values()
@@ -228,6 +230,7 @@ async fn configure_inner(
     if same && state.pro.configured.load(Ordering::Acquire) {
         let response = configure_ack(&config, accepted.as_ref().map(|v| v.ack()));
         *lock(&state.pro.runtime) = Some(config);
+        state.pro.delegation_refused.store(false, Ordering::Release);
         return response;
     }
     if let Err(error) = stop_tasks(&state).await {
@@ -253,6 +256,7 @@ async fn configure_inner(
         }
     }
     *lock(&state.pro.runtime) = Some(config);
+    state.pro.delegation_refused.store(false, Ordering::Release);
     state.pro.configured.store(true, Ordering::Release);
     engine::start(state.clone());
     // Only a worker is fenced by lease expiry; a device has nothing to watch.
@@ -292,17 +296,47 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     state.pro.configured.store(false, Ordering::Release);
     // Known remote ownership remains fenced across sign-out and restart. A
     // local or interrupted local transfer becomes ordinary local work: signing
-    // out publishes nothing more, but never stops this computer's agents.
-    lock(&state.pro.ownership).retain(|_, owner| !matches!(owner, Ownership::Local { .. }));
-    for owner in lock(&state.pro.ownership).values_mut() {
-        if let Ownership::Transferring { epoch } = owner {
-            *owner = Ownership::AwaitingVerification { epoch: *epoch };
+    // out publishes nothing more, but never stops this computer's agents. On a
+    // personal computer that includes a return this computer itself started
+    // (Hydrating/SettingUp): no account is left to finish it, so it must not
+    // stay fenced. Sessions a transfer stopped continue here.
+    let device = !execution::worker(&state);
+    lock(&state.pro.release_pending).clear();
+    let returned: Vec<String> = {
+        let mut ownership = lock(&state.pro.ownership);
+        ownership.retain(|_, owner| !matches!(owner, Ownership::Local { .. }));
+        let mut returned = Vec::new();
+        for (id, owner) in ownership.iter_mut() {
+            match owner {
+                Ownership::Transferring { epoch } => {
+                    *owner = Ownership::AwaitingVerification { epoch: *epoch };
+                    returned.push(id.clone());
+                }
+                Ownership::Hydrating { epoch } | Ownership::SettingUp { epoch } if device => {
+                    *owner = Ownership::AwaitingVerification { epoch: *epoch };
+                    returned.push(id.clone());
+                }
+                _ => {}
+            }
         }
+        returned
+    };
+    if let Err(error) = super::persist(&state).await {
+        return failure(error);
     }
-    match super::persist(&state).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => failure(error),
+    if device && !returned.is_empty() {
+        let owner = state.clone();
+        tokio::spawn(async move {
+            for workspace in returned {
+                if let Err(error) =
+                    crate::ledger::resume_deferred_workspace(&owner, &workspace).await
+                {
+                    tracing::warn!(%error, "Could not resume a project's sessions after sign-out");
+                }
+            }
+        });
     }
+    StatusCode::NO_CONTENT.into_response()
 }
 pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let authority = lock(&state.pro.authority).clone();
@@ -319,8 +353,12 @@ pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_jso
     let preferences = lock(&state.pro.preferences).clone();
     let ownership = lock(&state.pro.ownership).clone();
     let statuses = lock(&state.pro.status).clone();
+    // A delegation the account refused, or one that expired unrenewed, can do
+    // nothing: report the daemon as not configured (and why, additively) so
+    // the native app mints a fresh one instead of trusting its cached stamp.
+    let renewal_failed = super::delegation_lapsed(&state);
     Json(
-        json!({"configured":state.pro.configured.load(Ordering::Acquire),"workspace_configuration":authority.acknowledgment(),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().filter(|workspace| authority.allows(&workspace.id)).take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"continuity":preferences.get(&workspace.id).and_then(|p|p.continuity.as_ref()),"execution_allowed":super::may_execute(&state,&workspace.id),"execution_uncertain":preferences.get(&workspace.id).is_some_and(|p|p.execution_uncertain),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"profile":preferences.get(&workspace.id).map(|p|&p.profile)})).collect::<Vec<_>>()}),
+        json!({"configured":state.pro.configured.load(Ordering::Acquire) && !renewal_failed,"renewal_failed":renewal_failed,"workspace_configuration":authority.acknowledgment(),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().filter(|workspace| authority.allows(&workspace.id)).take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"continuity":preferences.get(&workspace.id).and_then(|p|p.continuity.as_ref()),"execution_allowed":super::may_execute(&state,&workspace.id),"execution_uncertain":preferences.get(&workspace.id).is_some_and(|p|p.execution_uncertain),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"profile":preferences.get(&workspace.id).map(|p|&p.profile)})).collect::<Vec<_>>()}),
     )
 }
 pub(crate) async fn privacy(
@@ -571,23 +609,42 @@ pub(crate) async fn wake(State(state): State<Arc<AppState>>) -> Response {
     // A flush still running for the sleep that just ended keeps its
     // publication but will not release; it returns the project itself.
     state.pro.sleep_generation.fetch_add(1, Ordering::AcqRel);
-    {
-        let sleeping = lock(&state.pro.sleeping).clone();
+    // Every project a sleep flush holds is this computer's again at once: a
+    // flush still running keeps its publication, skips the release and
+    // resumes what it stopped itself; one that finished without handing over
+    // resumes its stopped sessions here, without waiting for the account.
+    let returned: Vec<String> = {
+        let pending: std::collections::HashSet<String> =
+            lock(&state.pro.release_pending).drain().collect();
         let mut ownership = lock(&state.pro.ownership);
         let authority = lock(&state.pro.authority).clone();
-        for (_, owner) in ownership
-            .iter_mut()
-            .filter(|(id, _)| authority.allows(id) && !sleeping.contains(*id))
-        {
+        let mut returned = Vec::new();
+        for (id, owner) in ownership.iter_mut().filter(|(id, _)| authority.allows(id)) {
             if let Ownership::Transferring { epoch } = owner {
                 *owner = Ownership::AwaitingVerification { epoch: *epoch };
+                if pending.contains(id) {
+                    returned.push(id.clone());
+                }
             }
         }
+        returned
+    };
+    if let Err(error) = super::persist(&state).await {
+        return failure(error);
     }
-    match super::persist(&state).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => failure(error),
+    if !returned.is_empty() {
+        let owner = state.clone();
+        tokio::spawn(async move {
+            for workspace in returned {
+                if let Err(error) =
+                    crate::ledger::resume_deferred_workspace(&owner, &workspace).await
+                {
+                    tracing::warn!(%error, "Could not resume a project's sessions after waking");
+                }
+            }
+        });
     }
+    StatusCode::NO_CONTENT.into_response()
 }
 pub(crate) async fn hydrate(
     State(state): State<Arc<AppState>>,
@@ -615,7 +672,9 @@ pub(crate) async fn hydrate(
     .into_response()
 }
 async fn hydrate_owned(state: Arc<AppState>, mut request: Hydrate) -> detached::Outcome {
-    let _guard = state.pro.jobs.lock().await;
+    let Some(_guard) = super::drain::reserve(&state).await else {
+        return super::drain::refusal();
+    };
     let (config, generation) = {
         let _configuration = state.pro.configuration.lock().await;
         let Some(config) = lock(&state.pro.runtime).clone() else {
@@ -634,6 +693,17 @@ async fn hydrate_owned(state: Arc<AppState>, mut request: Hydrate) -> detached::
         Ok(root) => root,
         Err(error) => return outcome(error),
     };
+    // Running here with some sessions waiting for a provider: after sign-in
+    // resume the ready ones; nothing is fetched or reinstalled.
+    if config.role == super::protocol::Role::Worker
+        && lock(&state.workspaces).get(&request.workspace_id).is_some()
+        && matches!(lock(&state.pro.ownership).get(&request.workspace_id),Some(Ownership::Local{epoch}) if *epoch==request.expected_epoch)
+        && lock(&state.pro.status)
+            .get(&request.workspace_id)
+            .is_some_and(|status| !status.blocked_providers.is_empty())
+    {
+        return result(super::provider_gate::resume_ready(&state, &request.workspace_id).await);
+    }
     if lock(&state.workspaces).get(&request.workspace_id).is_some()
         && matches!(lock(&state.pro.ownership).get(&request.workspace_id),Some(Ownership::SettingUp{epoch}) if *epoch==request.expected_epoch)
     {
@@ -754,35 +824,6 @@ async fn hydrate_owned(state: Arc<AppState>, mut request: Hydrate) -> detached::
 }
 
 #[derive(Deserialize)]
-pub(crate) struct Pin {
-    session_id: String,
-    keep_running: bool,
-}
-pub(crate) async fn pin(State(state): State<Arc<AppState>>, Json(request): Json<Pin>) -> Response {
-    if lock(&state.pro.authority).restricted() {
-        let workspace = lock(&state.session_workspaces)
-            .get(&request.session_id)
-            .cloned();
-        if workspace
-            .as_ref()
-            .is_none_or(|workspace| authority::workspace(&state, workspace).is_err())
-        {
-            return failure(anyhow::anyhow!("workspace authority denied"));
-        }
-    }
-    if state.sessions.get(&request.session_id).is_none()
-        && state.chat.get(&request.session_id).is_none()
-        && !lock(&state.deferred_sessions).contains_key(&request.session_id)
-    {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    match super::set_keep_running(&state, &request.session_id, request.keep_running).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => failure(error),
-    }
-}
-
-#[derive(Deserialize)]
 pub(crate) struct Power {
     suitable: bool,
 }
@@ -821,6 +862,14 @@ pub(crate) async fn handoff(
     };
     let workspace = request.workspace_id.clone();
     let epoch = request.expected_epoch;
+    // A machine this request just woke is still renewing its own lease: let
+    // that answer first (bounded) instead of refusing the return it came for.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while execution::resuming(&state, &workspace) {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
     let owner = state.clone();
     let checked = state.clone();
     let key = request.workspace_id;
@@ -831,7 +880,9 @@ pub(crate) async fn handoff(
         epoch,
         || handoff_refusal(&checked, &key, epoch),
         move || async move {
-            let _guard = owner.pro.jobs.lock().await;
+            let Some(_guard) = super::drain::reserve(&owner).await else {
+                return super::drain::refusal();
+            };
             if let Some(refusal) = handoff_refusal(&owner, &workspace, epoch) {
                 return refusal;
             }

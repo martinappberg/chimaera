@@ -131,6 +131,14 @@ IFS= read -r code
         assert_eq!(attempt.snapshot().phase, Phase::Waiting);
     }
     assert!(attempt.submit("a".repeat(4097)).is_err());
+    // Half a pasted code keeps the attempt waiting for the whole one.
+    for partial in ["one-time-fixture", "one-time-fixture#", "#state"] {
+        assert_eq!(
+            attempt.submit(partial.into()),
+            Err("authorization_code_incomplete")
+        );
+        assert_eq!(attempt.snapshot().phase, Phase::Waiting);
+    }
     attempt.submit("one-time-fixture#state".into()).unwrap();
     assert_eq!(attempt.snapshot().phase, Phase::Verifying);
     assert!(attempt.submit("one-time-fixture#state".into()).is_err());
@@ -420,5 +428,65 @@ done
     );
     let status = super::super::readiness(&state, &["codex".into()], true).await;
     assert_eq!(status[0].state, super::super::ProviderState::Unknown);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// An uncertain cleanup keeps the provider reserved only while the old
+/// process group lives; once it is gone the provider is released without a
+/// daemon restart.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_uncertain_cleanup_releases_the_provider_once_the_old_group_is_gone() {
+    let (root, state) = fixture("cleanup-release");
+    let mut command = tokio::process::Command::new("/bin/sleep");
+    command.arg("30").process_group(0).kill_on_drop(true);
+    let mut child = command.spawn().unwrap();
+    let group = child.id().unwrap();
+    let (cancel, _receiver) = watch::channel(false);
+    let attempt = Arc::new(Attempt {
+        value: Mutex::new(Connection {
+            id: "id".into(),
+            operation: Operation::Connect,
+            provider_id: "github".into(),
+            phase: Phase::Canceled,
+            expires_at: now() + 900,
+            action: None,
+            error_code: None,
+        }),
+        cancel,
+        finished: AtomicBool::new(false),
+        session: Mutex::new(None),
+        process: Mutex::new(Some(group)),
+        input: Mutex::new(None),
+    });
+    let release = {
+        let (state, attempt) = (state.clone(), attempt.clone());
+        tokio::spawn(async move {
+            release_when_gone(
+                &state,
+                &attempt,
+                None,
+                Some(group),
+                Duration::from_millis(20),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        attempt.snapshot().error_code.as_deref(),
+        Some("cleanup_failed")
+    );
+    assert!(
+        !attempt.finished(),
+        "the provider stays reserved while the group lives"
+    );
+    child.kill().await.unwrap();
+    let _ = child.wait().await;
+    tokio::time::timeout(Duration::from_secs(2), release)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(attempt.finished());
     std::fs::remove_dir_all(root).unwrap();
 }

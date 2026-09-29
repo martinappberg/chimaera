@@ -2004,6 +2004,16 @@ impl CodexMapper {
                     // Promote one queued send so it isn't stranded.
                     if let Some(queued) = self.queued_sends.pop_front() {
                         self.redrive_as_fresh_turn(queued.input, queued.client_msg_id, step);
+                    } else {
+                        // The send never became a turn (a usage limit, an
+                        // expired sign-in). Say so, as the Claude driver does
+                        // for a failed turn, so nothing keeps waiting for a
+                        // turn that will not start (pause checks included).
+                        step.events.push(AgentEvent::TurnAborted {
+                            turn_id: String::new(),
+                            reason: "turn failed".into(),
+                            interrupted: false,
+                        });
                     }
                 }
             }
@@ -4914,6 +4924,37 @@ mod tests {
             "method": "turn/started",
             "params": { "turn": { "id": "turn-A" } },
         }));
+    }
+
+    /// A send whose turn/start is refused (usage limit, expired sign-in)
+    /// ends as a failed turn, so the session is idle again rather than
+    /// waiting forever for a turn that never starts.
+    #[test]
+    fn a_refused_turn_start_ends_the_turn_it_never_began() {
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+        });
+        let start = step
+            .outbound
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .expect("a fresh send starts a turn");
+        let rpc_id = start["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({
+            "id": rpc_id,
+            "error": { "code": -32000, "message": "usage limit reached" },
+        }));
+        assert!(step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { fatal: false, .. })));
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnAborted { interrupted: false, reason, .. } if reason == "turn failed"
+        )));
     }
 
     #[test]

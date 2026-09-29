@@ -109,6 +109,12 @@ impl Attempt {
             return Err("invalid_authorization_code");
         }
         let mut value = crate::lock(&self.value);
+        // Claude's page shows `code#state`; its CLI splits on `#` and, given
+        // only one half, prints an error nobody sees and keeps waiting. Refuse
+        // it here while the attempt is still waiting for the whole code.
+        if value.provider_id == "claude" && !claude::complete_code(&code) {
+            return Err("authorization_code_incomplete");
+        }
         if value.phase != Phase::Waiting
             || value.expires_at <= now()
             || !matches!(
@@ -304,16 +310,49 @@ fn start_operation(
         }
         if clean {
             attempt.finished.store(true, Ordering::Release);
-        } else {
-            // Never launch a replacement credential writer while cleanup is
-            // uncertain. A daemon restart is safer than racing that process.
-            let mut value = crate::lock(&attempt.value);
-            value.error_code = Some("cleanup_failed".into());
-            value.action = None;
+            state.changes.notify_waiters();
+            return;
         }
-        state.changes.notify_waiters();
+        // Never launch a replacement credential writer while cleanup is
+        // uncertain; keep checking (bounded) and release the provider as soon
+        // as the old process group is really gone, instead of until restart.
+        release_when_gone(&state, &attempt, session, process, CLEANUP_RECHECK).await;
     });
     Ok(value)
+}
+/// How often an uncertain cleanup is re-checked (bounded to ten minutes).
+const CLEANUP_RECHECK: Duration = Duration::from_secs(5);
+/// Reports `cleanup_failed` and keeps the provider reserved until its old
+/// login terminal and process group are really gone, then releases it; a
+/// retry otherwise kept returning the same failed attempt until restart.
+async fn release_when_gone(
+    state: &AppState,
+    attempt: &Attempt,
+    session: Option<String>,
+    process: Option<u32>,
+    every: Duration,
+) {
+    {
+        let mut value = crate::lock(&attempt.value);
+        value.error_code = Some("cleanup_failed".into());
+        value.action = None;
+    }
+    state.changes.notify_waiters();
+    for _ in 0..120 {
+        tokio::time::sleep(every).await;
+        if state.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        let gone = !session
+            .as_ref()
+            .is_some_and(|id| state.sessions.get(id).is_some_and(|s| s.alive))
+            && !process.is_some_and(process::group_alive);
+        if gone {
+            attempt.finished.store(true, Ordering::Release);
+            state.changes.notify_waiters();
+            return;
+        }
+    }
 }
 struct SessionGuard {
     state: Arc<AppState>,

@@ -168,6 +168,15 @@ pub(crate) fn session_json(
     serde_json::Value::Object(map)
 }
 
+/// Additive `needs_permission` on chat rows: a permission or question is
+/// waiting on the user. A cloud machine's supervisor keeps itself awake on it
+/// for a bounded time, so the question is still there when the answer comes.
+/// PTY rows omit it (a Claude TUI reports `agent_state: "needs_permission"`).
+fn chat_row(info: &chimaera_agent::ChatInfo, mut row: serde_json::Value) -> serde_json::Value {
+    row["needs_permission"] = json!(info.alive && info.pending_permission);
+    row
+}
+
 /// The full session list as JSON values (shared by GET /sessions and the
 /// /ws/events snapshots): PTY rows plus synthetic rows for structured chat
 /// sessions, sorted by creation time so the rail interleaves them honestly.
@@ -214,11 +223,14 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     rows.extend(chats.iter().map(|info| {
         (
             info.created_at_ms / 1000,
-            crate::chat::chat_session_json(
+            chat_row(
                 info,
-                workspaces.get(&info.id).cloned(),
-                agents.get(&info.id),
-                is_mastermind(&info.id),
+                crate::chat::chat_session_json(
+                    info,
+                    workspaces.get(&info.id).cloned(),
+                    agents.get(&info.id),
+                    is_mastermind(&info.id),
+                ),
             ),
         )
     }));
@@ -274,9 +286,6 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
         let at = row["id"].as_str().and_then(|id| activity.get(id)).copied();
         row["last_input_ms"] = json!(at);
         row["placement"] = json!("here");
-        row["keep_running"] = json!(row["id"]
-            .as_str()
-            .is_some_and(|id| crate::pro::keep_running(state, id)));
     }
     drop(execs);
     drop(cwds);
@@ -291,11 +300,15 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
         if !rows.iter().any(|(_, row)| row["id"] == entry.id) {
             let label = crate::pro::paused_label(state, entry);
             let mut row = crate::bundle::paused_row(entry, label);
-            row["keep_running"] = json!(crate::pro::keep_running(state, &entry.id));
             // Additive: why it is paused, the same shape its socket says it
             // in, so a pane that shows no socket (a paused terminal) can too.
             if let Some(pause) = crate::ws::pause_for(state, &entry.id, Some(entry)) {
                 row["pause"] = pause.frame();
+            }
+            // Additive: the provider this paused session waits for (its
+            // project otherwise runs), so the page can say what to connect.
+            if let Some(provider) = crate::pro::blocking_provider(state, entry) {
+                row["blocked_provider"] = json!(provider);
             }
             rows.push((entry.created_at, row));
         }

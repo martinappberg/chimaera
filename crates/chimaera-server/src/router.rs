@@ -38,7 +38,6 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             post(crate::pro::recover_execution),
         )
         .route("/pro/status", get(crate::pro::status))
-        .route("/pro/keep-running", put(crate::pro::pin))
         .route("/pro/privacy", put(crate::pro::privacy))
         .route(
             "/pro/projects",
@@ -80,7 +79,6 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             "/pro/cloud/connections/{id}/input",
             post(crate::cloud::providers::submit),
         )
-        .route("/pro/cloud/onboard", post(crate::cloud::onboard))
         .route("/pro/cloud/project", post(crate::cloud::project))
         .route("/pro/bundles/{id}", get(crate::bundle::snapshot_route))
         .route(

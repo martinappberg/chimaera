@@ -36,7 +36,9 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
   requires a fresh official signed-out result, not a timeout or invalid-token row.
 - `POST /connections/{id}/input {code}` accepts a single-use, nonempty authorization
   code (maximum 4096 bytes, no whitespace/control characters) only while that
-  exact attempt is waiting for `authorization_code`. Code bodies are never logged,
+  exact attempt is waiting for `authorization_code`. A Claude code must be the
+  whole `code#state` pair its page shows; half of one returns `409
+  authorization_code_incomplete` and the attempt stays waiting. Code bodies are never logged,
   persisted, returned, or added to a command line. Native submission remains bound
   to its account generation through the request.
 - An action is `{type:"browser",url,input:"authorization_code"}`,
@@ -52,6 +54,8 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
 - Passive status never installs, logs in, starts a model turn, or wakes compute.
   Readiness is auth configuration reported by the official CLI, not a promise
   about its billing, quota or model entitlement. Never read credential files.
+  Provider CLIs run with `HOME` set to the worker's provider home and Claude in
+  its default layout there (no `CLAUDE_CONFIG_DIR`), exactly as its sessions read it.
 - Codex uses only auth app-server requests: initialize, account/read with
   `refreshToken:false`, and explicit account/login/start with
   `type:"chatgptDeviceCode"`. Claude uses `auth status --json` and explicit
@@ -71,7 +75,9 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
 - A provider has at most one unfinished credential writer. Cancel clears the
   action immediately but retains that reservation until owned process-group/PTY
   exit is observed. The cancel endpoint waits up to four seconds; uncertain
-  cleanup fails closed with `cleanup_failed`. Retained finished attempts are
+  cleanup fails closed with `cleanup_failed` and keeps the provider reserved only
+  until the old login terminal and process group are gone (re-checked every 5 s,
+  at most ten minutes; `release_when_gone`), then releases it. Retained finished attempts are
   capped at 24 and expire on the next explicit connection request.
 - Cancellation stops the CLI process and device polling. It does not revoke a
   vendor code already issued (that code expires at the provider), or sign out an
@@ -143,7 +149,9 @@ support:
 6. Keep [ProviderConnections](../../../../../web-ui/src/lib/pro/ProviderConnections.svelte)
    driven by returned catalog rows, labels, categories and methods rather than a
    new hard-coded provider card. General onboarding needs one connected agent;
-   handoff requires every provider used by that project's deferred agents.
+   each deferred session resumes once its own provider is ready (a provider not
+   signed in holds back only its sessions; the project and everything else
+   continue).
    Unsupported required IDs must remain visible and blocked, never silently
    substituted with a connected provider.
 7. Cover unknown IDs, malformed status, missing runtime, denied/expired login,
