@@ -355,7 +355,9 @@ than holding the drain open. After a completed drain, any
 `GET /api/v1/health` reports `pro_cloud_operations` (transfer tasks, sleep
 flushes, held project caches and busy Git helpers; a completed drain counts
 zero) and additive `last_activity_ms`, the last user change that is not session
-input (file saves, uploads, Git operations, session lifecycle).
+input (file saves, drafts, uploads, file moves, Git worktrees, session and
+workspace lifecycle; an explicit route list, so read-only POST helpers and
+passive viewing never count).
 
 The supervisor's idle sample reads `GET /api/v1/sessions`. Besides
 `agent_state`, `output_active`, `background_running`, `phase`, `exec_stage` and
