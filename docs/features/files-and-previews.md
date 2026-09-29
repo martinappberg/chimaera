@@ -191,10 +191,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   the merge. When both copies exist with different text the newer wins by the writers' own
   clocks (each PUT carries the client's `updated_ms`, answered back as `client_updated_ms`), not
   the daemon's arrival stamp, which runs on another machine's clock; a mirror copy from an older
-  client falls back to that stamp. A save of exactly that text, or a discard, clears both
-  copies — but only the record this window wrote (each carries a per-page `writer` id; the
-  mirror's `DELETE ?writer=` spares another window's) or one holding exactly the saved or
-  discarded text, so one window's save never drops another window's draft of the same file.
+  client falls back to that stamp. A save of exactly that text, a discard, or an edit (an undo,
+  say) that takes the buffer back to the disk text clears both copies — but only the record this
+  window wrote (each carries a per-page `writer` id; the mirror's `DELETE ?writer=` spares
+  another window's) or one holding exactly the saved or discarded text, so one window's save
+  never drops another window's draft of the same file.
   Mirror writes for a path land in issue order, so a late journal write never re-creates a
   cleared draft. A hide/pagehide flush re-journals every dirty buffer even when its text is
   unchanged (another window may have overwritten the path's one record) and sends drafts as
@@ -856,7 +857,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   global preload signal catches nested PDF/editor/spreadsheet chunks as well as top-level pane
   surfaces. A pane keeps an in-place retry for ordinary tunnel loss; a shared notice offers reload
   when the current asset graph is unavailable. Reload waits behind unsaved file edits and chat
-  drafts that exist only in memory, with an explicit reload-anyway escape hatch.
+  drafts that exist only in memory, with an explicit reload-anyway escape hatch. The user's own
+  Reload Window rides the same gate (reason `manual`, cancellable; see
+  [native-app.md](native-app.md#reload-window)).
 - **Binary / Finder.** Non-text files get an info card (`BinaryView`: name, size, modified time
   from the parent listing; no hex view yet) with **open as text** — a per-tab override
   (`RawTextView`): the bytes decoded read-only (the editor refuses binary content), control
