@@ -262,6 +262,11 @@ restart closes any record left open.
   session's commits.
 - **Not used:** claude's own file backups for `/rewind` (`~/.claude/file-history/`).
   They are claude's private format and cover claude only.
+- **Two sessions, one file.** When two live sessions edit the same file (both
+  `files_touched` lists already exist), both rows get a quiet chip. Where the agent has
+  hooks, it also gets one line of context through the existing hook answer: "session
+  'fix normalization' edited src/qc.py 3 min ago". The agent can avoid the clash
+  itself. Nothing is locked, and this works with or without git.
 
 ### 9. The session history list
 
@@ -296,7 +301,7 @@ Parts 1 and 2 are independent and can proceed in parallel.
 | **G2: several repositories** | Discovery, per-repository status, the panel's repository list, `repo=` on the routes (§1). Before History, so History is per repository from its first version. |
 | **G3: history** | Log, commit view, file history, `rev=` diffs, "changes on this branch", the local branch list (§2, §3, §6). Coordinated with the plugin platform's log route. |
 | **H1: the record** | `sessions.jsonl`, `started_by`, the Mastermind's actions, the `git` fields when present (§7). |
-| **H2: history list and changes** | The All sessions list, changes without git (§8, §9). |
+| **H2: history list and changes** | The All sessions list, changes without git, the same-file warning (§8, §9). |
 | **H3: cost** | Totals and the cost page (§10). |
 
 Each phase follows the repository's shipping rules: verified live, a feature page,
