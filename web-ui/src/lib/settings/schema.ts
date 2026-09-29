@@ -758,7 +758,7 @@ const DEFS = {
     title: "Voice Dictation",
     category: "Chat",
     description:
-      "A mic button in every chat composer, Claude or Codex: click it (or press the Dictate shortcut) and speak, click again and the words land in your message; Enter sends, Esc discards. `/voice on|off` flips this too. Your speech goes to Claude's speech-to-text service (the one Claude Code's own /voice uses) with the claude.ai login on the daemon's host, so the button only shows where that login exists; the microphone is on only while you're dictating.",
+      "A mic button in every chat composer, Claude or Codex: click it (or press the Dictate shortcut) and speak — the words fill your message as they're heard; click again to keep them, Enter to send, Esc to discard. `/voice on|off` flips this too. Your speech goes to Claude's speech-to-text service (the one Claude Code's own /voice uses) with the claude.ai login on the daemon's host, so the button only shows where that login exists; the microphone is on only while you're dictating.",
     type: "boolean",
     default: true,
     scope: "client",

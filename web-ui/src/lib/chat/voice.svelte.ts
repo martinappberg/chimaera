@@ -34,6 +34,39 @@ export function joinSpoken(...parts: string[]): string {
     .join(" ");
 }
 
+/** The draft while dictating: the user's own text around the spoken words,
+ *  which are split into what has settled and what is still forming. */
+export interface DictationParts {
+  /** The text before the words, with the space that separates them. */
+  before: string;
+  finals: string;
+  /** The space between settled and forming words. */
+  gap: string;
+  interim: string;
+  /** The space after the words, then the text that followed the caret. */
+  after: string;
+}
+
+/** Lay out live dictation between `before` and `after` (the draft split at
+ *  the caret), spaced like typed words. `joinParts` is the draft itself. */
+export function dictationParts(
+  before: string,
+  after: string,
+  finals: string,
+  interim: string,
+): DictationParts {
+  const f = finals.trim();
+  const i = interim.trim();
+  const spoken = f.length > 0 || i.length > 0;
+  const lead = spoken && before.length > 0 && !/\s$/.test(before) ? " " : "";
+  const trail = spoken && after.length > 0 && !/^\s/.test(after) ? " " : "";
+  return { before: before + lead, finals: f, gap: f && i ? " " : "", interim: i, after: trail + after };
+}
+
+export function joinParts(p: DictationParts): string {
+  return p.before + p.finals + p.gap + p.interim + p.after;
+}
+
 /**
  * Put dictated `text` into `draft` at `at`, spaced from its neighbors so it
  * reads as typed words. Returns the new draft and the caret after the text.
@@ -286,6 +319,9 @@ export class Dictation {
     }
     if (generation !== this.generation) return null;
     const text = joinSpoken(this.finals, this.interim);
+    // The last words settle here, so what's shown never flickers at the end.
+    this.finals = text;
+    this.interim = "";
     if (text === "" && this.error === null) {
       this.error =
         this.peak < SILENT_RMS && this.device !== ""

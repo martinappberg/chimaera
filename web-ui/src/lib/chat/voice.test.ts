@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { insertDictation, joinSpoken } from "./voice.svelte";
+import { dictationParts, insertDictation, joinParts, joinSpoken } from "./voice.svelte";
 import { DICTATION_LANGUAGES } from "./voiceLanguages";
 
 describe("insertDictation", () => {
@@ -22,6 +22,24 @@ describe("insertDictation", () => {
   it("clamps a stale caret into the draft", () => {
     expect(insertDictation("abc", 99, "d")).toEqual({ draft: "abc d", caret: 5 });
     expect(insertDictation("abc", -4, "d")).toEqual({ draft: "d abc", caret: 1 });
+  });
+});
+
+describe("dictationParts", () => {
+  it("adds nothing until words arrive", () => {
+    const p = dictationParts("please", " now", "", "");
+    expect(joinParts(p)).toBe("please now");
+  });
+
+  it("spaces the words from the draft around them", () => {
+    const p = dictationParts("please", "now", "run the", "tests");
+    expect(p).toEqual({ before: "please ", finals: "run the", gap: " ", interim: "tests", after: " now" });
+    expect(joinParts(p)).toBe("please run the tests now");
+  });
+
+  it("keeps the user's own whitespace", () => {
+    expect(joinParts(dictationParts("please\n", "\nthanks", "run it", ""))).toBe("please\nrun it\nthanks");
+    expect(joinParts(dictationParts("", "", "", " forming "))).toBe("forming");
   });
 });
 

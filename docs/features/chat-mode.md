@@ -90,14 +90,18 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   never touches the credentials. Sign in there, toggle back to chat.
 - **Voice dictation — the mic button.** Every chat composer, Claude or Codex, has a mic beside
   send (on by default; shown only where the daemon's host can dictate — `GET /api/v1/voice`,
-  asked once per window and again after a login failure). Click it and speak: a strip above the
-  input shows a five-bar waveform (a flat row means the mic hears nothing) and the words as they
-  form; click again and they land at the caret, spaced like typed words. Enter stops and sends,
-  Esc (or the strip's ✕) discards. The **Dictate** chord (⌃⇧D on macOS, the Codex app's; unbound
+  asked once per window and again after a login failure). Click it and speak: the words fill the
+  message box at the caret as they're heard — spaced like typed words, settled phrases slightly
+  dimmed and the phrase still forming dimmer, the box growing for a long dictation — and a
+  five-bar waveform beside the stop button shows the mic hears you (a flat row means it hears
+  nothing). Click again and the words turn to ordinary text. Enter stops and sends, Esc restores
+  the draft exactly as it was. The **Dictate** chord (⌃⇧D on macOS, the Codex app's; unbound
   elsewhere, where `Mod+d` is Split Right) toggles it from a focused composer only. Right-click
   the mic to pick the microphone (`chat.voiceMicrophone`, stored by name — device ids are
   per-origin and a daemon's port changes); a silent recording names the device and says how to
-  switch. Typing is never taken over: Claude Code's hold-Space push-to-talk is a terminal's answer
+  switch. While dictating the box is read-only: the textarea keeps the text (its real size,
+  wrapping and scroll) but draws it transparent, and a mirror with the same box and font draws it
+  with the spoken part dimmed. Typing is never taken over: Claude Code's hold-Space push-to-talk is a terminal's answer
   to having no buttons and stays with the agents' own TUIs. `/voice on|off` shows or hides the
   mic (`chat.voice`; Claude's `hold`/`tap` read as `on`); `/voice on` also checks the login and
   asks for the microphone up front. A hidden tab finishes into the draft; an unmounted composer

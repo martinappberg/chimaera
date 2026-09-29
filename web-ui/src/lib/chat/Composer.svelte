@@ -21,9 +21,9 @@
   import { getSetting, setSetting } from "../settings/store.svelte";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
   import { keyHintSuffix, matchAction } from "../shared/keybindings";
-  import { Dictation, hostCanDictate, insertDictation } from "./voice.svelte";
+  import { Dictation, dictationParts, hostCanDictate, joinParts } from "./voice.svelte";
   import { CaptureError, listMicrophones } from "./voiceCapture";
-  import VoiceStrip from "./VoiceStrip.svelte";
+  import VoiceMeter from "./VoiceMeter.svelte";
   import {
     slashChoices as choicesForSlash,
     slashContextAt,
@@ -314,29 +314,90 @@
   });
 
   // --- voice dictation ------------------------------------------------------------
-  // The mic button IS voice mode in chat: click to talk, click again to put the
-  // words at the caret (Enter: stop and send; Esc: discard), or the Dictate
-  // chord while this composer has focus. Typing is never taken over — the
-  // hold-Space push-to-talk is a terminal's answer to having no buttons, and
-  // stays with the agents' own TUIs. Right-click picks the microphone.
+  // The mic button IS voice mode in chat: click to talk, click again when done
+  // (Enter: stop and send; Esc: discard), or the Dictate chord while this
+  // composer has focus. Typing is never taken over — the hold-Space
+  // push-to-talk is a terminal's answer to having no buttons, and stays with
+  // the agents' own TUIs. Right-click picks the microphone.
+  //
+  // The words stream INTO the draft at the caret as they're heard, so a long
+  // dictation fills (and grows) the box like typing would. While it runs the
+  // textarea is read-only with its text transparent, and `ghost` — a mirror
+  // with the textarea's exact box, font and wrapping — draws the same text:
+  // the user's own in full, settled words slightly dimmed, forming words
+  // dimmer. Stopping just drops the mirror; Esc restores the draft as it was.
   const dictation = new Dictation();
   const voiceOn = $derived(getSetting("chat.voice") && !disabled && hostCanDictate());
+  /** The draft around a dictation in progress, split where it started. */
+  let dictating = $state<{ original: string; before: string; after: string } | null>(null);
+  let ghost = $state<HTMLDivElement | null>(null);
+  const spoken = $derived(
+    dictating === null
+      ? null
+      : dictationParts(dictating.before, dictating.after, dictation.finals, dictation.interim),
+  );
+  /** Right padding for the stop button, send button and waveform. */
+  const DICTATING_PAD = 96;
 
-  async function startDictation() {
-    await dictation.start({ keyterms: voiceTerms });
+  // The draft follows the words. Reads the transcript, writes only `draft`.
+  $effect(() => {
+    if (spoken === null) return;
+    draft = joinParts(spoken);
+    void tick().then(followDictation);
+  });
+
+  /** Keep the newest words in view, the mirror scrolled with the textarea,
+   *  and its padding matched to the textarea's (a classic scrollbar takes
+   *  width from the text box). */
+  function followDictation() {
+    const t = el;
+    const g = ghost;
+    if (t === null || g === null) return;
+    if (dictating !== null && dictating.after === "") t.scrollTop = t.scrollHeight;
+    const scrollbar = Math.max(0, t.offsetWidth - t.clientWidth - 2);
+    g.style.paddingRight = `${DICTATING_PAD + scrollbar}px`;
+    g.scrollTop = t.scrollTop;
   }
 
-  /** Stop, and put the words at the caret — then send, for Enter. */
+  async function startDictation() {
+    const start = el?.selectionStart ?? caret;
+    const end = el?.selectionEnd ?? start;
+    dictating = { original: draft, before: draft.slice(0, start), after: draft.slice(end) };
+    if (!(await dictation.start({ keyterms: voiceTerms }))) restoreDraft();
+  }
+
+  /** The words are final: they stay in the draft as ordinary text. */
+  function settleDictation() {
+    const d = dictating;
+    if (d === null) return;
+    const parts = dictationParts(d.before, d.after, dictation.finals, "");
+    draft = joinParts(parts);
+    dictating = null;
+    focusAt(parts.before.length + parts.finals.length);
+  }
+
+  /** Discard: the draft exactly as it was before the mic opened. */
+  function restoreDraft() {
+    const d = dictating;
+    if (d === null) return;
+    dictating = null;
+    draft = d.original;
+    focusAt(d.before.length);
+  }
+
+  /** Stop and keep the words — then send, for Enter. */
   async function finishDictation(send: boolean) {
     const text = await dictation.finish();
-    if (text === null || text.length === 0) return;
-    const next = insertDictation(draft, el?.selectionStart ?? caret, text);
-    draft = next.draft;
-    focusAt(next.caret);
-    if (send) {
+    settleDictation();
+    if (send && text !== null && text.length > 0) {
       await tick();
       submit();
     }
+  }
+
+  function cancelDictation() {
+    restoreDraft();
+    dictation.cancel();
   }
 
   function toggleDictation() {
@@ -355,7 +416,7 @@
     if (!dictation.active) return false;
     if (e.key === "Escape") {
       e.preventDefault();
-      dictation.cancel();
+      cancelDictation();
       return true;
     }
     if (e.key === "Enter" && !e.shiftKey) {
@@ -409,6 +470,13 @@
     untrack(() => {
       if (dictation.active && dictation.state !== "finishing") void finishDictation(false);
     });
+  });
+
+  // A recording that ended on its own (the relay failed, the length cap)
+  // keeps what was settled.
+  $effect(() => {
+    if (dictation.active || dictating === null) return;
+    untrack(settleDictation);
   });
 
   // An unmounted composer can't take the words: stop and release the mic.
@@ -782,16 +850,7 @@
   {#if attachmentError !== null}
     <div class="attachment-error" role="status">{attachmentError}</div>
   {/if}
-  {#if dictation.active}
-    <VoiceStrip
-      state={dictation.state}
-      levels={dictation.levels}
-      finals={dictation.finals}
-      interim={dictation.interim}
-      device={dictation.device}
-      onCancel={() => dictation.cancel()}
-    />
-  {:else if dictation.error !== null}
+  {#if !dictation.active && dictation.error !== null}
     <div class="attachment-error" role="status">{dictation.error}</div>
   {/if}
 
@@ -817,20 +876,41 @@
       onselect={trackCaret}
       oninput={trackCaret}
       onpaste={onPaste}
+      onscroll={() => {
+        if (ghost !== null && el !== null) ghost.scrollTop = el.scrollTop;
+      }}
       role="combobox"
       aria-expanded={popover !== null}
       aria-controls="{uid}-pop"
       aria-autocomplete="list"
       aria-activedescendant={popover !== null ? `${uid}-opt-${selected}` : undefined}
       class:voice={voiceOn}
+      class:dictating={spoken !== null}
+      readonly={spoken !== null}
       placeholder={disabled
         ? "chat ended"
-        : running
-          ? "queue a follow-up for the next run (Esc to stop)"
-          : "message the agent… (Enter to send · / commands · @ files)"}
+        : spoken !== null
+          ? dictation.state === "starting"
+            ? "Starting the mic…"
+            : "Listening…"
+          : running
+            ? "queue a follow-up for the next run (Esc to stop)"
+            : "message the agent… (Enter to send · / commands · @ files)"}
       rows={1}
       {disabled}
     ></textarea>
+    {#if spoken !== null}
+      <div class="ghost" bind:this={ghost} aria-hidden="true">{spoken.before}<span class="g-final"
+          >{spoken.finals}</span
+        >{spoken.gap}<span class="g-interim">{spoken.interim}</span>{spoken.after}&#8203;</div>
+      <span class="meter-slot">
+        <VoiceMeter
+          levels={dictation.levels}
+          listening={dictation.state === "listening"}
+          device={dictation.device}
+        />
+      </span>
+    {/if}
     {#if voiceOn}
       <button
         type="button"
@@ -1023,6 +1103,44 @@
   /* Room for the mic beside the action button. */
   textarea.voice {
     padding-right: 66px;
+  }
+  /* Dictating: the textarea keeps the text (so its size, wrapping and scroll
+     are the real ones) but draws none of it; .ghost draws it instead, with
+     the spoken words dimmed. Every box and font property must match. */
+  textarea.dictating {
+    padding-right: 96px; /* DICTATING_PAD: stop + send + waveform */
+    color: transparent;
+    caret-color: transparent;
+  }
+  .ghost {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    pointer-events: none;
+    box-sizing: border-box;
+    border: 1px solid transparent;
+    padding: 7px 96px 7px 10px;
+    font: inherit;
+    font-size: var(--text-md);
+    line-height: var(--chat-line-height, 1.45);
+    color: var(--fg);
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    overflow: hidden;
+  }
+  .g-final {
+    color: color-mix(in srgb, var(--fg) 78%, transparent);
+  }
+  .g-interim {
+    color: color-mix(in srgb, var(--fg) 52%, transparent);
+  }
+  .meter-slot {
+    position: absolute;
+    right: 67px;
+    bottom: 10px;
+    z-index: 2;
+    display: inline-flex;
+    pointer-events: auto;
   }
   textarea:disabled {
     opacity: 0.5;
