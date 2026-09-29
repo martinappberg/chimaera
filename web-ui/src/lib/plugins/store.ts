@@ -703,7 +703,8 @@ export const checkedAt: Readable<ReadonlyMap<string, number>> = checkedStore;
 // ---- available cards opened in place (this page's session only) -------------
 
 const expandedStore = writable<ReadonlySet<string>>(new Set());
-/** The available cards the user opened, by plugin id — kept while this page
+/** The cards the user opened, by plugin id (available and installed alike,
+ *  so one opened before its install stays open) — kept while this page
  *  lives (a tab switch or a re-render keeps them open), never persisted. */
 export const expandedPlugins: Readable<ReadonlySet<string>> = expandedStore;
 
@@ -721,7 +722,7 @@ export const detailsKey = (pid: string, version: string): string => `${pid}@${ve
 
 /** Open or close an available card; opening fetches its details once (an
  *  earlier refusal is asked again). */
-export function toggleExpanded(pid: string, version: string): void {
+export function toggleExpanded(pid: string, version: string, details = true): void {
   let opened = false;
   expandedStore.update((set) => {
     const next = new Set(set);
@@ -729,7 +730,8 @@ export function toggleExpanded(pid: string, version: string): void {
     if (opened) next.add(pid);
     return next;
   });
-  if (opened) void loadPluginDetails(pid, version);
+  // An installed card has its details already.
+  if (opened && details) void loadPluginDetails(pid, version);
 }
 
 async function loadPluginDetails(pid: string, version: string): Promise<void> {

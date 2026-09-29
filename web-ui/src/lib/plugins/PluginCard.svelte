@@ -154,6 +154,10 @@
   /** An available card in the list (not a preview): it opens in place. */
   const opens = $derived(available && !previewing);
   const open = $derived(previewing || (opens && $expandedPlugins.has(p.id)));
+  /** An installed card folds too: its head and summary, the rest behind the
+   *  chevron (opened by id, so a card opened before its install stays open). */
+  const folds = $derived(!available && !previewing);
+  const unfolded = $derived(folds && $expandedPlugins.has(p.id));
   const fetched = $derived(opens ? $pluginDetails.get(detailsKey(p.id, p.version)) : undefined);
   /** What the body describes: an installed card its own entry, a preview
    *  what its release said, an opened card its fetched details (null while
@@ -201,6 +205,15 @@
    *  failing in this workspace, which switching off and on clears. */
   const blocked = $derived((p.fault !== null && !p.on) || (p.hold !== null && p.hold.kind !== "untrusted"));
   const hold = $derived(holdWords(p));
+  /** What a folded installed card still shows (`attentionLines`): an
+   *  update, a fault, a hold, or a status line. */
+  const attention = $derived.by(() => {
+    const callout = (p.installed && p.update !== null) || p.fault !== null || hold !== null;
+    const doing = working !== null && working !== "install" && working !== "update" && working !== "reinstall";
+    const said = error !== null || continuation !== null || note !== null;
+    const checkedNow = checked !== undefined && working !== "check";
+    return callout || doing || said || checkedNow;
+  });
 
   const WORKING: Record<Change, string> = {
     install: "installing…",
@@ -755,32 +768,64 @@
     {:else if error !== null || note !== null}
       <div class="body">{@render statusLines()}</div>
     {/if}
+  {:else if folds}
+    <!-- Folded like an available card: the chevron opens what it adds, can
+         do, its tools and settings; what needs the user (an update, a
+         fault, a hold, a status line) shows either way. -->
+    <div class="top" class:open={unfolded} class:follows={unfolded || attention}>
+      {@render head()}
+      <div class="lead">
+        <p class="summary">{p.summary}</p>
+        <button
+          class="expander"
+          aria-expanded={unfolded}
+          aria-controls="pc-more-{p.id}"
+          aria-label="More about {p.name}"
+          title={unfolded ? "Show less" : "What it adds, what it can do, its tools and settings"}
+          onclick={() => toggleExpanded(p.id, p.version, false)}
+        >
+          <svg class="chev" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+            <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+      </div>
+    </div>
+    {#if unfolded || attention}
+      <div class="body" class:tight={unfolded && p.description !== null} id="pc-more-{p.id}">
+        {#if unfolded}
+          {#if p.description !== null}
+            <div class="prose">
+              <p class="desc" class:clamped={!descOpen} use:clampWatch>{p.description}</p>
+              {#if overflowing}
+                <button class="toggle-more" aria-expanded={descOpen} onclick={() => (descOpen = !descOpen)}>
+                  {descOpen ? "less" : "more"}
+                </button>
+              {/if}
+            </div>
+          {/if}
+          {@render facts(p, here)}
+          {@render sides(true)}
+          {@render platformBlock()}
+        {/if}
+        {@render attentionLines()}
+      </div>
+    {/if}
   {:else}
     {@render head()}
     <div class="body">
       <div class="prose">
         <p class="summary">{p.summary}</p>
         {#if p.description !== null}
-          {#if previewing}
-            <p class="desc">{p.description}</p>
-          {:else}
-            <p class="desc" class:clamped={!descOpen} use:clampWatch>{p.description}</p>
-            {#if overflowing}
-              <button class="toggle-more" aria-expanded={descOpen} onclick={() => (descOpen = !descOpen)}>
-                {descOpen ? "less" : "more"}
-              </button>
-            {/if}
-          {/if}
+          <p class="desc">{p.description}</p>
         {/if}
       </div>
+      {@render beforeInstall(p)}
+      {@render statusLines()}
+    </div>
+  {/if}
+</article>
 
-      {#if previewing}
-        {@render beforeInstall(p)}
-      {:else}
-        {@render facts(p, here)}
-        {@render sides(true)}
-        {@render platformBlock()}
-
+{#snippet attentionLines()}
         {#if p.installed && p.update !== null}
           {@const u = p.update}
           <div class="callout update">
@@ -801,12 +846,8 @@
 
         {@render faultCallout(p, true)}
         {@render holdCallout()}
-      {/if}
-
-      {@render statusLines()}
-    </div>
-  {/if}
-</article>
+        {@render statusLines()}
+{/snippet}
 
 {#if asking !== null}
   {@const a = asking}
