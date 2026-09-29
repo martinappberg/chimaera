@@ -128,8 +128,10 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   code (`connection_preparing`, `connection_retrying`, `account_unreachable`)
   cleared by a live keeper host event; additive `payment_due` and `plans` come
   from the account's optional `/v1/me` fields. IPC errors are fixed sentences.
-  **SSH never waits on Pro**: routing reads `client_now()` (no installed client
-  means ordinary SSH now); only device aliases wait for readiness. A kept SSH
+  **SSH never hangs on Pro**: routing reads `client_now()` (no installed client
+  means ordinary SSH now); a kept SSH host waits at most `KEPT_STARTUP_WAIT`
+  (10 s) so launch restore still goes through the keeper without a new login;
+  only device aliases wait for readiness unbounded. A kept SSH
   host whose keeper route fails in transit (`LinkFailure::Transport`) connects
   directly; keeper-side login failures stay errors so nobody is prompted twice.
 - **Daemon setup is off the activation path.** Activation installs the account,

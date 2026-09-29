@@ -1712,10 +1712,21 @@ pub(super) async fn connection(
     alias: &str,
 ) -> Result<Option<(Client, Host, u64)>, String> {
     let device = state.pro.is_device(alias) || lock(&state.registry).is_link_device(alias);
-    // A device has no route but the account, so it waits for startup. An SSH
-    // host never waits: ordinary SSH works whether or not Pro is ready.
+    let saved_alias = alias.to_string();
+    let kept = super::connect::with_hosts(move |hosts| {
+        Ok(hosts.get(&saved_alias).is_some_and(|host| host.kept))
+    })
+    .await?;
+    // A device has no route but the account, so it waits for startup. A kept
+    // SSH host usually reconnects through Pro without a new login, so it gives
+    // startup a short, bounded chance; any other SSH host never waits.
     let snapshot = if device {
         state.pro.client_snapshot().await
+    } else if kept {
+        tokio::time::timeout(KEPT_STARTUP_WAIT, state.pro.client_snapshot())
+            .await
+            .ok()
+            .flatten()
     } else {
         state.pro.client_now()
     };
@@ -1725,11 +1736,6 @@ pub(super) async fn connection(
     if !state.pro.has_keeper() {
         return device_fallback(device);
     }
-    let saved_alias = alias.to_string();
-    let kept = super::connect::with_hosts(move |hosts| {
-        Ok(hosts.get(&saved_alias).is_some_and(|host| host.kept))
-    })
-    .await?;
     let known = lock(&state.pro.hosts)
         .values()
         .any(|host| host.alias == alias);
@@ -1761,6 +1767,7 @@ pub(super) async fn connection(
     }
 }
 
+const KEPT_STARTUP_WAIT: Duration = Duration::from_secs(10);
 const DEVICE_UNREACHABLE: &str =
     "Couldn't reach Chimaera Pro to reconnect this computer. It reconnects when Pro is back.";
 

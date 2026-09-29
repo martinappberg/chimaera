@@ -39,8 +39,9 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    account check is still required. When the account ends the sign-in (revoked,
    expired, or replaced by **Sign out everywhere**), Pro shows “Your sign-in has
    expired. Sign in again to continue.” and stops all background retries.
-   SSH hosts never wait for any of this: until Pro is ready, and whenever it is
-   unreachable, a saved SSH host connects directly.
+   SSH hosts never hang on any of this: a saved SSH host connects directly while
+   Pro starts (a host kept connected through Pro waits at most 10 seconds for it)
+   and whenever Pro is unreachable.
 3. Signed-out and confirmed no-plan accounts see an illustrated introduction:
    start a session on your computer, continue a supported agent in the cloud,
    then access the same sessions, files and conversation on another device.
@@ -341,10 +342,11 @@ Passive roster polls, reconnects and watchers carry no cloud wake intent.
   sign-in and never presents that token again. A network failure retries the
   refresh once with the same token and keeps the session. Daemon bearer tokens
   remain in memory and do not enter `hosts.json`.
-- SSH never waits for Pro: a saved SSH host connects directly while Pro starts,
-  and a kept host whose Pro route is unreachable falls back to a direct
-  connection (its row then reads as direct). Computers reached only through Pro
-  wait for it.
+- SSH never hangs on Pro: a saved SSH host connects directly while Pro starts
+  (a kept host waits at most 10 seconds first, so the usual Pro route needs no
+  new login), and a kept host whose Pro route is unreachable falls back to a
+  direct connection (its row then reads as direct). Computers reached only
+  through Pro wait for it.
 - Viewing a project owned elsewhere survives a failed check (account or keeper
   unreachable, owner asleep or reconnecting) for up to 150 seconds on the last
   verified route; only a definitive answer (unowned, owned here, private, a newer
