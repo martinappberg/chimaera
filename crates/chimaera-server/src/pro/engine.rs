@@ -1607,8 +1607,15 @@ async fn hydrate_scoped(
             cloud_internal: false,
         };
         let owner = state.clone();
-        tokio::task::spawn_blocking(move || lock(&owner.workspaces).import_exact(new_workspace))
-            .await??;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let (root, id) = (new_workspace.root.clone(), new_workspace.id.clone());
+            lock(&owner.workspaces).import_exact(new_workspace)?;
+            // The folder carries the id it was registered under, so a
+            // reinstall finds the same project again.
+            crate::workspaces::identity::write(&root, &id);
+            Ok(())
+        })
+        .await??;
         lock(&state.pro.preferences)
             .entry(workspace.into())
             .or_default()

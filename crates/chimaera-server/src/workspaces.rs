@@ -1,5 +1,7 @@
 //! Persistent workspace registry: `{id, root, name}` records stored as JSON.
 
+pub(crate) mod identity;
+
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -56,6 +58,24 @@ pub(crate) struct Workspace {
     /// Daemon-owned setup, never a user project or a mirror/adoption candidate.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) cloud_internal: bool,
+}
+
+/// What the caller learned from the folder (off the store's lock) for
+/// [`WorkspaceStore::add_identified`].
+pub(crate) struct FolderIdentity<'a> {
+    /// The folder's own marker, if it has a well-formed one.
+    pub(crate) marker: Option<&'a identity::Marker>,
+    /// The root the registry holds under the marker's id, when the caller
+    /// found it missing on disk: the only evidence that a folder was MOVED
+    /// rather than duplicated.
+    pub(crate) gone_root: Option<&'a Path>,
+}
+
+/// The outcome of [`WorkspaceStore::add_identified`].
+pub(crate) struct Registered {
+    pub(crate) workspace: Workspace,
+    /// The folder does not yet say this id: write its marker, off the lock.
+    pub(crate) write_marker: bool,
 }
 
 /// In-memory workspace list backed by a JSON file (save-on-change).
@@ -159,7 +179,9 @@ impl WorkspaceStore {
     }
 
     /// Register `root` (must already be canonical). Idempotent per canonical
-    /// root; re-registering stamps the existing entry as freshly opened.
+    /// root; re-registering stamps the existing entry as freshly opened. Mints
+    /// a new id and reads no folder identity — the route registers through
+    /// [`Self::add_identified`].
     pub(crate) fn add(&mut self, root: PathBuf) -> anyhow::Result<Workspace> {
         if let Some(existing) = self.items.iter_mut().find(|w| w.root == root) {
             existing.last_opened_at = unix_now();
@@ -167,12 +189,93 @@ impl WorkspaceStore {
             self.save()?;
             return Ok(workspace);
         }
-        let name = workspace_name(&root);
-        let id = format!("w-{}", &chimaera_core::generate_token()[..8]);
+        let id = self.mint_id();
+        self.push_new(id, root)
+    }
+
+    /// Register `root` (must already be canonical) the way the folder says
+    /// it should be: a folder carries its workspace id, so a reinstall, a
+    /// state reset or a second daemon reopens the same project instead of
+    /// minting a stranger the cloud copy can never match. The id follows the
+    /// folder to other computers too. The caller read the folder's marker off
+    /// the reactor; the entry is decided here:
+    ///
+    /// | the folder and the registry | result | `write_marker` |
+    /// |---|---|---|
+    /// | `root` already registered | that entry, stamped opened | when the marker is missing or names another id |
+    /// | no marker | fresh id | yes |
+    /// | marker id not registered | registered under the marker's id | no |
+    /// | marker id registered under another root that still exists | fresh id (this folder is a local duplicate) | yes |
+    /// | marker id registered under another root that is gone | THAT entry moves to `root`, id kept (Pro state survives a move) | yes |
+    ///
+    /// "Gone" is the caller's finding ([`FolderIdentity::gone_root`]): a stat
+    /// the store never makes under its own lock. Anything short of a
+    /// confirmed missing root reads as a duplicate, which never disturbs the
+    /// other entry. The caller writes the marker AFTER releasing the lock.
+    pub(crate) fn add_identified(
+        &mut self,
+        root: PathBuf,
+        folder: FolderIdentity<'_>,
+    ) -> anyhow::Result<Registered> {
+        if let Some(existing) = self.items.iter_mut().find(|w| w.root == root) {
+            existing.last_opened_at = unix_now();
+            let workspace = existing.clone();
+            self.save()?;
+            let write_marker = folder.marker.is_none_or(|marker| marker.id != workspace.id);
+            return Ok(Registered {
+                workspace,
+                write_marker,
+            });
+        }
+        let Some(marker) = folder.marker else {
+            let id = self.mint_id();
+            return Ok(Registered {
+                workspace: self.push_new(id, root)?,
+                write_marker: true,
+            });
+        };
+        let Some(holder) = self.items.iter().position(|w| w.id == marker.id) else {
+            return Ok(Registered {
+                workspace: self.push_new(marker.id.clone(), root)?,
+                write_marker: false,
+            });
+        };
+        if folder.gone_root != Some(self.items[holder].root.as_path()) {
+            let id = self.mint_id();
+            return Ok(Registered {
+                workspace: self.push_new(id, root)?,
+                write_marker: true,
+            });
+        }
+        let entry = &mut self.items[holder];
+        // A name the user never changed follows the folder.
+        if entry.name == workspace_name(&entry.root) {
+            entry.name = workspace_name(&root);
+        }
+        entry.root = root;
+        entry.last_opened_at = unix_now();
+        let workspace = entry.clone();
+        self.save()?;
+        Ok(Registered {
+            workspace,
+            write_marker: true,
+        })
+    }
+
+    fn mint_id(&self) -> String {
+        loop {
+            let id = format!("w-{}", &chimaera_core::generate_token()[..8]);
+            if !self.items.iter().any(|w| w.id == id) {
+                return id;
+            }
+        }
+    }
+
+    fn push_new(&mut self, id: String, root: PathBuf) -> anyhow::Result<Workspace> {
         let workspace = Workspace {
             id,
+            name: workspace_name(&root),
             root,
-            name,
             last_opened_at: unix_now(),
             mastermind: None,
             plugins_on: Vec::new(),
@@ -551,5 +654,170 @@ mod tests {
             "a failed persist must surface as Err, not silent success"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn marker(id: &str) -> identity::Marker {
+        identity::Marker {
+            id: id.to_owned(),
+            written_at: 1,
+        }
+    }
+
+    /// A store standing in for one daemon's registry (a new label is a new
+    /// daemon, e.g. after a reinstall or a state reset).
+    fn daemon(label: &str) -> WorkspaceStore {
+        WorkspaceStore::load(test_dir(label).join("workspaces.json"))
+    }
+
+    fn register(
+        store: &mut WorkspaceStore,
+        root: &Path,
+        marker: Option<&identity::Marker>,
+        gone_root: Option<&Path>,
+    ) -> Registered {
+        store
+            .add_identified(
+                root.to_path_buf(),
+                FolderIdentity {
+                    marker: marker.filter(|m| identity::valid_id(&m.id)),
+                    gone_root,
+                },
+            )
+            .unwrap()
+    }
+
+    /// Row: no marker. A fresh id, and the folder is asked to carry it.
+    #[test]
+    fn a_folder_without_a_marker_gets_a_fresh_id_and_a_marker() {
+        let mut store = daemon("id-none");
+        let root = test_dir("id-none-root");
+        let registered = register(&mut store, &root, None, None);
+        assert!(registered.write_marker);
+        assert!(registered.workspace.id.starts_with("w-"));
+        assert_eq!(registered.workspace.id.len(), 10);
+        assert_eq!(store.get(&registered.workspace.id).unwrap().root, root);
+    }
+
+    /// Row: root already registered. Today's behaviour (idempotent, stamped
+    /// opened); the marker is rewritten only when missing or naming another id.
+    #[test]
+    fn an_already_registered_root_keeps_its_entry_and_repairs_its_marker() {
+        let mut store = daemon("id-known");
+        let root = test_dir("id-known-root");
+        let first = register(&mut store, &root, None, None).workspace;
+        let matching = marker(&first.id);
+        let again = register(&mut store, &root, Some(&matching), None);
+        assert_eq!(again.workspace.id, first.id);
+        assert!(!again.write_marker, "the folder already says so");
+        let missing = register(&mut store, &root, None, None);
+        assert_eq!(missing.workspace.id, first.id);
+        assert!(missing.write_marker);
+        // The registry is this daemon's truth for a root it has: a marker
+        // naming another id is repaired, never followed.
+        let other = marker("w-otherone");
+        let wrong = register(&mut store, &root, Some(&other), None);
+        assert_eq!(wrong.workspace.id, first.id);
+        assert!(wrong.write_marker);
+        assert_eq!(store.list().len(), 1);
+    }
+
+    /// Row: marker id not registered. The reinstall / state reset / second
+    /// daemon case: the same folder is the same project, on any computer.
+    #[test]
+    fn a_marker_whose_id_is_not_registered_is_reused() {
+        let root = test_dir("id-reuse-root");
+        let mut first_daemon = daemon("id-reuse-1");
+        let original = register(&mut first_daemon, &root, None, None).workspace;
+        let carried = marker(&original.id);
+
+        // A fresh registry (another install of the daemon, or another computer).
+        let mut second_daemon = daemon("id-reuse-2");
+        let reopened = register(&mut second_daemon, &root, Some(&carried), None);
+        assert_eq!(reopened.workspace.id, original.id);
+        assert!(!reopened.write_marker, "nothing to rewrite");
+        assert_eq!(reopened.workspace.name, workspace_name(&root));
+        assert!(reopened.workspace.last_opened_at > 0);
+        // It is a real registration: it persists across a restart.
+        let restarted = WorkspaceStore::load(second_daemon.path.clone());
+        assert_eq!(restarted.get(&original.id).unwrap().root, root);
+    }
+
+    /// Row: marker id registered under another root that still exists. The
+    /// folder is a local duplicate: fresh id, the original untouched.
+    #[test]
+    fn a_duplicate_of_a_registered_folder_gets_its_own_id() {
+        let mut store = daemon("id-dup");
+        let original_root = test_dir("id-dup-original");
+        let copy_root = test_dir("id-dup-copy");
+        let original = register(&mut store, &original_root, None, None).workspace;
+        let carried = marker(&original.id);
+        // The original is still on disk, so the caller found nothing gone.
+        let copy = register(&mut store, &copy_root, Some(&carried), None);
+        assert_ne!(copy.workspace.id, original.id);
+        assert!(copy.write_marker, "the copy is told its own id");
+        assert_eq!(store.get(&original.id).unwrap().root, original_root);
+        assert_eq!(store.list().len(), 2);
+    }
+
+    /// Row: marker id registered under a root that is gone. The folder moved:
+    /// that entry follows it and keeps its id, name choice and bindings.
+    #[test]
+    fn a_moved_folder_keeps_its_workspace() {
+        let mut store = daemon("id-move");
+        let old_root = test_dir("id-move-old");
+        let new_root = test_dir("id-move-new-name");
+        let original = register(&mut store, &old_root, None, None).workspace;
+        store.set_plugin_on(&original.id, "p", true).unwrap();
+        let carried = marker(&original.id);
+        let moved = register(&mut store, &new_root, Some(&carried), Some(&old_root));
+        assert_eq!(moved.workspace.id, original.id);
+        assert!(moved.write_marker);
+        assert_eq!(moved.workspace.root, new_root);
+        assert_eq!(moved.workspace.plugins_on, ["p"], "the entry itself moved");
+        assert_eq!(
+            moved.workspace.name,
+            workspace_name(&new_root),
+            "a default name follows the folder"
+        );
+        assert_eq!(store.list().len(), 1);
+        assert!(store.list().iter().all(|w| w.root != old_root));
+        // A name the user chose stays.
+        let mut named = daemon("id-move-named");
+        let from = test_dir("id-move-named-from");
+        let to = test_dir("id-move-named-to");
+        let entry = register(&mut named, &from, None, None).workspace;
+        named.items[0].name = "My thesis".to_owned();
+        let carried = marker(&entry.id);
+        let moved = register(&mut named, &to, Some(&carried), Some(&from));
+        assert_eq!(moved.workspace.name, "My thesis");
+        // The move survives a restart.
+        let restarted = WorkspaceStore::load(named.path.clone());
+        assert_eq!(restarted.get(&entry.id).unwrap().root, to);
+    }
+
+    /// "Gone" must name the root the registry actually holds: a stale or
+    /// unrelated finding never moves an entry.
+    #[test]
+    fn only_a_matching_gone_root_moves_an_entry() {
+        let mut store = daemon("id-gone-mismatch");
+        let held = test_dir("id-gone-held");
+        let unrelated = test_dir("id-gone-unrelated");
+        let target = test_dir("id-gone-target");
+        let original = register(&mut store, &held, None, None).workspace;
+        let carried = marker(&original.id);
+        let registered = register(&mut store, &target, Some(&carried), Some(&unrelated));
+        assert_ne!(registered.workspace.id, original.id);
+        assert_eq!(store.get(&original.id).unwrap().root, held);
+    }
+
+    /// Every registered id stays unique whatever the marker says.
+    #[test]
+    fn a_fresh_id_never_collides_with_a_registered_one() {
+        let mut store = daemon("id-unique");
+        let mut seen = std::collections::HashSet::new();
+        for index in 0..64 {
+            let root = test_dir(&format!("id-unique-{index}"));
+            assert!(seen.insert(register(&mut store, &root, None, None).workspace.id));
+        }
     }
 }

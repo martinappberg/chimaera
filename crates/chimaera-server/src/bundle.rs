@@ -916,7 +916,10 @@ async fn import_inner(
             if canonical != workspace.root || !opened.entry.cwd.is_dir() {
                 bail!("bundle paths must exist without remapping");
             }
+            let (marker_root, marker_id) = (workspace.root.clone(), workspace.id.clone());
             crate::lock(&setup.workspaces).import_exact(workspace)?;
+            // The folder carries the id it was registered under.
+            crate::workspaces::identity::write(&marker_root, &marker_id);
             if let Some(native) = native_destination(&setup, &opened.entry)? {
                 install_member(&mut opened, "native.jsonl", &native)?;
                 if opened

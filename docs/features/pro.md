@@ -385,6 +385,10 @@ to the cloud…" while this computer hands it over — read from this daemon's o
 `GET /pro/status` ownership (`workspace/placementHints.ts`); it appears only when Pro is
 configured and the project is owned elsewhere, and never in the accent colour.
 
+### After a reinstall or reset
+
+A project folder remembers which project it is: registering it records its workspace id in the folder (inside `.git` when the folder is a Git repository, or in a linked worktree's own git directory, so it is never committed and never shows up as a changed file; otherwise in a small `.chimaera-workspace` file that is never copied to the cloud). Open the same folder again after a reinstall, a reset of Chimaera's data, or on a second computer, and it is the same project, not a new one: its cloud copy matches it instead of showing beside it as "In the cloud · not on this computer". A folder that is moved keeps its project; a duplicate of a folder on the same computer becomes a separate project of its own; a plain `git clone` is a separate project until you open the project from Cloud projects. A folder that cannot be written to (read-only, some network drives) simply carries no id. Implementation: [`workspaces/identity.rs`](../../crates/chimaera-server/src/workspaces/identity.rs) and the registration table in [`workspaces.rs`](../../crates/chimaera-server/src/workspaces.rs).
+
 Projects first created in the cloud appear on Home without being downloaded.
 Opening one on a computer without a local copy asks where to save it through the
 native picker. An empty folder becomes the project folder; choosing a folder

@@ -23,6 +23,9 @@ pub(super) fn allowed_path(path: &Path) -> bool {
         if matches!(
             name.as_str(),
             ".git"
+                // A folder's workspace-identity marker names this computer;
+                // it must never travel with a copy of the project.
+                | ".chimaera-workspace"
                 | ".ssh"
                 | ".aws"
                 | ".azure"
@@ -411,9 +414,17 @@ mod tests {
             "plugin/.credentials.json",
             "tls/private.pem",
             ".git/config",
+            // The workspace identity marker, at any depth (a nested project's
+            // own marker must not travel either).
+            ".chimaera-workspace",
+            "nested/project/.chimaera-workspace",
+            ".git/chimaera-workspace",
         ] {
             assert!(!allowed_path(Path::new(path)), "{path}");
         }
+        // Only the marker's exact name: neighbours are ordinary files.
+        assert!(allowed_path(Path::new("docs/chimaera-workspace.md")));
+        assert!(allowed_path(Path::new("chimaera-workspace")));
         assert!(allowed_path(Path::new("src/main.rs")));
         assert!(allowed_path(Path::new("skills/example/SKILL.md")));
         assert!(contains_credential(b"-----BEGIN OPENSSH PRIVATE KEY-----"));

@@ -23,7 +23,7 @@ revocable delegation over the authenticated local API.
 | `provider_gate.rs` / `provider_tests.rs` | Per-agent cloud readiness, bounded blocked-provider status, and staged retry/cancellation tests with a synthetic CLI and real PTY. |
 | `protocol.rs` | Additive account contract subset and strict worker host-to-holder identity translation; intentionally no link/TLS dependency in the daemon. |
 | `transport.rs` | Bounded external curl/git children; cached mirror-only Git compatibility selection; credentials only in memory, never argv or Git config. The account's 403 `{"error":"return_window_ended"}` (a plan that ended and whose time to bring cloud work home has passed) becomes an error of its own in `engine::account`, so its mirror-row and open `error_code` read `return_window_ended`; any other 403 stays a plain response. |
-| `policy.rs` | Mirrored-path policy, credential filtering, size budgets and cloud-profile classification. |
+| `policy.rs` | Mirrored-path policy (credentials, `.git`, staging names, kept copies and a folder's `.chimaera-workspace` identity marker at any depth are never mirrored), credential filtering, size budgets and cloud-profile classification. |
 | `mirror.rs` | Separate shadow and repository Git directories, incremental transfer and conservative hand-back. |
 | `shadow_cache.rs` | Validated reconstruction of an objectively damaged outgoing shadow, retaining its complete prior store in a bounded no-overwrite quarantine. |
 | `repository.rs` | Portable remote/tracking allowlist; bounded ref import, compare-and-swap adoption and index/ref-lock cancellation cleanup. |
