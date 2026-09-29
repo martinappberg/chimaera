@@ -6,6 +6,13 @@ use std::{
     time::Duration,
 };
 
+/// A 100 ms tick that took this long was not scheduled normally: the process
+/// was frozen.
+const FREEZE: Duration = Duration::from_secs(3);
+/// Wall and monotonic time disagreeing by this much across one tick is a
+/// clock step (a resumed machine correcting its clock), as the lease sees it.
+const JUMP: Duration = Duration::from_secs(1);
+
 fn signal(state: &AppState, workspace: &str) {
     let ids: Vec<_> = lock(&state.session_workspaces)
         .iter()
@@ -40,6 +47,7 @@ pub(in crate::pro) fn start(state: &Arc<AppState>) {
     let generation = state.pro.generation.load(Ordering::Acquire);
     std::thread::spawn(move || {
         let mut recorded = HashSet::new();
+        let mut last = (std::time::Instant::now(), std::time::SystemTime::now());
         loop {
             std::thread::sleep(Duration::from_millis(100));
             let Some(state) = weak.upgrade() else {
@@ -49,6 +57,21 @@ pub(in crate::pro) fn start(state: &Arc<AppState>) {
                 || state.pro.generation.load(Ordering::Acquire) != generation
             {
                 return;
+            }
+            // A tick far longer than its sleep, or the two clocks disagreeing
+            // about it, means this process was frozen (a suspended machine
+            // resumed) or the clock jumped. Renew before fencing: the account
+            // kept a suspended owner's lease for it.
+            let now = (std::time::Instant::now(), std::time::SystemTime::now());
+            let monotonic = now.0.saturating_duration_since(last.0);
+            let frozen = monotonic > FREEZE
+                || now
+                    .1
+                    .duration_since(last.1)
+                    .map_or(true, |wall| wall.abs_diff(monotonic) > JUMP);
+            last = now;
+            if frozen && super::resumed(&state, generation) {
+                state.pro.renew_now.notify_one();
             }
             let expired = super::expire(&state, generation);
             // Signal every expired workspace before any durable journal work.

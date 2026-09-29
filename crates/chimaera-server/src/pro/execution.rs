@@ -47,7 +47,15 @@ struct Proof {
     deadline: lease::Deadline,
     server_now: i128,
     stopped: bool,
+    /// Set when this process resumed from a freeze with the deadline lapsed:
+    /// one renewal at the recorded epoch is tried before the watchdog fences.
+    renew_until: Option<std::time::Instant>,
 }
+
+/// How long a resumed cloud machine may take to renew its own epoch before
+/// the watchdog fences it. The account keeps a suspended owner's lease for it
+/// (nobody else can acquire it meanwhile), so this is not a partition window.
+const RESUME_RENEW: Duration = Duration::from_secs(20);
 
 pub(super) fn validate_configuration(config: &Configure) -> Result<()> {
     let Some(execution) = &config.execution else {
@@ -398,6 +406,7 @@ pub(super) fn accept(
             deadline,
             server_now,
             stopped: false,
+            renew_until: None,
         },
     );
     Ok(())
@@ -414,7 +423,50 @@ pub(super) fn allows(state: &AppState, workspace: &str) -> bool {
     {
         return false;
     }
-    !worker(state) || lease_valid(state, workspace)
+    // A resumed machine keeps admitting the input that woke it while it renews
+    // its own paused lease; a refused renewal fences it at once.
+    !worker(state) || lease_valid(state, workspace) || resuming(state, workspace)
+}
+/// This process resumed from a freeze (see `resumed`) and is renewing its own
+/// epoch; the watchdog holds its fence until the renewal answers or the
+/// bounded window passes.
+pub(super) fn resuming(state: &AppState, workspace: &str) -> bool {
+    let generation = state.pro.generation.load(Ordering::Acquire);
+    lock(&state.pro.execution.proofs)
+        .get(workspace)
+        .is_some_and(|proof| {
+            !proof.stopped
+                && proof.generation == generation
+                && proof
+                    .renew_until
+                    .is_some_and(|until| std::time::Instant::now() < until)
+        })
+}
+/// The epoch of this project's current, unstopped execution proof.
+pub(super) fn proof_epoch(state: &AppState, workspace: &str) -> Option<u64> {
+    lock(&state.pro.execution.proofs)
+        .get(workspace)
+        .filter(|proof| !proof.stopped)
+        .map(|proof| proof.epoch)
+}
+/// The watchdog saw the process frozen: a suspended cloud machine resumed, or
+/// the clock jumped. Each proof whose deadline lapsed across the freeze gets
+/// one bounded renewal at its recorded epoch before any fence (renew before
+/// fencing). Returns whether any renewal is now due.
+pub(super) fn resumed(state: &AppState, generation: u64) -> bool {
+    let until = std::time::Instant::now() + RESUME_RENEW;
+    let mut due = false;
+    for proof in lock(&state.pro.execution.proofs).values_mut() {
+        if proof.generation == generation
+            && !proof.stopped
+            && proof.renew_until.is_none()
+            && !proof.deadline.valid()
+        {
+            proof.renew_until = Some(until);
+            due = true;
+        }
+    }
+    due
 }
 /// Sessions a previous daemon left running resume only once this life has
 /// verified ownership; `resume_unverified` applies the device fallback.
@@ -512,8 +564,13 @@ pub(super) fn expire(state: &AppState, generation: u64) -> Vec<String> {
     }
     let mut proofs = lock(&state.pro.execution.proofs);
     let mut expired = Vec::new();
+    let now = std::time::Instant::now();
     for (workspace, proof) in proofs.iter_mut() {
         if proof.generation == generation && (proof.stopped || !proof.deadline.valid()) {
+            // A resumed machine's own renewal is still in flight.
+            if !proof.stopped && proof.renew_until.is_some_and(|until| now < until) {
+                continue;
+            }
             proof.stopped = true;
             lock(&state.pro.preferences)
                 .entry(workspace.clone())
@@ -599,6 +656,17 @@ pub(crate) fn expired_lease_fixture(state: &AppState, workspace: &str) -> Vec<St
         proof.deadline = lease::Deadline::expired_fixture();
     }
     expire(state, state.pro.generation.load(Ordering::Acquire))
+}
+/// A suspended machine resumed after its lease deadline passed, as the
+/// watchdog's freeze detection sees it. Returns what the watchdog would fence.
+#[cfg(test)]
+pub(crate) fn resumed_fixture(state: &AppState, workspace: &str) -> Vec<String> {
+    if let Some(proof) = lock(&state.pro.execution.proofs).get_mut(workspace) {
+        proof.deadline = lease::Deadline::expired_fixture();
+    }
+    let generation = state.pro.generation.load(Ordering::Acquire);
+    resumed(state, generation);
+    expire(state, generation)
 }
 /// A verified other owner, as an authenticated baton read records it.
 #[cfg(test)]

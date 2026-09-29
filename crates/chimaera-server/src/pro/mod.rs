@@ -66,6 +66,8 @@ pub(crate) struct ProState {
     return_backoff: Mutex<HashMap<String, (u64, u64)>>,
     awake_since: AtomicU64,
     power_suitable: AtomicBool,
+    /// Wakes the lease loop at once: a resumed machine renews before fencing.
+    renew_now: tokio::sync::Notify,
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -270,6 +272,7 @@ impl ProState {
             return_backoff: Mutex::new(HashMap::new()),
             awake_since: AtomicU64::new(now()),
             power_suitable: AtomicBool::new(false),
+            renew_now: tokio::sync::Notify::new(),
         }
     }
 }

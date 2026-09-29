@@ -219,7 +219,10 @@ pub(super) fn start(state: Arc<AppState>) {
                 *lock(&state.pro.mirror_task) = Some(task);
                 last_mirror = super::now();
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(5)) => {}
+                () = state.pro.renew_now.notified() => {}
+            }
         }
     });
     if let Some(old) = lock(&state.pro.task).replace(task) {
@@ -299,6 +302,10 @@ async fn reconcile_generation(
     if baton.holder_id.as_deref().is_some_and(|id| id != holder) {
         // A worker never steals an active owner. Devices observe remote work
         // immediately; hand-back is a separate coordinated stop/release path.
+        // A resumed machine that finds another owner does not renew: fence.
+        if execution::resuming(state, workspace) {
+            execution::fence_workspace(state, workspace);
+        }
         lock(&state.pro.ownership).insert(
             workspace.into(),
             Ownership::Remote {
@@ -379,11 +386,20 @@ async fn reconcile_generation(
         return Ok(None);
     }
 
-    let operation = if owned
-        && baton
-            .expires_at
-            .as_ref()
-            .is_some_and(|expiry| expiry > &baton.server_now)
+    // A cloud machine resuming from suspension renews its own recorded epoch
+    // even though the lease reads expired: the account kept it as a paused
+    // owner (same epoch, no fork). Acquiring instead would install the
+    // checkpoint over its own newer work. Only a refused renewal fences.
+    let resuming = config.role == Role::Worker
+        && owned
+        && execution::resuming(state, workspace)
+        && execution::proof_epoch(state, workspace) == Some(baton.epoch);
+    let operation = if resuming
+        || (owned
+            && baton
+                .expires_at
+                .as_ref()
+                .is_some_and(|expiry| expiry > &baton.server_now))
     {
         "renew"
     } else {
@@ -474,6 +490,11 @@ async fn reconcile_generation(
             .is_ok_and(|value| value["error"] == "takeover_grace")
     {
         return Ok(None);
+    }
+    // The account refused this resumed machine's own epoch (someone else
+    // took the project while it slept): fence now, not at the window's end.
+    if resuming && (400..500).contains(&response.status) {
+        execution::fence_workspace(state, workspace);
     }
     let grant: Baton = response
         .json()

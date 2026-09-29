@@ -416,6 +416,76 @@ async fn reacquiring_its_own_epoch_continues_local_work_without_install_or_fork(
     }
 }
 
+/// A cloud machine that resumes after its lease deadline renews its own epoch
+/// first (the account kept it as a paused owner): no fence while the renewal is
+/// out, no checkpoint install over its own newer work, and a fence only when
+/// the account refuses.
+#[tokio::test]
+async fn a_resumed_cloud_machine_renews_its_own_epoch_before_any_fence() {
+    for refused in [false, true] {
+        let root = temp(if refused { "resume-refused" } else { "resume" });
+        let state = state(&root);
+        let account = FakeAccount::start(json!({})).await;
+        let mut config = device(&account.endpoint);
+        config.role = Role::Worker;
+        config.execution.as_mut().unwrap().installation_id = None;
+        let workspace = project(&state, &root, &config, 4);
+        *lock(&state.pro.runtime) = Some(config.clone());
+        let mut paused = owned(&workspace.id, "d-home", 4, "lease-fixture", 1);
+        paused["server_now"] = json!("2026-09-28T00:30:00Z");
+        paused["checkpoint"] = checkpoint(4);
+        *lock(&account.baton) = paused;
+        *lock(&account.grant) = Some(if refused {
+            (409, json!({"error":"stale_epoch"}))
+        } else {
+            let mut grant = owned(&workspace.id, "d-home", 4, "lease-fixture", 2);
+            grant["checkpoint"] = checkpoint(4);
+            (200, grant)
+        });
+        assert!(
+            execution::resumed_fixture(&state, &workspace.id).is_empty(),
+            "nothing is fenced before the renewal answers"
+        );
+        assert!(
+            crate::pro::may_execute(&state, &workspace.id),
+            "the input that woke the machine is admitted"
+        );
+        let result = reconcile(&state, &config, &workspace.id).await;
+        assert!(account
+            .calls("POST", &format!("/v2/baton/{}/acquire", workspace.id))
+            .is_empty());
+        assert_eq!(
+            account
+                .calls("POST", &format!("/v2/baton/{}/renew", workspace.id))
+                .len(),
+            1
+        );
+        assert!(
+            account.calls("POST", "/v2/mirror/credentials").is_empty(),
+            "no checkpoint is installed over the machine's own work"
+        );
+        let generation = state.pro.generation.load(Ordering::Acquire);
+        if refused {
+            assert!(result.is_err());
+            assert_eq!(
+                execution::expire(&state, generation),
+                vec![workspace.id.clone()]
+            );
+            assert!(!crate::pro::may_execute(&state, &workspace.id));
+        } else {
+            result.unwrap();
+            assert!(execution::expire(&state, generation).is_empty());
+            assert!(execution::lease_valid(&state, &workspace.id));
+            assert!(matches!(
+                lock(&state.pro.ownership).get(&workspace.id),
+                Some(Ownership::Local { epoch: 4 })
+            ));
+        }
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[tokio::test]
 async fn the_reconnect_grace_after_a_lapsed_lease_is_a_quiet_wait() {
     let root = temp("grace");

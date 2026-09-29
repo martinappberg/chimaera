@@ -424,7 +424,11 @@ historical recovery context directing the agent to inspect files and external
 state before repeating effects, using existing permissions without a routine
 human-review gate. Timeout alone is never proof that the old OS process stopped.
 
-Lease expiry fences execution only on a cloud worker. A personal computer is
+Lease expiry fences execution only on a cloud worker, and a resumed worker
+renews before fencing: after a suspension (seen as a clock discontinuity) its
+daemon first renews the recorded epoch, which the account grants to a suspended
+owner at the same epoch with no fork; only a refused renewal (or no answer within
+20 seconds) fences. A personal computer is
 fenced only by a verified other owner (an authenticated read naming another
 holder) or its own in-progress transfer: account unreachability, sign-out, a
 lapsed plan, the privacy switch or a daemon restart stop publication, never its

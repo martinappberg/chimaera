@@ -42,8 +42,14 @@ A cloud worker (`execution::worker`: `CHIMAERA_WORKER`, a persisted worker
 marker, or a Worker runtime) stays strict: its execution needs an unexpired
 acquire/renew proof, never a passive GET; a request-start deadline reserves stop
 time; clock divergence closes admission; and the watchdog (started only on
-workers) fences chat/PTY input and owned agent process groups. `lease_valid`
-gates publication and forwarded viewers on every host. Plain shells are never
+workers) fences chat/PTY input and owned agent process groups. Renew before
+fencing: when the watchdog sees the process was frozen (a 100 ms tick taking
+over 3 s, or wall and monotonic time disagreeing by over 1 s) and a deadline
+lapsed across it, it wakes the lease loop, which renews the recorded epoch
+(the account keeps a suspended owner's lease: same epoch, no fork, never an
+acquire/checkpoint install); input stays admitted meanwhile. A refused renewal
+or another verified owner fences at once; no answer within 20 s fences too.
+`lease_valid` gates publication and forwarded viewers on every host. Plain shells are never
 managed: not signalled by fences, not awaited by stops, never evidence. Sessions
 a previous daemon left running wait for this life's lease (`may_restore`); on a
 device `resume_unverified` resumes the restart-deferred ones after one minute
