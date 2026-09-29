@@ -916,6 +916,10 @@ export interface ProStatus {
 
 export interface CloudProvisioningStatus {
   phase?: "keeper" | "worker" | "connecting" | null;
+  /** Whether an agent was connected in the cloud at the last catalog read,
+   * remembered by the app and never probed, so a sleeping cloud is not woken
+   * to answer it. Absent or null when the app has not seen a catalog yet. */
+  agents_connected?: boolean | null;
   state: "no_plan" | "unavailable" | "preparing" | "ready" | "sleeping" | "limited" | "error";
   reason: "provisioning_disabled" | "beta_invite_required" | "hours_exhausted" | "storage_exhausted" | "spend_limit_reached" | "provisioning_failed" | null;
 }

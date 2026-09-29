@@ -9,12 +9,8 @@
   import { isNativeShell, proCloudStatus, proMirrorStatus, writeClipboard, type MirrorStatus, type CloudSetupInfo, type CloudSetupRequest, type CloudProvisioningStatus } from "../net/native";
 
   let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady }: { visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void } = $props();
-  /** Newer shells add `agents_connected`: whether an agent was connected in
-   * the cloud at the last catalog read, remembered by the app and never
-   * probed, so a sleeping cloud is not woken to answer it. */
-  type CloudStatus = CloudProvisioningStatus & { agents_connected?: boolean | null };
   let info = $state<CloudSetupInfo | null>(null);
-  let status = $state<CloudStatus | null>(null);
+  let status = $state<CloudProvisioningStatus | null>(null);
   let busy = $state<string | null>(null);
   let error = $state<string | null>(null);
   let repository = $state("");
@@ -76,7 +72,7 @@
           info = result; connectionChecked = true;
           reachable = result.available === true;
         } else {
-          const result: CloudStatus = await proCloudStatus();
+          const result: CloudProvisioningStatus = await proCloudStatus();
           if (!alive || signal?.aborted || current !== generation) return;
           // Passive status and metadata reads never wake a suspended machine.
           if (result.state === "ready") {
@@ -85,7 +81,7 @@
             reachable = details?.available === true;
             // A machine that just went to sleep answers nothing: ask the
             // account again before counting it as unreachable.
-            const again: CloudStatus | null = reachable ? null : await proCloudStatus().catch(() => null);
+            const again: CloudProvisioningStatus | null = reachable ? null : await proCloudStatus().catch(() => null);
             if (!alive || signal?.aborted || current !== generation) return;
             if (again !== null && again.state !== "ready") { status = again; info = null; connectionChecked = false; unreachable = 0; }
             else { status = result; info = details; connectionChecked = true; unreachable = reachable ? 0 : unreachable + 1; }

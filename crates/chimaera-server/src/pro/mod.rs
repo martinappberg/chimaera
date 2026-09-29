@@ -832,15 +832,10 @@ pub(crate) async fn shutdown(state: &std::sync::Arc<crate::AppState>) {
     }
 }
 
-/// The bounded return report: how many files a return kept in both versions
-/// and which (up to 32, project-relative). `/pro/status` carries it on the
-/// project's mirror row so the Pro page can say "Kept both versions of N files".
-fn return_report(state: &crate::AppState, workspace: &str, kept: (usize, Vec<PathBuf>)) {
-    report_return(state, workspace, kept, &[]);
-}
-/// [`return_report`] with the other machine's diverged branches the return
-/// kept beside the user's (`repository::receive`'s `<branch>@cloud-<commit>`
-/// names), so one notice covers the whole return.
+/// Records what a return kept beside the user's own work: the files kept as
+/// `.mine-…` siblings and the other machine's diverged branches
+/// (`repository::receive`'s `<branch>@cloud-<commit>` names), so one notice
+/// covers the whole return.
 ///
 /// The report replaces the previous return's and is persisted with the rest
 /// of the Pro state (`persist`, which the return runs before it resumes
@@ -1155,7 +1150,7 @@ mod tests {
         .into_iter()
         .map(PathBuf::from)
         .collect();
-        return_report(&old, &workspace.id, (3, kept.clone()));
+        report_return(&old, &workspace.id, (3, kept.clone()), &[]);
         let notices = old.notices.since(head);
         assert_eq!(notices.len(), 1, "one notice per return, not per file");
         let wire = notices[0].to_json(std::time::Instant::now());
@@ -1198,7 +1193,7 @@ mod tests {
 
         // The next return that keeps nothing clears the report, silently.
         let head = old.notices.head();
-        return_report(&old, &workspace.id, (0, Vec::new()));
+        report_return(&old, &workspace.id, (0, Vec::new()), &[]);
         assert!(old.notices.since(head).is_empty());
         persist(&old).await.unwrap();
         let restored = state(&root);

@@ -1519,7 +1519,7 @@ async fn hydrate_scoped(
             )
         })
         .await??;
-        super::return_report(state, workspace, kept);
+        super::report_return(state, workspace, kept, &git_branches);
         if let Some(repair) = super::shadow_cache::prepare(&local_shadow, &cache, cache_guard.clone()).await? {
             let configuration = state.pro.configuration.clone().lock_owned().await;
             let owner = state.clone();
