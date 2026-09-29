@@ -88,8 +88,55 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   send) instead flips the session to its real TUI (the [view switch](#view-switch-rewind-and-branch)),
   where claude's own `/login` runs the native auth flow (OAuth / setup-token / SSO); chimaera
   never touches the credentials. Sign in there, toggle back to chat.
+- **Voice dictation — the mic button.** Every chat composer, Claude or Codex, has a mic beside
+  send (on by default; shown only where the daemon's host can dictate — `GET /api/v1/voice`,
+  asked once per window and again after a login failure). Click it and speak: the words fill the
+  message box at the caret as they're heard — spaced like typed words, settled phrases slightly
+  dimmed and the phrase still forming dimmer, the box growing for a long dictation — and a
+  five-bar waveform beside the stop button shows the mic hears you (a flat row means it hears
+  nothing). Click again and the words turn to ordinary text. Enter stops and sends, Esc restores
+  the draft exactly as it was. **Each phrase corrects itself at the pause after it**: the speech
+  service revises nothing while audio flows — an early wrong guess (the wrong language, a
+  misheard start) stands until its stream is finalized, and only the finalize pass is accurate —
+  so a recording finalizes each phrase at a pause (≥ 0.8 s after ≥ 0.6 s of speech; 0.4 s once a
+  phrase passes 10 s; silence judged against the speaker's own recent loudness) and speaks on
+  into a fresh stream (opened when speech resumes), which also picks its language anew. The corrected phrase lands about a
+  second after you pause, in the settled style. The **Dictate** chord (⌃⇧D on macOS, the Codex app's; unbound
+  elsewhere, where `Mod+d` is Split Right) toggles it from a focused composer only. Right-click
+  the mic to pick the microphone (`chat.voiceMicrophone`, stored by name — device ids are
+  per-origin and a daemon's port changes); a silent recording names the device and says how to
+  switch. While dictating the box is read-only: the textarea keeps the text (its real size,
+  wrapping and scroll) but draws it transparent, and a mirror with the same box and font draws it
+  with the spoken part dimmed. Typing is never taken over: Claude Code's hold-Space push-to-talk is a terminal's answer
+  to having no buttons and stays with the agents' own TUIs. `/voice on|off` shows or hides the
+  mic (`chat.voice`; Claude's `hold`/`tap` read as `on`); `/voice on` also checks the login and
+  asks for the microphone up front. A hidden tab finishes into the draft; an unmounted composer
+  discards. Settings → Chat also holds the dictation language (`chat.voiceLanguage`: the
+  browser's language when the service takes it — the 20 Claude Code dictates — else English).
+  **The audio path:** the window records (an AudioWorklet box-filters to 16 kHz mono PCM16, ~100 ms
+  chunks; the mic is held only while recording) and streams to the daemon's `/ws/voice`, which
+  relays to Claude's speech-to-text service (`wss://api.anthropic.com/api/ws/speech_to_text/voice_stream`,
+  the one Claude Code's `/voice` uses) with the claude.ai login `claude` keeps on the daemon's
+  host — so a daemon on a login node with no microphone still dictates, and the speech crosses
+  the ssh tunnel first. The login is found where claude 2.1.283 looks: `CLAUDE_CODE_OAUTH_TOKEN`,
+  else on macOS the login keychain (`Claude Code-credentials`, read with `security` as claude
+  reads it, so no prompt), else `.credentials.json` in claude's config dir. Chimaera never
+  refreshes it (claude's refresh tokens rotate); an expired login says to send any Claude
+  message, which renews it. A dev build can point the relay at a stand-in
+  (`CHIMAERA_VOICE_STREAM_URL`), which never gets the login. The relay is one
+  socket per recording, first-frame authed, ≤ 4 at once daemon-wide, 10 min per recording, ~30 s
+  of audio buffered while the service connects (one reconnect before any words), KeepAlive every
+  8 s, and after `CloseStream` it waits ≤ 5 s for the last words (1.5 s if nothing comes). It
+  logs one line per recording — length, loudest level, utterance count, never words or login.
+  Keyterms (workspace and cwd names, agent names) bias recognition. It is the daemon's one TLS
+  client (rustls on `ring`, the host's trust roots, `https_proxy` CONNECT), since curl can't carry
+  a two-way stream. The Mac app declares `NSMicrophoneUsageDescription` and the hardened
+  runtime's `audio-input` entitlement; a plain browser needs https or localhost for the mic.
 - **Where.** `Composer.svelte`, `composer.ts`, `ChatView.svelte` (`sendNow`, `onSlash`, `composerCommands`),
   `composerBus.ts` (other surfaces drop references into the draft). Uses `fsValidate`/`fsQuickOpen`.
+  Dictation: `voice.svelte.ts` (the `Dictation` controller, `voiceProblem`), `voiceCapture.ts`,
+  `VoiceMeter.svelte`, `voiceLanguages.ts`; the daemon's `crates/chimaera-server/src/voice/`
+  (`mod.rs` the relay, `upstream.rs` the TLS/proxy connector, `login.rs` the login read).
 
 ## Header controls
 
@@ -536,25 +583,26 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 - **Written this turn.** After a turn's closing prose, the files the turn wrote — created or
   changed, by its edit tools or by **shell commands** (a plot saved by a script, a rendered
   report); never source code (its diff is in the tool card). The block **adds, never repeats**:
-  the prose is the reader's first view of the turn, so a figure it embeds inline
-  (`![](figs/plot.png)`) is not tiled again and a document it links is not chipped again (a name
-  claims the shallowest match, so `notes.md` covers the one at the base, not `docs/notes.md`); a
-  figure the prose only names still shows, because a link is not a picture. The heading says
-  "Written this turn" when the prose named none of it and "Also written" when it named some; a
-  turn whose prose covers everything ends with no block. Two shapes by what a file is *for*: a
-  **visual** (a figure, an HTML report, a PDF, a clip) is something to look at, so it shows as a
-  compact tile; a **document** (markdown, docx/pptx, tables and spreadsheets, notebooks) is
-  something to open, so it shows as one chip on a quiet line — click to open in a pane, rest on
-  it to preview that one file, "+n more" past six; with no tiles the heading sits on the chip
-  line, so a turn costs one line. Two files sharing a name show their folders (against
-  everything the turn wrote, linked in the prose or not). A chip knows
-  its file: gone (struck, not clickable) or changed after this turn (its preview says so), kept
-  current by the disk monitor while on screen. A stopped or failed turn keeps its block. Tiles
-  stay fresh when a file is overwritten, and say so when one is gone.
+  the prose is the reader's first view of the turn, so a file it embeds inline
+  (`![](figs/plot.png)`) or names (a path link, which previews on a rest just as a chip would)
+  is not listed again (a name claims the shallowest match, so `notes.md` covers the one at the
+  base, not `docs/notes.md`). The heading says "Written this turn" when the prose named none of
+  it and "Also written" when it named some; a turn whose prose covers everything ends with no
+  block. **Every file is a chip** on one quiet line after the heading — figures, HTML reports,
+  PDFs and clips as much as markdown, docx/pptx, tables and notebooks — in the order the turn
+  wrote them: click to open in a pane, rest on it to preview that one file (a picture, a PDF
+  page, a document's opening). Nothing draws inline, so a turn that saves twenty plots costs a
+  line or two; figures the agent wants seen it embeds in its prose. Past seven files, six show
+  — one of each kind before a second of any, so the report and the notes beside fourteen panels
+  are never the ones folded — and "+n more" unfolds the rest ("fewer" folds them again). Two
+  files sharing a name show their folders (against everything the turn wrote, linked in the
+  prose or not). A chip knows its file: gone (struck, not clickable) or changed after this turn
+  (its preview says so), kept current by the disk monitor while on screen. A stopped or failed
+  turn keeps its block.
 - **How the gallery finds shell-written files.** No structured event names them, so the reducer
-  lists the artifact-shaped paths the turn's commands and command outputs *mention*, plus figures
-  the prose names without embedding (`artifacts.ts`), and the gallery keeps those the daemon
-  confirms exist and were **modified inside the turn**. A command is scanned whole: an execute
+  lists the artifact-shaped paths the turn's commands and command outputs *mention*
+  (`artifacts.ts`), and the gallery keeps those the daemon confirms exist and were **modified
+  inside the turn**. A command is scanned whole: an execute
   `tool_call` carries its full text in the additive `command` field (8 KiB head+tail), because
   the ~120-char `title` is spent on claude's `cd "…/absolute/path" && …` prefix before any file
   name appears — between its journal-stamped start and end (daemon clock on both sides, a few
@@ -681,6 +729,7 @@ _Captured 2026-09-26 from the maintainer's own words in the session that shipped
 - **Why (maintainer, verbatim):** "'Made this turn · 3 files' — is this really even only when just files have been changed? Should this really be expanded? I know when agents want to show images figures etc. that is good, but just like this? I feel maybe collapsed by default or something, and in a better way." Later: "when the agent links to files here there is a lot of information on what was written that turn? like is that how we want it. Can we think about this so it becomes optimal experience for the user. And also think about the wording. If a file is only changed, is it really made that turn?" And: "can we make the tiles etc. prettier? so that it actually looks nice for the user? Still with our own touch but so that one actually wants to use this app."
 - **Decisions the maintainer took in that session:** ~~no hover-peek on chips ("too cluttered")~~ — retracted 2026-09-28, see below; one heading, not two; chips must know their file's state; same-named files must be told apart; billed CLI runs are fine for verifying this.
 - **What this fixed in the design:** the block now adds what the prose did not already show (an embedded figure is not tiled again, a linked document is not chipped again), the heading is precise ("Written", never "made", for an edited document; "Also written" when the prose showed a share), figures are a strip of captioned tiles, documents one line of chips.
+- **Figures became chips too (2026-09-28, maintainer verbatim):** "'Written this turn' images should also just be hoverable chips I feel! If a turn makes a lot of images that looks terrible. This should be default for all of those." The figure strip is gone: every written file is a chip that previews on a rest, and a figure the prose names (not only one it embeds) is no longer listed again, since its path link previews the same way.
 - _Settled vs. free-to-change, and what must not be "fixed": pending — not yet asked._
 
 ### Document chips and hover previews in chat — why they exist
@@ -880,3 +929,13 @@ _Captured 2026-09-26 (from the maintainer, in-session, PR #174)._
 - **How settled it is (intended vs provisional):** **all provisional** — an addition. The tile sizes, the preview overlay, the short upload names and how the daemon keeps the copies are all free to change if improved.
 - **Keep (the two design goals the maintainer marked):** attachments stay **compact** (they must not take a lot of space in the composer or the transcript), and your attachments keep reading **like the agent's files** (the figure-strip language of the turn-end block). These are goals, not a locked implementation: any look that meets them is fine.
 - **Deliberately open:** nothing further stated.
+
+### Voice dictation (`/voice`) — why it exists
+_Captured 2026-09-28 from the maintainer's own words in the session that built it; the settled/open questions are still pending._
+
+- **Problem it solves (verbatim):** "We need Chimera voice mode in all the agents. The slash voice. Uh, it should work for both Codex and Claude."
+- **Choices the maintainer made:** dictation for both agents (not a spoken conversation), on **Claude's dictation service** rather than the browser's built-in speech recognition — and approved chimaera reading the claude.ai login for it ("I appove the token use").
+- **The mic button is the chat's voice mode (verbatim):** "I think we should have only the icon be the voice mode (in chat UI) while in the terminal it could be different" — after hold-Space pushed a stray space into the message ("when you press space (but hold it) in the chat box, also one 'space' is sent"). And on whether it needs turning on: "should the voice not always be on or do we have to explictly turn it on by voice ?" — so it is on by default.
+- **Quality bar (verbatim):** "Make sure UI / UX for this is GREAT too. We don't want it to be a poor experience (and too verbose etc.)"
+- **Codex (verbatim):** "I think for Codex though, are you sure there is no voice mode ? like what if you open from the terminal ? If not then it should be excluded". Codex's own `/voice` is a spoken realtime conversation, not dictation; dictation is offered in Codex chats because the words only become composer text — whether to hide it there is pending.
+- **How settled it is / what must not change:** _pending_.

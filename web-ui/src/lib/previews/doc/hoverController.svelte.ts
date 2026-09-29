@@ -595,7 +595,7 @@ export class HoverPreviews {
   private drawCard(state: PreviewState, a: TargetInfo, fragment: string | null, cleanups: (() => void)[]): void {
     const slot = document.createElement("div");
     slot.className = "hp-card";
-    // A gallery tile's body: a fixed, shorter frame (a PDF page, a picture,
+    // The compact body: a fixed, shorter frame (a PDF page, a picture,
     // a table's first rows) — a hover is a glance.
     const card: EmbedHandle = mountEmbed(slot, { path: a.path, info: a, fragment, alt: "", compact: true });
     cleanups.push(() => card.destroy());

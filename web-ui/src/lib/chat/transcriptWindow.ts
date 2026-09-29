@@ -170,6 +170,24 @@ export function pageLater(current: TranscriptWindow, total: number): PagePlan {
 }
 
 /**
+ * A page's settled range, widened so it keeps every row in `reach` (the
+ * mounted rows near the reader — `readingAnchor.ts` `rowsInReach`). The cap
+ * counts blocks, but a settled activity fold is one short line however many
+ * tool calls it holds, so 192 blocks of an agent's tool-heavy history can be
+ * only a few screens tall. Discarding by count alone then unmounts the row
+ * being read, or pulls the discarded edge within reach — whose sentinel
+ * pages it straight back in, re-rendering a page (and reloading its
+ * previews) every frame of a fling. Never wider than the expanded range.
+ */
+export function keepInReach(plan: PagePlan, reach: TranscriptWindow | null): TranscriptWindow {
+  if (reach === null) return plan.settled;
+  return {
+    start: Math.max(plan.expanded.start, Math.min(plan.settled.start, reach.start)),
+    end: Math.min(plan.expanded.end, Math.max(plan.settled.end, reach.end)),
+  };
+}
+
+/**
  * How far ahead of the viewport, in viewport heights, the next page mounts
  * while the reader scrolls through history — far enough that a fling never
  * reaches the rendered edge (and stops dead against it) before the page exists.
@@ -232,9 +250,16 @@ export function pageAround(index: number, total: number): TranscriptWindow {
 
 /** Whether an idle moment should re-size the spacer: blank space left above
  *  a fully mounted history, rows pulled past the scroll origin, or an
- *  estimate that has drifted far enough to starve (or bloat) the next page. */
+ *  estimate that has drifted far enough to starve (or bloat) the next page.
+ *  Every re-size moves the scrollbar thumb, and an estimate is only ever
+ *  roughly right, so smaller drifts wait (the blank an overestimate leaves
+ *  above the first message is taken as the reader reaches it — ChatView
+ *  `holdTopEdge`). */
 export function spacerNeedsRebalance(current: number, target: number): boolean {
   if (current < 0) return true;
   if (target <= 0) return current > 0;
+  // An empty spacer under a real target starves the next page (it drives
+  // the spacer negative, rows past the scroll origin) however small.
+  if (current > 0 && Math.abs(current - target) < 200) return false;
   return current < target * 0.75 || current > target * 1.5;
 }

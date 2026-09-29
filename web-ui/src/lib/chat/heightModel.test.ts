@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { blockWeight, HistoryWeights } from "./heightModel";
+import { blockWeight, HistoryWeights, tailWeights } from "./heightModel";
 import type { ChatBlock } from "./store.svelte";
 
 const message = (text: string, uid = 1): ChatBlock =>
   ({ uid, kind: "message", text, turnId: "t", sentAtMs: 0, forkSeq: 0, nativeTurnComplete: false }) as ChatBlock;
 const tool = (uid = 1): ChatBlock =>
   ({ uid, kind: "tool", id: `t${uid}`, tool: "Bash", title: "", locations: [], status: "completed", content: null, denied: false, allowed: false, streaming: false, crossTurn: false, summary: null, command: null }) as ChatBlock;
-const turnEnd = (artifacts: string[]): ChatBlock =>
-  ({ uid: 9, kind: "turn_end", costUsd: null, outputTokens: 0, durationMs: 0, artifacts }) as ChatBlock;
+const turnEnd = (artifacts: string[], mentioned: string[] = []): ChatBlock =>
+  ({ uid: 9, kind: "turn_end", costUsd: null, outputTokens: 0, durationMs: 0, artifacts, mentioned }) as ChatBlock;
 
 describe("block height model", () => {
   it("weighs prose by wrapped length and hard breaks", () => {
@@ -18,17 +18,64 @@ describe("block height model", () => {
     );
   });
 
+  it("counts prose as rendered, without link targets or markup", () => {
+    const path = "/home/user/projects/example/results/2026-01/summaries/NAMES.md";
+    expect(blockWeight(message(`See **[NAMES.md](${path})** for \`names\`.`), null, 100)).toBe(
+      blockWeight(message("See NAMES.md for names."), null, 100),
+    );
+  });
+
+  it("weighs inline embeds as the cards they render", () => {
+    const base = blockWeight(message("Here."), null, 100);
+    expect(blockWeight(message("Here.\n\n![UMAP](figs/umap.png)"), null, 100) - base).toBeCloseTo(18 + 1, 0);
+    expect(blockWeight(message("Here.\n\n![p2](paper.pdf#page=2)"), null, 100) - base).toBeCloseTo(26 + 1, 0);
+    // A document embeds as an inline chip.
+    expect(blockWeight(message("Here.\n\n![notes](docs/notes.md)"), null, 100) - base).toBeLessThanOrEqual(1);
+  });
+
   it("puts a run of tool calls on one line and a bare turn end on none", () => {
     expect(blockWeight(tool(), null, 100)).toBe(1);
     expect(blockWeight(tool(2), tool(1), 100)).toBe(0);
     expect(blockWeight(turnEnd([]), null, 100)).toBe(0);
-    expect(blockWeight(turnEnd(["/a.png"]), null, 100)).toBe(12);
+    expect(blockWeight(turnEnd(["/a.png"]), null, 100)).toBe(2);
+    expect(blockWeight(turnEnd([], ["figs/a.png"]), null, 100)).toBe(1);
+  });
+
+  it("puts a run of thoughts and tool calls on the one line its fold renders", () => {
+    const thought = (uid = 7): ChatBlock => ({ uid, kind: "thought", text: "x".repeat(400) }) as ChatBlock;
+    expect(blockWeight(thought(), message("hi"), 100)).toBe(1);
+    expect(blockWeight(thought(), tool(), 100)).toBe(0);
+    expect(blockWeight(tool(), thought(), 100)).toBe(0);
+    // The live turn's trailing run is not folded yet.
+    expect(blockWeight(thought(), tool(), 100, false)).toBe(1);
+    expect(blockWeight(tool(), thought(), 100, false)).toBe(1);
+    expect(blockWeight(tool(2), tool(1), 100, false)).toBe(0);
   });
 
   it("adds a picture row to a user message with saved images", () => {
     const user = (attachmentPaths: string[]): ChatBlock =>
       ({ uid: 5, kind: "user", text: "look", attachments: attachmentPaths.length, attachmentPaths, checkpoint: null, id: null, origin: null, forkSeq: 0 }) as ChatBlock;
     expect(blockWeight(user(["/u/image-1.png"]), null, 100) - blockWeight(user([]), null, 100)).toBe(5.5);
+  });
+});
+
+describe("tail weights", () => {
+  const blocks = [message("x".repeat(100), 1), tool(2), tool(3), message("x".repeat(300), 4)];
+
+  it("sums the stretch from a block to the end and maps a weight back", () => {
+    const tail = tailWeights(blocks, 1, 100);
+    expect(tail.total).toBe(1 + 0 + 4);
+    expect(tail.at(0)).toBe(1);
+    expect(tail.at(1)).toBe(3);
+    expect(tail.at(1e9)).toBe(3);
+    expect(tailWeights(blocks, 4, 100).total).toBe(0);
+  });
+
+  it("re-weighs a block that grew since the last ask", () => {
+    const live = [message("x".repeat(100), 1), message("short", 2)];
+    const before = tailWeights(live, 1, 100).total;
+    live[1] = message("x".repeat(1000), 2);
+    expect(tailWeights(live, 1, 100).total).toBeGreaterThan(before + 5);
   });
 });
 

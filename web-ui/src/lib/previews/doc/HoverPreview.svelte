@@ -139,7 +139,7 @@
     overflow: hidden;
   }
 
-  /* The gallery tile's height (chat's ArtifactGallery). */
+  /* A glance's height: a picture, a PDF page, a table's first rows. */
   .card .hp-content :global(.hp-card) {
     height: 252px;
   }

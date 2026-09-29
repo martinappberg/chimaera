@@ -8,7 +8,7 @@ use crate::AppState;
 use crate::{
     agent_probe, agents, api, chat, compute, compute_jobs, download, drafts, environment, fs, git,
     launcher, links, mcp, notebook, notices, plugins, proxy, quickopen, recents, runtimes,
-    settings, timeline, update, upload, view_state, ws,
+    settings, timeline, update, upload, view_state, voice, ws,
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
@@ -134,6 +134,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/agents/claude/sessions", get(launcher::claude_resumables))
         .route("/recents", get(recents::list_recents))
         .route("/update", get(update::get_update))
+        .route("/voice", get(voice::availability))
         // The native shell's notice long-poll (agent finished / needs you).
         .route("/notices", get(notices::get_notices))
         .route(
@@ -239,6 +240,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/ws/sessions/{id}", get(ws::session_ws))
         .route("/ws/chat/{id}", get(ws::chat_ws))
         .route("/ws/events", get(ws::events_ws))
+        .route("/ws/voice", get(voice::voice_ws))
         .route("/raw/{ticket}", get(fs::raw))
         // An HTML report's relative assets, confined to its folder.
         .route("/raw/{ticket}/{*rest}", get(fs::raw_asset))

@@ -195,7 +195,9 @@
         fragment,
         alt,
         width,
-        ...(resolver !== undefined ? { resolve: () => resolver.resolve(target) } : {}),
+        ...(resolver !== undefined
+          ? { info: resolver.peek(target), resolve: () => resolver.resolve(target) }
+          : {}),
         ...(onOpenPath !== undefined
           ? { onOpen: (p, kind, reveal) => onOpenPath(p, kind, reveal !== undefined ? { reveal } : {}) }
           : {}),

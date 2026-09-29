@@ -74,6 +74,7 @@
   import {
     advanceTailWindow,
     autoPageEarlier,
+    keepInReach,
     pageAround,
     pageEarlier,
     pageLater,
@@ -87,9 +88,11 @@
     trimShift,
     type PagePlan,
   } from "./transcriptWindow";
-  import { measureShift, selectAnchor, type ReadingAnchor } from "./readingAnchor";
-  import { blockWeight, HistoryWeights } from "./heightModel";
-  import { activeTheme, getSetting } from "../settings/store.svelte";
+  import { measureShift, rowsInReach, selectAnchor, type ReadingAnchor } from "./readingAnchor";
+  import { blockWeight, HistoryWeights, tailWeights } from "./heightModel";
+  import { activeTheme, getSetting, setSetting } from "../settings/store.svelte";
+  import { hostCanDictate, voiceProblem } from "./voice.svelte";
+  import { keyHint } from "../shared/keybindings";
 
   interface Props {
     session: Session;
@@ -138,6 +141,7 @@
     if (followFrame !== null) cancelAnimationFrame(followFrame);
     if (prefetchFrame !== null) cancelAnimationFrame(prefetchFrame);
     if (idleTimer !== null) clearTimeout(idleTimer);
+    if (idleFrame !== null) cancelAnimationFrame(idleFrame);
   });
   onDestroy(() => prosePaths.dispose());
   onDestroy(() => proseEmbeds.dispose());
@@ -170,6 +174,7 @@
   let transcriptEl = $state<HTMLElement | null>(null);
   let columnEl = $state<HTMLElement | null>(null);
   let spacerEl = $state<HTMLElement | null>(null);
+  let laterSpacerEl = $state<HTMLElement | null>(null);
   let historySentinelEl = $state<HTMLElement | null>(null);
   let laterSentinelEl = $state<HTMLElement | null>(null);
   const canAutoLoadHistory = typeof IntersectionObserver !== "undefined";
@@ -262,6 +267,7 @@
     const safeStart = Math.max(0, Math.min(start, safeEnd));
     renderStart = safeStart;
     renderEnd = safeEnd;
+    if (safeEnd >= total) setLater(0, true);
     const source = store.blocks.slice(safeStart, safeEnd);
     renderBlocks = options.live ? source : $state.snapshot(source);
     rendersLive = options.live;
@@ -341,6 +347,7 @@
   let lastScrollTop = 0;
   let scrollDirection: -1 | 1 = -1;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  let idleFrame: number | null = null;
   let prefetchFrame: number | null = null;
   /** No scroll event for this long means no gesture or momentum is in flight. */
   const SCROLL_IDLE_MS = 160;
@@ -350,6 +357,52 @@
     if (spacerEl === null) return;
     spacerEl.style.height = `${Math.max(0, spacerPx)}px`;
     spacerEl.style.marginBottom = `${Math.min(0, spacerPx)}px`;
+  }
+
+  /** The history spacer's twin below the window: room for the unmounted
+   *  LATER rows of a reader paging through history. Without it the scroll
+   *  height swung by a page at every write (the scrollbar thumb resized and
+   *  jumped against the reader's direction) and the track's bottom meant
+   *  "the rendered end", not the conversation's. Everything it changes is
+   *  below the reader, so it is resized freely — never below the viewport's
+   *  bottom, where shrinking would clamp scrollTop. Zero at the live edge,
+   *  unconditionally (`force`): room past the newest row would break
+   *  following, and a reader looking into it belongs at the end anyway. */
+  let laterPx = 0;
+
+  function setLater(px: number, force = false): void {
+    const el = transcriptEl;
+    let next = Math.max(0, Math.round(px));
+    if (next === laterPx) return;
+    if (el !== null && next < laterPx && !force) {
+      const room = el.scrollHeight - el.scrollTop - el.clientHeight;
+      next = Math.max(next, laterPx - Math.max(0, room));
+    }
+    laterPx = next;
+    if (laterSpacerEl !== null) laterSpacerEl.style.height = `${laterPx}px`;
+  }
+
+  /** After a range write, give the later spacer whatever the scroll height
+   *  changed by since `before`: the reader's rows are held by the history
+   *  spacer, so the change is below them, and the thumb then moves only when
+   *  the reader scrolls. A window that reaches the live edge has nothing
+   *  unmounted below it. */
+  function settleLater(before: number): void {
+    const el = transcriptEl;
+    if (el === null) return;
+    if (renderEnd >= store.blocks.length) setLater(0, true);
+    // Never below the model of what is still unmounted: a running total
+    // that undershot (figures weigh more than their estimate) ran out with
+    // pages to go, the reader met the scroll range's end early, and the last
+    // page then moved the end — and the thumb — thousands of px away.
+    else setLater(Math.max(laterPx - (el.scrollHeight - before), laterTarget()));
+  }
+
+  /** The later spacer's modelled size: the unmounted rows after the window
+   *  at the mounted window's px per unit. */
+  function laterTarget(): number {
+    if (renderEnd >= store.blocks.length) return 0;
+    return spacerTarget(tailWeights(store.blocks, renderEnd, charsPerLine()).total, historyPxPerWeight());
   }
 
   /** Persist the reading position relative to the rendered rows — the spacer
@@ -367,17 +420,19 @@
 
   /** Give back any shift of the anchored row through the spacer — never a
    *  scroll write, which a gesture in flight would snap back. */
-  function holdReadingAnchor(): void {
+  function holdReadingAnchor(): number {
     const el = transcriptEl;
     const column = columnEl;
-    if (el === null || column === null || readingAnchor === null) return;
+    if (el === null || column === null || readingAnchor === null) return 0;
     const measured = measureShift(readingAnchor, column);
     if (measured === null) {
       pinReadingAnchor();
-      return;
+      return 0;
     }
     readingAnchor = measured.anchor;
-    if (Math.abs(measured.shift) >= 1) setSpacer(spacerPx - measured.shift);
+    if (Math.abs(measured.shift) < 1) return 0;
+    setSpacer(spacerPx - measured.shift);
+    return measured.shift;
   }
 
   /** Modelled weight of the unmounted history (heightModel.ts), and the px
@@ -413,12 +468,47 @@
     // Bounded by the live array: a reset or tail splice can shrink it before
     // the windowing effect repairs renderEnd.
     const end = Math.min(renderEnd, store.blocks.length);
+    // Activity after the window's last reply is the unfolded trailing run.
+    let settledEnd = end;
+    while (settledEnd > renderStart) {
+      const kind = store.blocks[settledEnd - 1].kind;
+      if (kind === "message" || kind === "finished") break;
+      settledEnd--;
+    }
     for (let i = renderStart; i < end; i++) {
-      weight += blockWeight(store.blocks[i], i > 0 ? store.blocks[i - 1] : null, cpl);
+      const previous = i > 0 ? store.blocks[i - 1] : null;
+      weight += blockWeight(store.blocks[i], previous, cpl, i < settledEnd);
     }
     if (first === null || last === null || weight <= 0) return nominal;
     const measured = (last.offsetTop + last.offsetHeight - first.offsetTop) / weight;
     return Math.min(nominal * 2.5, Math.max(nominal * 0.4, measured));
+  }
+
+  /** What the history pages mounted above the reader really measured (the
+   *  anchor shift each one caused) against what the model weighed them at:
+   *  a steadier scale for the rest of the history than the one window on
+   *  screen, which the live tail skews (its turn is unfolded, its cards
+   *  large). Keyed like the weights, so a trim, reset or reflow restarts it. */
+  let paged = { key: "", px: 0, weight: 0 };
+
+  function pagedKey(): string {
+    return `${historyGeneration()}|${Math.round(charsPerLine())}`;
+  }
+
+  function notePagedHeight(weight: number, px: number): void {
+    const key = pagedKey();
+    if (paged.key !== key) paged = { key, px: 0, weight: 0 };
+    if (weight <= 0 || px <= 0) return;
+    paged.px += px;
+    paged.weight += weight;
+  }
+
+  /** Px per model unit for the unmounted history: the paged measurements
+   *  once there are a few screens of them, else the mounted window. */
+  function historyPxPerWeight(): number {
+    const nominal = chatFontSize * chatLineHeight;
+    if (paged.key !== pagedKey() || paged.weight < 60) return windowPxPerWeight();
+    return Math.min(nominal * 2.5, Math.max(nominal * 0.4, paged.px / paged.weight));
   }
 
   /** The window start + history generation the spacer was last sized for;
@@ -436,6 +526,12 @@
     const sizedFor = `${renderStart}|${historyGeneration()}`;
     if (onlyIfMoved && sizedFor === spacerSizedFor) return;
     spacerSizedFor = sizedFor;
+    // The follow writer runs at the live edge, where the later spacer is
+    // already gone; only an idle or restore pass re-models it.
+    if (!onlyIfMoved) {
+      const later = laterTarget();
+      if (spacerNeedsRebalance(laterPx, later)) setLater(later);
+    }
     // A followed tail shorter than the viewport is still filling from the
     // sentinel; blank space above it would only push the rows down. A short
     // history page keeps its room, or the next page could not be absorbed.
@@ -444,23 +540,36 @@
         ? 0
         : spacerTarget(
             historyWeights.upTo(store.blocks, renderStart, charsPerLine(), historyGeneration()),
-            windowPxPerWeight(),
+            historyPxPerWeight(),
           );
     if (!spacerNeedsRebalance(spacerPx, target)) return;
+    // Read the offset BEFORE the spacer changes: shrinking it can leave the
+    // old offset past the new maximum, the engine clamps it, and a relative
+    // `+=` would then apply the shift on top of the clamp (a reader deep in
+    // a short window was thrown thousands of px).
+    const top = el.scrollTop;
     const delta = target - spacerPx;
     setSpacer(target);
-    el.scrollTop += delta;
+    el.scrollTop = top + delta;
     lastScrollTop = el.scrollTop;
   }
 
   function scheduleScrollIdle(): void {
     if (idleTimer !== null) clearTimeout(idleTimer);
+    if (idleFrame !== null) cancelAnimationFrame(idleFrame);
+    idleFrame = null;
     idleTimer = setTimeout(() => {
       idleTimer = null;
-      if (!visible || pagingTranscript || store.hydrating) return;
-      rebalanceSpacer();
-      if (!atBottom) pinReadingAnchor();
-      saveReadingPosition(atBottom);
+      // After a long task this timer can run ahead of the scroll events
+      // queued behind it, mid-fling: one rendering update delivers them
+      // first, and any of them re-arms the wait instead.
+      idleFrame = requestAnimationFrame(() => {
+        idleFrame = null;
+        if (!visible || pagingTranscript || store.hydrating) return;
+        rebalanceSpacer();
+        if (!atBottom) pinReadingAnchor();
+        saveReadingPosition(atBottom);
+      });
     }, SCROLL_IDLE_MS);
   }
 
@@ -468,7 +577,9 @@
     if (visible) return;
     untrack(() => {
       if (idleTimer !== null) clearTimeout(idleTimer);
+      if (idleFrame !== null) cancelAnimationFrame(idleFrame);
       idleTimer = null;
+      idleFrame = null;
     });
   });
 
@@ -479,6 +590,7 @@
     if (!store.hydrating) return;
     untrack(() => {
       setSpacer(0);
+      setLater(0, true);
       spacerSizedFor = "";
       readingAnchor = null;
     });
@@ -504,32 +616,65 @@
     else if (next === "later") revealLater();
   }
 
+  /** The mounted rows a page write must keep: those within one viewport past
+   *  the prefetch reach, so a direction change can't page straight back
+   *  either (transcriptWindow.ts `keepInReach`). */
+  function rowsNearReader(): { start: number; end: number } | null {
+    const el = transcriptEl;
+    const column = columnEl;
+    if (el === null || column === null) return null;
+    return rowsInReach(el, column, el.clientHeight * (PREFETCH_VIEWPORTS + 1));
+  }
+
   /** The viewport landed deep inside the spacer (a scrollbar drag): mount the
    *  page the modelled history puts there instead of paging toward it. The
    *  reader sees only blank space, so moving the spacer to put that page
    *  under them moves nothing they could be reading. */
   function farJump(el: HTMLElement, view: DOMRect, rows: DOMRect): boolean {
-    if (renderStart === 0 || spacerPx <= 0) return false;
-    if (rows.top - view.bottom < el.clientHeight * PREFETCH_VIEWPORTS) return false;
-    const earlier = historyWeights.upTo(
-      store.blocks,
-      renderStart,
-      charsPerLine(),
-      historyGeneration(),
-    );
-    // Map by the spacer's own proportion, not the model's px scale: it has
-    // absorbed real page heights since it was sized, and its two ends must
-    // still mean block 0 and the window's first block.
-    const spacerTop = rows.top - spacerPx;
-    const fraction = Math.min(1, Math.max(0, (view.top - spacerTop) / spacerPx));
-    const index = Math.min(renderStart - 1, historyWeights.indexAt(fraction * earlier));
-    const page = pageAround(index, store.blocks.length);
+    const reach = el.clientHeight * PREFETCH_VIEWPORTS;
+    const total = store.blocks.length;
+    let index: number;
+    /** A drag to the very end of the track means the conversation's end —
+     *  not the last page's first rows at the viewport's top, which left a
+     *  figure-heavy tail screens short of the bottom. */
+    let toEnd = false;
+    if (renderStart > 0 && spacerPx > 0 && rows.top - view.bottom >= reach) {
+      const earlier = historyWeights.upTo(store.blocks, renderStart, charsPerLine(), historyGeneration());
+      // Map by the spacer's own proportion, not the model's px scale: it has
+      // absorbed real page heights since it was sized, and its two ends must
+      // still mean block 0 and the window's first block.
+      const spacerTop = rows.top - spacerPx;
+      const fraction = Math.min(1, Math.max(0, (view.top - spacerTop) / spacerPx));
+      index = Math.min(renderStart - 1, historyWeights.indexAt(fraction * earlier));
+    } else if (renderEnd < total && laterPx > 0 && view.top - rows.bottom >= reach) {
+      // The same below: the later spacer's ends mean the window's end and
+      // the live edge.
+      const later = tailWeights(store.blocks, renderEnd, charsPerLine());
+      const fraction = Math.min(1, Math.max(0, (view.top - rows.bottom) / laterPx));
+      index = Math.min(total - 1, later.at(fraction * later.total));
+      toEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 2;
+    } else {
+      return false;
+    }
+    const height = el.scrollHeight;
     pagingTranscript = true;
-    setRange(page.start, page.end, { live: false, tail: false });
+    if (toEnd) {
+      setTail();
+    } else {
+      const page = pageAround(index, total);
+      setRange(page.start, page.end, { live: false, tail: false });
+    }
     void tick().then(() => {
       const column = columnEl;
       const current = transcriptEl;
-      if (column !== null && current !== null) {
+      if (column !== null && current !== null && toEnd) {
+        // The end on the viewport's bottom, by the space above it (no scroll
+        // write under a dragged thumb); the reader is following again.
+        settleLater(height);
+        setSpacer(spacerPx + current.scrollTop + current.clientHeight - current.scrollHeight);
+        atBottom = true;
+        markFollowed();
+      } else if (column !== null && current !== null) {
         const row = Array.from(column.children).find((child) => {
           const start = Number(child.getAttribute("data-block-index"));
           const end = Number(child.getAttribute("data-block-end") ?? start);
@@ -539,6 +684,7 @@
           const offset = row.getBoundingClientRect().top - current.getBoundingClientRect().top;
           setSpacer(spacerPx - offset);
         }
+        settleLater(height);
       }
       pinReadingAnchor();
       afterPaging();
@@ -546,15 +692,28 @@
     return true;
   }
 
+  /** The latest setRangeAnchored height hold; only it releases the column. */
+  let columnHeightHold = 0;
+
   /** Replace a range while keeping the row under the reader where it is. */
   function setRangeAnchored(
     start: number,
     end: number,
     options: { live: boolean; tail: boolean },
+    onHeld?: (shift: number) => void,
   ): void {
     // Settle any shift still pending, then pin the row at the viewport.
     holdReadingAnchor();
     pinReadingAnchor();
+    // Rows discarded above the reader shorten the content until the hold
+    // grows the spacer back, and the hold's own measuring is a layout: WebKit
+    // clamps scrollTop at any layout where the content is momentarily too
+    // short, and mid-gesture that clamp fights its scrolling thread for a few
+    // frames. The column keeps its height until the hold has run.
+    const column = columnEl;
+    const hold = ++columnHeightHold;
+    if (column !== null) column.style.minHeight = `${column.offsetHeight}px`;
+    const height = transcriptEl?.scrollHeight ?? 0;
     setRange(start, end, options);
     const revision = anchorRevision;
     anchorSettled = false;
@@ -562,10 +721,15 @@
       // A cancelled hold (a freeze bumped the revision before this ran)
       // leaves anchorSettled false, so the next activation reconciles instead
       // of early-outing on an unabsorbed shift.
-      if (revision !== anchorRevision) return;
-      holdReadingAnchor();
-      anchorSettled = true;
-      saveReadingPosition(false);
+      const current = revision === anchorRevision;
+      const shift = current ? holdReadingAnchor() : 0;
+      if (column !== null && hold === columnHeightHold) column.style.minHeight = "";
+      if (current) {
+        onHeld?.(shift);
+        settleLater(height);
+        anchorSettled = true;
+        saveReadingPosition(false);
+      }
     });
   }
 
@@ -784,13 +948,24 @@
   function noteScrollIntent(): void {
     scrollIntentAt = performance.now();
   }
+  /** A decelerating fling keeps sending momentum wheel events after its
+   *  per-frame move rounds to nothing, so scroll events stop while WebKit's
+   *  scrolling thread still owns the position — an idle rebalance's scroll
+   *  write then was snapped back, landing the reader thousands of px away in
+   *  a spacer. Wheel input keeps a pending idle waiting until it stops. */
+  function onWheel(): void {
+    noteScrollIntent();
+    if (idleTimer !== null || idleFrame !== null) scheduleScrollIdle();
+    // Pushing against the top produces wheel input but no scroll event.
+    if (!atBottom) holdTopEdge();
+  }
   // Passive by hand: Svelte attaches `onwheel` non-passive, which would pull
   // WebKit's wheel scrolling off its scrolling thread.
   $effect(() => {
     const el = transcriptEl;
     if (el === null) return;
-    el.addEventListener("wheel", noteScrollIntent, { passive: true });
-    return () => el.removeEventListener("wheel", noteScrollIntent);
+    el.addEventListener("wheel", onWheel, { passive: true });
+    return () => el.removeEventListener("wheel", onWheel);
   });
 
   function onScroll() {
@@ -831,6 +1006,7 @@
       // reader) is absorbed before the anchor moves to the new top row.
       holdReadingAnchor();
       pinReadingAnchor();
+      holdTopEdge();
       maybePrefetch();
     }
     // Persist into the pool so the next remount restores this position.
@@ -885,16 +1061,51 @@
       queueBottomScroll();
     } else {
       atBottom = false;
+      const settled = keepInReach(plan, rowsNearReader());
       // Prepending to a window that still ends at the live edge is scrolling
       // within the tail, not paging away from it: keep it live until the cap
       // drops the newest page (then it is an explicit history page).
-      const keepsTail = tracksTail && plan.settled.end >= store.blocks.length;
-      setRangeAnchored(plan.settled.start, plan.settled.end, {
-        live: keepsTail,
-        tail: keepsTail,
-      });
+      const keepsTail = tracksTail && settled.end >= store.blocks.length;
+      const cpl = charsPerLine();
+      const generation = historyGeneration();
+      const weight =
+        historyWeights.upTo(store.blocks, renderStart, cpl, generation) -
+        historyWeights.upTo(store.blocks, settled.start, cpl, generation);
+      setRangeAnchored(
+        settled.start,
+        settled.end,
+        { live: keepsTail, tail: keepsTail },
+        (shift) => notePagedHeight(weight, shift),
+      );
     }
     void tick().then(afterPaging);
+  }
+
+  /** Once the window holds the first row, whatever the spacer still holds
+   *  is the estimate's leftover: blank above the first message. It shrinks as
+   *  fast as the reader scrolls into it, so the first message stops at the
+   *  viewport's top like any document's start instead of sliding down into
+   *  screens of nothing (only an idle rebalance used to remove it, and a
+   *  reader who never paused dragged straight into it). Only the space above
+   *  them changes — never the scroll offset — so this is safe mid-gesture. A
+   *  negative spacer (rows pulled past the scroll origin) is given back once
+   *  the reader is pushing against the top. */
+  function holdTopEdge(): void {
+    const el = transcriptEl;
+    const column = columnEl;
+    if (el === null || column === null || renderStart !== 0 || spacerPx === 0) return;
+    const top = el.scrollTop;
+    if (spacerPx < 0) {
+      if (top > 0) return;
+      setSpacer(0);
+    } else {
+      const columnTop = column.getBoundingClientRect().top - el.getBoundingClientRect().top + top;
+      const blankFrom = columnTop - spacerPx;
+      const keep = Math.max(0, top - blankFrom);
+      if (keep >= spacerPx) return;
+      setSpacer(keep);
+    }
+    pinReadingAnchor();
   }
 
   /** A page landed: keep going while the reader is still within reach of an
@@ -902,6 +1113,7 @@
    *  spacer settle once scrolling stops. */
   function afterPaging(): void {
     pagingTranscript = false;
+    holdTopEdge();
     // One page per frame: a chain of microtask pages would render the whole
     // run in one blocking task.
     if (prefetchFrame === null) {
@@ -932,8 +1144,9 @@
     }
     pagingTranscript = true;
     const plan = pageLater({ start: renderStart, end: renderEnd }, total);
-    const reachesTail = plan.settled.end >= total;
-    setRangeAnchored(plan.settled.start, plan.settled.end, {
+    const settled = keepInReach(plan, rowsNearReader());
+    const reachesTail = settled.end >= total;
+    setRangeAnchored(settled.start, settled.end, {
       live: reachesTail,
       tail: reachesTail,
     });
@@ -1264,6 +1477,26 @@
   function onSlash(name: string, args = ""): boolean {
     const arg = args.trim().toLowerCase();
     switch (name) {
+      case "voice": {
+        // Chimaera's /voice shows or hides the composer's mic — the chat's
+        // voice mode, the same for every agent, dictated through Claude's
+        // speech service. Claude Code's own modes (hold / tap — push-to-talk
+        // on Space) are a terminal's; here they just mean "on".
+        const on = arg === "on" || arg === "hold" || arg === "tap";
+        if (arg !== "" && !on && arg !== "off") {
+          store.notice(`Unknown option “${args.trim()}” — use on or off.`, "info");
+          return true;
+        }
+        // Bare /voice turns it off only when the mic is actually there: where
+        // it's hidden (no login on this host), /voice says why instead.
+        if (arg === "off" || (arg === "" && getSetting("chat.voice") && hostCanDictate())) {
+          setSetting("chat.voice", false);
+          store.notice("Voice dictation off.", "info");
+          return true;
+        }
+        void enableVoice();
+        return true;
+      }
       case "rename": {
         // The agent CLIs can't rename their own thread from here (claude
         // punts, codex has no such command) — but chimaera owns the session
@@ -1377,6 +1610,30 @@
         return false;
     }
   }
+
+  /** Turn dictation on — after the checks /voice makes in Claude Code: a
+   *  login the speech service takes (on the daemon's host) and a microphone
+   *  this window may use (its permission prompt comes now, not mid-word). */
+  async function enableVoice() {
+    const problem = await voiceProblem();
+    if (problem !== null) {
+      store.notice(problem, "error");
+      return;
+    }
+    setSetting("chat.voice", true);
+    const chord = keyHint("dictate");
+    store.notice(`Voice dictation on — click the mic${chord ? ` or press ${chord}` : ""} to talk.`, "info");
+  }
+
+  /** Words dictation should favor: where this chat works, and who it's with. */
+  const voiceTerms = $derived.by(() => {
+    const ctx = linkContext();
+    const base = (p: string | null | undefined) =>
+      p ? (p.replace(/\/+$/, "").split("/").pop() ?? "") : "";
+    return ["Chimaera", "Claude", "Codex", base(ctx.root), base(ctx.cwd)].filter(
+      (t) => t.length > 0,
+    );
+  });
 
   function setUltracode(enabled: boolean): boolean {
     return sendCommand({ type: "set_ultracode", enabled }, "ultracode change not sent");
@@ -1544,6 +1801,14 @@
       });
     }
     native.push({ name: "usage", description: "plan usage limits — chimaera panel" });
+    native.push({
+      name: "voice",
+      description: "voice dictation: show or hide the mic (on/off) — Claude's speech service",
+      options: [
+        { value: "on", label: "on", description: "the mic button dictates into the message" },
+        { value: "off", label: "off", description: "hide the mic" },
+      ],
+    });
     if (agentKind === "claude" && store.remoteControlAvailable) {
       native.push({
         name: "remote-control",
@@ -2465,7 +2730,7 @@
       {:else if item.block.kind === "turn_end"}
         {@const block = item.block}
         <div class="source-block" data-block-index={item.index} data-block-uid={item.block.uid}>
-          <!-- What the turn made previews here, after the closing prose. -->
+          <!-- What the turn wrote, as one chip line after the closing prose. -->
           {#if block.artifacts.length > 0 || block.mentioned.length > 0}
             <ArtifactGallery
               paths={block.artifacts}
@@ -2634,6 +2899,8 @@
     {/if}
     {/if}
     </div>
+    <!-- Room for the later rows past a history page (the spacer's twin). -->
+    <div class="later-spacer" bind:this={laterSpacerEl} aria-hidden="true"></div>
   </div>
 
   {#if quoteChip !== null}
@@ -2764,6 +3031,7 @@
     {focused}
     {visible}
     {onSubmit}
+    {voiceTerms}
     onDraftState={(active) => (composerEngaged = active)}
     onInterrupt={interrupt}
     onCycleMode={cycleMode}
@@ -2823,10 +3091,11 @@
      overflowing transcript — and it fills the viewport when short, so
      .empty can center in it. */
   .column {
+    --row-gap: 3px;
     flex: 1 0 auto;
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: var(--row-gap);
     width: 100%;
     max-width: var(--chat-column);
     margin: 0 auto;
@@ -2909,7 +3178,8 @@
     height: 1px;
     pointer-events: none;
   }
-  .history-spacer {
+  .history-spacer,
+  .later-spacer {
     flex: none;
     height: 0;
   }
@@ -3356,6 +3626,11 @@
     place-items: center;
     width: 24px;
     height: 24px;
+    /* No net height in the column (its own plus the column's gap): it
+       appears and goes as the reader leaves and reaches the bottom, and a
+       row coming and going there clamped scrollTop — a snap on every
+       arrival at the live edge. */
+    margin-top: calc(-24px - var(--row-gap));
     padding: 0;
     font: inherit;
     font-size: var(--text-lg);

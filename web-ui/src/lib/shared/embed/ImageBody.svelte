@@ -23,7 +23,7 @@
 
   let { url, natural, region, alt, hint, compact, active, onOpen }: Props = $props();
 
-  /** Tallest a picture is drawn inline / in a gallery tile. */
+  /** Tallest a picture is drawn inline / in a compact glance. */
   const MAX_H = 420;
   const TILE_H = 200;
 
