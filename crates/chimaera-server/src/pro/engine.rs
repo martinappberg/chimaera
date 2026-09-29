@@ -1767,15 +1767,21 @@ pub(super) fn at_pause(state: &AppState, workspace: &str) -> bool {
                 agent_state,
             )
         } else {
-            lock(&state.agents).get(&id).is_none_or(|agent| {
-                matches!(
-                    agent.state,
-                    crate::agent_state::AgentState::IdlePrompt
-                        | crate::agent_state::AgentState::Finished
-                        | crate::agent_state::AgentState::NeedsPermission
-                        | crate::agent_state::AgentState::Errored
-                )
-            })
+            // Cloned first: the terminal registry has its own locks.
+            let Some(agent) = lock(&state.agents).get(&id).cloned() else {
+                return true;
+            };
+            let Some(info) = state.sessions.get(&id) else {
+                return true;
+            };
+            crate::agent_state::tui_at_pause(
+                &agent,
+                info.alive,
+                info.last_output_at,
+                info.pid,
+                state.sessions.foreground_pid(&id),
+                crate::session_view::now_ms(),
+            )
         }
     })
 }

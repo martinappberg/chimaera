@@ -26,6 +26,11 @@ async fn codex_notify_authenticates_and_only_records_verified_terminal_identity(
             .0,
         StatusCode::FORBIDDEN
     );
+    assert!(lock(&state.agents)
+        .get(&id)
+        .unwrap()
+        .turn_complete_at
+        .is_none());
     assert_eq!(
         request(
             &state,
@@ -37,6 +42,18 @@ async fn codex_notify_authenticates_and_only_records_verified_terminal_identity(
         .0,
         StatusCode::OK
     );
+    // The completed turn makes this silent TUI pausable at once.
+    let record = lock(&state.agents).get(&id).unwrap().clone();
+    assert!(record.turn_complete_at.is_some());
+    let info = state.sessions.get(&id).unwrap();
+    assert!(crate::agent_state::tui_at_pause(
+        &record,
+        info.alive,
+        info.last_output_at,
+        info.pid,
+        None,
+        crate::session_view::now_ms(),
+    ));
     assert!(
         lock(&state.agents).get(&id).unwrap().resume_id().is_none(),
         "missing rollout must not mint resume"

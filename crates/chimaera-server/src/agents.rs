@@ -498,6 +498,14 @@ pub(crate) async fn ingest(
         {
             return Json(json!({})).into_response();
         }
+        // The turn ended: with no output after it, this TUI is at a safe
+        // pause (see `agent_state::tui_at_pause`).
+        if let Some(record) = crate::lock(&state.agents)
+            .get_mut(&id)
+            .filter(|record| record.key == presented_key)
+        {
+            record.turn_complete_at = Some(crate::session_view::now_ms());
+        }
         let Some(home) = state
             .codex_config_path
             .parent()

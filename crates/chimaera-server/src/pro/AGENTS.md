@@ -267,7 +267,7 @@ a device also for its own `Hydrating`/`SettingUp` return. A device's own
 unfinished return retries after 15 s, doubling to two minutes. Failures and
 refusals carry stable codes (`routes::error_code`; mirror row `error_code`).
 
-Structured pause checks accept authoritative completed-turn/idle agent state even when a provider emits no textual idle status, but reject queued input, active turns, and background work (explicit permission/action waits remain safe pause points).
+Structured pause checks accept authoritative completed-turn/idle agent state even when a provider emits no textual idle status, but reject queued input, active turns, and background work (explicit permission/action waits remain safe pause points). Terminal agents (`agent_state::tui_at_pause`): Claude hook states decide (idle, finished, needs permission, errored and rate limited are pauses; running is not); a Codex TUI, which has no hook state, is at a pause once its authenticated `agent-turn-complete` notify arrived with no output after it, or once its terminal has been quiet for 10 s with the agent itself in the foreground.
 
 The distinct authenticated `POST /api/v1/pro/configure/workspace` accepts only a
 worker delegation bound to one workspace/revision, explicit account identity,
