@@ -430,7 +430,6 @@ pub(crate) const BOOT_VERIFICATION_GRACE: std::time::Duration = std::time::Durat
 /// Where a project's work stands, from this daemon's recorded ownership, in
 /// the terms a viewer needs (why a paused session is paused). Read-only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // Consumed by ws.rs `classify_pause` at integration.
 pub(crate) enum Phase {
     /// Runs here (or no Pro ownership at all).
     Here,
@@ -443,7 +442,6 @@ pub(crate) enum Phase {
     /// Arriving here from another machine (files installing, setup).
     Arriving,
 }
-#[allow(dead_code)] // Consumed by ws.rs `classify_pause` at integration.
 pub(crate) fn ownership_phase(state: &crate::AppState, workspace: &str) -> Phase {
     match crate::lock(&state.pro.ownership).get(workspace) {
         None | Some(Ownership::Local { .. } | Ownership::PrivacyDisabled { .. }) => Phase::Here,
@@ -454,7 +452,6 @@ pub(crate) fn ownership_phase(state: &crate::AppState, workspace: &str) -> Phase
     }
 }
 /// Whether this session waits at boot for this life's ownership proof.
-#[allow(dead_code)] // Consumed by ws.rs `classify_pause` at integration.
 pub(crate) fn restart_deferred(state: &crate::AppState, session_id: &str) -> bool {
     crate::lock(&state.pro.boot_deferred).contains(session_id)
 }

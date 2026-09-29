@@ -299,6 +299,12 @@ struct PauseFacts {
 }
 #[derive(Clone, Debug, Default)]
 struct EntryFacts {
+    /// Waiting at boot for this daemon life's ownership proof (a restart or
+    /// update), not moving anywhere.
+    restarting: bool,
+    /// Its project is arriving here (files installing, setup running): the
+    /// entry left from the original move is about to be replaced.
+    arriving: bool,
     /// Imported here by a transfer and not started yet.
     arrived: bool,
     /// A plain terminal that moved with its project; it only runs on a computer.
@@ -332,6 +338,16 @@ fn classify_pause(facts: &PauseFacts, ran_here: impl FnOnce() -> bool) -> Option
             provider: None,
         });
     };
+    if entry.restarting {
+        return Some(Pause::Paused {
+            reason: "restarting",
+            provider: None,
+        });
+    }
+    if !facts.worker && entry.arriving && !entry.arrived {
+        // Taking its work back: the old entry says so until the import lands.
+        return Some(Pause::Moved("computer"));
+    }
     if entry.arrived {
         return Some(if facts.worker && entry.moved_shell {
             Pause::Paused {
@@ -376,6 +392,11 @@ fn entry_facts(state: &AppState, entry: &crate::ledger::LedgerEntry) -> EntryFac
             .is_some_and(|blocks| blocks.iter().any(|block| block["id"] == provider))
     });
     EntryFacts {
+        // Recorded ownership decides the words, never a guess from which
+        // processes this daemon life happens to remember.
+        restarting: crate::pro::restart_deferred(state, &entry.id),
+        arriving: crate::pro::ownership_phase(state, &entry.workspace_id)
+            == crate::pro::Phase::Arriving,
         arrived: entry.handoff.is_some(),
         moved_shell: entry.agent.is_none()
             && entry
