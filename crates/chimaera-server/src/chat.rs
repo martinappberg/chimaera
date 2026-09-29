@@ -242,6 +242,7 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
             match signal {
                 ChatSignal::Event(id, entry) => {
                     apply_chat_event(&state, &id, &entry.ev);
+                    crate::history::observe_chat(&state, &id, &entry.ev);
                     // @term: grants ride the protocol input in chat mode —
                     // the UserPromptSubmit hook (the TUI's autolink path)
                     // does not fire under -p stream-json. Runs outside
@@ -287,6 +288,7 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
                     state.changes.notify_waiters();
                 }
                 ChatSignal::Exit(id, exit) => {
+                    crate::history::observe_exit(&state, &id, &exit);
                     // A view switch / rewind respawns under the same id, and a
                     // slow driver's reap can land after the successor is up
                     // (see handle_chat_exit): that exit is the deliberate
@@ -860,6 +862,18 @@ async fn degrade_to_pty(
 /// view switch). Chat-registry *presence* counts even when the driver died:
 /// a ProtocolError session is deliberately kept visible so the chat surface
 /// can show the failure; closing it is the user's call (DELETE).
+/// The folder an agent session runs in: its chat recipe's, else its PTY's
+/// spawn folder. That is the workspace root unless the session was started
+/// in a worktree (`CreateSession.cwd`, the Mastermind's `spawn_agent
+/// {branch}`) — and a view switch or rewind must respawn it there, where
+/// its native transcript lives.
+pub(crate) fn session_root(state: &AppState, id: &str) -> Option<PathBuf> {
+    if let Some(recipe) = crate::lock(&state.chat_recipes).get(id) {
+        return Some(recipe.workspace_root.clone());
+    }
+    state.sessions.get(id).map(|info| info.cwd)
+}
+
 pub(crate) fn session_alive(state: &AppState, id: &str) -> bool {
     state.sessions.get(id).is_some()
         || state.chat.contains(id)
@@ -1345,6 +1359,8 @@ pub(crate) async fn switch_view(
             "session has no workspace".to_string(),
         );
     };
+    // A session started in a worktree respawns there, where its transcript is.
+    let workspace_root = session_root(&state, &id).unwrap_or(workspace_root);
 
     // Serialize before the first await below. Acquiring after transcript
     // validation allowed a fast competing switch/rewind to complete while
@@ -1751,6 +1767,8 @@ pub(crate) async fn rewind_session(
             "session has no workspace".to_string(),
         );
     };
+    // A session started in a worktree respawns there, where its transcript is.
+    let workspace_root = session_root(&state, &id).unwrap_or(workspace_root);
 
     // Own the whole preflight + stop + journal rewrite + respawn window. The
     // old unconditional insert below could overwrite a live view-switch
@@ -2718,6 +2736,7 @@ pub(crate) async fn fork_session(
             prelude: None,
             mastermind: None,
             fork: Some(bootstrap),
+            started_by: crate::history::StartedBy::Session(id.clone()),
         },
     )
     .await
@@ -2851,6 +2870,8 @@ pub(crate) struct FreshChat {
     /// initializes the fresh destination with quiet native or portable context.
     /// Normal creates leave this absent.
     pub(crate) fork: Option<ForkBootstrap>,
+    /// Who started it, for the session's history record.
+    pub(crate) started_by: crate::history::StartedBy,
 }
 
 pub(crate) struct ForkBootstrap {
@@ -2909,6 +2930,20 @@ pub(crate) async fn spawn_fresh_chat(
     workspace: crate::workspaces::Workspace,
     spec: FreshChat,
 ) -> Result<serde_json::Value, ChatSpawnFailure> {
+    spawn_fresh_chat_at(state, workspace, spec, None).await
+}
+
+/// [`spawn_fresh_chat`] starting in `cwd` (a folder the caller validated
+/// inside the workspace or one of its worktrees) instead of the workspace
+/// root. The session still belongs to `workspace`; the folder rides the
+/// recipe, so a view switch, rewind or restart keeps it.
+pub(crate) async fn spawn_fresh_chat_at(
+    state: &Arc<AppState>,
+    workspace: crate::workspaces::Workspace,
+    spec: FreshChat,
+    cwd: Option<PathBuf>,
+) -> Result<serde_json::Value, ChatSpawnFailure> {
+    let root = cwd.unwrap_or_else(|| workspace.root.clone());
     let fork = spec.fork;
     let is_fork = fork.is_some();
     let native_fork = fork.as_ref().and_then(|fork| fork.native.clone());
@@ -2927,8 +2962,7 @@ pub(crate) async fn spawn_fresh_chat(
     // theme themselves. Codex needs no files — its MCP injection rides argv.
     let (settings, mcp_config) = if spec.kind == AgentKind::Claude {
         let (theme_set, user_statusline) =
-            crate::runtimes::claude_settings_gates(&state.claude_settings_path, &workspace.root)
-                .await;
+            crate::runtimes::claude_settings_gates(&state.claude_settings_path, &root).await;
         let settings_theme = (!theme_set).then_some(spec.theme.as_str());
         let plugin_tools = crate::plugins::spawn_allow(state, &workspace.id).await;
         let s = crate::agents::write_settings(
@@ -2979,7 +3013,7 @@ pub(crate) async fn spawn_fresh_chat(
     let cleanup_settings = settings.clone();
     let cleanup_mcp_config = mcp_config.clone();
     let recipe = ChatRecipe {
-        workspace_root: workspace.root.clone(),
+        workspace_root: root,
         workspace_id: workspace.id.clone(),
         kind: spec.kind,
         bin,
@@ -3026,7 +3060,7 @@ pub(crate) async fn spawn_fresh_chat(
     crate::lock(&state.session_workspaces).insert(id.clone(), workspace.id.clone());
     match spawn_chat_session(state, id.clone(), recipe, None).await {
         Ok(info) => {
-            crate::agents::spawn_agent_watch(state.clone(), id.clone());
+            crate::agents::spawn_agent_watch(state.clone(), id.clone(), spec.started_by);
             state.changes.notify_waiters();
             Ok(chat_session_json(
                 &info,
@@ -3365,9 +3399,13 @@ pub(crate) async fn resurrect_chat(
         .agent
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("chat resurrection requires an agent entry"))?;
-    // Chats spawn (and resolve their transcript) at the workspace root — the
-    // same cwd the create/toggle path uses.
-    let root = workspace.root.clone();
+    // Chats spawn (and resolve their transcript) where they ran: the
+    // workspace root, or the worktree they were started in — the ledger's
+    // cwd — while that folder still exists.
+    let root = match tokio::fs::metadata(&entry.cwd).await {
+        Ok(meta) if meta.is_dir() && !entry.cwd.as_os_str().is_empty() => entry.cwd.clone(),
+        _ => workspace.root.clone(),
+    };
     // Resolve the binary + the version it was probed at from the SAME detection.
     let detection = crate::launcher::detect(state, agent.kind, false).await;
     let bin = detection
@@ -3494,7 +3532,11 @@ pub(crate) async fn resurrect_chat(
             // the death → Recents backstop once the session finally goes (e.g.
             // a degrade-to-TUI that then exits). Without it a resurrected chat
             // would diverge from a created one.
-            crate::agents::spawn_agent_watch(state.clone(), entry.id.clone());
+            crate::agents::spawn_agent_watch(
+                state.clone(),
+                entry.id.clone(),
+                crate::history::StartedBy::Restart,
+            );
             // The restart ended the process that was running the turn and
             // the background work, and neither agent restarts them on resume
             // (the conversation survives, its processes do not). Tell the

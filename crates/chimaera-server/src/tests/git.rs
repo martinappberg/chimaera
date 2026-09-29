@@ -218,9 +218,19 @@ async fn git_worktree_create_is_managed_and_registered() {
         wt_path.starts_with(&managed),
         "{wt_path:?} under {managed:?}"
     );
-    // And registered as a workspace you can open.
-    let new_ws = body["workspace"]["id"].as_str().unwrap();
-    assert!(crate::lock(&state.workspaces).get(new_ws).is_some());
+    // A worktree stays a dimension of its workspace: nothing is registered,
+    // so no window moves and the home screen gains no entry.
+    assert!(
+        body["workspace"].is_null(),
+        "no workspace for a worktree: {body}"
+    );
+    assert!(
+        crate::lock(&state.workspaces)
+            .list()
+            .iter()
+            .all(|w| w.root != wt_path),
+        "the worktree is not registered as a workspace"
+    );
 
     // The list marks it managed (the UI only offers remove where the daemon allows it).
     let (_, list) = request(
@@ -282,7 +292,16 @@ async fn git_worktree_remove_is_fenced() {
     )
     .await;
     let wt_path = body["worktree"]["path"].as_str().unwrap().to_string();
-    let new_ws = body["workspace"]["id"].as_str().unwrap().to_string();
+    // The user opened the branch as its own window (any folder can be): the
+    // removal must drop that registration with the checkout.
+    let (_, opened) = request(
+        &state,
+        Method::POST,
+        "/api/v1/workspaces",
+        Some(serde_json::json!({"root": wt_path})),
+    )
+    .await;
+    let new_ws = opened["id"].as_str().unwrap().to_string();
 
     // Fence 1: a checkout chimaera did not create is never removed — even
     // though it IS a real worktree of this repo.
@@ -354,14 +373,14 @@ async fn git_worktree_remove_refuses_with_a_live_session_inside() {
     )
     .await;
     let wt_path = body["worktree"]["path"].as_str().unwrap().to_string();
-    let new_ws = body["workspace"]["id"].as_str().unwrap().to_string();
 
-    // A shell living in the new worktree.
+    // A shell living in the new worktree (started from the workspace itself,
+    // the way "Start an agent here" does).
     let (status, session) = request(
         &state,
         Method::POST,
         "/api/v1/sessions",
-        Some(serde_json::json!({"workspace_id": new_ws, "kind": "shell"})),
+        Some(serde_json::json!({"workspace_id": ws_id, "kind": "shell", "cwd": wt_path})),
     )
     .await;
     assert!(status.is_success(), "spawn failed: {session}");

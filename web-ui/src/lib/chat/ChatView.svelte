@@ -14,6 +14,8 @@
   } from "./paths";
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
+  import BranchChip from "../shared/BranchChip.svelte";
+  import { openBranchChanges } from "../workspace/git";
   import { insertIntoComposer, registerFollow } from "./composerBus";
   import {
     acquireChat,
@@ -57,6 +59,8 @@
   import ForkDialog from "./ForkDialog.svelte";
   import AgentMessageMeta from "./AgentMessageMeta.svelte";
   import Composer from "./Composer.svelte";
+  import SameFileNotice from "../workspace/SameFileNotice.svelte";
+  import { sameFile } from "../workspace/sameFile.svelte";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import { activeSelection, clearSelection, setSelection } from "../shared/reference";
   import { quotableRange, quoteChipPosition } from "./quoteSelection";
@@ -3036,6 +3040,21 @@
     </div>
   {/if}
 
+  {#if session.git || sameFile.notesFor(session.id).length > 0}
+    <!-- One quiet line just above the input. Left: the branch this
+         conversation works on (only in a repository; hover names the
+         worktree; never a prompt to do anything with git). Right: another
+         live session wrote a file this one wrote. -->
+    <div class="branch-line">
+      {#if session.git}
+        <span class="branch-slot"
+          ><BranchChip git={session.git} onOpen={() => session.git && openBranchChanges(session.git)} /></span
+        >
+      {/if}
+      <span class="branch-line-end"><SameFileNotice sessionId={session.id} {visible} /></span>
+    </div>
+  {/if}
+
   <Composer
     sessionId={session.id}
     view={quoteOwner}
@@ -3584,6 +3603,29 @@
   }
   .cancel-btn:hover {
     color: var(--err);
+  }
+  .branch-line {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-width: 0;
+    padding: 4px 14px 0;
+  }
+  .branch-slot {
+    display: inline-flex;
+    min-width: 0;
+    flex: 0 1 auto;
+  }
+  .branch-line-end {
+    display: inline-flex;
+    justify-content: flex-end;
+    min-width: 0;
+    flex: 0 1 auto;
+    margin-left: auto;
+  }
+  .branch-line-end:empty {
+    display: none;
   }
   .suggestion-row {
     display: flex;

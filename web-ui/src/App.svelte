@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
+  import { flip } from "svelte/animate";
+  import { fade } from "svelte/transition";
   import { runStallDrive, stallDriveSpec } from "./lib/perf/tabSwitchDrive";
   import {
     ApiError,
@@ -105,13 +107,16 @@
     clearSelection,
     composeAgentPathReference,
     composeChatQuote,
+    composeCommitReference,
     composeSelectionReference,
     composeShellPathReference,
     needsCropUpload,
     composeTerminalReference,
     referenceTarget,
     composeProvenanceSuffix,
+    setCommitReferenceHandler,
     setReferenceHandler,
+    type CommitSelection,
     setSelection,
     workspaceRelative,
   } from "./lib/shared/reference";
@@ -140,9 +145,9 @@
     movePaneToIndex,
     movePaneToRootEdge,
     openChanges,
-    openDiff,
     openFile,
     pinTab,
+    openTabAs,
     pinPaths,
     openFinder,
     findFinder,
@@ -157,6 +162,7 @@
     openTimeline,
     openKnowledge,
     openPlugins,
+    openSessionsList,
     openGit,
     openSession,
     openSettings,
@@ -185,6 +191,8 @@
     type Layout,
     type SplitDir,
     type Tab,
+    type DiffTab,
+    type GitDetailTab,
   } from "./lib/layout/layout";
   import type { LinkContext } from "./lib/shared/fileRef";
   import { openPath, setPathOpener, type OpenPathOptions, type PathKind } from "./lib/shared/openPath";
@@ -204,12 +212,23 @@
   } from "./lib/shared/editing";
   import {
     activateGitWorkspace,
+    aheadBehindWords,
     gitEnv,
+    gitExpandedRepos,
     gitRepoError,
+    gitRepos,
+    gitRepoStatuses,
     gitStatus,
     onGitNudge,
+    openFileHistory,
+    openRepoHistory,
+    repoForPath,
+    revealRepo,
+    setGitFocus,
+    setGitOpener,
     workspacesChanged,
     type DiffMode,
+    type GitStatus,
   } from "./lib/workspace/git";
   import { computeStatus, initCompute, queuedJobCount } from "./lib/workspace/compute";
   import { surfacesOf } from "./lib/layout/surfaces";
@@ -365,6 +384,10 @@
   import { focusOnMount } from "./lib/shared/focusOnMount";
   import Launcher from "./lib/workspace/Launcher.svelte";
   import SessionGlyph from "./lib/shared/SessionGlyph.svelte";
+  import BranchChip from "./lib/shared/BranchChip.svelte";
+  import { archiveRecents, nudgeHistory, unarchiveRecents } from "./lib/workspace/history";
+  import { sameFile, setSameFileOpener } from "./lib/workspace/sameFile.svelte";
+  import { requestSettingsSection } from "./lib/settings/jump";
   import QuickOpen from "./lib/workspace/QuickOpen.svelte";
   import FileTree from "./lib/workspace/FileTree.svelte";
   import SplitTree from "./lib/layout/SplitNode.svelte";
@@ -412,6 +435,13 @@
   let lastRecentsEpoch: number | null = null;
   let workspaces = $state<Workspace[]>([]);
   let sessions = $state<Session[]>([]);
+  // Two live sessions writing one file: the chat line's and the dashboard
+  // card's quiet notice (never the rail) reads this roster.
+  $effect(() => {
+    const list = sessions;
+    const names = displayNames;
+    untrack(() => sameFile.update(list, names));
+  });
   /** Sessions whose shell provably sits at its OSC 133 prompt AND isn't
    *  running anything via the exec engine — the set predictive local echo
    *  may arm for. Recomputed per sessions snapshot (a few times a minute)
@@ -1066,6 +1096,19 @@
     eventsSocket?.watchFs(files, dirs);
   });
 
+  // The repositories below the root this window is looking at — sections
+  // open in the Source Control panel, and those holding a mounted file. Only
+  // these ride the daemon's 12 s git backstop; the rest refresh on events.
+  $effect(() => {
+    const below = $gitRepos.filter((r) => r.kind === "nested" || r.kind === "submodule");
+    const watched = new Set<string>($gitExpandedRepos);
+    for (const f of $diskWatchFiles) {
+      const r = repoForPath(below, f);
+      if (r) watched.add(r.path);
+    }
+    eventsSocket?.watchGitRepos([...watched]);
+  });
+
   // A worktree create/remove changed the daemon's workspace registry: re-fetch
   // the list so the home screen and switcher stay honest (a removed worktree's
   // workspace disappears; a created one appears).
@@ -1092,6 +1135,7 @@
   /** terminal session id -> agent session id (one agent per terminal). */
   const linksByTerminal = $derived(new Map(links.map((l) => [l.terminal_id, l.agent_id])));
   const focusedSessionId = $derived(focusedSessionOf(layout));
+
   /** Sessions on screen in this window (each pane's active tab). */
   const visibleSessions = $derived(
     activeWsId !== null && layoutReady ? visibleSessionIds(layout) : [],
@@ -1118,6 +1162,43 @@
     return () => window.removeEventListener("focus", onFocus);
   });
   const focusedFilePath = $derived(focusedFileOf(layout));
+
+  /**
+   * The status strip's branch chip follows focus: the repository holding the
+   * focused file, else the focused session's checkout (or folder). Nothing
+   * focused inside one: the workspace's own repository, or — a folder of
+   * several — how many there are.
+   */
+  const gitFocusPath = $derived.by((): string | null => {
+    const s = focusedSessionId !== null ? sessionsById.get(focusedSessionId) : undefined;
+    return focusedFilePath ?? s?.git?.worktree ?? s?.cwd_current ?? s?.cwd ?? null;
+  });
+  // The Source Control panel auto-expands the repository holding this.
+  $effect(() => {
+    setGitFocus(gitFocusPath);
+  });
+  const stripGit = $derived.by(
+    (): { status: GitStatus; label: string | null; path: string | null } | null => {
+      const repos = $gitRepos;
+      if (repos.length > 1) {
+        const repo = repoForPath(repos, gitFocusPath);
+        if (repo !== null) {
+          const status =
+            repo.kind === "root" || repo.kind === "enclosing"
+              ? $gitStatus
+              : ($gitRepoStatuses.get(repo.path) ?? null);
+          if (status !== null && status.repo) {
+            const name = repo.path.split("/").filter(Boolean).pop() ?? repo.path;
+            return { status, label: repo.kind === "root" ? null : name, path: repo.path };
+          }
+        }
+        return null;
+      }
+      return $gitStatus !== null ? { status: $gitStatus, label: null, path: null } : null;
+    },
+  );
+  /** Repositories in the workspace, for the "N repos" chip. */
+  const stripRepoCount = $derived($gitRepos.length);
   /** Open file tabs' display titles (basename, disambiguated by parent dir). */
   const fileTitles = $derived(fileTabTitles(allFilePaths(layout)));
   const zoomedPane = $derived(
@@ -1262,6 +1343,7 @@
     onOpenTimeline: openTimelineSurface,
     onOpenKnowledge: openKnowledgeSurface,
     onOpenExtensions: openPluginsSurface,
+    onOpenActivity: openActivitySurface,
   });
 
   /**
@@ -1599,8 +1681,11 @@
     // wherever the link was; chat resolves against the same per-session
     // context as terminal links.
     setPathOpener(openPathInLayout);
+    setSameFileOpener(openSess);
     setChatLinkContext(linkContext);
     setReferenceHandler(referenceSelection);
+    setCommitReferenceHandler(referenceCommitNow);
+    setGitOpener((tab) => openGitFromPane(layout.focusedPaneId, tab, false));
     setUploadPathInserter(insertUploadedPath);
     // OS-desktop file drags: window-level so the navigate-away default is
     // dead EVERYWHERE, not just over accepting panes.
@@ -1624,6 +1709,8 @@
         if (lastRecentsEpoch !== epoch) {
           lastRecentsEpoch = epoch;
           refreshRecents();
+          // A session ended: the history surfaces refetch while visible.
+          nudgeHistory();
         }
       },
       onFs: notifyDiskChange,
@@ -1800,8 +1887,12 @@
       window.removeEventListener("drop", onWindowDrop);
       stopChordHints();
       setReferenceHandler(null);
+      setCommitReferenceHandler(null);
+      setGitOpener(null);
       setUploadPathInserter(null);
       setPathOpener(null);
+      setSameFileOpener(null);
+      if (archivedUndoTimer !== null) clearTimeout(archivedUndoTimer);
       setChatLinkContext(null);
       events.close();
       pool.disposePool();
@@ -2283,20 +2374,73 @@
   }
 
   /** Same grammar as openFileFromPane, for a diff opened from the git panel. */
-  function openDiffFromPane(paneId: string, path: string, mode: DiffMode, newSplit: boolean): void {
-    const existing = paneForTab(layout.root, { surface: "diff", path, mode });
+  function openDiffFromPane(
+    paneId: string,
+    path: string,
+    mode: DiffMode,
+    newSplit: boolean,
+    keep = false,
+  ): void {
+    openGitFromPane(paneId, { surface: "diff", path, mode }, newSplit, keep);
+  }
+
+  /** Open (or focus) any git view beside `paneId` — the openDiffFrom rule:
+   *  the adjacent pane, or a fresh split when there is none / `newSplit`.
+   *  A single click opens a PREVIEW tab (one slot per pane, like files: the
+   *  next click replaces it); `keep` (a double-click, or a tab carrying
+   *  `preview: false`) keeps it. */
+  function openGitFromPane(paneId: string, tab: Tab, newSplit: boolean, keep = false): void {
+    if (tab.surface !== "diff" && tab.surface !== "gitx") {
+      layout = openTab(layout, tab);
+      return;
+    }
+    const view: DiffTab | GitDetailTab = tab;
+    const kept = keep || view.preview === false;
+    const existing = paneForTab(layout.root, view);
     if (existing !== null) {
       layout = activateTab(layout, existing.paneId, existing.index);
+      if (kept) layout = pinTab(layout, existing.paneId, existing.index);
     } else {
       const neighbor = newSplit ? null : adjacentPane(layout, paneId);
       if (neighbor !== null) {
-        layout = openDiff(focusPane(layout, neighbor), path, mode);
+        layout = openTabAs(focusPane(layout, neighbor), view, !kept);
       } else {
         layout = splitPane(layout, paneId, "row");
-        layout = openDiff(layout, path, mode);
+        layout = openTabAs(layout, view, !kept);
       }
     }
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** A commit dropped on an agent's pane: referenced there like a file (a
+   *  shell gets the short sha). */
+  function referenceCommitDrop(paneId: string, tab: Tab): void {
+    if (tab.surface !== "gitx" || tab.view !== "commit" || tab.sha === undefined) return;
+    const p = findPane(layout.root, paneId);
+    const active = p?.tabs[p.active];
+    if (active === undefined || active.surface !== "terminal") return;
+    const s = sessionsById.get(active.sessionId);
+    if (s === undefined || !s.alive) return;
+    const text =
+      s.kind === "agent"
+        ? composeCommitReference(
+            { kind: "commit", sha: tab.sha, subject: tab.title ?? "", repo: tab.repo },
+            workspace?.root ?? null,
+          )
+        : `${tab.sha.slice(0, 7)} `;
+    typeIntoSession(active.sessionId, text);
+  }
+
+  /** "Reference in chat" on a commit: it lands in the agent references go to
+   *  (surfaced first, beside the focused pane when it isn't open). */
+  function referenceCommitNow(sel: CommitSelection): void {
+    const target = refTargetSession;
+    if (target === null) return;
+    if (sessionPaneId(layout, target.id) === null) {
+      layout = splitPane(layout, layout.focusedPaneId, "row");
+      layout = openSession(layout, target.id);
+    }
+    typeIntoSession(target.id, composeCommitReference(sel, workspace?.root ?? null));
   }
 
   /** Knowledge at one entry, beside the source pane (a chat's id chip): an
@@ -3289,6 +3433,20 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
+  /** Open/focus All sessions (the Recents header, the dashboard's usage
+   *  line, quick-open). */
+  function openSessionsSurface(): void {
+    if (activeWsId === null || !layoutReady) return;
+    layout = openSessionsList(layout);
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** Open Settings at Activity (the dashboard's activity line, quick-open). */
+  function openActivitySurface(): void {
+    openSettingsSurface();
+    requestSettingsSection("Activity");
+  }
+
   /** Open/focus the workspace Timeline (dashboard link, quick-open). */
   function openTimelineSurface(): void {
     if (activeWsId === null || !layoutReady) return;
@@ -3319,6 +3477,20 @@
   // that plugin's view; without one there is nothing to open).
   const quickOpenCommands = $derived([
     { id: "timeline", label: "Timeline", hint: "what happened", run: openTimelineSurface },
+    {
+      id: "sessions",
+      label: "All sessions",
+      aliases: ["history"],
+      hint: "every past session",
+      run: openSessionsSurface,
+    },
+    {
+      id: "activity",
+      label: "Activity",
+      aliases: ["usage", "tokens"],
+      hint: "sessions and tokens, every workspace",
+      run: openActivitySurface,
+    },
     ...($knowledgeProviderActive
       ? [{ id: "knowledge", label: "Knowledge", hint: "what your agents recorded", run: openKnowledgeSurface }]
       : []),
@@ -3336,7 +3508,28 @@
       hint: "the workspace's Mastermind panel",
       run: () => setMastermindPanelOpen(true),
     },
+    ...gitQuickOpenCommands(),
   ]);
+
+  /** Git's commands: only where a repository is (git is ambient). */
+  function gitQuickOpenCommands() {
+    if ($gitRepos.length === 0) return [];
+    const file = focusedFilePath;
+    return [
+      { id: "git", label: "Source Control", aliases: ["git", "changes"], hint: "changes and branches", run: openGitPanel },
+      { id: "git-history", label: "History", aliases: ["log", "commits"], hint: "recent commits", run: () => openRepoHistory() },
+      ...(file !== null && repoForPath($gitRepos, file) !== null
+        ? [
+            {
+              id: "git-file-history",
+              label: "File history",
+              hint: basename(file),
+              run: () => openFileHistory(file),
+            },
+          ]
+        : []),
+    ];
+  }
 
   function focusDirection(dir: FocusDir): void {
     layout = moveFocus(layout, dir);
@@ -3711,6 +3904,68 @@
     refreshRecents();
   });
 
+  /** Recents rows glide up when one is archived (the dashboard roster's
+   *  flip idiom); zero under reduced motion. */
+  const recentsFlipMs =
+    typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches
+      ? 0
+      : 220;
+
+  /** "Archived 12 · Undo" after Archive all, for ~6 s. */
+  let archivedUndo = $state<{ ws: string; keys: string[] } | null>(null);
+  let archivedUndoTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function archiveEntry(r: RecentConvo) {
+    return { key: r.key, kind: r.kind, title: r.title, resume: r.resume, ui: r.ui };
+  }
+
+  /** Archive hides a conversation from Recents — never deletes it; it stays
+   *  in All sessions under "Archived". Optimistic: the row animates out now,
+   *  and a failure refetches the truth. No confirm, no toast. */
+  async function archiveRecent(r: RecentConvo): Promise<void> {
+    const ws = activeWsId;
+    if (ws === null) return;
+    recents = recents.filter((x) => x.key !== r.key);
+    try {
+      await archiveRecents(ws, [archiveEntry(r)]);
+    } catch {
+      refreshRecents();
+    }
+  }
+
+  async function archiveAllRecents(): Promise<void> {
+    const ws = activeWsId;
+    const rows = visibleRecents;
+    if (ws === null || rows.length === 0) return;
+    const gone = new Set(rows.map((r) => r.key));
+    recents = recents.filter((x) => !gone.has(x.key));
+    try {
+      const keys = await archiveRecents(ws, rows.map(archiveEntry));
+      if (archivedUndoTimer !== null) clearTimeout(archivedUndoTimer);
+      archivedUndo = { ws, keys };
+      archivedUndoTimer = setTimeout(() => {
+        archivedUndo = null;
+        archivedUndoTimer = null;
+      }, 6000);
+    } catch {
+      refreshRecents();
+    }
+  }
+
+  /** Undo restores exactly the set Archive all hid. */
+  async function undoArchiveAll(): Promise<void> {
+    const undo = archivedUndo;
+    if (undo === null) return;
+    archivedUndo = null;
+    if (archivedUndoTimer !== null) clearTimeout(archivedUndoTimer);
+    archivedUndoTimer = null;
+    try {
+      await unarchiveRecents(undo.ws, undo.keys);
+    } finally {
+      refreshRecents();
+    }
+  }
+
   /** A Recents row: resume when the daemon captured a native conversation
    *  handle, else an honest fresh start (the tooltip says why). The row's
    *  title rides along so the restored conversation keeps its name instead of
@@ -3908,8 +4163,14 @@
     retargetBrowser(id, host, port, path) {
       layout = setBrowserTarget(layout, id, host, port, path);
     },
-    openDiffFrom(paneId, path, mode, newSplit) {
-      openDiffFromPane(paneId, path, mode, newSplit);
+    openDiffFrom(paneId, path, mode, newSplit, keep) {
+      openDiffFromPane(paneId, path, mode, newSplit, keep === true);
+    },
+    openGitFrom(paneId, tab, newSplit) {
+      openGitFromPane(paneId, tab, newSplit);
+    },
+    beginGitDrag(e, tab, onClick) {
+      beginDrag(e, tab, onClick);
     },
     revealWorktreeSession(sessionId, workspaceId) {
       void revealWorktreeSession(sessionId, workspaceId);
@@ -4265,7 +4526,12 @@
     // (file previews and Finder/dir payloads), link targets for shell-
     // terminal drags. Drives the partitioned zone previews (the band region
     // is reserved, never flashed over).
-    const refPath = tab.surface === "file" || tab.surface === "finder" ? tab.path : undefined;
+    const refPath =
+      tab.surface === "file" || tab.surface === "finder"
+        ? tab.path
+        : tab.surface === "gitx" && tab.view === "commit"
+          ? tab.sha
+          : undefined;
     const armed = new Set<string>();
     const linkTargets = linkTargetsFor(tab);
     const linkSessions = linkSessionsFor(tab);
@@ -4293,6 +4559,7 @@
             // Drag-to-reference: type into the session, never open a tab.
             if (tab.surface === "file") referenceFileDrop(spot.paneId, tab.path, "file");
             else if (tab.surface === "finder") referenceFileDrop(spot.paneId, tab.path, "dir");
+            else if (tab.surface === "gitx") referenceCommitDrop(spot.paneId, tab);
             return;
           }
           if (spot.kind === "link") {
@@ -4454,6 +4721,9 @@
           ? (basename(tab.path) || "Finder")
           : tab.surface === "diff"
             ? `${basename(tab.path)} (diff)`
+            : tab.surface === "gitx"
+              ? (tab.title ??
+                (tab.view === "commit" ? "Commit" : tab.view === "branch" ? "Changes on this branch" : "History"))
             : tab.surface === "git"
               ? "Source Control"
               : tab.surface === "changes"
@@ -4937,6 +5207,12 @@
                 >
                   <span class="name">
                     {displayNames.get(s.id) ?? displayName(s)}
+                    {#if s.kind === "agent" && s.git && s.git.worktree !== s.git.repo}
+                      <!-- Only an agent working in a separate worktree gets a
+                           mark: its branch, quiet, after the name (the name
+                           keeps the width). The main checkout shows nothing. -->
+                      <span class="wt-mark"><BranchChip git={s.git} /></span>
+                    {/if}
                     {#if s.kind === "agent" && s.remote_control_url}
                       <!-- Remote Control is on: this session is reachable from
                            the Claude app / claude.ai/code. Quiet accent pill;
@@ -5110,13 +5386,24 @@
         <!-- Recents: ended agent conversations, any agent type, newest
              first — the daemon remembers them across restarts. Click resumes
              when a native handle exists, otherwise starts fresh honestly. -->
-        {#if visibleRecents.length > 0}
+        {#if workspace !== null}
           <!-- The section fills whatever the sessions column has left and
                shows as many rows as FIT that space (measured, see
                recentsFit) — never a fixed three. -->
           <div class="recents" class:expanded={recentsExpanded}>
-            <div class="recents-head">
+            <!-- svelte-ignore a11y_no_static_element_interactions -- the
+                 context menu is a shortcut; nothing here needs a keyboard
+                 path beyond the rows' own. -->
+            <div
+              class="recents-head"
+              oncontextmenu={(e) => {
+                if (visibleRecents.length > 0) {
+                  contextMenu.openAt(e, [{ label: "Archive all", onSelect: () => void archiveAllRecents() }]);
+                }
+              }}
+            >
               <span>recent</span>
+              <span class="recents-actions">
               {#if recentsExpanded || visibleRecents.length > recentsFit}
                 <!-- In the header, not below the rows: on a short column the
                      rows may sit under the fold, the header never does. -->
@@ -5130,15 +5417,66 @@
                   {recentsExpanded ? "show less" : `all ${visibleRecents.length}`}
                 </button>
               {/if}
+              <!-- Every past session, beyond these: revealed while the
+                   pointer is over Recents (always on touch), and in ⌘P. -->
+              <button
+                class="recents-history"
+                title="All sessions — every past session in this workspace"
+                aria-label="All sessions"
+                onclick={openSessionsSurface}
+              >
+                <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+                  <path
+                    d="M2.6 8a5.4 5.4 0 1 0 1.6-3.85"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linecap="round"
+                  />
+                  <path
+                    d="M2.2 2.6v2.6h2.6"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                  <path
+                    d="M8 5.2v3l2 1.3"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </button>
+              </span>
             </div>
             <div class="recents-list" class:expanded={recentsExpanded} bind:this={recentsListEl}>
-              {#each recentsExpanded ? visibleRecents : visibleRecents.slice(0, recentsFit) as r (r.resume ?? `${r.kind}:${r.title}`)}
-                <button class="recent-row" title={recentTooltip(r)} onclick={() => openRecent(r)}>
+              {#each recentsExpanded ? visibleRecents : visibleRecents.slice(0, recentsFit) as r (r.key)}
+                <button
+                  class="recent-row"
+                  title={recentTooltip(r)}
+                  onclick={() => openRecent(r)}
+                  oncontextmenu={(e) =>
+                    contextMenu.openAt(e, [{ label: "Archive", onSelect: () => void archiveRecent(r) }])}
+                  animate:flip={{ duration: recentsFlipMs }}
+                  out:fade={{ duration: recentsFlipMs === 0 ? 0 : 120 }}
+                >
                   <SessionGlyph kind="agent" agentKind={r.kind} size={11} />
                   <span class="recent-title">{r.title}</span>
                   <span class="recent-age">{relativeAge(r.lastActive)}</span>
                 </button>
               {/each}
+              {#if archivedUndo !== null && archivedUndo.ws === activeWsId}
+                <div class="recents-note">
+                  Archived {archivedUndo.keys.length} ·
+                  <button class="recents-undo" onclick={() => void undoArchiveAll()}>Undo</button>
+                </div>
+              {:else if visibleRecents.length === 0}
+                <div class="recents-note">No recent conversations</div>
+              {/if}
             </div>
           </div>
         {/if}
@@ -5275,13 +5613,18 @@
         {/if}
         </span>
         <span class="daemon-tools">
-        {#if $gitStatus !== null}
+        {#if stripGit !== null}
+          {@const gs = stripGit.status}
           <!-- Always-on orientation: what branch you're on and how dirty the
-               tree is; one click opens the source-control panel. -->
+               tree is; one click opens the source-control panel. With several
+               repositories it names the one holding what's focused. -->
           <button
             class="daemon-git"
-            onclick={openGitPanel}
-            title={`${$gitStatus.detached ? `detached at ${$gitStatus.head ?? "?"}` : ($gitStatus.branch ?? "unborn branch")}${$gitStatus.upstream ? ` · ${$gitStatus.upstream}` : ""} — open source control`}
+            onclick={() => {
+              openGitPanel();
+              if (stripGit.path !== null) revealRepo(stripGit.path);
+            }}
+            title={`${stripGit.label ? `${stripGit.label}: ` : ""}${gs.detached ? `detached at ${gs.head ?? "?"}` : (gs.branch ?? "unborn branch")}${gs.upstream ? ` · ${gs.upstream}` : ""} — open source control`}
           >
             <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
               <path
@@ -5295,18 +5638,36 @@
               <circle cx="5" cy="2.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
               <circle cx="11" cy="2.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
             </svg>
+            {#if stripGit.label}<span class="dg-repo">{stripGit.label}</span>{/if}
             <span class="dg-branch"
-              >{$gitStatus.detached
-                ? ($gitStatus.head ?? "detached")
-                : ($gitStatus.branch ?? "unborn")}</span
+              >{gs.detached
+                ? `No branch (at ${gs.head ?? "?"})`
+                : (gs.branch ?? "No commits yet")}</span
             >
-            {#if $gitStatus.ahead > 0}<span class="dg-ab">↑{$gitStatus.ahead}</span>{/if}
-            {#if $gitStatus.behind > 0}<span class="dg-ab">↓{$gitStatus.behind}</span>{/if}
-            {#if $gitStatus.counts.total > 0}
-              <span class="dg-dirty" title="{$gitStatus.counts.total} changed">
-                ●{$gitStatus.counts.total}
+            {#if gs.ahead > 0}<span class="dg-ab" title={aheadBehindWords(gs.ahead, 0, gs.upstream)}>↑{gs.ahead}</span>{/if}
+            {#if gs.behind > 0}<span class="dg-ab" title={aheadBehindWords(0, gs.behind, gs.upstream)}>↓{gs.behind}</span>{/if}
+            {#if gs.counts.total > 0}
+              <span class="dg-dirty" title="{gs.counts.total} changed">
+                ●{gs.counts.total}
               </span>
             {/if}
+          </button>
+        {:else if stripRepoCount > 1}
+          <!-- A folder of repositories with nothing focused inside one. -->
+          <button class="daemon-git" onclick={openGitPanel} title="{stripRepoCount} repositories — open source control">
+            <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <path
+                d="M5 4v5.2M11 4v2a2.4 2.4 0 0 1-2.4 2.4H5"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+              />
+              <circle cx="5" cy="12" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <circle cx="5" cy="2.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <circle cx="11" cy="2.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+            </svg>
+            <span class="dg-branch">{stripRepoCount} repos</span>
           </button>
         {:else if $gitEnv?.ok === false}
           <!-- No repo shown because git itself can't run (too old / missing).
@@ -6267,6 +6628,11 @@
     font-family: var(--mono);
     font-size: var(--text-sm);
   }
+  /* An agent in a separate worktree: its branch after the name, quiet. */
+  .wt-mark {
+    margin-left: 0.4rem;
+    opacity: 0.85;
+  }
 
   .title {
     font-size: var(--text-xs);
@@ -6642,6 +7008,72 @@
       background-color 0.12s ease;
   }
 
+  .recents-note {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: var(--recent-row-h);
+    padding: 0 8px;
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+  .recents-undo {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0;
+    font: inherit;
+    color: var(--fg);
+    cursor: pointer;
+  }
+  .recents-undo:hover {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .recents-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  /* All sessions: a quiet history mark, shown while the pointer is over
+     Recents or a key focuses it, and always where there is no hover. */
+  .recents-history {
+    appearance: none;
+    border: none;
+    background: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin: -2px -4px -2px 0;
+    padding: 2px 4px;
+    border-radius: 4px;
+    color: var(--muted);
+    cursor: pointer;
+    opacity: 0;
+    transition:
+      opacity 0.12s ease,
+      color 0.12s ease;
+  }
+  .recents:hover .recents-history,
+  .recents-history:focus-visible {
+    opacity: 0.9;
+  }
+  .recents-history:hover {
+    opacity: 1;
+    color: var(--fg);
+    background: var(--row-hover);
+  }
+  .recents-history:focus-visible {
+    outline: 1px solid var(--focus-ring);
+  }
+  @media (hover: none) {
+    .recents-history {
+      opacity: 0.9;
+    }
+  }
+
   .recents-more:hover {
     color: var(--fg);
     background: var(--row-hover);
@@ -6895,6 +7327,15 @@
      never ellipsize it — the bar wraps instead, now that it can. */
   .daemon-git.bad .dg-branch {
     max-width: none;
+  }
+
+  /* With several repositories the chip names the focused one first. */
+  .dg-repo {
+    color: var(--muted);
+    max-width: 10em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   /* The branch's width budget scales with the rail (roughly what the old 50%

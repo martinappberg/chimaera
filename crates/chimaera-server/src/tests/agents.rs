@@ -1311,7 +1311,7 @@ async fn statusline_ingest_accepts_the_bearer_key_channel() {
 async fn agent_title_tail_polls_transcript() {
     let state = test_state();
     let id = inject_agent(&state, "k");
-    agents::spawn_agent_watch(state.clone(), id.clone());
+    agents::spawn_agent_watch(state.clone(), id.clone(), crate::history::StartedBy::You);
 
     // Synthetic SessionStart pointing transcript_path at a fixture file.
     let transcript = test_dir("transcript").join("session.jsonl");
@@ -1378,7 +1378,7 @@ async fn agent_title_tail_polls_transcript() {
 async fn agent_title_tail_bulk_catchup_keeps_head_titles() {
     let state = test_state();
     let id = inject_agent(&state, "k");
-    agents::spawn_agent_watch(state.clone(), id.clone());
+    agents::spawn_agent_watch(state.clone(), id.clone(), crate::history::StartedBy::You);
 
     let transcript = test_dir("transcript-bulk").join("session.jsonl");
     let mut body = String::new();
