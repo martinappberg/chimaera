@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildIndex, byDateDesc, entriesForId, qualifiedId, resolveRef, searchEntries } from "./entries";
+import { buildIndex, byDateDesc, cleanTitle, entriesForId, qualifiedId, resolveRef, searchEntries } from "./entries";
 import { sample } from "./snapshot.fixture";
 
 describe("buildIndex", () => {
@@ -77,5 +77,17 @@ describe("byDateDesc", () => {
   it("sorts newest first with undated last", () => {
     const out = byDateDesc([{ date: "" }, { date: "2026-01-02" }, { date: "2026-03-01" }]);
     expect(out.map((x) => x.date)).toEqual(["2026-03-01", "2026-01-02", ""]);
+  });
+});
+
+describe("cleanTitle", () => {
+  it("drops a trailing date the heading repeats", () => {
+    expect(cleanTitle("Depth has no knee (2026-09-28)")).toBe("Depth has no knee");
+    expect(cleanTitle("Depth [2026-09-28]")).toBe("Depth");
+  });
+
+  it("keeps anything else, and never empties a title", () => {
+    expect(cleanTitle("Stage 08 (v2)")).toBe("Stage 08 (v2)");
+    expect(cleanTitle("(2026-09-28)")).toBe("(2026-09-28)");
   });
 });

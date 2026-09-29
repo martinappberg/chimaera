@@ -81,6 +81,12 @@ const REF_KIND_OF: Record<string, EntryKind> = {
   todo: "todo",
 };
 
+/** A title without the date the heading repeats at its end ("… (2026-09-28)"):
+ *  the date is shown on its own. */
+export function cleanTitle(title: string): string {
+  return title.replace(/\s*[([]\d{4}-\d{2}-\d{2}[)\]]\s*$/, "").trim() || title;
+}
+
 function join(...parts: (string | readonly string[] | undefined)[]): string {
   const out: string[] = [];
   for (const p of parts) {
@@ -96,7 +102,7 @@ function fromFinding(f: Finding, t: Topic): Entry {
     ekey: `finding:${f.key}`,
     kind: "finding",
     id: f.id,
-    title: f.claim,
+    title: cleanTitle(f.claim),
     date: f.date || f.updated,
     topic: t.slug,
     // An older provider sends no `stated`: its normalized word is all there is.
@@ -132,7 +138,7 @@ function fromDecision(d: Decision): Entry {
     ekey: `decision:${d.key}`,
     kind: "decision",
     id: d.id,
-    title: d.title,
+    title: cleanTitle(d.title),
     date: d.date,
     topic: "",
     stated: d.stated,

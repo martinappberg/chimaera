@@ -121,7 +121,7 @@
         );
       }
       if (f.questions.length > 0) parts.push(`**Open questions**\n\n${f.questions.map((q) => `- ${q}`).join("\n")}`);
-      return parts.join("\n\n") || f.claim;
+      return parts.join("\n\n");
     }
     const d = e.decision;
     if (d !== undefined) {
@@ -131,7 +131,7 @@
       if (d.alternatives.length > 0) parts.push(`**Instead of**\n\n${d.alternatives.map((a) => `- ${a}`).join("\n")}`);
       if (d.rationale) parts.push(`**Why.** ${d.rationale}`);
       if (d.consequences) parts.push(`**Consequences.** ${d.consequences}`);
-      return parts.join("\n\n") || d.title;
+      return parts.join("\n\n");
     }
     const l = e.learning;
     if (l !== undefined) {
@@ -139,14 +139,16 @@
       if (l.what) parts.push(`**What happened.** ${l.what}`);
       if (l.why) parts.push(`**Why it matters.** ${l.why}`);
       if (l.resolution) parts.push(`**Resolution.** ${l.resolution}`);
-      return parts.join("\n\n") || l.title;
+      return parts.join("\n\n");
     }
     const t = e.todo;
     if (t !== undefined) return t.item;
     const s = e.session;
     if (s !== undefined) return [s.summary, s.outputs && `**Outputs.** ${s.outputs}`].filter(Boolean).join("\n\n");
-    return e.title;
+    return "";
   });
+  /** Nothing more to show than the title: say so instead of repeating it. */
+  const bodyless = $derived(e.span === null && (fallback.trim() === "" || fallback.trim() === e.title.trim()));
 
   const crumb = $derived(e.kind === "finding" ? e.topic : word(e.kind));
 </script>
@@ -156,7 +158,7 @@
     {#if onClose}<button class="navbtn list" onclick={onClose} aria-label="Back to the list">‹ list</button>{/if}
     <button class="navbtn" onclick={onBack} disabled={!canBack} aria-label="Back" title="Back  [">‹</button>
     <button class="navbtn" onclick={onForward} disabled={!canForward} aria-label="Forward" title="Forward  ]">›</button>
-    <span class="crumb mono">{crumb}{#if e.id !== ""} › {e.id}{/if}</span>
+    <span class="crumb mono">{crumb}{e.id !== "" ? ` › ${e.id}` : ""}</span>
     <span class="grow"></span>
     {#if e.file !== ""}
       <button class="link" onclick={() => onOpenFile(e.file, e.line, e.span?.end_line ?? 0)} title="{e.file}{e.line > 0 ? `:${e.line}` : ''}">
@@ -299,6 +301,9 @@
 
   <section class="sec">
     <h3>{e.kind === "session" ? "Log" : "As written"}</h3>
+    {#if bodyless}
+      <p class="note">The provider sent only this line — <button class="link" onclick={() => onOpenFile(e.file, e.line, 0)}>open it in its file</button> for the rest.</p>
+    {:else}
     {#key e.ekey}
       <EntryBody
         span={e.span}
@@ -312,6 +317,7 @@
         dropHeading={e.kind !== "session"}
       />
     {/key}
+    {/if}
   </section>
 
   {#if e.finding !== undefined && e.finding.addenda.length > 0}

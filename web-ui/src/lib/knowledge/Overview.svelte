@@ -153,7 +153,7 @@
             {@const st = stateLabel(e)}
             <button class="row" onclick={() => onOpen(e.ekey)}>
               <span class="line">
-                <span class="mono id">{qualifiedId(idx, e) || kindWord(labels, e.kind)}</span>
+                <span class="mono id">{qualifiedId(idx, e)}</span>
                 <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
                 <span class="t">{@html inlineMarkdown(e.title)}</span>
               </span>

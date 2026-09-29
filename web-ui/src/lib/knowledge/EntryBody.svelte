@@ -6,6 +6,8 @@
    * draws `fallback` — the provider's own fields, still markdown.
    */
   import { untrack } from "svelte";
+  import { followDocHref, requestAnchor, showLinkHint } from "../previews/docLinks";
+  import { openPath } from "../shared/openPath";
   import { activeTheme } from "../settings/store.svelte";
   import type { Span } from "../workspace/knowledge";
   import { linkReferences, type RefMatcher, type ReferenceChips } from "../shared/references";
@@ -35,6 +37,42 @@
 
   function abs(p: string): string {
     return p.startsWith("/") || wsRoot === null ? p : `${wsRoot}/${p}`;
+  }
+
+  /** A link in the body is routed, never a native navigation (that would
+   *  replace the whole workbench): a web URL opens in a browser, a file in
+   *  the workbench (Cmd/Ctrl beside), resolved against the entry's file. */
+  function follow(e: MouseEvent, split: boolean): void {
+    const a = (e.target as Element | null)?.closest?.("a[href]");
+    if (a === null || a === undefined || box?.contains(a) !== true || a.closest(".embed-card") !== null) return;
+    const href = a.getAttribute("href") ?? "";
+    if (/^(mailto|tel):/i.test(href)) return;
+    e.preventDefault();
+    const docPath = abs(span?.path ?? "");
+    const x = e.clientX;
+    const y = e.clientY;
+    void followDocHref(href, split, {
+      docPath,
+      wsRoot,
+      workspaceId: wsId,
+      toAnchor: (anchor) => {
+        requestAnchor(docPath, anchor);
+        return openPath(docPath, "file");
+      },
+      toLines: (r) => {
+        openPath(docPath, "file", { reveal: r });
+      },
+      hint: (text) => {
+        if (box !== null) showLinkHint(box, x, y, text);
+      },
+    });
+  }
+
+  function onAux(e: MouseEvent): void {
+    if (e.button !== 1) return;
+    const href = (e.target as Element | null)?.closest?.("a[href]")?.getAttribute("href") ?? "";
+    if (/^https?:/i.test(href)) return;
+    follow(e, true);
   }
 
   $effect(() => {
@@ -83,11 +121,13 @@
   });
 </script>
 
-<div class="body" bind:this={box}></div>
+<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+<div class="body" bind:this={box} onclick={(e) => follow(e, e.metaKey || e.ctrlKey)} onauxclick={onAux}></div>
 {#if problem !== null}<p class="problem">{problem}</p>{/if}
 
 <style>
   .body {
+    position: relative;
     font-size: 14.5px;
     line-height: 1.62;
     color: var(--fg);
