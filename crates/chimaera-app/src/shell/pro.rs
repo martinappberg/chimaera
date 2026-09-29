@@ -1971,6 +1971,8 @@ fn project_failure(detail: &str) -> &'static str {
         "The project's local folder is missing or moved. Restore that folder and try again."
     } else if text.contains("pause") || text.contains("busy") || text.contains("still running") {
         "The project is still running in the cloud. Try again when it reaches a pause."
+    } else if text.contains("git repository") || text.contains("another project") {
+        "Choose a folder that isn't inside another project or Git repository."
     } else if text.contains("account changed") || text.contains("configuration changed") {
         "Your account changed. Open the project again."
     } else {
