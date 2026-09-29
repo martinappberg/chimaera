@@ -27,7 +27,9 @@ export function cloudCopy(state: string, reason: string | null, _phase?: CloudPr
     case "preparing": return { title: "Getting things ready", detail: "Chimaera is preparing access to your projects and agent connections. You can keep working here." };
     case "no_plan": return { title: "Cloud is included with Pro", detail: "Choose a plan when you're ready. Local work and ordinary SSH stay available." };
     case "limited": return { title: "Cloud use is paused", detail: "Your account has reached a cloud limit. Your local work is unaffected." };
-    default: return { title: "Cloud is temporarily unavailable", detail: "We couldn’t check cloud access. Try again in a moment. Your local work is available." };
+    // A state this app does not know (a newer service) is not an outage.
+    case "unknown": return { title: "Checking cloud access", detail: "Your local work is available while Chimaera checks." };
+    default: return { title: "Cloud is temporarily unavailable", detail: "We couldn’t check cloud access. Chimaera keeps trying; your local work is available." };
   }
 }
 export function friendlyError(reason: unknown, fallback: string): string {
