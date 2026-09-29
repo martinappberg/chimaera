@@ -1869,6 +1869,27 @@ async fn owner_suspended(config: &Configure, workspace: &str) -> bool {
     })
 }
 
+/// How long this computer must have been awake on power before live cloud
+/// work moves home: five minutes. A development build (the loopback
+/// end-to-end harness) may shorten it with `CHIMAERA_PRO_SETTLE_SECS`;
+/// release builds ignore the variable.
+fn settle_seconds() -> u64 {
+    static SETTLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SETTLE.get_or_init(|| {
+        settle_override(
+            chimaera_core::is_dev_build(),
+            std::env::var("CHIMAERA_PRO_SETTLE_SECS").ok().as_deref(),
+        )
+    })
+}
+fn settle_override(dev: bool, value: Option<&str>) -> u64 {
+    const SETTLE: u64 = 300;
+    value
+        .filter(|_| dev)
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(SETTLE, |seconds| seconds.min(SETTLE))
+}
+
 pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> Result<()> {
     if config.delegation.workspace.is_some() || config.role != Role::Device {
         return Ok(());
@@ -1877,7 +1898,8 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
     // and on power for a while (both protocol versions); work the cloud is
     // not running returns at once (laptop first).
     let settled = state.pro.power_suitable.load(Ordering::Acquire)
-        && super::now().saturating_sub(state.pro.awake_since.load(Ordering::Acquire)) >= 300;
+        && super::now().saturating_sub(state.pro.awake_since.load(Ordering::Acquire))
+            >= settle_seconds();
     let candidates: Vec<_> = lock(&state.pro.ownership)
         .iter()
         .filter_map(|(id, owner)| match owner {

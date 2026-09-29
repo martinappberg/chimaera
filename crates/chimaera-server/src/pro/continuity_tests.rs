@@ -1604,3 +1604,14 @@ async fn hydrating_its_own_current_epoch_is_a_verified_no_op() {
     drop(state);
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// The five-minute settle gate before live cloud work moves home is fixed in
+/// release builds; only a development build may shorten it (never lengthen).
+#[test]
+fn the_settle_gate_is_fixed_in_release_builds() {
+    assert_eq!(super::settle_override(false, Some("5")), 300);
+    assert_eq!(super::settle_override(true, None), 300);
+    assert_eq!(super::settle_override(true, Some("5")), 5);
+    assert_eq!(super::settle_override(true, Some("9000")), 300);
+    assert_eq!(super::settle_override(true, Some("soon")), 300);
+}
