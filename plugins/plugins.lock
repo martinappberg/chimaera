@@ -14,10 +14,17 @@
 # each repository's latest release hourly (SHA256SUMS against the downloaded
 # bytes; the manifest's id, version and [release] github against this file),
 # rewrites the entry — version, the two sha256s, and `name` / `summary` from
-# the release's plugin.toml — and opens a `fix:` PR with auto-merge, which
-# CI (these same releases, downloaded and installed) gates. Hand edits
-# follow the same rules; keep every value a one-line "string". To run a local build of a plugin against
-# the daemon: `chimaera plugin add --path <dir>` (see plugins/AGENTS.md).
+# the release's plugin.toml — and opens a `fix:` PR, which CI (these same
+# releases, downloaded and installed) gates. `tier` and `caps` are what the
+# maintainers approved the plugin to do (`chimaera plugin caps plugin.toml`
+# prints both): a sandboxed plugin keeps its badge on an update only while
+# its capability digest is this one, and a privileged plugin (one that runs
+# or downloads programs) is verified only at the pinned version. So the PR
+# auto-merges only when the release is sandboxed and asks for nothing new;
+# anything else waits for a person, who updates tier and caps. Hand edits
+# follow the same rules; keep every value a one-line "string". To run a
+# local build of a plugin against the daemon: `chimaera plugin add --path
+# <dir>` (see plugins/AGENTS.md).
 
 [[plugin]]
 id = "agent-notes"
@@ -27,6 +34,8 @@ version = "0.1.3"
 repo = "martinappberg/chimaera-plugin-agent-notes"
 sha256_wasm = "a7c9d6c597466e22a378e63b730d6729e988aaa773c03c69b1306c17cb716b95"
 sha256_toml = "5b2927512aa9db161aa164d2032306b2cfddb404918bc7fb1e072c65316485ec"
+tier = "sandboxed"
+caps = "6f33e5e1ea3d69b1c42256e69671eb0f509e65d03820b38083e5aa784d8c2fd5"
 
 [[plugin]]
 id = "mycelium"
@@ -36,3 +45,5 @@ version = "0.1.3"
 repo = "martinappberg/chimaera-plugin-mycelium"
 sha256_wasm = "b5c8bd3dccb75eb1976fe11c9535ee3781637a0c6beeda1c717fe47048d25f76"
 sha256_toml = "c12b0eacee74ec1f917d5b6809b55db9240289144c3984f97b149a353088f9f0"
+tier = "sandboxed"
+caps = "718b4370c310b92b73c84eaf3a4e5e50666f44c77002cfb92f1cbf775c9269a9"

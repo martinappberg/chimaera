@@ -125,6 +125,10 @@ pub(crate) fn offer_for(state: &AppState, m: &Manifest) -> Option<Offer> {
     let offer = crate::lock(&state.plugin_releases.offers)
         .get(&m.id)
         .cloned()?;
+    // A version whose growth the user skipped isn't offered again.
+    if state.plugin_guard.skipped(&m.id).as_deref() == Some(offer.version.as_str()) {
+        return None;
+    }
     newer(&offer.version, &m.version).then_some(offer)
 }
 
@@ -401,7 +405,17 @@ impl std::fmt::Display for Refusal {
 
 impl IntoResponse for Refusal {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({"error": self.message}))).into_response()
+        let mut body = json!({"error": self.message});
+        // What the caller needs to act on the refusal (the capabilities a
+        // trust prompt shows): beside `error`, never replacing it.
+        if let Some(Value::Object(detail)) = self.detail {
+            for (k, v) in detail {
+                if k != "error" {
+                    body[k] = v;
+                }
+            }
+        }
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -410,7 +424,13 @@ impl Refusal {
         Refusal {
             status,
             message: message.into(),
+            detail: None,
         }
+    }
+    /// The same refusal, carrying `detail`'s keys beside `error`.
+    pub(crate) fn with(mut self, detail: Value) -> Self {
+        self.detail = Some(detail);
+        self
     }
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)

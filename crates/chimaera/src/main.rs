@@ -114,11 +114,41 @@ enum PluginCmd {
         /// plugin.toml (and SHA256SUMS, if it should be verified).
         #[arg(long)]
         path: Option<std::path::PathBuf>,
+        /// Trust what a plugin the maintainers haven't verified can do,
+        /// without asking (for scripts). The list is still printed.
+        #[arg(long)]
+        trust: bool,
     },
     /// Update an installed plugin to its latest release.
-    Update { id: String },
+    Update {
+        id: String,
+        /// Allow an update that asks for more, without asking.
+        #[arg(long)]
+        trust: bool,
+    },
     /// Remove an installed plugin (every version of it).
     Remove { id: String },
+    /// Trust what an installed plugin can do (one waiting for your trust
+    /// stays off until you do).
+    Trust {
+        id: String,
+        /// Don't ask (the list is still printed).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Withdraw your trust: the plugin goes off everywhere until trusted again.
+    Untrust { id: String },
+    /// What a plugin.toml can do: its tier, capability digest and the
+    /// card's Can list (no daemon needed; plugin authors and the lock's
+    /// maintainers use it).
+    Caps {
+        manifest: std::path::PathBuf,
+        /// Print the JSON the lock and the card read.
+        #[arg(long)]
+        json: bool,
+    },
+    /// A plugin's activity log (installs, updates, trust, blocks), newest first.
+    Activity { id: String },
 }
 
 #[derive(Subcommand)]
@@ -287,9 +317,22 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
                 plugin,
                 version,
                 path,
-            } => plugin::add(plugin.as_deref(), version.as_deref(), path.as_deref()).await,
-            PluginCmd::Update { id } => plugin::update(&id).await,
+                trust,
+            } => {
+                plugin::add(
+                    plugin.as_deref(),
+                    version.as_deref(),
+                    path.as_deref(),
+                    trust,
+                )
+                .await
+            }
+            PluginCmd::Update { id, trust } => plugin::update(&id, trust).await,
             PluginCmd::Remove { id } => plugin::remove(&id).await,
+            PluginCmd::Trust { id, yes } => plugin::trust(&id, yes).await,
+            PluginCmd::Untrust { id } => plugin::untrust(&id).await,
+            PluginCmd::Caps { manifest, json } => plugin::caps(&manifest, json),
+            PluginCmd::Activity { id } => plugin::activity(&id).await,
         },
     }
 }
@@ -376,11 +419,13 @@ mod tests {
                         plugin,
                         version,
                         path,
+                        trust,
                     },
             } => {
                 assert_eq!(plugin.as_deref(), Some("acme/latex"));
                 assert_eq!(version.as_deref(), Some("0.2.0"));
                 assert_eq!(path, None);
+                assert!(!trust, "asking is the default");
             }
             _ => panic!("expected plugin add"),
         }
@@ -398,7 +443,14 @@ mod tests {
             &["chimaera", "plugin", "list"][..],
             &["chimaera", "plugin", "add", "agent-notes"],
             &["chimaera", "plugin", "update", "latex"],
+            &["chimaera", "plugin", "update", "latex", "--trust"],
+            &["chimaera", "plugin", "add", "acme/x", "--trust"],
             &["chimaera", "plugin", "remove", "latex"],
+            &["chimaera", "plugin", "trust", "latex"],
+            &["chimaera", "plugin", "trust", "latex", "--yes"],
+            &["chimaera", "plugin", "untrust", "latex"],
+            &["chimaera", "plugin", "caps", "plugin.toml", "--json"],
+            &["chimaera", "plugin", "activity", "latex"],
         ] {
             assert!(Cli::try_parse_from(args).is_ok(), "{args:?}");
         }

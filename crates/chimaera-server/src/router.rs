@@ -61,6 +61,18 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             post(plugins::installed::rollback_route),
         )
         .route("/plugins/{pid}/check", post(plugins::releases::check_route))
+        // Trust (`plugins::trust`): trust what an installed build can do, or
+        // run a soft-blocked one anyway; withdraw every answer; skip an
+        // update that asks for more. The activity log (`plugins::activity`).
+        .route(
+            "/plugins/{pid}/trust",
+            post(plugins::trust::trust_route).delete(plugins::trust::untrust_route),
+        )
+        .route("/plugins/{pid}/skip", post(plugins::trust::skip_route))
+        .route(
+            "/plugins/{pid}/activity",
+            get(plugins::activity::activity_route),
+        )
         // What a plugin's release says before it is installed
         // (`plugins::preview`): nothing is written.
         .route(

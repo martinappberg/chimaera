@@ -190,10 +190,10 @@ for old in "$PLUGINS/dist" "$PLUGINS/cache"; do
 done
 
 [ -f "$LOCK" ] || die "plugins/plugins.lock is missing"
-LOCKED="$(read_tables "$LOCK" id name summary version repo sha256_wasm sha256_toml)"
+LOCKED="$(read_tables "$LOCK" id name summary version repo sha256_wasm sha256_toml tier caps)"
 
 seen=" "
-while IFS="$SEP" read -r id name _summary version repo sha_wasm sha_toml <&3; do
+while IFS="$SEP" read -r id name _summary version repo sha_wasm sha_toml _tier _caps <&3; do
   [ -n "$id" ] || continue
   [[ $id =~ $ID_RE ]] || die "plugins/plugins.lock: id \"$id\" is not lowercase letters, digits and dashes"
   [[ $version =~ $VERSION_RE ]] || die "plugins/plugins.lock: $id: version \"$version\" is not MAJOR.MINOR.PATCH"

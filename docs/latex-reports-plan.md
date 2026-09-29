@@ -940,13 +940,14 @@ the changes PDF, `render_page`, Word through a pandoc plugin, a Typst jump compa
 
 ## Open decisions
 
-1. **Which TinyTeX bundle.** The default bundle (about 150 MB on Linux, the common
-   packages already in) is recommended: fewer builds wait on a package download. The
-   smaller TinyTeX-1 (about 54 MB, about 100 packages) saves disk and installs more on
-   demand.
-2. **Missing packages install automatically** for the plugin's TinyTeX (recommended: a
-   build that fails for a missing `.sty` fixes itself, which is what an agent's
-   compile-and-fix loop needs), or a button on each error?
+Both were decided on 2026-09-29, as recommended:
+
+1. **The default TinyTeX bundle** (about 150 MB on Linux, the common packages already
+   in): fewer builds wait on a package download. TinyTeX-1 (about 54 MB) was the
+   smaller alternative.
+2. **Missing packages install automatically** into the plugin's TinyTeX (where the host
+   has `gpg`, so TeX Live's signature is checked): a build that fails for a missing
+   `.sty` fixes itself, which is what an agent's compile-and-fix loop needs.
 
 The platform's own open decisions (signing the revocation list, provenance,
 privileged updates only through the lock, how long 0.1 stays served, operating-system

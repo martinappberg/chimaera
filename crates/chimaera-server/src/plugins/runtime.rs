@@ -296,6 +296,9 @@ pub(crate) struct HostState {
     deadline: Instant,
     pub(super) plugin: String,
     pub(super) workspace: String,
+    /// What this build's manifest lets it read through the host
+    /// (`[access]`), enforced by every host function.
+    pub(super) access: super::capabilities::Access,
     /// Set by `begin`, cleared by `end`: an idle instance never holds the
     /// daemon's state (the store lives in that state — a cycle otherwise).
     pub(super) call: Option<CallScope>,
@@ -320,7 +323,7 @@ impl WasiView for HostState {
 }
 
 impl HostState {
-    fn new(plugin: &str, workspace: &str) -> Self {
+    fn new(plugin: &str, workspace: &str, access: super::capabilities::Access) -> Self {
         let stderr = StderrTail::default();
         let mut wasi = WasiCtxBuilder::new();
         // Nothing granted: no preopens, env or args (the builder's
@@ -337,6 +340,7 @@ impl HostState {
             deadline: Instant::now(),
             plugin: plugin.to_string(),
             workspace: workspace.to_string(),
+            access,
             call: None,
         }
     }
@@ -535,7 +539,8 @@ pub(crate) struct Offer {
 #[derive(Default)]
 struct Events {
     next: u64,
-    ring: VecDeque<(u64, Arc<str>)>,
+    /// (id, the workspace it belongs to, the frame).
+    ring: VecDeque<(u64, Arc<str>, Arc<str>)>,
 }
 
 type Key = (String, String);
@@ -791,7 +796,8 @@ impl PluginRuntime {
                 .clone()
                 .try_acquire_owned()
                 .map_err(|_| "all plugin instances are busy — retry shortly".to_string())?;
-            let mut store = Store::new(&shared()?.engine, HostState::new(&m.id, ws));
+            let access = super::capabilities::Access::of(m);
+            let mut store = Store::new(&shared()?.engine, HostState::new(&m.id, ws, access));
             store.limiter(|s| &mut s.limits);
             // Yield to tokio on every tick; stop the guest past its budget.
             store.epoch_deadline_callback(|ctx| {
@@ -1005,11 +1011,13 @@ impl PluginRuntime {
     }
 
     /// Record an `emit` frame for the `/ws/events` clients.
-    pub(super) fn push_event(&self, frame: String) {
+    pub(super) fn push_event(&self, workspace: &str, frame: String) {
         let mut events = crate::lock(&self.events);
         events.next += 1;
         let id = events.next;
-        events.ring.push_back((id, Arc::from(frame)));
+        events
+            .ring
+            .push_back((id, Arc::from(workspace), Arc::from(frame)));
         while events.ring.len() > EVENTS_KEPT {
             events.ring.pop_front();
         }
@@ -1020,14 +1028,16 @@ impl PluginRuntime {
         crate::lock(&self.events).next
     }
 
-    /// Frames newer than `last` for one client, advancing its mark.
-    pub(crate) fn events_since(&self, last: &mut u64) -> Vec<Arc<str>> {
+    /// Frames newer than `last` for one client showing `workspace`,
+    /// advancing its mark: a plugin's frames reach only the windows on its
+    /// workspace (none, for a window on no workspace).
+    pub(crate) fn events_since(&self, last: &mut u64, workspace: Option<&str>) -> Vec<Arc<str>> {
         let events = crate::lock(&self.events);
         let frames: Vec<Arc<str>> = events
             .ring
             .iter()
-            .filter(|(id, _)| *id > *last)
-            .map(|(_, f)| f.clone())
+            .filter(|(id, ws, _)| *id > *last && Some(&**ws) == workspace)
+            .map(|(_, _, f)| f.clone())
             .collect();
         *last = events.next;
         frames
@@ -1176,7 +1186,10 @@ mod tests {
 
     #[test]
     fn review_memory_budget_is_shared_by_all_memories_in_a_store() {
-        let mut store = Store::new(&shared().unwrap().engine, HostState::new("test", "ws"));
+        let mut store = Store::new(
+            &shared().unwrap().engine,
+            HostState::new("test", "ws", crate::plugins::capabilities::Access::NONE),
+        );
         store.limiter(|s| &mut s.limits);
         let forty_mb = wasmtime::MemoryType::new(640, None);
         assert!(wasmtime::Memory::new(&mut store, forty_mb.clone()).is_ok());
@@ -1188,7 +1201,10 @@ mod tests {
 
     #[test]
     fn review_table_budget_is_shared_by_all_tables_in_a_store() {
-        let mut store = Store::new(&shared().unwrap().engine, HostState::new("test", "ws"));
+        let mut store = Store::new(
+            &shared().unwrap().engine,
+            HostState::new("test", "ws", crate::plugins::capabilities::Access::NONE),
+        );
         store.limiter(|s| &mut s.limits);
         let table = wasmtime::TableType::new(wasmtime::RefType::FUNCREF, 40_000, None);
         assert!(wasmtime::Table::new(&mut store, table.clone(), wasmtime::Ref::Func(None)).is_ok());

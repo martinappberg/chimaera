@@ -655,6 +655,11 @@ impl WatchGuard {
         WatchGuard { state, ws: None }
     }
 
+    /// The workspace this connection shows, if any.
+    pub(crate) fn workspace(&self) -> Option<&str> {
+        self.ws.as_deref()
+    }
+
     /// Point this connection at `ws` (or nothing), releasing any previous one.
     pub(crate) fn set(&mut self, ws: Option<String>) {
         if self.ws == ws {

@@ -19,7 +19,8 @@ Writing one: [docs/agent-guides/plugins.md](../docs/agent-guides/plugins.md).
 
 | Path | What |
 |---|---|
-| `plugins.lock` | One `[[plugin]]` per first-party plugin: `id`, `name` and `summary` (what an available card shows before any install), `version` (the pinned release), `repo` (`owner/name`), `sha256_wasm`, `sha256_toml` (that release's `SHA256SUMS`). The daemon embeds it (`include_str!`, parsed with toml in `crates/chimaera-server/src/plugins/mod.rs`): each entry is listed as available until installed, and a first-party install fetches `https://github.com/<repo>/releases/download/v<version>/{SHA256SUMS,plugin.toml,plugin.wasm}` and refuses bytes that don't match both the release's `SHA256SUMS` and these sha256s. A bump is automatic — `.github/workflows/plugin-lock.yml` (below) — and CI-gated. `plugins::tests::every_locked_release_is_what_the_lock_says` checks each locked release (downloaded into `dist-test/`) against it: both sha256s, id, version, name, `[release] github` equal to `repo`, the gates, and that it says what it adds. |
+| `plugins.lock` | One `[[plugin]]` per first-party plugin: `id`, `name` and `summary` (what an available card shows before any install), `version` (the pinned release), `repo` (`owner/name`), `sha256_wasm`, `sha256_toml` (that release's `SHA256SUMS`), and `tier` + `caps` — what the maintainers approved it to do (`sandboxed` / `privileged`, and its capability digest; `chimaera plugin caps plugin.toml` prints both for a release's manifest). A sandboxed update keeps the badge only while its digest is `caps`; a privileged plugin is verified only at the pin (docs/plugin-platform-plan.md §2). The daemon embeds it (`include_str!`, parsed with toml in `crates/chimaera-server/src/plugins/mod.rs`): each entry is listed as available until installed, and a first-party install fetches `https://github.com/<repo>/releases/download/v<version>/{SHA256SUMS,plugin.toml,plugin.wasm}` and refuses bytes that don't match both the release's `SHA256SUMS` and these sha256s. A bump is automatic — `.github/workflows/plugin-lock.yml` (below) — and CI-gated. `plugins::tests::every_locked_release_is_what_the_lock_says` checks each locked release (downloaded into `dist-test/`) against it: both sha256s, id, version, name, `[release] github` equal to `repo`, the gates, that it says what it adds, and that `tier` and `caps` are its manifest's. |
+| `revoked.json`, `revocation-keys.txt` | The kill switch (`crates/chimaera-server/src/plugins/revoke.rs`): the list of blocked plugin builds (id, versions and/or `plugin.wasm` sha256s, `hard` or `soft`, a reason), embedded in every build, and the Ed25519 public keys (plus `threshold`) whose signatures make the live copy — this file on `main`, fetched daily — count. With no key listed only the embedded list counts. Block a build: add its entry, then `node scripts/revocations.mjs sign --key <your private key>` (writes `revoked.sig`), commit both, and ship a release for hosts that never fetch; `keygen` makes a maintainer's key (its private half never enters the repository), `verify` checks the current signatures. |
 | `Cargo.toml`, `Cargo.lock` | The workspace: `test-fixture` only, `chimaera-plugin-api` by path, a small release profile. |
 | `test-fixture/` | The host's test fixture (echo, loop, allocate, panic, read, state, append, recent): each tool pokes one host limit. Built here into `dist-test/`, which only the daemon's **test** builds embed — never shipped. Its `v2` feature (one more tool, `version`) with `plugin-v2.toml` (0.2.0) is its "next release" for the daemon's update tests: the script also lays that out as `dist-test/test-fixture-v2/`, which the tests serve from a fake releases server (`crates/chimaera-server/src/tests/plugin_updates.rs`). |
 | `dist-test/`, `target/` | Build output (gitignored). `dist-test/` holds the fixture (and its v2), embedded by test builds, and each locked release as `dist-test/<id>/{plugin.wasm,plugin.toml,SHA256SUMS}`, which tests install by path. |
@@ -69,9 +70,14 @@ version again replaces it in place).
    sees the newer release, downloads it, checks `SHA256SUMS` against the
    bytes and the manifest's id, version and `[release] github` against the
    lock, rewrites the entry (`version`, both sha256s, `name` / `summary`) and
-   opens `fix: update <Name> to <version>` with squash auto-merge. CI installs
-   the release against the new lock; the merge cuts a patch release, and from
-   it **Install** fetches that version. Run it by hand with **Actions →
+   opens `fix: update <Name> to <version>`. It auto-merges (squash) only when
+   the plugin is sandboxed and the release's capability lines (`api` and every
+   table but `[adds]`, `[release]` and `[detect]`) equal its pinned release's,
+   so `tier` and `caps` carry over. Otherwise the PR waits for a maintainer:
+   review the release, set `tier` and `caps` to what `chimaera plugin caps`
+   prints for its `plugin.toml` (CI stays red until they match), merge. CI
+   installs the release against the new lock; the merge cuts a patch release,
+   and from it **Install** fetches that version. Run it by hand with **Actions →
    plugin-lock → Run workflow**, or locally without writing:
    `node .github/scripts/plugin-lock.mjs`. One bump PR at a time: a newer
    release waits for the open one, which the workflow keeps up to date with

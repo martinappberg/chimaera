@@ -11,6 +11,14 @@
 // words). CI's plugin tests install the same release against the new lock,
 // so a bump this script writes still has to pass CI to merge.
 //
+// What the plugin can do is the maintainers' to approve (`tier` and `caps`,
+// docs/plugin-platform-plan.md §2): a bump auto-merges only when the entry is
+// sandboxed and the release's capability lines (`capabilityLines`: `api`
+// and every table but the card's words, the release source and detect) are
+// the pinned release's, so its digest is unchanged. Otherwise the PR opens
+// without auto-merge and says why; CI (which checks tier and caps against
+// the release) stays red until a person sets them.
+//
 //   node .github/scripts/plugin-lock.mjs [--write] [--lock <file>] [--out <dir>]
 //
 // Without --write it only reports. --out receives `title`, `branch` and
@@ -29,7 +37,9 @@ const API = "https://api.github.com";
 const WASM_MAX = 16 * 1024 * 1024;
 const TOML_MAX = 64 * 1024;
 const SUMS_MAX = 4 * 1024;
-const LOCK_KEYS = ["id", "name", "summary", "version", "repo", "sha256_wasm", "sha256_toml"];
+const LOCK_KEYS = ["id", "name", "summary", "version", "repo", "sha256_wasm", "sha256_toml", "tier", "caps"];
+/** Tables of a plugin.toml that say nothing about what it can do. */
+const WORDS_ONLY = new Set(["adds", "release", "detect"]);
 const VERSION_RE = /^[0-9]+\.[0-9]+\.[0-9]+$/;
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
@@ -111,6 +121,35 @@ export function manifestFields(text) {
   return { id: top.id, name: top.name, summary: top.summary, version: top.version, github: release.github };
 }
 
+/**
+ * The lines of a plugin.toml that decide what the plugin can do: the
+ * top-level `api`, and every line of every table except the card's words
+ * (`[adds]`), its release source and its detect paths. Comment and blank
+ * lines are dropped, the rest trimmed. Equal lines mean an equal capability
+ * digest; any difference (an inline comment too) is treated as asking for
+ * more, which only costs a person's review.
+ */
+export function capabilityLines(text) {
+  const out = [];
+  let table = null;
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (line === "" || line.startsWith("#")) continue;
+    const header = /^\[\[?\s*([^\]]*?)\s*\]\]?$/.exec(line);
+    if (header !== null) {
+      table = header[1];
+      if (!WORDS_ONLY.has(table.split(".")[0])) out.push(line);
+      continue;
+    }
+    if (table === null) {
+      if (/^api\s*=/.test(line)) out.push(line);
+      continue;
+    }
+    if (!WORDS_ONLY.has(table.split(".")[0])) out.push(line);
+  }
+  return out;
+}
+
 /** SHA256SUMS → file name → lowercase sha256 (`*name` and `./name` too). */
 export function parseSums(text) {
   const sums = new Map();
@@ -133,6 +172,7 @@ export function newer(a, b) {
  *  cuts a patch release, which is how the app gets the new lock), branch
  *  and body. */
 export function pullRequest(bumps) {
+  const review = bumps.filter((b) => !b.automerge);
   const named = bumps.map((b) => `${b.name} ${b.to}`);
   const title =
     bumps.length === 1
@@ -150,9 +190,21 @@ export function pullRequest(bumps) {
     "",
     ...bumps.map((b) => `- \`${b.id}\` ${b.to}: wasm \`${b.sha256_wasm}\` (${b.wasm_bytes} bytes), toml \`${b.sha256_toml}\``),
     "",
-    "CI installs these releases from GitHub against the new lock (`scripts/build-plugins.sh` and the server's plugin tests). Auto-merge (squash) is on: it lands when the required checks pass, and the `fix:` title cuts a patch release so the app picks the new versions up.",
+    ...(review.length === 0
+      ? [
+          "Each release is sandboxed and asks for nothing its pinned release didn't (the same capability lines), so `tier` and `caps` carry over.",
+          "",
+          "CI installs these releases from GitHub against the new lock (`scripts/build-plugins.sh` and the server's plugin tests). Auto-merge (squash) is on: it lands when the required checks pass, and the `fix:` title cuts a patch release so the app picks the new versions up.",
+        ]
+      : [
+          "**Needs a maintainer's review — no auto-merge.** What these plugins can do changed, or they run programs (privileged):",
+          "",
+          ...review.map((b) => `- \`${b.id}\` ${b.to}: ${b.why}`),
+          "",
+          "Review the release's code and manifest, then set its `tier` and `caps` in `plugins/plugins.lock` to what `chimaera plugin caps plugin.toml` prints for the release's `plugin.toml`. CI checks both against the release and stays red until they match. Merging cuts a patch release.",
+        ]),
   ].join("\n");
-  return { title, branch, body };
+  return { title, branch, body, automerge: review.length === 0 };
 }
 
 function sha256(bytes) {
@@ -209,6 +261,17 @@ async function check(entry, token) {
     throw refuse(`plugin.toml names [release] github = "${m.github}", the lock ${entry.repo}`);
   }
   if (!m.name || !m.summary) throw refuse("plugin.toml has no one-line name or summary");
+  // What it can do, against the release the lock pins now (its plugin.toml
+  // checked against the lock's sha256 first).
+  const pinned = await get(`https://github.com/${entry.repo}/releases/download/v${entry.version}/plugin.toml`, { max: TOML_MAX });
+  if (sha256(pinned) !== entry.sha256_toml) throw refuse(`the pinned v${entry.version} plugin.toml isn't the one the lock names`);
+  const same = JSON.stringify(capabilityLines(pinned.toString("utf8"))) === JSON.stringify(capabilityLines(toml.toString("utf8")));
+  const why =
+    entry.tier !== "sandboxed"
+      ? "it runs programs (privileged): every release is reviewed"
+      : same
+        ? null
+        : "its capability lines changed: it may ask for more";
   return {
     id: entry.id,
     name: m.name,
@@ -220,6 +283,8 @@ async function check(entry, token) {
     sha256_wasm: shaWasm,
     sha256_toml: shaToml,
     wasm_bytes: wasm.length,
+    automerge: why === null,
+    why,
   };
 }
 
@@ -264,8 +329,12 @@ async function main() {
     await writeFile(join(out, "branch"), pr.branch);
     await writeFile(join(out, "body.md"), pr.body);
   }
+  const automerge = bumps.length > 0 && bumps.every((b) => b.automerge);
   if (process.env.GITHUB_OUTPUT) {
-    await appendFile(process.env.GITHUB_OUTPUT, `bumped=${bumps.length > 0}\nproblems=${problems.length}\n`);
+    await appendFile(
+      process.env.GITHUB_OUTPUT,
+      `bumped=${bumps.length > 0}\nautomerge=${automerge}\nproblems=${problems.length}\n`,
+    );
   }
   if (bumps.length === 0 && problems.length === 0) console.log("plugins.lock is current");
   if (problems.length > 0) process.exitCode = 1;

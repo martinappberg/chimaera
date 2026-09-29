@@ -51,12 +51,16 @@ use serde_json::{json, Value};
 
 use crate::AppState;
 
+pub(crate) mod activity;
+pub mod capabilities;
 pub(crate) mod hostfns;
 pub(crate) mod installed;
 pub(crate) mod preview;
 pub(crate) mod releases;
+pub(crate) mod revoke;
 pub(crate) mod runtime;
 pub(crate) mod tools;
+pub(crate) mod trust;
 
 /// How long a workspace's detect result is trusted before a re-stat.
 const DETECT_TTL: Duration = Duration::from_secs(30);
@@ -96,6 +100,12 @@ pub(crate) struct Locked {
     /// That release's `SHA256SUMS` entries, lowercase hex.
     pub(crate) sha256_wasm: String,
     pub(crate) sha256_toml: String,
+    /// What the maintainers approved it to do: its tier (`sandboxed` or
+    /// `privileged`) and capability digest (`capabilities`). A sandboxed
+    /// update from its repository keeps the badge only while its digest is
+    /// this one; a privileged plugin is verified only at the pin.
+    pub(crate) tier: String,
+    pub(crate) caps: String,
 }
 
 /// Parse and check a lock: ids, versions, repos and sha256s well-formed,
@@ -125,12 +135,18 @@ pub(crate) fn parse_lock(text: &str) -> Result<Vec<Locked>, String> {
         if l.name.trim().is_empty() || l.summary.trim().is_empty() {
             return Err(format!("plugins.lock: {id}: name and summary are required"));
         }
-        for sha in [&l.sha256_wasm, &l.sha256_toml] {
+        for sha in [&l.sha256_wasm, &l.sha256_toml, &l.caps] {
             if sha.len() != 64 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
                 return Err(format!(
                     "plugins.lock: {id}: a sha256 is not 64 lowercase hex digits"
                 ));
             }
+        }
+        if capabilities::Tier::parse(&l.tier).is_none() {
+            return Err(format!(
+                "plugins.lock: {id}: tier {:?} is not sandboxed or privileged",
+                l.tier
+            ));
         }
     }
     entries.sort_by(|a, b| a.id.cmp(&b.id));
@@ -178,6 +194,9 @@ pub(crate) struct Manifest {
     pub(crate) api: String,
     #[serde(default)]
     pub(crate) detect: Detect,
+    /// `[access]`: what it may read through the host (`capabilities`).
+    #[serde(default)]
+    pub(crate) access: capabilities::AccessDecl,
     #[serde(default)]
     pub(crate) requires: Requires,
     #[serde(default)]
@@ -194,6 +213,10 @@ pub(crate) struct Manifest {
     /// The behaviour — set by the catalog, never by the TOML.
     #[serde(skip)]
     pub(crate) wasm: Wasm,
+    /// What it can do, derived once when the manifest is parsed
+    /// (`parse_manifest`): the card's Can list, its tier and digest.
+    #[serde(skip)]
+    pub(crate) caps: capabilities::Caps,
     /// Where this copy came from and what the catalog decided about it —
     /// set by the catalog, never by the TOML.
     #[serde(skip)]
@@ -251,6 +274,9 @@ pub(crate) struct Origin {
     /// Installed from a local directory (`POST /plugins/install {path}`):
     /// that directory.
     pub(crate) local_path: Option<PathBuf>,
+    /// The repository a release install came from (the host-written
+    /// `source-github` marker): where trust records say it came from.
+    pub(crate) source_github: Option<String>,
 }
 
 /// Workspace-relative paths whose presence makes the plugin active here.
@@ -437,14 +463,17 @@ pub(crate) fn validate(m: &Manifest) -> Result<(), String> {
     plugin_version(&m.version)?;
     let mut tools = BTreeSet::new();
     for tool in &m.provides.mcp_tools {
+        // No dots: codex pre-approves a tool through a dotted config key
+        // (`mcp_servers.chimaera.tools.<name>.approval_mode`), where a dot
+        // would split the name — refused here rather than skipped there.
         if tool.is_empty()
             || tool.len() > 64
             || !tool
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
         {
             return Err(format!(
-                "MCP tool {tool:?} must be 1–64 letters, digits, underscores, dots or dashes"
+                "MCP tool {tool:?} must be 1–64 letters, digits, underscores or dashes"
             ));
         }
         if crate::mcp::is_core_tool(tool) {
@@ -452,6 +481,19 @@ pub(crate) fn validate(m: &Manifest) -> Result<(), String> {
         }
         if !tools.insert(tool) {
             return Err(format!("MCP tool {tool:?} is listed twice"));
+        }
+    }
+    // Detect paths are stat'ed under the workspace root: relative, plain
+    // components only, so a manifest can't probe outside the workspace.
+    for rel in &m.detect.any {
+        let plain = !rel.is_empty()
+            && Path::new(rel)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !plain {
+            return Err(format!(
+                "detect path {rel:?} must be relative to the workspace, without `..` or `.`"
+            ));
         }
     }
     if let Some(release) = &m.release {
@@ -470,8 +512,9 @@ pub(crate) fn parse_manifest(text: &str) -> Result<Manifest, String> {
     if text.len() as u64 > installed::TOML_MAX {
         return Err("plugin.toml exceeds the 64 KiB manifest limit".into());
     }
-    let m = toml::from_str::<Manifest>(text).map_err(|e| format!("plugin.toml: {e}"))?;
+    let mut m = toml::from_str::<Manifest>(text).map_err(|e| format!("plugin.toml: {e}"))?;
     validate(&m)?;
+    m.caps = capabilities::Caps::of(&m);
     Ok(m)
 }
 
@@ -598,11 +641,11 @@ pub(crate) struct Catalog {
     merged: RwLock<(usize, Arc<Vec<Arc<Manifest>>>)>,
 }
 
-fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+pub(crate) fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+pub(crate) fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     lock.write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -653,6 +696,11 @@ impl Catalog {
         self.all().iter().find(|m| m.id == id).cloned()
     }
 
+    /// Every installed copy as found on disk.
+    pub(crate) fn installed_copies(&self) -> Arc<Vec<installed::InstalledCopy>> {
+        read(&self.installed).clone()
+    }
+
     /// The installed copy of `id` as found on disk, if any.
     pub(crate) fn installed_copy(&self, id: &str) -> Option<installed::InstalledCopy> {
         read(&self.installed)
@@ -681,6 +729,8 @@ impl Catalog {
 pub(crate) struct Refusal {
     pub(crate) status: StatusCode,
     pub(crate) message: String,
+    /// Keys the answer carries beside `error` (`Refusal::with`).
+    pub(crate) detail: Option<Value>,
 }
 
 /// The catalog every lookup reads: the loadable plugins.
@@ -900,7 +950,12 @@ pub(crate) async fn active(state: &AppState, ws: &str) -> Vec<Arc<Manifest>> {
     };
     catalog(state)
         .iter()
-        .filter(|m| on.contains(&m.id) && found.contains(&m.id) && m.origin.fault.is_none())
+        .filter(|m| {
+            on.contains(&m.id)
+                && found.contains(&m.id)
+                && m.origin.fault.is_none()
+                && trust::hold(state, m).is_none()
+        })
         .cloned()
         .collect()
 }
@@ -918,9 +973,12 @@ pub(crate) async fn active_for_session(state: &AppState, sid: &str) -> Vec<Arc<M
 /// plugin active there, plus `tell_mastermind` when the workspace has a
 /// Mastermind (empty — and so no settings change at all — when neither).
 pub(crate) async fn spawn_allow(state: &AppState, ws: &str) -> Vec<String> {
+    // A build the host refused or faulted here offers nothing, so nothing of
+    // it is pre-allowed.
     let mut tools: Vec<String> = active(state, ws)
         .await
         .iter()
+        .filter(|m| state.plugin_runtime.fault(m, ws).is_none())
         .flat_map(|m| m.provides.mcp_tools.iter().cloned())
         .collect();
     // A workspace with a Mastermind: its workers may message it without a
@@ -950,7 +1008,11 @@ pub(crate) fn manifest_json(state: &AppState, m: &Manifest) -> Value {
     let mut v = manifest_fields(m);
     v["source"] = json!("installed");
     v["installed"] = json!(true);
-    v["first_party"] = json!(o.first_party);
+    // The badge: Chimaera's own plugin, as the maintainers approved it (a
+    // first-party update that grew its capabilities is the user's to trust).
+    v["first_party"] =
+        json!(o.first_party && trust::standing(state, m) == trust::Standing::Verified);
+    trust::wire(state, m, &mut v);
     v["verified"] = json!(o.verified);
     v["sha256_wasm"] = json!(&*m.wasm.sha256);
     if let Some(path) = &o.path {
@@ -1006,6 +1068,11 @@ fn manifest_fields(m: &Manifest) -> Value {
         "recommends_summary": text_or_null(m.recommends.summary.as_deref()),
         "version": m.version,
         "api": m.api,
+        // What it can do, in the host's words (the card's Can list), its
+        // tier and its capability digest (what a trust answer confirms).
+        "tier": m.caps.tier().as_str(),
+        "caps": m.caps.digest(),
+        "can": m.caps.lines_json(),
     })
 }
 
@@ -1036,6 +1103,12 @@ pub(crate) fn available_json(l: &Locked) -> Value {
         "recommends_summary": null,
         "version": l.version,
         "api": null,
+        // The lock's record; the words come with the details (`preview`).
+        "tier": l.tier,
+        "caps": l.caps,
+        "can": [],
+        "standing": "verified",
+        "hold": null,
         "source": "available",
         "installed": false,
         "first_party": true,
@@ -1059,7 +1132,12 @@ pub(crate) async fn list_plugins(State(state): State<Arc<AppState>>) -> Response
             Entry::Available(l) => available_json(l),
         })
         .collect();
-    Json(json!({"schema": 1, "plugins": plugins})).into_response()
+    Json(json!({
+        "schema": 1,
+        "plugins": plugins,
+        "policy": trust::policy(&state).json(),
+    }))
+    .into_response()
 }
 
 /// An agent-plugin map on the wire: `[{agent, id, marketplace}]`.
@@ -1105,8 +1183,9 @@ pub(crate) async fn workspace_plugins(
             };
             let mut v = manifest_json(&state, m);
             // A plugin that can't run is off whatever its switch says: the
-            // switch is kept, and holds again once the fault is gone.
-            let is_on = on.contains(&m.id) && m.origin.fault.is_none();
+            // switch is kept, and holds again once the fault (or the hold:
+            // a block, the policy, missing trust) is gone.
+            let is_on = on.contains(&m.id) && m.origin.fault.is_none() && v["hold"].is_null();
             let detected = found.contains(&m.id);
             v["on"] = json!(is_on);
             v["detected"] = json!(detected);
@@ -1129,6 +1208,7 @@ pub(crate) async fn workspace_plugins(
         "workspace_id": id,
         "root": workspace.root,
         "plugins": plugins,
+        "policy": trust::policy(&state).json(),
     }))
     .into_response()
 }
@@ -1154,6 +1234,29 @@ pub(crate) async fn put_workspace_plugin(
                     Json(json!({"error": format!("{} can't run on this daemon: {fault}", m.name)})),
                 )
                     .into_response();
+            }
+            match trust::hold(&state, &m) {
+                None => {}
+                Some(trust::Hold::Untrusted) => {
+                    let source = trust::source_of(&m);
+                    return trust::needs_trust(&m, &source, &m.wasm.sha256, Some(&m), false)
+                        .into_response();
+                }
+                Some(trust::Hold::Blocked(b)) => {
+                    return Refusal::conflict(format!(
+                        "Chimaera blocked {} {}: {}",
+                        m.name, m.version, b.reason
+                    ))
+                    .with(json!({"blocked": revoke::block_json(&b)}))
+                    .into_response()
+                }
+                Some(trust::Hold::Policy(why)) => {
+                    return Refusal::new(
+                        StatusCode::FORBIDDEN,
+                        format!("{} can't run here: {why}", m.name),
+                    )
+                    .into_response()
+                }
             }
         }
         Some(_) => {}
@@ -1527,7 +1630,8 @@ mod tests {
         let entry = |extra: &str| {
             format!(
                 "[[plugin]]\nid = \"x\"\nname = \"X\"\nsummary = \"x\"\nversion = \"0.1.0\"\n\
-                 repo = \"a/b\"\nsha256_wasm = \"{0}\"\nsha256_toml = \"{0}\"\n{extra}",
+                 repo = \"a/b\"\nsha256_wasm = \"{0}\"\nsha256_toml = \"{0}\"\n\
+                 tier = \"sandboxed\"\ncaps = \"{0}\"\n{extra}",
                 "a".repeat(64)
             )
         };
@@ -1542,6 +1646,7 @@ mod tests {
             ("version = \"0.1.0\"", "version = \"0.1\""),
             ("repo = \"a/b\"", "repo = \"../b\""),
             ("summary = \"x\"", "summary = \" \""),
+            ("tier = \"sandboxed\"", "tier = \"trusted\""),
         ] {
             assert!(
                 parse_lock(&entry("").replacen(from, to, 1)).is_err(),
@@ -1582,6 +1687,13 @@ mod tests {
             );
             assert_eq!(m.api, API);
             assert_eq!(gate(&m, "0.4.1"), None, "{id} runs on a released daemon");
+            // What the maintainers approved it to do is what it can do:
+            // `chimaera plugin caps` prints both for a release's manifest.
+            assert_eq!(
+                (m.caps.tier().as_str(), m.caps.digest().as_str()),
+                (l.tier.as_str(), l.caps.as_str()),
+                "{id}: the lock's tier and caps are the release's (chimaera plugin caps plugin.toml)"
+            );
             assert!(!m.summary.is_empty());
             assert!(
                 !m.adds.ui.is_empty() || !m.adds.agents.is_empty(),
@@ -1729,8 +1841,27 @@ mod tests {
             demo("version='0.1.0'\napi='0.1'\n[provides]\nmcp_tools=['echo', 'echo']").is_err()
         );
         assert!(
-            demo("version='0.1.0'\napi='0.1'\n[provides]\nmcp_tools=['my_plugin.echo-v2']").is_ok()
+            demo("version='0.1.0'\napi='0.1'\n[provides]\nmcp_tools=['my_plugin-echo-V2']").is_ok()
         );
+        // A dot would split codex's dotted pre-approval key: refused here,
+        // never skipped silently at spawn.
+        assert!(
+            demo("version='0.1.0'\napi='0.1'\n[provides]\nmcp_tools=['my_plugin.echo']").is_err()
+        );
+    }
+
+    #[test]
+    fn detect_paths_stay_inside_the_workspace() {
+        for bad in ["../x", "/etc/passwd", "a/../../b", "./x", ""] {
+            assert!(
+                demo(&format!(
+                    "version='0.1.0'\napi='0.1'\n[detect]\nany=['{bad}']"
+                ))
+                .is_err(),
+                "{bad}"
+            );
+        }
+        assert!(demo("version='0.1.0'\napi='0.1'\n[detect]\nany=['.living/INDEX.md']").is_ok());
     }
 
     const BASE: &str = "id = \"demo\"\nname = \"Demo\"\nsummary = \"x\"\n";

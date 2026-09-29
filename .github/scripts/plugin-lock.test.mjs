@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { manifestFields, newer, parseLock, parseSums, pullRequest, setLockValues } from "./plugin-lock.mjs";
+import { capabilityLines, manifestFields, newer, parseLock, parseSums, pullRequest, setLockValues } from "./plugin-lock.mjs";
 
 const LOCK = `# comment
 [[plugin]]
@@ -13,6 +13,8 @@ version = "0.1.3"
 repo = "martinappberg/chimaera-plugin-agent-notes"
 sha256_wasm = "${"a".repeat(64)}"
 sha256_toml = "${"b".repeat(64)}"
+tier = "sandboxed"
+caps = "${"1".repeat(64)}"
 
 [[plugin]]
 id = "mycelium"
@@ -22,6 +24,8 @@ version = "0.1.2"
 repo = "martinappberg/chimaera-plugin-mycelium"
 sha256_wasm = "${"c".repeat(64)}"
 sha256_toml = "${"d".repeat(64)}"
+tier = "sandboxed"
+caps = "${"2".repeat(64)}"
 `;
 
 test("the repository's own lock parses", () => {
@@ -107,6 +111,7 @@ test("versions compare numerically", () => {
 test("the pull request is a fix: (a patch release ships the new lock)", () => {
   const bump = (id, name, to) => ({
     id, name, to, from: "0.1.0", repo: `o/${id}`, url: "https://x", sha256_wasm: "a", sha256_toml: "b", wasm_bytes: 1,
+    automerge: true, why: null,
   });
   const one = pullRequest([bump("mycelium", "Mycelium", "0.1.3")]);
   assert.equal(one.title, "fix: update Mycelium to 0.1.3");
@@ -115,4 +120,37 @@ test("the pull request is a fix: (a patch release ships the new lock)", () => {
   assert.equal(two.title, "fix: update first-party plugins (Agent notes 0.1.4, Mycelium 0.1.3)");
   assert.equal(two.branch, "plugin-lock/agent-notes-0.1.4+mycelium-0.1.3");
   assert.match(two.body, /\| Mycelium \(`mycelium`\) \| 0\.1\.0 \| 0\.1\.3 \|/);
+  assert.equal(two.automerge, true);
+  assert.match(two.body, /Auto-merge \(squash\) is on/);
+  const grown = pullRequest([{ ...bump("mycelium", "Mycelium", "0.2.0"), automerge: false, why: "its capability lines changed: it may ask for more" }]);
+  assert.equal(grown.automerge, false, "asking for more waits for a person");
+  assert.match(grown.body, /no auto-merge/);
+  assert.match(grown.body, /`mycelium` 0\.2\.0: its capability lines changed/);
+});
+
+test("capability lines: api and the tables that say what it can do, not the card's words", () => {
+  const base = `# a comment
+id = "x"
+name = "X"
+version = "0.1.0"
+summary = "One line."
+api = "0.1"
+
+[provides]
+mcp_tools = ["a", "b"]
+
+[adds]
+ui = ["words"]
+
+[release]
+github = "o/x"
+`;
+  assert.deepEqual(capabilityLines(base), ['api = "0.1"', "[provides]", 'mcp_tools = ["a", "b"]']);
+  const reworded = base.replace('summary = "One line."', 'summary = "Other words."').replace('ui = ["words"]', 'ui = ["new words"]').replace('version = "0.1.0"', 'version = "0.2.0"');
+  assert.deepEqual(capabilityLines(reworded), capabilityLines(base), "new words and a new version ask for nothing");
+  const grown = base.replace('mcp_tools = ["a", "b"]', 'mcp_tools = ["a", "b", "c"]');
+  assert.notDeepEqual(capabilityLines(grown), capabilityLines(base));
+  const access = `${base}\n[access]\ntimeline = "none"\n`;
+  assert.notDeepEqual(capabilityLines(access), capabilityLines(base), "even a narrowing is reviewed");
+  assert.notDeepEqual(capabilityLines(base.replace('api = "0.1"', 'api = "0.2"')), capabilityLines(base), "the API decides the defaults");
 });

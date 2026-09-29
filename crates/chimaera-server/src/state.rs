@@ -199,6 +199,9 @@ pub(crate) struct AppState {
     /// merged with the installed copies under `<data_dir>/plugins`, reloaded
     /// after every install, update, rollback or remove.
     pub(crate) plugin_catalog: plugins::Catalog,
+    /// Who approved what each plugin can do, the admin policy and the kill
+    /// switch (see `plugins::trust`, `plugins::revoke`).
+    pub(crate) plugin_guard: plugins::trust::Guard,
     /// Plugin release knowledge (see `plugins::releases`): the newer
     /// versions a check found, and the one-change-at-a-time lock. Hot state.
     pub(crate) plugin_releases: plugins::releases::Releases,
@@ -250,6 +253,8 @@ impl AppState {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         let (chat, chat_signals_rx) = chat::new_manager(data_dir.join("chat"));
+        let plugin_catalog = plugins::Catalog::load(data_dir.join("plugins"));
+        let plugin_guard = plugins::trust::Guard::load(&plugin_catalog);
         AppState {
             token,
             started: Instant::now(),
@@ -312,7 +317,8 @@ impl AppState {
             claude_settings_path: home.join(".claude").join("settings.json"),
             codex_config_path: home.join(".codex").join("config.toml"),
             timeline: timeline::TimelineService::new(data_dir.join("workspace")),
-            plugin_catalog: plugins::Catalog::load(data_dir.join("plugins")),
+            plugin_catalog,
+            plugin_guard,
             plugin_releases: plugins::releases::Releases::default(),
             plugin_detect: Mutex::new(plugins::DetectCache::default()),
             plugin_runtime: plugins::runtime::PluginRuntime::default(),

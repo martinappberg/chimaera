@@ -144,6 +144,12 @@ pub(crate) async fn run_checker(state: Arc<AppState>) {
                 .is_none_or(|at| at.elapsed() >= crate::plugins::releases::CHECK_INTERVAL);
             if plugins && due {
                 crate::plugins::releases::check_all(&state).await;
+                // The kill switch rides the same daily check, and an admin's
+                // policy file is re-read with it.
+                crate::plugins::revoke::refresh(&state).await;
+                let reading = state.clone();
+                let _ =
+                    tokio::task::spawn_blocking(move || reading.plugin_guard.reload_policy()).await;
                 plugins_checked = Some(std::time::Instant::now());
             }
         }

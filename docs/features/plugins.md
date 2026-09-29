@@ -8,7 +8,9 @@ installed only through their own plugin managers). Beside them: the **Skills** s
 skill each agent can use here), in-app **codex hook trust**, and **Agent notes** — agents
 talking, itself a workbench plugin. **Browse** (searching the marketplaces the agents already
 have) renders disabled, "later". Design: the WASM host, versions and updates in
-[docs/plugin-system-plan.md](../plugin-system-plan.md); the seam, the tab and notes in
+[docs/plugin-system-plan.md](../plugin-system-plan.md); trust — what a plugin can do and who
+approved it — in [docs/plugin-platform-plan.md](../plugin-platform-plan.md) §1–§2 (its phase
+P6, [below](#trust-what-a-plugin-can-do-and-who-approved-it)); the seam, the tab and notes in
 [docs/timeline-knowledge-plugins-plan.md](../timeline-knowledge-plugins-plan.md) §6–§7. Writing a
 plugin: [docs/agent-guides/plugins.md](../agent-guides/plugins.md).
 
@@ -16,7 +18,10 @@ plugin: [docs/agent-guides/plugins.md](../agent-guides/plugins.md).
 manifest, the embedded lock, the catalog and its gates, detect, the workspace routes),
 `runtime.rs` (the wasmtime host), `hostfns.rs` (every host function, bounded), `tools.rs` (plugin
 MCP tools through the runtime), `installed.rs` (the installed directory; install, update,
-rollback, remove), `releases.rs` (the release checker) — plus `agent_probe.rs` and `notes.rs`;
+rollback, remove), `releases.rs` (the release checker), `capabilities.rs` (what a manifest can
+do: `[access]`, the atoms, the digest, the tier, the Can list), `trust.rs` (standing, trust
+records, admission, the admin policy, holds), `revoke.rs` (the kill switch), `activity.rs` (the
+activity log) — plus `agent_probe.rs` and `notes.rs`;
 the interface `crates/chimaera-plugin-api` (the WIT world and its Rust bindings,
 [map](../../crates/chimaera-plugin-api/AGENTS.md)); the first-party plugins in their own
 repositories, [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes) and [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium), whose releases
@@ -31,12 +36,15 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
 `POST /plugins/install {github, version?}` or `{path}` · `POST /plugins/{pid}/install` ·
 `POST /plugins/{pid}/update` · `POST /plugins/{pid}/rollback` · `POST /plugins/{pid}/check` ·
 `DELETE /plugins/{pid}` · `GET /plugins/{pid}/details` · `POST /plugins/preview {github}` ·
+`POST /plugins/{pid}/trust {caps}` or `{allow_block: true}` · `DELETE /plugins/{pid}/trust` ·
+`POST /plugins/{pid}/skip {version}` · `GET /plugins/{pid}/activity` ·
 `POST /workspaces/{id}/plugins/{pid}/install {agent, agent_plugin_id?}` ·
 `POST …/{pid}/setup {agent}` · `POST …/{pid}/trust-hooks {hooks:[{key,hash}]}` ·
 `GET /workspaces/{id}/agent-plugins?refresh=` · `GET /workspaces/{id}/skills?refresh=` ·
 `POST /workspaces/{id}/timeline/{seq}/deliver`; plugin tools ride the per-session MCP endpoint
 ([linked-terminals.md](linked-terminals.md#the-mcp-server)); a plugin's `emit` reaches
-`/ws/events` as a `{"type":"plugin","plugin":…,"workspace":…}` frame (no UI reads one yet).
+`/ws/events` as a `{"type":"plugin","plugin":…,"workspace":…}` frame, sent only to windows
+showing that workspace (no UI reads one yet).
 The additive `{"type":"agent_plugins","epoch":…}` frame invalidates agent reports after
 installation or hook trust and on reconnect; it carries no plugin payload.
 
@@ -459,6 +467,98 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     version's manifest) and `SHA256SUMS`. A plugin's state and its per-workspace switch follow
     its id across versions; a first-party plugin's switch survives a remove and a reinstall
     (a third-party plugin's goes with it — see above).
+
+## Trust: what a plugin can do, and who approved it
+
+- **What & when.** Every plugin says what it can do in one list, derived by the daemon from its
+  manifest — the card's **Can** list, the trust prompt and what the host enforces are that same
+  list. A plugin the Chimaera maintainers verified installs with a click; anything else asks the
+  user to trust exactly that list first. An update that asks for more waits for the user, and
+  the version that runs keeps running meanwhile. Chimaera can block a bad build everywhere
+  (the kill switch), and a host's admin can allow only verified plugins. Shipped as the
+  platform plan's phase P6; nothing changed for Agent notes or Mycelium (both verified, both
+  asking for nothing new).
+- **How it's used.**
+  - **The Can list** is a row of every card's facts ("Can"), in plain words: "Reads files in this
+    workspace" · "Reads the Timeline and posts notes to it" · "Sees this workspace's sessions" ·
+    "Gives agents 2 tools: post_note · read_notes" · "Fills the Knowledge view" · "Offers an
+    agent-side plugin for claude: …" · "Has a setup prompt it sends to an agent you choose". A
+    plugin that runs programs (none yet; the platform's P8) carries a "runs programs" tag and
+    its program lines in the warning tone.
+  - **The trust prompt** (`TrustDialog.svelte`) opens when the daemon refuses an install, an
+    update, Use previous, a switch or Trust with 409 and what the plugin can do: who asks and
+    from where ("github.com/owner/repo", "a local build in /dir"), for an update "It would also"
+    (what it asks beyond the version that runs), then everything it can do. **Trust and install**
+    / **Allow update** / **Trust it** send the same request again with the capability digest
+    shown; an update also offers **Skip this version** (not offered again). A plugin that runs
+    programs is confirmed by typing its name. `chimaera plugin add` and `update` print the same
+    list and ask on the terminal (`--trust` answers yes for scripts; without a terminal the
+    answer is no).
+  - **A card that can't run here** says why in a callout: "X waits for your trust …" with
+    **Review and trust**; "Chimaera turned X off: … You can switch it back on anyway." with
+    **Use anyway** (a soft block); "Chimaera blocked X: … Update or remove it." (a hard block,
+    no override); "Off on this host: this host only allows verified plugins." (the policy). Its
+    switch words read "waiting for your trust" or "off on this host".
+  - **The card's "…" menu** adds **Activity…** (the log, newest first: installs, updates, Use
+    previous, trust given and withdrawn, blocks, skips — kept after a Remove) and, for a
+    plugin the user trusted, **Withdraw trust…** (it goes off everywhere at once and stays
+    installed). CLI: `chimaera plugin trust|untrust|activity <id>`, and `chimaera plugin caps
+    <plugin.toml>` prints a manifest's tier, digest and Can list with no daemon.
+  - **Settings → Extensions → Unverified Plugins** (`plugins.allowUnverified`, on by default):
+    off, only verified plugins install and run on this host. An admin's
+    `/etc/chimaera/policy.json` (`{"plugins": {"allowUnverified", "allowPrivileged": "all" |
+    "verified" | "none", "blocked": [ids]}}`) can only tighten it; a file that doesn't parse
+    fails closed (no unverified and no program-running plugin) and the install form says so.
+- **Where it lives.** `plugins/capabilities.rs` (`Access`, `Caps`: the atoms, `digest`, `tier`,
+  `covers` / `beyond`, `lines`), `plugins/trust.rs` (`Guard` on `AppState` — trust records in
+  `<data dir>/plugins/trust.json`, the policy file, the revocations —; `standing`, `hold`,
+  `admit` / `after_admit`, `needs_trust`, the trust / untrust / skip routes), `plugins/revoke.rs`
+  (the lists, signature checks, `refresh` on the daily checker, `apply`), `plugins/activity.rs`
+  (`<data dir>/plugins/.activity/<id>.jsonl`), `hostfns.rs` (`[access]` on every call), the
+  lock's `tier` / `caps`, `plugins/revoked.json` + `plugins/revocation-keys.txt` (embedded) and
+  `scripts/revocations.mjs` (make a key, sign a list); UI `TrustDialog.svelte`,
+  `ActivityDialog.svelte`, `store.ts` (`TrustNeeded`, `trustChange`), `installCopy.ts`
+  (`holdWords`, `trustWords`, `activityWords`); tests `tests/plugin_trust.rs`.
+- **Key behaviors.**
+  - **Capabilities are atoms** (`["access","files","read"]`, `["agent-tool","post_note"]`, …);
+    the **digest** is the SHA-256 of the sorted atoms under `chimaera-caps/1`, so a kind added
+    later changes no digest of a plugin that doesn't use it. "Asks for more" is set difference;
+    "covered" is subset. A 0.1 manifest without `[access]` is read as exactly what 0.1 allowed
+    (files, the Timeline with notes, sessions); the host refuses each read a build's
+    `[access]` doesn't allow (a file read errors, `timeline-recent` answers nothing,
+    `timeline-append` errors, `sessions` answers nothing).
+  - **Standing.** *Verified*: the lock covers it — the pinned release byte for byte, or a
+    sandboxed first-party update whose digest is the lock's `caps` (the check badge follows
+    this, so a first-party update that grew loses the badge and is the user's to trust).
+    *Trusted*: a trust record for this id, source (`github:<repo>` or `path:<dir>`) and digest.
+    *Untrusted*: installed and off everywhere until trusted. Records cover a digest, not a
+    version: an update that asks for nothing new asks nothing. The first daemon with no
+    `trust.json` trusts every copy already installed (the user's own installs); one that
+    doesn't parse trusts nothing (fail closed) until the user trusts again. Remove forgets the
+    records (a later install is a new question) and the plugin's kept state.
+  - **Admission** (install, update, Use previous, local build): blocked → 422 before any
+    download; the policy → 403; verified, trusted, or asking for no more than the covered build
+    it replaces (a record is written, `how: "subset"`) → proceeds; the caller's `trust` equal to
+    the digest → proceeds (`how: "prompt"`); else 409 with `trust` (`id`, `name`, `version`,
+    `source`, `tier`, `caps`, `can`, `grown`, `from_version`, `confirm`). All of it before the
+    component is fetched. A local build asks once per id and digest (the rebuild loop asks
+    nothing).
+  - **Holds** — why a loaded plugin may not run here — are checked by `active`, so a held plugin
+    offers agents nothing: blocked (kill switch, or the policy's list), refused by the policy,
+    or untrusted. The card wire carries `standing`, `hold` (`{kind, level?, reason?}`) and
+    `skipped_version`; every entry carries `tier`, `caps` and `can`; `GET /plugins` and the
+    workspace list carry `policy`.
+  - **The kill switch.** `plugins/revoked.json` (entries: id, versions and/or `plugin.wasm`
+    sha256s — neither is every version —, `hard` or `soft`, a reason) is embedded in every
+    build; the live copy on the repository's main branch is fetched with the daily plugin
+    check and counts only with Ed25519 signatures (`revoked.sig`) from `threshold` of the keys
+    in `plugins/revocation-keys.txt` (none yet: until a maintainer adds one, only the embedded
+    list counts). A list that newly blocks a loaded build drops its instances at once and logs
+    a `blocked` entry; a soft block the user allowed (by the build's sha256) runs.
+  - **Lock bumps.** The lock records each first-party plugin's `tier` and `caps`; the
+    `plugin-lock` workflow auto-merges a bump only when the plugin is sandboxed and its release's
+    capability lines match the pinned release's — otherwise the PR waits for a maintainer, and
+    CI (which checks both against the release) stays red until they are set.
 
 ## Agent plugins & the Skills view
 

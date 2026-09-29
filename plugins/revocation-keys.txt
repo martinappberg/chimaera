@@ -1,0 +1,10 @@
+# Keys whose signatures make a fetched plugins/revoked.json count
+# (plugins::revoke). One Ed25519 public key per line, 64 hex digits (the raw
+# 32 bytes), and `threshold <n>`: how many distinct keys must sign a list.
+# Every build embeds this file, so adding or removing a key ships in a
+# chimaera release. With no key here, only the list embedded in each build
+# counts: nothing fetched is trusted.
+#
+# Make a key and sign a list: node scripts/revocations.mjs (plugins/AGENTS.md).
+# The private half never enters this repository.
+threshold 1

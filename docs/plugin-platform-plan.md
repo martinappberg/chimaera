@@ -1,6 +1,8 @@
 # The plugin platform: screens, programs, tools and trust
 
-Dated 2026-09-29. A plan, not a record: nothing here has shipped. It grows the WASM
+Dated 2026-09-29. A plan, and from phase P6 on a record: **P6 (trust) is built**
+([the feature page](features/plugins.md#trust-what-a-plugin-can-do-and-who-approved-it));
+P7 onward is still plan. It grows the WASM
 plugin host of the [plugin system plan](plugin-system-plan.md) (shipped as the WIT
 world `chimaera:plugin@0.1.0`) into a platform: a plugin can draw screens in
 Chimaera's own format, run the programs it declares, install the side programs it
@@ -29,7 +31,9 @@ artifact attestations and Sigstore handle the same problems ([prior art](#prior-
 
 Proposed in the same discussion and accepted with the platform route: an update that
 asks for more needs the user's OK again; a kill switch can block a bad version
-everywhere; an admin can forbid unverified plugins on a host.
+everywhere; an admin can forbid unverified plugins on a host. Later the same day the
+maintainer accepted every recommendation in [open decisions](#17-open-decisions) and
+asked for the platform to be built, starting with the trust phase (P6).
 
 ## The short version
 
@@ -759,6 +763,12 @@ world chimaera-plugin {                    // 0.2
 
 ### P6: trust, for the plugins that exist (host only)
 
+**Built (2026-09-29).** One deviation: the revocation list needs `threshold` of the
+keys in `plugins/revocation-keys.txt` (1 while there is one maintainer; "two
+maintainers" is then a process rule, and the file can raise it), and it ships with
+no key, so only the list embedded in each build counts until a maintainer makes one
+(`node scripts/revocations.mjs keygen`).
+
 The capability model for 0.1 manifests and the card's **Can** list; the install policy,
 the trust prompt and trust records; the admin policy; the growth check; `tier` and
 `caps` in the lock and the lock-bump rule; the revocation list, its signature and its
@@ -836,21 +846,19 @@ run in parallel. P9 needs both. P10 needs P7.
 
 ## 17. Open decisions
 
-1. **Sign the revocation list** with an Ed25519 key the binary embeds (recommended: a
-   compromised GitHub account alone cannot then block or unblock plugins), or rely on
-   HTTPS from the repository?
-2. **Require build provenance** for privileged verified plugins (recommended), or
-   checksums and human review only?
-3. **Privileged updates only through the lock** (recommended), or also past the pin when
-   the capability digest is unchanged, as for sandboxed plugins?
-4. **Unverified plugins allowed by default** with the trust prompt (as decided), with
-   `plugins.allowUnverified` for admins to turn off: confirm the default is `true`.
-5. **How long 0.1 stays served** after both first-party plugins move (recommended: two
-   minor releases, then a card note, never a silent refusal).
-6. **Confine privileged jobs with the operating system** where the host allows it
-   (bubblewrap or Landlock): later and opt-in (recommended, because many login nodes
-   allow neither, so it can never be what safety rests on), or on by default wherever
-   it works?
+All six were decided on 2026-09-29, each as recommended:
+
+1. **The revocation list is signed** with an Ed25519 key the binary embeds, so a
+   compromised GitHub account alone cannot block or unblock plugins.
+2. **Build provenance is required** for privileged verified plugins.
+3. **Privileged updates come only through the lock.**
+4. **Unverified plugins are allowed by default**, through the trust prompt;
+   `plugins.allowUnverified` defaults to `true`.
+5. **0.1 stays served** for two minor releases after both first-party plugins move,
+   then loads with a card note, never a silent refusal.
+6. **Operating-system confinement of jobs** is later and opt-in, because many login
+   nodes allow neither bubblewrap nor Landlock, so it can never be what safety rests
+   on.
 
 ## Out of scope
 

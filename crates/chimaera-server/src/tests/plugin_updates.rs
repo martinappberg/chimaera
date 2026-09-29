@@ -17,19 +17,19 @@ use super::support::*;
 use crate::plugins::test_catalog;
 use crate::{lock, AppState};
 
-type Files = Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>;
+pub(super) type Files = Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>;
 
 /// A releases API on 127.0.0.1: `{api}/{owner}/{repo}/releases/latest`, the
 /// `…/releases/tags/v{version}` of every published version, and the assets
 /// under `/dl/`. It counts every request it answers (`hits`).
-struct FakeReleases {
+pub(super) struct FakeReleases {
     base: String,
     files: Files,
     hits: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FakeReleases {
-    async fn start() -> Self {
+    pub(super) async fn start() -> Self {
         let files: Files = Arc::default();
         let hits: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
         let served = files.clone();
@@ -51,20 +51,20 @@ impl FakeReleases {
     }
 
     /// Requests answered so far.
-    fn hits(&self) -> usize {
+    pub(super) fn hits(&self) -> usize {
         self.hits.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn api(&self) -> String {
+    pub(super) fn api(&self) -> String {
         format!("{}/api", self.base)
     }
 
-    fn downloads(&self) -> String {
+    pub(super) fn downloads(&self) -> String {
         format!("{}/gh", self.base)
     }
 
     /// Publish `version` of `github` as its latest release.
-    fn publish(&self, github: &str, version: &str, toml: &str, wasm: &[u8]) {
+    pub(super) fn publish(&self, github: &str, version: &str, toml: &str, wasm: &[u8]) {
         let sums = format!(
             "{}  plugin.wasm\n{}  plugin.toml\n",
             crate::fs::sha256_hex(wasm),
@@ -73,7 +73,14 @@ impl FakeReleases {
         self.publish_with_sums(github, version, toml, wasm, &sums);
     }
 
-    fn publish_with_sums(&self, github: &str, version: &str, toml: &str, wasm: &[u8], sums: &str) {
+    pub(super) fn publish_with_sums(
+        &self,
+        github: &str,
+        version: &str,
+        toml: &str,
+        wasm: &[u8],
+        sums: &str,
+    ) {
         let dl = format!("/dl/{github}/{version}");
         // The API lists each asset's size, as GitHub does.
         let asset = |name: &str, size: usize| json!({"name": name, "size": size, "browser_download_url": format!("{}{dl}/{name}", self.base)});
@@ -105,17 +112,17 @@ impl FakeReleases {
     }
 }
 
-fn v1_wasm() -> Vec<u8> {
+pub(super) fn v1_wasm() -> Vec<u8> {
     test_catalog::fixture_wasm()
 }
 
-fn v2_wasm() -> Vec<u8> {
+pub(super) fn v2_wasm() -> Vec<u8> {
     test_catalog::dist_test_bytes("test-fixture-v2/plugin.wasm")
 }
 
 /// The fixture's manifest (`v2`: its next release's) as plugin `id` at
 /// `version`, released from `acme/<id>`, plus `extra` TOML at the end.
-fn manifest(v2: bool, id: &str, version: &str, extra: &str) -> String {
+pub(super) fn manifest(v2: bool, id: &str, version: &str, extra: &str) -> String {
     let base = if v2 {
         test_catalog::dist_test_text("test-fixture-v2/plugin.toml")
     } else {
@@ -141,13 +148,13 @@ fn manifest(v2: bool, id: &str, version: &str, extra: &str) -> String {
 
 /// `manifest` without its `[release]` section: a plugin with nowhere to
 /// check or update from.
-fn unreleased(v2: bool, id: &str, version: &str) -> String {
+pub(super) fn unreleased(v2: bool, id: &str, version: &str) -> String {
     let full = manifest(v2, id, version, "");
     let cut = full.find("\n[release]").expect("manifest names a release");
     full[..cut].to_string()
 }
 
-fn sums_of(wasm: &[u8], toml: &str) -> String {
+pub(super) fn sums_of(wasm: &[u8], toml: &str) -> String {
     format!(
         "{}  plugin.wasm\n{}  plugin.toml\n",
         crate::fs::sha256_hex(wasm),
@@ -157,7 +164,7 @@ fn sums_of(wasm: &[u8], toml: &str) -> String {
 
 /// A local build's directory: its manifest, its component and, when given,
 /// a `SHA256SUMS`.
-fn local_build(src: &std::path::Path, toml: &str, wasm: &[u8], sums: Option<&str>) {
+pub(super) fn local_build(src: &std::path::Path, toml: &str, wasm: &[u8], sums: Option<&str>) {
     std::fs::write(src.join("plugin.toml"), toml).unwrap();
     std::fs::write(src.join("plugin.wasm"), wasm).unwrap();
     match sums {
@@ -169,13 +176,15 @@ fn local_build(src: &std::path::Path, toml: &str, wasm: &[u8], sums: Option<&str
 }
 
 /// The first-party release the lock pins for Agent notes.
-fn agent_notes_release() -> (&'static crate::plugins::Locked, String, Vec<u8>, String) {
+pub(super) fn agent_notes_release() -> (&'static crate::plugins::Locked, String, Vec<u8>, String) {
     locked_release("agent-notes")
 }
 
 /// A first-party release the lock pins, as the build script laid it out:
 /// its lock entry, manifest, component and SHA256SUMS.
-fn locked_release(id: &str) -> (&'static crate::plugins::Locked, String, Vec<u8>, String) {
+pub(super) fn locked_release(
+    id: &str,
+) -> (&'static crate::plugins::Locked, String, Vec<u8>, String) {
     (
         crate::plugins::lock_entry(id).unwrap(),
         test_catalog::dist_test_text(&format!("{id}/plugin.toml")),
@@ -185,7 +194,7 @@ fn locked_release(id: &str) -> (&'static crate::plugins::Locked, String, Vec<u8>
 }
 
 /// A test daemon whose plugin release fetches go to `fake`.
-fn state_for(fake: &FakeReleases) -> Arc<AppState> {
+pub(super) fn state_for(fake: &FakeReleases) -> Arc<AppState> {
     let state = test_state();
     state.plugin_releases.set_api_for_tests(&fake.api());
     state
@@ -195,19 +204,19 @@ fn state_for(fake: &FakeReleases) -> Arc<AppState> {
 }
 
 /// Re-read the installed copies, as the catalog does after a change.
-async fn reload(state: &Arc<AppState>) {
+pub(super) async fn reload(state: &Arc<AppState>) {
     let reloading = state.clone();
     tokio::task::spawn_blocking(move || reloading.plugin_catalog.reload())
         .await
         .unwrap();
 }
 
-async fn install(
+pub(super) async fn install(
     state: &Arc<AppState>,
     github: &str,
     version: Option<&str>,
 ) -> (StatusCode, Value) {
-    request(
+    request_trusting(
         state,
         Method::POST,
         "/api/v1/plugins/install",
@@ -216,12 +225,13 @@ async fn install(
     .await
 }
 
-async fn post(state: &Arc<AppState>, uri: &str) -> (StatusCode, Value) {
-    request(state, Method::POST, uri, None).await
+/// A change route, as the user clicking it (and Allow, when it asks).
+pub(super) async fn post(state: &Arc<AppState>, uri: &str) -> (StatusCode, Value) {
+    request_trusting(state, Method::POST, uri, None).await
 }
 
 /// `id`'s entry in GET /plugins (Null when it isn't listed).
-async fn listed(state: &Arc<AppState>, id: &str) -> Value {
+pub(super) async fn listed(state: &Arc<AppState>, id: &str) -> Value {
     let (status, body) = request(state, Method::GET, "/api/v1/plugins", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     body["plugins"]
@@ -233,11 +243,11 @@ async fn listed(state: &Arc<AppState>, id: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn plugin_dir(state: &Arc<AppState>, id: &str) -> PathBuf {
+pub(super) fn plugin_dir(state: &Arc<AppState>, id: &str) -> PathBuf {
     state.plugin_catalog.root.join(id)
 }
 
-fn link(state: &Arc<AppState>, id: &str, name: &str) -> Option<String> {
+pub(super) fn link(state: &Arc<AppState>, id: &str, name: &str) -> Option<String> {
     std::fs::read_link(plugin_dir(state, id).join(name))
         .ok()
         .map(|t| t.to_string_lossy().into_owned())
@@ -258,7 +268,7 @@ fn no_temp_left(state: &Arc<AppState>, id: &str) {
 }
 
 /// A workspace with `plugins` switched on and one agent session in it.
-async fn workspace_with(
+pub(super) async fn workspace_with(
     state: &Arc<AppState>,
     label: &str,
     key: &str,
@@ -280,7 +290,7 @@ async fn workspace_with(
     (ws, sid)
 }
 
-async fn tool_names(state: &Arc<AppState>, sid: &str, key: &str) -> Vec<String> {
+pub(super) async fn tool_names(state: &Arc<AppState>, sid: &str, key: &str) -> Vec<String> {
     let (_, out) = mcp_post(
         state,
         sid,
@@ -504,7 +514,7 @@ async fn a_newer_compatible_release_is_offered_and_an_older_or_incompatible_one_
         &v1_wasm(),
         None,
     );
-    let (status, body) = request(
+    let (status, body) = request_trusting(
         &state,
         Method::POST,
         "/api/v1/plugins/install",
@@ -1021,7 +1031,7 @@ async fn a_local_build_installs_from_a_directory_and_replaces_itself() {
     let path_install = |src: serde_json::Value| {
         let state = state.clone();
         async move {
-            request(
+            request_trusting(
                 &state,
                 Method::POST,
                 "/api/v1/plugins/install",
@@ -1697,7 +1707,7 @@ async fn a_removal_whose_caller_went_away_still_reloads_the_catalog() {
     let id = "up-detached";
     let src = test_dir("up-detached-src");
     local_build(&src, &unreleased(false, id, "0.1.0"), &v1_wasm(), None);
-    let (status, body) = request(
+    let (status, body) = request_trusting(
         &state,
         Method::POST,
         "/api/v1/plugins/install",

@@ -16,7 +16,10 @@
 //! - Timeline: `note` entries only, from a session's call, ≤ `TEXT_MAX`,
 //!   addressed within the workspace, under the per-session posts-per-minute
 //!   window `tell_mastermind` shares (`notes::take_post_slot`).
-//! - `emit`: one JSON object ≤ 16 KiB per frame, a bounded ring.
+//! - `emit`: one JSON object ≤ 16 KiB per frame, a bounded ring, sent only
+//!   to windows showing the plugin's workspace.
+//! - `[access]` (`capabilities::Access`): files, the Timeline and sessions
+//!   are refused to a build whose manifest doesn't allow them.
 //! - `log`: ≤ 64 lines per call, each ≤ 2 KiB.
 
 use std::collections::{BTreeMap, HashMap};
@@ -25,6 +28,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::{json, Value};
 
+use super::capabilities::{FilesAccess, SessionsAccess, TimelineAccess};
 use super::runtime::chimaera::plugin::host;
 use super::runtime::{wit, CallScope, HostState, EVENT_MAX};
 use crate::timeline;
@@ -98,6 +102,11 @@ impl PluginStates {
         Ok(())
     }
 
+    /// A removed plugin: its state in every workspace.
+    pub(crate) fn forget_plugin(&mut self, plugin: &str) {
+        self.by_key.retain(|(p, _), _| p != plugin);
+    }
+
     /// A deleted workspace: every plugin's state there.
     pub(crate) fn forget_workspace(&mut self, ws: &str) {
         self.by_key.retain(|(_, w), _| w != ws);
@@ -111,8 +120,14 @@ impl HostState {
             .ok_or_else(|| "no call is in flight".to_string())
     }
 
-    /// The workspace root and a checked relative path under it.
+    /// The workspace root and a checked relative path under it (for a
+    /// build whose `[access] files` is `read`).
     fn target(&self, path: &str) -> Result<(PathBuf, PathBuf), String> {
+        if self.access.files != FilesAccess::Read {
+            return Err(
+                "this plugin's manifest doesn't allow reading files ([access] files)".into(),
+            );
+        }
         let scope = self.scope()?;
         let root = crate::lock(&scope.app.workspaces)
             .get(&self.workspace)
@@ -322,6 +337,9 @@ impl host::Host for HostState {
     }
 
     async fn sessions(&mut self, _cx: wit::Context) -> Vec<wit::Session> {
+        if self.access.sessions != SessionsAccess::Read {
+            return Vec::new();
+        }
         let Ok(scope) = self.scope() else {
             return Vec::new();
         };
@@ -360,6 +378,11 @@ impl host::Host for HostState {
     }
 
     async fn timeline_append(&mut self, _cx: wit::Context, entry: String) -> Result<u64, String> {
+        if self.access.timeline < TimelineAccess::Notes {
+            return Err(
+                "this plugin's manifest doesn't allow posting notes ([access] timeline)".into(),
+            );
+        }
         let scope = self.scope()?;
         let app = scope.app.clone();
         let Some(sid) = scope.cx.session.clone() else {
@@ -426,6 +449,9 @@ impl host::Host for HostState {
         kinds: Vec<String>,
         limit: u32,
     ) -> Vec<String> {
+        if self.access.timeline < TimelineAccess::Read {
+            return Vec::new();
+        }
         let Ok(scope) = self.scope() else {
             return Vec::new();
         };
@@ -462,7 +488,8 @@ impl host::Host for HostState {
         frame["type"] = json!("plugin");
         frame["plugin"] = json!(self.plugin);
         frame["workspace"] = json!(self.workspace);
-        app.plugin_runtime.push_event(frame.to_string());
+        app.plugin_runtime
+            .push_event(&self.workspace, frame.to_string());
         app.changes.notify_waiters();
     }
 

@@ -132,6 +132,7 @@ export type SettingsMap = {
   "chat.toolSummaries": boolean;
   "chat.resumeAfterRestart": boolean;
   "update.autoCheck": boolean;
+  "plugins.allowUnverified": boolean;
   "keys.modifier": "auto" | "cmd" | "ctrl-shift" | "alt";
 } & Record<KeyBindingId, string>;
 
@@ -766,6 +767,17 @@ const DEFS = {
     category: "Updates",
     description:
       "Let the daemon check GitHub a few times a day for newer chimaera releases and offer them in the UI. Only the public releases feed is read; nothing installs without a click.",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
+  },
+
+  // --- Extensions --------------------------------------------------------------
+  "plugins.allowUnverified": {
+    title: "Unverified Plugins",
+    category: "Extensions",
+    description:
+      "Allow installing plugins the Chimaera maintainers haven't verified, each only after you trust what it can do. Off: only verified plugins install and run on this host. Whoever manages the machine can also turn this off for everyone.",
     type: "boolean",
     default: true,
     scope: "daemon",

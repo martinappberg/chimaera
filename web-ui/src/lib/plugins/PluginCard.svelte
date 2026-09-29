@@ -12,8 +12,15 @@
    *  - what it adds ("For you", "For agents") and what it found here;
    *  - the agent-side plugin box (requirementsModel.ts), only for agents
    *    installed on this host, each row one state and at most one action;
-   *  - an update, a fault (with Reinstall when that mends it), then one
+   *  - what it can do ("Can": the daemon's words for its capabilities, the
+   *    same list the trust prompt shows);
+   *  - an update, a fault (with Reinstall when that mends it), a hold (why
+   *    it can't run on this host: waiting for trust, blocked, the policy —
+   *    with Review and trust, or Use anyway for a soft block), then one
    *    outcome line and the quiet "checked …" after a check.
+   * An install, update, switch or Use previous the daemon answers with a
+   * trust prompt (`TrustNeeded`) opens `TrustDialog`; confirming repeats it
+   * with the capability digest shown.
    * A plugin not installed yet is the head and its summary, and the whole
    * top of the card is one button (a chevron beside the summary shows it)
    * that opens it in place: the same body, from what its release says
@@ -27,19 +34,24 @@
    * Versions and verification come from the daemon; agent state from the
    * agents.
    */
+  import ConfirmDialog from "../shared/ConfirmDialog.svelte";
   import Switch from "../shared/Switch.svelte";
+  import ActivityDialog from "./ActivityDialog.svelte";
+  import TrustDialog from "./TrustDialog.svelte";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
   import { isWebUrl, openInSystemBrowser } from "../shared/urlOpen";
   import {
     canReinstall,
     checkedWords,
     hereLine,
+    holdWords,
     installedOutcome,
     installLine,
     installTitle,
     repoUrl,
     stateWords,
     tileLetters,
+    trustAskFor,
     updatedOutcome,
     type Outcome,
   } from "./installCopy";
@@ -57,11 +69,14 @@
     pluginDetails,
     setWorkspacePluginOn,
     toggleExpanded,
+    TrustNeeded,
+    trustChange,
     type AgentId,
     type AgentPlugins,
     type PluginChange,
     type PluginDetails,
     type PluginUpdate,
+    type TrustAsk,
     type WorkspacePlugin,
   } from "./store";
 
@@ -83,7 +98,7 @@
     removing?: boolean;
     /** A release previewed from the repository form (`plugin` is what it
      *  described): its own Install, and closing it. */
-    preview?: { install: () => Promise<PluginChange>; close: () => void } | null;
+    preview?: { install: (trust?: string) => Promise<PluginChange>; close: () => void } | null;
   }
 
   let {
@@ -114,6 +129,20 @@
   let descOpen = $state(false);
   let overflowing = $state(false);
   let moreBtn = $state<HTMLButtonElement | null>(null);
+  /** An open trust prompt: what it asks, and what confirming does with the
+   *  digest shown (and, for an update that asks for more, Skip). */
+  let asking = $state<{
+    ask: TrustAsk;
+    mode: "install" | "update" | "trust";
+    retry: (caps: string) => Promise<void>;
+    skip: (() => Promise<void>) | null;
+  } | null>(null);
+  let askBusy = $state(false);
+  let askError = $state<string | null>(null);
+  let showActivity = $state(false);
+  let untrusting = $state(false);
+  let untrustBusy = $state(false);
+  let untrustError = $state<string | null>(null);
 
   const previewing = $derived(preview !== null);
   const available = $derived(p.source === "available");
@@ -165,7 +194,8 @@
   /** A plugin that can't run here: the switch can't turn it on (the daemon
    *  refuses) until the fault is gone. A fault while on is the plugin
    *  failing in this workspace, which switching off and on clears. */
-  const blocked = $derived(p.fault !== null && !p.on);
+  const blocked = $derived((p.fault !== null && !p.on) || (p.hold !== null && p.hold.kind !== "untrusted"));
+  const hold = $derived(holdWords(p));
 
   const WORKING: Record<Change, string> = {
     install: "installing…",
@@ -179,15 +209,80 @@
     return e instanceof Error ? e.message : String(e);
   }
 
+  /** Open the trust prompt the daemon answered with. */
+  function ask(
+    t: TrustAsk,
+    mode: "install" | "update" | "trust",
+    retry: (caps: string) => Promise<void>,
+    skip: (() => Promise<void>) | null = null,
+  ): void {
+    askError = null;
+    asking = { ask: t, mode, retry, skip };
+  }
+
+  /** Confirm: the same change again, with the digest shown. Asked again
+   *  (the plugin changed meanwhile) keeps the dialog open on the new list. */
+  async function answer(run: (() => Promise<void>) | null = null): Promise<void> {
+    if (asking === null || askBusy) return;
+    const current = asking;
+    askBusy = true;
+    askError = null;
+    try {
+      await (run ?? (() => current.retry(current.ask.caps)))();
+      asking = null;
+    } catch (e) {
+      if (e instanceof TrustNeeded) asking = { ...current, ask: e.ask };
+      askError = message(e);
+    } finally {
+      askBusy = false;
+    }
+  }
+
   async function toggle(on: boolean): Promise<void> {
     switching = true;
     error = null;
     try {
       await setWorkspacePluginOn(p.id, on);
     } catch (e) {
-      error = message(e);
+      if (e instanceof TrustNeeded) {
+        ask(e.ask, "trust", async (caps) => {
+          await trustChange("trust", p.id, caps);
+          await setWorkspacePluginOn(p.id, true);
+        });
+      } else {
+        error = message(e);
+      }
     } finally {
       switching = false;
+    }
+  }
+
+  /** The card's own "Review and trust" for a build waiting for trust. */
+  function openTrust(): void {
+    ask(trustAskFor(p), "trust", (caps) => trustChange("trust", p.id, caps));
+  }
+
+  /** Use anyway: a build the kill switch turned off (a soft block). */
+  async function allowAnyway(): Promise<void> {
+    error = null;
+    try {
+      await trustChange("allow-block", p.id);
+    } catch (e) {
+      error = message(e);
+    }
+  }
+
+  async function withdrawTrust(): Promise<void> {
+    if (untrustBusy) return;
+    untrustBusy = true;
+    untrustError = null;
+    try {
+      await trustChange("untrust", p.id);
+      untrusting = false;
+    } catch (e) {
+      untrustError = message(e);
+    } finally {
+      untrustBusy = false;
     }
   }
 
@@ -200,24 +295,36 @@
     return updatedOutcome(c);
   }
 
+  function run(kind: Change, trust?: string): Promise<PluginChange | { update: PluginUpdate | null }> {
+    if (kind === "install") return preview !== null ? preview.install(trust) : installFirstPartyPlugin(p.id);
+    if (kind === "reinstall") return installWorkbenchPlugin(p.repo ?? "", p.version, trust);
+    return changeWorkbenchPlugin(kind, p.id, trust);
+  }
+
   async function change(kind: Change): Promise<void> {
     if (working !== null) return;
     working = kind;
     error = null;
     note = null;
     try {
-      const res =
-        kind === "install"
-          ? await (preview !== null ? preview.install() : installFirstPartyPlugin(p.id))
-          : kind === "reinstall"
-            ? await installWorkbenchPlugin(p.repo ?? "", p.version)
-            : await changeWorkbenchPlugin(kind, p.id);
-      note = outcome(kind, res);
+      note = outcome(kind, await run(kind));
     } catch (e) {
-      error =
-        (kind === "install" || kind === "reinstall") && isMissingRoute(e)
-          ? "this daemon can't install plugins yet — update chimaera"
-          : message(e);
+      if (e instanceof TrustNeeded) {
+        const t = e.ask;
+        ask(
+          t,
+          kind === "install" || kind === "reinstall" ? "install" : kind === "update" || kind === "rollback" ? "update" : "trust",
+          async (caps) => {
+            note = outcome(kind, await run(kind, caps));
+          },
+          kind === "update" ? () => trustChange("skip", p.id, t.version) : null,
+        );
+      } else {
+        error =
+          (kind === "install" || kind === "reinstall") && isMissingRoute(e)
+            ? "this daemon can't install plugins yet — update chimaera"
+            : message(e);
+      }
     } finally {
       working = null;
     }
@@ -258,7 +365,21 @@
     const repo = repoUrl(p);
     if (repo !== null) items.push({ label: "Open on GitHub", onSelect: () => openInSystemBrowser(repo) });
     if (p.installed) {
+      items.push({ label: "Activity…", onSelect: () => (showActivity = true) });
+    }
+    if (p.installed) {
       if (items.length > 0) items.push("separator");
+      if (p.standing === "trusted") {
+        items.push({
+          label: "Withdraw trust…",
+          disabled: busy,
+          hint,
+          onSelect: () => {
+            untrustError = null;
+            untrusting = true;
+          },
+        });
+      }
       items.push({ label: "Remove…", danger: true, disabled: busy, hint, onSelect: () => onRemove(p) });
     }
     return items;
@@ -326,6 +447,9 @@
       {#if p.local_path !== null}
         <span class="tag" title="Installed from {p.local_path}">local build</span>
       {/if}
+      {#if p.tier === "privileged"}
+        <span class="tag warn" title="It can start programs on this host; its card lists which">runs programs</span>
+      {/if}
     </div>
     {#if previewing}
       <span class="state">not installed</span>
@@ -378,7 +502,7 @@
 
 <!-- What it adds and what it found here: the same list on every card. -->
 {#snippet facts(x: WorkspacePlugin, found: ReturnType<typeof hereLine>)}
-  {#if x.adds.ui.length > 0 || x.adds.agents.length > 0 || found !== null}
+  {#if x.adds.ui.length > 0 || x.adds.agents.length > 0 || x.can.length > 0 || found !== null}
     <dl class="facts">
       {#if x.adds.ui.length > 0}
         <dt>For you</dt>
@@ -387,6 +511,11 @@
       {#if x.adds.agents.length > 0}
         <dt>For agents</dt>
         <dd>{#each x.adds.agents as line, i (i)}<span>{line}</span>{/each}</dd>
+      {/if}
+      {#if x.can.length > 0}
+        <!-- The daemon's own words for what it can do: the trust prompt's list. -->
+        <dt>Can</dt>
+        <dd>{#each x.can as line, i (i)}<span class:priv={line.privileged}>{line.text}</span>{/each}</dd>
       {/if}
       {#if found !== null}
         <dt>Here</dt>
@@ -468,6 +597,25 @@
         >
           {working === "reinstall" ? "Reinstalling…" : "Reinstall"}
         </button>
+      {/if}
+    </div>
+  {/if}
+{/snippet}
+
+{#snippet holdCallout()}
+  {#if hold !== null}
+    <!-- Waiting for trust, or a soft block, is a question for the user (the
+         update callout's tone); a hard block or the policy is a fault. -->
+    <div class="callout" class:update={hold.action !== null} class:fault={hold.action === null} role="note">
+      <span class="ctext">{hold.text}</span>
+      {#if hold.action === "trust"}
+        <button class="opt primary small" disabled={busy} title="See what it can do, then trust it" onclick={openTrust}
+          >Review and trust</button
+        >
+      {:else if hold.action === "allow"}
+        <button class="opt small" disabled={busy} title="Switch it back on, despite why it was turned off" onclick={() => void allowAnyway()}
+          >Use anyway</button
+        >
       {/if}
     </div>
   {/if}
@@ -602,12 +750,46 @@
         {/if}
 
         {@render faultCallout(p, true)}
+        {@render holdCallout()}
       {/if}
 
       {@render statusLines()}
     </div>
   {/if}
 </article>
+
+{#if asking !== null}
+  {@const a = asking}
+  <TrustDialog
+    ask={a.ask}
+    mode={a.mode}
+    busy={askBusy}
+    error={askError}
+    onConfirm={() => void answer()}
+    onCancel={() => {
+      if (!askBusy) asking = null;
+    }}
+    onSkip={a.skip === null ? null : () => void answer(a.skip)}
+  />
+{/if}
+
+{#if showActivity}
+  <ActivityDialog pluginId={p.id} name={p.name} onClose={() => (showActivity = false)} />
+{/if}
+
+{#if untrusting}
+  <ConfirmDialog
+    title="Withdraw your trust in {p.name}?"
+    body="It goes off in every workspace at once, and stays installed. Trusting it again brings it back."
+    confirmLabel={untrustBusy ? "Withdrawing…" : "Withdraw trust"}
+    danger
+    error={untrustError}
+    onConfirm={() => void withdrawTrust()}
+    onCancel={() => {
+      if (!untrustBusy) untrusting = false;
+    }}
+  />
+{/if}
 
 <style>
   /* Its layout follows the view's width (PluginsView's scroller is the
@@ -708,6 +890,14 @@
     border-radius: 999px;
     padding: 0 7px;
     white-space: nowrap;
+  }
+  .tag.warn {
+    color: var(--warn);
+    border-color: color-mix(in srgb, var(--warn) 45%, var(--edge));
+  }
+  /* A Can line only a plugin that runs programs has. */
+  .facts dd .priv {
+    color: var(--warn);
   }
   .state {
     grid-area: state;

@@ -14,6 +14,15 @@
  *   DELETE /plugins/{pid}                          Remove (the installed copy, every version)
  *   GET  /plugins/{pid}/details                    everything a card shows, before install too
  *   POST /plugins/preview {github}                 a repository's plugin, described, nothing written
+ *   POST /plugins/{pid}/trust {caps} | {allow_block}  trust what it can do · run a soft-blocked build anyway
+ *   DELETE /plugins/{pid}/trust                    withdraw every trust answer (it goes off everywhere)
+ *   POST /plugins/{pid}/skip {version}             Skip this version (an update that asks for more)
+ *   GET  /plugins/{pid}/activity                   the activity log, newest first
+ *
+ * Trust (docs/plugin-platform-plan.md §2): a plugin the maintainers haven't
+ * verified, or an update that asks for more, is refused with 409 and what it
+ * can do (`TrustNeeded.ask`); the caller shows the trust prompt and sends
+ * the same request again with the capability digest the user saw.
  *
  * The user-facing surface is called Extensions; the wire, the routes and this
  * module keep the name "plugins".
@@ -46,6 +55,63 @@ export interface PluginUpdate {
   /** The release's page. */
   url: string;
   checked_ms: number;
+}
+
+/** One line of a card's "Can" list, in the daemon's words. */
+export interface CanLine {
+  text: string;
+  /** Only a plugin that runs programs has this line. */
+  privileged: boolean;
+}
+
+/** How a build stands: verified by the maintainers (the lock), trusted by
+ *  the user, or waiting for the user's trust. */
+export type Standing = "verified" | "trusted" | "untrusted";
+
+/** Why an installed plugin can't run on this host (null when it can). */
+export type PluginHold =
+  | { kind: "blocked"; level: "hard" | "soft"; reason: string }
+  | { kind: "policy"; reason: string }
+  | { kind: "untrusted" };
+
+/** What a trust prompt shows (a 409's `trust`): who asks, from where, what
+ *  it can do, what it would do beyond the version that runs, and the digest
+ *  the answer confirms. */
+export interface TrustAsk {
+  id: string;
+  name: string;
+  version: string;
+  /** In words: "github.com/owner/repo", "a local build in /dir". */
+  source: string;
+  tier: "sandboxed" | "privileged";
+  caps: string;
+  can: CanLine[];
+  /** An update: what it would do beyond `from_version` (null otherwise). */
+  grown: CanLine[] | null;
+  from_version: string | null;
+  /** For a plugin that runs programs, the name the user types to confirm. */
+  confirm: string | null;
+}
+
+/** This host's plugin policy: the Unverified Plugins setting and an
+ *  admin's machine-wide file (`managed`; `error` when it didn't parse and
+ *  the policy failed closed). */
+export interface PluginPolicy {
+  allow_unverified: boolean;
+  allow_privileged: "all" | "verified" | "none";
+  managed: boolean;
+  error: string | null;
+}
+
+/** A refusal that asks the user: the daemon's words, and the prompt. */
+export class TrustNeeded extends ApiError {
+  readonly ask: TrustAsk;
+
+  constructor(message: string, ask: TrustAsk) {
+    super(409, message);
+    this.name = "TrustNeeded";
+    this.ask = ask;
+  }
 }
 
 /** One catalog entry with its status in the active workspace. */
@@ -104,6 +170,17 @@ export interface WorkspacePlugin {
   update: PluginUpdate | null;
   /** Why it can't run on this daemon, or isn't answering here. */
   fault: string | null;
+  /** `privileged`: it runs or downloads programs. */
+  tier: "sandboxed" | "privileged";
+  /** Its capability digest (what a trust answer confirms). */
+  caps: string;
+  /** What it can do, in the daemon's words (empty for an available entry
+   *  until its details are fetched). */
+  can: CanLine[];
+  standing: Standing;
+  hold: PluginHold | null;
+  /** An update the user skipped (it asked for more). */
+  skipped_version: string | null;
 }
 
 /** A plugin as its release describes it before install (`/details` of an
@@ -132,6 +209,8 @@ export interface WorkspacePlugins {
   workspace_id: string;
   root: string;
   plugins: WorkspacePlugin[];
+  /** null from a daemon that predates trust. */
+  policy: PluginPolicy | null;
 }
 
 export interface AgentPlugin {
@@ -208,15 +287,65 @@ const generic = (status: number): string => `request failed with status ${status
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let message = generic(res.status);
+    let trust: unknown = null;
     try {
-      const body = (await res.json()) as { error?: string };
+      const body = (await res.json()) as { error?: string; trust?: unknown };
       if (body.error) message = body.error;
+      trust = body.trust ?? null;
     } catch {
       // non-JSON error body; keep the generic message
     }
-    throw new ApiError(res.status, message);
+    const ask = res.status === 409 ? normalizeTrustAsk(trust) : null;
+    throw ask !== null ? new TrustNeeded(message, ask) : new ApiError(res.status, message);
   }
   return (await res.json()) as T;
+}
+
+function canLines(v: unknown): CanLine[] {
+  return arr<{ text?: unknown; privileged?: unknown }>(v)
+    .filter((l) => typeof l?.text === "string")
+    .map((l) => ({ text: l.text as string, privileged: l.privileged === true }));
+}
+
+/** A 409's `trust`, checked: null when it isn't a trust prompt. */
+export function normalizeTrustAsk(raw: unknown): TrustAsk | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const t = raw as Record<string, unknown>;
+  if (typeof t.caps !== "string" || typeof t.id !== "string") return null;
+  return {
+    id: t.id,
+    name: typeof t.name === "string" ? t.name : t.id,
+    version: typeof t.version === "string" ? t.version : "",
+    source: typeof t.source === "string" ? t.source : "",
+    tier: t.tier === "privileged" ? "privileged" : "sandboxed",
+    caps: t.caps,
+    can: canLines(t.can),
+    grown: t.grown === null || t.grown === undefined ? null : canLines(t.grown),
+    from_version: str(t.from_version),
+    confirm: str(t.confirm),
+  };
+}
+
+function normalizeHold(raw: unknown): PluginHold | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const h = raw as Record<string, unknown>;
+  const reason = typeof h.reason === "string" ? h.reason : "";
+  if (h.kind === "blocked") return { kind: "blocked", level: h.level === "soft" ? "soft" : "hard", reason };
+  if (h.kind === "policy") return { kind: "policy", reason };
+  if (h.kind === "untrusted") return { kind: "untrusted" };
+  return null;
+}
+
+function normalizePolicy(raw: unknown): PluginPolicy | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const p = raw as Record<string, unknown>;
+  const privileged = p.allow_privileged === "verified" || p.allow_privileged === "none" ? p.allow_privileged : "all";
+  return {
+    allow_unverified: p.allow_unverified !== false,
+    allow_privileged: privileged,
+    managed: p.managed === true,
+    error: str(p.error),
+  };
 }
 
 const ws = (id: string): string => `/workspaces/${encodeURIComponent(id)}`;
@@ -273,6 +402,13 @@ function normalizePlugin(raw: WorkspacePlugin): WorkspacePlugin {
         ? { version: update.version, url: str(update.url) ?? "", checked_ms: Number(update.checked_ms ?? 0) }
         : null,
     fault: str(raw.fault),
+    tier: raw.tier === "privileged" ? "privileged" : "sandboxed",
+    caps: typeof raw.caps === "string" ? raw.caps : "",
+    can: canLines(raw.can),
+    // An older daemon has no trust: what it runs, it runs.
+    standing: raw.standing === "untrusted" || raw.standing === "trusted" ? raw.standing : "verified",
+    hold: normalizeHold(raw.hold),
+    skipped_version: str(raw.skipped_version),
   };
 }
 
@@ -288,7 +424,11 @@ function normalizeDetails(raw: PluginDetails): PluginDetails {
 
 export async function fetchWorkspacePlugins(workspaceId: string): Promise<WorkspacePlugins> {
   const body = await json<WorkspacePlugins>(await api(`${ws(workspaceId)}/plugins`));
-  return { ...body, plugins: arr<WorkspacePlugin>(body.plugins).map(normalizePlugin) };
+  return {
+    ...body,
+    plugins: arr<WorkspacePlugin>(body.plugins).map(normalizePlugin),
+    policy: normalizePolicy((body as { policy?: unknown }).policy),
+  };
 }
 
 export async function putWorkspacePlugin(
@@ -407,25 +547,80 @@ export async function installPinnedRelease(pid: string): Promise<PluginChange> {
   return json(await api(`${plugin(pid)}/install`, { method: "POST" }));
 }
 
-/** Install a plugin from its GitHub release (`owner/repo`, the latest or `version`). */
-export async function installFromRelease(github: string, version?: string): Promise<PluginChange> {
+/** A POST whose body is `{trust}` only when the user answered a prompt. */
+function trustBody(trust: string | undefined): RequestInit {
+  return trust === undefined
+    ? { method: "POST" }
+    : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ trust }) };
+}
+
+/** Install a plugin from its GitHub release (`owner/repo`, the latest or
+ *  `version`); `trust`: the digest a trust prompt confirmed. */
+export async function installFromRelease(github: string, version?: string, trust?: string): Promise<PluginChange> {
   return json(
     await api("/plugins/install", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ github, version: version ?? null }),
+      body: JSON.stringify({ github, version: version ?? null, ...(trust === undefined ? {} : { trust }) }),
     }),
   );
 }
 
 /** Update an installed plugin to its latest compatible release. */
-export async function updateWorkbenchPlugin(pid: string): Promise<PluginChange> {
-  return json(await api(`${plugin(pid)}/update`, { method: "POST" }));
+export async function updateWorkbenchPlugin(pid: string, trust?: string): Promise<PluginChange> {
+  return json(await api(`${plugin(pid)}/update`, trustBody(trust)));
 }
 
 /** Use previous: swap the installed copy back to its previous version. */
-export async function rollbackWorkbenchPlugin(pid: string): Promise<PluginChange> {
-  return json(await api(`${plugin(pid)}/rollback`, { method: "POST" }));
+export async function rollbackWorkbenchPlugin(pid: string, trust?: string): Promise<PluginChange> {
+  return json(await api(`${plugin(pid)}/rollback`, trustBody(trust)));
+}
+
+/** Trust what the installed build can do (`caps`: the digest shown). */
+export async function trustPlugin(pid: string, caps: string): Promise<{ id: string }> {
+  return json(
+    await api(`${plugin(pid)}/trust`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ caps }),
+    }),
+  );
+}
+
+/** Run a build the kill switch turned off (a soft block) anyway. */
+export async function allowBlockedPlugin(pid: string): Promise<{ id: string }> {
+  return json(
+    await api(`${plugin(pid)}/trust`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ allow_block: true }),
+    }),
+  );
+}
+
+/** Withdraw every trust answer: it goes off everywhere until trusted again. */
+export async function untrustPlugin(pid: string): Promise<{ id: string }> {
+  return json(await api(`${plugin(pid)}/trust`, { method: "DELETE" }));
+}
+
+/** Skip this version: an update that asks for more isn't offered again. */
+export async function skipPluginVersion(pid: string, version: string): Promise<{ id: string }> {
+  return json(
+    await api(`${plugin(pid)}/skip`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ version }),
+    }),
+  );
+}
+
+/** One activity entry: `kind` and `ts` (ms), plus the kind's own fields. */
+export type ActivityEntry = { kind: string; ts: number } & Record<string, unknown>;
+
+/** The activity log, newest first (kept after a Remove). */
+export async function fetchPluginActivity(pid: string): Promise<ActivityEntry[]> {
+  const body = await json<{ entries?: unknown }>(await api(`${plugin(pid)}/activity`));
+  return arr<ActivityEntry>(body.entries).filter((e) => typeof e?.kind === "string");
 }
 
 /** Remove the installed copy (every version of it). */
@@ -481,6 +676,9 @@ export const pluginsAvailable: Readable<boolean | null> = availableStore;
 export const knowledgeProviderActive: Readable<boolean> = derived(pluginsStore, (p) =>
   p !== null && p.plugins.some((x) => x.active && typeof x.provides.knowledge === "string"),
 );
+
+/** This host's plugin policy (null until loaded, or from an older daemon). */
+export const pluginPolicy: Readable<PluginPolicy | null> = derived(pluginsStore, (p) => p?.policy ?? null);
 
 /** The mycelium plugin's status here, for the attach affordances. */
 export const myceliumPlugin: Readable<WorkspacePlugin | null> = derived(
@@ -576,10 +774,11 @@ export function refreshWorkspacePlugins(): void {
 export async function changeWorkbenchPlugin(
   kind: "update" | "rollback" | "remove" | "check",
   pid: string,
+  trust?: string,
 ): Promise<PluginChange | { id: string; update: PluginUpdate | null }> {
   const call = {
-    update: updateWorkbenchPlugin,
-    rollback: rollbackWorkbenchPlugin,
+    update: (id: string) => updateWorkbenchPlugin(id, trust),
+    rollback: (id: string) => rollbackWorkbenchPlugin(id, trust),
     remove: removeWorkbenchPlugin,
     check: checkWorkbenchPlugin,
   }[kind];
@@ -597,9 +796,9 @@ export async function changeWorkbenchPlugin(
  *  github.com URL — the daemon normalizes both), then re-sync like any other
  *  change: a switch left on under that id comes back active, and a 409 for a
  *  version already installed (say, by the CLI) still brings its card up. */
-export async function installWorkbenchPlugin(github: string, version?: string): Promise<PluginChange> {
+export async function installWorkbenchPlugin(github: string, version?: string, trust?: string): Promise<PluginChange> {
   try {
-    return await installFromRelease(github, version);
+    return await installFromRelease(github, version, trust);
   } finally {
     if (currentWs !== null) await refresh(currentWs);
     refreshKnowledge();
@@ -612,6 +811,24 @@ export async function installWorkbenchPlugin(github: string, version?: string): 
 export async function installFirstPartyPlugin(pid: string): Promise<PluginChange> {
   try {
     return await installPinnedRelease(pid);
+  } finally {
+    if (currentWs !== null) await refresh(currentWs);
+    refreshKnowledge();
+  }
+}
+
+/** A trust answer, a soft block allowed, trust withdrawn or a version
+ *  skipped — then the cards (and Knowledge: a provider may come or go). */
+export async function trustChange(
+  kind: "trust" | "allow-block" | "untrust" | "skip",
+  pid: string,
+  arg = "",
+): Promise<void> {
+  try {
+    if (kind === "trust") await trustPlugin(pid, arg);
+    else if (kind === "allow-block") await allowBlockedPlugin(pid);
+    else if (kind === "untrust") await untrustPlugin(pid);
+    else await skipPluginVersion(pid, arg);
   } finally {
     if (currentWs !== null) await refresh(currentWs);
     refreshKnowledge();

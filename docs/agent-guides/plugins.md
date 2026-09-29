@@ -79,6 +79,9 @@ api = "0.1"                     # the chimaera:plugin WIT version it targets (MA
 [detect]                        # workspace-relative; ANY present ⇒ detected
 any = [".living/INDEX.md", "MYCELIUM.md"]   # empty/omitted ⇒ always present (on = active)
 
+[access]                        # optional: what it reads through the host (below)
+timeline = "none"               # "none" | "read" | "notes"; files and sessions: "none" | "read"
+
 [requires]
 chimaera = ">=0.4.0"            # optional: a semver requirement on the daemon
 
@@ -122,14 +125,15 @@ What each part does, and what exists today:
 | `id`, `name`, `summary`, `homepage` | the card; `id` names a directory and a URL segment, so it is charset-gated (and `install` / `preview`, routes' own segments, are taken); the name links to `homepage` (an http(s) URL; opened in the system browser) | `plugins::validate`, `manifest_json` |
 | `description` | optional: a few plain sentences from the author — what the plugin is and why a person would switch it on — shown under the summary, clamped to two lines with "more"; blank is omitted (`description: null` on the wire) | `manifest_json` |
 | `version`, `api` | which build runs, and the WIT it needs; `api` is a gate | `plugins::gate`, `resolve` |
-| `detect.any` | footprint → "active here" (no path component may be a symlink) | `plugins::detect_blocking` |
+| `detect.any` | footprint → "active here" (no path component may be a symlink); each path relative, plain components only (no `..`, `.` or absolute path: refused at parse) | `plugins::validate`, `plugins::detect_blocking` |
+| `[access]` | what the plugin may read through the host: `files` (`read` / `none`), `timeline` (`none` / `read` / `notes` = read and post notes), `sessions` (`read` / `none`). A 0.1 manifest without it (or a key left out) keeps exactly what 0.1 allowed without saying: files, notes, sessions. The card lists it; `hostfns` refuses what it doesn't allow. Narrow it to what the plugin uses — a new version that asks for more asks the user again | `plugins::capabilities`, `hostfns` |
 | `requires.agent_plugins` | a genuine hard requirement (no plugin has one today): per-agent install state (asked of the agents), "Requires the <agent> plugin <id>" on the card for agents installed here, and an install button running the agent's own `plugin marketplace add` + `install`/`add` in a visible terminal; the attach sheet's step 1; codex hook trust | `agent_probe.rs`, `plugins::install_requirement` |
 | `recommends.agent_plugins` | the same shape and the same install route, attach-sheet step and hook trust, for an agent-side plugin that makes this one more useful to the agents the user runs but is never needed: the card's **Agent-side plugin** box, one row per agent installed here ("claude · installed 0.7.2", "codex · not installed [Install]") | `agent_probe.rs`, `plugins::install_requirement` |
 | `requires.summary`, `recommends.summary` | optional: one plain sentence saying what the agent-side plugin is for; the box and the attach sheet's step 1 say it above the agents' rows (`requires_summary` / `recommends_summary` on the wire; a plain fallback when absent) | `manifest_json` |
 | `requires.chimaera` | a gate: this daemon's version must match | `plugins::gate` |
 | `setup.prompt` | a new chat session of the user's chosen agent, sent this prompt | `plugins::setup_workspace` |
 | `provides.knowledge` | the plugin is the Knowledge provider; its `knowledge` export feeds the view and `GET /workspaces/{id}/knowledge` | `knowledge.rs`, `runtime::knowledge` |
-| `provides.mcp_tools` | tools served by the chimaera MCP where active, plus the `instructions` paragraph; pre-allowed at spawn. Unique names, 1–64 ASCII letters, digits, underscores, dots or dashes; built-in names are reserved | `plugins/tools.rs`, `runtime::offer` |
+| `provides.mcp_tools` | tools served by the chimaera MCP where active, plus the `instructions` paragraph; pre-allowed at spawn. Unique names, 1–64 ASCII letters, digits, underscores or dashes — no dots (codex pre-approves a tool by a dotted config key a dot would split); built-in names are reserved | `plugins/tools.rs`, `runtime::offer` |
 | `provides.events` | which `on-event` variants the host delivers (none by default); `hook` and `session-ended` are delivered, `switched-on` / `switched-off` are declarable but not delivered yet | `runtime::hook`, `runtime::session_ended` |
 | `provides.views` | parses and rides the wire; nothing renders it | none yet |
 | `[adds]` | the card's "For you: …" (`ui`) and "For agents: …" (`agents`) sentences | the UI |
@@ -144,6 +148,28 @@ write them for someone deciding whether to install.
 
 `settings` and `commands`, sketched in the earlier plan, are not manifest
 keys; the first plugin that needs one adds it with a test and a row here.
+
+### What it can do: the capabilities
+
+The daemon derives one list from the manifest — the plugin's **capabilities**
+([platform plan §1](../plugin-platform-plan.md#1-capabilities)): its
+`[access]`, each agent tool, the hook line (`events = ["hook"]`), being the
+Knowledge provider, each agent-side plugin it names (with its marketplace) and
+a setup prompt. That list is the card's **Can** row, what a trust prompt asks
+about, and (for `[access]`) what the host enforces. Its **digest** (the SHA-256
+of the sorted atoms) is what the lock records the maintainers approved and what
+a user's trust answer covers. Print both for your manifest, no daemon needed:
+
+```sh
+chimaera plugin caps plugin.toml          # tier, digest, the Can list
+chimaera plugin caps plugin.toml --json   # the atoms too
+```
+
+A release whose digest isn't covered asks the user before it installs or
+updates (the running version keeps running): so a new tool, a wider
+`[access]` or a new agent-side plugin is a question for your users, and a
+release that asks for nothing new is not. A local build (`--path`) asks once
+per id and digest, so the rebuild loop asks nothing.
 
 ## The crate
 
@@ -411,6 +437,12 @@ What the card shows is the daemon's, never the plugin's own claim:
   installs do not copy that marker, so a rebuilt copy cannot assert the badge.
 - **"local build"**: the copy was installed from a directory (`--path`;
   `local_path` on the wire).
+- **Can**: what it can do, in the daemon's words (`can` on the wire), for
+  every plugin, verified or not — and, when it can't run on this host, why
+  (`hold`: waiting for the user's trust, blocked by Chimaera, or the host's
+  policy). A first-party update keeps the badge only while its capability
+  digest is the one the lock recorded (`caps`); one that asks for more is the
+  user's to trust, and loses the badge.
 - **Nothing about checksums.** The safety mechanism is the daemon's: it
   checks every download against the release's `SHA256SUMS` (and a
   first-party one against the lock's two sha256s), keeps that file beside the

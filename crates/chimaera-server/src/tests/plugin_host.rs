@@ -514,14 +514,47 @@ async fn an_emitted_event_is_a_plugin_frame_for_the_ui() {
         serde_json::json!({"emit": {"type": "sneaky", "built": 3}}),
     )
     .await;
-    let frames = state.plugin_runtime.events_since(&mut mark);
+    // A window on another workspace (or on none) never hears it.
+    let mut elsewhere = mark;
+    assert!(state
+        .plugin_runtime
+        .events_since(&mut elsewhere, Some("another-workspace"))
+        .is_empty());
+    let mut nowhere = mark;
+    assert!(state
+        .plugin_runtime
+        .events_since(&mut nowhere, None)
+        .is_empty());
+    let frames = state
+        .plugin_runtime
+        .events_since(&mut mark, Some(ws.as_str()));
     assert_eq!(frames.len(), 1);
     let frame: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
     assert_eq!(frame["type"], "plugin", "the host's keys win");
     assert_eq!(frame["plugin"], "test-fixture");
     assert_eq!(frame["workspace"], ws.as_str());
     assert_eq!(frame["built"], 3);
-    assert!(state.plugin_runtime.events_since(&mut mark).is_empty());
+    assert!(state
+        .plugin_runtime
+        .events_since(&mut mark, Some(ws.as_str()))
+        .is_empty());
+    state.sessions.kill(&sid).ok();
+}
+
+/// A plugin faulted here offers nothing, so nothing of it is pre-allowed
+/// for the next session spawned here.
+#[tokio::test]
+async fn a_faulted_plugins_tools_are_not_pre_allowed() {
+    let (state, ws, sid) = fixture_workspace("host-allow", "k12").await;
+    let allowed = crate::plugins::spawn_allow(&state, &ws).await;
+    assert!(allowed.contains(&"echo".to_string()), "{allowed:?}");
+    for _ in 0..5 {
+        mcp_tool_call(&state, &sid, "k12", "panic", serde_json::json!({})).await;
+    }
+    let m = crate::plugins::manifest(&state, "test-fixture").unwrap();
+    assert!(state.plugin_runtime.fault(&m, &ws).is_some(), "faulted");
+    let allowed = crate::plugins::spawn_allow(&state, &ws).await;
+    assert!(!allowed.contains(&"echo".to_string()), "{allowed:?}");
     state.sessions.kill(&sid).ok();
 }
 
