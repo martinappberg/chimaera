@@ -793,7 +793,9 @@ streams, unpacks into an empty folder (refusing absolute paths, `..`, hard
 links, devices, links that leave the folder, and writes through a link; ≤ 4 GiB
 and 200,000 entries), runs the setup steps as jobs, and keeps
 `~/.chimaera/tools/<plugin>/<tool>/<version>/` behind a `current` link (two
-versions at most). Nothing outside that folder changes: its `bin` joins only
+versions at most; the host setting `plugins.toolsDir` moves that root, and an
+install first checks for room: the download, about three times it unpacked,
+and 1 GB to spare). Nothing outside that folder changes: its `bin` joins only
 this plugin's jobs' PATH. Removing the plugin removes its tools.
 
 ### Testing a 0.2 plugin

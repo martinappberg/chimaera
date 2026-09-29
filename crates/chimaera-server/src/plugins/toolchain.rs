@@ -88,10 +88,83 @@ fn download_url(url: &str) -> (String, bool) {
     (url.to_string(), false)
 }
 
-/// `<data dir>/tools`.
+/// The host setting that moves plugins' tools out of the data dir: an HPC
+/// home is often a small quota (a TeX Live is ~500 MB), `$SCRATCH` or a
+/// group folder is not.
+const TOOLS_DIR_SETTING: &str = "plugins.toolsDir";
+/// What an install leaves free on the tools' filesystem, at least.
+const FREE_AFTER_MIN: u64 = 1 << 30;
+
+/// Where plugins' tools live: the `plugins.toolsDir` setting when it names
+/// a folder (`tools_dir_setting`), else `<data dir>/tools`. Tools already
+/// installed elsewhere stay there, unused, until installed again.
 pub(crate) fn tools_root(state: &AppState) -> PathBuf {
-    let plugins = &state.plugin_catalog.root;
-    plugins.parent().unwrap_or(plugins).join("tools")
+    match tools_dir_setting(state) {
+        Some(Ok(dir)) => dir,
+        _ => {
+            let plugins = &state.plugin_catalog.root;
+            plugins.parent().unwrap_or(plugins).join("tools")
+        }
+    }
+}
+
+/// The `plugins.toolsDir` setting: None when unset; else the folder (`~` and
+/// `$NAME` / `${NAME}` from the daemon's environment), or why it isn't one.
+fn tools_dir_setting(state: &AppState) -> Option<Result<PathBuf, String>> {
+    let raw = crate::lock(&state.settings)
+        .map_cached()
+        .get(TOOLS_DIR_SETTING)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)?;
+    Some(expand_dir(&raw, |name| std::env::var(name).ok()))
+}
+
+/// `raw` as an absolute folder: a leading `~`, and `$NAME` or `${NAME}`
+/// anywhere, expanded with `var`.
+fn expand_dir(raw: &str, var: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+    let mut out = String::new();
+    let mut rest = raw;
+    if rest == "~" || rest.starts_with("~/") {
+        out.push_str(&var("HOME").ok_or("HOME isn't set, so ~ can't be expanded")?);
+        rest = &rest[1..];
+    }
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + 1..];
+        let (name, after) = match rest.strip_prefix('{') {
+            Some(inner) => {
+                let end = inner.find('}').ok_or("a `${` without its `}`")?;
+                (&inner[..end], &inner[end + 1..])
+            }
+            None => {
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                (&rest[..end], &rest[end..])
+            }
+        };
+        if name.is_empty() {
+            return Err("a `$` without a variable name".into());
+        }
+        out.push_str(&var(name).ok_or_else(|| {
+            format!("${name} isn't set in the daemon's environment; write the folder out")
+        })?);
+        rest = after;
+    }
+    out.push_str(rest);
+    let dir = PathBuf::from(out);
+    if !dir.is_absolute() {
+        return Err(format!("{} isn't an absolute folder", dir.display()));
+    }
+    Ok(dir)
+}
+
+/// Bytes free to this user on the filesystem holding `dir` (blocking).
+fn free_bytes(dir: &Path) -> Option<u64> {
+    let st = rustix::fs::statvfs(dir).ok()?;
+    Some(st.f_bavail.saturating_mul(st.f_frsize))
 }
 
 fn tool_dir(state: &AppState, plugin: &str, tool: &str) -> PathBuf {
@@ -779,10 +852,42 @@ async fn install_inner(
     tool: &ToolDecl,
     artifact: &ArtifactDecl,
 ) -> Result<Value, String> {
+    if let Some(Err(why)) = tools_dir_setting(state) {
+        return Err(format!(
+            "the Plugin Tools Folder setting ({TOOLS_DIR_SETTING}): {why}"
+        ));
+    }
     let dir = tool_dir(state, &m.id, &tool.id);
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| e.to_string())?;
+    // Room for the download and what it unpacks to (an archive is some
+    // times its size), with a margin left: a small home quota fills before
+    // the install ends, and a full home breaks everything else too.
+    let need = artifact
+        .size
+        .saturating_mul(if artifact.unpack == "none" { 1 } else { 4 });
+    let free = {
+        let dir = dir.clone();
+        tokio::task::spawn_blocking(move || free_bytes(&dir))
+            .await
+            .ok()
+            .flatten()
+    };
+    if let Some(free) = free {
+        if free < need.saturating_add(FREE_AFTER_MIN) {
+            let _ = tokio::fs::remove_dir(&dir).await;
+            return Err(format!(
+                "{} needs about {} MB where plugin tools go ({}), with 1 GB to spare, and \
+                 {} MB is free there. Choose a folder with room in Settings → Extensions → \
+                 Plugin Tools Folder (on a cluster, $SCRATCH or a group folder).",
+                tool.name,
+                need >> 20,
+                tools_root(state).display(),
+                free >> 20
+            ));
+        }
+    }
     // An install that never finished left its files here (a 255 MB
     // download, a half-unpacked tree); this one holds the tool's slot.
     {
@@ -1187,6 +1292,36 @@ mod tests {
         // would have stopped quietly.
         let cut = &xz[..xz.len() - 16];
         assert!(unpack_xz(cut, "xz-cut").is_err());
+    }
+
+    #[test]
+    fn a_tools_folder_setting_expands_home_and_variables() {
+        let var = |name: &str| match name {
+            "HOME" => Some("/home/me".to_string()),
+            "SCRATCH" => Some("/scratch/users/me".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            expand_dir("~/tools", var).unwrap(),
+            PathBuf::from("/home/me/tools")
+        );
+        assert_eq!(
+            expand_dir("$SCRATCH/chimaera-tools", var).unwrap(),
+            PathBuf::from("/scratch/users/me/chimaera-tools")
+        );
+        assert_eq!(
+            expand_dir("${SCRATCH}/t", var).unwrap(),
+            PathBuf::from("/scratch/users/me/t")
+        );
+        assert_eq!(
+            expand_dir("/opt/tools", var).unwrap(),
+            PathBuf::from("/opt/tools")
+        );
+        assert!(expand_dir("$GROUP_HOME/t", var)
+            .unwrap_err()
+            .contains("GROUP_HOME"));
+        assert!(expand_dir("tools", var).unwrap_err().contains("absolute"));
+        assert!(expand_dir("${SCRATCH/t", var).is_err());
     }
 
     #[test]

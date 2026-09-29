@@ -445,3 +445,44 @@ async fn an_agents_tool_waits_for_its_job_and_gets_the_final_answer() {
     assert_eq!(text, "exit 0 · building");
     state.sessions.kill(&sid).ok();
 }
+
+#[tokio::test]
+async fn a_tools_folder_setting_moves_where_tools_install() {
+    let _one = TOOL_DOWNLOADS.lock().await;
+    let fake = FakeReleases::start().await;
+    fake.put("/fixture-tool-1.0.0.tar.gz", TOOL.to_vec());
+    crate::plugins::toolchain::set_downloads_for_tests("https://example.invalid", fake.base());
+    let (state, _ws) = jobs_workspace("jobs-tools-dir").await;
+    let set = |value: &str| {
+        let mut map = serde_json::Map::new();
+        map.insert("plugins.toolsDir".into(), value.into());
+        crate::lock(&state.settings).put(map).unwrap();
+    };
+    let url = format!("/api/v1/plugins/{PID}/tools/fixture-tool/install");
+    let install = || request(&state, Method::POST, &url, None);
+    // A value that isn't a folder refuses, naming the setting.
+    set("relative/tools");
+    let (status, body) = install().await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("Plugin Tools Folder"),
+        "{body}"
+    );
+    // A folder elsewhere (a cluster's $SCRATCH) is where it goes.
+    let elsewhere = std::env::temp_dir().join(format!(
+        "chimaera-tools-dir-{}",
+        &chimaera_core::generate_token()[..8]
+    ));
+    set(&elsewhere.to_string_lossy());
+    let (status, body) = install().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(crate::plugins::toolchain::tools_root(&state), elsewhere);
+    assert!(elsewhere
+        .join(PID)
+        .join("fixture-tool/1.0.0/setup-ran")
+        .is_file());
+    let _ = std::fs::remove_dir_all(&elsewhere);
+}

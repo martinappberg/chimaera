@@ -137,6 +137,7 @@ export type SettingsMap = {
   "chat.voiceLanguage": string;
   "update.autoCheck": boolean;
   "plugins.allowUnverified": boolean;
+  "plugins.toolsDir": string;
   "keys.modifier": "auto" | "cmd" | "ctrl-shift" | "alt";
 } & Record<KeyBindingId, string>;
 
@@ -817,6 +818,17 @@ const DEFS = {
     type: "boolean",
     default: true,
     scope: "daemon",
+  },
+  "plugins.toolsDir": {
+    title: "Plugin Tools Folder",
+    category: "Extensions",
+    description:
+      "Where plugins put the programs they download on your click (TeX Live for LaTeX is about 500 MB). Empty keeps them in chimaera's own folder under your home. On a cluster whose home is a small quota, name a folder with room: $SCRATCH/chimaera-tools, or a group folder. `~` and $VARIABLES are expanded on the daemon's host. Tools already installed stay where they were: install them again after changing this.",
+    type: "string",
+    default: "",
+    placeholder: "chimaera's own folder (under your home)",
+    scope: "daemon",
+    note: "Read by the daemon at each tool install; an install checks for room first.",
   },
 
   // --- Keyboard ----------------------------------------------------------------

@@ -659,6 +659,12 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     streams; unpacked into an empty folder that refuses `..`, absolute paths, hard links,
     devices and links that leave it; nothing outside `~/.chimaera/tools/<plugin>/<tool>/`
     changes (no PATH or rc edits). Two versions stay. Removing the plugin removes its tools.
+  - **Where tools go:** `~/.chimaera/tools/` unless Settings → Extensions → **Plugin Tools
+    Folder** (`plugins.toolsDir`, `~` and `$VARIABLES` expanded) names another — on a cluster
+    whose home is a small quota, `$SCRATCH` or a group folder. An install first checks the
+    folder has room for the download and about three times it unpacked, with 1 GB to spare,
+    and otherwise says so and points at the setting (a Sherlock home at 880 MB free would
+    otherwise have taken a 415 MB TeX Live). Tools already installed stay where they were.
   - **The lock covers downloads too:** the lock pins the manifest and the manifest pins each
     download's sha256, and the lock bump fetches every download and compares.
   - **The honest limit:** a program can do whatever its arguments allow. That is why programs
