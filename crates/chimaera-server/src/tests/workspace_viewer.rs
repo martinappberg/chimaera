@@ -1039,3 +1039,43 @@ async fn scoped_connection_reads_remain_valid_while_mutation_capacity_is_full() 
         .stopping
         .store(true, std::sync::atomic::Ordering::Release);
 }
+
+/// A project scope the daemon cannot admit yet (a wrong or not-yet-renewed
+/// epoch) is a retryable refusal, not a wrong token: the UI reconnects on
+/// `workspace_scope_changed` but treats `unauthorized` as final, which made the
+/// first sockets after a cloud machine woke fail for good.
+#[tokio::test]
+async fn refused_socket_scope_is_retryable_and_a_wrong_token_is_not() {
+    // The fixture already holds this project's execution grant at epoch 4.
+    let (state, project, _) = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    for (auth, expected) in [
+        (
+            json!({"type":"auth","token":"test-token","workspace_id":project.id,"epoch":99,"viewer_root":"L3Byb2plY3Q"}),
+            ("code", "workspace_scope_changed"),
+        ),
+        (
+            json!({"type":"auth","token":"wrong"}),
+            ("message", "unauthorized"),
+        ),
+    ] {
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/ws/events"))
+            .await
+            .unwrap();
+        socket
+            .send(Message::Text(auth.to_string().into()))
+            .await
+            .unwrap();
+        let frame = next_ws_frame(&mut socket).await;
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["type"], "error", "{frame}");
+        assert_eq!(frame[expected.0], expected.1, "{frame}");
+    }
+    server.abort();
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
+}

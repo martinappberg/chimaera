@@ -481,13 +481,9 @@ async fn handle(
     options: crate::session_proxy::SocketOptions,
 ) {
     let auth = match authenticate(&mut socket, &state).await {
-        Some(auth) => auth,
-        None => {
-            let _ = send_json(
-                &mut socket,
-                &json!({"type": "error", "message": "unauthorized"}),
-            )
-            .await;
+        Ok(auth) => auth,
+        Err(denied) => {
+            denied.answer(&mut socket).await;
             return;
         }
     };
@@ -1089,13 +1085,12 @@ async fn handle_chat(
     state: Arc<AppState>,
     options: crate::session_proxy::SocketOptions,
 ) {
-    let Some((last_seq, scope)) = chat_authenticate(&mut socket, &state).await else {
-        let _ = send_json(
-            &mut socket,
-            &json!({"type": "error", "message": "unauthorized"}),
-        )
-        .await;
-        return;
+    let (last_seq, scope) = match chat_authenticate(&mut socket, &state).await {
+        Ok(auth) => auth,
+        Err(denied) => {
+            denied.answer(&mut socket).await;
+            return;
+        }
     };
 
     if scope
@@ -1372,7 +1367,7 @@ fn chat_batch_end(replay: &[Arc<chimaera_agent::journal::SeqEvent>], start: usiz
 async fn chat_authenticate(
     socket: &mut WebSocket,
     state: &AppState,
-) -> Option<(u64, Option<SocketScope>)> {
+) -> Result<(u64, Option<SocketScope>), Denied> {
     #[derive(Deserialize)]
     struct ChatAuth {
         #[serde(rename = "type")]
@@ -1385,13 +1380,13 @@ async fn chat_authenticate(
     }
     match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
         Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ChatAuth>(&text) {
-            Ok(auth) if auth.kind == "auth" && auth.token == state.token => Some((
+            Ok(auth) if auth.kind == "auth" && auth.token == state.token => Ok((
                 auth.last_seq,
-                SocketScope::from_fields(state, auth.scope).ok()?,
+                SocketScope::from_fields(state, auth.scope).map_err(|_| Denied::Scope)?,
             )),
-            _ => None,
+            _ => Err(Denied::Token),
         },
-        _ => None,
+        _ => Err(Denied::Token),
     }
 }
 
@@ -1673,13 +1668,12 @@ impl ProjectView {
 }
 
 async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
-    let Some(auth) = authenticate(&mut socket, &state).await else {
-        let _ = send_json(
-            &mut socket,
-            &json!({"type": "error", "message": "unauthorized"}),
-        )
-        .await;
-        return;
+    let auth = match authenticate(&mut socket, &state).await {
+        Ok(auth) => auth,
+        Err(denied) => {
+            denied.answer(&mut socket).await;
+            return;
+        }
     };
     if let Some(scope) = auth.scope {
         scoped_events(socket, state, scope).await;
@@ -2138,7 +2132,29 @@ struct AuthParams {
     scope: Option<SocketScope>,
 }
 
-async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<AuthParams> {
+/// Why a first frame was refused. A wrong or missing token is final for the
+/// client; a project scope the daemon cannot admit right now (an owner that
+/// just woke and has not renewed yet, a changed epoch) is retryable, and the
+/// UI already reconnects on `workspace_scope_changed`. Answering it
+/// `unauthorized` made the first sockets after a cloud wake fail for good.
+enum Denied {
+    Token,
+    Scope,
+}
+
+impl Denied {
+    async fn answer(self, socket: &mut WebSocket) {
+        match self {
+            Denied::Token => {
+                let _ =
+                    send_json(socket, &json!({"type": "error", "message": "unauthorized"})).await;
+            }
+            Denied::Scope => scope_changed(socket).await,
+        }
+    }
+}
+
+async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Result<AuthParams, Denied> {
     match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
         Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ClientMessage>(&text) {
             Ok(ClientMessage::Auth {
@@ -2147,14 +2163,14 @@ async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<AuthPa
                 rows,
                 parked,
                 scope,
-            }) if token == state.token => Some(AuthParams {
+            }) if token == state.token => Ok(AuthParams {
                 dims: cols.zip(rows),
                 parked,
-                scope: SocketScope::from_fields(state, scope).ok()?,
+                scope: SocketScope::from_fields(state, scope).map_err(|_| Denied::Scope)?,
             }),
-            _ => None,
+            _ => Err(Denied::Token),
         },
-        _ => None,
+        _ => Err(Denied::Token),
     }
 }
 
