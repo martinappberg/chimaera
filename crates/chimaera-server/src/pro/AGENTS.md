@@ -50,7 +50,11 @@ lapsed across it, it wakes the lease loop, which renews the recorded epoch
 acquire/checkpoint install); input stays admitted meanwhile. Admission and the
 lease loop notice a freeze themselves when the watchdog has been silent for
 longer than one (`execution::thawed`), so the request that woke the machine is
-never refused before the watchdog's next tick. A worker that re-acquires its own
+never refused before the watchdog's next tick. A forwarded viewer scoped to the epoch
+being renewed (first socket frame or scoped HTTP) waits for that renewal
+(`execution::await_renewal`, woken by the proof change, never past the resume
+window) instead of being refused as `workspace_scope_changed`; a refused
+renewal or another epoch is refused at once. A worker that re-acquires its own
 held epoch (`held_here`, not mid-arrival) continues its own work like a device:
 no install, no re-import, no second transfer pickup. A refused renewal
 or another verified owner fences at once; no answer within 20 s fences too.

@@ -181,17 +181,36 @@ impl std::ops::Deref for SocketScope {
     }
 }
 impl SocketScope {
-    fn from_fields(
+    /// The first frame's scope. One this machine cannot admit yet only because
+    /// it just thawed and its own renewal of exactly that epoch is still out
+    /// waits for the renewal (bounded by the resume window) instead of being
+    /// refused, so the socket that woke the machine is the one that gets in.
+    /// `waking` tells a viewer that understands the frame why it is quiet. A
+    /// refused or unanswered renewal, or any other scope, is refused at once.
+    async fn admit(
         state: &AppState,
         fields: crate::workspace_scope::Fields,
+        waking: Option<&mut WebSocket>,
     ) -> anyhow::Result<Option<Self>> {
-        fields
-            .scope()?
-            .map(|scope| {
-                let admission = crate::workspace_scope::Mutation::for_scope(state, scope.clone())?;
-                Ok(Self { scope, admission })
-            })
-            .transpose()
+        let Some(scope) = fields.scope()? else {
+            return Ok(None);
+        };
+        let first = Self::bind(state, scope.clone());
+        if first.is_ok() || !scope.renewing(state) {
+            return first.map(Some);
+        }
+        if let Some(socket) = waking {
+            // A viewer that already left needs no wait.
+            send_json(socket, &json!({"type":"waking"})).await?;
+        }
+        if !scope.await_renewal(state).await {
+            return first.map(Some);
+        }
+        Self::bind(state, scope).map(Some)
+    }
+    fn bind(state: &AppState, scope: crate::workspace_scope::Scope) -> anyhow::Result<Self> {
+        let admission = crate::workspace_scope::Mutation::for_scope(state, scope.clone())?;
+        Ok(Self { scope, admission })
     }
     fn validate(&self, state: &AppState) -> anyhow::Result<()> {
         self.admission.validate(state)
@@ -506,7 +525,7 @@ async fn handle(
     state: Arc<AppState>,
     options: crate::session_proxy::SocketOptions,
 ) {
-    let auth = match authenticate(&mut socket, &state).await {
+    let auth = match authenticate(&mut socket, &state, true).await {
         Ok(auth) => auth,
         Err(denied) => {
             denied.answer(&mut socket).await;
@@ -1404,14 +1423,17 @@ async fn chat_authenticate(
         #[serde(flatten)]
         scope: crate::workspace_scope::Fields,
     }
-    match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
-        Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ChatAuth>(&text) {
-            Ok(auth) if auth.kind == "auth" && auth.token == state.token => Ok((
-                auth.last_seq,
-                SocketScope::from_fields(state, auth.scope).map_err(|_| Denied::Scope)?,
-            )),
-            _ => Err(Denied::Token),
-        },
+    let Ok(Some(Ok(Message::Text(text)))) = tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await
+    else {
+        return Err(Denied::Token);
+    };
+    match serde_json::from_str::<ChatAuth>(&text) {
+        Ok(auth) if auth.kind == "auth" && auth.token == state.token => Ok((
+            auth.last_seq,
+            SocketScope::admit(state, auth.scope, Some(socket))
+                .await
+                .map_err(|_| Denied::Scope)?,
+        )),
         _ => Err(Denied::Token),
     }
 }
@@ -1429,8 +1451,17 @@ pub(crate) async fn events_ws(
         .on_upgrade(move |socket| handle_events(socket, state))
 }
 
+/// The retryable project-scope refusal. Every caller returns right after, so
+/// it closes the socket properly too: without a close frame the viewer (or
+/// the gateway relaying it) saw a reset without a closing handshake.
 async fn scope_changed(socket: &mut WebSocket) {
     let _ = send_json(socket, &json!({"type":"error","code":"workspace_scope_changed","message":"Your project connection changed. Reconnecting…"})).await;
+    let _ = socket
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code: axum::extract::ws::close_code::AGAIN,
+            reason: "workspace_scope_changed".into(),
+        })))
+        .await;
 }
 
 async fn scoped_events(mut socket: WebSocket, state: Arc<AppState>, scope: SocketScope) {
@@ -1694,7 +1725,7 @@ impl ProjectView {
 }
 
 async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
-    let auth = match authenticate(&mut socket, &state).await {
+    let auth = match authenticate(&mut socket, &state, false).await {
         Ok(auth) => auth,
         Err(denied) => {
             denied.answer(&mut socket).await;
@@ -2196,22 +2227,32 @@ impl Denied {
     }
 }
 
-async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Result<AuthParams, Denied> {
-    match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
-        Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ClientMessage>(&text) {
-            Ok(ClientMessage::Auth {
-                token,
-                cols,
-                rows,
-                parked,
-                scope,
-            }) if token == state.token => Ok(AuthParams {
-                dims: cols.zip(rows),
-                parked,
-                scope: SocketScope::from_fields(state, scope).map_err(|_| Denied::Scope)?,
-            }),
-            _ => Err(Denied::Token),
-        },
+/// `waking`: the socket's viewer understands the `waking` frame (terminals;
+/// the events feed does not), sent while a thawed owner renews (see
+/// `SocketScope::admit`).
+async fn authenticate(
+    socket: &mut WebSocket,
+    state: &AppState,
+    waking: bool,
+) -> Result<AuthParams, Denied> {
+    let Ok(Some(Ok(Message::Text(text)))) = tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await
+    else {
+        return Err(Denied::Token);
+    };
+    match serde_json::from_str::<ClientMessage>(&text) {
+        Ok(ClientMessage::Auth {
+            token,
+            cols,
+            rows,
+            parked,
+            scope,
+        }) if token == state.token => Ok(AuthParams {
+            dims: cols.zip(rows),
+            parked,
+            scope: SocketScope::admit(state, scope, waking.then_some(socket))
+                .await
+                .map_err(|_| Denied::Scope)?,
+        }),
         _ => Err(Denied::Token),
     }
 }

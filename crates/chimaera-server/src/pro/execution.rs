@@ -41,6 +41,10 @@ pub(super) struct State {
     boot: Option<String>,
     /// The watchdog's latest tick (see `thawed`).
     tick: Mutex<Option<std::time::Instant>>,
+    /// Fires whenever a proof is installed, fenced or dropped, so a viewer
+    /// waiting on a resumed machine's own renewal (`await_renewal`) answers
+    /// the moment it lands instead of polling.
+    changed: tokio::sync::Notify,
 }
 struct Proof {
     lease: wire::ExecutionLease,
@@ -57,7 +61,7 @@ struct Proof {
 /// How long a resumed cloud machine may take to renew its own epoch before
 /// the watchdog fences it. The account keeps a suspended owner's lease for it
 /// (nobody else can acquire it meanwhile), so this is not a partition window.
-const RESUME_RENEW: Duration = Duration::from_secs(20);
+pub(super) const RESUME_RENEW: Duration = Duration::from_secs(20);
 
 pub(super) fn validate_configuration(config: &Configure) -> Result<()> {
     let Some(execution) = &config.execution else {
@@ -411,6 +415,8 @@ pub(super) fn accept(
             renew_until: None,
         },
     );
+    drop(proofs);
+    state.pro.execution.changed.notify_waiters();
     Ok(())
 }
 /// Local execution admission. Ownership transitions (another verified owner,
@@ -548,6 +554,74 @@ pub(super) fn fence_workspace(state: &AppState, workspace: &str) {
     if let Some(proof) = lock(&state.pro.execution.proofs).get_mut(workspace) {
         proof.stopped = true;
     }
+    state.pro.execution.changed.notify_waiters();
+}
+
+/// How a wait for a resumed machine's own renewal ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Renewal {
+    /// A fresh proof for the awaited epoch is installed.
+    Renewed,
+    /// The renewal was refused or the project fenced, replaced or dropped.
+    Refused,
+    /// The resume window (or the caller's cap) passed without an answer.
+    TimedOut,
+}
+
+/// This resumed machine is renewing exactly `epoch` of `workspace`: the lease
+/// lapsed while it was frozen and one renewal of the recorded epoch is out
+/// (see `resumed`). Only then is a scope it cannot admit yet worth waiting for;
+/// any other epoch, a device, or a fenced project answers at once.
+pub(super) fn renewing(state: &AppState, workspace: &str, epoch: u64) -> bool {
+    // A request can arrive before the watchdog's first tick after a thaw.
+    thawed(state);
+    resuming(state, workspace) && proof_epoch(state, workspace) == Some(epoch)
+}
+
+/// Waits (at most `cap`, and never past the resume window) for this resumed
+/// machine's own renewal of `epoch` to answer. It admits nothing itself: the
+/// caller re-validates its scope after `Renewed`, so a fresh proof must exist
+/// first. No lock is held across an await, and dropping it has no effect.
+pub(super) async fn await_renewal(
+    state: &AppState,
+    workspace: &str,
+    epoch: u64,
+    cap: Duration,
+) -> Renewal {
+    let generation = state.pro.generation.load(Ordering::Acquire);
+    let started = tokio::time::Instant::now();
+    loop {
+        // Registered before the check, so a proof installed in between still
+        // wakes this wait (notify_waiters keeps no permit for later waiters).
+        let changed = state.pro.execution.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let until = {
+            let proofs = lock(&state.pro.execution.proofs);
+            let Some(proof) = proofs.get(workspace) else {
+                return Renewal::Refused;
+            };
+            if proof.stopped || proof.generation != generation || proof.epoch != epoch {
+                return Renewal::Refused;
+            }
+            if proof.deadline.valid() {
+                return Renewal::Renewed;
+            }
+            match proof.renew_until {
+                Some(until) => until,
+                // Lapsed with no renewal out: the watchdog fences it.
+                None => return Renewal::Refused,
+            }
+        };
+        let deadline = tokio::time::Instant::from_std(until).min(started + cap);
+        if tokio::time::Instant::now() >= deadline {
+            return Renewal::TimedOut;
+        }
+        tokio::select! {
+            () = &mut changed => {}
+            () = tokio::time::sleep_until(deadline) => {}
+        }
+    }
 }
 
 /// Processes from a previous daemon life that were not proven gone.
@@ -587,6 +661,7 @@ pub(super) fn expire(state: &AppState, generation: u64) -> Vec<String> {
     }
     let mut proofs = lock(&state.pro.execution.proofs);
     let mut expired = Vec::new();
+    let mut fenced = false;
     let now = std::time::Instant::now();
     for (workspace, proof) in proofs.iter_mut() {
         if proof.generation == generation && (proof.stopped || !proof.deadline.valid()) {
@@ -594,6 +669,7 @@ pub(super) fn expire(state: &AppState, generation: u64) -> Vec<String> {
             if !proof.stopped && proof.renew_until.is_some_and(|until| now < until) {
                 continue;
             }
+            fenced |= !proof.stopped;
             proof.stopped = true;
             lock(&state.pro.preferences)
                 .entry(workspace.clone())
@@ -601,6 +677,10 @@ pub(super) fn expire(state: &AppState, generation: u64) -> Vec<String> {
                 .execution_uncertain = true;
             expired.push(workspace.clone());
         }
+    }
+    drop(proofs);
+    if fenced {
+        state.pro.execution.changed.notify_waiters();
     }
     expired
 }
@@ -610,10 +690,13 @@ pub(super) fn invalidate(state: &AppState) -> Vec<String> {
     for proof in proofs.values_mut() {
         proof.stopped = true;
     }
+    drop(proofs);
+    state.pro.execution.changed.notify_waiters();
     workspaces
 }
 pub(super) fn clear_stopped(state: &AppState) {
     lock(&state.pro.execution.proofs).clear();
+    state.pro.execution.changed.notify_waiters();
 }
 
 pub(super) fn valid_grant(state: &AppState, workspace: &str, epoch: u64) -> bool {
@@ -767,6 +850,28 @@ pub(crate) fn worker_fixture(state: &AppState) {
 /// production validation has no test-only permissive branch.
 #[cfg(test)]
 pub(crate) fn install_fixture(state: &AppState, workspace: &str, epoch: u64) -> Result<()> {
+    grant_fixture(state, workspace, epoch, 1)?;
+    lock(&state.pro.ownership).insert(workspace.into(), Ownership::Local { epoch });
+    Ok(())
+}
+/// The account answered a resumed machine's renewal of its own epoch: the
+/// lease loop accepts the same lease's next sequence (see `install_fixture`).
+#[cfg(test)]
+pub(crate) fn renewed_fixture(state: &AppState, workspace: &str, epoch: u64) -> Result<()> {
+    let sequence = lock(&state.pro.execution.proofs)
+        .get(workspace)
+        .context("no execution proof to renew")?
+        .lease
+        .sequence;
+    grant_fixture(state, workspace, epoch, sequence + 1)
+}
+/// The account refused a resumed machine's renewal (the lease loop fences).
+#[cfg(test)]
+pub(crate) fn refused_fixture(state: &AppState, workspace: &str) {
+    fence_workspace(state, workspace);
+}
+#[cfg(test)]
+fn grant_fixture(state: &AppState, workspace: &str, epoch: u64, sequence: u64) -> Result<()> {
     let config: Configure = serde_json::from_value(json!({
         "account_id":"a-fixture", "role":"device", "endpoint":"http://127.0.0.1:1",
         "keeper_url":"", "hours_exhausted":false,
@@ -778,7 +883,7 @@ pub(crate) fn install_fixture(state: &AppState, workspace: &str, epoch: u64) -> 
         "server_now":"2026-09-28T00:00:00Z","expires_at":"2026-09-28T00:01:30Z",
         "continuity":{"version":2,"mode":"managed_v1","policy_revision":1,"preferred_installation_id":"i-home"},
         "execution_capability":wire::ExecutionCapability::managed(),
-        "execution_lease":{"id":"lease-fixture","sequence":1}
+        "execution_lease":{"id":"lease-fixture","sequence":sequence}
     }))?;
     accept(
         state,
@@ -786,7 +891,5 @@ pub(crate) fn install_fixture(state: &AppState, workspace: &str, epoch: u64) -> 
         &grant,
         state.pro.generation.load(Ordering::Acquire),
         RequestStart::now(),
-    )?;
-    lock(&state.pro.ownership).insert(workspace.into(), Ownership::Local { epoch });
-    Ok(())
+    )
 }

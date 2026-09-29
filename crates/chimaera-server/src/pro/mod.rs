@@ -389,6 +389,11 @@ pub(crate) use execution::prepare_launch as prepare_managed_launch;
 pub(crate) use execution::recovery_context as checkpoint_recovery_context;
 #[cfg(test)]
 pub(crate) use execution::remote_owner_fixture as install_remote_owner_fixture;
+#[cfg(test)]
+pub(crate) use execution::{
+    refused_fixture as refuse_renewal_fixture, renewed_fixture as renew_execution_fixture,
+    resumed_fixture as resume_execution_fixture, worker_fixture as worker_execution_fixture,
+};
 pub(crate) fn managed_execution(state: &crate::AppState, workspace: &str) -> bool {
     execution::managed(state, workspace)
 }
@@ -566,6 +571,26 @@ pub(crate) fn validate_execution_scope(
         "workspace execution authority changed"
     );
     Ok(())
+}
+/// A forwarded viewer's scope this machine cannot admit yet only because it
+/// just thawed and its own renewal of exactly that epoch is still out. Worth
+/// waiting for (`await_scope_renewal`), never refusing on sight: the account
+/// keeps a suspended owner's lease, so the renewal normally lands in one round
+/// trip. Any other epoch, or a machine not renewing, is answered at once.
+pub(crate) fn scope_renewing(state: &crate::AppState, workspace: &str, epoch: u64) -> bool {
+    execution::managed(state, workspace) && execution::renewing(state, workspace, epoch)
+}
+/// Waits for that renewal, never past the resume window the watchdog fences
+/// at. `true` means a fresh proof for the epoch now exists and the caller
+/// validates its scope again; a refused, fenced or unanswered renewal is
+/// `false` as soon as it is known.
+pub(crate) async fn await_scope_renewal(
+    state: &crate::AppState,
+    workspace: &str,
+    epoch: u64,
+) -> bool {
+    execution::await_renewal(state, workspace, epoch, execution::RESUME_RENEW).await
+        == execution::Renewal::Renewed
 }
 pub(crate) fn owned_epoch(state: &crate::AppState, workspace: &str) -> Option<u64> {
     match crate::lock(&state.pro.ownership).get(workspace) {

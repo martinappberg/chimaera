@@ -90,6 +90,10 @@ reviewer can check each stays fixed:
    restarted running agents; a thawed cloud machine re-sent its pickup → all
    fixed (`agent_state.rs::tui_at_pause`, `spawn.rs`, `provider_gate.rs`,
    `execution::adopt_running`, `execution::thawed`).
+   A thawed cloud machine refused the viewer socket that woke it (its lease
+   lapsed while frozen) and dropped it without a close frame → it now waits
+   for its own renewal before admitting or refusing that viewer
+   (`execution::await_renewal`, `ws.rs::SocketScope::admit`).
 
 ## The acceptance gate: one flow that runs
 

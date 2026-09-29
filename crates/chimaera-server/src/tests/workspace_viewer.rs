@@ -1079,3 +1079,173 @@ async fn refused_socket_scope_is_retryable_and_a_wrong_token_is_not() {
         .stopping
         .store(true, std::sync::atomic::Ordering::Release);
 }
+
+type ViewerSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A cloud machine that just thawed from a suspension: its lease lapsed while
+/// it was frozen and its own renewal of epoch 4 is out (`execution::resumed`).
+fn thaw(state: &Arc<AppState>, project: &crate::workspaces::Workspace) {
+    pro::worker_execution_fixture(state);
+    assert!(
+        pro::resume_execution_fixture(state, &project.id).is_empty(),
+        "nothing is fenced while the renewal is out"
+    );
+    assert!(pro::validate_execution_scope(state, &project.id, 4).is_err());
+    assert!(pro::scope_renewing(state, &project.id, 4));
+}
+
+fn viewer_chat(state: &Arc<AppState>, project: &crate::workspaces::Workspace, id: &str) {
+    let fake = write_fake_claude(id);
+    let spec = chimaera_agent::driver::SpawnSpec::new(
+        id,
+        vec![fake.to_string_lossy().into_owned()],
+        project.root.clone(),
+    );
+    state
+        .chat
+        .spawn(&chimaera_agent::claude::ClaudeAdapter, spec)
+        .unwrap();
+    lock(&state.session_workspaces).insert(id.into(), project.id.clone());
+}
+
+async fn scoped_chat(
+    state: &Arc<AppState>,
+    id: &str,
+    workspace: &str,
+    epoch: u64,
+) -> (ViewerSocket, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    // The first input after a suspension carries wake intent.
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(format!("ws://{address}/ws/chat/{id}?wake=interaction"))
+            .await
+            .unwrap();
+    socket.send(Message::Text(json!({"type":"auth","token":"test-token","last_seq":0,"workspace_id":workspace,"epoch":epoch,"viewer_root":"L3Byb2plY3Q"}).to_string().into())).await.unwrap();
+    (socket, server)
+}
+
+async fn json_frame(socket: &mut ViewerSocket) -> Value {
+    let frame = next_ws_frame(socket).await;
+    serde_json::from_str(frame.to_text().unwrap()).unwrap()
+}
+
+/// The owner answered its refusal with a close frame: the viewer (and the
+/// gateway relaying it) sees a clean close, never a reset without one.
+async fn closed_cleanly(socket: &mut ViewerSocket) {
+    let frame = next_ws_frame(socket).await;
+    assert!(
+        matches!(&frame, Message::Close(Some(close)) if close.reason.as_str() == "workspace_scope_changed"),
+        "{frame:?}"
+    );
+}
+
+fn stop(state: &Arc<AppState>, id: &str, server: tokio::task::JoinHandle<()>) {
+    state.chat.kill(id);
+    server.abort();
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// The socket that woke a suspended cloud machine arrives while that machine
+/// renews its own lapsed lease. It waits for the renewal (a chat viewer is
+/// told it is waking) and is admitted once the fresh proof exists, instead of
+/// being refused and dropped so that only a second connection gets through.
+#[tokio::test]
+async fn a_thawed_owner_admits_the_socket_that_woke_it_once_its_renewal_lands() {
+    use futures::StreamExt;
+    let (state, project, _) = fixture();
+    viewer_chat(&state, &project, "s-thaw-renewed");
+    thaw(&state, &project);
+    let (mut socket, server) = scoped_chat(&state, "s-thaw-renewed", &project.id, 4).await;
+    let first = json_frame(&mut socket).await;
+    assert_eq!(first["type"], "waking", "{first}");
+    // Nothing is admitted before a fresh proof exists.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), socket.next())
+            .await
+            .is_err(),
+        "a viewer was answered before the renewal landed"
+    );
+    pro::renew_execution_fixture(&state, &project.id, 4).unwrap();
+    let ready = json_frame(&mut socket).await;
+    assert_eq!(ready["type"], "ready", "{ready}");
+    stop(&state, "s-thaw-renewed", server);
+}
+
+/// A refused renewal (someone else took the project while the machine slept)
+/// answers the waiting socket at once, with the retryable refusal and a clean
+/// close, never at the end of the resume window.
+#[tokio::test]
+async fn a_thawed_owner_whose_renewal_is_refused_refuses_the_waiting_socket_at_once() {
+    let (state, project, _) = fixture();
+    viewer_chat(&state, &project, "s-thaw-refused");
+    thaw(&state, &project);
+    let (mut socket, server) = scoped_chat(&state, "s-thaw-refused", &project.id, 4).await;
+    let first = json_frame(&mut socket).await;
+    assert_eq!(first["type"], "waking", "{first}");
+    let refused_at = std::time::Instant::now();
+    pro::refuse_renewal_fixture(&state, &project.id);
+    let refusal = json_frame(&mut socket).await;
+    assert_eq!(refusal["code"], "workspace_scope_changed", "{refusal}");
+    assert!(
+        refused_at.elapsed() < std::time::Duration::from_secs(2),
+        "refused as soon as the renewal was, not at the window's end"
+    );
+    closed_cleanly(&mut socket).await;
+    stop(&state, "s-thaw-refused", server);
+}
+
+/// Only the epoch the machine is renewing is worth waiting for: a socket for
+/// another epoch is refused at once, with no waiting and no `waking`.
+#[tokio::test]
+async fn a_thawed_owner_refuses_another_epoch_without_waiting() {
+    let (state, project, _) = fixture();
+    viewer_chat(&state, &project, "s-thaw-other-epoch");
+    thaw(&state, &project);
+    let started = std::time::Instant::now();
+    let (mut socket, server) = scoped_chat(&state, "s-thaw-other-epoch", &project.id, 5).await;
+    let refusal = json_frame(&mut socket).await;
+    assert_eq!(refusal["code"], "workspace_scope_changed", "{refusal}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(
+        pro::scope_renewing(&state, &project.id, 4),
+        "the machine's own renewal is still out"
+    );
+    closed_cleanly(&mut socket).await;
+    stop(&state, "s-thaw-other-epoch", server);
+}
+
+/// A scoped request that reaches a machine still renewing its own epoch (the
+/// gateway's health probe, a wake-marked action) is answered after the
+/// renewal with its scope acknowledged, not refused with 409.
+#[tokio::test]
+async fn a_thawed_owner_answers_a_scoped_request_once_its_renewal_lands() {
+    let (state, project, _) = fixture();
+    thaw(&state, &project);
+    let request = Request::builder()
+        .uri("/api/v1/health")
+        .header(header::AUTHORIZATION, "Bearer test-token")
+        .header("x-chimaera-workspace", &project.id)
+        .header("x-chimaera-epoch", "4")
+        .body(Body::empty())
+        .unwrap();
+    let mut pending = tokio::spawn(app(state.clone()).oneshot(request));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut pending)
+            .await
+            .is_err(),
+        "answered before the renewal landed"
+    );
+    pro::renew_execution_fixture(&state, &project.id, 4).unwrap();
+    let response = pending.await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-chimaera-epoch"], "4");
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
+}
