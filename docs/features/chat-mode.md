@@ -12,7 +12,7 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 `QuestionCard`, `RewindDialog`, `ForkDialog`, `McpPanel`, `UsagePanel`, `store.svelte.ts`, `chatWs.ts`,
 `paths.ts`). Engine `crates/chimaera-agent/src/` (`driver.rs`, `claude.rs`, `codex.rs`,
 `model.rs`, `journal.rs`). Daemon glue `crates/chimaera-server/src/chat.rs`, WS
-`ws.rs::chat_ws`. Wire: `GET /ws/chat/{id}` (events + the 19 `AgentCommand`s),
+`ws.rs::chat_ws`. Wire: `GET /ws/chat/{id}` (events + the 22 `AgentCommand`s),
 `POST /api/v1/sessions/{id}/view`, `POST /api/v1/sessions/{id}/rewind`,
 `POST /api/v1/sessions/{id}/fork`. Deep protocol facts:
 [PROTOCOL.md](../../crates/chimaera-agent/PROTOCOL.md); rules:
@@ -21,23 +21,27 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 
 ## Composing & sending
 
-- **Send / queue / steer.** Type, Enter to send (Shift+Enter = newline). Mid-turn sends queue for
-  the next run, matching both native clients; the placeholder says so. Codex queued rows expose
-  **↪ Steer**, which promotes only that follow-up into the current run via `turn/steer`. Claude has
-  no separate steer action. `socket.send` returns `false` when the socket isn't OPEN, so the draft
-  is only cleared on an accepted send — a message during a reconnect window is preserved, not lost;
-  reconnect replays the daemon-owned queue state.
-- **Delivery honesty + pending stack.** A mid-turn send doesn't become a delivered history block —
-  it waits in a faded **pending stack at the scrollable transcript tail**, with a small "queued"
-  mark. It therefore stays at the live end without covering the reading area or growing fixed
-  composer chrome. After a turn ends, Claude flushes its held queue; Codex opens exactly the oldest
-  queued item as the next turn and leaves later items queued. A Codex Steer instead resolves on the
-  steer RPC acknowledgement. Once consumed, the block leaves the stack and enters the transcript proper
-  as the newest user turn, solid. A genuinely undeliverable entry stays marked **"not delivered"**
-  (text kept readable/copyable, never auto-dumped into a draft you may have started). The ✕ pulls
-  back a queued item or dismisses a dropped one. This is driven by the single `pendingSends` reducer
-  and journaled via `user_message` `id`/`queued` + `user_message_update`, so replay rebuilds the same
-  order and delivery truth (see PROTOCOL.md passes 8 and 21).
+- **Send while the agent works.** Type, Enter to send (Shift+Enter = newline). A message sent
+  while a turn runs is read at the agent's **next step** — after its current tool call, inside the
+  same turn, several waiting messages together — the way Claude Code and the Codex app behave
+  (claude: the CLI's own queue, `priority:"next"`; codex: `turn/steer`). **⌥↩ / Alt+Enter** sends one
+  for **after this turn** instead (claude `priority:"later"`; codex's next-run queue). The running
+  placeholder names the chord. `socket.send` returns `false` when the socket isn't OPEN, so the
+  draft is only cleared on an accepted send — a message during a reconnect window is preserved, not
+  lost; reconnect replays the daemon-owned state.
+- **Delivery honesty + pending stack.** A waiting message is not a history block yet — it sits in a
+  faded **pending stack at the scrollable transcript tail**, captioned "next step" or "after this
+  turn", until the agent actually reads it (claude: the CLI's `command_lifecycle started`; codex:
+  the steered message's `userMessage` item — not the RPC ack). Then it leaves the stack and enters
+  the transcript right there, solid — mid-turn if that is where it was read. Each waiting bubble
+  has **Send now** (stops the current turn; every waiting message is then read at once — claude
+  keeps its queue through the interrupt, and Chimaera re-sends the steers Codex drops) and **✕**
+  (pulls it back — claude `cancel_async_message`; a Codex steer can't be withdrawn and says so).
+  Stop never drops the queue. A genuinely undeliverable entry stays marked **"not delivered"**
+  (text kept readable/copyable, never auto-dumped into a draft you may have started); ✕ dismisses
+  it. This is driven by the single `pendingSends` reducer and journaled via `user_message`
+  `id`/`queued`/`after_turn` + `user_message_update`, so replay rebuilds the same order and delivery
+  truth (see PROTOCOL.md passes 8, 21 and 38).
 - **Image attachments.** Paste (or drop) an image → a picture tile above the composer
   (`AttachmentStrip`): one 56px row, each tile as wide as its picture's aspect ratio, a small
   always-visible ✕, and a click that shows it large (`ImagePreview`: Esc / backdrop / ✕ close,
@@ -715,6 +719,13 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 > skill when a `feat:` ships in this area. **Never** inferred from code. Everything above
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
+
+### Messages sent mid-turn are read at the next step, with Send now — why it exists
+_Captured 2026-09-28 from the maintainer's own words in the session that built it; the settled/open questions are still pending._
+
+- **Why (maintainer, verbatim):** "Claude transcripts have like a new 'send now' and also items that are queued seem to be read even mid a turn ? is this true ? can we fix so chimaera works this way as well. And also if multiple messages are queued I assume they should all be read at the same time? This is just for good measure to keep on par with the other tools". Then: "Do a similar check for codex too to make sure we are on par".
+- **Decision the maintainer took (asked, with both agents' native defaults and his own Codex desktop setting `followUpQueueMode = "queue"` laid out):** "Read at next step" for both agents — Enter while an agent works is read at its next tool call and shows grey until then; a chord sends a message for after the turn instead; every waiting bubble has Send now and ✕. (The chord became ⌥↩ because the proposed ⇧⌘↩ is Zoom Pane here.)
+- _Settled vs. free-to-change, and what must not be "fixed": pending — not yet asked. The stated goal is parity with the official Claude and Codex clients._
 
 ### Quoting part of a reply back to the agent — why it exists
 _Captured 2026-09-28 from the maintainer, in the session that built it._

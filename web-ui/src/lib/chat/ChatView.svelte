@@ -1377,7 +1377,10 @@
     return m.attachmentPaths.length > 0 ? `+${n} ${noun}` : `${n} ${noun}`;
   }
 
-  function sendNow(text: string, images: ImageAttachment[]): boolean {
+  /** `afterTurn`: hold it until the running turn ends (`send_after_turn`)
+   *  instead of having the agent read it at its next step. Idle, the daemon
+   *  treats both as an ordinary send. */
+  function sendMessage(text: string, images: ImageAttachment[], afterTurn: boolean): boolean {
     const blocks: Record<string, unknown>[] = [];
     if (text.length > 0) blocks.push({ type: "text", text });
     // Codex exposes skills through `skills/list`; an exact `/skill-name`
@@ -1388,7 +1391,7 @@
     for (const img of images) {
       blocks.push({ type: "image", media_type: img.media_type, data: img.data });
     }
-    return socket.send({ type: "send", blocks });
+    return socket.send({ type: afterTurn ? "send_after_turn" : "send", blocks });
   }
 
   // A send made outside the composer (the Mastermind panel's one-click
@@ -1400,12 +1403,12 @@
     }),
   );
 
-  function onSubmit(text: string, images: ImageAttachment[]): boolean {
-    // The daemon owns delivery semantics so reconnect/replay stay exact:
-    // mid-turn sends queue for the next run; Codex entries can be explicitly
-    // promoted with Steer. Returns false when the socket isn't open so the
-    // composer keeps the draft.
-    const accepted = sendNow(text, images);
+  function onSubmit(text: string, images: ImageAttachment[], afterTurn = false): boolean {
+    // The daemon owns delivery semantics so reconnect/replay stay exact: a
+    // mid-turn send waits in the pending stack until the agent reads it at
+    // its next step (or, `afterTurn`, until the turn ends). Returns false
+    // when the socket isn't open so the composer keeps the draft.
+    const accepted = sendMessage(text, images, afterTurn);
     if (accepted) {
       // Submission is stronger intent than merely clearing a draft: the user
       // expects to see the delivered/queued bubble and the reply it starts.
@@ -1464,11 +1467,11 @@
     sendCommand({ type: "cancel_queued", id }, "couldn't cancel");
   }
 
-  /** Promote one Codex follow-up from the next-run FIFO into the active turn.
-   *  The pending bubble stays until the driver's turn/steer RPC resolves, so
-   *  a disconnect or rejection never lies about delivery. */
-  function steerQueued(id: string) {
-    sendCommand({ type: "steer_queued", id }, "couldn't steer");
+  /** Stop the running turn so this waiting message — and every other one
+   *  still waiting — is read right away. The bubble stays until the daemon
+   *  resolves it `sent`, so a disconnect or a no-op never lies about delivery. */
+  function sendQueuedNow(id: string) {
+    sendCommand({ type: "send_now", id }, "couldn't send now");
   }
 
   /** Dialog-only slash commands get native UI here instead of the CLI's
@@ -2827,15 +2830,22 @@
     {/if}
 
     <!-- Pending sends are part of the scrollable reading surface, but remain
-         OUT of `blocks`: a mid-turn send must not splice the agent's current
-         response. Keeping the stack at the transcript tail makes queued text
-         inspectable without pinning it to (and crowding) the composer. On
-         delivery it leaves this stack and enters `blocks` as the newest user
-         turn. A Stop preserves it; ✕ cancels it. Dropped sends remain visible
-         as "not delivered" until dismissed, with replay-safe state owned by
-         the daemon. -->
+         OUT of `blocks` until the agent reads them: a waiting send must not
+         splice the agent's current response. Keeping the stack at the
+         transcript tail makes waiting text inspectable without pinning it to
+         (and crowding) the composer. When the agent reads it — at its next
+         step, mid-turn, or after the turn for an after-turn send — it leaves
+         this stack and enters `blocks` right there. Send now interrupts the
+         turn so every waiting message is read at once; a Stop preserves them;
+         ✕ cancels one. Dropped sends remain visible as "not delivered" until
+         dismissed, with replay-safe state owned by the daemon. -->
     {#if pinnedSends.length > 0}
-      <div class="pending" aria-label="queued messages" aria-live={visible ? "polite" : "off"}>
+      {@const waiting = pinnedSends.filter((s) => s.state === "queued").length}
+      <div
+        class="pending"
+        aria-label="messages waiting for the agent"
+        aria-live={visible ? "polite" : "off"}
+      >
         {#each pinnedSends as send (send.id)}
           {@const pictureOnly = send.text.length === 0 && send.attachmentPaths.length > 0}
           <div class="msg user pending-msg" class:dropped={send.state === "dropped"}>
@@ -2854,29 +2864,35 @@
                   />
                 </div>
               {/if}
-              {#if agentKind === "codex" && send.state === "queued" && store.running}
+              {#if send.state === "queued" && store.running}
                 <button
-                  class="steer-btn"
-                  title="add this message to the current run"
-                  aria-label="steer queued message into current run"
-                  onclick={() => steerQueued(send.id)}
-                >↪ Steer</button>
+                  class="send-now-btn"
+                  title={waiting > 1
+                    ? "stop the current turn and send the waiting messages now"
+                    : "stop the current turn and send this now"}
+                  aria-label="send now (stops the current turn)"
+                  onclick={() => sendQueuedNow(send.id)}
+                >Send now</button>
               {/if}
               <button
                 class="cancel-btn"
                 title={send.state === "dropped"
                   ? "dismiss (this message was never delivered)"
-                  : "cancel this queued message (remove it before the agent sees it)"}
+                  : "cancel this message (remove it before the agent reads it)"}
                 aria-label={send.state === "dropped"
                   ? "dismiss undelivered message"
-                  : "cancel queued message"}
+                  : "cancel waiting message"}
                 onclick={() => cancelQueued(send.id)}
               >
                 ✕
               </button>
             </div>
             <span class="delivery" class:dropped={send.state === "dropped"}>
-              {send.state === "dropped" ? "not delivered" : "queued"}
+              {send.state === "dropped"
+                ? "not delivered"
+                : send.afterTurn
+                  ? "after this turn"
+                  : "next step"}
             </span>
             {#if unsavedImages(send) !== ""}
               <span class="attach">{unsavedImages(send)}</span>
@@ -3264,8 +3280,8 @@
     margin-top: 8px;
     padding-bottom: 10px;
   }
-  /* A pending bubble is half-present — not in the conversation yet (claude's
-     native mid-turn queue / a codex steer in flight). Reuses .msg.user's
+  /* A pending bubble is half-present — not in the conversation yet (waiting
+     for the agent's next step, or for the turn to end). Reuses .msg.user's
      right-alignment so the queued→sent transition is visually continuous:
      the same bubble un-fades and moves up into the transcript on delivery.
      Tighter margins than an inline turn (the stack sets its own gap). */
@@ -3285,7 +3301,7 @@
     outline-style: solid;
     outline-color: color-mix(in srgb, var(--err) 45%, transparent);
   }
-  .steer-btn {
+  .send-now-btn {
     flex: none;
     background: none;
     border: none;
@@ -3299,8 +3315,8 @@
       color 0.12s ease,
       background 0.12s ease;
   }
-  .steer-btn:hover,
-  .steer-btn:focus-visible {
+  .send-now-btn:hover,
+  .send-now-btn:focus-visible {
     color: var(--accent);
     background: color-mix(in srgb, var(--accent) 9%, transparent);
   }

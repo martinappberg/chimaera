@@ -1122,7 +1122,7 @@ pub(crate) struct DroppedTurns {
     pub(crate) first_turn_id: Option<String>,
 }
 
-type ForkCut = (usize, DroppedTurns, Option<(usize, String)>);
+type ForkCut = (usize, DroppedTurns, Vec<(usize, String)>);
 
 /// Locate the rewind cut for `resume_at` in a journal's content: the line
 /// index where dropped history starts, plus the number of turns
@@ -1131,20 +1131,29 @@ type ForkCut = (usize, DroppedTurns, Option<(usize, String)>);
 ///
 /// `resume_at` is the uuid of the message PRECEDING the selected user message
 /// (the fork's resume point). Fresh sends emit UserMessage-then-Checkpoint.
-/// A Codex follow-up queued during the previous turn receives its Checkpoint
-/// only when it later opens a turn, so its original queued echo can be earlier
-/// than the cut. In that case the third return member identifies the echo:
-/// truncation replaces it in-place with a Cancelled tombstone (same seq),
+/// A message sent while a turn ran receives its Checkpoint only when it later
+/// opens a turn (both drivers), so its original queued echo can be earlier
+/// than the cut — and so can the echoes of messages that opened that turn
+/// with it (a batch) or were still waiting. The third return member lists
+/// every queued echo before the cut whose delivery is not also before it:
+/// truncation replaces each in-place with a Cancelled tombstone (same seq),
 /// preserving the completed previous turn without replaying a phantom queue.
 /// `None` = no anchor match.
 fn find_fork_cut(content: &str, resume_at: &str) -> Option<ForkCut> {
     let lines: Vec<&str> = content.lines().collect();
-    let is_user_message = |line: &str| {
+    // The checkpoint's own echo, right before it (a fresh send) — matched by
+    // id: another message's echo can sit there too (sent in the gap before a
+    // waiting message was read). Pre-upgrade journal echoes carry no id and
+    // are always their checkpoint's own.
+    let is_echo_of = |line: &str, want: &str| {
         serde_json::from_str::<SeqEvent>(line)
-            .map(|e| matches!(e.ev, AgentEvent::UserMessage { .. }))
+            .map(|e| {
+                matches!(e.ev, AgentEvent::UserMessage { id, .. }
+                    if id.as_deref().is_none_or(|id| id == want))
+            })
             .unwrap_or(false)
     };
-    let mut found: Option<(usize, Option<(usize, String)>)> = None;
+    let mut found: Option<usize> = None;
     for (i, line) in lines.iter().enumerate() {
         let Ok(entry) = serde_json::from_str::<SeqEvent>(line) else {
             continue;
@@ -1155,31 +1164,37 @@ fn find_fork_cut(content: &str, resume_at: &str) -> Option<ForkCut> {
         } = &entry.ev
         {
             if preceding == resume_at {
-                found = Some(if i > 0 && is_user_message(lines[i - 1]) {
-                    (i - 1, None)
+                // A late checkpoint cuts right there, so every event from the
+                // previous turn stays; its early echo is neutralized below.
+                found = Some(if i > 0 && is_echo_of(lines[i - 1], user_message_id) {
+                    i - 1
                 } else {
-                    // Native queue timing: find the earlier queued echo by
-                    // delivery id. Cut at the later checkpoint so every event
-                    // from the previous turn stays; neutralize only the echo.
-                    let queued = lines[..i].iter().enumerate().rev().find_map(|(idx, line)| {
-                        serde_json::from_str::<SeqEvent>(line)
-                            .ok()
-                            .and_then(|entry| match entry.ev {
-                                AgentEvent::UserMessage {
-                                    id: Some(id),
-                                    queued: true,
-                                    ..
-                                } if id == *user_message_id => Some((idx, user_message_id.clone())),
-                                _ => None,
-                            })
-                    });
-                    (i, queued)
+                    i
                 });
                 break;
             }
         }
     }
-    let (cut, neutralize) = found.filter(|(c, _)| *c < lines.len())?;
+    let cut = found.filter(|c| *c < lines.len())?;
+    // Queued echoes before the cut that were not delivered before it: the
+    // rewind removes them with everything after the cut, so none may replay
+    // as a stranded pending bubble.
+    let mut waiting: Vec<(usize, String)> = Vec::new();
+    for (idx, line) in lines[..cut].iter().enumerate() {
+        let Ok(entry) = serde_json::from_str::<SeqEvent>(line) else {
+            continue;
+        };
+        match entry.ev {
+            AgentEvent::UserMessage {
+                id: Some(id),
+                queued: true,
+                ..
+            } => waiting.push((idx, id)),
+            AgentEvent::UserMessageUpdate { id, .. } => waiting.retain(|(_, w)| *w != id),
+            _ => {}
+        }
+    }
+    let neutralize = waiting;
     // Every turn the journal saw open at/after the cut is a turn codex's
     // history holds past the checkpoint (chat turns, steers folded into
     // them, and compaction turns alike). Turns run outside this journal
@@ -1234,22 +1249,21 @@ fn truncate_journal_at_fork(
         return Ok(None);
     };
     let mut kept = String::with_capacity(content.len());
+    let neutralize: HashMap<usize, String> = neutralize.into_iter().collect();
     for (idx, line) in content.lines().take(cut).enumerate() {
-        if let Some((neutralize_idx, id)) = &neutralize {
-            if idx == *neutralize_idx {
-                let mut entry: SeqEvent = serde_json::from_str(line)
-                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-                entry.ev = AgentEvent::UserMessageUpdate {
-                    id: id.clone(),
-                    state: chimaera_agent::model::UserMessageState::Cancelled,
-                };
-                kept.push_str(
-                    &serde_json::to_string(&entry)
-                        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?,
-                );
-                kept.push('\n');
-                continue;
-            }
+        if let Some(id) = neutralize.get(&idx) {
+            let mut entry: SeqEvent = serde_json::from_str(line)
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+            entry.ev = AgentEvent::UserMessageUpdate {
+                id: id.clone(),
+                state: chimaera_agent::model::UserMessageState::Cancelled,
+            };
+            kept.push_str(
+                &serde_json::to_string(&entry)
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?,
+            );
+            kept.push('\n');
+            continue;
         }
         kept.push_str(line);
         kept.push('\n');
@@ -1980,6 +1994,7 @@ fn render_fork_context(events: &[AgentEvent]) -> Vec<ForkContextRow> {
                 attachment_paths: _,
                 id,
                 queued: true,
+                after_turn: _,
                 origin: None,
             } => {
                 assistant_turn = None;
@@ -3754,6 +3769,7 @@ mod tests {
                     attachment_paths: Vec::new(),
                     id: Some("u1".into()),
                     queued: false,
+                    after_turn: false,
                     origin: None,
                 },
             ),
@@ -3839,6 +3855,7 @@ mod tests {
                     attachment_paths: Vec::new(),
                     id: None,
                     queued: false,
+                    after_turn: false,
                     origin: None,
                 },
             ),
@@ -3869,6 +3886,7 @@ mod tests {
                     attachment_paths: Vec::new(),
                     id: Some("u1".into()),
                     queued: false,
+                    after_turn: false,
                     origin: None,
                 },
             ),
@@ -3895,6 +3913,7 @@ mod tests {
                     attachment_paths: Vec::new(),
                     id: Some("u2".into()),
                     queued: true,
+                    after_turn: false,
                     origin: None,
                 },
             ),
@@ -3957,6 +3976,7 @@ mod tests {
                 attachment_paths: Vec::new(),
                 id: Some("u1".into()),
                 queued: false,
+                after_turn: false,
                 origin: None,
             },
             AgentEvent::MessageChunk {
@@ -4008,6 +4028,7 @@ mod tests {
                     attachment_paths: Vec::new(),
                     id: Some("u1".into()),
                     queued: false,
+                    after_turn: false,
                     origin: None,
                 },
             ),
@@ -4073,6 +4094,7 @@ mod tests {
                     attachment_paths: Vec::new(),
                     id: Some("u2".into()),
                     queued: false,
+                    after_turn: false,
                     origin: None,
                 },
             ),
@@ -4112,6 +4134,7 @@ mod tests {
                     attachment_paths: Vec::new(),
                     id: Some("u2".into()),
                     queued: false,
+                    after_turn: false,
                     origin: None,
                 },
             ),
@@ -4188,6 +4211,7 @@ mod tests {
                     attachment_paths: Vec::new(),
                     id: Some("u2".into()),
                     queued: false,
+                    after_turn: false,
                     origin: None,
                 },
             ),
@@ -4252,6 +4276,7 @@ mod tests {
                     attachment_paths: Vec::new(),
                     id: None,
                     queued: false,
+                    after_turn: false,
                     origin: None,
                 },
             ),
@@ -4283,6 +4308,7 @@ mod tests {
                     attachment_paths: Vec::new(),
                     id: None,
                     queued: false,
+                    after_turn: false,
                     origin: None,
                 },
             ),
@@ -4369,6 +4395,7 @@ mod tests {
                     attachment_paths: Vec::new(),
                     id: Some("m1".into()),
                     queued: false,
+                    after_turn: false,
                     origin: None,
                 },
             ),
@@ -4393,6 +4420,7 @@ mod tests {
                     attachment_paths: Vec::new(),
                     id: Some("q2".into()),
                     queued: true,
+                    after_turn: false,
                     origin: None,
                 },
             ),
@@ -4459,6 +4487,110 @@ mod tests {
             &kept[5].ev,
             AgentEvent::TurnCompleted { turn_id, .. } if turn_id == "t1"
         ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Several messages waiting when a turn ends open the next turn together
+    /// (Send now, or after-turn sends); only the first carries the rewind
+    /// boundary. Rewinding to it removes the whole batch — every queued echo
+    /// before the cut whose delivery is past it becomes a tombstone — while a
+    /// message the agent read mid-turn before the cut stays. Another message's
+    /// echo right before the checkpoint is not mistaken for the selected one.
+    #[test]
+    fn truncate_journal_neutralizes_every_undelivered_queued_echo() {
+        use chimaera_agent::model::UserMessageState::{Cancelled, Sent};
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-fork-batch-truncate-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        let user = |id: &str, queued: bool| AgentEvent::UserMessage {
+            text: id.into(),
+            attachments: 0,
+            attachment_paths: Vec::new(),
+            id: Some(id.into()),
+            queued,
+            after_turn: false,
+            origin: None,
+        };
+        let update = |id: &str| AgentEvent::UserMessageUpdate {
+            id: id.into(),
+            state: Sent,
+        };
+        let events = vec![
+            user("m1", false),
+            AgentEvent::Checkpoint {
+                user_message_id: "m1".into(),
+                preceding_uuid: None,
+            },
+            AgentEvent::TurnStarted {
+                turn_id: "t1".into(),
+            },
+            user("q2", true),
+            user("q3", true),
+            user("q0", true),
+            update("q0"),
+            AgentEvent::TurnCompleted {
+                turn_id: "t1".into(),
+                usage: Default::default(),
+            },
+            user("q4", true),
+            AgentEvent::Checkpoint {
+                user_message_id: "q2".into(),
+                preceding_uuid: Some("m1".into()),
+            },
+            update("q2"),
+            AgentEvent::Checkpoint {
+                user_message_id: "q3".into(),
+                preceding_uuid: Some("q2".into()),
+            },
+            update("q3"),
+            AgentEvent::TurnStarted {
+                turn_id: "t2".into(),
+            },
+            update("q4"),
+        ];
+        let lines: Vec<String> = events
+            .into_iter()
+            .enumerate()
+            .map(|(i, ev)| seq_line(i as u64 + 1, ev))
+            .collect();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        assert_eq!(
+            truncate_journal_at_fork(&path, "m1")
+                .unwrap()
+                .map(|d| d.count),
+            Some(1)
+        );
+        let kept: Vec<SeqEvent> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        // Cut at q2's checkpoint (seq 10): q4's echo before it is not q2's.
+        assert_eq!(
+            kept.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            (1..=9).collect::<Vec<_>>()
+        );
+        let tombstoned: Vec<&str> = kept
+            .iter()
+            .filter_map(|e| match &e.ev {
+                AgentEvent::UserMessageUpdate {
+                    id,
+                    state: Cancelled,
+                } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tombstoned, vec!["q2", "q3", "q4"]);
+        // Read mid-turn before the cut: still a delivered message.
+        assert!(matches!(&kept[5].ev, AgentEvent::UserMessage { id: Some(id), .. } if id == "q0"));
+        assert!(
+            matches!(&kept[6].ev, AgentEvent::UserMessageUpdate { id, state: Sent } if id == "q0")
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4552,6 +4684,7 @@ mod tests {
                 attachment_paths: Vec::new(),
                 id: None,
                 queued: false,
+                after_turn: false,
                 origin: None,
             },
             AgentEvent::TurnStarted {
