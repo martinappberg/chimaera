@@ -153,6 +153,8 @@ pub(super) fn start(state: Arc<AppState>) {
                     }
                 }
             }
+            // Previous-life processes that have exited release their fence.
+            execution::reprobe(&state);
             let workspaces = lock(&state.workspaces).list();
             for workspace in workspaces
                 .into_iter()
@@ -410,6 +412,13 @@ async fn reconcile_generation(
         suspend_workspace(state, workspace).await?;
         execution::stop(state, &[workspace.to_owned()]).await?;
     }
+    // Never take or extend a lease this worker could not accept: an expired
+    // one lets the laptop (or a clean worker) continue instead.
+    ensure!(
+        !execution::worker(state)
+            || (!state.pro.execution.invalid && !execution::unclean(state, workspace)),
+        "previous managed processes are still stopping"
+    );
     let request_start = execution::RequestStart::now();
     let grant: Baton = account(
         &operation_config,

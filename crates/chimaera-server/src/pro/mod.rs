@@ -80,6 +80,10 @@ struct Preference {
     execution_active: bool,
     #[serde(default)]
     execution_boot: Option<String>,
+    /// Process groups of live managed agents, for a same-boot successor's
+    /// probe after a crash (bounded to 64 per workspace).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    execution_groups: Vec<u32>,
     #[serde(default)]
     execution_identity: Option<execution::wire::Identity>,
     #[serde(default)]
@@ -194,7 +198,11 @@ impl ProState {
             })
             .collect();
         let authority = authority::Authority::load(&root);
-        let execution = execution::State::restore(&root, &disk.preferences);
+        let execution = execution::State::restore(
+            &root,
+            &disk.preferences,
+            disk.worker || crate::cloud::enabled(),
+        );
         Self {
             root,
             configured: AtomicBool::new(false),
@@ -366,6 +374,7 @@ fn now() -> u64 {
 async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
     let _guard = state.pro.persistence.lock().await;
     ensure_root(&state.pro.root).await?;
+    execution::record_groups(state);
     let keep_running = crate::lock(&state.pro.keep_running).clone();
     let ownership = crate::lock(&state.pro.ownership).clone();
     let preferences = crate::lock(&state.pro.preferences).clone();
@@ -477,6 +486,14 @@ pub(crate) async fn defer_command(
         persist(state).await?;
     }
     Ok(should_defer)
+}
+
+/// Graceful daemon stop: clear managed-execution evidence once this life's
+/// agents are proven stopped, so a same-boot successor is not fenced.
+pub(crate) async fn shutdown(state: &std::sync::Arc<crate::AppState>) {
+    if let Err(error) = execution::shutdown(state).await {
+        tracing::warn!(%error, "Project execution state could not be saved at shutdown");
+    }
 }
 
 pub(crate) fn active_operations(state: &crate::AppState) -> usize {

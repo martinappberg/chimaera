@@ -3,7 +3,7 @@
 mod lease;
 pub(crate) mod mutation;
 mod restart;
-pub(super) use restart::persist_latch;
+pub(super) use restart::{persist_latch, record_groups, reprobe, shutdown};
 pub(super) mod receipt;
 pub(super) mod recovery;
 #[cfg(test)]
@@ -31,7 +31,9 @@ pub(super) struct State {
     proofs: Mutex<HashMap<String, Proof>>,
     commits: mutation::Commits,
     pub(super) latched: Mutex<std::collections::HashSet<String>>,
-    unclean: std::collections::HashSet<String>,
+    /// Previous-life process groups not yet proven gone, per workspace. An
+    /// empty list means no evidence exists (worker only; see `restore`).
+    unclean: Mutex<HashMap<String, Vec<u32>>>,
     pub(super) invalid: bool,
     boot: Option<String>,
 }
@@ -237,8 +239,7 @@ pub(super) fn accept(
     // processes stopped. A device keeps running regardless (laptop first).
     ensure!(
         config.role == Role::Device
-            || (!state.pro.execution.invalid
-                && !state.pro.execution.unclean.contains(&baton.workspace_id)),
+            || (!state.pro.execution.invalid && !unclean(state, &baton.workspace_id)),
         "previous managed processes require supervisor cleanup"
     );
     observe(state, config, baton)?;
@@ -367,7 +368,7 @@ pub(super) fn allows(state: &AppState, workspace: &str) -> bool {
 /// Sessions a previous daemon left running resume only once this life has
 /// verified ownership; `resume_unverified` applies the device fallback.
 pub(super) fn restorable(state: &AppState, workspace: &str) -> bool {
-    lease_valid(state, workspace) && !state.pro.execution.unclean.contains(workspace)
+    lease_valid(state, workspace) && !unclean(state, workspace)
 }
 /// A fresh, unexpired acquire/renew proof for the current local epoch. It
 /// gates publication and forwarded viewers on every host, and all execution
@@ -425,7 +426,7 @@ pub(super) fn fence_workspace(state: &AppState, workspace: &str) {
 
 /// Processes from a previous daemon life that were not proven gone.
 pub(super) fn unclean(state: &AppState, workspace: &str) -> bool {
-    state.pro.execution.unclean.contains(workspace)
+    lock(&state.pro.execution.unclean).contains_key(workspace)
 }
 /// Agents are the managed workload. Plain shells are never managed: they are
 /// neither signalled by a fence nor awaited by a stop.
@@ -434,7 +435,7 @@ pub(super) fn managed_session(state: &AppState, id: &str) -> bool {
 }
 pub(super) fn quiescent(state: &AppState, workspace: &str) -> bool {
     if (state.pro.execution.invalid && worker(state))
-        || state.pro.execution.unclean.contains(workspace)
+        || unclean(state, workspace)
         || !mutation::idle(state, workspace)
     {
         return false;

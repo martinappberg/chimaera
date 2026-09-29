@@ -1037,6 +1037,11 @@ impl ChatManager {
         let _ = session.kill_tx.send(true);
         true
     }
+    /// The managed child's process group, when this session was spawned with
+    /// `managed_execution` and its process is attached and unreaped.
+    pub fn process_group(&self, id: &str) -> Option<u32> {
+        self.get_session(id).ok()?.process_control.process_group()
+    }
     pub fn kill(&self, id: &str) -> bool {
         match self.get_session(id) {
             Ok(session) => session.kill_tx.send(true).is_ok(),

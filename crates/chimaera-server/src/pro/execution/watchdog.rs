@@ -87,6 +87,7 @@ pub(in crate::pro) async fn stop(
     super::super::persist(state).await?;
     tokio::time::timeout(Duration::from_secs(12), async {
         loop {
+            super::reprobe(state);
             if workspaces
                 .iter()
                 .all(|workspace| super::quiescent(state, workspace))

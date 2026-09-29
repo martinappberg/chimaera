@@ -387,6 +387,18 @@ impl ProcessControl {
             Self::signal(&state);
         }
     }
+    /// The owned process group's id (the child's pid) while it is attached and
+    /// unreaped, so a daemon can record restart evidence for it.
+    pub fn process_group(&self) -> Option<u32> {
+        let child = self
+            .state
+            .lock()
+            .expect("process control lock")
+            .child
+            .upgrade()?;
+        let id = child.lock().expect("child lifecycle lock").id();
+        id
+    }
     /// Called repeatedly during the bounded stop window. First SIGTERM lets
     /// the official CLI stop detached helpers; the owned group gets SIGKILL
     /// after two seconds. This is not containment of arbitrary setsid children.

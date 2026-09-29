@@ -1,5 +1,6 @@
 use super::*;
 use crate::pro::protocol::Delegation;
+use std::os::unix::process::CommandExt;
 use std::sync::Arc;
 fn fixture() -> (Arc<AppState>, Configure, std::path::PathBuf) {
     let root = std::env::temp_dir().join(format!(
@@ -219,10 +220,34 @@ async fn same_boot_crash_never_turns_empty_registry_into_stopped_evidence() {
     lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
     crate::pro::ensure_root(&state.pro.root).await.unwrap();
     prepare_launch(&state, "w-a").await.unwrap();
-    let restored = State::restore(&state.pro.root, &lock(&state.pro.preferences));
-    assert!(restored.unclean.contains("w-a"));
-    let disk = crate::pro::ProState::new(state.pro.root.clone());
-    assert!(disk.execution.unclean.contains("w-a"));
+    // No recorded process group: a worker cannot prove anything.
+    let restored = State::restore(&state.pro.root, &lock(&state.pro.preferences), true);
+    assert!(lock(&restored.unclean).contains_key("w-a"));
+    // A device proceeds (laptop first).
+    let restored = State::restore(&state.pro.root, &lock(&state.pro.preferences), false);
+    assert!(!lock(&restored.unclean).contains_key("w-a"));
+    // A recorded group that is still alive fences both until it exits.
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let mut preferences = lock(&state.pro.preferences).clone();
+    preferences.get_mut("w-a").unwrap().execution_groups = vec![child.id()];
+    for worker in [false, true] {
+        let restored = State::restore(&state.pro.root, &preferences, worker);
+        assert_eq!(lock(&restored.unclean)["w-a"], vec![child.id()]);
+    }
+    lock(&state.pro.execution.unclean).insert("w-a".into(), vec![child.id()]);
+    reprobe(&state);
+    assert!(!quiescent(&state, "w-a"), "a live old group blocks handoff");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    reprobe(&state);
+    assert!(
+        quiescent(&state, "w-a"),
+        "an exited group releases its fence"
+    );
     std::fs::write(state.pro.root.join("state.json"), b"{}").unwrap();
     let damaged = crate::pro::ProState::new(state.pro.root.clone());
     assert!(lock(&damaged.execution.latched).contains("w-a"));
@@ -289,5 +314,48 @@ fn new_default_capability_never_changes_an_existing_strict_policy_renewal() {
     let mut mismatched = baton();
     mismatched.execution_capability = Some(wire::ExecutionCapability::checkpoint_fork());
     assert!(observe(&state, &config, &mismatched).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn graceful_same_boot_restart_does_not_fence_but_a_crash_probes_survivors() {
+    let (state, config, root) = fixture();
+    worker_fixture(&state);
+    accept(&state, &config, &baton(), 0, RequestStart::now()).unwrap();
+    lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
+    crate::pro::ensure_root(&state.pro.root).await.unwrap();
+    prepare_launch(&state, "w-a").await.unwrap();
+    let agent = state
+        .sessions
+        .spawn_managed(chimaera_pty::SpawnOpts {
+            cwd: root.clone(),
+            name: None,
+            cols: 80,
+            rows: 24,
+            command: Some(vec!["/bin/sh".into()]),
+            id: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            scrollback: None,
+        })
+        .unwrap();
+    lock(&state.agents).insert(
+        agent.id.clone(),
+        crate::agent_state::AgentRecord::new("k".into(), crate::agent_state::AgentKind::Claude),
+    );
+    lock(&state.session_workspaces).insert(agent.id.clone(), "w-a".into());
+    crate::pro::persist(&state).await.unwrap();
+    // A crash here leaves a live recorded group: a successor must wait for it.
+    let crashed = crate::pro::ProState::new(state.pro.root.clone());
+    assert_eq!(
+        lock(&crashed.execution.unclean)["w-a"],
+        vec![agent.pid.unwrap()]
+    );
+    // A graceful stop proves the agents exited and clears the evidence.
+    shutdown(&state).await.unwrap();
+    assert!(!state.sessions.get(&agent.id).is_some_and(|s| s.alive));
+    let restarted = crate::pro::ProState::new(state.pro.root.clone());
+    assert!(lock(&restarted.execution.unclean).is_empty());
+    assert!(!lock(&restarted.preferences)["w-a"].execution_active);
     std::fs::remove_dir_all(root).unwrap();
 }

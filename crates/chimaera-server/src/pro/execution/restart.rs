@@ -12,6 +12,7 @@ impl State {
     pub(in crate::pro) fn restore(
         root: &Path,
         preferences: &HashMap<String, super::super::Preference>,
+        worker: bool,
     ) -> Self {
         let loaded = (|| -> Result<HashSet<String>> {
             let file = match std::fs::File::open(root.join("execution-authority.json")) {
@@ -51,17 +52,145 @@ impl State {
                         || p.execution_boot.as_ref() == boot.as_ref()
                         || p.execution_boot.is_none())
             })
-            .map(|(id, _)| id.clone())
+            .filter_map(|(id, p)| {
+                // Probe what the previous life recorded instead of fencing
+                // forever. With no recorded group a device proceeds (laptop
+                // first); a worker cannot prove anything and stays strict.
+                let alive = surviving(&p.execution_groups);
+                (!alive.is_empty() || (p.execution_groups.is_empty() && worker))
+                    .then(|| (id.clone(), alive))
+            })
             .collect();
         Self {
             proofs: Mutex::default(),
             commits: mutation::Commits::default(),
             latched: Mutex::new(latched),
-            unclean,
+            unclean: Mutex::new(unclean),
             invalid,
             boot,
         }
     }
+}
+/// Recorded process groups that still exist. A group that has vanished can
+/// never run old work again; a reused group id errs toward waiting.
+fn surviving(groups: &[u32]) -> Vec<u32> {
+    groups
+        .iter()
+        .copied()
+        .filter(|group| {
+            i32::try_from(*group).is_ok_and(|group| {
+                group > 1
+                    && !matches!(
+                        nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), None),
+                        Err(nix::errno::Errno::ESRCH)
+                    )
+            })
+        })
+        .collect()
+}
+/// Re-probe previous-life evidence; a workspace is released as soon as none
+/// of its recorded groups remains. Unprovable (empty) records stay.
+pub(in crate::pro) fn reprobe(state: &AppState) {
+    lock(&state.pro.execution.unclean).retain(|_, groups| {
+        if groups.is_empty() {
+            return true;
+        }
+        *groups = surviving(groups);
+        !groups.is_empty()
+    });
+}
+/// Process groups of this life's live managed agents, recorded with every
+/// state write so a crash leaves probe-able evidence behind.
+pub(in crate::pro) fn record_groups(state: &AppState) {
+    let sessions: Vec<(String, String)> = lock(&state.session_workspaces)
+        .iter()
+        .map(|(session, workspace)| (session.clone(), workspace.clone()))
+        .collect();
+    let mut by_workspace: HashMap<String, Vec<u32>> = HashMap::new();
+    for (session, workspace) in sessions {
+        let agent = lock(&state.agents).contains_key(&session);
+        let group = state.chat.process_group(&session).or_else(|| {
+            agent
+                .then(|| state.sessions.get(&session).filter(|s| s.alive)?.pid)
+                .flatten()
+        });
+        if let Some(group) = group {
+            let groups = by_workspace.entry(workspace.clone()).or_default();
+            if groups.len() < 64 {
+                groups.push(group);
+            }
+        }
+    }
+    let mut preferences = lock(&state.pro.preferences);
+    for (workspace, preference) in preferences.iter_mut() {
+        if preference.execution_active {
+            let mut groups = by_workspace.remove(workspace).unwrap_or_default();
+            groups.sort_unstable();
+            preference.execution_groups = groups;
+        } else {
+            preference.execution_groups.clear();
+        }
+    }
+}
+/// Graceful shutdown: stop this life's managed agents and, once none remains,
+/// clear the evidence so a same-boot successor starts clean. Anything still
+/// running keeps its recorded groups for the successor's probe.
+pub(in crate::pro) async fn shutdown(state: &std::sync::Arc<AppState>) -> Result<()> {
+    let workspaces: Vec<String> = lock(&state.pro.preferences)
+        .iter()
+        .filter(|(_, p)| p.execution_active)
+        .map(|(id, _)| id.clone())
+        .collect();
+    if workspaces.is_empty() {
+        return Ok(());
+    }
+    let managed: Vec<String> = lock(&state.session_workspaces)
+        .iter()
+        .filter(|(_, workspace)| workspaces.contains(workspace))
+        .map(|(id, _)| id.clone())
+        .filter(|id| super::managed_session(state, id))
+        .collect();
+    for id in &managed {
+        if state.chat.get(id).is_some_and(|s| s.alive) {
+            state.chat.fence(id);
+        } else if state.sessions.get(id).is_some_and(|s| s.alive) {
+            let _ = state.sessions.kill(id);
+        }
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        while managed.iter().any(|id| {
+            state.chat.get(id).is_some_and(|s| s.alive)
+                || state.sessions.get(id).is_some_and(|s| s.alive)
+        }) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    let running: std::collections::HashSet<String> = managed
+        .iter()
+        .filter(|id| {
+            state.chat.get(id).is_some_and(|s| s.alive)
+                || state.sessions.get(id).is_some_and(|s| s.alive)
+        })
+        .filter_map(|id| lock(&state.session_workspaces).get(id).cloned())
+        .collect();
+    let unproven: std::collections::HashSet<String> = workspaces
+        .iter()
+        .filter(|workspace| unclean(state, workspace))
+        .cloned()
+        .collect();
+    {
+        let mut preferences = lock(&state.pro.preferences);
+        for workspace in &workspaces {
+            if let Some(preference) = preferences.get_mut(workspace) {
+                if !running.contains(workspace) && !unproven.contains(workspace) {
+                    preference.execution_active = false;
+                    preference.execution_groups.clear();
+                }
+            }
+        }
+    }
+    crate::pro::persist(state).await
 }
 pub(in crate::pro) async fn persist_latch(state: &AppState) -> Result<()> {
     let mut workspaces: Vec<_> = lock(&state.pro.execution.latched).iter().cloned().collect();
