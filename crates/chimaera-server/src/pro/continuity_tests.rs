@@ -11,6 +11,8 @@ use axum::{
 };
 use std::{collections::HashMap, sync::Mutex, time::Duration as StdDuration};
 
+type Canned = HashMap<(String, String), (u16, serde_json::Value)>;
+
 pub(super) struct FakeAccount {
     pub endpoint: String,
     pub requests: Arc<Mutex<Vec<(String, String, serde_json::Value)>>>,
@@ -18,6 +20,11 @@ pub(super) struct FakeAccount {
     /// The reply to acquire/renew: a status and body (a grant or a refusal).
     pub grant: Arc<Mutex<Option<(u16, serde_json::Value)>>>,
     pub delays: Arc<Mutex<HashMap<String, StdDuration>>>,
+    /// Scripted replies by (method, path), consulted before the defaults
+    /// (placement reads, keeper host lists and relayed worker requests).
+    pub canned: Arc<Mutex<Canned>>,
+    /// Paths of requests that carried `X-Chimaera-Wake: interaction`.
+    pub wakes: Arc<Mutex<Vec<String>>>,
     server: tokio::task::JoinHandle<()>,
 }
 impl Drop for FakeAccount {
@@ -31,29 +38,54 @@ impl FakeAccount {
         let baton = Arc::new(Mutex::new(baton));
         let grant = Arc::new(Mutex::new(None));
         let delays = Arc::new(Mutex::new(HashMap::<String, StdDuration>::new()));
+        let canned = Arc::new(Mutex::new(HashMap::new()));
+        let wakes = Arc::new(Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let (recorded, current, granted, delayed) = (
+        let (recorded, current, granted, delayed, scripted, woken) = (
             requests.clone(),
             baton.clone(),
             grant.clone(),
             delays.clone(),
+            canned.clone(),
+            wakes.clone(),
         );
         let router = Router::new().fallback(any(
-            move |method: Method, uri: axum::http::Uri, body: Bytes| {
-                let (recorded, current, granted, delayed) = (
+            move |method: Method,
+                  uri: axum::http::Uri,
+                  headers: axum::http::HeaderMap,
+                  body: Bytes| {
+                let (recorded, current, granted, delayed, scripted, woken) = (
                     recorded.clone(),
                     current.clone(),
                     granted.clone(),
                     delayed.clone(),
+                    scripted.clone(),
+                    woken.clone(),
                 );
                 async move {
                     let path = uri.path().to_owned();
                     let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
                     lock(&recorded).push((method.to_string(), path.clone(), body.clone()));
+                    if headers
+                        .get("x-chimaera-wake")
+                        .is_some_and(|value| value == "interaction")
+                    {
+                        lock(&woken).push(path.clone());
+                    }
                     let delay = lock(&delayed).get(&path).copied();
                     if let Some(delay) = delay {
                         tokio::time::sleep(delay).await;
+                    }
+                    let reply = lock(&scripted)
+                        .get(&(method.to_string(), path.clone()))
+                        .cloned();
+                    if let Some((status, body)) = reply {
+                        return (
+                            StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT),
+                            Json(body),
+                        )
+                            .into_response();
                     }
                     respond(&method, &path, &body, &current, &granted)
                 }
@@ -68,8 +100,13 @@ impl FakeAccount {
             baton,
             grant,
             delays,
+            canned,
+            wakes,
             server,
         }
+    }
+    pub fn script(&self, method: &str, path: &str, status: u16, body: serde_json::Value) {
+        lock(&self.canned).insert((method.into(), path.into()), (status, body));
     }
     pub fn calls(&self, method: &str, path: &str) -> Vec<serde_json::Value> {
         lock(&self.requests)
@@ -551,6 +588,70 @@ async fn a_device_takes_back_a_lapsed_cloud_lease_but_waits_to_move_live_cloud_w
         attempts,
         "a failed return is retried with backoff, not every pass"
     );
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A cloud machine asleep with ownership reads as an expired lease, but the
+/// account refuses anyone else's acquire (409 `held`). The computer must wake
+/// it and ask for the work back (once it is settled), never try to take it.
+#[tokio::test]
+async fn a_suspended_cloud_owner_is_woken_and_asked_never_taken_over() {
+    let root = temp("suspended-worker");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let mut config = device(&account.endpoint);
+    config.keeper_url = account.endpoint.clone();
+    let workspace = project(&state, &root, &config, 4);
+    lock(&state.pro.ownership).insert(
+        workspace.id.clone(),
+        Ownership::Remote {
+            epoch: 5,
+            holder: "worker-a".into(),
+        },
+    );
+    let mut cloud = owned(&workspace.id, "worker-a", 5, "lease-cloud", 3);
+    cloud["checkpoint"] = checkpoint(5);
+    cloud["server_now"] = json!("2026-09-28T00:30:00Z");
+    *lock(&account.baton) = cloud;
+    account.script(
+        "GET",
+        &format!("/v2/workspaces/{}/placement", workspace.id),
+        200,
+        json!({"workspace_id":workspace.id,"holder_id":"worker-a","route_host_id":"worker-worker-a",
+               "epoch":5,"policy_revision":1,"availability":"suspended","preferred_installation_id":"i-home",
+               "checkpoint_id":"cp-fixture","server_now":"2026-09-28T00:30:00Z","expires_at":"2026-09-28T00:01:30Z"}),
+    );
+    account.script(
+        "GET",
+        "/v1/hosts",
+        200,
+        json!([{"id":"worker-worker-a","kind":"worker","status":"connected","alias":"Cloud"}]),
+    );
+    let handoff = "/v1/hosts/worker-worker-a/http/api/v1/pro/handoff";
+    // The woken machine is still mid-turn this time.
+    account.script("POST", handoff, 409, json!({"error":"workspace_busy"}));
+    // Just woke on battery: nothing is woken, nothing is taken.
+    lazy_handback(&state, &config).await.unwrap();
+    assert!(account.calls("POST", handoff).is_empty());
+    assert!(account.calls("POST", "/v2/mirror/credentials").is_empty());
+    assert!(account
+        .calls("POST", &format!("/v2/baton/{}/acquire", workspace.id))
+        .is_empty());
+    // Settled on power: wake the machine and ask it for the work.
+    state.pro.power_suitable.store(true, Ordering::Release);
+    state.pro.awake_since.store(0, Ordering::Release);
+    lazy_handback(&state, &config).await.unwrap();
+    assert_eq!(
+        account.calls("POST", handoff),
+        vec![json!({"workspace_id": workspace.id, "expected_epoch": 5})]
+    );
+    assert_eq!(*lock(&account.wakes), vec![handoff.to_string()]);
+    assert!(
+        account.calls("POST", "/v2/mirror/credentials").is_empty(),
+        "a held project is never fetched or acquired from under its owner"
+    );
+    assert!(lock(&state.pro.return_backoff).get(&workspace.id).is_none());
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }

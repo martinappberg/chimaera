@@ -79,7 +79,9 @@ pub(super) async fn prepare(
             }
             ensure!(current(), "Account or project changed during return");
             if ambiguous != Some(seen_epoch) {
-                let response = transport::request(
+                // Asking for the work back is an interaction: a cloud machine
+                // asleep with ownership is woken to answer it.
+                let response = transport::request_waking(
                     &config.keeper_url,
                     &format!("/v1/hosts/{}/http/api/v1/pro/handoff", host.id),
                     "POST",

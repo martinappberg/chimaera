@@ -440,6 +440,16 @@ even though the account marks a lapsed-lease acquisition `requires_fork`. The
 account's `takeover_grace` refusal is a quiet wait. Plain shells are never
 managed processes.
 
+A cloud machine that suspends keeps ownership (placement `suspended`, lease
+expired by design); the account answers anyone else's acquire with 409 `held`
+for as long as it stays paused. A computer that wants the project back reads
+placement (passive, never wakes) and, once settled on power, POSTs the worker's
+`/api/v1/pro/handoff` through the keeper's HTTP adapter with `X-Chimaera-Wake:
+interaction`: the keeper wakes the machine, which renews its own epoch, flushes
+at a safe pause and releases, and the computer then hydrates. A `held` refusal
+is never treated as final, and the computer never fetches or acquires from
+under a suspended owner.
+
 ### v2 refusals
 
 v2 acquire/renew/release and the related routes answer with these stable codes

@@ -649,6 +649,7 @@ fn curl(
     method: &str,
     token: &str,
     body: Option<&serde_json::Value>,
+    wake: bool,
 ) -> Result<(Command, Vec<u8>)> {
     ensure!(
         matches!(method, "GET" | "POST" | "PUT" | "DELETE"),
@@ -664,6 +665,11 @@ fn curl(
         quote(method)?,
         quote(&format!("Authorization: Bearer {token}"))?
     );
+    if wake {
+        // The keeper wakes a suspended cloud machine only for a deliberate
+        // interaction; its HTTP adapter forwards this marker.
+        config.push_str("header = \"X-Chimaera-Wake: interaction\"\n");
+    }
     if let Some(body) = body {
         let body = serde_json::to_string(body)?;
         ensure!(body.len() <= JSON_CAP, "service request exceeds limit");
@@ -715,8 +721,31 @@ pub(super) async fn request(
     token: &str,
     body: Option<&serde_json::Value>,
 ) -> Result<Response> {
+    request_inner(base, path, method, token, body, false).await
+}
+
+/// A deliberate interaction with a cloud machine through the keeper: carries
+/// wake intent, so a suspended machine is started to answer it.
+pub(super) async fn request_waking(
+    base: &str,
+    path: &str,
+    method: &str,
+    token: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<Response> {
+    request_inner(base, path, method, token, body, true).await
+}
+
+async fn request_inner(
+    base: &str,
+    path: &str,
+    method: &str,
+    token: &str,
+    body: Option<&serde_json::Value>,
+    wake: bool,
+) -> Result<Response> {
     let url = checked_url(base, path)?;
-    let (mut command, input) = curl(&url, method, token, body)?;
+    let (mut command, input) = curl(&url, method, token, body, wake)?;
     command.args(["--write-out", "\n%{http_code}"]);
     let timeout = if path.ends_with("/pro/handoff") {
         command.args(["--max-time", "90"]);

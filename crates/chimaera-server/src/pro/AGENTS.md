@@ -166,7 +166,12 @@ from the last acknowledged checkpoint; the account's reconnect grace answers
 409 `takeover_grace`, treated as a quiet wait), or this device's own unfinished
 return (`Hydrating` held by it), with backoff from two minutes doubling to thirty.
 A bare 409 from the worker's handoff is final for the pass unless the worker woke
-into a new epoch. Re-acquiring the epoch this device itself held
+into a new epoch. A cloud machine asleep with ownership (placement
+`suspended`) reads expired too, but the account refuses anyone else's acquire
+(409 `held`): the device reads placement (passive) and, once settled, wakes it
+by POSTing its `/pro/handoff` through the keeper with `X-Chimaera-Wake:
+interaction`; it never fetches or acquires from under it. The woken worker's
+handoff waits (≤20 s) for its own lease renewal first. Re-acquiring the epoch this device itself held
 (`execution::held_here`: its clean release or its lapsed lease) skips
 hydration and never forks; a worker renewal after a same-epoch fence resumes
 what the fence preserved.

@@ -792,6 +792,14 @@ pub(crate) async fn handoff(
     };
     let workspace = request.workspace_id.clone();
     let epoch = request.expected_epoch;
+    // A machine this request just woke is still renewing its own lease: let
+    // that answer first (bounded) instead of refusing the return it came for.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while execution::resuming(&state, &workspace) {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
     let owner = state.clone();
     let checked = state.clone();
     let key = request.workspace_id;

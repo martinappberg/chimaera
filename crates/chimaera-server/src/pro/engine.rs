@@ -1702,6 +1702,29 @@ pub(super) fn at_pause(state: &AppState, workspace: &str) -> bool {
 /// A device waits this long between automatic attempts to finish one return.
 const RETURN_BACKOFF_MAX: u64 = 1800;
 
+/// Whether the account reports this project's owner as a cloud machine that
+/// is suspended but keeps ownership (placement availability `suspended`).
+/// Passive: reading placement never wakes anything. Any failure reads as not
+/// suspended, which keeps the earlier behavior.
+async fn owner_suspended(config: &Configure, workspace: &str) -> bool {
+    if config.execution.is_none() {
+        return false;
+    }
+    let Ok(response) = account(
+        config,
+        &format!("/v2/workspaces/{workspace}/placement"),
+        "GET",
+        None,
+    )
+    .await
+    else {
+        return false;
+    };
+    response.json::<serde_json::Value>().is_ok_and(|placement| {
+        placement["workspace_id"] == workspace && placement["availability"] == "suspended"
+    })
+}
+
 pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> Result<()> {
     if config.delegation.workspace.is_some() || config.role != Role::Device {
         return Ok(());
@@ -1758,6 +1781,14 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
             ensure!(baton.workspace_id == workspace, "baton workspace mismatch");
             execution::observe(state, config, &baton)?;
             let mine = baton.holder_id.as_deref() == Some(&config.delegation.device_id);
+            // A cloud machine asleep with ownership reads expired too, but the
+            // account refuses to let anyone else acquire it (409 `held`): it
+            // must be woken and asked to hand back, like live cloud work.
+            let suspended = holder.is_some()
+                && baton.holder_id.is_some()
+                && !mine
+                && execution::expired(&baton)
+                && owner_suspended(&operation_config, &workspace).await;
             let target = match (&holder, baton.holder_id.as_deref()) {
                 // Released by the cloud: nothing runs there, hydrate now.
                 (_, None) => Some(baton.epoch),
@@ -1766,7 +1797,9 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
                 (None, _) => None,
                 // The cloud's lease lapsed (it stopped or lost the account):
                 // take the project home from its last acknowledged checkpoint.
-                (Some(_), Some(_)) if !mine && execution::expired(&baton) => Some(baton.epoch),
+                (Some(_), Some(_)) if !mine && execution::expired(&baton) && !suspended => {
+                    Some(baton.epoch)
+                }
                 (Some(recorded), Some(current)) if current == recorded && settled => {
                     if hosts.is_none() {
                         hosts = Some(
