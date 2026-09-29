@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Merged into the bundle's Info.plist by the Tauri bundler. Voice
+         dictation (/voice in a chat) records from the microphone in the web
+         view; macOS terminates an app that touches the mic without this. -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>chimaera listens only while you dictate to an agent (/voice), and sends what you say to Claude's speech-to-text service.</string>
+</dict>
+</plist>
