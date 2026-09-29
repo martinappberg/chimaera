@@ -339,6 +339,15 @@ flushes, held project caches and busy Git helpers; a completed drain counts
 zero) and additive `last_activity_ms`, the last user change that is not session
 input (file saves, uploads, Git operations, session lifecycle).
 
+The supervisor's idle sample reads `GET /api/v1/sessions`. Besides
+`agent_state`, `output_active`, `background_running`, `phase`, `exec_stage` and
+nullable `last_input_ms`, chat rows carry an additive boolean
+`needs_permission`: true while the conversation waits on a permission or a
+question. The supervisor keeps the machine awake on it for a bounded time and
+then suspends with ownership retained, so the question survives in the frozen
+process and its answer wakes it. PTY rows omit the field (a Claude TUI reports
+`agent_state: "needs_permission"` instead).
+
 ## Explicit worker wake
 
 A full device may POST `/v1/worker/wake` with `{}` for a deliberate cloud action.

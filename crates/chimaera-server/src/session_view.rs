@@ -168,6 +168,15 @@ pub(crate) fn session_json(
     serde_json::Value::Object(map)
 }
 
+/// Additive `needs_permission` on chat rows: a permission or question is
+/// waiting on the user. A cloud machine's supervisor keeps itself awake on it
+/// for a bounded time, so the question is still there when the answer comes.
+/// PTY rows omit it (a Claude TUI reports `agent_state: "needs_permission"`).
+fn chat_row(info: &chimaera_agent::ChatInfo, mut row: serde_json::Value) -> serde_json::Value {
+    row["needs_permission"] = json!(info.alive && info.pending_permission);
+    row
+}
+
 /// The full session list as JSON values (shared by GET /sessions and the
 /// /ws/events snapshots): PTY rows plus synthetic rows for structured chat
 /// sessions, sorted by creation time so the rail interleaves them honestly.
@@ -214,11 +223,14 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     rows.extend(chats.iter().map(|info| {
         (
             info.created_at_ms / 1000,
-            crate::chat::chat_session_json(
+            chat_row(
                 info,
-                workspaces.get(&info.id).cloned(),
-                agents.get(&info.id),
-                is_mastermind(&info.id),
+                crate::chat::chat_session_json(
+                    info,
+                    workspaces.get(&info.id).cloned(),
+                    agents.get(&info.id),
+                    is_mastermind(&info.id),
+                ),
             ),
         )
     }));
