@@ -181,11 +181,11 @@ The design's maintainer decisions (2026-09-25) are in the
 [plan](../timeline-knowledge-plugins-plan.md#decisions-maintainer-2026-09-25).
 
 ### Knowledge redesign (2026-09-28) — why it exists
-_Captured 2026-09-28 from the maintainer's own words while deciding the design; the four questions were not put one by one, so two answers are still pending._
+_Captured 2026-09-28 from the maintainer's own words while deciding the design, and 2026-09-29 (how settled it is)._
 
 - **Problem it solves:** Knowledge should be "a UI on top of regular mycelium that is good and intuitive". The old view left the maintainer asking "why is so much unrated?" and whether it was clear where each status, piece of evidence and to-do comes from.
 - **What the maintainer decided:** Knowledge belongs to the plugin: "If you dont have mycelium, knowledge doesnt appear". An id an agent mentions in a chat (F-XXX) should be something you can hover, and clicking it should show the entry in Knowledge. Chimaera never rates: a status rule "has to be part of the mycelium plugin, our plugin cannot set such things", so status is shown exactly as the agent wrote it. Tidy up with "Ask an agent": yes. No proposals to upstream Mycelium. Handoffs (newest of Mycelium's own files, `RESUME_STATE.md` not read) was the implementer's recommendation after the maintainer deferred ("what do you think?"), not a maintainer decision.
-- **How settled it is (intended vs provisional):** _pending — not yet asked._
-- **Do not change (or: open to change):** _pending — not yet asked._ The implementer's reading until it is: the maintainer stated two things as rules (Knowledge exists only with a knowledge plugin; Chimaera never rates a status), so ask before changing those; the layout, sections, names and the handoff choice fall under the standing rule that additions can change when improved.
+- **How settled it is (intended vs provisional):** not settled. In the maintainer's words: "Design is not settled, will change later depending on plugin or how we think this works out."
+- **Do not change (or: open to change):** open to change — an addition to the core, not a core bet. The design is expected to move with the plugin and with how it works out in use.
 
 The full reasoning and the decisions are in the [redesign plan](../knowledge-redesign-plan.md).
