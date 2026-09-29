@@ -275,8 +275,8 @@ export type ChatBlock = BlockIdentity &
       id: string | null;
       /** Who sent it when nobody typed it here: "remote" (a Remote Control
        *  client injected it through the agent's own bridge), "restart" /
-       *  "moved" / "home" (the daemon's own pick-up after a restart or a
-       *  transfer), "worker" (a worker's `tell_mastermind`); null when this
+       *  "moved" / "home" / "recovered" (the daemon's own pick-up after a
+       *  restart or a transfer), "worker" (a worker's `tell_mastermind`); null when this
        *  workbench sent it. */
       origin: string | null;
       /** Inclusive journal boundary for a portable fork through this row. */
