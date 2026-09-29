@@ -9,6 +9,7 @@ import { isImagePath } from "../previews/files";
 import { artifactMentions, artifactShape, isArtifactPath, proseCovered, proseEmbedTargets } from "./artifacts";
 import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
 import type { SessionPause } from "../net/placement";
+import type { ImageAttachment } from "./images";
 
 /** Names a reply may use that still cover their files (a reply listing
  *  thirty outputs covers thirty); resolve candidates from shell text and
@@ -206,6 +207,12 @@ export interface CheckpointRef {
  *  events (`UserMessage{queued}` + its `UserMessageUpdate`), so replay agrees:
  *  `sent` moves it into `blocks`, `cancelled` removes it, `dropped` keeps it
  *  here marked "not delivered". */
+/** A refused send's text and pictures, going back into the composer. */
+export interface RestoredDraft {
+  text: string;
+  images: ImageAttachment[];
+}
+
 export interface PendingSend {
   /** Delivery key (the wire's client-minted uuid) — the `UserMessageUpdate` /
    *  `CancelQueued` match key. */
@@ -529,10 +536,10 @@ export class ChatStore {
   pausedFor = $state<SessionPause | null>(null);
   /** Text of a send the daemon refused before the agent received it, waiting
    *  to go back into the composer ({@link takeRestoredDraft}). */
-  restoredDraft = $state<string | null>(null);
+  restoredDraft = $state.raw<RestoredDraft | null>(null);
   /** The composer's last accepted send, until its echo proves the agent got
    *  it. Plain (not reactive): only the refusal path reads it. */
-  private unconfirmedSend: string | null = null;
+  private unconfirmedSend: RestoredDraft | null = null;
   /** A send picked a paused project back up and it is waking; cleared by the
    *  next `ready`, a disconnect or a move. */
   waking = $state(false);
@@ -773,6 +780,9 @@ export class ChatStore {
     this.pausedFor = null;
     this.waking = false;
     this.sending = null;
+    // Whatever could not be delivered was already refused (and handed back)
+    // before the move; what was delivered echoes where it runs now.
+    this.unconfirmedSend = null;
   }
 
   /** The conversation is paused here and resumes on its own; it did not exit. */
@@ -788,18 +798,22 @@ export class ChatStore {
 
   /** The composer's send was accepted by the socket; keep its text until the
    *  agent's echo proves delivery, so a refusal can hand it back. */
-  noteSent(text: string, images = 0): void {
-    this.unconfirmedSend = text;
+  noteSent(text: string, images: ImageAttachment[] = []): void {
+    this.unconfirmedSend = { text, images };
     // Sending is what picks a paused project back up: stop inviting it.
     const live = this.connected && !this.waking;
     this.asleep = false;
-    if (!live) this.sending = { text, images };
+    if (!live) this.sending = { text, images: images.length };
   }
 
   /** One command was refused before reaching the agent. Say so, and give an
    *  unconfirmed send's text back to the composer instead of losing it. */
-  onCommandFailed(message: string): void {
+  onCommandFailed(message: string, command: string | null = null): void {
     this.notice(message, "error");
+    // Only a refused SEND hands text back: a refused interrupt, permission
+    // answer or anything else says so without resurrecting a message that
+    // may already have been delivered (a re-send would be a second turn).
+    if (command !== "send") return;
     this.sending = null;
     if (this.unconfirmedSend !== null) {
       this.restoredDraft = this.unconfirmedSend;
@@ -808,7 +822,7 @@ export class ChatStore {
   }
 
   /** Hand the refused text to exactly one composer. */
-  takeRestoredDraft(): string | null {
+  takeRestoredDraft(): RestoredDraft | null {
     const draft = this.restoredDraft;
     this.restoredDraft = null;
     return draft;

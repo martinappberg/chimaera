@@ -114,9 +114,11 @@ it("a refused command keeps the socket and reports the refusal", async () => {
   const socket = new ChatSocket("s-chat", h);
   Socket.all[0].onopen?.();
   expect(socket.send({ type: "send", blocks: [] })).toBe(true);
-  Socket.all[0].frame({ type: "error", code: "command_failed", message: "not sent" });
+  Socket.all[0].frame({ type: "error", code: "command_failed", message: "not sent", command: "send" });
+  Socket.all[0].frame({ type: "error", code: "command_failed", message: "old daemon" });
   await drain();
-  expect(h.onCommandFailed).toHaveBeenCalledWith("not sent");
+  expect(h.onCommandFailed).toHaveBeenCalledWith("not sent", "send");
+  expect(h.onCommandFailed).toHaveBeenCalledWith("old daemon", null);
   expect(socket.healthy).toBe(true);
   socket.close();
 });

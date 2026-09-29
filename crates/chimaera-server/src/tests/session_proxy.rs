@@ -1333,6 +1333,8 @@ async fn a_send_that_cannot_reach_the_owner_is_answered_not_dropped() {
         let frame = next_json(&mut socket).await;
         assert_ne!(frame["type"], "ready");
         if frame["code"] == "command_failed" {
+            // Tagged, so the viewer hands back only a refused send's text.
+            assert_eq!(frame["command"], "send", "{frame}");
             break;
         }
     }
@@ -1365,6 +1367,7 @@ async fn a_second_send_while_waking_is_refused_not_queued() {
         assert_ne!(frame["type"], "ready", "the owner is still waking");
         if frame["code"] == "command_failed" {
             assert_eq!(frame["reason"], "waking", "{frame}");
+            assert_eq!(frame["command"], "send", "{frame}");
             break;
         }
     }

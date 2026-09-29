@@ -422,6 +422,28 @@ fn pause_frame(state: &AppState, id: &str) -> Option<serde_json::Value> {
     pause_state(state, id).map(|pause| pause.frame())
 }
 
+/// The `type` of a chat command frame (`send`, `interrupt`, `permission`…),
+/// for tagging a refusal with the command it answers: a client hands text
+/// back to the composer only for a refused `send`. `None` for anything that
+/// is not a small command tag.
+pub(crate) fn command_kind(text: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Kind {
+        #[serde(rename = "type")]
+        kind: String,
+    }
+    let kind = serde_json::from_str::<Kind>(text).ok()?.kind;
+    (kind.len() <= 32 && kind.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')).then_some(kind)
+}
+
+/// A chat refusal naming the command it answers (additive `command`).
+fn command_refusal(mut answer: serde_json::Value, text: &str) -> serde_json::Value {
+    if let Some(command) = command_kind(text) {
+        answer["command"] = json!(command);
+    }
+    answer
+}
+
 /// Input this socket may not deliver. The additive `reason` lets a client say
 /// why in its own words (`watching`: the viewer chose to watch; `elsewhere`:
 /// the project runs on another device right now); `message` stays plain.
@@ -1225,7 +1247,7 @@ async fn handle_chat(
                     match serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text) {
                         Ok(mut cmd) => {
                             if options.read_only || !session_writable(&state, &id) {
-                                let _ = send_json(&mut socket, &refusal(options.read_only)).await;
+                                let _ = send_json(&mut socket, &command_refusal(refusal(options.read_only), &text)).await;
                                 continue;
                             }
                             if let Err(err) = cmd.validate_ingress() {
@@ -1235,8 +1257,8 @@ async fn handle_chat(
                                 // can correct the payload and retry.
                                 let _ = send_json(
                                     &mut socket,
-                                    &json!({"type": "error", "code": "invalid_command",
-                                            "message": err.to_string()}),
+                                    &command_refusal(json!({"type": "error", "code": "invalid_command",
+                                            "message": err.to_string()}), &text),
                                 )
                                 .await;
                                 continue;
@@ -1274,8 +1296,8 @@ async fn handle_chat(
                                 };
                                 let _ = send_json(
                                     &mut socket,
-                                    &json!({"type": "error", "code": code,
-                                            "message": message}),
+                                    &command_refusal(json!({"type": "error", "code": code,
+                                            "message": message}), &text),
                                 )
                                 .await;
                             } else if interaction {
@@ -2158,6 +2180,26 @@ mod tests {
                 text: text.to_string(),
             },
         })
+    }
+
+    #[test]
+    fn a_refusal_names_the_command_it_answers() {
+        assert_eq!(
+            command_kind(r#"{"type":"send","blocks":[]}"#).as_deref(),
+            Some("send")
+        );
+        assert_eq!(
+            command_kind(r#"{"type":"interrupt"}"#).as_deref(),
+            Some("interrupt")
+        );
+        for text in ["", "{}", r#"{"type":"Send"}"#, r#"{"type":7}"#, "not json"] {
+            assert_eq!(command_kind(text), None, "{text}");
+        }
+        let refused = command_refusal(
+            json!({"type":"error","code":"command_failed"}),
+            r#"{"type":"permission","request_id":"r","option_id":"o"}"#,
+        );
+        assert_eq!(refused["command"], "permission");
     }
 
     fn paused(reason: &'static str) -> Option<Pause> {

@@ -14,7 +14,7 @@
   } from "./paths";
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { insertIntoComposer, registerFollow } from "./composerBus";
+  import { attachImageToComposer, insertIntoComposer, registerFollow } from "./composerBus";
   import { isBrowserGateway } from "../net/base";
   import { pauseLabel, placementLabel, sessionPause } from "../net/placement";
   import {
@@ -1192,7 +1192,7 @@
     if (accepted) {
       // Kept until the agent's echo: a send the daemon could not deliver
       // (the project was reconnecting) comes back into the composer.
-      store.noteSent(text, images.length);
+      store.noteSent(text, images);
       // Submission is stronger intent than merely clearing a draft: the user
       // expects to see the delivered/queued bubble and the reply it starts.
       atBottom = true;
@@ -1205,7 +1205,9 @@
   $effect(() => {
     if (store.restoredDraft === null) return;
     const draft = store.takeRestoredDraft();
-    if (draft !== null && draft.length > 0) insertIntoComposer(session.id, draft);
+    if (draft === null) return;
+    if (draft.text.length > 0) insertIntoComposer(session.id, draft.text);
+    for (const image of draft.images) attachImageToComposer(session.id, image);
   });
 
   /** One never-lose-a-click path for every interactive AgentCommand. A closed

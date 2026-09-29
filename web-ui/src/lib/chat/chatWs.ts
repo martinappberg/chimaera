@@ -44,8 +44,10 @@ export interface ChatSocketHandlers {
   /** Fatal server-side error; the socket will not reconnect. */
   onError(message: string): void;
   /** One command was refused (`command_failed` or `invalid_command`): the
-   *  socket stays up and keeps reconnecting — surface it, don't die. */
-  onCommandFailed(message: string): void;
+   *  socket stays up and keeps reconnecting — surface it, don't die.
+   *  `command` names the refused command (`send`, `interrupt`…) when the
+   *  daemon tagged it (additive); null from older daemons. */
+  onCommandFailed(message: string, command: string | null): void;
   /** The conversation's project is paused; the next send picks it back up. */
   onAsleep?(): void;
   /** A send picked the paused project back up: it is waking and the send is
@@ -75,7 +77,7 @@ type ChatDelivery =
   | { kind: "degraded" }
   | { kind: "exited"; status: number | null }
   | { kind: "error"; message: string }
-  | { kind: "command_failed"; message: string }
+  | { kind: "command_failed"; message: string; command: string | null }
   | { kind: "asleep" }
   | { kind: "waking" }
   | { kind: "moved"; to: "cloud" | "computer" }
@@ -130,7 +132,7 @@ export class ChatSocket {
           this.handlers.onError(delivery.message);
           break;
         case "command_failed":
-          this.handlers.onCommandFailed(delivery.message);
+          this.handlers.onCommandFailed(delivery.message, delivery.command);
           break;
         case "asleep":
           this.handlers.onAsleep?.();
@@ -259,6 +261,7 @@ export class ChatSocket {
             this.deliveries.push({
               kind: "command_failed",
               message: (msg.message as string) ?? "command failed",
+              command: typeof msg.command === "string" ? msg.command : null,
             });
             break;
           }

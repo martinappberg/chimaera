@@ -1507,10 +1507,17 @@ impl Link<'_> {
     /// Answer input that arrived while this socket's wake is pending: it is
     /// not held (a second send must never become a second turn once the owner
     /// answers), and the viewer is told why in plain words.
-    async fn refuse_waking(&self, downstream: &mut axum::extract::ws::WebSocket) -> Result<()> {
+    async fn refuse_waking(
+        &self,
+        downstream: &mut axum::extract::ws::WebSocket,
+        refused: &Down,
+    ) -> Result<()> {
         let frame = if self.chat {
-            json!({"type":"error","code":"command_failed","reason":"waking",
-                "message":"Still waking the cloud machine. That was not sent; send it again in a moment."})
+            tagged(
+                json!({"type":"error","code":"command_failed","reason":"waking",
+                    "message":"Still waking the cloud machine. That was not sent; send it again in a moment."}),
+                refused,
+            )
         } else {
             json!({"type":"error","code":"read_only","reason":"waking",
                 "message":"Waking the cloud machine… That input was not sent."})
@@ -1518,16 +1525,20 @@ impl Link<'_> {
         bounded_send(downstream, Down::Text(frame.to_string().into())).await
     }
     /// Answer input that never reached the owner, so nothing vanishes silently.
-    async fn refuse(
+    /// A chat hears one refusal per command, tagged with which command it was
+    /// (`command`, additive), so only a refused send hands its text back.
+    async fn refuse<'f>(
         &self,
         downstream: &mut axum::extract::ws::WebSocket,
-        count: usize,
+        refused: impl IntoIterator<Item = &'f Down>,
     ) -> Result<()> {
+        let mut refused = refused.into_iter().peekable();
         if self.chat {
-            for _ in 0..count {
-                bounded_send(downstream, Down::Text(not_sent().to_string().into())).await?;
+            for frame in refused {
+                let answer = tagged(not_sent(), frame);
+                bounded_send(downstream, Down::Text(answer.to_string().into())).await?;
             }
-        } else if count > 0 {
+        } else if refused.peek().is_some() {
             let frame = json!({"type":"error","code":"read_only","reason":"reconnecting",
                 "message":"Your project is reconnecting. That input was not sent."});
             bounded_send(downstream, Down::Text(frame.to_string().into())).await?;
@@ -1543,7 +1554,8 @@ struct Held {
     bytes: usize,
 }
 impl Held {
-    fn push(&mut self, frame: Down) -> bool {
+    /// Hold `frame`, or hand it back when it does not fit.
+    fn push(&mut self, frame: Down) -> std::result::Result<(), Down> {
         let size = match &frame {
             Down::Text(text) => text.len(),
             Down::Binary(bytes) => bytes.len(),
@@ -1554,11 +1566,12 @@ impl Held {
         } else {
             self.bytes + size <= HELD_TERMINAL_BYTES
         };
-        if fits {
-            self.bytes += size;
-            self.frames.push_back(frame);
+        if !fits {
+            return Err(frame);
         }
-        fits
+        self.bytes += size;
+        self.frames.push_back(frame);
+        Ok(())
     }
     fn take(&mut self) -> std::collections::VecDeque<Down> {
         self.bytes = 0;
@@ -1582,6 +1595,15 @@ const WAKING_NOTE_EVERY: Duration = Duration::from_secs(1);
 /// the unsent text.
 fn not_sent() -> Value {
     json!({"type":"error","code":"command_failed","message":"Not sent. Your project is reconnecting."})
+}
+/// A chat refusal naming the command it answers.
+fn tagged(mut answer: Value, refused: &Down) -> Value {
+    if let Down::Text(text) = refused {
+        if let Some(command) = crate::ws::command_kind(text) {
+            answer["command"] = json!(command);
+        }
+    }
+    answer
 }
 fn upward(frame: Down) -> Option<Up> {
     match frame {
@@ -1652,8 +1674,8 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                     }
                     Err(_) => {
                         // A failed wake attempt answers what it was carrying.
-                        let count = held.take().len();
-                        if link.refuse(downstream, count).await.is_err() { return; }
+                        let refused = held.take();
+                        if link.refuse(downstream, &refused).await.is_err() { return; }
                         wake = false;
                         waking = false;
                         if told != Some("remote_unavailable") {
@@ -1672,8 +1694,8 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
             }
             _ = ownership.tick() => {
                 if let Some(moved) = link.ended() {
-                    let count = held.take().len();
-                    let _ = link.refuse(downstream, count).await;
+                    let refused = held.take();
+                    let _ = link.refuse(downstream, &refused).await;
                     if let Some(moved) = moved {
                         let _ = bounded_send(downstream, Down::Text(moved.to_string().into())).await;
                     }
@@ -1708,8 +1730,8 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                 Some(Ok(Up::Close(_))) | None | Some(Err(_)) => {
                     // The owner ended this connection (exit, restart, owner
                     // change). The viewer reconnects and is routed afresh.
-                    let count = held.take().len();
-                    let _ = link.refuse(downstream, count).await;
+                    let refused = held.take();
+                    let _ = link.refuse(downstream, &refused).await;
                     return;
                 }
                 _ => {}
@@ -1722,7 +1744,7 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                     match upstream.as_mut() {
                         Some(socket) if ready => {
                             if let Some(moved) = link.ended() {
-                                let _ = link.refuse(downstream, usize::from(input)).await;
+                                let _ = link.refuse(downstream, input.then_some(&frame)).await;
                                 if let Some(moved) = moved {
                                     let _ = bounded_send(downstream, Down::Text(moved.to_string().into())).await;
                                 }
@@ -1736,12 +1758,12 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                             let say = link.chat || noted.is_none_or(|at| now >= at + WAKING_NOTE_EVERY);
                             if say {
                                 noted = Some(now);
-                                if link.refuse_waking(downstream).await.is_err() { return; }
+                                if link.refuse_waking(downstream, &frame).await.is_err() { return; }
                             }
                         }
                         _ if input => {
-                            if !held.push(frame) && link.refuse(downstream, 1).await.is_err() {
-                                return;
+                            if let Err(refused) = held.push(frame) {
+                                if link.refuse(downstream, [&refused]).await.is_err() { return; }
                             }
                             // The first real input carries wake intent; an
                             // in-flight passive attempt upgrades when it
