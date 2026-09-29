@@ -705,12 +705,6 @@ async fn laptop_first_sign_out_and_unreachable_account_keep_local_work_running()
     let ready: Value =
         serde_json::from_str(next_ws_frame(&mut terminal).await.to_text().unwrap()).unwrap();
     assert_eq!(ready["type"], "ready");
-    terminal
-        .send(Message::Binary(bytes::Bytes::from_static(
-            b"touch LOCAL_AFTER_SIGN_OUT\n",
-        )))
-        .await
-        .unwrap();
     let (mut chat, _) =
         tokio_tungstenite::connect_async(format!("ws://{address}/ws/chat/s-laptop-chat"))
             .await
@@ -729,17 +723,39 @@ async fn laptop_first_sign_out_and_unreachable_account_keep_local_work_running()
     ))
     .await
     .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    // The ordinary route starts the user's login shell, whose startup files
+    // can be slow on a loaded machine; the input is buffered meanwhile.
+    // Some interactive shell setups discard typeahead while they start, so
+    // the idempotent command is repeated until it lands.
+    tokio::time::timeout(std::time::Duration::from_secs(45), async {
+        let mut tick = 0u32;
         while !project.root.join("LOCAL_AFTER_SIGN_OUT").exists()
             || !std::fs::read_to_string(&captured)
                 .unwrap_or_default()
                 .contains("LOCAL_CHAT_AFTER_SIGN_OUT")
         {
+            if tick.is_multiple_of(100) && !project.root.join("LOCAL_AFTER_SIGN_OUT").exists() {
+                terminal
+                    .send(Message::Binary(bytes::Bytes::from_static(
+                        b"touch LOCAL_AFTER_SIGN_OUT\n",
+                    )))
+                    .await
+                    .unwrap();
+            }
+            tick += 1;
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("local terminal and chat input must still be accepted");
+    .unwrap_or_else(|_| {
+        panic!(
+            "local input must still be accepted: terminal={} chat={:?} shell_alive={} chat_alive={}",
+            project.root.join("LOCAL_AFTER_SIGN_OUT").exists(),
+            std::fs::read_to_string(&captured).ok(),
+            state.sessions.get(&shell).is_some_and(|s| s.alive),
+            state.chat.get("s-laptop-chat").is_some_and(|s| s.alive),
+        )
+    });
 
     // A verified other owner is the one fence: input stops, nothing is killed.
     pro::install_remote_owner_fixture(&state, &project.id, 5);
