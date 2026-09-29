@@ -1,12 +1,16 @@
 <script lang="ts">
+  import FileIcon from "../shared/FileIcon.svelte";
+  import FolderIcon from "../shared/FolderIcon.svelte";
   import { extractFileRefs, revealOf, type FileRef } from "../shared/fileRef";
   import { quoteRuns } from "../shared/reference";
+  import { chipLabels } from "./artifacts";
   import MathText from "./MathText.svelte";
   import { splitUserMath } from "./math";
   import {
+    mentionChipLabel,
     menuPoint,
     reopenResolution,
-    uploadMentionLabel,
+    uploadName,
     type OpenPathFn,
     type PathResolver,
     type Resolution,
@@ -16,10 +20,14 @@
    * The user's own message text: plain (never markdown — prompts are not
    * documents), whitespace preserved, with recognized LaTeX spans rendered
    * as math and @-mentions / real paths made clickable through the same
-   * resolver as agent prose. Mentions render as quiet pills — the visual
-   * receipt that the tag landed. A quoted passage (`>`-led lines, as the
-   * transcript's quote chip writes them) reads muted, markers kept, so the
-   * words about it stand apart.
+   * resolver as agent prose. An `@` mention reads as a file chip — its
+   * icon and name, like a document the prose names, where it was written —
+   * the receipt that the tag landed, which a long path would wrap and
+   * break; a desktop drop's machine-made landing-pad path never shows at
+   * all. The mention's whole text stays in its tooltip, in a copy, and in
+   * what the agent got. A path written without `@` stays as written. A
+   * quoted passage (`>`-led lines, as the transcript's quote chip writes
+   * them) reads muted, markers kept, so the words about it stand apart.
    */
   interface Props {
     text: string;
@@ -99,12 +107,36 @@
     return res?.state === "miss" ? undefined : res;
   }
 
-  /** A mention of an uploaded file reads as its name (`uploadMentionLabel`)
-   *  — the text after its last folder, so a `:12` suffix stays. Null for
+  /** Each mentioned file's name, widened with its folders only where two
+   *  mentioned files in this message share one. Uploads read by their own
+   *  name (`mentionChipLabel`). */
+  const names = $derived(
+    chipLabels([
+      ...new Set(
+        tokens.flatMap((t) =>
+          t.mention && t.ref !== null && uploadName(t.ref.path) === null ? [t.ref.path] : [],
+        ),
+      ),
+    ]),
+  );
+
+  /** A mention's chip text (no `@` — the icon says "file"), or null for
    *  any other token. */
-  function shortLabel(t: Token): string | null {
+  function chipLabel(t: Token): string | null {
     if (!t.mention || t.ref === null) return null;
-    return uploadMentionLabel(t.text, t.ref.path);
+    const segments = t.ref.path.split("/").filter((s) => s !== "");
+    return mentionChipLabel(t.text, t.ref.path, names.get(t.ref.path) ?? segments.at(-1) ?? t.ref.path);
+  }
+
+  function isDir(t: Token, res: Resolution | undefined): boolean {
+    if (res?.state === "hit") return res.hit.kind === "dir";
+    return t.text.replace(/"$/, "").endsWith("/");
+  }
+
+  /** The resolver answered that the mentioned file is not there. */
+  function missing(t: Token): boolean {
+    void answered;
+    return t.ref !== null && resolvePaths?.peek(t.ref.path)?.state === "miss";
   }
 
   let root = $state<HTMLElement | null>(null);
@@ -152,14 +184,23 @@
      newline/indent between blocks would render as literal extra spacing. -->
 <!-- prettier-ignore -->
 <span class="usertext" bind:this={root} oncopy={onCopy}
-  >{#each tokens as t, i (i)}{@const res = resFor(t)}{#if t.math !== null}<MathText source={t.math.source} display={t.math.display} />{:else if res !== undefined}<button
-        class="path"
-        class:mention={t.mention}
+  >{#snippet chip(t: Token, label: string, res: Resolution | undefined)}{#if isDir(t, res)}<FolderIcon size={12} />{:else}<FileIcon path={t.ref?.path ?? label} size={12} />{/if}<span class="chip-name">{label}</span>{/snippet}{#each tokens as t, i (i)}{@const res = resFor(t)}{@const label = chipLabel(t)}{#if t.math !== null}<MathText source={t.math.source} display={t.math.display} />{:else if label !== null && res !== undefined}<button
+        class="chip"
         class:quote={t.quote}
         class:ambiguous={res.state === "ambiguous"}
         title={titleFor(t, res)}
-        data-full={shortLabel(t) !== null ? t.text : undefined}
-        onclick={(e) => activate(e, t, res)}>{shortLabel(t) ?? t.text}</button>{:else if t.quote}<span class="quote">{t.text}</span>{:else}{t.text}{/if}{/each}</span
+        data-full={t.text}
+        onclick={(e) => activate(e, t, res)}>{@render chip(t, label, res)}</button>{:else if label !== null}<span
+        class="chip inert"
+        class:quote={t.quote}
+        class:missing={missing(t)}
+        title={missing(t) ? `${t.text} · not found` : t.text}
+        data-full={t.text}>{@render chip(t, label, res)}</span>{:else if res !== undefined}<button
+        class="path"
+        class:quote={t.quote}
+        class:ambiguous={res.state === "ambiguous"}
+        title={titleFor(t, res)}
+        onclick={(e) => activate(e, t, res)}>{t.text}</button>{:else if t.quote}<span class="quote">{t.text}</span>{:else}{t.text}{/if}{/each}</span
 >
 
 <style>
@@ -190,20 +231,61 @@
   .path.quote {
     color: var(--muted);
   }
-  .path.mention {
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    border-radius: 5px;
-    padding: 0 4px;
-    text-decoration: none;
-  }
   .path:hover {
     color: var(--accent);
     text-decoration-color: var(--accent);
   }
-  .path.mention:hover {
-    background: color-mix(in srgb, var(--accent) 20%, transparent);
-  }
   .path.ambiguous {
     text-decoration-style: dashed;
+  }
+  /* A mention reads as a file, not code: the doc chip's icon + name in the
+     message's own face, one unbroken token (a long name ellipsizes rather
+     than wrapping mid-word). */
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    max-width: 100%;
+    vertical-align: bottom;
+    margin: 0;
+    padding: 0 5px 0 4px;
+    border: none;
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: inherit;
+    font: inherit;
+    font-size: 0.95em;
+    cursor: pointer;
+    transition:
+      color 0.12s ease,
+      background-color 0.12s ease;
+  }
+  .chip:hover {
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 20%, transparent);
+  }
+  .chip.ambiguous {
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+  }
+  .chip-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* Not answered yet, or not a link here: the same chip, without the hover. */
+  .chip.inert {
+    cursor: default;
+  }
+  .chip.inert:hover {
+    color: inherit;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  /* Not (or no longer) on disk — uploads end with their session — or
+     inside a quoted passage, which reads muted throughout. */
+  .chip.missing,
+  .chip.missing:hover,
+  .chip.quote {
+    color: var(--muted);
   }
 </style>

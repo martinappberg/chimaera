@@ -86,6 +86,24 @@ export function uploadMentionLabel(text: string, path: string): string | null {
 }
 
 /**
+ * How a file mention reads as a chip in the user's own message: an upload
+ * by its name (`uploadMentionLabel`), any other file by `name` — its
+ * label among the message's files (`artifacts.ts::chipLabels`, widened
+ * where two share a name) — plus whatever the mention wrote after the
+ * path's last segment: a folder's `/`, a `#L3-L9` locator. `text` is the
+ * mention exactly as written; the chip's tooltip carries it whole.
+ */
+export function mentionChipLabel(text: string, path: string, name: string): string {
+  const upload = uploadMentionLabel(text, path);
+  if (upload !== null) return upload.slice(1);
+  const body = text.startsWith('@"') && text.endsWith('"') ? text.slice(2, -1) : text.slice(1);
+  const segments = path.split("/").filter((s) => s !== "");
+  const last = segments[segments.length - 1] ?? path;
+  const at = body.lastIndexOf(last);
+  return at < 0 ? name : name + body.slice(at + last.length);
+}
+
+/**
  * An inline code span's references: the whole span when it is one
  * (`src/x.rs:12`, `Screenshot (1).png`) and, when it holds several words
  * (`cat results/x.csv`) or a quoted mention (`@"src/x.ts"`, which the whole
