@@ -419,6 +419,37 @@ pub(crate) fn may_restore(state: &crate::AppState, workspace: &str) -> bool {
 /// How long a personal device waits for the account to confirm ownership
 /// before resuming its own interrupted sessions anyway (laptop first).
 pub(crate) const BOOT_VERIFICATION_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+/// Where a project's work stands, from this daemon's recorded ownership, in
+/// the terms a viewer needs (why a paused session is paused). Read-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Consumed by ws.rs `classify_pause` at integration.
+pub(crate) enum Phase {
+    /// Runs here (or no Pro ownership at all).
+    Here,
+    /// Here, waiting for the account to confirm after a restart or wake.
+    Verifying,
+    /// Being handed to another machine.
+    Leaving,
+    /// Another machine runs it.
+    Elsewhere,
+    /// Arriving here from another machine (files installing, setup).
+    Arriving,
+}
+#[allow(dead_code)] // Consumed by ws.rs `classify_pause` at integration.
+pub(crate) fn ownership_phase(state: &crate::AppState, workspace: &str) -> Phase {
+    match crate::lock(&state.pro.ownership).get(workspace) {
+        None | Some(Ownership::Local { .. } | Ownership::PrivacyDisabled { .. }) => Phase::Here,
+        Some(Ownership::AwaitingVerification { .. }) => Phase::Verifying,
+        Some(Ownership::Transferring { .. }) => Phase::Leaving,
+        Some(Ownership::Remote { .. }) => Phase::Elsewhere,
+        Some(Ownership::Hydrating { .. } | Ownership::SettingUp { .. }) => Phase::Arriving,
+    }
+}
+/// Whether this session waits at boot for this life's ownership proof.
+#[allow(dead_code)] // Consumed by ws.rs `classify_pause` at integration.
+pub(crate) fn restart_deferred(state: &crate::AppState, session_id: &str) -> bool {
+    crate::lock(&state.pro.boot_deferred).contains(session_id)
+}
 pub(crate) fn defer_boot_session(state: &crate::AppState, session: &str) {
     let mut deferred = crate::lock(&state.pro.boot_deferred);
     if deferred.len() < 512 {
@@ -860,6 +891,40 @@ mod tests {
             root.to_path_buf(),
             root.join("config"),
         ))
+    }
+    #[test]
+    fn ownership_reads_as_a_viewer_phase() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-pro-phase-{}",
+            chimaera_core::generate_token()
+        ));
+        let state = state(&root);
+        assert_eq!(ownership_phase(&state, "w-a"), Phase::Here);
+        for (owner, phase) in [
+            (Ownership::Local { epoch: 1 }, Phase::Here),
+            (Ownership::PrivacyDisabled { epoch: 1 }, Phase::Here),
+            (
+                Ownership::AwaitingVerification { epoch: 1 },
+                Phase::Verifying,
+            ),
+            (Ownership::Transferring { epoch: 1 }, Phase::Leaving),
+            (
+                Ownership::Remote {
+                    epoch: 1,
+                    holder: "worker-a".into(),
+                },
+                Phase::Elsewhere,
+            ),
+            (Ownership::Hydrating { epoch: 1 }, Phase::Arriving),
+            (Ownership::SettingUp { epoch: 1 }, Phase::Arriving),
+        ] {
+            crate::lock(&state.pro.ownership).insert("w-a".into(), owner);
+            assert_eq!(ownership_phase(&state, "w-a"), phase);
+        }
+        assert!(!restart_deferred(&state, "s-a"));
+        defer_boot_session(&state, "s-a");
+        assert!(restart_deferred(&state, "s-a"));
+        let _ = std::fs::remove_dir_all(root);
     }
     #[tokio::test]
     async fn restart_fences_old_conversations_and_never_persists_tokens() {
