@@ -1,6 +1,6 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, isHomeHub, leaveHomeHub, reclaimHomeHub } from "./api";
+import { ApiError, isHomeHub, leaveHomeHub, ownerElsewhere, plainError, reclaimHomeHub } from "./api";
 import { placementLabel } from "./placement";
 
 describe("daemon connection codes", () => {
@@ -32,6 +32,31 @@ describe("daemon connection codes", () => {
     expect(computer).not.toBeNull();
     expect(cloud).not.toBe(computer);
     expect(placementLabel({ remote: "worker-w1" }, false)).not.toBe(cloud);
+  });
+});
+
+describe("a project running elsewhere", () => {
+  afterEach(() => { vi.unstubAllGlobals(); sessionStorage.clear(); });
+
+  it("names the cloud or your computer from the daemon that refused, never a device", () => {
+    // This computer's own daemon hands projects to the cloud.
+    expect(ownerElsewhere()).toBe("cloud");
+    expect(new ApiError(409, "workspace_owned_elsewhere").message).toBe("This project is running in the cloud right now.");
+    vi.stubGlobal("location", new URL("https://fixture.invalid/app/worker-w1/"));
+    expect(ownerElsewhere()).toBe("computer");
+    expect(plainError("read_only")).toBe("This project is running on your computer right now.");
+    vi.stubGlobal("location", new URL("https://fixture.invalid/app/device-d1/"));
+    expect(ownerElsewhere()).toBe("cloud");
+    // A project view follows its project; a refusal there cannot name the owner.
+    vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-one/"));
+    expect(ownerElsewhere()).toBeNull();
+    for (const where of ["cloud", "computer", "other", null] as const) {
+      expect(plainError("workspace_owned_elsewhere", where)).not.toMatch(/device/);
+    }
+  });
+
+  it("calls a sleeping cloud machine asleep", () => {
+    expect(plainError("worker_asleep")).toBe("The cloud machine is asleep.");
   });
 });
 

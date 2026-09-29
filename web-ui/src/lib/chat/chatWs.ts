@@ -1,7 +1,7 @@
 import { daemonSocketUrl, isBrowserGateway } from "../net/base";
-import { parsePause, sendSocketAuth, type SessionPause } from "../net/placement";
+import { ownerSuspended, parsePause, sendSocketAuth, type SessionPause } from "../net/placement";
 import { getToken } from "../net/api";
-import { Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
+import { parkUntilAwake, Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 import { CooperativeQueue } from "./cooperativeQueue";
 
 /**
@@ -98,6 +98,13 @@ export class ChatSocket {
   private ended = false;
   /** A wake-carrying reconnect is in flight (at most one per drop). */
   private waking = false;
+  /** The owner said it is asleep (`worker_asleep`) and nothing has woken it
+   *  since (a `ready`, `waking`, a move or a pause ends it). */
+  private asleep = false;
+  /** Set while this socket is down because its owner is asleep: no retry
+   *  timer runs; a send (with wake intent) or a sign the owner answers again
+   *  dials it. Calling it leaves the waiting set. */
+  private leaveSleepWait: (() => void) | null = null;
   private unknownRetries = 0;
   private readonly recon = new Reconnector(() => this.connect());
   /** Replay, live events, and terminal frames share one cooperative FIFO.
@@ -160,6 +167,7 @@ export class ChatSocket {
    *  a paused project's owner to wake. */
   private connect(interaction = false): void {
     if (this.closed) return;
+    this.stopSleepWait();
     const ws = new WebSocket(daemonSocketUrl(`/ws/chat/${this.sessionId}${interaction ? "?wake=interaction" : ""}`));
     this.ws = ws;
 
@@ -182,6 +190,7 @@ export class ChatSocket {
           this.recon.succeeded();
           this.unknownRetries = 0;
           this.waking = false;
+          this.asleep = false;
           this.deliveries.push({
             kind: "ready",
             session: msg.session as ChatSessionInfo,
@@ -223,9 +232,11 @@ export class ChatSocket {
           // socket next and the ordinary reconnect follows the new owner.
           // Sends stop here, before that close lands.
           this.authenticatedSocket = null;
+          this.asleep = false;
           this.deliveries.push({ kind: "moved", to: msg.to === "computer" ? "computer" : "cloud" });
           break;
         case "waking":
+          this.asleep = false;
           this.deliveries.push({ kind: "waking" });
           break;
         case "paused": {
@@ -233,6 +244,7 @@ export class ChatSocket {
           // ordinary reconnect finds the conversation once it runs again.
           const pause = parsePause(msg);
           this.authenticatedSocket = null;
+          this.asleep = false;
           if (pause !== null) this.deliveries.push({ kind: "paused", pause });
           break;
         }
@@ -240,6 +252,7 @@ export class ChatSocket {
           // Connection states, never fatal: the socket stays (or reconnects)
           // and the next send carries wake intent.
           if (msg.code === "worker_asleep") {
+            this.asleep = true;
             this.deliveries.push({ kind: "asleep" });
             break;
           }
@@ -286,8 +299,41 @@ export class ChatSocket {
       // Live no longer: the composer must stop claiming the agent hears us and
       // stop clearing drafts into a closed socket until we reconnect.
       this.deliveries.push({ kind: "disconnected" });
+      // A project view's placement read may say the owner sleeps before any
+      // frame did (a gateway can close without one).
+      if (!this.asleep && ownerSuspended()) {
+        this.asleep = true;
+        this.deliveries.push({ kind: "asleep" });
+      }
+      if (this.asleep) {
+        this.waitForOwner();
+        return;
+      }
       this.recon.schedule();
     };
+  }
+
+  /** The owner is asleep: retrying on a backoff would only hear "asleep"
+   *  again. Wait with no timer until a send or {@link retrySoon} /
+   *  `ownerAwake` dials. */
+  private waitForOwner(): void {
+    this.recon.cancel();
+    this.recon.clear();
+    this.stopSleepWait();
+    this.leaveSleepWait = parkUntilAwake(() => {
+      this.leaveSleepWait = null;
+      if (!this.closed && !this.fatal && !this.ended && this.ws === null) this.connect();
+    });
+  }
+
+  private stopSleepWait(): void {
+    this.leaveSleepWait?.();
+    this.leaveSleepWait = null;
+  }
+
+  /** Waiting for a sleeping owner (no socket, no retry timer). */
+  get waitingForOwner(): boolean {
+    return this.leaveSleepWait !== null;
   }
 
   /**
@@ -311,14 +357,15 @@ export class ChatSocket {
   }
 
   /**
-   * A user action on a browser view whose socket is down: reconnect now,
-   * once, carrying wake intent, instead of waiting out the backoff. The
-   * action itself is NOT queued — the caller keeps it (a composer keeps its
-   * draft). Native windows never need this: their daemon keeps the socket
-   * open and holds the first input itself while the owner wakes.
+   * A user action on a browser view whose socket is down, or on any socket
+   * waiting for a sleeping owner: reconnect now, once, carrying wake intent,
+   * instead of waiting out the backoff. The action itself is NOT queued — the
+   * caller keeps it (a composer keeps its draft). A native window's open
+   * socket never needs this: its daemon holds the first input itself while
+   * the owner wakes.
    */
   private wakeOnInput(): void {
-    if (!isBrowserGateway() || this.closed || this.fatal || this.ended || this.waking) return;
+    if (!(isBrowserGateway() || this.leaveSleepWait !== null) || this.closed || this.fatal || this.ended || this.waking) return;
     this.waking = true;
     this.recon.cancel();
     if (this.ws !== null) {
@@ -337,11 +384,14 @@ export class ChatSocket {
    */
   retrySoon(): void {
     if (this.closed || this.fatal || this.ended) return;
-    this.recon.nudge(0);
+    // Waiting for a sleeping owner: dial once, passively (a send wakes it).
+    if (this.leaveSleepWait !== null) this.connect();
+    else this.recon.nudge(0);
   }
 
   close(): void {
     this.closed = true;
+    this.stopSleepWait();
     this.recon.cancel();
     this.recon.clear();
     this.deliveries.clear();

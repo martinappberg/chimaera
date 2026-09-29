@@ -1,7 +1,7 @@
 import { sendSocketAuth } from "./placement";
-import { daemonSocketUrl } from "./base";
+import { daemonSocketUrl, gatewayWorkspace } from "./base";
 import { getToken } from "./api";
-import { nudgeReconnectors, retryDelayMs } from "./reconnect";
+import { nudgeReconnectors, ownerAwake, retryDelayMs } from "./reconnect";
 import type { Link } from "../workspace/agentLinks";
 import type { Session } from "../workspace/sessions";
 import type { Notice } from "../workspace/notices";
@@ -319,6 +319,9 @@ export class EventsSocket {
       // message handler finishes applying the snapshot first and a
       // crash-looping daemon can't turn its flaps into connect herds.
       if (up) nudgeReconnectors();
+      // In a project view this socket reaches the project's owner itself:
+      // it answering means a sleeping owner woke, so parked sockets dial.
+      if (up && gatewayWorkspace() !== null) ownerAwake();
     }
   }
 

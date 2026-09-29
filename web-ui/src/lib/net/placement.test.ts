@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { parsePause, parsePlacement, pauseLabel, sessionPause } from "./placement";
+import { get } from "svelte/store";
+import { ownerSuspended, parsePause, parsePlacement, pauseLabel, placementLabel, projectWhere, projectWhereLabel, sessionPause } from "./placement";
 const live = { workspace_id: "w-one", holder_id: "d-home", route_host_id: "device-d-home", epoch: 4, policy_revision: 1, availability: "owned", server_now: "2026-09-28T19:00:00Z", expires_at: "2026-09-28T19:01:30Z" };
 describe("workspace routing authority", () => {
   it("accepts exact current owner without choosing a home or worker", () => {
@@ -8,6 +9,13 @@ describe("workspace routing authority", () => {
   });
   it("rejects stale, cross-workspace and malformed authority", () => {
     for (const change of [{ workspace_id: "w-other" }, { route_host_id: "worker-other" }, { route_host_id: "prefix-device-d-home" }, { holder_id: "../x" }, { epoch: 0 }, { epoch: 2 ** 60 }, { expires_at: live.server_now }, { server_now: "bad" }, { availability: "future" }, { availability: "expired" }]) expect(() => parsePlacement({ ...live, ...change }, "w-one")).toThrow();
+  });
+  it("routes a sleeping cloud machine (suspended) exactly like an owner, with its expired lease", () => {
+    const asleep = { ...live, holder_id: "wk", route_host_id: "worker-wk", availability: "suspended", expires_at: "2026-09-28T18:00:00Z" };
+    expect(parsePlacement(asleep, "w-one")).toMatchObject({ availability: "suspended", route_host_id: "worker-wk", epoch: 4 });
+    expect(parsePlacement({ ...asleep, expires_at: null }, "w-one").availability).toBe("suspended");
+    for (const change of [{ route_host_id: null }, { route_host_id: "device-wk" }, { route_host_id: "worker-other" }, { holder_id: "../x" }, { epoch: 0 }, { expires_at: "soon" }])
+      expect(() => parsePlacement({ ...asleep, ...change }, "w-one")).toThrow();
   });
   it("preserves unavailable states without inventing an execution route", () => {
     for (const availability of ["unowned", "expired", "privacy_disabled"])
@@ -88,5 +96,62 @@ describe("paused sessions", () => {
     expect(new Set(statuses).size).toBe(statuses.length);
     expect(reasons[1].detail).not.toBeNull();
     expect(reasons[0].detail).toBeNull();
+  });
+  it("names any restart by what happens next, not by an update", () => {
+    const restart = pauseLabel({ type: "paused", reason: "restarting", provider: null }).status;
+    expect(restart).toBe("Picking up where you left off…");
+    expect(restart).not.toMatch(/update/i);
+  });
+  it("after sign-out, a conversation the cloud holds is not on its way anywhere", () => {
+    const moving = pauseLabel({ type: "moved", to: "cloud" }).status;
+    const signedOut = pauseLabel({ type: "moved", to: "cloud" }, { signedOut: true }).status;
+    expect(moving).toBe("Continuing in the cloud…");
+    expect(signedOut).toBe("This conversation is in the cloud. Sign in to Chimaera Pro to bring it back.");
+    expect(signedOut).not.toContain("…");
+    // Coming home is unaffected: it does not need the account.
+    expect(pauseLabel({ type: "moved", to: "computer" }, { signedOut: true }).status).toBe("Continuing on your computer…");
+  });
+});
+
+describe("where a routed session runs", () => {
+  const cloud = { remote: "worker-w1" };
+  it("says asleep, not reconnecting, once the owner said it is asleep", () => {
+    expect(placementLabel(cloud, false)).toBe("In the cloud · reconnecting");
+    expect(placementLabel(cloud, false, { owner: "asleep" })).toBe("In the cloud · asleep");
+    expect(placementLabel(cloud, true, { owner: "asleep" })).toBe("In the cloud · asleep");
+    expect(placementLabel(cloud, false, { owner: "waking" })).not.toContain("reconnecting");
+  });
+  it("says reconnecting once: not in the label while the view's status line says it", () => {
+    expect(placementLabel(cloud, false, { reconnectingShown: true })).toBe("In the cloud");
+    expect(placementLabel("here", false, { owner: "asleep" })).toBeNull();
+  });
+  it("a project view names where its project runs from the latest placement read", async () => {
+    vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-one/"));
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce(Response.json({ ...live, holder_id: "worker-id", route_host_id: "worker-worker-id" }))
+      .mockResolvedValueOnce(Response.json({ ...live, holder_id: "worker-id", route_host_id: "worker-worker-id", availability: "suspended", expires_at: live.server_now }))
+      .mockResolvedValueOnce(Response.json(live)));
+    await readPlacement();
+    expect(projectWhereLabel(get(projectWhere))).toBe("In the cloud");
+    expect(ownerSuspended()).toBe(false);
+    // A sleeping owner is routed (the read resolves) and named asleep.
+    const asleep = await readPlacement();
+    expect(asleep.route_host_id).toBe("worker-worker-id");
+    expect(ownerSuspended()).toBe(true);
+    expect(projectWhereLabel(get(projectWhere), { state: true })).toBe("In the cloud · asleep");
+    expect(projectWhereLabel(get(projectWhere))).toBe("In the cloud");
+    await readPlacement();
+    expect(ownerSuspended()).toBe(false);
+    expect(projectWhereLabel(get(projectWhere), { state: true })).toBe("On your computer");
+    expect(projectWhereLabel(null)).toBe("This project");
+  });
+  it("a sleeping owner's scope is sent like an owner's: reading it never wakes it", async () => {
+    vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-one/"));
+    const fetch = vi.fn().mockResolvedValue(Response.json({ ...live, holder_id: "wk", route_host_id: "worker-wk", availability: "suspended", expires_at: null }));
+    vi.stubGlobal("fetch", fetch);
+    const headers = new Headers();
+    await workspaceHeaders(headers);
+    expect(headers.get("x-chimaera-epoch")).toBe("4");
+    for (const [, options] of fetch.mock.calls) expect(options.method).toBeUndefined();
   });
 });

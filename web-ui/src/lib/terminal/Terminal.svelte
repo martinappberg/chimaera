@@ -4,7 +4,7 @@
   import { isBrowserGateway } from "../net/base";
   import { isWatching, setWatching } from "./viewerMode.svelte";
   import { refusalFor } from "./refusals.svelte";
-  import { focusTerminal, release, show, refreshAccess } from "./termPool";
+  import { focusTerminal, release, show, refreshAccess, retryTerminal } from "./termPool";
 
   interface Props {
     /** Session whose pooled terminal this pane shows. */
@@ -14,18 +14,35 @@
     /** The pane's terminal font-size override (px); undefined = default. */
     fontSize?: number;
     /** Where a routed session runs ("In the cloud", "On another computer",
-     *  with "· reconnecting" while unreachable); null for a session here. */
+     *  with "· reconnecting" while unreachable or "· asleep" once its socket
+     *  heard so); null for a session here. */
     placement?: string | null;
+    /** The row facts that decide whether its owner can be reached (where it
+     *  runs, and whether the daemon reaches it). A change retries the socket
+     *  at once — a socket waiting on a sleeping owner dials instead of
+     *  waiting for a keystroke. Never derived from the socket's own state,
+     *  which would loop. */
+    reach?: string;
   }
 
-  let { sessionId, focused, fontSize = undefined, placement = null }: Props = $props();
+  let { sessionId, focused, fontSize = undefined, placement = null, reach = "" }: Props = $props();
 
   const watching = $derived(isWatching(sessionId));
   /** Watch/control only means something for a project viewed from another
    *  device: an ordinary local terminal never grows this strip. */
   const showAccess = $derived(placement !== null || isBrowserGateway());
-  /** Typing the daemon refused, said here instead of in the console. */
-  const refusal = $derived(refusalFor(sessionId));
+  /** Typing the daemon refused, said here instead of in the console. A
+   *  routed terminal's refusal comes from the machine its row points at, so
+   *  "running elsewhere" there is a route about to change: the text names no
+   *  machine rather than a wrong one. */
+  const refusal = $derived(refusalFor(sessionId, { where: placement !== null ? null : undefined, watching }));
+  let lastReach: { id: string; reach: string } | null = null;
+  $effect(() => {
+    const id = sessionId;
+    const now = reach;
+    if (lastReach?.id === id && lastReach.reach !== now) retryTerminal(id);
+    lastReach = { id, reach: now };
+  });
   function toggleAccess(): void { setWatching(sessionId, !watching); refreshAccess(sessionId); }
 
   let host = $state<HTMLDivElement | null>(null);

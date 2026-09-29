@@ -273,12 +273,18 @@ export type ChatBlock = BlockIdentity &
       /** Delivery key (the wire's client-minted uuid); null on old journals,
        *  transcript-seeded messages, and permission-feedback echoes. */
       id: string | null;
-      /** "remote" when a Remote Control client (phone / claude.ai) injected
-       *  the message through the agent's own bridge; null when this
+      /** Who sent it when nobody typed it here: "remote" (a Remote Control
+       *  client injected it through the agent's own bridge), "restart" /
+       *  "moved" / "home" (the daemon's own pick-up after a restart or a
+       *  transfer), "worker" (a worker's `tell_mastermind`); null when this
        *  workbench sent it. */
       origin: string | null;
       /** Inclusive journal boundary for a portable fork through this row. */
       forkSeq: number;
+      /** Journal time the agent received it (ms). Journal-backed, so replay
+       *  keeps the original time; the transcript shows it only on the
+       *  daemon's own transfer notes (`transfer.ts`). */
+      sentAtMs: number;
       /** The agent read it inside a running turn (a waiting send taken at a
        *  step boundary), so it joined that turn instead of opening one. */
       midTurn?: true;
@@ -532,8 +538,11 @@ export class ChatStore {
   exited = $state<null | { status: number | null }>(null);
   degraded = $state(false);
   connected = $state(false);
-  /** The project's owner is paused; the next send picks it back up. Cleared
-   *  by the next `ready` or disconnect. */
+  /** The project's owner (the cloud machine) is asleep; the next send wakes
+   *  it. It outlives a dropped socket — a gateway may close after saying so,
+   *  and a reconnect that finds it still asleep must not flicker through
+   *  "Reconnecting…" — and ends with the next `ready`, a wake (an accepted
+   *  send, `waking`) or a move. */
   asleep = $state(false);
   /** The conversation is continuing on another machine (a transfer between
    *  this computer and the cloud). The transcript stays; the next `ready`
@@ -765,10 +774,10 @@ export class ChatStore {
     }
   }
 
-  /** The socket dropped; we are no longer live until the next `ready`. */
+  /** The socket dropped; we are no longer live until the next `ready`. An
+   *  asleep owner stays asleep: dropping the socket wakes nothing. */
   onDisconnected(): void {
     this.connected = false;
-    this.asleep = false;
     this.waking = false;
   }
 
@@ -788,6 +797,7 @@ export class ChatStore {
     this.connected = false;
     this.moving = to;
     this.pausedFor = null;
+    this.asleep = false;
     this.waking = false;
     this.sending = null;
     // Whatever could not be delivered was already refused (and handed back)
@@ -804,6 +814,7 @@ export class ChatStore {
     }
     this.moving = null;
     this.pausedFor = pause;
+    this.asleep = false;
   }
 
   /** The composer's send was accepted by the socket; keep its text until the
@@ -1017,6 +1028,7 @@ export class ChatStore {
               id,
               origin,
               forkSeq: entry.seq,
+              sentAtMs: entry.ts,
             }),
           );
           if (id !== null) this.userIndex.set(id, this.blocks.length - 1);
@@ -1124,6 +1136,7 @@ export class ChatStore {
               checkpoint: pending.checkpoint,
               id: pending.id,
               forkSeq: entry.seq,
+              sentAtMs: entry.ts,
               ...(this.running ? { midTurn: true as const } : {}),
             }),
           );

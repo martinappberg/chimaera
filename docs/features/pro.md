@@ -375,16 +375,29 @@ view reconnects once with wake intent when the user types or sends into a
 dropped connection; the action itself is not queued (the composer keeps its
 text; a terminal says it is waking). There is no reconnect or wake button: the
 chat says "Reconnecting…" (only for a viewed project, after a short grace) or
-"Send a message to pick this conversation back up." while the project is paused.
+"Asleep in the cloud. Send a message to wake it." while the cloud machine is
+asleep, and its header reads "In the cloud · asleep"; a terminal says "Asleep in
+the cloud. Press a key to wake it." Asleep holds across dropped connections
+until something wakes it, and nothing retries against a sleeping cloud
+machine: a chat or terminal whose connection drops while it sleeps waits with
+no timer until you send or type (which wakes it) or the project answers again
+(its row becomes reachable, or a browser view's placement reads it awake). A
+browser view of a sleeping project still opens: the account reports it as
+`suspended`, which is routed like any owner and never woken by reading.
 
 **Moving between devices is not an exit.** When a conversation moves between
 this computer and the cloud, every open view is told it *moved*: the chat stays
 mounted with its transcript and scroll position, says "Continuing in the cloud…"
 or "Continuing on your computer…" (composer disabled for that reason), and
 reconnects to wherever it runs next — at once when its row comes back, not after
-a retry delay. Only a real transfer says so. A session that is only paused says
-why instead: "Reconnecting after an update…" (a daemon restart on the machine
-that owns the project), "Waiting for Claude Code on the cloud machine" (its
+a retry delay. Only a real transfer says so. Signed out, a conversation the cloud
+still holds reads "This conversation is in the cloud. Sign in to Chimaera Pro to
+bring it back." instead. Where the agent was told about the move, the transcript
+shows one line — "Continued in the cloud · 5m ago", "Back on your computer", or
+"Continued in the cloud after this computer stopped responding" — with the
+message itself behind "Show what the agent was told". A session that is only paused says
+why instead: "Picking up where you left off…" (a daemon restart on the machine
+that owns the project, whatever its cause), "Waiting for Claude Code in the cloud" (its
 agent is not signed in there yet; when the row names the agent with
 `blocked_provider`, the view offers **Connect Claude Code to continue**, which
 opens that sign-in in Chimaera Pro), or "Opening…" (its transfer is starting it).
@@ -409,7 +422,7 @@ Reading one asks the owner first: a conversation's pasted images come from the
 owner; a path where the owner has nothing is this computer's own file (your home
 folder, a download) and opens from here; and a path where the owner has a
 different file it may not show (a report an agent wrote to `/tmp` on the cloud
-machine, say) reads "This file is on the other machine" rather than showing this
+machine, say) reads "This file is in the cloud" rather than showing this
 computer's file of the same name. The owner never shows anything outside the
 project but the project's own pasted images, and says only whether it has
 something at such a path, never what.

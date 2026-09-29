@@ -767,6 +767,12 @@ export function getSize(id: string): { cols: number; rows: number } | null {
   return { cols: entry.term.cols, rows: entry.term.rows };
 }
 
+/** The session's row says its owner may answer again: a socket waiting on a
+ *  sleeping owner dials now; one in backoff retries at once. */
+export function retryTerminal(id: string): void {
+  pool.get(id)?.socket.retrySoon();
+}
+
 export function refreshAccess(id: string): void {
   const entry = pool.get(id); if (entry === undefined) return;
   entry.term.options.disableStdin = isWatching(id);

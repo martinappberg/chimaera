@@ -34,16 +34,26 @@ interface AccountState {
   plan: AccountPlan;
   /** Whether Pro is offered at all: null until the first answer. */
   offered: boolean | null;
+  /** This computer's account answered that it is signed out. False while
+   *  unknown, and always in a browser view (its account gateway serves only
+   *  a signed-in account). */
+  signedOut: boolean;
+}
+
+/** Signed out for certain: available, settled (not starting up or mid
+ *  sign-in) and not signed in. */
+function nativeSignedOut(status: ProStatus & { initializing?: boolean }): boolean {
+  return status.available && !status.initializing && !status.sign_in && !status.signed_in;
 }
 
 /** Account branding only; transport availability never implies entitlement.
  * Each window owns one subscription lifecycle and keeps no account data on disk.
  */
-const account = readable<AccountState>({ plan: "loading", offered: null }, (setState) => {
+const account = readable<AccountState>({ plan: "loading", offered: null, signedOut: false }, (setState) => {
   // Availability is a build property, so it survives every later refresh
   // (including the ones that clear the plan back to "loading").
   let offered: boolean | null = null;
-  const set = (plan: AccountPlan): void => setState({ plan, offered });
+  const set = (plan: AccountPlan, signedOut = false): void => setState({ plan, offered, signedOut });
   set("loading");
   if (typeof document === "undefined") return;
   const native = isNativeShell();
@@ -83,8 +93,8 @@ const account = readable<AccountState>({ plan: "loading", offered: null }, (setS
     });
     const deadline = setTimeout(() => controller.abort(), 10_000);
     try {
-      const lookup: Promise<{ plan: AccountPlan; available: boolean }> = native
-        ? proStatus().then((status) => ({ plan: nativePlan(status), available: status.available }))
+      const lookup: Promise<{ plan: AccountPlan; available: boolean; signedOut?: boolean }> = native
+        ? proStatus().then((status) => ({ plan: nativePlan(status), available: status.available, signedOut: nativeSignedOut(status) }))
         : fetch(workbenchPath(), {
           method: "HEAD",
           credentials: "same-origin",
@@ -98,7 +108,7 @@ const account = readable<AccountState>({ plan: "loading", offered: null }, (setS
       const result = await Promise.race([lookup, cancelled]);
       if (alive && revision === generation) {
         offered = result.available;
-        set(result.plan);
+        set(result.plan, result.signedOut === true);
       }
     } catch {
       if (alive && revision === generation) set("unknown");
@@ -138,6 +148,10 @@ const account = readable<AccountState>({ plan: "loading", offered: null }, (setS
 });
 
 export const accountPlan = derived(account, (state): AccountPlan => state.plan);
+
+/** This computer's account is signed out: a conversation the cloud still
+ *  holds stays there until the person signs in again. */
+export const accountSignedOut = derived(account, (state): boolean => state.signedOut);
 
 /** Gates every Pro entry point (Home, Settings). `null` while the first answer
  * is pending, so an endpoint-less build never flashes Pro chrome; once known it

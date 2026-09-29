@@ -17,6 +17,7 @@
   import { attachImageToComposer, insertIntoComposer, registerFollow } from "./composerBus";
   import { isBrowserGateway } from "../net/base";
   import { pauseLabel, placementLabel, sessionPause } from "../net/placement";
+  import { accountSignedOut } from "../net/plan";
   import { pausedConnect } from "../pro/providers";
   import { canOpenOnboarding, cloudOnboarding } from "../pro/onboarding.svelte";
   import BranchChip from "../shared/BranchChip.svelte";
@@ -62,6 +63,8 @@
   import AttachmentStrip from "./AttachmentStrip.svelte";
   import ForkDialog from "./ForkDialog.svelte";
   import AgentMessageMeta from "./AgentMessageMeta.svelte";
+  import TransferNote from "./TransferNote.svelte";
+  import { isTransferOrigin } from "./transfer";
   import Composer from "./Composer.svelte";
   import SameFileNotice from "../workspace/SameFileNotice.svelte";
   import { sameFile } from "../workspace/sameFile.svelte";
@@ -2047,8 +2050,6 @@
    *  running tools → working (between steps). */
   const agentBusy = $derived(store.running || store.compacting);
   const RECONNECTING_GRACE_MS = 2000;
-  /** "In the cloud" / "On another computer" for a routed conversation. */
-  const runsElsewhere = $derived(placementLabel(session.placement, session.placement_available));
   /** The conversation has no process where it is shown, and that is not an
    *  exit: its row is paused, or its socket said it moved or is paused and it
    *  has not been reached since. The transcript stays mounted. */
@@ -2063,16 +2064,19 @@
         : store.pausedFor !== null && !store.connected
           ? store.pausedFor
           : rowPause,
+      { signedOut: $accountSignedOut },
     ).status,
   );
   /** The agent sign-in this paused conversation waits for on the cloud (the
    *  row's additive `blocked_provider`); null otherwise. */
   const connect = $derived(canOpenOnboarding() ? pausedConnect(session) : null);
-  /** A paused row coming back (or the project changing where it runs) means
-   *  the conversation is reachable now: reconnect at once instead of sitting
-   *  out a backoff that grew while it was paused. */
+  /** A paused row coming back, the project changing where it runs, or its
+   *  owner becoming reachable (a sleeping cloud machine woke) means the
+   *  conversation is reachable now: reconnect at once instead of sitting out
+   *  a backoff — or, for a socket waiting on a sleeping owner, instead of
+   *  waiting for a send. */
   const reachKey = $derived(
-    `${session.suspended === true}|${rowPause?.type ?? ""}|${typeof session.placement === "object" ? session.placement.remote : "here"}`,
+    `${session.suspended === true}|${rowPause?.type ?? ""}|${typeof session.placement === "object" ? session.placement.remote : "here"}|${session.placement_available !== false}`,
   );
   let lastReachKey: string | null = null;
   $effect(() => {
@@ -2096,6 +2100,17 @@
     const timer = setTimeout(() => (reconnectingShown = true), RECONNECTING_GRACE_MS);
     return () => clearTimeout(timer);
   });
+  /** "In the cloud" / "On another computer" for a routed conversation. A
+   *  sleeping owner fails the daemon's passive roster read like an
+   *  unreachable one, so what this socket heard (asleep, waking) wins over
+   *  the row's "reconnecting"; and the status line under the transcript says
+   *  "Reconnecting…" itself when it is showing, so the header does not. */
+  const runsElsewhere = $derived(
+    placementLabel(session.placement, session.placement_available, {
+      owner: store.asleep ? "asleep" : store.waking && !store.connected ? "waking" : null,
+      reconnectingShown: reconnectingShown && !continuing && !store.waking && !store.asleep,
+    }),
+  );
   const activityLabel = $derived.by(() => {
     if (store.compacting) return "Compacting context";
     if (store.activityLine !== null) return store.activityLine;
@@ -2399,13 +2414,18 @@
     store.blocks.length > 0 ? store.blocks[store.blocks.length - 1].uid : -1,
   );
 
-  /** One precise wall-clock timer for every assistant timestamp in this view.
+  /** One precise wall-clock timer for every assistant timestamp (and each
+   *  transfer note's) in this view.
    *  Each row reports its next label boundary; scheduling the earliest avoids
    *  a timer per message and leaves old transcripts idle between midnights. */
   let messageTimeNowMs = $state(Date.now());
   const messageTimestamps = $derived(
     visible
-      ? renderBlocks.flatMap((block) => (block.kind === "message" ? [block.sentAtMs] : []))
+      ? renderBlocks.flatMap((block) =>
+          block.kind === "message" || (block.kind === "user" && isTransferOrigin(block.origin))
+            ? [block.sentAtMs]
+            : [],
+        )
       : [],
   );
   $effect(() => {
@@ -2660,6 +2680,15 @@
         </ActivityFold>
       {:else if isActivityRow(item)}
         {@render activityRow(item)}
+      {:else if item.block.kind === "user" && isTransferOrigin(item.block.origin)}
+        <TransferNote
+          origin={item.block.origin}
+          text={item.block.text}
+          sentAtMs={item.block.sentAtMs}
+          nowMs={messageTimeNowMs}
+          sourceIndex={item.index}
+          sourceUid={item.block.uid}
+        />
       {:else if item.block.kind === "user"}
         {@const block = item.block}
         <!-- Only delivered (sent) user messages render inline; queued/dropped
@@ -2704,14 +2733,12 @@
               </div>
             {/if}
           </div>
-          {#if unsavedImages(block) !== "" || block.origin === "remote" || block.origin === "restart" || block.origin === "moved" || block.origin === "home" || block.origin === "worker"}
+          {#if unsavedImages(block) !== "" || block.origin === "remote" || block.origin === "restart" || block.origin === "worker"}
             <span class="bubble-meta">
               {#if block.origin === "remote"}
                 <span class="origin" title="sent from a Remote Control client (the Claude app or claude.ai/code)">via Remote Control</span>
               {:else if block.origin === "restart"}
                 <span class="origin auto" title="chimaera sent this itself: the daemon restarted while this chat had work running, so it asked the resumed agent to pick that work back up (setting: Pick Up Interrupted Work After a Restart)">sent by chimaera after a restart</span>
-              {:else if block.origin === "moved" || block.origin === "home"}
-                <span class="origin auto" title="chimaera sent this so the agent picks up where it left off after the conversation moved">{block.origin === "home" ? "back on your computer" : "continued in the cloud"}</span>
               {:else if block.origin === "worker"}
                 <span class="origin auto" title="a worker in this workspace sent this with tell_mastermind; chimaera delivered it because the Mastermind acts on its own (auto)">from a worker</span>
               {/if}
@@ -3133,8 +3160,10 @@
     <div class="connection-status"><span role="status">{continuingLabel}</span>{#if connect !== null}<button type="button" class="connect" onclick={() => cloudOnboarding.request({ providerIds: [connect.providerId], workspaceId: connect.workspaceId })}>Connect {connect.label} to continue</button>{/if}</div>
   {:else if store.waking && !store.connected}
     <div class="connection-status" role="status">Waking the cloud machine…</div>
-  {:else if store.asleep && !store.connected}
-    <div class="connection-status" role="status">Send a message to pick this conversation back up.</div>
+  {:else if store.asleep}
+    <!-- Asleep is the owner's state, not this socket's: it holds across a
+         dropped connection and ends with a wake or the next ready. -->
+    <div class="connection-status" role="status">Asleep in the cloud. Send a message to wake it.</div>
   {:else if reconnectingShown}
     <div class="connection-status" role="status">Reconnecting…</div>
   {/if}
@@ -3175,7 +3204,7 @@
 
 <style>
   .placement-note { color: var(--accent); font-size: var(--text-xs); padding: 5px 12px; border-bottom: 1px solid var(--edge); }
-  .connection-status { padding: 8px 12px; color: var(--muted); font-size: 12px; text-align: center; }
+  .connection-status { padding: 8px 12px; color: var(--muted); font-size: var(--text-xs); text-align: center; }
   .connection-status .connect { margin-left: 10px; border: 1px solid var(--edge); border-radius: 6px; padding: 3px 9px; color: var(--fg); background: var(--bg); font: inherit; cursor: pointer; }
   .connection-status .connect:hover { background: var(--row-hover); }
   .connection-status .connect:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }

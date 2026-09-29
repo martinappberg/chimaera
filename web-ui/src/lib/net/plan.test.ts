@@ -15,7 +15,7 @@ vi.mock("./native", () => bridge);
 vi.mock("./base", () => gateway);
 vi.mock("./api", () => host);
 
-import { accountPlan, paidPlan, proOffered, type AccountPlan, type PaidPlan } from "./plan";
+import { accountPlan, accountSignedOut, paidPlan, proOffered, type AccountPlan, type PaidPlan } from "./plan";
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
@@ -132,6 +132,29 @@ describe("shared paid plan", () => {
     await flush();
     expect(account).toEqual(["loading", "pro", "free"]);
     expect(badge).toEqual([null, "pro", null]);
+  });
+
+  it("says signed out only on a settled native answer, never for a free plan or a browser view", async () => {
+    const signedOut: boolean[] = [];
+    subscriptions.push(accountSignedOut.subscribe((value) => signedOut.push(value)));
+    await flush();
+    expect(signedOut).toEqual([false]);
+    bridge.proStatus.mockResolvedValue(status("none"));
+    changed();
+    await flush();
+    expect(signedOut.at(-1)).toBe(false);
+    bridge.proStatus.mockResolvedValue({ ...status(null, false), sign_in: { phase: "waiting", expires_at: 1 } });
+    changed();
+    await flush();
+    expect(signedOut.at(-1)).toBe(false);
+    bridge.proStatus.mockResolvedValue(status(null, false));
+    changed();
+    await flush();
+    expect(signedOut.at(-1)).toBe(true);
+    bridge.proStatus.mockResolvedValue(status("pro"));
+    changed();
+    await flush();
+    expect(signedOut.at(-1)).toBe(false);
   });
 
   it("rejects an older native response after sign-out and clears failures", async () => {
