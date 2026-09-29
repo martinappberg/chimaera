@@ -91,4 +91,32 @@ describe("toolRunHealth", () => {
   it("never recovers a denial", () => {
     expect(toolRunHealth([call({ denied: true, status: "failed" }), call()])).toBe("failed");
   });
+
+  it("recovers a failed command with any later completed command", () => {
+    const cmd = (command: string, over: Partial<HealthTool> = {}) =>
+      call({ tool: "execute", title: command, command, ...over });
+    const failed = cmd("cargo build", { status: "failed" });
+    expect(toolRunHealth([failed, cmd("cargo build 2>&1 | tail")])).toBe("recovered");
+    expect(toolRunHealth([failed, cmd("cargo build", { status: "in_progress" })])).toBe("failed");
+    expect(toolRunHealth([failed, call({ title: "cargo build" })])).toBe("failed");
+  });
+
+  it("doesn't let a call that ran no command recover one", () => {
+    const failed = call({ tool: "execute", title: "cargo test", command: "cargo test", status: "failed" });
+    const kill = call({ tool: "execute", title: "KillShell: bg-1", command: null });
+    expect(toolRunHealth([failed, kill])).toBe("failed");
+    // A pre-field journal row still recovers the old way: the same title.
+    const ls = (over: Partial<HealthTool> = {}) => call({ tool: "execute", title: "ls", ...over });
+    expect(toolRunHealth([ls({ status: "failed" }), ls()])).toBe("recovered");
+  });
+
+  it("looks past the run into the rest of its turn", () => {
+    const failedEdit = call({ status: "failed", locations: ["/a.rs"] });
+    const retry = call({ locations: ["/a.rs"] });
+    const other = call({ locations: ["/b.rs"] });
+    expect(toolRunHealth([failedEdit], { tools: [failedEdit, other, retry], from: 1 })).toBe("recovered");
+    expect(toolRunHealth([failedEdit], { tools: [failedEdit, other], from: 1 })).toBe("failed");
+    // Calls before `from` belong to the run (or precede it) and don't count.
+    expect(toolRunHealth([failedEdit], { tools: [retry, failedEdit], from: 2 })).toBe("failed");
+  });
 });

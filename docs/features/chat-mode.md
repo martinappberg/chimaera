@@ -170,7 +170,11 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 - **Content.** User bubbles (right), agent prose (left, markdown), plan/todo panel, permission/
   question cards, inline artifacts — and, between the prose, one family of quiet 12px **activity
   lines** that cluster tight so messages stay the page's voice:
-  - **Thought** — a collapsed reasoning block: "Thought" + a faded first line; click for the text.
+  - **Thought** — a collapsed reasoning block: "Thought" + a faded first line read as plain text
+    (Codex titles each reasoning section in bold — `**Checking the screen**` — so the line is the
+    newest title, the way Codex's own status line reads, and stays put when the row settles); click
+    for the text, rendered as sanitized markdown (paths, hover previews and embeds as in a reply)
+    and mounted only while open.
   - **Tool groups** — a run of tool calls as one line, titled by the agent's own past-tense batch
     label when it offers one (Claude `tool_use_summary`: "Listed files in the workspace"; on by
     default, `chat.toolSummaries`), else readable counts ("Ran 2 commands, read a file"); calls
@@ -324,7 +328,11 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   Codex change opens, and a directory opens in the Finder). Consecutive calls condense into a
   group ("6 commands · 2 files"). Groups are collapsed by default, including while work is running, and remain
   expandable on demand; the summary badge (`running…` / `failed` / `recovered`) carries the verdict
-  without turning live activity or history into a wall of command rows.
+  without turning live activity or history into a wall of command rows. A failure is `recovered`
+  once a later call in the same turn made up for it — any later successful command for a failed
+  command (a retry rarely repeats the exact line), the same file (else the same title) for other
+  tools — even when reasoning lines split that turn into several groups. Denials never recover;
+  a fold shows only the hard `failed`.
   Tool calls upsert by id (a late enriching re-emit never walks a finished tool back to
   pending); `tool_output_delta` streams live output ahead of the authoritative result, but a late
   delta may only enrich terminal text — it cannot revive the streaming cursor. **Dangling

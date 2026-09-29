@@ -118,22 +118,47 @@ export interface HealthTool {
   status: string;
   locations: string[];
   denied: boolean;
+  /** The shell command the call ran; absent on execute-kind calls that run
+   *  none (claude's BashOutput / KillShell) and on pre-field journals. */
+  command?: string | null;
 }
 
-/** A run's failure badge. A failure is RECOVERED when a later call of the
- *  same tool against the same target completed (the read-before-write dance,
- *  a retried command) — a net-success run shouldn't wear the hard red badge.
+/** The rest of a run's turn: `tools[from..]` are the calls made after it.
+ *  Thought rows split one turn's calls into several groups, and the retry
+ *  that fixed a failure usually lands in a later one. */
+export interface TurnTail {
+  tools: readonly HealthTool[];
+  from: number;
+}
+
+/** Whether `later` completing undoes `failed`. Commands have no target to
+ *  match (the title is the command line, which a retry almost always
+ *  rewrites), so any later successful command counts — one that ran a
+ *  command, not a background-output read or a kill. Everything else must
+ *  hit the same file, or failing that the same title. */
+function recovers(failed: HealthTool, later: HealthTool): boolean {
+  if (later.status !== "completed" || later.denied || later.tool !== failed.tool) return false;
+  if (failed.tool === "execute" && typeof later.command === "string") return true;
+  return failed.locations.length > 0
+    ? later.locations.some((l) => failed.locations.includes(l))
+    : later.title === failed.title;
+}
+
+/** A run's failure badge. A failure is RECOVERED when a later call in the
+ *  same turn made up for it (the read-before-write dance, a retried or
+ *  reworked command) — a net-success run shouldn't wear the hard red badge.
  *  Presentation only: the failed row inside still shows its own error.
  *  Denials never recover (the user said no); a failure with no matching
- *  later success stays hard. */
-export function toolRunHealth(tools: HealthTool[]): "failed" | "recovered" | null {
+ *  later success stays hard. Later calls in the run itself count, and so do
+ *  those in `tail`. */
+export function toolRunHealth(tools: HealthTool[], tail?: TurnTail): "failed" | "recovered" | null {
   const failed = tools.some((t, i) => {
     if (t.denied) return true;
     if (t.status !== "failed") return false;
-    const sameTarget = (s: HealthTool) =>
-      s.tool === t.tool &&
-      (t.locations.length > 0 ? s.locations.some((l) => t.locations.includes(l)) : s.title === t.title);
-    return !tools.some((s, j) => j > i && s.status === "completed" && !s.denied && sameTarget(s));
+    if (tools.some((s, j) => j > i && recovers(t, s))) return false;
+    if (tail === undefined) return true;
+    for (let j = tail.from; j < tail.tools.length; j++) if (recovers(t, tail.tools[j])) return false;
+    return true;
   });
   if (failed) return "failed";
   return tools.some((t) => t.status === "failed" || t.denied) ? "recovered" : null;

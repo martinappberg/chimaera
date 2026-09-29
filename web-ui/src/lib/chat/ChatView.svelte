@@ -31,7 +31,9 @@
   import ChatHeader from "./ChatHeader.svelte";
   import Markdown from "./Markdown.svelte";
   import UserText from "./UserText.svelte";
+  import ThoughtRow from "./ThoughtRow.svelte";
   import ToolGroup from "./ToolGroup.svelte";
+  import type { TurnTail } from "./toolLabels";
   import FinishedRow from "./FinishedRow.svelte";
   import ActivityFold from "./ActivityFold.svelte";
   import { foldSpans } from "./activityFold";
@@ -1826,12 +1828,6 @@
     if (total < 1) return null;
     return formatElapsedSeconds(total);
   });
-  /** First line of a reasoning block, for its collapsed row. */
-  function thoughtPreview(text: string): string {
-    const line = text.trimStart().split("\n", 1)[0] ?? "";
-    return line.length > 160 ? `${line.slice(0, 160)}…` : line;
-  }
-
   /** A completed turn's duration for the turn-end badge. Sub-minute keeps one
    *  decimal ("2.4s"); a minute or more switches to the shared ladder so a
    *  long turn never renders as a raw "2664.6s". */
@@ -1941,6 +1937,8 @@
         index: number;
         endIndex: number;
         tools: Extract<ChatBlock, { kind: "tool" }>[];
+        /** The turn's later calls, where a retry clears this group's failure. */
+        tail: TurnTail;
       }
     | { t: "single"; key: string; index: number; block: ChatBlock };
   /** The rows a fold absorbs. Finished-work lines never fold: they are
@@ -1959,6 +1957,7 @@
         uid: number;
         items: ActivityRow[];
         tools: Extract<ChatBlock, { kind: "tool" }>[];
+        tail: TurnTail | undefined;
         thoughts: number;
       };
   const isActivityRow = (item: RowItem): item is ActivityRow =>
@@ -1966,8 +1965,11 @@
   const renderItems = $derived.by((): RenderItem[] => {
     const items: RowItem[] = [];
     let group: Extract<RowItem, { t: "group" }> | null = null;
+    // One shared array per turn; each group reads it from its own end on.
+    let turnTools: Extract<ChatBlock, { kind: "tool" }>[] = [];
     renderBlocks.forEach((block, i) => {
       const originalIndex = renderStart + i;
+      if (block.kind === "user" || block.kind === "wake" || block.kind === "turn_end") turnTools = [];
       // Every user block in `blocks` is delivered — queued/undelivered sends
       // live in the pending transcript tail (`store.pendingSends`), never
       // here — so they all render inline in transcript order.
@@ -1979,10 +1981,13 @@
             index: originalIndex,
             endIndex: originalIndex,
             tools: [],
+            tail: { tools: turnTools, from: 0 },
           };
           items.push(group);
         }
         group.tools.push(block);
+        turnTools.push(block);
+        group.tail.from = turnTools.length;
         group.endIndex = originalIndex;
       } else {
         group = null;
@@ -2018,6 +2023,7 @@
         uid: first.t === "group" ? first.tools[0].uid : first.block.uid,
         items: run,
         tools: run.flatMap((item) => (item.t === "group" ? item.tools : [])),
+        tail: run.reduce<TurnTail | undefined>((tail, item) => (item.t === "group" ? item.tail : tail), undefined),
         thoughts: run.filter((item) => item.t === "single").length,
       };
       folded.push(fold);
@@ -2176,6 +2182,7 @@
       {#if item.t === "group"}
         <ToolGroup
           tools={item.tools}
+          tail={item.tail}
           sourceIndex={item.index}
           sourceEnd={item.endIndex}
           sourceUid={item.tools[0]?.uid}
@@ -2186,21 +2193,24 @@
           onStopTask={agentKind === "claude" ? stopTask : undefined}
         />
       {:else}
-        {@const live = store.running && item.block.uid === lastInlineUid}
-        <details class="thought activity" data-block-index={item.index} data-block-uid={item.block.uid}>
-          <summary title="show the agent's reasoning">
-            <span class="thought-title" class:live>{live ? "Thinking" : "Thought"}</span>
-            <span class="thought-preview">{thoughtPreview(item.block.text)}</span>
-            <Chevron />
-          </summary>
-          <div class="thought-body">{item.block.text}</div>
-        </details>
+        <ThoughtRow
+          text={item.block.text}
+          live={store.running && item.block.uid === lastInlineUid}
+          {visible}
+          onOpenPath={openProsePath}
+          resolvePaths={prosePaths}
+          embeds={proseEmbeds}
+          {hoverTargets}
+          sourceIndex={item.index}
+          sourceUid={item.block.uid}
+        />
       {/if}
     {/snippet}
     {#each renderItems as item (item.key)}
       {#if item.t === "fold"}
         <ActivityFold
           tools={item.tools}
+          tail={item.tail}
           thoughts={item.thoughts}
           steps={item.items.length}
           {visible}
@@ -2954,81 +2964,6 @@
   .msg.agent.streaming :global(.agent-message-meta) {
     display: none;
   }
-  /* Reasoning is secondary to prose: one quiet line (label + the first
-     line of the thought, faded), the full text a click away — the same
-     voice as the tool-group and finished rows. */
-  .thought {
-    margin: 1px 0;
-  }
-  .thought > summary {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    width: fit-content;
-    max-width: 100%;
-    margin-left: -6px;
-    padding: 2px 6px;
-    border-radius: 6px;
-    color: var(--activity-fg, var(--muted));
-    font-size: var(--text-xs);
-    line-height: 1.4;
-    cursor: pointer;
-    user-select: none;
-    list-style: none;
-    transition:
-      background-color 0.12s ease,
-      color 0.12s ease;
-  }
-  .thought > summary::-webkit-details-marker {
-    display: none;
-  }
-  .thought > summary:hover,
-  .thought > summary:focus-visible {
-    color: var(--fg);
-    background: color-mix(in srgb, var(--fg) 4%, transparent);
-  }
-  .thought > summary :global(.chev) {
-    opacity: 0.55;
-  }
-  .thought[open] > summary :global(.chev) {
-    transform: rotate(90deg);
-  }
-  .thought-title {
-    flex: none;
-  }
-  .thought-title.live {
-    animation: label-pulse 1.6s ease-in-out infinite;
-  }
-  :global(html.app-hidden) .thought-title.live {
-    animation-play-state: paused;
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .thought-title.live {
-      animation: none;
-    }
-  }
-  .thought-preview {
-    min-width: 0;
-    max-width: 48ch;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: color-mix(in srgb, var(--muted) 60%, transparent);
-    font-style: italic;
-  }
-  .thought[open] .thought-preview {
-    display: none;
-  }
-  .thought-body {
-    color: var(--muted);
-    font-size: var(--text-sm);
-    line-height: 1.55;
-    white-space: pre-wrap;
-    word-break: break-word;
-    border-left: 2px solid color-mix(in srgb, var(--edge) 70%, transparent);
-    padding: 2px 0 2px 12px;
-    margin: 2px 0 8px 2px;
-  }
   .notice {
     color: var(--muted);
     font-size: var(--text-sm);
@@ -3134,15 +3069,6 @@
     50% {
       opacity: 0.45;
       transform: scale(0.88);
-    }
-  }
-  @keyframes label-pulse {
-    0%,
-    100% {
-      opacity: 0.9;
-    }
-    50% {
-      opacity: 0.55;
     }
   }
   @media (prefers-reduced-motion: reduce) {
