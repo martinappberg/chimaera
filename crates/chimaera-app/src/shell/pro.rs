@@ -93,6 +93,9 @@ pub struct Status {
     connection_warning: Option<&'static str>,
     /// Additive: the subscription needs a payment update.
     payment_due: bool,
+    /// Additive: the plan has ended and this RFC 3339 time is how long its
+    /// cloud work can still be brought home; null otherwise.
+    returning_until: Option<String>,
     /// Additive: the account's offers, passed through when the service
     /// supplies them; clients never hardcode prices.
     plans: Option<Vec<chimaera_link::PlanPrice>>,
@@ -217,6 +220,9 @@ impl Pro {
             payment_due: account
                 .as_ref()
                 .is_some_and(chimaera_link::Account::needs_payment),
+            returning_until: account
+                .as_ref()
+                .and_then(|account| account.returning_until.clone()),
             plans: account.as_ref().and_then(|account| account.plans.clone()),
             sign_in: self.sign_in.status(),
             billing: self.billing.status(),
@@ -1444,6 +1450,7 @@ mod tests {
         *lock(&pro.warning) = None;
         let wire = serde_json::to_value(pro.status_snapshot()).unwrap();
         assert!(wire["connection_warning"].is_null() && wire["plans"].is_null());
+        assert!(wire["returning_until"].is_null());
         assert_eq!(wire["payment_due"], false);
         assert_eq!(wire["plan"], "pro");
         let mut newer = fixture_account();
@@ -1451,6 +1458,14 @@ mod tests {
         *lock(&pro.account) = Some(newer);
         let wire = serde_json::to_value(pro.status_snapshot()).unwrap();
         assert!(wire["plan"].is_null(), "an unnamed plan stays neutral");
+        // An ended plan inside its return window carries the time it closes.
+        let mut ended = fixture_account();
+        ended.plan = chimaera_link::Plan::None;
+        ended.returning_until = Some("2026-11-03T09:30:00Z".into());
+        *lock(&pro.account) = Some(ended);
+        let wire = serde_json::to_value(pro.status_snapshot()).unwrap();
+        assert_eq!(wire["returning_until"], "2026-11-03T09:30:00Z");
+        assert_eq!(wire["plan"], "none");
     }
 
     #[test]
@@ -2054,11 +2069,7 @@ pub(super) async fn daemon_request(
         );
         if !response.status().is_success() {
             if suffix == "/pro/projects/open" {
-                let detail = serde_json::from_slice::<serde_json::Value>(&bytes)
-                    .ok()
-                    .and_then(|v| v["error"].as_str().map(str::to_owned))
-                    .unwrap_or_default();
-                anyhow::bail!(project_failure(&detail));
+                anyhow::bail!(open_failure(&bytes));
             }
             anyhow::bail!("The Pro operation couldn't finish. Try again shortly.");
         }
@@ -2071,9 +2082,36 @@ pub(super) async fn daemon_request(
     .await?
 }
 
-/// The daemon answers an open with diagnostic text only; it is classified
-/// here, once, into the fixed codes the page maps to sentences
-/// (`projects::open_code`). Raw text never reaches the page.
+/// The fixed code (`projects::open_code`) for a failed open, from the daemon's
+/// failure body. Its stable `error_code` decides; the sentence is classified
+/// only when the body has none (a daemon that predates the code). Raw text
+/// never reaches the page.
+fn open_failure(body: &[u8]) -> &'static str {
+    let body = serde_json::from_slice::<serde_json::Value>(body).unwrap_or_default();
+    match body["error_code"].as_str() {
+        Some(code) => project_failure_code(code),
+        None => project_failure(body["error"].as_str().unwrap_or_default()),
+    }
+}
+/// The daemon's stable open codes (its pro map lists them). A reason with no
+/// sentence of its own yet (`not_a_project`, `signed_out`, `owned_elsewhere`,
+/// `privacy`, `other_account`, `timed_out`, ...) and any code a newer daemon
+/// adds read as the generic line: never guessed from the sentence.
+fn project_failure_code(code: &str) -> &'static str {
+    use projects::open_code;
+    match code {
+        "folder_not_empty" => open_code::FOLDER_NOT_EMPTY,
+        "folder_missing" | "folder_moved" => open_code::FOLDER_MISSING,
+        "folder_nested" => open_code::FOLDER_NESTED,
+        "busy" => open_code::BUSY,
+        "account_changed" => open_code::ACCOUNT_CHANGED,
+        "unavailable" => open_code::UNAVAILABLE,
+        "return_window_ended" => open_code::RETURN_WINDOW_ENDED,
+        _ => open_code::FAILED,
+    }
+}
+/// Fallback for a daemon that predates `error_code`: its diagnostic text,
+/// classified once into the same fixed codes.
 fn project_failure(detail: &str) -> &'static str {
     use projects::open_code;
     let text = detail.to_ascii_lowercase();

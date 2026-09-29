@@ -336,6 +336,24 @@ describe("shared paid plan", () => {
     expect(badge.at(-1)).toBe("pro");
   });
 
+  it("shows an ended plan as no paid badge, even while the account still names the plan", async () => {
+    const account = subscribeAccount();
+    const badge = subscribe();
+    await flush();
+    const returning_until = "2026-11-03T09:30:00Z";
+    for (const plan of ["pro", "max", "none"] as const) {
+      bridge.proStatus.mockResolvedValue({ ...status(plan), returning_until });
+      changed();
+      await flush();
+      expect(account.at(-1)).toBe("free");
+      expect(badge.at(-1)).toBeNull();
+    }
+    bridge.proStatus.mockResolvedValue({ ...status("pro"), returning_until: null });
+    changed();
+    await flush();
+    expect(badge.at(-1)).toBe("pro");
+  });
+
   it("keeps the confirmed plan while the connection behind cloud features comes up", async () => {
     const account = subscribeAccount();
     const badge = subscribe();

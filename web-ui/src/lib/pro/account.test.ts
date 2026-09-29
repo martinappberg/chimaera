@@ -72,6 +72,22 @@ describe("payment needs attention", () => {
   });
 });
 
+describe("an ended plan inside its return window", () => {
+  const ended = { ...free, returning_until: "2026-11-03T09:30:00Z" };
+  it("offers plans, never the subscriber view, whatever plan the account still names", () => {
+    for (const plan of ["none", "pro", "max"] as const) {
+      expect(isConfirmedFree({ ...ended, plan })).toBe(true);
+      for (const read of reads) expect(accountPanel({ ...ended, plan }, read)).toBe("plans");
+    }
+    // The same account without a window keeps its subscriber view.
+    expect(accountPanel({ ...free, plan: "pro" }, "none")).toBe("subscriber");
+  });
+  it("still routes an overdue payment to billing and ignores the window while signed out", () => {
+    expect(accountPanel({ ...ended, payment_due: true }, "none")).toBe("payment");
+    expect(accountPanel({ ...ended, signed_in: false, email: null, plan: null }, "none")).toBe("plans");
+  });
+});
+
 describe("billing review", () => {
   it("keys a review by attempt, phase and plan so unrelated events keep it", () => {
     const failed = { ...free, billing: attempt("failed") };

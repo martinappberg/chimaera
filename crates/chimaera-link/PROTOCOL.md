@@ -161,6 +161,11 @@ Optional additive fields, omitted by older services:
   instead send `subscription_status` (the billing provider's status); clients
   treat `past_due` and `unpaid` as payment due. A lapsed payment otherwise
   reads as `plan:"none"`.
+- `returning_until` (RFC 3339 string or null): once a plan has ended, the time
+  until which its cloud work can still be brought home. After it, the account's
+  routes answer 403 `{"error":"return_window_ended"}`. Presentation only: a value
+  that is not an RFC 3339 timestamp reads as absent, never failing the account
+  read.
 - `plans`: the account's current offers,
   `[{plan:"pro"|"max",interval:"month"|"year",amount_cents,currency}]` with the
   amount in minor units and `currency` an ISO 4217 code. Clients never hardcode

@@ -19,10 +19,10 @@ revocable delegation over the authenticated local API.
 | `continuity_tests.rs` | Loopback account fixture (records requests, scripted grants, delays; Git endpoints refuse connections) for policy, abandoned flush, sleep deadline, own-epoch reacquire, lapsed cloud lease and drain tests. |
 | `snapshot_diagnostics.rs` | Fixed snapshot failure categories; no response bodies, paths, identifiers or error text enter diagnostic logs. |
 | `handback.rs` | Bounded automatic return coordination across worker wake and ownership changes; lost release replies are resolved by authority reads without repeating ambiguous requests. |
-| `release.rs` | Bounded clean-release retry for the account publication fence; changed ownership, account or lease never retries. |
+| `release.rs` | Bounded clean-release retry for the account publication fence; changed ownership, account or lease never retries. A legacy release the account refuses as 409 `continuity_upgrade_required` (a bare body, no `baton`) ends at once as `UpgradeRequired`: `engine` latches the project (`execution::require_v2`) so the next reconcile uses the v2 path, logs one line, and reconciles with the unrefined configuration; the same refusal to a v2 request is a plain failure. Its mirror-row code is `checkpoint_pending` (it retries by itself). |
 | `provider_gate.rs` / `provider_tests.rs` | Per-agent cloud readiness, bounded blocked-provider status, and staged retry/cancellation tests with a synthetic CLI and real PTY. |
 | `protocol.rs` | Additive account contract subset and strict worker host-to-holder identity translation; intentionally no link/TLS dependency in the daemon. |
-| `transport.rs` | Bounded external curl/git children; cached mirror-only Git compatibility selection; credentials only in memory, never argv or Git config. |
+| `transport.rs` | Bounded external curl/git children; cached mirror-only Git compatibility selection; credentials only in memory, never argv or Git config. The account's 403 `{"error":"return_window_ended"}` (a plan that ended and whose time to bring cloud work home has passed) becomes an error of its own in `engine::account`, so its mirror-row and open `error_code` read `return_window_ended`; any other 403 stays a plain response. |
 | `policy.rs` | Mirrored-path policy, credential filtering, size budgets and cloud-profile classification. |
 | `mirror.rs` | Separate shadow and repository Git directories, incremental transfer and conservative hand-back. |
 | `shadow_cache.rs` | Validated reconstruction of an objectively damaged outgoing shadow, retaining its complete prior store in a bounded no-overwrite quarantine. |
@@ -165,7 +165,16 @@ mkdir, Git fetch, workspace registration or baton mutation. The worker's explici
 from both discovery and automatic mirroring.
 
 `POST /api/v1/pro/projects/open` accepts `{workspace_id,destination_root?,expected_account_id,expected_endpoint}` and
-returns `{workspace_id,root,name}`. The native shell supplies the chosen final
+returns `{workspace_id,root,name}`. A failure answers 400 `{error,code,error_code}`: `error` is diagnostic text
+(not a contract), `code` the shared transfer category (`routes::error_code`), and `error_code` the additive stable
+reason the native app maps to its own words (a timeout is 504 `{error,error_code:"timed_out"}`). The codes are
+`folder_not_empty`, `folder_nested` (inside another project or Git repository), `folder_missing`, `folder_moved`
+(the saved folder was replaced), `folder_unusable` (not an absolute real, writable directory), `folder_required`
+(a folder must be chosen first), `folder_mismatch` (differs from the saved folder), `busy` (mid-step in the cloud),
+`owned_elsewhere`, `privacy` (the project stays on its device), `account_changed`, `other_account`, `signed_out`,
+`unavailable`, `not_a_project`, `limit_reached`, `return_window_ended` (the plan ended and the time to bring its
+work home has passed) and `failed` (anything else). Each is tagged where it is raised (`projects.rs` `Refused`);
+an engine failure falls back to its category (`open_error_code`). The native shell supplies the chosen final
 folder; webview arguments contain only a workspace ID. A fresh folder must
 already exist, be writable and empty, and lie outside another project/repository.
 The selection is checked before cloud hand-back and immediately before install.

@@ -90,7 +90,12 @@ Native account status includes optional `initializing` / `initialization_phase`,
 `connection_retrying`, `account_unreachable`, one quiet line each with no button;
 never a failure or an entitlement signal — older shells sent two such messages
 in `error`, which `status.ts` recognizes),
-`payment_due` (billing, never checkout) and `plans` (display prices).
+`payment_due` (billing, never checkout), `returning_until` (an ended plan's
+window to bring cloud work home: `status.ts` `grantedPlan` reads the plan as none
+while it is set, so the paid badge, subscriber view and upgrade review never
+follow an ended plan; the page shows one quiet line, `presentation.ts`
+`returningLine`, and the code `return_window_ended` reads as a plain sentence
+wherever it arrives) and `plans` (display prices).
 Show the keychain/account recovery explanation immediately while startup waits;
 keep sign-in, billing and sign-out mutations behind that startup fence. Older
 native builds omit these fields and retain their existing account behavior.

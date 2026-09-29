@@ -397,6 +397,41 @@ fn canonical_recovery_has_a_distinct_exact_capability_and_keeps_expired_input_cl
     assert!(crate::pro::may_execute(&state, "w-a"));
     std::fs::remove_dir_all(root).unwrap();
 }
+/// The account refused a legacy release as enrolled: the project is latched, so
+/// the next pass routes it through the newer path (once an authoritative read
+/// has restored its policy) and never silently back through the legacy one.
+#[test]
+fn a_project_the_account_requires_on_the_newer_path_is_latched_for_it() {
+    let (state, config, root) = fixture();
+    assert!(effective(&state, &config, "w-a")
+        .unwrap()
+        .execution
+        .is_none());
+    assert_eq!(
+        path(
+            &effective(&state, &config, "w-a").unwrap(),
+            "w-a",
+            "release"
+        ),
+        "/v1/baton/w-a/release"
+    );
+    assert!(require_v2(&state, "w-a"), "newly latched");
+    assert!(!require_v2(&state, "w-a"), "a repeat is a no-op");
+    assert!(managed(&state, "w-a"));
+    assert!(!require_v2(&state, "not a workspace id"));
+    // No policy yet: it waits for the account's answer instead of falling back.
+    assert!(effective(&state, &config, "w-a").is_err());
+    observe(&state, &config, &baton()).unwrap();
+    assert_eq!(
+        path(
+            &effective(&state, &config, "w-a").unwrap(),
+            "w-a",
+            "release"
+        ),
+        "/v2/baton/w-a/release"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
 #[test]
 fn new_default_capability_never_changes_an_existing_strict_policy_renewal() {
     let (state, mut config, root) = fixture();

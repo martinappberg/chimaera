@@ -1,4 +1,5 @@
 import type { CloudProvisioningStatus, MirrorStatus, MirrorWorkspace, ProAuthScreenHint } from "../net/native";
+import { formatFullTimestamp } from "../shared/time";
 
 export type PaidPlan = "pro" | "max";
 export type BillingInterval = "month" | "year";
@@ -43,8 +44,24 @@ export function cloudCopy(state: string, reason: string | null, _phase?: CloudPr
     default: return { title: "Cloud is temporarily unavailable", detail: "We couldn’t check cloud access. Chimaera keeps trying; your local work is available." };
   }
 }
+/** The account's `return_window_ended` code (403 once a plan has ended and the
+ * time to bring its cloud work home has passed). Quiet: a plain sentence, no
+ * alarm and no retry. */
+export const RETURN_WINDOW_ENDED_COPY = "The time to bring this work home has passed. Contact support.";
+
+/** The one quiet line for an ended plan inside its return window
+ * (`status.ts` `returningUntil`): when its cloud work can still be brought
+ * home. Once that time has passed it reads as the code does. Null when there
+ * is no window. */
+export function returningLine(until: string | null, now = Date.now(), locale?: string): string | null {
+  const ends = until === null ? Number.NaN : Date.parse(until);
+  if (!Number.isFinite(ends)) return null;
+  if (ends <= now) return RETURN_WINDOW_ENDED_COPY;
+  return `Your plan has ended. Bring your work home from the cloud by ${formatFullTimestamp(ends, locale)}.`;
+}
 export function friendlyError(reason: unknown, fallback: string): string {
   const text = reason instanceof Error ? reason.message : String(reason);
+  if (text === "return_window_ended") return RETURN_WINDOW_ENDED_COPY;
   if (text === "service_unsupported") return "Cloud work is off for now because this version of Chimaera and your account don’t match. Installing an update, if one is offered, turns it back on; otherwise it resumes on its own. Work on this computer isn’t affected.";
   // Sign-out finished here; the app removes the saved sign-in by itself.
   if (text === "sign_out_pending") return "You’re signed out on this computer. The saved sign-in is cleared automatically next time you’re online.";
@@ -95,6 +112,7 @@ const COPY_ERROR_CODES: Record<string, string> = {
   ownership_changed: "This project moved. Chimaera is catching up with where it runs now.",
   ownership_unverified: "Checking where this project is running…",
   account_changed: "Your account changed. Open the project again.",
+  return_window_ended: RETURN_WINDOW_ENDED_COPY,
   pending: "Copying…",
   checkpoint_pending: "Saving the latest copy…",
 };
@@ -102,11 +120,17 @@ const COPY_ERROR_CODES: Record<string, string> = {
  * check clears them without the user, so they read quietly and never make a
  * project "need attention". */
 const PROGRESS_CODES: ReadonlySet<string> = new Set(["pending", "checkpoint_pending", "ownership_unverified"]);
+/** Codes that are neither progress nor a problem to fix here: one quiet
+ * sentence, with no "needs attention" state and no warning colour. */
+const NOTE_CODES: ReadonlySet<string> = new Set(["return_window_ended"]);
 
-/** What a project's recorded copy error means: nothing, progress, or a problem. */
-export function copyIssue(mirror: MirrorWorkspace["mirror"] | undefined): "none" | "progress" | "problem" {
+/** What a project's recorded copy error means: nothing, progress, a quiet
+ * note, or a problem. */
+export function copyIssue(mirror: MirrorWorkspace["mirror"] | undefined): "none" | "progress" | "note" | "problem" {
   if (!mirror?.error) return "none";
-  return mirror.error_code != null && PROGRESS_CODES.has(mirror.error_code) ? "progress" : "problem";
+  if (mirror.error_code == null) return "problem";
+  if (PROGRESS_CODES.has(mirror.error_code)) return "progress";
+  return NOTE_CODES.has(mirror.error_code) ? "note" : "problem";
 }
 
 export function projectCopyError(reason: string, code?: string | null): string {

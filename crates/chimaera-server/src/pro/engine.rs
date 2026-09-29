@@ -68,14 +68,19 @@ pub(super) async fn account(
         );
     }
     authority::account_request(config, path, method, body)?;
-    transport::request(
+    let response = transport::request(
         &config.endpoint,
         path,
         method,
         &config.delegation.access_token,
         body,
     )
-    .await
+    .await?;
+    ensure!(
+        !transport::return_window_ended(&response),
+        transport::RETURN_WINDOW_ENDED
+    );
+    Ok(response)
 }
 async fn credentials(
     config: &Configure,
@@ -780,6 +785,11 @@ impl Sleep {
         state.pro.sleep_generation.load(Ordering::Acquire) != self.generation
     }
 }
+/// The account required the newer path for a legacy release (see
+/// `release::UpgradeRequired`); the project retries through it by itself.
+pub(super) fn upgrade_required(error: &anyhow::Error) -> bool {
+    error.is::<release::UpgradeRequired>()
+}
 pub(super) fn failure_code(error: &anyhow::Error) -> &'static str {
     snapshot_diagnostics::category(error)
 }
@@ -863,6 +873,9 @@ async fn snapshot_inner_scoped(
 ) -> Result<()> {
     authority::config_matches(state, config, workspace)?;
     let effective = execution::effective(state, config, workspace)?;
+    // The unrefined configuration, for a reconcile after the account has
+    // required the newer path (`effective` below is legacy for this project).
+    let requested = config;
     let config = &effective;
     ensure!(
         config.recovery || execution::lease_valid(state, workspace),
@@ -1040,6 +1053,12 @@ async fn snapshot_inner_scoped(
         Ok::<_,anyhow::Error>(())
     }.await;
     let _ = tokio::fs::remove_dir_all(staging).await;
+    // Recognised before any recovery below, so every path that follows (a wake,
+    // a sleep window, the reconcile) already sees the project as enrolled.
+    let must_upgrade = result.as_ref().err().is_some_and(upgrade_required);
+    if must_upgrade {
+        execution::require_v2(state, &workspace.id);
+    }
     let stopped_ids = stopped_ids.into_inner().unwrap_or_default();
     if clean && woke() {
         // The computer woke during this flush: whatever publication did, the
@@ -1089,6 +1108,9 @@ async fn snapshot_inner_scoped(
             }
         };
         if recover {
+            // A legacy configuration would read the project over the path the
+            // account just refused and be denied as a downgrade.
+            let config = if must_upgrade { requested } else { config };
             let _ = reconcile_generation(state, config, &workspace.id, generation).await;
         }
     }

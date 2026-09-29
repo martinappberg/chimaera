@@ -160,6 +160,15 @@ pub struct Account {
         skip_serializing_if = "Option::is_none"
     )]
     pub plans: Option<Vec<PlanPrice>>,
+    /// Additive: once a plan has ended, the RFC 3339 time until which its cloud
+    /// work can still be brought home; null or absent otherwise. Presentation
+    /// only: a value that is not a timestamp is dropped, never failing the read.
+    #[serde(
+        default,
+        deserialize_with = "returning_until",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub returning_until: Option<String>,
 }
 impl Account {
     /// A lapsed payment reads as plan `none` on older services; this is the
@@ -210,6 +219,25 @@ where
                 .filter(PlanPrice::valid)
                 .collect(),
         ),
+        _ => None,
+    })
+}
+fn returning_until<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::String(text))
+            if text.len() <= 64
+                && time::OffsetDateTime::parse(
+                    &text,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .is_ok() =>
+        {
+            Some(text)
+        }
         _ => None,
     })
 }
@@ -378,6 +406,40 @@ mod tests {
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
         serde_json::from_value(value).unwrap()
+    }
+    #[test]
+    fn an_ended_plans_return_window_is_optional_and_never_fails_the_account_read() {
+        assert!(account(serde_json::json!({})).returning_until.is_none());
+        assert!(account(serde_json::json!({"returning_until":null}))
+            .returning_until
+            .is_none());
+        let ended =
+            account(serde_json::json!({"plan":"none","returning_until":"2026-11-03T09:30:00Z"}));
+        assert_eq!(
+            ended.returning_until.as_deref(),
+            Some("2026-11-03T09:30:00Z")
+        );
+        assert_eq!(
+            serde_json::to_value(&ended).unwrap()["returning_until"],
+            "2026-11-03T09:30:00Z"
+        );
+        // A value this client cannot read as a time is dropped; the account still reads.
+        for unreadable in [
+            serde_json::json!("soon"),
+            serde_json::json!("2026-11-03"),
+            serde_json::json!(1_780_000_000),
+            serde_json::json!({"at":"2026-11-03T09:30:00Z"}),
+            serde_json::json!("2026-11-03T09:30:00Z".repeat(8)),
+        ] {
+            let read = account(serde_json::json!({"returning_until":unreadable}));
+            assert!(read.returning_until.is_none(), "{unreadable}");
+            assert_eq!(read.email, "a@example.invalid");
+        }
+        // Absent stays absent on the wire: an older app never sees the key.
+        assert!(serde_json::to_value(account(serde_json::json!({})))
+            .unwrap()
+            .get("returning_until")
+            .is_none());
     }
     #[test]
     fn billing_extensions_are_optional_and_pricing_never_fails_the_account_read() {

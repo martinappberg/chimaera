@@ -314,7 +314,7 @@ failures are forgotten so a retry starts fresh. The status codes are unchanged
 (204 on completion). Refusals carry an additive stable `code` next to the English
 `error` (for example `ownership_changed`, `checkpoint_pending`, `account_changed`,
 `draining`, `workspace_busy`, `cloud_provider_not_ready`, `git`,
-`service_rejected`); clients map codes, never error text. A bare 409 from a
+`service_rejected`, `return_window_ended`); clients map codes, never error text. A bare 409 from a
 worker handoff is final for that return pass unless the worker woke into a new
 epoch.
 
@@ -497,10 +497,11 @@ permanent refusals:
 | `installation_required` | A device acquiring without a bound installation | Bind the installation |
 | `not_preferred_home` | A device that is not the project's preferred installation | Leave it to its home/cloud |
 | `capability_not_supported` | The request's capability differs from the project's mode | Use the recorded mode |
-| `continuity_upgrade_required` | A legacy (v1) route on a v2-enrolled project, or v2 renew/release without a record | Use v2 |
+| `continuity_upgrade_required` | A legacy (v1) route on a v2-enrolled project, or v2 renew/release without a record | Use v2. A legacy release answered this way carries only `{"error":"continuity_upgrade_required"}` (no `baton`); the daemon recognises it before any conflict parse (`release.rs` `UpgradeRequired`), logs one line, latches the project as enrolled (`execution::require_v2`, in memory) so the next reconcile reads it over v2 and restores its policy, and never retries in the same call. The same refusal to a v2 request is a plain failure: no latch, no retry |
 | `recovery_in_progress` | An installation recovery owns the project | Wait for it |
 | `workspace_limit`, `installation_limit`, `installation_already_bound`, `stale_policy`, `publication_expired`, `checkpoint_mismatch` | Account limits and stale publication/policy state | Surface; no retry loop |
 | 403 `mirror_disabled` | The project is kept on its device (privacy) | Stop publishing |
+| 403 `return_window_ended` | The plan ended and the time to bring its cloud work home (`returning_until` on `/v1/me`) has passed | Say so plainly (the daemon's `error_code` and mirror-row code are `return_window_ended`); no retry |
 | 404 `workspace_not_found` | Placement read for a project with no ownership record | Treat as unowned, epoch 0 |
 
 Returning home installs the canonical receipt only after its own registered

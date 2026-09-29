@@ -4,6 +4,7 @@
   import { pageVisible } from "../shared/visibility";
   import { asyncDisposer } from "../shared/asyncDisposer";
   import type { Workspace } from "../workspace/sessions";
+  import { RETURN_WINDOW_ENDED_COPY } from "./presentation";
   let { onOpen, knownIds }: { onOpen: (workspace: Workspace) => void; knownIds: string[] } = $props();
   let projects = $state<CloudProject[]>([]);
   let busy = $state<string | null>(null);
@@ -25,6 +26,7 @@
     account_changed: "Your account changed. Open the project again.",
     project_already_opening: "Another project is opening. Try again when it's done.",
     project_unavailable: "This project isn't available in the cloud right now. Its cloud copy is intact. Try again shortly.",
+    return_window_ended: RETURN_WINDOW_ENDED_COPY,
   };
   // A legacy pending import can have a local registry row without an approved
   // destination. Keep its explicit folder-choice recovery action reachable.

@@ -22,6 +22,38 @@ use std::{
 };
 
 const MAX_PROJECTS: usize = 128;
+
+/// Why an open refused, as the stable `error_code` on the route's failure body
+/// (`open_error_code`; the list is in the pro map). Tagged where each refusal is
+/// raised so a client never has to read the sentence, which stays diagnostic.
+#[derive(Debug)]
+struct Refused {
+    code: &'static str,
+    message: &'static str,
+}
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+impl std::error::Error for Refused {}
+fn refuse(code: &'static str, message: &'static str) -> anyhow::Error {
+    Refused { code, message }.into()
+}
+/// The stable code for a failed open. A failure raised in this file names its
+/// own; one from the transfer engine falls back to its diagnostic category.
+pub(super) fn open_error_code(error: &anyhow::Error) -> &'static str {
+    if let Some(refused) = error.downcast_ref::<Refused>() {
+        return refused.code;
+    }
+    match super::routes::error_code(error) {
+        "account_changed" => "account_changed",
+        "return_window_ended" => "return_window_ended",
+        "ownership_changed" | "ownership_unverified" => "owned_elsewhere",
+        "previous_processes_running" | "checkpoint_pending" => "busy",
+        _ => "failed",
+    }
+}
 #[derive(Clone, Serialize)]
 pub(super) struct Project {
     workspace_id: String,
@@ -127,12 +159,12 @@ pub(super) fn bind_workspace_account(
     let mut preferences = lock(&state.pro.preferences);
     ensure!(
         preferences.len() < MAX_PROJECTS || preferences.contains_key(workspace),
-        "Local project limit reached"
+        refuse("limit_reached", "Local project limit reached")
     );
     let entry = preferences.entry(workspace.into()).or_default();
     ensure!(
         entry.account.as_ref().is_none_or(|saved| saved == &account),
-        "This project belongs to another account"
+        refuse("other_account", "This project belongs to another account")
     );
     entry.account = Some(account);
     Ok(())
@@ -299,13 +331,18 @@ fn check_directory(root: &Path) -> Result<(PathBuf, u64, u64)> {
             && !root
                 .components()
                 .any(|part| matches!(part, std::path::Component::ParentDir)),
-        "Choose an absolute project folder"
+        refuse("folder_unusable", "Choose an absolute project folder")
     );
-    let metadata = std::fs::symlink_metadata(root)
-        .context("The project folder is missing; restore it before opening this project")?;
+    let metadata = std::fs::symlink_metadata(root).context(Refused {
+        code: "folder_missing",
+        message: "The project folder is missing; restore it before opening this project",
+    })?;
     ensure!(
         metadata.is_dir() && !metadata.file_type().is_symlink(),
-        "The project folder must be a real directory"
+        refuse(
+            "folder_unusable",
+            "The project folder must be a real directory"
+        )
     );
     let canonical = std::fs::canonicalize(root)?;
     let (device, inode) = identity(&metadata);
@@ -324,18 +361,27 @@ fn reserve(
             && !other_roots
                 .iter()
                 .any(|other| root.starts_with(other) || other.starts_with(&root)),
-        "This folder belongs to another project; choose a separate empty folder"
+        refuse(
+            "folder_nested",
+            "This folder belongs to another project; choose a separate empty folder"
+        )
     );
     ensure!(
         std::fs::read_dir(&root)?.next().is_none(),
-        "Choose an empty folder; existing files and repositories will not be replaced"
+        refuse(
+            "folder_not_empty",
+            "Choose an empty folder; existing files and repositories will not be replaced"
+        )
     );
     ensure!(
         !root
             .ancestors()
             .skip(1)
             .any(|parent| parent.join(".git").exists()),
-        "Choose a folder outside an existing Git repository"
+        refuse(
+            "folder_nested",
+            "Choose a folder outside an existing Git repository"
+        )
     );
     let probe = root.join(format!(
         ".chimaera-write-probe-{}",
@@ -345,7 +391,10 @@ fn reserve(
         .write(true)
         .create_new(true)
         .open(&probe)
-        .context("The project folder is not writable")?;
+        .context(Refused {
+            code: "folder_unusable",
+            message: "The project folder is not writable",
+        })?;
     std::fs::remove_file(probe)?;
     Ok(Destination {
         root,
@@ -360,19 +409,28 @@ fn verify(destination: &Destination, require_empty: bool) -> Result<()> {
     let (root, device, inode) = check_directory(&destination.root)?;
     ensure!(
         root == destination.root && device == destination.device && inode == destination.inode,
-        "The saved project folder has changed; restore its original location before opening"
+        refuse(
+            "folder_moved",
+            "The saved project folder has changed; restore its original location before opening"
+        )
     );
     if require_empty {
         ensure!(
             std::fs::read_dir(&root)?.next().is_none(),
-            "The selected folder now contains files; nothing was imported"
+            refuse(
+                "folder_not_empty",
+                "The selected folder now contains files; nothing was imported"
+            )
         );
         ensure!(
             !root
                 .ancestors()
                 .skip(1)
                 .any(|parent| parent.join(".git").exists()),
-            "The selected folder is now inside another Git repository"
+            refuse(
+                "folder_nested",
+                "The selected folder is now inside another Git repository"
+            )
         );
     }
     Ok(())
@@ -385,13 +443,19 @@ pub(super) async fn begin_install(state: &AppState, workspace: &str, root: &Path
     };
     ensure!(
         destination.root == root,
-        "A project cannot change its saved local folder during import"
+        refuse(
+            "folder_mismatch",
+            "A project cannot change its saved local folder during import"
+        )
     );
     let workspaces = lock(&state.workspaces).list();
     ensure!(
         !workspaces.iter().any(|entry| entry.id != workspace
             && (root.starts_with(&entry.root) || entry.root.starts_with(root))),
-        "The chosen folder now belongs to another project"
+        refuse(
+            "folder_nested",
+            "The chosen folder now belongs to another project"
+        )
     );
     let check = destination.clone();
     tokio::task::spawn_blocking(move || verify(&check, !check.started)).await??;
@@ -409,25 +473,33 @@ pub(super) async fn begin_install(state: &AppState, workspace: &str, root: &Path
 async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value> {
     anyhow::ensure!(
         !crate::lock(&state.pro.authority).restricted(),
-        "workspace destination is fixed"
+        refuse("unavailable", "workspace destination is fixed")
     );
     ensure!(
         super::valid_id(&request.workspace_id),
-        "Invalid project identity"
+        refuse("not_a_project", "Invalid project identity")
     );
     let (config, generation) = configuration(state).await;
-    let config = config.context("Sign in to open a cloud project")?;
+    let config = config.context(Refused {
+        code: "signed_out",
+        message: "Sign in to open a cloud project",
+    })?;
     ensure!(
         config.role == Role::Device,
-        "Open locally is available on a personal device"
+        refuse(
+            "unavailable",
+            "Open locally is available on a personal device"
+        )
     );
-    let account =
-        account_scope(&config).context("Refresh sign-in before opening a cloud project")?;
+    let account = account_scope(&config).context(Refused {
+        code: "signed_out",
+        message: "Refresh sign-in before opening a cloud project",
+    })?;
     ensure!(
         config.account_id.as_deref() == Some(request.expected_account_id.as_str())
             && config.endpoint.trim_end_matches('/')
                 == request.expected_endpoint.trim_end_matches('/'),
-        "Account changed; open the project again"
+        refuse("account_changed", "Account changed; open the project again")
     );
     let project = list(state)
         .await
@@ -437,7 +509,7 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
     let _jobs = state.pro.jobs.lock().await;
     ensure!(
         generation == state.pro.generation.load(Ordering::Acquire),
-        "Account changed; open the project again"
+        refuse("account_changed", "Account changed; open the project again")
     );
     let explicit_unbound_recovery = lock(&state.pro.adoptions)
         .get(&request.workspace_id)
@@ -446,7 +518,10 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
         });
     ensure!(
         account_matches(state, &request.workspace_id) || explicit_unbound_recovery,
-        "This saved project belongs to another account; its local folder will not be changed"
+        refuse(
+            "other_account",
+            "This saved project belongs to another account; its local folder will not be changed"
+        )
     );
     let existing = lock(&state.workspaces).get(&request.workspace_id);
     let saved = lock(&state.pro.adoptions)
@@ -456,12 +531,18 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
     let destination = if let Some(mut saved) = saved {
         ensure!(
             saved.account.as_ref().is_none_or(|owner| owner == &account),
-            "This saved project belongs to another account; its local folder will not be changed"
+            refuse(
+                "other_account",
+                "This saved project belongs to another account; its local folder will not be changed"
+            )
         );
         if saved.account.is_none() {
             ensure!(
                 request.destination_root.as_ref() == Some(&saved.root),
-                "Explicitly select the original project folder to recover this earlier import"
+                refuse(
+                    "folder_required",
+                    "Explicitly select the original project folder to recover this earlier import"
+                )
             );
             saved.account = Some(account.clone());
             lock(&state.pro.adoptions).insert(request.workspace_id.clone(), saved.clone());
@@ -472,7 +553,10 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
                 .destination_root
                 .as_ref()
                 .is_none_or(|root| root == &saved.root),
-            "This project already has a saved local folder"
+            refuse(
+                "folder_mismatch",
+                "This project already has a saved local folder"
+            )
         );
         let check = saved.clone();
         tokio::task::spawn_blocking(move || verify(&check, !check.started)).await??;
@@ -483,7 +567,10 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
                 .destination_root
                 .as_ref()
                 .is_none_or(|root| root == &existing.root),
-            "This project already has a saved local folder"
+            refuse(
+                "folder_mismatch",
+                "This project already has a saved local folder"
+            )
         );
         let legacy = lock(&state.pro.legacy_pending).contains(&request.workspace_id)
             || lock(&state.pro.preferences)
@@ -491,7 +578,10 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
                 .is_none_or(|entry| entry.account.is_none());
         ensure!(
             !legacy || request.destination_root.is_some(),
-            "Explicitly select this existing project folder before importing cloud work into it"
+            refuse(
+                "folder_required",
+                "Explicitly select this existing project folder before importing cloud work into it"
+            )
         );
         let root = existing.root.clone();
         let (root, device, inode) =
@@ -514,11 +604,15 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
     } else {
         ensure!(
             project.is_some(),
-            "Cloud project is not available in this account"
+            refuse(
+                "unavailable",
+                "Cloud project is not available in this account"
+            )
         );
-        let root = request
-            .destination_root
-            .context("Choose where to save this project first")?;
+        let root = request.destination_root.context(Refused {
+            code: "folder_required",
+            message: "Choose where to save this project first",
+        })?;
         let workspaces = lock(&state.workspaces).list();
         let other_roots = lock(&state.pro.adoptions)
             .iter()
@@ -527,7 +621,7 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
             .collect::<Vec<_>>();
         ensure!(
             other_roots.len() < MAX_PROJECTS,
-            "Local project limit reached"
+            refuse("limit_reached", "Local project limit reached")
         );
         let mut destination =
             tokio::task::spawn_blocking(move || reserve(&root, &workspaces, &other_roots))
@@ -555,7 +649,7 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
     .json()?;
     ensure!(
         baton.workspace_id == request.workspace_id && !baton.mirror_disabled,
-        "Mirroring is not available for this project"
+        refuse("privacy", "Mirroring is not available for this project")
     );
     // A restart verification must not download an older mirror over a locally
     // completed adoption. Reconcile the owned lease, then open existing files.
@@ -565,9 +659,13 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
     {
         engine::reconcile(state, &config, &request.workspace_id).await?;
         if super::owned_epoch(state, &request.workspace_id).is_some() {
-            let workspace = lock(&state.workspaces)
-                .get(&request.workspace_id)
-                .context("Local project is unavailable")?;
+            let workspace =
+                lock(&state.workspaces)
+                    .get(&request.workspace_id)
+                    .context(Refused {
+                        code: "unavailable",
+                        message: "Local project is unavailable",
+                    })?;
             return Ok(
                 json!({"workspace_id":workspace.id,"root":workspace.root,"name":workspace.name}),
             );
@@ -578,12 +676,16 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
         .as_deref()
         .filter(|holder| *holder != config.delegation.device_id)
     {
-        let project = project
-            .as_ref()
-            .context("The cloud project is unavailable; try again when it reconnects")?;
+        let project = project.as_ref().context(Refused {
+            code: "unavailable",
+            message: "The cloud project is unavailable; try again when it reconnects",
+        })?;
         ensure!(
             super::protocol::worker_holder_id(&project.host_id) == Some(holder),
-            "This project is currently open on another device"
+            refuse(
+                "owned_elsewhere",
+                "This project is currently open on another device"
+            )
         );
         let response = transport::request(
             &config.keeper_url,
@@ -595,16 +697,19 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
         .await?;
         ensure!(
             response.status != 409,
-            "The cloud project is busy; wait for a pause and try again"
+            refuse(
+                "busy",
+                "The cloud project is busy; wait for a pause and try again"
+            )
         );
         ensure!(
             (200..300).contains(&response.status),
-            "Cloud hand-back is temporarily unavailable"
+            refuse("unavailable", "Cloud hand-back is temporarily unavailable")
         );
     }
     ensure!(
         generation == state.pro.generation.load(Ordering::Acquire),
-        "Account changed; open the project again"
+        refuse("account_changed", "Account changed; open the project again")
     );
     engine::hydrate(
         state,
@@ -623,7 +728,10 @@ async fn open(state: &Arc<AppState>, request: Open) -> Result<serde_json::Value>
     state.changes.notify_waiters();
     let workspace = lock(&state.workspaces)
         .get(&request.workspace_id)
-        .context("Imported project registration is unavailable")?;
+        .context(Refused {
+            code: "unavailable",
+            message: "Imported project registration is unavailable",
+        })?;
     Ok(json!({"workspace_id":workspace.id,"root":workspace.root,"name":workspace.name}))
 }
 pub(crate) async fn open_project(
@@ -634,8 +742,11 @@ pub(crate) async fn open_project(
     // partial import, never an automatic background adoption.
     match tokio::time::timeout(Duration::from_secs(19 * 60), open(&state, request)).await {
         Ok(Ok(project)) => Json(project).into_response(),
-        Ok(Err(error)) => super::routes::failure(error),
-        Err(_) => (StatusCode::GATEWAY_TIMEOUT, Json(json!({"error":"Project transfer timed out; retry Open on this Mac to continue at the saved folder"}))).into_response(),
+        Ok(Err(error)) => {
+            let code = open_error_code(&error);
+            super::routes::failure_with_code(error, code)
+        }
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, Json(json!({"error":"Project transfer timed out; retry Open on this Mac to continue at the saved folder","error_code":"timed_out"}))).into_response(),
     }
 }
 

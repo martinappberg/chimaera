@@ -3,7 +3,7 @@ import { getHostLabel } from "./api";
 import { asyncDisposer } from "../shared/asyncDisposer";
 import { isBrowserGateway, workbenchPath } from "./base";
 import { isNativeShell, onProChanged, proStatus, type ProStatus } from "./native";
-import { accountFailure, paymentDue } from "../pro/status";
+import { accountFailure, grantedPlan, paymentDue } from "../pro/status";
 
 export type PaidPlan = "pro" | "max" | null;
 
@@ -24,7 +24,8 @@ function nativePlan(status: ProStatus & { initializing?: boolean }): AccountPlan
   // A connection warning is informational; only a real failure is uncertain.
   if (accountFailure(status) !== null) return "unknown";
   if (!status.signed_in) return "free";
-  const plan = knownPlan(status.plan);
+  // An ended plan is not a paid badge even while the account still names it.
+  const plan = knownPlan(grantedPlan(status));
   // Overdue payment on an account without an active plan is neither a paid
   // badge nor a "Get Pro" offer; the Pro page explains it.
   return plan === "free" && paymentDue(status) ? "unknown" : plan;

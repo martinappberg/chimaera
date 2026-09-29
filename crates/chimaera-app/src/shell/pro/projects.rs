@@ -22,6 +22,8 @@ pub(in crate::shell) mod open_code {
     pub const ACCOUNT_CHANGED: &str = "account_changed";
     pub const ALREADY_OPENING: &str = "project_already_opening";
     pub const UNAVAILABLE: &str = "project_unavailable";
+    /// The plan ended and the time to bring its cloud work home has passed.
+    pub const RETURN_WINDOW_ENDED: &str = "return_window_ended";
     pub const FAILED: &str = "project_open_failed";
 
     pub(super) fn of(error: &anyhow::Error) -> &'static str {
@@ -34,6 +36,7 @@ pub(in crate::shell) mod open_code {
             ACCOUNT_CHANGED,
             ALREADY_OPENING,
             UNAVAILABLE,
+            RETURN_WINDOW_ENDED,
         ]
         .into_iter()
         .find(|code| text == *code)
@@ -351,6 +354,41 @@ mod tests {
         ] {
             assert_eq!(super::super::project_failure(detail), code, "{detail}");
         }
+    }
+
+    #[test]
+    fn a_daemon_error_code_decides_the_open_failure_and_prose_only_an_old_daemon() {
+        use super::super::open_failure;
+        let failure = |body: serde_json::Value| open_failure(&serde_json::to_vec(&body).unwrap());
+        for (daemon, page) in [
+            ("folder_not_empty", open_code::FOLDER_NOT_EMPTY),
+            ("folder_missing", open_code::FOLDER_MISSING),
+            ("folder_moved", open_code::FOLDER_MISSING),
+            ("folder_nested", open_code::FOLDER_NESTED),
+            ("busy", open_code::BUSY),
+            ("account_changed", open_code::ACCOUNT_CHANGED),
+            ("unavailable", open_code::UNAVAILABLE),
+            ("return_window_ended", open_code::RETURN_WINDOW_ENDED),
+            // Reasons without a sentence of their own read as the generic line.
+            ("privacy", open_code::FAILED),
+            ("owned_elsewhere", open_code::FAILED),
+            ("not_a_project", open_code::FAILED),
+            ("a_code_from_a_newer_daemon", open_code::FAILED),
+        ] {
+            assert_eq!(failure(json!({"error_code": daemon})), page, "{daemon}");
+        }
+        // The code wins; prose that would classify differently is not consulted.
+        assert_eq!(
+            failure(json!({"error":"destination folder is not empty","error_code":"privacy"})),
+            open_code::FAILED
+        );
+        // A daemon that predates the code is classified by its sentence.
+        assert_eq!(
+            failure(json!({"error":"destination folder is not empty","code":"other"})),
+            open_code::FOLDER_NOT_EMPTY
+        );
+        assert_eq!(open_failure(b""), open_code::FAILED);
+        assert_eq!(open_failure(b"<html>bad gateway</html>"), open_code::FAILED);
     }
 
     #[test]
