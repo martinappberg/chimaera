@@ -34,7 +34,7 @@
   import EntryReader from "./EntryReader.svelte";
   import { filtersFor, listGroups, SECTION_KIND, type ListGroup, type Section } from "./list";
   import Overview from "./Overview.svelte";
-  import { isoDay, providerLabels } from "./overview";
+  import { isoDay, providerLabels, shortStatusNote } from "./overview";
   import { knowledgeLookup } from "./store";
   import TidyList from "./TidyList.svelte";
 
@@ -70,6 +70,7 @@
   const k = $derived(lookup?.k ?? null);
   const idx = $derived(lookup?.idx ?? null);
   const labels = $derived(k !== null ? providerLabels(k) : null);
+  const statusNote = $derived(labels?.status_note || "A status is shown as it was written; Chimaera never rates.");
   const providerActive = $derived($knowledgeProviderActive && k !== null);
   const narrow = $derived(width < 820);
   const chips = new ReferenceChips();
@@ -402,7 +403,7 @@
         {#if !narrow}
           <div class="legend">
             <div class="lh">Status</div>
-            <p>{labels.status_note || "A status is shown as it was written; Chimaera never rates."}</p>
+            <p title={statusNote}>{shortStatusNote(statusNote)}</p>
           </div>
         {/if}
       </nav>
@@ -743,8 +744,14 @@
     border-right: 0;
     border-bottom: 1px solid var(--edge);
     overflow-x: auto;
+    overflow-y: hidden;
     padding: 6px 10px;
     gap: 2px;
+    /* the strip scrolls by wheel/drag; the scrollbar itself would be noise */
+    scrollbar-width: none;
+  }
+  .body.narrow .nav::-webkit-scrollbar {
+    display: none;
   }
   .body.narrow .nrow {
     width: auto;

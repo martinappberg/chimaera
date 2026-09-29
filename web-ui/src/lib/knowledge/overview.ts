@@ -107,6 +107,12 @@ export function isBadNews(e: Entry): boolean {
 // ---- what changed -----------------------------------------------------------
 
 /** YYYY-MM-DD in local time. */
+/** The provider's status note cut to its first sentence, for tight spots; the
+ *  whole note goes in a tooltip. */
+export function shortStatusNote(note: string): string {
+  return note.match(/^[^.!?]*[.!?]/)?.[0] ?? note;
+}
+
 export function isoDay(ms: number): string {
   const d = new Date(ms);
   const p = (n: number): string => String(n).padStart(2, "0");
@@ -256,7 +262,9 @@ export function waitingOnYou(k: Knowledge, idx: KnowledgeIndex, limit = 5): { it
     if (entry === null && a.source.id !== "") entry = idx.byId.get(a.source.id.toUpperCase())?.[0] ?? null;
     return {
       text: a.text,
-      date: a.date,
+      // A handoff ask carries the file's day as the provider saw it (UTC);
+      // the handoff's own write time gives the reader's local day.
+      date: kind === "handoff" && k.left_off !== null && k.left_off.written_ms > 0 ? isoDay(k.left_off.written_ms) : a.date,
       entry,
       sourceLabel: entry === null ? (kind === "handoff" ? "handoff" : a.source.id || kind) : "",
       span: a.span,

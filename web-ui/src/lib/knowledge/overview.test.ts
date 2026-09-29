@@ -4,6 +4,7 @@ import { buildIndex, entriesForId } from "./entries";
 import {
   isBadNews,
   isRetired,
+  isoDay,
   openWork,
   priorityRank,
   providerLabels,
@@ -123,5 +124,12 @@ describe("waitingOnYou", () => {
     expect(withEntry.entry!.id).toBe("F-228");
     const handoff = w.items.find((x) => x.entry === null)!;
     expect(handoff.sourceLabel).toBe("handoff");
+  });
+
+  it("dates a handoff ask by the reader's own day of the handoff write", () => {
+    const k = sample();
+    const w = waitingOnYou(k, buildIndex(k));
+    const handoff = w.items.find((x) => x.entry === null)!;
+    expect(handoff.date).toBe(isoDay(k.left_off!.written_ms));
   });
 });

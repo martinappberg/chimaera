@@ -2300,14 +2300,21 @@
   }
 
   /** Knowledge at one entry, beside the source pane (a chat's id chip): an
-   *  open Knowledge tab takes the request; else the adjacent pane, or a
-   *  split when the source stands alone. The view takes the focus request
-   *  when it shows. */
+   *  open Knowledge tab takes the request (moved beside when it hides behind
+   *  the source); else the adjacent pane, or a split when the source stands
+   *  alone. The view takes the focus request when it shows. */
   function openKnowledgeFromPane(paneId: string, ekey: string, newSplit: boolean): void {
     focusKnowledgeEntry(ekey);
     if (activeWsId === null || !layoutReady) return;
     const existing = paneForTab(layout.root, { surface: "knowledge" });
-    if (existing !== null && !newSplit) {
+    const source = findPane(layout.root, paneId);
+    const hiddenBehind =
+      existing !== null && existing.paneId === paneId && source !== null && source.active !== existing.index;
+    if (hiddenBehind) {
+      // Knowledge sits behind the source in its own pane: move it beside, so
+      // what the id was clicked in (a chat) stays in view.
+      layout = dropTab(layout, { surface: "knowledge" }, paneId, "right");
+    } else if (existing !== null && !newSplit) {
       layout = activateTab(layout, existing.paneId, existing.index);
     } else {
       const neighbor = newSplit ? null : adjacentPane(layout, paneId);

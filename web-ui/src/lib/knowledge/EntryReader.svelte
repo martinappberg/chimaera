@@ -14,7 +14,7 @@
   import FileCard from "../shared/ui/FileCard.svelte";
   import { qualifiedId, resolveRef, type Entry, type KnowledgeIndex } from "./entries";
   import EntryBody from "./EntryBody.svelte";
-  import { kindWord, priorityTone, stateLabel, TODO_GROUP_LABEL, todoGroup } from "./overview";
+  import { kindWord, priorityTone, shortStatusNote, stateLabel, TODO_GROUP_LABEL, todoGroup } from "./overview";
   import StatusMark from "./StatusMark.svelte";
 
   interface Props {
@@ -153,7 +153,7 @@
   const crumb = $derived(e.kind === "finding" ? e.topic : word(e.kind));
   /** The note beside a status: the provider's first sentence (the legend
    *  carries all of it). */
-  const shortNote = $derived(labels.status_note.match(/^[^.!?]*[.!?]/)?.[0] ?? labels.status_note);
+  const shortNote = $derived(shortStatusNote(labels.status_note));
   /** A follow-up written inside the finding's own lines is already in its
    *  body: listed, not drawn twice. */
   function insideEntry(sp: { path: string; line: number; end_line: number } | null): boolean {
@@ -409,6 +409,11 @@
     color: var(--muted);
     margin-bottom: 12px;
   }
+  /* In a narrow pane only the crumb gives way; the buttons keep one line. */
+  .rnav > :not(.crumb, .grow) {
+    flex: none;
+    white-space: nowrap;
+  }
   .grow {
     flex: 1;
   }
@@ -432,6 +437,7 @@
     color: var(--fg);
   }
   .crumb {
+    min-width: 0;
     margin-left: 4px;
     overflow: hidden;
     text-overflow: ellipsis;
