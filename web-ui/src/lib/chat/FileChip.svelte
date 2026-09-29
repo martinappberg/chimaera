@@ -4,8 +4,9 @@
 
 <script lang="ts">
   /**
-   * A document named on a chip: the "written this turn" line's files and a
-   * document the prose embeds (`![plan](analysis/PLAN.md)`). Click opens it;
+   * A file named on a chip: every file on the "written this turn" line (a
+   * figure as much as a note) and a document the prose embeds
+   * (`![plan](analysis/PLAN.md)`). Click opens it;
    * resting the pointer on it previews it — the chat's hover controller
    * finds the chip through the registry (`hoverTargets.ts`), so only a chip
    * whose file is known registers. A gone or not-found file keeps its name,

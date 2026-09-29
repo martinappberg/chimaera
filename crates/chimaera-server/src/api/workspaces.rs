@@ -235,6 +235,7 @@ pub(crate) async fn put_mastermind(
             prelude: None,
             mastermind: Some(mode),
             fork: None,
+            started_by: crate::history::StartedBy::You,
         },
     )
     .await
@@ -344,6 +345,8 @@ impl Drop for MastermindSwitchGuard {
 /// Recents — the Mastermind is never a roster conversation), then the
 /// process in whichever registry holds it.
 async fn retire_mastermind_session(state: &Arc<AppState>, session_id: &str) {
+    // Its history record closes while the identity it reads still exists.
+    crate::history::close_by_id(state, session_id, crate::history::Outcome::Exited);
     crate::lock(&state.agents).remove(session_id);
     crate::lock(&state.session_workspaces).remove(session_id);
     crate::lock(&state.chat_recipes).remove(session_id);
@@ -404,6 +407,10 @@ pub(crate) async fn delete_workspace(
             // Its Timeline too (memory now, the directory behind any queued
             // appends).
             state.timeline.remove_workspace(&id);
+            state.history.remove_workspace(&id);
+            if crate::lock(&state.recents_archive).forget_workspace(&id) {
+                crate::recents_archive::persist(&state).await;
+            }
             crate::lock(&state.plugin_detect).forget_workspace(&id);
             state.plugin_runtime.forget_workspace(&id);
             crate::lock(&state.plugin_state).forget_workspace(&id);

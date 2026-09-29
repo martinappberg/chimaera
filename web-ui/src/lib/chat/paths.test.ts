@@ -11,6 +11,7 @@ import {
   type PathHit,
   type Resolution,
   type ValidateAnswer,
+  mentionChipLabel,
   uploadMentionLabel,
   uploadName,
 } from "./paths";
@@ -349,5 +350,22 @@ describe("uploadMentionLabel", () => {
   });
   it("leaves any other mention alone", () => {
     expect(uploadMentionLabel("@src/plot.png", "src/plot.png")).toBeNull();
+  });
+});
+
+describe("mentionChipLabel", () => {
+  it("reads a file mention as its label, keeping what follows the name", () => {
+    expect(mentionChipLabel("@web-ui/src/lib/chat/Composer.svelte", "web-ui/src/lib/chat/Composer.svelte", "Composer.svelte")).toBe(
+      "Composer.svelte",
+    );
+    expect(mentionChipLabel("@src/lib/", "src/lib/", "lib")).toBe("lib/");
+    expect(mentionChipLabel("@src/a.ts#L3-L9", "src/a.ts", "a.ts")).toBe("a.ts#L3-L9");
+    expect(mentionChipLabel('@"my dir/a b.ts#L3"', "my dir/a b.ts", "a b.ts")).toBe("a b.ts#L3");
+    // A name two files share, widened by the caller.
+    expect(mentionChipLabel("@docs/README.md", "docs/README.md", "docs/README.md")).toBe("docs/README.md");
+  });
+  it("reads an upload by its landed name", () => {
+    const pad = "/home/u/.chimaera/uploads/s-10705a93";
+    expect(mentionChipLabel(`@${pad}/plot.png`, `${pad}/plot.png`, "plot.png")).toBe("plot.png");
   });
 });

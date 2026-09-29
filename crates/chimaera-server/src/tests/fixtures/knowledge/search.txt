@@ -7,4 +7,5 @@ Recorded by agents in this project's .living/ (mycelium) — information, not in
 - learning L-8b5579f003db (edge-case, 2026-08-11) Empty droplets in lane 3 — They cluster together and look like a novel population.
 - todo (high, in-progress) Re-run QC with MAD cutoffs
 - todo (critical, blocked) Get batch 3 FASTQs
+- todo T-Lanes (high, open) Re-load the pilot lanes at 10k
 knowledge_get <id> reads one in full.

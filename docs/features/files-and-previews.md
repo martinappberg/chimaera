@@ -347,12 +347,21 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
       box); a nested value shows as its source, and a block it can't read at all shows whole
       as source. Every value is text, never markup. Live mode keeps frontmatter as muted
       source.
-    - **Alerts.** GitHub's `> [!NOTE]` / `[!TIP]` / `[!IMPORTANT]` / `[!WARNING]` /
-      `[!CAUTION]` (any case; a custom title after the marker; the marker right after the
-      quote's `> `, as comrak reads it) render as `div.markdown-alert.markdown-alert-<type>`
-      with a `p.markdown-alert-title`: a tinted card with a colored rule and a title row led
-      by the type's glyph — semantic theme tokens (`--syn-func`, `--syn-string`, `--rate`,
-      `--warn`, `--err`), so every curated theme restyles them.
+    - **Callouts.** GitHub's alerts and Obsidian's callouts are one construct
+      (`doc/callouts.ts`): a quote whose first line opens `> [!type]` (any case, any type —
+      letters of any script, digits, `-`, `_`; the marker right after the quote's `> `, as
+      comrak reads it), an optional fold mark (`-` starts folded, `+` open) and an optional
+      title, read as markdown. It renders as `div.markdown-alert.markdown-alert-<family>` with
+      a `p.markdown-alert-title` — or, foldable, `details`/`summary` with a chevron — a tinted
+      card with a colored rule and a title row led by the family's glyph. GitHub's five keep
+      GitHub's colors (`important` purple, `caution` red); Obsidian's types and aliases get
+      Obsidian's families (`abstract`/`summary`/`tldr`, `info`, `todo`, `success`/`check`/
+      `done`, `question`/`help`/`faq`, `failure`/`fail`/`missing`, `danger`/`error`, `bug`,
+      `example`, `quote`/`cite`); an unknown type draws as a note titled with its own name.
+      Tints are semantic theme tokens (`--syn-*`, `--rate`, `--warn`, `--err`, `--muted`),
+      so every curated theme restyles them; one table feeds the view's stylesheet and the
+      exported page's. The daemon's fallback renders only GitHub's five, with a plain-text
+      title (the parity corpus records the difference).
     - **Task boxes.** `- [x]` items render as `span.md-task[data-task=done|todo]` (never an
       `<input>`; a raw checkbox becomes the same span), drawn as a check box in place of the
       bullet; a done item's own text is muted and struck through. A click toggles the item's
@@ -379,15 +388,18 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
       README's `<div align="center">`) is sanitized as one run with it, so the markdown lands
       inside, as on the daemon.
     - **Wikilinks** (read for Obsidian vaults; the daemon shows them as text) are links
-      carrying `data-wikilink`: `[[note]]` points at `note.md`, `#heading` at its slug, and a
-      click resolves it like any document link, by name in the workspace when it isn't beside
-      the document. `![[plot.png]]` on a line of its own is an embed (below), found by name
-      when it isn't beside the document; inline, an image one draws the image and any other
-      is a file link.
+      carrying `data-wikilink`: `[[note]]` points at `note.md`, `#heading` at its slug (into
+      any other file the fragment is a spot kept as written — `[[paper.pdf#page=34]]` opens
+      and previews page 34), and a click resolves it like any document link, by name in the
+      workspace when it isn't beside the document. `![[plot.png]]` is an embed (below), found
+      by name when it isn't beside the document.
     - **Embeds.** An image-syntax block — a paragraph that is one `![alt](target#fragment)`
       or `![[name]]` and nothing else — draws as an [embed card](#embed-cards) (a PDF page, a
       table slice, a code excerpt, a notebook cell, a note's section…), the same in reading
-      and live. A **picture** keeps drawing as a picture — through the card's image body, its
+      and live. An embed of a file that is not a picture draws its card wherever it stands in
+      a paragraph, as Obsidian embeds — `![[paper.pdf#page=34]] *Figure: …*` is the page with
+      its caption under it (`render.ts` `renderWithEmbeds`); an inline picture stays inline,
+      and an embed in a heading or table cell stays a file link. A **picture** keeps drawing as a picture — through the card's image body, its
       frame and header dropped (`MarkdownView` CSS) — with its box reserved from the header
       dimensions before a byte loads, `|400` size hints, `#xywh=` crops, and a missing file
       said in place; a click opens it in a pane (in live: Mod+click; a plain click edits its
@@ -854,8 +866,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 
 ## Embed cards
 
-- **What & when.** One card shows any file inside something else — agent prose in chat, a turn's
-  "made this turn" gallery, and markdown documents (reading and live, `doc/reader.ts` `Hydrator`): a thin
+- **What & when.** One card shows any file inside something else — agent prose in chat, the chat's
+  hover preview of a file, and markdown documents (reading and live, `doc/reader.ts` `Hydrator`): a thin
   header (file icon, name, the piece shown, **open in a pane** at that spot, **download** on a
   remote host) over the file's own viewer in a compact mode. The target is standard markdown,
   `![caption](path#fragment)`, with Obsidian's size hint (`![caption|400](plot.png)`).
@@ -867,7 +879,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   header's words count data rows as the full grid does, so `#row=2-6` shows rows 1–5;
   `#sheet=S&range=A1:F20` for
   spreadsheets, A1 counted from the sheet's corner and placed on the grid through `fs/xlsx`'s
-  used-range `origin`, a range wholly outside the sheet's data saying so; else the first rows);
+  used-range `origin`, a range wholly outside the sheet's data saying so; else the first rows;
+  a table with no rows to show says why where they would be — only the header, an empty file or
+  sheet, the table ending before the slice, a row further in than one read goes — and one that
+  fits the card is counted once, `3 rows`);
   an HTML report (the sandboxed frame on the folder-scoped raw URL, fixed height, expand);
   video/audio (`#t=start,end`, the browser seeks natively); a notebook cell (`#cell=N`, else the
   first cell that drew a figure); a Marp slide (`#slide=N`); a markdown excerpt (`#heading`, else
@@ -1153,6 +1168,20 @@ _Intent pending — drafted from the maintainer's request, 2026-09-07; questionn
 - **Pending.** The whole-table reveal (rather than Obsidian 1.5-style in-place cell editing),
   writing a short row's missing pipes on click, and rendering images inside cells have not
   been confirmed with the maintainer — capture via **capture-feature-intent** when available.
+
+### Why documents read Obsidian's callouts and embed a PDF page in place
+_Intent pending — drafted from the maintainer's request, 2026-09-28; questionnaire not yet run._
+
+- **Problem it solves (from the request).** An Obsidian note's `> [!example]` callout showed
+  as a plain quote with the marker visible ("it is an obsidian doc thing"), and a PDF page
+  the note embedded beside its caption was only a hoverable link, its preview stuck on
+  page 1 with a canvas error. The maintainer: "Should not a specific PDF page not just be
+  hoverable (when in an actual .md reading document) but embed itself in there somehow?
+  This does not apply to agent chat I feel." So documents embed wherever the `!` syntax
+  stands, as Obsidian does; chat keeps its own rules (documents as chips, results embedded).
+- **Pending.** Obsidian's families and colors beside GitHub's (`important` purple, `caution`
+  red), folding as a disclosure, and that a plain link (no `!`) stays a link have not been
+  confirmed with the maintainer — capture via **capture-feature-intent** when available.
 
 ### Finding your place in a deep tree — why it exists
 _Intent pending — drafted from the maintainer's request, 2026-09-06; questionnaire not yet run._

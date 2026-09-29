@@ -810,7 +810,7 @@ fn run_artifacts_turn(n: u32) {
             "out/summary.csv",
             "cluster,n,marker\nA,412,CD3E\nB,198,MS4A1\n",
         );
-        // A wide figure the prose never names: the gallery's own tile.
+        // A wide figure the prose never names: the gallery's own chip.
         write(
             "figs/heatmap.svg",
             "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 320 120'>\

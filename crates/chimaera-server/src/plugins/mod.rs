@@ -1443,6 +1443,7 @@ pub(crate) async fn setup_workspace(
             prelude: None,
             mastermind: None,
             fork: None,
+            started_by: crate::history::StartedBy::You,
         },
     )
     .await;

@@ -8,7 +8,7 @@ it never writes, curates or "keeps" knowledge. Both feed the dashboard's "Since 
 Design: [docs/timeline-knowledge-plugins-plan.md](../timeline-knowledge-plugins-plan.md) §4, §5.
 
 **Where it lives (shared):** daemon `crates/chimaera-server/src/{timeline.rs,episodes.rs,
-knowledge.rs,mycelium.rs}`; UI `web-ui/src/lib/workspace/` (`TimelineView.svelte`,
+knowledge.rs}`; UI `web-ui/src/lib/workspace/` (`TimelineView.svelte`,
 `TimelineRow.svelte`, `timeline.svelte.ts` store, `timelineModel.ts`, `knowledge.ts` store) and
 `web-ui/src/lib/knowledge/` ([map](../../web-ui/src/lib/knowledge/AGENTS.md)); the `timeline` /
 `knowledge` singleton tab kinds in `web-ui/src/lib/layout/layout.ts` (`{v:"timeline"}` /
@@ -44,8 +44,8 @@ and the Mastermind-tier MCP tool `read_timeline`.
     COMPLETED.
   - `session` — a chat session died on its own (non-zero exit, protocol error). Clean exits,
     kills, and handshake failures (which degrade to a terminal) are not history.
-  - `knowledge` — a finding's confidence moved, or a finding appeared that couldn't be
-    attributed to one turn (see Knowledge below).
+  - `knowledge` — a finding's status moved, or a finding appeared that couldn't be
+    attributed to one turn (see Knowledge below); its id opens the entry.
   - `note` — posted by the Agent notes plugin ([plugins.md](plugins.md#agent-notes)).
 - **How it's used.** The Timeline tab (quick-open "Timeline", or the dashboard's "open
   timeline →"): day groups (Today / Yesterday / dates), filter chips only for kinds that have
@@ -85,92 +85,80 @@ and the Mastermind-tier MCP tool `read_timeline`.
 
 ## Knowledge
 
-- **What & when.** "What do we know — and how sure?" A read-only view with a fixed,
-  plain-words shape over what agents recorded as they worked. The user's correction path is the
-  file itself ("open file" opens it in the editor — there is no jump to the entry's line).
-- **Sources.** The structured provider — **mycelium**, a WASM workbench plugin, only while it
-  is *active* here ([plugins.md](plugins.md#workbench-plugins)): `.living/findings/<topic>.md`,
-  `.living/decisions.md`, `.living/learnings.md`, `todo/TODO_REGISTRY.md`, and the
-  `.mycelium/last-session.md` handoff (falling back to an in-flight
-  `.mycelium/run/<host>/<session-id>/` one). Always: the guidance files at the root
-  (`MYCELIUM.md`, `AGENTS.md`, `CLAUDE.md` — a thin adapter or `@AGENTS.md` include says where
-  it points) and claude's per-project memory (`~/.claude/projects/<encoded cwd>/memory/`,
-  counted, `MEMORY.md` linked). Codex memories are not read.
-- **How it's used.** The Knowledge tab — from the rail's `knowledge` row (shown only while a
-  provider is active), quick-open "Knowledge", the dashboard's "open knowledge →", or a
-  Timeline knowledge row. Sections in a fixed order, each named for its question: Where we left
-  off (the handoff) · What we found (findings by topic, mycelium's confidence ladder ●○○
-  preliminary · ●●○ supported · ●●● robust · ✕ contradicted, plus an evidence strip — one mark
-  per ledger row) · What we decided · Watch out for · Open (todos + findings' open questions) ·
-  Guidance & memory. A sticky section nav with counts, a "How sure" legend, one client-side
-  search box (it covers the handoff too). Without a provider: Guidance & memory plus one card,
-  "Use mycelium for Knowledge →", opening the attach sheet.
-- **Where it lives.** Core `knowledge.rs` keeps guidance, attribution and the route
-  (`get_knowledge`, `prime_workspace`, `recorded_since_last_check`); it never parses the provider's
-  files. The provider is the WASM plugin Mycelium, its own repository
-  ([martinappberg/chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium),
-  pinned by `plugins/plugins.lock`) — `src/reader.rs` (plan, parse,
-  stamp, fingerprint, the `Knowledge` wire shape), `src/tools.rs` (`knowledge_search` /
-  `knowledge_get`), `src/lib.rs` (the `knowledge` export) — asked through
-  `plugins::runtime::knowledge` with the stamp the daemon holds. Route:
-  `GET /workspaces/{id}/knowledge` → `{schema:1, provider: "mycelium" | null, left_off, topics,
-  decisions, learnings, todos, questions, counts, guidance, warnings}` plus `error` only when the
-  provider couldn't answer; paths workspace-relative
-  (claude memory absolute). The route JSON and the tool texts are pinned by
-  `crates/chimaera-server/src/tests/knowledge.rs`. UI: `KnowledgeView.svelte`,
-  `FindingRow.svelte`, `Ladder.svelte`, `model.ts`.
+- **What & when.** "What do we know, what needs me, and what changed?" A read-only view over
+  what agents recorded through a **knowledge plugin** — the active plugin with
+  `provides.knowledge` (today Mycelium). **Knowledge exists only while such a plugin is on in
+  the workspace:** no rail row, quick-open entry or dashboard card without one, and a restored
+  tab says so in one line. Redesign plan and maintainer decisions:
+  [docs/knowledge-redesign-plan.md](../knowledge-redesign-plan.md).
+- **Sources.** Whatever the plugin reads (Mycelium: `.living/findings/*.md`,
+  `.living/decisions.md`, `.living/learnings.md`, `.living/conventions.md`,
+  `.living/log/LOG_REGISTRY.md`, `todo/TODO_REGISTRY.md` table and sections, the newest of
+  `.mycelium/last-session.md` and `.mycelium/run/<host>/<sid>/last-session.md`). The route
+  also lists guidance files: the plugin's own (its snapshot's `guidance`, e.g. `MYCELIUM.md`)
+  first, then `AGENTS.md`, `CLAUDE.md` and claude's per-project memory — shown on the
+  dashboard ("What the agents are told"), not in Knowledge.
+- **How it's used.** The Knowledge tab — the rail's `knowledge` row, quick-open "Knowledge",
+  the dashboard's "Where things stand", a Timeline knowledge row, or an id chip in a chat.
+  - **Overview:** Where we left off (the newest handoff's own sections, older handoffs behind
+    a disclosure) · Waiting on you (what agents put to the user, from the plugin's `asks`) ·
+    What changed (the last 7 days by the entries' own dates, corrections and supersessions
+    first) · Open work (in progress, blocked, critical/high to-dos).
+  - **Browse:** one section per kind (findings by topic, decisions, the plugin's "watch out
+    for", conventions, to-dos by status, sessions), filter chips built from what is there, and
+    a **reader** beside the list: breadcrumb and back/forward, the entry's standing
+    (corrected / superseded / retracted — only from markers the text contains), its status
+    **exactly as the agent wrote it** (with the plugin's ladder glyph only for the plugin's own
+    status words), "What backs it" (cited files that resolve open; jobs and commits as labels;
+    cited ids), the body **as written** (the entry's `span` of its file, drawn by the reading
+    renderer), follow-ups (addenda, corrections, resolutions), and "Referenced by". Narrow
+    panes swap list and reader. Keys: `j`/`k`, `/`, `[`/`]`, `Esc`.
+  - **Ids are chips everywhere** — the reader, chat transcripts, Timeline rows: hover previews
+    the entry's own lines, click opens it in Knowledge (beside the chat). A chip is made only
+    when the plugin's snapshot has the id; an id that names several entries previews both.
+  - **Tidy up:** factual inconsistencies the plugin found (reused ids, to-dos kept outside the
+    registry, a stub handoff) — never a status judgment — each with **Ask an agent**, which
+    drafts the plugin's request into the working agent's composer for the user to send.
+  - **Search:** one box over every kind; an id jumps to its entry.
+- **Where it lives.** Core `knowledge.rs` (route, guidance merge, Timeline attribution) never
+  parses the provider's files or names them. The provider is a WASM plugin in its own
+  repository ([martinappberg/chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium),
+  pinned by `plugins/plugins.lock`). Route `GET /workspaces/{id}/knowledge` → the
+  `knowledge/1` snapshot (`left_off`, `topics`, `decisions`, `learnings`, `todos`, `questions`,
+  `conventions`, `sessions`, `asks`, `tidy`, `id_shapes`, `labels`, `counts`, `warnings`) plus
+  `schema`, `provider`, `guidance`, and `error` only when the provider couldn't answer; spans
+  are `{path, line, end_line}`, workspace-relative. Pinned by
+  `crates/chimaera-server/src/tests/knowledge.rs`. UI: `web-ui/src/lib/knowledge/`
+  ([map](../../web-ui/src/lib/knowledge/AGENTS.md)); ids to chips through
+  `web-ui/src/lib/shared/references.ts` (Knowledge registers as the first source); "Ask an
+  agent" through `shared/askAgent.ts`; rows, badges, callouts and file cards in
+  `shared/ui/` (the plugin platform's `ui/1` prop names).
 - **Key behaviors.**
-  - **Agents write, Chimaera reads.** The ladder is mycelium's (derived from its evidence
-    ledger), read, never computed. Nothing writes a knowledge file or touches
-    `.mycelium/locks`.
-  - **A bounded, lenient reader** matching mycelium 0.7.2's writers: malformed input degrades
-    to fewer items plus a `warnings` line (never an error); fence- and HTML-comment-aware (an
-    example entry in a code block is not knowledge); never follows symlinks. Caps: a file over
-    2 MiB is skipped, 16 MiB per read, 200 topic files, 400 items per kind, 50 ledger rows,
-    2 KiB per text field. It reads through the plugin host's bounded filesystem functions
-    (workspace-relative, symlinks refused, off the reactor). Every request re-stats (metadata
-    only): when the stamp — `(path, mtime, len)` triples — still matches the one the daemon
-    holds, the plugin answers "unchanged" and the cached snapshot is served; otherwise it
-    re-parses. The first ask in a daemon's life compiles the plugin (about 200 ms in a release
-    build); later asks take milliseconds.
-  - **Ids:** findings by their `F-NNN`; decisions and learnings by a fingerprint (kind + date +
-    title hash), never mycelium's positional `L-N` / `D-N`.
-  - **Addenda are part of their finding.** A follow-up written as an `F-NNN addendum…` heading
-    (`##`–`####`, "(2)" and the like allowed) is listed under the finding it extends, in file
-    order — an "Addenda" block in the expanded row and "· N addenda" in its meta — and its
-    evidence rows, open questions and tags are the finding's (Mycelium plugin ≥ 0.1.3; the
-    route's optional `addenda: [{label, title, text, line}]`). A file that writes one id on two
-    different findings still shows both, with a warning.
+  - **Agents write, Chimaera reads — and never rates.** A status is shown as written; nothing
+    in core or the plugin computes, maps or corrects it. Core names no plugin, file or status
+    word: section names, kind words and status vocabulary come from the plugin's `labels`.
+  - **Bodies never ride the snapshot.** The reader fetches the entry's file (cached per
+    snapshot) and renders the span; a hover preview renders the same lines. The route adds a
+    `read` digest of the files the provider read, so any file change yields a new snapshot
+    and a fresh read, even when the parsed fields are unchanged.
+  - **Ids repeat; keys don't.** A finding id reused in two topic files is two entries (keys
+    `<topic>/<id>`); a reference resolves to the citing entry's topic first.
   - **Attribution (`recorded_by`) is never guessed.** At each episode end the provider is
-    diffed against the last check (the file mtimes come from the stamp); a new entry is
-    credited to that turn only when its file changed after the turn started (2 s slack) AND no
-    other agent in the workspace was running AND the turn's own session hadn't moved on to
-    another turn by the check. Otherwise it stays unattributed — a new finding
-    becomes its own `knowledge` Timeline entry (≤5 per check). The baseline is primed at turn
-    start (and when the view loads) so the first turn after a restart can be credited; a
-    workspace's first check only sets the baseline. Confidence moves are their own entries;
-    moves to or from `unknown` (a torn read) never are. `recorded_by` lives in daemon memory
-    (gone after a restart); the episode's `evidence.recorded` persists on the Timeline.
-  - **The check never holds anything up.** Turn starts and ends queue their Knowledge work on a
-    per-workspace FIFO (`episodes::EpisodeQueue`) instead of waiting on the provider where they
-    are seen — the chat relay carries every chat's events, and claude waits on a hook's answer
-    (10 s). Entries still land in the order their turns ended. A queue 16 or more jobs behind
-    catches up without asking the provider and drops the baseline, so nothing is credited
-    across the gap.
-  - **A provider that can't answer** (faulted, too slow, a snapshot that isn't a JSON object or
-    is over 4 MiB) is still the provider: the route serves the last snapshot it gave here with
-    an `error` (or empty lists, still naming it), and the view says so in one quiet line —
-    "Showing what mycelium read last — it couldn't refresh just now." — instead of offering to
-    switch it on. The snapshot is held per workspace and dropped when the provider is switched
-    off, updated, rolled back or removed.
-  - **Refresh:** the client refetches on the Timeline epoch nudge and on visibility return —
-    never polled. A hand edit between turns shows on the next fetch but writes no Timeline
-    entry until an episode ends.
-  - Everything shown is agent/file text: one-liners through `inlineMarkdown`
-    (escape-then-format), bodies through the sanitized chat `Markdown`.
-  - Agents reach Knowledge through the mycelium plugin's `knowledge_search` /
-    `knowledge_get` ([plugins.md](plugins.md#workbench-plugins)); a Mastermind-only
-    `knowledge` tool (plan phase A3) is not built.
+    diffed against the last check by entry key; a new entry is credited to that turn only when
+    its span's file changed after the turn started (2 s slack, mtimes from the stamp) AND no
+    other agent in the workspace was running AND the turn's session hadn't moved on. An entry
+    without a span is never credited. Otherwise a new finding becomes its own `knowledge`
+    Timeline entry (≤5 per check), carrying the entry's `key` so the row opens it. Status moves
+    are their own entries; moves to or from `unknown` never are.
+  - **The check never holds anything up** (per-workspace `episodes::EpisodeQueue`; a queue 16+
+    behind catches up without asking and drops the baseline).
+  - **A provider that can't answer** is still the provider: the last snapshot with an `error`,
+    one quiet line in the view.
+  - **Refresh:** on the Timeline epoch nudge and on visibility return — never polled.
+  - Everything shown is agent/file text: one-liners through `inlineMarkdown`, bodies through
+    the reading renderer's sanitized pipeline.
+  - Agents read Knowledge through the plugin's `knowledge_search` / `knowledge_get`
+    ([plugins.md](plugins.md#workbench-plugins)).
 
 ---
 
@@ -191,3 +179,13 @@ _Captured 2026-09-25 (from the maintainer, via capture-feature-intent)._
 
 The design's maintainer decisions (2026-09-25) are in the
 [plan](../timeline-knowledge-plugins-plan.md#decisions-maintainer-2026-09-25).
+
+### Knowledge redesign (2026-09-28) — why it exists
+_Captured 2026-09-28 from the maintainer's own words while deciding the design, and 2026-09-29 (how settled it is)._
+
+- **Problem it solves:** Knowledge should be "a UI on top of regular mycelium that is good and intuitive". The old view left the maintainer asking "why is so much unrated?" and whether it was clear where each status, piece of evidence and to-do comes from.
+- **What the maintainer decided:** Knowledge belongs to the plugin: "If you dont have mycelium, knowledge doesnt appear". An id an agent mentions in a chat (F-XXX) should be something you can hover, and clicking it should show the entry in Knowledge. Chimaera never rates: a status rule "has to be part of the mycelium plugin, our plugin cannot set such things", so status is shown exactly as the agent wrote it. Tidy up with "Ask an agent": yes. No proposals to upstream Mycelium. Handoffs (newest of Mycelium's own files, `RESUME_STATE.md` not read) was the implementer's recommendation after the maintainer deferred ("what do you think?"), not a maintainer decision.
+- **How settled it is (intended vs provisional):** not settled. In the maintainer's words: "Design is not settled, will change later depending on plugin or how we think this works out."
+- **Do not change (or: open to change):** open to change — an addition to the core, not a core bet. The design is expected to move with the plugin and with how it works out in use.
+
+The full reasoning and the decisions are in the [redesign plan](../knowledge-redesign-plan.md).

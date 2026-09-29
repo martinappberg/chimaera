@@ -1219,6 +1219,7 @@ mod tests {
             attachment_paths: vec![],
             id: Some("u".into()),
             queued: false,
+            after_turn: false,
             origin: None,
         });
         assert_eq!(budget.sends, 0);
@@ -1234,6 +1235,7 @@ mod tests {
             attachment_paths: vec![],
             id: Some("q".into()),
             queued: true,
+            after_turn: false,
             origin: None,
         });
         budget.observe(&mut AgentEvent::TurnCompleted {
@@ -1344,6 +1346,7 @@ mod tests {
             attachment_paths: Vec::new(),
             id: Some("q1".to_string()),
             queued: true,
+            after_turn: false,
             origin: None,
         });
         assert_eq!(budget.bytes, RETAINED_SEND_BYTES_MAX - 1);
@@ -1382,6 +1385,7 @@ mod tests {
             attachment_paths: Vec::new(),
             id: None,
             queued: false,
+            after_turn: false,
             origin: None,
         });
         assert_eq!(budget.bytes, 1024);
@@ -1393,6 +1397,7 @@ mod tests {
             attachment_paths: Vec::new(),
             id: Some("q1".to_string()),
             queued: true,
+            after_turn: false,
             origin: None,
         });
         assert!(budget.unassigned.is_empty());
@@ -1434,6 +1439,7 @@ mod tests {
             attachment_paths: Vec::new(),
             id: None,
             queued: false,
+            after_turn: false,
             origin: None,
         };
         budget.observe(&mut feedback);
@@ -1448,6 +1454,7 @@ mod tests {
             attachment_paths: Vec::new(),
             id: Some(id.to_string()),
             queued: false,
+            after_turn: false,
             origin: None,
         };
         let mut first = echo("m1");
@@ -1556,6 +1563,7 @@ mod tests {
             attachment_paths: Vec::new(),
             id: Some("m1".into()),
             queued: false,
+            after_turn: false,
             origin: Some(model::ORIGIN_RESTART.into()),
         });
         assert!(carry.pickup_at_ms > 0, "the pick-up is stamped");

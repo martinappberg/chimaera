@@ -32,7 +32,7 @@ import { isMac } from "../../shared/keys";
 import { mountEmbed, type EmbedHandle } from "../../shared/embed/mount.svelte";
 import { embedKind, isMissing, type TargetInfo, type TargetResult } from "../../shared/embed/embed";
 import { fragmentLabel, parseEmbedFragment } from "../../shared/embed/fragment";
-import { anchorIds, decodeAnchor } from "../mdDoc";
+import { anchorIds, decodeAnchor, parseLineFragment } from "../mdDoc";
 import { destinationText, inlineOf } from "../mdTable";
 import { isMarpSource } from "../marp";
 import type { LinkContext } from "../docLinks";
@@ -42,6 +42,7 @@ import { Hydrator, markTasks } from "./reader";
 import type { EmbedRef } from "./render";
 import { hoverTarget, isLineFragment, placeIn, sectionBounds, type HoverTarget, type Placement } from "./hover";
 import HoverPreview from "./HoverPreview.svelte";
+import { sliceLines } from "./slice";
 
 export interface HoverHost {
   /** The content box every link lives in: it hears the pointer, and the
@@ -517,6 +518,14 @@ export class HoverPreviews {
       const source = await this.source(a, signal);
       if (signal.aborted) return;
       if (!isMarpSource(source)) {
+        // A line range (`#L40-L62`, a Knowledge entry's span) shows those
+        // lines, parsed on their own; a single line or a heading shows its
+        // section as before.
+        const lines = t.fragment !== null ? parseLineFragment(t.fragment) : null;
+        if (lines !== null && lines.endLine !== undefined) {
+          this.drawDoc(state, a.path, sliceLines(source, lines.line, lines.endLine), null, cleanups);
+          return;
+        }
         const anchor = t.fragment !== null && !isLineFragment(t.fragment) ? decodeAnchor(t.fragment) : null;
         this.drawDoc(state, a.path, source, anchor, cleanups);
         return;
@@ -586,7 +595,7 @@ export class HoverPreviews {
   private drawCard(state: PreviewState, a: TargetInfo, fragment: string | null, cleanups: (() => void)[]): void {
     const slot = document.createElement("div");
     slot.className = "hp-card";
-    // A gallery tile's body: a fixed, shorter frame (a PDF page, a picture,
+    // The compact body: a fixed, shorter frame (a PDF page, a picture,
     // a table's first rows) — a hover is a glance.
     const card: EmbedHandle = mountEmbed(slot, { path: a.path, info: a, fragment, alt: "", compact: true });
     cleanups.push(() => card.destroy());

@@ -25,6 +25,9 @@
     type TimelineGroup,
   } from "./timelineModel";
   import { relPath } from "../dashboard/dash";
+  import { resolveReference } from "../shared/references";
+  import { knowledgeLookup } from "../knowledge/store";
+  import { providerLabels, statusWord, toneOf } from "../knowledge/overview";
 
   interface Props {
     group: TimelineGroup;
@@ -42,6 +45,26 @@
     onDeliver?: (entry: TimelineEntry) => void;
     /** The row's own delivery state text (the caller owns the request). */
     deliverState?: string | null;
+  }
+
+  /** A status's tone in the provider's own words (its status words carry
+   *  one); core names and rates none, so an unknown word stays neutral. */
+  function statusTone(to: string | undefined): string {
+    const l = $knowledgeLookup;
+    if (l === null || to === undefined) return "neutral";
+    const w = statusWord(providerLabels(l.k), to);
+    return w !== null ? toneOf(w.tone) : "neutral";
+  }
+
+  /** Open a knowledge id (a finding a turn recorded) through the
+   *  references registry — its entry in Knowledge, beside this view; the
+   *  Knowledge overview when nothing resolves it. `key` picks the entry an
+   *  id names when several do. */
+  function openRef(id: string, key?: string): void {
+    const found = resolveReference(id);
+    const t = (key !== undefined ? found.find((x) => x.key.endsWith(`:${key}`)) : undefined) ?? found[0];
+    if (t !== undefined) t.open({ paneId: null, newSplit: false });
+    else onOpenKnowledge?.();
   }
 
   let {
@@ -184,15 +207,16 @@
       <span class="title"><span class="mono">{first.job?.name}</span> {jobVerb}</span>
     {:else if first.kind === "knowledge"}
       {@const k = first.knowledge}
+      {@const tone = statusTone(k?.to)}
       <button
         class="name link"
-        class:err={k?.to === "contradicted"}
-        class:good={k?.to === "supported" || k?.to === "robust"}
-        onclick={onOpenKnowledge}
+        class:err={tone === "bad"}
+        class:good={tone === "good"}
+        onclick={() => (k !== undefined ? openRef(k.id, k.key) : onOpenKnowledge?.())}
         title="open in Knowledge">{k?.id}</button
       >
       <span class="title">
-        {#if k?.change === "new"}recorded{:else if k?.to === "contradicted"}was contradicted{:else}is now {k?.to}{/if}
+        {#if k?.change === "new"}recorded{:else}is now {k?.to}{/if}
         <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
         — {@html inlineMarkdown(k?.claim ?? "")}
       </span>
@@ -248,12 +272,15 @@
         {/if}
         {#if evidence.recorded !== null}
           {@const r = evidence.recorded}
-          <button class="pill" onclick={onOpenKnowledge} title="open in Knowledge">
-            recorded
-            {#if r.findings.length > 0}<span class="mono">{r.findings.join(" · ")}</span>{/if}
+          <span class="pill">
+            <button class="pill-open" onclick={onOpenKnowledge} title="open in Knowledge">recorded</button>
+            {#each r.findings as fid, i (i)}
+              {#if i > 0}<span class="mono">·</span>{/if}
+              <button class="mono pill-id" onclick={() => openRef(fid)} title="open {fid} in Knowledge">{fid}</button>
+            {/each}
             {#if r.learnings > 0}· {r.learnings} learning{r.learnings === 1 ? "" : "s"}{/if}
             {#if r.decisions > 0}· {r.decisions} decision{r.decisions === 1 ? "" : "s"}{/if}
-          </button>
+          </span>
         {/if}
         {#if first.via === "mastermind"}
           <span class="via" title="this prompt was relayed by the workspace Mastermind">via Mastermind</span>
@@ -483,8 +510,25 @@
     border-radius: 999px;
     white-space: nowrap;
   }
-  .pill:hover {
-    background: color-mix(in srgb, var(--accent) 20%, transparent);
+  .pill {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+    cursor: default;
+  }
+  .pill-open,
+  .pill-id {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+  }
+  .pill-open:hover,
+  .pill-id:hover {
+    text-decoration: underline;
   }
   .pill .mono {
     font-size: var(--text-xs);

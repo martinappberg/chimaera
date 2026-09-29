@@ -74,7 +74,7 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   re-runs the same curated script (it always fetches latest and re-swaps atomically) as a session
   named `update <agent>` — **managed binaries only**; for your own binary the daemon 400s and the
   UI never offers it. `DELETE /api/v1/agents/{id}/install` uninstalls the managed copy (driven
-  from the Agents settings panel).
+  from the Agents settings panel, after an in-app `ConfirmDialog` that keeps a failure inline).
 - **Where it lives.** `runtimes.rs` (`install_agent`, `update_agent`, `start_install`,
   `install_script`, `write_shims`, `regenerate_shims`); latest-release awareness in
   `agent_updates.rs`.
@@ -192,7 +192,10 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   registry removal. Resume stays **honest per row**: a row with no captured native handle starts
   fresh and says so without claiming the agent lacks resume support; Claude handles additionally
   require a real transcript (Claude 2.1.x interactive sessions can persist none). Cap 20/workspace;
-  live conversations are hidden at read time (they return when the session ends).
+  live conversations are hidden at read time (they return when the session ends). Right-click a
+  row → **Archive**, or the header → **Archive all** (with an Undo), hides conversations from the
+  rail without deleting anything; a quiet **All sessions** link ends the list
+  ([session-history.md](session-history.md#archiving-recents)).
 - **Codex terminal capture (Pro-configured projects).** `codex_notify.rs` injects an argv `notify`
   wrapper for terminal launches and chat-to-terminal switches in projects with a Pro cloud profile;
   elsewhere a Codex TUI's argv and notify stay exactly the user's. It posts to the existing

@@ -69,6 +69,7 @@ async fn tui_mcp(
         state,
         crate::spawn::SpawnSpec {
             workspace: workspace.clone(),
+            started_by: crate::history::StartedBy::You,
             id: None,
             name: None,
             cwd: None,

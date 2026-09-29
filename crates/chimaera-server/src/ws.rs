@@ -159,6 +159,11 @@ enum ClientMessage {
         files: Vec<String>,
         #[serde(default)]
         dirs: Vec<String>,
+        /// Additive: the repositories below the root this window watches
+        /// (sections open, files mounted), by top level. Only these nested
+        /// repositories ride the 12 s git backstop.
+        #[serde(default)]
+        git_repos: Vec<String>,
     },
 }
 
@@ -1522,7 +1527,7 @@ async fn scoped_events(mut socket: WebSocket, state: Arc<AppState>, scope: Socke
             _ = tick.tick() => {},
             message = socket.recv() => match message {
                 Some(Ok(Message::Text(text))) => {
-                    if let Ok(ClientMessage::Watch {workspace_id, files: mut wanted_files, mut dirs}) = serde_json::from_str(&text) {
+                    if let Ok(ClientMessage::Watch {workspace_id, files: mut wanted_files, mut dirs, git_repos: _}) = serde_json::from_str(&text) {
                         if workspace_id.as_deref().is_some_and(|id| id != scope.workspace_id) { return; }
                         if let Some(alias)=&alias { for path in wanted_files.iter_mut().chain(dirs.iter_mut()) { *path=alias.input(path); } }
                         // A path this viewer may not read is dropped, never a
@@ -1837,7 +1842,7 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
                 // The only client frame on this bus: which workspace this window
                 // shows + the exact mounted paths whose disk state it renders.
                 Some(Ok(Message::Text(text))) => {
-                    if let Ok(ClientMessage::Watch { workspace_id, files, dirs }) =
+                    if let Ok(ClientMessage::Watch { workspace_id, files, dirs, git_repos }) =
                         serde_json::from_str::<ClientMessage>(&text)
                     {
                         project.watch(workspace_id.as_deref(), &files, &dirs);
@@ -1864,6 +1869,7 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
                             project.stop_feed();
                             project.remote = false;
                             watch.set(workspace_id);
+                            watch.set_repos(git_repos);
                             if fs_watch.set(files, dirs) {
                                 // Establish new metadata baselines immediately when
                                 // the two-second client-I/O ceiling allows it. New
@@ -2093,11 +2099,13 @@ async fn send_settings_snapshot(
     Ok(())
 }
 
-/// Send a `{"type":"git","epochs":{workspace_id:epoch}}` invalidate frame when
-/// any workspace's git epoch moved. The status payload never rides this bus —
-/// the client refetches `GET /git/status` for its active workspace
-/// (invalidate-and-pull keeps big path lists off the daemon-wide firehose). The
-/// map is ordered (BTreeMap) so an unchanged snapshot compares equal.
+/// Send a `{"type":"git","epochs":{workspace_id:epoch},"repos":{workspace_id:
+/// {toplevel:epoch}}}` invalidate frame when any git epoch moved. The status
+/// payload never rides this bus — the client refetches `GET /git/status` for
+/// its active workspace, and for each repository whose own epoch moved
+/// (invalidate-and-pull keeps big path lists off the daemon-wide firehose).
+/// `repos` is additive; the maps are ordered (BTreeMap) so an unchanged
+/// snapshot compares equal.
 async fn send_git_snapshot(
     socket: &mut WebSocket,
     state: &AppState,
@@ -2110,7 +2118,20 @@ async fn send_git_snapshot(
     if let Some((workspace, epoch)) = remote {
         epochs.insert(workspace.clone(), *epoch);
     }
-    let frame = json!({"type": "git", "epochs": epochs}).to_string();
+    let repos: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> = state
+        .git
+        .repo_epochs_snapshot()
+        .into_iter()
+        .map(|(ws, m)| {
+            (
+                ws,
+                m.into_iter()
+                    .map(|(top, e)| (top.to_string_lossy().into_owned(), e))
+                    .collect(),
+            )
+        })
+        .collect();
+    let frame = json!({"type": "git", "epochs": epochs, "repos": repos}).to_string();
     if last.as_deref() == Some(frame.as_str()) {
         return Ok(());
     }

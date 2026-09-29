@@ -515,8 +515,8 @@ pub(crate) async fn save_send_images(
     session_id: &str,
     cmd: &mut chimaera_agent::model::AgentCommand,
 ) -> Vec<String> {
-    use chimaera_agent::model::{AgentCommand, ContentBlock};
-    let AgentCommand::Send { blocks } = cmd else {
+    use chimaera_agent::model::ContentBlock;
+    let Some(blocks) = cmd.send_blocks_mut() else {
         return Vec::new();
     };
     let mut wanted: Vec<(usize, &'static str, String)> = Vec::new();

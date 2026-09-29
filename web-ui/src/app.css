@@ -332,6 +332,19 @@
   }
 }
 
+/* The "working on it" breathe of a live text label — the chat's status line
+   and a still-streaming Thinking row. Each component keeps its own
+   prefers-reduced-motion and html.app-hidden overrides. */
+@keyframes label-pulse {
+  0%,
+  100% {
+    opacity: 0.9;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
 /* The slow "presence, not alarm" breathe shared by the work-tray header
    glyphs (subagents + background tasks) — one rhythm so the sibling trays
    read as one family. Reduced-motion overrides live in the components. */
@@ -607,4 +620,25 @@ body.dragging {
   border-radius: 4px;
   border: 2px solid transparent;
   background-clip: content-box;
+}
+
+/* Id chips (shared/references.ts): an id a reference source answers for
+   (a knowledge plugin's entries), in the Knowledge reader and chat
+   transcripts — hover previews the entry, a click opens it. Text-like, so
+   prose keeps its rhythm. */
+.kchip {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  color: var(--accent);
+  border-bottom: 1px dotted color-mix(in srgb, var(--accent) 55%, transparent);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.kchip:hover {
+  border-bottom-style: solid;
+}
+.kchip:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+  border-radius: 2px;
 }

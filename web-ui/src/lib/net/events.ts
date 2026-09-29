@@ -30,7 +30,11 @@ export interface EventsSocketHandlers {
    * whenever any workspace's git state may have changed. The caller refetches
    * `GET /git/status` for its active workspace iff that workspace's epoch moved.
    */
-  onGit?(epochs: Record<string, number>): void;
+  /** `repos` (additive): per workspace, each repository's own epoch. */
+  onGit?(
+    epochs: Record<string, number>,
+    repos?: Record<string, Record<string, number>>,
+  ): void;
   /**
    * Per-workspace Timeline epoch map (the git idiom): fired after auth and
    * whenever a workspace's timeline gained an entry. The caller refetches
@@ -83,6 +87,8 @@ interface ServerEventFrame {
   links?: Link[];
   settings?: Record<string, unknown>;
   epochs?: Record<string, number>;
+  /** The git frame's per-repository epochs (workspace → top level → epoch). */
+  repos?: Record<string, Record<string, number>>;
   epoch?: number;
   /** An `update` frame's discriminator; the rest is `parseUpdateStatus`'s. */
   available?: boolean;
@@ -121,6 +127,7 @@ export class EventsSocket {
   /** Mounted previews + visible listings. The daemon caps both arrays. */
   private watchedFiles: string[] = [];
   private watchedDirs: string[] = [];
+  private watchedRepos: string[] = [];
 
   constructor(private readonly handlers: EventsSocketHandlers) {
     // Reconnect delays take the slow tier while the document is hidden
@@ -181,6 +188,15 @@ export class EventsSocket {
     this.sendWatch();
   }
 
+  /** The repositories below the root this window watches (sections open,
+   *  files mounted): only these ride the daemon's git backstop. */
+  watchGitRepos(repos: string[]): void {
+    const next = [...repos].sort();
+    if (next.join("\n") === this.watchedRepos.join("\n")) return;
+    this.watchedRepos = next;
+    this.sendWatch();
+  }
+
   private sendWatch(): void {
     if (this.ws?.readyState !== WebSocket.OPEN || this.authenticatedSocket !== this.ws) return;
     this.ws.send(
@@ -189,6 +205,7 @@ export class EventsSocket {
         workspace_id: this.watching,
         files: this.watchedFiles,
         dirs: this.watchedDirs,
+        git_repos: this.watchedRepos,
       }),
     );
   }
@@ -235,7 +252,10 @@ export class EventsSocket {
         msg.epochs !== null
       ) {
         this.backoffMs = INITIAL_BACKOFF_MS;
-        this.handlers.onGit?.(msg.epochs);
+        this.handlers.onGit?.(
+          msg.epochs,
+          typeof msg.repos === "object" && msg.repos !== null ? msg.repos : undefined,
+        );
       } else if (
         msg.type === "timeline" &&
         typeof msg.epochs === "object" &&

@@ -82,6 +82,13 @@ the same attempt; Return to plans then acknowledges and clears that attempt. The
 review is keyed by attempt, phase and plan, so unrelated account events keep it. A targeted native
 return reopens Pro, including when a new window needed time to mount.
 
+**Exception — Activity.** Also store-backed and read-only: `ActivitySettings.svelte`
+shows sessions, tokens and time from the session records across every workspace
+(`GET /api/v1/activity`, CSV via `/api/v1/activity/csv`, both through
+`../workspace/history.ts`). No dollar figures (cost is only a CSV column); unknown is
+"—" with a tooltip, never zero. `jump.ts` lets another surface open Settings at a
+section (`requestSettingsSection`).
+
 ## File map
 
 | File | What it owns |
@@ -97,6 +104,8 @@ return reopens Pro, including when a new window needed time to mount.
 | `ProSettings.svelte` | Dedicated Pro overview content: account identity, plan choices, browser checkout/portal, usage, and progressive connection/privacy/security sections. |
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
 | `agentDocs.ts` | Wire types + `getAgentDocs`/`installAgentDocs` for `/api/v1/agent-docs`. |
+| `ActivitySettings.svelte` | The Activity panel (see the exception above): this week's sessions and tokens + time worked, one 14-day sessions chart, by agent and model / by workspace, Export CSV. Fetches while Settings is visible and on the history nudge. |
+| `jump.ts` | `settingsJump` / `requestSettingsSection`: open Settings scrolled to a section (Quick Open "Activity", the dashboard's activity line). |
 | `UpdatesStatus.svelte` | The Updates section's status block: app / daemon / agents, each up to date, available, or couldn't check (with why), plus "check now". Reads `workspace/update.svelte.ts`; the auto-check switch below it is a schema row. |
 | `NotificationStatus.svelte` | The Notifications section's status line: whether the OS (native) or browser will show alerts, with Allow / Open System Settings / Send test. The switches below it are ordinary schema rows. |
 | `SettingRow.svelte` | One schema-driven control. |

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { tick } from "svelte";
+  import { tick, untrack } from "svelte";
   import { fsQuickOpen, parentName, type QuickOpenEntry } from "../previews/files";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
@@ -9,6 +9,7 @@
     type ManualComposerHeight,
   } from "./composerHeight";
   import AttachmentStrip from "./AttachmentStrip.svelte";
+  import ComposerMentions from "./ComposerMentions.svelte";
   import ImagePreview from "./ImagePreview.svelte";
   import { registerComposer, registerComposerAttach } from "./composerBus";
   import {
@@ -18,7 +19,22 @@
     type ImageAttachment,
   } from "./images";
   import { loadDraft, saveDraft } from "./drafts";
+  import { getSetting, setSetting } from "../settings/store.svelte";
+  import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
+  import { keyHintSuffix, matchAction } from "../shared/keybindings";
+  import { displayChord, matchChord, type ParsedChord } from "../shared/keys";
+  import { Dictation, dictationParts, hostCanDictate, joinParts } from "./voice.svelte";
+  import { CaptureError, listMicrophones } from "./voiceCapture";
+  import VoiceMeter from "./VoiceMeter.svelte";
+  import { uploadChips } from "./uploadChips";
   import {
+    collapseUploadMentions,
+    expandUploadMentions,
+    tokenSpans,
+    type UploadTokens,
+  } from "./uploadTokens";
+  import {
+    draftWithInsert,
     slashChoices as choicesForSlash,
     slashContextAt,
     type ComposerCommand,
@@ -34,6 +50,9 @@
     /** Registers this composer for workbench insert flows (references,
      *  provenance tags) when set. */
     sessionId: string | null;
+    /** The mounting view's token, so an insert meant for this view (a quote
+     *  of its own transcript) finds it when the chat is mounted twice. */
+    view?: object;
     running: boolean;
     disabled: boolean;
     /** Why the composer is disabled, in plain words; defaults to an ended chat. */
@@ -49,8 +68,10 @@
      *  mounted, but invisible running chrome must stay still. */
     visible?: boolean;
     /** Returns whether the message was accepted (false during reconnect, so
-     *  the composer keeps the draft instead of losing it). */
-    onSubmit(text: string, images: ImageAttachment[]): boolean;
+     *  the composer keeps the draft instead of losing it). `afterTurn`: the
+     *  after-this-turn chord sent it — hold it until the running turn ends
+     *  rather than have the agent read it at its next step. */
+    onSubmit(text: string, images: ImageAttachment[], afterTurn?: boolean): boolean;
     onInterrupt(): void;
     /** Shift+Tab: advance to the next permission mode (agent-TUI parity). */
     onCycleMode(): void;
@@ -59,10 +80,13 @@
     /** Non-empty draft/attachment state. The transcript uses this to suspend
      *  live-following while the user is actively composing. */
     onDraftState(active: boolean): void;
+    /** Words dictation should favor (project and agent names). */
+    voiceTerms?: string[];
   }
 
   let {
     sessionId,
+    view,
     running,
     disabled,
     disabledReason = undefined,
@@ -76,6 +100,7 @@
     onCycleMode,
     onSlash,
     onDraftState,
+    voiceTerms = [],
   }: Props = $props();
 
   const uid = $props.id();
@@ -87,7 +112,12 @@
   // it, so the draft must live in the session-keyed module store, not here.
   // svelte-ignore state_referenced_locally
   const savedDraft = sessionId !== null ? loadDraft(sessionId) : { text: "", images: [] };
-  let draft = $state(savedDraft.text);
+  /** A dropped file's mention reads as its name here, where it sits in the
+   *  sentence, and edits as one unit (`uploadTokens.ts`, `uploadChips.ts`);
+   *  the whole mention goes back into every text that leaves the composer —
+   *  the send, a copy, and the saved draft. */
+  const uploadTokens: UploadTokens = new Map();
+  let draft = $state(collapseUploadMentions(savedDraft.text, uploadTokens));
   let images = $state<ImageAttachment[]>(savedDraft.images.slice(0, IMAGE_MAX_ATTACHMENTS));
   let attachmentError = $state<string | null>(null);
 
@@ -121,13 +151,14 @@
   // stores plain data. Reads $state, writes the module map — no read+write
   // loop, no timer.
   $effect(() => {
-    const text = draft;
+    const text = expandUploadMentions(draft, uploadTokens);
     const imgs = $state.snapshot(images);
     if (sessionId === null) return;
     saveDraft(sessionId, text, imgs);
   });
   let el = $state<HTMLTextAreaElement | null>(null);
-  let caret = $state(savedDraft.text.length);
+  // svelte-ignore state_referenced_locally
+  let caret = $state(draft.length);
   let paneHeight = $state(0);
   /** Null follows content; an object remembers the height chosen with the
    *  top-edge grip and how much content it held at that moment. */
@@ -286,15 +317,20 @@
     }
   }
 
-  // Workbench insert flows (selection references, provenance tags) land in
-  // the draft exactly like they would type into a PTY's input — appended,
-  // never submitted.
+  // Workbench insert flows (selection references, provenance tags, quoted
+  // passages) land in the draft exactly like they would type into a PTY's
+  // input — appended, never submitted.
   $effect(() => {
     if (sessionId === null) return;
-    return registerComposer(sessionId, (text) => {
-      draft = draft.length > 0 && !draft.endsWith(" ") ? `${draft} ${text}` : draft + text;
-      focusAt(draft.length);
-    });
+    return registerComposer(
+      sessionId,
+      (inserted, placement) => {
+        const text = collapseUploadMentions(inserted, uploadTokens, draft);
+        draft = draftWithInsert(draft, text, placement);
+        focusAt(draft.length);
+      },
+      view,
+    );
   });
 
   // Workbench attach flow (an image dropped from the OS desktop onto this
@@ -305,6 +341,195 @@
       addImage(image);
       el?.focus();
     });
+  });
+
+  // --- voice dictation ------------------------------------------------------------
+  // The mic button IS voice mode in chat: click to talk, click again when done
+  // (Enter: stop and send; Esc: discard), or the Dictate chord while this
+  // composer has focus. Typing is never taken over — the hold-Space
+  // push-to-talk is a terminal's answer to having no buttons, and stays with
+  // the agents' own TUIs. Right-click picks the microphone.
+  //
+  // The words stream INTO the draft at the caret as they're heard, so a long
+  // dictation fills (and grows) the box like typing would. While it runs the
+  // textarea is read-only with its text transparent, and `ghost` — a mirror
+  // with the textarea's exact box, font and wrapping — draws the same text:
+  // the user's own in full, settled words slightly dimmed, forming words
+  // dimmer. Stopping just drops the mirror; Esc restores the draft as it was.
+  const dictation = new Dictation();
+  const voiceOn = $derived(getSetting("chat.voice") && !disabled && hostCanDictate());
+  /** The draft around a dictation in progress, split where it started. */
+  let dictating = $state<{ original: string; before: string; after: string } | null>(null);
+  let ghost = $state<HTMLDivElement | null>(null);
+  const spoken = $derived(
+    dictating === null
+      ? null
+      : dictationParts(dictating.before, dictating.after, dictation.finals, dictation.interim),
+  );
+  /** Right padding for the stop button, send button and waveform. */
+  const DICTATING_PAD = 96;
+
+  // The draft follows the words. Reads the transcript, writes only `draft`.
+  $effect(() => {
+    if (spoken === null) return;
+    draft = joinParts(spoken);
+    void tick().then(followDictation);
+  });
+
+  /** Keep the newest words in view, the mirror scrolled with the textarea,
+   *  and its padding matched to the textarea's (a classic scrollbar takes
+   *  width from the text box). */
+  function followDictation() {
+    const t = el;
+    const g = ghost;
+    if (t === null || g === null) return;
+    if (dictating !== null && dictating.after === "") t.scrollTop = t.scrollHeight;
+    const scrollbar = Math.max(0, t.offsetWidth - t.clientWidth - 2);
+    g.style.paddingRight = `${DICTATING_PAD + scrollbar}px`;
+    g.scrollTop = t.scrollTop;
+  }
+
+  async function startDictation() {
+    // An unfocused textarea's selection is wherever it was last left (0 for
+    // a restored draft): words then go at the end, like picking up a thought.
+    const focused = el !== null && document.activeElement === el;
+    const start = focused ? el!.selectionStart : draft.length;
+    const end = focused ? el!.selectionEnd : start;
+    dictating = { original: draft, before: draft.slice(0, start), after: draft.slice(end) };
+    if (!(await dictation.start({ keyterms: voiceTerms }))) restoreDraft();
+  }
+
+  /** The words are final: they stay in the draft as ordinary text. */
+  function settleDictation() {
+    const d = dictating;
+    if (d === null) return;
+    const parts = dictationParts(d.before, d.after, dictation.finals, "");
+    draft = joinParts(parts);
+    dictating = null;
+    placeCaret(parts.before.length + parts.finals.length);
+  }
+
+  /** Discard: the draft exactly as it was before the mic opened. */
+  function restoreDraft() {
+    const d = dictating;
+    if (d === null) return;
+    dictating = null;
+    draft = d.original;
+    placeCaret(d.before.length);
+  }
+
+  /** The caret after dictation — focused only when the composer still has
+   *  focus: a recording that ends in a hidden tab, or while the user works in
+   *  another pane, must not pull focus back here. */
+  function placeCaret(position: number) {
+    if (el !== null && document.activeElement === el) focusAt(position);
+    else caret = position;
+  }
+
+  /** Stop and keep the words — then send, for Enter (or the after-turn
+   *  chord, which keeps its meaning through the stop). */
+  async function finishDictation(send: boolean, afterTurn = false) {
+    const text = await dictation.finish();
+    settleDictation();
+    if (send && text !== null && text.length > 0) {
+      await tick();
+      submit(afterTurn);
+    }
+  }
+
+  function cancelDictation() {
+    restoreDraft();
+    dictation.cancel();
+  }
+
+  function toggleDictation() {
+    if (!dictation.active) void startDictation();
+    else if (dictation.state !== "finishing") void finishDictation(false);
+  }
+
+  /** Dictation's keys: the Dictate chord, and while recording Esc (discard)
+   *  and Enter (stop and send). True = consumed. */
+  function voiceKey(e: KeyboardEvent): boolean {
+    if (voiceOn && matchAction(e)?.id === "dictate") {
+      e.preventDefault();
+      toggleDictation();
+      return true;
+    }
+    if (!dictation.active) return false;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      cancelDictation();
+      return true;
+    }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      // The after-turn chord keeps its meaning through the stop.
+      const afterTurn = matchChord(e, AFTER_TURN_CHORD) !== null && matchAction(e) === null;
+      if (dictation.state !== "finishing") void finishDictation(true, afterTurn);
+      return true;
+    }
+    return false;
+  }
+
+  /** Right-click the mic: this machine's microphones, the chosen one checked. */
+  async function openMicMenu(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    const { clientX: x, clientY: y } = e;
+    const chosen = getSetting("chat.voiceMicrophone");
+    const pick = (name: string) => () => setSetting("chat.voiceMicrophone", name);
+    let entries: ContextMenuEntry[];
+    try {
+      const mics = await listMicrophones();
+      entries = [
+        { label: "System default", checked: chosen === "", onSelect: pick("") },
+        ...(mics.length > 0 ? (["separator"] as const) : []),
+        ...mics.map((m) => ({ label: m.label, checked: m.label === chosen, onSelect: pick(m.label) })),
+      ];
+      if (chosen !== "" && !mics.some((m) => m.label === chosen)) {
+        entries.push({
+          label: `${chosen} (not connected)`,
+          checked: true,
+          disabled: true,
+          hint: "dictation uses the system default until it's back",
+          onSelect: () => {},
+        });
+      }
+    } catch (err) {
+      entries = [
+        {
+          label: err instanceof CaptureError ? err.message : `Couldn't list microphones: ${String(err)}`,
+          disabled: true,
+          onSelect: () => {},
+        },
+      ];
+    }
+    contextMenu.openAtPoint(x, y, entries);
+  }
+
+  // A hidden tab keeps what was said: finish into the draft. Untracked, so the
+  // state change this makes doesn't re-run the effect.
+  $effect(() => {
+    if (visible && !disabled) return;
+    untrack(() => {
+      if (dictation.active && dictation.state !== "finishing") void finishDictation(false);
+    });
+  });
+
+  // A recording that ended on its own (the relay failed, the length cap)
+  // keeps what was settled.
+  $effect(() => {
+    if (dictation.active || dictating === null) return;
+    untrack(settleDictation);
+  });
+
+  // An unmounted composer can't take the words: stop and release the mic.
+  $effect(() => () => dictation.cancel());
+
+  $effect(() => {
+    if (dictation.error === null || dictation.active) return;
+    const timer = setTimeout(() => dictation.clearError(), 8000);
+    return () => clearTimeout(timer);
   });
 
   /** Escape-dismissed slash token text — suppresses the popover for exactly
@@ -352,8 +577,10 @@
   });
 
   /** The @token under the caret, if any (mention autocomplete). ":" admits
-   *  @term:NAME (linked-terminal grants) alongside file paths. */
+   *  @term:NAME (linked-terminal grants) alongside file paths. A dropped
+   *  file's short form is already a finished mention: nothing to complete. */
   function atToken(): { start: number; text: string } | null {
+    if (tokenSpans(draft, uploadTokens).some((s) => s.end === caret)) return null;
     return caretToken(/(^|\s)(@[\w./:-]*)$/);
   }
 
@@ -458,7 +685,12 @@
     // Directories mention with a trailing slash (the TUI's own convention —
     // it also reads unambiguously as "this folder" in the prompt); a spaced
     // path takes claude's quoted form, like a drag-to-reference drop.
-    replaceToken(composeAgentPathReference(entry.kind === "dir" ? `${entry.rel}/` : entry.rel));
+    const rel = entry.kind === "dir" ? `${entry.rel}/` : entry.rel;
+    const mention = composeAgentPathReference(rel);
+    // A workspace file written exactly like a dropped file's short form
+    // (`@data.csv` beside a dropped data.csv) would be taken for the drop:
+    // name it from the workspace root instead.
+    replaceToken(uploadTokens.has(mention.trim()) ? composeAgentPathReference(`./${rel}`) : mention);
   }
 
   function pickTerm(t: TerminalOption) {
@@ -483,8 +715,14 @@
     if (el !== null) caret = el.selectionStart;
   }
 
-  function submit() {
-    const text = draft.trim();
+  function submit(afterTurn = false) {
+    // The send button mid-dictation means "stop and send": the words settle
+    // first (finishDictation then calls back here).
+    if (dictating !== null) {
+      if (dictation.state !== "finishing") void finishDictation(true, afterTurn);
+      return;
+    }
+    const text = expandUploadMentions(draft, uploadTokens).trim();
     if (text.length === 0 && images.length === 0) return;
     // Dialog-only slash commands get native UI, not a dead-end CLI reply;
     // arguments ride along ("/effort high"). Unhandled names fall through
@@ -499,17 +737,45 @@
     // Only clear the draft if the send was actually accepted — during a
     // reconnect window the socket is not OPEN and the message would otherwise
     // vanish silently.
-    if (onSubmit(text, images)) {
+    if (onSubmit(text, images, afterTurn)) {
       clearSubmittedDraft();
       images = [];
     }
   }
+
+  // Send after this turn: ⌥↩ / Alt+Enter — concrete modifiers, not the
+  // rebindable `Mod` (the Codex desktop app's ⇧⌘↩ is Zoom Pane here). No
+  // default action uses it under any base modifier; one the user binds to
+  // it wins (App's capture-phase handler takes it first), and then the
+  // chord is neither matched nor advertised.
+  const AFTER_TURN_KEYS = "Alt+Enter";
+  const AFTER_TURN_CHORD: ParsedChord = {
+    meta: false,
+    ctrl: false,
+    alt: true,
+    shift: false,
+    key: "Enter",
+  };
+  /** The chord's label while it is ours ("" while an app action owns it).
+   *  matchAction reads the live keys.* settings, so a rebind updates it. */
+  const afterTurnHint = $derived(
+    matchAction(
+      new KeyboardEvent("keydown", {
+        key: "Enter",
+        code: "Enter",
+        altKey: AFTER_TURN_CHORD.alt,
+      }),
+    ) === null
+      ? displayChord(AFTER_TURN_KEYS, "auto")
+      : "",
+  );
 
   function onKeydown(e: KeyboardEvent) {
     // IME composition: Enter/arrows select a conversion candidate, not a chat
     // action. WebKit (the Tauri shell's WKWebView) fires the committing Enter
     // after compositionend with isComposing=false but keyCode 229 — check both.
     if (e.isComposing || e.keyCode === 229) return;
+    if (voiceKey(e)) return;
     if (popover !== null) {
       const items =
         popover === "slash"
@@ -557,6 +823,13 @@
     if (e.key === "Tab" && e.shiftKey) {
       e.preventDefault();
       onCycleMode();
+      return;
+    }
+    // Also only reached with no popover open — there Enter, with or without
+    // modifiers, accepts a completion.
+    if (matchChord(e, AFTER_TURN_CHORD) !== null && matchAction(e) === null) {
+      e.preventDefault();
+      submit(true);
       return;
     }
     if (e.key === "Enter" && !e.shiftKey) {
@@ -668,6 +941,9 @@
   {#if attachmentError !== null}
     <div class="attachment-error" role="status">{attachmentError}</div>
   {/if}
+  {#if !dictation.active && dictation.error !== null}
+    <div class="attachment-error" role="status">{dictation.error}</div>
+  {/if}
 
   <div class="input-row">
     <button
@@ -683,27 +959,88 @@
       onkeydown={resizeWithKeyboard}
       onclick={toggleComposerHeight}
     ></button>
+    <ComposerMentions text={draft} tokens={uploadTokens} field={el} quiet={popover !== null} />
     <textarea
       bind:this={el}
       bind:value={draft}
+      {@attach uploadChips(uploadTokens, trackCaret)}
       onkeydown={onKeydown}
       onkeyup={trackCaret}
       onselect={trackCaret}
       oninput={trackCaret}
       onpaste={onPaste}
+      onscroll={() => {
+        if (ghost !== null && el !== null) ghost.scrollTop = el.scrollTop;
+      }}
       role="combobox"
       aria-expanded={popover !== null}
       aria-controls="{uid}-pop"
       aria-autocomplete="list"
       aria-activedescendant={popover !== null ? `${uid}-opt-${selected}` : undefined}
+      class:voice={voiceOn}
+      class:dictating={spoken !== null}
+      readonly={spoken !== null}
       placeholder={disabled
         ? (disabledReason ?? "chat ended")
-        : running
-          ? "queue a follow-up for the next run (Esc to stop)"
-          : "message the agent… (Enter to send · / commands · @ files)"}
+        : spoken !== null
+          ? dictation.state === "starting"
+            ? "Starting the mic…"
+            : "Listening…"
+          : running
+            ? afterTurnHint !== ""
+              ? `add to this turn… (${afterTurnHint} after it ends · Esc to stop)`
+              : "add to this turn… (Esc to stop)"
+            : "message the agent… (Enter to send · / commands · @ files)"}
       rows={1}
       {disabled}
     ></textarea>
+    {#if spoken !== null}
+      <div class="ghost" bind:this={ghost} aria-hidden="true">{spoken.before}<span class="g-final"
+          >{spoken.finals}</span
+        >{spoken.gap}<span class="g-interim">{spoken.interim}</span>{spoken.after}&#8203;</div>
+      <span class="meter-slot">
+        <VoiceMeter
+          levels={dictation.levels}
+          listening={dictation.state === "listening"}
+          device={dictation.device}
+        />
+      </span>
+    {/if}
+    {#if voiceOn}
+      <button
+        type="button"
+        class="mic"
+        class:live={dictation.active}
+        aria-pressed={dictation.active}
+        aria-label={dictation.active ? "insert the dictated words" : "dictate"}
+        title={dictation.active
+          ? "Insert — Enter sends, Esc discards"
+          : `Dictate${keyHintSuffix("dictate")} — right-click to choose the microphone`}
+        disabled={dictation.state === "finishing"}
+        onmousedown={(e) => e.preventDefault()}
+        onclick={toggleDictation}
+        oncontextmenu={openMicMenu}
+      >
+        {#if dictation.active}
+          <!-- Recording: the button is "done" — a stop square, like the
+               send button's stop while an agent runs. -->
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+            <rect x="4" y="4" width="8" height="8" rx="1.5" fill="currentColor" />
+          </svg>
+        {:else}
+          <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+            <rect x="5.5" y="1.75" width="5" height="8" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.5" />
+            <path
+              d="M3.5 7.5a4.5 4.5 0 0 0 9 0M8 12v2.25"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+            />
+          </svg>
+        {/if}
+      </button>
+    {/if}
     <!-- The action button morphs with the turn: send when idle, stop while the
          agent works. Enter-to-send and Esc-to-stop keep working unchanged;
          mousedown is swallowed so a click never steals the textarea's focus
@@ -729,7 +1066,7 @@
           title="send message (Enter)"
           disabled={draft.trim().length === 0 && images.length === 0}
           onmousedown={(e) => e.preventDefault()}
-          onclick={submit}
+          onclick={() => submit()}
         >
           <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
             <path
@@ -801,6 +1138,9 @@
   .input-row {
     position: relative;
     display: flex;
+    /* The mention highlights sit under the textarea's (translucent) fill:
+       their layer goes negative inside this row, not under the page. */
+    isolation: isolate;
   }
   /* A top-edge grip is the natural geometry for a bottom-anchored composer:
      dragging up makes room, while click toggles expanded/content-fit.
@@ -858,6 +1198,48 @@
   textarea:focus {
     border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
   }
+  /* Room for the mic beside the action button. */
+  textarea.voice {
+    padding-right: 66px;
+  }
+  /* Dictating: the textarea keeps the text (so its size, wrapping and scroll
+     are the real ones) but draws none of it; .ghost draws it instead, with
+     the spoken words dimmed. Every box and font property must match. */
+  textarea.dictating {
+    padding-right: 96px; /* DICTATING_PAD: stop + send + waveform */
+    color: transparent;
+    caret-color: transparent;
+  }
+  .ghost {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    pointer-events: none;
+    box-sizing: border-box;
+    border: 1px solid transparent;
+    padding: 7px 96px 7px 10px;
+    font: inherit;
+    font-size: var(--text-md);
+    line-height: var(--chat-line-height, 1.45);
+    color: var(--fg);
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    overflow: hidden;
+  }
+  .g-final {
+    color: color-mix(in srgb, var(--fg) 78%, transparent);
+  }
+  .g-interim {
+    color: color-mix(in srgb, var(--fg) 52%, transparent);
+  }
+  .meter-slot {
+    position: absolute;
+    right: 67px;
+    bottom: 10px;
+    z-index: 2;
+    display: inline-flex;
+    pointer-events: auto;
+  }
   textarea:disabled {
     opacity: 0.5;
   }
@@ -899,6 +1281,41 @@
     color: var(--muted);
     opacity: 0.55;
     cursor: default;
+  }
+  /* Quiet until recording: then it takes the recording red. */
+  .mic {
+    position: absolute;
+    right: 35px;
+    bottom: 5px;
+    width: 26px;
+    height: 26px;
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: none;
+    color: var(--muted);
+    cursor: pointer;
+    transition:
+      color 0.12s ease,
+      background-color 0.12s ease,
+      border-color 0.12s ease;
+  }
+  .mic:hover:not(:disabled) {
+    color: var(--fg);
+    background: var(--row-hover);
+  }
+  .mic.live {
+    color: var(--err);
+    background: color-mix(in srgb, var(--err) 12%, transparent);
+    border-color: color-mix(in srgb, var(--err) 45%, var(--edge));
+  }
+  .mic:disabled {
+    cursor: default;
+    opacity: 0.6;
   }
   .stop {
     background: color-mix(in srgb, var(--accent) 12%, transparent);

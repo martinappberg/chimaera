@@ -22,6 +22,9 @@
   import { pageVisible } from "../shared/visibility";
   import NotificationStatus from "./NotificationStatus.svelte";
   import UpdatesStatus from "./UpdatesStatus.svelte";
+  import ActivitySettings from "./ActivitySettings.svelte";
+  import { settingsJump } from "./jump";
+  import { tick, untrack } from "svelte";
   import { APP_MENU, PINNED } from "../shared/keys";
   import { activeModLabel } from "../shared/keybindings";
 
@@ -40,6 +43,11 @@
     const at = out.indexOf("Agents");
     out.splice(at >= 0 ? at + 1 : out.length, 0, "Environment", "Documents");
     if (isBrowserGateway()) out.splice(out.indexOf("Keyboard"), 0, "Cloud");
+    // Activity (sessions and tokens across workspaces) is read-only and
+    // store-backed (/api/v1/activity), like Environment and Documents. Before
+    // Keyboard: the pinned-chords block trails the list and belongs to it.
+    const kb = out.indexOf("Keyboard");
+    out.splice(kb >= 0 ? kb : out.length, 0, "Activity");
     return out;
   })();
 
@@ -94,6 +102,8 @@
   /** Same idea for the Documents section. */
   const DOC_KEYWORDS = ["documents", "markdown", "agents.md", "skill", "claude", "teach", "check"];
   const docsVisible = $derived(q === "" || DOC_KEYWORDS.some((k) => k.includes(q)));
+  const ACTIVITY_KEYWORDS = ["activity", "usage", "sessions", "tokens", "csv", "export"];
+  const activityVisible = $derived(q === "" || ACTIVITY_KEYWORDS.some((k) => k.includes(q)));
 
   const PRO_KEYWORDS = ["chimaera pro", "chimaera max", "sessions", "files", "account", "sign in", "plan", "kept", "connected", "devices", "sign out", "cloud", "github", "repository", "ssh public key"];
   const proVisible = $derived(q === "" || PRO_KEYWORDS.some((keyword) => keyword.includes(q)));
@@ -119,6 +129,10 @@
         if (proVisible && cloudMachine) out.push({ category: cat, defs: [] });
         continue;
       }
+      if (cat === "Activity") {
+        if (activityVisible) out.push({ category: cat, defs: [] });
+        continue;
+      }
       const defs = visible.filter((d) => d.category === cat);
       if (defs.length > 0) out.push({ category: cat, defs });
     }
@@ -133,6 +147,19 @@
     const el = listEl?.querySelector<HTMLElement>(`[data-section="${section}"]`);
     el?.scrollIntoView({ block: "start", behavior: "instant" as ScrollBehavior });
   }
+
+  // A section asked for from elsewhere (Quick Open "Usage", the dashboard's
+  // cost line): clear any search that hides it, then scroll there once shown.
+  $effect(() => {
+    const want = $settingsJump;
+    if (want === null || !tabVisible) return;
+    untrack(() => {
+      settingsJump.set(null);
+      tab = "ui";
+      query = "";
+      void tick().then(() => jumpTo(want));
+    });
+  });
 
   /** Keep the nav highlight on the topmost visible section while scrolling. */
   function onScroll(): void {
@@ -289,6 +316,12 @@
           {:else if group.category === "Cloud"}
             <section data-section={group.category}>
               <CloudSetup visible={tabVisible} />
+            </section>
+          {:else if group.category === "Activity"}
+            <!-- Bespoke panel: sessions, tokens and time from the session
+                 records (/api/v1/activity), every workspace. Its own <h2>. -->
+            <section data-section={group.category}>
+              <ActivitySettings visible={tabVisible} />
             </section>
           {:else if group.category === "Notifications"}
             <!-- Generic rows plus a status line: whether the OS/browser will

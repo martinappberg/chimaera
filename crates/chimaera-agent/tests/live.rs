@@ -891,15 +891,81 @@ async fn claude_mid_turn_send_queues_natively() {
         .expect("shutdown");
 }
 
+/// Pass 38: the facts the driver's native queue rests on. The CLI advertises
+/// `msg_lifecycle_v1`, and a message written with `priority:"next"` while a
+/// tool runs is read INSIDE that turn — its `command_lifecycle started` lands
+/// before the turn's only `result`, whose reply answers it.
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills one small tool turn"]
+async fn claude_next_priority_send_is_read_mid_turn() {
+    let dir = tmpdir();
+    let mut chat = spawn_claude(dir.path(), &["--allowedTools".into(), "Bash".into()]);
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    chat.send_user_text(
+        "Use the Bash tool to run `sleep 6`. When it finishes, reply with the word DONE \
+         plus any extra words I ask for.",
+    )
+    .await
+    .expect("send");
+
+    let mut capability = false;
+    let mut queued: Option<String> = None;
+    let mut started_mid_turn = false;
+    let reply = loop {
+        let frame = chat
+            .recv(TURN)
+            .await
+            .expect("recv")
+            .expect("claude exited early");
+        match frame["type"].as_str() {
+            Some("system") if frame["subtype"] == "init" => {
+                capability = frame["capabilities"]
+                    .as_array()
+                    .is_some_and(|caps| caps.iter().any(|c| c == "msg_lifecycle_v1"));
+            }
+            Some("assistant") if queued.is_none() => {
+                let tool = frame["message"]["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_use"));
+                if tool {
+                    queued = Some(
+                        chat.send_queued_text("Also include the word BANANA.", "next")
+                            .await
+                            .expect("queued send"),
+                    );
+                }
+            }
+            Some("command_lifecycle")
+                if queued.as_deref() == frame["command_uuid"].as_str()
+                    && frame["state"] == "started" =>
+            {
+                started_mid_turn = true;
+            }
+            Some("result") => break frame["result"].as_str().unwrap_or_default().to_string(),
+            _ => {}
+        }
+    };
+    assert!(capability, "system/init advertises msg_lifecycle_v1");
+    assert!(queued.is_some(), "the turn ran a tool");
+    assert!(
+        started_mid_turn,
+        "the queued message was read before the turn's result"
+    );
+    assert!(
+        reply.contains("BANANA"),
+        "the same turn answered it: {reply:?}"
+    );
+
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
 /// LIVE PROBE — does `cancel_async_message` actually un-queue a mid-turn send?
-/// The subtype is defined in the SDK but never called by the official
-/// extension. NOTE: since the hold-until-flush rework the driver no longer
-/// sends this control request at all — it HOLDS queued messages and cancels a
-/// still-held one locally (nothing ever reached the CLI to un-queue). This
-/// probe now only documents the raw CLI's behavior for the record; the driver's
-/// CancelQueued no longer depends on it. Queue a distinctively-answered message
-/// mid-turn, send the cancel for its uuid, drain to idle, and REPORT whether it
-/// ran — asserting only the session-health invariant.
+/// The driver's ✕ on a message in the CLI's own queue sends exactly this
+/// (Pass 38; hold-until-flush had dropped it). Queue a distinctively-answered
+/// message mid-turn, send the cancel for its uuid, drain to idle, and REPORT
+/// whether it ran — asserting only the session-health invariant.
 #[tokio::test]
 #[ignore = "live: spawns real claude, needs auth, bills tiny turns — reports cancel_async_message behavior"]
 async fn claude_cancel_async_message_behavior() {
@@ -977,13 +1043,13 @@ async fn claude_cancel_async_message_behavior() {
 }
 
 /// Three rapid sends against the REAL claude driver — the user's exact
-/// scenario. The hold-until-flush model must (a) settle idle: every turn the
-/// CLI opens also ends, and (b) DELIVER every held message: each `queued:true`
-/// echo resolves `sent`, none stranded "queued" or wrongly "dropped". The two
-/// trailing sends are HELD (never dumped mid-turn) and flushed at the running
-/// turn's end, so the CLI can't coalesce them into a bare result and lose one.
-/// This drives the full ChatManager pipeline (the same normalized events the
-/// UI folds).
+/// scenario. The driver must (a) settle idle: every turn the CLI opens also
+/// ends, and (b) DELIVER every waiting message: each `queued:true` echo
+/// resolves `sent`, none stranded "queued" or wrongly "dropped". The two
+/// trailing sends land before the first `system/init`, so they are held and
+/// handed to the CLI's own queue once init advertises it (Pass 38); each then
+/// resolves on its `command_lifecycle started`. This drives the full
+/// ChatManager pipeline (the same normalized events the UI folds).
 #[tokio::test]
 #[ignore = "live: spawns real claude, needs auth, bills a few tiny turns"]
 async fn driver_rapid_queued_sends_settle_idle() {

@@ -63,6 +63,40 @@ export interface DiffTab {
   /** Absolute path of the file being diffed. */
   path: string;
   mode: DiffMode;
+  /** A revision: the working tree against it (mode "rev"), or that commit
+   *  against its parent (mode "commit"). Absent for status diffs. */
+  rev?: string;
+  /** Which of the workspace's repositories (its top level, or a worktree's). */
+  repo?: string;
+  /** A renamed file's path before the commit (mode "commit"). */
+  orig?: string;
+  /** A preview tab (see FileTab.preview): single-clicking through changes
+   *  and commits reuses one slot; a double-click or a move keeps it. */
+  preview?: boolean;
+}
+/**
+ * Git history surfaces, one kind with a `view`: a commit (its message and
+ * files), a history (a repository's, one file's, or one branch's commits), or
+ * "Changes on this branch" (everything since a branch left its base).
+ * Keyed by what they show so re-opening focuses the existing tab.
+ */
+export interface GitDetailTab {
+  surface: "gitx";
+  view: "commit" | "history" | "branch";
+  /** The repository (top level, or a worktree's); null = the workspace's own. */
+  repo: string | null;
+  /** view "commit": the full sha. */
+  sha?: string;
+  /** view "history": one file's history. */
+  path?: string;
+  /** view "history": start from this branch/revision. */
+  rev?: string;
+  /** view "branch": compare against this base (the daemon picks otherwise). */
+  base?: string;
+  /** A label for the tab ("feat/x", "qc.py", a subject). */
+  title?: string;
+  /** A preview tab (see FileTab.preview). */
+  preview?: boolean;
 }
 /** The source-control (changes) panel — a singleton view like settings. */
 export interface GitTab {
@@ -84,6 +118,11 @@ export interface KnowledgeTab {
 /** Extensions (Plugins · Skills · Browse) — a singleton view. */
 export interface PluginsTab {
   surface: "plugins";
+}
+/** All sessions: every past session of the workspace (its history), opened
+ *  from the rail's Recents — a singleton view. */
+export interface SessionsTab {
+  surface: "sessions";
 }
 /**
  * A review of the files ONE session changed — a session-scoped changes list
@@ -118,12 +157,14 @@ export type Tab =
   | ProTab
   | FinderTab
   | DiffTab
+  | GitDetailTab
   | GitTab
   | ChangesTab
   | DashboardTab
   | TimelineTab
   | KnowledgeTab
   | PluginsTab
+  | SessionsTab
   | BrowserTab;
 
 /** Identity key for the no-duplicates invariant (one tab per surface). */
@@ -133,7 +174,15 @@ export function tabKey(t: Tab): string {
   if (t.surface === "finder") return `d:${t.id}`;
   // `g:`, not `d:` — the Finder owns the `d:` namespace, and two surfaces
   // sharing a key prefix would alias inside the no-duplicates set.
-  if (t.surface === "diff") return `g:${t.mode}:${t.path}`;
+  if (t.surface === "diff") {
+    return t.rev !== undefined || t.repo !== undefined
+      ? `g:${t.mode}|${t.rev ?? ""}|${t.repo ?? ""}:${t.path}`
+      : `g:${t.mode}:${t.path}`;
+  }
+  // `x:` — git history views, keyed by what they show.
+  if (t.surface === "gitx") {
+    return `x:${t.view}|${t.repo ?? ""}|${t.sha ?? ""}|${t.path ?? ""}|${t.rev ?? ""}|${t.base ?? ""}`;
+  }
   if (t.surface === "git") return "v:git";
   if (t.surface === "dashboard") return "v:dashboard";
   // Explicit keys: the trailing fallthrough is settings', and a new singleton
@@ -142,6 +191,7 @@ export function tabKey(t: Tab): string {
   if (t.surface === "knowledge") return "v:knowledge";
   if (t.surface === "plugins") return "v:plugins";
   if (t.surface === "pro") return "v:pro";
+  if (t.surface === "sessions") return "v:sessions";
   if (t.surface === "changes") return `changes:${t.sessionId}`;
   // `w:` (web) — its own namespace beside the Finder's `d:` and diff's `g:`.
   if (t.surface === "browser") return `w:${t.id}`;
@@ -498,7 +548,7 @@ export function openFile(l: Layout, path: string, preview = false): Layout {
   const paneId = findPane(l.root, l.focusedPaneId) !== null ? l.focusedPaneId : panes(l.root)[0]?.id;
   if (paneId === undefined) return openTab(l, tab);
   const pane = findPane(l.root, paneId);
-  const idx = pane?.tabs.findIndex((t) => t.surface === "file" && t.preview === true) ?? -1;
+  const idx = pane?.tabs.findIndex(isPreviewTab) ?? -1;
   if (pane !== undefined && idx >= 0) {
     const root = withPane(l.root, paneId, (p) => ({
       ...p,
@@ -510,17 +560,60 @@ export function openFile(l: Layout, path: string, preview = false): Layout {
   return openTab(l, tab);
 }
 
+/** Whether a tab is a preview tab (a file, a diff or a git view opened by a
+ *  single click): one per pane, replaced by the next preview open. */
+export function isPreviewTab(t: Tab): boolean {
+  return (t.surface === "file" || t.surface === "diff" || t.surface === "gitx") && t.preview === true;
+}
+
+/** The same tab, kept (its preview flag dropped). */
+function withoutPreview(t: Tab): Tab {
+  if (!isPreviewTab(t)) return t;
+  const { preview: _preview, ...kept } = t as FileTab | DiffTab | GitDetailTab;
+  return kept as Tab;
+}
+
 /** Promote the tab at `index` in `paneId` to a permanent (non-preview) tab.
- *  A no-op (same reference) when it isn't a preview file tab. */
+ *  A no-op (same reference) when it isn't a preview tab. */
 export function pinTab(l: Layout, paneId: string, index: number): Layout {
   const p = findPane(l.root, paneId);
   const t = p?.tabs[index];
-  if (p === undefined || t === undefined || t.surface !== "file" || t.preview !== true) return l;
+  if (p === undefined || t === undefined || !isPreviewTab(t)) return l;
   const root = withPane(l.root, paneId, (pane) => ({
     ...pane,
-    tabs: pane.tabs.map((x, i) => (i === index ? { surface: "file", path: (x as FileTab).path } : x)),
+    tabs: pane.tabs.map((x, i) => (i === index ? withoutPreview(x) : x)),
   }));
   return root === l.root ? l : { ...l, root };
+}
+
+/**
+ * Open a diff or a git view in the focused pane, as a preview or kept. The
+ * openFile grammar: a tab already open anywhere is focused (a kept open of a
+ * preview tab keeps it; a preview open never demotes a kept tab); a preview
+ * open replaces the focused pane's preview tab in place (one slot per pane,
+ * whatever it previews); a kept open appends.
+ */
+export function openTabAs(l: Layout, tab: DiffTab | GitDetailTab, preview: boolean): Layout {
+  const wanted: Tab = preview ? { ...tab, preview: true } : withoutPreview(tab);
+  const loc = paneForTab(l.root, wanted);
+  if (loc !== null) {
+    const focused = activateTab(l, loc.paneId, loc.index);
+    return preview ? focused : pinTab(focused, loc.paneId, loc.index);
+  }
+  if (!preview) return openTab(l, wanted);
+  const paneId = findPane(l.root, l.focusedPaneId) !== null ? l.focusedPaneId : panes(l.root)[0]?.id;
+  if (paneId === undefined) return openTab(l, wanted);
+  const pane = findPane(l.root, paneId);
+  const idx = pane?.tabs.findIndex(isPreviewTab) ?? -1;
+  if (pane !== undefined && idx >= 0) {
+    const root = withPane(l.root, paneId, (p) => ({
+      ...p,
+      tabs: p.tabs.toSpliced(idx, 1, wanted),
+      active: idx,
+    }));
+    return normalize({ ...l, root, focusedPaneId: paneId });
+  }
+  return openTab(l, wanted);
 }
 
 /** Promote every preview file tab whose path is in `paths` (a file became
@@ -553,7 +646,7 @@ export function pinPaths(l: Layout, paths: ReadonlySet<string>): Layout {
 /** Strip the preview flag off a file tab (used when a tab is dragged/reordered
  *  — a deliberate move pins it, VS Code semantics). */
 function pinned(tab: Tab): Tab {
-  return tab.surface === "file" && tab.preview === true ? { surface: "file", path: tab.path } : tab;
+  return withoutPreview(tab);
 }
 
 /** Open (or focus) a side-by-side diff of `path` at the given comparison. */
@@ -584,6 +677,11 @@ export function openKnowledge(l: Layout): Layout {
 /** Open (or focus) the Plugins tab. */
 export function openPlugins(l: Layout): Layout {
   return openTab(l, { surface: "plugins" });
+}
+
+/** Open (or focus) All sessions. */
+export function openSessionsList(l: Layout): Layout {
+  return openTab(l, { surface: "sessions" });
 }
 
 /** Open (or focus) the session-scoped changes review. */
@@ -1296,13 +1394,19 @@ type STab =
   | { f: string; pv?: 1 }
   | { v: string }
   | { d: string; di: string }
-  | { gd: string; dm?: string }
+  | { gd: string; dm?: string; gr?: string; go?: string; gp?: string; pv?: 1 }
+  | { gx: string; xr?: string; xs?: string; xp?: string; xv?: string; xb?: string; xt?: string; pv?: 1 }
   | { cs: string }
   | { w: string; wo: number; wi: string; wp: string };
 
 /** Coerce a persisted diff mode, defaulting to unstaged. */
 function diffModeOf(x: unknown): DiffMode {
-  return x === "staged" || x === "head" ? x : "unstaged";
+  return x === "staged" || x === "head" || x === "rev" || x === "commit" ? x : "unstaged";
+}
+
+/** A persisted optional string, bounded. */
+function optStr(x: unknown, max = 4096): string | undefined {
+  return typeof x === "string" && x.length > 0 && x.length <= max ? x : undefined;
 }
 interface SPane {
   t: "p";
@@ -1331,13 +1435,32 @@ function serNode(node: LayoutNode): SNode {
         if (t.surface === "terminal") return { s: t.sessionId };
         if (t.surface === "file") return t.preview === true ? { f: t.path, pv: 1 } : { f: t.path };
         if (t.surface === "finder") return { d: t.path, di: t.id };
-        if (t.surface === "diff") return { gd: t.path, dm: t.mode };
+        if (t.surface === "diff") {
+          const d: STab = { gd: t.path, dm: t.mode };
+          if (t.rev !== undefined) d.gr = t.rev;
+          if (t.repo !== undefined) d.gp = t.repo;
+          if (t.orig !== undefined) d.go = t.orig;
+          if (t.preview === true) d.pv = 1;
+          return d;
+        }
+        if (t.surface === "gitx") {
+          const x: STab = { gx: t.view };
+          if (t.repo !== null) x.xr = t.repo;
+          if (t.sha !== undefined) x.xs = t.sha;
+          if (t.path !== undefined) x.xp = t.path;
+          if (t.rev !== undefined) x.xv = t.rev;
+          if (t.base !== undefined) x.xb = t.base;
+          if (t.title !== undefined) x.xt = t.title;
+          if (t.preview === true) x.pv = 1;
+          return x;
+        }
         if (t.surface === "git") return { v: "git" };
         if (t.surface === "dashboard") return { v: "dashboard" };
         if (t.surface === "timeline") return { v: "timeline" };
         if (t.surface === "knowledge") return { v: "knowledge" };
         if (t.surface === "plugins") return { v: "plugins" };
         if (t.surface === "pro") return { v: "pro" };
+        if (t.surface === "sessions") return { v: "sessions" };
         if (t.surface === "changes") return { cs: t.sessionId };
         if (t.surface === "browser") return { w: t.host, wo: t.port, wi: t.id, wp: t.path };
         return { v: "settings" };
@@ -1392,7 +1515,29 @@ function deserNode(
         const id = typeof t.di === "string" && t.di.length > 0 ? t.di : uid();
         tab = { surface: "finder", id, path: t.d };
       } else if (typeof t.gd === "string" && t.gd.length > 0 && t.gd.length <= 4096) {
-        tab = { surface: "diff", path: t.gd, mode: diffModeOf(t.dm) };
+        const d: DiffTab = { surface: "diff", path: t.gd, mode: diffModeOf(t.dm) };
+        const rev = optStr(t.gr, 256);
+        const repo = optStr(t.gp);
+        const orig = optStr(t.go);
+        if (rev !== undefined) d.rev = rev;
+        if (repo !== undefined) d.repo = repo;
+        if (orig !== undefined) d.orig = orig;
+        if (t.pv === 1) d.preview = true;
+        tab = d;
+      } else if (t.gx === "commit" || t.gx === "history" || t.gx === "branch") {
+        const x: GitDetailTab = { surface: "gitx", view: t.gx, repo: optStr(t.xr) ?? null };
+        const sha = optStr(t.xs, 64);
+        const path = optStr(t.xp);
+        const rev = optStr(t.xv, 256);
+        const base = optStr(t.xb, 256);
+        const title = optStr(t.xt, 200);
+        if (sha !== undefined) x.sha = sha;
+        if (path !== undefined) x.path = path;
+        if (rev !== undefined) x.rev = rev;
+        if (base !== undefined) x.base = base;
+        if (title !== undefined) x.title = title;
+        if (t.pv === 1) x.preview = true;
+        tab = x;
       } else if (t.v === "git") {
         tab = { surface: "git" };
       } else if (t.v === "dashboard") {
@@ -1403,6 +1548,8 @@ function deserNode(
         tab = { surface: "knowledge" };
       } else if (t.v === "plugins") {
         tab = { surface: "plugins" };
+      } else if (t.v === "sessions") {
+        tab = { surface: "sessions" };
       } else if (typeof t.cs === "string" && t.cs.length > 0) {
         tab = { surface: "changes", sessionId: t.cs };
       } else if (

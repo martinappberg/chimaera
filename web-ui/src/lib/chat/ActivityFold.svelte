@@ -4,7 +4,7 @@
   import ActivityRows from "./ActivityRows.svelte";
   import ActivitySummary from "./ActivitySummary.svelte";
   import type { ChatBlock } from "./store.svelte";
-  import { isLive, toolRunHealth } from "./toolLabels";
+  import { isLive, toolRunHealth, type TurnTail } from "./toolLabels";
 
   /**
    * A settled run of thought and tool lines, folded (see activityFold.ts).
@@ -15,6 +15,8 @@
   interface Props {
     /** Every tool call in the run, across its groups. */
     tools: Extract<ChatBlock, { kind: "tool" }>[];
+    /** The turn's calls after the fold, where a retry clears a failure. */
+    tail?: TurnTail;
     thoughts: number;
     /** How many lines the fold holds (the tooltip's count). */
     steps: number;
@@ -30,6 +32,7 @@
 
   let {
     tools,
+    tail,
     thoughts,
     steps,
     visible = true,
@@ -45,7 +48,7 @@
   const running = $derived(tools.some(isLive));
   /** Only a hard failure surfaces on the fold; a recovered one is the
    *  inner group's detail. */
-  const failed = $derived(toolRunHealth(tools) === "failed");
+  const failed = $derived(toolRunHealth(tools, tail) === "failed");
 </script>
 
 <div

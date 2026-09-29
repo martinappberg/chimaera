@@ -157,6 +157,15 @@ export const ACTIONS = [
     def: "Mod2+Arrow",
     arrowSet: true,
   },
+  {
+    id: "dictate",
+    label: "Dictate",
+    description:
+      "Start or stop voice dictation in the focused chat composer (the mic button). Elsewhere the keys pass through untouched.",
+    // The Codex app's own Dictate chord on macOS. Elsewhere `Mod` is
+    // Ctrl+Shift, so this chord would be Split Right: unbound by default there.
+    def: isMac ? "Ctrl+Shift+d" : "",
+  },
 ] as const satisfies readonly ActionDef[];
 
 export type ActionId = (typeof ACTIONS)[number]["id"];

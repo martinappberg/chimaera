@@ -79,6 +79,7 @@
   import { getActiveWorkspaceId } from "../net/api";
   import { DocReader, MathTypesetter, markTasks, mathSpans } from "./doc/reader";
   import { DocEmbeds } from "./doc/embeds";
+  import { CalloutFolds, installCalloutStyle } from "./doc/callouts";
   import { createReadingWindow, type ReadingWindow } from "./readingWindow";
   import { copyText } from "../shared/clipboard";
   import { copyLabel, copyPayload, decorateCopyTargets } from "../shared/copyDecor";
@@ -128,6 +129,10 @@
 
   let { path, fontSize = undefined, wsRoot = null }: Props = $props();
 
+  // Callout tints and glyphs (every `.md-doc` this view draws, the daemon's
+  // fallback included): one stylesheet for the page.
+  installCalloutStyle();
+
   /** The path as a value: the host can hand this view its props anew with
    *  nothing changed (it does when the buffer turns dirty), and a per-path
    *  reset on that would remount the editor under the first keystroke. */
@@ -167,8 +172,18 @@
     if (seen === null || seen.embeds !== embeds || seen.mtime === null || seen.mtime === mtime) return;
     if (e?.isOwnWrite(mtime) !== true) embeds.refresh();
   });
+  /** The document's callout folds, per path: both views draw from them, so
+   *  a callout opened while reading is open when editing starts. */
+  const calloutFolds = $derived.by(() => {
+    void filePath;
+    return new CalloutFolds();
+  });
   /** What live mode reads at draw time (stable, like the link context). */
-  const liveHost = { theme: (): "light" | "dark" => themeMode, embeds: (): DocEmbeds => docEmbeds };
+  const liveHost = {
+    theme: (): "light" | "dark" => themeMode,
+    embeds: (): DocEmbeds => docEmbeds,
+    folds: (): CalloutFolds => calloutFolds,
+  };
 
   // Prose base size: the pane override, else the Markdown preference. Drives
   // the reading body AND the live editor, so the two views read identically.
@@ -469,6 +484,7 @@
       docPath,
       links: linkContext,
       embeds: untrack(() => docEmbeds),
+      folds: untrack(() => calloutFolds),
       theme: untrack(() => themeMode),
       // A wide equation typeset late is a scroller the last pass missed.
       onLayout: () => {
@@ -2023,42 +2039,18 @@
     text-decoration-color: color-mix(in srgb, var(--muted) 70%, transparent);
   }
 
-  /* GitHub alerts (comrak's classes): a tinted card with a colored rule and
-     a title row led by the type's glyph. Colors are semantic theme tokens,
-     so every curated theme restyles them; the glyph is a mask painted in
-     the title's own color. */
+  /* Callouts — GitHub alerts and Obsidian's callouts (comrak's classes):
+     a tinted card with a colored rule and a title row led by the type's
+     glyph. Each family's tint (a semantic theme token, so every curated
+     theme restyles it) and glyph come from doc/callouts.ts, installed as
+     `.md-doc .markdown-alert-<family>` rules; the glyph is a mask painted
+     in the title's own color. */
   .md-view :global(.md-doc .markdown-alert) {
-    --md-alert: var(--syn-func);
     margin: 0.9em 0;
     padding: 0.55em 1em 0.6em;
     border-left: 3px solid color-mix(in srgb, var(--md-alert) 75%, transparent);
     border-radius: 0 8px 8px 0;
     background: color-mix(in srgb, var(--md-alert) 7%, transparent);
-  }
-
-  .md-view :global(.md-doc .markdown-alert-note) {
-    --md-alert: var(--syn-func);
-    --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 8h.01M11 12h1v4h1'/%3E%3C/svg%3E");
-  }
-
-  .md-view :global(.md-doc .markdown-alert-tip) {
-    --md-alert: var(--syn-string);
-    --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 12h1m8-9v1m8 8h1M5.6 5.6l.7.7m12.1-.7-.7.7M9 16a5 5 0 1 1 6 0a3.5 3.5 0 0 0-1 3a2 2 0 0 1-4 0a3.5 3.5 0 0 0-1-3M9.7 17h4.6'/%3E%3C/svg%3E");
-  }
-
-  .md-view :global(.md-doc .markdown-alert-important) {
-    --md-alert: var(--rate);
-    --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M18 4a3 3 0 0 1 3 3v8a3 3 0 0 1-3 3h-5l-5 3v-3H6a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3zM12 8v3M12 14v.01'/%3E%3C/svg%3E");
-  }
-
-  .md-view :global(.md-doc .markdown-alert-warning) {
-    --md-alert: var(--warn);
-    --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 9v4M10.4 3.6L2.3 17.1a1.9 1.9 0 0 0 1.6 2.9h16.2a1.9 1.9 0 0 0 1.6-2.9L13.6 3.6a1.9 1.9 0 0 0-3.2 0zM12 16h.01'/%3E%3C/svg%3E");
-  }
-
-  .md-view :global(.md-doc .markdown-alert-caution) {
-    --md-alert: var(--err);
-    --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12.8 2.6l8.6 8.6a1.1 1.1 0 0 1 0 1.6l-8.6 8.6a1.1 1.1 0 0 1-1.6 0l-8.6-8.6a1.1 1.1 0 0 1 0-1.6l8.6-8.6a1.1 1.1 0 0 1 1.6 0zM12 8v4M12 16h.01'/%3E%3C/svg%3E");
   }
 
   .md-view :global(.md-doc .markdown-alert-title) {
@@ -2083,6 +2075,45 @@
 
   .md-view :global(.md-doc .markdown-alert > :last-child) {
     margin-bottom: 0;
+  }
+
+  /* A foldable callout (`[!type]-` / `[!type]+`): the title row is the
+     toggle, a chevron after the title shows the state. */
+  .md-view :global(.md-doc summary.markdown-alert-title) {
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+  }
+
+  .md-view :global(.md-doc summary.markdown-alert-title::-webkit-details-marker) {
+    display: none;
+  }
+
+  .md-view :global(.md-doc summary.markdown-alert-title::after) {
+    content: "";
+    flex: none;
+    width: 0.85em;
+    height: 0.85em;
+    background: currentColor;
+    opacity: 0.8;
+    -webkit-mask: var(--md-fold-icon) center / contain no-repeat;
+    mask: var(--md-fold-icon) center / contain no-repeat;
+    transform: rotate(-90deg);
+    transition: transform 0.12s ease;
+  }
+
+  .md-view :global(.md-doc details.markdown-alert[open] > summary.markdown-alert-title::after) {
+    transform: none;
+  }
+
+  .md-view :global(.md-doc details.markdown-alert:not([open]) > summary.markdown-alert-title) {
+    margin-bottom: 0;
+  }
+
+  .md-view :global(.md-doc summary.markdown-alert-title:focus-visible) {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
+    border-radius: 4px;
   }
 
   .md-view :global(.md-doc .markdown-alert > .markdown-alert-title + *) {
