@@ -7,7 +7,7 @@ The public UI runs directly on a daemon, inside the native shell, or beneath a b
 | `base.ts` | derive the immutable per-tab `/app/{host}` prefix and construct daemon HTTP/WebSocket URLs |
 | `api.ts` | authentication bootstrap, typed HTTP wrapper, browser CSRF marker, reauthentication signal; `ApiError` turns the daemon's project-connection codes (`project_unavailable`, `workspace_owned_elsewhere`, `remote_unavailable`, `workspace_scope_changed`, `read_only`, `worker_asleep`) into plain sentences and keeps the code on `.code` |
 | `events.ts` | daemon event stream and reconnect lifecycle; `remote_unavailable`/`workspace_scope_changed`/`worker_asleep` mean "reconnect", only other errors are fatal |
-| `placement.ts` | browser-view placement reads, scoped socket auth, and `placementLabel` ("In the cloud" / "On another computer" / "· reconnecting") for routed rows |
+| `placement.ts` | browser-view placement reads, scoped socket auth, `placementLabel` ("In the cloud" / "On another computer" / "· reconnecting") for routed rows, and `parsePause`/`sessionPause`/`pauseLabel`: a session's `moved`/`paused` state (socket frame or the row's additive `pause`) in plain words |
 | `native.ts` | native IPC with browser fallbacks and prefixed window URLs |
 | `proReturn.ts` | targeted account-return listener: register before consuming the native pending-window marker, coalesce events, and ignore late results after teardown |
 

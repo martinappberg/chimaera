@@ -337,21 +337,34 @@ rosters and watching files never wake a paused cloud project. The first real
 input does: a keystroke, a chat message or a permission answer. On a computer,
 the daemon keeps the chat/terminal connection open while the owner is paused or
 reconnecting, holds that first input (a little typing, up to four chat
-commands) and delivers it exactly once after the owner answers; anything it
-cannot deliver is answered, never dropped — a chat message comes back into the
-composer with a short notice, and refused typing is said in a small note over
-the terminal. A browser view reconnects once with wake intent when the user
-types or sends into a dropped connection; the action itself is not queued
-(the composer keeps its text). There is no reconnect or wake button: the chat
-says "Reconnecting…" (only for a viewed project, after a short grace) or "Send a
-message to pick this conversation back up." while the project is paused.
+commands, within one daemon-wide budget) and delivers it exactly once after the
+owner answers. The message shows at once as a "sending…" bubble and the chat
+says "Waking the cloud machine…"; a terminal says the same over the pane and
+echoes nothing until the owner answers. While it wakes, a second message or more
+typing is not held: it is refused with a short note (a message comes back into
+the composer), so nothing is ever sent or run twice. Anything that cannot be
+delivered is answered, never dropped — a refused message returns to the composer
+with its pictures, and refused typing is said in a small note over the terminal.
+Only a refused *message* comes back: a refused stop or permission answer says so
+without resurrecting a message that may already have been delivered. A browser
+view reconnects once with wake intent when the user types or sends into a
+dropped connection; the action itself is not queued (the composer keeps its
+text; a terminal says it is waking). There is no reconnect or wake button: the
+chat says "Reconnecting…" (only for a viewed project, after a short grace) or
+"Send a message to pick this conversation back up." while the project is paused.
 
 **Moving between devices is not an exit.** When a conversation moves between
 this computer and the cloud, every open view is told it *moved*: the chat stays
 mounted with its transcript and scroll position, says "Continuing in the cloud…"
 or "Continuing on your computer…" (composer disabled for that reason), and
-reconnects to wherever it runs next. A paused terminal reads "This terminal
-stays on your computer" (plain shells) or "Opening this conversation…" (agents).
+reconnects to wherever it runs next — at once when its row comes back, not after
+a retry delay. Only a real transfer says so. A session that is only paused says
+why instead: "Reconnecting after an update…" (a daemon restart on the machine
+that owns the project), "Waiting for Claude on the cloud machine" (its agent is
+not signed in there yet; the Pro page does that once), or "Opening…" (its
+transfer is starting it). A paused plain terminal reads "This terminal stays on
+your computer". A new tunnel or credential for the same owner is not a move:
+views just reconnect.
 
 **A window's own daemon stays in charge of the window.** For a project running
 elsewhere, the window's event stream merges only that project's sessions, file

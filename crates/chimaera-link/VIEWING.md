@@ -104,28 +104,58 @@ window's chat/terminal socket to its own daemon stays open while the owner is
 unreachable or asleep (`remote_unavailable` / `worker_asleep`, both non-fatal);
 the daemon retries the owner on its own (2 s doubling to 30 s). The first real
 input — terminal bytes or any chat command — is held (≤64 KiB of typing, ≤4 chat
-commands), opens the owner's socket with `?wake=interaction`, and is delivered
-exactly once, in order, right after the owner's `ready`. Input that cannot be
-delivered is answered, never dropped: each chat command gets `command_failed`
-(the UI puts its text back into the composer); typing gets `read_only` with
-`reason:"reconnecting"`. Nothing is resent automatically. When the project's
-route changes under an established socket, the viewer receives an additive
-`{"type":"moved","to":"cloud"|"computer"}` and the socket closes so the client
-re-routes; the owning daemon sends the same frame (instead of `exited`) for a
-session paused for a transfer, on the live socket and on every reconnect until
-it runs again. A scoped viewer whose connection changed hears
+commands, and ≤64 MiB across every socket of the daemon), opens the owner's
+socket with `?wake=interaction`, and is delivered exactly once, in order, right
+after the owner's `ready`. When that input finds the owner asleep the viewer
+gets the additive `{"type":"waking"}` status; while the wake is pending,
+further input is refused rather than held (chat: `command_failed` with
+`reason:"waking"`; typing: `read_only` with `reason:"waking"`, at most one
+note a second), so a repeated send never becomes a second turn. Input that
+cannot be delivered is answered, never dropped: each chat command gets
+`command_failed` (the UI puts a refused send's text and pictures back into the
+composer); typing gets `read_only` with `reason:"reconnecting"`. Every chat
+refusal carries the additive `command` it answers (`send`, `interrupt`,
+`permission`…), and a client restores a draft only for `command:"send"`.
+Nothing is resent automatically.
+
+A session with no process where a viewer asks is not an exit, and its owning
+daemon says why (additively; older clients ignore both and reconnect):
+`{"type":"moved","to":"cloud"|"computer"}` only for a real transfer — while the
+source exports it, or once this machine may no longer run its project (`to` is
+where the session is going; a computer receiving its work back says
+`"computer"`) — and otherwise
+`{"type":"paused","reason":"restarting"|"needs_provider"|"importing"|"stays_on_computer","provider"?}`:
+waiting out a daemon restart on the machine that owns the project, waiting for
+its agent (`provider`) to be signed in on the cloud machine, being opened by
+its transfer, or a plain terminal that moved with its project and only runs on
+a computer. The socket then closes; the session's paused row carries the same
+object as its additive `pause` field, and a client reconnects at once when the
+row stops being paused. When the project's route changes under an established
+socket, the viewer's daemon sends `moved` (to where the new route points) and
+closes; a change of only the host's transport (a tunnel rebind or a new
+credential for the same owner) closes quietly and the client reconnects to the
+same owner. A scoped viewer whose connection changed hears
 `workspace_scope_changed` first. Browser views have no local daemon to hold
-input: a send or keystroke into a dropped socket reconnects once with wake intent
-and the action is not queued.
+input: a send or keystroke into a dropped socket reconnects once with wake
+intent, and the action is not queued (a terminal says so over the pane).
 
 **Events.** A window's own `/ws/events` loop stays authoritative. For a routed
 project it runs a bounded feed from the owner that contributes only that
 project's session rows (merged into the local roster), file invalidations (in the
 window's paths) and Git/Timeline epochs; the owner's settings, recents, notices,
-update and plugin frames are never forwarded, and local Git/file watching is
-parked until the project is local again. A feed that ends restarts with backoff;
-the window's socket never closes for an owner change. `remote_unavailable` and
-`workspace_scope_changed` on an events socket mean "reconnect", not "rejected".
+update and plugin frames are never forwarded. Only paths under the project's
+folder are registered with the owner; the window's daemon keeps watching the
+rest itself (a pasted upload, a note in the home folder), and an owner drops a
+registered path its viewer may not read instead of closing. Local Git watching
+is parked until the project is local again. An owner's Git and Timeline epochs
+(in its events nudges and in its proxied `/git/status` and Timeline pages) are
+reported as `((registration mod 2^20) + 1) << 32 | epoch`: above any daemon's own
+counter and different per registration, so a local-to-routed switch (or back,
+or between owners) always refetches. A feed ends as soon as its route changes
+(a registration notifies it; a 2 s tick backs that up) and restarts with
+backoff; the window's socket never closes for an owner change.
+`remote_unavailable` and `workspace_scope_changed` on an events socket mean
+"reconnect", not "rejected".
 
 **Budgets.** Forwarded HTTP (requests, polls, probes) shares 32 permits; long-lived
 sockets have their own 128. Response heads get 30 s (75 min for uploads and exec,
@@ -147,10 +177,18 @@ local. This keeps existing file tabs stable while the project runs elsewhere.
 A native window's `/fs/*` request goes to the owner only when it belongs there:
 any path under the project's local root (and requests with no path) go to the
 owner; a read naming only paths outside the project asks the owner first (a
-conversation that runs there links its own files) and is answered by this
-computer when the owner declines (403/404) or is unreachable; a write outside
-the project stays on this computer when its folder exists here and otherwise
-goes to the owner. A file tab opened from an owner's real path is not rewritten
+conversation that runs there links its own files). For such a path the owner
+answers only whether it has something there: 404 `{"error":"not_found"}` when
+nothing exists (this computer then answers with its own file; so it does when
+the owner is unreachable, or is an older daemon that refuses every outside path
+alike) and 403 `{"error":"outside_project"}` when a different file exists that
+the viewer may not read (this computer then answers 403
+`{"error":"on_other_machine"}` instead of its own same-named file). A write
+outside the project stays on this computer when its folder exists here and
+otherwise goes to the owner. The document checker (`/fs/check_document`) for a
+viewer resolves root-relative links at the project's own folder (the viewer's
+`root` query is dropped) and never stats, reads or lists a link target outside
+the project; such targets are counted in one "outside this project" note. A file tab opened from an owner's real path is not rewritten
 to the local root, so it stops resolving once the project is local again.
 
 Only known path fields are translated: filesystem `path`/`dir`, create/delete
