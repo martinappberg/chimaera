@@ -38,6 +38,13 @@ async fn handle(
         }
         return Json(json!({"execution_authority":2,"execution_capability":{"version":1,"boundary":"managed_processes","expired_takeover":false},"installation_binding":1,"workspace_placement":2,"checkpoint_receipts":1})).into_response();
     }
+    if path == "/v2/workspaces/w-unrecorded/placement" {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"workspace_not_found"})),
+        )
+            .into_response();
+    }
     if path == "/v2/workspaces/w-one/placement" {
         assert_eq!(method, Method::GET);
         return Json(json!({"workspace_id":"w-one","holder_id":"d-home","route_host_id":"device-d-home","epoch":4,"policy_revision":1,"availability":"owned","preferred_installation_id":"i-home","checkpoint_id":"cp-one","server_now":"2026-09-28T19:00:00Z","expires_at":"2026-09-28T19:01:30Z"})).into_response();
@@ -146,5 +153,38 @@ async fn passive_placement_and_exact_installation_acknowledgments_never_infer_au
         8,
         "no fallback, acquire or automatic retry"
     );
+    task.abort();
+}
+
+#[tokio::test]
+async fn an_unrecorded_project_is_unowned_but_a_missing_route_is_not() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let state = Arc::new(Fixture::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let router = Router::new().fallback(handle).with_state(state.clone());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let client = Client::new(
+        &endpoint,
+        Some(Tokens {
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            token_type: "Bearer".into(),
+            expires_in: 3600,
+        }),
+    )
+    .unwrap();
+    let unowned = client.workspace_placement("w-unrecorded").await.unwrap();
+    assert_eq!(
+        unowned.availability,
+        chimaera_link::PlacementAvailability::Unowned
+    );
+    assert_eq!(unowned.epoch, 0);
+    assert!(unowned.holder_id.is_none() && unowned.route_host_id.is_none());
+    unowned.validate("w-unrecorded").unwrap();
+    // A 404 without the service's code is an older service, not "unowned".
+    assert!(client.workspace_placement("w-elsewhere").await.is_err());
     task.abort();
 }

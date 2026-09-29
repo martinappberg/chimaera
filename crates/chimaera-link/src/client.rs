@@ -322,13 +322,14 @@ impl Client {
         Ok(value)
     }
     /// Read the current owner without acquiring, waking or transferring work.
+    /// A project the account has never recorded is simply unowned.
     pub async fn workspace_placement(&self, workspace: &str) -> Result<crate::WorkspacePlacement> {
         anyhow::ensure!(
             crate::placement::valid_id(workspace),
             "invalid workspace identity"
         );
-        let value: crate::WorkspacePlacement = json_response(
-            self.request(
+        let response = self
+            .request_raw(
                 Method::GET,
                 path(
                     &self.inner.account,
@@ -336,9 +337,15 @@ impl Client {
                 ),
                 None,
             )
-            .await?,
-        )
-        .await?;
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            let error: Option<ApiError> = json_response_body(response).await.ok();
+            if error.is_some_and(|error| error.error == "workspace_not_found") {
+                return Ok(crate::WorkspacePlacement::unowned(workspace));
+            }
+            bail!("account request rejected (404)");
+        }
+        let value: crate::WorkspacePlacement = json_response(response).await?;
         value.validate(workspace)?;
         Ok(value)
     }

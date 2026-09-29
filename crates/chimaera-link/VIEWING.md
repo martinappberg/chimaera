@@ -22,20 +22,34 @@ permission.
 ```
 
 Availability is `owned`, `unowned`, `expired`, or `privacy_disabled`. Only a live
-owned placement has a route. Keeper device route IDs are `device-` plus the exact
+owned placement has a route, and even a live one may have none: a holder whose
+device was revoked or whose cloud machine was removed is owned but unroutable
+until its lease lapses. Keeper device route IDs are `device-` plus the exact
 raw holder; workers use `worker-` plus that holder. Neither fuzzy prefix matching
 nor preferred-home metadata overrides the current owner. The account proves
 ownership, not network reachability. A checkpoint ID proves a reported saved
 copy, not that a fresh sync completed on this viewing device.
 
+A project the account has no ownership record for answers
+`404 {"error":"workspace_not_found"}`; clients read that as `unowned` at epoch 0.
+Any other 404 means the service lacks this route. `403` means the account has
+no plan for cloud work.
+
 The local authenticated `GET /api/v1/pro/placements` returns registered
 `{host_id,workspace_id,epoch}` rows only. It never exposes transport URLs, tokens
 or filesystem roots and is not available through a forwarded project scope.
-Native reconciliation uses this daemon inventory even after its own restart:
-missing, private, unowned, local-owned, disconnected or unsuccessfully verified
-projects are retired with `DELETE ...?workspace_id=…`. A shared transport stays
-open while any healthy project still needs it. Failed probes do not skip healthy
-siblings; failed retirements remain reported and retry on the next bounded refresh.
+Native reconciliation uses this daemon inventory even after its own restart.
+A route is retired with `DELETE ...?workspace_id=…` only on a definitive
+answer: the project is gone from this computer, private, unowned, expired,
+owned here, or owned at a **newer epoch** than the registered route. A check
+that merely fails (account or keeper unreachable, owner connection down or
+asleep, the scope probe timing out) keeps the last verified route for at most
+150 seconds, longer than one lease plus the takeover grace, so a real owner
+change is always seen as a definitive answer first. A kept route also needs its
+shared transport, so after a native restart a failed check retires it. A shared
+transport stays open while any kept or healthy project still needs it. Failed
+probes do not skip healthy siblings; failed retirements remain reported and
+retry on the next bounded refresh.
 The daemon also polls each project roster independently, with at most four requests
 in flight and a ten-second deadline per project. One failure only marks that
 project unavailable; healthy siblings keep updating. Changed results notify views

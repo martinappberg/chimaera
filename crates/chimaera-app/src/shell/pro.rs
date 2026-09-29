@@ -49,6 +49,7 @@ pub(super) struct Pro {
     credential_persistence: Arc<credentials::Persistence>,
     recovery: recovery::Recovery<Client>,
     placements: Mutex<HashMap<String, chimaera_link::WorkspacePlacement>>,
+    verified_routes: Mutex<placements::Verified>,
 }
 
 struct Runtime {
@@ -119,6 +120,7 @@ impl Pro {
             credential_persistence: Arc::new(credentials::Persistence::default()),
             recovery: recovery::Recovery::default(),
             placements: Mutex::new(HashMap::new()),
+            verified_routes: Mutex::new(placements::Verified::default()),
         }
     }
 
@@ -785,6 +787,7 @@ async fn host_signal(app: &AppHandle, host: &Host) {
 pub(super) async fn stop(state: &Shell) {
     state.pro.billing.clear();
     lock(&state.pro.placements).clear();
+    *lock(&state.pro.verified_routes) = placements::Verified::default();
     *lock(&state.pro.return_target) = None;
     let links = std::mem::take(&mut *state.pro.worker_links.lock().await);
     for (host, link) in links {
@@ -2040,64 +2043,96 @@ async fn reconcile_placements(state: &Shell, client: &Client) -> Result<()> {
     let inventory = daemon_request(state, "GET", "/pro/placements", None).await?;
     let mut reconciliation = placements::Reconciliation::new(inventory)?;
     let mut links = state.pro.worker_links.lock().await;
+    let now = std::time::Instant::now();
     for workspace in workspaces {
         let Some(id) = workspace["workspace_id"].as_str() else {
             continue;
         };
-        let result = async {
+        let observation = async {
+            use placements::Observation;
             if workspace["never_mirror"] == true {
-                return Ok(None);
+                return Observation::Retire;
             }
-            let placement = client.workspace_placement(id).await?;
+            let placement = match client.workspace_placement(id).await {
+                Ok(placement) => placement,
+                Err(error) => return Observation::Unverified { epoch: None, error },
+            };
             lock(&state.pro.placements).insert(id.to_owned(), placement.clone());
             if placement.availability != chimaera_link::PlacementAvailability::Owned
                 || placement.holder_id.as_deref() == Some(&account.device_id)
             {
-                return Ok(None);
+                return Observation::Retire;
             }
-            let route = placement
+            // The owner is known but not reachable right now (its connection
+            // is down, asleep, or not yet listed): keep the last good route.
+            let unverified = |error: anyhow::Error| Observation::Unverified {
+                epoch: Some(placement.epoch),
+                error,
+            };
+            let Some(host) = placement
                 .route_host_id
                 .as_ref()
-                .context("workspace route unavailable")?;
-            let Some(host) = hosts.get(route).filter(|host| {
-                placement
-                    .holder_id
-                    .as_deref()
-                    .is_some_and(|holder| host_holds(host, holder))
-                    && host.status == HostStatus::Connected
-            }) else {
-                return Ok(None);
+                .and_then(|route| hosts.get(route))
+                .filter(|host| {
+                    placement
+                        .holder_id
+                        .as_deref()
+                        .is_some_and(|holder| host_holds(host, holder))
+                        && host.status == HostStatus::Connected
+                })
+            else {
+                return unverified(anyhow::anyhow!("project owner unavailable"));
             };
             let Some(daemon) = host.daemon.as_ref() else {
-                return Ok(None);
+                return unverified(anyhow::anyhow!("project owner unavailable"));
             };
-            if !links.contains_key(&host.id) {
-                links.insert(
-                    host.id.clone(),
-                    chimaera_link::LinkTunnel::bind(client.clone(), host.id.clone()).await?,
-                );
+            let verified = async {
+                if !links.contains_key(&host.id) {
+                    links.insert(
+                        host.id.clone(),
+                        chimaera_link::LinkTunnel::bind(client.clone(), host.id.clone()).await?,
+                    );
+                }
+                let port = links
+                    .get(&host.id)
+                    .context("project connection unavailable")?
+                    .local_port;
+                verify_project_target(port, &daemon.token, id, placement.epoch).await?;
+                daemon_request(
+                    state,
+                    "POST",
+                    "/pro/placements",
+                    Some(serde_json::json!({
+                        "host_id":host.id,"endpoint":format!("http://127.0.0.1:{port}"),
+                        "token":daemon.token,"workspace_id":id,"epoch":placement.epoch
+                    })),
+                )
+                .await
             }
-            let port = links
-                .get(&host.id)
-                .context("project connection unavailable")?
-                .local_port;
-            verify_project_target(port, &daemon.token, id, placement.epoch).await?;
-            daemon_request(
-                state,
-                "POST",
-                "/pro/placements",
-                Some(serde_json::json!({
-                    "host_id":host.id,"endpoint":format!("http://127.0.0.1:{port}"),
-                    "token":daemon.token,"workspace_id":id,"epoch":placement.epoch
-                })),
-            )
-            .await?;
-            Ok(Some(host.id.clone()))
+            .await;
+            match verified {
+                Ok(_) => Observation::Route(host.id.clone()),
+                Err(error) => unverified(error),
+            }
         }
         .await;
+        if matches!(observation, placements::Observation::Route(_)) {
+            lock(&state.pro.verified_routes).confirm(id, now);
+        }
+        // A kept route also needs its shared transport; after a shell restart
+        // there is none, so a failed check retires the stale endpoint.
+        let fresh = reconciliation
+            .registered(id)
+            .is_some_and(|row| links.contains_key(&row.host_id))
+            && lock(&state.pro.verified_routes).fresh(id, now);
         // One unavailable project must not skip reconciliation of its siblings.
-        reconciliation.observe(id, result);
+        reconciliation.observe(id, observation, fresh);
     }
+    lock(&state.pro.verified_routes).retain(|id| {
+        workspaces
+            .iter()
+            .any(|row| row["workspace_id"].as_str() == Some(id))
+    });
     let mut retained_hosts = reconciliation.desired_hosts();
     for (workspace, host) in reconciliation.retired_workspaces() {
         if let Err(error) = daemon_request(

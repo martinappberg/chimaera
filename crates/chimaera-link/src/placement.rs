@@ -33,6 +33,24 @@ pub(crate) fn valid_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
 }
 impl WorkspacePlacement {
+    /// The account's answer for a project it has no ownership record for
+    /// (404 `workspace_not_found`): nobody executes it, epoch 0.
+    pub(crate) fn unowned(workspace: &str) -> Self {
+        Self {
+            workspace_id: workspace.into(),
+            holder_id: None,
+            route_host_id: None,
+            epoch: 0,
+            policy_revision: 0,
+            availability: PlacementAvailability::Unowned,
+            preferred_installation_id: None,
+            checkpoint_id: None,
+            server_now: time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            expires_at: None,
+        }
+    }
     pub fn validate(&self, workspace: &str) -> Result<()> {
         ensure!(
             valid_id(workspace) && self.workspace_id == workspace,
@@ -63,15 +81,16 @@ impl WorkspacePlacement {
                 .holder_id
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("workspace owner missing"))?;
-            let route = self
-                .route_host_id
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("workspace route missing"))?;
-            ensure!(
-                route.strip_prefix("worker-") == Some(holder)
-                    || route.strip_prefix("device-") == Some(holder),
-                "workspace route does not match owner"
-            );
+            // A live lease whose holder has no route (a revoked device, a
+            // removed cloud machine) is a real state: owned but unreachable
+            // until the lease lapses. Callers treat it as not routable now.
+            if let Some(route) = self.route_host_id.as_deref() {
+                ensure!(
+                    route.strip_prefix("worker-") == Some(holder)
+                        || route.strip_prefix("device-") == Some(holder),
+                    "workspace route does not match owner"
+                );
+            }
             let expiry = self
                 .expires_at
                 .as_deref()
@@ -171,6 +190,10 @@ mod tests {
         assert!(value.validate("w-project").is_err());
         value.route_host_id = Some("worker-d-home".into());
         value.validate("w-project").unwrap();
+        // Owned by a holder the account can no longer route to.
+        value.route_host_id = None;
+        value.validate("w-project").unwrap();
+        value.route_host_id = Some("worker-d-home".into());
         value.availability = PlacementAvailability::Expired;
         assert!(value.validate("w-project").is_err());
         value.route_host_id = None;
