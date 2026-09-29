@@ -32,14 +32,12 @@ pub(crate) fn project_temp_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
     std::ffi::OsString::from_vec(out)
 }
 
-/// Write `contents` to `path` atomically: ensure the parent dir exists, write
-/// a `.json.tmp` sibling, then rename it over `path`. The stores all target
-/// `*.json`, so the tmp name mirrors the historical `with_extension("json.tmp")`.
 /// Like [`atomic_write_json`], but the bytes and the rename reach stable
 /// storage before returning (F_FULLFSYNC on macOS, where fsync alone may stay
 /// in the drive cache). For state whose loss after a crash or power cut would
 /// let two machines run the same work: Pro ownership and the session ledger's
-/// handoff writes. Ordinary preference stores keep the cheaper write.
+/// Pro transfer writes. Ordinary preference stores and the generic bundle
+/// routes keep the cheaper write.
 pub(crate) fn atomic_write_json_durable(
     path: &Path,
     contents: impl AsRef<[u8]>,
@@ -56,8 +54,22 @@ pub(crate) fn atomic_write_json_durable(
     drop(file);
     std::fs::rename(&tmp, path)
         .with_context(|| format!("failed to rename into {}", path.display()))?;
-    full_sync(&std::fs::File::open(parent)?)?;
-    Ok(())
+    // The new bytes are in place. A filesystem that cannot sync a directory
+    // (EINVAL/ENOTSUP on some network and FUSE mounts) does not make this
+    // write a failure; any other error does.
+    let directory = std::fs::File::open(parent)?;
+    match full_sync(&directory) {
+        Err(error) if !directory_sync_unsupported(&error) => Err(error),
+        _ => Ok(()),
+    }
+}
+fn directory_sync_unsupported(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        .is_some_and(|code| {
+            code == nix::libc::EINVAL || code == nix::libc::ENOTSUP || code == nix::libc::EOPNOTSUPP
+        })
 }
 fn full_sync(file: &std::fs::File) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
@@ -73,6 +85,9 @@ fn full_sync(file: &std::fs::File) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Write `contents` to `path` atomically: ensure the parent dir exists, write
+/// a `.json.tmp` sibling, then rename it over `path`. The stores all target
+/// `*.json`, so the tmp name mirrors the historical `with_extension("json.tmp")`.
 pub(crate) fn atomic_write_json(path: &Path, contents: impl AsRef<[u8]>) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -83,4 +98,29 @@ pub(crate) fn atomic_write_json(path: &Path, contents: impl AsRef<[u8]>) -> anyh
     std::fs::rename(&tmp, path)
         .with_context(|| format!("failed to rename into {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// After a successful rename, a filesystem that cannot sync a directory
+    /// does not turn the write into a failure; a real I/O error still does.
+    #[test]
+    fn an_unsupported_directory_sync_is_not_a_failed_write() {
+        for (code, unsupported) in [
+            (nix::libc::EINVAL, true),
+            (nix::libc::ENOTSUP, true),
+            (nix::libc::EIO, false),
+        ] {
+            let error = anyhow::Error::from(std::io::Error::from_raw_os_error(code));
+            assert_eq!(directory_sync_unsupported(&error), unsupported, "{code}");
+        }
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-durable-{}",
+            chimaera_core::generate_token()
+        ));
+        atomic_write_json_durable(&root.join("state.json"), b"{}").unwrap();
+        assert_eq!(std::fs::read(root.join("state.json")).unwrap(), b"{}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

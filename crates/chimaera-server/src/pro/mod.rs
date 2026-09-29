@@ -765,6 +765,13 @@ pub(crate) fn cloud_hours_exhausted(state: &crate::AppState) -> Option<bool> {
         .as_ref()
         .map(|config| config.hours_exhausted)
 }
+/// Whether the native app configured this daemon for Pro at all.
+pub(crate) fn configured(state: &crate::AppState) -> bool {
+    state
+        .pro
+        .configured
+        .load(std::sync::atomic::Ordering::Acquire)
+}
 pub(crate) fn is_worker(state: &crate::AppState) -> bool {
     crate::lock(&state.pro.runtime)
         .as_ref()

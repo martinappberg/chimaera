@@ -198,11 +198,19 @@ fn native_path(state: &AppState, entry: &LedgerEntry) -> Result<Option<PathBuf>>
         _ => bail!("this agent does not support portable session archives"),
     }
 }
-async fn flush_ledger(state: &Arc<AppState>) -> Result<()> {
+/// A Pro transfer's ledger writes must survive a power cut (losing one could
+/// let two machines run the same work); the generic bundle routes keep the
+/// ordinary atomic write.
+async fn flush_ledger(state: &Arc<AppState>, durable: bool) -> Result<()> {
     let state = state.clone();
     tokio::task::spawn_blocking(move || {
         let (entries, links) = crate::ledger::snapshot(&state);
-        crate::lock(&state.ledger).write_durable(&entries, &links)
+        let mut ledger = crate::lock(&state.ledger);
+        if durable {
+            ledger.write_durable(&entries, &links)
+        } else {
+            ledger.write_checked(&entries, &links)
+        }
     })
     .await?
 }
@@ -232,7 +240,18 @@ pub(crate) async fn sweep_temporary(state: &Arc<AppState>) {
 
 /// The caller owns and must unlink the returned temporary archive.
 pub(crate) async fn export(state: Arc<AppState>, id: &str, mode: ExportMode) -> Result<PathBuf> {
-    export_inner(state, id, mode, false)
+    export_inner(state, id, mode, false, false)
+        .await?
+        .context("conversation is empty")
+}
+
+/// [`export`] for a Pro transfer: its ledger writes are durable.
+pub(crate) async fn export_durable(
+    state: Arc<AppState>,
+    id: &str,
+    mode: ExportMode,
+) -> Result<PathBuf> {
+    export_inner(state, id, mode, false, true)
         .await?
         .context("conversation is empty")
 }
@@ -245,7 +264,7 @@ pub(crate) async fn export_for_mirror(
     id: &str,
     mode: ExportMode,
 ) -> Result<Option<PathBuf>> {
-    export_inner(state, id, mode, true).await
+    export_inner(state, id, mode, true, true).await
 }
 
 async fn export_inner(
@@ -253,6 +272,7 @@ async fn export_inner(
     id: &str,
     mode: ExportMode,
     skip_unstarted: bool,
+    durable: bool,
 ) -> Result<Option<PathBuf>> {
     let _permit = OPERATIONS.try_acquire().context("bundle operation limit")?;
     if !valid_id(id) {
@@ -293,7 +313,7 @@ async fn export_inner(
         let mut suspended = entry.clone();
         suspended.suspended = true;
         crate::ledger::defer(&state, suspended)?;
-        flush_ledger(&state).await?;
+        flush_ledger(&state, durable).await?;
         if let Some(pause) = paused.take() {
             pause.commit_kill();
         } else if state.chat.get(id).is_some() {
@@ -330,7 +350,7 @@ async fn export_inner(
         let session = id.to_string();
         let _ = tokio::task::spawn_blocking(move || drain.chat.attach(&session, 0)).await;
         state.chat.remove(id);
-        flush_ledger(&state).await?;
+        flush_ledger(&state, durable).await?;
     }
     if !native {
         return Ok(None);
@@ -663,18 +683,30 @@ fn native_destination(state: &AppState, entry: &LedgerEntry) -> Result<Option<Pa
         _ => bail!("unsupported native agent"),
     }
 }
+/// An ordinary (non-durable) import; the route streams into `import_inner`.
+#[cfg(test)]
 pub(crate) async fn import(
     state: Arc<AppState>,
     path: &Path,
     options: ImportOptions,
 ) -> Result<ImportedSession> {
     let _permit = OPERATIONS.try_acquire().context("bundle operation limit")?;
-    import_inner(state, path, options).await
+    import_inner(state, path, options, false).await
+}
+/// [`import`] for a Pro transfer: its ledger writes are durable.
+pub(crate) async fn import_durable(
+    state: Arc<AppState>,
+    path: &Path,
+    options: ImportOptions,
+) -> Result<ImportedSession> {
+    let _permit = OPERATIONS.try_acquire().context("bundle operation limit")?;
+    import_inner(state, path, options, true).await
 }
 async fn import_inner(
     state: Arc<AppState>,
     path: &Path,
     options: ImportOptions,
+    durable: bool,
 ) -> Result<ImportedSession> {
     let path = path.to_owned();
     let mut opened = tokio::task::spawn_blocking(move || open_archive(&path)).await??;
@@ -906,7 +938,7 @@ async fn import_inner(
             links.insert(terminal, agent);
         }
     }
-    flush_ledger(&state).await?;
+    flush_ledger(&state, durable).await?;
     if !paused {
         let workspace = crate::lock(&state.workspaces)
             .get(&workspace_id)
@@ -922,7 +954,7 @@ async fn import_inner(
         .await?;
         crate::lock(&state.deferred_sessions).remove(&id);
         state.session_proxy.clear_workspace(&workspace_id);
-        flush_ledger(&state).await?;
+        flush_ledger(&state, durable).await?;
     }
     let imported_root = crate::lock(&state.workspaces)
         .get(&workspace_id)
@@ -989,7 +1021,14 @@ pub(crate) async fn export_route(
     } else {
         ExportMode::Snapshot
     };
-    match export(state, &id, mode).await {
+    // Through a keeper this route moves work between machines (the durable
+    // ledger then matters); for everyone else it is an ordinary export.
+    let exported = if crate::pro::configured(&state) {
+        export_durable(state, &id, mode).await
+    } else {
+        export(state, &id, mode).await
+    };
+    match exported {
         Ok(path) => archive_response(path).await.unwrap_or_else(failure),
         Err(error) => failure(error),
     }
@@ -1020,7 +1059,8 @@ pub(crate) async fn import_route(
         }
         file.flush().await?;
         drop(file);
-        import_inner(state, &path, options).await
+        let durable = crate::pro::configured(&state);
+        import_inner(state, &path, options, durable).await
     }
     .await;
     let _ = tokio::fs::remove_file(path).await;

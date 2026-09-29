@@ -692,7 +692,9 @@ async fn stop_after_verified_owner(
 
 async fn suspend_workspace(state: &Arc<AppState>, workspace: &str) -> Result<()> {
     for id in sessions(state, workspace) {
-        match crate::bundle::export(state.clone(), &id, crate::bundle::ExportMode::Stop).await {
+        match crate::bundle::export_durable(state.clone(), &id, crate::bundle::ExportMode::Stop)
+            .await
+        {
             Ok(archive) => {
                 let _ = tokio::fs::remove_file(archive).await;
             }
@@ -1540,7 +1542,7 @@ async fn hydrate_scoped(
             });
         for archive in manifest.sessions {
             current()?;
-            crate::bundle::import(
+            crate::bundle::import_durable(
                 state.clone(),
                 &stage.join("handoff").join(archive.archive),
                 crate::bundle::ImportOptions {
