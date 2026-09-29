@@ -267,6 +267,28 @@ pub(crate) async fn export_for_mirror(
     export_inner(state, id, mode, true, true).await
 }
 
+/// What a terminal agent's successor needs to know about its process: whether
+/// a turn was in flight (running, or parked on a permission question). A TUI
+/// idle at its prompt carries nothing, so it resumes without a new turn.
+pub(crate) fn tui_carryover(state: &AppState, id: &str) -> Option<chimaera_agent::Carryover> {
+    let record = crate::lock(&state.agents).get(id).cloned()?;
+    let info = state.sessions.get(id)?;
+    let in_flight = info.alive
+        && (record.state == crate::agent_state::AgentState::NeedsPermission
+            || !crate::agent_state::tui_at_pause(
+                &record,
+                info.alive,
+                info.last_output_at,
+                info.pid,
+                state.sessions.foreground_pid(id),
+                crate::session_view::now_ms(),
+            ));
+    in_flight.then(|| chimaera_agent::Carryover {
+        turn_in_flight: true,
+        ..Default::default()
+    })
+}
+
 async fn export_inner(
     state: Arc<AppState>,
     id: &str,
@@ -287,6 +309,15 @@ async fn export_inner(
         .context("unknown session")?;
     entry.suspended = false;
     entry.handoff = None;
+    // A terminal agent carries whether a turn was in flight, read while it
+    // still runs: only then does its successor get a pickup prompt.
+    if let Some(agent) = entry
+        .agent
+        .as_mut()
+        .filter(|agent| agent.ui == chimaera_agent::model::SessionUi::Term)
+    {
+        agent.carryover = tui_carryover(&state, id);
+    }
     let workspace = crate::lock(&state.workspaces)
         .get(&entry.workspace_id)
         .context("unknown workspace")?;

@@ -261,12 +261,15 @@ pub(crate) async fn spawn_session(
             }
             let transferred = crate::lock(&state.deferred_sessions).get(&id).cloned();
             if let Some(entry) = transferred.filter(|entry| entry.workspace_id == workspace.id) {
-                if let Some(handoff) = entry.handoff {
-                    let context = crate::chat::transfer_context(
-                        handoff.origin.as_str(),
+                // A positional prompt starts a billed turn: only a terminal
+                // agent whose turn was cut off by the move gets one.
+                let pickup = entry.handoff.is_some().then(|| {
+                    tui_pickup(
                         entry.agent.as_ref().and_then(|a| a.carryover.as_ref()),
                         crate::pro::checkpoint_recovery_context(state, &workspace.id),
-                    );
+                    )
+                });
+                if let Some(context) = pickup.flatten() {
                     crate::launcher::append_transfer_prompt(&mut argv, &context);
                 }
             }
@@ -374,6 +377,59 @@ pub(crate) async fn spawn_session(
             crate::lock(&state.agents).remove(&id);
             tracing::error!(%err, "failed to spawn session");
             Err(SpawnFailure::Internal(err))
+        }
+    }
+}
+
+/// The one message a moved terminal agent starts with, shown in its terminal
+/// as the user's own line: only when a turn was cut off by the move (idle
+/// conversations resume silently), in plain words that name no machines.
+/// After an abrupt loss (`recovery`) it also asks the agent to check what
+/// already happened before repeating anything.
+pub(crate) fn tui_pickup(
+    carry: Option<&chimaera_agent::Carryover>,
+    recovery: bool,
+) -> Option<String> {
+    let carry = carry.filter(|carry| carry.turn_in_flight || carry.interrupted_work())?;
+    let mut text = String::from(
+        "Continuing here. The previous run stopped while this task was underway; please continue it.",
+    );
+    if recovery {
+        text.push_str(
+            " Some of that work may have happened after the last saved point: check the project and any external effects before repeating a step.",
+        );
+    }
+    if !carry.background.is_empty() {
+        text.push_str(
+            " Background tasks that were running have stopped; restart the ones still needed.",
+        );
+    }
+    Some(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_a_cut_off_turn_gets_a_neutral_pickup_prompt() {
+        let idle = chimaera_agent::Carryover::default();
+        assert_eq!(
+            tui_pickup(None, false),
+            None,
+            "unknown means no billed turn"
+        );
+        assert_eq!(tui_pickup(None, true), None);
+        assert_eq!(tui_pickup(Some(&idle), true), None);
+        let busy = chimaera_agent::Carryover {
+            turn_in_flight: true,
+            ..Default::default()
+        };
+        for recovery in [false, true] {
+            let text = tui_pickup(Some(&busy), recovery).unwrap();
+            assert!(text.starts_with("Continuing here."));
+            for word in ["host", "transfer", "laptop", "cloud", "Chimaera"] {
+                assert!(!text.contains(word), "{word}: {text}");
+            }
         }
     }
 }

@@ -98,6 +98,33 @@ async fn codex_notify_authenticates_and_only_records_verified_terminal_identity(
     state.sessions.kill(&id).unwrap();
 }
 
+/// A moved terminal agent carries whether its turn was in flight, read while
+/// it still runs; an idle one carries nothing (so it resumes with no turn).
+#[tokio::test]
+async fn a_terminal_agents_bundle_records_only_a_turn_in_flight() {
+    let state = test_state();
+    let id = inject_silent_agent(&state, "carry-key");
+    // Quiet terminal, no hook yet: idle.
+    tokio::time::sleep(std::time::Duration::from_millis(
+        crate::agent_state::TUI_QUIET_MS + 100,
+    ))
+    .await;
+    assert!(bundle::tui_carryover(&state, &id).is_none());
+    for busy in [
+        crate::agent_state::AgentState::Running,
+        crate::agent_state::AgentState::NeedsPermission,
+    ] {
+        lock(&state.agents).get_mut(&id).unwrap().state = busy;
+        assert!(
+            bundle::tui_carryover(&state, &id).is_some_and(|carry| carry.turn_in_flight),
+            "{busy:?}"
+        );
+    }
+    lock(&state.agents).get_mut(&id).unwrap().state = crate::agent_state::AgentState::IdlePrompt;
+    assert!(bundle::tui_carryover(&state, &id).is_none());
+    state.sessions.kill(&id).unwrap();
+}
+
 /// The degrade contract end-to-end minus a real agent: a chat driver
 /// whose handshake cannot complete (cat echoes our initialize request
 /// back) must be respawned as a PTY session under the SAME id, with the

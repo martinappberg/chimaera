@@ -277,7 +277,8 @@ the lifecycle, keep them consistent:
   Mastermind, and withheld within 10 min of the chat's last pick-up so a
   crash loop can't bill a turn per crash).
   Transfer restore similarly sends a `moved`/`home` pickup only for captured
-  interrupted work. Finished conversations remain idle; regenerated MCP
+  interrupted work (a terminal agent: one neutral positional prompt, only when
+  its bundle recorded a turn in flight). Finished conversations remain idle; regenerated MCP
   initialization provides current-host context without starting a model turn.
 - **`close-all` / `shutdown` must stop chat drivers too** (`kill_all` only
   covers PTYs).

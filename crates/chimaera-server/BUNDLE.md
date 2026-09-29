@@ -111,10 +111,13 @@ Structured chats receive one attributed `moved`/`home` context message only when
 the captured carryover records an interrupted turn or background work. Finished
 conversations resume idle, preserving history without starting a model turn.
 Fresh MCP initialization supplies current-host context for configured cloud
-projects, including idle chats and native TUIs. Native TUIs receive the same
-bounded context as one positional prompt on resume/fork. Their ledger does not yet
-capture reliable active-versus-idle turn state across providers, so the idle-turn
-suppression currently applies only to structured chats. The Mastermind remains
+projects, including idle chats and native TUIs. A native TUI's bundle records,
+while it still runs, whether a turn was in flight (a Claude hook state of
+running or waiting on a permission; a Codex TUI not yet at a pause, see
+`agent_state::tui_at_pause`) as `carryover.turn_in_flight`. Only then does its
+successor start with one short positional prompt ("Continuing here…", naming no
+machines; after an abrupt loss it also asks to check what already happened); an
+idle TUI resumes with no prompt and no model turn. The Mastermind remains
 reactive and receives no automatic turn.
 
 Plain terminals remain on the source laptop. Their moved bundle imports as a
