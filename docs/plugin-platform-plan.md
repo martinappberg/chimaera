@@ -865,8 +865,10 @@ CI run. Every program run and download is in the plugin's Activity log. A `.tar.
 through the host's `xz` (a login node always has one); `lzma-rs`, which holds a whole
 xz block in memory, only unpacks one of at most 32 MiB where there is no `xz`. Verified
 against the privileged fixture (`tests/plugin_jobs.rs`, the unpacker's hostile
-corpus in `toolchain.rs`) and live on a Linux host with a headless daemon; not yet
-on an HPC login node.
+corpus in `toolchain.rs`) and live on a Linux host with a headless daemon, then on a
+Sherlock login node (2026-09-29): a job under the prelude's `module load texlive`, a
+TinyTeX install streamed through `xz` with RSS flat, and a job stopped at its limit with
+its whole process group.
 
 Jobs and their limits, `job-finished`, long agent tools, tool downloads and setup,
 the Tools section, the privileged fixture, provenance in the lock check.

@@ -909,8 +909,14 @@ highlights in the editor through `codemirror-lang-typst`'s Lezer grammar
 (`web-ui/src/lib/previews/languages.ts`: its parser and editing aids in the app's
 `--syn-*` colors, not its own styles or syntax linter; about 29 KB gzipped, loaded
 for `.typ` only). A file the plugin claims where it is installed but off offers
-**Turn on** in the file bar. Not yet verified on a login node, nor by a claude and a codex session running the
-compile-and-fix loop.
+**Turn on** in the file bar. Verified on a Sherlock login node (2026-09-29, a musl
+daemon under `$SCRATCH`): with `module load system` and `module load texlive` (TeX Live
+2019, latexmk 4.65; the two must be separate commands there) in the host's Environment
+prelude a build runs the module's TeX Live (`from: path`), and still does once TinyTeX
+is installed; TinyTeX's Linux `.tar.xz` (152 MB, 415 MB unpacked) installed in 59 s with
+the daemon's RSS flat (110 MB before and at its peak); an endless document stopped at a
+15 s limit with nothing of its group left running. A claude and a codex session each ran
+the compile-and-fix loop (macOS, 2026-09-29).
 
 Both plugins with the file view, building on open, save and agent writes, the output
 folder, both log parsers and their corpus, the `diagnostics` and `output` surfaces,
