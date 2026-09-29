@@ -1233,6 +1233,76 @@ mod tests {
         assert!(reusable_delegation(None, false).is_none());
     }
 
+    #[test]
+    fn a_lapsed_plan_or_missing_keeper_pauses_setup_without_signing_out() {
+        let mut account = fixture_account();
+        assert!(setup_available(&account));
+        account.plan = chimaera_link::Plan::None;
+        assert!(!setup_available(&account));
+        let mut preparing = fixture_account();
+        preparing.keeper_url.clear();
+        assert!(!setup_available(&preparing));
+    }
+
+    #[tokio::test]
+    async fn sign_out_retries_the_daemon_then_falls_back_to_revoking_this_device() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let delays = [Duration::ZERO, Duration::from_millis(5)];
+        let calls = AtomicUsize::new(0);
+        let never = retry_acknowledged(&delays, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(anyhow::anyhow!("daemon unavailable")) }
+        })
+        .await;
+        assert!(!never);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let calls = AtomicUsize::new(0);
+        let second = retry_acknowledged(&delays, || {
+            let failed = calls.fetch_add(1, Ordering::SeqCst) == 0;
+            async move {
+                anyhow::ensure!(!failed, "busy");
+                Ok(())
+            }
+        })
+        .await;
+        assert!(second);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(UNCONFIGURE_RETRIES.len(), 2);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8192];
+            let n = stream.read(&mut request).await.unwrap();
+            let request = std::str::from_utf8(&request[..n]).unwrap().to_owned();
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+            request
+        });
+        let client = Client::new(
+            &endpoint,
+            Some(Tokens {
+                access_token: "fixture-access".into(),
+                refresh_token: "fixture-refresh".into(),
+                token_type: "Bearer".into(),
+                expires_in: 900,
+            }),
+        )
+        .unwrap();
+        assert!(!revoke_this_device(None, Some("d-fixture")).await);
+        assert!(!revoke_this_device(Some(&client), None).await);
+        assert!(revoke_this_device(Some(&client), Some("d-fixture")).await);
+        assert!(server
+            .await
+            .unwrap()
+            .starts_with("DELETE /v1/devices/d-fixture "));
+    }
+
     #[tokio::test]
     async fn ssh_routing_never_waits_for_account_startup() {
         let pro = Pro::new(Some("http://127.0.0.1:1".into()));
@@ -1340,10 +1410,40 @@ async fn sign_out(app: &AppHandle, everywhere: bool, expected: Option<u64>) -> R
             previous
         };
         stop(&state).await;
-        let _ = daemon_request(&state, "DELETE", "/pro/configure", None).await;
+        let device = lock(&state.pro.account)
+            .as_ref()
+            .map(|account| account.device_id.clone());
+        // Sign-out-everywhere and an account-ended session already revoked
+        // this device server-side, which also ends the daemon's grant.
+        let mut revoked = everywhere || expected.is_some();
+        // Signing out is the only thing that removes the daemon's setup. If the
+        // daemon never acknowledges, revoke this device so its grant stops
+        // copying projects for a signed-out account anyway.
+        let acknowledged = retry_acknowledged(&UNCONFIGURE_RETRIES, || async {
+            daemon_request(&state, "DELETE", "/pro/configure", None)
+                .await
+                .map(|_| ())
+        })
+        .await;
+        if !acknowledged && !revoked {
+            revoked = revoke_this_device(client.as_ref(), device.as_deref()).await;
+        }
         *lock(&state.pro.delegation) = None;
         *lock(&state.pro.daemon_stamp) = None;
         crate::askpass::close_keeper(app, None);
+        // Delete the saved pair while the session can still revoke itself: a
+        // pair left in the credential store would otherwise sign this computer
+        // back in on the next launch.
+        let saved_removed = match state.pro.endpoint.clone() {
+            Some(endpoint) => matches!(
+                tokio::task::spawn_blocking(move || save_tokens(&endpoint, None)).await,
+                Ok(Ok(()))
+            ),
+            None => true,
+        };
+        if !saved_removed && !revoked {
+            revoked = revoke_this_device(client.as_ref(), device.as_deref()).await;
+        }
         if let Some(client) = client {
             client.clear_tokens().await;
         }
@@ -1378,9 +1478,9 @@ async fn sign_out(app: &AppHandle, everywhere: bool, expected: Option<u64>) -> R
                 },
             );
         }
-        if let Some(endpoint) = state.pro.endpoint.clone() {
-            tokio::task::spawn_blocking(move || save_tokens(&endpoint, None)).await??;
-        }
+        // A revoked pair left behind is harmless: the next launch is refused
+        // and deletes it. Only a still-valid saved pair must be reported.
+        anyhow::ensure!(saved_removed || revoked, SIGN_OUT_INCOMPLETE);
         // `expected` marks an account-initiated end (revoked, expired or
         // replayed refresh token). It is final: the reconcile loop, events
         // and serve were stopped above, so nothing retries in the background.
@@ -1390,6 +1490,33 @@ async fn sign_out(app: &AppHandle, everywhere: bool, expected: Option<u64>) -> R
     }
     .await
     .map_err(|error| error.to_string())
+}
+
+const SIGN_OUT_INCOMPLETE: &str = "You're signed out here, but Chimaera couldn't remove your saved sign-in from this computer's credential store. Sign out again once you're online.";
+const UNCONFIGURE_RETRIES: [Duration; 2] = [Duration::ZERO, Duration::from_secs(1)];
+
+/// Tries `attempt` after each delay until it succeeds; false when none did.
+async fn retry_acknowledged<F, Fut>(delays: &[Duration], mut attempt: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    for delay in delays {
+        tokio::time::sleep(*delay).await;
+        if attempt().await.is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Best effort: revoking this device ends its refresh token and the daemon
+/// grant derived from it on the account side.
+async fn revoke_this_device(client: Option<&Client>, device: Option<&str>) -> bool {
+    let (Some(client), Some(device)) = (client, device) else {
+        return false;
+    };
+    client.revoke_device(device).await.is_ok()
 }
 
 #[tauri::command]
@@ -1745,6 +1872,13 @@ impl DaemonStamp {
     }
 }
 
+/// Only an explicit sign-out removes the daemon's setup (see `sign_out`). A
+/// plan that lapsed or a keeper that is still being assigned pauses new setup
+/// but never tears down the daemon's existing one.
+fn setup_available(account: &Account) -> bool {
+    !account.keeper_url.is_empty() && account.plan != chimaera_link::Plan::None
+}
+
 /// Minting a grant revokes the previous one, so an unchanged daemon that still
 /// holds its setup keeps the grant it is using. A daemon that lost its setup
 /// (restart, reset, or a grant the account may have invalidated) gets a fresh
@@ -1770,13 +1904,14 @@ async fn configure_daemon(state: &Shell, client: &Client) -> Result<()> {
     )
     .await?;
     let local = lock(&state.local).clone();
-    if account.keeper_url.is_empty() || account.plan == chimaera_link::Plan::None {
+    if !setup_available(&account) {
         let cleared = DaemonStamp::cleared(&local);
         if lock(&state.pro.daemon_stamp).as_ref() != Some(&cleared) {
-            // The daemon outlives the GUI. A downgrade must revoke its local
-            // runtime even when this app process never configured that runtime.
-            // Keep the stamp unchanged on failure so reconciliation retries.
-            daemon_request(state, "DELETE", "/pro/configure", None).await?;
+            // A lapsed payment or a keeper that is not assigned yet is not a
+            // sign-out: the daemon keeps its setup and its local work (the
+            // account already refuses cloud copies without a plan). Only
+            // project views routed through the keeper are retired. Keep the
+            // stamp unchanged on failure so reconciliation retries.
             let mut links = state.pro.worker_links.lock().await;
             for link in links.values() {
                 link.close();
@@ -1792,7 +1927,6 @@ async fn configure_daemon(state: &Shell, client: &Client) -> Result<()> {
                 .await?;
                 links.remove(&id);
             }
-            *lock(&state.pro.delegation) = None;
             *lock(&state.pro.daemon_stamp) = Some(cleared);
         }
         return Ok(());
