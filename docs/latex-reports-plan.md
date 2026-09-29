@@ -1,6 +1,6 @@
 # LaTeX and Typst reports: the plan
 
-Dated 2026-09-25, revised 2026-09-26 and 2026-09-28. A plan, not a record: nothing
+Dated 2026-09-25, revised 2026-09-26, 2026-09-28 and 2026-09-29. A plan, not a record: nothing
 here has shipped. It covers compiling LaTeX and Typst documents on the host, showing
 the PDF beside the source, jumping between the two, turning compile errors into
 editor marks an agent can fix, showing what changed (in the source and in the PDF),
@@ -45,10 +45,18 @@ Also decided the same day, on the plan's open questions:
    template or an existing project ([the guide](#document_guide-and-the-instructions)).
 9. **Markdown to PDF starts with the small Typst template**; a converter in core only
    if its gaps matter ([markdown to PDF](#6-markdown-to-pdf-and-word-later)).
-10. **No Tectonic.** LaTeX builds with the host's TeX Live only; a host without it
-    gets clear directions instead of a second, older LaTeX
-    ([why](#latex-the-hosts-tex-live)). Typst is the one engine Chimaera installs,
-    with one click, like an agent CLI; the user's own Typst wins.
+10. **No Tectonic.** A second, older LaTeX would build documents differently than
+    TeX Live does for co-authors and journals ([why](#latex-the-hosts-tex-live)).
+
+Added on 2026-09-29:
+
+11. **One-click TeX Live through TinyTeX.** A host without TeX Live gets a real,
+    current TeX Live (TinyTeX, about 150 MB, in the home folder, no admin rights)
+    with one click, the way agent CLIs are installed. The user's own TeX Live always
+    wins. Typst installs the same way ([installs](#installing-engines-like-an-agent)).
+12. **Settings → Documents becomes the one place for this**: which engines run,
+    where they come from, install, update and remove, missing packages, and the
+    build behaviour ([settings](#9-settings-documents)).
 
 **Why not a plugin** (the reasoning the decision rests on). The workbench plugin model
 ([plugin system plan](plugin-system-plan.md)) exists for add-ons that are someone
@@ -65,16 +73,20 @@ repositories and an install step for every user. Plugins stay what they are for.
 ## The short version
 
 - **Open a `.tex` or `.typ` file and it works.** Source and PDF side by side, with no
-  plugin and no switch. A host without Typst is one click from it.
+  plugin and no switch. A host without TeX Live or Typst is one click from it.
 - **Compile on the host, never in the browser.** The daemon runs the host's own
   engine as a small, limited child process, only when a document is open or an agent
   asks. Only the PDF crosses the tunnel, and only the pages you look at.
-- **The host's LaTeX, and Typst on one click.** LaTeX builds with the host's TeX Live
-  through latexmk: whatever `module load texlive` puts on PATH in a terminal. No
-  TeX Live, no LaTeX build, and the view says how to get it. Typst (a newer, much
-  faster typesetting language with simpler syntax): your own `typst`, else one click
-  installs it the way agent CLIs are installed
-  ([installs](#installing-typst-like-an-agent)). No engine ships in the binary.
+- **Your engines first, then one click.** LaTeX builds with TeX Live through latexmk:
+  the host's own (whatever `module load texlive` puts on PATH in a terminal), else
+  TinyTeX, a small, current TeX Live Chimaera installs with one click. Typst (a newer,
+  much faster typesetting language with simpler syntax): your own `typst`, else one
+  click installs it. Both install the way agent CLIs do
+  ([installs](#installing-engines-like-an-agent)); no engine ships in the binary.
+- **Missing LaTeX packages install on the spot** for Chimaera's TinyTeX: the build
+  finds the package that provides the missing file and adds it.
+- **Settings → Documents is the one place** to see which engines run and where they
+  come from, install, update or remove them, and set how builds behave.
 - **Compile on save.** Debounced, one job at a time, niced, time-limited, output
   capped. An agent's write to any file of the document recompiles it too while it is
   open. Build files go to a cache folder, never into the repository.
@@ -148,8 +160,10 @@ Cmd-click, change marks), a SyncTeX parser in a Web Worker, diagnostics through
 `@codemirror/lint`, the change bars, and a lazily loaded Typst grammar. Every chunk
 loads only when a document opens.
 
-**Installs:** a curated Typst recipe beside the agents' in `runtimes.rs`, reusing its
-layout, checksums, visible terminal and update check.
+**Installs:** a TinyTeX recipe and a Typst recipe beside the agents' in
+`runtimes.rs`, reusing its visible terminal, download checks and update check, plus
+one bounded `tlmgr install` for missing packages. **Settings:** the Documents panel
+reworked around them ([section 9](#9-settings-documents)).
 
 **Agents:** no new tool. `check_document` builds `.tex` and `.typ`; `document_guide`
 gains a section; the documents paragraph gains one sentence.
@@ -157,7 +171,8 @@ gains a section; the documents paragraph gains one sentence.
 **Deliberately not built** (each is either out of scope or a later, separate step):
 
 - no plugin, no manifest point, no WIT change;
-- no engine in the binary, no WASM engine, and no Tectonic (Typst installs on a click);
+- no engine in the binary, no WASM engine, and no Tectonic (TinyTeX and Typst install
+  on a click);
 - no language server, completion or refactoring;
 - no copy of SyncTeX in the daemon: the browser parses it;
 - no second build of an old revision in the first version (before-and-after and the
@@ -196,16 +211,18 @@ document tool. Never at boot, so users who never write a report pay nothing.
 
 ### LaTeX: the host's TeX Live
 
-LaTeX builds only with **latexmk and the TeX Live the host already has**. For a
-given main file:
+LaTeX builds only with **latexmk and TeX Live**: the host's own when it has one,
+else Chimaera's TinyTeX. For a given main file:
 
 1. **A project `latexmkrc`** is honored, its Perl running only behind the
    [trust gate](#security).
 2. **The engine** comes from a `% !TEX program = xelatex | lualatex | pdflatex` magic
    comment, else a per-workspace choice in the toolbar, else pdfLaTeX.
-3. **latexmk and that engine on PATH** build it.
-4. **Otherwise nothing builds**, and the empty state says exactly what is missing
-   ([below](#when-there-is-no-engine)).
+3. **The host's latexmk and that engine on PATH** build it. **Yours always wins.**
+4. **Else Chimaera's TinyTeX**, when it has been installed
+   ([installs](#installing-engines-like-an-agent)).
+5. **Otherwise nothing builds yet**, and the empty state offers the one-click install
+   and says what is missing ([below](#when-there-is-no-engine)).
 
 **Why not Tectonic** (decided 2026-09-28). Tectonic is the one LaTeX small enough to
 install like an agent (a 10 MB binary that downloads packages on demand), but it is
@@ -220,8 +237,7 @@ the wrong second LaTeX:
   network.
 
 A document that builds here should build the same way everywhere else. Where TeX Live
-is missing, Typst covers new reports, and an existing LaTeX project's authors usually
-have TeX Live already.
+is missing, TinyTeX is the answer: it *is* TeX Live, current, just trimmed.
 
 **Is TeX Live common?** Mostly where LaTeX gets written, and rarely by default:
 
@@ -233,6 +249,9 @@ have TeX Live already.
 - **Macs:** not by default. People who write LaTeX usually have MacTeX (about 5 GB) or
   the smaller BasicTeX.
 - **Fresh cloud machines and containers:** usually not.
+
+Hence the one-click TinyTeX: without it, a `.tex` file on a laptop or a fresh
+machine would open but never build.
 
 The latexmk command, run with the main file's folder as the working directory:
 
@@ -290,15 +309,14 @@ second. If font discovery on a network filesystem turns out slow,
 The document still opens and edits exactly like any text file today. The PDF side
 shows a calm empty state instead of an error:
 
-- **No TeX Live on this host.** "Chimaera builds LaTeX with the TeX Live your
-  terminals get on *sherlock*, including your environment prelude, and didn't find
-  latexmk." Then the one step that fits the host: on a cluster, **Open Environment
-  settings** with a hint such as `module load texlive` (shown, never written for
-  them); elsewhere, how to install TeX Live on this system, with a link. When TeX
-  Live is there but latexmk is not, it names the missing package. **Check again**
-  re-detects.
-- **No Typst on this host.** **Install Typst** (one click, below), which says what it
-  installs and where before it runs.
+- **No TeX Live on this host.** "No TeX Live on *sherlock*: Chimaera looked on the
+  PATH your terminals get, including your environment prelude." The main button is
+  **Install TeX Live (TinyTeX, about 150 MB)**, which says what it installs and where
+  before it runs. Beside it, quietly: "Have your own? On a cluster, load it in
+  **Environment settings**" (with a hint such as `module load texlive`, shown, never
+  written for them), and **Check again**. When TeX Live is there but latexmk is not,
+  it names the missing package.
+- **No Typst on this host.** **Install Typst (17 MB)**, the same way.
 - **A PDF already sits beside the source** (`report.pdf` next to `report.tex`): show
   it, with a banner "built elsewhere; may be older than the source" when its mtime is
   older than the source's.
@@ -306,28 +324,59 @@ shows a calm empty state instead of an error:
   (`status: no_engine`, what was searched, and how the user can fix it), never a
   failure without words.
 
-### Installing Typst like an agent
+### Installing engines like an agent
 
 **Not bundled in the binary; installed with one click, the way agent CLIs are.**
 Chimaera already installs claude and codex for users who do not have them: a click
 on an install chip runs a curated script in a visible terminal (official release
-files, checksums checked, never sudo), puts the program under `~/.chimaera`, and
-labels it **chimaera** beside the user's own copies, labelled **yours**
+files, checked, never sudo), puts the program under `~/.chimaera`, and labels it
+**chimaera** beside the user's own copies, labelled **yours**
 ([agents](features/agents.md#managed-runtimes--install--update--theming-shims)).
-Typst gets the same treatment, with the same rule: **yours always wins**.
+TeX Live and Typst get the same treatment, with the same rule: **yours always wins**.
 
-- **Typst** installs as one static binary (16.7 MB download for 0.15.1). That is the
-  whole engine: a Chimaera-installed Typst builds any Typst document.
-- **TeX Live cannot be installed this way.** It is several GB and belongs to the host's
-  admins or the user's own setup, and Tectonic, the small alternative, is
-  [not supported](#latex-the-hosts-tex-live).
-- **The layout is the agents' layout:** `~/.chimaera/tools/typst/<version>/` behind an
-  atomic symlink swap, `~/.chimaera/tools/bin` placed *after* the user's own PATH so
-  their Typst wins, an **update →** chip when a newer release exists, and uninstall
-  from Settings. Nothing installs without a click.
-- **In the binary instead?** No: every host would carry 17 MB it may never use, and
-  every deploy and update over ssh would move it. Installing on first use gives the
-  same one-click result without the weight.
+- **TeX Live, as TinyTeX.** TinyTeX is TeX Live, current, trimmed to the common
+  packages, portable, maintained by the RStudio (Posit) team and released about
+  monthly. Its default bundle is about 150 MB for Linux x86_64 (its release page also
+  lists Linux arm64, a musl build and macOS). It unpacks into
+  `~/.chimaera/tools/tinytex/` with no admin rights; the install then adds `latexmk`
+  (and biber where TeX Live ships it for the platform) with TeX Live's own package
+  manager, `tlmgr`. Because it is real TeX Live, a document builds here as it does
+  for co-authors, and packages can be added later (below).
+- **Typst** installs as one static binary (16.7 MB download for 0.15.1) under
+  `~/.chimaera/tools/typst/<version>/`. That is the whole engine.
+- **Where they sit on PATH:** `~/.chimaera/tools/bin`, placed *after* the user's own
+  PATH in the build environment, so the host's TeX Live or the user's own Typst wins
+  whenever it exists.
+- **Updates:** an **update →** chip when a newer release exists, as for agents. For
+  Typst that is the next release. For TinyTeX it is `tlmgr update --all` within a TeX
+  Live year, and a fresh bundle when TeX Live's yearly release comes out, re-adding
+  the packages Chimaera installed (it keeps their list).
+- **Remove** from Settings deletes only Chimaera's copy. Nothing installs without a
+  click, and the install runs in a terminal the user can watch.
+- **Download checks:** each download is checked against the checksums its release
+  publishes, as agent installs are (Phase B confirms what the TinyTeX releases
+  publish); `tlmgr` checks TeX Live's own repository as it always does.
+- **In the binary instead?** No: every host would carry about 170 MB it may never use
+  (the chimaera binary itself is under 40 MB), and every deploy and update over ssh
+  would move it. Offering the install at the moment a `.tex` or `.typ` needs it gives
+  the same result without the weight. It is installed per host, on the host that
+  builds, so a remote cluster gets it without the laptop needing it.
+
+### Missing LaTeX packages
+
+The most common LaTeX error on a small TeX Live is "`siunitx.sty` not found".
+
+- **With Chimaera's TinyTeX**, the build fixes it: the log parser names the missing
+  file, `tlmgr search --global --file` finds the package that provides it, `tlmgr
+  install` adds it (one package at a time, time-limited, in the same queue, logged in
+  the build output), and the build reruns once. The chip says "installed siunitx".
+  A setting turns this off, and then the error offers an **Install siunitx** button
+  instead. It needs the network; offline, the error says so.
+- **With the user's own TeX Live**, Chimaera never changes it. The error names the
+  package and says how to get it: ask the admins, load a fuller TeX Live module, or
+  switch this workspace to Chimaera's TinyTeX in Settings.
+- **Agents** see the same: `check_document` reports "installed siunitx and rebuilt",
+  or names the missing package and who can add it.
 
 **A WASM engine in the browser** is rejected as the main path:
   - typst.ts's compiler is 28 MB (11 MB gzipped), and it fetches fonts and packages
@@ -454,9 +503,9 @@ Typst gets the same treatment, with the same rule: **yours always wins**.
   noise until the end.
 - **Problems list** under the PDF, grouped by file. Clicking an entry opens the file at
   the line (the documents plan's Phase 1 "open at the spot").
-- **Special cases get plain words.** "`siunitx.sty` not found: this TeX Live does not
-  have it; load a fuller TeX Live in your prelude, or ask your admins." "biber 2.19
-  does not match biblatex 3.20; use the biber from the same TeX Live." "Package
+- **Special cases get plain words.** A missing package is installed or explained
+  ([missing packages](#missing-latex-packages)). "biber 2.19 does not match biblatex
+  3.20; use the biber from the same TeX Live." "Package
   `@preview/cetz:0.3.4` is not cached and this host is offline."
 - **Log text is untrusted.** It contains text from the document. It is shown as text,
   never as HTML ([web-UI rules](../.claude/rules/web-ui.md)).
@@ -793,6 +842,11 @@ plain wall-clock limit where it does not.
   never touches the network, and a missing one on an offline host becomes a
   plain-words diagnostic. Chimaera does not sandbox the
   network itself, for the same reason as reads.
+- **Installs.** TinyTeX and Typst come only from their official release pages over
+  HTTPS, checked against the checksums those releases publish, into
+  `~/.chimaera/tools`, on a click, in a visible terminal, never with sudo. Missing
+  packages come through `tlmgr` from TeX Live's own repository, only into Chimaera's
+  TinyTeX, one bounded call per package.
 - **Environment hygiene.** Compiles get the captured prelude environment, minus the
   daemon's own variables and anything on `api::spawn_env_remove`. No token ever reaches
   an engine.
@@ -896,6 +950,52 @@ browser (above 20,000 lines it falls back to lines), and no build. Nothing polls
 the git epoch refetches. Every git call runs through the existing runner (a timeout
 that kills the child, output caps, a concurrency permit).
 
+## 9. Settings: Documents
+
+Today **Settings → Documents** holds one thing: the opt-in installs that teach agents
+the document dialect (an `AGENTS.md` section, a Claude Code skill). It becomes the one
+place for documents, in three groups, built like **Settings → Agents** (one row per
+program, where it comes from in words, one action) so nothing about it is new to
+learn.
+
+**Engines.** One row each, read from the same detection the builds use:
+
+| Row | What it says | Action |
+|---|---|---|
+| TeX Live | "yours · TeX Live 2025 · from your environment prelude", or "chimaera · TinyTeX 2026.09 · 180 MB · 214 packages", or "not found on this host" | yours: none (its updates are yours) · chimaera: **update →** when there is one, **Remove** · not found: **Install TinyTeX (about 150 MB)** |
+| under it: latexmk, biber | found, or missing with the fix in words ("your TeX Live has no latexmk: ask your admins, or use Chimaera's TinyTeX") | none |
+| Typst | "yours · 0.15.1", "chimaera · 0.15.1", or "not found" | the same as TeX Live; **Install Typst (17 MB)** |
+| pandoc | found or not; used only for Word and optional exports | none |
+
+Under the rows: **TeX Live for this workspace: Automatic (yours, else Chimaera's) ·
+Chimaera's TinyTeX**, for a cluster whose TeX Live is old or short of packages; and
+**Check again**, after changing a module load.
+
+**Building.** Ordinary schema rows (`schema.ts`), so search finds them ("latex",
+"tex", "typst", "pdf"):
+
+- **Build LaTeX and Typst** (on). Off, `.tex` and `.typ` open as plain text.
+- **Build when a document opens** (on), **Build when an agent edits one** (on).
+- **Install missing LaTeX packages automatically** (on; Chimaera's TinyTeX only).
+- **Build folder**: its path, "312 MB of 1 GB used", **Clear**, and the cap.
+- Per workspace: **Unrestricted shell escape** (off, with a plain warning), and the
+  **trusted `latexmkrc` files**, each with **Revoke**.
+
+**Teach agents.** Today's content, unchanged: the `AGENTS.md` section and the Claude
+Code skill, which now also carry the report conventions.
+
+**Two small links elsewhere:**
+
+- **Settings → Environment** shows, under the prelude editors, what that prelude puts
+  in reach: "Found through this prelude: TeX Live 2025, typst 0.15.1". Loading a
+  module then visibly does what it should.
+- The document view's empty state, its status chip and a build error that names a
+  missing engine all link to this panel.
+
+The panel adds no settings framework: engine rows reuse the Agents rows' pattern,
+build rows are schema rows, and per-workspace choices sit in the same small capped
+JSON file as the remembered main files.
+
 ## What changes where
 
 The daemon module is in [what core gets](#what-core-gets-and-what-it-does-not).
@@ -908,15 +1008,19 @@ Around it:
 | `web-ui/src/lib/previews/` | `files.ts` (the `document` kind), `DocumentView.svelte`, `SplitEditPreview.svelte` (three-state `show`), `PdfView.svelte` (in-place reload, boxes, Cmd-click, change marks), `doc/compile.svelte.ts` (status, the events frame), `doc/diagnostics.ts`, `doc/synctex.ts` + `doc/synctex.worker.ts`, `doc/textSync.ts` (Typst), `doc/changes.ts`, `doc/typstLang.ts` |
 | `web-ui/src/lib/workspace/`, timeline, chat turn-end | the **Changes in PDF** row action and the "pages changed" chip |
 | `web-ui/src/lib/shared/reference.ts` | the compile-error and change composers |
-| settings | **Documents → Build LaTeX and Typst**, the build folder, compile on open and agent writes |
+| `crates/chimaera-server/src/runtimes.rs` | the TinyTeX and Typst recipes beside the agents', and the bounded `tlmgr install` for missing packages |
+| `web-ui/src/lib/settings/` | `DocumentsSettings.svelte` reworked ([section 9](#9-settings-documents)); the build rows in `schema.ts`; the "found through this prelude" line in `EnvironmentSettings.svelte` |
 | docs | the feature pages for files and previews, git and agents when each phase ships; this plan's status |
 
 New routes, all bearer-authed and additive: `GET /api/v1/doc/engines`
 (`?refresh=true` re-detects), `POST /api/v1/doc/compile {path, reason}` →
 `202 {main, version}`, `GET /api/v1/doc/status?path=` (engine, state, PDF, SyncTeX
 path, counts, diagnostics), `PUT /api/v1/doc/main {path, main}`,
-`POST /api/v1/doc/trust {path, file, hash}`, `GET /api/v1/git/log`, `rev=` on
-`GET /api/v1/git/diff`, and the `/ws/events` frame `{"type":"doc", …}`.
+`POST /api/v1/doc/trust {path, file, hash}`, `GET` and `DELETE /api/v1/doc/cache`
+(the build folder's use, and **Clear**), `POST /api/v1/tools/{tinytex|typst}/install`,
+`POST …/update` and `DELETE …/install` (the agents' install routes, for engines),
+`GET /api/v1/git/log`, `rev=` on `GET /api/v1/git/diff`, and the `/ws/events` frame
+`{"type":"doc", …}`.
 
 ## Phases
 
@@ -944,13 +1048,18 @@ both agents' MCP tool-call timeouts.
 
 `DocumentView`, compile on open, on save and on agent writes to the open file or its
 main file, the in-place PDF swap, error marks, the problems list, **Ask agent**, the
-status chip, the empty states with the TeX Live directions and **Install Typst** (the
-curated recipe in `runtimes.rs`), **Save PDF beside source**, the setting.
+status chip, the empty states with **Install TinyTeX** and **Install Typst** (the
+recipes in `runtimes.rs`), missing packages installed on the spot, **Save PDF beside
+source**, and the reworked Settings → Documents.
 
 **Verification.** Driven live in the isolated preview on Chromium and WebKit, against a
 remote daemon over a real tunnel: type, save, watch the PDF swap without a flash; let
 an agent edit a chapter and watch the PDF follow; break a macro and send the error to
-the agent. A `scripts/perf/` scenario measures bytes per rebuild of a 20 MB report.
+the agent. On a machine with no TeX Live: install TinyTeX from the empty state, build a
+document that needs a package TinyTeX lacks and watch it install and rebuild, then
+remove TinyTeX from Settings. On a cluster: check that the host's TeX Live wins over
+an installed TinyTeX. A `scripts/perf/` scenario measures bytes per rebuild of a
+20 MB report.
 
 ### Phase C: jumps and references
 
@@ -979,7 +1088,7 @@ The template, **Export PDF**, pandoc when present.
 | Phase | What | Size |
 |---|---|---|
 | A | The build module, `check_document`, the guide | medium |
-| B | Document view, compile loop, error marks | large |
+| B | Document view, compile loop, error marks, one-click engines, the settings panel | large |
 | C | Jumps both ways, source references | medium |
 | D | Multi-file depth | small |
 | E | Changes in the source and the PDF | medium |
@@ -1008,10 +1117,18 @@ is there:
 
 ## Open decisions
 
-None. Everything the plan asked was decided on 2026-09-28: core, not a plugin; kept
-lean; and the questions listed under [decisions](#decisions-maintainer-2026-09-28),
-including LaTeX through the host's TeX Live only and Typst installed with one click.
-New questions will surface in Phase A's measurements; they go here.
+Two small ones, from the TinyTeX addition:
+
+1. **Which TinyTeX bundle.** The default bundle (about 150 MB on Linux, the common
+   packages already in) is recommended: fewer builds wait on a package download. The
+   smaller TinyTeX-1 (about 54 MB, about 100 packages) saves disk and installs more
+   packages on demand.
+2. **Missing packages install automatically** for Chimaera's TinyTeX (recommended: a
+   build that fails for a missing `.sty` fixes itself, which is what an agent's
+   check-and-fix loop needs), or a button on each error?
+
+Everything else is decided: core, not a plugin; kept lean; and the questions listed
+under [decisions](#decisions-maintainer-2026-09-28).
 
 ## Out of scope
 
@@ -1020,10 +1137,10 @@ New questions will surface in Phase A's measurements; they go here.
 - **A language server, completion or refactoring** (texlab, tinymist): the DESIGN.md
   non-goal.
 - **A WASM engine in the browser**, **bundling** Typst or TeX Live in the binary
-  ([why](#installing-typst-like-an-agent)), and **Tectonic**
+  ([why](#installing-engines-like-an-agent)), and **Tectonic**
   ([why](#latex-the-hosts-tex-live)).
-- **Managing TeX packages** (`tlmgr`). The host's admins and the user's prelude own the
-  TeX installation.
+- **Changing the user's own TeX Live.** Chimaera installs packages only into its own
+  TinyTeX; the host's TeX Live belongs to its admins and the user's prelude.
 - **Committing, staging or reverting from the changes views.** Git stays read-only
   here; the views show and point, the terminal commits.
 - **Editing a `.docx` in place**, styles and tracked changes preserved.
@@ -1172,7 +1289,12 @@ instead; those links are what is cited.
 
 - **Changes and conversion**: [latexdiff on CTAN](https://ctan.org/pkg/latexdiff)
   (`--flatten`, the markup options), [mitex](https://github.com/mitex-rs/mitex) (the
-  Rust converter behind the Typst package; crate and licence to confirm).
+  Rust converter behind the Typst package, Apache-2.0; it converts math and basic text
+  commands, not packages or whole documents).
+- **TinyTeX**: [release repository](https://github.com/rstudio/tinytex-releases) (the
+  bundles and their sizes per platform, the release cadence, `tlmgr` for missing
+  packages; checked 2026-09-29; its homepage was unreachable from the research
+  environment).
 
 **Not verified, measured in Phase A instead**: Typst's time and memory for a
 20-page report; how long a login shell with `module load texlive` takes on a busy login node; whether
