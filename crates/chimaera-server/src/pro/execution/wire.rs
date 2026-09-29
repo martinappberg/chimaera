@@ -46,8 +46,11 @@ pub(crate) struct ExecutionConfiguration {
     pub installation_id: Option<String>,
     pub capability: ExecutionCapability,
 }
+// Account responses below accept additive fields, matching the link crate
+// (PROTOCOL.md): a newer service must not break an older daemon. The
+// capability above and the local configure/recovery/identity records stay
+// exact: an unknown field there means a different contract, not a newer one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct Continuity {
     pub version: u16,
     pub mode: String,
@@ -55,7 +58,6 @@ pub(crate) struct Continuity {
     pub preferred_installation_id: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct ExecutionLease {
     pub id: String,
     pub sequence: u64,
@@ -65,11 +67,12 @@ pub(crate) struct ExecutionLease {
 pub(crate) enum Continuation {
     Idle,
     Interrupted,
+    /// Unknown evidence is uncertain, never a blind replay.
     #[default]
+    #[serde(other)]
     Uncertain,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct Checkpoint {
     pub id: String,
     pub sequence: u64,

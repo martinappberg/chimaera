@@ -402,7 +402,11 @@ release. Acquire/renew/release add execution_capability and return continuity
 execution_lease (opaque id and increasing sequence), and a checkpoint. Acquiring
 and renewing pin the selected checkpoint; GET reports the latest acknowledged
 publication. Once enrolled, legacy acquisition/renewal/write credentials and
-publication cannot downgrade the workspace.
+publication cannot downgrade the workspace. Both the link client and the daemon
+decode these account responses leniently: unknown fields in the baton,
+continuity, lease and checkpoint are ignored and an unknown `continuation` value
+reads as `uncertain`. The capability object and the daemon's own acknowledgments
+stay exact.
 
 A client deadline starts before the mutating request and uses server-relative
 lease duration (at most 90 seconds), minus a 15-second stop margin. Passive GET,

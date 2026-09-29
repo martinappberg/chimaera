@@ -43,6 +43,25 @@ fn baton() -> Baton {
     "continuity":{"version":2,"mode":"managed_v1","policy_revision":1,"preferred_installation_id":"i-home"},"execution_capability":{"version":1,"boundary":"managed_processes","expired_takeover":false},"execution_lease":{"id":"lease-a","sequence":1}})).unwrap()
 }
 
+/// A newer account may add fields to what it sends; the daemon keeps working
+/// (unknown evidence of a turn is uncertain, never a blind replay). The
+/// capability identity stays exact: an unknown field there is a different one.
+#[test]
+fn service_responses_accept_additive_fields() {
+    let mut value = json!({"workspace_id":"w-a","holder_id":"d-home","epoch":2,"requires_fork":false,"server_now":"2026-09-28T00:00:00Z","expires_at":"2026-09-28T00:01:30Z",
+    "continuity":{"version":2,"mode":"managed_v1","policy_revision":1,"preferred_installation_id":"i-home","future":true},"execution_capability":{"version":1,"boundary":"managed_processes","expired_takeover":false},"execution_lease":{"id":"lease-a","sequence":1,"issued_by":"future"},
+    "checkpoint":{"id":"cp-a","sequence":1,"source_holder_id":"d-home","source_epoch":2,"working_tree_oid":"a","config_oid":"b","handoff_oid":"c","continuation":"paused_on_question","signed":"future"},
+    "placement":{"availability":"suspended"}});
+    let baton: Baton = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(baton.execution_lease.unwrap().sequence, 1);
+    assert_eq!(
+        baton.checkpoint.unwrap().continuation,
+        wire::Continuation::Uncertain
+    );
+    value["execution_capability"]["future"] = json!(true);
+    assert!(serde_json::from_value::<Baton>(value).is_err());
+}
+
 #[tokio::test]
 async fn strict_worker_polling_fences_released_work_until_hydration() {
     use axum::{http::StatusCode, response::IntoResponse, routing::any, Json, Router};
