@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { MirrorStatus, MirrorWorkspace } from "../net/native";
-import { paid, readIntent, cloudCopy, cloudPollDelay, cloudProjectStatus, connectionWarningCopy, copyIssue, friendlyError, projectCopiesSetupLine, projectCopyError, projectPlace, signInNoteCopy, alreadySubscribed, recoverableAccountRestore } from "./presentation";
+import { paid, readIntent, cloudCopy, cloudPollDelay, cloudProjectStatus, connectionWarningCopy, copyIssue, friendlyError, projectCopiesSetupLine, projectCopyError, projectPlace, returningLine, RETURN_WINDOW_ENDED_COPY, signInNoteCopy, alreadySubscribed, recoverableAccountRestore } from "./presentation";
 
 // Copy is free to change; these tests pin which states read alike or apart,
 // what takes precedence, and that nothing from a raw error reaches the page.
@@ -154,6 +154,13 @@ describe("cloud preparation progress", () => {
     expect(copyIssue(null)).toBe("none");
     expect(copyIssue(undefined)).toBe("none");
   });
+  it("reads an ended return window as one quiet note, never progress or a problem", () => {
+    const ended = (): MirrorWorkspace => { const r = row("saved", 123); r.mirror!.error = "return_window_ended"; r.mirror!.error_code = "return_window_ended"; return r; };
+    expect(copyIssue(ended().mirror)).toBe("note");
+    expect(projectCopyError("return_window_ended", "return_window_ended")).toBe(RETURN_WINDOW_ENDED_COPY);
+    // It never makes a project "need attention".
+    expect(cloudProjectStatus(mirror([ended()]))?.state).not.toBe("attention");
+  });
   it("explains a failed cloud setup on its own, as a problem", () => {
     const setup = (): MirrorWorkspace => { const r = row("saved", 123); r.mirror!.error = "project setup failed"; r.mirror!.error_code = "cloud_setup_failed"; return r; };
     expect(copyIssue(setup().mirror)).toBe("problem");
@@ -222,5 +229,28 @@ describe("saved account recovery", () => {
     expect(recoverableAccountRestore("account_restore_locked")).toBe(true);
     expect(recoverableAccountRestore("account_restore_unavailable")).toBe(true);
     for (const value of [null, "sign in required", "authorization revoked", "some upstream error"]) expect(recoverableAccountRestore(value)).toBe(false);
+  });
+});
+
+describe("an ended plan's return window", () => {
+  const until = "2026-11-03T09:30:00Z";
+  const before = Date.parse("2026-10-20T12:00:00Z");
+  it("says when the cloud work can still be brought home, in the person's own date format", () => {
+    const line = returningLine(until, before, "en-US");
+    expect(line).toMatch(/^Your plan has ended\. Bring your work home from the cloud by .*2026.*\.$/);
+    expect(returningLine(until, before, "en-US")).not.toBe(returningLine(until, before, "de-DE"));
+  });
+  it("is absent without a window and reads as the code once the time has passed", () => {
+    expect(returningLine(null, before)).toBeNull();
+    expect(returningLine("soon", before)).toBeNull();
+    expect(returningLine(until, Date.parse(until))).toBe(RETURN_WINDOW_ENDED_COPY);
+    expect(returningLine(until, Date.parse(until) + 86_400_000)).toBe(RETURN_WINDOW_ENDED_COPY);
+  });
+  it("renders the return_window_ended code as one plain, quiet sentence wherever it arrives", () => {
+    expect(RETURN_WINDOW_ENDED_COPY).toBe("The time to bring this work home has passed. Contact support.");
+    expect(friendlyError(new Error("return_window_ended"), "fallback")).toBe(RETURN_WINDOW_ENDED_COPY);
+    expect(friendlyError("return_window_ended", "fallback")).toBe(RETURN_WINDOW_ENDED_COPY);
+    expect(friendlyError(new Error("return_window_ended and more"), "fallback")).toBe("fallback");
+    expect(RETURN_WINDOW_ENDED_COPY).not.toMatch(/return_window_ended|epoch|window/i);
   });
 });

@@ -1,13 +1,13 @@
 import type { ProStatus } from "../net/native";
 import { billingNeedsReview, billingPending } from "./billing";
 import { paid } from "./presentation";
-import { accountFailure, paymentDue, rechecksItself } from "./status";
+import { accountFailure, grantedPlan, paymentDue, rechecksItself } from "./status";
 
 /** A confirmed account with no plan (or signed out). Rendering reads the last
  * confirmed status; purchase actions separately require a fresh read. */
 export function isConfirmedFree(status: ProStatus | null): boolean {
   return status?.available === true && !status.initializing && accountFailure(status) === null
-    && !paymentDue(status) && (status.signed_in ? status.plan === "none" : true);
+    && !paymentDue(status) && (status.signed_in ? grantedPlan(status) === "none" : true);
 }
 
 /** The Pro page's main area. Derived from the last confirmed status so a
@@ -22,7 +22,9 @@ export function accountPanel(status: ProStatus | null, read: AccountRead): Accou
   if (status === null) return "loading";
   if (!status.available) return "unavailable";
   if (status.initializing) return "initializing";
-  const subscribed = status.signed_in && paid(status.plan);
+  // An ended plan grants nothing even while the account still names it: the
+  // page offers plans (with the quiet return line), never the subscriber view.
+  const subscribed = status.signed_in && paid(grantedPlan(status));
   const billing = billingPending(status.billing) || billingNeedsReview(status.billing, subscribed);
   if (isConfirmedFree(status) && !billing) return "plans";
   if (subscribed) return "subscriber";

@@ -561,6 +561,7 @@ mod tests {
             payment_due: None,
             subscription_status: None,
             plans: None,
+            returning_until: None,
         };
         assert!(!confirms("own", Some(&Plan::Pro), &account));
         account.plan = Plan::Pro;

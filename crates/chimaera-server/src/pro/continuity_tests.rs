@@ -1326,9 +1326,47 @@ fn transfer_failures_carry_stable_codes_not_just_words() {
             "previous_processes_running",
         ),
         ("mirror Git operation failed", "git"),
+        ("return_window_ended", "return_window_ended"),
     ] {
         assert_eq!(error_code(&anyhow::anyhow!(text)), code, "{text}");
     }
+}
+
+/// Once a plan has ended and the time to bring cloud work home has passed, the
+/// account answers 403 `return_window_ended`. It reads as itself (the page says
+/// so plainly); any other 403 stays a plain response for its caller to judge.
+#[tokio::test]
+async fn an_ended_return_window_reads_as_itself_not_a_bare_refusal() {
+    let fake = FakeAccount::start(json!({})).await;
+    let config = device(&fake.endpoint);
+    fake.script(
+        "GET",
+        "/v2/baton/w-ended",
+        403,
+        json!({"error":"return_window_ended"}),
+    );
+    fake.script(
+        "GET",
+        "/v2/baton/w-other",
+        403,
+        json!({"error":"mirror_disabled"}),
+    );
+    let error = account(&config, "/v2/baton/w-ended", "GET", None)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(
+        super::super::routes::error_code(&error),
+        "return_window_ended"
+    );
+    assert_eq!(
+        super::super::projects::open_error_code(&error),
+        "return_window_ended"
+    );
+    let other = account(&config, "/v2/baton/w-other", "GET", None)
+        .await
+        .unwrap();
+    assert_eq!(other.status, 403);
 }
 /// Subscribing never interrupts running work: the first v2 enrollment takes
 /// the project's lease around a mid-turn chat, which keeps its process and

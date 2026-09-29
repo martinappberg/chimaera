@@ -58,7 +58,10 @@ Only confirmed free accounts see the illustrated introduction and plan selection
 Paid accounts see an operational overview without a sales pitch or walkthrough.
 Unknown/startup/error account states stay neutral; a connection warning is not an
 error. An overdue payment (`payment_due`) shows Payment needs attention with
-Manage billing and never plans or checkout. The page renders from the last
+Manage billing and never plans or checkout. An ended plan inside its return
+window (`returning_until`) reads as no plan: the badge says **Plan ended**, plans
+are offered, and one quiet line says when its cloud work can still be brought
+home. The page renders from the last
 confirmed status (`pro/account.ts` `accountPanel`) while background reads run, so
 nothing unmounts on `pro-changed` or focus; an account needing attention keeps
 that panel too, and only Check again shows checking (the error bar hides

@@ -93,6 +93,9 @@ pub struct Status {
     connection_warning: Option<&'static str>,
     /// Additive: the subscription needs a payment update.
     payment_due: bool,
+    /// Additive: the plan has ended and this RFC 3339 time is how long its
+    /// cloud work can still be brought home; null otherwise.
+    returning_until: Option<String>,
     /// Additive: the account's offers, passed through when the service
     /// supplies them; clients never hardcode prices.
     plans: Option<Vec<chimaera_link::PlanPrice>>,
@@ -217,6 +220,9 @@ impl Pro {
             payment_due: account
                 .as_ref()
                 .is_some_and(chimaera_link::Account::needs_payment),
+            returning_until: account
+                .as_ref()
+                .and_then(|account| account.returning_until.clone()),
             plans: account.as_ref().and_then(|account| account.plans.clone()),
             sign_in: self.sign_in.status(),
             billing: self.billing.status(),
@@ -1444,6 +1450,7 @@ mod tests {
         *lock(&pro.warning) = None;
         let wire = serde_json::to_value(pro.status_snapshot()).unwrap();
         assert!(wire["connection_warning"].is_null() && wire["plans"].is_null());
+        assert!(wire["returning_until"].is_null());
         assert_eq!(wire["payment_due"], false);
         assert_eq!(wire["plan"], "pro");
         let mut newer = fixture_account();
@@ -1451,6 +1458,14 @@ mod tests {
         *lock(&pro.account) = Some(newer);
         let wire = serde_json::to_value(pro.status_snapshot()).unwrap();
         assert!(wire["plan"].is_null(), "an unnamed plan stays neutral");
+        // An ended plan inside its return window carries the time it closes.
+        let mut ended = fixture_account();
+        ended.plan = chimaera_link::Plan::None;
+        ended.returning_until = Some("2026-11-03T09:30:00Z".into());
+        *lock(&pro.account) = Some(ended);
+        let wire = serde_json::to_value(pro.status_snapshot()).unwrap();
+        assert_eq!(wire["returning_until"], "2026-11-03T09:30:00Z");
+        assert_eq!(wire["plan"], "none");
     }
 
     #[test]

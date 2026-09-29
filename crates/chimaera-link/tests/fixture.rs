@@ -254,6 +254,7 @@ async fn unassigned_keeper_does_not_block_account_and_devices() {
         payment_due: None,
         subscription_status: None,
         plans: None,
+        returning_until: None,
     };
     let router = Router::new()
         .route(

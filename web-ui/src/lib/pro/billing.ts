@@ -1,12 +1,12 @@
 import type { ProBillingAttempt, ProPlanPrice, ProStatus } from "../net/native";
 
 import type { PlanChoice } from "./presentation";
-import { accountFailure, paymentDue } from "./status";
+import { accountFailure, grantedPlan, paymentDue } from "./status";
 
 /** Called only by an explicit purchase action; remembered drafts are never authority. */
 export function explicitCheckoutChoice(status: ProStatus | null, fresh: boolean, selected: PlanChoice): PlanChoice | null {
   if (!fresh || !status?.available || !status.signed_in || status.initializing || accountFailure(status) !== null
-    || status.sign_in != null || status.plan !== "none" || paymentDue(status) || billingPending(status.billing)
+    || status.sign_in != null || grantedPlan(status) !== "none" || paymentDue(status) || billingPending(status.billing)
     || billingNeedsReview(status.billing, false)) return null;
   return { ...selected };
 }
@@ -62,7 +62,7 @@ export function billingCopy(attempt: ProBillingAttempt, plan: ProStatus["plan"])
 /** Only a fresh, confirmed Pro subscriber is offered an upgrade review. */
 export function canReviewUpgrade(status: ProStatus | null, fresh: boolean): boolean {
   return fresh && status?.available === true && status.signed_in && !status.initializing
-    && accountFailure(status) === null && status.sign_in == null && status.plan === "pro" && !billingPending(status.billing);
+    && accountFailure(status) === null && status.sign_in == null && grantedPlan(status) === "pro" && !billingPending(status.billing);
 }
 
 /** A display price from the account's own list. Prices are never built into

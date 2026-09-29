@@ -73,7 +73,13 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    messages older shells put in `error`) is one quiet line for that state, with
    no button, never an account failure. An account whose payment needs attention
    (optional `ProStatus.payment_due`) sees **Payment needs attention** with
-   **Manage billing**, and is never offered plans or checkout.
+   **Manage billing**, and is never offered plans or checkout. An account whose
+   plan has ended shows the plan badge as **Plan ended** (never a paid one, even
+   if the account still names the plan) and, while it lasts, one quiet line: **Your
+   plan has ended. Bring your work home from the cloud by** the date the account
+   gives (optional `ProStatus.returning_until`). After that date the account
+   refuses with `return_window_ended`, which reads as **The time to bring this
+   work home has passed. Contact support.** No dialog, no warning colour.
    The page shows the signed-in email and current plan. Without a plan, choose
    Pro or Max and monthly or yearly billing, then continue to checkout in the
    system browser. Both **Sign up** and **Sign in** remember that
@@ -277,7 +283,9 @@ does not poll while parked. Project privacy and copy status use authenticated
 `pro_status` carries, additively: `error` (a failure needing the user, or a fixed
 code), `connection_warning` (informational fixed code: `connection_preparing`,
 `connection_retrying`, `account_unreachable`; work continues and Chimaera
-retries), `payment_due` (the account reports a payment problem) and `plans` (the
+retries), `payment_due` (the account reports a payment problem),
+`returning_until` (an RFC 3339 time, or null: an ended plan's cloud work can be
+brought home until then) and `plans` (the
 account's offers with amounts, when the service supplies them; prices are never
 hardcoded). `error` is `service_unsupported` when the Pro service does not
 support this app version; project continuity then stays off (rechecked every ten

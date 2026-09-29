@@ -56,6 +56,8 @@ pub(super) fn error_code(error: &anyhow::Error) -> &'static str {
         // The next pass retries through the newer path on its own, so it reads
         // as the copy still being saved rather than a problem.
         "checkpoint_pending"
+    } else if has(transport::RETURN_WINDOW_ENDED) {
+        "return_window_ended"
     } else if has("Account changed") || has("account changed") {
         "account_changed"
     } else if has("previous managed processes") || has("previous execution is stopping") {

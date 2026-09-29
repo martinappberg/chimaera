@@ -68,14 +68,19 @@ pub(super) async fn account(
         );
     }
     authority::account_request(config, path, method, body)?;
-    transport::request(
+    let response = transport::request(
         &config.endpoint,
         path,
         method,
         &config.delegation.access_token,
         body,
     )
-    .await
+    .await?;
+    ensure!(
+        !transport::return_window_ended(&response),
+        transport::RETURN_WINDOW_ENDED
+    );
+    Ok(response)
 }
 async fn credentials(
     config: &Configure,

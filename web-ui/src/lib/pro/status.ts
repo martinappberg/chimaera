@@ -40,6 +40,26 @@ export function paymentDue(status: Pick<ProStatus, "signed_in" | "payment_due"> 
   return status?.signed_in === true && status.payment_due === true;
 }
 
+/** The RFC 3339 time until which an ended plan's cloud work can still be
+ * brought home, or null when the account reports none (or a value that is not
+ * a time). */
+export function returningUntil(status: Pick<ProStatus, "signed_in" | "returning_until"> | null | undefined): string | null {
+  const until = status?.signed_in === true ? status.returning_until : null;
+  return typeof until === "string" && Number.isFinite(Date.parse(until)) ? until : null;
+}
+
+/** The plan has ended and its cloud work is being brought home. */
+export function planEnded(status: Pick<ProStatus, "signed_in" | "returning_until"> | null | undefined): boolean {
+  return returningUntil(status) !== null;
+}
+
+/** The plan the account currently grants: none once it has ended, even while
+ * the account still names it. Paid content, the subscriber page and the paid
+ * badge follow this, never the named plan alone. */
+export function grantedPlan(status: Pick<ProStatus, "signed_in" | "plan" | "returning_until"> | null | undefined): ProStatus["plan"] | undefined {
+  return planEnded(status) ? "none" : status?.plan;
+}
+
 /** Which informational connection state the account is in, if any:
  * `connection_preparing`, `connection_retrying`, `account_unreachable`, or a
  * newer shell's code (older shells' two messages in `error` map to the first

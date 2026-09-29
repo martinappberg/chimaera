@@ -902,6 +902,10 @@ export interface ProStatus {
   /** Optional: the subscription's payment failed and needs the customer's
    * attention (billing portal). Checkout must never start a second plan. */
   payment_due?: boolean;
+  /** Optional: once the plan has ended, the RFC 3339 time until which its cloud
+   * work can still be brought home; null or absent otherwise (older shells
+   * omit it). An ended plan grants nothing (`pro/status.ts` `grantedPlan`). */
+  returning_until?: string | null;
   /** Optional: the account's current prices. Absent or null means the page
    * names the plans only; amounts are never built into the app. */
   plans?: ProPlanPrice[] | null;

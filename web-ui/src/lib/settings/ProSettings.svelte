@@ -11,9 +11,9 @@
   import ConfirmDialog from "../shared/ConfirmDialog.svelte";
   import { asyncDisposer } from "../shared/asyncDisposer";
   import { pageVisible } from "../shared/visibility";
-  import { paid, readIntent, friendlyError, recoverableAccountRestore, alreadySubscribed, connectionWarningCopy, signInNoteCopy, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
+  import { paid, readIntent, friendlyError, recoverableAccountRestore, alreadySubscribed, connectionWarningCopy, returningLine, signInNoteCopy, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
   import { accountErrorBar, accountPanel, completesReview, isConfirmedFree, nearLimit, offersCheck, reviewKey } from "../pro/account";
-  import { accountFailure, connectionWarningCode, paymentDue, signInNote } from "../pro/status";
+  import { accountFailure, connectionWarningCode, grantedPlan, paymentDue, planEnded, returningUntil, signInNote } from "../pro/status";
   import {
     onProChanged, proStatus, proSignIn, proCancelSignIn, proSignOut, proSignOutEverywhere,
     proHosts, proSetHostKept, proDevices, proRevokeDevice, proBillingCheckout, proBillingPortal, proCancelBilling, proRefreshAccount, proMirrorStatus,
@@ -61,7 +61,11 @@
   let plansElement = $state<HTMLElement>();
   let generation = 0;
   let alive = true;
-  const subscribed = $derived(status?.signed_in === true && paid(status.plan));
+  // An ended plan grants nothing even while the account still names it.
+  const subscribed = $derived(status?.signed_in === true && paid(grantedPlan(status)));
+  const ended = $derived(planEnded(status));
+  /** One quiet line while an ended plan's cloud work can still be brought home. */
+  const returning = $derived(returningLine(returningUntil(status)));
   const confirmedFree = $derived(isConfirmedFree(status));
   const panel = $derived(accountPanel(status, checking ? "check" : refreshing ? "background" : "none"));
   const failure = $derived(accountFailure(status));
@@ -110,7 +114,7 @@
       accountFresh = true;
       if (completesReview(next, reviewRequest)) { reviewed = reviewKey(next); reviewRequest = null; }
       if (!next.signed_in) notice = null;
-      if (!next.initializing && next.signed_in && paid(next.plan) && intent !== null) {
+      if (!next.initializing && next.signed_in && paid(grantedPlan(next)) && intent !== null) {
         remember(null);
         notice = "Your plan is active.";
       }
@@ -374,8 +378,9 @@
     {#if status.signed_in}
       <div class="identity">
         <div><span class="email">{status.email}</span><span class="muted small">{subscribed ? "Your account" : paymentNeeded ? "Signed in · Payment needs attention" : confirmedFree ? "Signed in · No active plan" : "Signed in · Checking your plan"}</span></div>
-        <PlanBadge plan={paid(status.plan) ? status.plan : null} />
+        <PlanBadge plan={subscribed && paid(status.plan) ? status.plan : null} {ended} />
       </div>
+      {#if returning !== null}<p class="muted small returning" role="status">{returning}</p>{/if}
       {#if warning !== null}<p class="muted small connection-warning" role="status">{connectionWarningCopy(warning)}</p>{/if}
     {/if}
 
@@ -488,7 +493,7 @@
   .identity > div { flex: 1 1 220px; min-width: 0; }
   .email { overflow-wrap: anywhere; }
   .identity .small, .row .small { display: block; margin-top: 4px; }
-  .connection-warning { margin: -13px 0 25px; }
+  .connection-warning, .returning { margin: -13px 0 25px; }
   .panel { margin: 20px 0; padding: 24px; border: 1px solid var(--edge); border-radius: 10px; }
   .section-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 18px; }
   .plan-heading p { margin-bottom: 0; }

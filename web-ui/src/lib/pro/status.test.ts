@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { accountFailure, connectionWarningCode, rechecksItself, signInNote } from "./status";
+import { accountFailure, connectionWarningCode, grantedPlan, planEnded, rechecksItself, returningUntil, signInNote } from "./status";
 
 const connectionWarning = (status: Parameters<typeof connectionWarningCode>[0]) => connectionWarningCode(status) !== null;
 
@@ -46,5 +46,27 @@ describe("account status interpretation", () => {
     for (const error of [null, undefined, "", "account_restore_unavailable", "sign in required", "service_unsupported extra"]) {
       expect(rechecksItself(error)).toBe(false);
     }
+  });
+});
+
+describe("an ended plan inside its return window", () => {
+  const until = "2026-11-03T09:30:00Z";
+  it("reads the account's time only while signed in, and only when it is a time", () => {
+    expect(returningUntil({ signed_in: true, returning_until: until })).toBe(until);
+    for (const status of [null, undefined, { signed_in: true }, { signed_in: true, returning_until: null }, { signed_in: false, returning_until: until }, { signed_in: true, returning_until: "soon" }, { signed_in: true, returning_until: "" }]) {
+      expect(returningUntil(status)).toBeNull();
+      expect(planEnded(status)).toBe(false);
+    }
+    expect(planEnded({ signed_in: true, returning_until: until })).toBe(true);
+  });
+  it("grants no plan once it has ended, even while the account still names it", () => {
+    for (const plan of ["pro", "max", "none"] as const) {
+      expect(grantedPlan({ signed_in: true, plan, returning_until: until })).toBe("none");
+      // Unchanged for every account without a return window.
+      expect(grantedPlan({ signed_in: true, plan })).toBe(plan);
+      expect(grantedPlan({ signed_in: true, plan, returning_until: null })).toBe(plan);
+    }
+    expect(grantedPlan({ signed_in: true, plan: null })).toBeNull();
+    expect(grantedPlan(null)).toBeUndefined();
   });
 });
