@@ -144,6 +144,7 @@ repositories and an install step for every user. Plugins stay what they are for.
 | File | What |
 |---|---|
 | `mod.rs` | the routes, the `{"type":"doc"}` frame on `/ws/events`, and the `check_document` hook |
+| `tools.rs` | the tool list and the format list (below) |
 | `run.rs` | detection through the prelude, the queue, every limit, build folders and eviction |
 | `latex.rs` | the ladder, finding the main file, the log parser (with its fixture corpus) |
 | `typst.rs` | the command and its short diagnostics |
@@ -164,6 +165,26 @@ loads only when a document opens.
 `runtimes.rs`, reusing its visible terminal, download checks and update check, plus
 one bounded `tlmgr install` for missing packages. **Settings:** the Documents panel
 reworked around them ([section 9](#9-settings-documents)).
+
+**Generic where it is cheap to be.** Two small tables, not LaTeX-shaped code, carry
+the format-specific parts, so a later document tool is an entry, not a feature:
+
+- **A tool list** (`build/tools.rs`): per program, its name, how to find it (names on
+  PATH), how to read its version, whether Chimaera can install it (a `runtimes.rs`
+  recipe or none), and which features use it. Detection, the Settings rows, the empty
+  states and `check_document`'s `no_engine` answer all read this one list.
+- **A format list**: per source kind (`.tex`, `.typ`, and later markdown to PDF or
+  Word), the tool, the command, the diagnostics parser and the sync kind (SyncTeX,
+  text matching or none). The queue, the limits, the build folders, the document view
+  and the change marks never name a format.
+
+Today Chimaera runs no other program for documents: every other viewer draws in the
+browser (pdf.js, docx-preview, the pptx renderer, Marp, mermaid, KaTeX, hyparquet) or
+parses in the daemon with a Rust library (comrak, calamine, the notebook pager), with
+nothing to find, install or configure. The candidates that would join the lists later
+are pandoc (Word export and import, section 6), `pdftoppm` (only if agents need
+`render_page`) and LibreOffice (a faithful Office-to-PDF view, if ever wanted). Git and
+the agent CLIs keep their own homes (the Git panel's `git.path`, Settings → Agents).
 
 **Agents:** no new tool. `check_document` builds `.tex` and `.typ`; `document_guide`
 gains a section; the documents paragraph gains one sentence.
@@ -965,7 +986,7 @@ learn.
 | TeX Live | "yours · TeX Live 2025 · from your environment prelude", or "chimaera · TinyTeX 2026.09 · 180 MB · 214 packages", or "not found on this host" | yours: none (its updates are yours) · chimaera: **update →** when there is one, **Remove** · not found: **Install TinyTeX (about 150 MB)** |
 | under it: latexmk, biber | found, or missing with the fix in words ("your TeX Live has no latexmk: ask your admins, or use Chimaera's TinyTeX") | none |
 | Typst | "yours · 0.15.1", "chimaera · 0.15.1", or "not found" | the same as TeX Live; **Install Typst (17 MB)** |
-| pandoc | found or not; used only for Word and optional exports | none |
+| pandoc (once Word export ships) | found or not | none |
 
 Under the rows: **TeX Live for this workspace: Automatic (yours, else Chimaera's) ·
 Chimaera's TinyTeX**, for a cluster whose TeX Live is old or short of packages; and
@@ -992,9 +1013,11 @@ Code skill, which now also carry the report conventions.
 - The document view's empty state, its status chip and a build error that names a
   missing engine all link to this panel.
 
-The panel adds no settings framework: engine rows reuse the Agents rows' pattern,
-build rows are schema rows, and per-workspace choices sit in the same small capped
-JSON file as the remembered main files.
+The panel adds no settings framework: engine rows reuse the Agents rows' pattern and
+come from the tool list ([what core gets](#what-core-gets-and-what-it-does-not)), so a
+row appears only for a tool some shipped feature uses (pandoc's row waits for Word
+export); build rows are schema rows; and per-workspace choices sit in the same small
+capped JSON file as the remembered main files.
 
 ## What changes where
 
