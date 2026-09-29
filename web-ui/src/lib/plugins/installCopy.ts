@@ -115,12 +115,13 @@ export function repoUrl(p: WorkspacePlugin): string | null {
   return p.repo !== null ? `https://github.com/${p.repo}` : null;
 }
 
-/** The two letters (or TeX) on the card's tile. */
-export function tileLetters(id: string): string {
-  if (id === "mycelium") return "my";
-  if (id === "agent-notes") return "an";
-  if (id === "latex") return "TeX";
-  return id.replace(/[^a-z0-9]/g, "").slice(0, 2);
+/** The two letters on the card's tile, from the plugin's name (core names no
+ *  plugin): the first two words' initials ("Agent notes" → "an"), else the
+ *  name's first two letters ("Mycelium" → "my"). */
+export function tileLetters(name: string): string {
+  const words = name.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((w) => w !== "");
+  if (words.length >= 2) return words[0][0] + words[1][0];
+  return (words[0] ?? "").slice(0, 2);
 }
 
 /** Where an installed copy came from, as the trust prompt says it. */

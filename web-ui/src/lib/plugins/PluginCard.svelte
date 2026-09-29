@@ -417,7 +417,7 @@
 
 {#snippet head()}
   <header class="head">
-    <span class="tile" class:on={p.active} aria-hidden="true">{tileLetters(p.id)}</span>
+    <span class="tile" class:on={p.active} aria-hidden="true">{tileLetters(p.name || p.id)}</span>
     <div class="ident">
       <h3 class="name" id="pc-{p.id}{previewing ? '-preview' : ''}">
         {#if home !== null}

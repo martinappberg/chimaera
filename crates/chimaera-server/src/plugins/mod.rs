@@ -349,13 +349,21 @@ pub(crate) struct Recommends {
 }
 
 impl Manifest {
-    /// The agent-side plugin this plugin names for `agent`: a requirement
-    /// first, else a recommendation (the install route and codex hook trust
-    /// serve both).
-    pub(crate) fn agent_plugin(&self, agent: &str) -> Option<&AgentPluginReq> {
-        self.agent_plugin_matching(agent, None)
+    /// Every agent-side plugin id this plugin names for `agent`, required
+    /// and recommended: the hooks codex hook trust may write for it.
+    pub(crate) fn agent_plugin_ids(&self, agent: &str) -> Vec<&str> {
+        self.requires
+            .agent_plugins
+            .get(agent)
+            .into_iter()
+            .chain(self.recommends.agent_plugins.get(agent))
+            .map(|req| req.id.as_str())
+            .collect()
     }
 
+    /// The agent-side plugin this plugin names for `agent` (with `id`, that
+    /// one): a requirement first, else a recommendation (the install route
+    /// serves both).
     fn agent_plugin_matching(&self, agent: &str, id: Option<&str>) -> Option<&AgentPluginReq> {
         self.requires
             .agent_plugins
@@ -1862,12 +1870,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            m.agent_plugin("codex").unwrap().id,
+            m.agent_plugin_matching("codex", None).unwrap().id,
             "need@x",
             "a requirement wins"
         );
-        assert_eq!(m.agent_plugin("claude").unwrap().id, "nice@x");
-        assert!(m.agent_plugin("agy").is_none());
+        assert_eq!(
+            m.agent_plugin_matching("claude", None).unwrap().id,
+            "nice@x"
+        );
+        assert!(m.agent_plugin_matching("agy", None).is_none());
+        assert_eq!(m.agent_plugin_ids("codex"), ["need@x", "also@x"]);
+        assert_eq!(m.agent_plugin_ids("claude"), ["nice@x"]);
+        assert!(m.agent_plugin_ids("agy").is_empty());
         assert_eq!(
             m.agent_plugin_matching("codex", Some("also@x"))
                 .unwrap()

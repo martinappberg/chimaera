@@ -143,9 +143,13 @@ describe("the card's words", () => {
   });
 
   it("the tile's letters", () => {
-    expect(tileLetters("mycelium")).toBe("my");
-    expect(tileLetters("test-fixture")).toBe("te");
+    expect(tileLetters("Mycelium")).toBe("my");
+    expect(tileLetters("Agent notes")).toBe("an");
+    expect(tileLetters("Test fixture")).toBe("tf");
+    expect(tileLetters("LaTeX")).toBe("la");
     expect(tileLetters("x-ray")).toBe("xr");
+    expect(tileLetters("Écrit")).toBe("éc");
+    expect(tileLetters("")).toBe("");
   });
 });
 

@@ -741,7 +741,9 @@ world chimaera-plugin {                    // 0.2
 After the Knowledge redesign merged (2026-09-29): `ids_of` reads each entry's `key`
 (no `.living/` paths), core no longer lists `MYCELIUM.md` (guidance is the
 dashboard's `GuidanceRow`, from the snapshot), and `store.ts` picks the provider by
-`provides.knowledge` (`knowledgePlugin`). The other rows are P10's.
+`provides.knowledge` (`knowledgePlugin`). In P10 so far: the card's tile letters come
+from the plugin's name, and codex hook trust accepts the hooks of every codex plugin
+the manifest names, required or recommended. The other rows are P10's.
 
 ## 13. Host limits, new and old
 
