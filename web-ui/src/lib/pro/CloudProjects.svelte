@@ -15,6 +15,17 @@
    * bounded time, and only after its folder is saved so no picker reappears. */
   let retry: { id: string; until: number } | null = null;
   const BUSY = "This project is finishing a step in the cloud. It opens here as soon as that step finishes.";
+  /** The app's fixed codes for a project that didn't open (`open_code` in
+   * shell/pro/projects.rs); anything else reads as the generic line. */
+  const OPEN_ERRORS: Record<string, string> = {
+    project_busy: BUSY,
+    project_folder_not_empty: "That folder already contains files. Choose a new empty project folder so your existing work stays untouched.",
+    project_folder_missing: "This project's local folder is unavailable. Restore or reconnect that folder, then try again. No new copy was created.",
+    project_folder_nested: "Choose a folder that isn't inside another project or Git repository.",
+    account_changed: "Your account changed. Open the project again.",
+    project_already_opening: "Another project is opening. Try again when it's done.",
+    project_unavailable: "This project isn't available in the cloud right now. Its cloud copy is intact. Try again shortly.",
+  };
   // A legacy pending import can have a local registry row without an approved
   // destination. Keep its explicit folder-choice recovery action reachable.
   const cloudOnly = $derived(projects.filter(project => project.local_root === null || !knownIds.includes(project.workspace_id)));
@@ -53,16 +64,10 @@
       retry = null;
       if (local !== null) onOpen({ id: local.workspace_id, root: local.root, name: local.name });
     } catch (reason) {
-      const message = String(reason);
-      const waiting = /busy|pause|running/i.test(message);
+      const code = reason instanceof Error ? reason.message : String(reason);
+      const waiting = code === "project_busy";
       retry = waiting ? { id: project.workspace_id, until: retry?.id === project.workspace_id ? retry.until : Date.now() + 15 * 60_000 } : null;
-      error = /not.empty|empty.*folder|unrelated|already.*files|destination.*conflict/i.test(message)
-        ? "That folder already contains files. Choose a new empty project folder so your existing work stays untouched."
-        : /missing|moved|not.*exist|unavailable.*folder|folder.*unavailable/i.test(message)
-        ? "This project's local folder is unavailable. Restore or reconnect that folder, then try again. No new copy was created."
-        : waiting
-          ? BUSY
-          : "This project couldn't open here. Its cloud copy is intact. Please try again shortly.";
+      error = Object.hasOwn(OPEN_ERRORS, code) ? OPEN_ERRORS[code] : "This project couldn't open here. Its cloud copy is intact. Please try again shortly.";
     } finally { busy = null; }
   }
 </script>

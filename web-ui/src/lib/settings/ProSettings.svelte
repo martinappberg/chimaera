@@ -8,14 +8,15 @@
   import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling, planPrices } from "../pro/billing";
   import { onMount, tick, untrack } from "svelte";
   import MirrorSettings from "./MirrorSettings.svelte";
+  import ConfirmDialog from "../shared/ConfirmDialog.svelte";
   import { asyncDisposer } from "../shared/asyncDisposer";
   import { pageVisible } from "../shared/visibility";
-  import { paid, readIntent, friendlyError, recoverableAccountRestore, alreadySubscribed, connectionWarningCopy, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
+  import { paid, readIntent, friendlyError, recoverableAccountRestore, alreadySubscribed, connectionWarningCopy, signInNoteCopy, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
   import { accountErrorBar, accountPanel, completesReview, isConfirmedFree, nearLimit, offersCheck, reviewKey } from "../pro/account";
-  import { accountFailure, connectionWarningCode, paymentDue } from "../pro/status";
+  import { accountFailure, connectionWarningCode, paymentDue, signInNote } from "../pro/status";
   import {
     onProChanged, proStatus, proSignIn, proCancelSignIn, proSignOut, proSignOutEverywhere,
-    proHosts, proSetHostKept, proDevices, proRevokeDevice, proBillingCheckout, proBillingPortal, proCancelBilling, proRefreshAccount,
+    proHosts, proSetHostKept, proDevices, proRevokeDevice, proBillingCheckout, proBillingPortal, proCancelBilling, proRefreshAccount, proMirrorStatus,
     type ProStatus, type ProHost, type ProDevice, type ProAuthScreenHint,
   } from "../net/native";
 
@@ -79,6 +80,15 @@
   const priced = $derived(prices !== null);
   const canReturnToPlans = $derived(billingRecovery && confirmedFree && reviewed !== null && reviewed === reviewKey(status));
   const errorBar = $derived(accountErrorBar(panel, error, failure, billingRecovery));
+  /** A browser sign-in that ended without signing in: one quiet line; the
+   * plans and the Sign in button stay. */
+  const signInLine = $derived(signInPhase === null ? signInNoteCopy(signInNote(status)) : null);
+  /** Sign-out being confirmed: every "Sign out everywhere", and a plain one
+   * while a project is running in the cloud (named, since it stays there). */
+  let signOutAsk = $state<{ everywhere: boolean; cloud: string[] } | null>(null);
+  /** Sign-out finished here while the saved sign-in is removed later by the
+   * app; shown quietly on the signed-out page, not as a failure. */
+  let signOutLine = $state<string | null>(null);
 
   function showPlans(): void {
     plansElement?.scrollIntoView({ block: "start", behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
@@ -198,6 +208,7 @@
   async function authenticate(screenHint: ProAuthScreenHint): Promise<void> {
     if (busy !== null || !status?.available || status.initializing || status.signed_in || billingActive || billingRecovery) return;
     authScreen = screenHint;
+    signOutLine = null;
     remember({ plan: selected, interval, stage: "sign_in", screenHint, created: Date.now() });
     await act("sign-in", () => proSignIn(screenHint), "Your browser couldn't open. Please try again.");
   }
@@ -252,11 +263,50 @@
   }
   async function cancelSignIn(): Promise<void> {
     remember(null);
-    await act("cancel", proCancelSignIn, "Sign-in couldn't be cancelled. Please try again.");
+    await act("cancel", proCancelSignIn, "Sign-in couldn't be canceled. Please try again.");
   }
   function setKept(host: ProHost, checkbox: HTMLInputElement): void {
     const kept = checkbox.checked; checkbox.checked = host.kept;
     void act(`host:${host.alias}`, async () => { await proSetHostKept(host.alias, kept); hosts = (await proHosts()).filter(host => host.kind !== "worker"); }, "This connection couldn't be updated. Please try again.");
+  }
+  function projectList(names: string[]): string {
+    return names.length < 2 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  }
+  const signOutBody = $derived.by(() => {
+    if (signOutAsk === null) return "";
+    const { everywhere, cloud } = signOutAsk;
+    const lines: string[] = [];
+    if (everywhere) lines.push("This signs you out everywhere you use Chimaera Pro, including this computer, and closes the cluster logins Pro keeps connected for you.");
+    if (cloud.length === 1) lines.push(`${cloud[0]} is running in the cloud. It stays there until you sign in again.`);
+    else if (cloud.length > 1) lines.push(`${projectList(cloud)} are running in the cloud. They stay there until you sign in again.`);
+    lines.push("Nothing on this computer stops.");
+    return lines.join(" ");
+  });
+  /** Projects running in the cloud are named before signing out: they stay
+   * there until the next sign-in. Unknown (the read failed) names none. */
+  async function requestSignOut(everywhere: boolean): Promise<void> {
+    if (busy !== null || status?.initializing) return;
+    busy = "sign-out-check";
+    let cloud: string[] = [];
+    try { cloud = (await proMirrorStatus()).workspaces.filter(workspace => workspace.ownership?.state === "remote" && !workspace.never_mirror).map(workspace => workspace.name); }
+    catch { /* Nothing to name; signing out still stops nothing here. */ }
+    finally { busy = null; }
+    if (!alive) return;
+    if (everywhere || cloud.length > 0) signOutAsk = { everywhere, cloud };
+    else await signOut(false);
+  }
+  async function signOut(everywhere: boolean): Promise<void> {
+    signOutAsk = null;
+    remember(null);
+    signOutLine = null;
+    await act(everywhere ? "sign-out-all" : "sign-out", async () => {
+      try { await (everywhere ? proSignOutEverywhere() : proSignOut()); }
+      catch (reason) {
+        // Signed out here already; the app clears the saved sign-in later.
+        if ((reason instanceof Error ? reason.message : String(reason)) !== "sign_out_pending") throw reason;
+        signOutLine = friendlyError(reason, "");
+      }
+    }, "Sign-out couldn't finish. Please try again.");
   }
   async function removeSignIn(device: ProDevice): Promise<void> {
     await act(`device:${device.id}`, async () => { await proRevokeDevice(device.id); devices = await proDevices(); }, "This sign-in couldn't be removed. Please try again.");
@@ -297,9 +347,14 @@
       <h1>Your Chimaera account</h1>
     {:else if offerPlans}
       <h1>Your work, wherever you are.</h1>
-      <p class="lede">Let your agents keep working while you’re away. Return to the same project, conversation, and files on another device.</p>
-      <button class="secondary intro-plans" onclick={showPlans}>See plans</button>
+      <p class="lede">Let your agents keep working while you're away. Return to the same project, conversation, and files on another device.</p>
+      <div class="intro-actions">
+        <button class="secondary" onclick={showPlans}>See plans</button>
+        {#if status?.signed_in === false}<button class="secondary" disabled={busy !== null || signInPhase !== null || billingActive} onclick={() => void authenticate("sign-in")}>Sign in</button>{/if}
+      </div>
+      {#if signInLine}<p class="muted small sign-in-note" role="status">{signInLine}</p>{/if}
     {/if}
+    {#if signOutLine && status?.signed_in === false}<p class="muted small sign-in-note" role="status">{signOutLine}</p>{/if}
   </header>
 
   {#if status?.initializing}
@@ -325,7 +380,7 @@
     {/if}
 
     {#if signInPhase === "waiting"}
-      <div class="panel notice" role="status"><h2>Continue in your browser</h2><p>Complete sign-in and verification there. Your selection is saved here, and this request stays open for up to 15 minutes.</p><div class="actions"><button disabled={busy !== null} onclick={() => void authenticate(authScreen)}>Start again</button><button class="secondary" disabled={busy !== null} onclick={() => void cancelSignIn()}>Cancel sign-in</button></div></div>
+      <div class="panel notice" role="status"><h2>Continue in your browser</h2><p>Finish signing in there. This page updates when you're done, and the sign-in stays open for 15 minutes.{authScreen === "sign-up" ? " Your plan choice is kept here." : ""}</p><div class="actions"><button disabled={busy !== null} onclick={() => void authenticate(authScreen)}>Start again</button><button class="secondary" disabled={busy !== null} onclick={() => void cancelSignIn()}>Cancel sign-in</button></div></div>
     {:else if signInPhase === "finishing"}
       <div class="panel notice" role="status"><h2>Finishing sign-in…</h2><p>Saving your account securely on this computer.</p></div>
     {/if}
@@ -350,7 +405,7 @@
             </button>
           {/each}
         </div>
-        <div class="included"><span class="section-label">Included with both</span><ul><li>Projects stay in sync across devices</li><li>Cluster logins that stay connected</li><li>Browser access to your work</li><li>Project-by-project privacy controls</li></ul></div>
+        <div class="included"><span class="section-label">Included with both</span><ul><li>Projects stay in sync between your computer and the cloud</li><li>Cluster logins that stay connected</li><li>Browser access to your work</li><li>Project-by-project privacy controls</li></ul></div>
         <div class="purchase"><button disabled={busy !== null || signInPhase !== null || billingActive} onclick={() => status?.signed_in ? void checkout() : void authenticate("sign-up")}>{busy === "checkout" ? "Opening checkout…" : status.signed_in ? "Continue to checkout" : "Sign up"}</button><p class="small muted">{#if status.signed_in}{#if priced}Billed {price(selected, interval)} {interval === "year" ? "yearly" : "monthly"}. {:else}Prices are shown at checkout. {/if}Cloud time and project storage have monthly limits. Review billing details in secure checkout before subscribing.{:else}Create your account first. You can review your plan before checkout.{/if}</p></div>
         {#if !status.signed_in}<p class="signin-alternative small muted">Already have an account? <button class="text-button" disabled={busy !== null || signInPhase !== null || billingActive} onclick={() => void authenticate("sign-in")}>Sign in</button></p>{/if}
         <p class="free-note"><strong>Your local workbench stays free.</strong> Local projects, agents and ordinary SSH work without a Pro account.</p>
@@ -392,8 +447,12 @@
 
     {#if status.signed_in}
       {#if !subscribed}<details class="section" ontoggle={(event) => (recoveryOpen = event.currentTarget.open)}><summary>Project privacy</summary>{#if recoveryOpen}<MirrorSettings visible={visible && recoveryOpen} recoveryOnly />{/if}</details>{/if}
-      <details class="section" ontoggle={(event) => (securityOpen = event.currentTarget.open)}><summary>Account and devices</summary>{#if securityOpen}<div class="section-body"><AccountDevices {devices} busy={busy !== null} onrevoke={removeSignIn} /><div class="actions"><button class="secondary" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out", proSignOut, "Sign-out couldn't finish. Please try again."); }}>Sign out</button><button class="text-button" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out-all", proSignOutEverywhere, "Sign-out couldn't finish. Please try again."); }}>Sign out everywhere</button></div><p class="muted small">Signing out everywhere also closes the cluster logins Pro keeps connected.</p></div>{/if}</details>
+      <details class="section" ontoggle={(event) => (securityOpen = event.currentTarget.open)}><summary>Account and devices</summary>{#if securityOpen}<div class="section-body"><AccountDevices {devices} busy={busy !== null} onrevoke={removeSignIn} /><div class="actions"><button class="secondary" disabled={busy !== null} onclick={() => void requestSignOut(false)}>Sign out</button><button class="text-button" disabled={busy !== null} onclick={() => void requestSignOut(true)}>Sign out everywhere</button></div><p class="muted small">Signing out doesn't stop anything on this computer.</p></div>{/if}</details>
     {/if}
+  {/if}
+  {#if signOutAsk}
+    <ConfirmDialog title={signOutAsk.everywhere ? "Sign out everywhere?" : "Sign out?"} body={signOutBody} confirmLabel={signOutAsk.everywhere ? "Sign out everywhere" : "Sign out"}
+      danger={signOutAsk.everywhere} onConfirm={() => void signOut(signOutAsk?.everywhere ?? false)} onCancel={() => (signOutAsk = null)} />
   {/if}
   {#if errorBar}<div class="error" role="alert"><span>{error ?? friendlyError(failure, "Part of your account couldn't refresh. Your local work remains available.")}</span>{#if errorBar.check}<button class="secondary" disabled={busy !== null || checking} onclick={() => void check()}>{checking ? "Checking…" : "Try again"}</button>{/if}</div>{/if}
   {/if}
@@ -412,7 +471,8 @@
   h2 { margin: 0; font-size: calc(var(--text-lg) + 2px); font-weight: 560; letter-spacing: -.3px; }
   p { margin: 10px 0; line-height: 1.65; }
   .lede { max-width: 56ch; margin: 0; font-size: var(--text-lg); color: var(--muted); line-height: 1.7; }
-  .intro-plans { margin-top: 20px; }
+  .intro-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+  .sign-in-note { margin: 14px 0 0; }
   .plans { scroll-margin-top: 20px; }
   .plans:focus { outline: none; }
   .muted { color: var(--muted); }

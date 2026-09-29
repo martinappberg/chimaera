@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { MirrorStatus, MirrorWorkspace } from "../net/native";
-import { paid, readIntent, cloudCopy, cloudPollDelay, cloudProjectStatus, connectionWarningCopy, copyIssue, friendlyError, projectCopiesSetupLine, projectCopyError, alreadySubscribed, recoverableAccountRestore } from "./presentation";
+import { paid, readIntent, cloudCopy, cloudPollDelay, cloudProjectStatus, connectionWarningCopy, copyIssue, friendlyError, projectCopiesSetupLine, projectCopyError, projectPlace, signInNoteCopy, alreadySubscribed, recoverableAccountRestore } from "./presentation";
 
 // Copy is free to change; these tests pin which states read alike or apart,
 // what takes precedence, and that nothing from a raw error reaches the page.
@@ -33,6 +33,29 @@ describe("honest cloud state", () => {
     expect(new Set([disabled.title, preparing.title, unknown.title, cloudCopy("ready", null).title]).size).toBe(4);
     expect(cloudCopy("ready", null)).toEqual(cloudCopy("sleeping", null));
     for (const copy of [disabled, preparing, unknown]) { expect(copy.title).not.toBe(""); expect(copy.detail).not.toBe(""); }
+  });
+  it("claims connected agents only when the app remembers one, and names the step when none", () => {
+    const unknown = cloudCopy("sleeping", null);
+    const connected = cloudCopy("sleeping", null, undefined, true);
+    const none = cloudCopy("sleeping", null, undefined, false);
+    expect(new Set([unknown.detail, connected.detail, none.detail]).size).toBe(3);
+    expect(none.title).not.toBe(connected.title);
+    // Awake, the connection panel names the step; the heading stays about availability.
+    expect(cloudCopy("ready", null, undefined, false).title).toBe(connected.title);
+    expect(cloudCopy("ready", null, undefined, true)).toEqual(connected);
+    // A limit still takes precedence over the agent step.
+    expect(cloudCopy("sleeping", "hours_exhausted", undefined, false)).toEqual(cloudCopy("limited", "hours_exhausted"));
+  });
+  it("gives each ended sign-in its own quiet line and a signed-out sign-out its own sentence", () => {
+    const notes = ["sign_in_timed_out", "sign_in_incomplete", "browser_unavailable"].map(signInNoteCopy);
+    expect(new Set(notes).size).toBe(3);
+    for (const note of notes) expect(note).not.toBeNull();
+    expect(signInNoteCopy("sign in required")).toBeNull();
+    expect(signInNoteCopy(null)).toBeNull();
+    expect(friendlyError("sign_in_timed_out", "fallback")).toBe(signInNoteCopy("sign_in_timed_out"));
+    const pending = friendlyError("sign_out_pending", "fallback");
+    expect(pending).not.toBe("fallback");
+    expect(pending).not.toBe(friendlyError("sign in required", "fallback"));
   });
   it("explains each limit separately instead of as a generic pause or a setup task", () => {
     const generic = cloudCopy("limited", null);
@@ -138,6 +161,36 @@ describe("cloud preparation progress", () => {
     const text = projectCopyError("project setup failed", "cloud_setup_failed");
     expect(text).not.toBe(projectCopyError("project setup failed"));
     expect(text).not.toBe(projectCopyError("x", "root_setup_required"));
+  });
+  it("reads project setup as progress unless it waits on an agent or failed", () => {
+    const setup = (patch: Partial<MirrorWorkspace> = {}, code: string | null = null): MirrorWorkspace => {
+      const r = { ...row("saved", 123), ownership: { state: "setting_up" as const, epoch: 2 }, ...patch };
+      if (code) { r.mirror = { ...r.mirror!, error: "diagnostic", error_code: code }; }
+      return r;
+    };
+    const running = cloudProjectStatus(mirror([setup()]));
+    expect(running?.state).toBe("active");
+    expect(cloudProjectStatus(mirror([setup()]), undefined, "cloud")?.state).toBe("active");
+    expect(cloudProjectStatus(mirror([setup()]), undefined, "cloud")?.title).not.toBe(running?.title);
+    const failed = cloudProjectStatus(mirror([setup({}, "cloud_setup_failed")]));
+    const waiting = cloudProjectStatus(mirror([setup({ blocked_providers: [{ id: "claude", state: "needs_sign_in", reason: null }] })]));
+    expect(failed?.state).toBe("attention");
+    expect(waiting?.state).toBe("attention");
+    expect(failed?.title).not.toBe(waiting?.title);
+    // A problem in one project outranks another project's normal setup.
+    expect(cloudProjectStatus(mirror([setup(), { ...setup({}, "cloud_setup_failed"), workspace_id: "other" }]))).toEqual(failed);
+    const broken = row("other", 123); broken.mirror!.error = "diagnostic"; broken.mirror!.error_code = "git_too_old";
+    expect(cloudProjectStatus(mirror([setup(), broken]))?.state).toBe("attention");
+    expect(projectPlace(setup())).not.toBe(projectPlace(setup({}, "cloud_setup_failed")));
+    expect(projectPlace(setup({}, "cloud_setup_failed"))).not.toBe(projectPlace(setup({ blocked_providers: [{ id: "codex", state: "missing", reason: null }] })));
+  });
+  it("names who runs a project, and reads a pending privacy change as progress", () => {
+    const local = projectPlace(row("a", 1));
+    const remote = projectPlace({ ...row("a", 1), ownership: { state: "remote", epoch: 3 } });
+    expect(local).not.toBe(remote);
+    const kept = projectPlace({ ...row("a", 1), never_mirror: true });
+    const keeping = projectPlace({ ...row("a", 1), never_mirror: true, privacy_pending: true });
+    expect(new Set([local, remote, kept, keeping]).size).toBe(4);
   });
   it("reads a lapsed account connection as quiet progress, apart from first setup", () => {
     const renewing = { ...mirror([row("saved", 123)]), configured: false, renewal_failed: true };

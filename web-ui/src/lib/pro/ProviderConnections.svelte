@@ -5,8 +5,10 @@
   import { cloudRequest } from "./cloudTransport";
   import { canDisconnect, canStartConnection, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, nextReadyHandoff, pendingConnection, providerLabel, providerLoginUrl, providersReady, providerStateLabel, recoverDisconnect, sameConnection } from "./providers";
 
-  let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady, onReadiness, compact = false }: {
-    visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void; onReadiness?: (ready: boolean | null) => void; compact?: boolean;
+  let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady, onReadiness, onAgents, compact = false }: {
+    visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void; onReadiness?: (ready: boolean | null) => void;
+    /** Whether any agent is connected by a fresh catalog; null when unknown. */
+    onAgents?: (connected: boolean | null) => void; compact?: boolean;
   } = $props();
   type Handoff = NonNullable<CloudSetupInfo["handoffs"]>[number];
   let providers = $state<CloudProviderStatus[]>([]);
@@ -50,7 +52,7 @@
   const catalogFresh = $derived(current && catalogMutation === mutation && catalogVisibility === visibilityGeneration);
   const ready = $derived(catalogFresh && providersReady(providers, required));
   const uncertain = $derived(!loaded || !current || !ready && agents.some(p => p.state === "unknown"));
-  const heading = $derived(uncertain ? !loaded ? "Checking your agent connections…" : error ? "Agent connections need attention" : "Agent connections aren’t confirmed yet" : ready ? required.length ? "The required agents are connected" : "Ready for cloud work" : required.length ? `Connect your agents${projectName ? ` for ${projectName}` : " to continue"}` : "Connect an agent to start cloud work");
+  const heading = $derived(uncertain ? !loaded ? "Checking your agent connections…" : error ? "Agent connections need attention" : "Agent connections aren't confirmed yet" : ready ? required.length ? "The required agents are connected" : "Ready for cloud work" : required.length ? `Connect your agents${projectName ? ` for ${projectName}` : " to continue"}` : "Connect an agent to start cloud work");
   const introduction = $derived(uncertain ? "Chimaera is checking which agents are connected for cloud work." : ready ? required.length ? selectedHandoff && !resumeFailures[handoffKey(selectedHandoff)] ? "The agents this project needs are connected. Chimaera will continue it automatically." : "The agents this project needs are connected." : "Your connected agents are ready for cloud work. You can add another whenever you need it." : required.length ? "Connect the agents this project uses so it can continue automatically." : "Choose the agent you want to use. Connect one to get started; you can add others later.");
   const waiting = $derived(pendingConnection(connection));
   const disconnecting = $derived(disconnectConnection(connection));
@@ -66,6 +68,10 @@
     ? providerLoginUrl(connection.provider_id, action.type === "device_code" ? action.verification_url : action.url) : null);
 
   $effect(() => { const value = current ? ready : null; untrack(() => onReadiness?.(value)); });
+  $effect(() => {
+    const value = !catalogFresh ? null : agents.some(p => p.state === "signed_in") ? true : agents.some(p => p.state === "unknown") ? null : false;
+    untrack(() => onAgents?.(value));
+  });
 
   $effect(() => {
     if (!visible || !$pageVisible || busy !== null || waiting || disconnectCandidate || catalogDisconnectBusy) return;
@@ -175,7 +181,7 @@
       if (alive && request === mutation) {
         operationError = cause === "provider_busy" || cause instanceof Error && cause.message === "provider_busy"
           ? connectionError("provider_busy", operation)
-          : operation === "disconnect" ? "Disconnection couldn't be confirmed. Check the connection before trying again." : "Sign-in couldn't start in Chimaera cloud. Try again in a moment.";
+          : operation === "disconnect" ? "Disconnection couldn't be confirmed. Check the connection before trying again." : "Sign-in couldn't start in the cloud. Try again in a moment.";
         failedDisconnectProvider = operation === "disconnect" ? providerId : null;
         current = false; void load();
       }
@@ -260,7 +266,7 @@
         await load();
         if (returnAfter && alive && request === mutation && visible && $pageVisible && workspaceId === handoff.workspace_id) onReady?.();
       }
-    } catch { if (alive && request === mutation) resumeFailures[key] = "This project couldn’t continue yet. Your saved work is intact. Try again when you’re ready."; }
+    } catch { if (alive && request === mutation) resumeFailures[key] = "This project couldn't continue yet. Your saved work is intact. Try again when you're ready."; }
     finally { if (alive && request === mutation) busy = null; }
   }
 </script>
@@ -270,9 +276,9 @@
     <button class="management" aria-expanded={showDetails} onclick={() => (expanded = !expanded)}><span><strong>Agent connections</strong><span class="management-state">{!loaded ? "Checking connections…" : ready ? "Ready for cloud work" : "Checking connection status…"}</span></span><span class="chevron" class:expanded aria-hidden="true">›</span></button>
   {/if}
   {#if showDetails}
-  <div class="heading"><div><span class="eyebrow">Your cloud agents</span><h2>{requestingDisconnect ? `Disconnecting ${connectingLabel}…` : waiting ? disconnecting ? `Disconnecting ${connectingLabel}…` : connection?.phase === "preparing" ? `Preparing ${connectingLabel} sign-in…` : connection?.phase === "verifying" ? `Connecting ${connectingLabel}…` : `Connect ${connectingLabel}` : heading}</h2></div></div>
-  <p class="intro">{requestingDisconnect || waiting && disconnecting ? "Chimaera is signing this service out in your personal cloud." : waiting ? connection?.phase === "preparing" ? "Sign-in will appear here when it’s ready." : connection?.phase === "verifying" ? "Chimaera is confirming your sign-in with the provider." : "Finish sign-in below. Chimaera will confirm the connection automatically." : introduction}</p>
-  <p class="privacy">Use your own provider account and subscription. Connected services are available across your cloud projects. Signing in or disconnecting here doesn’t change sign-in on your other devices.</p>
+  <div class="heading"><div><span class="eyebrow">Cloud agents</span><h2>{requestingDisconnect ? `Disconnecting ${connectingLabel}…` : waiting ? disconnecting ? `Disconnecting ${connectingLabel}…` : connection?.phase === "preparing" ? `Preparing ${connectingLabel} sign-in…` : connection?.phase === "verifying" ? `Connecting ${connectingLabel}…` : `Connect ${connectingLabel}` : heading}</h2></div></div>
+  <p class="intro">{requestingDisconnect || waiting && disconnecting ? "Chimaera is signing this service out in the cloud." : waiting ? connection?.phase === "preparing" ? "Sign-in will appear here when it's ready." : connection?.phase === "verifying" ? "Chimaera is confirming your sign-in with the provider." : "Finish sign-in below. Chimaera will confirm the connection automatically." : introduction}</p>
+  <p class="privacy">Use your own provider account and subscription. Connected services are available across your cloud projects. Signing in or disconnecting here doesn't change sign-in on your computer.</p>
   {#if !loaded}<p class="muted" role="status">Checking your cloud connections…</p>{/if}
   {#if loaded && agents.length === 0}<p class="muted">No cloud agent connections are available yet.</p>{/if}
   {#if !waiting && !requestingDisconnect}<div class="provider-cards">
@@ -285,27 +291,27 @@
       </article>
     {/each}
   </div>
-  {#each [...new Set(required.filter(id => !agents.some(p => p.id === id)))] as id (id)}<p class="error">{providerLabel(id)} isn’t available in the cloud yet. This project waits on your computer.</p>{/each}
+  {#each [...new Set(required.filter(id => !agents.some(p => p.id === id)))] as id (id)}<p class="error">{providerLabel(id)} isn't available in the cloud yet. This project waits on your computer.</p>{/each}
 
   {/if}
 
   {#if disconnectCandidate}
     <section class="connection confirmation" aria-label={`Disconnect ${disconnectCandidate.label}`} tabindex="-1" bind:this={confirmationElement}>
-      <h3>Disconnect {disconnectCandidate.label} from your cloud?</h3>
-      <p class="muted">This signs {disconnectCandidate.label} out in your personal cloud. All your cloud projects share this connection. Running work that uses it may lose access and need you to reconnect.</p>
-      <p class="muted small">Sign-in on this computer and your other devices stays as it is.</p>
+      <h3>Disconnect {disconnectCandidate.label} in the cloud?</h3>
+      <p class="muted">This signs {disconnectCandidate.label} out in the cloud. All your cloud projects share this connection. Running work that uses it may lose access and need you to reconnect.</p>
+      <p class="muted small">Sign-in on your computer stays as it is.</p>
       <div class="confirmation-actions"><button class="button secondary" onclick={() => void keepConnected()}>Keep connected</button><button class="button" disabled={!canStart || !providers.some(p => p.id === disconnectCandidate?.id && canDisconnect(p))} onclick={() => void connect(disconnectCandidate!.id, "disconnect")}>Disconnect {disconnectCandidate.label}</button></div>
     </section>
   {/if}
 
   {#if connection}
-    {#if connection.phase === "disconnected"}{#if confirmedSuccess}<p class="connection-success" role="status">{connectingLabel} is signed out in your cloud. Sign-in on your other devices hasn’t changed.</p>{/if}
+    {#if connection.phase === "disconnected"}{#if confirmedSuccess}<p class="connection-success" role="status">{connectingLabel} is signed out in the cloud. Sign-in on your computer hasn't changed.</p>{/if}
     {:else if disconnecting}
     <section class="connection" aria-label={`Disconnect ${connectingLabel}`} tabindex="-1" bind:this={connectionElement}>
       {#if !waiting}<h3>{connectingLabel} disconnection needs attention</h3>{/if}
-      <p class="muted" role="status">{waiting ? connection.phase === "verifying" ? "Confirming that this service is signed out in your cloud." : "Signing this service out in your cloud. Sign-in on your other devices stays as it is." : connectionError(connection.phase === "failed" ? connection.error_code : connection.phase, "disconnect")}</p>
+      <p class="muted" role="status">{waiting ? connection.phase === "verifying" ? "Confirming that this service is signed out in the cloud." : "Signing this service out in the cloud. Sign-in on your computer stays as it is." : connectionError(connection.phase === "failed" ? connection.error_code : connection.phase, "disconnect")}</p>
       {#if !waiting || pollingPaused || connectionNotice}<div class="connection-actions"><button class="text-button" disabled={connectionFlight || catalogFlight || busy !== null} onclick={() => waiting ? void checkConnection() : void load()}>{waiting ? "Check disconnection status" : "Check connection"}</button>{#if !waiting && canStart}{@const provider = providers.find(p => p.id === connection?.provider_id)}{#if provider && canDisconnect(provider)}<button class="text-button" onclick={(event) => void requestDisconnect(provider, event.currentTarget)}>Try disconnecting again</button>{/if}{/if}</div>{/if}
-      {#if pollingPaused && waiting}<p class="muted small" role="status">This is taking longer than expected. Check the request’s status before trying again.</p>{/if}
+      {#if pollingPaused && waiting}<p class="muted small" role="status">This is taking longer than expected. Check the request's status before trying again.</p>{/if}
       {#if connectionNotice}<p class="error" role="status">{connectionNotice}</p>{/if}
     </section>
     {:else if connection.phase === "connected"}{#if confirmedSuccess}<p class="connection-success" role="status">{connectingLabel} is connected for cloud work.</p>{/if}{:else}
@@ -327,12 +333,12 @@
             <label for={`provider-code-${connection.id}`}>Code from {connectingLabel}</label>
             <!-- Visible so a paste can be checked; still cleared on submit, cancel, hide and teardown. -->
             <div class="authorization-row"><input id={`provider-code-${connection.id}`} type="text" bind:value={authorizationCode} autocomplete="off" autocapitalize="off" spellcheck={false} maxlength="4096" placeholder="Paste the code here" disabled={busy !== null} /><button class="button" type="submit" disabled={busy !== null || !authorizationCode.trim()}>{busy === "submit" ? "Confirming…" : "Connect"}</button></div>
-            <p class="muted small">The code goes directly to the provider’s sign-in process. It isn’t saved in Chimaera.</p>
+            <p class="muted small">The code goes directly to the provider's sign-in process. It isn't saved in Chimaera.</p>
           </form>
         {/if}
       {:else if action?.type === "terminal"}
         <p class="muted">This provider completes sign-in in its own terminal. Open it, follow the provider's instructions, then return here. We'll verify the connection for you.</p><button class="button" disabled={busy !== null} onclick={() => void openSignIn(true)}>Open sign-in terminal</button>
-      {:else}<p class="muted">We're preparing this provider's sign-in in Chimaera cloud. This may take a moment.</p>{/if}
+      {:else}<p class="muted">We're preparing this provider's sign-in in the cloud. This may take a moment.</p>{/if}
       {#if waiting}<div class="connection-actions">{#if pollingPaused || connectionNotice}<button class="text-button" disabled={connectionFlight || busy !== null} onclick={() => void checkConnection()}>Check sign-in status</button>{/if}<button class="text-button" disabled={busy !== null} onclick={() => void cancel()}>{busy === "cancel" ? "Canceling…" : "Cancel sign-in"}</button></div>{/if}
       {#if pollingPaused && waiting}<p class="muted small" role="status">Automatic checks have paused after this request's time limit. Check its status or cancel before trying again.</p>{/if}
       {#if connectionNotice}<p class="error" role="status">{connectionNotice}</p>{/if}
@@ -340,7 +346,7 @@
     {/if}
   {/if}
 
-  {#if ready && onReady && !selectedHandoff && !disconnectCandidate && !waiting}<div class="ready"><p>{required.length ? "The required agents are connected." : "Your first agent is connected. You’re ready for cloud work."}</p><button class="button" disabled={busy !== null} onclick={() => onReady?.()}>{required.length ? "Back to project" : "Back to projects"}</button></div>{/if}
+  {#if ready && onReady && !selectedHandoff && !disconnectCandidate && !waiting}<div class="ready"><p>{required.length ? "The required agents are connected." : "Your first agent is connected. You're ready for cloud work."}</p><button class="button" disabled={busy !== null} onclick={() => onReady?.()}>{required.length ? "Back to project" : "Back to projects"}</button></div>{/if}
   {#each handoffs as handoff (handoff.workspace_id)}
     <div class="handoff"><div><h3>{handoff.name}</h3><p class="muted small" role="status">{resumeFailures[handoffKey(handoff)] ?? (current && providersReady(providers, handoff.blocked_providers.map(p => p.id)) ? "Continuing your project…" : "Waiting for an agent connection for cloud work.")}</p></div>{#if resumeFailures[handoffKey(handoff)]}<button class="button" disabled={busy !== null || !nextReadyHandoff(providers, [handoff], [], current)} onclick={() => void resume(handoff, handoff.workspace_id === workspaceId)}>Try again</button>{:else if !current || !providersReady(providers, handoff.blocked_providers.map(p => p.id))}<button class="button secondary" onclick={() => (focusedHandoff = handoff)}>Connect required agents</button>{/if}</div>
   {/each}
