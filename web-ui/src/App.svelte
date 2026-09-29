@@ -122,7 +122,7 @@
   } from "./lib/shared/reference";
   import { provenanceFor, rememberCopy } from "./lib/shared/provenance";
   import { asyncDisposer } from "./lib/shared/asyncDisposer";
-  import { modalFocus } from "./lib/shared/modalFocus";
+  import { modalFocus, modalOpen } from "./lib/shared/modalFocus";
   import {
     activateTab,
     adjacentPane,
@@ -278,7 +278,14 @@
     type XwinTransport,
     type XwinWindowInfo,
   } from "./lib/layout/crossWindow";
-  import { chordDigit, fontChord, isMac, matchChord, REFERENCE_CHORD } from "./lib/shared/keys";
+  import {
+    chordDigit,
+    fontChord,
+    isMac,
+    isReloadWindowKey,
+    matchChord,
+    REFERENCE_CHORD,
+  } from "./lib/shared/keys";
   import {
     activeModLabel,
     isCapturing,
@@ -379,8 +386,11 @@
     planAssetNavigation,
     rearmAssetNavigation,
     requestAssetReload,
+    requestWindowReload,
+    cancelWindowReload,
     requireAssetNavigation,
   } from "./lib/layout/assetTransition";
+  import { claimWindowReload } from "./lib/layout/windowReload";
   import { focusOnMount } from "./lib/shared/focusOnMount";
   import Launcher from "./lib/workspace/Launcher.svelte";
   import SessionGlyph from "./lib/shared/SessionGlyph.svelte";
@@ -1548,6 +1558,9 @@
   $effect(() => () => {
     if (assetRearmTimer !== null) clearTimeout(assetRearmTimer);
   });
+  // The native Reload Window (layout/windowReload.ts) reloads through the
+  // gate above while it is mounted, not plainly.
+  $effect(() => claimWindowReload());
 
   // Slurm strip: one probe at boot; the store keeps its own 60s poll gated on
   // "scheduler is slurm" + a visible window (see workspace/compute.ts).
@@ -1807,6 +1820,8 @@
       readAppStatus();
       unlistenMenu = asyncDisposer(
         onMenu((action) => {
+          // Workbench commands wait while a modal asks something.
+          if (modalOpen() && action !== "check-updates") return;
           switch (action) {
             case "close-view":
               if (activeWsId === null) closeThisWindow();
@@ -2708,6 +2723,21 @@
   function onKeydown(e: KeyboardEvent): void {
     // A settings row is recording a chord — the press is the recorder's.
     if (isCapturing()) return;
+    // Reload Window's F5 (native Windows/Linux). The menu accelerator carries
+    // it, but WebView2 reloads on F5 itself (wry leaves its browser
+    // accelerator keys on) and can see the key first: claiming it here lands
+    // both paths in the safety gate — ahead of the modal stand-down, which
+    // would otherwise hand F5 to WebView2's ungated reload. A browser tab
+    // keeps its own F5.
+    if (isNativeShell() && isReloadWindowKey(e)) {
+      e.preventDefault();
+      e.stopPropagation();
+      requestWindowReload();
+      return;
+    }
+    // A shown modal owns the keyboard: workbench chords stand down behind it
+    // (the picker and Quick Open handle their own chords below).
+    if (modalOpen() && !pickerOpen && !quickOpenOpen) return;
     // Per-pane text size (Cmd/Ctrl +/−/0, spec-pinned chords): intercepted
     // ONLY while the focused pane shows a font-sizable surface (a terminal or
     // a rendered markdown document), so browser zoom keeps working elsewhere.
@@ -3509,6 +3539,13 @@
       run: () => setMastermindPanelOpen(true),
     },
     ...gitQuickOpenCommands(),
+    {
+      id: "reload-window",
+      label: "Reload Window",
+      aliases: ["refresh"],
+      hint: "a fresh page, same layout",
+      run: requestWindowReload,
+    },
   ]);
 
   /** Git's commands: only where a repository is (git is ambient). */
@@ -4238,6 +4275,42 @@
   };
 
   /**
+   * The open question of a forced view switch (a mid-task agent), answered
+   * by the ConfirmDialog below — `window.confirm` never shows in the native
+   * app. One question at a time: a newer ask answers the older one "no", so
+   * its switch settles and releases `switchingViews`.
+   */
+  let switchAsk = $state.raw<{
+    sessionId: string;
+    target: "chat" | "term";
+    answer(go: boolean): void;
+  } | null>(null);
+
+  // A question that no longer applies closes itself: the agent is gone, or
+  // another window already switched it. (Answering clears `switchAsk`, so
+  // this settles on the re-run.)
+  $effect(() => {
+    const ask = switchAsk;
+    if (ask === null) return;
+    const s = sessionsById.get(ask.sessionId);
+    if (s === undefined || !s.alive || s.ui === ask.target) ask.answer(false);
+  });
+
+  function askForcedSwitch(sessionId: string, target: "chat" | "term"): Promise<boolean> {
+    switchAsk?.answer(false);
+    return new Promise((resolve) => {
+      switchAsk = {
+        sessionId,
+        target,
+        answer(go) {
+          switchAsk = null;
+          resolve(go);
+        },
+      };
+    });
+  }
+
+  /**
    * The chat⇄terminal toggle: the daemon stops the current process and
    * resumes the same conversation in the other mode; the session row's `ui`
    * flips on the events bus and every pane follows. A mid-task agent 409s
@@ -4245,7 +4318,7 @@
    *
    * Guarded against double-fire: the toggle button and its ⌘-chord both call
    * here, so a switch already in flight for this id is ignored, and the button
-   * disables itself via the `switchingViews` store meanwhile. The server's own
+   * reads as pending via the `switchingViews` store meanwhile. The server's own
    * concurrent-switch 409 (without `busy`) is the backstop, dropped silently.
    */
   async function switchView(sessionId: string, target: "chat" | "term"): Promise<void> {
@@ -4262,10 +4335,7 @@
           console.error("view switch failed", e);
           return;
         }
-        const go = confirm(
-          "The agent is mid-task. Switching restarts it via resume and interrupts the current turn — switch anyway?",
-        );
-        if (!go) return;
+        if (!(await askForcedSwitch(sessionId, target))) return;
         try {
           await switchSessionView(sessionId, target, true);
         } catch (err) {
@@ -6130,6 +6200,18 @@
   />
 {/if}
 
+<!-- A mid-task agent's view switch interrupts its turn: asked, not assumed. -->
+{#if switchAsk !== null}
+  <ConfirmDialog
+    title={switchAsk.target === "chat" ? "Open as chat?" : "Open as terminal?"}
+    body={`${sessionLabel(displayNames, sessionsById, switchAsk.sessionId)} is mid-task. Switching restarts it via resume, which interrupts the current turn.`}
+    confirmLabel="switch"
+    enterConfirms
+    onConfirm={() => switchAsk?.answer(true)}
+    onCancel={() => switchAsk?.answer(false)}
+  />
+{/if}
+
 <!-- The native window close / app quit over every unsaved file here; it takes
      precedence over a tab close already asking (whose files it includes). -->
 {#if windowClose.prompt !== null}
@@ -6164,6 +6246,7 @@
     blockedDrafts={$volatileChatDrafts.size}
     onReload={requestAssetReload}
     onDismiss={clearChunkFailure}
+    onCancel={cancelWindowReload}
   />
 {/if}
 

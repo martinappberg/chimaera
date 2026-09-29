@@ -467,7 +467,15 @@ export const APP_MENU = {
   newTerminal: isMac ? "⌘T" : "Ctrl+T",
   newAgent: isMac ? "⇧⌘T" : "Ctrl+Shift+T",
   newWindow: isMac ? "⇧⌘N" : "Ctrl+Shift+N",
+  // F5 off macOS: Ctrl+R is the shell's reverse history search (the terminal
+  // owns bare Ctrl), and Ctrl+Shift+R is the pinned reference chord there.
+  reloadWindow: isMac ? "⌘R" : "F5",
 } as const;
+
+/** Bare F5 off macOS: Reload Window's menu chord there (APP_MENU). */
+export function isReloadWindowKey(e: KeyboardEvent): boolean {
+  return !isMac && e.key === "F5" && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey;
+}
 
 /** The pinned reference chord as a parsed matcher. */
 export const REFERENCE_CHORD: ParsedChord = {

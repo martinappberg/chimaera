@@ -2,10 +2,11 @@
 //! Cmd+W closes the focused VIEW (the web UI decides what that means);
 //! Cmd+T / Cmd+Shift+T start sessions; Cmd+Shift+N opens a New Window at Home
 //! (or focuses the one unused launcher). Items the page handles are forwarded
-//! as a "menu" event to the focused window (see onMenu in native.ts).
+//! as a "menu" event to the focused window (see onMenu in native.ts); Reload
+//! Window instead runs a fixed script in it (see [`RELOAD_WINDOW_JS`]).
 
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
-use tauri::{App, AppHandle, Emitter, Manager, Wry};
+use tauri::{App, AppHandle, Emitter, Manager, WebviewWindow, Wry};
 
 /// Handles to menu items whose enabled state tracks runtime context, so
 /// [`sync_settings_enabled`] can toggle them. Managed on the app at install.
@@ -14,6 +15,31 @@ pub(crate) struct MenuState {
     /// focused window actually has a workspace open (not the home screen).
     settings: MenuItem<Wry>,
 }
+
+/// Reload Window's chord. Off macOS, Ctrl+R is the shell's reverse history
+/// search (the terminal owns bare Ctrl) and Ctrl+Shift+R is the pinned
+/// reference chord, so it takes F5, the platform's reload key. Mirrored in
+/// web-ui's keys.ts `APP_MENU`.
+#[cfg(target_os = "macos")]
+const RELOAD_WINDOW_CHORD: &str = "CmdOrCtrl+R";
+#[cfg(not(target_os = "macos"))]
+const RELOAD_WINDOW_CHORD: &str = "F5";
+
+/// Reload Window runs in the page, not as a webview reload: the page's gate
+/// holds it while unsaved edits or unsent chat drafts would be lost (a native
+/// reload skips beforeunload, which wry never prompts for), and the window's
+/// layout comes back from its view-state. Script, not a "menu" event: a page
+/// whose interface never booted — a failed load, a UI build half-written —
+/// has no listener, yet it is exactly the window that needs the reload; the
+/// hook (web-ui layout/windowReload.ts) is installed before the app mounts
+/// and reloads plainly when there is nothing to hold. A rendered interface
+/// without the hook predates this item and may hold edits it cannot report,
+/// so it is left alone.
+const RELOAD_WINDOW_JS: &str = r#"(() => {
+  const reload = window.__chimaeraReloadWindow;
+  if (typeof reload === "function") reload();
+  else if (!document.getElementById("app")?.hasChildNodes()) location.reload();
+})();"#;
 
 pub fn install(app: &App) -> tauri::Result<()> {
     let handle = app.handle();
@@ -100,6 +126,12 @@ pub fn install(app: &App) -> tauri::Result<()> {
         .build()?;
 
     let view = SubmenuBuilder::new(handle, "View")
+        .item(
+            &MenuItemBuilder::with_id("reload-window", "Reload Window")
+                .accelerator(RELOAD_WINDOW_CHORD)
+                .build(handle)?,
+        )
+        .separator()
         .item(&PredefinedMenuItem::fullscreen(handle, None)?)
         .build()?;
 
@@ -164,15 +196,20 @@ pub fn install(app: &App) -> tauri::Result<()> {
                     }
                 }
             }
+            "reload-window" => {
+                // Only the focused window. The WSL wizard is shell-local:
+                // reloading it mid-install would orphan the running step.
+                if let Some(window) =
+                    focused_window(app).filter(|w| !w.label().starts_with("wsl-setup"))
+                {
+                    let _ = window.eval(RELOAD_WINDOW_JS);
+                }
+            }
             "close-view" | "new-terminal" | "new-agent" | "settings" => {
                 // The page knows what "close the focused view" / "open settings"
                 // means; the shell only knows which window is focused. emit_to,
                 // not emit: a broadcast would act in EVERY window.
-                if let Some(window) = app
-                    .webview_windows()
-                    .into_values()
-                    .find(|w| w.is_focused().unwrap_or(false))
-                {
+                if let Some(window) = focused_window(app) {
                     let _ = app.emit_to(window.label(), "menu", id);
                 }
             }
@@ -180,6 +217,13 @@ pub fn install(app: &App) -> tauri::Result<()> {
         }
     });
     Ok(())
+}
+
+/// The window a menu command acts on: the focused one, if any.
+fn focused_window(app: &AppHandle) -> Option<WebviewWindow> {
+    app.webview_windows()
+        .into_values()
+        .find(|w| w.is_focused().unwrap_or(false))
 }
 
 /// Enable the Settings menu item only when the focused window has a workspace
