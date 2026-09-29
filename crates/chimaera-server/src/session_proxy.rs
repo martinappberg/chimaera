@@ -1178,6 +1178,11 @@ async fn alias_request(
                 *value = alias.input(value);
             }
         }
+        // The document checker's `root` names a folder on this computer; the
+        // owner checks against the project's own folder instead.
+        if path == "/fs/check_document" {
+            query.retain(|(key, _)| key != "root");
+        }
         let query = crate::workspace_scope::paths::encode_query(&query);
         *incoming.uri_mut() = format!(
             "{}{}{}",
@@ -2185,6 +2190,25 @@ mod tests {
         // An upload's body keeps the link alive; only a silent stall ends it.
         assert!(Budget::UPLOAD.quiet < Budget::UPLOAD.head);
         assert!(Budget::EXEC.quiet >= Budget::EXEC.head);
+    }
+
+    #[tokio::test]
+    async fn the_document_checker_never_forwards_this_computers_root() {
+        let alias = crate::workspace_scope::paths::Alias {
+            root: std::path::PathBuf::from("/project"),
+            viewer: std::path::PathBuf::from("/Users/me/project"),
+        };
+        let request = Request::builder()
+            .uri("/fs/check_document?path=%2FUsers%2Fme%2Fproject%2Fdoc.md&root=%2FUsers%2Fme%2Fproject")
+            .body(Body::empty())
+            .unwrap();
+        let (mapped, _) = alias_request(request, "/fs/check_document", &alias)
+            .await
+            .unwrap();
+        assert_eq!(
+            mapped.uri().to_string(),
+            "/fs/check_document?path=%2Fproject%2Fdoc.md"
+        );
     }
 
     #[test]

@@ -278,6 +278,22 @@ impl Scope {
         Err(Outside { missing }.into())
     }
 }
+/// A refused scoped request. A read outside the project: `not_found` lets
+/// the viewer's own computer answer with its own file; `outside_project`
+/// tells it this machine has a different one it must not stand in for.
+fn outside_read(error: anyhow::Error) -> Response {
+    match error.downcast_ref::<Outside>() {
+        Some(Outside { missing: true }) => {
+            (StatusCode::NOT_FOUND, Json(json!({"error":"not_found"}))).into_response()
+        }
+        Some(Outside { missing: false }) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"outside_project"})),
+        )
+            .into_response(),
+        None => denied(StatusCode::FORBIDDEN),
+    }
+}
 /// A viewer's read of a path outside what it may read here.
 #[derive(Debug)]
 struct Outside {
@@ -472,6 +488,25 @@ async fn scoped_request(
         }
         return Json(value).into_response();
     }
+    // The reading view's checker, for a viewer of this project: root-relative
+    // links resolve at the project's own folder (the viewer's `root` names a
+    // folder on another machine and is ignored), and no link target outside
+    // the project is stat-ed or read.
+    if path == "/fs/check_document" && read {
+        let Some(document) = query.get("path").cloned() else {
+            return denied(StatusCode::BAD_REQUEST);
+        };
+        if let Err(error) = scope.read(&state, document.clone()).await {
+            return outside_read(error);
+        }
+        let Some(root) = crate::lock(&state.workspaces)
+            .get(&scope.workspace_id)
+            .map(|workspace| workspace.root)
+        else {
+            return denied(StatusCode::CONFLICT);
+        };
+        return crate::doc_check::check_within(document, root).await;
+    }
     if path == "/fs/home" && read {
         let root = crate::lock(&state.workspaces)
             .get(&scope.workspace_id)
@@ -527,20 +562,7 @@ async fn scoped_request(
     // Validation may narrow a compound body (unreadable candidates dropped),
     // so the forwarded body is built from what it approved.
     if let Err(error) = validate_resource(&state, &scope, &method, &path, &query, &mut body).await {
-        // A read outside the project: `not_found` lets the viewer's own
-        // computer answer with its own file; `outside_project` tells it this
-        // machine has a different one it must not stand in for.
-        return match error.downcast_ref::<Outside>() {
-            Some(Outside { missing: true }) => {
-                (StatusCode::NOT_FOUND, Json(json!({"error":"not_found"}))).into_response()
-            }
-            Some(Outside { missing: false }) => (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error":"outside_project"})),
-            )
-                .into_response(),
-            None => denied(StatusCode::FORBIDDEN),
-        };
+        return outside_read(error);
     }
     let mut request = match stream {
         Some(stream) => Request::from_parts(parts, stream),

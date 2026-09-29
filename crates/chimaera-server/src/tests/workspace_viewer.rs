@@ -475,6 +475,44 @@ async fn scoped_http_viewer_reads_only_registered_project_and_keeps_content_unch
         .0,
         StatusCode::OK
     );
+    // It checks against the project's own folder (never the viewer's root,
+    // which names a folder on another machine) and touches no link target
+    // outside the project: no existence, no heading names.
+    std::fs::write(other.root.join("secret.md"), "# Secret heading name\n").unwrap();
+    std::fs::write(
+        one.root.join("doc.md"),
+        format!(
+            "# Doc\n\n[mine](/note.txt)\n\n[theirs]({}#secret-heading-name)\n\n[gone]({})\n",
+            other.root.join("secret.md").display(),
+            other.root.join("never-written.md").display()
+        ),
+    )
+    .unwrap();
+    let (status, bytes) = scoped(
+        &state,
+        &one.id,
+        4,
+        Method::GET,
+        "/api/v1/fs/check_document?path=%2Fproject%2Fdoc.md&root=%2FUsers%2Fviewer%2Fproject",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(bytes).unwrap();
+    let report: Value = serde_json::from_str(&text).unwrap();
+    let codes: Vec<&str> = report["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|issue| issue["code"].as_str())
+        .collect();
+    assert!(codes.contains(&"outside_project"), "{text}");
+    assert!(
+        !codes.iter().any(|code| code.starts_with("broken")),
+        "a root-relative link resolves in the project; an outside one is not probed: {text}"
+    );
+    assert!(!codes.contains(&"missing-heading"), "{text}");
+    assert!(!text.contains("Secret heading name"), "{text}");
     assert_eq!(
         scoped(&state, &one.id, 3, Method::GET, "/api/v1/workspaces", None)
             .await
