@@ -133,6 +133,9 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // (crashes, unclean stops) — swept once restore has decided which
     // sessions still exist.
     crate::upload::spawn_boot_prune(state.clone());
+    // Transfer leftovers (staging copies, Git locks, temporary archives) from
+    // a previous daemon life that never finished them.
+    crate::pro::sweep_leftovers(&state);
 
     // `state.clone()` (not a move) so the post-serve ledger snapshot + handoff
     // below still own it after graceful shutdown returns.

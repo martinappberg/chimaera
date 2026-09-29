@@ -221,10 +221,10 @@ async fn same_boot_crash_never_turns_empty_registry_into_stopped_evidence() {
     crate::pro::ensure_root(&state.pro.root).await.unwrap();
     prepare_launch(&state, "w-a").await.unwrap();
     // No recorded process group: a worker cannot prove anything.
-    let restored = State::restore(&state.pro.root, &lock(&state.pro.preferences), true);
+    let restored = State::restore(&state.pro.root, &lock(&state.pro.preferences), true, false);
     assert!(lock(&restored.unclean).contains_key("w-a"));
     // A device proceeds (laptop first).
-    let restored = State::restore(&state.pro.root, &lock(&state.pro.preferences), false);
+    let restored = State::restore(&state.pro.root, &lock(&state.pro.preferences), false, false);
     assert!(!lock(&restored.unclean).contains_key("w-a"));
     // A recorded group that is still alive fences both until it exits.
     let mut child = std::process::Command::new("/bin/sleep")
@@ -235,7 +235,7 @@ async fn same_boot_crash_never_turns_empty_registry_into_stopped_evidence() {
     let mut preferences = lock(&state.pro.preferences).clone();
     preferences.get_mut("w-a").unwrap().execution_groups = vec![child.id()];
     for worker in [false, true] {
-        let restored = State::restore(&state.pro.root, &preferences, worker);
+        let restored = State::restore(&state.pro.root, &preferences, worker, false);
         assert_eq!(lock(&restored.unclean)["w-a"], vec![child.id()]);
     }
     lock(&state.pro.execution.unclean).insert("w-a".into(), vec![child.id()]);
@@ -252,6 +252,9 @@ async fn same_boot_crash_never_turns_empty_registry_into_stopped_evidence() {
     let damaged = crate::pro::ProState::new(state.pro.root.clone());
     assert!(lock(&damaged.execution.latched).contains("w-a"));
     assert!(damaged.execution.proofs.lock().unwrap().is_empty());
+    // Unreadable ownership state fails closed and keeps the damaged copy.
+    assert!(damaged.execution.invalid);
+    assert!(state.pro.root.join("state.json.damaged").exists());
     std::fs::remove_dir_all(root).unwrap();
 }
 

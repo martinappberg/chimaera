@@ -251,34 +251,55 @@ impl LedgerStore {
             tracing::error!(%error, "failed to persist session ledger");
         }
     }
+    /// A handoff's ledger write (a suspended session, a stopped agent) must
+    /// survive a power cut: it is what keeps two machines from resuming the
+    /// same conversation.
+    pub(crate) fn write_durable(
+        &mut self,
+        entries: &[LedgerEntry],
+        links: &HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        // Always written: an unchanged body may still sit in a cache only.
+        let body = Self::body(entries, links);
+        self.save(&body, true)?;
+        self.last_written = Some(body);
+        Ok(())
+    }
+    fn body(entries: &[LedgerEntry], links: &HashMap<String, String>) -> String {
+        // BTreeMap orders the links so an unchanged snapshot compares equal.
+        let links: std::collections::BTreeMap<&String, &String> = links.iter().collect();
+        json!({
+            "sessions": entries.iter().map(LedgerEntry::to_json).collect::<Vec<_>>(),
+            "links": links,
+        })
+        .to_string()
+    }
     pub(crate) fn write_checked(
         &mut self,
         entries: &[LedgerEntry],
         links: &HashMap<String, String>,
     ) -> anyhow::Result<()> {
-        // BTreeMap orders the links so an unchanged snapshot compares equal.
-        let links: std::collections::BTreeMap<&String, &String> = links.iter().collect();
-        let body = json!({
-            "sessions": entries.iter().map(LedgerEntry::to_json).collect::<Vec<_>>(),
-            "links": links,
-        })
-        .to_string();
+        let body = Self::body(entries, links);
         if self.last_written.as_deref() == Some(body.as_str()) {
             return Ok(());
         }
-        self.save(&body)?;
+        self.save(&body, false)?;
         self.last_written = Some(body);
         Ok(())
     }
 
-    fn save(&self, body: &str) -> anyhow::Result<()> {
+    fn save(&self, body: &str, durable: bool) -> anyhow::Result<()> {
         let full = {
             let mut value: serde_json::Value = serde_json::from_str(body)?;
             value["v"] = json!(1);
             value["written_at"] = json!(unix_now());
             value.to_string()
         };
-        crate::persist::atomic_write_json(&self.path, full)
+        if durable {
+            crate::persist::atomic_write_json_durable(&self.path, full)
+        } else {
+            crate::persist::atomic_write_json(&self.path, full)
+        }
     }
 }
 

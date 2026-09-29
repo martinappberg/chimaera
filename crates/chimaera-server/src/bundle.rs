@@ -202,9 +202,32 @@ async fn flush_ledger(state: &Arc<AppState>) -> Result<()> {
     let state = state.clone();
     tokio::task::spawn_blocking(move || {
         let (entries, links) = crate::ledger::snapshot(&state);
-        crate::lock(&state.ledger).write_checked(&entries, &links)
+        crate::lock(&state.ledger).write_durable(&entries, &links)
     })
     .await?
+}
+/// Temporary archives a previous daemon life left behind. Only files older
+/// than an hour go: a transfer started by this life may be writing one.
+pub(crate) async fn sweep_temporary(state: &Arc<AppState>) {
+    let directory = root(state).join("tmp");
+    let _ = tokio::task::spawn_blocking(move || {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.filter_map(std::result::Result::ok).take(4096) {
+            let stale = entry
+                .metadata()
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > Duration::from_secs(3600));
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    })
+    .await;
 }
 
 /// The caller owns and must unlink the returned temporary archive.

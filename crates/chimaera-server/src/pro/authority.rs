@@ -323,7 +323,8 @@ pub(super) async fn save(state: &AppState, value: &Accepted) -> Result<()> {
         bytes.len() <= 16 * 1024,
         "workspace authority record exceeds limit"
     );
-    tokio::task::spawn_blocking(move || crate::persist::atomic_write_json(&path, bytes)).await??;
+    tokio::task::spawn_blocking(move || crate::persist::atomic_write_json_durable(&path, bytes))
+        .await??;
     Ok(())
 }
 pub(super) async fn destination(

@@ -644,7 +644,7 @@ async fn suspend_workspace(state: &Arc<AppState>, workspace: &str) -> Result<()>
     let owner = state.clone();
     tokio::task::spawn_blocking(move || {
         let (entries, links) = crate::ledger::snapshot(&owner);
-        lock(&owner.ledger).write_checked(&entries, &links)
+        lock(&owner.ledger).write_durable(&entries, &links)
     })
     .await??;
     Ok(())

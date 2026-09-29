@@ -56,7 +56,8 @@ pub(crate) struct ProState {
     /// keeps its publication but never releases a project after the wake.
     sleep_generation: AtomicU64,
     sleeping: Mutex<std::collections::HashSet<String>>,
-    persistence: AsyncMutex<()>,
+    /// The last bytes written, so an unchanged tick costs no disk sync.
+    persistence: AsyncMutex<Option<Vec<u8>>>,
     configuration: Arc<AsyncMutex<()>>,
     caches: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     boot_deferred: Mutex<std::collections::HashSet<String>>,
@@ -167,17 +168,30 @@ impl ProState {
     pub(crate) fn new(root: PathBuf) -> Self {
         // Construction already happens on the daemon's startup blocking path.
         // A capped record can gate restore without needing an account token.
-        let disk = std::fs::File::open(root.join("state.json"))
-            .ok()
-            .and_then(|file| {
+        let path = root.join("state.json");
+        let loaded = match std::fs::File::open(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Some(DiskState::default())
+            }
+            Err(_) => None,
+            Ok(file) => {
                 use std::io::Read;
                 let mut bytes = Vec::new();
-                file.take(1024 * 1024 + 1).read_to_end(&mut bytes).ok()?;
-                (bytes.len() <= 1024 * 1024)
-                    .then(|| serde_json::from_slice::<DiskState>(&bytes).ok())
-                    .flatten()
-            })
-            .unwrap_or_default();
+                file.take(1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)
+                    .ok()
+                    .filter(|_| bytes.len() <= 1024 * 1024)
+                    .and_then(|_| serde_json::from_slice::<DiskState>(&bytes).ok())
+            }
+        };
+        // Unreadable ownership state fails closed: every enrolled project is
+        // verified again rather than silently losing its fences. The damaged
+        // copy is kept (one slot) instead of being overwritten.
+        let damaged = loaded.is_none();
+        if damaged {
+            let _ = std::fs::rename(&path, root.join("state.json.damaged"));
+        }
+        let disk = loaded.unwrap_or_default();
         let legacy_pending = disk
             .legacy_pending
             .into_iter()
@@ -222,6 +236,7 @@ impl ProState {
             &root,
             &disk.preferences,
             disk.worker || crate::cloud::enabled(),
+            damaged,
         );
         Self {
             root,
@@ -245,7 +260,7 @@ impl ProState {
             jobs: Arc::new(AsyncMutex::new(())),
             sleep_generation: AtomicU64::new(0),
             sleeping: Mutex::new(Default::default()),
-            persistence: AsyncMutex::new(()),
+            persistence: AsyncMutex::new(None),
             configuration: Arc::new(AsyncMutex::new(())),
             caches: Mutex::new(HashMap::new()),
             boot_deferred: Mutex::new(Default::default()),
@@ -397,7 +412,7 @@ fn now() -> u64 {
         .as_secs()
 }
 async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
-    let _guard = state.pro.persistence.lock().await;
+    let mut written = state.pro.persistence.lock().await;
     ensure_root(&state.pro.root).await?;
     execution::record_groups(state);
     let keep_running = crate::lock(&state.pro.keep_running).clone();
@@ -424,9 +439,18 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
         preferences,
     })?;
     anyhow::ensure!(bytes.len() <= 1024 * 1024, "mirror settings exceed limit");
-    execution::persist_latch(state).await?;
+    // State first, then the enrollment latch: a crash between them leaves a
+    // policy the latch does not list yet (restored as enrolled), never a latch
+    // naming a workspace whose policy is missing (which fails closed).
+    if written.as_deref() == Some(bytes.as_slice()) {
+        return Ok(());
+    }
     let path = state.pro.root.join("state.json");
-    tokio::task::spawn_blocking(move || crate::persist::atomic_write_json(&path, bytes)).await??;
+    let copy = bytes.clone();
+    tokio::task::spawn_blocking(move || crate::persist::atomic_write_json_durable(&path, copy))
+        .await??;
+    execution::persist_latch(state).await?;
+    *written = Some(bytes);
     Ok(())
 }
 
@@ -511,6 +535,44 @@ pub(crate) async fn defer_command(
         persist(state).await?;
     }
     Ok(should_defer)
+}
+
+/// Leftovers of transfers a previous daemon life never finished: staging
+/// copies and Git locks per project (each under its cache guard, so a transfer
+/// that starts meanwhile is never touched) and old temporary bundle archives.
+pub(crate) fn sweep_leftovers(state: &std::sync::Arc<crate::AppState>) {
+    let owner = state.clone();
+    tokio::spawn(async move {
+        let root = owner.pro.root.clone();
+        let projects = tokio::task::spawn_blocking(move || {
+            std::fs::read_dir(root)
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                        .filter_map(|entry| entry.file_name().into_string().ok())
+                        .filter(|name| valid_id(name))
+                        .take(256)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+        for workspace in projects {
+            let Ok(cache) = owner.pro.cache(&workspace) else {
+                continue;
+            };
+            let _guard = cache.lock().await;
+            if transport::cache_quiescent(&workspace).is_err() {
+                continue;
+            }
+            let directory = owner.pro.root.join(&workspace);
+            let _ =
+                tokio::task::spawn_blocking(move || mirror::clear_interrupted(&directory)).await;
+        }
+        crate::bundle::sweep_temporary(&owner).await;
+    });
 }
 
 /// Graceful daemon stop: clear managed-execution evidence once this life's

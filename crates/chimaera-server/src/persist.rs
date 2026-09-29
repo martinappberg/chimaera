@@ -35,6 +35,44 @@ pub(crate) fn project_temp_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
 /// Write `contents` to `path` atomically: ensure the parent dir exists, write
 /// a `.json.tmp` sibling, then rename it over `path`. The stores all target
 /// `*.json`, so the tmp name mirrors the historical `with_extension("json.tmp")`.
+/// Like [`atomic_write_json`], but the bytes and the rename reach stable
+/// storage before returning (F_FULLFSYNC on macOS, where fsync alone may stay
+/// in the drive cache). For state whose loss after a crash or power cut would
+/// let two machines run the same work: Pro ownership and the session ledger's
+/// handoff writes. Ordinary preference stores keep the cheaper write.
+pub(crate) fn atomic_write_json_durable(
+    path: &Path,
+    contents: impl AsRef<[u8]>,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let parent = path.parent().context("durable state needs a parent")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let tmp = path.with_extension("json.tmp");
+    let mut file = std::fs::File::create(&tmp)
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    file.write_all(contents.as_ref())?;
+    full_sync(&file)?;
+    drop(file);
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("failed to rename into {}", path.display()))?;
+    full_sync(&std::fs::File::open(parent)?)?;
+    Ok(())
+}
+fn full_sync(file: &std::fs::File) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a valid open descriptor; F_FULLFSYNC takes no argument.
+        if unsafe { nix::libc::fcntl(file.as_raw_fd(), nix::libc::F_FULLFSYNC) } == 0 {
+            return Ok(());
+        }
+        // Some filesystems (network, FAT) refuse F_FULLFSYNC; fall back.
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
 pub(crate) fn atomic_write_json(path: &Path, contents: impl AsRef<[u8]>) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)

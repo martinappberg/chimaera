@@ -13,6 +13,7 @@ impl State {
         root: &Path,
         preferences: &HashMap<String, super::super::Preference>,
         worker: bool,
+        damaged: bool,
     ) -> Self {
         let loaded = (|| -> Result<HashSet<String>> {
             let file = match std::fs::File::open(root.join("execution-authority.json")) {
@@ -32,7 +33,7 @@ impl State {
             );
             Ok(latch.workspaces.into_iter().collect())
         })();
-        let mut invalid = loaded.is_err();
+        let mut invalid = loaded.is_err() || damaged;
         let mut latched = loaded.unwrap_or_default();
         invalid |= latched
             .iter()
@@ -204,7 +205,8 @@ pub(in crate::pro) async fn persist_latch(state: &AppState) -> Result<()> {
         workspaces,
     })?;
     let path = state.pro.root.join("execution-authority.json");
-    tokio::task::spawn_blocking(move || crate::persist::atomic_write_json(&path, bytes)).await??;
+    tokio::task::spawn_blocking(move || crate::persist::atomic_write_json_durable(&path, bytes))
+        .await??;
     Ok(())
 }
 /// The OS boot identifier changes only on a new kernel boot, where old local

@@ -24,7 +24,7 @@ async fn cold_boot_proof_clears_only_orphan_process_uncertainty_not_execution_au
     prepare_launch(&state, "w-a").await.unwrap();
     let mut saved = lock(&state.pro.preferences).clone();
     saved.get_mut("w-a").unwrap().execution_boot = Some("different-synthetic-kernel-boot".into());
-    let restored = State::restore(&state.pro.root, &saved, true);
+    let restored = State::restore(&state.pro.root, &saved, true, false);
     if restored.boot.is_some() {
         assert!(!lock(&restored.unclean).contains_key("w-a"));
     } else {
@@ -36,7 +36,9 @@ async fn cold_boot_proof_clears_only_orphan_process_uncertainty_not_execution_au
     assert!(restored.proofs.lock().unwrap().is_empty());
     assert!(restored.latched.lock().unwrap().contains("w-a"));
     saved.get_mut("w-a").unwrap().execution_boot = None;
-    assert!(lock(&State::restore(&state.pro.root, &saved, true).unclean).contains_key("w-a"));
+    assert!(
+        lock(&State::restore(&state.pro.root, &saved, true, false).unclean).contains_key("w-a")
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 
