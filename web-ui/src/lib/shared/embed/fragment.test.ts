@@ -287,7 +287,11 @@ describe("tableCounts", () => {
     expect(
       tableCounts({ columns: cols, rows: rows(10), truncated: true, total_rows: null, est_rows: 1_234_567.4 }, whole)
         .foot,
-    ).toBe("first 10 · ~1,234,567 rows");
+    ).toBe("first 10 · ~1.2M rows");
+    // The same words as the full grid's footer for the same estimate.
+    expect(tableCounts({ columns: cols, rows: rows(10), truncated: true, est_rows: 4_321 }, whole).foot).toBe(
+      "first 10 · ~4,321 rows",
+    );
     expect(tableCounts({ columns: cols, rows: rows(10), truncated: true }, whole).foot).toBe("first 10 · more rows");
     expect(tableCounts({ columns: cols, rows: rows(3), truncated: false, total_rows: 40 }, sliced).foot).toBe(
       "3 shown · 40 rows",
@@ -301,6 +305,12 @@ describe("tableCounts", () => {
     expect(tableCounts(deep, { ...sliced, first: 1_500_000 }).empty).toBe(
       "row 1,500,000 is further in than one read goes — open the table to get there",
     );
+    // A .gz past its decode cap: rows go on, but no read reaches them.
+    const capped = { columns: cols, rows: [], truncated: true, total_rows: null, est_rows: null };
+    expect(tableCounts(capped, { ...sliced, first: 9_000_000 })).toEqual({
+      foot: "more rows",
+      empty: "row 9,000,000 is past what a preview can read",
+    });
     // fs/xlsx: a range below the sheet's data, no total to name.
     expect(tableCounts({ columns: cols, rows: [], truncated: false }, { ...sliced, sheet: true }).empty).toBe(
       "no rows there",

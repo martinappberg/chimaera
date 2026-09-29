@@ -16,6 +16,7 @@
 import { lineAnchor, revealOf } from "../fileRef";
 import { a1Column, a1ToBlock, clockLabel, parseLocator } from "../locator";
 import type { TablePage } from "../../previews/files";
+import { formatRowCount } from "../../previews/tableGrid";
 import type { Locator, Reveal } from "../reveal";
 
 /** A region (`#xywh=`), as the locator reads it. */
@@ -207,7 +208,8 @@ export function tableWindow(
 
 // --- a table card's counts -------------------------------------------------------------
 
-const rowCount = (n: number) => `${n.toLocaleString("en-US")} ${n === 1 ? "row" : "rows"}`;
+/** "1 row", "20,000 rows", "~1.2M rows": the full grid's own numbers. */
+const rowCount = (n: number, exact = true) => `${formatRowCount(n, exact)} ${exact && n === 1 ? "row" : "rows"}`;
 
 /**
  * A table card's count line, and what it says where the rows would be when
@@ -227,7 +229,7 @@ export function tableCounts(
     total !== null
       ? rowCount(total)
       : est !== null
-        ? `~${rowCount(Math.round(est))}`
+        ? rowCount(Math.round(est), false)
         : page.truncated
           ? "more rows"
           : rowCount(n);
@@ -237,11 +239,15 @@ export function tableCounts(
     const all = total !== null ? n >= total : est === null && !page.truncated;
     return { foot: all ? of : `first ${n.toLocaleString("en-US")} · ${of}`, empty: null };
   }
+  const row = o.first.toLocaleString("en-US");
   if (o.numbered && page.scan_limited === true) {
     // The daemon's scan budget ran out short of the slice; the full grid
     // resumes from where it stopped.
-    const row = o.first.toLocaleString("en-US");
     return { foot: of, empty: `row ${row} is further in than one read goes — open the table to get there` };
+  }
+  if (o.numbered && total === null && page.truncated) {
+    // Rows go on but none came back: a gzip file past its decode cap.
+    return { foot: of, empty: `row ${row} is past what a preview can read` };
   }
   if (o.numbered && total !== 0) {
     const end = total !== null ? `the table ends at row ${total.toLocaleString("en-US")}` : "no rows there";

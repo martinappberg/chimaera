@@ -149,7 +149,7 @@
         </table>
       {/if}
     </div>
-    {#if counts?.empty != null}
+    {#if counts?.empty}
       <div class="empty">{counts.empty}</div>
     {/if}
     <div class="foot">{counts?.foot ?? ""}</div>
@@ -158,6 +158,8 @@
 
 <style>
   .table-body {
+    /* The grid's top inset, which the empty note sits below the header by. */
+    --pad-y: 4px;
     position: relative;
     display: flex;
     flex-direction: column;
@@ -172,7 +174,7 @@
     height: calc((var(--rows) + 1) * (var(--row-h) + 1px) + 10px);
     overflow: auto;
     scrollbar-width: thin;
-    padding: 4px 8px;
+    padding: var(--pad-y) 8px;
   }
   .tile .scroll {
     flex: 1;
@@ -226,7 +228,7 @@
      the (wider) header is scrolled sideways. */
   .empty {
     position: absolute;
-    top: calc(4px + var(--row-h) + 1px);
+    top: calc(var(--pad-y) + var(--row-h) + 1px);
     left: 0;
     right: 0;
     padding: 8px 16px;
