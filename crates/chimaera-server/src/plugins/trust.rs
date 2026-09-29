@@ -715,14 +715,17 @@ pub(crate) async fn trust_route(
             super::read(&state.plugin_guard.revoked).block(&m.id, &m.version, &m.wasm.sha256);
         match listed {
             Some(b) if b.level == Level::Soft => {
-                crate::lock(&state.plugin_guard.store)
-                    .file
-                    .allowed_blocks
-                    .push(AllowedBlock {
+                {
+                    // One allowance per build: asking again only renews it.
+                    let mut store = crate::lock(&state.plugin_guard.store);
+                    let allowed = &mut store.file.allowed_blocks;
+                    allowed.retain(|a| !(a.id == m.id && a.sha256 == *m.wasm.sha256));
+                    allowed.push(AllowedBlock {
                         id: m.id.clone(),
                         sha256: m.wasm.sha256.to_string(),
                         granted_ms: crate::timeline::now_ms(),
                     });
+                }
                 if let Err(r) = persist(&state).await {
                     return r.into_response();
                 }

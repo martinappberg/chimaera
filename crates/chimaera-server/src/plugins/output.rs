@@ -199,8 +199,18 @@ pub(crate) fn prune_oldest(dir: &Path, rel: &Path, keep: usize) -> Result<(), St
 }
 
 /// The parent folder of `rel` beneath `root`, made on the way (never
-/// through a link), and `rel`'s last component.
+/// through a link, private: the output folder's), and `rel`'s last
+/// component.
 fn parent_of(root: &File, rel: &Path) -> Result<(File, std::ffi::OsString), String> {
+    parent_made(root, rel, 0o700)
+}
+
+/// `parent_of`, making missing folders with `mode` (the umask applies).
+fn parent_made(
+    root: &File,
+    rel: &Path,
+    mode: rustix::fs::RawMode,
+) -> Result<(File, std::ffi::OsString), String> {
     let mut parts: Vec<&std::ffi::OsStr> = rel
         .components()
         .map(|c| match c {
@@ -214,7 +224,7 @@ fn parent_of(root: &File, rel: &Path) -> Result<(File, std::ffi::OsString), Stri
         .to_os_string();
     let mut dir = root.try_clone().map_err(|e| io(rel, e))?;
     for part in parts {
-        match rustix::fs::mkdirat(&dir, part, Mode::from_raw_mode(0o700)) {
+        match rustix::fs::mkdirat(&dir, part, Mode::from_raw_mode(mode)) {
             Ok(()) | Err(rustix::io::Errno::EXIST) => {}
             Err(e) => return Err(io(rel, e)),
         }
@@ -320,7 +330,9 @@ pub(crate) fn copy_out(
         return Err(io(rel, "not a regular file"));
     }
     let dst_root = File::open(dst).map_err(|e| format!("the workspace root: {e}"))?;
-    let (parent, name) = parent_of(&dst_root, dst_rel)?;
+    // Folders made in the workspace are ordinary ones (collaborators on a
+    // shared project read them), not the output folder's private ones.
+    let (parent, name) = parent_made(&dst_root, dst_rel, 0o755)?;
     let shown = || dst_rel.display().to_string();
     match rustix::fs::statat(&parent, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW) {
         Ok(st) if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile => {
@@ -359,6 +371,13 @@ pub(crate) fn copy_out(
         format!("{}: {e}", shown())
     })?;
     Ok(n)
+}
+
+/// Whether any component of `rel` is hidden (starts with a dot).
+fn hidden(rel: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    rel.components()
+        .any(|c| c.as_os_str().as_bytes().first() == Some(&b'.'))
 }
 
 /// Remove `rel`, a file or a whole folder, never following a link
@@ -633,6 +652,14 @@ pub(crate) async fn save_route(
         (Err(e), _) | (_, Err(e)) => return super::bad_request(e),
         _ => return super::bad_request("name the file to save to"),
     };
+    // The plugin names where its button saves: never a hidden path, where a
+    // file does more than sit there (`.envrc`, `.git/hooks`, `.github/`).
+    if hidden(&dst_rel) {
+        return super::bad_request(format!(
+            "{}: a plugin saves only to visible paths in the workspace",
+            body.to
+        ));
+    }
     let dir = folder(&state.plugin_platform.output_root, &pid, &ws);
     let target = root.join(&dst_rel);
     let copied = {
@@ -695,6 +722,14 @@ mod tests {
         assert!(outside.join("keep.txt").exists());
         // Nothing there yet is fine.
         prune_oldest(&dir, Path::new("none"), 2).unwrap();
+    }
+
+    #[test]
+    fn a_save_goes_only_to_visible_paths() {
+        assert!(hidden(Path::new(".envrc")));
+        assert!(hidden(Path::new(".github/workflows/x.yml")));
+        assert!(hidden(Path::new("docs/.git/hooks/pre-commit")));
+        assert!(!hidden(Path::new("thesis/main.pdf")));
     }
 
     #[test]

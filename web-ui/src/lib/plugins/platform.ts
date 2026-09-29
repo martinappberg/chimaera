@@ -486,15 +486,24 @@ export function outputRoot(ws: string, pid: string): Promise<string> {
   return p;
 }
 
-/** `ref` (a workspace path, or `output:<path>`) as an absolute path. */
+/** Whether `rel` is a plain relative path: no `..`, not absolute. */
+export function plainRelative(rel: string): boolean {
+  return rel !== "" && !rel.startsWith("/") && !rel.split("/").some((c) => c === "..");
+}
+
+/** `ref` (a workspace path, or `output:<path>`) as an absolute path. A
+ *  plugin's screen names only those two places: an absolute path or one
+ *  that climbs out (`..`) is refused, so no screen opens a host file the
+ *  plugin was never given (an editor on `~/.ssh/…`). */
 export async function resolvePlace(ws: string, wsRoot: string | null, pid: string, ref: string): Promise<string> {
   if (ref.startsWith("output:")) {
+    const rel = ref.slice("output:".length);
+    if (!plainRelative(rel)) throw new Error(`${ref}: not a path in the plugin's output folder`);
     const root = await outputRoot(ws, pid);
-    return `${root}/${ref.slice("output:".length).replace(/^\/+/, "")}`;
+    return `${root}/${rel}`;
   }
-  if (ref.startsWith("/")) return ref;
-  const r = wsRoot ?? "";
-  return `${r.endsWith("/") ? r.slice(0, -1) : r}/${ref}`;
+  if (!plainRelative(ref) || wsRoot === null) throw new Error(`${ref}: not a path in this workspace`);
+  return `${wsRoot.endsWith("/") ? wsRoot.slice(0, -1) : wsRoot}/${ref}`;
 }
 
 export async function saveOutput(

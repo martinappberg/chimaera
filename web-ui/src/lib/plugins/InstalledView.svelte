@@ -49,9 +49,14 @@
   let { plugins: loaded, agentPlugins, agentState, agentError, wsId, visible, onAttach, onOpenSession, onRefresh }: Props =
     $props();
 
+  /** One of Chimaera's own plugins (in the lock, whatever build runs):
+   *  `first_party` is the badge — the build the maintainers approved —
+   *  while `pinned_version` comes with every copy of a locked plugin. */
+  const ours = (p: WorkspacePlugin): boolean => p.first_party || p.pinned_version !== null;
+
   /** Chimaera's own plugins first (the curated list), then the rest, each
    *  in the daemon's order. */
-  const plugins = $derived([...(loaded ?? [])].sort((a, b) => Number(b.first_party) - Number(a.first_party)));
+  const plugins = $derived([...(loaded ?? [])].sort((a, b) => Number(ours(b)) - Number(ours(a))));
 
   const k = $derived($knowledge);
   const counts = $derived(k !== null && k.provider !== null ? k.counts : null);
@@ -76,7 +81,7 @@
   function removeBody(p: WorkspacePlugin): string {
     const versions = [p.version, p.previous].filter((v) => v !== null && v !== "").join(" and ");
     const what = `This deletes ${p.name} ${versions} from this host.`;
-    return p.first_party ? `${what} You can install it again from here.` : `${what} Workspaces where it is on lose what it adds.`;
+    return ours(p) ? `${what} You can install it again from here.` : `${what} Workspaces where it is on lose what it adds.`;
   }
 
   async function confirmRemove(): Promise<void> {

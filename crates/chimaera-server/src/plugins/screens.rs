@@ -454,6 +454,13 @@ pub(crate) async fn render_route(
     let Some(decl) = m.views.iter().find(|v| v.id == view) else {
         return super::not_found(&format!("view {view} of {}", m.name));
     };
+    // The file a view shows is the plugin's to read and the sweep's to
+    // stat: a workspace path, never one that climbs out.
+    if let Some(file) = q.file.as_deref() {
+        if file.is_empty() || super::hostfns_relative(file).is_err() {
+            return super::bad_request(format!("{file:?} is not a path in this workspace"));
+        }
+    }
     if decl.slot == Slot::File {
         let Some(file) = q.file.as_deref() else {
             return super::bad_request("a file view needs ?file=");

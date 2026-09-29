@@ -213,6 +213,9 @@ pub(crate) struct Revocations {
     pub(crate) fetched_ms: Option<u64>,
     /// Why the last fetch wasn't accepted (unreachable, unsigned).
     pub(crate) error: Option<String>,
+    /// Builds whose block the activity log already has (id, sha256): the
+    /// daily pass stops them again quietly.
+    reported: BTreeSet<(String, String)>,
 }
 
 impl Revocations {
@@ -247,6 +250,7 @@ impl Revocations {
             serial,
             fetched_ms: None,
             error: None,
+            reported: BTreeSet::new(),
         }
     }
 
@@ -375,7 +379,11 @@ pub(crate) async fn apply(state: &Arc<AppState>) {
         // Its programs stop too, wherever they run.
         state.plugin_platform.jobs.cancel_where(&m.id, None);
         crate::lock(&state.knowledge).forget_provider(&m.id, None);
-        if *blocked {
+        let first = *blocked
+            && super::write(&state.plugin_guard.revoked)
+                .reported
+                .insert((m.id.clone(), m.wasm.sha256.to_string()));
+        if first {
             super::activity::record(
                 state,
                 &m.id,

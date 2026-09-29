@@ -832,6 +832,20 @@ mod tests {
     }
 
     #[test]
+    fn a_name_is_words_without_control_characters() {
+        // `name` as TOML source (`\u001B` is TOML's escape for ESC).
+        let with = |name: &str| {
+            super::super::parse_manifest(&format!(
+                "id = \"demo\"\nname = \"{name}\"\nversion = \"0.1.0\"\nsummary = \"x\"\napi = \"0.2\"\n"
+            ))
+        };
+        assert!(with("Demo").is_ok());
+        let escaped = with(r"Evil\u001B[2KGood").unwrap_err();
+        assert!(escaped.contains("control characters"), "{escaped}");
+        assert!(with("  ").unwrap_err().contains("the name"));
+    }
+
+    #[test]
     fn the_tables_are_checked() {
         let good = manifest(
             r#"

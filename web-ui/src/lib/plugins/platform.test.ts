@@ -8,6 +8,8 @@ import {
   EMPTY_PLATFORM,
   matchesPattern,
   normalizePlatform,
+  plainRelative,
+  resolvePlace,
   offersFor,
   pluginViewTitle,
   sizeWords,
@@ -121,6 +123,19 @@ describe("file patterns (the daemon's rules)", () => {
     expect(matchesPattern(many, "a/b/c/d/e/f/g")).toBe(false);
     expect(matchesPattern(many, "a/b/c/d/e/f/x")).toBe(true);
     expect(performance.now() - started).toBeLessThan(100);
+  });
+
+  it("resolves a screen's paths only inside the workspace or the output folder", async () => {
+    expect(plainRelative("a/b.tex")).toBe(true);
+    expect(plainRelative("../x")).toBe(false);
+    expect(plainRelative("a/../../x")).toBe(false);
+    expect(plainRelative("/etc/passwd")).toBe(false);
+    expect(plainRelative("")).toBe(false);
+    await expect(resolvePlace("w", "/w/p", "demo", "a/b.tex")).resolves.toBe("/w/p/a/b.tex");
+    await expect(resolvePlace("w", "/w/p", "demo", "/Users/me/.ssh/id_rsa")).rejects.toThrow();
+    await expect(resolvePlace("w", "/w/p", "demo", "../x")).rejects.toThrow();
+    await expect(resolvePlace("w", "/w/p", "demo", "output:../../x")).rejects.toThrow();
+    await expect(resolvePlace("w", null, "demo", "a.tex")).rejects.toThrow();
   });
 
   it("is relative to the workspace root", () => {

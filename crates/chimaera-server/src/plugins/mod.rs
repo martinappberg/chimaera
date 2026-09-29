@@ -515,6 +515,16 @@ pub(crate) fn validate(m: &Manifest) -> Result<(), String> {
         ));
     }
     plugin_version(&m.version)?;
+    // Shown on every card, prompt and terminal: words, never control
+    // characters (a terminal escape could redraw a trust prompt).
+    for (what, text) in [("name", &m.name), ("summary", &m.summary)] {
+        let empty_name = what == "name" && text.trim().is_empty();
+        if empty_name || text.len() > 200 || text.chars().any(char::is_control) {
+            return Err(format!(
+                "the {what} is one line of at most 200 bytes, without control characters"
+            ));
+        }
+    }
     let mut tools = BTreeSet::new();
     for tool in &m.provides.mcp_tools {
         // No dots: codex pre-approves a tool through a dotted config key

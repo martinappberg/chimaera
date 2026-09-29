@@ -90,6 +90,14 @@ async fn request(method: &str, path: &str, body: Option<&Value>) -> anyhow::Resu
     Ok((code, value))
 }
 
+/// `text` safe to print on a terminal: a plugin's words (its name, its
+/// Can lines) never carry an escape that redraws the prompt around them.
+fn plain(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 /// What a trust prompt shows, in lines: who asks, from where, and what it
 /// can do (or, for an update, what it would do beyond the running version).
 fn trust_text(error: &str, t: &Value) -> String {
@@ -132,7 +140,7 @@ fn trust_text(error: &str, t: &Value) -> String {
         out.push("  - nothing beyond running in its sandbox".into());
     }
     out.extend(can);
-    out.join("\n")
+    out.iter().map(|l| plain(l)).collect::<Vec<_>>().join("\n")
 }
 
 /// Ask on the terminal: yes, or (for a plugin that runs programs) its
@@ -144,7 +152,7 @@ fn ask(t: &Value) -> anyhow::Result<bool> {
     }
     let confirm = t.get("confirm").and_then(Value::as_str);
     match confirm {
-        Some(name) => print!("Type {name} to trust it: "),
+        Some(name) => print!("Type {} to trust it: ", plain(name)),
         None => print!("Trust it? [y/N] "),
     }
     std::io::stdout().flush()?;
@@ -467,6 +475,16 @@ fn removed_line(id: &str, body: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_trust_prompt_prints_no_terminal_escapes() {
+        let ask = json!({"name": "Evil\u{1b}[2K\u{1b}[1AGood", "version": "1.0.0",
+            "source": "github.com/acme/evil", "tier": "privileged",
+            "can": [{"text": "Runs sh\u{1b}[8m: hidden"}]});
+        let text = trust_text("needs trust", &ask);
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(text.contains("Evil?[2K?[1AGood"));
+    }
 
     #[test]
     fn config_quoting_keeps_json_intact() {

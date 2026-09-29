@@ -53,6 +53,45 @@ const PAGES_MAX: usize = 2000;
 const SHAPES_MAX: usize = 16;
 const REF_IDS_MAX: usize = 5000;
 const PATTERN_MAX: usize = 80;
+/// Unbounded repeats one alternative of a shape may have: each more one
+/// next to another multiplies the backtracking a scan of a long word does
+/// (the UI's `usable` in `shared/references.ts` holds the same line).
+const UNBOUNDED_MAX: usize = 2;
+
+/// The most unbounded repeats (`*`, `+`, `{n,}`) in any one `|`
+/// alternative of a regex source without groups.
+fn unbounded_per_alternative(pattern: &str) -> usize {
+    let bytes = pattern.as_bytes();
+    let (mut most, mut here, mut i, mut in_class) = (0, 0, 0, false);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            _ if in_class => {}
+            b'*' | b'+' => here += 1,
+            b'{' => {
+                if let Some(end) = pattern[i..].find('}') {
+                    if pattern[i + 1..i + end].ends_with(',') {
+                        here += 1;
+                    }
+                    i += end + 1;
+                    continue;
+                }
+            }
+            b'|' => {
+                most = most.max(here);
+                here = 0;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    most.max(here)
+}
 
 /// What one surface key holds: the data (small surfaces), or where it was
 /// written (large ones).
@@ -257,6 +296,12 @@ pub(crate) fn check(surface: &str, data: &Value) -> Result<(), String> {
                     return Err(format!(
                         "{at}.pattern is a regex source of 1–{PATTERN_MAX} bytes \
                          without groups or anchors"
+                    ));
+                }
+                if unbounded_per_alternative(pattern) > UNBOUNDED_MAX {
+                    return Err(format!(
+                        "{at}.pattern has more than {UNBOUNDED_MAX} unbounded repeats \
+                         (`*`, `+`, `{{n,}}`) in one alternative"
                     ));
                 }
             }
@@ -598,11 +643,24 @@ mod tests {
             ],
         });
         check("references/1", &good).unwrap();
+        // Two repeats in one alternative (Mycelium's topic ids) are fine;
+        // a class keeps its brackets' `*` and `+` to itself.
+        assert_eq!(unbounded_per_alternative("T-\\d*[A-Za-z][A-Za-z0-9]*"), 2);
+        assert_eq!(
+            unbounded_per_alternative("sec:[a-z0-9-]+|fig:[a-z0-9-]+"),
+            1
+        );
+        assert_eq!(unbounded_per_alternative("F-\\d{1,4}|[*+]x"), 0);
+        assert_eq!(unbounded_per_alternative("a{2,}b\\+c+"), 2);
         for (bad, why) in [
             (json!({"shapes": [], "ids": []}), "shapes per key"),
             (
                 json!({"shapes": [{"kind": "x", "pattern": "(a+)+"}], "ids": []}),
-                "without groups",
+                "groups",
+            ),
+            (
+                json!({"shapes": [{"kind": "x", "pattern": "\\w*\\w*\\w*Z"}], "ids": []}),
+                "unbounded repeats",
             ),
             (
                 json!({"shapes": [{"kind": "x", "pattern": "^F-\\d+$"}], "ids": []}),

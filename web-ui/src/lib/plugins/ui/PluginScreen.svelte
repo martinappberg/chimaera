@@ -135,6 +135,8 @@
         const running = installTool(plugin, tool);
         void load();
         taskPoll = setInterval(() => {
+          // Only while the page can be seen; the install's answer ends it.
+          if (document.visibilityState !== "visible") return;
           void fetchTools(plugin)
             .then((all) => {
               const t = all.find((x) => x.tool === tool);

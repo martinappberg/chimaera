@@ -39,7 +39,9 @@
     void load();
   });
 
-  // While one installs, its progress is read every second.
+  // While one installs, its progress is read every second — while anyone
+  // can see it (a hidden page skips the tick; the next visible one catches
+  // up, and the install's own answer reloads the row at the end).
   let poll: ReturnType<typeof setInterval> | null = null;
   onDestroy(() => {
     if (poll !== null) clearInterval(poll);
@@ -48,7 +50,11 @@
   async function run(t: ToolState, what: "install" | "remove"): Promise<void> {
     working = { tool: t.tool, what };
     rowError = null;
-    if (what === "install") poll = setInterval(() => void load(), 1000);
+    if (what === "install") {
+      poll = setInterval(() => {
+        if (document.visibilityState === "visible") void load();
+      }, 1000);
+    }
     try {
       if (what === "install") await installTool(plugin, t.tool);
       else await removeTool(plugin, t.tool);
