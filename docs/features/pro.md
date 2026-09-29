@@ -274,7 +274,11 @@ are not account controls; Chimaera and its agents manage those details. There
 is no per-session placement pin: neither the native shell nor the daemon (the old `PUT /pro/keep-running` route is gone) offers one.
 **Keep this project on this device** stops local publication and disables account-side
 mirror access. Existing stored data is not silently deleted. Cloud setup commands
-and learned laptop-only commands appear in each project's details. If the account side
+and learned laptop-only commands appear in each project's details. A command that
+needs your computer is never run on a cloud machine: the agent is told it was not
+run there, and it is kept as a pending step for the project (`profile.deferred` on
+its status row) for you to run on your computer; nothing runs it later by itself.
+If the account side
 has not confirmed a privacy change yet, the project says cloud copies are being turned off
 and the page re-sends the change on its own (at most once a minute while visible).
 

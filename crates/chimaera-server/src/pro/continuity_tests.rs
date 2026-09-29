@@ -1525,3 +1525,41 @@ async fn the_request_that_wakes_a_cloud_machine_is_admitted_before_its_watchdog_
     drop(state);
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// A step that needs the user's computer is never run on a cloud machine, and
+/// the agent is told so plainly: it is recorded as a pending step for the
+/// project (never queued to run by itself later).
+#[tokio::test]
+async fn a_computer_only_step_on_a_cloud_machine_is_not_run_and_says_so() {
+    let root = temp("defer-step");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let mut config = device(&account.endpoint);
+    config.role = Role::Worker;
+    config.execution.as_mut().unwrap().installation_id = None;
+    let workspace = project(&state, &root, &config, 4);
+    *lock(&state.pro.runtime) = Some(config);
+    lock(&state.session_workspaces).insert("s-cloud-shell".into(), workspace.id.clone());
+    let error = crate::exec::run_exec(
+        &state,
+        "s-cloud-shell",
+        "xcodebuild test".into(),
+        None,
+        None,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("was not run here") && error.contains("pending step"),
+        "{error}"
+    );
+    assert!(!error.contains("queued to run"), "{error}");
+    assert_eq!(
+        lock(&state.pro.preferences)[&workspace.id].profile.deferred,
+        ["xcodebuild test"]
+    );
+    drop(account);
+    drop(state);
+    let _ = std::fs::remove_dir_all(root);
+}
