@@ -13,6 +13,7 @@ mod git;
 mod git_history;
 mod git_repos;
 mod git_sessions;
+mod history;
 mod knowledge;
 mod ledger;
 mod links;

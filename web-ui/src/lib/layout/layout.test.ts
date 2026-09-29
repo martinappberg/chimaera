@@ -20,6 +20,7 @@ import {
   openTimeline,
   openKnowledge,
   openPlugins,
+  openSessionsList,
   openSettings,
   openChanges,
   openBrowser,
@@ -77,6 +78,7 @@ describe("tabKey", () => {
     expect(tabKey({ surface: "timeline" })).toBe("v:timeline");
     expect(tabKey({ surface: "knowledge" })).toBe("v:knowledge");
     expect(tabKey({ surface: "plugins" })).toBe("v:plugins");
+    expect(tabKey({ surface: "sessions" })).toBe("v:sessions");
     // diff uses `g:` (NOT `d:`) so it can't alias a Finder in the dedupe set.
     expect(tabKey({ surface: "diff", path: "/a", mode: "head" } as unknown as Tab)).toBe(
       "g:head:/a",
@@ -140,15 +142,17 @@ describe("opening surfaces", () => {
     expect(pane.tabs[0]).toEqual({ surface: "dashboard" });
   });
 
-  it("timeline, knowledge and plugins are singletons that coexist with settings and round-trip", () => {
+  it("timeline, knowledge, plugins and all sessions are singletons that coexist with settings and round-trip", () => {
     let l = openTimeline(defaultLayout());
     l = openTimeline(l);
     l = openKnowledge(l);
     l = openKnowledge(l);
     l = openPlugins(l);
     l = openPlugins(l);
+    l = openSessionsList(l);
+    l = openSessionsList(l);
     l = openSettings(l);
-    expect(tabCount(l)).toBe(4);
+    expect(tabCount(l)).toBe(5);
     const restored = deserializeLayout(serializeLayout(l));
     expect(restored).not.toBeNull();
     const pane = panes(restored!.root)[0];
@@ -156,6 +160,7 @@ describe("opening surfaces", () => {
       { surface: "timeline" },
       { surface: "knowledge" },
       { surface: "plugins" },
+      { surface: "sessions" },
       { surface: "settings" },
     ]);
   });

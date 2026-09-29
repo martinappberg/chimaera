@@ -22,6 +22,7 @@
   import NowLine from "./NowLine.svelte";
   import SinceYouLeft from "./SinceYouLeft.svelte";
   import WhereThingsStand from "./WhereThingsStand.svelte";
+  import ActivityLine from "./ActivityLine.svelte";
   import { acquireChat, releaseChat } from "../chat/chatPool";
   import type { ChatStore } from "../chat/store.svelte";
   import type { ChatSocket } from "../chat/chatWs";
@@ -526,6 +527,9 @@
             />
           {/if}
         {/if}
+
+        <!-- One quiet line: this workspace's sessions and tokens this week. -->
+        <ActivityLine {wsId} {visible} onOpenActivity={dash.onOpenActivity} />
       </div>
         </div>
       </div>

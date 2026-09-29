@@ -33,6 +33,21 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             put(api::put_mastermind).delete(api::delete_mastermind),
         )
         .route("/workspaces/{id}/timeline", get(timeline::get_timeline))
+        // Session history: every past session's record, and cost totals
+        // across workspaces (`history`).
+        .route(
+            "/workspaces/{id}/history",
+            get(crate::history::routes::list),
+        )
+        .route(
+            "/workspaces/{id}/same-file",
+            get(crate::history::routes::same_file),
+        )
+        .route("/activity", get(crate::history::routes::get_activity))
+        .route(
+            "/activity/csv",
+            get(crate::history::routes::get_activity_csv),
+        )
         // Agent notes: the USER sends a note to its addressee (their click).
         .route(
             "/workspaces/{id}/timeline/{seq}/deliver",
@@ -120,6 +135,11 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             )),
         )
         .route("/sessions/{id}/journal", get(api::session_journal))
+        // The agent's own edits per file, live or ended (`history::edits`).
+        .route(
+            "/sessions/{id}/edits",
+            get(crate::history::routes::session_edits),
+        )
         .route("/sessions/{id}/view", post(chat::switch_view))
         .route("/sessions/{id}/rewind", post(chat::rewind_session))
         .route("/sessions/{id}/fork", post(chat::fork_session))
@@ -134,6 +154,17 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/agents/{id}/update", post(runtimes::update_agent))
         .route("/agents/claude/sessions", get(launcher::claude_resumables))
         .route("/recents", get(recents::list_recents))
+        // Archive hides a conversation from Recents (never deletes it); it
+        // stays in All sessions under "Archived" (`recents_archive`).
+        .route("/recents/archive", post(crate::recents_archive::archive))
+        .route(
+            "/recents/unarchive",
+            post(crate::recents_archive::unarchive),
+        )
+        .route(
+            "/recents/archived",
+            get(crate::recents_archive::list_archived),
+        )
         .route("/update", get(update::get_update))
         // The native shell's notice long-poll (agent finished / needs you).
         .route("/notices", get(notices::get_notices))

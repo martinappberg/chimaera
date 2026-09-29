@@ -167,9 +167,13 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   git status.
 - **Where it lives.** `SessionChangesView.svelte`; data is `session.files_touched` × git status.
 - **Key behaviors.** If the session lives in a *linked worktree* (different `workspace_id`), the view
-  fetches that workspace's own status. A row with a git change opens the diff; a touched-but-unchanged
-  row just opens the file. Read-only. (Status: partial for workspaces with several repositories — it
-  cross-references the primary repository's status only.)
+  fetches that workspace's own status rather than mis-decorating every row "no change". With several
+  repositories each row takes the status of the repository that contains it. A row with a git change
+  opens the diff; a touched-but-unchanged row (a `·` dot) just opens the file. Read-only. Without a
+  repository the rows carry no git mark. One list with or without git: each file shows its edit
+  count, and a file with no uncommitted git change opens the agent's own edits for it, in order
+  ([session-history.md](session-history.md#what-a-session-changed-with-or-without-git)). The
+  session's commits lead the view when it made any.
 
 ## Git-binary / repo remediation
 

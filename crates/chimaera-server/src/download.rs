@@ -575,8 +575,8 @@ fn zip_datetime(mtime: SystemTime, utc_offset: i64) -> ZipDateTime {
 
 /// Proleptic-Gregorian civil date from days since 1970-01-01 — Howard
 /// Hinnant's `civil_from_days`, the standard allocation-free algorithm
-/// (keeps a date dependency out of the daemon).
-fn civil_from_days(days: i64) -> (i32, u32, u32) {
+/// (keeps a date dependency out of the daemon). Shared with `history::usage`.
+pub(crate) fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097; // [0, 146096]

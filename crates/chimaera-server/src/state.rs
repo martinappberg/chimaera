@@ -30,6 +30,11 @@ pub(crate) struct AppState {
     /// Ended agent conversations per workspace (the rail's Recents section),
     /// persisted to `recents.json` on change.
     pub(crate) recents: Mutex<recents::RecentsStore>,
+    /// Conversations the user archived out of Recents, per workspace
+    /// (`recents-archive.json`; see `recents_archive`). Hidden, never deleted.
+    pub(crate) recents_archive: Mutex<crate::recents_archive::ArchiveStore>,
+    /// Serializes the archive's file writes (each snapshots under it).
+    pub(crate) recents_archive_write: tokio::sync::Mutex<()>,
     /// Bumped whenever the recents store changes; `/ws/events` pushes a
     /// `recents` frame so the rail refetches instead of guessing at timing.
     pub(crate) recents_epoch: std::sync::atomic::AtomicU64,
@@ -195,6 +200,10 @@ pub(crate) struct AppState {
     /// what happened, written from signals the daemon already receives. Its
     /// per-workspace epochs drive the `/ws/events` timeline frame.
     pub(crate) timeline: timeline::TimelineService,
+    /// Session history (`<data_dir>/workspace/<ws>/sessions.jsonl`): one
+    /// record per agent session, opened at start and closed at end; only
+    /// the open ones live here. See `history`.
+    pub(crate) history: crate::history::HistoryService,
     /// The plugin catalog (see `plugins::Catalog`): the embedded plugins
     /// merged with the installed copies under `<data_dir>/plugins`, reloaded
     /// after every install, update, rollback or remove.
@@ -263,6 +272,10 @@ impl AppState {
                 data_dir.join("view-state.json"),
             )),
             recents: Mutex::new(recents::RecentsStore::load(data_dir.join("recents.json"))),
+            recents_archive: Mutex::new(crate::recents_archive::ArchiveStore::load(
+                data_dir.join("recents-archive.json"),
+            )),
+            recents_archive_write: tokio::sync::Mutex::new(()),
             recents_epoch: std::sync::atomic::AtomicU64::new(0),
             ledger: Mutex::new(ledger::LedgerStore::new(data_dir.join("sessions.json"))),
             session_themes: Mutex::new(HashMap::new()),
@@ -312,6 +325,7 @@ impl AppState {
             claude_settings_path: home.join(".claude").join("settings.json"),
             codex_config_path: home.join(".codex").join("config.toml"),
             timeline: timeline::TimelineService::new(data_dir.join("workspace")),
+            history: crate::history::HistoryService::new(&data_dir),
             plugin_catalog: plugins::Catalog::load(data_dir.join("plugins")),
             plugin_releases: plugins::releases::Releases::default(),
             plugin_detect: Mutex::new(plugins::DetectCache::default()),

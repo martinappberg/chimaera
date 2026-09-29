@@ -393,6 +393,7 @@
     if (tab.surface === "timeline") return "Timeline";
     if (tab.surface === "knowledge") return "Knowledge";
     if (tab.surface === "plugins") return "Extensions";
+    if (tab.surface === "sessions") return "All sessions";
     if (tab.surface === "finder") return basename(tab.path) || "Finder";
     if (tab.surface === "git") return "Source Control";
     if (tab.surface === "diff") {
@@ -840,6 +841,12 @@
                 stroke-width="1.3"
                 stroke-linejoin="round"
               />
+            </svg>
+          {:else if tab.surface === "sessions"}
+            <!-- Stacked rows: every past session. -->
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>all sessions</title>
+              <path d="M3 4h10M3 8h10M3 12h6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
             </svg>
           {:else if tab.surface === "plugins"}
             <!-- Extensions: three cells and a plus (plugins/glyph.ts), at its

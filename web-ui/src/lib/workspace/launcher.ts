@@ -219,6 +219,9 @@ export interface LaunchPick {
 
 /** One ended agent conversation from GET /api/v1/recents (newest first). */
 export interface RecentConvo {
+  /** The identity an archive hides it under (its native id, or a
+   *  kind+title stand-in for a handle-less row). */
+  key: string;
   /** Which agent CLI ran it ("claude"/"codex"/"gemini") — drives the glyph. */
   kind: string;
   title: string;
@@ -242,11 +245,16 @@ export async function listRecents(workspaceId: string): Promise<RecentConvo[]> {
     if (typeof raw !== "object" || raw === null) return [];
     const r = raw as Record<string, unknown>;
     if (typeof r.kind !== "string" || typeof r.title !== "string") return [];
+    const resume = typeof r.resume === "string" ? r.resume : null;
     return [
       {
+        key:
+          typeof r.key === "string" && r.key !== ""
+            ? r.key
+            : (resume ?? `~${r.kind}:${r.title}`),
         kind: r.kind,
         title: r.title,
-        resume: typeof r.resume === "string" ? r.resume : null,
+        resume,
         lastActive: typeof r.last_active === "number" ? r.last_active : 0,
         ui: r.ui === "chat" || r.ui === "term" ? r.ui : null,
       },

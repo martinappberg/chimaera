@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
+  import { flip } from "svelte/animate";
+  import { fade } from "svelte/transition";
   import { runStallDrive, stallDriveSpec } from "./lib/perf/tabSwitchDrive";
   import {
     ApiError,
@@ -160,6 +162,7 @@
     openTimeline,
     openKnowledge,
     openPlugins,
+    openSessionsList,
     openGit,
     openSession,
     openSettings,
@@ -370,6 +373,9 @@
   import { focusOnMount } from "./lib/shared/focusOnMount";
   import Launcher from "./lib/workspace/Launcher.svelte";
   import SessionGlyph from "./lib/shared/SessionGlyph.svelte";
+  import { archiveRecents, nudgeHistory, unarchiveRecents } from "./lib/workspace/history";
+  import { sameFile, setSameFileOpener } from "./lib/workspace/sameFile.svelte";
+  import { requestSettingsSection } from "./lib/settings/jump";
   import QuickOpen from "./lib/workspace/QuickOpen.svelte";
   import FileTree from "./lib/workspace/FileTree.svelte";
   import SplitTree from "./lib/layout/SplitNode.svelte";
@@ -417,6 +423,13 @@
   let lastRecentsEpoch: number | null = null;
   let workspaces = $state<Workspace[]>([]);
   let sessions = $state<Session[]>([]);
+  // Two live sessions writing one file: the chat line's and the dashboard
+  // card's quiet notice (never the rail) reads this roster.
+  $effect(() => {
+    const list = sessions;
+    const names = displayNames;
+    untrack(() => sameFile.update(list, names));
+  });
   /** Sessions whose shell provably sits at its OSC 133 prompt AND isn't
    *  running anything via the exec engine — the set predictive local echo
    *  may arm for. Recomputed per sessions snapshot (a few times a minute)
@@ -714,7 +727,8 @@
     if (pitch <= 0) return;
     // The last row needs no trailing gap: a box exactly N rows tall fits N.
     const gap = pitch - first.offsetHeight;
-    const fit = Math.max(RECENTS_MIN_ROWS, Math.floor((el.clientHeight + gap) / pitch));
+    // One row of the box is the "All sessions" link at the list's end.
+    const fit = Math.max(RECENTS_MIN_ROWS, Math.floor((el.clientHeight + gap) / pitch)) - 1;
     if (fit !== recentsFit) recentsFit = fit;
   }
   $effect(() => {
@@ -1301,6 +1315,7 @@
     onOpenTimeline: openTimelineSurface,
     onOpenKnowledge: openKnowledgeSurface,
     onOpenExtensions: openPluginsSurface,
+    onOpenActivity: openActivitySurface,
   });
 
   /**
@@ -1638,6 +1653,7 @@
     // wherever the link was; chat resolves against the same per-session
     // context as terminal links.
     setPathOpener(openPathInLayout);
+    setSameFileOpener(openSess);
     setChatLinkContext(linkContext);
     setReferenceHandler(referenceSelection);
     setCommitReferenceHandler(referenceCommitNow);
@@ -1665,6 +1681,8 @@
         if (lastRecentsEpoch !== epoch) {
           lastRecentsEpoch = epoch;
           refreshRecents();
+          // A session ended: the history surfaces refetch while visible.
+          nudgeHistory();
         }
       },
       onFs: notifyDiskChange,
@@ -1845,6 +1863,8 @@
       setGitOpener(null);
       setUploadPathInserter(null);
       setPathOpener(null);
+      setSameFileOpener(null);
+      if (archivedUndoTimer !== null) clearTimeout(archivedUndoTimer);
       setChatLinkContext(null);
       events.close();
       pool.disposePool();
@@ -3329,6 +3349,20 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
+  /** Open/focus All sessions (the Recents header, the dashboard's usage
+   *  line, quick-open). */
+  function openSessionsSurface(): void {
+    if (activeWsId === null || !layoutReady) return;
+    layout = openSessionsList(layout);
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** Open Settings at Activity (the dashboard's activity line, quick-open). */
+  function openActivitySurface(): void {
+    openSettingsSurface();
+    requestSettingsSection("Activity");
+  }
+
   /** Open/focus the workspace Timeline (dashboard link, quick-open). */
   function openTimelineSurface(): void {
     if (activeWsId === null || !layoutReady) return;
@@ -3357,6 +3391,20 @@
    *  "skills" still find). */
   const quickOpenCommands = $derived([
     { id: "timeline", label: "Timeline", hint: "what happened", run: openTimelineSurface },
+    {
+      id: "sessions",
+      label: "All sessions",
+      aliases: ["history"],
+      hint: "every past session",
+      run: openSessionsSurface,
+    },
+    {
+      id: "activity",
+      label: "Activity",
+      aliases: ["usage", "tokens"],
+      hint: "sessions and tokens, every workspace",
+      run: openActivitySurface,
+    },
     { id: "knowledge", label: "Knowledge", hint: "what we know", run: openKnowledgeSurface },
     {
       id: "plugins",
@@ -3767,6 +3815,68 @@
     recentsExpanded = false;
     refreshRecents();
   });
+
+  /** Recents rows glide up when one is archived (the dashboard roster's
+   *  flip idiom); zero under reduced motion. */
+  const recentsFlipMs =
+    typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches
+      ? 0
+      : 220;
+
+  /** "Archived 12 · Undo" after Archive all, for ~6 s. */
+  let archivedUndo = $state<{ ws: string; keys: string[] } | null>(null);
+  let archivedUndoTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function archiveEntry(r: RecentConvo) {
+    return { key: r.key, kind: r.kind, title: r.title, resume: r.resume, ui: r.ui };
+  }
+
+  /** Archive hides a conversation from Recents — never deletes it; it stays
+   *  in All sessions under "Archived". Optimistic: the row animates out now,
+   *  and a failure refetches the truth. No confirm, no toast. */
+  async function archiveRecent(r: RecentConvo): Promise<void> {
+    const ws = activeWsId;
+    if (ws === null) return;
+    recents = recents.filter((x) => x.key !== r.key);
+    try {
+      await archiveRecents(ws, [archiveEntry(r)]);
+    } catch {
+      refreshRecents();
+    }
+  }
+
+  async function archiveAllRecents(): Promise<void> {
+    const ws = activeWsId;
+    const rows = visibleRecents;
+    if (ws === null || rows.length === 0) return;
+    const gone = new Set(rows.map((r) => r.key));
+    recents = recents.filter((x) => !gone.has(x.key));
+    try {
+      const keys = await archiveRecents(ws, rows.map(archiveEntry));
+      if (archivedUndoTimer !== null) clearTimeout(archivedUndoTimer);
+      archivedUndo = { ws, keys };
+      archivedUndoTimer = setTimeout(() => {
+        archivedUndo = null;
+        archivedUndoTimer = null;
+      }, 6000);
+    } catch {
+      refreshRecents();
+    }
+  }
+
+  /** Undo restores exactly the set Archive all hid. */
+  async function undoArchiveAll(): Promise<void> {
+    const undo = archivedUndo;
+    if (undo === null) return;
+    archivedUndo = null;
+    if (archivedUndoTimer !== null) clearTimeout(archivedUndoTimer);
+    archivedUndoTimer = null;
+    try {
+      await unarchiveRecents(undo.ws, undo.keys);
+    } finally {
+      refreshRecents();
+    }
+  }
 
   /** A Recents row: resume when the daemon captured a native conversation
    *  handle, else an honest fresh start (the tooltip says why). The row's
@@ -5182,12 +5292,22 @@
         <!-- Recents: ended agent conversations, any agent type, newest
              first — the daemon remembers them across restarts. Click resumes
              when a native handle exists, otherwise starts fresh honestly. -->
-        {#if visibleRecents.length > 0}
+        {#if workspace !== null}
           <!-- The section fills whatever the sessions column has left and
                shows as many rows as FIT that space (measured, see
                recentsFit) — never a fixed three. -->
           <div class="recents" class:expanded={recentsExpanded}>
-            <div class="recents-head">
+            <!-- svelte-ignore a11y_no_static_element_interactions -- the
+                 context menu is a shortcut; nothing here needs a keyboard
+                 path beyond the rows' own. -->
+            <div
+              class="recents-head"
+              oncontextmenu={(e) => {
+                if (visibleRecents.length > 0) {
+                  contextMenu.openAt(e, [{ label: "Archive all", onSelect: () => void archiveAllRecents() }]);
+                }
+              }}
+            >
               <span>recent</span>
               {#if recentsExpanded || visibleRecents.length > recentsFit}
                 <!-- In the header, not below the rows: on a short column the
@@ -5204,13 +5324,33 @@
               {/if}
             </div>
             <div class="recents-list" class:expanded={recentsExpanded} bind:this={recentsListEl}>
-              {#each recentsExpanded ? visibleRecents : visibleRecents.slice(0, recentsFit) as r (r.resume ?? `${r.kind}:${r.title}`)}
-                <button class="recent-row" title={recentTooltip(r)} onclick={() => openRecent(r)}>
+              {#each recentsExpanded ? visibleRecents : visibleRecents.slice(0, recentsFit) as r (r.key)}
+                <button
+                  class="recent-row"
+                  title={recentTooltip(r)}
+                  onclick={() => openRecent(r)}
+                  oncontextmenu={(e) =>
+                    contextMenu.openAt(e, [{ label: "Archive", onSelect: () => void archiveRecent(r) }])}
+                  animate:flip={{ duration: recentsFlipMs }}
+                  out:fade={{ duration: recentsFlipMs === 0 ? 0 : 120 }}
+                >
                   <SessionGlyph kind="agent" agentKind={r.kind} size={11} />
                   <span class="recent-title">{r.title}</span>
                   <span class="recent-age">{relativeAge(r.lastActive)}</span>
                 </button>
               {/each}
+              {#if archivedUndo !== null && archivedUndo.ws === activeWsId}
+                <div class="recents-note">
+                  Archived {archivedUndo.keys.length} ·
+                  <button class="recents-undo" onclick={() => void undoArchiveAll()}>Undo</button>
+                </div>
+              {:else if visibleRecents.length === 0}
+                <div class="recents-note">No recent conversations</div>
+              {/if}
+              <!-- Every past session (history), beyond the last 20: a quiet
+                   link at the end of the list, one row tall (the fit
+                   reserves it — measureRecents). -->
+              <button class="recents-all" title="every past session in this workspace" onclick={openSessionsSurface}>All sessions</button>
             </div>
           </div>
         {/if}
@@ -6735,6 +6875,50 @@
     transition:
       color 0.12s ease,
       background-color 0.12s ease;
+  }
+
+  .recents-note {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: var(--recent-row-h);
+    padding: 0 8px;
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+  .recents-undo {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0;
+    font: inherit;
+    color: var(--fg);
+    cursor: pointer;
+  }
+  .recents-undo:hover {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .recents-all {
+    flex: none;
+    appearance: none;
+    border: none;
+    background: none;
+    display: flex;
+    align-items: center;
+    height: var(--recent-row-h);
+    padding: 0 8px;
+    border-radius: 5px;
+    font: inherit;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    cursor: pointer;
+    transition: color 0.12s ease;
+  }
+  .recents-all:hover {
+    color: var(--fg);
   }
 
   .recents-more:hover {

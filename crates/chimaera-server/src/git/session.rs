@@ -185,6 +185,26 @@ impl SessionGits {
         crate::lock(&self.probes).retain(|_, repo| repo.is_some());
     }
 
+    /// A session's start and latest-or-end anchors from memory only (no git
+    /// runs): what the session record can carry the instant it closes,
+    /// before its commits are known.
+    pub(crate) fn anchors_json(&self, id: &str) -> Option<serde_json::Value> {
+        let (start, current) = match crate::lock(&self.live).get(id) {
+            Some(t) => (t.start.clone(), t.latest.clone()),
+            None => {
+                let ended = self.ended(id)?;
+                (ended.start, ended.end)
+            }
+        };
+        if start.is_none() && current.is_none() {
+            return None;
+        }
+        Some(json!({
+            "start": start.as_ref().map(Anchor::json),
+            "current": current.as_ref().map(Anchor::json),
+        }))
+    }
+
     fn push_ended(&self, id: String, ended: Ended) {
         let mut list = crate::lock(&self.ended);
         list.retain(|(other, _)| *other != id);
@@ -430,6 +450,7 @@ async fn pass(state: &Arc<AppState>, seen_epochs: &mut HashMap<String, u64>) {
             (Some(repo), true) => capture_in(state, &git.path, repo).await,
             _ => None,
         };
+        let in_repo = tracked.start.is_some();
         state.git.sessions.push_ended(
             id.clone(),
             Ended {
@@ -437,6 +458,17 @@ async fn pass(state: &Arc<AppState>, seen_epochs: &mut HashMap<String, u64>) {
                 end: end.or(tracked.latest.clone()),
             },
         );
+        // The session record learns where its session left the repository
+        // and which commits it made (its own task: the commits run git).
+        if in_repo {
+            let state = state.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                if let Some(body) = session_git_value(&state, &id).await {
+                    crate::history::attach_git(&state, &id, &body);
+                }
+            });
+        }
         crate::lock(&state.git.sessions.hook_cwds).remove(&id);
     }
 
@@ -657,16 +689,32 @@ pub(crate) async fn session_git(
     State(state): State<Arc<AppState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Response {
-    let tracked = crate::lock(&state.git.sessions.live).get(&id).cloned();
-    let live = crate::chat::session_alive(&state, &id);
+    match session_git_value(&state, &id).await {
+        Some(body) => Json(body).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown session {id}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// The body of [`session_git`]; `None` for a session the tracker never saw
+/// and that is not alive. Runs git (the current anchor, the commits).
+pub(crate) async fn session_git_value(
+    state: &Arc<AppState>,
+    id: &str,
+) -> Option<serde_json::Value> {
+    let tracked = crate::lock(&state.git.sessions.live).get(id).cloned();
+    let live = crate::chat::session_alive(state, id);
     let (start, current, dir) = if let Some(t) = tracked {
-        let git = state.git.resolve_git(configured_git(&state)).await;
+        let git = state.git.resolve_git(configured_git(state)).await;
         let current = match (&t.repo, git.adequate) {
-            (Some(repo), true) => capture_in(&state, &git.path, repo).await,
+            (Some(repo), true) => capture_in(state, &git.path, repo).await,
             _ => None,
         };
         (t.start, current, t.repo.map(|r| r.toplevel))
-    } else if let Some(ended) = state.git.sessions.ended(&id) {
+    } else if let Some(ended) = state.git.sessions.ended(id) {
         let dir = ended
             .end
             .as_ref()
@@ -676,17 +724,13 @@ pub(crate) async fn session_git(
     } else if live {
         // Alive but not reconciled yet (it just started): where it stands
         // now, from the folder it was started in.
-        let current = match crate::chat::session_root(&state, &id) {
-            Some(dir) => super::anchor::capture(&state, &dir).await,
+        let current = match crate::chat::session_root(state, id) {
+            Some(dir) => super::anchor::capture(state, &dir).await,
             None => None,
         };
         (None, current, None)
     } else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("unknown session {id}")})),
-        )
-            .into_response();
+        return None;
     };
 
     let mut body = json!({
@@ -706,7 +750,7 @@ pub(crate) async fn session_git(
         } else {
             body["branch_changed"] = json!(start.branch != current.branch);
             if let (Some(old), Some(new), Some(dir)) = (&start.head, &current.head, &dir) {
-                if let Some(between) = commits_between(&state, dir, old, new).await {
+                if let Some(between) = commits_between(state, dir, old, new).await {
                     body["commits"] = between.commits.iter().map(|c| c.json()).collect();
                     body["truncated"] = json!(between.truncated);
                     // A branch switch is not a rewrite: only a same-branch
@@ -716,7 +760,7 @@ pub(crate) async fn session_git(
             }
         }
     }
-    Json(body).into_response()
+    Some(body)
 }
 
 #[cfg(test)]

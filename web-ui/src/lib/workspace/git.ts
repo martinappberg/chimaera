@@ -228,6 +228,33 @@ export async function fetchGitDiff(
   );
 }
 
+/** Where a session's repository stood (`GET /sessions/{id}/git`). */
+export interface SessionGitAnchor {
+  repo: string;
+  worktree: string;
+  branch: string | null;
+  head: string | null;
+  at_ms: number;
+}
+
+/** A session's git story: where it started, where it stands (or ended), and
+ *  the commits in between (newest first, ≤50). */
+export interface SessionGitStory {
+  session_id: string;
+  live: boolean;
+  start: SessionGitAnchor | null;
+  current: SessionGitAnchor | null;
+  commits: { sha: string; subject: string; time: number }[];
+  truncated: boolean;
+  rewritten: boolean;
+  branch_changed: boolean;
+  repo_changed: boolean;
+}
+
+export async function fetchSessionGit(sessionId: string): Promise<SessionGitStory> {
+  return json(await api(`/sessions/${encodeURIComponent(sessionId)}/git`));
+}
+
 /** One commit of a history page. */
 export interface GitCommit {
   sha: string;

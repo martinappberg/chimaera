@@ -5,9 +5,9 @@ Dated 2026-09-28. A plan, not a record: nothing here has shipped. It has two par
 - **Part 1: the core git pieces that are missing.** Several repositories in one
   workspace, history, diffs against any revision, sessions that know their branch,
   refresh after terminal commands, and worktree polish.
-- **Part 2: session history and cost.** A lasting record of each agent session: who
-  started it, what it changed, what it cost, and where its transcript is. It needs no
-  git.
+- **Part 2: session history and activity.** A lasting record of each agent session:
+  who started it, what it changed, what it used, and where its transcript is. It needs
+  no git.
 
 Working with other people (seeing a colleague's agents, messages between people,
 forge integrations such as GitHub, commit trailers) is out of scope here and planned
@@ -216,7 +216,7 @@ describes.
 - **Git missing or older than 2.15:** today's diagnostic and the `git.path` field, per
   repository where it matters.
 
-## Part 2: session history and cost
+## Part 2: session history and activity
 
 This part works the same with or without git. Git only adds fields.
 
@@ -279,17 +279,22 @@ restart closes any record left open.
   directory is pruned at 100 MiB. When one is gone, the row says so in plain words.
 - **Recents stays as it is** (the last 20 in the rail), with an **All sessions** entry
   that opens this list.
+- **Archive** hides a conversation from Recents (right-click a row → Archive, or the
+  section → Archive all, with an Undo). Nothing is deleted: it stays in All sessions
+  under **Archived**, where Unarchive brings it back.
 - **The Mastermind** can read an ended session's record through `read_session`.
 
-### 10. Cost
+### 10. Activity
 
-- **Totals** per session, per workspace, per day and week, and per agent and model,
-  with a CSV export.
-- **Honest numbers.** Claude reports what the work would cost at API prices, which is
-  not what a subscriber pays. The page says "estimated at API prices" and shows tokens
-  beside it.
-- **Unknown stays unknown.** A codex TUI has no cost telemetry, and codex chats report
-  tokens but not cost. Those show "—", never zero.
+- **Totals** of sessions, tokens and the time agents spent working, per workspace, per
+  day and week, and per agent and model, on an **Activity** page in Settings covering
+  all workspaces, with a CSV export. Each workspace's dashboard carries one line of it:
+  "This week: 38 sessions · 1.2M tokens".
+- **No dollar figures in the UI.** The record keeps the cost the agent reports (claude's
+  estimate at API prices, which is not what a subscriber pays); it appears only as an
+  `estimated_cost_usd` column in the CSV export.
+- **Unknown stays unknown.** A codex TUI reports no tokens; that shows "—" with a
+  tooltip saying why, never zero.
 - No budgets or alerts in this plan.
 
 ## Phases
@@ -303,7 +308,7 @@ Parts 1 and 2 are independent and can proceed in parallel.
 | **G3: history** | Log, commit view, file history, `rev=` diffs, "changes on this branch", the local branch list (§2, §3, §6). Coordinated with the plugin platform's log route. |
 | **H1: the record** | `sessions.jsonl`, `started_by`, the Mastermind's actions, the `git` fields when present (§7). |
 | **H2: history list and changes** | The All sessions list, changes without git, the same-file warning (§8, §9). |
-| **H3: cost** | Totals and the cost page (§10). |
+| **H3: activity** | Totals and the Activity page (§10). |
 
 Each phase follows the repository's shipping rules: verified live, a feature page,
 and captured intent for each `feat:`.
@@ -312,8 +317,9 @@ and captured intent for each `feat:`.
 
 1. **Where the session list lives:** a pane surface opened from Recents' **All
    sessions** (recommended), or a section of the workspace dashboard.
-2. **Where cost lives:** a Usage page in Settings covering all workspaces, plus one
-   line per workspace on its dashboard (recommended), or the dashboard only.
+2. **Where activity lives:** an Activity page in Settings covering all workspaces
+   (sessions, tokens and time; no dollars), plus one line per workspace on its
+   dashboard (decided), or the dashboard only.
 3. **Discovery depth at open:** two levels below the root (recommended), one level,
    or only what the file tree and agents reveal.
 4. **The local branch list:** read-only with no checkout (recommended), or leave
