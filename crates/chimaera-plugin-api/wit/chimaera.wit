@@ -1,4 +1,11 @@
-package chimaera:plugin@0.1.0;
+package chimaera:plugin@0.2.0;
+
+// The platform world (docs/plugin-platform-plan.md). Everything 0.1 had keeps
+// its meaning; 0.2 adds the `platform` imports (output folders, data surfaces,
+// screens' invalidation, the watch set, declared settings, durable state, the
+// roots, and programs run as jobs), the `screens` exports (render, on-action,
+// tool-resume), new events, and `wait` on a tool result. The host serves 0.1
+// beside it (`wit-0.1/`).
 
 interface types {
     /// A JSON document as text (serde on both sides).
@@ -9,14 +16,17 @@ interface types {
         /// The workspace id the call is for.
         workspace: string,
         /// The calling agent session (tool calls, hook events); absent for
-        /// workspace-level asks (knowledge, queries from the UI).
+        /// workspace-level asks (knowledge, screens, file events).
         session: option<string>,
         /// That session is the workspace's Mastermind.
         mastermind: bool,
     }
 
     record tool-def { name: string, description: string, input-schema: json }
-    record tool-result { text: string, is-error: bool }
+    /// A tool's answer. `wait`: a job this answer waits for — the host holds
+    /// the agent's call until the job ends (at most about 45 s), then asks
+    /// `tool-resume` for the final answer.
+    record tool-result { text: string, is-error: bool, wait: option<string> }
 
     record stat { size: u64, mtime-ms: u64, is-dir: bool }
     record entry { name: string, is-dir: bool, is-symlink: bool }
@@ -34,69 +44,135 @@ interface types {
         session-ended(string),
         switched-on,
         switched-off,
+        /// The editor saved a file this plugin claims (`[[files]]`):
+        /// workspace-relative.
+        file-saved(string),
+        /// A claimed file, or one in the plugin's watch set, changed on disk
+        /// (an agent's write, or the sweep saw it), after the host's debounce.
+        file-changed(string),
+        /// A job this plugin started ended.
+        job-finished(job-end),
+        /// One of its declared settings changed: its key.
+        settings-changed(string),
     }
     record hook { session: string, name: string }
+
+    /// How a job ended: its exit code (none when a signal ended it),
+    /// whether the host's time limit stopped it, and how long it ran.
+    record job-end { id: string, exit: option<s32>, timed-out: bool, duration-ms: u64 }
 
     enum level { debug, info, warn, error }
 }
 
-/// What a plugin may ask the host. Every function is bounded by the host.
+/// What a plugin may ask the host (as in 0.1). Every function is bounded by
+/// the host, and `[access]` in the manifest decides which may answer.
 interface host {
     use types.{context, stat as file-stat, entry, session, json, level};
 
     /// Workspace files. Paths are workspace-relative; no component may be a
-    /// symlink; reads stop at `cap` bytes; listings at `cap` entries. All of
-    /// it runs off the reactor behind the filesystem semaphore.
+    /// symlink; reads stop at `cap` bytes; listings at `cap` entries.
     read: func(cx: context, path: string, cap: u32) -> result<list<u8>, string>;
     stat: func(cx: context, path: string) -> result<file-stat, string>;
     %list: func(cx: context, path: string, cap: u32) -> result<list<entry>, string>;
 
-    /// Small per-(plugin, workspace) state the host keeps for the plugin
-    /// (cursors, caches): 64 KiB per plugin per workspace, in memory.
+    /// Small per-(plugin, workspace) state: 64 KiB per plugin per workspace,
+    /// in memory (`state-keep` makes a key durable).
     state-get: func(cx: context, key: string) -> option<json>;
     state-put: func(cx: context, key: string, value: json) -> result<_, string>;
 
-    /// The workspace's sessions, and one session's display name.
     sessions: func(cx: context) -> list<session>;
 
-    /// The Timeline. `entry` is the wire shape of an entry; the host accepts
-    /// the kinds a plugin may write (`note` today), fills seq/ts/name, and
-    /// rate-caps appends per session (10 a minute). `recent` returns the
-    /// newest entries of the given kinds, newest first, at most `limit`.
     timeline-append: func(cx: context, entry: json) -> result<u64, string>;
     timeline-recent: func(cx: context, kinds: list<string>, limit: u32) -> list<json>;
 
-    /// A frame on /ws/events: {"type":"plugin","plugin":<id>, ...event}.
+    /// A frame on /ws/events for windows showing this workspace.
     emit: func(cx: context, event: json);
 
     now-ms: func() -> u64;
     log: func(level: level, message: string);
 }
 
-/// What a plugin provides. Every export is optional in effect: a plugin
-/// without tools returns an empty list, one without knowledge returns none.
+/// The platform: what 0.2 adds for a plugin to ask.
+interface platform {
+    use types.{context, entry, json};
+
+    /// The plugin's output folder for this workspace (outside the
+    /// repository; a quota; `output:<path>` in screens and job specs).
+    /// Reads start at `offset` and stop at `cap` (≤ 8 MiB), so a large log
+    /// streams; writes are ≤ 8 MiB a file.
+    output-read: func(cx: context, path: string, offset: u64, cap: u32) -> result<list<u8>, string>;
+    output-list: func(cx: context, path: string, cap: u32) -> result<list<entry>, string>;
+    output-write: func(cx: context, path: string, bytes: list<u8>) -> result<_, string>;
+    output-remove: func(cx: context, path: string) -> result<_, string>;
+
+    /// Publish a data surface (`diagnostics/1`, `output/1`, `sourcemap/1`,
+    /// `knowledge/1`, `references/1`) under `key`: the host checks its shape and cap, keeps
+    /// the latest, and tells this workspace's windows. `null` removes it.
+    publish: func(cx: context, surface: string, key: string, data: json) -> result<_, string>;
+
+    /// A view of this plugin changed: windows showing it render it again.
+    invalidate: func(cx: context, view: string);
+
+    /// The workspace paths (≤ 256) whose changes this plugin hears as
+    /// `file-changed`; replaces the previous set.
+    watch: func(cx: context, paths: list<string>) -> result<_, string>;
+
+    /// A declared setting's value (`[[settings]]`): the user's, else the
+    /// declared default.
+    setting-get: func(cx: context, key: string) -> option<json>;
+
+    /// Store a value durably (it survives a daemon restart; `null` removes
+    /// it); read back with `state-get`. Counts against the same 64 KiB.
+    state-keep: func(cx: context, key: string, value: json) -> result<_, string>;
+
+    /// `{"workspace": <abs>, "output": <abs>}`: for building a folder a
+    /// program's arguments name, and mapping printed paths back.
+    roots: func(cx: context) -> json;
+
+    /// Run a declared program as a job (`[[programs]]`); its id. The spec:
+    /// {program, args, cwd?, env?, stdin?, wall-s?, label?, priority?}.
+    job-start: func(cx: context, spec: json) -> result<string, string>;
+    job-status: func(cx: context, id: string) -> json;
+    job-cancel: func(cx: context, id: string);
+
+    /// A declared side program (`[[tools]]`): installed? which version? a
+    /// copy found on the PATH?
+    tool-state: func(cx: context, tool: string) -> json;
+}
+
+/// What a plugin provides (as in 0.1).
 interface plugin {
     use types.{context, tool-def, tool-result, snapshot, event, json};
 
-    /// The MCP tools offered in workspaces where the plugin is on. Names
-    /// must equal the manifest's provides.mcp_tools.
     tools: func() -> list<tool-def>;
-    /// The paragraph appended to the agents' MCP instructions where on.
     instructions: func() -> option<string>;
     call-tool: func(cx: context, name: string, args: json) -> tool-result;
-
-    /// The Knowledge snapshot, or none when `known` is still current.
     knowledge: func(cx: context, known: option<json>) -> result<option<snapshot>, string>;
-
-    /// Reads the UI makes (GET /workspaces/{id}/plugins/{pid}/query/{name}).
+    /// Reads the UI makes (GET /workspaces/{id}/plugins/{pid}/query/{name}),
+    /// and a long list's next page.
     query: func(cx: context, name: string, args: json) -> result<json, string>;
-
-    /// Something happened. A hook event may return one line the host adds to
-    /// the agent's hook context (the "N unread notes" hint).
     on-event: func(cx: context, event: event) -> option<string>;
+}
+
+/// Screens in the Chimaera format (`ui/1`), and the end of a long tool.
+interface screens {
+    use types.{context, tool-result, json};
+
+    /// A view's tree: `{"ui": "1", "root": <node>}`. `args` carries the
+    /// file for a file view and the window's width class.
+    render: func(cx: context, view: string, args: json) -> result<json, string>;
+
+    /// A node's action (a button, a form, a file action): the view's new
+    /// tree, or `null` to keep it.
+    on-action: func(cx: context, view: string, action: string, payload: json) -> result<json, string>;
+
+    /// The final answer of a tool that answered `wait`, once its job ended.
+    tool-resume: func(cx: context, name: string, job: string) -> tool-result;
 }
 
 world chimaera-plugin {
     import host;
+    import platform;
     export plugin;
+    export screens;
 }

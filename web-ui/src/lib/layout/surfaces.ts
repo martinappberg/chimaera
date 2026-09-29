@@ -36,6 +36,8 @@ function refOf(t: Tab, wsRoot: string | null): SurfaceRef {
       return { surface: "diff", path: rel(wsRoot, t.path) };
     case "changes":
       return { surface: "changes", sid: t.sessionId };
+    case "plugin":
+      return { surface: "plugin", path: `${t.plugin}/${t.view}` };
     default:
       // dashboard · knowledge · timeline · plugins · git · settings · browser
       return { surface: t.surface };

@@ -1,0 +1,89 @@
+# Test-only: built into plugins/dist-test, embedded only by the daemon's
+# test builds. Every 0.2 table, event and screen node, once.
+id = "test-platform"
+name = "Platform fixture"
+version = "0.1.0"
+summary = "Draws every screen node and uses every platform call, for chimaera's tests."
+description = "A plugin that exists only for chimaera's own tests of the 0.2 plugin platform: screens, surfaces, file kinds and actions, file events, the watch set, output folders, settings and durable state."
+api = "0.2"
+
+[access]
+files = "read"
+
+[provides]
+events = ["file-saved", "file-changed", "settings-changed", "switched-on", "switched-off"]
+
+[adds]
+ui = ["A Platform board tab, a dashboard panel, a status chip and a card section", "Opens .fixture files in its own view"]
+
+[[views]]
+id = "board"
+title = "Platform board"
+slot = "tab"
+icon = "grid"
+
+[[views]]
+id = "panel"
+title = "Platform panel"
+slot = "panel"
+
+[[views]]
+id = "doc"
+title = "Fixture document"
+slot = "file"
+
+[[views]]
+id = "chip"
+title = "Fixture status"
+slot = "status"
+
+[[views]]
+id = "card"
+title = "Fixture card"
+slot = "card"
+
+[[files]]
+match = ["*.fixture"]
+view = "doc"
+label = "Fixture document"
+debounce_ms = 100
+
+[[actions]]
+match = ["*.md", "*.fixture"]
+label = "Count words"
+action = "count-words"
+
+[[settings]]
+key = "greeting"
+type = "string"
+default = "hello"
+label = "Greeting"
+description = "What the board says first."
+
+[[settings]]
+key = "loud"
+type = "bool"
+default = false
+label = "Shout the greeting"
+
+[[settings]]
+key = "mode"
+type = "enum"
+options = ["calm", "busy"]
+default = "calm"
+label = "Mode"
+scope = "host"
+
+[[settings]]
+key = "limit"
+type = "number"
+default = 3
+min = 1
+max = 10
+label = "Rows"
+
+[[settings]]
+key = "main"
+type = "path"
+default = ""
+label = "Main file"

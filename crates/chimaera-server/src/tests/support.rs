@@ -63,6 +63,23 @@ pub(super) fn test_state_with_claude_store(store: PathBuf) -> Arc<AppState> {
     Arc::new(state)
 }
 
+/// `request`, answering a trust prompt as the user's Trust click would: a
+/// 409 carrying `trust` is sent again with the digest it asked about.
+pub(super) async fn request_trusting(
+    state: &Arc<AppState>,
+    method: Method,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let (status, out) = request(state, method.clone(), uri, body.clone()).await;
+    if status != StatusCode::CONFLICT || !out["trust"].is_object() {
+        return (status, out);
+    }
+    let mut body = body.unwrap_or_else(|| serde_json::json!({}));
+    body["trust"] = out["trust"]["caps"].clone();
+    request(state, method, uri, Some(body)).await
+}
+
 pub(super) async fn request(
     state: &Arc<AppState>,
     method: Method,

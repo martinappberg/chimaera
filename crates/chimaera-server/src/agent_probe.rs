@@ -810,8 +810,9 @@ pub(crate) struct TrustHook {
 
 /// POST /workspaces/{id}/plugins/{pid}/trust-hooks {hooks:[{key,hash}]} —
 /// the user's click, written as codex's own trust record. Re-lists first and
-/// writes ONLY hooks that belong to this plugin's codex plugin id, are
-/// untrusted or modified, and still hash to exactly what the user was shown.
+/// writes ONLY hooks that belong to a codex plugin this plugin names (required
+/// or recommended), are untrusted or modified, and still hash to exactly what
+/// the user was shown.
 pub(crate) async fn trust_hooks(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     axum::extract::Path((id, pid)): axum::extract::Path<(String, String)>,
@@ -822,15 +823,21 @@ pub(crate) async fn trust_hooks(
     let Some(root) = workspace_root(&state, &id) else {
         return not_found();
     };
-    let Some(codex_plugin) = crate::plugins::manifest(&state, &pid)
-        .and_then(|m| m.agent_plugin("codex").map(|r| r.id.clone()))
-    else {
+    let codex_plugins: Vec<String> = crate::plugins::manifest(&state, &pid)
+        .map(|m| {
+            m.agent_plugin_ids("codex")
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if codex_plugins.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(json!({"error": "this plugin has no codex hooks to trust"})),
         )
             .into_response();
-    };
+    }
     let (bin, _) = match bin_of(&state, AgentKind::Codex).await {
         Ok(found) => found,
         Err(err) => {
@@ -862,7 +869,10 @@ pub(crate) async fn trust_hooks(
                 skipped.push(json!({"key": want.key, "reason": "no longer listed"}));
                 continue;
             };
-            let belongs = hook.get("pluginId").and_then(Value::as_str) == Some(&codex_plugin);
+            let belongs = hook
+                .get("pluginId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| codex_plugins.iter().any(|p| p == id));
             let status = hook
                 .get("trustStatus")
                 .and_then(Value::as_str)

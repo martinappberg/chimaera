@@ -162,6 +162,7 @@
     openTimeline,
     openKnowledge,
     openPlugins,
+    openPluginViewTab,
     openSessionsList,
     openGit,
     openSession,
@@ -239,9 +240,11 @@
     registerKnowledgeOpener,
     setKnowledgeRoot,
   } from "./lib/workspace/knowledge";
-  // Registers the active workspace's knowledge as the first id-reference
-  // source (chat chips, previews) — a side-effect import.
+  // Register the active workspace's id-reference sources (chat chips,
+  // previews): its knowledge, then plugins' `references/1` — side-effect
+  // imports.
   import "./lib/knowledge/references";
+  import "./lib/plugins/references";
   import { registerAskAgent } from "./lib/shared/askAgent";
   import {
     activatePluginsWorkspace,
@@ -249,7 +252,9 @@
     closeAttachSheet,
     knowledgeProviderActive,
     onAgentPluginsChanged,
+    workspacePlugins,
   } from "./lib/plugins/store";
+  import { platformFrame, pluginViewTitle, setViewOpener } from "./lib/plugins/platform";
   import ExtensionsGlyph from "./lib/plugins/ExtensionsGlyph.svelte";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import {
@@ -1694,6 +1699,7 @@
     // wherever the link was; chat resolves against the same per-session
     // context as terminal links.
     setPathOpener(openPathInLayout);
+    setViewOpener(openPluginViewSurface);
     setSameFileOpener(openSess);
     setChatLinkContext(linkContext);
     setReferenceHandler(referenceSelection);
@@ -1727,6 +1733,7 @@
         }
       },
       onFs: notifyDiskChange,
+      onPlatform: platformFrame,
       // The browser's notification source. The native app ignores these: its
       // shell consumes the same feed per daemon and posts OS notifications.
       onNotices: (list) => {
@@ -1906,6 +1913,7 @@
       setGitOpener(null);
       setUploadPathInserter(null);
       setPathOpener(null);
+      setViewOpener(null);
       setSameFileOpener(null);
       if (archivedUndoTimer !== null) clearTimeout(archivedUndoTimer);
       setChatLinkContext(null);
@@ -3500,6 +3508,13 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
+  /** Open/focus a plugin's tab view (its card, a screen's `open-view`, a
+   *  file action's answer). */
+  function openPluginViewSurface(plugin: string, view: string): void {
+    if (activeWsId === null || !layoutReady) return;
+    layout = openPluginViewTab(layout, plugin, view);
+  }
+
   /** Quick-open commands: the workspace surfaces that have no file or session
    *  to match on ("Timeline", "Knowledge", "Extensions" — which "plugins" and
    *  "skills" still find). */
@@ -4806,7 +4821,9 @@
                       ? "Knowledge"
                       : tab.surface === "plugins"
                         ? "Extensions"
-                        : tab.surface === "browser"
+                        : tab.surface === "plugin"
+                          ? pluginViewTitle($workspacePlugins?.plugins, tab.plugin, tab.view)
+                          : tab.surface === "browser"
                           ? (tab.host || "Browser")
                           : "Settings";
   }

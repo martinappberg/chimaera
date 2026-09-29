@@ -13,6 +13,8 @@
   import AgentsSettings from "./AgentsSettings.svelte";
   import EnvironmentSettings from "./EnvironmentSettings.svelte";
   import DocumentsSettings from "./DocumentsSettings.svelte";
+  import PluginsSettings from "./PluginsSettings.svelte";
+  import { workspacePlugins } from "../plugins/store";
   import NotificationStatus from "./NotificationStatus.svelte";
   import UpdatesStatus from "./UpdatesStatus.svelte";
   import ActivitySettings from "./ActivitySettings.svelte";
@@ -34,6 +36,9 @@
     const out = [...CATEGORIES];
     const at = out.indexOf("Agents");
     out.splice(at >= 0 ? at + 1 : out.length, 0, "Environment", "Documents");
+    // Plugins' own declared settings, after the Extensions policy.
+    const ext = out.indexOf("Extensions");
+    out.splice(ext >= 0 ? ext + 1 : out.length, 0, "Plugins");
     // Activity (sessions and tokens across workspaces) is read-only and
     // store-backed (/api/v1/activity), like Environment and Documents. Before
     // Keyboard: the pinned-chords block trails the list and belongs to it.
@@ -79,6 +84,16 @@
   /** Same idea for the Documents section. */
   const DOC_KEYWORDS = ["documents", "markdown", "agents.md", "skill", "claude", "teach", "check"];
   const docsVisible = $derived(q === "" || DOC_KEYWORDS.some((k) => k.includes(q)));
+  /** Plugins: its own word, or a plugin or setting it names. */
+  const pluginsVisible = $derived(
+    q === "" ||
+      "plugins".includes(q) ||
+      ($workspacePlugins?.plugins ?? []).some(
+        (p) =>
+          p.platform.settings.length > 0 &&
+          (p.name.toLowerCase().includes(q) || p.platform.settings.some((s) => s.label.toLowerCase().includes(q))),
+      ),
+  );
   const ACTIVITY_KEYWORDS = ["activity", "usage", "sessions", "tokens", "csv", "export"];
   const activityVisible = $derived(q === "" || ACTIVITY_KEYWORDS.some((k) => k.includes(q)));
 
@@ -92,6 +107,10 @@
       }
       if (cat === "Documents") {
         if (docsVisible) out.push({ category: cat, defs: [] });
+        continue;
+      }
+      if (cat === "Plugins") {
+        if (pluginsVisible) out.push({ category: cat, defs: [] });
         continue;
       }
       if (cat === "Activity") {
@@ -257,6 +276,12 @@
                  /api/v1/agent-docs. It renders its own <h2>. -->
             <section data-section={group.category}>
               <DocumentsSettings />
+            </section>
+          {:else if group.category === "Plugins"}
+            <!-- Bespoke panel: each installed plugin's declared settings,
+                 kept by the daemon per plugin (not settings.json). -->
+            <section data-section={group.category}>
+              <PluginsSettings query={"plugins".includes(q) ? "" : q} />
             </section>
           {:else if group.category === "Activity"}
             <!-- Bespoke panel: sessions, tokens and time from the session

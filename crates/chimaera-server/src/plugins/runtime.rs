@@ -54,14 +54,29 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use super::Manifest;
 use crate::AppState;
 
-wasmtime::component::bindgen!({
-    world: "chimaera-plugin",
-    path: "../chimaera-plugin-api/wit",
-    imports: { default: async },
-    exports: { default: async },
-});
+/// The 0.2 world (`wit/`): what the host implements and speaks inside.
+pub(crate) mod v2 {
+    wasmtime::component::bindgen!({
+        world: "chimaera-plugin",
+        path: "../chimaera-plugin-api/wit",
+        imports: { default: async },
+        exports: { default: async },
+    });
+}
 
-pub(crate) use chimaera::plugin::types as wit;
+/// The 0.1 world (`wit-0.1/`), served unchanged beside 0.2: a component
+/// built against it instantiates through these bindings, and the host
+/// translates its few types at the edge (`v1_*` below).
+pub(crate) mod v1 {
+    wasmtime::component::bindgen!({
+        world: "chimaera-plugin",
+        path: "../chimaera-plugin-api/wit-0.1",
+        imports: { default: async },
+        exports: { default: async },
+    });
+}
+
+pub(crate) use v2::chimaera::plugin::types as wit;
 
 /// Wall-clock budget for `tools`, `instructions`, `call-tool`, `query` and
 /// `on-event`; `knowledge` (a whole reader pass) gets `KNOWLEDGE_BUDGET`.
@@ -103,12 +118,25 @@ const STAMP_MAX: usize = 1 << 20;
 /// view and logged, so bounded like a hook line.
 const KNOWLEDGE_ERROR_MAX: usize = 1024;
 /// `emit` frames kept for the `/ws/events` clients, and one frame's size.
-const EVENTS_KEPT: usize = 64;
+const EVENTS_KEPT: usize = 256;
 pub(crate) const EVENT_MAX: usize = 16 * 1024;
+
+/// A compiled build, pre-linked for the world its manifest's `api` names.
+#[derive(Clone)]
+enum Pre {
+    V1(v1::ChimaeraPluginPre<HostState>),
+    V2(v2::ChimaeraPluginPre<HostState>),
+}
+
+/// A live instance's bindings, of the world it was built against.
+enum Bindings {
+    V1(v1::ChimaeraPlugin),
+    V2(v2::ChimaeraPlugin),
+}
 
 /// One plugin's compiled builds by SHA-256, most recently used first. Only
 /// builds that compiled: why one can't is the daemon's (`refused`).
-type Builds = VecDeque<(Arc<str>, ChimaeraPluginPre<HostState>)>;
+type Builds = VecDeque<(Arc<str>, Pre)>;
 
 /// The process-wide half: engine, linker, compiled components. A test
 /// process builds many `AppState`s; they share this, as one daemon would.
@@ -144,7 +172,10 @@ fn build_shared() -> wasmtime::Result<Shared> {
     let engine = Engine::new(&config)?;
     let mut linker: Linker<HostState> = Linker::new(&engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-    ChimaeraPlugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
+    // Both worlds in one linker: their imports are versioned
+    // (`chimaera:plugin/host@0.1.0`, `…@0.2.0`), so they never collide.
+    v1::ChimaeraPlugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
+    v2::ChimaeraPlugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
     // The daemon's one ticker: it only bumps an atomic, 10 times a second,
     // and only once a plugin has been used.
     let ticking = engine.clone();
@@ -165,7 +196,7 @@ fn build_shared() -> wasmtime::Result<Shared> {
 /// of ms of CPU, so on the blocking pool) and kept while it is one of the
 /// plugin's last `COMPILED_PER_ID` builds. A failure isn't kept here: the
 /// caller remembers it (`PluginRuntime::refused`), where a retry clears it.
-async fn component(m: &Manifest) -> Result<ChimaeraPluginPre<HostState>, String> {
+async fn component(m: &Manifest) -> Result<Pre, String> {
     let shared = shared()?;
     let mut compiled = shared.compiled.lock().await;
     let mut builds = compiled
@@ -185,10 +216,17 @@ async fn component(m: &Manifest) -> Result<ChimaeraPluginPre<HostState>, String>
     let engine = shared.engine.clone();
     let linker = shared.linker.clone();
     let name = m.name.clone();
+    let api = m.api.clone();
     let started = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
         let component = Component::new(&engine, &**bytes)?;
-        ChimaeraPluginPre::new(linker.instantiate_pre(&component)?)
+        let pre = linker.instantiate_pre(&component)?;
+        // The gate already refused an `api` this host doesn't serve.
+        Ok::<_, wasmtime::Error>(if api == "0.1" {
+            Pre::V1(v1::ChimaeraPluginPre::new(pre)?)
+        } else {
+            Pre::V2(v2::ChimaeraPluginPre::new(pre)?)
+        })
     })
     .await
     .map_err(|e| format!("{name}: compile task failed: {e}"))
@@ -211,6 +249,34 @@ async fn component(m: &Manifest) -> Result<ChimaeraPluginPre<HostState>, String>
         compiled.truncate(COMPILED_IDS);
     }
     result
+}
+
+/// Compile, in the background, the builds of plugins switched on in some
+/// workspace (or just `only`), so a window's first render or an agent's
+/// first tool call never waits on Cranelift: seconds for a large component
+/// on a slow login node. One at a time, after a short delay at boot; a build
+/// already compiled is a cache hit. Faulted and held plugins are skipped
+/// (they never run here).
+pub(crate) fn warm(state: &Arc<AppState>, only: Option<String>, delay: Duration) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let on: std::collections::HashSet<String> = crate::lock(&state.workspaces)
+            .list()
+            .into_iter()
+            .flat_map(|w| w.plugins_on)
+            .collect();
+        for m in super::catalog(&state).iter() {
+            if only.as_ref().is_some_and(|id| id != &m.id)
+                || !on.contains(&m.id)
+                || m.origin.fault.is_some()
+                || super::trust::hold(&state, m).is_some()
+            {
+                continue;
+            }
+            let _ = component(m).await;
+        }
+    });
 }
 
 /// A component can contain several core memories and tables. Account for
@@ -296,6 +362,12 @@ pub(crate) struct HostState {
     deadline: Instant,
     pub(super) plugin: String,
     pub(super) workspace: String,
+    /// What this build's manifest lets it read through the host
+    /// (`[access]`), enforced by every host function.
+    pub(super) access: super::capabilities::Access,
+    /// This build's manifest (its declared views and settings), for the
+    /// platform imports; None only in unit tests.
+    pub(super) manifest: Option<Arc<Manifest>>,
     /// Set by `begin`, cleared by `end`: an idle instance never holds the
     /// daemon's state (the store lives in that state — a cycle otherwise).
     pub(super) call: Option<CallScope>,
@@ -320,7 +392,7 @@ impl WasiView for HostState {
 }
 
 impl HostState {
-    fn new(plugin: &str, workspace: &str) -> Self {
+    fn new(plugin: &str, workspace: &str, access: super::capabilities::Access) -> Self {
         let stderr = StderrTail::default();
         let mut wasi = WasiCtxBuilder::new();
         // Nothing granted: no preopens, env or args (the builder's
@@ -337,6 +409,8 @@ impl HostState {
             deadline: Instant::now(),
             plugin: plugin.to_string(),
             workspace: workspace.to_string(),
+            access,
+            manifest: None,
             call: None,
         }
     }
@@ -401,7 +475,7 @@ impl StderrTail {
 
 /// `text` cut to at most `max` bytes on a char boundary, marked when cut —
 /// never trimmed: what a plugin says reaches the agent byte for byte.
-fn clip(text: &str, max: usize) -> String {
+pub(crate) fn clip(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }
@@ -484,7 +558,7 @@ impl tokio::io::AsyncWrite for StderrTail {
 /// runs.
 struct Live {
     store: Store<HostState>,
-    plugin: ChimaeraPlugin,
+    plugin: Bindings,
     sha256: Arc<str>,
     // A reset can detach a running slot. Its allocation still counts until
     // that call finishes and drops the store.
@@ -535,7 +609,8 @@ pub(crate) struct Offer {
 #[derive(Default)]
 struct Events {
     next: u64,
-    ring: VecDeque<(u64, Arc<str>)>,
+    /// (id, the workspace it belongs to, the frame).
+    ring: VecDeque<(u64, Arc<str>, Arc<str>)>,
 }
 
 type Key = (String, String);
@@ -564,7 +639,11 @@ enum Call {
     Instructions,
     Tool(String, String),
     Knowledge(Option<String>),
+    Query(String, String),
     OnEvent(wit::Event),
+    Render(String, String),
+    Action(String, String, String),
+    ToolResume(String, String),
 }
 
 enum Reply {
@@ -572,12 +651,20 @@ enum Reply {
     Instructions(Option<String>),
     ToolResult(wit::ToolResult),
     Knowledge(Result<Option<wit::Snapshot>, String>),
+    Json(Result<String, String>),
     Event(Option<String>),
+    /// A 0.2 export asked of a 0.1 build (the routes check `api` first).
+    Unsupported,
 }
 
 async fn invoke(live: &mut Live, cx: &wit::Context, call: Call) -> wasmtime::Result<Reply> {
-    let exports = live.plugin.chimaera_plugin_plugin();
     let store = &mut live.store;
+    let plugin = match &live.plugin {
+        Bindings::V2(plugin) => plugin,
+        Bindings::V1(old) => return invoke_v1(old, store, cx, call).await,
+    };
+    let exports = plugin.chimaera_plugin_plugin();
+    let screens = plugin.chimaera_plugin_screens();
     Ok(match call {
         Call::Tools => Reply::Tools(exports.call_tools(store).await?),
         Call::Instructions => Reply::Instructions(exports.call_instructions(store).await?),
@@ -587,7 +674,86 @@ async fn invoke(live: &mut Live, cx: &wit::Context, call: Call) -> wasmtime::Res
         Call::Knowledge(known) => {
             Reply::Knowledge(exports.call_knowledge(store, cx, known.as_ref()).await?)
         }
+        Call::Query(name, args) => Reply::Json(exports.call_query(store, cx, &name, &args).await?),
         Call::OnEvent(event) => Reply::Event(exports.call_on_event(store, cx, &event).await?),
+        Call::Render(view, args) => {
+            Reply::Json(screens.call_render(store, cx, &view, &args).await?)
+        }
+        Call::Action(view, action, payload) => Reply::Json(
+            screens
+                .call_on_action(store, cx, &view, &action, &payload)
+                .await?,
+        ),
+        Call::ToolResume(name, job) => {
+            Reply::ToolResult(screens.call_tool_resume(store, cx, &name, &job).await?)
+        }
+    })
+}
+
+/// A call into a 0.1 build: the same exports, its own types.
+async fn invoke_v1(
+    plugin: &v1::ChimaeraPlugin,
+    store: &mut Store<HostState>,
+    cx: &wit::Context,
+    call: Call,
+) -> wasmtime::Result<Reply> {
+    use v1::chimaera::plugin::types as old;
+    let exports = plugin.chimaera_plugin_plugin();
+    let cx = old::Context {
+        workspace: cx.workspace.clone(),
+        session: cx.session.clone(),
+        mastermind: cx.mastermind,
+    };
+    Ok(match call {
+        Call::Tools => Reply::Tools(
+            exports
+                .call_tools(store)
+                .await?
+                .into_iter()
+                .map(|d| wit::ToolDef {
+                    name: d.name,
+                    description: d.description,
+                    input_schema: d.input_schema,
+                })
+                .collect(),
+        ),
+        Call::Instructions => Reply::Instructions(exports.call_instructions(store).await?),
+        Call::Tool(name, args) => {
+            let r = exports.call_call_tool(store, &cx, &name, &args).await?;
+            Reply::ToolResult(wit::ToolResult {
+                text: r.text,
+                is_error: r.is_error,
+                wait: None,
+            })
+        }
+        Call::Knowledge(known) => Reply::Knowledge(
+            exports
+                .call_knowledge(store, &cx, known.as_ref())
+                .await?
+                .map(|s| {
+                    s.map(|s| wit::Snapshot {
+                        stamp: s.stamp,
+                        data: s.data,
+                    })
+                }),
+        ),
+        Call::Query(name, args) => Reply::Json(exports.call_query(store, &cx, &name, &args).await?),
+        Call::OnEvent(event) => {
+            // 0.1 has four events; the rest never reach a 0.1 build (its
+            // manifest can't declare them).
+            let event = match event {
+                wit::Event::Hook(h) => old::Event::Hook(old::Hook {
+                    session: h.session,
+                    name: h.name,
+                }),
+                wit::Event::SessionEnded(s) => old::Event::SessionEnded(s),
+                wit::Event::SwitchedOn => old::Event::SwitchedOn,
+                wit::Event::SwitchedOff => old::Event::SwitchedOff,
+                _ => return Ok(Reply::Event(None)),
+            };
+            Reply::Event(exports.call_on_event(store, &cx, &event).await?)
+        }
+        Call::Render(..) | Call::Action(..) | Call::ToolResume(..) => Reply::Unsupported,
     })
 }
 
@@ -617,7 +783,14 @@ fn describe(
 impl PluginRuntime {
     fn budget(&self, call: &Call) -> Duration {
         match self.budget_override_ms.load(Ordering::Relaxed) {
-            0 if matches!(call, Call::Knowledge(_)) => KNOWLEDGE_BUDGET,
+            // A reader pass, and digesting a finished job's outputs.
+            0 if matches!(
+                call,
+                Call::Knowledge(_) | Call::OnEvent(wit::Event::JobFinished(_))
+            ) =>
+            {
+                KNOWLEDGE_BUDGET
+            }
             0 => CALL_BUDGET,
             ms => Duration::from_millis(ms),
         }
@@ -750,6 +923,18 @@ impl PluginRuntime {
         session: Option<&str>,
         call: Call,
     ) -> Result<Reply, String> {
+        // The one gate every call passes (tools, views, events, a job's
+        // end): a copy that failed its checks, or a build that is blocked,
+        // untrusted or refused by policy, never runs, whoever asks.
+        if let Some(fault) = &m.origin.fault {
+            return Err(format!("{} can't run on this daemon: {fault}", m.name));
+        }
+        if super::trust::hold(state, m).is_some() {
+            return Err(format!(
+                "{} can't run here until it is trusted and allowed",
+                m.name
+            ));
+        }
         let key: Key = (m.id.clone(), ws.to_string());
         if let Some(fault) = self.faulted(&key) {
             return Err(format!(
@@ -791,7 +976,10 @@ impl PluginRuntime {
                 .clone()
                 .try_acquire_owned()
                 .map_err(|_| "all plugin instances are busy — retry shortly".to_string())?;
-            let mut store = Store::new(&shared()?.engine, HostState::new(&m.id, ws));
+            let access = super::capabilities::Access::of(m);
+            let mut host = HostState::new(&m.id, ws, access);
+            host.manifest = Some(Arc::new(m.clone()));
+            let mut store = Store::new(&shared()?.engine, host);
             store.limiter(|s| &mut s.limits);
             // Yield to tokio on every tick; stop the guest past its budget.
             store.epoch_deadline_callback(|ctx| {
@@ -803,8 +991,13 @@ impl PluginRuntime {
             });
             store.data_mut().begin(state, &cx, budget);
             store.set_epoch_deadline(1);
-            let made =
-                tokio::time::timeout(budget + HOST_GRACE, pre.instantiate_async(&mut store)).await;
+            let made = tokio::time::timeout(budget + HOST_GRACE, async {
+                match &pre {
+                    Pre::V1(pre) => pre.instantiate_async(&mut store).await.map(Bindings::V1),
+                    Pre::V2(pre) => pre.instantiate_async(&mut store).await.map(Bindings::V2),
+                }
+            })
+            .await;
             store.data_mut().end();
             match made {
                 Ok(Ok(plugin)) => {
@@ -917,7 +1110,20 @@ impl PluginRuntime {
             return tool_error(refused);
         }
         let call = Call::Tool(name.to_string(), args.to_string());
-        match self.run(state, m, ws, Some(session), call).await {
+        let mut answer = self.run(state, m, ws, Some(session), call).await;
+        // A long tool: the call waits (the instance doesn't) for its job,
+        // then the plugin gives the final answer; past the hold, its own
+        // "still running" text stands.
+        if let Ok(Reply::ToolResult(result)) = &answer {
+            if let Some(job) = result.wait.clone() {
+                if super::jobs::tool_wait(state, &m.id, &job).await {
+                    let resume = Call::ToolResume(name.to_string(), job);
+                    answer = self.run(state, m, ws, Some(session), resume).await;
+                }
+            }
+        }
+        match answer {
+            Ok(Reply::Unsupported) => tool_error(format!("{} can't resume a tool", m.name)),
             Ok(Reply::ToolResult(result)) => {
                 let text = clip(&result.text, RESULT_MAX);
                 if result.is_error {
@@ -1004,12 +1210,73 @@ impl PluginRuntime {
         }
     }
 
-    /// Record an `emit` frame for the `/ws/events` clients.
-    pub(super) fn push_event(&self, frame: String) {
+    /// A 0.2 export that answers JSON text (`render`, `on-action`, `query`).
+    async fn json_call(
+        &self,
+        state: &Arc<AppState>,
+        m: &Manifest,
+        ws: &str,
+        call: Call,
+    ) -> Result<String, String> {
+        match self.run(state, m, ws, None, call).await? {
+            Reply::Json(answer) => answer.map_err(|e| clip(&e, KNOWLEDGE_ERROR_MAX)),
+            Reply::Unsupported => Err(format!(
+                "{} is built for plugin API {}, which has no screens",
+                m.name, m.api
+            )),
+            _ => unreachable!("render, on-action and query answer Json"),
+        }
+    }
+
+    /// A view's tree (JSON text), unchecked (`screens::check_tree`).
+    pub(crate) async fn render(
+        &self,
+        state: &Arc<AppState>,
+        m: &Manifest,
+        ws: &str,
+        view: &str,
+        args: &str,
+    ) -> Result<String, String> {
+        let call = Call::Render(view.to_string(), args.to_string());
+        self.json_call(state, m, ws, call).await
+    }
+
+    /// A node's action: the view's new tree, or `null`.
+    pub(crate) async fn on_action(
+        &self,
+        state: &Arc<AppState>,
+        m: &Manifest,
+        ws: &str,
+        view: &str,
+        action: &str,
+        payload: &str,
+    ) -> Result<String, String> {
+        let call = Call::Action(view.to_string(), action.to_string(), payload.to_string());
+        self.json_call(state, m, ws, call).await
+    }
+
+    /// A read the UI makes (`query`, 0.1 and 0.2).
+    pub(crate) async fn query(
+        &self,
+        state: &Arc<AppState>,
+        m: &Manifest,
+        ws: &str,
+        name: &str,
+        args: &str,
+    ) -> Result<String, String> {
+        let call = Call::Query(name.to_string(), args.to_string());
+        self.json_call(state, m, ws, call).await
+    }
+
+    /// Record a frame for the `/ws/events` clients showing `workspace`
+    /// (`emit`, and the platform's `surface` and `view` frames).
+    pub(crate) fn push_event(&self, workspace: &str, frame: String) {
         let mut events = crate::lock(&self.events);
         events.next += 1;
         let id = events.next;
-        events.ring.push_back((id, Arc::from(frame)));
+        events
+            .ring
+            .push_back((id, Arc::from(workspace), Arc::from(frame)));
         while events.ring.len() > EVENTS_KEPT {
             events.ring.pop_front();
         }
@@ -1020,14 +1287,16 @@ impl PluginRuntime {
         crate::lock(&self.events).next
     }
 
-    /// Frames newer than `last` for one client, advancing its mark.
-    pub(crate) fn events_since(&self, last: &mut u64) -> Vec<Arc<str>> {
+    /// Frames newer than `last` for one client showing `workspace`,
+    /// advancing its mark: a plugin's frames reach only the windows on its
+    /// workspace (none, for a window on no workspace).
+    pub(crate) fn events_since(&self, last: &mut u64, workspace: Option<&str>) -> Vec<Arc<str>> {
         let events = crate::lock(&self.events);
         let frames: Vec<Arc<str>> = events
             .ring
             .iter()
-            .filter(|(id, _)| *id > *last)
-            .map(|(_, f)| f.clone())
+            .filter(|(id, ws, _)| *id > *last && Some(&**ws) == workspace)
+            .map(|(_, _, f)| f.clone())
             .collect();
         *last = events.next;
         frames
@@ -1176,7 +1445,10 @@ mod tests {
 
     #[test]
     fn review_memory_budget_is_shared_by_all_memories_in_a_store() {
-        let mut store = Store::new(&shared().unwrap().engine, HostState::new("test", "ws"));
+        let mut store = Store::new(
+            &shared().unwrap().engine,
+            HostState::new("test", "ws", crate::plugins::capabilities::Access::NONE),
+        );
         store.limiter(|s| &mut s.limits);
         let forty_mb = wasmtime::MemoryType::new(640, None);
         assert!(wasmtime::Memory::new(&mut store, forty_mb.clone()).is_ok());
@@ -1188,7 +1460,10 @@ mod tests {
 
     #[test]
     fn review_table_budget_is_shared_by_all_tables_in_a_store() {
-        let mut store = Store::new(&shared().unwrap().engine, HostState::new("test", "ws"));
+        let mut store = Store::new(
+            &shared().unwrap().engine,
+            HostState::new("test", "ws", crate::plugins::capabilities::Access::NONE),
+        );
         store.limiter(|s| &mut s.limits);
         let table = wasmtime::TableType::new(wasmtime::RefType::FUNCREF, 40_000, None);
         assert!(wasmtime::Table::new(&mut store, table.clone(), wasmtime::Ref::Func(None)).is_ok());

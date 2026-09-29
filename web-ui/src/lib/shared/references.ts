@@ -87,8 +87,44 @@ export interface RefMatcher {
 
 /** A shape is used only when it is a plain, bounded regex source that
  *  can't match nothing (an empty match would never advance the scan). */
+/** The most unbounded repeats (`*`, `+`, `{n,}`) in any one `|`
+ *  alternative of a regex source without groups (the daemon's references/1
+ *  check, `surfaces::unbounded_per_alternative`, mirrored). */
+export function unboundedPerAlternative(pattern: string): number {
+  let most = 0;
+  let here = 0;
+  let inClass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === "\\") {
+      i++;
+    } else if (c === "[" && !inClass) {
+      inClass = true;
+    } else if (c === "]" && inClass) {
+      inClass = false;
+    } else if (inClass) {
+      // A class's own `*` and `+` are characters.
+    } else if (c === "*" || c === "+") {
+      here++;
+    } else if (c === "{") {
+      const end = pattern.indexOf("}", i);
+      if (end !== -1) {
+        if (pattern.slice(i + 1, end).endsWith(",")) here++;
+        i = end;
+      }
+    } else if (c === "|") {
+      most = Math.max(most, here);
+      here = 0;
+    }
+  }
+  return Math.max(most, here);
+}
+
+/** A shape this page will scan text with: short, no groups (so no nested
+ *  repeats), at most two unbounded repeats per alternative (each more one
+ *  multiplies the backtracking over a long word), and never empty. */
 function usable(pattern: string): boolean {
-  if (pattern.length > 80 || pattern.includes("(")) return false;
+  if (pattern.length > 80 || pattern.includes("(") || unboundedPerAlternative(pattern) > 2) return false;
   try {
     return !new RegExp(`^(?:${pattern})$`).test("");
   } catch {

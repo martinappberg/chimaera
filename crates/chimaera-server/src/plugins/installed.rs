@@ -90,7 +90,9 @@ pub(crate) struct InstalledCopy {
 
 /// Every installed copy under `root`, sorted by id (blocking). A copy that
 /// doesn't hold together (an unreadable manifest, an id or version that
-/// isn't its directory's, a component over the cap) is left out, loudly.
+/// isn't its directory's, a component over the cap) is listed by its id
+/// with why as its fault (`unreadable`): its card says so and Remove still
+/// works, where leaving it out would hide it with no way to remove it.
 pub(crate) fn scan(root: &Path) -> Vec<InstalledCopy> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -110,14 +112,35 @@ pub(crate) fn scan(root: &Path) -> Vec<InstalledCopy> {
             match load_current(root, &id) {
                 Ok(copy) => copy,
                 Err(err) => {
-                    tracing::warn!(plugin = %id, %err, "installed plugin skipped");
-                    None
+                    tracing::warn!(plugin = %id, %err, "installed plugin can't load");
+                    unreadable(root, &id, &err)
                 }
             }
         })
         .collect();
     copies.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
     copies
+}
+
+/// A copy of `id` this daemon can't load (its manifest a format it doesn't
+/// read, a check it fails): a stand-in named by its id and version with
+/// `why` as its fault — never active, never run, removable.
+fn unreadable(root: &Path, id: &str, why: &str) -> Option<InstalledCopy> {
+    let dir = root.join(id);
+    let version = link(&dir, CURRENT).ok().flatten()?;
+    let text = format!(
+        "id = {id:?}\nname = {id:?}\nversion = {version:?}\nsummary = \"\"\napi = {:?}\n",
+        super::API
+    );
+    let mut m = super::parse_manifest(&text).ok()?;
+    m.origin.fault = Some(format!(
+        "its plugin.toml doesn't load on this chimaera: {why}"
+    ));
+    Some(InstalledCopy {
+        manifest: m,
+        dir: dir.join(&version),
+        previous: None,
+    })
 }
 
 /// `<root>/<id>`'s `current` copy; `None` when nothing is current (a
@@ -170,6 +193,10 @@ pub(crate) fn load_version(dir: &Path, id: &str, version: &str) -> Result<Manife
     m.origin.local_path = read_optional(&vdir.join(LOCAL_PATH), 4 << 10)?
         .map(|bytes| PathBuf::from(String::from_utf8_lossy(&bytes).trim()))
         .filter(|p| p.is_absolute());
+    m.origin.source_github = source
+        .map(str::trim)
+        .filter(|s| super::valid_github(s))
+        .map(str::to_string);
     Ok(m)
 }
 
@@ -447,6 +474,8 @@ async fn after_change(state: &Arc<AppState>, id: &str) {
     state.plugin_runtime.forget_plugin(id);
     crate::lock(&state.knowledge).forget_provider(id, None);
     crate::lock(&state.plugin_detect).clear();
+    // The new build compiled before a window asks for it.
+    super::runtime::warm(state, Some(id.to_string()), std::time::Duration::ZERO);
     state.changes.notify_waiters();
 }
 
@@ -479,6 +508,7 @@ async fn install(
     state: &Arc<AppState>,
     from: Fetch<'_>,
     update_of: Option<&Manifest>,
+    token: Option<&str>,
 ) -> Result<Installed, Refusal> {
     let _change = state.plugin_releases.changing.lock().await;
     let (release, pin, source) = match from {
@@ -605,6 +635,22 @@ async fn install(
             m.name, release.version
         )));
     }
+    // What it can do, before a byte of its code is fetched: verified,
+    // trusted, no more than the build it replaces, or confirmed by the user
+    // (`token`); otherwise the refusal carries what to ask them.
+    let source_key = format!("github:{}", source.to_ascii_lowercase());
+    reload_policy(state).await;
+    let admitted = super::trust::admit(
+        state,
+        &super::trust::Incoming {
+            m: &m,
+            source: source_key.clone(),
+            wasm_sha256: &want_wasm,
+            pinned: pin.is_some(),
+        },
+        token,
+    )?;
+    super::trust::after_admit(state, &m, &source_key, admitted).await?;
     let first_party = super::lock_entry(&id).is_some_and(|l| l.repo.eq_ignore_ascii_case(&source));
     fresh_switches(state, &id, first_party).await?;
     let dir = state.plugin_catalog.root.join(&id);
@@ -618,6 +664,11 @@ async fn install(
     }
     let replaced = fetched?;
     after_change(state, &id).await;
+    let verb = if update_of.is_some() {
+        "updated"
+    } else {
+        "installed"
+    };
     tracing::info!(
         plugin = %id,
         version = %release.version,
@@ -625,9 +676,16 @@ async fn install(
         source = %source,
         pinned = pin.is_some(),
         sha256 = %want_wasm,
-        "plugin {}",
-        if update_of.is_some() { "updated" } else { "installed" }
+        "plugin {verb}",
     );
+    super::activity::record(
+        state,
+        &id,
+        json!({"kind": if update_of.is_some() { "update" } else { "install" },
+            "version": release.version, "from": replaced, "source": source,
+            "sha256": want_wasm}),
+    )
+    .await;
     Ok(Installed {
         id,
         version: release.version,
@@ -679,7 +737,11 @@ async fn fetch_and_activate(
 /// `<id>/<version>/`, with a `local-path` naming `src`. The same version
 /// installed again replaces the copy (the loop of developing a plugin); a
 /// `SHA256SUMS` there must match both files.
-async fn install_path(state: &Arc<AppState>, src: PathBuf) -> Result<Installed, Refusal> {
+async fn install_path(
+    state: &Arc<AppState>,
+    src: PathBuf,
+    token: Option<&str>,
+) -> Result<Installed, Refusal> {
     if !src.is_absolute() {
         return Err(Refusal::bad_request(format!(
             "{} is not an absolute path",
@@ -747,6 +809,22 @@ async fn install_path(state: &Arc<AppState>, src: PathBuf) -> Result<Installed, 
     // A local build is first-party only as the pinned release's exact bytes
     // (no release marker is written for it).
     let pinned = first_party(&m, &files.wasm_sha256, &files.toml_sha256, None);
+    let at_pin = pinned && super::lock_entry(&m.id).is_some_and(|l| l.version == m.version);
+    // Asked once per id and capability digest: rebuilding and adding again
+    // (the development loop) doesn't ask again.
+    let source_key = format!("path:{}", src.display());
+    reload_policy(state).await;
+    let admitted = super::trust::admit(
+        state,
+        &super::trust::Incoming {
+            m: &m,
+            source: source_key.clone(),
+            wasm_sha256: &files.wasm_sha256,
+            pinned: at_pin,
+        },
+        token,
+    )?;
+    super::trust::after_admit(state, &m, &source_key, admitted).await?;
     fresh_switches(state, &m.id, pinned).await?;
     let from = src.clone();
     let done = blocking(move || {
@@ -789,6 +867,13 @@ async fn install_path(state: &Arc<AppState>, src: PathBuf) -> Result<Installed, 
         sha256 = %done.wasm_sha256,
         "plugin installed from a local directory"
     );
+    super::activity::record(
+        state,
+        &done.id,
+        json!({"kind": "install", "version": done.version, "from": done.replaced,
+            "source": format!("{}", from.display()), "sha256": done.wasm_sha256}),
+    )
+    .await;
     Ok(done)
 }
 
@@ -812,6 +897,32 @@ pub(crate) struct InstallBody {
     /// Instead of a release: an absolute directory holding a local build.
     #[serde(default)]
     path: Option<PathBuf>,
+    /// The capability digest the user was shown and confirmed (a trust
+    /// prompt's answer), for a plugin the maintainers haven't verified.
+    #[serde(default)]
+    trust: Option<String>,
+}
+
+/// An optional `{trust}` body (Update and Use previous carry one only
+/// after a trust prompt): an empty body is none.
+#[derive(Deserialize, Default)]
+pub(crate) struct TrustToken {
+    #[serde(default)]
+    trust: Option<String>,
+}
+
+fn token_of(body: &[u8]) -> Result<TrustToken, Refusal> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(TrustToken::default());
+    }
+    serde_json::from_slice(body).map_err(|e| Refusal::bad_request(format!("the body: {e}")))
+}
+
+/// Re-read the machine-wide policy before a change (off the reactor): an
+/// admin's edit applies from the next install on.
+async fn reload_policy(state: &Arc<AppState>) {
+    let reading = state.clone();
+    let _ = tokio::task::spawn_blocking(move || reading.plugin_guard.reload_policy()).await;
 }
 
 /// What was typed for a repository, as the install route and Preview read
@@ -835,8 +946,11 @@ pub(crate) async fn install_route(
     Json(body): Json<InstallBody>,
 ) -> Response {
     let changing = state.clone();
+    let token = body.trust;
     let result = match (body.github, body.path) {
-        (None, Some(path)) => detached(async move { install_path(&changing, path).await }).await,
+        (None, Some(path)) => {
+            detached(async move { install_path(&changing, path, token.as_deref()).await }).await
+        }
         (Some(github), None) => {
             let version = body.version;
             detached(async move {
@@ -850,7 +964,7 @@ pub(crate) async fn install_route(
                     Some(l) => Fetch::Pinned(l),
                     None => Fetch::Release { github, version },
                 };
-                install(&changing, from, None).await
+                install(&changing, from, None, token.as_deref()).await
             })
             .await
         }
@@ -875,7 +989,8 @@ pub(crate) async fn pinned_install_route(
         .into_response();
     };
     let changing = state.clone();
-    let result = detached(async move { install(&changing, Fetch::Pinned(l), None).await }).await;
+    let result =
+        detached(async move { install(&changing, Fetch::Pinned(l), None, None).await }).await;
     installed_reply(&state, result)
 }
 
@@ -884,7 +999,12 @@ pub(crate) async fn pinned_install_route(
 pub(crate) async fn update_route(
     State(state): State<Arc<AppState>>,
     AxPath(pid): AxPath<String>,
+    body: axum::body::Bytes,
 ) -> Response {
+    let token = match token_of(&body) {
+        Ok(t) => t.trust,
+        Err(r) => return r.into_response(),
+    };
     let Some(m) = super::manifest(&state, &pid) else {
         return super::not_installed(&pid).into_response();
     };
@@ -897,7 +1017,7 @@ pub(crate) async fn update_route(
             github: &github,
             version: None,
         };
-        install(&changing, from, Some(&m)).await
+        install(&changing, from, Some(&m), token.as_deref()).await
     })
     .await;
     installed_reply(&state, result)
@@ -923,9 +1043,14 @@ fn installed_reply(state: &AppState, result: Result<Installed, Refusal>) -> Resp
 pub(crate) async fn rollback_route(
     State(state): State<Arc<AppState>>,
     AxPath(pid): AxPath<String>,
+    body: axum::body::Bytes,
 ) -> Response {
+    let token = match token_of(&body) {
+        Ok(t) => t.trust,
+        Err(r) => return r.into_response(),
+    };
     let (changing, id) = (state.clone(), pid.clone());
-    match detached(async move { rollback(&changing, &id).await }).await {
+    match detached(async move { rollback(&changing, &id, token.as_deref()).await }).await {
         Ok((version, previous)) => Json(json!({
             "id": pid,
             "version": version,
@@ -937,7 +1062,11 @@ pub(crate) async fn rollback_route(
     }
 }
 
-async fn rollback(state: &Arc<AppState>, pid: &str) -> Result<(String, String), Refusal> {
+async fn rollback(
+    state: &Arc<AppState>,
+    pid: &str,
+    token: Option<&str>,
+) -> Result<(String, String), Refusal> {
     let _change = state.plugin_releases.changing.lock().await;
     let Some(copy) = state.plugin_catalog.installed_copy(pid) else {
         return Err(super::not_installed(pid));
@@ -951,16 +1080,45 @@ async fn rollback(state: &Arc<AppState>, pid: &str) -> Result<(String, String), 
     let current = copy.manifest.version.clone();
     let dir = state.plugin_catalog.root.join(pid);
     let daemon = state.plugin_catalog.daemon_version();
-    let (id, back_to, now) = (pid.to_string(), previous.clone(), current.clone());
-    blocking(move || {
-        let m = load_version(&dir, &id, &back_to)
+    let (id, back_to) = (pid.to_string(), previous.clone());
+    let (reading, daemon_version) = (dir.clone(), daemon.clone());
+    let m = blocking(move || {
+        let m = load_version(&reading, &id, &back_to)
             .map_err(|e| Refusal::invalid(format!("{id} {back_to} can't be loaded: {e}")))?;
-        if let Some(why) = m.origin.fault.clone().or_else(|| super::gate(&m, &daemon)) {
+        if let Some(why) = m
+            .origin
+            .fault
+            .clone()
+            .or_else(|| super::gate(&m, &daemon_version))
+        {
             return Err(Refusal::invalid(format!(
                 "{} {back_to} can't run on this daemon: {why}",
                 m.name
             )));
         }
+        Ok(m)
+    })
+    .await?;
+    // The version it goes back to is admitted like an update: it may ask
+    // for what the running one doesn't.
+    let source_key = super::trust::source_of(&m);
+    reload_policy(state).await;
+    let pinned = m.origin.first_party
+        && m.origin.verified
+        && super::lock_entry(pid).is_some_and(|l| l.version == m.version);
+    let admitted = super::trust::admit(
+        state,
+        &super::trust::Incoming {
+            m: &m,
+            source: source_key.clone(),
+            wasm_sha256: &m.wasm.sha256,
+            pinned,
+        },
+        token,
+    )?;
+    super::trust::after_admit(state, &m, &source_key, admitted).await?;
+    let (back_to, now) = (previous.clone(), current.clone());
+    blocking(move || {
         swap_link(&dir, CURRENT, &back_to).map_err(io("could not update the current link"))?;
         swap_link(&dir, PREVIOUS, &now).map_err(io("could not update the previous link"))?;
         Ok(())
@@ -968,6 +1126,12 @@ async fn rollback(state: &Arc<AppState>, pid: &str) -> Result<(String, String), 
     .await?;
     after_change(state, pid).await;
     tracing::info!(plugin = %pid, version = %previous, from = %current, "plugin rolled back");
+    super::activity::record(
+        state,
+        pid,
+        json!({"kind": "rollback", "version": previous, "from": current}),
+    )
+    .await;
     Ok((previous, current))
 }
 
@@ -1013,8 +1177,14 @@ async fn remove(state: &Arc<AppState>, pid: &str) -> Result<(), Refusal> {
         return Err(super::not_installed(pid));
     }
     state.plugin_releases.forget(pid);
+    // What it kept in the daemon goes with it; so does the user's trust: a
+    // later install of the id is a new question.
+    crate::lock(&state.plugin_state).forget_plugin(pid);
+    super::platform::forget_plugin(state, pid).await;
+    super::trust::forget(state, pid).await;
     after_change(state, pid).await;
     tracing::info!(plugin = %pid, "plugin removed");
+    super::activity::record(state, pid, json!({"kind": "remove"})).await;
     // A third-party plugin's switches go with it: nothing is left to show
     // them on, and they'd switch on whatever is installed under the id
     // next (a first-party switch holds across Remove → Install).
@@ -1054,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_reads_current_and_previous_and_skips_what_does_not_hold() {
+    fn scan_reads_current_and_previous_and_faults_what_does_not_hold() {
         let root = dir("scan");
         plant(&root, "demo", "0.1.0");
         plant(&root, "demo", "0.2.0");
@@ -1077,7 +1247,18 @@ mod tests {
         std::fs::create_dir_all(root.join(".tmp-x")).unwrap();
 
         let copies = scan(&root);
-        assert_eq!(copies.len(), 1, "{copies:?}");
+        // `liar` is listed by its id with why (removable from its card);
+        // `bare` has nothing current and `odd` names no version.
+        assert_eq!(copies.len(), 2, "{copies:?}");
+        let liar = &copies[1];
+        assert_eq!(liar.manifest.id, "liar");
+        assert_eq!(liar.manifest.version, "1.0.0");
+        assert!(liar
+            .manifest
+            .origin
+            .fault
+            .as_deref()
+            .is_some_and(|f| f.contains("doesn't load") && f.contains("someone-else")));
         let c = &copies[0];
         assert_eq!(c.manifest.id, "demo");
         assert_eq!(c.manifest.version, "0.2.0");

@@ -250,3 +250,23 @@ jobs:
             artifacts/chimaera-aarch64-unknown-linux-musl \
             artifacts/chimaera-aarch64-apple-darwin \
             --repo "${{ github.repository }}" --clobber
+
+  # A plugin release plugins.lock pins may be a pre-release: a manifest only
+  # this chimaera reads, hidden from released daemons and the lock bot until
+  # now. With this release out, each becomes a full release (and its
+  # repository's latest). Edits other repositories, so it writes with
+  # PLUGIN_LOCK_TOKEN, not GITHUB_TOKEN (plugins/AGENTS.md).
+  plugin-pins:
+    needs: [version, attach-daemons]
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+      - env:
+          PLUGIN_TOKEN: ${{ secrets.PLUGIN_LOCK_TOKEN }}
+        run: node .github/scripts/plugin-pins.mjs --write

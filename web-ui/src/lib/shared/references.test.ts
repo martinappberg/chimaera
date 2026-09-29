@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { referenceHoverTarget, referenceMatcher, type RefSource } from "./references";
+import { referenceHoverTarget, referenceMatcher, unboundedPerAlternative, type RefSource } from "./references";
 
 function source(patterns: string[]): RefSource {
   return {
@@ -28,6 +28,18 @@ describe("referenceMatcher", () => {
   it("skips shapes that can match nothing (the scan would never advance)", () => {
     expect(referenceMatcher(new Map([["t", source(["\\d*", "F-\\d?"])]]))!.groups).toHaveLength(1);
     expect(referenceMatcher(new Map([["t", source(["x?"])]]))).toBeNull();
+  });
+
+  it("skips shapes whose repeats would backtrack over a long word", () => {
+    expect(unboundedPerAlternative("T-\\d*[A-Za-z][A-Za-z0-9]*")).toBe(2);
+    expect(unboundedPerAlternative("sec:[a-z0-9-]+|fig:[a-z0-9-]+")).toBe(1);
+    expect(unboundedPerAlternative("F-\\d{1,4}|[*+]x")).toBe(0);
+    expect(unboundedPerAlternative("a{2,}b\\+c+")).toBe(2);
+    const m = referenceMatcher(new Map([["t", source(["\\w*\\w*\\w*Z", "T-\\d*[A-Za-z][A-Za-z0-9]*"])]]))!;
+    expect(m.groups).toHaveLength(1);
+    const started = performance.now();
+    expect([..."A".repeat(20_000).matchAll(m.re)]).toHaveLength(0);
+    expect(performance.now() - started).toBeLessThan(500);
   });
 
   it("is null with no sources", () => {

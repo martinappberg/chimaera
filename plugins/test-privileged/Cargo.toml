@@ -1,0 +1,17 @@
+# The privileged fixture: programs run as jobs, a tool download with a
+# setup step, a long agent tool, job-finished — driven by the daemon's tests
+# (crates/chimaera-server/src/tests/plugin_jobs.rs). Laid out under
+# plugins/dist-test, which only test builds embed: never in a real catalog.
+[package]
+name = "chimaera-plugin-test-privileged"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+chimaera-plugin-api.workspace = true

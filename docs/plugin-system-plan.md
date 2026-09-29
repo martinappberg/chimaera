@@ -6,8 +6,11 @@ Mycelium) to run as WASM components before anything new is built on it. Read
 this first when touching `crates/chimaera-plugin-api`, `crates/chimaera-server/src/plugins/`
 or `plugins/`. The earlier plugin seam (manifests embedded as data, behaviour as
 named first-party code) is in [timeline-knowledge-plugins-plan.md §6](timeline-knowledge-plugins-plan.md);
-this plan replaces its "named built-in" column. The LaTeX and Typst plugins are
-the first new plugins on it ([latex-reports-plan.md](latex-reports-plan.md)).
+this plan replaces its "named built-in" column. What comes after it (screens,
+programs, side-program installs, and trust in proportion to what a plugin can do) is
+the [plugin platform plan](plugin-platform-plan.md) (2026-09-29). LaTeX and Typst are
+the first plugins planned on it ([latex-reports-plan.md](latex-reports-plan.md)); a
+2026-09-28 decision to make them core was reversed the next day.
 
 ## Status (2026-09-27)
 
@@ -162,9 +165,10 @@ describe what shipped; the phases below remain the design record.
   10.2 MB with a workspace and a session, 28.8 MB after the first plugin call
   (compile + instantiate, 70 ms end to end), 28.9 MB after 50 more calls. The
   debug daemon stayed at 29 to 64 MB through the P3 run.
-- **Later (P5):** the Browse view; `exec` and `watch` (WIT 0.2) and the LaTeX
-  plan's `build` point on them; the UI-facing `query` route; delivering
-  `switched-on` / `switched-off`; a UI that reads `emit` frames; and, only if
+- **Later (P5):** the Browse view; programs, a watch set, screens and the rest of
+  WIT 0.2 (now the [plugin platform plan](plugin-platform-plan.md)); the UI-facing
+  `query` route; delivering `switched-on` / `switched-off`; a UI that reads `emit`
+  frames; and, only if
   cold compile or binary size hurts on a real login node (not yet measured on
   one), an on-disk `.cwasm` cache or the runtime-only host. (Adding a
   plugin from a repository shipped: the Plugins segment's **Install from a
@@ -387,10 +391,13 @@ Two WIT spellings to know: `%list` escapes a keyword (the function is
 hence `stat as file-stat` in `host`.
 
 What is deliberately not in 0.1: **`exec`** (a bounded child process on the
-host, the heart of the LaTeX plan's `build` point) and **`watch`** (ask the host
-to report file changes). Both are additive: a host may offer more imports than a
+host) and **`watch`** (ask the host to report file changes). Both are additive: a host may offer more imports than a
 component uses, so 0.2 adds them without breaking 0.1 plugins. They land with the
-first plugin that needs them. Removing or changing an export is the breaking
+first plugin that needs them. (LaTeX is that plugin. A process that outlives a guest
+call's 5 s budget needs a different shape than an import called from inside the
+guest: the [plugin platform plan](plugin-platform-plan.md#6-programs) runs it as a job
+the host owns.) Removing or changing
+an export is the breaking
 direction; the exports above are the complete set a plugin must provide.
 
 ### The Rust side of it
@@ -631,7 +638,8 @@ visible, checksum-verified download.
   reviewed change to one file, shipped by the next chimaera release. It pins
   what Install fetches, not what an installed copy may update to.
 - **Versioning the interface itself:** the WIT package version is the contract.
-  Adding a host import is a minor bump (0.2 adds `exec` and `watch`); changing
+  Adding a host import is a minor bump (0.2 adds jobs, a watch set and screens:
+  the [platform plan](plugin-platform-plan.md#11-the-interface-wit-02)); changing
   or removing an export is a new major with a new world, which the host serves
   beside the old one for a transition. The `chimaera-plugin-api` crate's
   version tracks the WIT.
@@ -816,8 +824,8 @@ their own repositories, `plugins/plugins.lock`, and embedded plugins updating
 from their repositories; then (2026-09-27, decisions 6 and 7) no embedded
 plugins at all, the three install kinds, `SHA256SUMS` kept and re-checked,
 `recommends`, and the Extensions tab. Still to come: the Browse view over plugin
-repositories; `exec` and `watch` in the WIT (0.2)
-and the LaTeX plan's `build` point on them; the UI-facing `query` route;
+repositories; WIT 0.2, planned in the [plugin platform plan](plugin-platform-plan.md);
+the UI-facing `query` route;
 precompiled first-party components if cold compile is slow on a login node.
 
 ## Risks, and what the spike answered

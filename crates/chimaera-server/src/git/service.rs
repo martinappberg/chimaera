@@ -937,6 +937,11 @@ impl WatchGuard {
         }
     }
 
+    /// The workspace this connection shows, if any.
+    pub(crate) fn workspace(&self) -> Option<&str> {
+        self.ws.as_deref()
+    }
+
     /// Point this connection at `ws` (or nothing), releasing any previous one.
     pub(crate) fn set(&mut self, ws: Option<String>) {
         if self.ws == ws {
@@ -1036,6 +1041,9 @@ pub(crate) async fn mark_path_dirty(state: &AppState, path: &str) {
         // Component-wise prefix (so `/repo` never matches `/repo2`).
         if !target.starts_with(&ws.root) {
             continue;
+        }
+        if let Ok(rel) = target.strip_prefix(&ws.root) {
+            crate::plugins::files::touched(state, &expanded, &ws.id, &rel.to_string_lossy());
         }
         // Only the repository containing the path refreshes (and a
         // submodule's superproject, whose status marks it). We just

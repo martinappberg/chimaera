@@ -13,11 +13,12 @@ import {
   type Range,
 } from "@codemirror/state";
 import { Decoration, EditorView, type DecorationSet } from "@codemirror/view";
-import { HighlightStyle } from "@codemirror/language";
+import { HighlightStyle, type TagStyle } from "@codemirror/language";
 import { tags as t } from "@lezer/highlight";
 
-/** Syntax highlight mapping onto the app's --syn-* tokens. */
-export const codeHighlight = HighlightStyle.define([
+/** Syntax highlight mapping onto the app's --syn-* tokens: the rules, for a
+ *  language that must carry them in a highlighter of its own (`languages.ts`). */
+export const codeHighlightRules: readonly TagStyle[] = [
   { tag: [t.keyword, t.operatorKeyword, t.modifier, t.self], color: "var(--syn-keyword)" },
   { tag: [t.string, t.special(t.string), t.character], color: "var(--syn-string)" },
   { tag: [t.regexp, t.escape], color: "var(--syn-string)" },
@@ -34,7 +35,9 @@ export const codeHighlight = HighlightStyle.define([
   { tag: t.emphasis, fontStyle: "italic" },
   { tag: t.strong, fontWeight: "600" },
   { tag: t.invalid, color: "var(--err)" },
-]);
+];
+
+export const codeHighlight = HighlightStyle.define([...codeHighlightRules]);
 
 /** Editor theme (transparent surface, mono gutters) at a given size/line-height. */
 export const makeCodeTheme = (fontSize: number, lineHeight: number) =>

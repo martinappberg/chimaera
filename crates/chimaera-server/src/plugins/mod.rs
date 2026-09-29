@@ -51,21 +51,34 @@ use serde_json::{json, Value};
 
 use crate::AppState;
 
+pub(crate) mod activity;
+pub mod capabilities;
+pub(crate) mod files;
 pub(crate) mod hostfns;
 pub(crate) mod installed;
+pub(crate) mod jobs;
+pub(crate) mod output;
+pub(crate) mod pdata;
+pub(crate) mod platform;
 pub(crate) mod preview;
 pub(crate) mod releases;
+pub(crate) mod revoke;
 pub(crate) mod runtime;
+pub(crate) mod screens;
+pub(crate) mod surfaces;
+pub(crate) mod toolchain;
 pub(crate) mod tools;
+pub(crate) mod trust;
 
 /// How long a workspace's detect result is trusted before a re-stat.
 const DETECT_TTL: Duration = Duration::from_secs(30);
 
-/// The WIT version (`chimaera:plugin@0.1.x`) first-party plugins target.
-pub(crate) const API: &str = "0.1";
+/// The newest WIT version (`chimaera:plugin@0.2.x`): what a new plugin targets.
+pub(crate) const API: &str = "0.2";
 /// Every WIT version this host serves. A manifest's `api` must be one of
-/// them; an additive WIT bump adds a version here and keeps the old ones.
-pub(crate) const SERVED_APIS: &[&str] = &[API];
+/// them; a WIT bump adds a version here and keeps the old ones (0.1 through
+/// its own bindings, `runtime::v1`).
+pub(crate) const SERVED_APIS: &[&str] = &["0.1", API];
 
 /// The test-only plugins (the host's fixture, and the first-party releases
 /// the lock pins, which tests install by path): embedded by test builds
@@ -96,6 +109,12 @@ pub(crate) struct Locked {
     /// That release's `SHA256SUMS` entries, lowercase hex.
     pub(crate) sha256_wasm: String,
     pub(crate) sha256_toml: String,
+    /// What the maintainers approved it to do: its tier (`sandboxed` or
+    /// `privileged`) and capability digest (`capabilities`). A sandboxed
+    /// update from its repository keeps the badge only while its digest is
+    /// this one; a privileged plugin is verified only at the pin.
+    pub(crate) tier: String,
+    pub(crate) caps: String,
 }
 
 /// Parse and check a lock: ids, versions, repos and sha256s well-formed,
@@ -125,12 +144,18 @@ pub(crate) fn parse_lock(text: &str) -> Result<Vec<Locked>, String> {
         if l.name.trim().is_empty() || l.summary.trim().is_empty() {
             return Err(format!("plugins.lock: {id}: name and summary are required"));
         }
-        for sha in [&l.sha256_wasm, &l.sha256_toml] {
+        for sha in [&l.sha256_wasm, &l.sha256_toml, &l.caps] {
             if sha.len() != 64 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
                 return Err(format!(
                     "plugins.lock: {id}: a sha256 is not 64 lowercase hex digits"
                 ));
             }
+        }
+        if capabilities::Tier::parse(&l.tier).is_none() {
+            return Err(format!(
+                "plugins.lock: {id}: tier {:?} is not sandboxed or privileged",
+                l.tier
+            ));
         }
     }
     entries.sort_by(|a, b| a.id.cmp(&b.id));
@@ -178,6 +203,9 @@ pub(crate) struct Manifest {
     pub(crate) api: String,
     #[serde(default)]
     pub(crate) detect: Detect,
+    /// `[access]`: what it may read through the host (`capabilities`).
+    #[serde(default)]
+    pub(crate) access: capabilities::AccessDecl,
     #[serde(default)]
     pub(crate) requires: Requires,
     #[serde(default)]
@@ -191,9 +219,32 @@ pub(crate) struct Manifest {
     /// Where newer versions are published (the release checker's source).
     #[serde(default)]
     pub(crate) release: Option<ReleaseSource>,
+    /// `[[views]]` (0.2): the screens it draws, in the Chimaera format.
+    #[serde(default)]
+    pub(crate) views: Vec<platform::ViewDecl>,
+    /// `[[files]]` (0.2): the file kinds it opens in one of its views.
+    #[serde(default)]
+    pub(crate) files: Vec<platform::FileKind>,
+    /// `[[actions]]` (0.2): items it adds to matching files' menus.
+    #[serde(default)]
+    pub(crate) actions: Vec<platform::FileAction>,
+    /// `[[settings]]` (0.2): its settings, drawn in Settings → Plugins.
+    #[serde(default)]
+    pub(crate) settings: Vec<platform::SettingDecl>,
+    /// `[[programs]]` (0.2): the programs it may run as jobs (privileged).
+    #[serde(default)]
+    pub(crate) programs: Vec<platform::ProgramDecl>,
+    /// `[[tools]]` (0.2): side programs the host downloads on a click
+    /// (privileged).
+    #[serde(default)]
+    pub(crate) tools: Vec<platform::ToolDecl>,
     /// The behaviour — set by the catalog, never by the TOML.
     #[serde(skip)]
     pub(crate) wasm: Wasm,
+    /// What it can do, derived once when the manifest is parsed
+    /// (`parse_manifest`): the card's Can list, its tier and digest.
+    #[serde(skip)]
+    pub(crate) caps: capabilities::Caps,
     /// Where this copy came from and what the catalog decided about it —
     /// set by the catalog, never by the TOML.
     #[serde(skip)]
@@ -251,6 +302,9 @@ pub(crate) struct Origin {
     /// Installed from a local directory (`POST /plugins/install {path}`):
     /// that directory.
     pub(crate) local_path: Option<PathBuf>,
+    /// The repository a release install came from (the host-written
+    /// `source-github` marker): where trust records say it came from.
+    pub(crate) source_github: Option<String>,
 }
 
 /// Workspace-relative paths whose presence makes the plugin active here.
@@ -295,13 +349,21 @@ pub(crate) struct Recommends {
 }
 
 impl Manifest {
-    /// The agent-side plugin this plugin names for `agent`: a requirement
-    /// first, else a recommendation (the install route and codex hook trust
-    /// serve both).
-    pub(crate) fn agent_plugin(&self, agent: &str) -> Option<&AgentPluginReq> {
-        self.agent_plugin_matching(agent, None)
+    /// Every agent-side plugin id this plugin names for `agent`, required
+    /// and recommended: the hooks codex hook trust may write for it.
+    pub(crate) fn agent_plugin_ids(&self, agent: &str) -> Vec<&str> {
+        self.requires
+            .agent_plugins
+            .get(agent)
+            .into_iter()
+            .chain(self.recommends.agent_plugins.get(agent))
+            .map(|req| req.id.as_str())
+            .collect()
     }
 
+    /// The agent-side plugin this plugin names for `agent` (with `id`, that
+    /// one): a requirement first, else a recommendation (the install route
+    /// serves both).
     fn agent_plugin_matching(&self, agent: &str, id: Option<&str>) -> Option<&AgentPluginReq> {
         self.requires
             .agent_plugins
@@ -362,6 +424,24 @@ pub(crate) enum EventKind {
     SessionEnded,
     SwitchedOn,
     SwitchedOff,
+    // 0.2 only (`validate`).
+    FileSaved,
+    FileChanged,
+    JobFinished,
+    SettingsChanged,
+}
+
+impl EventKind {
+    /// Whether a 0.1 build could hear it (its WIT's `event` variant).
+    fn in_v1(self) -> bool {
+        matches!(
+            self,
+            EventKind::Hook
+                | EventKind::SessionEnded
+                | EventKind::SwitchedOn
+                | EventKind::SwitchedOff
+        )
+    }
 }
 
 /// The card's "Adds" lines, in words — mandatory honesty, not decoration.
@@ -435,16 +515,29 @@ pub(crate) fn validate(m: &Manifest) -> Result<(), String> {
         ));
     }
     plugin_version(&m.version)?;
+    // Shown on every card, prompt and terminal: words, never control
+    // characters (a terminal escape could redraw a trust prompt).
+    for (what, text) in [("name", &m.name), ("summary", &m.summary)] {
+        let empty_name = what == "name" && text.trim().is_empty();
+        if empty_name || text.len() > 200 || text.chars().any(char::is_control) {
+            return Err(format!(
+                "the {what} is one line of at most 200 bytes, without control characters"
+            ));
+        }
+    }
     let mut tools = BTreeSet::new();
     for tool in &m.provides.mcp_tools {
+        // No dots: codex pre-approves a tool through a dotted config key
+        // (`mcp_servers.chimaera.tools.<name>.approval_mode`), where a dot
+        // would split the name — refused here rather than skipped there.
         if tool.is_empty()
             || tool.len() > 64
             || !tool
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
         {
             return Err(format!(
-                "MCP tool {tool:?} must be 1–64 letters, digits, underscores, dots or dashes"
+                "MCP tool {tool:?} must be 1–64 letters, digits, underscores or dashes"
             ));
         }
         if crate::mcp::is_core_tool(tool) {
@@ -454,6 +547,40 @@ pub(crate) fn validate(m: &Manifest) -> Result<(), String> {
             return Err(format!("MCP tool {tool:?} is listed twice"));
         }
     }
+    // Detect paths are stat'ed under the workspace root: relative, plain
+    // components only, so a manifest can't probe outside the workspace.
+    for rel in &m.detect.any {
+        let plain = !rel.is_empty()
+            && Path::new(rel)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !plain {
+            return Err(format!(
+                "detect path {rel:?} must be relative to the workspace, without `..` or `.`"
+            ));
+        }
+    }
+    if m.api == "0.1" {
+        if let Some(e) = m.provides.events.iter().find(|e| !e.in_v1()) {
+            return Err(format!(
+                "the event {e:?} needs api = \"0.2\" (a 0.1 component can't hear it)"
+            ));
+        }
+        if !(m.views.is_empty()
+            && m.files.is_empty()
+            && m.actions.is_empty()
+            && m.settings.is_empty()
+            && m.programs.is_empty()
+            && m.tools.is_empty())
+        {
+            return Err(
+                "[[views]], [[files]], [[actions]], [[settings]], [[programs]] and \
+                 [[tools]] need api = \"0.2\""
+                    .into(),
+            );
+        }
+    }
+    platform::validate(m)?;
     if let Some(release) = &m.release {
         if !valid_github(&release.github) {
             return Err(format!(
@@ -470,8 +597,9 @@ pub(crate) fn parse_manifest(text: &str) -> Result<Manifest, String> {
     if text.len() as u64 > installed::TOML_MAX {
         return Err("plugin.toml exceeds the 64 KiB manifest limit".into());
     }
-    let m = toml::from_str::<Manifest>(text).map_err(|e| format!("plugin.toml: {e}"))?;
+    let mut m = toml::from_str::<Manifest>(text).map_err(|e| format!("plugin.toml: {e}"))?;
     validate(&m)?;
+    m.caps = capabilities::Caps::of(&m);
     Ok(m)
 }
 
@@ -538,6 +666,11 @@ fn describe_req(req: &semver::VersionReq) -> String {
         .join(", ")
 }
 
+/// A workspace-relative path of plain components (`hostfns`' rule).
+pub(crate) fn hostfns_relative(path: &str) -> Result<PathBuf, String> {
+    hostfns::relative(path)
+}
+
 /// The loadable plugins, one entry per id, sorted by id (the Extensions
 /// tab's order, and the order active plugins' tools and instruction
 /// paragraphs reach an agent in): every installed copy, and (test builds)
@@ -598,11 +731,11 @@ pub(crate) struct Catalog {
     merged: RwLock<(usize, Arc<Vec<Arc<Manifest>>>)>,
 }
 
-fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+pub(crate) fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+pub(crate) fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     lock.write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -653,6 +786,11 @@ impl Catalog {
         self.all().iter().find(|m| m.id == id).cloned()
     }
 
+    /// Every installed copy as found on disk.
+    pub(crate) fn installed_copies(&self) -> Arc<Vec<installed::InstalledCopy>> {
+        read(&self.installed).clone()
+    }
+
     /// The installed copy of `id` as found on disk, if any.
     pub(crate) fn installed_copy(&self, id: &str) -> Option<installed::InstalledCopy> {
         read(&self.installed)
@@ -681,6 +819,8 @@ impl Catalog {
 pub(crate) struct Refusal {
     pub(crate) status: StatusCode,
     pub(crate) message: String,
+    /// Keys the answer carries beside `error` (`Refusal::with`).
+    pub(crate) detail: Option<Value>,
 }
 
 /// The catalog every lookup reads: the loadable plugins.
@@ -775,6 +915,23 @@ pub(crate) mod test_catalog {
     /// `plugins/dist-test`), added to the catalog.
     pub(crate) fn fixture() -> Arc<Manifest> {
         add(&fixture_manifest(), fixture_wasm())
+    }
+
+    /// The 0.2 platform fixture (`plugins/test-platform`).
+    pub(crate) fn platform() -> Arc<Manifest> {
+        add(
+            &dist_test_text("test-platform/plugin.toml"),
+            dist_test_bytes("test-platform/plugin.wasm"),
+        )
+    }
+
+    /// The privileged fixture (`plugins/test-privileged`): programs, a
+    /// tool download, a long agent tool.
+    pub(crate) fn privileged() -> Arc<Manifest> {
+        add(
+            &dist_test_text("test-privileged/plugin.toml"),
+            dist_test_bytes("test-privileged/plugin.wasm"),
+        )
     }
 
     pub(crate) fn fixture_manifest() -> String {
@@ -900,7 +1057,12 @@ pub(crate) async fn active(state: &AppState, ws: &str) -> Vec<Arc<Manifest>> {
     };
     catalog(state)
         .iter()
-        .filter(|m| on.contains(&m.id) && found.contains(&m.id) && m.origin.fault.is_none())
+        .filter(|m| {
+            on.contains(&m.id)
+                && found.contains(&m.id)
+                && m.origin.fault.is_none()
+                && trust::hold(state, m).is_none()
+        })
         .cloned()
         .collect()
 }
@@ -918,9 +1080,12 @@ pub(crate) async fn active_for_session(state: &AppState, sid: &str) -> Vec<Arc<M
 /// plugin active there, plus `tell_mastermind` when the workspace has a
 /// Mastermind (empty — and so no settings change at all — when neither).
 pub(crate) async fn spawn_allow(state: &AppState, ws: &str) -> Vec<String> {
+    // A build the host refused or faulted here offers nothing, so nothing of
+    // it is pre-allowed.
     let mut tools: Vec<String> = active(state, ws)
         .await
         .iter()
+        .filter(|m| state.plugin_runtime.fault(m, ws).is_none())
         .flat_map(|m| m.provides.mcp_tools.iter().cloned())
         .collect();
     // A workspace with a Mastermind: its workers may message it without a
@@ -950,7 +1115,11 @@ pub(crate) fn manifest_json(state: &AppState, m: &Manifest) -> Value {
     let mut v = manifest_fields(m);
     v["source"] = json!("installed");
     v["installed"] = json!(true);
-    v["first_party"] = json!(o.first_party);
+    // The badge: Chimaera's own plugin, as the maintainers approved it (a
+    // first-party update that grew its capabilities is the user's to trust).
+    v["first_party"] =
+        json!(o.first_party && trust::standing(state, m) == trust::Standing::Verified);
+    trust::wire(state, m, &mut v);
     v["verified"] = json!(o.verified);
     v["sha256_wasm"] = json!(&*m.wasm.sha256);
     if let Some(path) = &o.path {
@@ -1006,6 +1175,14 @@ fn manifest_fields(m: &Manifest) -> Value {
         "recommends_summary": text_or_null(m.recommends.summary.as_deref()),
         "version": m.version,
         "api": m.api,
+        // What it can do, in the host's words (the card's Can list), its
+        // tier and its capability digest (what a trust answer confirms).
+        "tier": m.caps.tier().as_str(),
+        "caps": m.caps.digest(),
+        "can": m.caps.lines_json(),
+        // The 0.2 tables: its screens, the file kinds it opens, its file
+        // menu items, its settings, its programs and its tools.
+        "platform": platform::wire(m),
     })
 }
 
@@ -1036,6 +1213,12 @@ pub(crate) fn available_json(l: &Locked) -> Value {
         "recommends_summary": null,
         "version": l.version,
         "api": null,
+        // The lock's record; the words come with the details (`preview`).
+        "tier": l.tier,
+        "caps": l.caps,
+        "can": [],
+        "standing": "verified",
+        "hold": null,
         "source": "available",
         "installed": false,
         "first_party": true,
@@ -1059,7 +1242,12 @@ pub(crate) async fn list_plugins(State(state): State<Arc<AppState>>) -> Response
             Entry::Available(l) => available_json(l),
         })
         .collect();
-    Json(json!({"schema": 1, "plugins": plugins})).into_response()
+    Json(json!({
+        "schema": 1,
+        "plugins": plugins,
+        "policy": trust::policy(&state).json(),
+    }))
+    .into_response()
 }
 
 /// An agent-plugin map on the wire: `[{agent, id, marketplace}]`.
@@ -1105,8 +1293,9 @@ pub(crate) async fn workspace_plugins(
             };
             let mut v = manifest_json(&state, m);
             // A plugin that can't run is off whatever its switch says: the
-            // switch is kept, and holds again once the fault is gone.
-            let is_on = on.contains(&m.id) && m.origin.fault.is_none();
+            // switch is kept, and holds again once the fault (or the hold:
+            // a block, the policy, missing trust) is gone.
+            let is_on = on.contains(&m.id) && m.origin.fault.is_none() && v["hold"].is_null();
             let detected = found.contains(&m.id);
             v["on"] = json!(is_on);
             v["detected"] = json!(detected);
@@ -1129,6 +1318,7 @@ pub(crate) async fn workspace_plugins(
         "workspace_id": id,
         "root": workspace.root,
         "plugins": plugins,
+        "policy": trust::policy(&state).json(),
     }))
     .into_response()
 }
@@ -1155,6 +1345,29 @@ pub(crate) async fn put_workspace_plugin(
                 )
                     .into_response();
             }
+            match trust::hold(&state, &m) {
+                None => {}
+                Some(trust::Hold::Untrusted) => {
+                    let source = trust::source_of(&m);
+                    return trust::needs_trust(&m, &source, &m.wasm.sha256, Some(&m), false)
+                        .into_response();
+                }
+                Some(trust::Hold::Blocked(b)) => {
+                    return Refusal::conflict(format!(
+                        "Chimaera blocked {} {}: {}",
+                        m.name, m.version, b.reason
+                    ))
+                    .with(json!({"blocked": revoke::block_json(&b)}))
+                    .into_response()
+                }
+                Some(trust::Hold::Policy(why)) => {
+                    return Refusal::new(
+                        StatusCode::FORBIDDEN,
+                        format!("{} can't run here: {why}", m.name),
+                    )
+                    .into_response()
+                }
+            }
         }
         Some(_) => {}
         // Nothing installed has nothing to run; switching it off is still
@@ -1171,6 +1384,11 @@ pub(crate) async fn put_workspace_plugin(
         )
             .into_response()
     };
+    // Only a plugin that was on hears it is going (clearing a switch kept
+    // from before never runs its code).
+    let was_on = crate::lock(&state.workspaces)
+        .get(&id)
+        .is_some_and(|w| w.plugins_on.iter().any(|p| p == &pid));
     let staged = crate::lock(&state.workspaces).stage_plugin_on(&id, &pid, body.on);
     let crate::workspaces::PluginSwitch {
         workspace,
@@ -1190,6 +1408,22 @@ pub(crate) async fn put_workspace_plugin(
         crate::lock(&state.workspaces).undo_plugin_on(&id, &pid, undo);
         return save_failed(err);
     }
+    // A plugin that asked to hear it is told it is going (on the instance
+    // it had, so it can let go of what it kept), before it starts over.
+    let heard = |kind| manifest(&state, &pid).filter(|m| m.provides.hears(kind));
+    if !body.on && was_on {
+        if let Some(m) = heard(EventKind::SwitchedOff) {
+            state
+                .plugin_runtime
+                .on_event(&state, &m, &id, None, runtime::wit::Event::SwitchedOff)
+                .await;
+        }
+    }
+    if !body.on {
+        // Its programs stop with it, and what it published here goes.
+        jobs::cancel_where(&state, &pid, Some(&id));
+        crate::lock(&state.plugin_platform.surfaces).forget_pair(&pid, &id);
+    }
     // Either way the plugin starts over here: a fresh instance on next use,
     // and a fault cleared (switching off and on is how the user retries a
     // faulted plugin).
@@ -1198,6 +1432,22 @@ pub(crate) async fn put_workspace_plugin(
     // The switch is the moment agents' view changes: re-detect now so the
     // next connect answers from a fresh footprint.
     refresh_detect(&state, &id).await;
+    if body.on {
+        runtime::warm(&state, Some(pid.clone()), std::time::Duration::ZERO);
+        if let Some(m) = heard(EventKind::SwitchedOn) {
+            let (state, id) = (state.clone(), id.clone());
+            // Off the request: the switch answers at once. Delivered only
+            // where it is active (its footprint found).
+            tokio::spawn(async move {
+                if active(&state, &id).await.iter().any(|a| a.id == m.id) {
+                    state
+                        .plugin_runtime
+                        .on_event(&state, &m, &id, None, runtime::wit::Event::SwitchedOn)
+                        .await;
+                }
+            });
+        }
+    }
     state.changes.notify_waiters();
     Json(json!({"workspace_id": id, "plugins_on": workspace.plugins_on})).into_response()
 }
@@ -1528,7 +1778,8 @@ mod tests {
         let entry = |extra: &str| {
             format!(
                 "[[plugin]]\nid = \"x\"\nname = \"X\"\nsummary = \"x\"\nversion = \"0.1.0\"\n\
-                 repo = \"a/b\"\nsha256_wasm = \"{0}\"\nsha256_toml = \"{0}\"\n{extra}",
+                 repo = \"a/b\"\nsha256_wasm = \"{0}\"\nsha256_toml = \"{0}\"\n\
+                 tier = \"sandboxed\"\ncaps = \"{0}\"\n{extra}",
                 "a".repeat(64)
             )
         };
@@ -1543,6 +1794,7 @@ mod tests {
             ("version = \"0.1.0\"", "version = \"0.1\""),
             ("repo = \"a/b\"", "repo = \"../b\""),
             ("summary = \"x\"", "summary = \" \""),
+            ("tier = \"sandboxed\"", "tier = \"trusted\""),
         ] {
             assert!(
                 parse_lock(&entry("").replacen(from, to, 1)).is_err(),
@@ -1581,8 +1833,15 @@ mod tests {
                 Some(l.repo.as_str()),
                 "{id}: it updates from the repository the lock pins"
             );
-            assert_eq!(m.api, API);
+            assert!(SERVED_APIS.contains(&m.api.as_str()), "{id}: api {}", m.api);
             assert_eq!(gate(&m, "0.4.1"), None, "{id} runs on a released daemon");
+            // What the maintainers approved it to do is what it can do:
+            // `chimaera plugin caps` prints both for a release's manifest.
+            assert_eq!(
+                (m.caps.tier().as_str(), m.caps.digest().as_str()),
+                (l.tier.as_str(), l.caps.as_str()),
+                "{id}: the lock's tier and caps are the release's (chimaera plugin caps plugin.toml)"
+            );
             assert!(!m.summary.is_empty());
             assert!(
                 !m.adds.ui.is_empty() || !m.adds.agents.is_empty(),
@@ -1627,12 +1886,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            m.agent_plugin("codex").unwrap().id,
+            m.agent_plugin_matching("codex", None).unwrap().id,
             "need@x",
             "a requirement wins"
         );
-        assert_eq!(m.agent_plugin("claude").unwrap().id, "nice@x");
-        assert!(m.agent_plugin("agy").is_none());
+        assert_eq!(
+            m.agent_plugin_matching("claude", None).unwrap().id,
+            "nice@x"
+        );
+        assert!(m.agent_plugin_matching("agy", None).is_none());
+        assert_eq!(m.agent_plugin_ids("codex"), ["need@x", "also@x"]);
+        assert_eq!(m.agent_plugin_ids("claude"), ["nice@x"]);
+        assert!(m.agent_plugin_ids("agy").is_empty());
         assert_eq!(
             m.agent_plugin_matching("codex", Some("also@x"))
                 .unwrap()
@@ -1730,8 +1995,27 @@ mod tests {
             demo("version='0.1.0'\napi='0.1'\n[provides]\nmcp_tools=['echo', 'echo']").is_err()
         );
         assert!(
-            demo("version='0.1.0'\napi='0.1'\n[provides]\nmcp_tools=['my_plugin.echo-v2']").is_ok()
+            demo("version='0.1.0'\napi='0.1'\n[provides]\nmcp_tools=['my_plugin-echo-V2']").is_ok()
         );
+        // A dot would split codex's dotted pre-approval key: refused here,
+        // never skipped silently at spawn.
+        assert!(
+            demo("version='0.1.0'\napi='0.1'\n[provides]\nmcp_tools=['my_plugin.echo']").is_err()
+        );
+    }
+
+    #[test]
+    fn detect_paths_stay_inside_the_workspace() {
+        for bad in ["../x", "/etc/passwd", "a/../../b", "./x", ""] {
+            assert!(
+                demo(&format!(
+                    "version='0.1.0'\napi='0.1'\n[detect]\nany=['{bad}']"
+                ))
+                .is_err(),
+                "{bad}"
+            );
+        }
+        assert!(demo("version='0.1.0'\napi='0.1'\n[detect]\nany=['.living/INDEX.md']").is_ok());
     }
 
     const BASE: &str = "id = \"demo\"\nname = \"Demo\"\nsummary = \"x\"\n";
@@ -1794,7 +2078,8 @@ mod tests {
             demo(&format!("version = \"0.1.0\"\napi = \"{api}\"\n{req}")).unwrap()
         };
         assert_eq!(gate(&with("0.1", None), "0.4.1"), None);
-        let newer = gate(&with("0.2", None), "0.4.1").unwrap();
+        assert_eq!(gate(&with("0.2", None), "0.4.1"), None);
+        let newer = gate(&with("0.9", None), "0.4.1").unwrap();
         assert!(newer.starts_with("needs a newer chimaera"), "{newer}");
         let older = gate(&with("0.0", None), "0.4.1").unwrap();
         assert!(older.starts_with("needs a newer plugin"), "{older}");
@@ -1868,7 +2153,7 @@ mod tests {
 
         // A gate fails: listed, with why.
         let mut newer = copy("demo", "0.4.0", None);
-        newer.manifest.api = "0.2".into();
+        newer.manifest.api = "0.9".into();
         let m = &resolve(&[], &[newer], "0.4.1")[0];
         assert!(m
             .origin

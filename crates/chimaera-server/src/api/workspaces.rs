@@ -406,6 +406,7 @@ pub(crate) async fn delete_workspace(
             crate::lock(&state.plugin_detect).forget_workspace(&id);
             state.plugin_runtime.forget_workspace(&id);
             crate::lock(&state.plugin_state).forget_workspace(&id);
+            crate::plugins::platform::forget_workspace(&state, &id);
             crate::lock(&state.knowledge).forget_workspace(&id);
             StatusCode::NO_CONTENT.into_response()
         }

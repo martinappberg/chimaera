@@ -70,6 +70,8 @@
   const k = $derived(lookup?.k ?? null);
   const idx = $derived(lookup?.idx ?? null);
   const labels = $derived(k !== null ? providerLabels(k) : null);
+  /** Who reads the project, in its own word (never its id). */
+  const providerName = $derived(labels?.source || $knowledgePlugin?.name || "The knowledge plugin");
   const statusNote = $derived(labels?.status_note || "A status is shown as it was written; Chimaera never rates.");
   const providerActive = $derived($knowledgeProviderActive && k !== null);
   const narrow = $derived(width < 820);
@@ -376,8 +378,8 @@
 
     {#if providerActive && k.error !== null}
       <p class="stale">
-        {#if hasSnapshot}Showing what {k.provider} read last — it couldn't refresh just now.{:else}{k.provider} couldn't read this
-          project just now.{/if}
+        {#if hasSnapshot}Showing what {providerName} read last — it couldn't refresh just now.{:else}{providerName} couldn't read
+          this project just now.{/if}
         <span class="why">{k.error}</span>
       </p>
     {/if}

@@ -2,9 +2,12 @@ name: plugin-lock
 
 # Keeps plugins/plugins.lock on each first-party plugin's latest release, so
 # a plugin release reaches the app with no hand-made pull request: a newer,
-# checked release (.github/scripts/plugin-lock.mjs) becomes a `fix:` PR with
-# squash auto-merge, CI installs it against the new lock, and the merge cuts
-# a patch release. Hourly, on demand, and on a `plugin-released` dispatch
+# checked release (.github/scripts/plugin-lock.mjs) becomes a `fix:` PR, CI
+# installs it against the new lock, and the merge cuts a patch release. The
+# PR auto-merges (squash) only when every bumped plugin is sandboxed and asks
+# for nothing new (the same capability lines as its pinned release); a
+# privileged plugin, or one whose capabilities changed, waits for a person
+# to review it and set its tier and caps (docs/plugin-platform-plan.md §2). Hourly, on demand, and on a `plugin-released` dispatch
 # (a plugin repository may send one after publishing; the schedule covers
 # it otherwise).
 #
@@ -90,6 +93,7 @@ jobs:
         if: steps.bump.outputs.bumped == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          AUTOMERGE: ${{ steps.bump.outputs.automerge }}
         run: |
           set -euo pipefail
           dir="$RUNNER_TEMP/plugin-lock"
@@ -120,7 +124,11 @@ jobs:
           git push -q --force "https://x-access-token:${LOCK_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${branch}"
           export GH_TOKEN="$LOCK_TOKEN"
           gh pr create --repo "$REPO" --base main --head "$branch" --title "$title" --body-file "$dir/body.md"
-          gh pr merge "$branch" --repo "$REPO" --auto --squash
+          if [ "$AUTOMERGE" = true ]; then
+            gh pr merge "$branch" --repo "$REPO" --auto --squash
+          else
+            echo "::notice title=plugin-lock::'$title' needs a maintainer's review (capabilities changed, or a privileged plugin): no auto-merge"
+          fi
 
       - name: a release failed its checks
         if: steps.bump.outcome == 'failure'

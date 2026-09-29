@@ -17,7 +17,7 @@
   import { EditorView, lineNumbers, highlightSpecialChars } from "@codemirror/view";
   import { MergeView } from "@codemirror/merge";
   import { LanguageDescription, syntaxHighlighting } from "@codemirror/language";
-  import { languages } from "@codemirror/language-data";
+  import { languages } from "./languages";
   import { codeHighlight, makeCodeTheme } from "./cm";
   import { fetchGitDiff, gitRepoStatuses, gitStatus, type DiffMode, type GitDiff } from "../workspace/git";
   import { basename } from "./files";

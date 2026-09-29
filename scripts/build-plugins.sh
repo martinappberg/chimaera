@@ -15,8 +15,13 @@
 #       a run without network needs them there already.
 #   plugins/dist-test/test-fixture/{plugin.wasm,plugin.toml}
 #   plugins/dist-test/test-fixture-v2/{plugin.wasm,plugin.toml}
-#       plugins/test-fixture, the one crate of the plugins/ cargo workspace,
+#       plugins/test-fixture (a 0.1 plugin, on the frozen plugins/api-0.1)
 #       and its `v2` build (the "next release" the update tests serve).
+#   plugins/dist-test/test-platform/{plugin.wasm,plugin.toml}
+#       plugins/test-platform, the 0.2 platform fixture.
+#   plugins/dist-test/test-privileged/{plugin.wasm,plugin.toml}
+#       plugins/test-privileged, the programs-and-tools fixture (its tool's
+#       archive stays in its crate; the tests serve it from a fake host).
 #
 # Run before `cargo test` / `cargo clippy --all-targets` of chimaera-server
 # (its test build embeds plugins/dist-test; CI and `just check` do).
@@ -198,10 +203,10 @@ for old in "$PLUGINS/dist" "$PLUGINS/cache"; do
 done
 
 [ -f "$LOCK" ] || die "plugins/plugins.lock is missing"
-LOCKED="$(read_tables "$LOCK" id name summary version repo sha256_wasm sha256_toml)"
+LOCKED="$(read_tables "$LOCK" id name summary version repo sha256_wasm sha256_toml tier caps)"
 
 seen=" "
-while IFS="$SEP" read -r id name _summary version repo sha_wasm sha_toml <&3; do
+while IFS="$SEP" read -r id name _summary version repo sha_wasm sha_toml _tier _caps <&3; do
   [ -n "$id" ] || continue
   [[ $id =~ $ID_RE ]] || die "plugins/plugins.lock: id \"$id\" is not lowercase letters, digits and dashes"
   [[ $version =~ $VERSION_RE ]] || die "plugins/plugins.lock: $id: version \"$version\" is not MAJOR.MINOR.PATCH"
@@ -214,13 +219,19 @@ while IFS="$SEP" read -r id name _summary version repo sha_wasm sha_toml <&3; do
   lay_out_locked "$id" "$name" "$version" "$repo" "$sha_wasm" "$sha_toml" "$STAGE"
 done 3<<<"$LOCKED"
 
-# The test fixture. Its manifest is the one source of truth for its version
+# The test fixtures. A manifest is the one source of truth for its version
 # and API, so it must agree with the crate and the WIT rather than have them
 # injected: `version` equals the crate's (resolved) package version, and
-# `api` is the WIT package's MAJOR.MINOR that chimaera-plugin-api publishes.
-WIT="$ROOT/crates/chimaera-plugin-api/wit/chimaera.wit"
-API="$(sed -n 's/^package chimaera:plugin@\([0-9]*\.[0-9]*\)\..*/\1/p' "$WIT")"
-[ -n "$API" ] || die "no package version in $(rel "$WIT")"
+# `api` is the MAJOR.MINOR of a WIT package the host serves — the current
+# one (wit/, what chimaera-plugin-api publishes) or a frozen one it still
+# serves beside it (wit-0.1/, what plugins/api-0.1 publishes).
+APIS=" "
+for WIT in "$ROOT"/crates/chimaera-plugin-api/wit/chimaera.wit "$ROOT"/crates/chimaera-plugin-api/wit-*/chimaera.wit; do
+  [ -f "$WIT" ] || continue
+  one="$(sed -n 's/^package chimaera:plugin@\([0-9]*\.[0-9]*\)\..*/\1/p' "$WIT")"
+  [ -n "$one" ] || die "no package version in $(rel "$WIT")"
+  APIS="$APIS$one "
+done
 for manifest in "$PLUGINS"/*/plugin.toml; do
   dir="$(dirname "$manifest")"
   crate="$(basename "$dir")"
@@ -237,7 +248,10 @@ for manifest in "$PLUGINS"/*/plugin.toml; do
   if [ -z "$version" ] || [ "$version" != "$crate_version" ]; then
     die "$crate: plugin.toml version \"$version\" is not the crate's $crate_version"
   fi
-  [ "$api" = "$API" ] || die "$crate: plugin.toml api \"$api\" is not the WIT's $API"
+  case "$APIS" in
+    *" $api "*) ;;
+    *) die "$crate: plugin.toml api \"$api\" is not a WIT version the host serves:$APIS" ;;
+  esac
 done
 
 cargo +"$TOOLCHAIN" build --manifest-path "$PLUGINS/Cargo.toml" --target "$TARGET" --release

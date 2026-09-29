@@ -121,6 +121,17 @@ export interface SessionsTab {
   surface: "sessions";
 }
 /**
+ * A plugin's own screen: one of its `[[views]]` with `slot = "tab"`, drawn
+ * in the Chimaera format (`plugins/ui/PluginScreen.svelte`). Keyed by
+ * plugin and view, so opening it again focuses the existing tab. A plugin
+ * switched off here leaves the tab saying so (never a blank pane).
+ */
+export interface PluginViewTab {
+  surface: "plugin";
+  plugin: string;
+  view: string;
+}
+/**
  * A review of the files ONE session changed — a session-scoped changes list
  * built on the same git status/diff APIs as the source-control panel. Keyed by
  * session so re-opening focuses the existing tab; it reads the session's live
@@ -159,6 +170,7 @@ export type Tab =
   | TimelineTab
   | KnowledgeTab
   | PluginsTab
+  | PluginViewTab
   | SessionsTab
   | BrowserTab;
 
@@ -185,6 +197,8 @@ export function tabKey(t: Tab): string {
   if (t.surface === "timeline") return "v:timeline";
   if (t.surface === "knowledge") return "v:knowledge";
   if (t.surface === "plugins") return "v:plugins";
+  // `x:` (extension) — a plugin's view, its own namespace.
+  if (t.surface === "plugin") return `x:${t.plugin}/${t.view}`;
   if (t.surface === "sessions") return "v:sessions";
   if (t.surface === "changes") return `changes:${t.sessionId}`;
   // `w:` (web) — its own namespace beside the Finder's `d:` and diff's `g:`.
@@ -671,6 +685,11 @@ export function openKnowledge(l: Layout): Layout {
 /** Open (or focus) the Plugins tab. */
 export function openPlugins(l: Layout): Layout {
   return openTab(l, { surface: "plugins" });
+}
+
+/** Open (or focus) a plugin's tab view. */
+export function openPluginViewTab(l: Layout, plugin: string, view: string): Layout {
+  return openTab(l, { surface: "plugin", plugin, view });
 }
 
 /** Open (or focus) All sessions. */
@@ -1377,8 +1396,9 @@ export function moveFocus(l: Layout, dir: FocusDir): Layout {
 // --- (de)serialization ------------------------------------------------------
 
 /** Tab wire form: `{s}` terminal, `{f}` file, `{d,di}` finder (dir + instance
- *  id), `{gd,dm}` git diff (path + mode), `{cs}` session changes, `{v}` view
- *  (additive within blob v1; `v` is "settings" or "git"). */
+ *  id), `{gd,dm}` git diff (path + mode), `{cs}` session changes, `{pg,pgv}`
+ *  a plugin's view, `{v}` view (additive within blob v1; `v` is "settings" or
+ *  "git"). */
 type STab =
   | { s: string }
   | { f: string; pv?: 1 }
@@ -1387,6 +1407,7 @@ type STab =
   | { gd: string; dm?: string; gr?: string; go?: string; gp?: string; pv?: 1 }
   | { gx: string; xr?: string; xs?: string; xp?: string; xv?: string; xb?: string; xt?: string; pv?: 1 }
   | { cs: string }
+  | { pg: string; pgv: string }
   | { w: string; wo: number; wi: string; wp: string };
 
 /** Coerce a persisted diff mode, defaulting to unstaged. */
@@ -1449,6 +1470,7 @@ function serNode(node: LayoutNode): SNode {
         if (t.surface === "timeline") return { v: "timeline" };
         if (t.surface === "knowledge") return { v: "knowledge" };
         if (t.surface === "plugins") return { v: "plugins" };
+        if (t.surface === "plugin") return { pg: t.plugin, pgv: t.view };
         if (t.surface === "sessions") return { v: "sessions" };
         if (t.surface === "changes") return { cs: t.sessionId };
         if (t.surface === "browser") return { w: t.host, wo: t.port, wi: t.id, wp: t.path };
@@ -1537,6 +1559,13 @@ function deserNode(
         tab = { surface: "knowledge" };
       } else if (t.v === "plugins") {
         tab = { surface: "plugins" };
+      } else if (
+        typeof t.pg === "string" &&
+        /^[a-z0-9][a-z0-9-]{0,63}$/.test(t.pg) &&
+        typeof t.pgv === "string" &&
+        /^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$/.test(t.pgv)
+      ) {
+        tab = { surface: "plugin", plugin: t.pg, view: t.pgv };
       } else if (t.v === "sessions") {
         tab = { surface: "sessions" };
       } else if (typeof t.cs === "string" && t.cs.length > 0) {

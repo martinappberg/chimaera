@@ -90,6 +90,51 @@ async fn git_status_reads_a_real_repo() {
     assert_eq!(diff["binary"], false);
     assert_eq!(diff["a"], "one\n");
     assert_eq!(diff["b"], "two\n");
+
+    // Against a revision (a change-bar base, `rev:<ref>`): that commit's
+    // blob beside the working tree; a name git can't resolve, or one
+    // that could pass as an option, is refused.
+    git(&["commit", "-qam", "second"]);
+    std::fs::write(repo.join("tracked.txt"), "three\n").unwrap();
+    let diff_at = |rev: &str| {
+        let state = state.clone();
+        let uri = format!(
+            "/api/v1/git/diff?workspace_id={ws_id}&path={}&rev={}",
+            urlencode(&path.to_string_lossy()),
+            urlencode(rev)
+        );
+        async move { request(&state, Method::GET, &uri, None).await }
+    };
+    let (status, diff) = diff_at("HEAD~1").await;
+    assert_eq!(status, StatusCode::OK, "{diff}");
+    assert_eq!(diff["a"], "one\n");
+    assert_eq!(diff["b"], "three\n");
+    assert_eq!(diff["a_label"], "HEAD~1");
+    for bad in ["nope", "--output=/tmp/x", "HEAD:tracked.txt"] {
+        let (status, _) = diff_at(bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+
+    // The file's history, newest first: what a base picker offers.
+    let (status, log) = request(
+        &state,
+        Method::GET,
+        &format!(
+            "/api/v1/git/log?workspace_id={ws_id}&path={}",
+            urlencode(&path.to_string_lossy())
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{log}");
+    let subjects: Vec<&str> = log["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["subject"].as_str().unwrap())
+        .collect();
+    assert_eq!(subjects, ["second", "init"]);
+    assert_eq!(log["commits"][0]["sha"].as_str().unwrap().len(), 40);
 }
 
 /// A workspace opened AT A LINKED WORKTREE — how Chimaera itself is

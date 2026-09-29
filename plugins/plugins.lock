@@ -14,25 +14,58 @@
 # each repository's latest release hourly (SHA256SUMS against the downloaded
 # bytes; the manifest's id, version and [release] github against this file),
 # rewrites the entry — version, the two sha256s, and `name` / `summary` from
-# the release's plugin.toml — and opens a `fix:` PR with auto-merge, which
-# CI (these same releases, downloaded and installed) gates. Hand edits
-# follow the same rules; keep every value a one-line "string". To run a local build of a plugin against
-# the daemon: `chimaera plugin add --path <dir>` (see plugins/AGENTS.md).
+# the release's plugin.toml — and opens a `fix:` PR, which CI (these same
+# releases, downloaded and installed) gates. `tier` and `caps` are what the
+# maintainers approved the plugin to do (`chimaera plugin caps plugin.toml`
+# prints both): a sandboxed plugin keeps its badge on an update only while
+# its capability digest is this one, and a privileged plugin (one that runs
+# or downloads programs) is verified only at the pinned version. So the PR
+# auto-merges only when the release is sandboxed and asks for nothing new;
+# anything else waits for a person, who updates tier and caps. Hand edits
+# follow the same rules; keep every value a one-line "string". To run a
+# local build of a plugin against the daemon: `chimaera plugin add --path
+# <dir>` (see plugins/AGENTS.md).
 
 [[plugin]]
 id = "agent-notes"
 name = "Agent notes"
 summary = "Agents leave short notes for each other and for the Mastermind."
-version = "0.1.3"
+version = "0.1.4"
 repo = "martinappberg/chimaera-plugin-agent-notes"
-sha256_wasm = "a7c9d6c597466e22a378e63b730d6729e988aaa773c03c69b1306c17cb716b95"
-sha256_toml = "5b2927512aa9db161aa164d2032306b2cfddb404918bc7fb1e072c65316485ec"
+sha256_wasm = "0fc717d85b8f1f34072fdc8c9fc83216aa5ab5865ddc5b50588668fd75eba44c"
+sha256_toml = "d703772594a667a13525cb0230664b7f0fae9d1fc2f305012ec595c710972601"
+tier = "sandboxed"
+caps = "3cd49d8c51a08c4f20524e55ae610473c56978917dd3ff6bee0d5738a57ec456"
 
 [[plugin]]
 id = "mycelium"
 name = "Mycelium"
 summary = "Project memory your agents record as they work — findings, decisions, learnings."
-version = "0.2.0"
+version = "0.2.1"
 repo = "martinappberg/chimaera-plugin-mycelium"
-sha256_wasm = "bb7ec55a0da6b7a87b1e4605dd7bff51ef530b9a966390997f8b971ed1862b33"
-sha256_toml = "20c03da37e957cb4111b7d90ea5035e14b97bf8a028046dd9a2ab6dbc40edd86"
+sha256_wasm = "0e84277246d16243f312fb5b04df6c1db6d2d1412a0c4a5d84f14cda5ff45359"
+sha256_toml = "527acbd13057a58852ff74c9aba3965eace25db7290eb516d6610df761c0516a"
+tier = "sandboxed"
+caps = "4ac70a95ec5d441f9ca6a0164222e74ede596e176853d1751d80cdaf862b0ec5"
+
+[[plugin]]
+id = "latex"
+name = "LaTeX"
+summary = "Build .tex to PDF beside the source with latexmk, errors as editor marks, compile_latex for agents, and TeX Live on one click."
+version = "0.1.1"
+repo = "martinappberg/chimaera-plugin-latex"
+sha256_wasm = "8f83c41abf28d168542b904cd2f4cb8a4b42f8cc8a03136679601cf5c39f676b"
+sha256_toml = "6a4b832cc6af5e2f703a252a4203052a60212d485adbfd9fbdf94f9edd921828"
+tier = "privileged"
+caps = "39ded32b020795e0980da149e79b2c14c899fca2a764b5b85883dd755c1b3f0e"
+
+[[plugin]]
+id = "typst"
+name = "Typst"
+summary = "Build .typ to PDF beside the source, with errors as editor marks, compile_typst for agents, and Typst on one click."
+version = "0.1.0"
+repo = "martinappberg/chimaera-plugin-typst"
+sha256_wasm = "9a41ea42caa57ef7613d98f07749e3a89f7c5508d7bce87b774dfb967497c8e3"
+sha256_toml = "d79107af0955a755eaa01b8030abd274e5949104a54f3d00d94e4824a4a2d004"
+tier = "privileged"
+caps = "3030956b9321bdbfd2a11652164338a86d57b62ae83b04f1f3a6ce0a83130f07"

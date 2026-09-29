@@ -693,7 +693,7 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   download so it can play locally. A parked pane pauses its video (it doesn't resume by
   itself); audio keeps playing.
 - **Notebooks.** `.ipynb` opens read-only in `NotebookView.svelte`: code cells highlighted
-  (the editor's `--syn-*` palette, parsers from `@codemirror/language-data` via `highlight.ts`)
+  (the editor's `--syn-*` palette, parsers from `@codemirror/language-data` plus Typst, `previews/languages.ts`, via `highlight.ts`)
   beside their `[n]` execution counts; markdown cells through `marked` + DOMPurify with chat's
   profile (no `<style>`, web links in a new tab without an opener), math (`$…$`, `$$…$$`,
   `\(…\)`, `\[…\]`, `\begin{…}` blocks) typeset through the shared KaTeX policy only when a

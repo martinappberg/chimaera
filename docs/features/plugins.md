@@ -8,7 +8,9 @@ installed only through their own plugin managers). Beside them: the **Skills** s
 skill each agent can use here), in-app **codex hook trust**, and **Agent notes** — agents
 talking, itself a workbench plugin. **Browse** (searching the marketplaces the agents already
 have) renders disabled, "later". Design: the WASM host, versions and updates in
-[docs/plugin-system-plan.md](../plugin-system-plan.md); the seam, the tab and notes in
+[docs/plugin-system-plan.md](../plugin-system-plan.md); trust — what a plugin can do and who
+approved it — in [docs/plugin-platform-plan.md](../plugin-platform-plan.md) §1–§2 (its phase
+P6, [below](#trust-what-a-plugin-can-do-and-who-approved-it)); the seam, the tab and notes in
 [docs/timeline-knowledge-plugins-plan.md](../timeline-knowledge-plugins-plan.md) §6–§7. Writing a
 plugin: [docs/agent-guides/plugins.md](../agent-guides/plugins.md).
 
@@ -16,10 +18,13 @@ plugin: [docs/agent-guides/plugins.md](../agent-guides/plugins.md).
 manifest, the embedded lock, the catalog and its gates, detect, the workspace routes),
 `runtime.rs` (the wasmtime host), `hostfns.rs` (every host function, bounded), `tools.rs` (plugin
 MCP tools through the runtime), `installed.rs` (the installed directory; install, update,
-rollback, remove), `releases.rs` (the release checker) — plus `agent_probe.rs` and `notes.rs`;
+rollback, remove), `releases.rs` (the release checker), `capabilities.rs` (what a manifest can
+do: `[access]`, the atoms, the digest, the tier, the Can list), `trust.rs` (standing, trust
+records, admission, the admin policy, holds), `revoke.rs` (the kill switch), `activity.rs` (the
+activity log) — plus `agent_probe.rs` and `notes.rs`;
 the interface `crates/chimaera-plugin-api` (the WIT world and its Rust bindings,
 [map](../../crates/chimaera-plugin-api/AGENTS.md)); the first-party plugins in their own
-repositories, [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes) and [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium), whose releases
+repositories, [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes), [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium), [chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex) and [chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst), whose releases
 `plugins/plugins.lock` pins — the lock is all the daemon carries of them
 ([map](../../plugins/AGENTS.md)); the CLI `crates/chimaera/src/plugin.rs`; UI
 `web-ui/src/lib/plugins/` ([map](../../web-ui/src/lib/plugins/AGENTS.md)) — the `plugins`
@@ -31,12 +36,15 @@ sheet, hosted once in `web-ui/src/App.svelte`. Wire (all under `/api/v1`, bearer
 `POST /plugins/install {github, version?}` or `{path}` · `POST /plugins/{pid}/install` ·
 `POST /plugins/{pid}/update` · `POST /plugins/{pid}/rollback` · `POST /plugins/{pid}/check` ·
 `DELETE /plugins/{pid}` · `GET /plugins/{pid}/details` · `POST /plugins/preview {github}` ·
+`POST /plugins/{pid}/trust {caps}` or `{allow_block: true}` · `DELETE /plugins/{pid}/trust` ·
+`POST /plugins/{pid}/skip {version}` · `GET /plugins/{pid}/activity` ·
 `POST /workspaces/{id}/plugins/{pid}/install {agent, agent_plugin_id?}` ·
 `POST …/{pid}/setup {agent}` · `POST …/{pid}/trust-hooks {hooks:[{key,hash}]}` ·
 `GET /workspaces/{id}/agent-plugins?refresh=` · `GET /workspaces/{id}/skills?refresh=` ·
 `POST /workspaces/{id}/timeline/{seq}/deliver`; plugin tools ride the per-session MCP endpoint
 ([linked-terminals.md](linked-terminals.md#the-mcp-server)); a plugin's `emit` reaches
-`/ws/events` as a `{"type":"plugin","plugin":…,"workspace":…}` frame (no UI reads one yet).
+`/ws/events` as a `{"type":"plugin","plugin":…,"workspace":…}` frame, sent only to windows
+showing that workspace (no UI reads one yet).
 The additive `{"type":"agent_plugins","epoch":…}` frame invalidates agent reports after
 installation or hook trust and on reconnect; it carries no plugin payload.
 
@@ -187,8 +195,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     carrying plugin bytes: the lock is the curated list, and first-party plugins install from
     their releases like any plugin. Later: Browse renders disabled, "later"; the `switched-on` /
     `switched-off` events (declarable, never delivered); the UI-facing `query` route (the export
-    exists, no route calls it); the `exec` and `watch` host imports (WIT 0.2), which the LaTeX
-    and Typst plugins' `build` point waits for ([plan](../latex-reports-plan.md#the-plugin-shape)).
+    exists, no route calls it); screens, programs, side-program installs and trust by
+    capability (WIT 0.2), planned in the [plugin platform plan](../plugin-platform-plan.md),
+    with LaTeX and Typst as its first plugins ([plan](../latex-reports-plan.md)).
 
 ## The plugin host
 
@@ -459,6 +468,213 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     its id across versions; a first-party plugin's switch survives a remove and a reinstall
     (a third-party plugin's goes with it — see above).
 
+## Trust: what a plugin can do, and who approved it
+
+- **What & when.** Every plugin says what it can do in one list, derived by the daemon from its
+  manifest — the card's **Can** list, the trust prompt and what the host enforces are that same
+  list. A plugin the Chimaera maintainers verified installs with a click; anything else asks the
+  user to trust exactly that list first. An update that asks for more waits for the user, and
+  the version that runs keeps running meanwhile. Chimaera can block a bad build everywhere
+  (the kill switch), and a host's admin can allow only verified plugins. Shipped as the
+  platform plan's phase P6; nothing changed for Agent notes or Mycelium (both verified, both
+  asking for nothing new).
+- **How it's used.**
+  - **The Can list** is a row of every card's facts ("Can"), in plain words: "Reads files in this
+    workspace" · "Reads the Timeline and posts notes to it" · "Sees this workspace's sessions" ·
+    "Gives agents 2 tools: post_note · read_notes" · "Fills the Knowledge view" · "Offers an
+    agent-side plugin for claude: …" · "Has a setup prompt it sends to an agent you choose". A
+    plugin that runs programs ([below](#programs-and-tools-the-privileged-tier)) carries a "runs
+    programs" tag and its program lines in the warning tone.
+  - **The trust prompt** (`TrustDialog.svelte`) opens when the daemon refuses an install, an
+    update, Use previous, a switch or Trust with 409 and what the plugin can do: who asks and
+    from where ("github.com/owner/repo", "a local build in /dir"), for an update "It would also"
+    (what it asks beyond the version that runs), then everything it can do. **Trust and install**
+    / **Allow update** / **Trust it** send the same request again with the capability digest
+    shown; an update also offers **Skip this version** (not offered again). A plugin that runs
+    programs is confirmed by typing its name. `chimaera plugin add` and `update` print the same
+    list and ask on the terminal (`--trust` answers yes for scripts; without a terminal the
+    answer is no).
+  - **A card that can't run here** says why in a callout: "X waits for your trust …" with
+    **Review and trust**; "Chimaera turned X off: … You can switch it back on anyway." with
+    **Use anyway** (a soft block); "Chimaera blocked X: … Update or remove it." (a hard block,
+    no override); "Off on this host: this host only allows verified plugins." (the policy). Its
+    switch words read "waiting for your trust" or "off on this host".
+  - **The card's "…" menu** adds **Activity…** (the log, newest first: installs, updates, Use
+    previous, trust given and withdrawn, blocks, skips — kept after a Remove) and, for a
+    plugin the user trusted, **Withdraw trust…** (it goes off everywhere at once and stays
+    installed). CLI: `chimaera plugin trust|untrust|activity <id>`, and `chimaera plugin caps
+    <plugin.toml>` prints a manifest's tier, digest and Can list with no daemon.
+  - **Settings → Extensions → Unverified Plugins** (`plugins.allowUnverified`, on by default):
+    off, only verified plugins install and run on this host. An admin's
+    `/etc/chimaera/policy.json` (`{"plugins": {"allowUnverified", "allowPrivileged": "all" |
+    "verified" | "none", "blocked": [ids]}}`) can only tighten it; a file that doesn't parse
+    fails closed (no unverified and no program-running plugin) and the install form says so.
+- **Where it lives.** `plugins/capabilities.rs` (`Access`, `Caps`: the atoms, `digest`, `tier`,
+  `covers` / `beyond`, `lines`), `plugins/trust.rs` (`Guard` on `AppState` — trust records in
+  `<data dir>/plugins/trust.json`, the policy file, the revocations —; `standing`, `hold`,
+  `admit` / `after_admit`, `needs_trust`, the trust / untrust / skip routes), `plugins/revoke.rs`
+  (the lists, signature checks, `refresh` on the daily checker, `apply`), `plugins/activity.rs`
+  (`<data dir>/plugins/.activity/<id>.jsonl`), `hostfns.rs` (`[access]` on every call), the
+  lock's `tier` / `caps`, `plugins/revoked.json` + `plugins/revocation-keys.txt` (embedded) and
+  `scripts/revocations.mjs` (make a key, sign a list); UI `TrustDialog.svelte`,
+  `ActivityDialog.svelte`, `store.ts` (`TrustNeeded`, `trustChange`), `installCopy.ts`
+  (`holdWords`, `trustWords`, `activityWords`); tests `tests/plugin_trust.rs`.
+- **Key behaviors.**
+  - **Capabilities are atoms** (`["access","files","read"]`, `["agent-tool","post_note"]`, …);
+    the **digest** is the SHA-256 of the sorted atoms under `chimaera-caps/1`, so a kind added
+    later changes no digest of a plugin that doesn't use it. "Asks for more" is set difference;
+    "covered" is subset. A 0.1 manifest without `[access]` is read as exactly what 0.1 allowed
+    (files, the Timeline with notes, sessions); the host refuses each read a build's
+    `[access]` doesn't allow (a file read errors, `timeline-recent` answers nothing,
+    `timeline-append` errors, `sessions` answers nothing).
+  - **Standing.** *Verified*: the lock covers it — the pinned release byte for byte, or a
+    sandboxed first-party update whose digest is the lock's `caps` (the check badge follows
+    this, so a first-party update that grew loses the badge and is the user's to trust).
+    *Trusted*: a trust record for this id, source (`github:<repo>` or `path:<dir>`) and digest.
+    *Untrusted*: installed and off everywhere until trusted. Records cover a digest, not a
+    version: an update that asks for nothing new asks nothing. The first daemon with no
+    `trust.json` trusts every copy already installed (the user's own installs); one that
+    doesn't parse trusts nothing (fail closed) until the user trusts again. Remove forgets the
+    records (a later install is a new question) and the plugin's kept state.
+  - **Admission** (install, update, Use previous, local build): blocked → 422 before any
+    download; the policy → 403; verified, trusted, or asking for no more than the covered build
+    it replaces (a record is written, `how: "subset"`) → proceeds; the caller's `trust` equal to
+    the digest → proceeds (`how: "prompt"`); else 409 with `trust` (`id`, `name`, `version`,
+    `source`, `tier`, `caps`, `can`, `grown`, `from_version`, `confirm`). All of it before the
+    component is fetched. A local build asks once per id and digest (the rebuild loop asks
+    nothing).
+  - **Holds** — why a loaded plugin may not run here — are checked by `active`, so a held plugin
+    offers agents nothing: blocked (kill switch, or the policy's list), refused by the policy,
+    or untrusted. The card wire carries `standing`, `hold` (`{kind, level?, reason?}`) and
+    `skipped_version`; every entry carries `tier`, `caps` and `can`; `GET /plugins` and the
+    workspace list carry `policy`.
+  - **The kill switch.** `plugins/revoked.json` (entries: id, versions and/or `plugin.wasm`
+    sha256s — neither is every version —, `hard` or `soft`, a reason) is embedded in every
+    build; the live copy on the repository's main branch is fetched with the daily plugin
+    check and counts only with Ed25519 signatures (`revoked.sig`) from `threshold` of the keys
+    in `plugins/revocation-keys.txt` (none yet: until a maintainer adds one, only the embedded
+    list counts). Each list carries a `serial` raised with every change, and a host refuses a
+    list older than the one it holds, so an old signed list can't lift a later block. A list
+    that newly blocks a loaded build drops its instances and cancels its jobs at once and logs
+    a `blocked` entry; a soft block the user allowed (by the build's sha256) runs.
+  - **Lock bumps.** The lock records each first-party plugin's `tier` and `caps`; the
+    `plugin-lock` workflow auto-merges a bump only when the plugin is sandboxed and its release's
+    capability lines match the pinned release's — otherwise the PR waits for a maintainer, and
+    CI (which checks both against the release) stays red until they are set.
+
+## Plugin screens, files and settings (the 0.2 platform)
+
+- **What & when.** A plugin built for plugin API 0.2 can add to the app itself, not only to
+  agents: screens drawn in Chimaera's own format (a tab, a dashboard panel, a file's view, a
+  status chip, a section of its Extensions card), the kinds of files it opens (a `.tex` file
+  opens in the LaTeX plugin's view, **Text** always one click away), items in a file's bar
+  ("Export PDF"), published data core draws (problems in a file, a build's result), its own
+  settings in Settings → Plugins, a folder for what it makes, and state that survives a
+  restart. Shipped as the platform plan's phase P7; 0.1 plugins (Agent notes, Mycelium) run
+  unchanged beside it.
+- **How to use.** Switch the plugin on in a workspace. Its card gains **Open <view>** for each
+  tab it offers, its card sections, and **Settings**. A file it claims opens in its view; the
+  bar above has **Text** (and, when two plugins claim it, each one — the choice is remembered
+  per workspace), its status chips and file actions. Opening such a file where the plugin is
+  installed but off offers **Turn on** in that bar (**Not now** is remembered per workspace;
+  one waiting for trust is left to its card). The dashboard shows its panels after
+  Chimaera's own. Settings → **Plugins** lists every installed plugin's settings (host-wide or
+  per workspace), with what its output folder uses and **Clear**.
+- **Where it's wired.**
+  - **Daemon** (`crates/chimaera-server/src/plugins/`): `runtime.rs` binds both WIT worlds
+    (`v1`, `v2`) in one linker and picks by the manifest's `api`; `hostfns.rs` serves 0.1's
+    `host` through 0.2's and the new `platform` imports; `platform.rs` (the manifest tables,
+    their checks, the file patterns, the per-daemon `Platform`), `screens.rs` (the `ui/1`
+    check, render / action / file-action / query routes, invalidation at ≤ 4 a second),
+    `surfaces.rs` (`diagnostics/1`, `output/1`, `sourcemap/1`, `knowledge/1`, `references/1`), `output.rs`
+    (output folders under the cache dir, the 1 GiB quota, Save to workspace), `pdata.rs`
+    (durable state and setting values, capped JSON under `<data>/plugins/.data/`), `files.rs`
+    (file events from every write the daemon knows of via `git::mark_path_dirty`, the save
+    mark, per-file debounce, the watch sweep while a view is open, `settings-changed`).
+    `switched-on` / `switched-off` are delivered from the switch route. `GET /git/diff?rev=`
+    and `GET /git/log?path=` give the `diff` node its bases.
+  - **Routes** (bearer-authed): `GET /workspaces/{id}/plugins/{pid}/views/{view}`,
+    `POST …/views/{view}/actions`, `POST …/file-actions/{action}`, `GET …/query/{name}`,
+    `GET …/output`, `POST …/output/save`, `GET /workspaces/{id}/surfaces/{kind}/{version}`,
+    `GET`/`DELETE /plugins/{pid}/output`, `GET`/`PUT /plugins/{pid}/settings`. `/ws/events`
+    carries `view`, `surface` and `plugin` frames, each only to windows on that workspace.
+  - **UI** (`web-ui/src/lib/plugins/`): `platform.ts` (the wire, the pure matching, the
+    fetchers, the frame bus), `ui/UiNode.svelte` (every node), `ui/PluginScreen.svelte` (one
+    view: render, actions, built-in actions, re-render on `view` frames), `ui/PluginTab.svelte`
+    (the `plugin` tab kind, `layout.ts`), `ui/PluginFileGate.svelte` (inside `FileView`),
+    `PluginSettings.svelte` (the card and `settings/PluginsSettings.svelte`),
+    `dashboard/PluginPanels.svelte`, `editorMarks.ts` (a plugin's `diagnostics/1` as gutter marks
+    and underlines in the editor, errors and warnings only).
+- **Rules.**
+  - A screen is data: semantic props only (tone, size, icon names), so light, dark and the
+    brand hold; markdown goes through chat's sanitizer; links open outside; images and files
+    come from the workspace or the plugin's output folder only.
+  - A tree the daemon's check refuses (size, node count, a missing label or alt) is not drawn:
+    the view says so and lists each problem with its JSON path.
+  - A plugin never writes into the workspace itself: **Save to workspace** is the user's click.
+  - Nothing polls: a screen renders on open, on an action and on the plugin's `invalidate`; the
+    watch sweep runs only while one of its views was open in the last 10 minutes.
+  - Claiming a file kind is on the **Can** list, so a release that claims a new one asks again.
+  - The author's guide has every node, prop, surface and limit:
+    [docs/agent-guides/plugins.md](../agent-guides/plugins.md#the-platform-api-02).
+
+## Programs and tools (the privileged tier)
+
+- **What & when.** A 0.2 plugin may run programs on your computer (a LaTeX build, a
+  formatter) and download the ones it needs. It names each one in its manifest; nothing else
+  can run. The host runs them as **jobs** under fixed limits, and downloads a **tool** only
+  when you click Install. Shipped as the platform plan's phase P8; no first-party plugin uses it
+  yet (the LaTeX and Typst plugins will).
+- **How to use.** Such a plugin's card says **runs programs** and lists every program under
+  **Can** ("Runs latexmk"; a shell gets "Runs sh: this plugin can run any command on this
+  host"; a program that reaches the network says so: "tlmgr uses the network: CTAN mirrors"). Before install, **Downloads** says what its tools would fetch and from where ("TeX
+  Live 2026.09 · 152 MB from github.com"). Once installed, its **Tools** section shows each tool
+  with **Install**, **Update** (the plugin names a newer version) and **Remove**. A program you
+  already have wins over the plugin's copy unless the plugin offers a setting to prefer its own.
+- **Where it's wired.**
+  - **Daemon** (`crates/chimaera-server/src/plugins/`): `jobs.rs` (the queue, the limits, the
+    POSIX `sh` preamble that sets them, the captured login environment, process-group kills,
+    logs in the output folder, `job-finished`, the `job` frame, an agent tool's wait) and
+    `toolchain.rs` (the https download with its streamed sha256 and size cap, the safe
+    unpacker, setup steps, the `current` link, Install / Update / Remove); `platform.rs`
+    validates `[[programs]]` and `[[tools]]`; `capabilities.rs` makes them `program` and
+    `download` atoms (privileged); `runtime.rs` holds a tool call that answered `wait` and asks
+    `tool_resume`; switching the plugin off or a block cancels its jobs.
+  - **Routes** (bearer-authed): `GET /plugins/{pid}/tools`, `POST
+    /plugins/{pid}/tools/{tool}/install`, `DELETE /plugins/{pid}/tools/{tool}`, `GET` / `DELETE
+    /workspaces/{id}/jobs/{job}`. `/ws/events` carries `job` frames to that workspace's windows.
+  - **UI**: `PluginTools.svelte` (the Tools section, with a progress bar while one
+    installs), the card's Downloads line (`platform.ts`'s `downloadWords`), and a
+    screen's `install-tool` button (the same install, its progress at the top of the
+    screen).
+- **Rules.**
+  - **Only declared programs, by name.** No path to a binary, no shell between the plugin and
+    the program; a URL that moves (`/latest/`) doesn't validate.
+  - **Limits for every job:** 2 running on the host, 1 per plugin, 8 waiting; 60 s by default,
+    600 s at most, then the whole process group is stopped; 4 GiB of memory, 256 MiB per
+    written file, low CPU and I/O priority; stdout and stderr to 16 MiB logs in the output
+    folder, never in the daemon's memory; the host's own variables (`PATH`, `HOME`, `LD_*`, …)
+    can't be set.
+  - **A tool is checked before it counts:** https only, the declared size and sha256 while it
+    streams; unpacked into an empty folder that refuses `..`, absolute paths, hard links,
+    devices and links that leave it; nothing outside `~/.chimaera/tools/<plugin>/<tool>/`
+    changes (no PATH or rc edits). Two versions stay. Removing the plugin removes its tools.
+  - **Where tools go:** `~/.chimaera/tools/` unless Settings → Extensions → **Plugin Tools
+    Folder** (`plugins.toolsDir`, `~` and `$VARIABLES` expanded) names another — on a cluster
+    whose home is a small quota, `$SCRATCH` or a group folder. An install first checks the
+    folder has room for the download and about three times it unpacked, with 1 GB to spare,
+    and otherwise says so and points at the setting (a Sherlock home at 880 MB free would
+    otherwise have taken a 415 MB TeX Live). Tools already installed stay where they were.
+  - **The lock covers downloads too:** the lock pins the manifest and the manifest pins each
+    download's sha256, and the lock bump fetches every download and compares.
+  - **The honest limit:** a program can do whatever its arguments allow. That is why programs
+    make a plugin privileged and why its card names each one.
+  - A switched-on plugin is compiled in the background when the daemon starts, when
+    it is installed or updated, and when it is switched on, so opening a file never
+    waits on it.
+  - Every job and install is in the plugin's **Activity** log. The author's side:
+    [docs/agent-guides/plugins.md](../agent-guides/plugins.md#programs-jobs-and-tools).
+
 ## Agent plugins & the Skills view
 
 - **What & when.** "What can my agents do here?" — answered by asking each agent CLI, never by
@@ -575,3 +791,19 @@ The design's maintainer decisions (2026-09-25) are in the
 
 ### WASM plugins, versions & updates — why it exists
 _Intent for the WASM plugin system: pending capture._
+
+### The plugin platform: trust, screens, programs and tools, LaTeX and Typst — why it exists
+_Captured 2026-09-29 (from the maintainer, via capture-feature-intent)._
+
+- **Problem it solves:** "Just to become a platform and extendable, without missing chimaera's
+  core principles."
+- **How settled it is:** an addition to the core, not a core bet — "open to change". The
+  platform's shape (the `ui/1` format, the surfaces, the job limits, the trust prompt) is how it
+  works today.
+- **Do not change (or: open to change):** open to change, as long as it keeps chimaera's core
+  principles (the plan's [principles](../plugin-platform-plan.md#principles) are how it holds
+  them today).
+
+The design decisions of 2026-09-29 are recorded in the
+[plugin platform plan](../plugin-platform-plan.md#decisions-maintainer-2026-09-29) and the
+[LaTeX and Typst plan](../latex-reports-plan.md#decisions).

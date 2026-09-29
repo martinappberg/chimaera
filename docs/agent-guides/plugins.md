@@ -12,7 +12,10 @@ versions and updates) and
 The maps: the API crate [chimaera-plugin-api](../../crates/chimaera-plugin-api/AGENTS.md),
 the lock and the test fixture [plugins/](../../plugins/AGENTS.md). The first-party
 plugins, each its own repository and the worked examples here: [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes) and
-[chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium).
+[chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium) (API 0.1, sandboxed), and
+[chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex) and
+[chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst) (API 0.2, privileged: file
+views, programs, a downloaded tool, long agent tools).
 
 ## The rules that don't bend
 
@@ -30,8 +33,9 @@ plugins, each its own repository and the worked examples here: [chimaera-plugin-
   provides the six exports of the `plugin` interface (the `Plugin` trait
   gives each a default). Removing or changing an export, or a record a
   plugin returns, breaks every built plugin. A new host import does not: a
-  host may offer more than a component uses, so WIT 0.2 adds `exec` and
-  `watch` without breaking a 0.1 plugin.
+  host may offer more than a component uses, so the planned WIT 0.2 (jobs,
+  a watch set, screens: the [platform plan](../plugin-platform-plan.md)) adds
+  imports without breaking a 0.1 plugin.
 - **No host call in a native test.** Built natively (tests, clippy), every
   host import is a wit-bindgen stub that aborts the whole test binary. Keep
   pure logic in functions that take data (Agent notes' `src/notes.rs`) or
@@ -73,10 +77,13 @@ version = "0.1.1"               # the plugin's own, MAJOR.MINOR.PATCH; must equa
 summary = "Project memory your agents record as they work — findings, decisions, learnings."
 description = "Mycelium is the Arjun Raj lab's living-repository framework: …"   # optional: a few plain sentences
 homepage = "https://github.com/arjunrajlaboratory/mycelium"   # optional; the card's name links here
-api = "0.1"                     # the chimaera:plugin WIT version it targets (MAJOR.MINOR)
+api = "0.1"                     # the chimaera:plugin WIT version it targets (MAJOR.MINOR): "0.1" or "0.2"
 
 [detect]                        # workspace-relative; ANY present ⇒ detected
 any = [".living/INDEX.md", "MYCELIUM.md"]   # empty/omitted ⇒ always present (on = active)
+
+[access]                        # optional: what it reads through the host (below)
+timeline = "none"               # "none" | "read" | "notes"; files and sessions: "none" | "read"
 
 [requires]
 chimaera = ">=0.4.0"            # optional: a semver requirement on the daemon
@@ -121,14 +128,15 @@ What each part does, and what exists today:
 | `id`, `name`, `summary`, `homepage` | the card; `id` names a directory and a URL segment, so it is charset-gated (and `install` / `preview`, routes' own segments, are taken); the name links to `homepage` (an http(s) URL; opened in the system browser) | `plugins::validate`, `manifest_json` |
 | `description` | optional: a few plain sentences from the author — what the plugin is and why a person would switch it on — shown under the summary, clamped to two lines with "more"; blank is omitted (`description: null` on the wire) | `manifest_json` |
 | `version`, `api` | which build runs, and the WIT it needs; `api` is a gate | `plugins::gate`, `resolve` |
-| `detect.any` | footprint → "active here" (no path component may be a symlink) | `plugins::detect_blocking` |
+| `detect.any` | footprint → "active here" (no path component may be a symlink); each path relative, plain components only (no `..`, `.` or absolute path: refused at parse) | `plugins::validate`, `plugins::detect_blocking` |
+| `[access]` | what the plugin may read through the host: `files` (`read` / `none`), `timeline` (`none` / `read` / `notes` = read and post notes), `sessions` (`read` / `none`). A 0.1 manifest without it (or a key left out) keeps exactly what 0.1 allowed without saying: files, notes, sessions. The card lists it; `hostfns` refuses what it doesn't allow. Narrow it to what the plugin uses — a new version that asks for more asks the user again | `plugins::capabilities`, `hostfns` |
 | `requires.agent_plugins` | a genuine hard requirement (no plugin has one today): per-agent install state (asked of the agents), "Requires the <agent> plugin <id>" on the card for agents installed here, and an install button running the agent's own `plugin marketplace add` + `install`/`add` in a visible terminal; the attach sheet's step 1; codex hook trust | `agent_probe.rs`, `plugins::install_requirement` |
 | `recommends.agent_plugins` | the same shape and the same install route, attach-sheet step and hook trust, for an agent-side plugin that makes this one more useful to the agents the user runs but is never needed: the card's **Agent-side plugin** box, one row per agent installed here ("claude · installed 0.7.2", "codex · not installed [Install]") | `agent_probe.rs`, `plugins::install_requirement` |
 | `requires.summary`, `recommends.summary` | optional: one plain sentence saying what the agent-side plugin is for; the box and the attach sheet's step 1 say it above the agents' rows (`requires_summary` / `recommends_summary` on the wire; a plain fallback when absent) | `manifest_json` |
 | `requires.chimaera` | a gate: this daemon's version must match | `plugins::gate` |
 | `setup.prompt` | a new chat session of the user's chosen agent, sent this prompt | `plugins::setup_workspace` |
 | `provides.knowledge` | the plugin is the Knowledge provider; its `knowledge` export feeds the view and `GET /workspaces/{id}/knowledge` | `knowledge.rs`, `runtime::knowledge` |
-| `provides.mcp_tools` | tools served by the chimaera MCP where active, plus the `instructions` paragraph; pre-allowed at spawn. Unique names, 1–64 ASCII letters, digits, underscores, dots or dashes; built-in names are reserved | `plugins/tools.rs`, `runtime::offer` |
+| `provides.mcp_tools` | tools served by the chimaera MCP where active, plus the `instructions` paragraph; pre-allowed at spawn. Unique names, 1–64 ASCII letters, digits, underscores or dashes — no dots (codex pre-approves a tool by a dotted config key a dot would split); built-in names are reserved | `plugins/tools.rs`, `runtime::offer` |
 | `provides.events` | which `on-event` variants the host delivers (none by default); `hook` and `session-ended` are delivered, `switched-on` / `switched-off` are declarable but not delivered yet | `runtime::hook`, `runtime::session_ended` |
 | `provides.views` | parses and rides the wire; nothing renders it | none yet |
 | `[adds]` | the card's "For you: …" (`ui`) and "For agents: …" (`agents`) sentences | the UI |
@@ -143,6 +151,28 @@ write them for someone deciding whether to install.
 
 `settings` and `commands`, sketched in the earlier plan, are not manifest
 keys; the first plugin that needs one adds it with a test and a row here.
+
+### What it can do: the capabilities
+
+The daemon derives one list from the manifest — the plugin's **capabilities**
+([platform plan §1](../plugin-platform-plan.md#1-capabilities)): its
+`[access]`, each agent tool, the hook line (`events = ["hook"]`), being the
+Knowledge provider, each agent-side plugin it names (with its marketplace) and
+a setup prompt. That list is the card's **Can** row, what a trust prompt asks
+about, and (for `[access]`) what the host enforces. Its **digest** (the SHA-256
+of the sorted atoms) is what the lock records the maintainers approved and what
+a user's trust answer covers. Print both for your manifest, no daemon needed:
+
+```sh
+chimaera plugin caps plugin.toml          # tier, digest, the Can list
+chimaera plugin caps plugin.toml --json   # the atoms too
+```
+
+A release whose digest isn't covered asks the user before it installs or
+updates (the running version keeps running): so a new tool, a wider
+`[access]` or a new agent-side plugin is a question for your users, and a
+release that asks for nothing new is not. A local build (`--path`) asks once
+per id and digest, so the rebuild loop asks nothing.
 
 ## The crate
 
@@ -410,6 +440,12 @@ What the card shows is the daemon's, never the plugin's own claim:
   installs do not copy that marker, so a rebuilt copy cannot assert the badge.
 - **"local build"**: the copy was installed from a directory (`--path`;
   `local_path` on the wire).
+- **Can**: what it can do, in the daemon's words (`can` on the wire), for
+  every plugin, verified or not — and, when it can't run on this host, why
+  (`hold`: waiting for the user's trust, blocked by Chimaera, or the host's
+  policy). A first-party update keeps the badge only while its capability
+  digest is the one the lock recorded (`caps`); one that asks for more is the
+  user's to trust, and loses the badge.
 - **Nothing about checksums.** The safety mechanism is the daemon's: it
   checks every download against the release's `SHA256SUMS` (and a
   first-party one against the lock's two sha256s), keeps that file beside the
@@ -511,18 +547,264 @@ host:
   every installed version; a first-party plugin is then listed as available
   again.
 - **Changing the interface.** The WIT package version is the contract. Adding
-  a host import is a minor bump (0.2 adds `exec` and `watch`); changing or
+  a host import is a minor bump (0.2 is planned in the
+  [platform plan](../plugin-platform-plan.md#11-the-interface-wit-02)); changing or
   removing an export is a new major with a new world, served beside the old
   one for a transition. With any WIT change, bump the package version, the
   API crate's version with it, and the host's `plugins::API`, adding the new
   version to `plugins::SERVED_APIS` beside those it still serves.
 
-## The LaTeX plugin
+## The platform: API 0.2
 
-The LaTeX and Typst plugins are the first new plugins planned on this host.
-Their contribution point is `build` (files → a bounded, quiet child process
-on the host, diagnostics as editor marks, SyncTeX, a `compile_document` tool
-where on), designed in the
-[LaTeX and Typst plan](../latex-reports-plan.md#the-plugin-shape). It waits for
-WIT 0.2's `exec` import: running an engine is a host call, never something a
-plugin does itself.
+A plugin that says `api = "0.2"` gets the platform
+([plan](../plugin-platform-plan.md) §3–§9): screens in Chimaera's own format,
+file kinds and file actions, data surfaces core draws, file events, an output
+folder, declared settings and durable state. The host serves 0.1 beside it
+unchanged (its own bindings, `wit-0.1/`), so moving is a choice: bump the
+`chimaera-plugin-api` dependency and `api`, and **declare `[access]`** — in 0.2
+a key left out means none (0.1 implied files, the Timeline with notes, and
+sessions). Every new export has a default, so a 0.1 plugin compiles on 0.2
+unchanged. Programs, side-program downloads and long agent tools are in
+[their own section](#programs-jobs-and-tools); they make a plugin privileged.
+
+```toml
+api = "0.2"
+
+[access]
+files = "read"
+
+[provides]
+events = ["file-saved", "file-changed", "settings-changed", "switched-on", "switched-off"]
+
+[[views]]                  # a screen: slot tab | panel | file | status | card
+id = "document"
+title = "Document"         # required: every view has a name
+slot = "file"
+
+[[files]]                  # files matching `match` open in `view` (Text one click away)
+match = ["*.tex", "*.ltx"] # a pattern without `/` matches the name anywhere; `**` spans folders
+view = "document"          # must be a `slot = "file"` view
+label = "LaTeX"
+debounce_ms = 300          # how long a burst of changes settles (≤ 5000)
+
+[[actions]]                # a file toolbar item; its click calls on_action("", action, {"file"})
+match = ["*.md"]
+label = "Export PDF"
+action = "export-pdf"      # never a built-in action's name (below)
+
+[[settings]]               # drawn in Settings → Plugins and on the card
+key = "engine"
+type = "enum"              # bool | enum | string | number | path
+options = ["pdflatex", "xelatex"]
+default = "pdflatex"
+label = "Engine"
+scope = "workspace"        # workspace (default) | host
+```
+
+Claiming a file kind is on the card's **Can** list ("Opens *.tex files in its own
+view"), so a release that claims a new kind asks its users again.
+
+### The exports and imports
+
+`Plugin` gains `render(cx, view, args)` (the view's tree; `args` carries
+`file` for a file view, `width` `narrow`/`wide`, `slot`), `on_action(cx, view,
+action, payload)` (the new tree, or `None` to keep it) and `tool_resume` (a
+long agent tool's final answer, [below](#programs-jobs-and-tools)). `platform::`
+has what 0.2 adds:
+
+| Call | What |
+|---|---|
+| `output_read(cx, path, offset, cap)` · `output_list` · `output_write` · `output_remove` | the plugin's output folder for this workspace (`output:<path>`), outside the repository; reads ≤ 8 MiB a call from an offset, its own writes ≤ 8 MiB a file, 1 GiB per plugin (the oldest top-level entries go past it); never through a link |
+| `publish(cx, surface, key, &data)` · `unpublish` | a data surface (below); checked, kept, announced to this workspace's windows |
+| `invalidate(cx, view)` | windows showing the view render it again (≤ 4 a second; a burst is one) |
+| `watch(cx, &paths)` | up to 256 workspace paths heard as `file-changed`; swept every 5 s only while one of its views was rendered in the last 10 minutes |
+| `setting(cx, key)` | a declared setting: the user's value, else its default |
+| `state_keep(cx, key, &value)` | durable state, read back with `host::state_get`; within the same 64 KiB. `state_put` stays memory-only (and makes a kept key memory-only again) |
+| `roots(cx)` | the absolute workspace root and output folder (for arguments a program will need, and for mapping printed paths back) |
+| `job_start(cx, &spec)` · `job_status` · `job_cancel` | run a declared program as a job ([below](#programs-jobs-and-tools)) |
+| `tool_state(cx, tool)` | a declared tool: its version, whether (and which version) is installed here, what Install would download, `installing` and its `progress` (`{stage, done, total}`) while it installs |
+
+### Screens: `ui/1`
+
+A view's tree is `{"ui": "1", "root": <node>}`; a node is `{"type": …,
+props…, "children": […]}` (`chimaera_plugin_api::ui` has helpers). Props are
+semantic, never visual: `tone` is `neutral | accent | good | warn | bad`, `size`
+`small | large`, `gap` `small | large`. The daemon checks every tree before a
+window sees it (≤ 256 KiB, ≤ 5,000 nodes, ≤ 200 rows a list or table); a bad one
+is not drawn, and the view says so with each problem's JSON path (also in the
+daemon log).
+
+| Node | Props (required in bold) |
+|---|---|
+| `stack`, `row`, `grid`, `card` | `children`; `gap`; row `align` (`center`, `end`, `between`); grid `columns` (1–6); card `title` |
+| `split` | **`children`** (two); `ratio` (0.1–0.9) — stacked in a narrow window |
+| `tabs` | **`tabs`**: `[{title, children}]` |
+| `section` | **`title`**, `children`, `collapsed` |
+| `divider` | — |
+| `text` | **`text`**, `tone`, `size`, `emphasis`, `mono` |
+| `heading` | **`text`**, `level` (1–3) |
+| `markdown` | **`text`** (chat's renderer and its sanitizing) |
+| `code` | **`text`**, `language` |
+| `keyvalue` | **`items`**: `[{key, value, tone?}]` |
+| `badge` | **`text`**, `tone` |
+| `status` | **`text`**, `state` (`idle busy ok warn bad`: a spinner for busy, a check for ok), `detail` (muted, beside it) — one pill for a process's state, a build's |
+| `icon` | **`name`** (`check x alert info clock file folder play stop refresh download external grid list book bolt settings search`), `label`, `tone` |
+| `progress` | `value` (0–1; absent: indeterminate), `label` |
+| `empty` | **`title`**, `text`, `action` `{label, action, payload}` |
+| `callout` | **`text`**, `title`, `tone`, `actions` (buttons beside it: a notice with its fix) |
+| `list` | **`items`**: `[{title, subtitle?, badges?, actions?: [nodes], action?, payload?, file?, line?}]`; `more` `{query, args}` pages through `query` (it answers `{items, more?}`) |
+| `table` | **`columns`** `[{key, title, align?}]`, **`rows`** `[{<key>: text}]`; `more` as for a list (`{rows, more?}`) |
+| `file` | **`path`** (a workspace path or `output:<path>`), `label`, `line` — a card that opens it |
+| `link` | **`text`**; `href` (http/https, opens outside) or `file` + `line` |
+| `image` | **`src`**, **`alt`** |
+| `button` | **`label`**, **`action`**, `payload`, `tone`, `icon`, `disabled`, `title` (its tooltip) |
+| `toggle` | **`label`**, **`name`**, `value`, `action` (sends `{value}` beside the payload) |
+| `select` | **`label`**, **`name`**, **`options`** (`[{value, label}]` or strings), `value`, `action` |
+| `segmented` | **`name`**, **`options`** (`[{value, label, icon?, title?}]` or strings), `value`, `action` (sends `{value}` beside the payload), `label` — the app's own switch (Split · Source · PDF) |
+| `textfield` | **`label`**, **`name`**, `value`, `placeholder`, `multiline` |
+| `form` | **`action`**, `children` (its fields), `submit`; sends `{form: {name: value}}` beside the payload |
+| `editor` | **`path`** — the file in the app's own editor (saves, merges) |
+| `pdf` | **`src`** — the app's PDF viewer |
+| `log` | **`src`** — the app's viewer for that file (a `.log` streams from its tail) |
+| `diagnostics` | `file`; `key` (one of your surface keys only: a document's problems); `mine` (only yours); `quiet` (draws nothing while there is nothing to say); `compact` (a shorter list); `title` — the problems list from every active plugin's `diagnostics/1`: counts in its head, each row opens its place (**Go to**) with **Ask agent**, `info`/`hint` items (a LaTeX box) behind a "Show N layout notes" toggle |
+| `diff` | `before` + `after`, or `path` + `base` (`head`, `index`, `rev:<ref>`, `output:<path>`); `mode` `prose` (default: words within a changed line) or `code` |
+
+A node this chimaera doesn't know draws its `fallback` (a node, or `"drop"`),
+else a quiet "needs a newer chimaera" with its children. Actions a plugin names
+but never handles (the app carries them out): `open-file {file, line?}`,
+`open-view {view}`, `open-url {url}`, `copy {text}`, `save-to-workspace {from,
+to}` (the user's click copies an output file into the workspace; asks before
+replacing), `ask-agent {file?, line?, text}`, `install-tool {tool}` (the user's
+click installs one of your `[[tools]]`, as the card's Install does: a progress
+bar with its stage and megabytes sits at the top of your screen meanwhile, the
+view draws again at once — `tool_state` then says `installing` — and when it is
+done).
+
+Where a view draws: `tab` (its own tab: the card's **Open**, `open-view`, a file
+action's `open`), `panel` (the dashboard, after core's sections), `file` (a
+claimed file; the view owns the pane: the root stack's last child grows to its
+height, and an `editor` or `pdf` first in a split pane, a stack or a tab fills
+it — an embedded viewer shows no path bar), `status` (a chip in a claimed file's bar), `card` (inside its
+Extensions card). The UI renders only on open, on an action, and on
+`invalidate`; nothing polls.
+
+### Data surfaces
+
+Data core draws with its own views; `publish` checks the shape:
+
+| Surface | Shape |
+|---|---|
+| `diagnostics/1` | `{items: [{file, severity (error warning info hint), line (from 1), column?, end_line?, end_column?, message, context?, source?}]}`, ≤ 200 per file, ≤ 2,000 per key |
+| `output/1` | `{source, output, state (building ok errors failed), label?, finished_ms?, changed_pages?, log?}` |
+| `sourcemap/1` | `{output, files: [path], records: [[file, line, page, x, y, width, height]]}`, ≤ 4 MiB, kept in the output folder |
+| `knowledge/1` | the Knowledge snapshot (see the [coordination section](../plugin-platform-plan.md#coordination-the-knowledge-redesign-2026-09-29)), ≤ 4 MiB |
+| `references/1` | ids it answers for: `{shapes: [{kind, pattern}], ids: [{id, key, kind, title, span?: {path, line, end_line}, view?}]}` — 1–16 shapes, each a regex source of ≤ 80 bytes with no groups or anchors; ≤ 5,000 ids a key; ≤ 4 MiB, kept in the output folder. Every id with a `span` or a `view` becomes a chip where its shape matches in chats and Knowledge: hover previews the span, a click opens it (or the plugin's view). `end_line` 0 means to the end of the file |
+
+Paths are workspace-relative or `output:<path>`. A window asks
+`GET /workspaces/{id}/surfaces/{kind}/{version}?file=` and hears a `surface`
+frame when one changes.
+
+### Events
+
+`file-saved(path)` (the editor saved a file you claim), `file-changed(path)` (a
+claimed or watched file changed: an agent's write, a file operation, or the
+sweep), `settings-changed(key)`, `switched-on`, `switched-off` (on the instance
+it had, before it goes) — each only if declared in `provides.events`, and file
+events debounced per file. Declaring one of the 0.2 events needs `api = "0.2"`.
+
+### Programs, jobs and tools
+
+A plugin may run programs on the host, and download the ones it needs
+([plan](../plugin-platform-plan.md) §6, §8). Either makes it **privileged**: the
+card says "runs programs" and lists each one, a shell (`sh`, `bash`, `python`,
+`node`, `env`, …) gets "Runs sh: this plugin can run any command on this host",
+and a first-party privileged plugin is verified only at the lock's pin, since
+every release is reviewed.
+
+```toml
+[[programs]]               # only declared names run, by name, never a path
+name = "latexmk"
+version = ["-v"]           # the arguments that print its version
+
+[[programs]]
+name = "tlmgr"
+network = "CTAN mirrors (TeX Live packages)"   # what it reaches: said on the card, not enforced
+
+[[tools]]                  # a side program the host downloads on the user's click
+id = "tinytex"
+name = "TeX Live (TinyTeX)"
+version = "2026.09"
+programs = ["latexmk", "pdflatex"]   # each also a [[programs]] entry
+home = "https://github.com/rstudio/tinytex-releases"
+
+[[tools.artifacts]]        # one per platform: linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64
+platform = "linux-x86_64"
+url = "https://github.com/…/releases/download/v2026.09/TinyTeX-1.tar.xz"  # https, a fixed release
+sha256 = "…"               # required; checked while it streams
+size = 159_000_000         # the download stops past it (and past 2 GiB)
+unpack = "tar.xz"          # tar | tar.gz | tar.xz | zip | none (the file is the program, named after the tool's first program)
+bin = "TinyTeX/bin/x86_64-linux"     # where its programs are, inside the folder
+
+[[tools.setup]]            # run once after unpacking, as jobs; this tool's programs only
+program = "tlmgr"
+args = ["install", "latexmk"]
+
+[provides]
+events = ["job-finished"]
+```
+
+A URL that moves (`/latest/`, `/daily/`, `/nightly/`, `/main/`, …) doesn't
+validate: the manifest's sha256 must stay true.
+
+**A job** is `platform::job_start(cx, &json!({…}))` with `program` (declared),
+`args` (a list; there is no shell), `cwd` (a workspace path, or `output:` for
+the output folder), `env` (added variables, portable names in either case; never `PATH`,
+`HOME`, `SHELL`, `USER`, `LD_*`, `DYLD_*`, `CHIMAERA_*`), `stdin` (≤ 4 MiB,
+else closed), `wall_s` (60 by default, ≤ 600), `label` (the UI's words),
+`priority` (`user`, `agent`, `background`) and `prefer` (`"tool:<id>"`: this
+plugin's own copy even when the user has one; otherwise the user's copy on the
+PATH their terminals get, host and workspace prelude included, wins). It answers
+the job's id at once; the host runs it:
+
+| Limit | What |
+|---|---|
+| Queue | 2 jobs running daemon-wide, 1 per plugin, 8 waiting per plugin (a 9th is refused), by priority then age |
+| Time | `wall_s`, then SIGTERM to the whole process group and SIGKILL 5 s later |
+| Memory, CPU, files | `ulimit -v` 4 GiB, `-t` the wall time plus slack, `-f` 256 MiB per written file; `nice -n 10`, idle I/O where there is `ionice` |
+| Output | `output:.jobs/<id>/stdout.log` and `stderr.log`, 16 MiB each |
+| Switched off, blocked | its jobs are cancelled |
+
+`job_status(cx, id)` answers `{id, state (queued running done), program,
+from (`path`: the user's copy; `tool:<id>`: one of yours), label, exit, timed_out, cancelled, error, queued_ms, started_ms, finished_ms,
+duration_ms, stdout, stderr}` for this plugin's jobs in this workspace. When
+one ends the plugin hears `job-finished {id, exit, timed_out, duration_ms}`
+(with the 30 s budget, so it can digest a large output), and windows get a
+`job` frame.
+
+**A long agent tool** starts a job and answers `ToolResult::wait(job_id,
+"still building")`. The host holds the agent's call until the job ends (at most
+45 s) and calls `tool_resume(cx, name, job)` for the final answer; past that
+the agent gets the `text` given with `wait`, so say how to check back.
+
+**Tools** install only on the user's click (the card's **Tools** section:
+Install, Update, Remove; before install its **Downloads** line says what and
+from where). The host downloads over https, checks the size and sha256 while it
+streams, unpacks into an empty folder (refusing absolute paths, `..`, hard
+links, devices, links that leave the folder, and writes through a link; ≤ 4 GiB
+and 200,000 entries), runs the setup steps as jobs, and keeps
+`~/.chimaera/tools/<plugin>/<tool>/<version>/` behind a `current` link (two
+versions at most; the host setting `plugins.toolsDir` moves that root, and an
+install first checks for room: the download, about three times it unpacked,
+and 1 GB to spare). Nothing outside that folder changes: its `bin` joins only
+this plugin's jobs' PATH. Removing the plugin removes its tools.
+
+### Testing a 0.2 plugin
+
+`plugins/test-platform` uses every node, import and event once; the daemon's
+`tests/plugin_platform.rs` drives it through the routes (render, actions, file
+actions, query, settings, output, surfaces, file events, a restart).
+`plugins/test-privileged` does the same for programs and tools
+(`tests/plugin_jobs.rs`: a job and its event, the limits, the queue, a tool
+served by a local fake host, a wrong checksum, a waiting agent tool). Copy
+their shape: pure logic in functions that take data, the host calls in the
+daemon's tests.

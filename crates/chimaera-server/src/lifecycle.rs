@@ -195,6 +195,9 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // live chat agents cleanly so their own teardown stops their background
     // work (see `chat::stop_all_for_exit`); they resurrect from the ledger.
     crate::chat::stop_all_for_exit(&state).await;
+    // Plugins' programs end with the daemon, their whole process groups (a
+    // build is started again on the next save; nothing resumes it).
+    state.plugin_platform.jobs.kill_all();
 
     if let Err(err) = chimaera_core::Handoff::new(port, state.token.clone()).write() {
         tracing::warn!(%err, "failed to write restart handoff");

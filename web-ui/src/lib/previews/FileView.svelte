@@ -23,6 +23,7 @@
   import BinaryView from "./BinaryView.svelte";
   import RawTextView from "./RawTextView.svelte";
   import Spinner from "./Spinner.svelte";
+  import PluginFileGate from "../plugins/ui/PluginFileGate.svelte";
 
   interface Props {
     path: string;
@@ -30,9 +31,15 @@
     wsRoot?: string | null;
     /** Per-pane text-size override (px); markdown preview scales to it. */
     fontSize?: number;
+    /** Let active plugins claim the file (false inside a plugin's own
+     *  screen, which shows the file itself). */
+    plugins?: boolean;
+    /** Show where an out-of-workspace file lives (off inside a plugin's
+     *  screen, which names what it shows). */
+    pathBar?: boolean;
   }
 
-  let { path, wsRoot = null, fontSize = undefined }: Props = $props();
+  let { path, wsRoot = null, fontSize = undefined, plugins = true, pathBar = true }: Props = $props();
 
   const kind = $derived(viewKindFor(path));
 
@@ -305,9 +312,10 @@
   {/if}
 {/snippet}
 
+{#snippet fileBody()}
 {#key path}
   <div class="file-view">
-    {#if external}
+    {#if external && pathBar}
       <!-- Full path for an out-of-workspace file: where is this coming from? -->
       <div class="ext-path" title={path}>
         <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -454,8 +462,23 @@
     </div>
   </div>
 {/key}
+{/snippet}
+
+{#if plugins}
+  <!-- A file an active plugin claims opens in its view (Text one click
+       away); its file actions and status chips ride a bar above. -->
+  <div class="file-gate">
+    <PluginFileGate {path} {wsRoot}>{@render fileBody()}</PluginFileGate>
+  </div>
+{:else}
+  {@render fileBody()}
+{/if}
 
 <style>
+  .file-gate {
+    position: absolute;
+    inset: 0;
+  }
   .file-view {
     position: absolute;
     inset: 0;

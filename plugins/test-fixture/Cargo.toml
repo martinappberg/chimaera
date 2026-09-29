@@ -13,7 +13,9 @@ publish.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-chimaera-plugin-api.workspace = true
+# The 0.1 API (frozen): this fixture is the host's proof that a 0.1 plugin
+# still loads beside 0.2 ones (test-platform is the 0.2 fixture).
+chimaera-plugin-api = { package = "chimaera-plugin-api-v0-1", path = "../api-0.1" }
 
 [features]
 # The fixture's "next release" for the daemon's update tests: one more tool

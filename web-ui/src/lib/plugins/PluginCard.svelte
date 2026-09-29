@@ -12,8 +12,15 @@
    *  - what it adds ("For you", "For agents") and what it found here;
    *  - the agent-side plugin box (requirementsModel.ts), only for agents
    *    installed on this host, each row one state and at most one action;
-   *  - an update, a fault (with Reinstall when that mends it), then one
+   *  - what it can do ("Can": the daemon's words for its capabilities, the
+   *    same list the trust prompt shows);
+   *  - an update, a fault (with Reinstall when that mends it), a hold (why
+   *    it can't run on this host: waiting for trust, blocked, the policy —
+   *    with Review and trust, or Use anyway for a soft block), then one
    *    outcome line and the quiet "checked …" after a check.
+   * An install, update, switch or Use previous the daemon answers with a
+   * trust prompt (`TrustNeeded`) opens `TrustDialog`; confirming repeats it
+   * with the capability digest shown.
    * A plugin not installed yet is the head and its summary, and the whole
    * top of the card is one button (a chevron beside the summary shows it)
    * that opens it in place: the same body, from what its release says
@@ -27,19 +34,28 @@
    * Versions and verification come from the daemon; agent state from the
    * agents.
    */
+  import ConfirmDialog from "../shared/ConfirmDialog.svelte";
   import Switch from "../shared/Switch.svelte";
+  import ActivityDialog from "./ActivityDialog.svelte";
+  import TrustDialog from "./TrustDialog.svelte";
+  import PluginSettings from "./PluginSettings.svelte";
+  import PluginTools from "./PluginTools.svelte";
+  import PluginScreen from "./ui/PluginScreen.svelte";
+  import { downloadWords, openPluginView } from "./platform";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
   import { isWebUrl, openInSystemBrowser } from "../shared/urlOpen";
   import {
     canReinstall,
     checkedWords,
     hereLine,
+    holdWords,
     installedOutcome,
     installLine,
     installTitle,
     repoUrl,
     stateWords,
     tileLetters,
+    trustAskFor,
     updatedOutcome,
     type Outcome,
   } from "./installCopy";
@@ -57,12 +73,16 @@
     pluginDetails,
     setWorkspacePluginOn,
     toggleExpanded,
+    TrustNeeded,
+    trustChange,
     type AgentId,
     type AgentPlugins,
     type PluginChange,
     type PluginDetails,
     type PluginUpdate,
+    type TrustAsk,
     type WorkspacePlugin,
+    workspacePlugins,
   } from "./store";
 
   interface Props {
@@ -83,7 +103,7 @@
     removing?: boolean;
     /** A release previewed from the repository form (`plugin` is what it
      *  described): its own Install, and closing it. */
-    preview?: { install: () => Promise<PluginChange>; close: () => void } | null;
+    preview?: { install: (trust?: string) => Promise<PluginChange>; close: () => void } | null;
   }
 
   let {
@@ -114,12 +134,30 @@
   let descOpen = $state(false);
   let overflowing = $state(false);
   let moreBtn = $state<HTMLButtonElement | null>(null);
+  /** An open trust prompt: what it asks, and what confirming does with the
+   *  digest shown (and, for an update that asks for more, Skip). */
+  let asking = $state<{
+    ask: TrustAsk;
+    mode: "install" | "update" | "trust";
+    retry: (caps: string) => Promise<void>;
+    skip: (() => Promise<void>) | null;
+  } | null>(null);
+  let askBusy = $state(false);
+  let askError = $state<string | null>(null);
+  let showActivity = $state(false);
+  let untrusting = $state(false);
+  let untrustBusy = $state(false);
+  let untrustError = $state<string | null>(null);
 
   const previewing = $derived(preview !== null);
   const available = $derived(p.source === "available");
   /** An available card in the list (not a preview): it opens in place. */
   const opens = $derived(available && !previewing);
   const open = $derived(previewing || (opens && $expandedPlugins.has(p.id)));
+  /** An installed card folds too: its head and summary, the rest behind the
+   *  chevron (opened by id, so a card opened before its install stays open). */
+  const folds = $derived(!available && !previewing);
+  const unfolded = $derived(folds && $expandedPlugins.has(p.id));
   const fetched = $derived(opens ? $pluginDetails.get(detailsKey(p.id, p.version)) : undefined);
   /** What the body describes: an installed card its own entry, a preview
    *  what its release said, an opened card its fetched details (null while
@@ -165,7 +203,17 @@
   /** A plugin that can't run here: the switch can't turn it on (the daemon
    *  refuses) until the fault is gone. A fault while on is the plugin
    *  failing in this workspace, which switching off and on clears. */
-  const blocked = $derived(p.fault !== null && !p.on);
+  const blocked = $derived((p.fault !== null && !p.on) || (p.hold !== null && p.hold.kind !== "untrusted"));
+  const hold = $derived(holdWords(p));
+  /** What a folded installed card still shows (`attentionLines`): an
+   *  update, a fault, a hold, or a status line. */
+  const attention = $derived.by(() => {
+    const callout = (p.installed && p.update !== null) || p.fault !== null || hold !== null;
+    const doing = working !== null && working !== "install" && working !== "update" && working !== "reinstall";
+    const said = error !== null || continuation !== null || note !== null;
+    const checkedNow = checked !== undefined && working !== "check";
+    return callout || doing || said || checkedNow;
+  });
 
   const WORKING: Record<Change, string> = {
     install: "installing…",
@@ -179,15 +227,80 @@
     return e instanceof Error ? e.message : String(e);
   }
 
+  /** Open the trust prompt the daemon answered with. */
+  function ask(
+    t: TrustAsk,
+    mode: "install" | "update" | "trust",
+    retry: (caps: string) => Promise<void>,
+    skip: (() => Promise<void>) | null = null,
+  ): void {
+    askError = null;
+    asking = { ask: t, mode, retry, skip };
+  }
+
+  /** Confirm: the same change again, with the digest shown. Asked again
+   *  (the plugin changed meanwhile) keeps the dialog open on the new list. */
+  async function answer(run: (() => Promise<void>) | null = null): Promise<void> {
+    if (asking === null || askBusy) return;
+    const current = asking;
+    askBusy = true;
+    askError = null;
+    try {
+      await (run ?? (() => current.retry(current.ask.caps)))();
+      asking = null;
+    } catch (e) {
+      if (e instanceof TrustNeeded) asking = { ...current, ask: e.ask };
+      askError = message(e);
+    } finally {
+      askBusy = false;
+    }
+  }
+
   async function toggle(on: boolean): Promise<void> {
     switching = true;
     error = null;
     try {
       await setWorkspacePluginOn(p.id, on);
     } catch (e) {
-      error = message(e);
+      if (e instanceof TrustNeeded) {
+        ask(e.ask, "trust", async (caps) => {
+          await trustChange("trust", p.id, caps);
+          await setWorkspacePluginOn(p.id, true);
+        });
+      } else {
+        error = message(e);
+      }
     } finally {
       switching = false;
+    }
+  }
+
+  /** The card's own "Review and trust" for a build waiting for trust. */
+  function openTrust(): void {
+    ask(trustAskFor(p), "trust", (caps) => trustChange("trust", p.id, caps));
+  }
+
+  /** Use anyway: a build the kill switch turned off (a soft block). */
+  async function allowAnyway(): Promise<void> {
+    error = null;
+    try {
+      await trustChange("allow-block", p.id);
+    } catch (e) {
+      error = message(e);
+    }
+  }
+
+  async function withdrawTrust(): Promise<void> {
+    if (untrustBusy) return;
+    untrustBusy = true;
+    untrustError = null;
+    try {
+      await trustChange("untrust", p.id);
+      untrusting = false;
+    } catch (e) {
+      untrustError = message(e);
+    } finally {
+      untrustBusy = false;
     }
   }
 
@@ -200,24 +313,36 @@
     return updatedOutcome(c);
   }
 
+  function run(kind: Change, trust?: string): Promise<PluginChange | { update: PluginUpdate | null }> {
+    if (kind === "install") return preview !== null ? preview.install(trust) : installFirstPartyPlugin(p.id);
+    if (kind === "reinstall") return installWorkbenchPlugin(p.repo ?? "", p.version, trust);
+    return changeWorkbenchPlugin(kind, p.id, trust);
+  }
+
   async function change(kind: Change): Promise<void> {
     if (working !== null) return;
     working = kind;
     error = null;
     note = null;
     try {
-      const res =
-        kind === "install"
-          ? await (preview !== null ? preview.install() : installFirstPartyPlugin(p.id))
-          : kind === "reinstall"
-            ? await installWorkbenchPlugin(p.repo ?? "", p.version)
-            : await changeWorkbenchPlugin(kind, p.id);
-      note = outcome(kind, res);
+      note = outcome(kind, await run(kind));
     } catch (e) {
-      error =
-        (kind === "install" || kind === "reinstall") && isMissingRoute(e)
-          ? "this daemon can't install plugins yet — update chimaera"
-          : message(e);
+      if (e instanceof TrustNeeded) {
+        const t = e.ask;
+        ask(
+          t,
+          kind === "install" || kind === "reinstall" ? "install" : kind === "update" || kind === "rollback" ? "update" : "trust",
+          async (caps) => {
+            note = outcome(kind, await run(kind, caps));
+          },
+          kind === "update" ? () => trustChange("skip", p.id, t.version) : null,
+        );
+      } else {
+        error =
+          (kind === "install" || kind === "reinstall") && isMissingRoute(e)
+            ? "this daemon can't install plugins yet — update chimaera"
+            : message(e);
+      }
     } finally {
       working = null;
     }
@@ -258,7 +383,21 @@
     const repo = repoUrl(p);
     if (repo !== null) items.push({ label: "Open on GitHub", onSelect: () => openInSystemBrowser(repo) });
     if (p.installed) {
+      items.push({ label: "Activity…", onSelect: () => (showActivity = true) });
+    }
+    if (p.installed) {
       if (items.length > 0) items.push("separator");
+      if (p.standing === "trusted") {
+        items.push({
+          label: "Withdraw trust…",
+          disabled: busy,
+          hint,
+          onSelect: () => {
+            untrustError = null;
+            untrusting = true;
+          },
+        });
+      }
       items.push({ label: "Remove…", danger: true, disabled: busy, hint, onSelect: () => onRemove(p) });
     }
     return items;
@@ -291,7 +430,7 @@
 
 {#snippet head()}
   <header class="head">
-    <span class="tile" class:on={p.active} aria-hidden="true">{tileLetters(p.id)}</span>
+    <span class="tile" class:on={p.active} aria-hidden="true">{tileLetters(p.name || p.id)}</span>
     <div class="ident">
       <h3 class="name" id="pc-{p.id}{previewing ? '-preview' : ''}">
         {#if home !== null}
@@ -325,6 +464,9 @@
       {/if}
       {#if p.local_path !== null}
         <span class="tag" title="Installed from {p.local_path}">local build</span>
+      {/if}
+      {#if p.tier === "privileged"}
+        <span class="tag warn" title="It can start programs on this host; its card lists which">runs programs</span>
       {/if}
     </div>
     {#if previewing}
@@ -377,8 +519,43 @@
 {/snippet}
 
 <!-- What it adds and what it found here: the same list on every card. -->
+<!-- What a 0.2 plugin adds to its card: its tab views to open, its card
+     sections (`slot = "card"`), and its settings. -->
+{#snippet platformBlock()}
+  {@const tabs = p.installed ? p.platform.views.filter((v) => v.slot === "tab") : []}
+  {@const cards = p.installed && p.active ? p.platform.views.filter((v) => v.slot === "card") : []}
+  {#if p.active && wsId !== null && tabs.length > 0}
+    <div class="opens">
+      {#each tabs as v (v.id)}
+        <button class="opt small" onclick={() => openPluginView(p.id, v.id)}>Open {v.title}</button>
+      {/each}
+    </div>
+  {/if}
+  {#if wsId !== null}
+    {#each cards as v (v.id)}
+      <div class="card-section" aria-label={v.title}>
+        <PluginScreen ws={wsId} wsRoot={$workspacePlugins?.root ?? null} plugin={p.id} view={v.id} compact />
+      </div>
+    {/each}
+  {/if}
+  {#if p.installed && p.platform.tools.length > 0}
+    <!-- The side programs it downloads (§8): Install / Update / Remove. -->
+    <div class="card-tools">
+      <h4>Tools</h4>
+      <PluginTools plugin={p.id} name={p.name} canInstall={p.fault === null && p.hold === null} />
+    </div>
+  {/if}
+  {#if p.installed && p.platform.settings.length > 0}
+    <details class="card-settings">
+      <summary>Settings</summary>
+      <PluginSettings plugin={p.id} name={p.name} {wsId} />
+    </details>
+  {/if}
+{/snippet}
+
 {#snippet facts(x: WorkspacePlugin, found: ReturnType<typeof hereLine>)}
-  {#if x.adds.ui.length > 0 || x.adds.agents.length > 0 || found !== null}
+  {@const downloads = x.installed ? [] : x.platform.tools}
+  {#if x.adds.ui.length > 0 || x.adds.agents.length > 0 || x.can.length > 0 || downloads.length > 0 || found !== null}
     <dl class="facts">
       {#if x.adds.ui.length > 0}
         <dt>For you</dt>
@@ -387,6 +564,20 @@
       {#if x.adds.agents.length > 0}
         <dt>For agents</dt>
         <dd>{#each x.adds.agents as line, i (i)}<span>{line}</span>{/each}</dd>
+      {/if}
+      {#if x.can.length > 0}
+        <!-- The daemon's own words for what it can do: the trust prompt's list. -->
+        <dt>Can</dt>
+        <dd>{#each x.can as line, i (i)}<span class:priv={line.privileged}>{line.text}</span>{/each}</dd>
+      {/if}
+      {#if downloads.length > 0}
+        <!-- What its Tools section would download, once installed. -->
+        <dt>Downloads</dt>
+        <dd>
+          {#each downloads as t (t.id)}<span title="Only when you click Install on its Tools section; checked against the sha256 its release names"
+              >{downloadWords(t)}</span
+            >{/each}
+        </dd>
       {/if}
       {#if found !== null}
         <dt>Here</dt>
@@ -468,6 +659,25 @@
         >
           {working === "reinstall" ? "Reinstalling…" : "Reinstall"}
         </button>
+      {/if}
+    </div>
+  {/if}
+{/snippet}
+
+{#snippet holdCallout()}
+  {#if hold !== null}
+    <!-- Waiting for trust, or a soft block, is a question for the user (the
+         update callout's tone); a hard block or the policy is a fault. -->
+    <div class="callout" class:update={hold.action !== null} class:fault={hold.action === null} role="note">
+      <span class="ctext">{hold.text}</span>
+      {#if hold.action === "trust"}
+        <button class="opt primary small" disabled={busy} title="See what it can do, then trust it" onclick={openTrust}
+          >Review and trust</button
+        >
+      {:else if hold.action === "allow"}
+        <button class="opt small" disabled={busy} title="Switch it back on, despite why it was turned off" onclick={() => void allowAnyway()}
+          >Use anyway</button
+        >
       {/if}
     </div>
   {/if}
@@ -558,31 +768,64 @@
     {:else if error !== null || note !== null}
       <div class="body">{@render statusLines()}</div>
     {/if}
+  {:else if folds}
+    <!-- Folded like an available card: the chevron opens what it adds, can
+         do, its tools and settings; what needs the user (an update, a
+         fault, a hold, a status line) shows either way. -->
+    <div class="top" class:open={unfolded} class:follows={unfolded || attention}>
+      {@render head()}
+      <div class="lead">
+        <p class="summary">{p.summary}</p>
+        <button
+          class="expander"
+          aria-expanded={unfolded}
+          aria-controls="pc-more-{p.id}"
+          aria-label="More about {p.name}"
+          title={unfolded ? "Show less" : "What it adds, what it can do, its tools and settings"}
+          onclick={() => toggleExpanded(p.id, p.version, false)}
+        >
+          <svg class="chev" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+            <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+      </div>
+    </div>
+    {#if unfolded || attention}
+      <div class="body" class:tight={unfolded && p.description !== null} id="pc-more-{p.id}">
+        {#if unfolded}
+          {#if p.description !== null}
+            <div class="prose">
+              <p class="desc" class:clamped={!descOpen} use:clampWatch>{p.description}</p>
+              {#if overflowing}
+                <button class="toggle-more" aria-expanded={descOpen} onclick={() => (descOpen = !descOpen)}>
+                  {descOpen ? "less" : "more"}
+                </button>
+              {/if}
+            </div>
+          {/if}
+          {@render facts(p, here)}
+          {@render sides(true)}
+          {@render platformBlock()}
+        {/if}
+        {@render attentionLines()}
+      </div>
+    {/if}
   {:else}
     {@render head()}
     <div class="body">
       <div class="prose">
         <p class="summary">{p.summary}</p>
         {#if p.description !== null}
-          {#if previewing}
-            <p class="desc">{p.description}</p>
-          {:else}
-            <p class="desc" class:clamped={!descOpen} use:clampWatch>{p.description}</p>
-            {#if overflowing}
-              <button class="toggle-more" aria-expanded={descOpen} onclick={() => (descOpen = !descOpen)}>
-                {descOpen ? "less" : "more"}
-              </button>
-            {/if}
-          {/if}
+          <p class="desc">{p.description}</p>
         {/if}
       </div>
+      {@render beforeInstall(p)}
+      {@render statusLines()}
+    </div>
+  {/if}
+</article>
 
-      {#if previewing}
-        {@render beforeInstall(p)}
-      {:else}
-        {@render facts(p, here)}
-        {@render sides(true)}
-
+{#snippet attentionLines()}
         {#if p.installed && p.update !== null}
           {@const u = p.update}
           <div class="callout update">
@@ -602,12 +845,42 @@
         {/if}
 
         {@render faultCallout(p, true)}
-      {/if}
+        {@render holdCallout()}
+        {@render statusLines()}
+{/snippet}
 
-      {@render statusLines()}
-    </div>
-  {/if}
-</article>
+{#if asking !== null}
+  {@const a = asking}
+  <TrustDialog
+    ask={a.ask}
+    mode={a.mode}
+    busy={askBusy}
+    error={askError}
+    onConfirm={() => void answer()}
+    onCancel={() => {
+      if (!askBusy) asking = null;
+    }}
+    onSkip={a.skip === null ? null : () => void answer(a.skip)}
+  />
+{/if}
+
+{#if showActivity}
+  <ActivityDialog pluginId={p.id} name={p.name} onClose={() => (showActivity = false)} />
+{/if}
+
+{#if untrusting}
+  <ConfirmDialog
+    title="Withdraw your trust in {p.name}?"
+    body="It goes off in every workspace at once, and stays installed. Trusting it again brings it back."
+    confirmLabel={untrustBusy ? "Withdrawing…" : "Withdraw trust"}
+    danger
+    error={untrustError}
+    onConfirm={() => void withdrawTrust()}
+    onCancel={() => {
+      if (!untrustBusy) untrusting = false;
+    }}
+  />
+{/if}
 
 <style>
   /* Its layout follows the view's width (PluginsView's scroller is the
@@ -708,6 +981,14 @@
     border-radius: 999px;
     padding: 0 7px;
     white-space: nowrap;
+  }
+  .tag.warn {
+    color: var(--warn);
+    border-color: color-mix(in srgb, var(--warn) 45%, var(--edge));
+  }
+  /* A Can line only a plugin that runs programs has. */
+  .facts dd .priv {
+    color: var(--warn);
   }
   .state {
     grid-area: state;
@@ -813,6 +1094,41 @@
 
   /* What it adds and what it found: labels in the muted label style, the
      values in body text, one column line for all three. */
+  /* --- a 0.2 plugin's own additions -------------------------------------- */
+  .opens {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .card-section {
+    border-top: 1px solid var(--edge);
+    padding-top: 12px;
+  }
+  .card-tools {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 12px;
+    border-top: 1px solid var(--edge);
+  }
+  .card-tools > h4 {
+    margin: 0;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
+  }
+  .card-settings > summary {
+    cursor: pointer;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
+    padding-top: 12px;
+    border-top: 1px solid var(--edge);
+  }
   .facts {
     display: grid;
     grid-template-columns: max-content minmax(0, 1fr);
