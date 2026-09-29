@@ -2556,7 +2556,7 @@
       return;
     }
     if (pickerOpen) return;
-    if (homeSettingsOpen && e.key === "Escape") {
+    if (homeSettingsOpen && e.key === "Escape" && !escapeBelongsElsewhere(e.target)) {
       intercept();
       homeSettingsOpen = false;
       return;
@@ -2694,6 +2694,23 @@
     if (t.classList.contains("xterm-helper-textarea")) return false;
     if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement) return true;
     return t.isContentEditable || t.closest(".cm-content") !== null;
+  }
+
+  /**
+   * Escape on the Home settings/Pro surface closes it only when nothing closer
+   * owns the key: a field holding text (Escape there must not close the page
+   * and wipe a pasted sign-in code), a select, an editor, or an open dialog.
+   * An empty field — Settings focuses its search box on open — still closes.
+   * This handler runs in the capture phase, before any of those see the key.
+   */
+  function escapeBelongsElsewhere(t: EventTarget | null): boolean {
+    const choice = ["checkbox", "radio", "button", "submit", "reset", "range", "color", "file"];
+    if (t instanceof HTMLTextAreaElement || (t instanceof HTMLInputElement && !choice.includes(t.type))) return t.value !== "";
+    if (t instanceof HTMLSelectElement) return true;
+    if (!(t instanceof HTMLInputElement) && isEditableTarget(t)) return true;
+    const modal = "dialog[open], [role='dialog'], [role='alertdialog'], [aria-modal='true']";
+    if (t instanceof Element && t.closest(modal) !== null) return true;
+    return document.querySelector("dialog[open], [aria-modal='true']") !== null;
   }
 
   $effect(() => {
