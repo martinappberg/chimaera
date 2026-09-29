@@ -11,6 +11,7 @@
   import { asyncDisposer } from "../shared/asyncDisposer";
   import { pageVisible } from "../shared/visibility";
   import { paid, readIntent, friendlyError, recoverableAccountRestore, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
+  import { accountPanel, completesReview, isConfirmedFree, reviewKey } from "../pro/account";
   import {
     onProChanged, proStatus, proSignIn, proCancelSignIn, proSignOut, proSignOutEverywhere,
     proHosts, proSetHostKept, proDevices, proRevokeDevice, proBillingCheckout, proBillingPortal, proCancelBilling, proRefreshAccount,
@@ -33,15 +34,19 @@
   let interval = $state<BillingInterval>(initialIntent?.interval ?? "month");
   let authScreen = $state<ProAuthScreenHint>(initialIntent?.screenHint ?? "sign-in");
   let shownSelection: number | null = null;
+  /** The last confirmed account read. It stays rendered while newer reads run. */
   let status = $state<ProStatus | null>(null);
+  /** No account event arrived since `status` was read. Purchases require it;
+   * rendering never does, so background reads cannot unmount the page. */
   let accountFresh = $state(false);
-  let accountLoading = $state(false);
+  let refreshing = $state(false);
   let hosts = $state<ProHost[]>([]);
   let devices = $state<ProDevice[]>([]);
   let deviceAccount: string | null = null;
   let error = $state<string | null>(null);
   let notice = $state<string | null>(null);
-  let reviewedBilling = $state<number | null>(null);
+  let reviewed = $state<string | null>(null);
+  let reviewRequest: number | null = null;
   let upgradeOpen = $state(false);
   let upgradeInterval = $state<BillingInterval>("month");
   let busy = $state<string | null>(null);
@@ -55,15 +60,16 @@
   let generation = 0;
   let alive = true;
   const subscribed = $derived(status?.signed_in === true && paid(status.plan));
-  const confirmedFree = $derived(accountFresh && status?.available === true && !status.initializing && !status.error && (status.signed_in ? status.plan === "none" : true));
-  const accountNeedsAttention = $derived(status?.available === true && !status.initializing && !subscribed && !confirmedFree && !accountLoading);
+  const confirmedFree = $derived(isConfirmedFree(status));
+  const panel = $derived(accountPanel(status, refreshing));
+  const accountNeedsAttention = $derived(panel === "attention");
   const signInPhase = $derived(status?.sign_in?.phase ?? null);
   const billing = $derived(status?.billing ?? null);
   const billingActive = $derived(billingPending(billing));
   const billingMessage = $derived(billing && !(openingBillingAfter !== null && billing.id <= openingBillingAfter) ? billingCopy(billing, status?.plan ?? null) : null);
   const billingRecovery = $derived(billingNeedsReview(billing, subscribed));
-  const offerPlans = $derived(confirmedFree && !billingActive && !billingRecovery);
-  const canReturnToPlans = $derived(billingRecovery && confirmedFree && reviewedBilling === billing?.id);
+  const offerPlans = $derived(panel === "plans");
+  const canReturnToPlans = $derived(billingRecovery && confirmedFree && reviewed !== null && reviewed === reviewKey(status));
 
   function showPlans(): void {
     plansElement?.scrollIntoView({ block: "start", behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
@@ -75,8 +81,7 @@
   }
   async function load(refresh = false): Promise<void> {
     const request = ++generation;
-    accountFresh = false;
-    accountLoading = true;
+    refreshing = true;
     try {
       let next = await proStatus();
       if (refresh && next.signed_in && !next.initializing) { await proRefreshAccount(); next = await proStatus(); }
@@ -84,6 +89,7 @@
       if (next.signed_in && status?.signed_in && next.email === status.email) next.billing = latestBilling(status.billing, next.billing);
       status = next;
       accountFresh = true;
+      if (completesReview(next, reviewRequest)) { reviewed = reviewKey(next); reviewRequest = null; }
       if (!next.signed_in) notice = null;
       if (!next.initializing && next.signed_in && paid(next.plan) && intent !== null) {
         remember(null);
@@ -103,13 +109,18 @@
     } catch (reason) {
       if (alive && request === generation) error = friendlyError(reason, "Your account couldn't refresh. Please try again in a moment.");
     } finally {
-      if (alive && request === generation) accountLoading = false;
+      if (alive && request === generation) refreshing = false;
     }
+  }
+  /** A purchase acts on a current read; a pending account event is read first. */
+  async function ensureFresh(): Promise<boolean> {
+    for (let attempt = 0; attempt < 3 && alive && !accountFresh; attempt += 1) await load();
+    return alive && accountFresh;
   }
   $effect(() => {
     revision;
     if (visible && $pageVisible) untrack(() => void load());
-    else untrack(() => { accountFresh = false; accountLoading = false; generation += 1; });
+    else untrack(() => { accountFresh = false; refreshing = false; generation += 1; });
   });
   $effect(() => {
     if (!visible || !$pageVisible || !status?.signed_in || status.initializing || !subscribed || !connectionsOpen) return;
@@ -127,7 +138,8 @@
     return () => { stopped = true; };
   });
   onMount(() => {
-    const changed = () => { if (alive) { generation += 1; reviewedBilling = null; accountFresh = false; revision += 1; } };
+    // An account event marks the rendered status stale without clearing it.
+    const changed = () => { if (alive) { generation += 1; accountFresh = false; revision += 1; } };
     const dispose = asyncDisposer(onProChanged(changed).then((unlisten) => { changed(); return unlisten; }));
     const focus = () => { if (visible && document.visibilityState === "visible") void load(true); };
     window.addEventListener("focus", focus);
@@ -143,6 +155,11 @@
   async function checkout(): Promise<void> {
     if (busy !== null || status?.initializing) return;
     // A returning subscriber uses the same sign-in action, never a new checkout.
+    if (subscribed) { remember(null); return; }
+    busy = "checkout";
+    const fresh = await ensureFresh();
+    busy = null;
+    if (!fresh) return;
     if (subscribed) { remember(null); return; }
     if (!confirmedFree || billingActive || billingRecovery) return;
     const choice = explicitCheckoutChoice(status, accountFresh, { plan: selected, interval });
@@ -168,7 +185,12 @@
   }
   async function openBilling(target?: { plan: PaidPlan; interval: BillingInterval }): Promise<void> {
     if (busy !== null || billingActive || !status?.signed_in || !subscribed || status.initializing) return;
-    if (target && !canReviewUpgrade(status, accountFresh)) return;
+    if (target) {
+      busy = "upgrade";
+      const fresh = await ensureFresh();
+      busy = null;
+      if (!fresh || !canReviewUpgrade(status, accountFresh)) return;
+    }
     notice = null;
     openingBillingAfter = billing?.id ?? 0;
     await act(target ? "upgrade" : "billing", async () => {
@@ -181,13 +203,15 @@
   async function checkBillingAccount(): Promise<void> {
     const id = billing?.id;
     if (id === undefined || busy !== null) return;
-    reviewedBilling = null;
+    // Reads that began before this check cannot complete the review.
+    generation += 1;
+    reviewRequest = id;
     let refreshed = false;
     await act("billing-check", async () => {
       await proRefreshAccount();
       refreshed = true;
     }, "Your account couldn't be checked. Please try again before starting another checkout.");
-    if (alive && refreshed && confirmedFree && billing?.id === id) reviewedBilling = id;
+    if (!refreshed) reviewRequest = null;
   }
   async function stopBilling(): Promise<void> {
     const id = billing?.id;
@@ -204,7 +228,7 @@
     if (!canReturnToPlans || id === undefined) return;
     remember(null);
     await act("dismiss-billing", () => proCancelBilling(id), "This request couldn't be closed. Please check your account again.");
-    reviewedBilling = null;
+    reviewed = null;
   }
   async function cancelSignIn(): Promise<void> {
     remember(null);
@@ -224,7 +248,7 @@
       <div class="panel notice" role="status">
         <h2>{billingMessage.title}</h2><p>{billingMessage.detail}</p>
         {#if billingMessage.pending}<button class="secondary" disabled={busy !== null} onclick={() => void stopBilling()}>Stop waiting</button>
-        {:else if billingMessage.check}<div class="actions"><button class="secondary" disabled={busy !== null || accountLoading} onclick={() => void checkBillingAccount()}>{busy === "billing-check" || accountLoading ? "Checking…" : "Check account"}</button>{#if canReturnToPlans}<button onclick={() => void returnToPlans()} disabled={busy !== null}>Return to plans</button>{/if}</div>{/if}
+        {:else if billingMessage.check}<div class="actions"><button class="secondary" disabled={busy !== null} onclick={() => void checkBillingAccount()}>{busy === "billing-check" ? "Checking…" : "Check account"}</button>{#if canReturnToPlans}<button onclick={() => void returnToPlans()} disabled={busy !== null}>Return to plans</button>{/if}</div>{/if}
         {#if !billingMessage.pending && !billingRecovery}<button class="text-button" disabled={busy !== null} onclick={() => void dismissBilling()}>Dismiss</button>{/if}
         {#if canReturnToPlans}<p class="small muted">Your account currently has no active plan. You can return to plans when you're ready.</p>{/if}
         {#if billingRecovery && error}<p class="small" role="alert">{error}</p>{/if}
@@ -282,7 +306,7 @@
     {#if notice}<p class="notice message" role="status">{notice}</p>{/if}
     {#if !subscribed}{@render billingNotice()}{/if}
 
-    {#if offerPlans}
+    {#if panel === "plans"}
       <section class="plans" aria-labelledby="plans-title" tabindex="-1" bind:this={plansElement}>
         <div class="section-heading plan-heading">
           <div><h2 id="plans-title">Choose your plan</h2><p class="muted small">The same features in both. More cloud capacity with Max.</p></div>
@@ -304,7 +328,7 @@
         {#if !status.signed_in}<p class="signin-alternative small muted">Already have an account? <button class="text-button" disabled={busy !== null || signInPhase !== null || billingActive} onclick={() => void authenticate("sign-in")}>Sign in</button></p>{/if}
         <p class="free-note"><strong>Your local workbench stays free.</strong> Local projects, agents and ordinary SSH work without a Pro account.</p>
       </section>
-    {:else if subscribed}
+    {:else if panel === "subscriber"}
       {#key status.email}<CloudSetup {visible} {requiredProviders} {contextLabel} {workspaceId} {onReady} />{/key}
       <section class="panel plan-current" aria-label="Current plan">
         <div class="section-heading"><div><span class="section-label">Your plan</span><h2>Chimaera {status.plan === "max" ? "Max" : "Pro"}</h2></div><button class="secondary" disabled={busy !== null || billingActive} onclick={() => void openBilling()}>{busy === "billing" ? "Opening billing…" : "Manage billing"}</button></div>
@@ -312,7 +336,7 @@
         {#if status.plan === "pro"}
           <div class="upgrade-entry">
             <div><h3>More room for your work</h3><p class="small muted">Max includes more cloud time and mirrored storage, with the same workflow.</p></div>
-            <button class="secondary" aria-expanded={upgradeOpen} disabled={busy !== null || billingActive || !canReviewUpgrade(status, accountFresh)} onclick={() => (upgradeOpen = !upgradeOpen)}>{billing?.kind === "plan_change" && billing.phase === "unconfirmed" ? "Review upgrade again" : "Upgrade to Max"}</button>
+            <button class="secondary" aria-expanded={upgradeOpen} disabled={busy !== null || billingActive || !canReviewUpgrade(status, true)} onclick={() => (upgradeOpen = !upgradeOpen)}>{billing?.kind === "plan_change" && billing.phase === "unconfirmed" ? "Review upgrade again" : "Upgrade to Max"}</button>
           </div>
           {#if upgradeOpen}
             <div class="upgrade-review" aria-label="Review Max upgrade">
@@ -320,7 +344,7 @@
               <div class="interval" role="group" aria-label="Upgrade billing interval"><button class:chosen={upgradeInterval === "month"} aria-pressed={upgradeInterval === "month"} onclick={() => (upgradeInterval = "month")}>Monthly</button><button class:chosen={upgradeInterval === "year"} aria-pressed={upgradeInterval === "year"} onclick={() => (upgradeInterval = "year")}>Yearly</button></div>
               <p class="upgrade-price">${prices.max[upgradeInterval]} <span class="small muted">/ {upgradeInterval === "year" ? "year" : "month"}</span></p>
               <p class="small muted">Your current plan stays active. Review the final amount, any prorated charge, and when the change takes effect before confirming in secure billing. Any remaining trial time is kept.</p>
-              <div class="actions"><button disabled={busy !== null || !canReviewUpgrade(status, accountFresh)} onclick={() => void openBilling({ plan: "max", interval: upgradeInterval })}>{busy === "upgrade" ? "Opening review…" : "Review upgrade in browser"}</button><button class="text-button" disabled={busy !== null} onclick={() => (upgradeOpen = false)}>Keep current plan</button></div>
+              <div class="actions"><button disabled={busy !== null || !canReviewUpgrade(status, true)} onclick={() => void openBilling({ plan: "max", interval: upgradeInterval })}>{busy === "upgrade" ? "Opening review…" : "Review upgrade in browser"}</button><button class="text-button" disabled={busy !== null} onclick={() => (upgradeOpen = false)}>Keep current plan</button></div>
             </div>
           {/if}
         {/if}
@@ -328,10 +352,10 @@
       </section>
       <details class="section" ontoggle={(event) => (connectionsOpen = event.currentTarget.open)}><summary>Connected machines</summary>{#if connectionsOpen}<div class="section-body"><p class="muted small">Add your remote hosts on Home. Keep a connection available through Pro here.</p>{#if hosts.length === 0}<p class="muted">No machines to show yet.</p>{/if}{#each hosts as host (host.alias)}<div class="row"><div><span>{host.alias}</span><span class="muted small">{host.status === "prompting" ? "Waiting for authentication" : host.status === "connecting" ? "Connecting…" : host.status === "connected" ? "Connected" : "Offline"}</span></div>{#if host.kind === "ssh"}<label class="keep"><input type="checkbox" checked={host.kept} disabled={busy !== null} onchange={(event) => setKept(host, event.currentTarget)} />Keep connected</label>{/if}</div>{/each}</div>{/if}</details>
       <details class="section" ontoggle={(event) => (mirrorsOpen = event.currentTarget.open)}><summary>Projects and privacy</summary>{#if mirrorsOpen}<MirrorSettings visible={visible && mirrorsOpen} />{/if}</details>
-    {:else if billingActive || billingRecovery}
+    {:else if panel === "billing"}
       <!-- The native attempt continues while this surface is hidden or closed. -->
-    {:else if accountLoading}
-      <p class="muted" role="status">Refreshing your account…</p>
+    {:else if panel === "checking"}
+      <p class="muted" role="status">Checking your account…</p>
     {:else}
       <div class="panel" role="status"><h2>Your account needs attention</h2><p class="muted">{friendlyError(error ?? status.error, "We couldn't confirm your account details. Your local work remains available.")}</p>{#if !status.signed_in && signInPhase === null && !recoverableAccountRestore(status.error)}<button disabled={busy !== null} onclick={() => void authenticate(authScreen)}>{authScreen === "sign-up" ? "Try signing up again" : "Sign in again"}</button>{:else if signInPhase === null}<button class="secondary" disabled={busy !== null} onclick={() => void load(true)}>Check again</button>{/if}</div>
     {/if}

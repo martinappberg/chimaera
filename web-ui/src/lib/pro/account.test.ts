@@ -1,0 +1,58 @@
+import { describe, expect, it } from "vitest";
+import type { ProBillingAttempt, ProStatus } from "../net/native";
+import { accountPanel, completesReview, isConfirmedFree, reviewKey } from "./account";
+
+const free: ProStatus = { available: true, signed_in: true, email: "fixture@example.invalid", plan: "none", error: null };
+const attempt = (phase: ProBillingAttempt["phase"], id = 7): ProBillingAttempt => ({ id, kind: "checkout", phase, expires_at: 123, error: null });
+
+describe("Pro page panel", () => {
+  it("keeps confirmed plans and subscriber views mounted while a background read runs", () => {
+    for (const refreshing of [false, true]) {
+      expect(accountPanel(free, refreshing)).toBe("plans");
+      expect(accountPanel({ ...free, signed_in: false, email: null, plan: null }, refreshing)).toBe("plans");
+      expect(accountPanel({ ...free, plan: "pro" }, refreshing)).toBe("subscriber");
+      expect(accountPanel({ ...free, plan: "max" }, refreshing)).toBe("subscriber");
+    }
+  });
+  it("shows a checking state only for an uncertain account", () => {
+    const uncertain = { ...free, plan: null };
+    expect(accountPanel(uncertain, true)).toBe("checking");
+    expect(accountPanel(uncertain, false)).toBe("attention");
+    expect(accountPanel({ ...free, error: "account_restore_unavailable" }, false)).toBe("attention");
+  });
+  it("routes startup, endpoint-less builds and billing attempts ahead of plans", () => {
+    expect(accountPanel(null, true)).toBe("loading");
+    expect(accountPanel({ ...free, available: false }, false)).toBe("unavailable");
+    expect(accountPanel({ ...free, initializing: true }, false)).toBe("initializing");
+    for (const phase of ["opening", "waiting", "confirming", "expired", "failed", "confirmed"] as const) {
+      expect(accountPanel({ ...free, billing: attempt(phase) }, false)).toBe("billing");
+    }
+    expect(accountPanel({ ...free, billing: attempt("canceled") }, false)).toBe("plans");
+  });
+  it("never treats a stale or failed account as confirmed free", () => {
+    expect(isConfirmedFree(null)).toBe(false);
+    for (const delta of [{ available: false }, { initializing: true }, { error: "failed" }, { plan: null }, { plan: "pro" as const }]) {
+      expect(isConfirmedFree({ ...free, ...delta })).toBe(false);
+    }
+  });
+});
+
+describe("billing review", () => {
+  it("keys a review by attempt, phase and plan so unrelated events keep it", () => {
+    const failed = { ...free, billing: attempt("failed") };
+    expect(reviewKey(failed)).toBe(reviewKey({ ...failed, usage: null }));
+    expect(reviewKey(failed)).not.toBe(reviewKey({ ...failed, billing: attempt("expired") }));
+    expect(reviewKey(failed)).not.toBe(reviewKey({ ...failed, billing: attempt("failed", 8) }));
+    expect(reviewKey(failed)).not.toBe(reviewKey({ ...failed, plan: "pro" }));
+    expect(reviewKey(free)).toBeNull();
+  });
+  it("completes only for the requested unresolved attempt on a confirmed free account", () => {
+    const failed = { ...free, billing: attempt("failed") };
+    expect(completesReview(failed, 7)).toBe(true);
+    expect(completesReview(failed, null)).toBe(false);
+    expect(completesReview(failed, 8)).toBe(false);
+    expect(completesReview({ ...failed, plan: "pro" }, 7)).toBe(false);
+    expect(completesReview({ ...failed, error: "failed" }, 7)).toBe(false);
+    expect(completesReview({ ...free, billing: attempt("waiting") }, 7)).toBe(false);
+  });
+});
