@@ -273,12 +273,18 @@ export type ChatBlock = BlockIdentity &
       /** Delivery key (the wire's client-minted uuid); null on old journals,
        *  transcript-seeded messages, and permission-feedback echoes. */
       id: string | null;
-      /** "remote" when a Remote Control client (phone / claude.ai) injected
-       *  the message through the agent's own bridge; null when this
+      /** Who sent it when nobody typed it here: "remote" (a Remote Control
+       *  client injected it through the agent's own bridge), "restart" /
+       *  "moved" / "home" (the daemon's own pick-up after a restart or a
+       *  transfer), "worker" (a worker's `tell_mastermind`); null when this
        *  workbench sent it. */
       origin: string | null;
       /** Inclusive journal boundary for a portable fork through this row. */
       forkSeq: number;
+      /** Journal time the agent received it (ms). Journal-backed, so replay
+       *  keeps the original time; the transcript shows it only on the
+       *  daemon's own transfer notes (`transfer.ts`). */
+      sentAtMs: number;
       /** The agent read it inside a running turn (a waiting send taken at a
        *  step boundary), so it joined that turn instead of opening one. */
       midTurn?: true;
@@ -1017,6 +1023,7 @@ export class ChatStore {
               id,
               origin,
               forkSeq: entry.seq,
+              sentAtMs: entry.ts,
             }),
           );
           if (id !== null) this.userIndex.set(id, this.blocks.length - 1);
@@ -1124,6 +1131,7 @@ export class ChatStore {
               checkpoint: pending.checkpoint,
               id: pending.id,
               forkSeq: entry.seq,
+              sentAtMs: entry.ts,
               ...(this.running ? { midTurn: true as const } : {}),
             }),
           );

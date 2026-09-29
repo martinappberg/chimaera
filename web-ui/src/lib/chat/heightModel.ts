@@ -1,4 +1,5 @@
 import type { ChatBlock } from "./store.svelte";
+import { isTransferOrigin } from "./transfer";
 
 /**
  * A content-based height model for transcript blocks that are NOT mounted —
@@ -74,6 +75,9 @@ export function blockWeight(
     case "message":
       return textLines(renderedMarkdown(block.text), charsPerLine) + embedLines(block.text) + 1;
     case "user":
+      // The daemon's transfer pick-up renders as a one-line note and a
+      // collapsed disclosure, whatever the length of its text.
+      if (isTransferOrigin(block.origin)) return 2.5;
       // Bubbles wrap narrower than the column and carry padding; a row of
       // picture tiles (AttachmentStrip, 112px) sits above one with images.
       return (

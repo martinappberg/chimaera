@@ -62,6 +62,8 @@
   import AttachmentStrip from "./AttachmentStrip.svelte";
   import ForkDialog from "./ForkDialog.svelte";
   import AgentMessageMeta from "./AgentMessageMeta.svelte";
+  import TransferNote from "./TransferNote.svelte";
+  import { isTransferOrigin } from "./transfer";
   import Composer from "./Composer.svelte";
   import SameFileNotice from "../workspace/SameFileNotice.svelte";
   import { sameFile } from "../workspace/sameFile.svelte";
@@ -2399,13 +2401,18 @@
     store.blocks.length > 0 ? store.blocks[store.blocks.length - 1].uid : -1,
   );
 
-  /** One precise wall-clock timer for every assistant timestamp in this view.
+  /** One precise wall-clock timer for every assistant timestamp (and each
+   *  transfer note's) in this view.
    *  Each row reports its next label boundary; scheduling the earliest avoids
    *  a timer per message and leaves old transcripts idle between midnights. */
   let messageTimeNowMs = $state(Date.now());
   const messageTimestamps = $derived(
     visible
-      ? renderBlocks.flatMap((block) => (block.kind === "message" ? [block.sentAtMs] : []))
+      ? renderBlocks.flatMap((block) =>
+          block.kind === "message" || (block.kind === "user" && isTransferOrigin(block.origin))
+            ? [block.sentAtMs]
+            : [],
+        )
       : [],
   );
   $effect(() => {
@@ -2660,6 +2667,15 @@
         </ActivityFold>
       {:else if isActivityRow(item)}
         {@render activityRow(item)}
+      {:else if item.block.kind === "user" && isTransferOrigin(item.block.origin)}
+        <TransferNote
+          origin={item.block.origin}
+          text={item.block.text}
+          sentAtMs={item.block.sentAtMs}
+          nowMs={messageTimeNowMs}
+          sourceIndex={item.index}
+          sourceUid={item.block.uid}
+        />
       {:else if item.block.kind === "user"}
         {@const block = item.block}
         <!-- Only delivered (sent) user messages render inline; queued/dropped
@@ -2704,14 +2720,12 @@
               </div>
             {/if}
           </div>
-          {#if unsavedImages(block) !== "" || block.origin === "remote" || block.origin === "restart" || block.origin === "moved" || block.origin === "home" || block.origin === "worker"}
+          {#if unsavedImages(block) !== "" || block.origin === "remote" || block.origin === "restart" || block.origin === "worker"}
             <span class="bubble-meta">
               {#if block.origin === "remote"}
                 <span class="origin" title="sent from a Remote Control client (the Claude app or claude.ai/code)">via Remote Control</span>
               {:else if block.origin === "restart"}
                 <span class="origin auto" title="chimaera sent this itself: the daemon restarted while this chat had work running, so it asked the resumed agent to pick that work back up (setting: Pick Up Interrupted Work After a Restart)">sent by chimaera after a restart</span>
-              {:else if block.origin === "moved" || block.origin === "home"}
-                <span class="origin auto" title="chimaera sent this so the agent picks up where it left off after the conversation moved">{block.origin === "home" ? "back on your computer" : "continued in the cloud"}</span>
               {:else if block.origin === "worker"}
                 <span class="origin auto" title="a worker in this workspace sent this with tell_mastermind; chimaera delivered it because the Mastermind acts on its own (auto)">from a worker</span>
               {/if}
