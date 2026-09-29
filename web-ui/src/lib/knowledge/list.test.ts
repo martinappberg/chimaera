@@ -19,6 +19,14 @@ describe("filtersFor", () => {
     for (const x of f.slice(1)) expect(x.count).toBeGreaterThan(0);
   });
 
+  it("keeps a resolved entry out of Corrections", () => {
+    const resolved = { ...findings[0], amends: [], state: { kind: "resolved", by: "" } };
+    const c = filtersFor("findings", findings, "2026-09-22").find((x) => x.id === "amended")!;
+    expect(c.label).toBe("Corrections");
+    expect(c.test(resolved)).toBe(false);
+    expect(c.test({ ...resolved, state: { kind: "corrected", by: "F-9" } })).toBe(true);
+  });
+
   it("splits decisions into in force and superseded", () => {
     const d = filtersFor(
       "decisions",

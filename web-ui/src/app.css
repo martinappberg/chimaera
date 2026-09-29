@@ -622,9 +622,10 @@ body.dragging {
   background-clip: content-box;
 }
 
-/* Knowledge id chips (knowledge/chips.ts): an id a knowledge plugin answers
-   for, in the Knowledge reader and chat transcripts — hover previews the
-   entry, a click opens it. Text-like, so prose keeps its rhythm. */
+/* Id chips (shared/references.ts): an id a reference source answers for
+   (a knowledge plugin's entries), in the Knowledge reader and chat
+   transcripts — hover previews the entry, a click opens it. Text-like, so
+   prose keeps its rhythm. */
 .kchip {
   font-family: var(--mono);
   font-size: 0.9em;

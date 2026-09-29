@@ -20,14 +20,16 @@
 
   let { rows, idx, title, onAsk, onOpen }: Props = $props();
 
-  /** Per row: what the last ask did (by row index). */
-  let outcome = $state<Record<number, { ok: boolean; text: string }>>({});
+  /** Per row: what the last ask did — by the row's own words, so a refresh
+   *  that drops a fixed row doesn't hand its note to the next. */
+  let outcome = $state<Record<string, { ok: boolean; text: string }>>({});
+  const rowKey = (r: TidyRow): string => `${r.kind}\u0000${r.text}`;
 
-  function ask(i: number, text: string): void {
+  function ask(r: TidyRow, text: string): void {
     const name = onAsk(text);
     outcome = {
       ...outcome,
-      [i]:
+      [rowKey(r)]:
         name !== null
           ? { ok: true, text: `Drafted into ${name}'s message box — read it, then send.` }
           : { ok: false, text: "No agent chat is open in this workspace — start one, then ask again." },
@@ -62,12 +64,13 @@
                 {#if r.refs.length > 24}<span class="more">+{r.refs.length - 24}</span>{/if}
               </span>
             {/if}
-            {#if outcome[i] !== undefined}
-              <span class="outcome" class:bad={!outcome[i].ok}>{outcome[i].text}</span>
+            {#if outcome[rowKey(r)] !== undefined}
+              {@const o = outcome[rowKey(r)]}
+              <span class="outcome" class:bad={!o.ok}>{o.text}</span>
             {/if}
           </div>
           {#if r.ask !== ""}
-            <button class="ask" onclick={() => ask(i, r.ask)} title={r.ask}>Ask an agent</button>
+            <button class="ask" onclick={() => ask(r, r.ask)} title={r.ask}>Ask an agent</button>
           {/if}
         </div>
       {/each}

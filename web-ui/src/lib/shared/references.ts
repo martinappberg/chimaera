@@ -85,12 +85,12 @@ export interface RefMatcher {
   groups: { source: RefSource; kind: string }[];
 }
 
-/** A shape is used only when it is a plain, bounded regex source. */
+/** A shape is used only when it is a plain, bounded regex source that
+ *  can't match nothing (an empty match would never advance the scan). */
 function usable(pattern: string): boolean {
   if (pattern.length > 80 || pattern.includes("(")) return false;
   try {
-    new RegExp(pattern);
-    return true;
+    return !new RegExp(`^(?:${pattern})$`).test("");
   } catch {
     return false;
   }
@@ -190,6 +190,10 @@ export function linkReferences(
     const frag = document.createDocumentFragment();
     while ((m = matcher.re.exec(text)) !== null) {
       const id = m[0];
+      if (id === "") {
+        matcher.re.lastIndex += 1;
+        continue;
+      }
       const g = m.slice(1).findIndex((x) => x !== undefined);
       const group = matcher.groups[g];
       if (group === undefined) continue;

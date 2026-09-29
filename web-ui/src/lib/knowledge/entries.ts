@@ -48,7 +48,8 @@ export interface Entry {
   refs: Ref[];
   cites: Cite[];
   span: Span | null;
-  /** The file it lives in (the span's, else the kind's known file). */
+  /** The file it lives in: its span's (a finding's topic file without
+   *  one); "" when the provider didn't say — core names no provider's files. */
   file: string;
   /** 1-based line of its heading; 0 when unknown. */
   line: number;
@@ -147,7 +148,7 @@ function fromDecision(d: Decision): Entry {
     refs: d.refs,
     cites: d.cites,
     span: d.span,
-    file: d.span?.path || ".living/decisions.md",
+    file: d.span?.path ?? "",
     line: d.span?.line || d.line,
     recordedBy: d.recorded_by ?? null,
     haystack: join(
@@ -180,7 +181,7 @@ function fromLearning(l: Learning): Entry {
     refs: l.refs,
     cites: l.cites,
     span: l.span,
-    file: l.span?.path || ".living/learnings.md",
+    file: l.span?.path ?? "",
     line: l.span?.line || l.line,
     recordedBy: l.recorded_by ?? null,
     haystack: join(l.id, l.title, l.category, l.what, l.why, l.resolution, l.tags, l.cites.map((c) => c.text)),
@@ -202,7 +203,7 @@ function fromConvention(c: Convention): Entry {
     refs: c.refs,
     cites: c.cites,
     span: c.span,
-    file: c.span?.path || ".living/conventions.md",
+    file: c.span?.path ?? "",
     line: c.span?.line || 0,
     recordedBy: null,
     haystack: join(c.id, c.title, c.status, c.cites.map((x) => x.text)),
@@ -224,7 +225,7 @@ function fromTodo(t: Todo): Entry {
     refs: t.refs,
     cites: [],
     span: t.span,
-    file: t.span?.path || "todo/TODO_REGISTRY.md",
+    file: t.span?.path ?? "",
     line: t.span?.line || 0,
     recordedBy: null,
     haystack: join(t.id, t.item, t.title, t.status, t.priority, t.category, t.author),

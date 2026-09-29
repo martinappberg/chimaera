@@ -106,13 +106,13 @@ export function isBadNews(e: Entry): boolean {
 
 // ---- what changed -----------------------------------------------------------
 
-/** YYYY-MM-DD in local time. */
 /** The provider's status note cut to its first sentence, for tight spots; the
  *  whole note goes in a tooltip. */
 export function shortStatusNote(note: string): string {
   return note.match(/^[^.!?]*[.!?]/)?.[0] ?? note;
 }
 
+/** YYYY-MM-DD in local time. */
 export function isoDay(ms: number): string {
   const d = new Date(ms);
   const p = (n: number): string => String(n).padStart(2, "0");
@@ -253,6 +253,14 @@ export interface Waiting {
   span: Ask["span"];
 }
 
+/** When the handoff at `path` was written (ms; 0 when unknown). */
+function handoffWritten(k: Knowledge, path: string): number {
+  const lo = k.left_off;
+  if (lo === null || path === "") return 0;
+  if (path === lo.path) return lo.written_ms;
+  return lo.sources.find((x) => x.path === path)?.written_ms ?? 0;
+}
+
 /** What is put to the user: the provider's asks, newest first. */
 export function waitingOnYou(k: Knowledge, idx: KnowledgeIndex, limit = 5): { items: Waiting[]; total: number } {
   const items: Waiting[] = k.asks.map((a) => {
@@ -260,11 +268,12 @@ export function waitingOnYou(k: Knowledge, idx: KnowledgeIndex, limit = 5): { it
     let entry: Entry | null = null;
     if (a.source.key !== "") entry = idx.byKey.get(`${kind}:${a.source.key}`) ?? null;
     if (entry === null && a.source.id !== "") entry = idx.byId.get(a.source.id.toUpperCase())?.[0] ?? null;
+    // A handoff ask carries its file's day as the provider saw it (UTC);
+    // that handoff's own write time gives the reader's local day.
+    const written = kind === "handoff" ? handoffWritten(k, a.span?.path ?? "") : 0;
     return {
       text: a.text,
-      // A handoff ask carries the file's day as the provider saw it (UTC);
-      // the handoff's own write time gives the reader's local day.
-      date: kind === "handoff" && k.left_off !== null && k.left_off.written_ms > 0 ? isoDay(k.left_off.written_ms) : a.date,
+      date: written > 0 ? isoDay(written) : a.date,
       entry,
       sourceLabel: entry === null ? (kind === "handoff" ? "handoff" : a.source.id || kind) : "",
       span: a.span,

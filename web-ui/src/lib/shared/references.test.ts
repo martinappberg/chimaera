@@ -25,6 +25,11 @@ describe("referenceMatcher", () => {
     expect(m.groups).toHaveLength(1);
   });
 
+  it("skips shapes that can match nothing (the scan would never advance)", () => {
+    expect(referenceMatcher(new Map([["t", source(["\\d*", "F-\\d?"])]]))!.groups).toHaveLength(1);
+    expect(referenceMatcher(new Map([["t", source(["x?"])]]))).toBeNull();
+  });
+
   it("is null with no sources", () => {
     expect(referenceMatcher(new Map())).toBeNull();
   });

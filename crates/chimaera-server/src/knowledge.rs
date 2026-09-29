@@ -119,6 +119,27 @@ impl Stamp {
             .find(|(path, _, _)| path == rel)
             .map(|(_, mtime, _)| *mtime)
     }
+
+    /// What was read, as one short token (FNV-1a over each file's path,
+    /// mtime and length). An entry's body is read from its file, never the
+    /// snapshot, so a reworded paragraph re-reads to the same snapshot; this
+    /// on the wire makes the view's bytes differ whenever the files did.
+    fn digest(&self) -> String {
+        fn eat(h: &mut u64, bytes: &[u8]) {
+            for b in bytes {
+                *h ^= u64::from(*b);
+                *h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for (path, mtime, len) in &self.files {
+            eat(&mut h, path.as_bytes());
+            eat(&mut h, &[0]);
+            eat(&mut h, &mtime.to_le_bytes());
+            eat(&mut h, &len.to_le_bytes());
+        }
+        format!("{h:016x}")
+    }
 }
 
 /// The provider's current snapshot.
@@ -657,9 +678,13 @@ fn guidance_file(root: &Path, rel: &str) -> bool {
 /// protocol file, say) that exist in the project — workspace-relative, at
 /// most a few — ahead of the ones every project has. Core names none.
 fn provider_guidance(root: &Path, k: &Value) -> Vec<Value> {
+    let mut seen = HashSet::new();
     items(k, "guidance")
         .filter_map(|g| {
             let path = text(g, "path");
+            if !seen.insert(path) {
+                return None;
+            }
             let rel = Path::new(path);
             let plain = !path.is_empty()
                 && rel.is_relative()
@@ -848,6 +873,7 @@ pub(crate) async fn get_knowledge(
         body["schema"] = json!(1);
         body["provider"] = json!(now.provider);
         body["guidance"] = json!(all);
+        body["read"] = json!(now.files.digest());
         // `error` is the daemon's word that the provider couldn't answer,
         // never a field of the provider's own.
         if let Some(fields) = body.as_object_mut() {
@@ -936,6 +962,18 @@ mod tests {
         assert_eq!(claim_of(&k, "b/F-177"), "two");
     }
 
+    /// The read digest moves with any file's mtime or length, and only then.
+    #[test]
+    fn the_read_digest_follows_the_files() {
+        let stamp = |mtime: u64, len: u64| Stamp {
+            files: vec![("a.md".into(), 1, 10), ("b.md".into(), mtime, len)],
+        };
+        assert_eq!(stamp(5, 7).digest(), stamp(5, 7).digest());
+        assert_ne!(stamp(5, 7).digest(), stamp(6, 7).digest());
+        assert_ne!(stamp(5, 7).digest(), stamp(5, 8).digest());
+        assert_eq!(stamp(5, 7).digest().len(), 16);
+    }
+
     /// The provider's guidance files are listed only when they are plain,
     /// workspace-relative files that exist.
     #[test]
@@ -946,13 +984,14 @@ mod tests {
         std::fs::write(dir.join("PROTOCOL.md"), "x").unwrap();
         let k = json!({"guidance": [
             {"path": "PROTOCOL.md", "label": "PROTOCOL.md", "description": "how agents record"},
+            {"path": "PROTOCOL.md", "label": "again"},
             {"path": "missing.md", "label": "missing"},
             {"path": "../outside.md"},
             {"path": "/etc/hosts"},
         ]});
         let g = provider_guidance(&dir, &k);
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(g.len(), 1);
+        assert_eq!(g.len(), 1, "a repeated path is listed once");
         assert_eq!(g[0]["path"], "PROTOCOL.md");
         assert_eq!(g[0]["description"], "how agents record");
     }

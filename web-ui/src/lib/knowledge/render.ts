@@ -30,7 +30,10 @@ export function entrySource(path: string, owner: unknown): Promise<string> {
   if (hit !== undefined) return hit;
   const p = fsFile(path, 0, FILE_MAX).then((chunk) => new TextDecoder().decode(chunk.bytes));
   cache.set(path, p);
-  p.catch(() => cache.delete(path));
+  // A failed read is retried next time — unless a newer read took its slot.
+  p.catch(() => {
+    if (cache.get(path) === p) cache.delete(path);
+  });
   while (cache.size > CACHE_FILES) cache.delete(cache.keys().next().value ?? "");
   return p;
 }

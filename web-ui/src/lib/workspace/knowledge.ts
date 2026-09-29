@@ -401,10 +401,25 @@ function entryState(v: unknown): EntryState | null {
   return kind === "" ? null : { kind, by: str(o.by) };
 }
 
+/** Once per `key(x)`, first wins: views key their lists by these, and a
+ *  provider's lists can repeat. */
+function unique<T>(xs: T[], key: (x: T) => string): T[] {
+  const seen = new Set<string>();
+  return xs.filter((x) => {
+    const k = key(x);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
 function amends(v: unknown): Amend[] {
-  return objs<Amend>(v)
-    .map((a) => ({ kind: str(a.kind), id: str(a.id) }))
-    .filter((a) => a.kind !== "" && a.id !== "");
+  return unique(
+    objs<Amend>(v)
+      .map((a) => ({ kind: str(a.kind), id: str(a.id) }))
+      .filter((a) => a.kind !== "" && a.id !== ""),
+    (a) => `${a.kind}\u0000${a.id}`,
+  );
 }
 
 function labels(v: unknown): KnowledgeLabels | null {
@@ -606,14 +621,17 @@ export function normalizeKnowledge(raw: unknown): Knowledge {
           next: strs((leftRaw as LeftOff).next),
           written_ms: num((leftRaw as LeftOff).written_ms, 0),
           span: span((leftRaw as LeftOff).span),
-          sources: objs<LeftOff["sources"][number]>((leftRaw as LeftOff).sources)
-            .map((x) => ({
-              path: str(x.path),
-              written_ms: num(x.written_ms, 0),
-              ...(typeof x.session_id === "string" ? { session_id: x.session_id } : {}),
-              ...(typeof x.host === "string" ? { host: x.host } : {}),
-            }))
-            .filter((x) => x.path !== ""),
+          sources: unique(
+            objs<LeftOff["sources"][number]>((leftRaw as LeftOff).sources)
+              .map((x) => ({
+                path: str(x.path),
+                written_ms: num(x.written_ms, 0),
+                ...(typeof x.session_id === "string" ? { session_id: x.session_id } : {}),
+                ...(typeof x.host === "string" ? { host: x.host } : {}),
+              }))
+              .filter((x) => x.path !== ""),
+            (x) => x.path,
+          ),
         }
       : null;
   const openTodos = todos.filter((t) => !t.closed).length;
@@ -643,7 +661,10 @@ export function normalizeKnowledge(raw: unknown): Knowledge {
       conventions: num(counts.conventions, conventions.length),
       sessions: num(counts.sessions, sessions.length),
     },
-    guidance: objs<GuidanceFile>(r.guidance),
+    guidance: unique(
+      objs<GuidanceFile>(r.guidance).filter((g) => typeof g.path === "string" && g.path !== ""),
+      (g) => g.path,
+    ),
     warnings: strs(r.warnings),
     error: typeof r.error === "string" && r.error !== "" ? r.error : null,
   };
@@ -676,7 +697,9 @@ export function setKnowledgeRoot(root: string | null): void {
 let refreshSeq = 0;
 /** The body behind the snapshot held: most refetches (every turn end
  *  nudges one) answer the same bytes, and a new object would re-render
- *  every row of a large repository for nothing. */
+ *  every row of a large repository for nothing. The daemon's `read` digest
+ *  makes the bytes differ whenever the provider's files did, so a new
+ *  object is also the reader's cue to re-read entry bodies. */
 let heldText: string | null = null;
 let staleWhileHidden = false;
 

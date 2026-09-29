@@ -138,7 +138,9 @@ and the Mastermind-tier MCP tool `read_timeline`.
     in core or the plugin computes, maps or corrects it. Core names no plugin, file or status
     word: section names, kind words and status vocabulary come from the plugin's `labels`.
   - **Bodies never ride the snapshot.** The reader fetches the entry's file (cached per
-    snapshot) and renders the span; a hover preview renders the same lines.
+    snapshot) and renders the span; a hover preview renders the same lines. The route adds a
+    `read` digest of the files the provider read, so any file change yields a new snapshot
+    and a fresh read, even when the parsed fields are unchanged.
   - **Ids repeat; keys don't.** A finding id reused in two topic files is two entries (keys
     `<topic>/<id>`); a reference resolves to the citing entry's topic first.
   - **Attribution (`recorded_by`) is never guessed.** At each episode end the provider is

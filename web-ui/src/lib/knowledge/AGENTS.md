@@ -47,7 +47,14 @@ refetched off the Timeline epoch nudge and on visibility return — never polled
   A chip's target lives in a `ReferenceChips` WeakMap, never in DOM attributes.
 - **Ids repeat; keys don't.** Every list and element is keyed by `ekey`
   (`<kind>:<normalized key>`); a finding's key is the provider's `<topic>/<id>`.
-  A repeated `{#each}` key throws and used to freeze the whole window.
+  A repeated `{#each}` key throws and used to freeze the whole window, so
+  `normalizeKnowledge` lists a provider's amends, guidance files and handoff
+  sources once each (the daemon also dedupes the guidance it merges).
+- **A body is as fresh as the snapshot object.** `render.ts` caches each
+  file per snapshot; the daemon's `read` digest (the provider's stamp:
+  every read file's path, mtime and length) makes the response bytes differ
+  whenever any file did, so a reworded paragraph that leaves the snapshot's
+  fields alone still yields a new object and a re-read.
 - **Spans are `{path, line, end_line}`**, workspace-relative, 1-based and
   inclusive; `end_line` 0 means the whole file (a session log); a one-line
   span (a to-do table row) has no body of its own.

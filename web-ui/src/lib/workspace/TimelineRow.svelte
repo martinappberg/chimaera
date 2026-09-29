@@ -26,6 +26,8 @@
   } from "./timelineModel";
   import { relPath } from "../dashboard/dash";
   import { resolveReference } from "../shared/references";
+  import { knowledgeLookup } from "../knowledge/store";
+  import { providerLabels, statusWord, toneOf } from "../knowledge/overview";
 
   interface Props {
     group: TimelineGroup;
@@ -43,6 +45,15 @@
     onDeliver?: (entry: TimelineEntry) => void;
     /** The row's own delivery state text (the caller owns the request). */
     deliverState?: string | null;
+  }
+
+  /** A status's tone in the provider's own words (its status words carry
+   *  one); core names and rates none, so an unknown word stays neutral. */
+  function statusTone(to: string | undefined): string {
+    const l = $knowledgeLookup;
+    if (l === null || to === undefined) return "neutral";
+    const w = statusWord(providerLabels(l.k), to);
+    return w !== null ? toneOf(w.tone) : "neutral";
   }
 
   /** Open a knowledge id (a finding a turn recorded) through the
@@ -196,15 +207,16 @@
       <span class="title"><span class="mono">{first.job?.name}</span> {jobVerb}</span>
     {:else if first.kind === "knowledge"}
       {@const k = first.knowledge}
+      {@const tone = statusTone(k?.to)}
       <button
         class="name link"
-        class:err={k?.to === "contradicted"}
-        class:good={k?.to === "supported" || k?.to === "robust"}
+        class:err={tone === "bad"}
+        class:good={tone === "good"}
         onclick={() => (k !== undefined ? openRef(k.id, k.key) : onOpenKnowledge?.())}
         title="open in Knowledge">{k?.id}</button
       >
       <span class="title">
-        {#if k?.change === "new"}recorded{:else if k?.to === "contradicted"}was contradicted{:else}is now {k?.to}{/if}
+        {#if k?.change === "new"}recorded{:else}is now {k?.to}{/if}
         <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
         — {@html inlineMarkdown(k?.claim ?? "")}
       </span>

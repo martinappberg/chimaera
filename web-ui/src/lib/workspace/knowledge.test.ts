@@ -30,6 +30,25 @@ describe("normalizeKnowledge (0.2 fields)", () => {
     expect(k.id_shapes).toHaveLength(4);
   });
 
+  it("lists a repeated amend, guidance file or handoff once (views key by them)", () => {
+    const odd = normalizeKnowledge({
+      topics: [
+        {
+          slug: "a",
+          findings: [{ id: "F-1", amends: [{ kind: "corrects", id: "F-0" }, { kind: "corrects", id: "F-0" }] }],
+        },
+      ],
+      guidance: [
+        { path: "P.md", label: "P" },
+        { path: "P.md", label: "again" },
+      ],
+      left_off: { path: "h.md", sources: [{ path: "h.md" }, { path: "h.md" }] },
+    });
+    expect(odd.topics[0].findings[0].amends).toHaveLength(1);
+    expect(odd.guidance.map((g) => g.label)).toEqual(["P"]);
+    expect(odd.left_off?.sources).toHaveLength(1);
+  });
+
   it("drops a span without a path or line", () => {
     const odd = normalizeKnowledge({ topics: [{ slug: "a", findings: [{ id: "F-1", span: { path: "", line: 3 } }] }] });
     expect(odd.topics[0].findings[0].span).toBeNull();

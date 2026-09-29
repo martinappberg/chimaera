@@ -338,7 +338,7 @@ ellipsized) · state chips (`corrects F-171`, `superseded → D-157`,
 *backs* mark (the ledger's rows when there is a ledger; otherwise a count
 of cited files, scripts and jobs). Findings group by topic (topic
 description as the group's subtitle); decisions and learnings are newest
-first; filter chips above the list (*Changed this week*, *Corrected*, the
+first; filter chips above the list (*Changed this week*, *Corrections*, the
 status words that occur, a tag).
 
 The reader shows, in order:

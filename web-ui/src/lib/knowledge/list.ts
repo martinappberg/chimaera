@@ -4,8 +4,8 @@
  * chips that fit what is actually there. Pure; unit-tested in list.test.ts.
  */
 import type { Todo } from "../workspace/knowledge";
-import { byDateDesc, type Entry, type EntryKind } from "./entries";
-import { isRetired, TODO_GROUP_LABEL, todoGroups } from "./overview";
+import type { Entry, EntryKind } from "./entries";
+import { isBadNews, isRetired, TODO_GROUP_LABEL, todoGroups } from "./overview";
 
 export type Section = "findings" | "decisions" | "learnings" | "conventions" | "todos" | "sessions";
 
@@ -46,10 +46,13 @@ function numericId(id: string): number {
   return m !== null ? Number(m[1]) : -1;
 }
 
-/** Newest first, then the higher id (F-231 above F-228 on one day). */
+/** Newest day first (undated last), then the higher id (F-231 above F-228
+ *  on one day); stable otherwise. */
 function newestFirst(entries: readonly Entry[]): Entry[] {
-  return byDateDesc(entries).sort((a, b) => {
-    if (a.date.slice(0, 10) !== b.date.slice(0, 10)) return 0;
+  return [...entries].sort((a, b) => {
+    const da = a.date.slice(0, 10);
+    const db = b.date.slice(0, 10);
+    if (da !== db) return da === "" ? 1 : db === "" ? -1 : db.localeCompare(da);
     return numericId(b.id) - numericId(a.id);
   });
 }
@@ -68,7 +71,9 @@ export function filtersFor(section: Section, entries: readonly Entry[], weekStar
   if (section === "findings" || section === "decisions") {
     out.push(chip("week", "This week", entries, (e) => e.date.slice(0, 10) >= weekStart));
     if (section === "findings") {
-      out.push(chip("amended", "Corrected", entries, (e) => e.amends.length > 0 || e.state !== null));
+      // Corrections either way (it corrects something, or was), never a
+      // resolved entry: the same test "What changed" leads with.
+      out.push(chip("amended", "Corrections", entries, isBadNews));
       const heads = new Map<string, number>();
       for (const e of entries) {
         const h = statusHead(e.stated);

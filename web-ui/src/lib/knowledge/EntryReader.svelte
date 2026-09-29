@@ -77,9 +77,13 @@
   const refs = $derived(
     e.refs.map((r) => ({ r, found: resolveRef(idx, r, e) })).filter((x) => !e.amends.some((a) => a.id === x.r.id)),
   );
-  const handoffCites = $derived(
-    k.left_off !== null && e.id !== "" && k.asks.some((a) => a.source.kind === "handoff" && a.text.includes(e.id)),
-  );
+  /** The handoff's asks name this entry's id (whole, not inside D-157). */
+  const handoffCites = $derived.by(() => {
+    if (k.left_off === null || e.id === "") return false;
+    const id = e.id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(`(?<![\\w-])${id}(?![\\w-])`, "i");
+    return k.asks.some((a) => a.source.kind === "handoff" && re.test(a.text));
+  });
 
   const FILE_KINDS = new Set(["script", "data", "figure", "doc", "path"]);
   /** Cited paths that resolve in the workspace (only those open). */
@@ -311,7 +315,11 @@
   <section class="sec">
     <h3>{e.kind === "session" ? "Log" : "As written"}</h3>
     {#if bodyless}
-      <p class="note">The provider sent only this line — <button class="link" onclick={() => onOpenFile(e.file, e.line, 0)}>open it in its file</button> for the rest.</p>
+      <p class="note">
+        The provider sent only this line{#if e.file !== ""} — <button class="link" onclick={() => onOpenFile(e.file, e.line, 0)}
+            >open it in its file</button
+          > for the rest{/if}.
+      </p>
     {:else}
     {#key e.ekey}
       <EntryBody

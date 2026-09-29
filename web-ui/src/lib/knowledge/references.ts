@@ -39,11 +39,15 @@ function isEntry(v: unknown): v is Entry {
 let unregister: (() => void) | null = null;
 
 derived([knowledgeLookup, knowledgeRoot], (x) => x).subscribe(([lookup, root]) => {
-  unregister?.();
-  unregister = null;
-  if (lookup === null || lookup.k.id_shapes.length === 0) return;
+  if (lookup === null || lookup.k.id_shapes.length === 0) {
+    unregister?.();
+    unregister = null;
+    return;
+  }
   const { k, idx } = lookup;
   const labels = providerLabels(k);
+  // Registering replaces the source in place: one registry update per
+  // snapshot, so every transcript re-links once, not twice.
   unregister = registerReferenceSource({
     id: KNOWLEDGE_SOURCE,
     shapes: k.id_shapes,

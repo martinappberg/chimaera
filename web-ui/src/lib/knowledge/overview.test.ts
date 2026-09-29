@@ -126,10 +126,17 @@ describe("waitingOnYou", () => {
     expect(handoff.sourceLabel).toBe("handoff");
   });
 
-  it("dates a handoff ask by the reader's own day of the handoff write", () => {
+  it("dates a handoff ask by the reader's own day of its handoff's write", () => {
     const k = sample();
+    k.asks = [
+      { text: "new", date: "2000-01-01", source: { kind: "handoff", id: "", key: "" }, span: { path: k.left_off!.path, line: 3, end_line: 3 } },
+      { text: "old", date: "2000-01-01", source: { kind: "handoff", id: "", key: "" }, span: { path: ".mycelium/last-session.md", line: 2, end_line: 2 } },
+      { text: "unplaced", date: "2000-01-02", source: { kind: "handoff", id: "", key: "" }, span: null },
+    ];
     const w = waitingOnYou(k, buildIndex(k));
-    const handoff = w.items.find((x) => x.entry === null)!;
-    expect(handoff.date).toBe(isoDay(k.left_off!.written_ms));
+    const date = (t: string): string => w.items.find((x) => x.text === t)!.date;
+    expect(date("new")).toBe(isoDay(k.left_off!.written_ms));
+    expect(date("old")).toBe(isoDay(k.left_off!.sources[1].written_ms));
+    expect(date("unplaced")).toBe("2000-01-02");
   });
 });
