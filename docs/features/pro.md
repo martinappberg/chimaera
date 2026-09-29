@@ -21,12 +21,18 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    windows have no Pro entry. A build with no configured endpoint has no Pro
    entry on Home or in Settings and no plan badge; if the Pro page is reached
    anyway it shows only “Chimaera Pro isn't available in this build.”
-2. With an endpoint configured, choose **Sign up**, or the smaller
-   **Already have an account? Sign in** link. Each opens its corresponding
+2. With an endpoint configured, choose **Sign up**, or **Sign in** (beside
+   **See plans** at the top, and as the smaller **Already have an account? Sign
+   in** link under the plans). Each opens its corresponding
    identity-provider screen. Complete the system-browser authentication; the app receives an authorization code through its loopback callback.
    The app waits up to 15 minutes for sign-in and verification. While waiting,
    **Start again** opens a fresh sign-in and **Cancel sign-in** closes the request.
-   An expired or failed request offers **Try again**. The browser confirms success
+   A request that timed out, could not finish or could not open the browser
+   leaves the person signed out: the plans stay, with one quiet line such as
+   “Sign-in timed out. Start again when you’re ready.” (the app's fixed
+   `sign_in_timed_out`, `sign_in_incomplete` and `browser_unavailable` codes,
+   never an account failure). A failure page in the browser tells the person to
+   return and choose **Sign in**, the same button. The browser confirms success
    as soon as the account is active in the app; keeper provisioning and setting up
    project copying on this computer continue in the background.
    Successful sign-in returns to Pro in the initiating app window, restoring it
@@ -104,11 +110,19 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
 4. Open that host from Home. Its **via Pro** label identifies the connection;
    workspaces still open through a local loopback port with the existing daemon UI.
 5. **Sign out** removes this app's credentials, removes the local daemon's Pro
-   setup and closes its link connections. If the daemon does not confirm, or the
-   saved sign-in cannot be deleted from the credential store, the app revokes this
-   computer's sign-in on the account instead, so nothing keeps copying projects
-   or signs back in on the next launch. **Sign out everywhere** also revokes other
-   devices and closes SSH logins held by the keeper.
+   setup and closes its link connections. Signing out doesn't stop anything on
+   this computer. If a project is running in the cloud, a confirmation names it
+   first: it stays there until the next sign-in. If the daemon does not confirm,
+   or the saved sign-in cannot be deleted from the credential store, the app
+   revokes this computer's sign-in on the account instead, so nothing keeps
+   copying projects or signs back in on the next launch. When neither deletion
+   nor revocation works (a refused credential store while offline), the person is
+   still signed out: the page says “You’re signed out on this computer. The saved
+   sign-in is cleared automatically next time you’re online.” A small marker
+   (`pro-sign-out.json`) keeps that saved sign-in from being restored, also after
+   a restart; the app revokes it once the account answers, then deletes it
+   (`shell/pro/signout.rs`). **Sign out everywhere** always asks first: it also
+   revokes other sign-ins and closes the SSH logins held by the keeper.
 
 A developer can configure `pro.endpoint` in the native app's `app.json` as
 `{"pro":{"endpoint":"http://127.0.0.1:PORT"}}`. The file is under
@@ -123,7 +137,7 @@ for a local integration run.
 
 ## Subscriber branding
 
-An active Pro or Max account wears a small plan badge beside the Home wordmark and in the workspace header. The dedicated Pro page uses the same badge. The workspace badge opens the dedicated Pro page. There is no full-width Pro row in the workspace sidebar; free and signed-out users can still find Pro at the top of Settings and from Home. Settings offers **Get Pro** with a short cross-device benefit for confirmed free or signed-out accounts. Paid accounts see **Your Chimaera Pro** or **Your Chimaera Max** and **View account**. Loading or unknown account state, and an account whose payment needs attention without an active plan, stay neutral. A connection warning never clears the badge. The styling follows the current theme, and an unknown, signed-out or inactive plan shows no paid badge.
+An active Pro or Max account wears a small plan badge beside the Home wordmark and in the workspace header. The dedicated Pro page uses the same badge. The workspace badge opens the dedicated Pro page. There is no full-width Pro row in the workspace sidebar; free and signed-out users can still find Pro at the end of Settings and from Home. Pro is an optional add-on, so its Settings group follows every working section and its entry uses the same neutral style for everyone: **Get Pro** with one short optional-benefit line for confirmed free or signed-out accounts. Paid accounts see **Your Chimaera Pro** or **Your Chimaera Max** and **View account**. Loading or unknown account state, and an account whose payment needs attention without an active plan, stay neutral. A connection warning never clears the badge. The styling follows the current theme, and an unknown, signed-out or inactive plan shows no paid badge.
 
 The shared `web-ui/src/lib/net/plan.ts` store exposes confirmed free/paid, loading, unknown and unavailable (no endpoint, or an ordinary browser) account state to Settings, derives the existing paid badge from the same subscription, and `proOffered` gates every Pro entry point (null until the first answer, so an endpoint-less build never flashes one). It reads native `pro_status` and refreshes on `pro-changed` and visibility return. Account-browser windows instead make a bounded, same-origin `HEAD` request to their workbench index (`/app/{host}/` or `/workspace/{id}/`). Its optional `X-Chimaera-Plan` response header is `none`, `pro` or `max`, derived from the authenticated account's active or trialing subscription; an absent header or failed request leaves branding neutral. Index responses remain `Cache-Control: no-store`. The browser refreshes once per minute while visible and when returning to the page, without requesting or waking a keeper or worker. Ordinary daemon browser windows make no account request. The badge is presentation only and grants no capabilities.
 
@@ -200,7 +214,15 @@ again; the UI cannot release the setup fence or infer a new move. A canceled
 connection leaves those conversations paused. A successful continuation returns to the
 originating project only if that context is still current.
 
-Status reads never wake a sleeping worker. Opening the optional **Agent connections**
+Status reads never wake a sleeping worker. The app remembers, per account,
+whether an agent was connected at the last catalog read (`pro-agents.json`;
+`pro_cloud_status` adds it as `agents_connected`), so the page can answer while
+the cloud sleeps: the check mark beside “Available when you need it” appears
+only when an agent is on record; none connected reads as the next step,
+“Connect an agent to start cloud work”; unknown claims nothing. A passive read
+that finds a cloud the account called ready unreachable is re-checked with the
+account first (it usually just went to sleep) and is reported as unavailable
+only on a second read in a row. Opening the optional **Agent connections**
 disclosure loads those connections and acquires access automatically. There is no
 separate cloud-start action. Connecting a provider, or opening a repository on
 the cloud machine's own page, also acquires access as part of that user request. Catalog checks are
@@ -284,20 +306,27 @@ controls, and setup commands are not edited there; Chimaera and its agents manag
 those details. The two exceptions are decisions only the user makes. A setup
 command an agent proposed (`profile.pending_setup_command`) shows once per
 project, whole, in monospace, as "Your agent proposed a setup command for the
-cloud machine" with **Confirm** (it becomes the project's `setup_command`) and
+cloud" with **Confirm** (it becomes the project's `setup_command`) and
 **Dismiss** (the proposal is cleared). Steps kept for this computer
 (`profile.deferred`) are listed under **Steps that need your computer**, a plain
 list with no run button. There
 is no per-session placement pin: neither the native shell nor the daemon (the old `PUT /pro/keep-running` route is gone) offers one.
-**Keep this project on this device** stops local publication and disables account-side
+**Keep this project on this computer** stops local publication and disables account-side
 mirror access. Existing stored data is not silently deleted. A command that
 needs your computer is never run on a cloud machine: the agent is told it was not
 run there, and it is kept as a pending step for the project (`profile.deferred` on
 its status row), listed for you under **Steps that need your computer**; nothing
 runs it later by itself.
 If the account side
-has not confirmed a privacy change yet, the project says cloud copies are being turned off
-and the page re-sends the change on its own (at most once a minute while visible).
+has not confirmed a privacy change yet, the change still succeeds (copying already
+stopped here; the status row carries `privacy_pending`): the switch stays on, the
+project says quietly that it now stays on this computer while Chimaera confirms it
+with the account, and the page re-sends the change on its own (at most once a
+minute while visible). Each project row names who runs it: "This project is
+running in the cloud right now" or "…on your computer right now". A project whose
+saved setup command is running reads as progress ("Setting up the project in the
+cloud…" on the cloud's own page); only a setup that failed (`cloud_setup_failed`)
+or one waiting for an agent connection asks for attention.
 
 Repository history and working files are separate Git mirrors. Snapshot commits
 use an independent index under the daemon's data directory; they never make WIP
@@ -309,7 +338,7 @@ aliases, helpers, hooks, includes and signing credentials stay on their host.
 Safe remote URLs, refspecs and branch tracking follow the repository. Conversations are complete native archives: text the user
 or agent put in a conversation remains part of that archive.
 
-The daemon renews a workspace ownership lease independently of mirror jobs: account requests have their own small budget, and installing a returned checkpoint or stopping agents runs as its own task. Laptop first: account unreachability, signing out, a lapsed plan, **Keep this project on this device** or a daemon restart never stop or lock a computer's own agents and terminals; they only stop publication. Subscribing never interrupts running work either: a project's first enrollment takes its lease around the agents already running, which keep their processes and get no pick-up message. A verified other owner refuses local input at once, and the computer's agents stop at their next safe pause (at most five minutes later); plain terminals are never stopped. After a restart, previous sessions resume once this computer's ownership is verified, or after one minute when the account cannot be reached; a project another owner took over meanwhile keeps them paused. Re-acquiring its own released or lapsed ownership continues local work without reinstalling files or forking conversations. A cloud takeover after an abrupt loss forks native conversations; a clean handoff resumes their existing identities. Imported sessions remain suspended while the complete handoff is staged.
+The daemon renews a workspace ownership lease independently of mirror jobs: account requests have their own small budget, and installing a returned checkpoint or stopping agents runs as its own task. Laptop first: account unreachability, signing out, a lapsed plan, **Keep this project on this computer** or a daemon restart never stop or lock a computer's own agents and terminals; they only stop publication. Subscribing never interrupts running work either: a project's first enrollment takes its lease around the agents already running, which keep their processes and get no pick-up message. A verified other owner refuses local input at once, and the computer's agents stop at their next safe pause (at most five minutes later); plain terminals are never stopped. After a restart, previous sessions resume once this computer's ownership is verified, or after one minute when the account cannot be reached; a project another owner took over meanwhile keeps them paused. Re-acquiring its own released or lapsed ownership continues local work without reinstalling files or forking conversations. A cloud takeover after an abrupt loss forks native conversations; a clean handoff resumes their existing identities. Imported sessions remain suspended while the complete handoff is staged.
 
 Agents running in the cloud receive a current-host brief through MCP initialization. On the user's own computer an agent gets no brief at all, unless its project came back from the cloud while this daemon was running; then the brief says work runs on the computer again and replaces the earlier cloud assumptions. Structured conversations with an interrupted turn or background work also receive it in their transfer pickup message. That pickup says in plain words where the conversation now runs (in the cloud, or on the user's computer), whether it is the same conversation or a copy continuing from the last saved point because the other machine stopped responding, that the project files were installed and may differ, and to re-check tools and paths; a recovery adds how to treat work of uncertain state. It is tagged `UserMessage.origin` `moved` (now in the cloud), `home` (back on the user's computer) or `recovered` (either way, continuing from the last saved point after the other machine stopped responding), and the chat view keys its divider on that tag. Finished structured conversations resume idle without starting a model turn merely because they moved or returned. Their fresh MCP context is available when the user next asks them to work. The brief identifies device or cloud execution, the registered project root, OS/architecture needed for builds, headless limitations, and fresh cached provider observations. Guidance about the cloud machine's resource capacity appears only in a cloud brief. Absent or expired observations remain unknown; generating context never probes, logs in, wakes compute or sends a turn. Both MCP initialization and read_cloud_profile use this same projection, and returning to a device replaces stale cloud assumptions. Generated context omits topology, routing IDs, raw diagnostics, hardware allocations and credentials. User-owned profile content remains untrusted project data; missing variable names do not prove a dependency is unavailable. Agents should inspect actual tools and failures, use compatible headless or lower-resource alternatives within existing permissions, preserve completed work, and explain only meaningful progress or the specific user action needed. This prompt is product guidance, not an authorization or confidentiality boundary: agents can inspect their permitted environment and may infer where they run. It does not guarantee compliance or prevent all inference. Ordinary Claude and Codex terminal sessions receive the same MCP context under the same rule; a terminal session whose turn was cut off by the move starts with one short "Continuing here" line, and an idle one resumes without starting a turn.
 

@@ -17,6 +17,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use super::{lock, Shell};
 
+pub(super) mod agents;
 mod auth;
 pub(super) mod billing;
 mod credentials;
@@ -25,6 +26,7 @@ mod machine;
 mod placements;
 pub(super) mod projects;
 mod recovery;
+mod signout;
 mod store;
 
 pub(super) struct Pro {
@@ -55,6 +57,8 @@ pub(super) struct Pro {
     /// After the service reported that it does not support this version,
     /// recheck no more often than this.
     unsupported_until: Mutex<Option<std::time::Instant>>,
+    /// Whether an agent was connected in the cloud at the last catalog read.
+    pub(super) agents: agents::Agents,
 }
 
 struct Runtime {
@@ -114,6 +118,17 @@ pub(super) mod code {
     /// work, SSH and the account itself are unaffected; nothing is retried
     /// more often than every ten minutes.
     pub const SERVICE_UNSUPPORTED: &str = "service_unsupported";
+    /// A browser sign-in that ended without signing in: its window ran out,
+    /// it could not complete, or the browser could not open. The person is
+    /// simply signed out, so the page keeps its plans and shows one quiet
+    /// line; none of these is an account failure.
+    pub const SIGN_IN_TIMED_OUT: &str = "sign_in_timed_out";
+    pub const SIGN_IN_INCOMPLETE: &str = "sign_in_incomplete";
+    pub const BROWSER_UNAVAILABLE: &str = "browser_unavailable";
+    /// Returned by sign-out after it finished on this computer while the saved
+    /// sign-in could be neither deleted nor revoked; `signout` finishes that
+    /// on its own once the account answers.
+    pub const SIGN_OUT_PENDING: &str = "sign_out_pending";
 }
 
 #[derive(Serialize)]
@@ -156,6 +171,7 @@ impl Pro {
             placements: Mutex::new(HashMap::new()),
             verified_routes: Mutex::new(placements::Verified::default()),
             unsupported_until: Mutex::new(None),
+            agents: agents::Agents::default(),
         }
     }
 
@@ -242,6 +258,12 @@ impl Pro {
 
     pub fn generation(&self) -> u64 {
         self.credential_generation.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn account_id(&self) -> Option<String> {
+        lock(&self.account)
+            .as_ref()
+            .map(|account| account.account_id.clone())
     }
 
     pub(super) fn has_keeper(&self) -> bool {
@@ -337,6 +359,16 @@ fn save_tokens_locked(endpoint: &str, tokens: Option<&Tokens>) -> Result<()> {
     Ok(())
 }
 
+/// Replaces a small nonsecret state file whole, so a reader never sees half
+/// of it.
+fn replace_small_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
 pub(super) fn start(app: AppHandle) {
     restore_account(app);
 }
@@ -353,6 +385,32 @@ fn restore_account(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let state = app.state::<Shell>();
         let _ready = ReadyOnExit(&state.pro.ready);
+        // The person signed out; a saved sign-in that could not be removed
+        // then is never restored. It is revoked and deleted instead.
+        if let Some(device) = signout::pending(&endpoint) {
+            let read_endpoint = endpoint.clone();
+            let loaded = tokio::task::spawn_blocking(move || load_tokens(&read_endpoint)).await;
+            let _operation = state.pro.operation.lock().await;
+            if !attempt.current(state.pro.generation()) {
+                return;
+            }
+            match loaded {
+                Ok(Ok(Some(tokens))) => signout::finish(
+                    app.clone(),
+                    endpoint,
+                    device,
+                    Some(tokens),
+                    state.pro.generation(),
+                ),
+                Ok(Ok(None)) => signout::clear(),
+                // Unreadable now; the marker keeps it from being restored.
+                _ => {}
+            }
+            *lock(&state.pro.error) = None;
+            state.pro.ready.send_replace(true);
+            let _ = app.emit("pro-changed", ());
+            return;
+        }
         for retry in 0..=recovery::RETRIES.len() {
             if retry > 0 {
                 tokio::time::sleep(Duration::from_secs(recovery::RETRIES[retry - 1])).await;
@@ -498,6 +556,11 @@ async fn activate_snapshot(
     // Successful authentication remains usable even when the OS cannot save it.
     // The writer retries the current pair without inventing an auth failure.
     let credentials_dirty = !matches!(persisted, Ok(Ok(())));
+    if authenticated && !credentials_dirty {
+        // A newer sign-in is saved now; an earlier unfinished sign-out must
+        // not keep it from being restored.
+        signout::clear();
+    }
     let (account, hosts, connection_error) = snapshot?;
     anyhow::ensure!(authenticated, "sign in required");
     let has_keeper = keeper_available(&account);
@@ -1009,9 +1072,9 @@ pub async fn pro_sign_in(
         let mut accepted = None;
         let outcome = async {
             tokio::select! {
-                _ = attempt.cancelled() => anyhow::bail!("Sign-in cancelled"),
+                _ = attempt.cancelled() => anyhow::bail!("Sign-in canceled"),
                 result = tokio::task::spawn_blocking(move || open::that(url.as_str())) => {
-                    result?.context("Could not open your browser. Try again from Chimaera.")?;
+                    result?.context(code::BROWSER_UNAVAILABLE)?;
                 }
             }
             let callback =
@@ -1020,12 +1083,12 @@ pub async fn pro_sign_in(
             // Waiting for the browser never locks sign-out, sleep handling or
             // account reconciliation. Only the bounded credential commit does.
             let _operation = tokio::select! {
-                _ = attempt.cancelled() => anyhow::bail!("Sign-in cancelled"),
+                _ = attempt.cancelled() => anyhow::bail!("Sign-in canceled"),
                 result = tokio::time::timeout_at(deadline, state.pro.operation.lock()) => {
-                    result.context("Sign-in expired. Choose Try again.")?
+                    result.context(code::SIGN_IN_TIMED_OUT)?
                 }
             };
-            anyhow::ensure!(state.pro.sign_in.finishing(attempt.id), "Sign-in cancelled");
+            anyhow::ensure!(state.pro.sign_in.finishing(attempt.id), "Sign-in canceled");
             let _ = app.emit("pro-changed", ());
             client
                 .exchange_code(chimaera_link::TokenRequest {
@@ -1036,10 +1099,10 @@ pub async fn pro_sign_in(
                     device_name: machine_name(),
                 })
                 .await
-                .context("Sign-in could not be completed. Choose Try again.")?;
+                .context(code::SIGN_IN_INCOMPLETE)?;
             activate(&app, client)
                 .await
-                .context("Sign-in could not be completed. Choose Try again.")?;
+                .context(code::SIGN_IN_INCOMPLETE)?;
             Ok::<_, anyhow::Error>(state.pro.generation())
         }
         .await;
@@ -1048,7 +1111,7 @@ pub async fn pro_sign_in(
         let success = current && outcome.is_ok();
         if current {
             if let Err(error) = outcome {
-                *lock(&state.pro.error) = Some(error.to_string());
+                *lock(&state.pro.error) = Some(sign_in_failure(&error).into());
             }
             let _ = app.emit("pro-changed", ());
         }
@@ -1063,6 +1126,21 @@ pub async fn pro_sign_in(
         }
     });
     Ok(())
+}
+
+/// The fixed code for a browser sign-in that ended without signing in. A
+/// provider's own refusal and anything unexpected read as incomplete; raw
+/// text never reaches the page.
+fn sign_in_failure(error: &anyhow::Error) -> &'static str {
+    let text = error.to_string();
+    [
+        code::SIGN_IN_TIMED_OUT,
+        code::BROWSER_UNAVAILABLE,
+        code::SIGN_IN_INCOMPLETE,
+    ]
+    .into_iter()
+    .find(|code| text == *code)
+    .unwrap_or(code::SIGN_IN_INCOMPLETE)
 }
 
 /// Only an authenticated, current flow may focus a managed daemon window.
@@ -1586,6 +1664,14 @@ async fn sign_out(app: &AppHandle, everywhere: bool, expected: Option<u64>) -> R
         if !saved_removed && !revoked {
             revoked = revoke_this_device(client.as_ref(), device.as_deref()).await;
         }
+        // A revoked pair left behind is harmless: the next launch is refused
+        // and deletes it. A still-valid one is finished by `signout`, which
+        // needs this session's tokens to revoke it later.
+        let unfinished = !(saved_removed || revoked);
+        let leftover = match (&client, unfinished) {
+            (Some(client), true) => client.tokens().await,
+            _ => None,
+        };
         if let Some(client) = client {
             client.clear_tokens().await;
         }
@@ -1620,22 +1706,34 @@ async fn sign_out(app: &AppHandle, everywhere: bool, expected: Option<u64>) -> R
                 },
             );
         }
-        // A revoked pair left behind is harmless: the next launch is refused
-        // and deletes it. Only a still-valid saved pair must be reported.
-        anyhow::ensure!(saved_removed || revoked, SIGN_OUT_INCOMPLETE);
         // `expected` marks an account-initiated end (revoked, expired or
         // replayed refresh token). It is final: the reconcile loop, events
         // and serve were stopped above, so nothing retries in the background.
         *lock(&state.pro.error) = expected.map(|_| SIGN_IN_EXPIRED.into());
         *lock(&state.pro.warning) = None;
+        match (unfinished, state.pro.endpoint.clone()) {
+            (true, Some(endpoint)) => {
+                signout::record(&endpoint, device.as_deref());
+                signout::finish(
+                    app.clone(),
+                    endpoint,
+                    device,
+                    leftover,
+                    state.pro.generation(),
+                );
+            }
+            _ => signout::clear(),
+        }
         let _ = app.emit("pro-changed", ());
+        // Signed out here either way; the code tells the page the rest
+        // finishes on its own, which is not a failure to retry.
+        anyhow::ensure!(!unfinished, code::SIGN_OUT_PENDING);
         Ok::<_, anyhow::Error>(())
     }
     .await
     .map_err(|error| error.to_string())
 }
 
-const SIGN_OUT_INCOMPLETE: &str = "You're signed out here, but Chimaera couldn't remove your saved sign-in from this computer's credential store. Sign out again once you're online.";
 const UNCONFIGURE_RETRIES: [Duration; 2] = [Duration::ZERO, Duration::from_secs(1)];
 
 /// Tries `attempt` after each delay until it succeeds; false when none did.
@@ -1973,7 +2071,11 @@ pub(super) async fn daemon_request(
     .await?
 }
 
+/// The daemon answers an open with diagnostic text only; it is classified
+/// here, once, into the fixed codes the page maps to sentences
+/// (`projects::open_code`). Raw text never reaches the page.
 fn project_failure(detail: &str) -> &'static str {
+    use projects::open_code;
     let text = detail.to_ascii_lowercase();
     if text.contains("not empty")
         || text.contains("nonempty")
@@ -1981,21 +2083,23 @@ fn project_failure(detail: &str) -> &'static str {
         || text.contains("empty folder")
         || text.contains("folder now contains files")
     {
-        "Choose an empty folder for this project. Its cloud copy is unchanged."
+        open_code::FOLDER_NOT_EMPTY
     } else if text.contains("missing")
         || text.contains("no such file")
         || text.contains("moved")
         || text.contains("destination changed")
     {
-        "The project's local folder is missing or moved. Restore that folder and try again."
+        open_code::FOLDER_MISSING
     } else if text.contains("pause") || text.contains("busy") || text.contains("still running") {
-        "The project is still running in the cloud. Try again when it reaches a pause."
+        open_code::BUSY
     } else if text.contains("git repository") || text.contains("another project") {
-        "Choose a folder that isn't inside another project or Git repository."
+        open_code::FOLDER_NESTED
     } else if text.contains("account changed") || text.contains("configuration changed") {
-        "Your account changed. Open the project again."
+        open_code::ACCOUNT_CHANGED
+    } else if text.contains("unavailable") || text.contains("not available") {
+        open_code::UNAVAILABLE
     } else {
-        "The project couldn't open here. Its cloud copy is intact. Try again shortly."
+        open_code::FAILED
     }
 }
 /// Everything the daemon's current setup was derived from. The daemon token
@@ -2452,9 +2556,9 @@ pub async fn pro_set_never_mirror(
                 .await
                 .context(PRIVACY_FAILED)?;
         }
-        // Stop local publishing first. If account deletion fails, the local
-        // privacy flag remains true and the UI reports that cloud policy could
-        // not yet be disabled; it must never silently re-enable local copying.
+        // Stop local publishing first. The daemon marks the project
+        // `privacy_pending` until the account confirms; local copying must
+        // never silently turn back on while that is outstanding.
         daemon_request(
             &state,
             "PUT",
@@ -2464,15 +2568,23 @@ pub async fn pro_set_never_mirror(
         .await
         .context(PRIVACY_FAILED)?;
         if never_mirror {
-            state
-                .pro
-                .client()
-                .await
-                .context(PRIVACY_PENDING)?
-                .disable_handoff_policy(&workspace_id)
-                .await
-                .context(PRIVACY_PENDING)?;
-            daemon_request(&state, "PUT", "/pro/privacy", Some(serde_json::json!({"workspace_id":workspace_id,"never_mirror":true,"confirmed":true}))).await.context(PRIVACY_PENDING)?;
+            let confirmed = async {
+                state
+                    .pro
+                    .client()
+                    .await
+                    .context("signed out")?
+                    .disable_handoff_policy(&workspace_id)
+                    .await?;
+                daemon_request(&state, "PUT", "/pro/privacy", Some(serde_json::json!({"workspace_id":workspace_id,"never_mirror":true,"confirmed":true}))).await
+            }
+            .await;
+            // The switch already took effect here, so an unconfirmed account
+            // is progress, not a failure: the status row keeps
+            // `privacy_pending` and the page re-sends this until it lands.
+            if confirmed.is_err() {
+                tracing::debug!("project privacy awaits account confirmation");
+            }
         }
         Ok::<_, anyhow::Error>(())
     }
@@ -2482,7 +2594,3 @@ pub async fn pro_set_never_mirror(
 }
 
 const PRIVACY_FAILED: &str = "Couldn't change this project's setting. Try again shortly.";
-/// Copying already stopped on this computer; only the account's
-/// confirmation is outstanding.
-const PRIVACY_PENDING: &str =
-    "This project now stays on this computer. Chimaera couldn't confirm that with your account yet.";

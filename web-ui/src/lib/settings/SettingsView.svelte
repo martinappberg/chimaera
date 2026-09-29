@@ -39,7 +39,6 @@
    */
   const sections = (() => {
     const out = [...CATEGORIES];
-    if (isNativeShell() || isBrowserGateway()) out.unshift("Chimaera Pro");
     const at = out.indexOf("Agents");
     out.splice(at >= 0 ? at + 1 : out.length, 0, "Environment", "Documents");
     if (isBrowserGateway()) out.splice(out.indexOf("Keyboard"), 0, "Cloud");
@@ -48,6 +47,9 @@
     // Keyboard: the pinned-chords block trails the list and belongs to it.
     const kb = out.indexOf("Keyboard");
     out.splice(kb >= 0 ? kb : out.length, 0, "Activity");
+    // Pro is an optional add-on, so it follows every working section rather
+    // than opening Settings (and its nav) with an account entry.
+    if (isNativeShell() || isBrowserGateway()) out.push("Chimaera Pro");
     return out;
   })();
 
@@ -138,9 +140,6 @@
     }
     return out;
   });
-
-  /** The pinned-chords block travels with the Keyboard section. */
-  const keyboardVisible = $derived(groups.some((g) => g.category === "Keyboard"));
 
   function jumpTo(section: string): void {
     activeSection = section;
@@ -276,13 +275,13 @@
           {#if group.category === "Chimaera Pro"}
             <section data-section={group.category}>
               <h2 class="cat">Chimaera Pro</h2>
-              <button class="pro-entry" class:offer={$accountPlan === "free"} aria-label={proAction === "Get Pro" ? "Get Chimaera Pro" : `View Chimaera ${$accountPlan === "max" ? "Max" : "Pro"} account`}
+              <button class="pro-entry" aria-label={proAction === "Get Pro" ? "Get Chimaera Pro" : `View Chimaera ${$accountPlan === "max" ? "Max" : "Pro"} account`}
                 onclick={() => window.dispatchEvent(new Event("chimaera:open-pro"))}>
                 <BrandMark size={30} />
                 <span class="pro-copy">
                   {#if $accountPlan === "free"}
-                    <strong>Your work, across devices.</strong>
-                    <span>Pick up your agent sessions and project files on another device.</span>
+                    <strong>Chimaera Pro</strong>
+                    <span>Optional: agents keep working in the cloud while you're away, and your work opens on another device.</span>
                   {:else if paid}
                     <strong>Your Chimaera {$accountPlan === "max" ? "Max" : "Pro"}</strong>
                     <span>Your plan, cloud agents and project sync.</span>
@@ -344,6 +343,48 @@
                 <SettingRow {def} />
               {/each}
             </section>
+          {:else if group.category === "Keyboard"}
+            <!-- Generic rows, then the reference chords that belong to them. -->
+            <section data-section={group.category}>
+              <h2 class="cat">{group.category}</h2>
+              {#each group.defs as def (def.id)}
+                <SettingRow {def} />
+              {/each}
+              <div class="kbd-reference">
+                <div class="kbd-group">
+                  <h3 class="kbd-group-title">Pinned chords</h3>
+                  <p class="kbd-note">
+                    Not rebindable — the terminal owns bare Ctrl on every platform, and these shadow
+                    browser conventions too carefully to open up.
+                  </p>
+                  <ul class="kbd-list">
+                    {#each pinnedRows as row (row.label)}
+                      <li class="kbd-row">
+                        <span class="kbd-label">{row.label}</span>
+                        <kbd class="kbd-pill">{row.chord}</kbd>
+                      </li>
+                    {/each}
+                  </ul>
+                </div>
+
+                <div class="kbd-group">
+                  <h3 class="kbd-group-title">chimaera app menu</h3>
+                  <p class="kbd-note">
+                    The native app's menu bar owns the chords a browser reserves, so these fire only in
+                    the chimaera app. Several are a second way to reach a rebindable action above —
+                    {APP_MENU.closeView} also closes a view, {APP_MENU.newTerminal} opens a new terminal.
+                  </p>
+                  <ul class="kbd-list">
+                    {#each appMenuRows as row (row.label)}
+                      <li class="kbd-row">
+                        <span class="kbd-label">{row.label}</span>
+                        <kbd class="kbd-pill">{row.chord}</kbd>
+                      </li>
+                    {/each}
+                  </ul>
+                </div>
+              </div>
+            </section>
           {:else}
             <section data-section={group.category}>
               <h2 class="cat">{group.category}</h2>
@@ -353,41 +394,6 @@
             </section>
           {/if}
         {/each}
-
-        {#if keyboardVisible}
-          <div class="kbd-group">
-            <h3 class="kbd-group-title">Pinned chords</h3>
-            <p class="kbd-note">
-              Not rebindable — the terminal owns bare Ctrl on every platform, and these shadow
-              browser conventions too carefully to open up.
-            </p>
-            <ul class="kbd-list">
-              {#each pinnedRows as row (row.label)}
-                <li class="kbd-row">
-                  <span class="kbd-label">{row.label}</span>
-                  <kbd class="kbd-pill">{row.chord}</kbd>
-                </li>
-              {/each}
-            </ul>
-          </div>
-
-          <div class="kbd-group">
-            <h3 class="kbd-group-title">chimaera app menu</h3>
-            <p class="kbd-note">
-              The native app's menu bar owns the chords a browser reserves, so these fire only in
-              the chimaera app. Several are a second way to reach a rebindable action above —
-              {APP_MENU.closeView} also closes a view, {APP_MENU.newTerminal} opens a new terminal.
-            </p>
-            <ul class="kbd-list">
-              {#each appMenuRows as row (row.label)}
-                <li class="kbd-row">
-                  <span class="kbd-label">{row.label}</span>
-                  <kbd class="kbd-pill">{row.chord}</kbd>
-                </li>
-              {/each}
-            </ul>
-          </div>
-        {/if}
 
         {#if groups.length === 0}
           <div class="empty">no settings match “{query}”</div>
@@ -592,9 +598,7 @@
     text-align: left;
     cursor: pointer;
   }
-  .pro-entry.offer { border-color: color-mix(in srgb, var(--accent) 28%, var(--edge)); background: color-mix(in srgb, var(--accent) 4%, transparent); }
   .pro-entry:hover { background: var(--row-hover); }
-  .offer .pro-open { color: var(--fg); font-weight: 600; }
   .pro-entry:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
   .pro-copy { display: grid; flex: 1; min-width: 0; gap: 4px; font-size: var(--text-sm); }
   .pro-copy strong { font-size: var(--text-md); font-weight: 550; }

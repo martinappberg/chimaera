@@ -26,10 +26,13 @@ owns the text; the confirm dialog shows it verbatim before anything is written.
 
 **Pro is a separate account surface.** `../pro/ProView.svelte` is a singleton
 workbench tab and Home view. When Pro is offered (`net/plan.ts` `proOffered`;
-a build without an account endpoint offers none) Settings starts with a small
-Chimaera Pro group that opens it; Home retains its Pro navigation. Confirmed free/signed-out users
-see a benefit-led Get Pro entry; paid users see Your Chimaera Pro/Max and View
-account. `../net/plan.ts` shares its existing subscription between this entry
+a build without an account endpoint offers none) Settings ends with a small
+Chimaera Pro group that opens it (Pro is an optional add-on, so it follows every
+working section, and its entry is neutral for every plan, never accent-tinted);
+Home retains its Pro navigation. Confirmed free/signed-out users see a short
+optional-benefit Get Pro entry; paid users see Your Chimaera Pro/Max and View
+account. The Keyboard section carries its reference chords inside it, so a
+group after it never splits them off. `../net/plan.ts` shares its existing subscription between this entry
 and the badges: loading or failed/unknown entitlement stays neutral, never a
 sales prompt or an active-plan claim. There is no extra poll or cloud wake. A paid workspace plan badge also
 opens it, without adding a full-width sidebar row for any plan.
@@ -99,9 +102,9 @@ section (`requestSettingsSection`).
 | `AgentsSettings.svelte` | Per-agent binary/model settings (paths, managed installs). |
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
-| `CloudSetup.svelte` | Automatic cloud status, bounded visible polling (no manual check), historical project-copy summaries and contextual provider connections; sleeping workers wake only for explicit connection management/use. Opening a repository exists only on the cloud machine's own page, as navigation; the app has none. See [provider map](../pro/AGENTS.md). |
-| `MirrorSettings.svelte` | Native project-copy status and privacy; visibility-gated 15-second status refresh; a pending privacy change is re-sent quietly (≤1/min); copy work still under way reads as a muted hint, only real problems in the warning colour; `renewal_failed` reads "Reconnecting your account…"; kept-both rows name the user's versions saved beside each file; blocked-provider rows open the shared connection flow. An agent's proposed setup command (`pending_setup_command`) shows once per project, whole, with Confirm/Dismiss (`pro/profile.ts`); `profile.deferred` is a plain "Steps that need your computer" list with no run button. Setup commands are otherwise not edited here, and idle-session policy stays internal. |
-| `ProSettings.svelte` | Dedicated Pro overview content: account identity, plan choices, browser checkout/portal, usage, and progressive connection/privacy/security sections. |
+| `CloudSetup.svelte` | Automatic cloud status, bounded visible polling (no manual check); the check mark needs an agent on record (live from the connection panel, else the app's remembered `agents_connected`), none connected reads as the next step and unknown claims nothing; a ready-but-unreachable read is re-checked with the account and reported only on a second read in a row; historical project-copy summaries and contextual provider connections; sleeping workers wake only for explicit connection management/use. Opening a repository exists only on the cloud machine's own page, as navigation; the app has none. See [provider map](../pro/AGENTS.md). |
+| `MirrorSettings.svelte` | Native project-copy status and privacy; visibility-gated 15-second status refresh; the row is re-read after every change; a privacy change the account hasn't confirmed yet is a success that reads as quiet progress and is re-sent quietly (≤1/min, the first a minute after the click); each row names who runs the project (`presentation.ts` `projectPlace`), and setup reads as progress unless it failed or waits on an agent; the switch is **Keep this project on this computer**; copy work still under way and too-large files read as a muted hint, only real problems in the warning colour; `renewal_failed` reads "Reconnecting your account…"; kept-both rows name the user's versions saved beside each file; blocked-provider rows open the shared connection flow. An agent's proposed setup command (`pending_setup_command`) shows once per project, whole, with Confirm/Dismiss (`pro/profile.ts`); `profile.deferred` is a plain "Steps that need your computer" list with no run button. Setup commands are otherwise not edited here, and idle-session policy stays internal. |
+| `ProSettings.svelte` | Dedicated Pro overview content: account identity, plan choices, browser checkout/portal, usage, and progressive connection/privacy/security sections; **Sign in** beside **See plans** for signed-out users; a browser sign-in that ended (`status.ts` `signInNote`) keeps the plans with one quiet line; sign-out asks first (ConfirmDialog) for **Sign out everywhere** and when a project is running in the cloud, and `sign_out_pending` reads as a quiet signed-out line. |
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
 | `agentDocs.ts` | Wire types + `getAgentDocs`/`installAgentDocs` for `/api/v1/agent-docs`. |
 | `ActivitySettings.svelte` | The Activity panel (see the exception above): this week's sessions and tokens + time worked, one 14-day sessions chart, by agent and model / by workspace, Export CSV. Fetches while Settings is visible and on the history nudge. |

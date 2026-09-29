@@ -2,12 +2,15 @@
   import { untrack } from "svelte";
   import { cloudOnboarding } from "../pro/onboarding.svelte";
   import { pageVisible } from "../shared/visibility";
-  import { copyIssue, projectCopiesSetupLine, projectCopyError } from "../pro/presentation";
+  import { copyIssue, projectCopiesSetupLine, projectCopyError, projectPlace } from "../pro/presentation";
   import { computerSteps, proposedSetup, settleProposal, type ProposalDecision } from "../pro/profile";
   import { proMirrorStatus, proSetNeverMirror, type MirrorStatus, type MirrorWorkspace } from "../net/native";
   let { visible = true, recoveryOnly = false }: { visible?: boolean; recoveryOnly?: boolean } = $props();
   let status = $state<MirrorStatus | null>(null);
   let error = $state<string | null>(null);
+  /** A change that didn't go through. Kept apart from `error` so the re-read
+   * that follows every change can't clear it. */
+  let actionError = $state<string | null>(null);
   let busy = $state<string | null>(null);
   let revision = 0;
   /** Last automatic privacy retry per project. Turning cloud copies off is
@@ -43,12 +46,15 @@
     const timer = setInterval(() => void load(), 15000);
     return () => { clearInterval(timer); revision += 1; };
   });
+  /** The row is re-read after every change, failed or not: the daemon's
+   * status is what the switch and its lines show, including a privacy change
+   * still waiting for the account (quiet progress, never this error). */
   async function act(id: string, action: () => Promise<void>): Promise<void> {
     if (busy !== null) return;
-    busy = id; error = null;
-    try { await action(); await load(); }
-    catch { error = "This change couldn’t be confirmed. Try again before changing another project setting."; }
-    finally { busy = null; }
+    busy = id; actionError = null;
+    try { await action(); }
+    catch { actionError = "This change didn’t go through. Try again in a moment."; }
+    finally { busy = null; await load(); }
   }
   /** Set when a decision found the proposal replaced or withdrawn meanwhile:
    * nothing was saved, and the refreshed row shows what is waiting now. */
@@ -63,6 +69,8 @@
   }
   function privacy(workspace: MirrorWorkspace, checkbox: HTMLInputElement): void {
     const value = checkbox.checked; checkbox.checked = workspace.never_mirror;
+    // This click already asked the account; the quiet re-send waits its minute.
+    if (value) privacyRetries.set(workspace.workspace_id, Date.now());
     void act(workspace.workspace_id, () => proSetNeverMirror(workspace.workspace_id, value));
   }
   /** The daemon saves the user's version beside each file and names those
@@ -76,35 +84,23 @@
     const more = count > paths.length ? `, and ${count - paths.length} more` : "";
     return `${kept} Your version is saved beside ${count === 1 ? "the file" : "each file"}: ${paths.join(", ")}${more}.`;
   }
-  function place(workspace: MirrorWorkspace): string {
-    if (workspace.never_mirror) return "Only on this device";
-    switch (workspace.ownership?.state) {
-      case "local": return "On this device";
-      case "remote": return "Continuing in the cloud";
-      case "transferring": return "Preparing to continue in the cloud…";
-      case "privacy_disabled": return "Automatic copying is off";
-      case "setting_up": return workspace.blocked_providers?.length ? "Waiting for cloud agent sign-in" : "Cloud project setup needs attention";
-      case "hydrating": return "Restoring files and conversations…";
-      case "awaiting_verification": return "Checking for recent changes…";
-      default: return "Waiting for the first copy";
-    }
-  }
 </script>
 <div class="mirrors">
   <h3>Project copies</h3>
-  {#if !recoveryOnly}<p class="hint">Your files, conversations and supported agent settings stay together across devices. Connected services are authorized separately.</p>{:else}<p class="hint">You can still manage project privacy without an active plan.</p>{/if}
+  {#if !recoveryOnly}<p class="hint">Your files, conversations and supported agent settings stay together between this computer and the cloud. Connected services are authorized separately.</p>{:else}<p class="hint">You can still manage project privacy without an active plan.</p>{/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}
+  {#if actionError}<p class="error" role="alert">{actionError}</p>{/if}
   {#if !recoveryOnly && projectCopiesSetupLine(status) !== null}<p class="hint" role="status">{projectCopiesSetupLine(status)}</p>{/if}
   {#if status?.workspaces.length === 0}<p class="hint">No project copies to show yet.</p>{/if}
   {#each status?.workspaces ?? [] as workspace (workspace.workspace_id)}
     {@const steps = computerSteps(workspace.profile)}
     <details>
-      <summary><span class="title">{workspace.name}</span><span class="hint">{place(workspace)}</span></summary>
+      <summary><span class="title">{workspace.name}</span><span class="hint">{projectPlace(workspace)}</span></summary>
       <div class="project">
         <p class="path">{workspace.root}</p>
-        <label class="check"><input type="checkbox" checked={workspace.never_mirror} disabled={busy !== null || (recoveryOnly && workspace.never_mirror)} onchange={(event) => privacy(workspace,event.currentTarget)} />Keep this project on this device</label>
+        <label class="check"><input type="checkbox" checked={workspace.never_mirror} disabled={busy !== null || (recoveryOnly && workspace.never_mirror)} onchange={(event) => privacy(workspace,event.currentTarget)} />Keep this project on this computer</label>
         {#if workspace.never_mirror && !workspace.privacy_pending}<p class="hint">Automatic copying and cloud access are off. Existing saved copies haven’t been deleted.</p>{/if}
-        {#if workspace.privacy_pending}<p class="hint" role="status">Turning off cloud copies for this project… We’ll keep trying.</p>{/if}
+        {#if workspace.privacy_pending}<p class="hint" role="status">This project now stays on this computer. Chimaera is confirming that with your account and keeps trying on its own.</p>{/if}
         {#if workspace.git_branches?.length}<p class="hint">Cloud changes are saved in {workspace.git_branches.join(", ")} for you to merge.</p>{/if}
         {#if !recoveryOnly && workspace.blocked_providers?.length}
           <div class="connection-needed"><p class="hint">Connect the agents this project uses so it can continue automatically.</p><button class="btn" onclick={() => cloudOnboarding.request({ providerIds: workspace.blocked_providers!.map(provider => provider.id), workspaceId: workspace.workspace_id, workspaceName: workspace.name })}>Connect agents to continue</button></div>
@@ -113,7 +109,7 @@
           {@const proposal = proposedSetup(workspace.profile)}
           {#if proposal !== null}
             <div class="proposal" role="group" aria-label="Proposed setup command">
-              <p class="lead">Your agent proposed a setup command for the cloud machine</p>
+              <p class="lead">Your agent proposed a setup command for the cloud</p>
               <pre class="command">{proposal}</pre>
               <p class="hint">Once you confirm it, it runs in the project folder before work continues in the cloud.{#if workspace.profile?.setup_command} It replaces the current setup command.{/if}</p>
               <div class="actions"><button class="btn" disabled={busy !== null} onclick={() => decide(workspace, proposal, "confirm")}>Confirm</button><button class="btn" disabled={busy !== null} onclick={() => decide(workspace, proposal, "dismiss")}>Dismiss</button></div>
@@ -131,7 +127,7 @@
         {#if workspace.mirror}
           {#if workspace.mirror.last_mirrored_at}<p class="hint">Last copied {new Date(workspace.mirror.last_mirrored_at * 1000).toLocaleString()}</p>{/if}
           {#if workspace.mirror.kept_both}<p class="hint kept" role="status">{keptBoth(workspace.mirror)}</p>{/if}
-          {#if workspace.mirror.too_large}<p class="error" role="status">Some files are too large to include in the cloud copy. They remain available on this device.</p>{/if}
+          {#if workspace.mirror.too_large}<p class="hint" role="status">Some files are too large for the cloud copy. They stay on this computer.</p>{/if}
           {#if workspace.mirror.error && workspace.mirror.error !== "cloud_provider_not_ready"}<p class={copyIssue(workspace.mirror) === "progress" ? "hint" : "error"} role="status">{projectCopyError(workspace.mirror.error, workspace.mirror.error_code)}</p>{/if}
         {/if}
       </div>

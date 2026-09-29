@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { accountFailure, connectionWarningCode, rechecksItself } from "./status";
+import { accountFailure, connectionWarningCode, rechecksItself, signInNote } from "./status";
 
 const connectionWarning = (status: Parameters<typeof connectionWarningCode>[0]) => connectionWarningCode(status) !== null;
 
@@ -32,6 +32,14 @@ describe("account status interpretation", () => {
     expect(connectionWarningCode({ error: preparing })).not.toBe(connectionWarningCode({ error: retrying }));
     expect(connectionWarningCode({ error: null, connection_warning: "account_unreachable" })).toBe("account_unreachable");
     expect(connectionWarningCode({ error: "sign in required" })).toBeNull();
+  });
+  it("reads a sign-in attempt that ended as a note while signed out, never an account failure", () => {
+    for (const error of ["sign_in_timed_out", "sign_in_incomplete", "browser_unavailable"]) {
+      expect(accountFailure({ error })).toBeNull();
+      expect(signInNote({ error, signed_in: false })).toBe(error);
+      expect(signInNote({ error, signed_in: true })).toBeNull();
+    }
+    for (const error of [null, "sign in required", "account_restore_locked", "sign_in_timed_out extra"]) expect(signInNote({ error, signed_in: false })).toBeNull();
   });
   it("recognizes only the unsupported service as rechecked by the app", () => {
     expect(rechecksItself("service_unsupported")).toBe(true);

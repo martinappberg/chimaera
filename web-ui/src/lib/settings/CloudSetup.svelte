@@ -9,8 +9,12 @@
   import { isNativeShell, proCloudStatus, proMirrorStatus, writeClipboard, type MirrorStatus, type CloudSetupInfo, type CloudSetupRequest, type CloudProvisioningStatus } from "../net/native";
 
   let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady }: { visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void } = $props();
+  /** Newer shells add `agents_connected`: whether an agent was connected in
+   * the cloud at the last catalog read, remembered by the app and never
+   * probed, so a sleeping cloud is not woken to answer it. */
+  type CloudStatus = CloudProvisioningStatus & { agents_connected?: boolean | null };
   let info = $state<CloudSetupInfo | null>(null);
-  let status = $state<CloudProvisioningStatus | null>(null);
+  let status = $state<CloudStatus | null>(null);
   let busy = $state<string | null>(null);
   let error = $state<string | null>(null);
   let repository = $state("");
@@ -24,16 +28,28 @@
   let connectionsRequested = $state(false);
   let projects = $state<MirrorStatus | null>(null);
   let refreshFlight: Promise<void> | null = null;
+  /** Passive reads in a row that found the cloud unreachable although the
+   * account said it was ready. One is usually the machine going to sleep in
+   * between, which is not an outage; only a second in a row is reported. */
+  let unreachable = $state(0);
+  /** From the connection panel's own fresh catalog while it shows. */
+  let liveAgents = $state<boolean | null>(null);
   const browser = !isNativeShell();
-  const copy = $derived(status?.state === "ready" && info?.available !== true
-    ? { title: connectionChecked ? "Cloud access is temporarily unavailable" : "Checking availability…", detail: connectionChecked ? "We couldn’t reach your projects and agent connections. We’ll keep checking. You can keep working here." : "Checking access to your projects and agent connections." }
-    : cloudCopy(status?.state ?? "error", status?.reason ?? null, status?.phase));
+  const agents = $derived(liveAgents ?? (browser ? null : status?.agents_connected ?? null));
   const connected = $derived(info?.available === true && (browser || status?.state === "ready"));
+  const outage = $derived(status?.state === "ready" && !connected && unreachable >= 2);
+  const asleep = $derived(status?.state === "sleeping" || status?.state === "ready" && connectionChecked && !connected && !outage);
+  const copy = $derived(outage
+    ? { title: "Cloud access is temporarily unavailable", detail: "We couldn’t reach your projects and agent connections. We’ll keep checking. You can keep working here." }
+    : status?.state === "ready" && !connected
+      ? connectionChecked ? cloudCopy("sleeping", status.reason, status.phase, agents) : { title: "Checking availability…", detail: "Checking access to your projects and agent connections." }
+      : cloudCopy(status?.state ?? "error", status?.reason ?? null, status?.phase, agents));
   $effect(() => { if (connected) { providersMounted = true; connectionsRequested = false; } });
   const preparing = $derived(!browser && (status?.state === "preparing" || status?.state === "ready" && !connected && !connectionChecked));
-  const available = $derived(connected || status?.state === "sleeping");
-  const projectStatus = $derived(cloudProjectStatus(projects, workspaceId));
-  const needsCheck = $derived(browser ? connectionChecked && !connected : status?.state === "error" || status?.state === "unavailable" || status?.state === "ready" && connectionChecked && !connected);
+  // The check mark claims a connected agent, so it needs one on record.
+  const available = $derived((connected || asleep) && agents === true);
+  const projectStatus = $derived(cloudProjectStatus(projects, workspaceId, browser ? "cloud" : "computer"));
+  const needsCheck = $derived(browser ? connectionChecked && !connected : status?.state === "error" || status?.state === "unavailable" || outage);
 
   async function readProjects(signal?: AbortSignal): Promise<MirrorStatus | null> {
     try {
@@ -60,17 +76,20 @@
           info = result; connectionChecked = true;
           reachable = result.available === true;
         } else {
-          const result = await proCloudStatus();
+          const result: CloudStatus = await proCloudStatus();
           if (!alive || signal?.aborted || current !== generation) return;
-          status = result;
           // Passive status and metadata reads never wake a suspended machine.
           if (result.state === "ready") {
             const details = await cloudRequest({ operation: "info" }, signal).catch(() => null);
             if (!alive || signal?.aborted || current !== generation) return;
-            info = details;
-            connectionChecked = true;
             reachable = details?.available === true;
-          } else { info = null; connectionChecked = false; }
+            // A machine that just went to sleep answers nothing: ask the
+            // account again before counting it as unreachable.
+            const again: CloudStatus | null = reachable ? null : await proCloudStatus().catch(() => null);
+            if (!alive || signal?.aborted || current !== generation) return;
+            if (again !== null && again.state !== "ready") { status = again; info = null; connectionChecked = false; unreachable = 0; }
+            else { status = result; info = details; connectionChecked = true; unreachable = reachable ? 0 : unreachable + 1; }
+          } else { status = result; info = null; connectionChecked = false; unreachable = 0; }
         }
         // Native mirror metadata is local and stays useful while compute is idle.
         const nextProjects = !browser || reachable ? await readProjects(signal) : null;
@@ -127,25 +146,25 @@
       if (!alive || action !== actionGeneration) return;
       if (request.operation === "project") repository = "";
       if (request.operation === "start") await refresh(undefined, true);
-    } catch (reason) { if (alive && action === actionGeneration) error = friendlyError(reason, request.operation === "project" ? "This repository couldn't open in the cloud. Check the URL and your Git access, then try again." : "Your agent connections couldn’t load. Try again in a moment."); }
+    } catch (reason) { if (alive && action === actionGeneration) error = friendlyError(reason, request.operation === "project" ? "This repository couldn’t open in the cloud. Check the URL and your Git access, then try again." : "Your agent connections couldn’t load. Try again in a moment."); }
     finally { if (alive && action === actionGeneration) busy = null; }
   }
   async function copyKey(): Promise<void> {
     if (!info?.ssh_public_key) return;
-    try { if (!await writeClipboard(info.ssh_public_key)) throw new Error("clipboard unavailable"); copied = true; } catch { error = "The public key couldn't be copied. You can select it below."; }
+    try { if (!await writeClipboard(info.ssh_public_key)) throw new Error("clipboard unavailable"); copied = true; } catch { error = "The public key couldn’t be copied. You can select it below."; }
   }
 </script>
 
 <section class="cloud" aria-label="Cloud status">
   <div class="machine" class:attention={needsCheck}>
-    <div class="heading"><div><span class="eyebrow">Your cloud</span><h2>{browser ? connected ? "Available when you need it" : connectionChecked ? "Cloud access is temporarily unavailable" : "Checking availability…" : status ? copy.title : "Checking availability…"}</h2></div><span class="status-mark" class:connected={available} class:preparing aria-hidden="true">{#if available}<svg viewBox="0 0 24 24"><path d="m6 12 4 4 8-8" /></svg>{:else}<svg viewBox="0 0 24 24"><path d="M7 17a4 4 0 0 1-1-7.9 6 6 0 0 1 11.4-1.5A4.7 4.7 0 0 1 18 17H7Z" /></svg>{/if}</span></div>
-    <p class="hint" role="status">{browser ? connected ? "Agents connected here can keep working while your computer sleeps." : connectionChecked ? "We couldn’t reach your projects and agent connections. We’ll keep checking." : "Checking access to your projects and agent connections." : status ? copy.detail : "Your projects and conversations stay together across devices."}</p>
+    <div class="heading"><div><span class="eyebrow">Cloud</span><h2>{browser ? connected ? "Available when you need it" : connectionChecked ? "Cloud access is temporarily unavailable" : "Checking availability…" : status ? copy.title : "Checking availability…"}</h2></div><span class="status-mark" class:connected={available} class:preparing aria-hidden="true">{#if available}<svg viewBox="0 0 24 24"><path d="m6 12 4 4 8-8" /></svg>{:else}<svg viewBox="0 0 24 24"><path d="M7 17a4 4 0 0 1-1-7.9 6 6 0 0 1 11.4-1.5A4.7 4.7 0 0 1 18 17H7Z" /></svg>{/if}</span></div>
+    <p class="hint" role="status">{browser ? connected ? agents ? "Agents connected here can keep working while your computer sleeps." : "Agents you connect here can keep working while your computer sleeps." : connectionChecked ? "We couldn’t reach your projects and agent connections. We’ll keep checking." : "Checking access to your projects and agent connections." : status ? copy.detail : "Your projects and conversations come with you."}</p>
     {#if needsCheck && browser}<div class="recovery"><a class="account-link" href="/account">Open your account →</a></div>{/if}
   </div>
   {#if projectStatus}
     <div class="project-status" class:attention={projectStatus.state === "attention"} role="status"><span class="project-dot" class:active={projectStatus.state === "active"} aria-hidden="true"></span><div><h3>{projectStatus.title}</h3><p class="hint">{projectStatus.detail}</p></div></div>
   {/if}
-  {#if !browser && !connected && (status?.state === "sleeping" || connectionsRequested)}
+  {#if !browser && !connected && (asleep || connectionsRequested)}
     <details class="sleeping-connections" ontoggle={(event) => { if (event.currentTarget.open && !connectionsRequested) void act("connections", { operation: "start" }); }}>
       <summary>Agent connections</summary>
       {#if busy === "connections" || preparing}<p class="hint" role="status">Loading your agent connections…</p>
@@ -154,7 +173,7 @@
   {/if}
   {#if providersMounted}
     <div class="provider-section" hidden={!connected}>
-      <ProviderConnections visible={visible && connected} {requiredProviders} {contextLabel} {workspaceId} {onReady} compact />
+      <ProviderConnections visible={visible && connected} {requiredProviders} {contextLabel} {workspaceId} {onReady} onAgents={(value) => (liveAgents = value)} compact />
     </div>
   {/if}
   {#if connected && (browser || info?.ssh_public_key)}
@@ -194,7 +213,7 @@
   label { font-size: var(--text-sm); }
   input, textarea { border: 1px solid var(--edge); border-radius: 6px; background: var(--bg); color: var(--fg); padding: 8px; font: inherit; min-width: 0; }
   input { flex: 1; width: 100%; }
-  textarea { width: 100%; box-sizing: border-box; font-family: monospace; resize: vertical; }
+  textarea { width: 100%; box-sizing: border-box; font-family: var(--mono); resize: vertical; }
   .account-link { color: var(--accent); font-size: var(--text-sm); }
   summary { cursor: pointer; color: var(--muted); font-size: var(--text-sm); padding: 10px 0; }
   details p { margin-bottom: 12px; }

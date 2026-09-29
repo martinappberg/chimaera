@@ -113,7 +113,7 @@ export function connectionError(code: string | null, operation: "connect" | "dis
       case "disconnect_not_confirmed": return "The service still reports a connection. Check its status before trying again.";
       case "expired": case "connection_expired": return "This request timed out before disconnection could be confirmed. Check the connection before trying again.";
       case "invalid_status": return "The service couldn't confirm its connection status. Check again before trying to disconnect.";
-      default: return "Disconnection couldn't be confirmed. Check the connection before trying again. Sign-in on your other devices hasn't changed.";
+      default: return "Disconnection couldn't be confirmed. Check the connection before trying again. Sign-in on your computer hasn't changed.";
     }
   }
   switch (code) {
@@ -122,14 +122,14 @@ export function connectionError(code: string | null, operation: "connect" | "dis
     case "expired": case "connection_expired": return "This sign-in request expired. Start again for a fresh request.";
     case "canceled": case "connection_canceled": return "Sign-in was canceled. Your existing provider connections haven't changed.";
     case "device_login_unavailable": return "Device sign-in couldn't start. Check your connection and that your provider account allows device sign-in, then try again.";
-    case "installation_failed": case "install_failed": return "Sign-in couldn’t be prepared for this agent. Try again in a moment.";
-    case "installation_unavailable": return "Sign-in isn’t available for this agent right now. Try again later.";
+    case "installation_failed": case "install_failed": return "Sign-in couldn't be prepared for this agent. Try again in a moment.";
+    case "installation_unavailable": return "Sign-in isn't available for this agent right now. Try again later.";
     case "probe_timeout": return "The agent took too long to confirm sign-in. Check the connection again in a moment.";
-    case "sign_in_not_confirmed": return "The provider hasn’t confirmed sign-in yet. Open its sign-in flow again to finish.";
+    case "sign_in_not_confirmed": return "The provider hasn't confirmed sign-in yet. Open its sign-in flow again to finish.";
     // Claude's page shows `code#state`; half of it keeps the sign-in waiting.
     case "authorization_code_incomplete": return "Paste the whole code, including the part after #.";
-    case "browser_login_unavailable": return "Guided sign-in isn’t available for this agent right now. Try again later.";
-    case "unsupported": case "unsupported_auth": return "This provider doesn’t support guided sign-in for cloud work yet.";
+    case "browser_login_unavailable": return "Guided sign-in isn't available for this agent right now. Try again later.";
+    case "unsupported": case "unsupported_auth": return "This provider doesn't support guided sign-in for cloud work yet.";
     default: return "The provider couldn't complete sign-in. You can try again without changing your local account.";
   }
 }

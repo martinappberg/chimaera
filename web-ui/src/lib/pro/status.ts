@@ -10,11 +10,23 @@ const LEGACY_WARNINGS: ReadonlyMap<string, string> = new Map([
 
 type StatusFields = Pick<ProStatus, "error" | "connection_warning">;
 
-/** A real account failure. An informational connection message is never one:
- * entitlement, the plan badge and plan choice must not depend on it. */
+/** Codes for a browser sign-in that ended without signing in. The person is
+ * simply signed out: the page keeps its plans and shows one quiet line. */
+const SIGN_IN_NOTES: ReadonlySet<string> = new Set(["sign_in_timed_out", "sign_in_incomplete", "browser_unavailable"]);
+
+/** A real account failure. An informational connection message or a sign-in
+ * attempt that ended is never one: entitlement, the plan badge and plan
+ * choice must not depend on it. */
 export function accountFailure(status: StatusFields | null | undefined): string | null {
   const error = status?.error ?? null;
-  return error !== null && LEGACY_WARNINGS.has(error) ? null : error;
+  return error !== null && (LEGACY_WARNINGS.has(error) || SIGN_IN_NOTES.has(error)) ? null : error;
+}
+
+/** The code of the last browser sign-in that ended without signing in, while
+ * still signed out; null otherwise (`presentation.ts` `signInNoteCopy`). */
+export function signInNote(status: Pick<ProStatus, "error" | "signed_in"> | null | undefined): string | null {
+  const error = status?.error ?? null;
+  return error !== null && !status?.signed_in && SIGN_IN_NOTES.has(error) ? error : null;
 }
 
 /** A failure the app rechecks on its own, so the page offers no manual check:

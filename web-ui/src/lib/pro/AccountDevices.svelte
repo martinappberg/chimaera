@@ -19,8 +19,8 @@
 
 <div class="devices">
   {#each groups.devices as device (device.id)}
-    <div class="device"><div class="row"><div><strong>{device.name}</strong><span class="muted detail">{device.current ? "This device" : lastSeen(device.lastSeen)}</span></div>{#if !device.current && device.signIns.length === 1}<button class="text-button" disabled={busy} onclick={() => pending = device.signIns[0]}>Sign out</button>{/if}</div>
-      {#if device.signIns.length > 1}<details><summary>Sign-ins on this device</summary>{#each device.signIns as signIn (signIn.id)}{@render signInRow(signIn)}{/each}</details>{/if}
+    <div class="device"><div class="row"><div><strong>{device.name}</strong><span class="muted detail">{device.current ? "This computer" : lastSeen(device.lastSeen)}</span></div>{#if !device.current && device.signIns.length === 1}<button class="text-button" disabled={busy} onclick={() => pending = device.signIns[0]}>Sign out</button>{/if}</div>
+      {#if device.signIns.length > 1}<details><summary>Sign-ins</summary>{#each device.signIns as signIn (signIn.id)}{@render signInRow(signIn)}{/each}</details>{/if}
     </div>
   {/each}
   {#if groups.currentSignIn}<div class="row"><div><strong>This sign-in</strong><span class="muted detail">{lastSeen(groups.currentSignIn.last_seen)}</span></div></div>{/if}
