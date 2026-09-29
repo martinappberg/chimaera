@@ -47,8 +47,10 @@ use crate::AppState;
 
 const SERVICE_BASE: &str = "wss://api.anthropic.com";
 const SERVICE_PATH: &str = "/api/ws/speech_to_text/voice_stream";
-/// Replaces `SERVICE_BASE` (e.g. `ws://127.0.0.1:9123`) — a local stand-in
-/// for tests and live verification, like claude's `VOICE_STREAM_BASE_URL`.
+/// Replaces `SERVICE_BASE` (e.g. `ws://127.0.0.1:9123`) with a local stand-in
+/// for live verification, like claude's `VOICE_STREAM_BASE_URL`. Dev builds
+/// only, and a stand-in never gets the login: nothing but Anthropic's own
+/// endpoint ever sees the token.
 const SERVICE_BASE_ENV: &str = "CHIMAERA_VOICE_STREAM_URL";
 
 /// The dictation languages the service takes (claude's list); anything else
@@ -99,7 +101,7 @@ impl Drop for Slot {
 /// GET /api/v1/voice — can this host dictate? `/voice` asks before turning
 /// on, so a missing login says so at once rather than on the first recording.
 pub(crate) async fn availability() -> Json<Value> {
-    if service_override().is_some() && chimaera_core::is_dev_build() {
+    if service_override().is_some() {
         return Json(json!({ "available": true }));
     }
     match login::access_token().await {
@@ -180,12 +182,13 @@ async fn relay(socket: &mut WebSocket, state: &AppState) {
     };
 
     let base = service_override();
-    let token = match login::access_token().await {
-        Ok(token) => Some(token),
-        // A local stand-in needs no login — dev builds only, so a release can
-        // never be pointed at a service while skipping the login check.
-        Err(_) if base.is_some() && chimaera_core::is_dev_build() => None,
-        Err(e) => return fail(socket, e.code(), &e.to_string()).await,
+    let token = if base.is_some() {
+        None
+    } else {
+        match login::access_token().await {
+            Ok(token) => Some(token),
+            Err(e) => return fail(socket, e.code(), &e.to_string()).await,
+        }
     };
     let url = service_url(base.as_deref(), &dictation_language(language.as_deref()));
     let mut headers = vec![
@@ -214,6 +217,9 @@ fn service_override() -> Option<String> {
     #[cfg(test)]
     if let Some(base) = SERVICE_FOR_TESTS.lock().unwrap().clone() {
         return Some(base);
+    }
+    if !chimaera_core::is_dev_build() {
+        return None;
     }
     std::env::var(SERVICE_BASE_ENV)
         .ok()

@@ -191,7 +191,7 @@ async fn voice_relays_audio_and_transcripts() {
         assert!(s.uri.contains("language=sv&"), "{}", s.uri);
         assert_eq!(s.x_app.as_deref(), Some("cli"));
         assert_eq!(s.keyterms.as_deref(), Some("chimaera,Claude Codex"));
-        // A dev build's stand-in needs no login, and none is sent.
+        // A stand-in never gets the login.
         assert_eq!(s.authorization, None);
         assert_eq!(s.first_text.as_deref(), Some(r#"{"type":"KeepAlive"}"#));
         assert_eq!(s.audio_bytes, 6400);

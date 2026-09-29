@@ -107,8 +107,12 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   relays to Claude's speech-to-text service (`wss://api.anthropic.com/api/ws/speech_to_text/voice_stream`,
   the one Claude Code's `/voice` uses) with the claude.ai login `claude` keeps on the daemon's
   host — so a daemon on a login node with no microphone still dictates, and the speech crosses
-  the ssh tunnel first. Chimaera reads that login and never refreshes it (claude's refresh tokens
-  rotate); an expired login says to send any Claude message, which renews it. The relay is one
+  the ssh tunnel first. The login is found where claude 2.1.283 looks: `CLAUDE_CODE_OAUTH_TOKEN`,
+  else on macOS the login keychain (`Claude Code-credentials`, read with `security` as claude
+  reads it, so no prompt), else `.credentials.json` in claude's config dir. Chimaera never
+  refreshes it (claude's refresh tokens rotate); an expired login says to send any Claude
+  message, which renews it. A dev build can point the relay at a stand-in
+  (`CHIMAERA_VOICE_STREAM_URL`), which never gets the login. The relay is one
   socket per recording, first-frame authed, ≤ 4 at once daemon-wide, 10 min per recording, ~30 s
   of audio buffered while the service connects (one reconnect before any words), KeepAlive every
   8 s, and after `CloseStream` it waits ≤ 5 s for the last words (1.5 s if nothing comes).
@@ -654,9 +658,6 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 
 ## Status: partial
 
-- Voice dictation's claude.ai login read (`voice/login.rs`) is not written yet: every host
-  currently answers "needs a Claude.ai login". A dev build pointed at a stand-in service
-  (`CHIMAERA_VOICE_STREAM_URL`) dictates end to end.
 - Chat sessions survive a *disconnect* **and a daemon restart** — the ledger resurrects them live
   (resuming the native conversation, carrying the pinned title, the Remote Control bridge and
   ultracode; a turn or background work the restart cut off is handed back to the agent in one
