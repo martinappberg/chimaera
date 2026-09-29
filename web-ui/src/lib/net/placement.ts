@@ -8,7 +8,11 @@ export interface WorkspacePlacement {
   route_host_id: string | null;
   epoch: number;
   policy_revision: number;
-  availability: "owned" | "unowned" | "expired" | "privacy_disabled";
+  /** `suspended`: a cloud machine that went to sleep keeping ownership. It
+   *  keeps its `worker-` route and is routed exactly like `owned`; its lease
+   *  reads expired by design. Reading it never wakes it; the first send or
+   *  keystroke carries wake intent. */
+  availability: "owned" | "suspended" | "unowned" | "expired" | "privacy_disabled";
   server_now: string;
   expires_at: string | null;
 }
@@ -17,9 +21,13 @@ export function parsePlacement(value: unknown, workspace: string): WorkspacePlac
   if (typeof value !== "object" || value === null) throw new Error("Project connection is unavailable");
   const row = value as Record<string, unknown>;
   if (!safeId(workspace) || row.workspace_id !== workspace || !Number.isSafeInteger(row.epoch) || (row.epoch as number) < 0 || !Number.isSafeInteger(row.policy_revision) || (row.policy_revision as number) < 0 || typeof row.server_now !== "string" || !Number.isFinite(Date.parse(row.server_now))) throw new Error("Project connection is unavailable");
-  if (!["owned", "unowned", "expired", "privacy_disabled"].includes(String(row.availability))) throw new Error("Project connection is unavailable");
+  if (!["owned", "suspended", "unowned", "expired", "privacy_disabled"].includes(String(row.availability))) throw new Error("Project connection is unavailable");
   if (row.availability === "owned") {
     if (!safeId(row.holder_id) || !safeId(row.route_host_id) || !["device-", "worker-"].some(prefix => row.route_host_id === prefix + row.holder_id) || (row.epoch as number) < 1 || typeof row.expires_at !== "string" || !Number.isFinite(Date.parse(row.expires_at)) || Date.parse(row.expires_at) <= Date.parse(row.server_now)) throw new Error("Project connection is unavailable");
+  } else if (row.availability === "suspended") {
+    // A sleeping cloud machine: its own worker route, a live epoch, and a
+    // lease that may read expired (it is not renewed while asleep).
+    if (!safeId(row.holder_id) || row.route_host_id !== `worker-${row.holder_id}` || (row.epoch as number) < 1 || (row.expires_at !== null && (typeof row.expires_at !== "string" || !Number.isFinite(Date.parse(row.expires_at))))) throw new Error("Project connection is unavailable");
   } else if (row.route_host_id !== null) throw new Error("Project connection is unavailable");
   return row as unknown as WorkspacePlacement;
 }
@@ -152,7 +160,9 @@ export function readPlacement(): Promise<WorkspacePlacement> {
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
     const placement = parsePlacement(JSON.parse(new TextDecoder().decode(bytes)), workspace);
-    if (placement.availability !== "owned") throw new PlacementError(503);
+    // A sleeping owner is routed like an awake one; the transport wakes it
+    // for a request or socket that carries wake intent, never for a read.
+    if (placement.availability !== "owned" && placement.availability !== "suspended") throw new PlacementError(503);
     noteProjectWhere(placement);
     return placement;
   })();

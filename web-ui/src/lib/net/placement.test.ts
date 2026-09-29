@@ -10,6 +10,13 @@ describe("workspace routing authority", () => {
   it("rejects stale, cross-workspace and malformed authority", () => {
     for (const change of [{ workspace_id: "w-other" }, { route_host_id: "worker-other" }, { route_host_id: "prefix-device-d-home" }, { holder_id: "../x" }, { epoch: 0 }, { epoch: 2 ** 60 }, { expires_at: live.server_now }, { server_now: "bad" }, { availability: "future" }, { availability: "expired" }]) expect(() => parsePlacement({ ...live, ...change }, "w-one")).toThrow();
   });
+  it("routes a sleeping cloud machine (suspended) exactly like an owner, with its expired lease", () => {
+    const asleep = { ...live, holder_id: "wk", route_host_id: "worker-wk", availability: "suspended", expires_at: "2026-09-28T18:00:00Z" };
+    expect(parsePlacement(asleep, "w-one")).toMatchObject({ availability: "suspended", route_host_id: "worker-wk", epoch: 4 });
+    expect(parsePlacement({ ...asleep, expires_at: null }, "w-one").availability).toBe("suspended");
+    for (const change of [{ route_host_id: null }, { route_host_id: "device-wk" }, { route_host_id: "worker-other" }, { holder_id: "../x" }, { epoch: 0 }, { expires_at: "soon" }])
+      expect(() => parsePlacement({ ...asleep, ...change }, "w-one")).toThrow();
+  });
   it("preserves unavailable states without inventing an execution route", () => {
     for (const availability of ["unowned", "expired", "privacy_disabled"])
       expect(parsePlacement({ ...live, availability, route_host_id: null }, "w-one").availability).toBe(availability);
@@ -128,5 +135,14 @@ describe("where a routed session runs", () => {
     await readPlacement();
     expect(projectWhereLabel(get(projectWhere))).toBe("On your computer");
     expect(projectWhereLabel(null)).toBe("This project");
+  });
+  it("a sleeping owner's scope is sent like an owner's: reading it never wakes it", async () => {
+    vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-one/"));
+    const fetch = vi.fn().mockResolvedValue(Response.json({ ...live, holder_id: "wk", route_host_id: "worker-wk", availability: "suspended", expires_at: null }));
+    vi.stubGlobal("fetch", fetch);
+    const headers = new Headers();
+    await workspaceHeaders(headers);
+    expect(headers.get("x-chimaera-epoch")).toBe("4");
+    for (const [, options] of fetch.mock.calls) expect(options.method).toBeUndefined();
   });
 });
