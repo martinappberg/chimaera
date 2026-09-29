@@ -893,6 +893,7 @@ mod tests {
             attachment_paths: Vec::new(),
             id: id.map(Into::into),
             queued,
+            after_turn: false,
             origin: None,
         }
     }

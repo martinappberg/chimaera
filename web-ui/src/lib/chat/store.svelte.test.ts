@@ -239,8 +239,39 @@ describe("ChatStore pending-send ordering", () => {
       id: "q1",
       text: "meanwhile do X",
       state: "queued",
+      // No `after_turn` on the echo: read at the agent's next step.
+      afterTurn: false,
       checkpoint: { id: "q1", preceding: "p0" },
     });
+  });
+
+  it("a next-step send joins the turn where the agent read it; an after-turn one waits", () => {
+    const events: Record<string, unknown>[] = [
+      { type: "turn_started", turn_id: "t1" },
+      { type: "message_chunk", turn_id: "t1", text: "step one" },
+      { type: "user_message", text: "also check the tests", id: "q1", queued: true },
+      { type: "user_message", text: "then summarize", id: "q2", queued: true, after_turn: true },
+      // The agent reads q1 at its next step — mid-turn, by design.
+      { type: "user_message_update", id: "q1", state: "sent" },
+      { type: "message_chunk", turn_id: "t1", text: "step two" },
+      { type: "turn_completed", turn_id: "t1", usage: { output_tokens: 2 } },
+      { type: "user_message_update", id: "q2", state: "sent" },
+    ];
+    const midTurn = fold(events.slice(0, 6));
+    expect(midTurn.pendingSends).toHaveLength(1);
+    expect(midTurn.pendingSends[0]).toMatchObject({ id: "q2", state: "queued", afterTurn: true });
+    expect(midTurn.blocks.map((b) => b.kind)).toEqual(["message", "user", "message"]);
+    expect(midTurn.blocks[1]).toMatchObject({ kind: "user", id: "q1", text: "also check the tests" });
+
+    const done = fold(events);
+    expect(done.pendingSends).toHaveLength(0);
+    // q1 sits at the step boundary it was read at; q2 after the whole turn.
+    expect(done.blocks.map((b) => b.kind)).toEqual(["message", "user", "message", "turn_end", "user"]);
+    expect(done.blocks[4]).toMatchObject({ kind: "user", id: "q2" });
+    // Pure reducer: a replay of the same journal agrees exactly.
+    const replay = fold(events);
+    expect(replay.blocks).toEqual(done.blocks);
+    expect(fold(events.slice(0, 6)).pendingSends).toEqual(midTurn.pendingSends);
   });
 
   it("appends a delivered send AFTER the full agent message, never splicing it", () => {

@@ -225,6 +225,10 @@ export interface PendingSend {
    *  re-sent, until its ✕ dismisses it (the same `cancel_queued` command; the
    *  driver's tombstone `Cancelled` makes the dismissal survive replay). */
   state: "queued" | "dropped";
+  /** Sent with `send_after_turn`: held until the running turn ends instead of
+   *  being read at the agent's next step (the wire's `after_turn`, absent =
+   *  false). Fixed at the echo — Send now reads it early, never re-labels it. */
+  afterTurn: boolean;
 }
 
 /** Identity every transcript block carries alongside its variant body. */
@@ -245,9 +249,10 @@ export type ChatBlock = BlockIdentity &
   ({
       /** A DELIVERED user message, in transcript order. A queued send is NOT a
        *  block — it lives in `pendingSends` until it resolves `sent`, then it
-       *  is appended here at the current end (after the turn it waited behind),
-       *  never spliced into a running turn's output. So a user block in `blocks`
-       *  is always one the agent received. */
+       *  is appended here at the current end (where the agent read it: a step
+       *  boundary mid-turn, or the turn it opened), never spliced into output
+       *  already rendered. So a user block in `blocks` is always one the agent
+       *  received. */
       kind: "user";
       text: string;
       attachments: number;
@@ -609,7 +614,8 @@ export class ChatStore {
    *  message is one you've typed and are waiting on. This is its OWN
    *  list, not a slice of `blocks`, so a queued send can't splice into a
    *  running turn's output. A `user_message_update{sent}` moves the entry into
-   *  `blocks` at the current end (the reducer, so replay agrees); `cancelled`
+   *  `blocks` at the current end — where the agent read it, possibly mid-turn
+   *  (the reducer, so replay agrees); `cancelled`
    *  removes it; `dropped` marks it "not delivered" and it stays here. */
   pendingSends = $state<PendingSend[]>([]);
 
@@ -873,7 +879,7 @@ export class ChatStore {
         if (ev.queued === true && id !== null) {
           // Queued: park it in the pending stack, NOT in the transcript at its
           // mid-turn send position (that splice would split the agent's live
-          // message in two). It enters `blocks` only once delivery resolves.
+          // message in two). It enters `blocks` only once the agent reads it.
           this.pendingSends.push({
             id,
             text,
@@ -881,6 +887,7 @@ export class ChatStore {
             attachmentPaths,
             checkpoint: null,
             state: "queued",
+            afterTurn: ev.after_turn === true,
           });
         } else {
           // A fresh (turn-opening) send, or a permission-feedback echo — it was
@@ -986,10 +993,11 @@ export class ChatStore {
         const pending = this.pendingSends[pIdx];
         const state = ev.state as string;
         if (state === "sent") {
-          // Delivered: leave the pending stack and enter the transcript at the
-          // CURRENT end — after the turn it was queued behind, never spliced
-          // into it. appendText only inspects the tail, so a following agent
-          // chunk starts a fresh block: the agent's message is never split.
+          // Read: leave the pending stack and enter the transcript at the
+          // CURRENT end — where the agent read it (a step boundary mid-turn,
+          // or the turn it opened), never at its send position. appendText
+          // only inspects the tail, so a following agent chunk starts a fresh
+          // block: the agent's message is never split.
           this.pendingSends.splice(pIdx, 1);
           this.blocks.push(
             this.stamp({
@@ -1967,8 +1975,8 @@ export class ChatStore {
    *  superseding messages REPLACE it). Tool cards and user messages stay. Only
    *  delivered user messages live in `blocks` now (queued sends are in the
    *  pending stack), so the trailing prose run is always at the very tail — a
-   *  plain tail splice. A codex steer that resolved `sent` mid-turn is a real
-   *  boundary and correctly stops the scan. A non-tail splice → rebuild. */
+   *  plain tail splice. A queued send the agent read mid-turn (resolved `sent`
+   *  at a step boundary) is a real boundary and correctly stops the scan. A non-tail splice → rebuild. */
   private dropTrailingProse(): void {
     const end = this.blocks.length;
     let start = end;
