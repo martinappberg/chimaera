@@ -61,7 +61,7 @@ nothing unmounts on `pro-changed` or focus; an account needing attention keeps
 that panel too, and only Check again shows checking (the error bar hides
 meanwhile). `service_unsupported` shows its explanation with no manual check,
 since the app rechecks it itself. Checkout and the Max review re-read
-the account first when an event is pending. Prices come only from `ProStatus.plans`.
+the account first when an event is pending. Prices come only from `ProStatus.plans`, all four or none.
 Neither a remembered selection nor a successful account refresh can trigger checkout. Usage shows percentages
 computed from the account's current allowances, not fixed hour or storage totals. The static introduction shows
 project/conversation continuity; it is not live setup progress or arbitrary

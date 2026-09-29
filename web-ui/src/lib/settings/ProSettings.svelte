@@ -5,7 +5,7 @@
   import PlanBadge from "../shared/PlanBadge.svelte";
   import ProWalkthrough from "../pro/ProWalkthrough.svelte";
   import AccountUsage from "../pro/AccountUsage.svelte";
-  import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling, planPrice } from "../pro/billing";
+  import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling, planPrices } from "../pro/billing";
   import { onMount, tick, untrack } from "svelte";
   import MirrorSettings from "./MirrorSettings.svelte";
   import { asyncDisposer } from "../shared/asyncDisposer";
@@ -72,9 +72,11 @@
   const billingMessage = $derived(billing && !(openingBillingAfter !== null && billing.id <= openingBillingAfter) ? billingCopy(billing, status?.plan ?? null) : null);
   const billingRecovery = $derived(billingNeedsReview(billing, subscribed));
   const offerPlans = $derived(panel === "plans");
-  // Amounts come only from the account; without them the cards name the plans.
-  const price = (plan: PaidPlan, every: BillingInterval): string | null => planPrice(status?.plans, plan, every);
-  const priced = $derived(planChoices.every(choice => price(choice.plan, interval) !== null));
+  // Amounts come only from the account, all four or none; without them every
+  // place names the plans and says prices are shown at checkout.
+  const prices = $derived(planPrices(status?.plans));
+  const price = (plan: PaidPlan, every: BillingInterval): string | null => prices?.[plan][every] ?? null;
+  const priced = $derived(prices !== null);
   const canReturnToPlans = $derived(billingRecovery && confirmedFree && reviewed !== null && reviewed === reviewKey(status));
   const errorBar = $derived(accountErrorBar(panel, error, failure, billingRecovery));
 
@@ -349,7 +351,7 @@
           {/each}
         </div>
         <div class="included"><span class="section-label">Included with both</span><ul><li>Projects stay in sync across devices</li><li>Cluster logins that stay connected</li><li>Browser access to your work</li><li>Project-by-project privacy controls</li></ul></div>
-        <div class="purchase"><button disabled={busy !== null || signInPhase !== null || billingActive} onclick={() => status?.signed_in ? void checkout() : void authenticate("sign-up")}>{busy === "checkout" ? "Opening checkout…" : status.signed_in ? "Continue to checkout" : "Sign up"}</button><p class="small muted">{#if status.signed_in}{#if price(selected, interval)}Billed {price(selected, interval)} {interval === "year" ? "yearly" : "monthly"}. {/if}Cloud time and project storage have monthly limits. Review billing details in secure checkout before subscribing.{:else}Create your account first. You can review your plan before checkout.{/if}</p></div>
+        <div class="purchase"><button disabled={busy !== null || signInPhase !== null || billingActive} onclick={() => status?.signed_in ? void checkout() : void authenticate("sign-up")}>{busy === "checkout" ? "Opening checkout…" : status.signed_in ? "Continue to checkout" : "Sign up"}</button><p class="small muted">{#if status.signed_in}{#if priced}Billed {price(selected, interval)} {interval === "year" ? "yearly" : "monthly"}. {:else}Prices are shown at checkout. {/if}Cloud time and project storage have monthly limits. Review billing details in secure checkout before subscribing.{:else}Create your account first. You can review your plan before checkout.{/if}</p></div>
         {#if !status.signed_in}<p class="signin-alternative small muted">Already have an account? <button class="text-button" disabled={busy !== null || signInPhase !== null || billingActive} onclick={() => void authenticate("sign-in")}>Sign in</button></p>{/if}
         <p class="free-note"><strong>Your local workbench stays free.</strong> Local projects, agents and ordinary SSH work without a Pro account.</p>
       </section>
