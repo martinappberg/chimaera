@@ -179,6 +179,46 @@ pub(super) struct Output {
     pub stdout: Vec<u8>,
     diagnostic: &'static str,
     damaged_object: bool,
+    /// The mirror service answered 503: its admission queue was full and
+    /// nothing was transferred.
+    busy: bool,
+}
+
+/// A busy mirror answers 503 with `Retry-After` before doing any work, so a
+/// transfer it refused is safe to repeat. Git does not surface response
+/// headers; the daemon waits the service's documented Retry-After (10 s),
+/// growing with each attempt, plus jitter, a bounded number of times.
+const MIRROR_BUSY_RETRIES: u32 = 3;
+#[cfg(not(test))]
+const MIRROR_RETRY_AFTER: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const MIRROR_RETRY_AFTER: Duration = Duration::from_millis(20);
+
+fn busy_delay(attempt: u32) -> Duration {
+    let jitter_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |now| now.subsec_nanos() as u64)
+        % (MIRROR_RETRY_AFTER.as_millis() as u64 / 2).max(1);
+    MIRROR_RETRY_AFTER * attempt + Duration::from_millis(jitter_ms)
+}
+
+/// Rebuilds a helper command created by `git()` (always on a cleared
+/// environment) so a refused transfer can be run again unchanged.
+fn replicate(command: &Command) -> Command {
+    let source = command.as_std();
+    let mut copy = Command::new(source.get_program());
+    copy.env_clear();
+    for (key, value) in source.get_envs() {
+        match value {
+            Some(value) => copy.env(key, value),
+            None => copy.env_remove(key),
+        };
+    }
+    copy.args(source.get_args());
+    if let Some(directory) = source.get_current_dir() {
+        copy.current_dir(directory);
+    }
+    copy
 }
 
 impl Output {
@@ -469,11 +509,15 @@ async fn run_owned(
             ]
             .iter()
             .any(|pattern| text.contains(pattern));
+        // Git reports an HTTP status as "The requested URL returned error:
+        // 503" (or "HTTP 503" for a failed RPC); only 503 means "not admitted".
+        let busy = !status && (text.contains("error: 503") || text.contains("http 503"));
         Ok::<_, anyhow::Error>(Output {
             success: status,
             stdout,
             diagnostic,
             damaged_object,
+            busy,
         })
     };
     let result = tokio::select! {
@@ -836,12 +880,27 @@ pub(super) async fn git_output(
     } else {
         Duration::from_secs(45)
     };
-    let compatibility_hint = http_transfer(args) && !known_fixed(mirror_git().await?.version);
-    let result = run(command, input, timeout, PATH_CAP).await;
-    let output = if compatibility_hint {
-        result.context(HTTP_GIT_HINT)?
-    } else {
-        result?
+    let transfer = http_transfer(args);
+    let compatibility_hint = transfer && !known_fixed(mirror_git().await?.version);
+    let mut attempt = 0;
+    let output = loop {
+        let attempt_command = if transfer && attempt < MIRROR_BUSY_RETRIES {
+            replicate(&command)
+        } else {
+            std::mem::replace(&mut command, Command::new("git"))
+        };
+        let result = run(attempt_command, input.clone(), timeout, PATH_CAP).await;
+        let output = if compatibility_hint {
+            result.context(HTTP_GIT_HINT)?
+        } else {
+            result?
+        };
+        if !(transfer && output.busy && attempt < MIRROR_BUSY_RETRIES) {
+            break output;
+        }
+        attempt += 1;
+        tracing::info!(attempt, "mirror busy; retrying the transfer");
+        tokio::time::sleep(busy_delay(attempt)).await;
     };
     if !output.success {
         let operation = match args.first().copied() {
@@ -958,6 +1017,7 @@ mod tests {
             stdout: text.as_bytes().to_vec(),
             diagnostic: "unknown",
             damaged_object: false,
+            busy: false,
         };
         assert!(output("missing blob 0123456789012345678901234567890123456789\n").object_damage());
         for text in [
@@ -1122,5 +1182,54 @@ mod tests {
         assert!(quote("secret\nurl=bad").is_err());
         assert!(checked_url("https://example.test", "//other.test").is_err());
         assert!(checked_url("https://example.test", "/../token").is_err());
+    }
+
+    /// A busy mirror (503 + Retry-After, nothing admitted) is retried with
+    /// backoff a bounded number of times; any other failure is not retried.
+    #[tokio::test]
+    async fn a_busy_mirror_is_retried_a_bounded_number_of_times() {
+        use axum::response::IntoResponse;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (busy_answers, expected) in [
+            (2, 3),
+            (usize::MAX, 1 + MIRROR_BUSY_RETRIES as usize),
+            (0, 1),
+        ] {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counted = hits.clone();
+            let router = axum::Router::new().fallback(move || {
+                let counted = counted.clone();
+                async move {
+                    if counted.fetch_add(1, Ordering::SeqCst) < busy_answers {
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            [("retry-after", "10")],
+                            "busy",
+                        )
+                            .into_response()
+                    } else {
+                        axum::http::StatusCode::NOT_FOUND.into_response()
+                    }
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/repository.git", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let directory = std::env::temp_dir().join(format!(
+                "chimaera-busy-mirror-{}",
+                chimaera_core::generate_token()
+            ));
+            super::super::mirror::initialize(&directory).await.unwrap();
+            let result = git_output(
+                git(&directory, None).await.unwrap(),
+                &["fetch", &url, "+refs/heads/*:refs/remotes/mirror/*"],
+                Vec::new(),
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(hits.load(Ordering::SeqCst), expected, "{busy_answers}");
+            server.abort();
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 }

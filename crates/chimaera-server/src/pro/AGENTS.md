@@ -127,7 +127,10 @@ unknown PATH Git falls back to `/usr/bin/git` if that binary reports at least
 keep their existing selection. This affects only mirror helpers, not ordinary
 workspace Git settings. Failed HTTP transfers with an older/unknown selected
 Git give static upgrade guidance without exposing stderr. Failed helpers emit only fixed diagnostic categories and a fixed operation name; stderr, URLs, paths and credentials never enter logs. There is no enlarged
-POST buffer, automatic failed-push replay, or weakened publication check.
+POST buffer, automatic failed-push replay, or weakened publication check. The
+one retried failure is a busy mirror: its 503 (with `Retry-After`) admits
+nothing, so a fetch or push is repeated up to three times after the documented
+10 s, growing per attempt, plus jitter (Git hides the header itself).
 Another worktree's branch is retained separately. Unsupported
 transaction support preserves a cloud ref instead. Network Git has a finite
 16-minute deadline; ordinary helpers retain short deadlines. The remote
