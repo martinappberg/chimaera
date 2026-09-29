@@ -161,6 +161,43 @@ pub(crate) fn list(
     Ok(out)
 }
 
+/// Keep the `keep` newest entries of folder `rel` (by modification time)
+/// and remove the rest, never following a link (blocking). A folder that
+/// isn't there yet is fine.
+pub(crate) fn prune_oldest(dir: &Path, rel: &Path, keep: usize) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let root = open_root(dir)?;
+    let folder = match crate::download::open_beneath(&root, rel, dir_flags()) {
+        Ok(folder) => folder,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io(rel, e)),
+    };
+    let mut entries = Vec::new();
+    for entry in rustix::fs::Dir::read_from(&folder).map_err(|e| io(rel, e))? {
+        if entries.len() >= LIST_MAX {
+            break;
+        }
+        let entry = entry.map_err(|e| io(rel, e))?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        let name = std::ffi::OsStr::from_bytes(name).to_os_string();
+        if let Ok(st) = rustix::fs::statat(&folder, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW) {
+            entries.push((st.st_mtime, name));
+        }
+    }
+    if entries.len() <= keep {
+        return Ok(());
+    }
+    entries.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+    let mut left = WALK_MAX;
+    for (_, name) in entries.into_iter().skip(keep) {
+        remove_entry(&folder, &name, &mut left).map_err(|e| io(rel, e))?;
+    }
+    Ok(())
+}
+
 /// The parent folder of `rel` beneath `root`, made on the way (never
 /// through a link), and `rel`'s last component.
 fn parent_of(root: &File, rel: &Path) -> Result<(File, std::ffi::OsString), String> {
@@ -627,6 +664,37 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_and_never_follows_a_link() {
+        let dir = temp("prune");
+        let outside = temp("prune-outside");
+        std::fs::write(outside.join("keep.txt"), b"x").unwrap();
+        let jobs = dir.join(".jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        // The oldest of all: a link out, which goes as a link.
+        std::os::unix::fs::symlink(&outside, jobs.join("j-link")).unwrap();
+        let now = SystemTime::now();
+        for (i, name) in ["j-a", "j-b", "j-c"].iter().enumerate() {
+            let f = jobs.join(name);
+            std::fs::create_dir(&f).unwrap();
+            std::fs::write(f.join("stdout.log"), b"log").unwrap();
+            File::open(&f)
+                .unwrap()
+                .set_modified(now + Duration::from_secs(10 + i as u64 * 10))
+                .unwrap();
+        }
+        prune_oldest(&dir, Path::new(".jobs"), 2).unwrap();
+        let mut left: Vec<String> = std::fs::read_dir(&jobs)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["j-b", "j-c"]);
+        assert!(outside.join("keep.txt").exists());
+        // Nothing there yet is fine.
+        prune_oldest(&dir, Path::new("none"), 2).unwrap();
     }
 
     #[test]

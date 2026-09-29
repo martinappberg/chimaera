@@ -640,6 +640,34 @@ async fn a_remove_forgets_the_plugins_state_and_the_users_trust() {
 }
 
 #[tokio::test]
+async fn a_privileged_first_party_release_past_the_pin_asks() {
+    let (l, toml, wasm, sums) = locked_release("latex");
+    let fake = FakeReleases::start().await;
+    let state = state_for(&fake);
+    fake.publish_with_sums(&l.repo, &l.version, &toml, &wasm, &sums);
+    let (status, body) = request(&state, Method::POST, "/api/v1/plugins/latex/install", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["plugin"]["standing"], "verified");
+    assert_eq!(body["plugin"]["tier"], "privileged");
+    // The next release asks for nothing more, but the lock vouches for the
+    // pin alone: a privileged update comes through the lock or asks.
+    let next = toml.replacen(
+        &format!("version = \"{}\"", l.version),
+        "version = \"9.9.9\"",
+        1,
+    );
+    fake.publish(&l.repo, "9.9.9", &next, &wasm);
+    let (status, body) = request(&state, Method::POST, "/api/v1/plugins/latex/update", None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["trust"]["tier"], "privileged", "{body}");
+    assert_eq!(body["trust"]["grown"], json!([]), "{body}");
+    assert_eq!(
+        link(&state, "latex", "current").as_deref(),
+        Some(l.version.as_str())
+    );
+}
+
+#[tokio::test]
 async fn a_first_party_plugin_is_verified_and_asks_nothing() {
     let (l, toml, wasm, sums) = agent_notes_release();
     let fake = FakeReleases::start().await;

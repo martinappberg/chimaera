@@ -11,7 +11,12 @@
 //!   (`revoked.sig` beside it) from at least `threshold` of the keys this
 //!   binary embeds (`plugins/revocation-keys.txt`), so a compromised GitHub
 //!   account alone can neither block nor unblock a plugin. With no key
-//!   embedded, no fetched list counts: the embedded snapshot still does.
+//!   embedded, no fetched list counts (none is fetched): the embedded
+//!   snapshot still does.
+//! - **Never older.** Each list carries a `serial`, signed with it; a list
+//!   older than the one in force is refused, so an old signed list can't be
+//!   served again to lift a later block. The kept copy's signature is kept
+//!   beside it and checked again at boot.
 //! - **Entries** name an id and the versions or `plugin.wasm` sha256s they
 //!   cover (neither: every version), a level and a reason. **Hard**: the
 //!   build never loads, no override. **Soft**: switched off, and the user
@@ -37,8 +42,10 @@ const KEYS: &str = include_str!("../../../../plugins/revocation-keys.txt");
 const LIST_MAX: usize = 256 << 10;
 const ENTRIES_MAX: usize = 1024;
 const REASON_MAX: usize = 300;
-/// The last good fetched list, beside the installed plugins.
+/// The last good fetched list, beside the installed plugins, and its
+/// signatures.
 const CACHE: &str = "revoked.json";
+const CACHE_SIG: &str = "revoked.sig";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -82,6 +89,9 @@ impl Entry {
 #[serde(deny_unknown_fields)]
 pub(crate) struct List {
     pub(crate) schema: u32,
+    /// Raised with every published change; a host never takes a lower one.
+    #[serde(default)]
+    pub(crate) serial: u64,
     #[serde(default)]
     pub(crate) entries: Vec<Entry>,
 }
@@ -197,6 +207,8 @@ pub(crate) struct Block {
 pub(crate) struct Revocations {
     embedded: Vec<Entry>,
     fetched: Vec<Entry>,
+    /// The newest serial in force (the embedded list's or the kept one's).
+    serial: u64,
     /// When the live list was last fetched and accepted.
     pub(crate) fetched_ms: Option<u64>,
     /// Why the last fetch wasn't accepted (unreachable, unsigned).
@@ -204,25 +216,35 @@ pub(crate) struct Revocations {
 }
 
 impl Revocations {
-    /// The embedded list and the cached copy under `root` (blocking; boot).
+    /// The embedded list and the kept copy under `root`, if its signatures
+    /// still verify (blocking; boot).
     pub(crate) fn load(root: &Path) -> Self {
         let embedded = match parse(EMBEDDED) {
-            Ok(list) => list.entries,
+            Ok(list) => list,
             Err(err) => {
                 tracing::error!(%err, "the embedded plugins/revoked.json is invalid");
-                Vec::new()
+                List {
+                    schema: 1,
+                    serial: 0,
+                    entries: Vec::new(),
+                }
             }
         };
-        // The cache was verified before it was written; it is re-parsed,
-        // not re-verified (its signature isn't kept).
-        let fetched = std::fs::read_to_string(root.join(CACHE))
+        let (keys, threshold) = keys();
+        let kept = std::fs::read_to_string(root.join(CACHE))
             .ok()
+            .filter(|text| text.len() <= LIST_MAX)
+            .filter(|text| {
+                let sig = std::fs::read_to_string(root.join(CACHE_SIG)).unwrap_or_default();
+                signed(text.as_bytes(), &sig, &keys, threshold)
+            })
             .and_then(|text| parse(&text).ok())
-            .map(|l| l.entries)
-            .unwrap_or_default();
+            .filter(|l| l.serial >= embedded.serial);
+        let serial = kept.as_ref().map_or(embedded.serial, |l| l.serial);
         Revocations {
-            embedded,
-            fetched,
+            embedded: embedded.entries,
+            fetched: kept.map(|l| l.entries).unwrap_or_default(),
+            serial,
             fetched_ms: None,
             error: None,
         }
@@ -269,31 +291,49 @@ pub(crate) async fn refresh(state: &Arc<AppState>) {
     let Some(url) = list_url() else {
         return;
     };
+    let (keys, threshold) = keys();
+    if keys.is_empty() {
+        super::write(&state.plugin_guard.revoked).error = Some(
+            "this build embeds no revocation key, so only its own snapshot counts".to_string(),
+        );
+        return;
+    }
     let result = async {
         let list = crate::agent_updates::curl(&url, &[])
             .await
             .map_err(|e| format!("could not fetch {url}: {e:#}"))?;
-        let sig = crate::agent_updates::curl(&url.replace(".json", ".sig"), &[])
+        let sig_url = match url.strip_suffix(".json") {
+            Some(base) => format!("{base}.sig"),
+            None => format!("{url}.sig"),
+        };
+        let sig = crate::agent_updates::curl(&sig_url, &[])
             .await
             .map_err(|e| format!("could not fetch its signatures: {e:#}"))?;
-        let (keys, threshold) = keys();
-        if !signed(&list, &String::from_utf8_lossy(&sig), &keys, threshold) {
-            return Err(if keys.is_empty() {
-                "this build embeds no revocation key, so only its own snapshot counts".to_string()
-            } else {
-                "its signatures don't verify against the keys this chimaera trusts".to_string()
-            });
+        let sig = String::from_utf8_lossy(&sig).into_owned();
+        if !signed(&list, &sig, &keys, threshold) {
+            return Err(
+                "its signatures don't verify against the keys this chimaera trusts".to_string(),
+            );
         }
         let text = String::from_utf8(list).map_err(|_| "the list is not UTF-8".to_string())?;
         let parsed = parse(&text)?;
-        Ok::<_, String>((text, parsed))
+        let in_force = super::read(&state.plugin_guard.revoked).serial;
+        if parsed.serial < in_force {
+            return Err(format!(
+                "it is older than the list in force (serial {} < {in_force})",
+                parsed.serial
+            ));
+        }
+        Ok::<_, String>((text, sig, parsed))
     }
     .await;
     match result {
-        Ok((text, parsed)) => {
-            let path = state.plugin_catalog.root.join(CACHE);
+        Ok((text, sig, parsed)) => {
+            let root = state.plugin_catalog.root.clone();
             let written = tokio::task::spawn_blocking(move || {
-                crate::persist::atomic_write_json(&path, text.as_bytes())
+                // The signatures first: a list kept without them doesn't count.
+                crate::persist::atomic_write_json(&root.join(CACHE_SIG), sig.as_bytes())?;
+                crate::persist::atomic_write_json(&root.join(CACHE), text.as_bytes())
             })
             .await;
             if !matches!(written, Ok(Ok(()))) {
@@ -301,6 +341,7 @@ pub(crate) async fn refresh(state: &Arc<AppState>) {
             }
             {
                 let mut r = super::write(&state.plugin_guard.revoked);
+                r.serial = parsed.serial;
                 r.fetched = parsed.entries;
                 r.fetched_ms = Some(crate::timeline::now_ms());
                 r.error = None;
@@ -314,26 +355,34 @@ pub(crate) async fn refresh(state: &Arc<AppState>) {
     }
 }
 
-/// A list changed: every loaded build it now blocks stops at once (its
-/// instances and offers dropped, a knowledge snapshot forgotten), and
-/// windows are told.
+/// A list or the host policy changed: every loaded build it now holds
+/// (blocked, or refused by policy) stops at once (its instances and offers
+/// dropped, its jobs cancelled, a knowledge snapshot forgotten), and windows
+/// are told.
 pub(crate) async fn apply(state: &Arc<AppState>) {
-    let blocked: Vec<Arc<Manifest>> = super::catalog(state)
+    use super::trust::Hold;
+    let held: Vec<(Arc<Manifest>, bool)> = super::catalog(state)
         .iter()
-        .filter(|m| super::trust::block(state, m).is_some())
-        .cloned()
+        .filter_map(|m| match super::trust::hold(state, m) {
+            Some(Hold::Blocked(_)) => Some((m.clone(), true)),
+            Some(Hold::Policy(_)) => Some((m.clone(), false)),
+            // Withdrawing trust stops a plugin itself.
+            Some(Hold::Untrusted) | None => None,
+        })
         .collect();
-    for m in &blocked {
+    for (m, blocked) in &held {
         state.plugin_runtime.forget_plugin(&m.id);
         // Its programs stop too, wherever they run.
         state.plugin_platform.jobs.cancel_where(&m.id, None);
         crate::lock(&state.knowledge).forget_provider(&m.id, None);
-        super::activity::record(
-            state,
-            &m.id,
-            json!({"kind": "blocked", "version": m.version, "sha256": &*m.wasm.sha256}),
-        )
-        .await;
+        if *blocked {
+            super::activity::record(
+                state,
+                &m.id,
+                json!({"kind": "blocked", "version": m.version, "sha256": &*m.wasm.sha256}),
+            )
+            .await;
+        }
     }
     state.changes.notify_waiters();
 }
@@ -426,6 +475,36 @@ mod tests {
         assert_eq!(r.block("x", "0.2.0", "b"), None);
         assert!(r.block("y", "9.9.9", "c").is_some());
         assert_eq!(r.block("z", "0.1.0", "b"), None);
+    }
+
+    #[test]
+    fn a_kept_list_counts_only_with_its_signatures() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-revoke-{}-{}",
+            std::process::id(),
+            &chimaera_core::generate_token()[..8]
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(CACHE),
+            r#"{"schema":1,"serial":9,"entries":[{"id":"x","level":"hard","reason":"r"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join(CACHE_SIG), "00").unwrap();
+        let r = Revocations::load(&root);
+        assert_eq!(r.block("x", "0.1.0", "a"), None, "unsigned: not in force");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_list_carries_its_serial() {
+        let list = parse(r#"{"schema":1,"serial":3,"entries":[]}"#).unwrap();
+        assert_eq!(list.serial, 3);
+        assert_eq!(parse(r#"{"schema":1,"entries":[]}"#).unwrap().serial, 0);
+        assert!(
+            parse(EMBEDDED).unwrap().serial >= 1,
+            "the embedded list has one"
+        );
     }
 
     #[test]

@@ -402,6 +402,7 @@ fn lock_covers(m: &Manifest) -> bool {
 pub(crate) fn standing(state: &AppState, m: &Manifest) -> Standing {
     // A test build's catalog extras aren't installed copies: the test put
     // them there.
+    #[cfg(test)]
     if m.origin.path.is_none() {
         return Standing::Trusted;
     }
@@ -580,10 +581,20 @@ pub(crate) fn admit(
         return Ok(Admitted::Trusted(None));
     }
     // The build it replaces, if that one was covered and came from the same
-    // place: asking for no more than it is no new question.
+    // place: asking for no more than it is no new question. Except where
+    // only the lock vouched for a privileged build: the lock covers its pin
+    // alone, so a later release asks (privileged updates come through the
+    // lock, plan §17).
     let running = super::manifest(state, &m.id)
         .filter(|r| source_of(r) == incoming.source && standing_ok(state, r));
-    if running.as_ref().is_some_and(|r| r.caps.covers(&m.caps)) {
+    let lock_only = |r: &Manifest| {
+        m.caps.tier() == Tier::Privileged
+            && crate::plugins::trust::standing(state, r) == Standing::Verified
+    };
+    if running
+        .as_ref()
+        .is_some_and(|r| r.caps.covers(&m.caps) && !lock_only(r))
+    {
         return Ok(Admitted::Trusted(Some("subset")));
     }
     if token == Some(digest.as_str()) {
@@ -781,6 +792,8 @@ pub(crate) async fn untrust_route(
         return r.into_response();
     }
     state.plugin_runtime.forget_plugin(&pid);
+    // Its programs stop with its trust, wherever they run.
+    state.plugin_platform.jobs.cancel_where(&pid, None);
     crate::lock(&state.knowledge).forget_provider(&pid, None);
     super::activity::record(&state, &pid, json!({"kind": "untrust"})).await;
     state.changes.notify_waiters();

@@ -365,6 +365,8 @@ pub(crate) async fn publish(
     } else {
         Some(Held::Inline(Arc::new(data), text.len()))
     };
+    // A stored file unpublished below, removed once the lock is let go.
+    let mut dropped: Option<PathBuf> = None;
     {
         let mut surfaces = crate::lock(&state.plugin_platform.surfaces);
         let held_map = surfaces.by_pair.entry(pair.clone()).or_default();
@@ -397,13 +399,16 @@ pub(crate) async fn publish(
             }
             None => {
                 if let Some(Held::Stored(file)) = held_map.remove(&skey) {
-                    let _ = std::fs::remove_file(file);
+                    dropped = Some(file);
                 }
                 if held_map.is_empty() {
                     surfaces.by_pair.remove(&pair);
                 }
             }
         }
+    }
+    if let Some((dir, rel)) = dropped.as_deref().and_then(stored_parts) {
+        let _ = tokio::task::spawn_blocking(move || super::output::remove(&dir, &rel)).await;
     }
     let frame = json!({
         "type": "surface",
@@ -417,19 +422,36 @@ pub(crate) async fn publish(
     Ok(())
 }
 
-async fn read_held(held: Held) -> Option<Value> {
+/// A stored surface's file as the output folder and the path beneath it
+/// (`stored_path` puts it at `<output>/.surfaces/<name>`).
+fn stored_parts(file: &std::path::Path) -> Option<(PathBuf, PathBuf)> {
+    let dir = file.parent()?.parent()?.to_path_buf();
+    let rel = file.strip_prefix(&dir).ok()?.to_path_buf();
+    Some((dir, rel))
+}
+
+/// What `held` holds. A stored one is read again from a folder the
+/// plugin's own programs can write: beneath it, never through a link,
+/// capped, and checked again as the surface it claims to be.
+async fn read_held(surface: &str, held: Held) -> Option<Value> {
     match held {
         Held::Inline(v, _) => Some((*v).clone()),
-        Held::Stored(file) => tokio::task::spawn_blocking(move || {
-            let bytes = std::fs::read(&file).ok()?;
-            if bytes.len() > LARGE_MAX {
-                return None;
-            }
-            serde_json::from_slice(&bytes).ok()
-        })
-        .await
-        .ok()
-        .flatten(),
+        Held::Stored(file) => {
+            let surface = surface.to_string();
+            tokio::task::spawn_blocking(move || {
+                let (dir, rel) = stored_parts(&file)?;
+                let bytes = super::output::read(&dir, &rel, 0, LARGE_MAX + 1).ok()?;
+                if bytes.len() > LARGE_MAX {
+                    return None;
+                }
+                let data: Value = serde_json::from_slice(&bytes).ok()?;
+                check(&surface, &data).ok()?;
+                Some(data)
+            })
+            .await
+            .ok()
+            .flatten()
+        }
     }
 }
 
@@ -484,7 +506,7 @@ pub(crate) async fn route(
     };
     let mut items = Vec::new();
     for (plugin, key, held) in wanted {
-        let Some(mut data) = read_held(held).await else {
+        let Some(mut data) = read_held(&surface, held).await else {
             continue;
         };
         if let Some(file) = &q.file {

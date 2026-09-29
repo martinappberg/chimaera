@@ -11,7 +11,8 @@
 //       line to add to plugins/revocation-keys.txt (it ships in the next
 //       chimaera release).
 //   node scripts/revocations.mjs sign --key <private-key.pem> [--append]
-//       Sign plugins/revoked.json as it is now into plugins/revoked.sig
+//       Sign plugins/revoked.json as it is now (its `serial` raised above
+//       the last published list's) into plugins/revoked.sig
 //       (replacing it, or adding a line with --append: a second maintainer
 //       signs the same bytes). Commit both files together.
 //   node scripts/revocations.mjs verify
@@ -87,7 +88,12 @@ function main() {
     if (at === -1 || !args[at + 1]) throw new Error("usage: sign --key <private-key.pem> [--append]");
     const key = createPrivateKey(readFileSync(args[at + 1]));
     const list = readFileSync(LIST);
-    JSON.parse(list.toString("utf8"));
+    const parsed = JSON.parse(list.toString("utf8"));
+    // Hosts refuse a list older than the one they hold, so every change
+    // raises it (an old signed list can't be served again to lift a block).
+    if (!Number.isInteger(parsed.serial) || parsed.serial < 1) {
+      throw new Error("plugins/revoked.json needs a serial: raise it above the last published list's");
+    }
     const line = sign(null, list, key).toString("hex");
     const kept = args.includes("--append") ? readFileSync(SIG, "utf8").trimEnd() : "";
     writeFileSync(SIG, `${kept === "" ? "" : `${kept}\n`}${line}\n`);

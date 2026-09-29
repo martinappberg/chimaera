@@ -446,7 +446,9 @@ fn unpack_zip(file: File, root: &File, budget: &mut Budget) -> Result<(), String
         let name = entry.name_raw().to_vec();
         let rel = entry_path(&name)?;
         let mode = entry.unix_mode().unwrap_or(0o644);
-        let ftype = FileType::from_raw_mode(mode);
+        // zip keeps 16 bits of Unix mode; rustix's `RawMode` is u16 on
+        // macOS and u32 on Linux.
+        let ftype = FileType::from_raw_mode(mode as rustix::fs::RawMode);
         if entry.is_dir() {
             dir_beneath(root, &rel)?;
         } else if ftype == FileType::Symlink {
@@ -496,6 +498,21 @@ pub(crate) fn unpack(
             &mut budget,
         )?,
         "tar.xz" => {
+            // The host's `xz` streams the tar into our own unpacker (a
+            // login node always has one); only where there is none does
+            // lzma-rs decode it, and lzma-rs holds a whole xz block in
+            // memory (TinyTeX's is one 410 MiB block), so only small ones.
+            if let Some(result) = unpack_tar_xz_streamed(archive, &root, &mut budget) {
+                result?;
+                return finish_links(dest, budget);
+            }
+            let size = std::fs::metadata(archive).map_err(|e| e.to_string())?.len();
+            if size > XZ_IN_MEMORY_MAX {
+                return Err(format!(
+                    "a .tar.xz of {} MiB needs the xz program on this host to unpack",
+                    size >> 20
+                ));
+            }
             // lzma-rs decodes to a writer: a capped temporary tar beside the
             // archive, then read as a tar.
             let tar_path = archive.with_extension("tar.tmp");
@@ -526,6 +543,11 @@ pub(crate) fn unpack(
         }
         other => return Err(format!("unpack {other:?} is not supported")),
     }
+    finish_links(dest, budget)
+}
+
+/// The links, checked once the whole tree is there; the bytes unpacked.
+fn finish_links(dest: &Path, budget: Budget) -> Result<u64, String> {
     for link in &budget.links {
         if !resolves_inside(dest, link) {
             return Err(format!(
@@ -535,6 +557,51 @@ pub(crate) fn unpack(
         }
     }
     Ok(budget.bytes)
+}
+
+/// A `.tar.xz` lzma-rs may decode (it holds a whole xz block in memory).
+const XZ_IN_MEMORY_MAX: u64 = 32 << 20;
+
+/// What may follow a tar's end inside its xz stream (its zero padding is a
+/// few KiB) before the rest is left unread.
+const XZ_TAIL_MAX: u64 = 64 << 20;
+
+/// Unpack `archive` through the host's `xz -dc`, streamed (blocking); None
+/// when this host has no `xz`. xz only decompresses: the entries are read
+/// by `unpack_tar`, with every check it makes. A tar reader stops quietly at
+/// an early end, so xz must also end well — else a stream cut short (xz
+/// killed, out of memory) would install half a tool.
+fn unpack_tar_xz_streamed(
+    archive: &Path,
+    root: &File,
+    budget: &mut Budget,
+) -> Option<Result<(), String>> {
+    let mut child = std::process::Command::new("xz")
+        .args(["-dc", "--"])
+        .arg(archive)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut out = BufReader::new(child.stdout.take()?);
+    let result = unpack_tar(&mut out, root, budget).and_then(|()| {
+        let tail = std::io::copy(&mut (&mut out).take(XZ_TAIL_MAX + 1), &mut std::io::sink())
+            .map_err(|e| format!("reading from xz: {e}"))?;
+        if tail > XZ_TAIL_MAX {
+            return Err("more than the tar inside the .tar.xz".into());
+        }
+        let status = child.wait().map_err(|e| e.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("xz could not decompress it ({status})"))
+        }
+    });
+    // A refusal leaves xz with more to write: stop it and reap it.
+    let _ = child.kill();
+    let _ = child.wait();
+    Some(result)
 }
 
 struct CappedWriter<W: Write> {
@@ -997,6 +1064,52 @@ mod tests {
                 & 0o111,
             0
         );
+    }
+
+    /// `bytes` through the host's `xz` (None where it has none).
+    fn xz_of(bytes: &[u8]) -> Option<Vec<u8>> {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("xz")
+            .args(["-c", "-T1"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        child.stdin.take()?.write_all(bytes).ok()?;
+        let out = child.wait_with_output().ok()?;
+        out.status.success().then_some(out.stdout)
+    }
+
+    fn unpack_xz(bytes: &[u8], label: &str) -> Result<PathBuf, String> {
+        let dir = temp(label);
+        let archive = dir.join("a.tar.xz");
+        std::fs::write(&archive, bytes).unwrap();
+        let dest = dir.join("out");
+        unpack(&archive, "tar.xz", &dest, "x", 1 << 20, 100).map(|_| dest)
+    }
+
+    #[test]
+    fn a_tar_xz_streams_through_xz_with_every_check_and_a_cut_one_is_refused() {
+        let tar = tar_of(&[
+            ("tool/", tar::EntryType::Directory, b"", ""),
+            ("tool/run", tar::EntryType::Regular, b"#!/bin/sh\n", ""),
+        ]);
+        let Some(xz) = xz_of(&tar) else {
+            eprintln!("no xz on this host: the streamed path is untested here");
+            return;
+        };
+        let dest = unpack_xz(&xz, "xz-good").unwrap();
+        assert_eq!(
+            std::fs::read(dest.join("tool/run")).unwrap(),
+            b"#!/bin/sh\n"
+        );
+        // The entries are still ours to check.
+        let evil = xz_of(&tar_of(&[("../evil", tar::EntryType::Regular, b"x", "")])).unwrap();
+        assert!(unpack_xz(&evil, "xz-evil").unwrap_err().contains("`..`"));
+        // A stream cut short installs nothing, even where the tar reader
+        // would have stopped quietly.
+        let cut = &xz[..xz.len() - 16];
+        assert!(unpack_xz(cut, "xz-cut").is_err());
     }
 
     #[test]

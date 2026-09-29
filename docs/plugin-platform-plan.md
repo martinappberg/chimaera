@@ -281,7 +281,9 @@ plugin stays off until the user allows the update or removes the plugin.
   (Firefox's hard and soft blocks).
 - **The daemon fetches it** with the plugin release checker (once after boot, then
   daily, under `update.autoCheck`), verifies the signature, and keeps the last good
-  copy on disk, so a host that goes offline keeps the list it had.
+  copy on disk, so a host that goes offline keeps the list it had. The list carries a
+  signed `serial`, and a host never takes a lower one than it holds: an old signed list
+  served again can't lift a later block.
 - **It acts at once**, not at the next restart: a newly blocked build's instances are
   dropped, its running jobs are killed, its switches go off, and the card says
   "Chimaera blocked this version: <reason>. Update or remove it." Its tools stay on
@@ -859,7 +861,9 @@ with `wait`, and whether a repeat call joins the running job is the plugin's cho
 Remove of a plugin removes its tools without asking; the Environment page's "found
 through this prelude" line is not built; the lock check that fetches every tool
 download runs in the lock bump (`.github/scripts/plugin-lock.mjs`), not on every
-CI run. Every program run and download is in the plugin's Activity log. Verified
+CI run. Every program run and download is in the plugin's Activity log. A `.tar.xz` streams
+through the host's `xz` (a login node always has one); `lzma-rs`, which holds a whole
+xz block in memory, only unpacks one of at most 32 MiB where there is no `xz`. Verified
 against the privileged fixture (`tests/plugin_jobs.rs`, the unpacker's hostile
 corpus in `toolchain.rs`) and live on a Linux host with a headless daemon; not yet
 on an HPC login node.

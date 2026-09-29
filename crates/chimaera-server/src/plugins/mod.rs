@@ -1374,6 +1374,11 @@ pub(crate) async fn put_workspace_plugin(
         )
             .into_response()
     };
+    // Only a plugin that was on hears it is going (clearing a switch kept
+    // from before never runs its code).
+    let was_on = crate::lock(&state.workspaces)
+        .get(&id)
+        .is_some_and(|w| w.plugins_on.iter().any(|p| p == &pid));
     let staged = crate::lock(&state.workspaces).stage_plugin_on(&id, &pid, body.on);
     let crate::workspaces::PluginSwitch {
         workspace,
@@ -1396,7 +1401,7 @@ pub(crate) async fn put_workspace_plugin(
     // A plugin that asked to hear it is told it is going (on the instance
     // it had, so it can let go of what it kept), before it starts over.
     let heard = |kind| manifest(&state, &pid).filter(|m| m.provides.hears(kind));
-    if !body.on {
+    if !body.on && was_on {
         if let Some(m) = heard(EventKind::SwitchedOff) {
             state
                 .plugin_runtime

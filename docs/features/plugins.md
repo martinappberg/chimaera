@@ -553,7 +553,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     build; the live copy on the repository's main branch is fetched with the daily plugin
     check and counts only with Ed25519 signatures (`revoked.sig`) from `threshold` of the keys
     in `plugins/revocation-keys.txt` (none yet: until a maintainer adds one, only the embedded
-    list counts). A list that newly blocks a loaded build drops its instances at once and logs
+    list counts). Each list carries a `serial` raised with every change, and a host refuses a
+    list older than the one it holds, so an old signed list can't lift a later block. A list
+    that newly blocks a loaded build drops its instances and cancels its jobs at once and logs
     a `blocked` entry; a soft block the user allowed (by the build's sha256) runs.
   - **Lock bumps.** The lock records each first-party plugin's `tier` and `caps`; the
     `plugin-lock` workflow auto-merges a bump only when the plugin is sandboxed and its release's

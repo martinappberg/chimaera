@@ -137,6 +137,11 @@ async fn a_declared_program_runs_as_a_job_and_the_plugin_hears_it_end() {
     .await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(route["plugin"], PID);
+    // A job that ended before anyone waited on it (an agent's call that
+    // got there late) is done at once, not after the whole hold.
+    let asked = Instant::now();
+    assert!(crate::plugins::jobs::wait(&state, PID, &id, Duration::from_secs(10)).await);
+    assert!(asked.elapsed() < Duration::from_secs(1));
     // The activity log names the program, its arguments and how it ended.
     let entry = activity(&state, "job").await;
     assert_eq!(entry["program"], "echo");
@@ -306,6 +311,20 @@ async fn a_hard_block_stops_a_running_job_at_once() {
     )
     .await;
     assert!(body["tree"].is_null(), "{body}");
+    // Nor did the blocked build hear its job end (it would start the next
+    // one): with the block lifted, its record has no `finished` for it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    crate::plugins::write(&state.plugin_guard.revoked).set_fetched_for_tests(vec![]);
+    let events = query(&state, &ws, "events", json!({})).await;
+    assert!(
+        !events
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|e| e.starts_with(&format!("finished {id} "))),
+        "{events}"
+    );
 }
 
 #[tokio::test]

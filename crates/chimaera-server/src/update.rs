@@ -150,6 +150,8 @@ pub(crate) async fn run_checker(state: Arc<AppState>) {
                 let reading = state.clone();
                 let _ =
                     tokio::task::spawn_blocking(move || reading.plugin_guard.reload_policy()).await;
+                // A stricter policy stops what it now refuses.
+                crate::plugins::revoke::apply(&state).await;
                 plugins_checked = Some(std::time::Instant::now());
             }
         }

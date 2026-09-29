@@ -184,14 +184,22 @@ function glob(pat: string, name: string): boolean {
   return p === pat.length;
 }
 
+/** `pat` against `parts`, row by row from the end (`row[j]`: whether
+ *  `pat[i..]` matches `parts[j..]`) — linear, where recursion over many
+ *  `**`s is exponential. */
 function components(pat: string[], parts: string[]): boolean {
-  if (pat.length === 0) return parts.length === 0;
-  const [first, ...rest] = pat;
-  if (first === "**") {
-    for (let skip = 0; skip <= parts.length; skip++) if (components(rest, parts.slice(skip))) return true;
-    return false;
+  const n = parts.length;
+  let next: boolean[] = new Array<boolean>(n + 1).fill(false);
+  next[n] = true;
+  for (let i = pat.length - 1; i >= 0; i--) {
+    const p = pat[i];
+    const row: boolean[] = new Array<boolean>(n + 1).fill(false);
+    for (let j = n; j >= 0; j--) {
+      row[j] = p === "**" ? next[j] || (j < n && row[j + 1]) : j < n && next[j + 1] && glob(p, parts[j]);
+    }
+    next = row;
   }
-  return parts.length > 0 && glob(first, parts[0]) && components(rest, parts.slice(1));
+  return next[0];
 }
 
 /** Whether workspace-relative `path` matches `pattern`: a pattern without

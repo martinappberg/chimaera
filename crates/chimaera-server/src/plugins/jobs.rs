@@ -61,6 +61,8 @@ const ARGS_MAX: usize = 256;
 const ARG_LEN_MAX: usize = 16 << 10;
 /// Finished jobs kept for `job-status` (the newest).
 const FINISHED_KEPT: usize = 128;
+/// Jobs whose logs an output folder keeps (the newest).
+const JOB_LOGS_KEPT: usize = 32;
 /// Arguments an activity entry keeps (the rest are the log's detail).
 const ACTIVITY_ARGS: usize = 4;
 /// How long the captured login environment is trusted before it is
@@ -316,7 +318,9 @@ impl Jobs {
             inner.finished.pop_front();
         }
         drop(inner);
-        let _ = job.done.send(true);
+        // `send` drops the value when no one has subscribed yet, and a job
+        // can end before its agent's call starts waiting on it.
+        job.done.send_replace(true);
     }
 }
 
@@ -452,7 +456,18 @@ async fn capture_env(
     Ok(env)
 }
 
-/// `name` on `path` (a `PATH` value): the first executable file.
+/// `path`'s absolute entries. A job starts in the workspace, so a relative
+/// one (`.`, an empty entry, `bin`) would find a project's file first — for
+/// the preamble's `nice`, and for every program the program starts.
+fn absolute_path(path: &str) -> String {
+    let kept: Vec<&str> = path.split(':').filter(|d| d.starts_with('/')).collect();
+    if kept.is_empty() {
+        "/usr/local/bin:/usr/bin:/bin".to_string()
+    } else {
+        kept.join(":")
+    }
+}
+
 /// `name` in the first absolute `path` folder holding an executable file.
 /// A relative entry (`.`, `bin`) is skipped: the job starts in the
 /// workspace, so it would run whatever file of that name the project has.
@@ -609,11 +624,11 @@ pub(crate) async fn start(
     };
 
     let env = login_env(state, Some(ws)).await?;
-    let path = env
-        .iter()
-        .find(|(k, _)| k == "PATH")
-        .map(|(_, v)| v.clone())
-        .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
+    let path = absolute_path(
+        env.iter()
+            .find(|(k, _)| k == "PATH")
+            .map_or("", |(_, v)| v.as_str()),
+    );
     let (program, tool_bin) =
         resolve(state, m, &spec.program, spec.prefer.as_deref(), &path).await?;
     let mut job_env: Vec<(String, String)> =
@@ -730,6 +745,23 @@ fn dispatch(state: &Arc<AppState>) {
             }
             job
         };
+        // A plugin blocked, untrusted or refused since its job queued never
+        // starts it.
+        let held = super::manifest(state, &next.plugin)
+            .is_none_or(|m| m.origin.fault.is_some() || super::trust::hold(state, &m).is_some());
+        if held {
+            let jobs = &state.plugin_platform.jobs;
+            crate::lock(&jobs.inner).running -= 1;
+            jobs.finish(
+                &next,
+                None,
+                false,
+                true,
+                Some("its plugin can't run here now".into()),
+            );
+            frame(state, &next);
+            continue;
+        }
         let state = state.clone();
         tokio::spawn(async move {
             run(&state, &next).await;
@@ -764,6 +796,11 @@ async fn run(state: &Arc<AppState>, job: &Arc<Job>) {
         let dir = launch.output.clone();
         let id = job.id.clone();
         tokio::task::spawn_blocking(move || {
+            // The newest jobs' logs stay (a plugin reads its last build's);
+            // older ones go, so a build on every save doesn't fill the disk.
+            if let Err(err) = super::output::prune_oldest(&dir, Path::new(".jobs"), JOB_LOGS_KEPT) {
+                tracing::debug!(%err, "old job logs not pruned");
+            }
             let rel = PathBuf::from(".jobs").join(&id);
             super::output::make_dir(&dir, &rel)?;
             let out = super::output::create_file(&dir, &rel.join("stdout.log"))?;
@@ -819,6 +856,8 @@ async fn run(state: &Arc<AppState>, job: &Arc<Job>) {
     entry["cancelled"] = json!(s.cancelled);
     entry["duration_ms"] = json!(s.duration_ms);
     super::activity::record(state, &job.plugin, entry).await;
+    // What the job wrote counts against the plugin's output quota.
+    super::output::usage(state, &job.plugin, false).await;
 }
 
 /// How a process ended.
@@ -958,11 +997,11 @@ pub(crate) async fn run_setup(
     args: &[String],
 ) -> Result<(), String> {
     let env = login_env(state, None).await?;
-    let path = env
-        .iter()
-        .find(|(k, _)| k == "PATH")
-        .map(|(_, v)| v.clone())
-        .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
+    let path = absolute_path(
+        env.iter()
+            .find(|(k, _)| k == "PATH")
+            .map_or("", |(_, v)| v.as_str()),
+    );
     let mut job_env: Vec<(String, String)> =
         env.iter().filter(|(k, _)| k != "PATH").cloned().collect();
     job_env.push(("PATH".into(), format!("{}:{path}", bin.display())));
@@ -1009,13 +1048,21 @@ pub(crate) async fn run_setup(
     }
 }
 
-/// A job ended: its frame, and the plugin's `job-finished` if it declared it.
+/// A job ended: its frame, and the plugin's `job-finished` if it declared it
+/// and is still on in the job's workspace (a job stopped by a switch-off
+/// must not start the plugin's next one).
 async fn after(state: &Arc<AppState>, job: &Arc<Job>) {
     frame(state, job);
     let Some(m) = super::manifest(state, &job.plugin) else {
         return;
     };
     if !m.provides.hears(EventKind::JobFinished) {
+        return;
+    }
+    let on = crate::lock(&state.workspaces)
+        .get(&job.workspace)
+        .is_some_and(|w| w.plugins_on.iter().any(|p| p == &job.plugin));
+    if !on {
         return;
     }
     let s = job.status();
@@ -1123,6 +1170,15 @@ mod tests {
         assert!(Path::new(&cwd).join(&relative).join("prog").is_file());
         assert_eq!(on_path("prog", &format!(".:{relative}")), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_jobs_path_keeps_only_absolute_entries() {
+        assert_eq!(
+            absolute_path(".:/opt/tex/bin::bin:/usr/bin:"),
+            "/opt/tex/bin:/usr/bin"
+        );
+        assert_eq!(absolute_path(".:"), "/usr/local/bin:/usr/bin:/bin");
     }
 
     #[test]

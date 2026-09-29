@@ -923,6 +923,18 @@ impl PluginRuntime {
         session: Option<&str>,
         call: Call,
     ) -> Result<Reply, String> {
+        // The one gate every call passes (tools, views, events, a job's
+        // end): a copy that failed its checks, or a build that is blocked,
+        // untrusted or refused by policy, never runs, whoever asks.
+        if let Some(fault) = &m.origin.fault {
+            return Err(format!("{} can't run on this daemon: {fault}", m.name));
+        }
+        if super::trust::hold(state, m).is_some() {
+            return Err(format!(
+                "{} can't run here until it is trusted and allowed",
+                m.name
+            ));
+        }
         let key: Key = (m.id.clone(), ws.to_string());
         if let Some(fault) = self.faulted(&key) {
             return Err(format!(

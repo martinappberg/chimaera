@@ -635,15 +635,26 @@ pub(crate) fn matches(pattern: &str, path: &str) -> bool {
     components(&pat, &parts)
 }
 
+/// `pat` against `parts`, component by component, row by row from the end:
+/// `row[j]` says whether `pat[i..]` matches `parts[j..]`. Linear in both
+/// (a pattern of many `**`s tried by recursion is exponential, and a
+/// manifest chooses its patterns).
 fn components(pat: &[&str], parts: &[&str]) -> bool {
-    match pat.split_first() {
-        None => parts.is_empty(),
-        Some((&"**", rest)) => (0..=parts.len()).any(|skip| components(rest, &parts[skip..])),
-        Some((first, rest)) => match parts.split_first() {
-            Some((part, more)) => glob(first.as_bytes(), part.as_bytes()) && components(rest, more),
-            None => false,
-        },
+    let n = parts.len();
+    let mut next = vec![false; n + 1];
+    next[n] = true;
+    for p in pat.iter().rev() {
+        let mut row = vec![false; n + 1];
+        for j in (0..=n).rev() {
+            row[j] = if *p == "**" {
+                next[j] || (j < n && row[j + 1])
+            } else {
+                j < n && next[j + 1] && glob(p.as_bytes(), parts[j].as_bytes())
+            };
+        }
+        next = row;
     }
+    next[0]
 }
 
 /// `*` and `?` within one component (no `/` in either side here).
@@ -803,6 +814,15 @@ mod tests {
         assert!(matches("ma?n.typ", "main.typ"));
         assert!(matches("*", "anything"));
         assert!(!matches("a*b", "a/b"));
+        assert!(matches("docs/**", "docs/a/b.md"));
+        assert!(matches("a/**/**/b", "a/b"));
+        assert!(!matches("a/**/b", "a/x/c"));
+        // Many `**`s (within a manifest's pattern cap) cost no more than a few.
+        let many = format!("{}x", "**/".repeat(41));
+        let started = std::time::Instant::now();
+        assert!(!matches(&many, "a/b/c/d/e/f/g"));
+        assert!(matches(&many, "a/b/c/d/e/f/x"));
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
     }
 
     fn manifest(extra: &str) -> Result<Manifest, String> {

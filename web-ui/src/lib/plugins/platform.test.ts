@@ -110,6 +110,17 @@ describe("file patterns (the daemon's rules)", () => {
     expect(matchesPattern("docs/**/*.md", "docs/x/y/a.md")).toBe(true);
     expect(matchesPattern("ma?n.typ", "main.typ")).toBe(true);
     expect(matchesPattern("a*b", "a/b")).toBe(false);
+    expect(matchesPattern("docs/**", "docs/a/b.md")).toBe(true);
+    expect(matchesPattern("a/**/**/b", "a/b")).toBe(true);
+    expect(matchesPattern("a/**/b", "a/x/c")).toBe(false);
+  });
+
+  it("costs no more with many `**`s", () => {
+    const many = `${"**/".repeat(41)}x`;
+    const started = performance.now();
+    expect(matchesPattern(many, "a/b/c/d/e/f/g")).toBe(false);
+    expect(matchesPattern(many, "a/b/c/d/e/f/x")).toBe(true);
+    expect(performance.now() - started).toBeLessThan(100);
   });
 
   it("is relative to the workspace root", () => {
