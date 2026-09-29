@@ -127,7 +127,7 @@ mod tests {
             hours_exhausted: false,
         };
         let mut phase = "ownership";
-        let error = engine::snapshot_inner(&state, &config, "w-diagnostic", true, &mut phase)
+        let error = engine::snapshot_inner(&state, &config, "w-diagnostic", true, None, &mut phase)
             .await
             .unwrap_err();
         assert_eq!(phase, "credentials");

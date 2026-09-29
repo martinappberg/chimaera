@@ -583,6 +583,14 @@ async fn suspend_workspace(state: &Arc<AppState>, workspace: &str) -> Result<()>
     Ok(())
 }
 
+/// Running agents make a project worth handing to the cloud before sleep.
+pub(super) fn live_agents(state: &AppState, workspace: &str) -> bool {
+    sessions(state, workspace).into_iter().any(|id| {
+        state.chat.get(&id).is_some_and(|s| s.alive)
+            || state.sessions.get(&id).is_some_and(|s| s.alive)
+    })
+}
+
 fn sessions(state: &AppState, workspace: &str) -> Vec<String> {
     let ids: Vec<_> = lock(&state.session_workspaces)
         .iter()
@@ -595,14 +603,55 @@ fn sessions(state: &AppState, workspace: &str) -> Vec<String> {
         .filter(|id| agents.contains_key(id) || state.chat.get(id).is_some())
         .collect()
 }
+/// A clean flush before this computer sleeps: one shared deadline, and no
+/// release once the computer woke again (the project simply stays here).
+#[derive(Clone, Copy)]
+pub(super) struct Sleep {
+    pub generation: u64,
+    pub deadline: tokio::time::Instant,
+}
+impl Sleep {
+    pub fn woke(&self, state: &AppState) -> bool {
+        state.pro.sleep_generation.load(Ordering::Acquire) != self.generation
+    }
+}
+pub(super) fn failure_code(error: &anyhow::Error) -> &'static str {
+    snapshot_diagnostics::category(error)
+}
 pub(super) async fn snapshot(
     state: &Arc<AppState>,
     config: &Configure,
     workspace: &str,
     clean: bool,
 ) -> Result<()> {
+    snapshot_before(state, config, workspace, clean, None).await
+}
+pub(super) async fn sleep_flush(
+    state: &Arc<AppState>,
+    config: &Configure,
+    workspace: &str,
+    sleep: Sleep,
+) -> Result<()> {
+    let result = snapshot_before(state, config, workspace, true, Some(sleep)).await;
+    // Woken during the flush: its publication stands, the project stays here.
+    if sleep.woke(state) {
+        let _configuration = state.pro.configuration.lock().await;
+        let mut ownership = lock(&state.pro.ownership);
+        if let Some(Ownership::Transferring { epoch }) = ownership.get(workspace).cloned() {
+            ownership.insert(workspace.into(), Ownership::AwaitingVerification { epoch });
+        }
+    }
+    result
+}
+async fn snapshot_before(
+    state: &Arc<AppState>,
+    config: &Configure,
+    workspace: &str,
+    clean: bool,
+    sleep: Option<Sleep>,
+) -> Result<()> {
     let mut phase = "ownership";
-    let result = snapshot_inner(state, config, workspace, clean, &mut phase).await;
+    let result = snapshot_inner(state, config, workspace, clean, sleep, &mut phase).await;
     if let Err(error) = &result {
         // Recovery may clear the transient status while resuming an idle session.
         // The fixed phase/category survives that recovery without recording data.
@@ -621,6 +670,7 @@ async fn snapshot_inner(
     config: &Configure,
     workspace: &str,
     clean: bool,
+    sleep: Option<Sleep>,
     phase: &mut &'static str,
 ) -> Result<()> {
     let generation = state.pro.generation.load(Ordering::Acquire);
@@ -633,7 +683,7 @@ async fn snapshot_inner(
     transport::cache_scope(
         workspace,
         cache,
-        snapshot_inner_scoped(state, config, workspace, clean, phase),
+        snapshot_inner_scoped(state, config, workspace, clean, sleep, phase),
     )
     .await
 }
@@ -643,6 +693,7 @@ async fn snapshot_inner_scoped(
     config: &Configure,
     workspace: &str,
     clean: bool,
+    sleep: Option<Sleep>,
     phase: &mut &'static str,
 ) -> Result<()> {
     authority::config_matches(state, config, workspace)?;
@@ -759,10 +810,17 @@ async fn snapshot_inner_scoped(
         lock(&state.pro.status).insert(workspace.id.clone(), WorkspaceStatus {report,last_mirrored_at:Some(super::now()),storage_limit_bytes:budget,error:None,blocked_providers:Vec::new()});
         *phase = "persist_snapshot";
         super::persist(state).await?;
-        if clean {
+        if clean && !sleep.is_some_and(|sleep| sleep.woke(state)) {
             *phase = "release";
-            release::after_publication(config, &workspace.id, epoch, || {
+            // Before sleep, the account's short publication fence is not
+            // waited out past the deadline: an unreleased lease simply lapses
+            // and the cloud continues from this acknowledged checkpoint.
+            let budget = sleep.map_or(Duration::from_secs(15), |sleep| {
+                sleep.deadline.saturating_duration_since(tokio::time::Instant::now())
+            });
+            release::after_publication(config, &workspace.id, epoch, budget, || {
                 generation == state.pro.generation.load(Ordering::Acquire)
+                    && !sleep.is_some_and(|sleep| sleep.woke(state))
                     && matches!(lock(&state.pro.ownership).get(&workspace.id), Some(Ownership::Transferring { epoch: current }) if *current == epoch)
             }).await?;
         }

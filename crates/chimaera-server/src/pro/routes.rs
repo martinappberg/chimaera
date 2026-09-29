@@ -374,40 +374,165 @@ pub(crate) async fn put_profile(
         Err(error) => failure(error),
     }
 }
-pub(crate) async fn sleep(State(state): State<Arc<AppState>>) -> Response {
+#[derive(Default, Deserialize)]
+struct SleepRequest {
+    /// How long the caller will wait before the computer sleeps (additive).
+    #[serde(default)]
+    deadline_ms: Option<u64>,
+}
+/// Time kept back from the caller's deadline for the reply itself.
+const SLEEP_REPLY_MARGIN: std::time::Duration = std::time::Duration::from_millis(1500);
+/// Default budget for callers that send no deadline (macOS allows ~25 s).
+const SLEEP_DEFAULT_MS: u64 = 25_000;
+
+/// Hand projects with running agents to the cloud before this computer
+/// sleeps, within one deadline: the periodic pass is preempted, every flush
+/// runs in parallel as an owned task (stopping its agents first), projects
+/// with live agents go first, and a flush that outlives the deadline still
+/// finishes or recovers on its own instead of leaving half a transfer.
+pub(crate) async fn sleep(State(state): State<Arc<AppState>>, body: axum::body::Bytes) -> Response {
+    let request: SleepRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        SleepRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(request) => request,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        }
+    };
     let Some(config) = lock(&state.pro.runtime).clone() else {
         return StatusCode::NO_CONTENT.into_response();
     };
     if config.hours_exhausted {
         return Json(json!({"handoff":false,"reason":"cloud_hours_exhausted"})).into_response();
     }
-    let _guard = state.pro.jobs.lock().await;
-    let workspaces = lock(&state.workspaces).list();
-    let mut failed = Vec::new();
-    for workspace in workspaces
-        .into_iter()
-        .filter(|workspace| lock(&state.pro.authority).allows(&workspace.id))
-        .take(128)
+    let budget = std::time::Duration::from_millis(
+        request
+            .deadline_ms
+            .unwrap_or(SLEEP_DEFAULT_MS)
+            .clamp(1_000, 120_000),
+    )
+    .saturating_sub(SLEEP_REPLY_MARGIN);
+    let deadline = tokio::time::Instant::now() + budget;
+    let generation = state.pro.sleep_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    let sleep = engine::Sleep {
+        generation,
+        deadline,
+    };
+    // The periodic pass holds the job reservation across every project; a
+    // sleep preempts it rather than queueing behind a long push. Anything it
+    // leaves half-done recovers on the next pass (locks, fences, returns).
+    let jobs = state.pro.jobs.clone();
+    let guard = match tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        jobs.clone().lock_owned(),
+    )
+    .await
     {
-        if lock(&state.pro.preferences)
-            .get(&workspace.id)
-            .is_some_and(|p| p.never_mirror)
+        Ok(guard) => guard,
+        Err(_) => {
+            let pass = lock(&state.pro.mirror_task).take();
+            if let Some(pass) = pass {
+                pass.abort();
+                let _ = pass.await;
+            }
+            match tokio::time::timeout_at(deadline, jobs.lock_owned()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return Json(json!({"handoff":false,"reason":"transfer_busy","failed":[]}))
+                        .into_response()
+                }
+            }
+        }
+    };
+    let mut active = Vec::new();
+    let mut quiet = Vec::new();
+    for workspace in lock(&state.workspaces).list().into_iter().take(128) {
+        if !lock(&state.pro.authority).allows(&workspace.id)
+            || lock(&state.pro.preferences)
+                .get(&workspace.id)
+                .is_some_and(|p| p.never_mirror)
             || super::owned_epoch(&state, &workspace.id).is_none()
         {
             continue;
         }
-        if let Err(error) = engine::snapshot(&state, &config, &workspace.id, true).await {
-            failed.push(json!({"workspace_id":workspace.id,"error":error.to_string().chars().take(256).collect::<String>()}));
+        if engine::live_agents(&state, &workspace.id) {
+            active.push(workspace.id);
+        } else {
+            quiet.push(workspace.id);
         }
     }
-    Json(json!({"handoff":failed.is_empty(),"failed":failed})).into_response()
+    let owner = state.clone();
+    let coordinator = tokio::spawn(async move {
+        let _guard = guard;
+        let flush = |workspace: String| {
+            let owner = owner.clone();
+            let config = config.clone();
+            async move {
+                if sleep.woke(&owner) {
+                    return (workspace, Ok(()));
+                }
+                lock(&owner.pro.sleeping).insert(workspace.clone());
+                // Owned: the deadline returning early never cancels a flush.
+                let task = tokio::spawn({
+                    let owner = owner.clone();
+                    let workspace = workspace.clone();
+                    async move { engine::sleep_flush(&owner, &config, &workspace, sleep).await }
+                });
+                let result = task
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("transfer_interrupted")));
+                lock(&owner.pro.sleeping).remove(&workspace);
+                (workspace, result)
+            }
+        };
+        let mut results = futures::future::join_all(active.into_iter().map(flush)).await;
+        // Projects without running agents are only worth publishing while time
+        // remains; the cloud would not start them anyway.
+        if tokio::time::Instant::now() + std::time::Duration::from_secs(5) < sleep.deadline
+            && !sleep.woke(&owner)
+        {
+            results.extend(futures::future::join_all(quiet.into_iter().map(flush)).await);
+        }
+        results
+    });
+    let failed = |results: Vec<(String, anyhow::Result<()>)>| -> Vec<serde_json::Value> {
+        results
+            .into_iter()
+            .filter_map(|(workspace, result)| {
+                result.err().map(
+                    |error| json!({"workspace_id":workspace,"error":engine::failure_code(&error)}),
+                )
+            })
+            .collect()
+    };
+    match tokio::time::timeout_at(deadline + SLEEP_REPLY_MARGIN / 2, coordinator).await {
+        Ok(Ok(results)) => {
+            let failed = failed(results);
+            Json(json!({"handoff":failed.is_empty(),"failed":failed})).into_response()
+        }
+        Ok(Err(_)) => Json(json!({"handoff":false,"reason":"transfer_interrupted","failed":[]}))
+            .into_response(),
+        Err(_) => {
+            // Still publishing: the flushes finish or recover on their own.
+            let pending: Vec<_> = lock(&state.pro.sleeping).iter().cloned().collect();
+            Json(json!({"handoff":false,"reason":"deadline","pending":pending,"failed":[]}))
+                .into_response()
+        }
+    }
 }
 pub(crate) async fn wake(State(state): State<Arc<AppState>>) -> Response {
     state.pro.awake_since.store(super::now(), Ordering::Release);
+    // A flush still running for the sleep that just ended keeps its
+    // publication but will not release; it returns the project itself.
+    state.pro.sleep_generation.fetch_add(1, Ordering::AcqRel);
     {
+        let sleeping = lock(&state.pro.sleeping).clone();
         let mut ownership = lock(&state.pro.ownership);
         let authority = lock(&state.pro.authority).clone();
-        for (_, owner) in ownership.iter_mut().filter(|(id, _)| authority.allows(id)) {
+        for (_, owner) in ownership
+            .iter_mut()
+            .filter(|(id, _)| authority.allows(id) && !sleeping.contains(*id))
+        {
             if let Ownership::Transferring { epoch } = owner {
                 *owner = Ownership::AwaitingVerification { epoch: *epoch };
             }

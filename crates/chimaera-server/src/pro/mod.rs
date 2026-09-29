@@ -49,7 +49,11 @@ pub(crate) struct ProState {
     status: Mutex<HashMap<String, WorkspaceStatus>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     mirror_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    jobs: AsyncMutex<()>,
+    jobs: Arc<AsyncMutex<()>>,
+    /// Advanced by every sleep and wake: a flush started for an older sleep
+    /// keeps its publication but never releases a project after the wake.
+    sleep_generation: AtomicU64,
+    sleeping: Mutex<std::collections::HashSet<String>>,
     persistence: AsyncMutex<()>,
     configuration: Arc<AsyncMutex<()>>,
     caches: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
@@ -225,7 +229,9 @@ impl ProState {
             status: Mutex::new(status),
             task: Mutex::new(None),
             mirror_task: Mutex::new(None),
-            jobs: AsyncMutex::new(()),
+            jobs: Arc::new(AsyncMutex::new(())),
+            sleep_generation: AtomicU64::new(0),
+            sleeping: Mutex::new(Default::default()),
             persistence: AsyncMutex::new(()),
             configuration: Arc::new(AsyncMutex::new(())),
             caches: Mutex::new(HashMap::new()),

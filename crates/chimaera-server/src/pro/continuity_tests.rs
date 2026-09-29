@@ -470,3 +470,92 @@ async fn a_device_takes_back_a_lapsed_cloud_lease_but_waits_to_move_live_cloud_w
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+async fn post(state: &Arc<AppState>, path: &str, body: &str) -> (StatusCode, serde_json::Value) {
+    use tower::ServiceExt;
+    let response = crate::app(state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("Authorization", "Bearer fixture")
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or_default())
+}
+
+#[tokio::test]
+async fn a_sleep_flush_preempts_the_periodic_pass_and_answers_within_its_deadline() {
+    let root = temp("sleep");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let config = device(&account.endpoint);
+    let workspace = project(&state, &root, &config, 4);
+    *lock(&account.baton) = owned(&workspace.id, "d-home", 4, "lease-fixture", 1);
+    *lock(&state.pro.runtime) = Some(config);
+    // A periodic pass is holding the job reservation (a long push).
+    let jobs = state.pro.jobs.clone();
+    let pass = tokio::spawn(async move {
+        let _guard = jobs.lock_owned().await;
+        tokio::time::sleep(StdDuration::from_secs(3600)).await;
+    });
+    tokio::time::sleep(StdDuration::from_millis(50)).await;
+    *lock(&state.pro.mirror_task) = Some(pass);
+    // Publishing is slower than the caller's deadline.
+    lock(&account.delays).insert(
+        format!("/v1/baton/{}/policy", workspace.id),
+        StdDuration::from_secs(12),
+    );
+    let started = std::time::Instant::now();
+    let (status, reply) = post(&state, "/api/v1/pro/sleep", r#"{"deadline_ms":9000}"#).await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        elapsed < StdDuration::from_millis(9000),
+        "answered within the caller's deadline: {elapsed:?}"
+    );
+    assert_eq!(reply["handoff"], false);
+    assert_eq!(reply["reason"], "deadline");
+    assert_eq!(reply["pending"], json!([workspace.id]));
+    // The computer woke before the flush finished: nothing is released and
+    // the flush still ends on its own, returning the project here.
+    assert_eq!(
+        post(&state, "/api/v1/pro/wake", "").await.0,
+        StatusCode::NO_CONTENT
+    );
+    tokio::time::timeout(StdDuration::from_secs(60), async {
+        while !lock(&state.pro.sleeping).is_empty()
+            || matches!(
+                lock(&state.pro.ownership).get(&workspace.id),
+                Some(Ownership::Transferring { .. })
+            )
+        {
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the flush finishes after its caller's deadline");
+    assert!(crate::pro::may_write(&state, &workspace.id));
+    assert!(account
+        .calls("POST", &format!("/v2/baton/{}/release", workspace.id))
+        .is_empty());
+    assert_eq!(
+        leftovers(&state.pro.root.join(&workspace.id)),
+        Vec::<String>::new()
+    );
+    // The old request shape (no body) still works.
+    assert_eq!(
+        post(&state, "/api/v1/pro/sleep", "").await.0,
+        StatusCode::OK
+    );
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}

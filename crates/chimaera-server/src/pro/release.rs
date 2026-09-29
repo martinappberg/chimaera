@@ -17,9 +17,10 @@ pub(super) async fn after_publication(
     config: &Configure,
     workspace: &str,
     epoch: u64,
+    budget: Duration,
     current: impl Fn() -> bool,
 ) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(budget.min(Duration::from_secs(15)), async {
         loop {
             ensure!(
                 current(),
@@ -186,7 +187,7 @@ mod tests {
                 device_id: "device".into(),
             },
         };
-        let result = after_publication(&config, "w-fixture", 4, || {
+        let result = after_publication(&config, "w-fixture", 4, Duration::from_secs(15), || {
             fixture.current.load(Ordering::SeqCst)
         })
         .await;
