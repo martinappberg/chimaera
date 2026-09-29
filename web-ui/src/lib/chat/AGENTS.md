@@ -322,17 +322,25 @@ resurrect a delivered message. A send accepted while not live shows at once as
 `store.sending` ("sending…") until its echo. In a browser view, `send()` into a
 dropped socket reconnects once with `?wake=interaction` and returns false (the
 composer keeps the draft). Socket states that are not errors: `worker_asleep` →
-`store.asleep` ("Send a message to pick this conversation back up.", cleared by
-an accepted send); the additive `{"type":"moved","to"}` → `store.moving` (only
+`store.asleep` ("Asleep in the cloud. Send a message to wake it.", and the
+header's "In the cloud · asleep" instead of "· reconnecting"; it survives a
+dropped socket and ends with an accepted send, `waking`, a move or `ready`);
+the additive `{"type":"moved","to"}` → `store.moving` (only
 for a real transfer); and the additive `{"type":"paused","reason","provider"?}`
 → `store.pausedFor` (restarting / needs_provider / importing): the chat is NOT
 ended, stays mounted (the pane keeps a paused chat row's ChatView), hides the
 replayed "agent exited", disables the composer with `net/placement.ts`
-`pauseLabel` ("Continuing in the cloud…", "Reconnecting after an update…",
-"Waiting for Claude Code on the cloud machine", "Opening…"; a row naming the
+`pauseLabel` ("Continuing in the cloud…" — or, signed out (`net/plan.ts`
+`accountSignedOut`), "This conversation is in the cloud. Sign in to Chimaera
+Pro to bring it back." — "Picking up where you left off…",
+"Waiting for Claude Code in the cloud", "Opening…"; a row naming the
 agent in `blocked_provider` adds **Connect <agent> to continue**, `pro/providers.ts`
 `pausedConnect`), and retries at once
 (`ChatSocket.retrySoon`) when its row stops being paused or changes owner. The connection row appears only for a viewed project (routed row or
-browser view) after a 2 s grace. Browser sockets use `net/base` to preserve
-gateway prefixes. Transfer context echoes render the additive `moved` and `home`
-origins.
+browser view) after a 2 s grace; while it says "Reconnecting…" the header does
+not repeat it. Browser sockets use `net/base` to preserve gateway prefixes. The
+daemon's transfer pick-up (a user message with origin `moved` or `home`) renders
+as `TransferNote.svelte`: one line ("Continued in the cloud · 5m ago", "Back on
+your computer", or "… after this computer stopped responding" when the text
+carries the daemon's recovery paragraph — `transfer.ts`) with the agent-facing
+text behind "Show what the agent was told".
