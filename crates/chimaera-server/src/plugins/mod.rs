@@ -1420,8 +1420,9 @@ pub(crate) async fn put_workspace_plugin(
         }
     }
     if !body.on {
-        // Its programs stop with it.
-        state.plugin_platform.jobs.cancel_where(&pid, Some(&id));
+        // Its programs stop with it, and what it published here goes.
+        jobs::cancel_where(&state, &pid, Some(&id));
+        crate::lock(&state.plugin_platform.surfaces).forget_pair(&pid, &id);
     }
     // Either way the plugin starts over here: a fresh instance on next use,
     // and a fault cleared (switching off and on is how the user retries a

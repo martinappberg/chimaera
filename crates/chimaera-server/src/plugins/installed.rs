@@ -90,7 +90,9 @@ pub(crate) struct InstalledCopy {
 
 /// Every installed copy under `root`, sorted by id (blocking). A copy that
 /// doesn't hold together (an unreadable manifest, an id or version that
-/// isn't its directory's, a component over the cap) is left out, loudly.
+/// isn't its directory's, a component over the cap) is listed by its id
+/// with why as its fault (`unreadable`): its card says so and Remove still
+/// works, where leaving it out would hide it with no way to remove it.
 pub(crate) fn scan(root: &Path) -> Vec<InstalledCopy> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -110,14 +112,35 @@ pub(crate) fn scan(root: &Path) -> Vec<InstalledCopy> {
             match load_current(root, &id) {
                 Ok(copy) => copy,
                 Err(err) => {
-                    tracing::warn!(plugin = %id, %err, "installed plugin skipped");
-                    None
+                    tracing::warn!(plugin = %id, %err, "installed plugin can't load");
+                    unreadable(root, &id, &err)
                 }
             }
         })
         .collect();
     copies.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
     copies
+}
+
+/// A copy of `id` this daemon can't load (its manifest a format it doesn't
+/// read, a check it fails): a stand-in named by its id and version with
+/// `why` as its fault — never active, never run, removable.
+fn unreadable(root: &Path, id: &str, why: &str) -> Option<InstalledCopy> {
+    let dir = root.join(id);
+    let version = link(&dir, CURRENT).ok().flatten()?;
+    let text = format!(
+        "id = {id:?}\nname = {id:?}\nversion = {version:?}\nsummary = \"\"\napi = {:?}\n",
+        super::API
+    );
+    let mut m = super::parse_manifest(&text).ok()?;
+    m.origin.fault = Some(format!(
+        "its plugin.toml doesn't load on this chimaera: {why}"
+    ));
+    Some(InstalledCopy {
+        manifest: m,
+        dir: dir.join(&version),
+        previous: None,
+    })
 }
 
 /// `<root>/<id>`'s `current` copy; `None` when nothing is current (a
@@ -1201,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_reads_current_and_previous_and_skips_what_does_not_hold() {
+    fn scan_reads_current_and_previous_and_faults_what_does_not_hold() {
         let root = dir("scan");
         plant(&root, "demo", "0.1.0");
         plant(&root, "demo", "0.2.0");
@@ -1224,7 +1247,18 @@ mod tests {
         std::fs::create_dir_all(root.join(".tmp-x")).unwrap();
 
         let copies = scan(&root);
-        assert_eq!(copies.len(), 1, "{copies:?}");
+        // `liar` is listed by its id with why (removable from its card);
+        // `bare` has nothing current and `odd` names no version.
+        assert_eq!(copies.len(), 2, "{copies:?}");
+        let liar = &copies[1];
+        assert_eq!(liar.manifest.id, "liar");
+        assert_eq!(liar.manifest.version, "1.0.0");
+        assert!(liar
+            .manifest
+            .origin
+            .fault
+            .as_deref()
+            .is_some_and(|f| f.contains("doesn't load") && f.contains("someone-else")));
         let c = &copies[0];
         assert_eq!(c.manifest.id, "demo");
         assert_eq!(c.manifest.version, "0.2.0");

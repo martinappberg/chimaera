@@ -888,7 +888,9 @@ programs and tools (its P8). Their own work:
 
 ### L1: build, errors, agents
 
-**Built and released (2026-09-29): 0.1.0 of each, pinned in `plugins/plugins.lock`.**
+**Built and released (2026-09-29): 0.1.0 of each, pinned in `plugins/plugins.lock`; LaTeX
+0.1.1 the same day (a rebuild after a failed build runs latexmk with `-g`, so an installed
+missing package builds; the install offer names this host's download size).**
 Both plugins as repositories of their own
 ([chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex),
 [chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst)), verified live against a
@@ -900,8 +902,7 @@ edits, the LaTeX log parser against real TeX Live 2026 logs (pdfLaTeX, XeLaTeX,
 LuaLaTeX, biber) with the failing control sequence marked, Typst's diagnostics,
 parts found by `% !TEX root`, the recorder file or Typst's deps, TinyTeX and Typst
 installed on one click with progress, a missing package looked up and installed
-with `tlmgr` (the lookup needs the network, which this sandbox blocks: the notice
-says so), `compile_latex` / `compile_typst` and the guides. Where it differs: a
+with `tlmgr` (verified on macOS with the network: 0.1.1 then rebuilds with `-g`), `compile_latex` / `compile_typst` and the guides. Where it differs: a
 failed build shows the partial PDF LaTeX left (no `prev/` copy yet); the user's
 `~/.latexmkrc` isn't read (`-norc` only); the old-LuaTeX gate is not built. Typst
 highlights in the editor through `codemirror-lang-typst`'s Lezer grammar

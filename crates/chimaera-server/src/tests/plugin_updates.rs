@@ -1740,3 +1740,33 @@ async fn a_removal_whose_caller_went_away_still_reloads_the_catalog() {
     .expect("the catalog never caught up with the removal");
     assert!(!plugin_dir(&state, id).exists());
 }
+
+#[tokio::test]
+async fn a_copy_this_daemon_cannot_load_is_listed_with_why_and_removable() {
+    let state = test_state();
+    let dir = plugin_dir(&state, "old-dotted");
+    let v = dir.join("0.1.0");
+    std::fs::create_dir_all(&v).unwrap();
+    // A dotted tool name: allowed once, refused now (codex's dotted keys).
+    std::fs::write(
+        v.join("plugin.toml"),
+        "id = \"old-dotted\"\nname = \"Old\"\nversion = \"0.1.0\"\nsummary = \"x\"\n\
+         api = \"0.1\"\n[provides]\nmcp_tools = [\"notes.post\"]\n",
+    )
+    .unwrap();
+    std::fs::write(v.join("plugin.wasm"), b"\0asm").unwrap();
+    std::os::unix::fs::symlink("0.1.0", dir.join("current")).unwrap();
+    reload(&state).await;
+    let entry = listed(&state, "old-dotted").await;
+    assert!(
+        entry["fault"]
+            .as_str()
+            .unwrap_or("")
+            .contains("doesn't load"),
+        "{entry}"
+    );
+    assert!(entry["hold"].is_null(), "{entry}");
+    let (status, body) = request(&state, Method::DELETE, "/api/v1/plugins/old-dotted", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!dir.exists());
+}

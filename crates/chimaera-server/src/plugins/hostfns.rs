@@ -858,7 +858,7 @@ impl platform::Host for HostState {
         let jobs = &scope.app.plugin_platform.jobs;
         if let Some(job) = jobs.get(&id) {
             if job.plugin == self.plugin && job.workspace == self.workspace && !job.is_done() {
-                jobs.cancel(&id);
+                super::jobs::cancel(&scope.app, &id);
             }
         }
     }

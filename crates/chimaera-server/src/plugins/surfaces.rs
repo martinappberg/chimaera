@@ -47,6 +47,9 @@ const SMALL_MAX: usize = 512 << 10;
 /// What one (plugin, workspace) may hold in memory across its small
 /// surfaces: the daemon's RSS target is ~150 MB for everything.
 const INLINE_BUDGET: usize = 2 << 20;
+/// What every plugin in every workspace holds in memory together (JSON
+/// bytes; parsed, several times that).
+const INLINE_TOTAL: usize = 8 << 20;
 const PAGES_MAX: usize = 2000;
 /// references/1: id shapes per key, ids per key, and a shape's regex
 /// source (the client's registry refuses longer ones, and any group).
@@ -111,6 +114,25 @@ pub(crate) struct Surfaces {
 impl Surfaces {
     pub(crate) fn forget_plugin(&mut self, plugin: &str) {
         self.by_pair.retain(|(p, _), _| p != plugin);
+    }
+
+    /// Switched off in `ws`: what it published there goes (it publishes
+    /// again when it is on and runs).
+    pub(crate) fn forget_pair(&mut self, plugin: &str, ws: &str) {
+        self.by_pair.remove(&(plugin.to_string(), ws.to_string()));
+    }
+
+    /// The JSON bytes every small surface holds in memory, but `except`.
+    fn inline_total(&self, except: (&(String, String), &(String, String))) -> usize {
+        self.by_pair
+            .iter()
+            .flat_map(|(pair, m)| m.iter().map(move |(k, h)| (pair, k, h)))
+            .filter(|(pair, k, _)| (*pair, *k) != except)
+            .map(|(_, _, h)| match h {
+                Held::Inline(_, n) => *n,
+                Held::Stored(_) => 0,
+            })
+            .sum()
     }
 
     pub(crate) fn forget_workspace(&mut self, ws: &str) {
@@ -414,6 +436,7 @@ pub(crate) async fn publish(
     let mut dropped: Option<PathBuf> = None;
     {
         let mut surfaces = crate::lock(&state.plugin_platform.surfaces);
+        let everyone_else = surfaces.inline_total((&pair, &skey));
         let held_map = surfaces.by_pair.entry(pair.clone()).or_default();
         match held {
             Some(held) => {
@@ -437,6 +460,13 @@ pub(crate) async fn publish(
                             "{surface}: this plugin's published data here is capped at {} MiB \
                              (unpublish old keys)",
                             INLINE_BUDGET >> 20
+                        ));
+                    }
+                    if everyone_else + size > INLINE_TOTAL {
+                        return Err(format!(
+                            "{surface}: the plugins' published data is capped at {} MiB on \
+                             this host; try again later",
+                            INLINE_TOTAL >> 20
                         ));
                     }
                 }

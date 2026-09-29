@@ -151,6 +151,8 @@ pub(crate) struct Job {
     launch: Mutex<Option<Launch>>,
     /// Its `stdin`'s size, held until it starts.
     stdin_bytes: usize,
+    /// Its process group once it runs (0 before): what `kill_all` stops.
+    group: std::sync::atomic::AtomicI32,
 }
 
 #[derive(Clone)]
@@ -249,46 +251,21 @@ impl Jobs {
             .or_else(|| inner.finished.iter().find(|j| j.id == id).cloned())
     }
 
-    /// Stop one job (queued: it never starts; running: its process group
-    /// gets SIGTERM, then SIGKILL).
-    pub(crate) fn cancel(&self, id: &str) {
-        let Some(job) = crate::lock(&self.inner).live.get(id).cloned() else {
-            return;
-        };
-        let queued = {
-            let mut inner = crate::lock(&self.inner);
-            match inner.waiting.iter().position(|w| w.id == id) {
-                Some(at) => {
-                    inner.waiting.remove(at);
-                    true
-                }
-                None => false,
-            }
-        };
-        if queued {
-            self.finish(
-                &job,
-                None,
-                false,
-                true,
-                Some("cancelled before it started".into()),
-            );
-        } else {
-            job.cancel.notify_one();
-        }
-    }
-
-    /// Stop every job of `plugin` (a hard block, a remove), or only those in
-    /// `workspace` (switched off there).
-    pub(crate) fn cancel_where(&self, plugin: &str, workspace: Option<&str>) {
-        let ids: Vec<String> = crate::lock(&self.inner)
+    /// Every running job's process group gets SIGKILL now (the daemon is
+    /// stopping: `kill_on_drop` would reach only each group's leader, and
+    /// what it started would run on unowned).
+    pub(crate) fn kill_all(&self) {
+        let groups: Vec<i32> = crate::lock(&self.inner)
             .live
             .values()
-            .filter(|j| j.plugin == plugin && workspace.is_none_or(|w| j.workspace == w))
-            .map(|j| j.id.clone())
+            .map(|j| j.group.load(std::sync::atomic::Ordering::Relaxed))
+            .filter(|g| *g > 0)
             .collect();
-        for id in ids {
-            self.cancel(&id);
+        for g in groups {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(g),
+                nix::sys::signal::Signal::SIGKILL,
+            );
         }
     }
 
@@ -321,6 +298,64 @@ impl Jobs {
         // `send` drops the value when no one has subscribed yet, and a job
         // can end before its agent's call starts waiting on it.
         job.done.send_replace(true);
+    }
+}
+
+/// Stop one job (queued: it never starts, and ends like any other job —
+/// its frame, an activity line, the plugin's `job-finished` where it is
+/// still on; running: its process group gets SIGTERM, then SIGKILL).
+pub(crate) fn cancel(state: &Arc<AppState>, id: &str) {
+    let jobs = &state.plugin_platform.jobs;
+    let Some(job) = crate::lock(&jobs.inner).live.get(id).cloned() else {
+        return;
+    };
+    let queued = {
+        let mut inner = crate::lock(&jobs.inner);
+        match inner.waiting.iter().position(|w| w.id == id) {
+            Some(at) => {
+                inner.waiting.remove(at);
+                true
+            }
+            None => false,
+        }
+    };
+    if !queued {
+        job.cancel.notify_one();
+        return;
+    }
+    jobs.finish(
+        &job,
+        None,
+        false,
+        true,
+        Some("cancelled before it started".into()),
+    );
+    let state = state.clone();
+    tokio::spawn(async move {
+        let entry = json!({
+            "kind": "job",
+            "job": job.id,
+            "workspace": job.workspace,
+            "program": job.program,
+            "cancelled": true,
+            "started": false,
+        });
+        super::activity::record(&state, &job.plugin, entry).await;
+        after(&state, &job).await;
+    });
+}
+
+/// Stop every job of `plugin` (a hard block, a remove), or only those in
+/// `workspace` (switched off there).
+pub(crate) fn cancel_where(state: &Arc<AppState>, plugin: &str, workspace: Option<&str>) {
+    let ids: Vec<String> = crate::lock(&state.plugin_platform.jobs.inner)
+        .live
+        .values()
+        .filter(|j| j.plugin == plugin && workspace.is_none_or(|w| j.workspace == w))
+        .map(|j| j.id.clone())
+        .collect();
+    for id in ids {
+        cancel(state, &id);
     }
 }
 
@@ -699,6 +734,7 @@ pub(crate) async fn start(
                 output,
             })),
             stdin_bytes,
+            group: std::sync::atomic::AtomicI32::new(0),
         });
         inner.live.insert(job.id.clone(), job.clone());
         inner.waiting.push(job.clone());
@@ -834,7 +870,14 @@ async fn run(state: &Arc<AppState>, job: &Arc<Job>) {
         "args": launch.args.iter().take(ACTIVITY_ARGS).map(|a| super::runtime::clip(a, 120)).collect::<Vec<_>>(),
         "cwd": launch.cwd.to_string_lossy(),
     });
-    let outcome = run_process(launch, Some(&job.cancel), out_file, err_file).await;
+    let outcome = run_process(
+        launch,
+        Some(&job.cancel),
+        Some(&job.group),
+        out_file,
+        err_file,
+    )
+    .await;
     tracing::info!(
         plugin = %job.plugin,
         job = %job.id,
@@ -873,6 +916,7 @@ struct Outcome {
 async fn run_process(
     launch: Launch,
     cancel: Option<&tokio::sync::Notify>,
+    group_slot: Option<&std::sync::atomic::AtomicI32>,
     out_file: std::fs::File,
     err_file: std::fs::File,
 ) -> Outcome {
@@ -905,6 +949,9 @@ async fn run_process(
         }
     };
     let group = child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32));
+    if let (Some(slot), Some(g)) = (group_slot, group) {
+        slot.store(g.as_raw(), std::sync::atomic::Ordering::Relaxed);
+    }
     if let (Some(bytes), Some(mut stdin)) = (launch.stdin, child.stdin.take()) {
         tokio::spawn(async move {
             let _ = stdin.write_all(&bytes).await;
@@ -1036,7 +1083,7 @@ pub(crate) async fn run_setup(
         output: cwd.to_path_buf(),
     };
     tracing::info!(plugin = %m.id, %program, "plugin tool setup step");
-    let outcome = run_process(launch, None, out, err).await;
+    let outcome = run_process(launch, None, None, out, err).await;
     match (outcome.error, outcome.exit, outcome.timed_out) {
         (Some(err), _, _) => Err(err),
         (None, _, true) => Err(format!("{program} ran past {WALL_MAX} s")),
@@ -1116,7 +1163,7 @@ pub(crate) async fn cancel_route(
     let jobs = &state.plugin_platform.jobs;
     match jobs.get(&id) {
         Some(job) if job.workspace == ws => {
-            jobs.cancel(&id);
+            cancel(&state, &id);
             axum::Json(json!({"id": id, "cancelled": true})).into_response()
         }
         _ => super::not_found(&format!("job {id}")),

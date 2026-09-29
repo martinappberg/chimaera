@@ -768,7 +768,7 @@ pub(crate) async fn forget_plugin(state: &std::sync::Arc<crate::AppState>, plugi
     crate::lock(&p.surfaces).forget_plugin(plugin);
     crate::lock(&p.screens).forget_plugin(plugin);
     crate::lock(&p.files).forget_plugin(plugin);
-    p.jobs.cancel_where(plugin, None);
+    super::jobs::cancel_where(state, plugin, None);
     let state = state.clone();
     let plugin = plugin.to_string();
     let _ = tokio::task::spawn_blocking(move || {
@@ -787,7 +787,7 @@ pub(crate) fn forget_workspace(state: &std::sync::Arc<crate::AppState>, ws: &str
     crate::lock(&p.screens).forget_workspace(ws);
     crate::lock(&p.files).forget_workspace(ws);
     for m in super::catalog(state).iter() {
-        p.jobs.cancel_where(&m.id, Some(ws));
+        super::jobs::cancel_where(state, &m.id, Some(ws));
     }
     let state = state.clone();
     let ws = ws.to_string();

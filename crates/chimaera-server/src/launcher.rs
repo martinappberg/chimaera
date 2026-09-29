@@ -832,7 +832,9 @@ fn codex_mcp_overrides(url: &str) -> [String; 4] {
 /// (`[A-Za-z0-9_-]`): plugin manifests refuse anything else (a dot would
 /// split the key), so none is skipped silently. Live (codex 0.153.0,
 /// PROTOCOL.md Pass 35): a pre-approved tool runs with no prompt, while a
-/// linked-terminal tool still asks.
+/// linked-terminal tool still asks. Codex 0.157.1 reads a capitalized,
+/// dashed segment as that tool's key too (`tools.Post-Note.approval_mode`:
+/// a bad value there is refused by that exact path, 2026-09-29).
 pub(crate) fn codex_tui_mcp_args(url: &str, approve: &[String]) -> Vec<String> {
     let mut args = codex_mcp_overrides(url).to_vec();
     for tool in approve {

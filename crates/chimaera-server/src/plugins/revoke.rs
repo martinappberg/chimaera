@@ -376,8 +376,10 @@ pub(crate) async fn apply(state: &Arc<AppState>) {
         .collect();
     for (m, blocked) in &held {
         state.plugin_runtime.forget_plugin(&m.id);
-        // Its programs stop too, wherever they run.
-        state.plugin_platform.jobs.cancel_where(&m.id, None);
+        // Its programs stop too, wherever they run, and what it published
+        // goes.
+        super::jobs::cancel_where(state, &m.id, None);
+        crate::lock(&state.plugin_platform.surfaces).forget_plugin(&m.id);
         crate::lock(&state.knowledge).forget_provider(&m.id, None);
         let first = *blocked
             && super::write(&state.plugin_guard.revoked)

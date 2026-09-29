@@ -116,7 +116,13 @@ fn read_record(version_dir: &Path) -> Option<Record> {
     if !std::fs::symlink_metadata(&path).ok()?.is_file() {
         return None;
     }
-    let text = std::fs::read(&path).ok()?;
+    // Capped as it is read: the tool's own setup could have grown it.
+    let mut text = Vec::new();
+    File::open(&path)
+        .ok()?
+        .take((64 << 10) + 1)
+        .read_to_end(&mut text)
+        .ok()?;
     if text.len() > 64 << 10 {
         return None;
     }
@@ -777,6 +783,12 @@ async fn install_inner(
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| e.to_string())?;
+    // An install that never finished left its files here (a 255 MB
+    // download, a half-unpacked tree); this one holds the tool's slot.
+    {
+        let dir = dir.clone();
+        let _ = tokio::task::spawn_blocking(move || sweep_leftovers(&dir)).await;
+    }
     let nonce = &chimaera_core::generate_token()[..10];
     let archive = dir.join(format!(".download-{nonce}"));
     let staging = dir.join(format!(".unpack-{nonce}"));
@@ -891,6 +903,71 @@ async fn install_inner(
 async fn restore(version_dir: &Path, aside: &Path) {
     let _ = tokio::fs::remove_dir_all(version_dir).await;
     let _ = tokio::fs::rename(aside, version_dir).await;
+}
+
+/// Whether `name` is what an install leaves in a tool's folder while it
+/// runs: the download, the unpack, a reinstall's set-aside copy, the xz
+/// fallback's temporary tar (`install_inner`'s names).
+fn install_leftover(name: &str) -> bool {
+    [".download-", ".unpack-", ".old-"]
+        .iter()
+        .any(|p| name.starts_with(p))
+}
+
+/// Remove what an install that never finished (the daemon stopped, the
+/// host rebooted) left in `dir`, a tool's folder — never a link, never a
+/// version or `current` (blocking). The caller holds the tool's install
+/// slot, or runs before any install can start.
+fn sweep_leftovers(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        if !install_leftover(&name.to_string_lossy()) {
+            continue;
+        }
+        let path = e.path();
+        let removed = match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.is_dir() => std::fs::remove_dir_all(&path),
+            Ok(_) => std::fs::remove_file(&path),
+            Err(_) => continue,
+        };
+        if let Err(err) = removed {
+            tracing::warn!(path = %path.display(), %err, "plugin tool leftover not removed");
+        }
+    }
+}
+
+/// At boot: every tool folder's leftovers, each swept holding its tool's
+/// install slot (one that is installing is left alone) (blocking).
+pub(crate) fn sweep_all_leftovers(state: &AppState) {
+    let Ok(plugins) = std::fs::read_dir(tools_root(state)) else {
+        return;
+    };
+    let installs = &state.plugin_platform.installs;
+    for p in plugins.flatten() {
+        if !p.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(tools) = std::fs::read_dir(p.path()) else {
+            continue;
+        };
+        for t in tools.flatten() {
+            if !t.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let key = (
+                p.file_name().to_string_lossy().into_owned(),
+                t.file_name().to_string_lossy().into_owned(),
+            );
+            if !crate::lock(&installs.busy).insert(key.clone()) {
+                continue;
+            }
+            sweep_leftovers(&t.path());
+            crate::lock(&installs.busy).remove(&key);
+        }
+    }
 }
 
 /// A removed plugin: all of its tools (blocking).
@@ -1110,6 +1187,31 @@ mod tests {
         // would have stopped quietly.
         let cut = &xz[..xz.len() - 16];
         assert!(unpack_xz(cut, "xz-cut").is_err());
+    }
+
+    #[test]
+    fn an_unfinished_installs_leftovers_go_and_nothing_else() {
+        let dir = temp("leftovers");
+        let outside = temp("leftovers-outside");
+        std::fs::write(outside.join("keep"), b"x").unwrap();
+        std::fs::write(dir.join(".download-abc"), b"x").unwrap();
+        std::fs::write(dir.join(".download-abc.tar.tmp"), b"x").unwrap();
+        std::fs::create_dir_all(dir.join(".unpack-abc/a")).unwrap();
+        std::fs::create_dir_all(dir.join(".old-abc")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join(".old-link")).unwrap();
+        std::fs::create_dir_all(dir.join("1.0.0/bin")).unwrap();
+        std::os::unix::fs::symlink("1.0.0", dir.join("current")).unwrap();
+        sweep_leftovers(&dir);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["1.0.0", "current"]);
+        assert!(
+            outside.join("keep").exists(),
+            "a link is removed, never followed"
+        );
     }
 
     #[test]

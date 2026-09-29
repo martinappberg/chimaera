@@ -17,6 +17,11 @@ use super::support::*;
 use crate::{lock, AppState};
 
 const PID: &str = "test-privileged";
+
+/// The tests that point the process-wide download override at their own
+/// server run one at a time (in parallel, one would fetch from the other's
+/// server after it stopped).
+static TOOL_DOWNLOADS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const TOOL: &[u8] = include_bytes!("../../../../plugins/test-privileged/fixture-tool-1.0.0.tar.gz");
 
 async fn switch(state: &Arc<AppState>, ws: &str, on: bool) {
@@ -329,6 +334,7 @@ async fn a_hard_block_stops_a_running_job_at_once() {
 
 #[tokio::test]
 async fn a_tool_downloads_checks_unpacks_sets_up_and_runs() {
+    let _one = TOOL_DOWNLOADS.lock().await;
     let fake = FakeReleases::start().await;
     fake.put("/fixture-tool-1.0.0.tar.gz", TOOL.to_vec());
     crate::plugins::toolchain::set_downloads_for_tests("https://example.invalid", fake.base());
@@ -397,6 +403,7 @@ async fn a_tool_downloads_checks_unpacks_sets_up_and_runs() {
 
 #[tokio::test]
 async fn a_download_that_is_not_the_declared_file_installs_nothing() {
+    let _one = TOOL_DOWNLOADS.lock().await;
     let fake = FakeReleases::start().await;
     let mut other = TOOL.to_vec();
     *other.last_mut().unwrap() ^= 1;
@@ -411,11 +418,6 @@ async fn a_download_that_is_not_the_declared_file_installs_nothing() {
         None,
     )
     .await;
-    // Another test may have pointed the override at its own server
-    // meanwhile; either way nothing but the declared bytes installs.
-    if status == StatusCode::OK {
-        return;
-    }
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert!(
         body["error"].as_str().unwrap().contains("checksum"),

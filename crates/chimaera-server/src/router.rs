@@ -22,6 +22,11 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
     plugins::files::spawn_worker(state.clone());
     // Switched-on plugins compiled ahead of their first use.
     plugins::runtime::warm(&state, None, std::time::Duration::from_secs(3));
+    // What an install cut short (a stop, a reboot) left in a tool's folder.
+    {
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || plugins::toolchain::sweep_all_leftovers(&state));
+    }
     let api = Router::new()
         .route("/health", get(api::health))
         .route(

@@ -501,7 +501,14 @@ pub(crate) fn hold(state: &AppState, m: &Manifest) -> Option<Hold> {
 /// (`{kind: blocked|policy|untrusted, reason?, level?}`).
 pub(crate) fn wire(state: &AppState, m: &Manifest, v: &mut Value) {
     v["standing"] = json!(standing(state, m).as_str());
-    v["hold"] = match hold(state, m) {
+    // A copy that can't run at all says why once (its `fault`), not also
+    // that it waits for trust it couldn't use.
+    let held = if m.origin.fault.is_some() {
+        None
+    } else {
+        hold(state, m)
+    };
+    v["hold"] = match held {
         None => Value::Null,
         Some(Hold::Blocked(b)) => {
             json!({"kind": "blocked", "level": b.level.as_str(), "reason": b.reason})
@@ -795,8 +802,10 @@ pub(crate) async fn untrust_route(
         return r.into_response();
     }
     state.plugin_runtime.forget_plugin(&pid);
-    // Its programs stop with its trust, wherever they run.
-    state.plugin_platform.jobs.cancel_where(&pid, None);
+    // Its programs stop with its trust, wherever they run, and what it
+    // published goes.
+    super::jobs::cancel_where(&state, &pid, None);
+    crate::lock(&state.plugin_platform.surfaces).forget_plugin(&pid);
     crate::lock(&state.knowledge).forget_provider(&pid, None);
     super::activity::record(&state, &pid, json!({"kind": "untrust"})).await;
     state.changes.notify_waiters();

@@ -787,7 +787,17 @@ The design's maintainer decisions (2026-09-25) are in the
 _Intent for the WASM plugin system: pending capture._
 
 ### The plugin platform: trust, screens, programs and tools, LaTeX and Typst — why it exists
-_Intent: pending capture (capture-feature-intent when this `feat:` ships). The maintainer's
-decisions of 2026-09-29 are recorded in the
+_Captured 2026-09-29 (from the maintainer, via capture-feature-intent)._
+
+- **Problem it solves:** "Just to become a platform and extendable, without missing chimaera's
+  core principles."
+- **How settled it is:** an addition to the core, not a core bet — "open to change". The
+  platform's shape (the `ui/1` format, the surfaces, the job limits, the trust prompt) is how it
+  works today.
+- **Do not change (or: open to change):** open to change, as long as it keeps chimaera's core
+  principles (the plan's [principles](../plugin-platform-plan.md#principles) are how it holds
+  them today).
+
+The design decisions of 2026-09-29 are recorded in the
 [plugin platform plan](../plugin-platform-plan.md#decisions-maintainer-2026-09-29) and the
-[LaTeX and Typst plan](../latex-reports-plan.md#decisions); they are not restated here._
+[LaTeX and Typst plan](../latex-reports-plan.md#decisions).
