@@ -363,6 +363,12 @@ worktree are preserved separately. Diverged branch tips remain as
 remote configuration and `FETCH_HEAD` stay intact. Files merge three ways against the last snapshot this computer actually published (a snapshot whose upload failed never counts): a file only one side changed takes that side's version, so edits made here while the cloud worked are kept. If a file changed on both machines, the cloud's version takes the path and your version is saved right beside it as `<name>.mine-<yyyymmdd-hhmm>` (a file that stays on this computer and is never copied to the cloud); a local edit to a file the cloud deleted is saved the same way. The project's row reports how many files kept both versions and names the saved copies (Projects and privacy: "Kept both versions of 3 files. Your version is saved beside each file"), and that report survives a daemon restart until the next return replaces it. The same return raises one notification, in the app and from the OS: "Kept both versions of 3 files", the project's name, and the first saved copies by name (a `kept_both` notice, see [notifications.md](notifications.md)); a return that kept nothing says nothing. A file missing from the cloud's snapshot is removed only when that snapshot's inventory shows it was deleted, never because the mirror left it out (a large file, a symlink, a credential-looking file, `.chimaeraignore`). A saved setup command runs in
 the background on the cloud machine (the user's login shell, in the project folder, at most ten minutes) before any conversation continues there; no terminal opens for it. If it fails, the project shows one line (`cloud_setup_failed`) and its output is kept in the project's setup log. Deferred steps remain guidance for the returning agent, which assesses and runs them under its normal permissions; they are never automatically replayed by the daemon.
 
+A project on Home whose work the cloud holds carries a quiet line in its muted meta
+text — "In the cloud · 9m ago", "Coming home… · 9m ago" while a return installs, "Moving
+to the cloud…" while this computer hands it over — read from this daemon's own
+`GET /pro/status` ownership (`workspace/placementHints.ts`); it appears only when Pro is
+configured and the project is owned elsewhere, and never in the accent colour.
+
 Projects first created in the cloud appear on Home without being downloaded.
 Opening one on a computer without a local copy asks where to save it through the
 native picker. An empty folder becomes the project folder; choosing a folder
