@@ -177,7 +177,11 @@ column any more. **Git** is the strip's branch chip (ahead/behind + uncommitted 
 opening source control; the live `gitStatus` store, epoch-driven, never polled).
 **Changed files** ride each Timeline episode's evidence (and a card's evidence row in cards
 mode). **Recents** show only in the blank state ("pick up where you left off", cap 5). The
-old "last active" jump is the `↳` mark on the Now line.
+old "last active" jump is the `↳` mark on the Now line. The last line of the surface is the
+workspace's **activity** for the last seven days (`ActivityLine.svelte`: "This week: 38 sessions ·
+1.2M tokens", opening Settings → Activity) — [session-history.md](session-history.md#activity). A
+card whose session wrote a file another live session also wrote carries a small warn-toned notice
+("qc.py also edited by 'fix normalization' · 3 min ago"), which opens that session.
 
 ## The Mastermind panel
 

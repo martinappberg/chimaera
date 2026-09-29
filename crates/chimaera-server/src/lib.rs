@@ -34,6 +34,7 @@ mod plugins;
 mod proxy;
 mod quickopen;
 mod recents;
+mod recents_archive;
 mod router;
 mod runtimes;
 mod session_view;

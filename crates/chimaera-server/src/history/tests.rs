@@ -211,6 +211,7 @@ fn usage_report_buckets_days_weeks_and_models_honestly() {
             cost: Some(1.5),
             tin: Some(1000),
             tout: Some(100),
+            duration_ms: 60_000,
         },
         Row {
             started: now - day,
@@ -219,6 +220,7 @@ fn usage_report_buckets_days_weeks_and_models_honestly() {
             cost: None,
             tin: Some(500),
             tout: Some(50),
+            duration_ms: 60_000,
         },
         Row {
             started: now - 10 * day,
@@ -227,6 +229,7 @@ fn usage_report_buckets_days_weeks_and_models_honestly() {
             cost: Some(0.5),
             tin: None,
             tout: None,
+            duration_ms: 60_000,
         },
     ];
     let months = vec![Month {
@@ -241,6 +244,7 @@ fn usage_report_buckets_days_weeks_and_models_honestly() {
             tokens_in: 10,
             tokens_out: 1,
             token_sessions: 3,
+            duration_ms: 180_000,
         }],
     }];
     let inputs = vec![Input {
@@ -252,6 +256,8 @@ fn usage_report_buckets_days_weeks_and_models_honestly() {
     let r = usage::report(&inputs, now, 0, 14, 4);
     assert_eq!(r.basis, "estimated at API prices");
     assert_eq!(r.totals.sessions, 6);
+    // Time agents spent working: every session's duration, folded ones too.
+    assert_eq!(r.totals.duration_ms, 3 * 60_000 + 180_000);
     assert!((r.totals.cost_usd - 4.0).abs() < 1e-9);
     // The codex session and one folded one have no cost: unknown, not $0.
     assert_eq!(r.totals.unknown_cost_sessions, 2);

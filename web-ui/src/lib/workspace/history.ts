@@ -3,8 +3,8 @@
  *
  *   GET /workspaces/{id}/history?before=&q=&agent=&limit=&acts=   every past session
  *   GET /sessions/{id}/edits?workspace_id=                        the agent's own edits
- *   GET /usage?workspace_id=&tz=&days=&weeks=                     cost and token totals
- *   GET /usage/csv?workspace_id=&tz=                              the same, as a file
+ *   GET /activity?workspace_id=&tz=&days=&weeks=                  sessions, tokens, time
+ *   GET /activity/csv?workspace_id=&tz=                           one row per session, as a file
  *
  * Pulled, never pushed: views fetch while visible and refetch on the rail's
  * `recents` nudge (a session ending is what changes the list). The pure
@@ -99,9 +99,11 @@ export interface SessionEdits {
   files: { path: string; edits: FileEdit[] }[];
   edits: number;
   truncated: boolean;
+  /** The session ran shell commands (whose changes have no before/after here). */
+  ran_commands: boolean;
 }
 
-export interface UsageAgg {
+export interface ActivityAgg {
   sessions: number;
   cost_usd: number;
   cost_sessions: number;
@@ -109,19 +111,21 @@ export interface UsageAgg {
   tokens_in: number;
   tokens_out: number;
   token_sessions: number;
+  /** Time agents spent working: the sessions' summed durations, ms. */
+  duration_ms: number;
 }
 
-export interface UsageReport {
+export interface ActivityReport {
   basis: string;
   now: number;
-  totals: UsageAgg;
-  today: UsageAgg;
-  week: UsageAgg;
-  workspaces: (UsageAgg & { id: string; name: string })[];
-  by_agent_model: (UsageAgg & { agent: string; model: string | null })[];
-  days: (UsageAgg & { day: string })[];
-  weeks: (UsageAgg & { week: string })[];
-  months: (UsageAgg & { month: string; folded: boolean })[];
+  totals: ActivityAgg;
+  today: ActivityAgg;
+  week: ActivityAgg;
+  workspaces: (ActivityAgg & { id: string; name: string })[];
+  by_agent_model: (ActivityAgg & { agent: string; model: string | null })[];
+  days: (ActivityAgg & { day: string })[];
+  weeks: (ActivityAgg & { week: string })[];
+  months: (ActivityAgg & { month: string; folded: boolean })[];
   since: number | null;
 }
 
@@ -202,21 +206,21 @@ export async function fetchSessionEdits(
   );
 }
 
-export async function fetchUsage(
+export async function fetchActivity(
   opts: { workspaceId?: string; days?: number; weeks?: number } = {},
-): Promise<UsageReport> {
+): Promise<ActivityReport> {
   const q = new URLSearchParams({ tz: String(tzOffset()) });
   if (opts.workspaceId !== undefined) q.set("workspace_id", opts.workspaceId);
   if (opts.days !== undefined) q.set("days", String(opts.days));
   if (opts.weeks !== undefined) q.set("weeks", String(opts.weeks));
-  return json<UsageReport>(await api(`/usage?${q.toString()}`));
+  return json<ActivityReport>(await api(`/activity?${q.toString()}`));
 }
 
 /** Download the CSV export (bearer-authed fetch → a blob the browser saves). */
-export async function downloadUsageCsv(workspaceId?: string): Promise<void> {
+export async function downloadActivityCsv(workspaceId?: string): Promise<void> {
   const q = new URLSearchParams({ tz: String(tzOffset()) });
   if (workspaceId !== undefined) q.set("workspace_id", workspaceId);
-  const res = await api(`/usage/csv?${q.toString()}`);
+  const res = await api(`/activity/csv?${q.toString()}`);
   if (!res.ok)
     throw new ApiError(res.status, `export failed with status ${res.status}`);
   const blob = await res.blob();
@@ -224,7 +228,7 @@ export async function downloadUsageCsv(workspaceId?: string): Promise<void> {
   try {
     const a = document.createElement("a");
     a.href = url;
-    a.download = "chimaera-usage.csv";
+    a.download = "chimaera-activity.csv";
     a.rel = "noopener";
     document.body.appendChild(a);
     a.click();
@@ -235,14 +239,53 @@ export async function downloadUsageCsv(workspaceId?: string): Promise<void> {
   }
 }
 
-// ---- the honest-number rules -------------------------------------------------
+// ---- archived Recents -----------------------------------------------------------
 
-/** Dollars, or "—" when the agent reports no cost. Never "$0.00" for unknown. */
-export function formatCost(v: number | null | undefined): string {
-  if (v === null || v === undefined || !Number.isFinite(v)) return "—";
-  if (v > 0 && v < 0.01) return "<$0.01";
-  return `$${v.toFixed(2)}`;
+/** A conversation archived out of Recents (`recents_archive.rs`): hidden,
+ *  never deleted. */
+export interface ArchivedConvo {
+  key: string;
+  kind: string;
+  title: string;
+  resume?: string;
+  ui?: "chat" | "term";
+  /** When it was archived, unix seconds. */
+  at: number;
 }
+
+/** Hide these Recents rows; answers the keys archived (for an Undo). */
+export async function archiveRecents(
+  workspaceId: string,
+  entries: { key: string; kind: string; title: string; resume: string | null; ui: "chat" | "term" | null }[],
+): Promise<string[]> {
+  const body = await json<{ archived?: string[] }>(
+    await api("/recents/archive", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace_id: workspaceId, entries }),
+    }),
+  );
+  return body.archived ?? [];
+}
+
+export async function unarchiveRecents(workspaceId: string, keys: string[]): Promise<number> {
+  const body = await json<{ unarchived?: number }>(
+    await api("/recents/unarchive", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace_id: workspaceId, keys }),
+    }),
+  );
+  return body.unarchived ?? 0;
+}
+
+export async function fetchArchived(workspaceId: string): Promise<ArchivedConvo[]> {
+  const q = new URLSearchParams({ workspace_id: workspaceId });
+  const body = await json<{ archived?: ArchivedConvo[] }>(await api(`/recents/archived?${q.toString()}`));
+  return Array.isArray(body.archived) ? body.archived : [];
+}
+
+// ---- the honest-number rules: unknown is "—", never zero ---------------------
 
 /** A token count, compact ("1.2M", "34k"), or "—" when unknown. */
 export function formatTokens(v: number | null | undefined): string {
@@ -266,11 +309,9 @@ export function formatDuration(ms: number): string {
   return `${Math.round(mins / (24 * 60))} d`;
 }
 
-/** An aggregate's cost, honest about sessions with no cost telemetry. */
-export function aggCost(
-  a: Pick<UsageAgg, "cost_usd" | "cost_sessions">,
-): string {
-  return a.cost_sessions === 0 ? "—" : formatCost(a.cost_usd);
+/** An aggregate's tokens, or "—" when none of its sessions reported any. */
+export function aggTokens(a: Pick<ActivityAgg, "tokens_in" | "tokens_out" | "token_sessions">): string {
+  return a.token_sessions === 0 ? "—" : formatTokens(a.tokens_in + a.tokens_out);
 }
 
 /** Who started a session, in words. A session id is a fork of that session. */

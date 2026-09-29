@@ -60,9 +60,15 @@ pub(crate) struct RecentEntry {
 const SUPERSEDES_CAP: usize = 32;
 
 impl RecentEntry {
+    /// The identity an archive hides it under (see `recents_archive`).
+    fn archive_key(&self) -> String {
+        crate::recents_archive::key_of(self.resume.as_deref(), self.kind.as_str(), &self.title)
+    }
+
     /// The wire shape (`supersedes` stays internal to the store file).
     fn to_api_json(&self) -> serde_json::Value {
         json!({
+            "key": self.archive_key(),
             "kind": self.kind.as_str(),
             "title": self.title,
             "resume": self.resume,
@@ -197,6 +203,17 @@ impl RecentsStore {
         self.items.get(workspace_id).cloned().unwrap_or_default()
     }
 
+    /// resume id -> the ancestor ids that conversation absorbed.
+    fn ancestors(&self, workspace_id: &str) -> HashMap<String, Vec<String>> {
+        self.items
+            .get(workspace_id)
+            .into_iter()
+            .flatten()
+            .filter(|e| !e.supersedes.is_empty())
+            .filter_map(|e| Some((e.resume.clone()?, e.supersedes.clone())))
+            .collect()
+    }
+
     /// Atomically persist the map (tmp file + rename).
     fn save(&self) -> anyhow::Result<()> {
         let map: serde_json::Map<String, serde_json::Value> = self
@@ -211,6 +228,12 @@ impl RecentsStore {
             .collect();
         crate::persist::atomic_write_json(&self.path, serde_json::to_vec(&map)?)
     }
+}
+
+/// resume id -> ancestor ids, for a workspace's Recents (the archive hides a
+/// conversation's whole chain).
+pub(crate) fn ancestors(state: &AppState, workspace_id: &str) -> HashMap<String, Vec<String>> {
+    crate::lock(&state.recents).ancestors(workspace_id)
 }
 
 /// Retire a dead agent session: drop its record (and workspace mapping) and,
@@ -384,6 +407,9 @@ pub(crate) async fn list_recents(
         )
     };
     let store_entries = crate::lock(&state.recents).list(&query.workspace_id);
+    // Archived conversations are hidden here (never deleted): by their key,
+    // or any id of their resume chain.
+    let archived = crate::lock(&state.recents_archive).hidden(&query.workspace_id);
 
     let dir = state
         .claude_projects_dir
@@ -408,17 +434,22 @@ pub(crate) async fn list_recents(
     let mut merged: Vec<serde_json::Value> = store_entries
         .iter()
         .filter(|e| e.resume.as_ref().is_none_or(|r| !live.contains(r)))
+        .filter(|e| {
+            !archived.contains(&e.archive_key())
+                && !e.supersedes.iter().any(|s| archived.contains(s))
+        })
         .map(RecentEntry::to_api_json)
         .collect();
     for row in scanned {
         let Some(id) = row.get("id").and_then(|v| v.as_str()) else {
             continue;
         };
-        if seen.contains(id) || live.contains(id) {
+        if seen.contains(id) || live.contains(id) || archived.contains(id) {
             continue;
         }
         seen.insert(id.to_string());
         merged.push(json!({
+            "key": id,
             "kind": AgentKind::Claude.as_str(),
             "title": row.get("title").cloned().unwrap_or_default(),
             "resume": id,

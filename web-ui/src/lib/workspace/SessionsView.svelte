@@ -1,30 +1,37 @@
 <script lang="ts">
   /**
    * All sessions: every past session of the workspace, from its history
-   * records (`GET /workspaces/{id}/history`) — date, duration, agent and
-   * model, who started it, files changed, commits (in a repository) and
-   * cost. Search by title and first prompt, filter by agent; a row opens to
-   * its details, its edits, and a way back in while the agent still has the
-   * conversation (the Recents resume flow) — or says plainly why not. The
-   * Mastermind's actions are one toggle away. Pulled while visible, and
-   * again on the recents nudge (a session ended); never polled.
+   * records (`GET /workspaces/{id}/history`), grouped by day. A row is the
+   * agent glyph and the title (else the first prompt), then — muted, right —
+   * who started it when it wasn't you, duration, files and tokens. Clicking
+   * opens the conversation (a running one, or a resume through the Recents
+   * flow while the agent still has it; "Resume" shows on hover). A row whose
+   * conversation is gone is muted and says so. The files count opens what
+   * the session changed. Search matches titles and first prompts; the agent
+   * filter shows only when more than one agent kind exists, and "Archived"
+   * (conversations hidden from Recents, with Unarchive) only when there are
+   * some; the Mastermind's actions are a quiet link away. Pulled while
+   * visible and on the recents nudge (a session ended, a row archived) —
+   * never polled.
    */
   import { untrack } from "svelte";
   import type { DashCtx } from "../dashboard/dash";
   import type { LayoutCtrl } from "../layout/dnd";
   import { ApiError } from "../net/api";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import FileIcon from "../shared/FileIcon.svelte";
-  import type { Session } from "./sessions";
+  import { contextMenu } from "../shared/contextMenu.svelte";
+  import { dotState, type Session } from "./sessions";
   import {
     commitCount,
+    fetchArchived,
     fetchHistory,
-    formatCost,
     formatDuration,
     formatTokens,
     historyNudge,
     recordTitle,
     startedByLabel,
+    unarchiveRecents,
+    type ArchivedConvo,
     type HistoryAct,
     type HistoryRecord,
   } from "./history";
@@ -52,6 +59,8 @@
   let loading = $state(false);
   let error = $state<string | null>(null);
   let loaded = $state(false);
+  /** Agent kinds this workspace has shown (the filter appears past one). */
+  let kinds = $state<string[]>([]);
 
   let query = $state("");
   /** The query the list was fetched with (debounced). */
@@ -59,12 +68,28 @@
   let agent = $state("");
   let showActs = $state(false);
   let expanded = $state<string | null>(null);
+  /** Conversations archived out of Recents (the "Archived" filter). */
+  let archived = $state<ArchivedConvo[]>([]);
+  let showArchived = $state(false);
 
   // Typing settles for a beat before a fetch.
   $effect(() => {
     const q = query;
     const t = setTimeout(() => (applied = q), 250);
     return () => clearTimeout(t);
+  });
+
+  // A new workspace starts its filter afresh.
+  $effect(() => {
+    void wsId;
+    untrack(() => {
+      kinds = [];
+      agent = "";
+      showActs = false;
+      showArchived = false;
+      archived = [];
+      expanded = null;
+    });
   });
 
   /** Monotone fetch counter: a slow early page must not clobber a newer one. */
@@ -77,17 +102,21 @@
     loading = true;
     try {
       const before = reset ? undefined : records.at(-1)?.started;
-      const page = await fetchHistory(ws, {
-        before,
-        q: applied,
-        agent,
-        limit: PAGE,
-        acts: reset && showActs,
-      });
+      const [page, arch] = await Promise.all([
+        fetchHistory(ws, { before, q: applied, agent, limit: PAGE, acts: reset }),
+        reset ? fetchArchived(ws).catch(() => null) : Promise.resolve(null),
+      ]);
       if (mine !== seq) return;
+      if (arch !== null) {
+        archived = arch;
+        if (arch.length === 0) showArchived = false;
+      }
       records = reset ? page.records : [...records, ...page.records];
       more = page.more;
       if (reset) acts = page.acts ?? [];
+      const seen = new Set(kinds);
+      for (const r of page.records) seen.add(r.agent);
+      if (seen.size !== kinds.length) kinds = [...seen].sort();
       error = null;
       loaded = true;
     } catch (e) {
@@ -109,19 +138,11 @@
     if (!visible || wsId === null) return;
     void applied;
     void agent;
-    void showActs;
     void $historyNudge;
     untrack(() => void load(true));
   });
 
-  /** Agents present in what's loaded (the filter chips), plus the active one. */
-  const agents = $derived.by(() => {
-    const set = new Set(records.map((r) => r.agent));
-    if (agent !== "") set.add(agent);
-    return [...set].sort();
-  });
-
-  /** Day groups, newest first (the Timeline's vocabulary). */
+  /** Day groups, newest first: Today, Yesterday, Sep 26. */
   const days = $derived.by(() => {
     const out: { key: string; label: string; rows: HistoryRecord[] }[] = [];
     const today = new Date();
@@ -136,7 +157,6 @@
         : same(d, yesterday)
           ? "Yesterday"
           : d.toLocaleDateString([], {
-              weekday: "short",
               month: "short",
               day: "numeric",
               year: d.getFullYear() === today.getFullYear() ? undefined : "numeric",
@@ -150,28 +170,45 @@
 
   /** A name for a session id: live names first, then what the records say. */
   function nameOf(id: string): string | undefined {
+    if (id === dash.mastermind?.session_id) return "the Mastermind";
     const live = names.get(id) ?? sessions.get(id)?.display_name ?? undefined;
     if (live) return live;
     const rec = records.find((r) => r.id === id);
     return rec !== undefined ? recordTitle(rec) : undefined;
   }
 
-  function clock(ms: number): string {
-    return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  /** Who started it, in words — only when it wasn't you. */
+  function by(r: HistoryRecord): string | null {
+    switch (r.started_by) {
+      case "you":
+        return null;
+      case "mastermind":
+        return "by Mastermind";
+      case "restart":
+        return "after restart";
+      default:
+        return startedByLabel(r.started_by, nameOf);
+    }
   }
 
-  function model(r: HistoryRecord): string | null {
-    return r.models?.at(-1) ?? null;
-  }
+  /** Its conversation can't be reopened (a Mastermind's is never, by design
+   *  — not "gone"). */
+  const gone = (r: HistoryRecord) =>
+    !r.live && r.mastermind !== true && (r.reopen?.resume ?? null) === null;
 
-  function reopen(r: HistoryRecord): void {
+  function activate(r: HistoryRecord): void {
     if (r.live) {
       dash.onOpenSession(r.id);
       return;
     }
     const resume = r.reopen?.resume ?? null;
-    if (resume === null) return;
+    if (resume === null) {
+      // Nothing to open: show what it did instead.
+      toggle(r);
+      return;
+    }
     dash.onOpenRecent({
+      key: resume,
       kind: r.agent,
       title: recordTitle(r),
       resume,
@@ -184,10 +221,14 @@
     expanded = expanded === r.rid ? null : r.rid;
   }
 
-  const openFile = (p: string, e: MouseEvent) => {
-    const abs = wsRoot !== null && !p.startsWith("/") ? `${wsRoot}/${p}` : p;
-    ctrl.openFileFrom(paneId, abs, e.metaKey || e.ctrlKey);
-  };
+  /** Record paths are workspace-relative; the edit record's are absolute. */
+  function abs(p: string): string {
+    return wsRoot !== null && !p.startsWith("/") ? `${wsRoot}/${p}` : p;
+  }
+
+  function clock(ms: number): string {
+    return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
 
   const ACT_WORDS: Record<string, string> = {
     spawn_agent: "started",
@@ -201,61 +242,93 @@
   /** The Mastermind's acts name it by role, whatever its session is called. */
   const MASTERMIND_ACTS = new Set(["spawn_agent", "spawn_terminal", "message_agent", "interrupt_agent"]);
 
-  function who(id: string): string {
-    if (id === dash.mastermind?.session_id) return "the Mastermind";
-    return nameOf(id) ?? id;
+  /** Unarchive: back in Recents (the recents nudge refetches every view). */
+  async function unarchive(a: ArchivedConvo): Promise<void> {
+    const ws = wsId;
+    if (ws === null) return;
+    archived = archived.filter((x) => x.key !== a.key);
+    if (archived.length === 0) showArchived = false;
+    try {
+      await unarchiveRecents(ws, [a.key]);
+    } catch {
+      void load(true);
+    }
+  }
+
+  function day(secs: number): string {
+    return new Date(secs * 1000).toLocaleDateString([], { month: "short", day: "numeric" });
   }
 
   function actor(a: HistoryAct): string {
     if (a.by === "you") return "You";
     if (MASTERMIND_ACTS.has(a.act)) return "The Mastermind";
-    return who(a.by);
+    return nameOf(a.by) ?? a.by;
   }
 </script>
 
 <div class="sessions">
   <div class="inner">
     <header class="head">
-      <div class="titles">
-        <h1>All sessions</h1>
-        <p class="sub">Every agent session in this workspace — kept by chimaera, with or without git.</p>
-      </div>
-      <div class="tools">
-        <input class="search" type="search" placeholder="Search titles and first prompts" bind:value={query} aria-label="search sessions" />
-      </div>
+      <h1>{showActs ? "Mastermind actions" : "All sessions"}</h1>
+      {#if !showActs && !showArchived}
+        <input class="search" type="search" placeholder="Search" bind:value={query} aria-label="search titles and first prompts" />
+      {/if}
     </header>
 
-    <div class="chips" role="group" aria-label="Show">
-      <button class="chip" class:on={agent === "" && !showActs} aria-pressed={agent === "" && !showActs} onclick={() => ((agent = ""), (showActs = false))}>all</button>
-      {#each agents as a (a)}
-        <button class="chip" class:on={agent === a && !showActs} aria-pressed={agent === a && !showActs} onclick={() => ((agent = a), (showActs = false))}>{a}</button>
-      {/each}
-      <button class="chip" class:on={showActs} aria-pressed={showActs} onclick={() => (showActs = !showActs)}>Mastermind actions</button>
-    </div>
+    {#if !showActs && (kinds.length > 1 || archived.length > 0)}
+      <div class="filters">
+        {#if kinds.length > 1}
+          <div class="seg" role="radiogroup" aria-label="agent">
+            <button role="radio" aria-checked={agent === "" && !showArchived} class:on={agent === "" && !showArchived} onclick={() => ((agent = ""), (showArchived = false))}>All</button>
+            {#each kinds as k (k)}
+              <button role="radio" aria-checked={agent === k && !showArchived} class:on={agent === k && !showArchived} onclick={() => ((agent = k), (showArchived = false))}>{k === "claude" ? "Claude" : k === "codex" ? "Codex" : k}</button>
+            {/each}
+          </div>
+        {/if}
+        {#if archived.length > 0}
+          <button class="seg-one" class:on={showArchived} aria-pressed={showArchived} onclick={() => (showArchived = !showArchived)}>Archived</button>
+        {/if}
+      </div>
+    {/if}
 
-    {#if error !== null && records.length === 0}
-      <p class="empty err">{error}</p>
+    {#if showArchived && !showActs}
+      <div class="rows">
+        {#each archived as a (a.key)}
+          <div
+            class="row arch"
+            role="listitem"
+            oncontextmenu={(e) => contextMenu.openAt(e, [{ label: "Unarchive", onSelect: () => void unarchive(a) }])}
+          >
+            <span class="main static">
+              <SessionGlyph kind="agent" agentKind={a.kind} size={11} title={a.kind} />
+              <span class="text"><span class="title">{a.title || a.kind}</span></span>
+              <button class="hint act-btn" onclick={() => void unarchive(a)}>Unarchive</button>
+            </span>
+            <span class="meta"><span>archived {day(a.at)}</span></span>
+          </div>
+        {/each}
+      </div>
+      <p class="quiet">Archived conversations are hidden from Recents; nothing was deleted.</p>
     {:else if showActs}
-      {#if acts.length === 0}
-        <p class="empty">{loading ? "loading…" : "No Mastermind actions or note deliveries recorded here."}</p>
-      {:else}
-        <ol class="acts">
-          {#each acts as a, i (`${a.ts}:${i}`)}
-            <li class="act">
-              <span class="when">{new Date(a.ts).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span>
-              <span class="what">
-                <b>{actor(a)}</b>
-                {ACT_WORDS[a.act] ?? a.act}
-                {#if a.target !== undefined}<b>{who(a.target)}</b>{/if}
-                {#if a.detail !== undefined}<span class="detail">— {a.detail}</span>{/if}
-              </span>
-            </li>
-          {/each}
-        </ol>
-      {/if}
+      <ol class="acts">
+        {#each acts as a, i (`${a.ts}:${i}`)}
+          <li class="act">
+            <span class="when">{new Date(a.ts).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span>
+            <span class="what">
+              {actor(a)}
+              {ACT_WORDS[a.act] ?? a.act}
+              {#if a.target !== undefined}<button class="who" onclick={() => dash.onOpenSession(a.target ?? "")}>{nameOf(a.target) ?? a.target}</button>{/if}
+              {#if a.detail !== undefined}<span class="detail">— {a.detail}</span>{/if}
+            </span>
+          </li>
+        {/each}
+      </ol>
+      <div class="foot"><button class="link" onclick={() => (showActs = false)}>All sessions</button></div>
+    {:else if error !== null && records.length === 0}
+      <p class="empty">{error}</p>
     {:else if records.length === 0}
       <p class="empty">
-        {#if !loaded || loading}loading…{:else if applied !== "" || agent !== ""}No session matches.{:else}No sessions recorded yet. Every agent session started from now on lands here when it ends.{/if}
+        {#if !loaded}&nbsp;{:else if applied !== "" || agent !== ""}No session matches.{:else}No sessions yet. Each agent session lands here.{/if}
       </p>
     {:else}
       {#each days as day (day.key)}
@@ -265,69 +338,46 @@
             {#each day.rows as r (r.rid)}
               {@const isOpen = expanded === r.rid}
               {@const commits = commitCount(r)}
-              <div class="rec" class:open={isOpen}>
-                <button class="row" aria-expanded={isOpen} onclick={() => toggle(r)}>
-                  <span class="time">{clock(r.started)}</span>
-                  <SessionGlyph kind="agent" agentKind={r.agent} size={11} title={r.agent} />
-                  <span class="main">
-                    <span class="title">{recordTitle(r)}</span>
-                    {#if r.first_prompt !== undefined && r.first_prompt !== recordTitle(r)}
-                      <span class="prompt">{r.first_prompt}</span>
-                    {/if}
-                  </span>
+              {@const live = r.live ? sessions.get(r.id) : undefined}
+              {@const isGone = gone(r)}
+              {@const who = by(r)}
+              <div class="rec" class:gone={isGone}>
+                <div class="row">
+                  <button class="main" onclick={() => activate(r)} title={isGone ? (r.reopen?.gone ?? "") : r.live ? "open this session" : "resume this conversation"}>
+                    <SessionGlyph kind="agent" agentKind={r.agent} state={live !== undefined ? dotState(live) : ""} size={11} title={r.agent} />
+                    <span class="text">
+                      <span class="title">{recordTitle(r)}</span>
+                      {#if isGone}<span class="sub">Conversation no longer available</span>{/if}
+                    </span>
+                    {#if r.live || (r.reopen?.resume ?? null) !== null}<span class="hint">{r.live ? "Open" : "Resume"}</span>{/if}
+                  </button>
                   <span class="meta">
-                    {#if r.live}
-                      <span class="tag live">running</span>
-                    {:else if r.outcome === "crashed"}
-                      <span class="tag crash">crashed</span>
-                    {:else if r.outcome === "retired"}
-                      <span class="tag" title="the daemon stopped; a resumed session continues in its own row">stopped by a restart</span>
+                    {#if who !== null}<span>{who}</span>{/if}
+                    {#if r.outcome === "crashed"}<span>crashed</span>{/if}
+                    <span class="dur">{formatDuration((r.ended ?? Date.now()) - r.started)}</span>
+                    {#if r.files.n > 0}
+                      <button class="files" aria-expanded={isOpen} title="what this session changed" onclick={() => toggle(r)}>{r.files.n} file{r.files.n === 1 ? "" : "s"}</button>
                     {/if}
-                    {#if r.mastermind}<span class="tag">Mastermind</span>{/if}
-                    <span class="m" title="duration">{r.ended !== undefined ? formatDuration(r.ended - r.started) : formatDuration(Date.now() - r.started)}</span>
-                    {#if model(r) !== null}<span class="m mono" title="model">{model(r)}</span>{/if}
-                    <span class="m" title="started by">by {startedByLabel(r.started_by, nameOf)}</span>
-                    <span class="m" title="files written">{r.files.n} file{r.files.n === 1 ? "" : "s"}</span>
-                    {#if commits !== null}<span class="m" title="commits made during the session">{commits} commit{commits === 1 ? "" : "s"}</span>{/if}
-                    <span class="m cost" title={r.usage.cost_usd === null ? "this agent reports no cost" : "estimated at API prices"}>{formatCost(r.usage.cost_usd)}</span>
+                    {#if commits !== null}<span>{commits} commit{commits === 1 ? "" : "s"}</span>{/if}
+                    {#if r.usage.tokens_in !== null || r.usage.tokens_out !== null}
+                      <span class="tok">{formatTokens((r.usage.tokens_in ?? 0) + (r.usage.tokens_out ?? 0))} tokens</span>
+                    {/if}
                   </span>
-                </button>
+                </div>
                 {#if isOpen}
                   <div class="detail-box">
-                    <div class="facts">
-                      <span>{new Date(r.started).toLocaleString()}{r.ended !== undefined ? ` – ${clock(r.ended)}` : ""}</span>
-                      <span>{r.agent}{r.ui === "chat" ? " chat" : " terminal"}{(r.models ?? []).length > 0 ? ` · ${(r.models ?? []).join(", ")}` : ""}</span>
-                      <span>
-                        {r.usage.turns !== null ? `${r.usage.turns} turn${r.usage.turns === 1 ? "" : "s"} · ` : ""}{formatCost(r.usage.cost_usd)}
-                        <span class="basis">estimated at API prices</span>
-                        · {formatTokens(r.usage.tokens_in)} in / {formatTokens(r.usage.tokens_out)} out
-                      </span>
-                    </div>
-                    <div class="actions">
-                      {#if r.live}
-                        <button class="opt primary" onclick={() => reopen(r)}>open</button>
-                      {:else if r.reopen?.resume}
-                        <button class="opt primary" onclick={() => reopen(r)}>resume</button>
-                      {:else if r.reopen?.gone}
-                        <span class="gone">{r.reopen.gone}</span>
-                      {/if}
-                    </div>
-                    {#if (r.files.top ?? []).length > 0}
-                      <div class="written">
-                        <span class="lbl">Files written</span>
-                        {#each r.files.top ?? [] as p (p)}
-                          <button class="file" title="open {p}" onclick={(e) => openFile(p, e)}>
-                            <FileIcon path={p} size={13} />
-                            <span>{p}</span>
-                          </button>
-                        {/each}
-                        {#if r.files.n > (r.files.top ?? []).length}
-                          <span class="more">and {r.files.n - (r.files.top ?? []).length} more</span>
-                        {/if}
-                      </div>
-                    {/if}
+                    <p class="facts">
+                      {new Date(r.started).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}{r.ended !== undefined ? ` – ${clock(r.ended)}` : ""}{(r.models ?? []).length > 0 ? ` · ${(r.models ?? []).join(", ")}` : ""}{r.usage.turns !== null ? ` · ${r.usage.turns} turn${r.usage.turns === 1 ? "" : "s"}` : ""}{r.usage.tokens_in !== null || r.usage.tokens_out !== null ? ` · ${formatTokens((r.usage.tokens_in ?? 0) + (r.usage.tokens_out ?? 0))} tokens` : ""}
+                    </p>
                     {#if wsId !== null}
-                      <SessionEdits sessionId={r.id} {wsId} {wsRoot} {visible} onOpenFile={(p, e) => ctrl.openFileFrom(paneId, p, e.metaKey || e.ctrlKey)} />
+                      <SessionEdits
+                        sessionId={r.id}
+                        {wsId}
+                        {wsRoot}
+                        paths={(r.files.top ?? []).map(abs)}
+                        {visible}
+                        onOpenFile={(p, e) => ctrl.openFileFrom(paneId, p, e.metaKey || e.ctrlKey)}
+                      />
                     {/if}
                   </div>
                 {/if}
@@ -338,9 +388,10 @@
       {/each}
       <div class="foot">
         {#if more}
-          <button class="opt quiet" disabled={loading} onclick={() => void load(false)}>{loading ? "loading…" : "load older"}</button>
-        {:else}
-          <span class="end">the beginning of what chimaera kept</span>
+          <button class="link" disabled={loading} onclick={() => void load(false)}>{loading ? "loading…" : "Older sessions"}</button>
+        {/if}
+        {#if acts.length > 0}
+          <button class="link" onclick={() => (showActs = true)}>Mastermind actions</button>
         {/if}
         {#if error !== null}<span class="err">{error}</span>{/if}
       </div>
@@ -357,7 +408,7 @@
     container-type: inline-size;
   }
   .inner {
-    max-width: 980px;
+    max-width: 880px;
     margin: 0 auto;
     padding: 26px 32px 48px;
     display: flex;
@@ -366,15 +417,9 @@
   }
   .head {
     display: flex;
-    align-items: flex-end;
+    align-items: center;
     gap: 20px;
     flex-wrap: wrap;
-  }
-  .titles {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    min-width: 0;
   }
   h1 {
     margin: 0;
@@ -382,18 +427,11 @@
     font-weight: 600;
     letter-spacing: -0.01em;
   }
-  .sub {
-    margin: 0;
-    font-size: var(--text-sm);
-    color: var(--muted);
-  }
-  .tools {
-    margin-left: auto;
-  }
   .search {
-    width: 260px;
+    margin-left: auto;
+    width: 220px;
     max-width: 100%;
-    padding: 5px 10px;
+    padding: 4px 10px;
     border: 1px solid var(--edge);
     border-radius: 6px;
     background: var(--bg);
@@ -403,38 +441,36 @@
   }
   .search:focus {
     outline: none;
-    border-color: var(--accent);
+    border-color: var(--focus-ring);
   }
-  .chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-  .chip {
-    appearance: none;
+  .seg {
+    display: inline-flex;
+    align-self: flex-start;
     border: 1px solid var(--edge);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .seg button {
+    appearance: none;
+    border: none;
     background: none;
-    color: var(--muted);
+    padding: 3px 12px;
     font: inherit;
     font-size: var(--text-xs);
-    padding: 3px 11px;
-    border-radius: 999px;
+    color: var(--muted);
     cursor: pointer;
-    transition:
-      color 0.12s ease,
-      border-color 0.12s ease;
   }
-  .chip:hover {
-    color: var(--fg);
+  .seg button + button {
+    border-left: 1px solid var(--edge);
   }
-  .chip.on {
+  .seg button.on {
     color: var(--fg);
-    border-color: var(--fg);
+    background: var(--row-active);
   }
   .day {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 4px;
   }
   .lbl {
     margin: 0;
@@ -447,45 +483,38 @@
   .rows {
     display: flex;
     flex-direction: column;
-    border-bottom: 1px solid var(--edge);
-  }
-  .rec {
-    border-top: 1px solid var(--edge);
   }
   .row {
-    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    border-radius: 5px;
+  }
+  .row:hover {
+    background: var(--row-hover);
+  }
+  .main {
+    flex: 1;
+    min-width: 0;
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 8px 6px;
+    padding: 6px 8px;
     border: none;
     background: none;
     color: var(--fg);
     font: inherit;
     text-align: left;
     cursor: pointer;
-    border-radius: 5px;
   }
-  .row:hover {
-    background: var(--row-hover);
-  }
-  .time {
-    flex: none;
-    min-width: 5.2em;
-    white-space: nowrap;
-    font-size: var(--text-xs);
-    color: var(--muted);
-    font-variant-numeric: tabular-nums;
-  }
-  .main {
+  .text {
     flex: 1;
     min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 1px;
   }
   .title,
-  .prompt {
+  .sub {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -493,102 +522,111 @@
   .title {
     font-size: var(--text-sm);
   }
-  .prompt {
+  .sub {
     font-size: var(--text-xs);
     color: var(--muted);
+  }
+  .rec.gone .title {
+    color: var(--muted);
+  }
+  .hint {
+    flex: none;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    opacity: 0;
+    transition: opacity 0.12s ease;
+  }
+  .row:hover .hint,
+  .main:focus-visible .hint {
+    opacity: 1;
   }
   .meta {
     flex: none;
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 12px;
+    padding-right: 8px;
     font-size: var(--text-xs);
     color: var(--muted);
     white-space: nowrap;
-  }
-  .m.mono {
-    font-family: var(--mono, monospace);
-    max-width: 12em;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .m.cost {
-    min-width: 3.6em;
-    text-align: right;
-    color: var(--fg);
     font-variant-numeric: tabular-nums;
   }
-  .tag {
-    padding: 0 6px;
-    border: 1px solid var(--edge);
-    border-radius: 999px;
-    font-size: 10.5px;
+  .files {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
   }
-  .tag.live {
-    color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 45%, var(--edge));
+  .files:hover,
+  .files[aria-expanded="true"] {
+    color: var(--fg);
   }
-  .tag.crash {
-    color: var(--err);
-    border-color: color-mix(in srgb, var(--err) 45%, var(--edge));
+  .dur {
+    min-width: 3.6em;
+    text-align: right;
   }
-  @container (max-width: 640px) {
-    .meta .m:not(.cost) {
+  @container (max-width: 560px) {
+    .meta > :not(.dur) {
       display: none;
     }
+  }
+  .filters {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .seg-one {
+    appearance: none;
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    background: none;
+    padding: 3px 12px;
+    font: inherit;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .seg-one.on {
+    color: var(--fg);
+    background: var(--row-active);
+  }
+  .main.static {
+    cursor: default;
+  }
+  .act-btn {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0;
+    font: inherit;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .act-btn:hover {
+    color: var(--fg);
+  }
+  .act-btn:focus-visible {
+    opacity: 1;
+  }
+  .quiet {
+    margin: 0;
+    font-size: var(--text-xs);
+    color: var(--muted);
   }
   .detail-box {
     display: flex;
     flex-direction: column;
-    gap: 12px;
-    padding: 4px 8px 14px calc(5.2em + 33px);
+    gap: 6px;
+    padding: 2px 8px 12px 29px;
   }
   .facts {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    font-size: var(--text-sm);
-    color: var(--muted);
-  }
-  .basis {
-    font-size: var(--text-xs);
-    opacity: 0.85;
-  }
-  .actions {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  .gone {
-    font-size: var(--text-sm);
-    color: var(--muted);
-  }
-  .written {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 2px;
-  }
-  .file {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 2px 6px;
-    border: none;
-    border-radius: 4px;
-    background: none;
-    color: var(--fg);
-    font-family: var(--mono, monospace);
-    font-size: var(--text-sm);
-    cursor: pointer;
-  }
-  .file:hover {
-    background: var(--row-hover);
-  }
-  .more {
+    margin: 0;
     font-size: var(--text-xs);
     color: var(--muted);
-    padding-left: 6px;
   }
   .acts {
     list-style: none;
@@ -596,13 +634,11 @@
     padding: 0;
     display: flex;
     flex-direction: column;
-    border-top: 1px solid var(--edge);
   }
   .act {
     display: flex;
     gap: 12px;
-    padding: 7px 6px;
-    border-bottom: 1px solid var(--edge);
+    padding: 6px 8px;
     font-size: var(--text-sm);
   }
   .act .when {
@@ -615,8 +651,19 @@
   .act .what {
     min-width: 0;
   }
-  .act b {
+  .who {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0;
+    font: inherit;
+    color: var(--fg);
     font-weight: 600;
+    cursor: pointer;
+  }
+  .who:hover {
+    text-decoration: underline;
+    text-underline-offset: 2px;
   }
   .act .detail {
     color: var(--muted);
@@ -633,11 +680,20 @@
   .foot {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 16px;
     font-size: var(--text-xs);
     color: var(--muted);
   }
-  .end {
-    opacity: 0.8;
+  .link {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0;
+    font: inherit;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .link:hover:not(:disabled) {
+    color: var(--fg);
   }
 </style>

@@ -1,8 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  aggCost,
+  aggTokens,
   commitCount,
-  formatCost,
   formatDuration,
   formatTokens,
   isRecord,
@@ -32,16 +31,10 @@ function agent(id: string, ws: string, files: string[], alive = true): Session {
 }
 
 describe("honest numbers", () => {
-  it("never shows an unknown cost as zero", () => {
-    expect(formatCost(null)).toBe("—");
-    expect(formatCost(undefined)).toBe("—");
-    expect(formatCost(Number.NaN)).toBe("—");
-    expect(formatCost(0)).toBe("$0.00");
-    expect(formatCost(0.004)).toBe("<$0.01");
-    expect(formatCost(1.234)).toBe("$1.23");
-    // An aggregate with no costed session is unknown too.
-    expect(aggCost({ cost_usd: 0, cost_sessions: 0 })).toBe("—");
-    expect(aggCost({ cost_usd: 2.5, cost_sessions: 3 })).toBe("$2.50");
+  it("never shows unknown tokens as zero", () => {
+    expect(aggTokens({ tokens_in: 0, tokens_out: 0, token_sessions: 0 })).toBe("—");
+    expect(aggTokens({ tokens_in: 1000, tokens_out: 234, token_sessions: 2 })).toBe("1.2k");
+    expect(aggTokens({ tokens_in: 0, tokens_out: 0, token_sessions: 1 })).toBe("0");
   });
 
   it("formats tokens and durations compactly", () => {

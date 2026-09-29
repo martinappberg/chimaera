@@ -22,7 +22,7 @@
   import NowLine from "./NowLine.svelte";
   import SinceYouLeft from "./SinceYouLeft.svelte";
   import WhereThingsStand from "./WhereThingsStand.svelte";
-  import { sameFileOverlaps } from "../workspace/history";
+  import ActivityLine from "./ActivityLine.svelte";
   import { acquireChat, releaseChat } from "../chat/chatPool";
   import type { ChatStore } from "../chat/store.svelte";
   import type { ChatSocket } from "../chat/chatWs";
@@ -60,9 +60,6 @@
   }
 
   let { dash, sessions, names, wsId, wsRoot, paneId, ctrl, visible = true }: Props = $props();
-
-  /** Live agents that wrote a file another live agent also wrote. */
-  const sameFile = $derived(sameFileOverlaps(sessions.values()));
 
   // --- the roster --------------------------------------------------------------
 
@@ -497,8 +494,6 @@
                           ? (taskId) => stopTask(s.id, taskId)
                           : undefined}
                         {visible}
-                        sameFile={sameFile.get(s.id)}
-                        nameOf={(id) => names.get(id) ?? sessions.get(id)?.name ?? id}
                       />
                     </div>
                   {/each}
@@ -532,6 +527,9 @@
             />
           {/if}
         {/if}
+
+        <!-- One quiet line: this workspace's sessions and tokens this week. -->
+        <ActivityLine {wsId} {visible} onOpenActivity={dash.onOpenActivity} />
       </div>
         </div>
       </div>

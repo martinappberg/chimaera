@@ -26,8 +26,7 @@
     type Session,
   } from "../workspace/sessions";
   import { isUnread } from "../workspace/unread.svelte";
-  import SameFileChip from "../workspace/SameFileChip.svelte";
-  import type { SameFile } from "../workspace/history";
+  import SameFileNotice from "../workspace/SameFileNotice.svelte";
   import { inlineMarkdown } from "../shared/inlineMarkdown";
   import type { BackgroundTask, ChatBlock, ChatStore } from "../chat/store.svelte";
   import { provenanceOf, provenanceTitle , relPath as sharedRelPath} from "./dash";
@@ -50,10 +49,6 @@
     /** False while the dashboard pane is a hidden tab — a parked dashboard
      *  must not keep every card's clock and row dots running. */
     visible?: boolean;
-    /** Live sessions that also wrote a file this one wrote (the quiet
-     *  "same file" chip) and how to name them. */
-    sameFile?: SameFile[];
-    nameOf?: (id: string) => string;
   }
 
   let {
@@ -67,8 +62,6 @@
     onOpenChanges,
     onStopTask,
     visible = true,
-    sameFile = [],
-    nameOf = (id: string) => id,
   }: Props = $props();
 
   const prov = $derived(provenanceOf(session));
@@ -265,9 +258,6 @@
     />
     <span class="dot {dotState(session)}" title={dotTitle(session)}></span>
     <span class="name" title={name}>{name}</span>
-    {#if sameFile.length > 0}
-      <SameFileChip overlaps={sameFile} {nameOf} {wsRoot} />
-    {/if}
     {#if isUnread(session.id)}
       <span class="unread-dot" aria-hidden="true"></span>
     {/if}
@@ -313,6 +303,9 @@
     <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
     <div class="now" title={nowLine}>{@html inlineMarkdown(nowLine)}</div>
   {/if}
+  <!-- Another live session wrote a file this one wrote (warn-toned, click
+       opens it); renders nothing otherwise. -->
+  <SameFileNotice sessionId={session.id} {visible} />
 
   {#if planEntries.length > 0}
     <div class="plan">

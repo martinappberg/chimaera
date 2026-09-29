@@ -7,9 +7,11 @@
 //!   newest Mastermind actions and note deliveries.
 //! - `GET /sessions/{id}/edits?workspace_id=` — the agent's own edits per
 //!   file, in order (see `edits`), live or ended.
-//! - `GET /usage?workspace_id=&tz=&days=&weeks=` — cost and token totals
-//!   (see `usage`), every workspace unless one is named.
-//! - `GET /usage/csv?workspace_id=&tz=` — the same as a CSV file.
+//! - `GET /activity?workspace_id=&tz=&days=&weeks=` — sessions, tokens,
+//!   time and (unshown) cost totals (see `usage`), every workspace unless one
+//!   is named.
+//! - `GET /activity/csv?workspace_id=&tz=` — one row per session, as a CSV
+//!   file (the one place the estimated cost shows).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -265,6 +267,7 @@ pub(crate) async fn session_edits(
                 "files": [],
                 "edits": 0,
                 "truncated": false,
+                "ran_commands": false,
             }));
         };
         let out = edits::extract(events);
@@ -274,6 +277,7 @@ pub(crate) async fn session_edits(
             "files": out.files,
             "edits": out.edits,
             "truncated": out.truncated,
+            "ran_commands": out.ran_commands,
         }))
     })
     .await;
@@ -286,6 +290,25 @@ pub(crate) async fn session_edits(
         )
             .into_response(),
     }
+}
+
+/// GET /workspaces/{id}/same-file — every pair of LIVE agent sessions here
+/// that wrote the same file, with when the other one wrote it (the chat's
+/// notice line and the dashboard card read it; nothing locks).
+pub(crate) async fn same_file(
+    State(state): State<Arc<AppState>>,
+    AxPath(id): AxPath<String>,
+) -> Response {
+    if crate::lock(&state.workspaces).get(&id).is_none() {
+        return not_found(format!("unknown workspace {id}"));
+    }
+    let pairs: Vec<serde_json::Value> = super::same_file_pairs(&state, &id)
+        .into_iter()
+        .map(|(session, other, path, at)| {
+            json!({"session": session, "other": other, "path": path, "at": at})
+        })
+        .collect();
+    Json(json!({"pairs": pairs})).into_response()
 }
 
 #[derive(Deserialize)]
@@ -331,7 +354,7 @@ fn inputs_for(state: &Arc<AppState>, workspace_id: Option<&str>) -> Option<Vec<W
     )
 }
 
-pub(crate) async fn get_usage(
+pub(crate) async fn get_activity(
     State(state): State<Arc<AppState>>,
     Query(query): Query<UsageQuery>,
 ) -> Response {
@@ -359,13 +382,13 @@ pub(crate) async fn get_usage(
         Ok(report) => Json(report).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("usage read failed: {err}")})),
+            Json(json!({"error": format!("activity read failed: {err}")})),
         )
             .into_response(),
     }
 }
 
-pub(crate) async fn get_usage_csv(
+pub(crate) async fn get_activity_csv(
     State(state): State<Arc<AppState>>,
     Query(query): Query<UsageQuery>,
 ) -> Response {
@@ -398,7 +421,7 @@ pub(crate) async fn get_usage_csv(
                 (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
                 (
                     header::CONTENT_DISPOSITION,
-                    "attachment; filename=\"chimaera-usage.csv\"",
+                    "attachment; filename=\"chimaera-activity.csv\"",
                 ),
             ],
             body,
@@ -406,7 +429,7 @@ pub(crate) async fn get_usage_csv(
             .into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("usage export failed: {err}")})),
+            Json(json!({"error": format!("activity export failed: {err}")})),
         )
             .into_response(),
     }

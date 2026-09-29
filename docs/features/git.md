@@ -78,6 +78,9 @@ create/remove, `resolve.rs`, `service.rs`, `parse.rs`). Wire: `GET /api/v1/git/s
 - **Key behaviors.** If the session lives in a *linked worktree* (different `workspace_id`), the view
   fetches that workspace's own status rather than mis-decorating every row "no change". A row with a
   git change opens the diff; a touched-but-unchanged row (a `·` dot) just opens the file. Read-only.
+  Without a repository the rows carry no git mark. One list with or without git: each file shows its
+  edit count, and a file with no uncommitted git change opens the agent's own edits for it, in order
+  ([session-history.md](session-history.md#what-a-session-changed-with-or-without-git)).
 
 ## Git-binary / repo remediation
 

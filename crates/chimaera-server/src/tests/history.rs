@@ -402,6 +402,24 @@ async fn two_sessions_writing_one_file_hear_about_each_other_once() {
         .unwrap_or_else(|| panic!("no context: {body}"));
     assert!(ctx.contains("'plot the QC'"), "{ctx}");
 
+    // The UI's notice reads the same pairs, both directions, with times.
+    let (status, body) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/workspaces/{ws}/same-file"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let pairs = body["pairs"].as_array().unwrap();
+    assert_eq!(pairs.len(), 2, "{body}");
+    assert!(pairs
+        .iter()
+        .all(|p| p["path"] == "/w/qc.py" && p["at"].as_u64().unwrap() > 0));
+    assert!(pairs
+        .iter()
+        .any(|p| p["session"] == a.as_str() && p["other"] == b.as_str()));
+
     state.sessions.kill(&a).ok();
     state.sessions.kill(&b).ok();
 }
@@ -499,7 +517,7 @@ async fn usage_totals_span_workspaces_and_export_as_csv() {
     history::open(&state, "s-u3", StartedBy::You);
     state.history.flush(std::time::Duration::from_secs(5));
 
-    let (status, all) = request(&state, Method::GET, "/api/v1/usage", None).await;
+    let (status, all) = request(&state, Method::GET, "/api/v1/activity", None).await;
     assert_eq!(status, StatusCode::OK, "{all}");
     assert_eq!(all["basis"], "estimated at API prices");
     assert_eq!(all["totals"]["sessions"], 3);
@@ -511,7 +529,7 @@ async fn usage_totals_span_workspaces_and_export_as_csv() {
     let (_, one) = request(
         &state,
         Method::GET,
-        &format!("/api/v1/usage?workspace_id={ws2}"),
+        &format!("/api/v1/activity?workspace_id={ws2}"),
         None,
     )
     .await;
@@ -520,7 +538,7 @@ async fn usage_totals_span_workspaces_and_export_as_csv() {
     let res = app(state.clone())
         .oneshot(
             Request::builder()
-                .uri("/api/v1/usage/csv")
+                .uri("/api/v1/activity/csv")
                 .header(header::AUTHORIZATION, "Bearer test-token")
                 .body(Body::empty())
                 .unwrap(),
@@ -540,7 +558,7 @@ async fn usage_totals_span_workspaces_and_export_as_csv() {
     let res = app(state.clone())
         .oneshot(
             Request::builder()
-                .uri("/api/v1/usage")
+                .uri("/api/v1/activity")
                 .body(Body::empty())
                 .unwrap(),
         )

@@ -55,6 +55,9 @@ pub(crate) struct Extracted {
     pub(crate) edits: usize,
     /// Something was left out by the caps.
     pub(crate) truncated: bool,
+    /// The session ran shell commands — changes those made have no
+    /// before/after here (the UI says so where no repository shows them).
+    pub(crate) ran_commands: bool,
 }
 
 struct Call {
@@ -98,8 +101,13 @@ fn clip(text: String) -> (String, bool) {
 pub(crate) fn extract(events: impl IntoIterator<Item = (Option<u64>, AgentEvent)>) -> Extracted {
     let mut calls: HashMap<String, Call> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
+    let mut ran_commands = false;
     for (ts, ev) in events {
         match ev {
+            AgentEvent::ToolCall {
+                kind: ToolKind::Execute,
+                ..
+            } => ran_commands = true,
             AgentEvent::ToolCall {
                 id,
                 kind: ToolKind::Edit,
@@ -153,7 +161,10 @@ pub(crate) fn extract(events: impl IntoIterator<Item = (Option<u64>, AgentEvent)
         }
     }
 
-    let mut out = Extracted::default();
+    let mut out = Extracted {
+        ran_commands,
+        ..Extracted::default()
+    };
     let mut at: HashMap<String, usize> = HashMap::new();
     let mut bytes = 0usize;
     for id in order {
@@ -221,7 +232,8 @@ pub(crate) fn journal_events(path: &Path) -> Vec<(Option<u64>, AgentEvent)> {
         if line.len() > JOURNAL_LINE_MAX {
             continue;
         }
-        // Only tool rows matter; skip the parse for everything else.
+        // Only tool rows matter (edits, and whether commands ran); skip the
+        // parse for everything else.
         let is_tool = line
             .windows(b"\"tool_call".len())
             .any(|w| w == b"\"tool_call");
@@ -340,6 +352,21 @@ mod tests {
         assert_eq!(out.files[1].edits[1].ts, Some(7));
         assert_eq!(out.edits, 4);
         assert!(!out.truncated);
+        assert!(!out.ran_commands, "no shell command ran");
+
+        let ran = extract(vec![(
+            None,
+            AgentEvent::ToolCall {
+                id: "x".into(),
+                kind: ToolKind::Execute,
+                title: "Bash: make".into(),
+                locations: vec![],
+                status: ToolStatus::Completed,
+                cross_turn: false,
+                command: Some("make".into()),
+            },
+        )]);
+        assert!(ran.ran_commands);
     }
 
     #[test]

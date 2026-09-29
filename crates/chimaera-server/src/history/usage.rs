@@ -1,8 +1,9 @@
-//! Cost and token totals from the session records (plan §10): per session,
-//! per workspace, per day and week, per agent and model, and a CSV export.
-//! Honest numbers: cost is what the agent reports at API prices (not what a
-//! subscriber pays), and a session whose agent reports no cost counts as
-//! unknown — never as zero.
+//! Activity totals from the session records (plan §10): sessions, tokens
+//! and time agents spent working — per workspace, per day and week, per
+//! agent and model — and a CSV export. The UI leads with sessions and tokens
+//! and shows no dollars; cost (what the agent reports at API prices) is
+//! still summed here and exported as `estimated_cost_usd`. A session whose
+//! agent reports nothing counts as unknown — never as zero.
 //!
 //! Each workspace's file parses once per change into compact rows, cached
 //! (`Cache`, at most `CACHE_MAX` workspaces) and keyed by the file's length
@@ -34,6 +35,8 @@ pub(crate) struct Row {
     pub(crate) cost: Option<f64>,
     pub(crate) tin: Option<u64>,
     pub(crate) tout: Option<u64>,
+    /// How long it ran (so far, for an open record), ms.
+    pub(crate) duration_ms: u64,
 }
 
 impl Row {
@@ -45,6 +48,10 @@ impl Row {
             cost: rec.usage.cost_usd,
             tin: rec.usage.tokens_in,
             tout: rec.usage.tokens_out,
+            duration_ms: rec
+                .ended
+                .unwrap_or_else(super::now_ms)
+                .saturating_sub(rec.started),
         }
     }
 }
@@ -134,11 +141,14 @@ pub(crate) struct Agg {
     pub(crate) tokens_in: u64,
     pub(crate) tokens_out: u64,
     pub(crate) token_sessions: u64,
+    /// Time agents spent working: the sum of the sessions' durations, ms.
+    pub(crate) duration_ms: u64,
 }
 
 impl Agg {
     fn add(&mut self, row: &Row) {
         self.sessions += 1;
+        self.duration_ms += row.duration_ms;
         match row.cost {
             Some(c) => {
                 self.cost_usd += c;
@@ -155,6 +165,7 @@ impl Agg {
 
     fn add_month_row(&mut self, r: &super::MonthRow) {
         self.sessions += r.sessions;
+        self.duration_ms += r.duration_ms;
         self.cost_usd += r.cost_usd;
         self.cost_sessions += r.cost_sessions;
         self.unknown_cost_sessions += r.sessions.saturating_sub(r.cost_sessions);
@@ -433,7 +444,7 @@ pub(crate) fn csv(workspaces: &[(String, Vec<Record>, Vec<Month>)], tz: i64) -> 
         "turns",
         "tokens_in",
         "tokens_out",
-        "cost_usd_estimated_at_api_prices",
+        "estimated_cost_usd",
         "title",
     ]);
     let opt = |v: Option<String>| v.unwrap_or_default();
@@ -464,7 +475,7 @@ pub(crate) fn csv(workspaces: &[(String, Vec<Record>, Vec<Month>)], tz: i64) -> 
                     cell(name),
                     month.month.clone(),
                     String::new(),
-                    String::new(),
+                    (r.duration_ms / 1000).to_string(),
                     cell(&r.agent),
                     cell(r.model.as_deref().unwrap_or("")),
                     String::new(),

@@ -8,20 +8,17 @@
     type GitStatus,
   } from "./git";
   import { decoFor } from "./gitDeco";
-  import { workspaceRelative } from "../shared/reference";
   import { displayName, type Session } from "./sessions";
   import type { LayoutCtrl } from "../layout/dnd";
-  import FileIcon from "../shared/FileIcon.svelte";
   import SessionEdits from "./SessionEdits.svelte";
 
   /**
-   * Session-scoped changes review: the files THIS agent touched (its
-   * hook-derived files_touched list), cross-referenced with the workspace's
-   * live git status. Each row opens the same side-by-side diff the Source
-   * Control panel uses (ctrl.openDiffFrom), so this is purely a session-scoped
-   * entry point onto main's git service — no duplicated diff plumbing, and it
-   * inherits the resolved git.path. Files with no current git change still
-   * open in a viewer.
+   * What this session changed, one view with or without git: the files THIS
+   * agent touched (its files_touched list plus what its edit record names),
+   * each with its edit count (`SessionEdits`). A file with an uncommitted git
+   * change opens the same side-by-side diff the Source Control panel uses
+   * (ctrl.openDiffFrom — main's git service, the resolved git.path); any
+   * other file opens the agent's own edits for it, in order.
    */
   interface Props {
     session: Session;
@@ -88,14 +85,6 @@
   function modeFor(e: GitEntry): DiffMode {
     return e.staged && !e.unstaged && !e.untracked && !e.conflicted ? "staged" : "unstaged";
   }
-  function rel(path: string): string {
-    return base !== null ? workspaceRelative(path, base) : path;
-  }
-  function open(e: MouseEvent, path: string): void {
-    const entry = byPath.get(path);
-    if (entry !== undefined) ctrl.openDiffFrom(paneId, path, modeFor(entry), e.metaKey || e.ctrlKey);
-    else ctrl.openFileFrom(paneId, path, e.metaKey || e.ctrlKey);
-  }
 </script>
 
 <div class="changes">
@@ -114,37 +103,31 @@
     </div>
   {/if}
 
-  {#if files.length === 0}
-    <div class="empty">this agent hasn't changed any files yet</div>
-  {:else}
-    <div class="list">
-      {#each files as path (path)}
-        {@const entry = byPath.get(path)}
-        {@const deco = entry !== undefined ? decoFor(entry) : null}
-        <button class="row" title={path} onclick={(e) => open(e, path)}>
-          <span class="glyph"><FileIcon {path} size={14} /></span>
-          <span class="name">{rel(path)}</span>
-          {#if deco !== null}
-            <span class="badge" style:color={deco.color} title={deco.label}>{deco.letter}</span>
-          {:else if status !== null}
-            <span class="badge quiet" title="no current git change">·</span>
-          {/if}
-        </button>
-      {/each}
-    </div>
-  {/if}
+  <!-- Commits come first when there are any ("Committed 2", rows like
+       History's) — wired in from GET /api/v1/sessions/{id}/git. -->
 
-  <!-- The session's commits ("N commits") land here once Part 1's
-       GET /api/v1/sessions/{id}/git is wired in. -->
-
-  <!-- Its own edits, per file, in order — with or without git. -->
-  <div class="edits-wrap">
+  <!-- The files, each with its edit count: a click opens the git diff when
+       the file has an uncommitted change, else the agent's own edits for it,
+       in order — one list, with or without git. -->
+  <div class="list">
     <SessionEdits
       sessionId={session.id}
       wsId={session.workspace_id}
-      {wsRoot}
-      refreshKey={session.files_touched?.length ?? 0}
+      wsRoot={base}
+      paths={files}
+      repo={status !== null}
+      gitMark={(p) => {
+        const entry = byPath.get(p);
+        return entry !== undefined ? decoFor(entry) : null;
+      }}
+      onOpenDiff={(p, e) => {
+        const entry = byPath.get(p);
+        if (entry === undefined) return false;
+        ctrl.openDiffFrom(paneId, p, modeFor(entry), e.metaKey || e.ctrlKey);
+        return true;
+      }}
       onOpenFile={(p, e) => ctrl.openFileFrom(paneId, p, e.metaKey || e.ctrlKey)}
+      refreshKey={session.files_touched?.length ?? 0}
     />
   </div>
 </div>
@@ -193,60 +176,7 @@
     font-family: var(--mono, monospace);
     font-size: 0.92em;
   }
-  .empty {
-    padding: 20px;
-    text-align: center;
-    color: var(--muted);
-    font-size: var(--text-sm);
-  }
   .list {
     padding: 6px 8px;
-  }
-  .edits-wrap {
-    padding: 10px 14px 18px;
-    border-top: 1px solid var(--edge);
-  }
-  .row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-    padding: 4px 8px;
-    border: none;
-    border-radius: 5px;
-    background: none;
-    color: var(--fg);
-    font: inherit;
-    font-size: var(--text-sm);
-    text-align: left;
-    cursor: pointer;
-    transition: background-color 0.12s ease;
-  }
-  .row:hover {
-    background: var(--row-hover);
-  }
-  .glyph {
-    flex: none;
-    display: inline-flex;
-    align-items: center;
-  }
-  .name {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-family: var(--mono, monospace);
-  }
-  .badge {
-    flex: none;
-    width: 1.2em;
-    text-align: center;
-    font-family: var(--mono, monospace);
-    font-weight: 600;
-  }
-  .badge.quiet {
-    color: var(--muted);
-    font-weight: 400;
   }
 </style>

@@ -233,6 +233,9 @@ pub(crate) struct MonthRow {
     pub(crate) tokens_in: u64,
     pub(crate) tokens_out: u64,
     pub(crate) token_sessions: u64,
+    /// Time the sessions ran (the sum of their durations), ms.
+    #[serde(default)]
+    pub(crate) duration_ms: u64,
 }
 
 /// One line of `sessions.jsonl`. `t` is serialized first.
@@ -731,6 +734,7 @@ fn fold_month(into: &mut Month, from: &Month) {
                 r.tokens_in += row.tokens_in;
                 r.tokens_out += row.tokens_out;
                 r.token_sessions += row.token_sessions;
+                r.duration_ms += row.duration_ms;
             }
             None => into.rows.push(row.clone()),
         }
@@ -768,6 +772,7 @@ fn fold_record(months: &mut BTreeMap<String, Month>, rec: &Record) {
         }
     };
     row.sessions += 1;
+    row.duration_ms += rec.ended.map_or(0, |e| e.saturating_sub(rec.started));
     if let Some(c) = rec.usage.cost_usd {
         row.cost_usd += c;
         row.cost_sessions += 1;
@@ -1475,6 +1480,33 @@ pub(crate) fn observe_exit(state: &AppState, sid: &str, exit: &chimaera_agent::d
 }
 
 // ---- the same-file warning -------------------------------------------------
+
+/// Cap on pairs one same-file answer lists.
+const SAME_FILE_PAIRS_MAX: usize = 200;
+
+/// Every (session, other session, path, when the other wrote it) among this
+/// workspace's LIVE sessions, newest first — both directions of each pair.
+pub(crate) fn same_file_pairs(state: &AppState, ws: &str) -> Vec<(String, String, String, u64)> {
+    let live = crate::lock(&state.history.live);
+    let mine: Vec<(&String, &Live)> = live.iter().filter(|(_, l)| l.ws == ws).collect();
+    let mut out = Vec::new();
+    for (sid, me) in &mine {
+        let paths: HashSet<&str> = me.touched.iter().map(|(p, _)| p.as_str()).collect();
+        for (osid, other) in &mine {
+            if sid == osid {
+                continue;
+            }
+            for (path, at) in &other.touched {
+                if paths.contains(path.as_str()) {
+                    out.push(((*sid).clone(), (*osid).clone(), path.clone(), *at));
+                }
+            }
+        }
+    }
+    out.sort_by_key(|(_, _, _, at)| std::cmp::Reverse(*at));
+    out.truncate(SAME_FILE_PAIRS_MAX);
+    out
+}
 
 /// Context lines for a hook answer: another LIVE session in this workspace
 /// wrote a file this one also wrote. Once per (other session, file) per

@@ -57,6 +57,8 @@
   import ForkDialog from "./ForkDialog.svelte";
   import AgentMessageMeta from "./AgentMessageMeta.svelte";
   import Composer from "./Composer.svelte";
+  import SameFileNotice from "../workspace/SameFileNotice.svelte";
+  import { sameFile } from "../workspace/sameFile.svelte";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import { activeSelection, clearSelection, setSelection } from "../shared/reference";
   import { quotableRange, quoteChipPosition } from "./quoteSelection";
@@ -2753,6 +2755,14 @@
     </div>
   {/if}
 
+  <!-- The line just above the input: another live session wrote a file
+       this one wrote (right side; renders nothing otherwise). -->
+  {#if sameFile.notesFor(session.id).length > 0}
+    <div class="composer-context">
+      <SameFileNotice sessionId={session.id} {visible} />
+    </div>
+  {/if}
+
   <Composer
     sessionId={session.id}
     view={quoteOwner}
@@ -3298,6 +3308,13 @@
   }
   .cancel-btn:hover {
     color: var(--err);
+  }
+  /* The line above the input: context on the right (the same-file notice). */
+  .composer-context {
+    display: flex;
+    justify-content: flex-end;
+    min-width: 0;
+    padding: 2px 12px 0;
   }
   .suggestion-row {
     display: flex;

@@ -30,6 +30,11 @@ pub(crate) struct AppState {
     /// Ended agent conversations per workspace (the rail's Recents section),
     /// persisted to `recents.json` on change.
     pub(crate) recents: Mutex<recents::RecentsStore>,
+    /// Conversations the user archived out of Recents, per workspace
+    /// (`recents-archive.json`; see `recents_archive`). Hidden, never deleted.
+    pub(crate) recents_archive: Mutex<crate::recents_archive::ArchiveStore>,
+    /// Serializes the archive's file writes (each snapshots under it).
+    pub(crate) recents_archive_write: tokio::sync::Mutex<()>,
     /// Bumped whenever the recents store changes; `/ws/events` pushes a
     /// `recents` frame so the rail refetches instead of guessing at timing.
     pub(crate) recents_epoch: std::sync::atomic::AtomicU64,
@@ -267,6 +272,10 @@ impl AppState {
                 data_dir.join("view-state.json"),
             )),
             recents: Mutex::new(recents::RecentsStore::load(data_dir.join("recents.json"))),
+            recents_archive: Mutex::new(crate::recents_archive::ArchiveStore::load(
+                data_dir.join("recents-archive.json"),
+            )),
+            recents_archive_write: tokio::sync::Mutex::new(()),
             recents_epoch: std::sync::atomic::AtomicU64::new(0),
             ledger: Mutex::new(ledger::LedgerStore::new(data_dir.join("sessions.json"))),
             session_themes: Mutex::new(HashMap::new()),

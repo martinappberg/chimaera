@@ -450,3 +450,171 @@ async fn recents_unknown_workspace_is_404() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
+fn archive_state(data: &std::path::Path, store: &std::path::Path) -> Arc<AppState> {
+    let mut s = AppState::new(
+        "test-token".into(),
+        "testhost".into(),
+        4242,
+        0,
+        data.to_path_buf(),
+        data.join("config"),
+    );
+    s.claude_projects_dir = store.to_path_buf();
+    Arc::new(s)
+}
+
+/// Archive only hides: a daemon-remembered conversation and one only the
+/// claude store knows both leave Recents, stay listed as archived, survive a
+/// restart, come back on unarchive, and nothing on disk is deleted. A
+/// conversation resumed under a new id stays hidden (its chain is archived).
+#[tokio::test]
+async fn archiving_hides_recents_without_deleting_anything() {
+    let store = test_dir("recents-archive-store");
+    let data = test_dir("recents-archive-data");
+    let state = archive_state(&data, &store);
+    let root = test_dir("recents-archive-root");
+    let (_, ws) = request(
+        &state,
+        Method::POST,
+        "/api/v1/workspaces",
+        Some(serde_json::json!({"root": root.to_string_lossy()})),
+    )
+    .await;
+    let ws_id = ws["id"].as_str().unwrap().to_string();
+    let project_dir = store.join(launcher::encode_cwd(std::path::Path::new(
+        ws["root"].as_str().unwrap(),
+    )));
+    std::fs::create_dir_all(&project_dir).unwrap();
+    write_transcript(
+        &project_dir,
+        "store-only",
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":"annotate the variants"}}"#,
+            "\n",
+        ),
+        500,
+    );
+    let kept = project_dir.join("kept-1.jsonl");
+    write_transcript(
+        &project_dir,
+        "kept-1",
+        concat!(
+            r#"{"type":"ai-title","aiTitle":"t","sessionId":"kept-1"}"#,
+            "\n"
+        ),
+        400,
+    );
+    plant_agent_record(
+        &state,
+        "s-kept",
+        &ws_id,
+        agents::AgentKind::Claude,
+        Some("normalize the counts"),
+        Some(kept.to_str().unwrap()),
+    );
+    recents::retire(
+        &state,
+        "s-kept",
+        None,
+        None,
+        chimaera_agent::model::SessionUi::Chat,
+    );
+    let rows = recents_of(&state, &ws_id).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.iter().all(|r| r["key"].is_string()));
+    let epoch = state
+        .recents_epoch
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    // "Archive all": both rows.
+    let entries: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({"key": r["key"], "kind": r["kind"], "title": r["title"],
+                "resume": r["resume"], "ui": r["ui"]})
+        })
+        .collect();
+    let (status, body) = request(
+        &state,
+        Method::POST,
+        "/api/v1/recents/archive",
+        Some(serde_json::json!({"workspace_id": ws_id, "entries": entries})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["archived"].as_array().unwrap().len(), 2);
+    assert!(recents_of(&state, &ws_id).await.is_empty());
+    assert!(
+        state
+            .recents_epoch
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > epoch,
+        "every window hears about it"
+    );
+    // Nothing was deleted.
+    assert!(kept.is_file());
+    assert!(project_dir.join("store-only.jsonl").is_file());
+
+    // Listed as archived; and still archived after a restart.
+    let (_, archived) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/recents/archived?workspace_id={ws_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(archived["archived"].as_array().unwrap().len(), 2);
+    let reloaded = archive_state(&data, &store);
+    assert!(
+        recents_of(&reloaded, &ws_id).await.is_empty(),
+        "a claude-store conversation stays archived across a restart"
+    );
+
+    // Resumed under a newer id (older CLIs fork one): still hidden.
+    write_transcript(&project_dir, "kept-2", "{}\n", 10);
+    plant_agent_record(
+        &reloaded,
+        "s-next",
+        &ws_id,
+        agents::AgentKind::Claude,
+        Some("normalize the counts, again"),
+        Some(project_dir.join("kept-2.jsonl").to_str().unwrap()),
+    );
+    lock(&reloaded.agents)
+        .get_mut("s-next")
+        .unwrap()
+        .resumed_from = Some("kept-1".into());
+    recents::retire(
+        &reloaded,
+        "s-next",
+        None,
+        None,
+        chimaera_agent::model::SessionUi::Chat,
+    );
+    assert!(recents_of(&reloaded, &ws_id).await.is_empty());
+
+    // Unarchive (the Undo, or All sessions' action) brings one back.
+    let (status, body) = request(
+        &reloaded,
+        Method::POST,
+        "/api/v1/recents/unarchive",
+        Some(serde_json::json!({"workspace_id": ws_id, "keys": ["store-only"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["unarchived"], 1);
+    let rows = recents_of(&reloaded, &ws_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["key"], "store-only");
+
+    // Deleting the workspace drops its archive.
+    let (status, _) = request(
+        &reloaded,
+        Method::DELETE,
+        &format!("/api/v1/workspaces/{ws_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(lock(&reloaded.recents_archive).hidden(&ws_id).is_empty());
+}

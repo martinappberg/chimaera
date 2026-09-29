@@ -191,7 +191,10 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   registry removal. Resume stays **honest per row**: a row with no captured native handle starts
   fresh and says so without claiming the agent lacks resume support; Claude handles additionally
   require a real transcript (Claude 2.1.x interactive sessions can persist none). Cap 20/workspace;
-  live conversations are hidden at read time (they return when the session ends).
+  live conversations are hidden at read time (they return when the session ends). Right-click a
+  row → **Archive**, or the header → **Archive all** (with an Undo), hides conversations from the
+  rail without deleting anything; a quiet **All sessions** link ends the list
+  ([session-history.md](session-history.md#archiving-recents)).
 
 ## Documents: the portable dialect, `check_document` and the issues chip
 
