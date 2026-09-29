@@ -11,6 +11,11 @@ import "@fontsource/jetbrains-mono/latin-ext-500.css";
 import "@fontsource/jetbrains-mono/latin-ext-600.css";
 import "./app.css";
 import App from "./App.svelte";
+import { installReloadHook } from "./lib/layout/windowReload";
+
+// Before mount: the native Reload Window must still reach a window whose App
+// fails to boot.
+installReloadHook();
 
 const target = document.getElementById("app");
 if (!target) {

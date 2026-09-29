@@ -6,12 +6,14 @@ import {
   assetTransition,
   BUILD_META_PLACEHOLDER,
   buildSource,
+  cancelWindowReload,
   clearChunkFailure,
   documentBuildSource,
   noteChunkFailure,
   planAssetNavigation,
   rearmAssetNavigation,
   requestAssetReload,
+  requestWindowReload,
   requireAssetNavigation,
 } from "./assetTransition";
 
@@ -138,6 +140,52 @@ describe("asset transition identity", () => {
     noteChunkFailure();
     requestAssetReload();
     expect(get(assetTransition)!.revision).toBeGreaterThan(handled);
+  });
+
+  it("requests Reload Window once, however often it is asked", () => {
+    requestWindowReload();
+    const first = get(assetTransition);
+    expect(first).toMatchObject({
+      reason: "manual",
+      target: null,
+      requested: true,
+      forced: false,
+      attempts: 0,
+    });
+    // A held key or a double press: a navigation in flight is never re-issued.
+    requestWindowReload();
+    expect(get(assetTransition)).toBe(first);
+  });
+
+  it("lets Reload Window carry a pending transition's reason and target", () => {
+    noteChunkFailure();
+    requestWindowReload();
+    expect(get(assetTransition)).toMatchObject({ reason: "chunk", requested: true });
+    assetTransition.set(null);
+    requireAssetNavigation("connection", "http://127.0.0.1:9800/#token=fresh");
+    const pending = get(assetTransition);
+    requestWindowReload();
+    expect(get(assetTransition)).toBe(pending);
+  });
+
+  it("keeps an asked-for reload ahead of a chunk failure, behind a build move", () => {
+    requestWindowReload();
+    const manual = get(assetTransition);
+    noteChunkFailure();
+    expect(get(assetTransition)).toBe(manual);
+    clearChunkFailure();
+    expect(get(assetTransition)).toBe(manual);
+    requireAssetNavigation("build", null);
+    expect(get(assetTransition)).toMatchObject({ reason: "build", requested: true });
+  });
+
+  it("cancels only the user's own reload", () => {
+    requestWindowReload();
+    cancelWindowReload();
+    expect(get(assetTransition)).toBeNull();
+    requireAssetNavigation("build", null);
+    cancelWindowReload();
+    expect(get(assetTransition)).toMatchObject({ reason: "build" });
   });
 
   it("schedules 10s, 20s, then 30s retries and re-arms a prompted attempt at once", () => {

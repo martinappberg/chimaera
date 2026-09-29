@@ -3,7 +3,9 @@ import { writable } from "svelte/store";
 export const BUILD_META_NAME = "chimaera-build";
 export const BUILD_META_PLACEHOLDER = "__CHIMAERA_BUILD_ID__";
 
-export type AssetTransitionReason = "build" | "connection" | "chunk";
+/** `manual` is the user's own Reload Window (the native menu's ⌘R/F5, Quick
+ *  Open): no interface change behind it, just a fresh document. */
+export type AssetTransitionReason = "build" | "connection" | "manual" | "chunk";
 
 export interface AssetTransition {
   reason: AssetTransitionReason;
@@ -80,8 +82,12 @@ export function documentBuildSource(content: string | null | undefined): string 
 function rank(reason: AssetTransitionReason): number {
   switch (reason) {
     case "build":
-      return 3;
+      return 4;
     case "connection":
+      return 3;
+    // Above chunk: an asked-for reload already cures a failed chunk, so a
+    // later chunk failure must not demote it to an unrequested notice.
+    case "manual":
       return 2;
     case "chunk":
       return 1;
@@ -94,7 +100,7 @@ function rank(reason: AssetTransitionReason): number {
  *  "connected" event) mints nothing, so a navigation in flight is never
  *  re-issued underneath itself. */
 export function requireAssetNavigation(
-  reason: Exclude<AssetTransitionReason, "chunk">,
+  reason: Exclude<AssetTransitionReason, "chunk" | "manual">,
   target: string | null,
 ): void {
   assetTransition.update((current) => {
@@ -145,6 +151,33 @@ export function requestAssetReload(force = false): void {
     revision: nextRevision(),
     attempts: current?.attempts ?? 0,
   }));
+}
+
+/** Reload Window: the user asked for a fresh document. It rides the same
+ *  safety gate as every transition (unsaved edits and memory-only chat drafts
+ *  hold it; the layout comes back from the window's view-state). A pending
+ *  transition keeps its reason and target, so a build or connection move
+ *  still lands on the right origin. Asking again while a reload is already
+ *  requested mints nothing: a held key or a double press must never re-issue
+ *  a navigation in flight (every re-issue cancels the load underway). */
+export function requestWindowReload(): void {
+  assetTransition.update((current) => {
+    if (current?.requested) return current;
+    return {
+      reason: current?.reason ?? "manual",
+      target: current?.target ?? null,
+      requested: true,
+      forced: false,
+      revision: nextRevision(),
+      attempts: current?.attempts ?? 0,
+    };
+  });
+}
+
+/** Withdraw a Reload Window the user no longer wants (held by unsaved work,
+ *  or still retrying). Only the user's own reload: the others stand. */
+export function cancelWindowReload(): void {
+  assetTransition.update((current) => (current?.reason === "manual" ? null : current));
 }
 
 /** Retry schedule for an attempt that left the document alive: 10s, 20s,

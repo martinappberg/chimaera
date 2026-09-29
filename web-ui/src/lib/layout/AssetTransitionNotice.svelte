@@ -7,9 +7,11 @@
     blockedDrafts: number;
     onReload: (force: boolean) => void;
     onDismiss: () => void;
+    /** Withdraw the user's own Reload Window. */
+    onCancel: () => void;
   }
 
-  let { transition, blockedFiles, blockedDrafts, onReload, onDismiss }: Props = $props();
+  let { transition, blockedFiles, blockedDrafts, onReload, onDismiss, onCancel }: Props = $props();
 
   const blocked = $derived(blockedFiles > 0 || blockedDrafts > 0);
   /** Volatile state holds the navigation and the user has not overridden it. */
@@ -17,12 +19,17 @@
   /** An attempt was issued and the document is still here: the load failed
    *  (or is being retried); the window keeps trying on its own. */
   const retrying = $derived(!held && transition.requested && transition.attempts > 0);
+  const manual = $derived(transition.reason === "manual");
   const title = $derived(
     transition.reason === "build"
       ? "this window needs the current interface"
       : transition.reason === "connection"
         ? "the remote connection moved"
-        : "part of the interface did not load",
+        : manual
+          ? held
+            ? "the reload waits for unsaved work"
+            : "reloading this window"
+          : "part of the interface did not load",
   );
   const blockedMessage = $derived.by(() => {
     const drafts = blockedDrafts === 1 ? "chat draft" : "chat drafts";
@@ -37,8 +44,11 @@
   const body = $derived.by(() => {
     if (held) return blockedMessage;
     if (retrying) {
-      return "The new interface has not answered yet. The window keeps trying on its own.";
+      return manual
+        ? "The daemon has not answered yet. The window keeps trying on its own."
+        : "The new interface has not answered yet. The window keeps trying on its own.";
     }
+    if (manual) return "Its layout and open views come back as they were.";
     if (transition.reason === "chunk") {
       return "If the affected view offers Retry, try it first. If it still fails, reload this window to obtain the current interface.";
     }
@@ -66,6 +76,9 @@
     {/if}
     {#if transition.reason === "chunk" && !transition.requested}
       <button class="quiet" onclick={onDismiss}>dismiss</button>
+    {/if}
+    {#if manual && (held || retrying)}
+      <button class="quiet" onclick={onCancel}>cancel</button>
     {/if}
   </div>
 </div>
