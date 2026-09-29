@@ -659,6 +659,15 @@ async fn snapshot_inner_scoped(
             tokio::fs::rename(path, handoff.join(&archive)).await?;
             archives.push(SessionArchive {id,archive});
         }
+        // Automatic continuation requires this per-epoch eligibility on the
+        // account in both protocol versions: its offline wake and the worker's
+        // discovery read only these flags. Publish it while this epoch is
+        // still owned and before any snapshot bytes leave, so a refusal cannot
+        // strand a published checkpoint that nothing will ever continue.
+        if !config.recovery {
+            *phase = "update_policy";
+            publish_policy(config, &workspace.id, epoch, has_agents).await?;
+        }
         *phase = "capture_repository";
         let branch=transport::git_output(transport::git(&workspace.root,None).await?,&["symbolic-ref","-q","HEAD"],vec![]).await.ok().and_then(|bytes|String::from_utf8(bytes).ok()).map(|text|text.trim().to_string());
         let repository_origin=mirror::repository_origin(&workspace.root).await;
@@ -677,11 +686,6 @@ async fn snapshot_inner_scoped(
         mirror::push(&shadow, &grant, &["refs/heads/main", "refs/heads/config", "refs/heads/handoff"]).await?;
         *phase = "confirm_checkpoint";
         if config.execution.is_some(){execution::receipt::published(config,&workspace.id,epoch,[&tree_oid,&config_oid,&handoff_oid],continuation).await?;}
-        if config.execution.is_none() {
-            *phase = "update_policy";
-            let policy = account(config, &format!("/v1/baton/{}/policy", workspace.id), "PUT", Some(&json!({"holder_id":config.delegation.device_id,"epoch":epoch,"handoff_enabled":!config.hours_exhausted,"offline_takeover":!config.hours_exhausted,"has_agents":has_agents}))).await?;
-            ensure!((200..300).contains(&policy.status), "mirror policy update failed");
-        }
         lock(&state.pro.preferences).entry(workspace.id.clone()).or_default().profile = profile;
         lock(&state.pro.status).insert(workspace.id.clone(), WorkspaceStatus {report,last_mirrored_at:Some(super::now()),storage_limit_bytes:budget,error:None,blocked_providers:Vec::new()});
         *phase = "persist_snapshot";
@@ -719,6 +723,35 @@ async fn snapshot_inner_scoped(
         }
     }
     result
+}
+
+/// The account's policy route is the same `/v1` resource for both protocol
+/// versions; it checks the exact live holder and epoch itself.
+async fn publish_policy(
+    config: &Configure,
+    workspace: &str,
+    epoch: u64,
+    has_agents: bool,
+) -> Result<()> {
+    let continuation = !config.hours_exhausted;
+    let policy = account(
+        config,
+        &format!("/v1/baton/{workspace}/policy"),
+        "PUT",
+        Some(&json!({
+            "holder_id": config.delegation.device_id,
+            "epoch": epoch,
+            "handoff_enabled": continuation,
+            "offline_takeover": continuation,
+            "has_agents": has_agents,
+        })),
+    )
+    .await?;
+    ensure!(
+        (200..300).contains(&policy.status),
+        "mirror policy update failed"
+    );
+    Ok(())
 }
 
 pub(super) async fn fetch_snapshot(
@@ -1611,6 +1644,9 @@ async fn run_profile_steps(
     Ok(())
 }
 
+#[cfg(test)]
+#[path = "continuity_tests.rs"]
+pub(super) mod continuity_tests;
 #[cfg(test)]
 #[path = "provider_tests.rs"]
 mod provider_tests;

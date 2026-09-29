@@ -232,7 +232,8 @@ pub(super) fn account_request(
             .iter()
             .any(|action| path == format!("{baton}/{action}"))
             && method == "POST")
-        || (path == format!("{baton}/policy") && method == "PUT")
+        // Eligibility has one `/v1` resource in both protocol versions.
+        || (path == format!("/v1/baton/{}/policy", binding.workspace_id) && method == "PUT")
         || (path
             == if config.execution.is_some() {
                 "/v2/mirror/credentials"
