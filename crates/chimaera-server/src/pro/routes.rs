@@ -42,6 +42,10 @@ pub(super) fn error_code(error: &anyhow::Error) -> &'static str {
         .is_some()
     {
         "cloud_provider_not_ready"
+    } else if engine::upgrade_required(error) {
+        // The next pass retries through the newer path on its own, so it reads
+        // as the copy still being saved rather than a problem.
+        "checkpoint_pending"
     } else if has("Account changed") || has("account changed") {
         "account_changed"
     } else if has("previous managed processes") || has("previous execution is stopping") {

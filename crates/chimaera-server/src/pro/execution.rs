@@ -113,6 +113,28 @@ pub(super) fn any_uncertain(state: &AppState) -> bool {
     !lock(&state.pro.execution.uncertain).is_empty()
 }
 
+/// The account refused a legacy release of this project because it is
+/// enrolled, which this daemon had not seen (a lost record, or an enrollment
+/// that raced the read). Latch it so `managed`, and with it `effective`, route
+/// the project through the newer path from the next pass. In memory only: the
+/// state file and its latch are written once an authoritative read has
+/// restored the policy (`observe`), never a latch naming a project without
+/// one. Returns whether it was newly latched, so the one log line is not
+/// repeated.
+pub(super) fn require_v2(state: &AppState, workspace: &str) -> bool {
+    let mut latched = lock(&state.pro.execution.latched);
+    // The persisted latch holds at most 128 projects; more would make every
+    // state write fail.
+    if !super::valid_id(workspace) || latched.len() >= 128 || !latched.insert(workspace.to_owned())
+    {
+        return false;
+    }
+    tracing::info!(
+        "The account requires the newer transfer path for a project; using it from the next pass"
+    );
+    true
+}
+
 pub(super) fn managed(state: &AppState, workspace: &str) -> bool {
     let latched = lock(&state.pro.execution.latched).contains(workspace);
     uncertain(state, workspace)

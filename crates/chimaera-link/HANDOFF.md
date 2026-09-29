@@ -497,7 +497,7 @@ permanent refusals:
 | `installation_required` | A device acquiring without a bound installation | Bind the installation |
 | `not_preferred_home` | A device that is not the project's preferred installation | Leave it to its home/cloud |
 | `capability_not_supported` | The request's capability differs from the project's mode | Use the recorded mode |
-| `continuity_upgrade_required` | A legacy (v1) route on a v2-enrolled project, or v2 renew/release without a record | Use v2 |
+| `continuity_upgrade_required` | A legacy (v1) route on a v2-enrolled project, or v2 renew/release without a record | Use v2. A legacy release answered this way carries only `{"error":"continuity_upgrade_required"}` (no `baton`); the daemon recognises it before any conflict parse (`release.rs` `UpgradeRequired`), logs one line, latches the project as enrolled (`execution::require_v2`, in memory) so the next reconcile reads it over v2 and restores its policy, and never retries in the same call. The same refusal to a v2 request is a plain failure: no latch, no retry |
 | `recovery_in_progress` | An installation recovery owns the project | Wait for it |
 | `workspace_limit`, `installation_limit`, `installation_already_bound`, `stale_policy`, `publication_expired`, `checkpoint_mismatch` | Account limits and stale publication/policy state | Surface; no retry loop |
 | 403 `mirror_disabled` | The project is kept on its device (privacy) | Stop publishing |

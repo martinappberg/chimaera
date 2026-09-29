@@ -10,6 +10,9 @@ pub(super) fn category(error: &Error) -> &'static str {
             _ => "io",
         };
     }
+    if error.is::<super::release::UpgradeRequired>() {
+        return "service_rejected";
+    }
     match error.to_string().as_str() {
         "mirror Git operation failed" => "git",
         "workspace release failed" | "mirror policy update failed" => "service_rejected",

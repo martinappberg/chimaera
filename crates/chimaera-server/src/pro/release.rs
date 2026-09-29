@@ -1,5 +1,7 @@
 //! A successful mirror publication retains its account fence for ten seconds.
 //! Only that explicit conflict may delay release; other failures retain ownership.
+//! A legacy release the account refuses as `continuity_upgrade_required` is not
+//! retried here: it ends as `UpgradeRequired` and the caller latches the project.
 use super::{account, Baton, Configure};
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
@@ -12,6 +14,26 @@ struct Conflict {
     error: String,
     baton: Baton,
 }
+
+/// The account's refusal of a legacy release names only its `error` (no
+/// `baton`), so it is read on its own before a conflict is parsed.
+#[derive(Deserialize)]
+struct Refusal {
+    error: String,
+}
+
+/// The account refused a legacy (v1) release because the project is enrolled
+/// in managed execution: it must be released through v2. Typed so the caller
+/// can latch the project for the newer path (`execution::require_v2`); the
+/// conflict parse below would reject this body, which has no `baton`.
+#[derive(Debug)]
+pub(super) struct UpgradeRequired;
+impl std::fmt::Display for UpgradeRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The account needs this project's newer transfer path; trying again shortly")
+    }
+}
+impl std::error::Error for UpgradeRequired {}
 
 pub(super) async fn after_publication(
     config: &Configure,
@@ -48,6 +70,15 @@ pub(super) async fn after_publication(
                 );
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
+            }
+            if serde_json::from_slice::<Refusal>(&response.body)
+                .is_ok_and(|refusal| refusal.error == "continuity_upgrade_required")
+            {
+                // Only a legacy request can be answered by switching paths. The
+                // same refusal to a v2 request contradicts itself: fail without
+                // a latch or a retry so a confused account cannot loop this.
+                ensure!(config.execution.is_none(), "workspace release failed");
+                return Err(UpgradeRequired.into());
             }
             let conflict: Conflict = serde_json::from_slice(&response.body)
                 .context("invalid workspace release response")?;
@@ -131,6 +162,8 @@ mod tests {
         live: bool,
         current: AtomicBool,
         invalidate: bool,
+        /// Whether the request goes through the newer (v2) path.
+        v2: bool,
     }
     async fn release(
         State(f): State<Arc<Fixture>>,
@@ -138,13 +171,25 @@ mod tests {
         Json(body): Json<serde_json::Value>,
     ) -> (StatusCode, Json<serde_json::Value>) {
         assert_eq!(headers["authorization"], "Bearer fixture");
-        assert_eq!(body, json!({"holder_id":"device","epoch":4}));
+        let mut expected = json!({"holder_id":"device","epoch":4});
+        if f.v2 {
+            expected["execution_capability"] =
+                json!(crate::pro::execution::wire::ExecutionCapability::managed());
+        }
+        assert_eq!(body, expected);
         let call = f.calls.fetch_add(1, Ordering::SeqCst);
         if f.invalidate {
             f.current.store(false, Ordering::SeqCst);
         }
         if call >= 2 {
             return (StatusCode::OK, Json(json!({})));
+        }
+        // The account's refusal of a legacy release names only its `error`.
+        if f.error == "continuity_upgrade_required" {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error":"continuity_upgrade_required"})),
+            );
         }
         let now = "2026-09-28T00:00:00Z";
         (
@@ -157,6 +202,16 @@ mod tests {
         )
     }
     async fn run(error: &'static str, epoch: u64, live: bool, invalidate: bool) -> (bool, usize) {
+        let (result, calls) = release_with(error, epoch, live, invalidate, false).await;
+        (result.is_ok(), calls)
+    }
+    async fn release_with(
+        error: &'static str,
+        epoch: u64,
+        live: bool,
+        invalidate: bool,
+        v2: bool,
+    ) -> (Result<()>, usize) {
         let fixture = Arc::new(Fixture {
             calls: AtomicUsize::new(0),
             error,
@@ -164,16 +219,22 @@ mod tests {
             live,
             current: AtomicBool::new(true),
             invalidate,
+            v2,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let app = Router::new()
             .route("/v1/baton/w-fixture/release", post(release))
+            .route("/v2/baton/w-fixture/release", post(release))
             .with_state(fixture.clone());
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let config = Configure {
             recovery: false,
-            execution: None,
+            execution: v2.then(|| crate::pro::execution::wire::ExecutionConfiguration {
+                version: 1,
+                installation_id: Some("i-fixture".into()),
+                capability: crate::pro::execution::wire::ExecutionCapability::managed(),
+            }),
             account_id: None,
             role: Role::Device,
             endpoint,
@@ -192,7 +253,7 @@ mod tests {
         })
         .await;
         task.abort();
-        (result.is_ok(), fixture.calls.load(Ordering::SeqCst))
+        (result, fixture.calls.load(Ordering::SeqCst))
     }
     #[test]
     fn utc_timestamp_order_normalizes_fraction_and_rejects_other_offsets() {
@@ -223,6 +284,29 @@ mod tests {
             run("mirror_commit_in_progress", 4, false, false).await,
             (false, 1)
         );
+    }
+    /// An enrolled workspace released over the legacy path is answered with a
+    /// bare `{"error":"continuity_upgrade_required"}` (no `baton`), which the
+    /// conflict parse rejects. It ends at once as `UpgradeRequired`, for the
+    /// caller to latch the project, and is never repeated here.
+    #[tokio::test]
+    async fn a_legacy_release_the_account_wants_on_the_newer_path_ends_at_once() {
+        let (result, calls) =
+            release_with("continuity_upgrade_required", 4, true, false, false).await;
+        let error = result.unwrap_err();
+        assert!(error.is::<UpgradeRequired>(), "{error:#}");
+        assert_eq!(calls, 1, "never retried, so it can never loop");
+        assert_eq!(crate::pro::routes::error_code(&error), "checkpoint_pending");
+        assert_eq!(crate::pro::engine::failure_code(&error), "service_rejected");
+    }
+    #[tokio::test]
+    async fn the_same_refusal_from_the_newer_path_is_a_plain_failure() {
+        let (result, calls) =
+            release_with("continuity_upgrade_required", 4, true, false, true).await;
+        let error = result.unwrap_err();
+        assert!(!error.is::<UpgradeRequired>());
+        assert_eq!(error.to_string(), "workspace release failed");
+        assert_eq!(calls, 1);
     }
     #[tokio::test]
     async fn account_change_during_publication_wait_prevents_another_request() {
