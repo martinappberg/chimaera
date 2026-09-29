@@ -285,16 +285,48 @@ Implementation: [`pro/`](../../crates/chimaera-server/src/pro/AGENTS.md),
 
 A transferred session keeps its public ID, pinned title, linked terminals and
 workspace tabs. The local workbench merges remote session rows under those IDs
-and forwards their chat and terminal connections through the signed-in app.
-An unavailable host stays visibly unavailable; opening its session cannot
-silently start another local agent. Chat offers an explicit **Reconnect and
-wake** action when the host is asleep or unreachable.
+and forwards their chat and terminal connections through the signed-in app. A
+routed session is labelled "In the cloud" or "On another computer" ("·
+reconnecting" while its owner cannot be reached); opening it never silently
+starts another local agent.
 
-The terminal toolbar supports **Just watching**. Phones start there with the
-sidebar collapsed: the existing server grid stays at its original size, readable
-with horizontal scrolling, and the viewer cannot type or resize it. **Take
-control** explicitly reconnects and fits the terminal to the current pane.
-Passive roster polls, reconnects and watchers carry no cloud wake intent.
+**Opening is viewing; doing wakes.** Attaching to a chat or terminal, polling
+rosters and watching files never wake a paused cloud project. The first real
+input does: a keystroke, a chat message or a permission answer. On a computer,
+the daemon keeps the chat/terminal connection open while the owner is paused or
+reconnecting, holds that first input (a little typing, up to four chat
+commands) and delivers it exactly once after the owner answers; anything it
+cannot deliver is answered, never dropped — a chat message comes back into the
+composer with a short notice, and refused typing is said in a small note over
+the terminal. A browser view reconnects once with wake intent when the user
+types or sends into a dropped connection; the action itself is not queued
+(the composer keeps its text). There is no reconnect or wake button: the chat
+says "Reconnecting…" (only for a viewed project, after a short grace) or "Send a
+message to pick this conversation back up." while the project is paused.
+
+**Moving between devices is not an exit.** When a conversation moves between
+this computer and the cloud, every open view is told it *moved*: the chat stays
+mounted with its transcript and scroll position, says "Continuing in the cloud…"
+or "Continuing on your computer…" (composer disabled for that reason), and
+reconnects to wherever it runs next. A paused terminal reads "This terminal
+stays on your computer" (plain shells) or "Opening this conversation…" (agents).
+
+**A window's own daemon stays in charge of the window.** For a project running
+elsewhere, the window's event stream merges only that project's sessions, file
+changes, Git and Timeline updates from the owner; the owner's settings, recents,
+notices and update status never replace this computer's. An owner change never
+closes the window's connection. Files outside the project (your home folder, a
+download) are read and saved on this computer even while the project's own
+paths go to its owner; a conversation's pasted images and links to the owner's
+files are read from the owner.
+
+The terminal toolbar (shown only for a viewed project) supports **Just
+watching**. A phone-width browser view starts there with the sidebar collapsed
+(that collapse is never saved into the shared layout): the existing server grid
+stays at its original size, readable with horizontal scrolling, and the viewer
+cannot type or resize it. **Take control** reconnects and fits the terminal to
+the current pane; taking control is not itself interaction, typing is. Native
+windows of any width keep full control, and free users never see this toolbar.
 
 ## Constraints and edge cases
 
