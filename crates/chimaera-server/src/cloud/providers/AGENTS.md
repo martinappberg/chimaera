@@ -36,7 +36,9 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
   requires a fresh official signed-out result, not a timeout or invalid-token row.
 - `POST /connections/{id}/input {code}` accepts a single-use, nonempty authorization
   code (maximum 4096 bytes, no whitespace/control characters) only while that
-  exact attempt is waiting for `authorization_code`. Code bodies are never logged,
+  exact attempt is waiting for `authorization_code`. A Claude code must be the
+  whole `code#state` pair its page shows; half of one returns `409
+  authorization_code_incomplete` and the attempt stays waiting. Code bodies are never logged,
   persisted, returned, or added to a command line. Native submission remains bound
   to its account generation through the request.
 - An action is `{type:"browser",url,input:"authorization_code"}`,

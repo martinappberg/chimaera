@@ -109,6 +109,12 @@ impl Attempt {
             return Err("invalid_authorization_code");
         }
         let mut value = crate::lock(&self.value);
+        // Claude's page shows `code#state`; its CLI splits on `#` and, given
+        // only one half, prints an error nobody sees and keeps waiting. Refuse
+        // it here while the attempt is still waiting for the whole code.
+        if value.provider_id == "claude" && !claude::complete_code(&code) {
+            return Err("authorization_code_incomplete");
+        }
         if value.phase != Phase::Waiting
             || value.expires_at <= now()
             || !matches!(

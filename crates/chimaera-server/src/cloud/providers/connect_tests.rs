@@ -131,6 +131,14 @@ IFS= read -r code
         assert_eq!(attempt.snapshot().phase, Phase::Waiting);
     }
     assert!(attempt.submit("a".repeat(4097)).is_err());
+    // Half a pasted code keeps the attempt waiting for the whole one.
+    for partial in ["one-time-fixture", "one-time-fixture#", "#state"] {
+        assert_eq!(
+            attempt.submit(partial.into()),
+            Err("authorization_code_incomplete")
+        );
+        assert_eq!(attempt.snapshot().phase, Phase::Waiting);
+    }
     attempt.submit("one-time-fixture#state".into()).unwrap();
     assert_eq!(attempt.snapshot().phase, Phase::Verifying);
     assert!(attempt.submit("one-time-fixture#state".into()).is_err());
