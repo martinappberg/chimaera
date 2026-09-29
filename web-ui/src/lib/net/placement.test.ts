@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parsePlacement } from "./placement";
+import { parsePause, parsePlacement, pauseLabel, sessionPause } from "./placement";
 const live = { workspace_id: "w-one", holder_id: "d-home", route_host_id: "device-d-home", epoch: 4, policy_revision: 1, availability: "owned", server_now: "2026-09-28T19:00:00Z", expires_at: "2026-09-28T19:01:30Z" };
 describe("workspace routing authority", () => {
   it("accepts exact current owner without choosing a home or worker", () => {
@@ -67,5 +67,26 @@ describe("passive placement transport", () => {
     sendSocketAuth(socket as unknown as WebSocket,{type:"auth"},()=>true);
     await expect(readPlacement()).rejects.toThrow();
     expect(fetch).toHaveBeenCalledOnce(); expect(socket.send).not.toHaveBeenCalled(); expect(socket.close).toHaveBeenCalledWith(4000,"Project connection changed");
+  });
+});
+
+describe("paused sessions", () => {
+  it("reads the moved and paused frames and the row field alike", () => {
+    expect(parsePause({ type: "moved", to: "computer" })).toEqual({ type: "moved", to: "computer" });
+    expect(parsePause({ type: "moved" })).toEqual({ type: "moved", to: "cloud" });
+    expect(parsePause({ type: "paused", reason: "restarting" })).toEqual({ type: "paused", reason: "restarting", provider: null });
+    expect(sessionPause({ id: "s", pause: { type: "paused", reason: "needs_provider", provider: "codex" } }))
+      .toEqual({ type: "paused", reason: "needs_provider", provider: "codex" });
+    for (const value of [null, "moved", { type: "exited" }, { type: "paused" }]) expect(parsePause(value)).toBeNull();
+    expect(sessionPause({ id: "s" })).toBeNull();
+  });
+  it("gives every reason its own status and only a sign-in something to do", () => {
+    const reasons = ["restarting", "needs_provider", "importing", "stays_on_computer"].map((reason) =>
+      pauseLabel({ type: "paused", reason, provider: "claude" }));
+    const moves = (["cloud", "computer"] as const).map((to) => pauseLabel({ type: "moved", to }));
+    const statuses = [...reasons, ...moves].map((label) => label.status);
+    expect(new Set(statuses).size).toBe(statuses.length);
+    expect(reasons[1].detail).not.toBeNull();
+    expect(reasons[0].detail).toBeNull();
   });
 });

@@ -292,6 +292,11 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
             let label = crate::pro::paused_label(state, entry);
             let mut row = crate::bundle::paused_row(entry, label);
             row["keep_running"] = json!(crate::pro::keep_running(state, &entry.id));
+            // Additive: why it is paused, the same shape its socket says it
+            // in, so a pane that shows no socket (a paused terminal) can too.
+            if let Some(pause) = crate::ws::pause_for(state, &entry.id, Some(entry)) {
+                row["pause"] = pause.frame();
+            }
             rows.push((entry.created_at, row));
         }
     }

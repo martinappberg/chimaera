@@ -31,6 +31,54 @@ export function placementLabel(placement: unknown, available: boolean | undefine
   return available === false ? `${where} · reconnecting` : where;
 }
 
+/**
+ * Why a session has no process where it is shown, as its socket (`moved` /
+ * `paused` frames) and its paused row (`pause`, additive) both say it. Not an
+ * exit: `moved` continues on another machine; `paused` resumes on its own.
+ */
+export type SessionPause =
+  | { type: "moved"; to: "cloud" | "computer" }
+  | { type: "paused"; reason: string; provider: string | null };
+
+/** Parse a `moved`/`paused` frame or a row's `pause` field; null otherwise. */
+export function parsePause(value: unknown): SessionPause | null {
+  if (typeof value !== "object" || value === null) return null;
+  const frame = value as Record<string, unknown>;
+  if (frame.type === "moved") return { type: "moved", to: frame.to === "computer" ? "computer" : "cloud" };
+  if (frame.type === "paused" && typeof frame.reason === "string") {
+    return { type: "paused", reason: frame.reason, provider: typeof frame.provider === "string" ? frame.provider : null };
+  }
+  return null;
+}
+
+/** A paused session row's reason (the daemon's additive `pause` field). */
+export function sessionPause(row: unknown): SessionPause | null {
+  return typeof row === "object" && row !== null ? parsePause((row as { pause?: unknown }).pause) : null;
+}
+
+const PROVIDER_NAMES: Record<string, string> = { claude: "Claude", codex: "Codex", gemini: "Gemini" };
+
+/** A paused session, in plain words: a one-line status and, when the person
+ *  can do something about it, what. */
+export function pauseLabel(pause: SessionPause | null): { status: string; detail: string | null } {
+  if (pause === null) return { status: "Opening…", detail: null };
+  if (pause.type === "moved") {
+    return { status: pause.to === "computer" ? "Continuing on your computer…" : "Continuing in the cloud…", detail: null };
+  }
+  switch (pause.reason) {
+    case "restarting":
+      return { status: "Reconnecting after an update…", detail: null };
+    case "needs_provider": {
+      const name = pause.provider === null ? "the agent" : (PROVIDER_NAMES[pause.provider] ?? pause.provider);
+      return { status: `Waiting for ${name} on the cloud machine`, detail: `Sign in to ${name} there from Chimaera Pro, and this continues.` };
+    }
+    case "stays_on_computer":
+      return { status: "This terminal stays on your computer", detail: "It opens again when the project is back on your computer." };
+    default:
+      return { status: "Opening…", detail: null };
+  }
+}
+
 export class PlacementError extends Error {
   constructor(readonly status: number) { super("Your project is reconnecting. This action was not sent."); }
 }

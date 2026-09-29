@@ -90,6 +90,12 @@ struct Ticket {
 /// What a captured connection or ticket proves about its project's route:
 /// the host transport and that one project's registration.
 type Stamp = (u64, u64);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteChange {
+    Current,
+    Transport,
+    Owner,
+}
 #[derive(Clone)]
 struct Route {
     host_id: String,
@@ -253,6 +259,25 @@ impl Store {
     }
     fn current(&self, route: &Route, workspace: &str) -> bool {
         crate::lock(&self.inner).is_current(route, workspace)
+    }
+    /// Why a captured route stopped being current: only its host's transport
+    /// changed (a tunnel rebind or a new credential: the same owner, reached
+    /// afresh), or the project itself changed owner or left this registry.
+    fn change(&self, route: &Route, workspace: &str) -> RouteChange {
+        let data = crate::lock(&self.inner);
+        if data.is_current(route, workspace) {
+            return RouteChange::Current;
+        }
+        let same_owner = data.routes.get(&route.host_id).is_some_and(|live| {
+            live.address.is_some()
+                && live.workspaces.get(workspace) == route.workspaces.get(workspace)
+                && live.generations.get(workspace) == route.generations.get(workspace)
+        });
+        if same_owner {
+            RouteChange::Transport
+        } else {
+            RouteChange::Owner
+        }
     }
     /// A recent probe already proved this exact project registration speaks
     /// scope: skip the extra round trip for the next request or poll.
@@ -1366,10 +1391,20 @@ enum Opened {
     Sleeping,
 }
 impl Link<'_> {
-    fn current(&self) -> bool {
-        self.state
+    /// `None` while this socket's route is current. Once it is not: a
+    /// transport-only change (tunnel rebind, new credential) ends the socket
+    /// quietly so the viewer reconnects to the same owner, and a real owner
+    /// change also says where the session continues.
+    fn ended(&self) -> Option<Option<Value>> {
+        match self
+            .state
             .session_proxy
-            .current(&self.route, &self.workspace)
+            .change(&self.route, &self.workspace)
+        {
+            RouteChange::Current => None,
+            RouteChange::Transport => Some(None),
+            RouteChange::Owner => Some(Some(self.moved())),
+        }
     }
     async fn open(&self, wake: bool) -> Result<Opened> {
         let reach = verify_scope(&self.state.session_proxy, &self.route, &self.workspace).await?;
@@ -1575,10 +1610,12 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                 attempt = Some(Box::pin(link.open(wake)));
             }
             _ = ownership.tick() => {
-                if !link.current() {
+                if let Some(moved) = link.ended() {
                     let count = held.take().len();
                     let _ = link.refuse(downstream, count).await;
-                    let _ = bounded_send(downstream, Down::Text(link.moved().to_string().into())).await;
+                    if let Some(moved) = moved {
+                        let _ = bounded_send(downstream, Down::Text(moved.to_string().into())).await;
+                    }
                     return;
                 }
             }
@@ -1622,9 +1659,11 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                     let input = link.chat || matches!(frame, Down::Binary(_));
                     match upstream.as_mut() {
                         Some(socket) if ready => {
-                            if !link.current() {
+                            if let Some(moved) = link.ended() {
                                 let _ = link.refuse(downstream, usize::from(input)).await;
-                                let _ = bounded_send(downstream, Down::Text(link.moved().to_string().into())).await;
+                                if let Some(moved) = moved {
+                                    let _ = bounded_send(downstream, Down::Text(moved.to_string().into())).await;
+                                }
                                 return;
                             }
                             let Some(frame) = upward(frame) else { continue };
@@ -2175,6 +2214,54 @@ mod tests {
         assert!(!store.current(&store.for_workspace("w-b").unwrap(), "w-z"));
     }
 
+    #[test]
+    fn a_tunnel_rebind_is_not_a_move_but_a_new_owner_is() {
+        let store = Store::default();
+        let registration = |host: &str, epoch: u64, endpoint: &str, token: &str| Registration {
+            host_id: host.into(),
+            endpoint: endpoint.into(),
+            token: token.into(),
+            workspace_id: "w-rebind".into(),
+            epoch,
+        };
+        store
+            .register(
+                registration("worker-a", 4, "http://127.0.0.1:1234", "one"),
+                "/p".into(),
+            )
+            .unwrap();
+        let captured = store.for_workspace("w-rebind").unwrap();
+        assert_eq!(store.change(&captured, "w-rebind"), RouteChange::Current);
+        // Same owner and epoch, reached through a new tunnel and credential.
+        store
+            .register(
+                registration("worker-a", 4, "http://127.0.0.1:4321", "two"),
+                "/p".into(),
+            )
+            .unwrap();
+        assert_eq!(store.change(&captured, "w-rebind"), RouteChange::Transport);
+        // A new epoch on the same host is a real change of owner.
+        let rebound = store.for_workspace("w-rebind").unwrap();
+        store
+            .register(
+                registration("worker-a", 5, "http://127.0.0.1:4321", "two"),
+                "/p".into(),
+            )
+            .unwrap();
+        assert_eq!(store.change(&rebound, "w-rebind"), RouteChange::Owner);
+        // So is another host, and so is the route leaving this registry.
+        let latest = store.for_workspace("w-rebind").unwrap();
+        store
+            .register(
+                registration("device-b", 6, "http://127.0.0.1:4321", "two"),
+                "/p".into(),
+            )
+            .unwrap();
+        assert_eq!(store.change(&latest, "w-rebind"), RouteChange::Owner);
+        let device = store.for_workspace("w-rebind").unwrap();
+        store.clear_workspace("w-rebind");
+        assert_eq!(store.change(&device, "w-rebind"), RouteChange::Owner);
+    }
     #[test]
     fn a_project_moving_between_hosts_rehomes_its_rows_at_once() {
         let store = Store::default();

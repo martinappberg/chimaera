@@ -253,20 +253,173 @@ async fn chat_command(
     .await?
 }
 
-/// A session paused for a transfer (or held while its project runs
-/// elsewhere) continues on another machine: it did not exit. The additive
-/// `moved` frame tells the viewer to keep the conversation mounted and follow
-/// it; older clients ignore the frame and simply reconnect. Only Pro transfer
-/// and ownership paths ever populate either registry.
-fn moved_frame(state: &AppState, id: &str) -> Option<serde_json::Value> {
-    let transferring = crate::lock(&state.chat_switching)
-        .get(id)
-        .map(String::as_str)
-        == Some("transfer");
-    let paused = transferring || crate::lock(&state.deferred_sessions).contains_key(id);
-    paused.then(|| {
-        json!({"type":"moved","to": if crate::pro::is_worker(state) { "computer" } else { "cloud" }})
+/// Why a session with no process here is not an exit. `Moved`: it continues on
+/// another machine (`to` is where it is going, in the viewer's words).
+/// `Paused`: it stays here and resumes on its own — after this daemon restarts
+/// (`restarting`), once its agent is signed in on this cloud machine
+/// (`needs_provider`), while its transfer finishes opening it (`importing`), or
+/// never here at all (`stays_on_computer`: a plain terminal that moved with its
+/// project waits for the computer). Both frames are additive; older clients
+/// ignore them and reconnect. Only Pro transfer and ownership paths ever
+/// populate the registries this reads, so free users never see either.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Pause {
+    Moved(&'static str),
+    Paused {
+        reason: &'static str,
+        provider: Option<String>,
+    },
+}
+impl Pause {
+    pub(crate) fn frame(&self) -> serde_json::Value {
+        match self {
+            Pause::Moved(to) => json!({"type":"moved","to":to}),
+            Pause::Paused { reason, provider } => {
+                let mut frame = json!({"type":"paused","reason":reason});
+                if let Some(provider) = provider {
+                    frame["provider"] = json!(provider);
+                }
+                frame
+            }
+        }
+    }
+}
+
+/// What [`classify_pause`] decides from, gathered from daemon state.
+#[derive(Clone, Debug, Default)]
+struct PauseFacts {
+    /// This daemon is a cloud machine (its sessions move to "your computer").
+    worker: bool,
+    /// A transfer holds this session's lifecycle right now: the source is
+    /// exporting it, or the destination is opening it.
+    transfer: bool,
+    /// The session's process is known to this daemon life.
+    known: bool,
+    entry: Option<EntryFacts>,
+}
+#[derive(Clone, Debug, Default)]
+struct EntryFacts {
+    /// Imported here by a transfer and not started yet.
+    arrived: bool,
+    /// A plain terminal that moved with its project; it only runs on a computer.
+    moved_shell: bool,
+    /// The agent CLI this session runs, when it is an agent.
+    provider: Option<String>,
+    /// That agent is not ready on this cloud machine.
+    blocked: bool,
+    /// This machine may run the project right now.
+    writable: bool,
+}
+
+/// Decide what a viewer of a stopped session is told. Deliberately pure so
+/// every transfer phase is covered by unit tests without Pro fixtures.
+///
+/// A session that stopped HERE (no import) moved away only while a transfer
+/// exports it or when this machine may no longer run its project; one this
+/// machine still owns is waiting out a restart check. A cloud machine cannot
+/// tell "restart awaiting verification" from "returned to the computer" by
+/// ownership alone (both refuse writes): a session that ran in this daemon
+/// life was stopped by a hand-back, one that did not is restart-deferred.
+/// [`ProState`](crate::pro) exposing the ownership phase would settle both
+/// without that inference.
+fn classify_pause(facts: &PauseFacts, ran_here: impl FnOnce() -> bool) -> Option<Pause> {
+    let away = if facts.worker { "computer" } else { "cloud" };
+    let Some(entry) = &facts.entry else {
+        // Opening a transfer before its entry is recorded: say so rather than
+        // "unknown session", which a client gives up on after a few retries.
+        return (facts.transfer && !facts.known).then_some(Pause::Paused {
+            reason: "importing",
+            provider: None,
+        });
+    };
+    if entry.arrived {
+        return Some(if facts.worker && entry.moved_shell {
+            Pause::Paused {
+                reason: "stays_on_computer",
+                provider: None,
+            }
+        } else if facts.worker && entry.blocked {
+            Pause::Paused {
+                reason: "needs_provider",
+                provider: entry.provider.clone(),
+            }
+        } else if !facts.worker {
+            // Work coming back to this computer.
+            Pause::Moved("computer")
+        } else {
+            Pause::Paused {
+                reason: "importing",
+                provider: None,
+            }
+        });
+    }
+    if facts.transfer {
+        return Some(Pause::Moved(away));
+    }
+    if entry.writable || (facts.worker && !ran_here()) {
+        return Some(Pause::Paused {
+            reason: "restarting",
+            provider: None,
+        });
+    }
+    Some(Pause::Moved(away))
+}
+
+fn entry_facts(state: &AppState, entry: &crate::ledger::LedgerEntry) -> EntryFacts {
+    let provider = entry
+        .agent
+        .as_ref()
+        .map(|agent| agent.kind.as_str().to_owned());
+    let blocked = provider.as_deref().is_some_and(|provider| {
+        crate::pro::workspace_provider_blocks(state, &entry.workspace_id)
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(|block| block["id"] == provider))
+    });
+    EntryFacts {
+        arrived: entry.handoff.is_some(),
+        moved_shell: entry.agent.is_none()
+            && entry
+                .handoff
+                .as_ref()
+                .is_some_and(|handoff| handoff.origin == crate::bundle::Origin::Moved),
+        provider,
+        blocked,
+        writable: crate::pro::may_write(state, &entry.workspace_id),
+    }
+}
+
+/// The pause state of session `id`, if it has no process here for a reason
+/// that is not an exit.
+pub(crate) fn pause_state(state: &AppState, id: &str) -> Option<Pause> {
+    let entry = crate::lock(&state.deferred_sessions).get(id).cloned();
+    pause_for(state, id, entry.as_ref())
+}
+
+/// [`pause_state`] for a deferred entry the caller already holds (a paused
+/// session row).
+pub(crate) fn pause_for(
+    state: &AppState,
+    id: &str,
+    entry: Option<&crate::ledger::LedgerEntry>,
+) -> Option<Pause> {
+    let facts = PauseFacts {
+        worker: crate::pro::is_worker(state),
+        transfer: crate::lock(&state.chat_switching)
+            .get(id)
+            .map(String::as_str)
+            == Some("transfer"),
+        known: state.chat.get(id).is_some() || state.sessions.get(id).is_some(),
+        entry: entry.map(|entry| entry_facts(state, entry)),
+    };
+    classify_pause(&facts, || {
+        state.chat.get(id).is_some()
+            || state.sessions.get(id).is_some()
+            || state.sessions.last_words(id).is_some()
     })
+}
+
+fn pause_frame(state: &AppState, id: &str) -> Option<serde_json::Value> {
+    pause_state(state, id).map(|pause| pause.frame())
 }
 
 /// Input this socket may not deliver. The additive `reason` lets a client say
@@ -361,8 +514,8 @@ async fn handle(
     let mut attachment = match attach_res {
         // A stopped process still registered for a moment after a transfer
         // stop is not an exit to replay: the viewer follows the session.
-        Ok(attachment) if !attachment.info.alive && moved_frame(&state, &id).is_some() => {
-            if let Some(frame) = moved_frame(&state, &id) {
+        Ok(attachment) if !attachment.info.alive && pause_frame(&state, &id).is_some() => {
+            if let Some(frame) = pause_frame(&state, &id) {
                 let _ = send_json(&mut socket, &frame).await;
             }
             return;
@@ -371,7 +524,7 @@ async fn handle(
         Err(err) => {
             // Paused for a transfer: not an exit, and its last screen is not
             // its last words. The viewer follows it to its new owner.
-            if let Some(frame) = moved_frame(&state, &id) {
+            if let Some(frame) = pause_frame(&state, &id) {
                 let _ = send_json(&mut socket, &frame).await;
                 return;
             }
@@ -602,7 +755,7 @@ async fn handle(
                             scope_changed(&mut socket).await;
                             return;
                         }
-                        if let Some(frame) = moved_frame(&state, &id) {
+                        if let Some(frame) = pause_frame(&state, &id) {
                             let _ = send_ordered_json(&mut socket, &mut batch, &frame).await;
                             return;
                         }
@@ -672,7 +825,7 @@ async fn handle(
                             }
                             // Session is gone; flush the batched tail (its
                             // last words), tell the client, and hang up.
-                            let gone = moved_frame(&state, &id)
+                            let gone = pause_frame(&state, &id)
                                 .unwrap_or_else(|| json!({"type": "exited", "status": null}));
                             let _ = send_ordered_json(&mut socket, &mut batch, &gone).await;
                             return;
@@ -947,7 +1100,7 @@ async fn handle_chat(
     // A conversation paused for a transfer continues elsewhere: never greet
     // the viewer with its stopped driver (`alive:false` reads as "exited").
     if !state.chat.get(&id).is_some_and(|chat| chat.alive) {
-        if let Some(frame) = moved_frame(&state, &id) {
+        if let Some(frame) = pause_frame(&state, &id) {
             let _ = send_json(&mut socket, &frame).await;
             return;
         }
@@ -1054,7 +1207,7 @@ async fn handle_chat(
                         return;
                     }
                     let switching = crate::lock(&state.chat_switching).get(&id).cloned();
-                    let frame = moved_frame(&state, &id).unwrap_or_else(|| match switching.as_deref() {
+                    let frame = pause_frame(&state, &id).unwrap_or_else(|| match switching.as_deref() {
                         Some("term") => json!({"type": "degraded"}),
                         Some(_) => json!({"type": "error", "code": "unknown_session",
                                           "message": "session switching"}),
@@ -1960,6 +2113,122 @@ mod tests {
                 text: text.to_string(),
             },
         })
+    }
+
+    fn paused(reason: &'static str) -> Option<Pause> {
+        Some(Pause::Paused {
+            reason,
+            provider: None,
+        })
+    }
+
+    #[test]
+    fn only_a_real_transfer_says_moved_and_it_names_where_the_session_goes() {
+        let stopped = |worker, writable| PauseFacts {
+            worker,
+            entry: Some(EntryFacts {
+                writable,
+                provider: Some("claude".into()),
+                ..EntryFacts::default()
+            }),
+            ..PauseFacts::default()
+        };
+        // Exporting for a transfer: away from this machine.
+        let exporting = |worker| PauseFacts {
+            transfer: true,
+            ..stopped(worker, true)
+        };
+        assert_eq!(
+            classify_pause(&exporting(false), || true),
+            Some(Pause::Moved("cloud"))
+        );
+        assert_eq!(
+            classify_pause(&exporting(true), || true),
+            Some(Pause::Moved("computer"))
+        );
+        // Stopped because another machine now runs the project.
+        assert_eq!(
+            classify_pause(&stopped(false, false), || true),
+            Some(Pause::Moved("cloud"))
+        );
+        assert_eq!(
+            classify_pause(&stopped(true, false), || true),
+            Some(Pause::Moved("computer"))
+        );
+        // Waiting out a restart on the machine that owns the project: after
+        // every Pro update, a computer's own chats are not "in the cloud".
+        assert_eq!(
+            classify_pause(&stopped(false, true), || false),
+            paused("restarting")
+        );
+        // A cloud machine that restarted refuses writes until verified, yet
+        // its sessions did not go anywhere.
+        assert_eq!(
+            classify_pause(&stopped(true, false), || false),
+            paused("restarting")
+        );
+        // No entry and no transfer: an ordinary session, nothing to say.
+        assert_eq!(classify_pause(&PauseFacts::default(), || true), None);
+        // A transfer opening a session before its entry exists.
+        let opening = PauseFacts {
+            transfer: true,
+            ..PauseFacts::default()
+        };
+        assert_eq!(classify_pause(&opening, || false), paused("importing"));
+        let snapshot_of_a_live_session = PauseFacts {
+            known: true,
+            ..opening
+        };
+        assert_eq!(classify_pause(&snapshot_of_a_live_session, || true), None);
+    }
+
+    #[test]
+    fn work_arriving_is_opening_or_waiting_never_moving_away() {
+        let arrived = |worker, blocked, moved_shell| PauseFacts {
+            worker,
+            transfer: true,
+            entry: Some(EntryFacts {
+                arrived: true,
+                blocked,
+                moved_shell,
+                provider: (!moved_shell).then(|| "codex".to_owned()),
+                ..EntryFacts::default()
+            }),
+            ..PauseFacts::default()
+        };
+        assert_eq!(
+            classify_pause(&arrived(true, false, false), || true),
+            paused("importing")
+        );
+        assert_eq!(
+            classify_pause(&arrived(true, true, false), || true),
+            Some(Pause::Paused {
+                reason: "needs_provider",
+                provider: Some("codex".into())
+            })
+        );
+        assert_eq!(
+            classify_pause(&arrived(true, false, true), || true),
+            paused("stays_on_computer")
+        );
+        // A computer receiving its work back.
+        assert_eq!(
+            classify_pause(&arrived(false, false, false), || true),
+            Some(Pause::Moved("computer"))
+        );
+        let frame = Pause::Paused {
+            reason: "needs_provider",
+            provider: Some("claude".into()),
+        }
+        .frame();
+        assert_eq!(
+            frame,
+            json!({"type":"paused","reason":"needs_provider","provider":"claude"})
+        );
+        assert_eq!(
+            Pause::Moved("cloud").frame(),
+            json!({"type":"moved","to":"cloud"})
+        );
     }
 
     #[test]

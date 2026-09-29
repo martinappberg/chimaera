@@ -16,7 +16,7 @@
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { insertIntoComposer, registerFollow } from "./composerBus";
   import { isBrowserGateway } from "../net/base";
-  import { placementLabel } from "../net/placement";
+  import { pauseLabel, placementLabel, sessionPause } from "../net/placement";
   import {
     acquireChat,
     releaseChat,
@@ -1767,17 +1767,36 @@
   const RECONNECTING_GRACE_MS = 2000;
   /** "In the cloud" / "On another computer" for a routed conversation. */
   const runsElsewhere = $derived(placementLabel(session.placement, session.placement_available));
-  /** The conversation is moving between this computer and the cloud: its
-   *  row is paused here, or its socket said it moved and it has not been
-   *  reached where it runs now. Not an exit — the transcript stays mounted. */
-  const continuing = $derived(session.suspended === true || (store.moving !== null && !store.connected));
-  const continuingLabel = $derived(
-    store.moving === "computer"
-      ? "Continuing on your computer…"
-      : store.moving === "cloud"
-        ? "Continuing in the cloud…"
-        : "Opening this conversation…",
+  /** The conversation has no process where it is shown, and that is not an
+   *  exit: its row is paused, or its socket said it moved or is paused and it
+   *  has not been reached since. The transcript stays mounted. */
+  const rowPause = $derived(sessionPause(session));
+  const continuing = $derived(
+    session.suspended === true || ((store.moving !== null || store.pausedFor !== null) && !store.connected),
   );
+  const continuingLabel = $derived(
+    pauseLabel(
+      store.moving !== null && !store.connected
+        ? { type: "moved", to: store.moving }
+        : store.pausedFor !== null && !store.connected
+          ? store.pausedFor
+          : rowPause,
+    ).status,
+  );
+  /** A paused row coming back (or the project changing where it runs) means
+   *  the conversation is reachable now: reconnect at once instead of sitting
+   *  out a backoff that grew while it was paused. */
+  const reachKey = $derived(
+    `${session.suspended === true}|${rowPause?.type ?? ""}|${typeof session.placement === "object" ? session.placement.remote : "here"}`,
+  );
+  let lastReachKey: string | null = null;
+  $effect(() => {
+    const key = reachKey;
+    if (lastReachKey !== null && lastReachKey !== key && !untrack(() => store.connected)) {
+      socket.retrySoon();
+    }
+    lastReachKey = key;
+  });
   /** A project viewed from another device (a routed row, or a browser view of
    *  a project). An ordinary local chat never grows connection chrome. */
   const viewed = $derived(typeof session.placement === "object" || isBrowserGateway());

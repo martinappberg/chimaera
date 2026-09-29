@@ -73,6 +73,7 @@ function makeSocket(sessionId: string, store: ChatStore): ChatSocket {
     onCommandFailed: (message: string) => store.onCommandFailed(message),
     onAsleep: () => store.onAsleep(),
     onMoved: (to: "cloud" | "computer") => store.onMoved(to),
+    onPaused: (pause) => store.onPaused(pause),
     onDisconnected: () => store.onDisconnected(),
     lastSeq: () => store.lastSeq,
   });

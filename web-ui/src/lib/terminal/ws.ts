@@ -220,8 +220,10 @@ export class SessionSocket {
         this.handlers.onExited(msg.status ?? null);
         break;
       case "moved":
-        // Continuing on another machine: not an exit. Keep the screen; the
-        // daemon closes this socket and the ordinary reconnect follows it.
+      case "paused":
+        // Continuing on another machine, or resuming here on its own: not an
+        // exit. Keep the screen; the daemon closes this socket and the
+        // ordinary reconnect follows it (the pane says why from the row).
         break;
       case "error":
         if (msg.code === "read_only") {

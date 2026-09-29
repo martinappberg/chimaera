@@ -1862,6 +1862,31 @@ describe("ChatStore unsent text", () => {
     expect(store.moving).toBeNull();
   });
 
+  it("a conversation paused here is neither moving nor exited, and clears on ready", () => {
+    const store = new ChatStore();
+    store.onMoved("cloud");
+    store.onPaused({ type: "paused", reason: "restarting", provider: null });
+    expect(store.pausedFor).toEqual({ type: "paused", reason: "restarting", provider: null });
+    expect(store.moving).toBeNull();
+    expect(store.exited).toBeNull();
+    expect(store.connected).toBe(false);
+    store.onReady(
+      {
+        id: "s",
+        agent: "claude",
+        alive: true,
+        exit_status: null,
+        native_session_id: null,
+        model: null,
+        current_mode: null,
+        pending_permission: false,
+      },
+      0,
+      0,
+    );
+    expect(store.pausedFor).toBeNull();
+  });
+
   it("a paused owner is a state, cleared when the conversation is live again", () => {
     const store = new ChatStore();
     store.onAsleep();

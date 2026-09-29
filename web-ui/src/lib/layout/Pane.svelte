@@ -7,7 +7,7 @@
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { registerPane, unregisterPane, zoneWord } from "./dnd";
   import { dirLabel } from "../previews/files";
-  import { placementLabel } from "../net/placement";
+  import { pauseLabel, placementLabel, sessionPause } from "../net/placement";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
   import { activeModLabel, keyHint } from "../shared/keybindings";
   import PaneTabs from "./PaneTabs.svelte";
@@ -363,14 +363,17 @@
            tab): render nothing, never a fresh TerminalView against a dead id. -->
       <div class="hint"><span>closing…</span></div>
     {:else if s.suspended && s.ui !== "chat"}
-      <!-- A paused terminal (its project runs elsewhere right now). A paused
-           chat stays mounted below: its transcript and scroll survive the
-           move and it follows the conversation to where it continues. -->
-      {#if s.kind === "shell"}
-        <div class="hint paused" role="status"><span>This terminal stays on your computer</span><small>It opens again when the project is back on your computer.</small></div>
-      {:else}
-        <div class="hint paused" role="status"><span>Opening this conversation…</span><small>It picks up in a moment.</small></div>
-      {/if}
+      <!-- A paused terminal: its project runs elsewhere, or it waits for an
+           update, a sign-in on the cloud machine or its transfer (the row's
+           additive `pause` says which). A paused chat stays mounted below:
+           its transcript and scroll survive and it follows the conversation. -->
+      {@const pause = sessionPause(s)}
+      {@const paused = pauseLabel(
+        s.kind === "shell" && !(pause?.type === "paused" && pause.reason === "restarting")
+          ? { type: "paused", reason: "stays_on_computer", provider: null }
+          : pause,
+      )}
+      <div class="hint paused" role="status"><span>{paused.status}</span>{#if paused.detail !== null}<small>{paused.detail}</small>{/if}</div>
     {:else if s.ui === "chat"}
       {@const ChatView = views.chat}
       {#if ChatView !== undefined}

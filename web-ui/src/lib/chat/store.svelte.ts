@@ -8,6 +8,7 @@
 import { isImagePath } from "../previews/files";
 import { artifactMentions, artifactShape, isArtifactPath, proseCovered, proseEmbedTargets } from "./artifacts";
 import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
+import type { SessionPause } from "../net/placement";
 
 /** Names a reply may use that still cover their files (a reply listing
  *  thirty outputs covers thirty); resolve candidates from shell text and
@@ -522,6 +523,10 @@ export class ChatStore {
    *  this computer and the cloud). The transcript stays; the next `ready`
    *  from wherever it runs now clears this. */
   moving = $state<"cloud" | "computer" | null>(null);
+  /** The conversation has no process yet and resumes on its own (after an
+   *  update, once its agent is signed in on the cloud machine, while it
+   *  opens); the next `ready` clears this. */
+  pausedFor = $state<SessionPause | null>(null);
   /** Text of a send the daemon refused before the agent received it, waiting
    *  to go back into the composer ({@link takeRestoredDraft}). */
   restoredDraft = $state<string | null>(null);
@@ -706,6 +711,7 @@ export class ChatStore {
     this.connected = true;
     this.asleep = false;
     this.moving = null;
+    this.pausedFor = null;
     // This handshake succeeded, which is the one fact a socket-level fatal
     // claimed was impossible; a journal fatal says nothing about the socket.
     if (this.fatalSource === "socket") this.clearFatal();
@@ -748,6 +754,18 @@ export class ChatStore {
   onMoved(to: "cloud" | "computer"): void {
     this.connected = false;
     this.moving = to;
+    this.pausedFor = null;
+  }
+
+  /** The conversation is paused here and resumes on its own; it did not exit. */
+  onPaused(pause: SessionPause): void {
+    this.connected = false;
+    if (pause.type === "moved") {
+      this.onMoved(pause.to);
+      return;
+    }
+    this.moving = null;
+    this.pausedFor = pause;
   }
 
   /** The composer's send was accepted by the socket; keep its text until the
