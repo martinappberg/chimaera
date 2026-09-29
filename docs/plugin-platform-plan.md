@@ -854,13 +854,19 @@ The first privileged plugins, in their own repositories
 first-party plugins (`chimaera-plugin-latex`, `chimaera-plugin-typst`: CI and release
 workflows, native tests, pinned to this repository's API by commit) and verified
 live here, including TinyTeX 2026.09 and Typst 0.15.1 installed from their pinned
-downloads. Their GitHub repositories, first releases and lock entries come next.
-What they needed from the platform landed with them: the `status` and `segmented`
+downloads. Both are public
+([chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex),
+[chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst)), 0.1.0 of
+each is released and pinned in `plugins/plugins.lock` as privileged, and a fresh daemon
+installs either from its Extensions card as verified with no prompt. Their release
+workflows also run by hand (`workflow_dispatch`: tag and publish `plugin.toml`'s
+version) where a tag can't be pushed. What they needed from the platform landed with them: the `status` and `segmented`
 nodes, a callout's `actions`, the `diagnostics` node's `key` / `quiet` / layout
 notes, editor marks from `diagnostics/1`, full-height file views, the `install-tool`
 action with install progress, a job's `from` (whose copy ran), lowercase job
 variables (TeX's own), a program's `network` line, and plugins compiled ahead of
-their first use.
+their first use; and in core, a claimed file where its plugin is installed but off
+offers **Turn on**, and Typst highlights in the editor.
 
 ### P10: today's plugins adopt, and core stops naming them
 
