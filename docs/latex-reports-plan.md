@@ -888,8 +888,10 @@ programs and tools (its P8). Their own work:
 
 ### L1: build, errors, agents
 
-**Built (2026-09-29), not yet released.** Both plugins as crates of their own
-(`chimaera-plugin-latex`, `chimaera-plugin-typst`), verified live against a
+**Built and released (2026-09-29): 0.1.0 of each, pinned in `plugins/plugins.lock`.**
+Both plugins as repositories of their own
+([chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex),
+[chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst)), verified live against a
 headless daemon and in the browser, light and dark: the view (a status pill,
 Split / Source / PDF, Build, Save PDF, Log, **Ask agent to fix**; a notice bar only
 when something needs the user; the PDF kept through a rebuild and refreshed in
@@ -901,9 +903,12 @@ installed on one click with progress, a missing package looked up and installed
 with `tlmgr` (the lookup needs the network, which this sandbox blocks: the notice
 says so), `compile_latex` / `compile_typst` and the guides. Where it differs: a
 failed build shows the partial PDF LaTeX left (no `prev/` copy yet); the user's
-`~/.latexmkrc` isn't read (`-norc` only); the old-LuaTeX gate is not built; Typst
-has no editor highlighting yet (`codemirror-lang-typst` is the next core asset).
-Not yet verified on a login node, nor by a claude and a codex session running the
+`~/.latexmkrc` isn't read (`-norc` only); the old-LuaTeX gate is not built. Typst
+highlights in the editor through `codemirror-lang-typst`'s Lezer grammar
+(`web-ui/src/lib/previews/languages.ts`: its parser and editing aids in the app's
+`--syn-*` colors, not its own styles or syntax linter; about 29 KB gzipped, loaded
+for `.typ` only). A file the plugin claims where it is installed but off offers
+**Turn on** in the file bar. Not yet verified on a login node, nor by a claude and a codex session running the
 compile-and-fix loop.
 
 Both plugins with the file view, building on open, save and agent writes, the output

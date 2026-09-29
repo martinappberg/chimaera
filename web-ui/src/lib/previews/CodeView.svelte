@@ -25,7 +25,7 @@
     bracketMatching,
     indentUnit,
   } from "@codemirror/language";
-  import { languages } from "@codemirror/language-data";
+  import { languages } from "./languages";
   import {
     codeHighlight as highlight,
     makeCodeTheme as makeTheme,
