@@ -236,33 +236,21 @@ aliases, helpers, hooks, includes and signing credentials stay on their host.
 Safe remote URLs, refspecs and branch tracking follow the repository. Conversations are complete native archives: text the user
 or agent put in a conversation remains part of that archive.
 
-The daemon renews a workspace ownership lease independently of mirror jobs.
-A connectivity failure leaves local work running. A verified other owner fences
-local input and stops its agents. On restart, previously owned projects wait for
-ownership verification before old conversations can resume. A cold cloud takeover
-forks native conversations; a clean handoff resumes their existing identities.
-Imported sessions remain suspended while the complete handoff is staged.
+The daemon renews a workspace ownership lease independently of mirror jobs: account requests have their own small budget, and installing a returned checkpoint or stopping agents runs as its own task. Laptop first: account unreachability, signing out, a lapsed plan, **Keep this project on this device** or a daemon restart never stop or lock a computer's own agents and terminals; they only stop publication. A verified other owner refuses local input at once, and the computer's agents stop at their next safe pause (at most five minutes later); plain terminals are never stopped. After a restart, previous sessions resume once this computer's ownership is verified, or after one minute when the account cannot be reached; a project another owner took over meanwhile keeps them paused. Re-acquiring its own released or lapsed ownership continues local work without reinstalling files or forking conversations. A cloud takeover after an abrupt loss forks native conversations; a clean handoff resumes their existing identities. Imported sessions remain suspended while the complete handoff is staged.
 
 Agents receive a current-host brief through MCP initialization; structured conversations with an interrupted turn or background work also receive it in their transfer pickup message. Finished structured conversations resume idle without starting a model turn merely because they moved or returned. Their fresh MCP context is available when the user next asks them to work. The brief identifies device or cloud execution, the registered project root, OS/architecture needed for builds, headless limitations, and fresh cached provider observations. Absent or expired observations remain unknown; generating context never probes, logs in, wakes compute or sends a turn. Both MCP initialization and read_cloud_profile use this same projection, and returning to a device replaces stale cloud assumptions. Generated context omits topology, routing IDs, raw diagnostics, hardware allocations and credentials. User-owned profile content remains untrusted project data; missing variable names do not prove a dependency is unavailable. Agents should inspect actual tools and failures, use compatible headless or lower-resource alternatives within existing permissions, preserve completed work, and explain only meaningful progress or the specific user action needed. This prompt is product guidance, not an authorization or confidentiality boundary: agents can inspect their permitted environment and may infer where they run. It does not guarantee compliance or prevent all inference. Ordinary Claude and Codex terminal sessions receive the same MCP context for configured cloud projects; their transfer still sends a positional context prompt because reliable active-versus-idle state is not yet recorded for every TUI provider.
 
 `read_cloud_profile` and `update_cloud_profile` operate only on the authenticated session's registered project. Updates require the current revision, reject unknown fields and credential-shaped content, and are capped at 32 KiB. They keep ordinary agent permissions: saving `setup_command` schedules future cloud setup, while deferred laptop steps remain guidance. Saving a profile never runs a command or wakes a machine. Implementation: [`mcp/cloud_context.rs`](../../crates/chimaera-server/src/mcp/cloud_context.rs).
 
-On macOS, the app's system sleep hook gives publication up to 25 seconds before
-acknowledging sleep. A failed flush leaves the lease takeover path available.
-After the laptop has been awake on AC power for five minutes, connected cloud
-projects can return at an agent pause. Busy or unobservable agent states stay on
-the cloud. A return attempt follows ownership changes caused by waking an idle
-worker immediately, and imports its saved conversation before local work can
-resume. A lost response is checked against current ownership without repeating
-the same release request. Plain shells become paused placeholders in the cloud; arbitrary
-foreground programs are not automatically relaunched.
+On macOS, the app's system sleep hook gives publication up to 25 seconds before acknowledging sleep; the daemon's flush fits the deadline it is given. It preempts the periodic mirror pass, stops agents and publishes every project in parallel (projects with running agents first), and never leaves a half transfer: a flush that outlives the deadline finishes or recovers on its own. The publication fence is not waited out past the deadline; an unreleased lease lapses and the cloud continues from the acknowledged checkpoint. Waking before a flush finishes keeps the project on the computer. A failed flush leaves the lease takeover path available.
+
+Moving live cloud work home waits until the laptop has been awake on AC power for five minutes (in both protocol versions) and happens at an agent pause; busy or unobservable agent states stay on the cloud. Work the cloud is no longer running returns at once: a project the cloud released, or one whose cloud lease lapsed (the computer takes it from the last acknowledged checkpoint). A return that did not finish is retried with backoff (two minutes, doubling to thirty) rather than every pass. A return attempt follows ownership changes caused by waking an idle worker immediately, and imports its saved conversation before local work can resume. A lost response is checked against current ownership without repeating the same release request; a refusal is final for that pass. Plain shells become paused placeholders in the cloud; arbitrary foreground programs are not automatically relaunched.
 
 Hand-back restores new branches and fast-forwards unchanged local branches. The
 current checkout uses Git's index and ref locks; branches checked out in another
 worktree are preserved separately. Diverged branch tips remain as
-`<branch>@cloud-<commit>`, and Projects and privacy lists them for merging. Existing
-remote configuration and `FETCH_HEAD` stay intact. If a file changed on both machines,
-the local file and a sibling cloud copy both remain. Saved setup commands run in
+`<branch>@cloud-<commit>`, and Projects and privacy lists them for merging; only branches are preserved this way (divergent remote-tracking refs and tags from the cloud are not copied). An untracked local file identical to one the cloud committed no longer blocks the fast-forward; a differing one keeps the cloud branch separate. Existing
+remote configuration and `FETCH_HEAD` stay intact. Files merge three ways against the last snapshot this computer actually published (a snapshot whose upload failed never counts): a file only one side changed takes that side's version, so edits made here while the cloud worked are kept. If a file changed on both machines, the cloud's version takes the path and the local copy is kept privately (older strict-mode projects keep a sibling cloud copy instead); the project's row reports how many files kept both versions. A file missing from the cloud's snapshot is removed only when that snapshot's inventory shows it was deleted, never because the mirror left it out (a large file, a symlink, a credential-looking file, `.chimaeraignore`). Saved setup commands run in
 a visible **Cloud setup** terminal. Deferred steps remain guidance for the returning agent, which assesses and runs them under its normal permissions; they are never automatically replayed by the daemon.
 
 Projects first created in the cloud appear on Home without being downloaded.
@@ -331,8 +319,11 @@ gates; Linux and Windows physical sleep still need their own hosts.
 
 The opt-in v2 contract separates the preferred home installation from the viewing
 device and current execution holder. Passive viewing never grants execution.
-Managed processes need a fresh bounded execution lease; expiration fences input
-and stops registered chat/terminal process groups. A clean handoff publishes an
+On a cloud machine, managed agents need a fresh bounded execution lease;
+expiration fences input and stops registered agent process groups. A computer is
+never fenced by lease expiry (laptop first): it stops publishing until the lease
+is renewed, and only a verified other owner stops its agents. Publication and
+forwarded viewers need a live lease everywhere. A clean handoff publishes an
 immutable, acknowledged checkpoint before releasing ownership, and hydration
 selects that receipt rather than a moving mirror head. Same-installation sign-in
 recovery publishes stopped local work before replacing its old device binding.
@@ -347,11 +338,19 @@ mode remains supported and is never silently changed during a live grant.
 
 Returning home adopts canonical cloud files and sessions after stopping its
 registered managed work. Unsynchronized local conflicts are retained privately
-outside the mirrored project within explicit storage bounds. Persisted unclean
-launch evidence still blocks unsafe same-boot restart until supervisor cleanup;
-process groups alone cannot contain detached descendants or guarantee OS-resume
-ordering. Local non-Pro execution is unchanged; no machine chooser or new
-secret-sharing capability is introduced.
+outside the mirrored project within explicit storage bounds. Launch evidence
+records the process groups of live managed agents: a graceful daemon stop (an
+update or restart) clears it once they exit, and a successor after a crash waits
+only for recorded groups that still exist. Process groups alone cannot contain
+detached descendants or guarantee OS-resume ordering. Local non-Pro execution is
+unchanged; no machine chooser or new secret-sharing capability is introduced.
+
+A cloud machine suspends only after draining: the supervisor asks the daemon to
+refuse new transfers and wait until every transfer, Git helper and project cache
+is idle and state is on disk (`POST /api/v1/pro/drain`; see
+[HANDOFF](../../crates/chimaera-link/HANDOFF.md)). Ownership state, the
+execution latch and handoff ledger writes are synced to stable storage, and an
+unreadable ownership state fails closed instead of silently forgetting fences.
 
 ## Project views follow the current owner
 

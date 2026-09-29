@@ -95,8 +95,13 @@ root; an import never silently retargets another registered project. Import reje
 workspace ID/root collisions, an active session with that ID, a known remote
 owner, and an ownership epoch mismatch. An exact successful archive+epoch retry
 is idempotent. Imported state is retained as a suspended ledger entry before
-spawn, so failure preserves recoverable history. A known Pro workspace remains
-suspended after daemon restart until its ownership has been verified.
+spawn, so failure preserves recoverable history. After a daemon restart, a known
+Pro workspace's previous sessions stay suspended until this daemon life verifies
+its ownership. On a personal computer they resume anyway after one minute when
+the account cannot confirm (laptop first); a verified other owner keeps them
+suspended. A cloud machine always waits. Suspending and stopping for a handoff
+writes the ledger durably (file and directory synced, `F_FULLFSYNC` on macOS);
+the periodic ledger reconcile keeps its cheaper write.
 
 Clean transfer resumes the same native conversation. Offline takeover requests
 the CLI's native head fork: Claude `--fork-session`, Codex `thread/fork` without
@@ -113,7 +118,15 @@ reactive and receives no automatic turn.
 
 Plain terminals remain on the source laptop. Their moved bundle imports as a
 paused row, preserving tabs without restarting arbitrary foreground programs.
-Returning a shell home recreates its shell at the recorded cwd.
+Returning a shell home recreates its shell at the recorded cwd. Plain terminals
+are never managed processes: a fence never signals them and a stop never waits
+for them; a verified other owner only refuses their input.
+
+A paused row is named by its pinned name, else its conversation title, else
+words for where it is shown: on a cloud machine "Terminal on your computer"
+(a moved shell) or "Starting here" (an agent waiting to start); on a computer
+"Continuing in the cloud" when another owner holds the project, otherwise
+"Paused".
 
 ## Placement forwarding
 

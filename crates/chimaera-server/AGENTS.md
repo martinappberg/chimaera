@@ -288,7 +288,11 @@ the lifecycle, keep them consistent:
   `chimaera-agent`), then note it in the PR.
 
 Pro ownership gates restore and mutation, including terminal input and resize.
-The ledger retains suspended imports and restart-deferred sessions until the
-coordinator verifies local ownership; staged native fork intent survives restart.
+On a personal computer only a verified other owner (or its own in-progress
+transfer) fences them; lease expiry, sign-out and restarts never do (laptop
+first). The ledger retains suspended imports and restart-deferred sessions until
+the coordinator verifies local ownership (a computer resumes restart-deferred
+ones after a one-minute grace when the account cannot confirm); staged native
+fork intent survives restart.
 Terminal `read_only=true` sockets never acquire resize ownership or accept input.
 An explicit `wake=interaction` is distinct from passive reconnect/polling.

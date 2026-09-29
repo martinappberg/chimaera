@@ -13,7 +13,10 @@ revocable delegation over the authenticated local API.
 | `projects/tests.rs` | Synthetic loopback HTTP plus real Git transfer, passive-read, conflict, retry, restart and two-device destination checks. |
 | `execution.rs` / `execution/` | Negotiated execution leases, independent stop watchdog, durable launch/crash evidence, immutable receipts and stopped same-installation recovery. |
 | `execution/mutation.rs` | Bounded file/lifecycle/command commit reservations; account/epoch admission uses short in-memory locks, while clean stop and replacement wait for actual work even if its HTTP caller disappears. Reserved launches fail promptly if configuration is draining them, rather than waiting on themselves. |
-| `engine.rs` | Independent lease renewal, mirror coordinator, transactional hydration, profile execution and lazy return. |
+| `engine.rs` | Lease renewal (own account-request budget; installs and agent stops run as their own tasks), mirror coordinator, staged hydration (files are installed in place, not transactionally), deadline-bound sleep flush, three-way return and lazy return. |
+| `detached.rs` | Owned transfer tasks keyed by (kind, project, epoch): a caller that disconnects never cancels a flush or hydration; repeats join; a completed release is remembered ten minutes. |
+| `drain.rs` | `POST/DELETE /pro/drain`: refuse new transfer work and wait for jobs, transfer tasks, project caches and Git helpers before a cloud machine suspends. |
+| `continuity_tests.rs` | Loopback account fixture (records requests, scripted grants, delays; Git endpoints refuse connections) for policy, abandoned flush, sleep deadline, own-epoch reacquire, lapsed cloud lease and drain tests. |
 | `snapshot_diagnostics.rs` | Fixed snapshot failure categories; no response bodies, paths, identifiers or error text enter diagnostic logs. |
 | `handback.rs` | Bounded automatic return coordination across worker wake and ownership changes; lost release replies are resolved by authority reads without repeating ambiguous requests. |
 | `release.rs` | Bounded clean-release retry for the account publication fence; changed ownership, account or lease never retries. |
@@ -27,17 +30,36 @@ revocable delegation over the authenticated local API.
 | `canonical.rs` | Bounded private preservation of unpublished local file conflicts before canonical checkpoint adoption; never overwrites previous conflict copies. |
 | `config.rs` | Portable agent configuration export/import, scoped environment-omission diagnostics and destination connection identity preservation. |
 
-One recorded holder and epoch controls shared writes. Legacy v1 retains its
-existing offline-local behavior and expired remote conversation forks. Negotiated
-v2 execution requires an unexpired acquire/renew proof, never a passive GET.
-A request-start deadline reserves stop time; clock divergence closes admission.
-The independent watchdog fences chat/PTY input and owned process groups, including
-stalled startup. Clean release waits for observed termination, durable publication
-and an exact immutable keeper receipt. Each managed launch first persists active
-execution evidence; same-boot restart cannot treat an empty registry as proof that
-old children stopped. A separate enrollment latch rejects lost ordinary state or
-protocol downgrade. macOS boot-session UUID and Linux boot ID can distinguish a
-cold reboot; neither authorizes takeover by another device.
+One recorded holder and epoch controls shared writes. **Laptop first (D1):** a
+personal computer is fenced only by a verified other owner (`Ownership::Remote`,
+from an authenticated read) or its own in-progress transfer (`Transferring`,
+`Hydrating`, `SettingUp`); `AwaitingVerification` stays writable there. Lease
+expiry, account unreachability, sign-out (`disconnect` never stops sessions),
+plan changes, the privacy switch and daemon restarts stop publication only. A
+verified other owner refuses input at once (`may_write`); the device's agents
+then stop at their next safe pause, bounded to five minutes, as an owned task.
+A cloud worker (`execution::worker`: `CHIMAERA_WORKER`, a persisted worker
+marker, or a Worker runtime) stays strict: its execution needs an unexpired
+acquire/renew proof, never a passive GET; a request-start deadline reserves stop
+time; clock divergence closes admission; and the watchdog (started only on
+workers) fences chat/PTY input and owned agent process groups. `lease_valid`
+gates publication and forwarded viewers on every host. Plain shells are never
+managed: not signalled by fences, not awaited by stops, never evidence. Sessions
+a previous daemon left running wait for this life's lease (`may_restore`); on a
+device `resume_unverified` resumes the restart-deferred ones after one minute
+when the account cannot confirm, unless another owner was verified meanwhile.
+Clean release waits for observed termination, durable publication and an exact
+immutable keeper receipt. Each managed launch persists active execution
+evidence, and every state write records the live managed agents' process groups
+(≤64 per project). A graceful stop clears the evidence once they exit; a
+same-boot successor after a crash probes the recorded groups and waits only for
+survivors (re-probed every lease tick); without recorded groups a device
+proceeds and a worker stays fenced, and a worker never acquires or renews a lease
+it could not accept. A separate enrollment latch rejects lost ordinary state or
+protocol downgrade; an unreadable `state.json` fails closed (kept as
+`state.json.damaged`). `state.json` is written (durably) before the latch.
+macOS boot-session UUID and Linux boot ID can distinguish a cold reboot; neither
+authorizes takeover by another device.
 
 Strict `managed_processes` retains `expired_takeover:false`. The separately
 negotiated `canonical_checkpoint` capability supports automatic native-conversation
@@ -52,7 +74,7 @@ mirror/release grant after execution stops, keeps it in memory, publishes the
 stopped source and consumes release; it cannot acquire/renew or resume execution.
 Failed or ambiguous recovery retains the local files and execution fence. Clean
 handoff stops agents before final export and releases only after the mirror and
-bundles are durable. A fresh publication retains its account fence for ten seconds; release waits at most fifteen seconds and retries only `mirror_commit_in_progress` while the same server-confirmed holder, epoch and live lease remain valid. An unstarted structured Claude chat with no native transcript is omitted only when a complete bounded startup-only journal, fresh-spawn recipe, and no submitted input or background work prove it empty; snapshots leave its source live, while clean handoff atomically fences input and durably suspends it for local return. Only exported agents enable automatic worker wake. Missing meaningful or ambiguous history still fails the flush and retains local ownership.
+bundles are durable. A fresh publication retains its account fence for ten seconds; release waits at most fifteen seconds and retries only `mirror_commit_in_progress` while the same server-confirmed holder, epoch and live lease remain valid. An unstarted structured Claude chat with no native transcript is omitted only when a complete bounded startup-only journal, fresh-spawn recipe, and no submitted input or background work prove it empty; snapshots leave its source live, while clean handoff atomically fences input and durably suspends it for local return. Every snapshot publishes the account's continuation policy (`/v1/baton/{w}/policy`: `handoff_enabled`/`offline_takeover` = not hours-exhausted, `has_agents` = an agent was archived) in both protocol versions, while the epoch is owned and before any bytes are pushed; only exported agents enable automatic worker wake. Missing meaningful or ambiguous history still fails the flush and retains local ownership.
 
 Configuration export keeps portable settings and MCP definitions, including
 validated `bearer_token_env_var` names, while excluding credential values and
@@ -84,7 +106,7 @@ the matching index after a committed ref; ambiguous failures retain the prepared
 index. Prepared transactions serialize so their helper cannot deadlock on the
 two-child transport budget. Git selection is probed once asynchronously with
 credential-free, output-capped two-second helpers. The bounded 30-second wait for
-a helper slot is retryable and never caches a transient capacity failure. On macOS only, an older or
+a helper slot is retryable and never caches a transient capacity failure. Account and keeper requests use their own six-request budget, never the two Git helper slots. On macOS only, an older or
 unknown PATH Git falls back to `/usr/bin/git` if that binary reports at least
 2.45 (the upstream curl POST-size reuse fix); modern PATH Git and other platforms
 keep their existing selection. This affects only mirror helpers, not ordinary
@@ -93,8 +115,9 @@ Git give static upgrade guidance without exposing stderr. Failed helpers emit on
 POST buffer, automatic failed-push replay, or weakened publication check.
 Another worktree's branch is retained separately. Unsupported
 transaction support preserves a cloud ref instead. Network Git has a finite
-16-minute deadline; ordinary helpers retain short deadlines. Repository and
-shadow histories are quota-bound and retained, never silently rewritten/pruned.
+16-minute deadline; ordinary helpers retain short deadlines. The remote
+repository and shadow histories are quota-bound by the account; local shadow
+history is retained and not yet pruned; neither is silently rewritten.
 
 Cloud discovery is independent of power state and the obsolete global projects
 folder. `GET /api/v1/pro/projects` returns `{projects,error}`; each row has
@@ -121,6 +144,17 @@ pending-ID fences, never to permission to import. A partially registered legacy
 project needs explicit selection of its original folder before recovery.
 
 Normal lazy return only handles registered projects without a pending adoption.
+Moving live cloud work waits for the settle gate (awake on power for five
+minutes) in both protocol versions. Work the cloud is not running returns at
+once: a cloud release (holder none), a lapsed cloud lease (the device takes it
+from the last acknowledged checkpoint; the account's reconnect grace answers
+409 `takeover_grace`, treated as a quiet wait), or this device's own unfinished
+return (`Hydrating` held by it), with backoff from two minutes doubling to thirty.
+A bare 409 from the worker's handoff is final for the pass unless the worker woke
+into a new epoch. Re-acquiring the epoch this device itself held
+(`execution::held_here`: its clean release or its lapsed lease) skips
+hydration and never forks; a worker renewal after a same-epoch fence resumes
+what the fence preserved.
 A return attempt rechecks ownership immediately after a worker wakes, rather than
 waiting for the next mirror pass. The verified source epoch is persisted before
 release; ambiguous responses are resolved by reading ownership, without repeating
@@ -138,8 +172,16 @@ regression returns a completed synthetic conversation through that route, retain
 its session/native identity and history without starting a new model turn. Hydration checks account
 generation at ownership, filesystem and session-install boundaries; signing out
 cannot finish an old transfer as a fresh local ownership grant. HTTP transfer is
-bounded to nineteen minutes. Cancellation can leave a persisted Hydrating fence
-and partial files; an explicit retry resumes at the saved destination. No worker
+bounded to nineteen minutes. `/pro/handoff` and `/pro/hydrate` run as owned
+tasks (`detached.rs`), so a caller that gives up never cancels them; a daemon
+crash can still leave a persisted Hydrating fence and partial files, and a
+retry resumes at the saved destination. Snapshot and hydration first clear
+interrupted-helper leftovers (ref/index/packed-refs locks, `index-*`, `tmp_*`
+packs, `stage-*`/`hydrate-*` copies) under the project's cache guard, and the
+daemon sweeps them per project at start. Before a snapshot builds on the
+outgoing shadow, each existing tip must name a readable tree; on real damage the
+shadow is set aside (`working-tree.damaged`, one slot) and rebuilt from the
+published remote. No worker
 project is adopted merely because this daemon starts or becomes suitable for work.
 
 Required worker setup runs before any imported agent resumes. Persisted
@@ -164,6 +206,25 @@ files and repeats setup/readiness without fetching another snapshot. It never
 starts authentication or transfers provider credentials. Account replacement,
 ownership changes and cancellation retain the fence. Personal-device and
 ordinary SSH/free workspace behavior is unchanged.
+
+Returns merge three ways against `published_tree`, the working-tree commit of
+the last acknowledged publication (advanced to the installed tree after a
+return); a file only one side changed takes that side; both changed keeps the
+local copy (checkpoint mode: private `local-conflicts`; strict mode: sibling
+`.cloud-*`) and counts it in the mirror row's additive `kept_both`/`kept_paths`.
+A baseline file absent from the incoming snapshot is deleted only when the
+manifest's additive `left_out` inventory (≤4096 paths the sender omitted by
+policy, size, symlink, credential content or `.chimaeraignore`) is present and
+does not list it. Fast-forwards set identical untracked files aside and keep
+the cloud branch separate on a differing one; only `refs/heads` get `@cloud`
+copies.
+
+The sleep flush (`/pro/sleep {deadline_ms?}`) preempts the periodic pass, flushes
+projects in parallel as owned tasks (live agents first), releases within the
+remaining deadline only, and reports `pending` flushes that continue after it
+answers. `/pro/wake` advances `sleep_generation`: a running flush then keeps its
+publication, skips release and returns the project itself. Failures and
+refusals carry stable codes (`routes::error_code`; mirror row `error_code`).
 
 Structured pause checks accept authoritative completed-turn/idle agent state even when a provider emits no textual idle status, but reject queued input, active turns, and background work (explicit permission/action waits remain safe pause points).
 

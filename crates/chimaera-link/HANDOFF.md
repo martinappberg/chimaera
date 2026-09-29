@@ -235,12 +235,21 @@ rejection, and foreign-workspace requests with no file or network side effects.
 
 ## Automatic takeover policy
 
-After publishing a usable mirror, the current holder may PUT
+The current holder PUTs
 `/v1/baton/{workspace}/policy` with
 `{holder_id, epoch, handoff_enabled, offline_takeover, has_agents}`. It requires
 an unexpired owned epoch and returns 204. Delegation credentials may publish the
 same policy. A full device may DELETE that path to disable all three flags even
 when another device holds the baton; scoped delegations cannot disable policy.
+
+The daemon publishes this policy with every snapshot in **both** protocol
+versions (the account's offline wake and the worker's discovery read only these
+flags, and v2 has no other resource that sets them). It is published while the
+epoch is still owned and before any snapshot bytes are pushed, so a refusal
+cannot strand a published checkpoint that nothing will continue.
+`handoff_enabled` and `offline_takeover` are `!hours_exhausted`; `has_agents`
+says whether the snapshot archived an agent session. A workspace-scoped
+delegation may reach this one `/v1` path under v2 as well.
 
 Policy survives ownership changes. Automatic worker wake considers an expired
 **device** holder only, and requires all three flags, a published mirror, and
@@ -251,10 +260,11 @@ active-owner takeover.
 ## Required placement and execution-fencing follow-up
 
 The maintainer's requested next placement contract is distinct from the current
-v1 behavior above. V1 deliberately lets a laptop keep running during account
-unreachability until it verifies a newer epoch; its remote write fences do not
-prove that an offline old process has stopped. The workspace credential consumer
-contract does not resolve that execution-partition gap.
+v1 behavior above. Both protocol versions deliberately let a personal computer
+keep running during account unreachability until it verifies a newer epoch
+("laptop first"); remote write fences do not prove that an offline old process
+has stopped. The workspace credential consumer contract does not resolve that
+execution-partition gap.
 
 Acceptance for the placement follow-up requires:
 
@@ -277,6 +287,50 @@ Acceptance for the placement follow-up requires:
 These are required follow-up gates, not claims that v1 or the workspace-bound
 credential addition already implements automatic home-first routing or complete
 execution fencing.
+
+## Transfer operations, sleep and drain (daemon routes)
+
+`POST /api/v1/pro/handoff {workspace_id, expected_epoch}` and
+`POST /api/v1/pro/hydrate {workspace_id, expected_epoch, requires_fork?, destination_root?}`
+run as owned daemon tasks keyed by (kind, workspace, epoch). A caller that
+disconnects (the keeper's 90-second relay, a supervisor timeout) loses only the
+reply: the flush or hydration completes, or its recovery restores ownership, and
+it never leaves Git mid-write. A repeated request joins the running task. A
+completed handoff is remembered for ten minutes, so a retry after a lost reply
+answers 204 instead of a bare 409; hydration re-verifies on every request, and
+failures are forgotten so a retry starts fresh. The status codes are unchanged
+(204 on completion). Refusals carry an additive stable `code` next to the English
+`error` (for example `ownership_changed`, `checkpoint_pending`, `account_changed`,
+`draining`, `workspace_busy`, `cloud_provider_not_ready`, `git`,
+`service_rejected`); clients map codes, never error text. A bare 409 from a
+worker handoff is final for that return pass unless the worker woke into a new
+epoch.
+
+`POST /api/v1/pro/sleep` accepts an optional `{deadline_ms}` (additive; an empty
+body keeps the 25-second default) and answers within it. It preempts the
+periodic mirror pass, flushes every owned project in parallel (projects with
+live agents first, the rest only while time remains) as owned tasks, and does
+not wait out the account's publication fence past the deadline (an unreleased
+lease lapses and the cloud continues from the acknowledged checkpoint). The
+reply is `{handoff, failed:[{workspace_id, error:<code>}]}`, plus
+`reason:"deadline", pending:[workspace_id]` when flushes are still finishing on
+their own. `POST /api/v1/pro/wake` advances a sleep generation: a flush still
+running keeps its publication but never releases after the wake and returns the
+project to this computer itself.
+
+`POST /api/v1/pro/drain {deadline_ms?}` is the public half of a fenced cloud
+suspension. It takes the job reservation, stops new periodic passes, refuses new
+handoff/hydrate/sleep/privacy work with 409 `{error:"draining"}`, and answers 200
+`{token}` once every transfer task, sleep flush, project cache (including a Git
+finalizer outliving its caller) and Git helper slot is free and state is synced
+to disk. Past the deadline (default 60 s, at most 600 s) it releases itself and
+answers 409 `{error:"transfer_busy"}`. `DELETE /api/v1/pro/drain` cancels; a drain
+also lapses 15 wall-clock minutes after it began (a machine resumed without a
+cancel). Lease renewals continue while drained. On a cloud machine
+`GET /api/v1/health` reports `pro_cloud_operations` (transfer tasks, sleep
+flushes, held project caches and busy Git helpers; a completed drain counts
+zero) and additive `last_activity_ms`, the last user change that is not session
+input (file saves, uploads, Git operations, session lifecycle).
 
 ## Explicit worker wake
 
@@ -344,12 +398,32 @@ historical recovery context directing the agent to inspect files and external
 state before repeating effects, using existing permissions without a routine
 human-review gate. Timeout alone is never proof that the old OS process stopped.
 
+Lease expiry fences execution only on a cloud worker. A personal computer is
+fenced only by a verified other owner (an authenticated read naming another
+holder) or its own in-progress transfer: account unreachability, sign-out, a
+lapsed plan, the privacy switch or a daemon restart stop publication, never its
+agents or shells. A verified other owner refuses local input at once; the
+computer's agents stop at their next safe pause, at most five minutes later.
+Re-acquiring the epoch this installation itself held (its own clean release, or
+its own lapsed lease) continues local work: no checkpoint install and no fork,
+even though the account marks a lapsed-lease acquisition `requires_fork`. The
+account's `takeover_grace` refusal is a quiet wait. Plain shells are never
+managed processes.
+
 Returning home installs the canonical receipt only after its own registered
-managed processes are stopped. Unclean same-boot restart remains fenced until
-supervisor cleanup is proven. Unsynchronized local file conflicts are retained
+managed processes are stopped. Launch evidence records the process groups of
+live managed agents; a graceful daemon stop clears it once they exit, and a
+same-boot successor after a crash waits only for recorded groups that still
+exist (re-probed every lease tick). Without recorded groups a computer proceeds
+and a worker stays fenced; a worker never acquires or renews a lease it could
+not accept. Unsynchronized local file conflicts are retained
 outside the mirrored project (100 MB per file, 1 GiB/4096 files total), while
 canonical file content occupies the original path. Exceeding preservation limits
 retains the original and fails the import; it never deletes old conflict copies.
+The three-way baseline is the last acknowledged publication (never a local
+commit whose push failed); a file only this computer changed keeps its edit, and
+a file absent from the incoming snapshot is deleted only when that snapshot's
+additive `left_out` inventory (paths it deliberately omitted) shows it gone.
 A globally advertised new capability does not change an existing strict-mode
 renewal; mode changes require an explicit clean unowned acquisition.
 
