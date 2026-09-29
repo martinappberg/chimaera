@@ -8,6 +8,8 @@
 import { isImagePath } from "../previews/files";
 import { artifactMentions, artifactShape, isArtifactPath, proseCovered, proseEmbedTargets } from "./artifacts";
 import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
+import type { SessionPause } from "../net/placement";
+import type { ImageAttachment } from "./images";
 
 /** Names a reply may use that still cover their files (a reply listing
  *  thirty outputs covers thirty); resolve candidates from shell text and
@@ -205,6 +207,12 @@ export interface CheckpointRef {
  *  events (`UserMessage{queued}` + its `UserMessageUpdate`), so replay agrees:
  *  `sent` moves it into `blocks`, `cancelled` removes it, `dropped` keeps it
  *  here marked "not delivered". */
+/** A refused send's text and pictures, going back into the composer. */
+export interface RestoredDraft {
+  text: string;
+  images: ImageAttachment[];
+}
+
 export interface PendingSend {
   /** Delivery key (the wire's client-minted uuid) — the `UserMessageUpdate` /
    *  `CancelQueued` match key. */
@@ -522,12 +530,24 @@ export class ChatStore {
    *  this computer and the cloud). The transcript stays; the next `ready`
    *  from wherever it runs now clears this. */
   moving = $state<"cloud" | "computer" | null>(null);
+  /** The conversation has no process yet and resumes on its own (after an
+   *  update, once its agent is signed in on the cloud machine, while it
+   *  opens); the next `ready` clears this. */
+  pausedFor = $state<SessionPause | null>(null);
   /** Text of a send the daemon refused before the agent received it, waiting
    *  to go back into the composer ({@link takeRestoredDraft}). */
-  restoredDraft = $state<string | null>(null);
+  restoredDraft = $state.raw<RestoredDraft | null>(null);
   /** The composer's last accepted send, until its echo proves the agent got
    *  it. Plain (not reactive): only the refusal path reads it. */
-  private unconfirmedSend: string | null = null;
+  private unconfirmedSend: RestoredDraft | null = null;
+  /** A send picked a paused project back up and it is waking; cleared by the
+   *  next `ready`, a disconnect or a move. */
+  waking = $state(false);
+  /** A send accepted while the conversation is not live (paused, waking,
+   *  reconnecting): shown at once as a pending bubble so it is never typed
+   *  twice. Its echo, a refusal (which hands the text back), a move or an
+   *  exit clears it. */
+  sending = $state<{ text: string; images: number } | null>(null);
   fatalError = $state<string | null>(null);
   /** Where the fatal came from. A SOCKET fatal (handshake failure) is
    *  disproved by the next successful `ready` — chatPool recreates a fatal
@@ -705,7 +725,9 @@ export class ChatStore {
   onReady(session: ChatSessionInfo, _replayFrom: number, head: number | undefined): void {
     this.connected = true;
     this.asleep = false;
+    this.waking = false;
     this.moving = null;
+    this.pausedFor = null;
     // This handshake succeeded, which is the one fact a socket-level fatal
     // claimed was impossible; a journal fatal says nothing about the socket.
     if (this.fatalSource === "socket") this.clearFatal();
@@ -737,6 +759,7 @@ export class ChatStore {
   onDisconnected(): void {
     this.connected = false;
     this.asleep = false;
+    this.waking = false;
   }
 
   /** The owner is paused and nothing has asked it to wake yet. */
@@ -744,22 +767,54 @@ export class ChatStore {
     this.asleep = true;
   }
 
+  /** A send picked the paused project back up; it is waking now. */
+  onWaking(): void {
+    this.asleep = false;
+    this.waking = true;
+  }
+
   /** The conversation moved to another machine; it did not exit. */
   onMoved(to: "cloud" | "computer"): void {
     this.connected = false;
     this.moving = to;
+    this.pausedFor = null;
+    this.waking = false;
+    this.sending = null;
+    // Whatever could not be delivered was already refused (and handed back)
+    // before the move; what was delivered echoes where it runs now.
+    this.unconfirmedSend = null;
+  }
+
+  /** The conversation is paused here and resumes on its own; it did not exit. */
+  onPaused(pause: SessionPause): void {
+    this.connected = false;
+    if (pause.type === "moved") {
+      this.onMoved(pause.to);
+      return;
+    }
+    this.moving = null;
+    this.pausedFor = pause;
   }
 
   /** The composer's send was accepted by the socket; keep its text until the
    *  agent's echo proves delivery, so a refusal can hand it back. */
-  noteSent(text: string): void {
-    this.unconfirmedSend = text;
+  noteSent(text: string, images: ImageAttachment[] = []): void {
+    this.unconfirmedSend = { text, images };
+    // Sending is what picks a paused project back up: stop inviting it.
+    const live = this.connected && !this.waking;
+    this.asleep = false;
+    if (!live) this.sending = { text, images: images.length };
   }
 
   /** One command was refused before reaching the agent. Say so, and give an
    *  unconfirmed send's text back to the composer instead of losing it. */
-  onCommandFailed(message: string): void {
+  onCommandFailed(message: string, command: string | null = null): void {
     this.notice(message, "error");
+    // Only a refused SEND hands text back: a refused interrupt, permission
+    // answer or anything else says so without resurrecting a message that
+    // may already have been delivered (a re-send would be a second turn).
+    if (command !== "send") return;
+    this.sending = null;
     if (this.unconfirmedSend !== null) {
       this.restoredDraft = this.unconfirmedSend;
       this.unconfirmedSend = null;
@@ -767,7 +822,7 @@ export class ChatStore {
   }
 
   /** Hand the refused text to exactly one composer. */
-  takeRestoredDraft(): string | null {
+  takeRestoredDraft(): RestoredDraft | null {
     const draft = this.restoredDraft;
     this.restoredDraft = null;
     return draft;
@@ -776,6 +831,7 @@ export class ChatStore {
   /** The structured driver fell back to its terminal surface. */
   onDegraded(): void {
     this.hydrating = false;
+    this.sending = null;
     this.degraded = true;
     this.touchTranscript();
   }
@@ -783,6 +839,7 @@ export class ChatStore {
   /** The driver closed before (or after) an initial journal replay. */
   onExited(status: number | null): void {
     this.hydrating = false;
+    this.sending = null;
     this.exited = { status };
     this.touchTranscript();
   }
@@ -920,7 +977,10 @@ export class ChatStore {
           : [];
         const origin = typeof ev.origin === "string" ? ev.origin : null;
         // The agent received the user's own send: nothing is left to hand back.
-        if (origin === null) this.unconfirmedSend = null;
+        if (origin === null) {
+          this.unconfirmedSend = null;
+          this.sending = null;
+        }
         if (ev.queued === true && id !== null) {
           // Queued: park it in the pending stack, NOT in the transcript at its
           // mid-turn send position (that splice would split the agent's live

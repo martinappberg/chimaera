@@ -1805,13 +1805,32 @@ describe("ChatStore turn artifacts (the made-this-turn gallery)", () => {
 describe("ChatStore unsent text", () => {
   it("a send refused before the agent got it goes back to the composer, once", () => {
     const store = new ChatStore();
-    store.noteSent("please run the tests");
-    store.onCommandFailed("refused");
+    const picture = { media_type: "image/png", data: "AA==", label: "shot" };
+    store.noteSent("please run the tests", [picture]);
+    store.onCommandFailed("refused", "send");
     expect(store.blocks.at(-1)?.kind).toBe("notice");
-    expect(store.takeRestoredDraft()).toBe("please run the tests");
+    expect(store.takeRestoredDraft()).toEqual({ text: "please run the tests", images: [picture] });
     expect(store.takeRestoredDraft()).toBeNull();
     // A later, unrelated refusal has nothing left to hand back.
-    store.onCommandFailed("refused");
+    store.onCommandFailed("refused", "send");
+    expect(store.restoredDraft).toBeNull();
+  });
+
+  it("a refusal of anything but a send never hands a message back", () => {
+    const store = new ChatStore();
+    store.noteSent("already delivered, echo on its way");
+    for (const command of ["interrupt", "permission", "answer", null]) {
+      store.onCommandFailed("refused", command);
+      expect(store.restoredDraft).toBeNull();
+    }
+    expect(store.blocks.filter((b) => b.kind === "notice")).toHaveLength(4);
+  });
+
+  it("a move forgets an unconfirmed send instead of handing it back later", () => {
+    const store = new ChatStore();
+    store.noteSent("sent before the move");
+    store.onMoved("cloud");
+    store.onCommandFailed("refused", "send");
     expect(store.restoredDraft).toBeNull();
   });
 
@@ -1819,7 +1838,7 @@ describe("ChatStore unsent text", () => {
     const store = new ChatStore();
     store.noteSent("hello");
     store.apply({ seq: 1, ts: 0, ev: { type: "user_message", text: "hello", id: "u1" } } as SeqEvent);
-    store.onCommandFailed("refused");
+    store.onCommandFailed("refused", "send");
     expect(store.restoredDraft).toBeNull();
   });
 
@@ -1831,8 +1850,8 @@ describe("ChatStore unsent text", () => {
       ts: 0,
       ev: { type: "user_message", text: "from the phone app", origin: "remote" },
     } as SeqEvent);
-    store.onCommandFailed("refused");
-    expect(store.takeRestoredDraft()).toBe("mine");
+    store.onCommandFailed("refused", "send");
+    expect(store.takeRestoredDraft()?.text).toBe("mine");
   });
 
   it("a move keeps the transcript and clears when the conversation is reached again", () => {
@@ -1860,6 +1879,80 @@ describe("ChatStore unsent text", () => {
       2,
     );
     expect(store.moving).toBeNull();
+  });
+
+  it("a send that picks a paused project back up shows at once and is never offered twice", () => {
+    const store = new ChatStore();
+    store.onAsleep();
+    store.noteSent("wake up", [{ media_type: "image/png", data: "AA==", label: "shot" }]);
+    expect(store.asleep).toBe(false);
+    expect(store.sending).toEqual({ text: "wake up", images: 1 });
+    store.onWaking();
+    expect(store.waking).toBe(true);
+    store.onReady(
+      {
+        id: "s",
+        agent: "claude",
+        alive: true,
+        exit_status: null,
+        native_session_id: null,
+        model: null,
+        current_mode: null,
+        pending_permission: false,
+      },
+      0,
+      0,
+    );
+    expect(store.waking).toBe(false);
+    // Still pending until the agent's echo proves delivery.
+    expect(store.sending).not.toBeNull();
+    store.apply({ seq: 1, ts: 0, ev: { type: "user_message", text: "wake up", id: "u1" } } as SeqEvent);
+    expect(store.sending).toBeNull();
+  });
+
+  it("a live conversation's send shows no extra pending bubble", () => {
+    const store = new ChatStore();
+    store.onReady(
+      {
+        id: "s",
+        agent: "claude",
+        alive: true,
+        exit_status: null,
+        native_session_id: null,
+        model: null,
+        current_mode: null,
+        pending_permission: false,
+      },
+      0,
+      0,
+    );
+    store.noteSent("hello");
+    expect(store.sending).toBeNull();
+  });
+
+  it("a conversation paused here is neither moving nor exited, and clears on ready", () => {
+    const store = new ChatStore();
+    store.onMoved("cloud");
+    store.onPaused({ type: "paused", reason: "restarting", provider: null });
+    expect(store.pausedFor).toEqual({ type: "paused", reason: "restarting", provider: null });
+    expect(store.moving).toBeNull();
+    expect(store.exited).toBeNull();
+    expect(store.connected).toBe(false);
+    store.onReady(
+      {
+        id: "s",
+        agent: "claude",
+        alive: true,
+        exit_status: null,
+        native_session_id: null,
+        model: null,
+        current_mode: null,
+        pending_permission: false,
+      },
+      0,
+      0,
+    );
+    expect(store.pausedFor).toBeNull();
   });
 
   it("a paused owner is a state, cleared when the conversation is live again", () => {

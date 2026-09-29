@@ -106,12 +106,89 @@ async fn ws_sessions_stopped_for_a_transfer_say_moved_not_exited() {
             }
         }
         drop(guard);
-        // Reconnecting while the session runs elsewhere keeps saying so,
+        // The project now runs in the cloud. Reconnecting keeps saying so,
         // never replaying a stopped driver as `ready {alive:false}`.
+        crate::pro::install_remote_owner_fixture(&state, "w-moving", 5);
         let mut again = connect(path.clone()).await;
         let frame = next_json(&mut again).await;
         assert_eq!(frame["type"], "moved", "{path}: {frame}");
+        assert_eq!(frame["to"], "cloud", "{path}: {frame}");
     }
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// A session waiting out a daemon restart on the computer that owns its
+/// project did not move anywhere: its views say it is reconnecting after an
+/// update (`paused`, reason `restarting`), on the socket and on its row.
+#[tokio::test]
+async fn a_restart_deferred_session_is_paused_here_not_moved() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let state = test_state();
+    let cwd = test_dir("ws-restart-deferred");
+    let workspace = lock(&state.workspaces).add(cwd.clone()).unwrap();
+    let entry = |id: &str, agent| crate::ledger::LedgerEntry {
+        id: id.into(),
+        suspended: true,
+        handoff: None,
+        workspace_id: workspace.id.clone(),
+        cwd: cwd.clone(),
+        pinned_name: None,
+        cols: 80,
+        rows: 24,
+        theme: "dark".into(),
+        created_at: 0,
+        agent,
+    };
+    let agent = crate::ledger::LedgerAgent {
+        kind: crate::agents::AgentKind::Claude,
+        resume: None,
+        transcript: None,
+        native_cwd: None,
+        title: "restart".into(),
+        ui: chimaera_agent::model::SessionUi::Chat,
+        model: None,
+        carryover: None,
+    };
+    crate::ledger::defer(&state, entry("s-restart-chat", Some(agent))).unwrap();
+    crate::ledger::defer(&state, entry("s-restart-term", None)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    for path in ["/ws/chat/s-restart-chat", "/ws/sessions/s-restart-term"] {
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}{path}"))
+            .await
+            .unwrap();
+        socket
+            .send(WsMessage::text(
+                serde_json::json!({"type": "auth", "token": "test-token", "last_seq": 0})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        let frame = loop {
+            if let WsMessage::Text(text) = next_ws_frame(&mut socket).await {
+                break serde_json::from_str::<serde_json::Value>(&text).unwrap();
+            }
+        };
+        assert_eq!(
+            frame,
+            serde_json::json!({"type":"paused","reason":"restarting"}),
+            "{path}"
+        );
+    }
+    let rows = crate::session_view::sessions_json(&state);
+    let row = rows
+        .iter()
+        .find(|row| row["id"] == "s-restart-chat")
+        .unwrap();
+    assert_eq!(row["suspended"], true);
+    assert_eq!(row["pause"]["type"], "paused");
+    assert_eq!(row["pause"]["reason"], "restarting");
     state
         .stopping
         .store(true, std::sync::atomic::Ordering::Release);

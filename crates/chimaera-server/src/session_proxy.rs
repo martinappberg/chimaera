@@ -53,6 +53,10 @@ const WORKER_STATE_HEADER: &str = "x-chimaera-worker-state";
 pub(crate) struct Store {
     inner: Mutex<Data>,
     started: AtomicBool,
+    /// Events feeds that ended because their project's route changed: what a
+    /// test waits for instead of sleeping past a tick.
+    #[cfg(test)]
+    pub(crate) feeds_retired: std::sync::atomic::AtomicUsize,
 }
 #[derive(Default)]
 struct Data {
@@ -90,6 +94,12 @@ struct Ticket {
 /// What a captured connection or ticket proves about its project's route:
 /// the host transport and that one project's registration.
 type Stamp = (u64, u64);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteChange {
+    Current,
+    Transport,
+    Owner,
+}
 #[derive(Clone)]
 struct Route {
     host_id: String,
@@ -134,6 +144,10 @@ pub(crate) struct SocketOptions {
     pub read_only: bool,
     #[serde(default)]
     pub wake: Option<String>,
+}
+/// Whether `path` names the project folder `root` or something in it.
+fn inside(root: &std::path::Path, path: &str) -> bool {
+    std::path::Path::new(path).starts_with(root)
 }
 fn valid_id(value: &str) -> bool {
     !value.is_empty()
@@ -254,6 +268,25 @@ impl Store {
     fn current(&self, route: &Route, workspace: &str) -> bool {
         crate::lock(&self.inner).is_current(route, workspace)
     }
+    /// Why a captured route stopped being current: only its host's transport
+    /// changed (a tunnel rebind or a new credential: the same owner, reached
+    /// afresh), or the project itself changed owner or left this registry.
+    fn change(&self, route: &Route, workspace: &str) -> RouteChange {
+        let data = crate::lock(&self.inner);
+        if data.is_current(route, workspace) {
+            return RouteChange::Current;
+        }
+        let same_owner = data.routes.get(&route.host_id).is_some_and(|live| {
+            live.address.is_some()
+                && live.workspaces.get(workspace) == route.workspaces.get(workspace)
+                && live.generations.get(workspace) == route.generations.get(workspace)
+        });
+        if same_owner {
+            RouteChange::Transport
+        } else {
+            RouteChange::Owner
+        }
+    }
     /// A recent probe already proved this exact project registration speaks
     /// scope: skip the extra round trip for the next request or poll.
     fn acknowledged(&self, route: &Route, workspace: &str) -> bool {
@@ -291,6 +324,22 @@ impl Store {
             .routes
             .values()
             .any(|route| route.workspaces.contains_key(workspace))
+    }
+    /// The paths of a window watching `workspace` that its owner cannot see:
+    /// everything outside the project's folder on this computer (a pasted
+    /// upload, a note in the home folder, a download). This computer keeps
+    /// watching those itself while the project's own paths come from the
+    /// owner. Every path when the project is not routed.
+    pub(crate) fn outside_project(&self, workspace: &str, paths: &[String]) -> Vec<String> {
+        let root = crate::lock(&self.inner)
+            .routes
+            .values()
+            .find_map(|route| route.roots.get(workspace).cloned());
+        paths
+            .iter()
+            .filter(|path| root.as_ref().is_none_or(|root| !inside(root, path)))
+            .cloned()
+            .collect()
     }
     fn for_workspace(&self, workspace: &str) -> Option<Route> {
         crate::lock(&self.inner)
@@ -685,18 +734,26 @@ impl Progress {
         self.start.elapsed().as_millis() as u64
     }
     fn touch(&self) {
-        self.last_ms.store(self.now_ms(), Ordering::Relaxed);
+        self.touch_at(self.now_ms());
+    }
+    /// The clock is a parameter below so tests drive it exactly.
+    fn touch_at(&self, now_ms: u64) {
+        self.last_ms.store(now_ms, Ordering::Relaxed);
     }
     fn limit(&self, limit: Duration) {
-        self.touch();
+        self.limit_at(self.now_ms(), limit);
+    }
+    fn limit_at(&self, now_ms: u64, limit: Duration) {
+        self.touch_at(now_ms);
         self.limit_ms
             .store(limit.as_millis() as u64, Ordering::Relaxed);
     }
     /// Time left before the connection counts as stalled.
     fn remaining(&self) -> Duration {
-        let quiet = self
-            .now_ms()
-            .saturating_sub(self.last_ms.load(Ordering::Relaxed));
+        self.remaining_at(self.now_ms())
+    }
+    fn remaining_at(&self, now_ms: u64) -> Duration {
+        let quiet = now_ms.saturating_sub(self.last_ms.load(Ordering::Relaxed));
         Duration::from_millis(self.limit_ms.load(Ordering::Relaxed).saturating_sub(quiet))
     }
 }
@@ -963,22 +1020,43 @@ pub(crate) async fn api_proxy(
         let response = request(&state.session_proxy, &route, &workspace, incoming, budget).await?;
         tokio::time::timeout(ADAPTER_DEADLINE, async {
             let response = alias_response(response, &path, &alias, &target_keys).await?;
+            let response = epoch_response(response, &path, &route, &workspace).await?;
             ticket_response(&state, &route, &workspace, &path, response).await
         })
         .await?
     }
     .await;
-    // A read of a path outside the project that its owner does not have (or
-    // may not show) is this computer's own file: answer it here.
+    // A read of a path outside the project: the owner's own file when it may
+    // show it; this computer's file when the owner has nothing there (or
+    // cannot be reached); and when the owner has a different file at that
+    // path that it may not show, a plain answer instead of this computer's
+    // same-named file standing in for it.
     if let Some(local) = fallback {
-        let owner_declined = result.as_ref().map_or(true, |response| {
-            matches!(
-                response.status(),
-                StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
-            )
-        });
-        if owner_declined {
-            return next.run(local).await;
+        match result {
+            Err(_) => return next.run(local).await,
+            Ok(response) if response.status() == StatusCode::NOT_FOUND => {
+                return next.run(local).await
+            }
+            Ok(response) if response.status() == StatusCode::FORBIDDEN => {
+                let (parts, body) = response.into_parts();
+                let bytes = axum::body::to_bytes(body, 16 * 1024)
+                    .await
+                    .unwrap_or_default();
+                let reason = serde_json::from_slice::<Value>(&bytes)
+                    .ok()
+                    .and_then(|value| value["error"].as_str().map(str::to_owned));
+                if reason.as_deref() == Some("outside_project") {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({"error":"on_other_machine"})),
+                    )
+                        .into_response();
+                }
+                // An older owner refuses every outside path alike.
+                drop(parts);
+                return next.run(local).await;
+            }
+            Ok(response) => return response,
         }
     }
     result.unwrap_or_else(|_| {
@@ -1113,6 +1191,11 @@ async fn alias_request(
                 *value = alias.input(value);
             }
         }
+        // The document checker's `root` names a folder on this computer; the
+        // owner checks against the project's own folder instead.
+        if path == "/fs/check_document" {
+            query.retain(|(key, _)| key != "root");
+        }
         let query = crate::workspace_scope::paths::encode_query(&query);
         *incoming.uri_mut() = format!(
             "{}{}{}",
@@ -1174,6 +1257,40 @@ async fn alias_response(
     let mut value: Value = serde_json::from_slice(&bytes)?;
     crate::workspace_scope::paths::Alias::restore_keys(&mut value, target_keys);
     alias.response(path, &mut value);
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Ok(Response::from_parts(
+        parts,
+        Body::from(serde_json::to_vec(&value)?),
+    ))
+}
+
+/// A routed project's Git status and Timeline pages carry the same salted
+/// epoch its events nudges do ([`routed_epoch`]), so a window compares like
+/// with like: it refetches when the owner's epoch moves or the project moves,
+/// and never on every nudge.
+async fn epoch_response(
+    response: Response,
+    path: &str,
+    route: &Route,
+    workspace: &str,
+) -> Result<Response> {
+    let epochs = path == "/git/status"
+        || path
+            .strip_prefix("/workspaces/")
+            .is_some_and(|rest| rest.ends_with("/timeline"));
+    let Some(generation) = route.generations.get(workspace).copied() else {
+        return Ok(response);
+    };
+    if !epochs || !response.status().is_success() {
+        return Ok(response);
+    }
+    let (mut parts, body) = response.into_parts();
+    // Git status is capped at 5000 entries; a Timeline page at its page size.
+    let bytes = axum::body::to_bytes(body, 8 * 1024 * 1024).await?;
+    let mut value: Value = serde_json::from_slice(&bytes)?;
+    if let Some(epoch) = value["epoch"].as_u64() {
+        value["epoch"] = json!(routed_epoch(generation, epoch));
+    }
     parts.headers.remove(header::CONTENT_LENGTH);
     Ok(Response::from_parts(
         parts,
@@ -1303,6 +1420,35 @@ const HELD_TERMINAL_BYTES: usize = 64 * 1024;
 /// structured command is ~10 MiB (images), so the byte bound admits one.
 const HELD_CHAT_COMMANDS: usize = 4;
 const HELD_CHAT_BYTES: usize = 11 * 1024 * 1024;
+/// Input held across every relay at once. Per-socket caps alone let a window
+/// full of chats to a sleeping owner pin gigabytes (128 sockets × 11 MiB);
+/// past this, new input is refused visibly instead of held.
+const HELD_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+static HELD_BUDGET: HeldBudget = HeldBudget::new(HELD_TOTAL_BYTES);
+
+/// Bytes held by every relay's [`Held`], against one daemon-wide limit.
+struct HeldBudget {
+    used: std::sync::atomic::AtomicUsize,
+    limit: usize,
+}
+impl HeldBudget {
+    const fn new(limit: usize) -> Self {
+        Self {
+            used: std::sync::atomic::AtomicUsize::new(0),
+            limit,
+        }
+    }
+    fn reserve(&self, bytes: usize) -> bool {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|total| *total <= self.limit)
+            })
+            .is_ok()
+    }
+    fn release(&self, bytes: usize) {
+        self.used.fetch_sub(bytes, Ordering::AcqRel);
+    }
+}
 /// Owner-socket retry pacing while nobody is typing.
 const RETRY_MIN: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(30);
@@ -1364,19 +1510,38 @@ enum Opened {
     Live(Box<Upstream>),
     /// The owner is asleep and this attempt carried no interaction.
     Sleeping,
+    /// The owner is asleep and this attempt carries interaction: the relay
+    /// says it is waking, then connects (which wakes it).
+    Waking,
 }
 impl Link<'_> {
-    fn current(&self) -> bool {
-        self.state
+    /// `None` while this socket's route is current. Once it is not: a
+    /// transport-only change (tunnel rebind, new credential) ends the socket
+    /// quietly so the viewer reconnects to the same owner, and a real owner
+    /// change also says where the session continues.
+    fn ended(&self) -> Option<Option<Value>> {
+        match self
+            .state
             .session_proxy
-            .current(&self.route, &self.workspace)
+            .change(&self.route, &self.workspace)
+        {
+            RouteChange::Current => None,
+            RouteChange::Transport => Some(None),
+            RouteChange::Owner => Some(Some(self.moved())),
+        }
     }
     async fn open(&self, wake: bool) -> Result<Opened> {
         let reach = verify_scope(&self.state.session_proxy, &self.route, &self.workspace).await?;
         // Viewing never wakes a sleeping owner; only interaction may.
-        if reach == Reach::Sleeping && !wake {
-            return Ok(Opened::Sleeping);
+        match (reach, wake) {
+            (Reach::Sleeping, false) => Ok(Opened::Sleeping),
+            (Reach::Sleeping, true) => Ok(Opened::Waking),
+            (Reach::Awake, _) => self.connect(wake, reach).await,
         }
+    }
+    /// The owner's socket, opened with wake intent when `wake`. A sleeping
+    /// owner gets the wake deadline to resume before it answers.
+    async fn connect(&self, wake: bool, reach: Reach) -> Result<Opened> {
         let address = self.route.address.context("remote placement unavailable")?;
         let query = if self.read_only {
             "?read_only=true"
@@ -1440,17 +1605,41 @@ impl Link<'_> {
         };
         json!({"type":"moved","to":to})
     }
-    /// Answer input that never reached the owner, so nothing vanishes silently.
-    async fn refuse(
+    /// Answer input that arrived while this socket's wake is pending: it is
+    /// not held (a second send must never become a second turn once the owner
+    /// answers), and the viewer is told why in plain words.
+    async fn refuse_waking(
         &self,
         downstream: &mut axum::extract::ws::WebSocket,
-        count: usize,
+        refused: &Down,
     ) -> Result<()> {
+        let frame = if self.chat {
+            tagged(
+                json!({"type":"error","code":"command_failed","reason":"waking",
+                    "message":"Still waking the cloud machine. That was not sent; send it again in a moment."}),
+                refused,
+            )
+        } else {
+            json!({"type":"error","code":"read_only","reason":"waking",
+                "message":"Waking the cloud machine… That input was not sent."})
+        };
+        bounded_send(downstream, Down::Text(frame.to_string().into())).await
+    }
+    /// Answer input that never reached the owner, so nothing vanishes silently.
+    /// A chat hears one refusal per command, tagged with which command it was
+    /// (`command`, additive), so only a refused send hands its text back.
+    async fn refuse<'f>(
+        &self,
+        downstream: &mut axum::extract::ws::WebSocket,
+        refused: impl IntoIterator<Item = &'f Down>,
+    ) -> Result<()> {
+        let mut refused = refused.into_iter().peekable();
         if self.chat {
-            for _ in 0..count {
-                bounded_send(downstream, Down::Text(not_sent().to_string().into())).await?;
+            for frame in refused {
+                let answer = tagged(not_sent(), frame);
+                bounded_send(downstream, Down::Text(answer.to_string().into())).await?;
             }
-        } else if count > 0 {
+        } else if refused.peek().is_some() {
             let frame = json!({"type":"error","code":"read_only","reason":"reconnecting",
                 "message":"Your project is reconnecting. That input was not sent."});
             bounded_send(downstream, Down::Text(frame.to_string().into())).await?;
@@ -1459,14 +1648,22 @@ impl Link<'_> {
     }
 }
 
-/// Input held until the owner's socket is ready. Bounded per socket.
-struct Held {
+/// Input held until the owner's socket is ready. Bounded per socket and,
+/// through `budget`, across the daemon.
+struct Held<'b> {
     chat: bool,
     frames: std::collections::VecDeque<Down>,
     bytes: usize,
+    budget: &'b HeldBudget,
 }
-impl Held {
-    fn push(&mut self, frame: Down) -> bool {
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+impl Held<'_> {
+    /// Hold `frame`, or hand it back when it does not fit.
+    fn push(&mut self, frame: Down) -> std::result::Result<(), Down> {
         let size = match &frame {
             Down::Text(text) => text.len(),
             Down::Binary(bytes) => bytes.len(),
@@ -1477,14 +1674,15 @@ impl Held {
         } else {
             self.bytes + size <= HELD_TERMINAL_BYTES
         };
-        if fits {
-            self.bytes += size;
-            self.frames.push_back(frame);
+        if !fits || !self.budget.reserve(size) {
+            return Err(frame);
         }
-        fits
+        self.bytes += size;
+        self.frames.push_back(frame);
+        Ok(())
     }
     fn take(&mut self) -> std::collections::VecDeque<Down> {
-        self.bytes = 0;
+        self.budget.release(std::mem::take(&mut self.bytes));
         std::mem::take(&mut self.frames)
     }
 }
@@ -1494,10 +1692,26 @@ fn unavailable() -> Value {
 fn asleep() -> Value {
     json!({"type":"error","code":"worker_asleep","message":"Your project is paused. Sending a message picks it back up."})
 }
+/// Additive status: the viewer's first input is waking the owner and will be
+/// delivered once it answers. Older clients ignore it.
+fn waking_status() -> Value {
+    json!({"type":"waking"})
+}
+/// A terminal says "waking" at most this often while typing is refused.
+const WAKING_NOTE_EVERY: Duration = Duration::from_secs(1);
 /// The existing per-command refusal: the socket stays up, the client keeps
 /// the unsent text.
 fn not_sent() -> Value {
     json!({"type":"error","code":"command_failed","message":"Not sent. Your project is reconnecting."})
+}
+/// A chat refusal naming the command it answers.
+fn tagged(mut answer: Value, refused: &Down) -> Value {
+    if let Down::Text(text) = refused {
+        if let Some(command) = crate::ws::command_kind(text) {
+            answer["command"] = json!(command);
+        }
+    }
+    answer
 }
 fn upward(frame: Down) -> Option<Up> {
     match frame {
@@ -1520,6 +1734,7 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
         chat: link.chat,
         frames: Default::default(),
         bytes: 0,
+        budget: &HELD_BUDGET,
     };
     let mut upstream: Option<Box<Upstream>> = None;
     let mut ready = false;
@@ -1533,6 +1748,10 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
     let mut retry_armed = false;
     let mut ownership = tokio::time::interval(Duration::from_secs(2));
     ownership.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // A wake this socket asked for is pending: the input that asked is held,
+    // anything more is refused until the owner answers.
+    let mut waking = false;
+    let mut noted: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
             Some(result) = futures::future::OptionFuture::from(attempt.as_mut()), if attempt.is_some() => {
@@ -1542,6 +1761,13 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                         upstream = Some(socket);
                         ready = false;
                         backoff = RETRY_MIN;
+                    }
+                    Ok(Opened::Waking) => {
+                        if !waking {
+                            waking = true;
+                            if bounded_send(downstream, Down::Text(waking_status().to_string().into())).await.is_err() { return; }
+                        }
+                        attempt = Some(Box::pin(link.connect(true, Reach::Sleeping)));
                     }
                     Ok(Opened::Sleeping) if !held.frames.is_empty() => {
                         wake = true;
@@ -1557,9 +1783,10 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                     }
                     Err(_) => {
                         // A failed wake attempt answers what it was carrying.
-                        let count = held.take().len();
-                        if link.refuse(downstream, count).await.is_err() { return; }
+                        let refused = held.take();
+                        if link.refuse(downstream, &refused).await.is_err() { return; }
                         wake = false;
+                        waking = false;
                         if told != Some("remote_unavailable") {
                             told = Some("remote_unavailable");
                             if bounded_send(downstream, Down::Text(unavailable().to_string().into())).await.is_err() { return; }
@@ -1575,10 +1802,12 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                 attempt = Some(Box::pin(link.open(wake)));
             }
             _ = ownership.tick() => {
-                if !link.current() {
-                    let count = held.take().len();
-                    let _ = link.refuse(downstream, count).await;
-                    let _ = bounded_send(downstream, Down::Text(link.moved().to_string().into())).await;
+                if let Some(moved) = link.ended() {
+                    let refused = held.take();
+                    let _ = link.refuse(downstream, &refused).await;
+                    if let Some(moved) = moved {
+                        let _ = bounded_send(downstream, Down::Text(moved.to_string().into())).await;
+                    }
                     return;
                 }
             }
@@ -1589,6 +1818,7 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                     if is_ready && !ready {
                         ready = true;
                         told = None;
+                        waking = false;
                         // Deliver what the viewer typed while connecting, once, in order.
                         if let Some(socket) = upstream.as_mut() {
                             for frame in held.take() {
@@ -1609,8 +1839,8 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                 Some(Ok(Up::Close(_))) | None | Some(Err(_)) => {
                     // The owner ended this connection (exit, restart, owner
                     // change). The viewer reconnects and is routed afresh.
-                    let count = held.take().len();
-                    let _ = link.refuse(downstream, count).await;
+                    let refused = held.take();
+                    let _ = link.refuse(downstream, &refused).await;
                     return;
                 }
                 _ => {}
@@ -1622,17 +1852,27 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                     let input = link.chat || matches!(frame, Down::Binary(_));
                     match upstream.as_mut() {
                         Some(socket) if ready => {
-                            if !link.current() {
-                                let _ = link.refuse(downstream, usize::from(input)).await;
-                                let _ = bounded_send(downstream, Down::Text(link.moved().to_string().into())).await;
+                            if let Some(moved) = link.ended() {
+                                let _ = link.refuse(downstream, input.then_some(&frame)).await;
+                                if let Some(moved) = moved {
+                                    let _ = bounded_send(downstream, Down::Text(moved.to_string().into())).await;
+                                }
                                 return;
                             }
                             let Some(frame) = upward(frame) else { continue };
                             if bounded_send(socket.as_mut(), frame).await.is_err() { return; }
                         }
+                        _ if input && waking => {
+                            let now = tokio::time::Instant::now();
+                            let say = link.chat || noted.is_none_or(|at| now >= at + WAKING_NOTE_EVERY);
+                            if say {
+                                noted = Some(now);
+                                if link.refuse_waking(downstream, &frame).await.is_err() { return; }
+                            }
+                        }
                         _ if input => {
-                            if !held.push(frame) && link.refuse(downstream, 1).await.is_err() {
-                                return;
+                            if let Err(refused) = held.push(frame) {
+                                if link.refuse(downstream, [&refused]).await.is_err() { return; }
                             }
                             // The first real input carries wake intent; an
                             // in-flight passive attempt upgrades when it
@@ -1663,10 +1903,20 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
 pub(crate) enum FeedFrame {
     /// A path-only invalidation, already in this window's paths.
     Fs(Value),
-    /// The project's Git epoch on its owner.
+    /// The project's Git epoch on its owner, as [`routed_epoch`] reports it.
     Git(u64),
-    /// The project's Timeline epoch on its owner.
+    /// The project's Timeline epoch on its owner, as [`routed_epoch`] reports it.
     Timeline(u64),
+}
+/// An owner's Git or Timeline epoch as a window reports it: in a range of its
+/// own per project registration, above any daemon's own counter. A window
+/// refetches only when an epoch it was sent changes, and this computer's
+/// counter and an owner's (or two owners') can hold the same number: without
+/// the salt a local-to-routed switch (or back) could read as "unchanged" and
+/// leave Git status and the Timeline stale after a move. JS numbers are exact
+/// below 2^53: 20 bits of registration above 32 bits of epoch.
+pub(crate) fn routed_epoch(registration: u64, epoch: u64) -> u64 {
+    (((registration & 0xF_FFFF) + 1) << 32) | (epoch & 0xFFFF_FFFF)
 }
 pub(crate) struct Feed {
     pub(crate) workspace: String,
@@ -1746,21 +1996,50 @@ async fn feed(
         .workspaces
         .get(workspace)
         .context("workspace route missing")?;
+    let project_generation = *route
+        .generations
+        .get(workspace)
+        .context("workspace route missing")?;
     let auth = json!({"type":"auth","token":route.token,"workspace_id":workspace,
         "epoch":epoch,"viewer_root":"L3Byb2plY3Q"});
     bounded_send(&mut upstream, Up::Text(auth.to_string().into())).await?;
+    // Only the project's own paths go to its owner; the window's daemon
+    // watches the rest (see `Store::outside_project`).
     let registration = |(files, dirs): &(Vec<String>, Vec<String>)| {
-        let map = |paths: &[String]| paths.iter().map(|p| alias.input(p)).collect::<Vec<_>>();
+        let map = |paths: &[String]| {
+            paths
+                .iter()
+                .filter(|path| inside(&alias.viewer, path))
+                .map(|path| alias.input(path))
+                .collect::<Vec<_>>()
+        };
         json!({"type":"watch","workspace_id":workspace,"files":map(files),"dirs":map(dirs)})
     };
     let initial = registration(&paths.borrow_and_update());
     bounded_send(&mut upstream, Up::Text(initial.to_string().into())).await?;
     let mut ownership = tokio::time::interval(Duration::from_secs(2));
     ownership.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let retired = || {
+        let gone = !state.session_proxy.current(&route, workspace);
+        #[cfg(test)]
+        if gone {
+            state
+                .session_proxy
+                .feeds_retired
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        gone
+    };
     loop {
         tokio::select! {
+            // A registration notifies at once; the tick backs up missed edges.
+            _ = state.changes.notified() => {
+                if retired() {
+                    return Ok(());
+                }
+            }
             _ = ownership.tick() => {
-                if !state.session_proxy.current(&route, workspace) {
+                if retired() {
                     return Ok(());
                 }
             }
@@ -1792,12 +2071,12 @@ async fn feed(
                         }
                         Some("git") => {
                             if let Some(epoch) = value["epochs"][workspace].as_u64() {
-                                frames.send(FeedFrame::Git(epoch)).await?;
+                                frames.send(FeedFrame::Git(routed_epoch(project_generation, epoch))).await?;
                             }
                         }
                         Some("timeline") => {
                             if let Some(epoch) = value["epochs"][workspace].as_u64() {
-                                frames.send(FeedFrame::Timeline(epoch)).await?;
+                                frames.send(FeedFrame::Timeline(routed_epoch(project_generation, epoch))).await?;
                             }
                         }
                         // The owner's connection for this project changed:
@@ -1992,16 +2271,80 @@ mod tests {
     }
 
     #[test]
+    fn an_owners_epochs_never_read_as_unchanged_across_a_move() {
+        const JS_SAFE: u64 = 1 << 53;
+        for epoch in [0, 1, 7, u32::MAX as u64] {
+            // Never equal to any number this computer's own counter holds.
+            assert!(routed_epoch(1, epoch) > u32::MAX as u64);
+            // A new registration (a move to another owner) reads as a change.
+            assert_ne!(routed_epoch(1, epoch), routed_epoch(2, epoch));
+            // And stays exact for the browser.
+            assert!(routed_epoch(u64::MAX, epoch) < JS_SAFE);
+        }
+        // Within one registration, the owner's own changes still move it.
+        assert_ne!(routed_epoch(3, 4), routed_epoch(3, 5));
+    }
+
+    #[tokio::test]
+    async fn the_document_checker_never_forwards_this_computers_root() {
+        let alias = crate::workspace_scope::paths::Alias {
+            root: std::path::PathBuf::from("/project"),
+            viewer: std::path::PathBuf::from("/Users/me/project"),
+        };
+        let request = Request::builder()
+            .uri("/fs/check_document?path=%2FUsers%2Fme%2Fproject%2Fdoc.md&root=%2FUsers%2Fme%2Fproject")
+            .body(Body::empty())
+            .unwrap();
+        let (mapped, _) = alias_request(request, "/fs/check_document", &alias)
+            .await
+            .unwrap();
+        assert_eq!(
+            mapped.uri().to_string(),
+            "/fs/check_document?path=%2Fproject%2Fdoc.md"
+        );
+    }
+
+    #[test]
+    fn held_input_shares_one_daemon_wide_budget() {
+        let budget = HeldBudget::new(10 * 1024);
+        let frame = |size: usize| Down::Binary(vec![b'x'; size].into());
+        let mut first = Held {
+            chat: false,
+            frames: Default::default(),
+            bytes: 0,
+            budget: &budget,
+        };
+        let mut second = Held {
+            chat: false,
+            frames: Default::default(),
+            bytes: 0,
+            budget: &budget,
+        };
+        assert!(first.push(frame(6 * 1024)).is_ok());
+        // Within its own cap, but not within what is left daemon-wide.
+        assert!(second.push(frame(6 * 1024)).is_err());
+        assert!(second.push(frame(4 * 1024)).is_ok());
+        // Delivering (or dropping) held input gives its bytes back.
+        assert_eq!(first.take().len(), 1);
+        assert!(second.push(frame(6 * 1024)).is_ok());
+        drop(second);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn transfer_progress_extends_the_idle_deadline() {
         let progress = Progress::new(Duration::from_millis(80));
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(progress.remaining() <= Duration::from_millis(30));
-        progress.touch();
-        assert!(progress.remaining() > Duration::from_millis(50));
-        std::thread::sleep(Duration::from_millis(90));
-        assert!(progress.remaining().is_zero(), "a silent link stalls out");
-        progress.limit(Duration::from_secs(60));
-        assert!(progress.remaining() > Duration::from_secs(59));
+        progress.touch_at(0);
+        assert_eq!(progress.remaining_at(50), Duration::from_millis(30));
+        progress.touch_at(50);
+        assert_eq!(progress.remaining_at(60), Duration::from_millis(70));
+        assert!(
+            progress.remaining_at(140).is_zero(),
+            "a silent link stalls out"
+        );
+        progress.limit_at(140, Duration::from_secs(60));
+        assert_eq!(progress.remaining_at(140), Duration::from_secs(60));
+        assert_eq!(progress.remaining_at(150), Duration::from_millis(59_990));
     }
 
     #[test]
@@ -2175,6 +2518,84 @@ mod tests {
         assert!(!store.current(&store.for_workspace("w-b").unwrap(), "w-z"));
     }
 
+    #[test]
+    fn only_a_routed_projects_own_paths_leave_this_computer() {
+        let store = Store::default();
+        let paths = vec![
+            "/Users/me/project".to_owned(),
+            "/Users/me/project/src/a.rs".to_owned(),
+            "/Users/me/project-notes/b.md".to_owned(),
+            "/tmp/upload.png".to_owned(),
+        ];
+        assert_eq!(store.outside_project("w-split", &paths), paths);
+        store
+            .register(
+                Registration {
+                    host_id: "worker-split".into(),
+                    endpoint: "http://127.0.0.1:1234".into(),
+                    token: "fixture".into(),
+                    workspace_id: "w-split".into(),
+                    epoch: 1,
+                },
+                "/Users/me/project".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.outside_project("w-split", &paths),
+            vec![
+                "/Users/me/project-notes/b.md".to_owned(),
+                "/tmp/upload.png".to_owned()
+            ]
+        );
+    }
+    #[test]
+    fn a_tunnel_rebind_is_not_a_move_but_a_new_owner_is() {
+        let store = Store::default();
+        let registration = |host: &str, epoch: u64, endpoint: &str, token: &str| Registration {
+            host_id: host.into(),
+            endpoint: endpoint.into(),
+            token: token.into(),
+            workspace_id: "w-rebind".into(),
+            epoch,
+        };
+        store
+            .register(
+                registration("worker-a", 4, "http://127.0.0.1:1234", "one"),
+                "/p".into(),
+            )
+            .unwrap();
+        let captured = store.for_workspace("w-rebind").unwrap();
+        assert_eq!(store.change(&captured, "w-rebind"), RouteChange::Current);
+        // Same owner and epoch, reached through a new tunnel and credential.
+        store
+            .register(
+                registration("worker-a", 4, "http://127.0.0.1:4321", "two"),
+                "/p".into(),
+            )
+            .unwrap();
+        assert_eq!(store.change(&captured, "w-rebind"), RouteChange::Transport);
+        // A new epoch on the same host is a real change of owner.
+        let rebound = store.for_workspace("w-rebind").unwrap();
+        store
+            .register(
+                registration("worker-a", 5, "http://127.0.0.1:4321", "two"),
+                "/p".into(),
+            )
+            .unwrap();
+        assert_eq!(store.change(&rebound, "w-rebind"), RouteChange::Owner);
+        // So is another host, and so is the route leaving this registry.
+        let latest = store.for_workspace("w-rebind").unwrap();
+        store
+            .register(
+                registration("device-b", 6, "http://127.0.0.1:4321", "two"),
+                "/p".into(),
+            )
+            .unwrap();
+        assert_eq!(store.change(&latest, "w-rebind"), RouteChange::Owner);
+        let device = store.for_workspace("w-rebind").unwrap();
+        store.clear_workspace("w-rebind");
+        assert_eq!(store.change(&device, "w-rebind"), RouteChange::Owner);
+    }
     #[test]
     fn a_project_moving_between_hosts_rehomes_its_rows_at_once() {
         let store = Store::default();

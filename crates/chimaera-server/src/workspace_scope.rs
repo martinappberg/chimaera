@@ -260,13 +260,52 @@ impl Scope {
         .await?
     }
     async fn read(&self, state: &AppState, path: String) -> Result<()> {
-        ensure!(
-            self.readable(state, vec![path]).await?.first() == Some(&true),
-            "path outside workspace"
-        );
-        Ok(())
+        if self.readable(state, vec![path.clone()]).await?.first() == Some(&true) {
+            return Ok(());
+        }
+        // Whether this machine has anything at that path decides who else may
+        // answer: nothing here means the viewer's own computer can (its own
+        // file); something here means the viewer must not show a different
+        // file that happens to share the path. Contents never leave.
+        let _permit = crate::fs::FILESYSTEM_WORK.acquire().await?;
+        let missing = tokio::task::spawn_blocking(move || {
+            crate::fs::expand_tilde(&path).is_ok_and(|path| {
+                matches!(std::fs::symlink_metadata(path), Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound)
+            })
+        })
+        .await?;
+        Err(Outside { missing }.into())
     }
 }
+/// A refused scoped request. A read outside the project: `not_found` lets
+/// the viewer's own computer answer with its own file; `outside_project`
+/// tells it this machine has a different one it must not stand in for.
+fn outside_read(error: anyhow::Error) -> Response {
+    match error.downcast_ref::<Outside>() {
+        Some(Outside { missing: true }) => {
+            (StatusCode::NOT_FOUND, Json(json!({"error":"not_found"}))).into_response()
+        }
+        Some(Outside { missing: false }) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"outside_project"})),
+        )
+            .into_response(),
+        None => denied(StatusCode::FORBIDDEN),
+    }
+}
+/// A viewer's read of a path outside what it may read here.
+#[derive(Debug)]
+struct Outside {
+    /// Nothing exists at that path on this machine.
+    missing: bool,
+}
+impl std::fmt::Display for Outside {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("path outside workspace")
+    }
+}
+impl std::error::Error for Outside {}
 /// Resolve existing symlinks and the nearest existing parent of a new file.
 /// `..` is rejected before walking nonexistent parents, so it cannot escape later.
 fn within(root: &Path, raw: &str) -> Result<bool> {
@@ -449,6 +488,25 @@ async fn scoped_request(
         }
         return Json(value).into_response();
     }
+    // The reading view's checker, for a viewer of this project: root-relative
+    // links resolve at the project's own folder (the viewer's `root` names a
+    // folder on another machine and is ignored), and no link target outside
+    // the project is stat-ed or read.
+    if path == "/fs/check_document" && read {
+        let Some(document) = query.get("path").cloned() else {
+            return denied(StatusCode::BAD_REQUEST);
+        };
+        if let Err(error) = scope.read(&state, document.clone()).await {
+            return outside_read(error);
+        }
+        let Some(root) = crate::lock(&state.workspaces)
+            .get(&scope.workspace_id)
+            .map(|workspace| workspace.root)
+        else {
+            return denied(StatusCode::CONFLICT);
+        };
+        return crate::doc_check::check_within(document, root).await;
+    }
     if path == "/fs/home" && read {
         let root = crate::lock(&state.workspaces)
             .get(&scope.workspace_id)
@@ -503,11 +561,8 @@ async fn scoped_request(
     };
     // Validation may narrow a compound body (unreadable candidates dropped),
     // so the forwarded body is built from what it approved.
-    if validate_resource(&state, &scope, &method, &path, &query, &mut body)
-        .await
-        .is_err()
-    {
-        return denied(StatusCode::FORBIDDEN);
+    if let Err(error) = validate_resource(&state, &scope, &method, &path, &query, &mut body).await {
+        return outside_read(error);
     }
     let mut request = match stream {
         Some(stream) => Request::from_parts(parts, stream),

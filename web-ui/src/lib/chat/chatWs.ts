@@ -1,5 +1,5 @@
 import { daemonSocketUrl, isBrowserGateway } from "../net/base";
-import { sendSocketAuth } from "../net/placement";
+import { parsePause, sendSocketAuth, type SessionPause } from "../net/placement";
 import { getToken } from "../net/api";
 import { Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 import { CooperativeQueue } from "./cooperativeQueue";
@@ -44,13 +44,22 @@ export interface ChatSocketHandlers {
   /** Fatal server-side error; the socket will not reconnect. */
   onError(message: string): void;
   /** One command was refused (`command_failed` or `invalid_command`): the
-   *  socket stays up and keeps reconnecting — surface it, don't die. */
-  onCommandFailed(message: string): void;
+   *  socket stays up and keeps reconnecting — surface it, don't die.
+   *  `command` names the refused command (`send`, `interrupt`…) when the
+   *  daemon tagged it (additive); null from older daemons. */
+  onCommandFailed(message: string, command: string | null): void;
   /** The conversation's project is paused; the next send picks it back up. */
   onAsleep?(): void;
+  /** A send picked the paused project back up: it is waking and the send is
+   *  delivered once it answers. */
+  onWaking?(): void;
   /** The conversation is continuing on another machine: stay mounted and
    *  keep reconnecting; it did not exit. */
   onMoved?(to: "cloud" | "computer"): void;
+  /** The conversation has no process here yet and resumes on its own
+   *  (after an update, once its agent is signed in on the cloud machine,
+   *  while its transfer opens it): stay mounted, keep reconnecting. */
+  onPaused?(pause: SessionPause): void;
   /** The socket dropped and is reconnecting; the UI is no longer live. */
   onDisconnected(): void;
   /** Highest seq applied so far — sent with auth so reconnects replay only the gap. */
@@ -68,9 +77,11 @@ type ChatDelivery =
   | { kind: "degraded" }
   | { kind: "exited"; status: number | null }
   | { kind: "error"; message: string }
-  | { kind: "command_failed"; message: string }
+  | { kind: "command_failed"; message: string; command: string | null }
   | { kind: "asleep" }
+  | { kind: "waking" }
   | { kind: "moved"; to: "cloud" | "computer" }
+  | { kind: "paused"; pause: SessionPause }
   | { kind: "disconnected" };
 
 /**
@@ -121,13 +132,19 @@ export class ChatSocket {
           this.handlers.onError(delivery.message);
           break;
         case "command_failed":
-          this.handlers.onCommandFailed(delivery.message);
+          this.handlers.onCommandFailed(delivery.message, delivery.command);
           break;
         case "asleep":
           this.handlers.onAsleep?.();
           break;
+        case "waking":
+          this.handlers.onWaking?.();
+          break;
         case "moved":
           this.handlers.onMoved?.(delivery.to);
+          break;
+        case "paused":
+          this.handlers.onPaused?.(delivery.pause);
           break;
         case "disconnected":
           this.handlers.onDisconnected();
@@ -208,6 +225,17 @@ export class ChatSocket {
           this.authenticatedSocket = null;
           this.deliveries.push({ kind: "moved", to: msg.to === "computer" ? "computer" : "cloud" });
           break;
+        case "waking":
+          this.deliveries.push({ kind: "waking" });
+          break;
+        case "paused": {
+          // Not an exit either: the daemon closes this socket next and the
+          // ordinary reconnect finds the conversation once it runs again.
+          const pause = parsePause(msg);
+          this.authenticatedSocket = null;
+          if (pause !== null) this.deliveries.push({ kind: "paused", pause });
+          break;
+        }
         case "error":
           // Connection states, never fatal: the socket stays (or reconnects)
           // and the next send carries wake intent.
@@ -233,6 +261,7 @@ export class ChatSocket {
             this.deliveries.push({
               kind: "command_failed",
               message: (msg.message as string) ?? "command failed",
+              command: typeof msg.command === "string" ? msg.command : null,
             });
             break;
           }
@@ -299,6 +328,16 @@ export class ChatSocket {
       this.ws = null;
     }
     this.connect(true);
+  }
+
+  /**
+   * The conversation became reachable again (its row stopped being paused,
+   * or it now runs somewhere else): retry now instead of sitting out the rest
+   * of a backoff that grew while it was paused. No-op while connected.
+   */
+  retrySoon(): void {
+    if (this.closed || this.fatal || this.ended) return;
+    this.recon.nudge(0);
   }
 
   close(): void {

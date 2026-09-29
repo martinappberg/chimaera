@@ -28,7 +28,7 @@
  */
 
 import { isWatching } from "./viewerMode.svelte";
-import { refuse } from "./refusals.svelte";
+import { refuse, setTerminalStatus } from "./refusals.svelte";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -413,7 +413,7 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
     buf: new ParkedBuffer(PARKED_BUFFER_MAX_BYTES),
     // Ghosting a keystroke the closed socket silently dropped would show
     // input that was never delivered — the socket gate is non-negotiable.
-    echo: createLocalEcho(term, () => !isWatching(id) && entry.socket.isOpen && (handlers?.echoArmed?.(id) ?? false)),
+    echo: createLocalEcho(term, () => !isWatching(id) && entry.socket.isLive && (handlers?.echoArmed?.(id) ?? false)),
     webgl: null,
     webglFailed: false,
     webglLosses: 0,
@@ -486,6 +486,7 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
     // Refused typing is said inline over the pane (Terminal.svelte), in
     // plain words, instead of vanishing into the console.
     onRefused: (reason, message) => refuse(id, reason, message),
+    onStatus: (status) => setTerminalStatus(id, status),
     parked: () => entry.buf.isParked(),
     onParkedReady: () => {
       // A parked (re)connect carries no snapshot, and pre-drop buffered

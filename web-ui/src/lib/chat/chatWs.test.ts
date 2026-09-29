@@ -33,6 +33,7 @@ function handlers(): ChatSocketHandlers & Record<string, ReturnType<typeof vi.fn
     onCommandFailed: vi.fn(),
     onAsleep: vi.fn(),
     onMoved: vi.fn(),
+    onPaused: vi.fn(),
     onDisconnected: vi.fn(),
     lastSeq: () => 0,
   } as unknown as ChatSocketHandlers & Record<string, ReturnType<typeof vi.fn>>;
@@ -84,14 +85,40 @@ it("a moved conversation stays healthy and reconnects to follow it", async () =>
   socket.close();
 });
 
+it("a paused conversation is not an exit and reconnects at once when it is reachable", async () => {
+  const h = handlers();
+  const socket = new ChatSocket("s-chat", h);
+  Socket.all[0].onopen?.();
+  Socket.all[0].frame({ type: "paused", reason: "needs_provider", provider: "claude" });
+  expect(socket.send({ type: "send", blocks: [] })).toBe(false);
+  Socket.all[0].close();
+  await drain();
+  expect(h.onPaused).toHaveBeenCalledWith({ type: "paused", reason: "needs_provider", provider: "claude" });
+  expect(h.onExited).not.toHaveBeenCalled();
+  expect(socket.healthy).toBe(true);
+  // Several paused answers grow the backoff...
+  for (let i = 1; i <= 4; i++) {
+    await vi.advanceTimersByTimeAsync(20_000);
+    Socket.all.at(-1)?.close();
+  }
+  const before = Socket.all.length;
+  // ...but the row coming back retries now, not after the rest of it.
+  socket.retrySoon();
+  await vi.advanceTimersByTimeAsync(1);
+  expect(Socket.all.length).toBe(before + 1);
+  socket.close();
+});
+
 it("a refused command keeps the socket and reports the refusal", async () => {
   const h = handlers();
   const socket = new ChatSocket("s-chat", h);
   Socket.all[0].onopen?.();
   expect(socket.send({ type: "send", blocks: [] })).toBe(true);
-  Socket.all[0].frame({ type: "error", code: "command_failed", message: "not sent" });
+  Socket.all[0].frame({ type: "error", code: "command_failed", message: "not sent", command: "send" });
+  Socket.all[0].frame({ type: "error", code: "command_failed", message: "old daemon" });
   await drain();
-  expect(h.onCommandFailed).toHaveBeenCalledWith("not sent");
+  expect(h.onCommandFailed).toHaveBeenCalledWith("not sent", "send");
+  expect(h.onCommandFailed).toHaveBeenCalledWith("old daemon", null);
   expect(socket.healthy).toBe(true);
   socket.close();
 });

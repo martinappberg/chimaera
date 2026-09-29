@@ -703,15 +703,15 @@ async fn a_routed_window_keeps_this_computers_files_outside_the_project_local() 
     )
     .await;
     assert_eq!((status, body.as_str()), (StatusCode::OK, "owner copy"));
-    // This computer's own files and folders outside the project stay here.
+    // Both daemons share this test's filesystem, so the owner has a file at
+    // this outside path too: the window says so instead of showing this
+    // computer's same-named file in its place (the fake-owner test below
+    // covers the owner having nothing there).
     let (status, body) = call(Method::GET, "/fs/file", &own, Body::empty()).await;
-    assert_eq!(
-        (status, body.as_str()),
-        (StatusCode::OK, "this computer's file")
-    );
-    let (status, body) = call(Method::GET, "/fs/list", &elsewhere, Body::empty()).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body.contains("own.txt"), "{body}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("on_other_machine"), "{body}");
+    assert!(!body.contains("this computer's file"), "{body}");
+    // Saving where the folder exists on this computer stays here.
     let (status, _) = call(
         Method::PUT,
         "/fs/file",
@@ -738,6 +738,188 @@ async fn a_routed_window_keeps_this_computers_files_outside_the_project_local() 
             .stopping
             .store(true, std::sync::atomic::Ordering::Release);
     }
+}
+
+/// A routed project's Git status and Timeline pages carry the owner's epoch
+/// in a range of their own (what its events nudges carry too), so switching
+/// between this computer's copy and the owner always reads as a change.
+#[tokio::test]
+async fn a_routed_projects_epochs_never_collide_with_this_computers() {
+    let remote = test_state();
+    let local = test_state();
+    let workspace = lock(&remote.workspaces)
+        .add(test_dir("epochs-remote").canonicalize().unwrap())
+        .unwrap();
+    let mut viewing = workspace.clone();
+    viewing.root = test_dir("epochs-local").canonicalize().unwrap();
+    lock(&local.workspaces).import_exact(viewing).unwrap();
+    pro::install_execution_fixture(&remote, &workspace.id, 4).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = listener.local_addr().unwrap();
+    let router = app(remote.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let routes = [
+        format!("/api/v1/git/status?workspace_id={}", workspace.id),
+        format!("/api/v1/workspaces/{}/timeline", workspace.id),
+    ];
+    let id = workspace.id.clone();
+    let epoch = move |state: Arc<AppState>, uri: String| {
+        let id = id.clone();
+        async move {
+            let request = Request::builder()
+                .uri(uri)
+                .header(header::AUTHORIZATION, "Bearer test-token")
+                .header("x-chimaera-viewer-workspace", &id)
+                .body(Body::empty())
+                .unwrap();
+            let response = app(state).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["epoch"]
+                .as_u64()
+                .unwrap()
+        }
+    };
+    let here: Vec<u64> =
+        futures::future::join_all(routes.iter().map(|uri| epoch(local.clone(), uri.clone()))).await;
+    assert_eq!(
+        request(
+            &local,
+            Method::POST,
+            "/api/v1/pro/placements",
+            Some(serde_json::json!({
+                "host_id":"worker-epochs","endpoint":format!("http://{remote_addr}"),
+                "token":"test-token","workspace_id":workspace.id,"epoch":4
+            })),
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    for (uri, local_epoch) in routes.iter().zip(here) {
+        let owner = epoch(remote.clone(), uri.clone()).await;
+        let routed = epoch(local.clone(), uri.clone()).await;
+        assert_ne!(routed, local_epoch, "{uri}");
+        assert!(routed > u64::from(u32::MAX), "{uri}: {routed}");
+        assert_eq!(routed & 0xFFFF_FFFF, owner, "{uri}");
+    }
+    for state in [&remote, &local] {
+        state
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// A routed window's read of a file outside the project: the owner's copy
+/// when it may show it; this computer's own file when the owner has nothing
+/// there; and when the owner has a different file at that path it may not
+/// show, a plain answer — never this computer's same-named file in its place.
+#[tokio::test]
+async fn an_outside_read_the_owner_cannot_show_never_serves_this_computers_file() {
+    use axum::{extract::Query, http::HeaderMap, response::IntoResponse, routing::get, Router};
+    let local = test_state();
+    let workspace = lock(&local.workspaces)
+        .add(test_dir("other-machine-viewer").canonicalize().unwrap())
+        .unwrap();
+    let elsewhere = test_dir("other-machine-home").canonicalize().unwrap();
+    for name in ["mine.txt", "theirs.txt", "old-owner.txt"] {
+        std::fs::write(elsewhere.join(name), format!("this computer's {name}")).unwrap();
+    }
+    let owner = Router::new()
+        .route(
+            "/api/v1/health",
+            get(|headers: HeaderMap| async move {
+                let mut response = StatusCode::OK.into_response();
+                for name in [
+                    crate::workspace_scope::WORKSPACE_HEADER,
+                    crate::workspace_scope::EPOCH_HEADER,
+                ] {
+                    response.headers_mut().insert(name, headers[name].clone());
+                }
+                response
+                    .headers_mut()
+                    .insert("x-chimaera-scope-version", "1".parse().unwrap());
+                response
+            }),
+        )
+        .route(
+            "/api/v1/fs/file",
+            get(
+                |Query(query): Query<std::collections::HashMap<String, String>>| async move {
+                    let path = query.get("path").cloned().unwrap_or_default();
+                    let refuse = |status: StatusCode, error: &str| {
+                        (status, axum::Json(serde_json::json!({ "error": error }))).into_response()
+                    };
+                    if path.starts_with("/project/") {
+                        "owner copy".into_response()
+                    } else if path.ends_with("theirs.txt") {
+                        refuse(StatusCode::FORBIDDEN, "outside_project")
+                    } else if path.ends_with("old-owner.txt") {
+                        // An owner from before this distinction refuses alike.
+                        refuse(StatusCode::FORBIDDEN, "workspace_scope_changed")
+                    } else {
+                        refuse(StatusCode::NOT_FOUND, "not_found")
+                    }
+                },
+            ),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let owner_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, owner).await.unwrap() });
+    assert_eq!(
+        request(
+            &local,
+            Method::POST,
+            "/api/v1/pro/placements",
+            Some(serde_json::json!({
+                "host_id":"worker-fake","endpoint":format!("http://{owner_addr}"),
+                "token":"fixture","workspace_id":workspace.id,"epoch":4
+            })),
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let read = |path: std::path::PathBuf| {
+        let query = crate::workspace_scope::paths::encode_query(&[(
+            "path".into(),
+            path.to_string_lossy().into_owned(),
+        )]);
+        let request = Request::builder()
+            .uri(format!("/api/v1/fs/file?{query}"))
+            .header(header::AUTHORIZATION, "Bearer test-token")
+            .header("x-chimaera-viewer-workspace", &workspace.id)
+            .body(Body::empty())
+            .unwrap();
+        let local = local.clone();
+        async move {
+            let response = app(local).oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+    assert_eq!(
+        read(workspace.root.join("note.txt")).await,
+        (StatusCode::OK, "owner copy".to_owned())
+    );
+    assert_eq!(
+        read(elsewhere.join("mine.txt")).await,
+        (StatusCode::OK, "this computer's mine.txt".to_owned())
+    );
+    let (status, body) = read(elsewhere.join("theirs.txt")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"error":"on_other_machine"})
+    );
+    assert_eq!(
+        read(elsewhere.join("old-owner.txt")).await,
+        (StatusCode::OK, "this computer's old-owner.txt".to_owned())
+    );
+    local
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// A window watching a project that runs on another daemon gets that
@@ -887,9 +1069,17 @@ async fn events_for_a_routed_project_merge_only_its_frames_and_survive_an_owner_
     assert!(noticed, "the owner raised a notice while viewed");
 
     // The project changes owner. The window's own socket stays and keeps
-    // serving this daemon's frames.
+    // serving this daemon's frames once its feed for the old owner has ended.
+    let retired = local.session_proxy.feeds_retired.load(Ordering::Acquire);
     assert_eq!(register("worker-other", 5).await, StatusCode::NO_CONTENT);
-    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while local.session_proxy.feeds_retired.load(Ordering::Acquire) == retired {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the old owner's feed never ended"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     let (status, _) = request(
         &local,
         Method::PUT,
@@ -911,6 +1101,107 @@ async fn events_for_a_routed_project_merge_only_its_frames_and_survive_an_owner_
     }
 }
 
+/// A routed window with one tab outside the project (an upload, a note in the
+/// home folder) keeps hearing about both: the project's file from its owner,
+/// the outside file from this computer. The owner never sees the outside
+/// path, and never closes the feed over it.
+#[tokio::test]
+async fn a_routed_window_with_an_outside_tab_hears_owner_and_local_changes() {
+    let remote = test_state();
+    let local = test_state();
+    let workspace = lock(&remote.workspaces)
+        .add(test_dir("mixed-remote").canonicalize().unwrap())
+        .unwrap();
+    let mut viewing = workspace.clone();
+    viewing.root = test_dir("mixed-local").canonicalize().unwrap();
+    lock(&local.workspaces)
+        .import_exact(viewing.clone())
+        .unwrap();
+    let note = workspace.root.join("note.txt");
+    std::fs::write(&note, "v0").unwrap();
+    let outside = test_dir("mixed-outside")
+        .canonicalize()
+        .unwrap()
+        .join("mine.txt");
+    std::fs::write(&outside, "v0").unwrap();
+    pro::install_execution_fixture(&remote, &workspace.id, 4).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = listener.local_addr().unwrap();
+    let router = app(remote.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    assert_eq!(
+        request(
+            &local,
+            Method::POST,
+            "/api/v1/pro/placements",
+            Some(serde_json::json!({
+                "host_id":"worker-mixed","endpoint":format!("http://{remote_addr}"),
+                "token":"test-token","workspace_id":workspace.id,"epoch":4
+            })),
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    let router = app(local.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{local_addr}/ws/events"))
+        .await
+        .unwrap();
+    socket
+        .send(Message::Text(
+            serde_json::json!({"type":"auth","token":"test-token"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let viewer_note = viewing.root.join("note.txt").to_string_lossy().into_owned();
+    let outside_path = outside.to_string_lossy().into_owned();
+    socket
+        .send(Message::Text(
+            serde_json::json!({"type":"watch","workspace_id":workspace.id,
+                "files":[viewer_note, outside_path],"dirs":[]})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let (mut owner_seen, mut local_seen) = (false, false);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut writes = 0;
+    while !(owner_seen && local_seen) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "owner change seen: {owner_seen}, local change seen: {local_seen}"
+        );
+        writes += 1;
+        std::fs::write(&note, format!("v{writes}")).unwrap();
+        std::fs::write(&outside, format!("v{writes}")).unwrap();
+        let wait = tokio::time::Instant::now() + std::time::Duration::from_millis(700);
+        while let Ok(Some(Ok(Message::Text(text)))) =
+            tokio::time::timeout_at(wait, futures::StreamExt::next(&mut socket)).await
+        {
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_ne!(frame["type"], "error", "{frame}");
+            if frame["type"] != "fs" {
+                continue;
+            }
+            for path in frame["files"].as_array().unwrap() {
+                owner_seen |= path == viewer_note.as_str();
+                local_seen |= path == outside_path.as_str();
+            }
+        }
+    }
+    for state in [&remote, &local] {
+        state
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// An in-process stand-in for the account transport in front of a real
 /// daemon: while "asleep" it answers health for the owner (marked sleeping)
 /// and refuses socket upgrades that carry no interaction, exactly as the
@@ -919,6 +1210,9 @@ async fn events_for_a_routed_project_merge_only_its_frames_and_survive_an_owner_
 struct FakeTransport {
     asleep: std::sync::atomic::AtomicBool,
     refuse_wake: std::sync::atomic::AtomicBool,
+    /// Keep a waking owner waking until the test releases it.
+    hold_wake: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
     upgrades: std::sync::Mutex<Vec<String>>,
 }
 impl FakeTransport {
@@ -943,6 +1237,9 @@ impl FakeTransport {
                                     axum::Json(serde_json::json!({"error":"worker_asleep"})),
                                 )
                                     .into_response();
+                            }
+                            if transport.hold_wake.load(Ordering::Acquire) {
+                                transport.release.notified().await;
                             }
                             transport.asleep.store(false, Ordering::Release);
                         }
@@ -973,6 +1270,7 @@ struct SleepingChat {
 impl Drop for SleepingChat {
     fn drop(&mut self) {
         self.remote.chat.kill(&self.id);
+        self.remote.sessions.kill(&self.id).ok();
         for state in [&self.remote, &self.local] {
             state
                 .stopping
@@ -984,6 +1282,12 @@ impl Drop for SleepingChat {
 /// A remote chat whose fake agent writes its stdin to `capture`, served
 /// behind a sleeping fake transport, with a viewing daemon routed to it.
 async fn sleeping_remote_chat(label: &str) -> SleepingChat {
+    sleeping_remote(label, false).await
+}
+
+/// [`sleeping_remote_chat`], or a terminal whose process writes its input
+/// to `capture`.
+async fn sleeping_remote(label: &str, terminal: bool) -> SleepingChat {
     let remote = test_state();
     let local = test_state();
     let workspace = lock(&remote.workspaces)
@@ -1001,19 +1305,40 @@ async fn sleeping_remote_chat(label: &str) -> SleepingChat {
     )
     .unwrap();
     let id = format!("s-{label}");
-    let mut spec = chimaera_agent::driver::SpawnSpec::new(
-        id.clone(),
-        vec![fake.to_string_lossy().into_owned()],
-        workspace.root.clone(),
-    );
-    spec.env.push((
-        "CHIMAERA_TEST_CAPTURE".into(),
-        capture.to_string_lossy().into_owned(),
-    ));
-    remote
-        .chat
-        .spawn(&chimaera_agent::claude::ClaudeAdapter, spec)
-        .unwrap();
+    if terminal {
+        remote
+            .sessions
+            .spawn(chimaera_pty::SpawnOpts {
+                cwd: workspace.root.clone(),
+                name: None,
+                cols: 80,
+                rows: 24,
+                command: Some(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("cat > '{}'", capture.display()),
+                ]),
+                id: Some(id.clone()),
+                env: Vec::new(),
+                env_remove: Vec::new(),
+                scrollback: None,
+            })
+            .unwrap();
+    } else {
+        let mut spec = chimaera_agent::driver::SpawnSpec::new(
+            id.clone(),
+            vec![fake.to_string_lossy().into_owned()],
+            workspace.root.clone(),
+        );
+        spec.env.push((
+            "CHIMAERA_TEST_CAPTURE".into(),
+            capture.to_string_lossy().into_owned(),
+        ));
+        remote
+            .chat
+            .spawn(&chimaera_agent::claude::ClaudeAdapter, spec)
+            .unwrap();
+    }
     lock(&remote.session_workspaces).insert(id.clone(), workspace.id.clone());
     pro::install_execution_fixture(&remote, &workspace.id, 4).unwrap();
     let transport = Arc::new(FakeTransport::default());
@@ -1198,10 +1523,125 @@ async fn a_send_that_cannot_reach_the_owner_is_answered_not_dropped() {
         let frame = next_json(&mut socket).await;
         assert_ne!(frame["type"], "ready");
         if frame["code"] == "command_failed" {
+            // Tagged, so the viewer hands back only a refused send's text.
+            assert_eq!(frame["command"], "send", "{frame}");
             break;
         }
     }
     // The socket survives the refusal and says what it is waiting for.
     assert_eq!(next_json(&mut socket).await["code"], "remote_unavailable");
     assert_eq!(user_turns(&fixture.capture, "LOST_MESSAGE"), 0);
+}
+
+/// While a viewer's first send wakes the owner, the viewer is told so and a
+/// second send is refused with a plain reason instead of being held: once
+/// the owner answers, exactly one message is delivered.
+#[tokio::test]
+async fn a_second_send_while_waking_is_refused_not_queued() {
+    use std::sync::atomic::Ordering;
+    let fixture = sleeping_remote_chat("waking-chat").await;
+    fixture.transport.hold_wake.store(true, Ordering::Release);
+    let mut socket = open_chat(&fixture).await;
+    assert_eq!(next_json(&mut socket).await["code"], "worker_asleep");
+    socket.send(send_text("FIRST_SEND")).await.unwrap();
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "ready", "the owner is still waking");
+        if frame["type"] == "waking" {
+            break;
+        }
+    }
+    socket.send(send_text("SECOND_SEND")).await.unwrap();
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "ready", "the owner is still waking");
+        if frame["code"] == "command_failed" {
+            assert_eq!(frame["reason"], "waking", "{frame}");
+            assert_eq!(frame["command"], "send", "{frame}");
+            break;
+        }
+    }
+    fixture.transport.release.notify_one();
+    loop {
+        if next_json(&mut socket).await["type"] == "ready" {
+            break;
+        }
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while user_turns(&fixture.capture, "FIRST_SEND") == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "first send never delivered"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(user_turns(&fixture.capture, "FIRST_SEND"), 1);
+    assert_eq!(user_turns(&fixture.capture, "SECOND_SEND"), 0);
+}
+
+/// A terminal waking its owner holds the typing that woke it and refuses
+/// the rest (with a plain note) until the owner answers: nothing typed
+/// twice is ever run twice.
+#[tokio::test]
+async fn a_waking_terminal_holds_one_burst_and_refuses_the_rest() {
+    use std::sync::atomic::Ordering;
+    let fixture = sleeping_remote("waking-term", true).await;
+    fixture.transport.hold_wake.store(true, Ordering::Release);
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{}/ws/sessions/{}",
+        fixture.local_addr, fixture.id
+    ))
+    .await
+    .unwrap();
+    socket
+        .send(Message::Text(
+            serde_json::json!({"type":"auth","token":"test-token","cols":80,"rows":24})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(next_json(&mut socket).await["code"], "worker_asleep");
+    socket
+        .send(Message::Binary(b"FIRST_BURST\r".to_vec().into()))
+        .await
+        .unwrap();
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "ready", "the owner is still waking");
+        if frame["type"] == "waking" {
+            break;
+        }
+    }
+    socket
+        .send(Message::Binary(b"SECOND_BURST\r".to_vec().into()))
+        .await
+        .unwrap();
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "ready", "the owner is still waking");
+        if frame["type"] == "error" {
+            assert_eq!(frame["reason"], "waking", "{frame}");
+            break;
+        }
+    }
+    fixture.transport.release.notify_one();
+    loop {
+        if next_json(&mut socket).await["type"] == "ready" {
+            break;
+        }
+    }
+    let captured = || std::fs::read_to_string(&fixture.capture).unwrap_or_default();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !captured().contains("FIRST_BURST") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "held typing never delivered"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(captured().matches("FIRST_BURST").count(), 1);
+    assert!(!captured().contains("SECOND_BURST"));
 }

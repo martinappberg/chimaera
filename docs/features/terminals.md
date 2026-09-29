@@ -229,8 +229,11 @@ A phone-width browser view starts in **Just watching** mode: it shows the
 daemon’s existing grid and scrolls horizontally without resizing it or
 accepting input. Taking control reconnects and fits the terminal to the current
 pane; it is not itself interaction. Opening, reconnecting and watching never
-wake a paused cloud project — the first keystroke does, and the typing waits
-for it (see [Pro: continuing and viewing](pro.md#continuing-and-viewing-a-remote-session)).
+wake a paused cloud project — the first keystroke does. In a native window that
+first burst of typing waits for it (the pane says "Waking the cloud machine…",
+nothing echoes until it answers, and more typing meanwhile is refused with a
+note rather than run twice); a browser view drops the keystroke, reconnects with
+wake intent and says so over the pane (see [Pro: continuing and viewing](pro.md#continuing-and-viewing-a-remote-session)).
 Typing the daemon refuses (watching, busy, running on another device) is said
 in a short note over the pane, never in the scrollback. A terminal whose session
 moves to another machine keeps its screen and reconnects; it does not show as
