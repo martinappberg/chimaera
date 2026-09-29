@@ -27,7 +27,8 @@
     isCutPending,
     pasteInto,
   } from "./fileClipboard.svelte";
-  import { isRemoteHost } from "../net/api";
+  import { isOwnerAsleep, isRemoteHost, projectStateNote } from "../net/api";
+  import { refetchWhenOwnerAwake } from "../net/reconnect";
   import { stemLength, validateEntryName } from "../shared/fsNames";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
   import { writeClipboard } from "../net/native";
@@ -478,6 +479,7 @@
       listings = new Map();
       truncatedDirs = new Set();
       rootError = null;
+      stopWaitingForOwner();
       lastGitEpoch = -1;
       prevGitEntries = new Map();
       relistDirs = new Set();
@@ -562,6 +564,30 @@
     });
   });
 
+  // The root's listing met a project whose owner sleeps (or is reconnecting):
+  // the note stands until the owner answers, then the tree is listed again —
+  // it never reads again on its own, so without this a woken project's tree
+  // kept saying "asleep".
+  let cancelOwnerWait: (() => void) | null = null;
+  function stopWaitingForOwner(): void {
+    cancelOwnerWait?.();
+    cancelOwnerWait = null;
+  }
+  function waitForOwner(asleep: boolean): void {
+    stopWaitingForOwner();
+    cancelOwnerWait = refetchWhenOwnerAwake(
+      () => {
+        cancelOwnerWait = null;
+        void load(root);
+      },
+      // A sleeping owner's wake is announced; a project routed elsewhere that
+      // came home is not (nothing on this computer says so), so it is asked
+      // again now and then while the note stands.
+      { pollMs: asleep ? undefined : 30_000 },
+    );
+  }
+  $effect(() => stopWaitingForOwner);
+
   async function load(dir: string): Promise<void> {
     loading = new Set(loading).add(dir);
     try {
@@ -573,13 +599,17 @@
       if (listing.truncated === true) truncated.add(dir);
       else truncated.delete(dir);
       truncatedDirs = truncated;
-      if (dir === root) rootError = null;
+      if (dir === root) {
+        rootError = null;
+        stopWaitingForOwner();
+      }
     } catch (e) {
       const truncated = new Set(truncatedDirs);
       truncated.delete(dir);
       truncatedDirs = truncated;
       if (dir === root) {
         rootError = e instanceof Error ? e.message : "failed to list files";
+        if (projectStateNote(e) !== null) waitForOwner(isOwnerAsleep(e));
       } else {
         // Collapse a dir that failed to list (deleted, permission denied).
         const n = new Set(expanded);

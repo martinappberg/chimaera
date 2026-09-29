@@ -1,7 +1,7 @@
 import { ownerSuspended, sendSocketAuth } from "../net/placement";
 import { daemonSocketUrl, isBrowserGateway } from "../net/base";
 import { getToken } from "../net/api";
-import { parkUntilAwake, Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
+import { ownerAwake, parkUntilAwake, Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 
 export interface SessionSocketHandlers {
   readOnly?(): boolean;
@@ -234,6 +234,8 @@ export class SessionSocket {
         this.waking = false;
         this.asleep = false;
         this.live = true;
+        // The project answers on this socket: whatever waited for it reads again.
+        ownerAwake();
         this.handlers.onStatus?.(null);
         if (this.sentParkedAuth) {
           // No snapshot follows on a parked connection — never reset the

@@ -13,7 +13,8 @@
  * workspace lives in localStorage (every access wrapped — private mode and
  * quota errors must never break the surface).
  */
-import { api, ApiError } from "../net/api";
+import { api, ApiError, isOwnerAsleep, projectStateNote } from "../net/api";
+import { refetchWhenOwnerAwake } from "../net/reconnect";
 
 export type TimelineKind = "episode" | "command" | "job" | "session" | "knowledge" | "note";
 export type EpisodeEnd = "finished" | "interrupted" | "errored" | "exited" | "unknown";
@@ -181,9 +182,46 @@ class TimelineStore {
   available = $state<boolean | null>(null);
   /** The daemon's own words for a failed fetch, or null. */
   error = $state<string | null>(null);
+  /** A fetch the project's owner could not answer yet — asleep, reconnecting,
+   *  unreachable while the project is routed elsewhere: where the project is,
+   *  not something that failed. Shown as a quiet line; the store reads again
+   *  once the owner answers. Never set together with `error`. */
+  note = $state<string | null>(null);
 }
 
 export const timelineStore = new TimelineStore();
+
+/** How long a project that could not be reached waits before one more read,
+ *  when no sign announces its return (see {@link refetchWhenOwnerAwake}). */
+const STATE_RECHECK_MS = 30_000;
+/** The wait for a sleeping/unreachable owner, when a read met one. */
+let cancelWake: (() => void) | null = null;
+
+/** A read failed: a project's state becomes the quiet `note` and a re-read
+ *  once the owner answers; anything else stays an `error`. */
+function readFailed(e: unknown, wsId: string): void {
+  cancelWake?.();
+  cancelWake = null;
+  const note = projectStateNote(e);
+  timelineStore.note = note;
+  timelineStore.error = note === null ? (e instanceof Error ? e.message : String(e)) : null;
+  if (note === null) return;
+  cancelWake = refetchWhenOwnerAwake(
+    () => {
+      cancelWake = null;
+      if (timelineStore.wsId === wsId) void pull(wsId);
+    },
+    { pollMs: isOwnerAsleep(e) ? undefined : STATE_RECHECK_MS },
+  );
+}
+
+/** A read succeeded: the owner answers, nothing is waiting on it. */
+function readSucceeded(): void {
+  cancelWake?.();
+  cancelWake = null;
+  timelineStore.note = null;
+  timelineStore.error = null;
+}
 
 /** Separate counters: a load-older must never discard a nudge pull (whose
  *  epoch would then go unrecorded) or the other way round. */
@@ -229,7 +267,7 @@ export async function activateTimelineWorkspace(wsId: string | null): Promise<vo
   timelineStore.entries = [];
   timelineStore.head = 0;
   timelineStore.more = false;
-  timelineStore.error = null;
+  readSucceeded();
   timelineStore.available = null;
   staleWhileHidden = false;
   if (wsId !== null) await pull(wsId);
@@ -258,7 +296,7 @@ async function pull(wsId: string): Promise<void> {
     if (timelineStore.wsId !== wsId || seq !== pullSeq) return;
     lastEpoch.set(wsId, page.epoch);
     timelineStore.available = true;
-    timelineStore.error = null;
+    readSucceeded();
     const wasEmpty = timelineStore.entries.length === 0;
     const overflowed = since !== undefined && page.more;
     if (page.entries.length > 0) {
@@ -274,9 +312,9 @@ async function pull(wsId: string): Promise<void> {
     if (timelineStore.wsId !== wsId || seq !== pullSeq) return;
     if (e instanceof ApiError && e.status === 404) {
       timelineStore.available = false;
-      timelineStore.error = null;
+      readSucceeded();
     } else {
-      timelineStore.error = e instanceof Error ? e.message : String(e);
+      readFailed(e, wsId);
     }
   } finally {
     if (timelineStore.wsId === wsId && seq === pullSeq) timelineStore.loading = false;
@@ -318,10 +356,10 @@ export async function loadOlderTimeline(): Promise<void> {
     if (timelineStore.wsId !== ws || seq !== olderSeq) return;
     timelineStore.entries = merge(timelineStore.entries, page.entries);
     timelineStore.more = page.more;
-    timelineStore.error = null;
+    readSucceeded();
   } catch (e) {
     if (timelineStore.wsId !== ws || seq !== olderSeq) return;
-    timelineStore.error = e instanceof Error ? e.message : String(e);
+    readFailed(e, ws);
   } finally {
     if (timelineStore.wsId === ws && seq === olderSeq) timelineStore.loading = false;
   }

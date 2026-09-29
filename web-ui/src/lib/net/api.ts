@@ -326,6 +326,31 @@ export function plainError(message: string, where: "cloud" | "computer" | "other
   return PLAIN_ERRORS[message] ?? message;
 }
 
+/** Codes that say where the project is right now rather than that something
+ *  went wrong: its owner sleeps, is reconnecting, or is not reachable while
+ *  the project is routed elsewhere. A surface that read something and got one
+ *  of these shows a quiet note and reads again once the owner answers; it
+ *  never paints it as an error. */
+const STATE_CODES = new Set(["worker_asleep", "project_unavailable", "remote_unavailable", "workspace_scope_changed", "workspace_unavailable"]);
+
+/** The line for a sleeping owner: the chat's footer says the same, and a
+ *  dashboard or panel has the room for the way out. */
+export const ASLEEP_NOTE = "Asleep in the cloud. Send a message to wake it.";
+
+/** The failure is a sleeping cloud machine: its wake is announced (a socket
+ *  ready, a placement read), so nothing needs to poll for it. */
+export function isOwnerAsleep(e: unknown): boolean {
+  return e instanceof ApiError && e.code === "worker_asleep";
+}
+
+/** The quiet note a state-code failure reads as ("Asleep in the cloud. …",
+ *  "This project isn’t reachable right now."), or null for anything else —
+ *  a real failure, which keeps its error styling. */
+export function projectStateNote(e: unknown): string | null {
+  if (!(e instanceof ApiError) || e.code === null || !STATE_CODES.has(e.code)) return null;
+  return e.code === "worker_asleep" ? ASLEEP_NOTE : e.message;
+}
+
 export class ApiError extends Error {
   readonly status: number;
   /** The daemon's code when it sent one this module knows (additive). */

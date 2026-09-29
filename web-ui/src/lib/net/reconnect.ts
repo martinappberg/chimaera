@@ -114,6 +114,53 @@ export function parkUntilAwake(retry: () => void): () => void {
   };
 }
 
+/** Re-read a surface (the file tree, the Timeline) once its project answers
+ *  again, after a read of it met a project state (its owner asleep,
+ *  reconnecting, unreachable). It parks like a socket — no timer, no backoff
+ *  churn against a sleeping owner — and, since a re-read costs a request,
+ *  waits for the document to be visible: a hidden tab reads once when it is
+ *  next seen. `pollMs` adds one slow recheck for a state no sign announces the
+ *  end of (a project routed elsewhere that has come home: nothing on this
+ *  computer says so). `refetch` that meets the state again calls this again.
+ *  Returns the cancel (call it when the surface goes away or reads some other
+ *  way first). */
+export function refetchWhenOwnerAwake(refetch: () => void, { pollMs }: { pollMs?: number } = {}): () => void {
+  let done = false;
+  let unpark: () => void = () => {};
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let onVisible: (() => void) | null = null;
+  const cancel = (): void => {
+    done = true;
+    unpark();
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+    if (onVisible !== null) document.removeEventListener("visibilitychange", onVisible);
+    onVisible = null;
+  };
+  const fire = (): void => {
+    if (done) return;
+    if (documentHidden()) {
+      if (onVisible === null) {
+        onVisible = () => {
+          if (!documentHidden()) fire();
+        };
+        document.addEventListener("visibilitychange", onVisible);
+      }
+      return;
+    }
+    cancel();
+    refetch();
+  };
+  unpark = parkUntilAwake(fire);
+  if (pollMs !== undefined) {
+    timer = setTimeout(() => {
+      timer = null;
+      fire();
+    }, pollMs);
+  }
+  return cancel;
+}
+
 /** A sign the owner answers again (a placement read says owned, a project
  *  view's events socket is up, a row became reachable): dial every parked
  *  socket once, passively, each on its own 0–2s slot out of the caller's
