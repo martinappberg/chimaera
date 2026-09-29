@@ -74,7 +74,7 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   re-runs the same curated script (it always fetches latest and re-swaps atomically) as a session
   named `update <agent>` — **managed binaries only**; for your own binary the daemon 400s and the
   UI never offers it. `DELETE /api/v1/agents/{id}/install` uninstalls the managed copy (driven
-  from the Agents settings panel).
+  from the Agents settings panel, after an in-app `ConfirmDialog` that keeps a failure inline).
 - **Where it lives.** `runtimes.rs` (`install_agent`, `update_agent`, `start_install`,
   `install_script`, `write_shims`, `regenerate_shims`); latest-release awareness in
   `agent_updates.rs`.

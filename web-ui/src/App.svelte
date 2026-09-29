@@ -3977,6 +3977,32 @@
   };
 
   /**
+   * The open question of a forced view switch (a mid-task agent), answered
+   * by the ConfirmDialog below — `window.confirm` never shows in the native
+   * app. One question at a time: a newer ask answers the older one "no", so
+   * its switch settles and releases `switchingViews`.
+   */
+  let switchAsk = $state.raw<{
+    sessionId: string;
+    target: "chat" | "term";
+    answer(go: boolean): void;
+  } | null>(null);
+
+  function askForcedSwitch(sessionId: string, target: "chat" | "term"): Promise<boolean> {
+    switchAsk?.answer(false);
+    return new Promise((resolve) => {
+      switchAsk = {
+        sessionId,
+        target,
+        answer(go) {
+          switchAsk = null;
+          resolve(go);
+        },
+      };
+    });
+  }
+
+  /**
    * The chat⇄terminal toggle: the daemon stops the current process and
    * resumes the same conversation in the other mode; the session row's `ui`
    * flips on the events bus and every pane follows. A mid-task agent 409s
@@ -4001,10 +4027,7 @@
           console.error("view switch failed", e);
           return;
         }
-        const go = confirm(
-          "The agent is mid-task. Switching restarts it via resume and interrupts the current turn — switch anyway?",
-        );
-        if (!go) return;
+        if (!(await askForcedSwitch(sessionId, target))) return;
         try {
           await switchSessionView(sessionId, target, true);
         } catch (err) {
@@ -5766,6 +5789,18 @@
       pendingDelete.set(null);
       deleteError = null;
     }}
+  />
+{/if}
+
+<!-- A mid-task agent's view switch interrupts its turn: asked, not assumed. -->
+{#if switchAsk !== null}
+  <ConfirmDialog
+    title={switchAsk.target === "chat" ? "Open as chat?" : "Open as terminal?"}
+    body={`${sessionLabel(displayNames, sessionsById, switchAsk.sessionId)} is mid-task. Switching restarts it via resume, which interrupts the current turn.`}
+    confirmLabel="switch"
+    enterConfirms
+    onConfirm={() => switchAsk?.answer(true)}
+    onCancel={() => switchAsk?.answer(false)}
   />
 {/if}
 
