@@ -209,3 +209,21 @@ _Intent pending — drafted from the maintainer's request, 2026-09-06; questionn
 - **Pending.** The label vocabulary ("split right", "add to this pane", "@ reference in ⟨session⟩",
   "link to ⟨agent⟩", "upload into ⟨dir⟩/") and the Finder row-beats-column rule have not been
   confirmed with the maintainer — capture via **capture-feature-intent** when available.
+
+### Dropped files read as their name, and mentions read as chips — why it exists
+_Captured 2026-09-28 (from the maintainer, choosing among drafts built from their own words while
+the feature was designed with them)._
+
+- **Problem it solves.** A dropped screenshot put ~100 characters of machine-made landing-pad path in
+  front of what the user wanted to write, and it looked bad. Chimaera is full of referencing (`@`
+  files, drops, quotes), so a reference should read the way a document does in text — a name where
+  it was written, the details on hover — without breaking how referencing works.
+- **How settled it is.**
+  - **Core bets:** the agent receives **exactly the full mention**, and the reference stays
+    **where it was written** in the sentence; a copy gives the full path.
+  - **Additions (improvable):** everything about the look — the composer pills, the chip editing
+    behavior, the bubble chips, the hover tip. Change them freely if something reads better.
+- **Deliberately open.** A real **hover preview** of the file (like the chat's document hovers) in
+  place of today's name-and-path tip.
+- **Do not change:** **what the agent receives** — the whole `@/…/uploads/<session>/<name>` mention
+  (or the typed mention), in place. The display may change; the sent text may not.
