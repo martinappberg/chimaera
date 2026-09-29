@@ -1,97 +1,190 @@
 # Git & source control
 
-Read-only git for a workspace's repo — porcelain-v2 status and side-by-side diff — plus the
-one class of mutation: creating/removing **worktrees** confined to a daemon-managed root
-("spin a branch into its own openable window"). There is **no** stage / unstage / commit /
-discard / push / pull endpoint anywhere; the panel reviews, it doesn't commit.
+Read-only git for a workspace's repositories — porcelain-v2 status, side-by-side diffs, history —
+plus the one class of mutation: creating/removing **worktrees** confined to a daemon-managed root
+(and locking/unlocking them while an agent works inside). There is **no** stage / unstage / commit
+/ discard / push / pull / checkout / reset endpoint anywhere; the panel reviews, it doesn't commit.
+Git is **optional and ambient**: without a repository nothing git-shaped appears, and nothing ever
+suggests using git.
 
-**Where it lives (shared):** UI `web-ui/src/lib/workspace/{GitView.svelte,git.ts,gitDeco.ts,
-SessionChangesView.svelte}` + the diff surface `web-ui/src/lib/previews/DiffView.svelte`.
-Daemon: `crates/chimaera-server/src/git/` (`http.rs` status/diff/worktrees, `worktree.rs`
-create/remove, `resolve.rs`, `service.rs`, `parse.rs`). Wire: `GET /api/v1/git/status`,
-`GET /api/v1/git/diff`, `GET/POST/DELETE /api/v1/git/worktrees`, and a git **epoch** on
-`/ws/events`.
+**Where it lives (shared):** UI `web-ui/src/lib/workspace/{GitView.svelte (the panel shell + the
+repository list), GitRepoSection.svelte (one repository's changes, Branches, History),
+GitDetailView.svelte (the commit / history / "Changes on this branch" surface), GitHistoryList.svelte,
+CommitRow.svelte, git.ts (stores + fetchers), gitFormat.ts, gitDeco.ts, SessionChangesView.svelte}`,
+`shared/BranchChip.svelte`, and the diff surface `web-ui/src/lib/previews/DiffView.svelte`.
+Daemon: `crates/chimaera-server/src/git/` (`http.rs` status/diff/worktrees/branches/repos, `history.rs`
+log/show/compare, `repos.rs` discovery, `session.rs` the session tracker, `anchor.rs`, `worktree.rs`,
+`include.rs`, `rev.rs`, `resolve.rs`, `service.rs`, `parse.rs`). Wire: `GET /api/v1/git/{status,diff,
+repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
+`GET /api/v1/sessions/{id}/git`, the additive `git` field on session rows, and a git **epoch** frame on
+`/ws/events` (with per-repository epochs).
 
 ## Source-control panel
 
-- **What & when.** A singleton pane surface: a branch header plus every changed path grouped
-  into Conflicts / Staged / Changes / Untracked, click-to-diff.
-- **How it's used.** The header names the branch (or `detached`+SHA / `(unborn)`) with `↑N`/`↓N`
-  ahead/behind and a refresh button. Each changed row shows a file glyph, a mid-truncated
+- **What & when.** A singleton pane surface. With one repository: a branch header plus every changed
+  path grouped into Conflicts / Staged / Changes / Untracked (click-to-diff), then two collapsible
+  sections, **Branches** and **History**. With several repositories: a compact list instead.
+- **How it's used.** The header names the branch (`No branch (at 3f2a1c9)` when detached, `No commits
+  yet` when unborn) with `↑N`/`↓N` (tooltip in words: "2 commits to push · 1 to pull from
+  origin/main") and a refresh button. Each changed row shows a file glyph, a mid-truncated
   repo-relative path, a rename `←` marker, and a letter badge. Clicking a row opens its diff in an
-  **adjacent** pane (Cmd/Ctrl-click forces a fresh split) so the panel stays visible beside it.
-- **Where it lives.** `GitView.svelte` (`groups`, `openDiff`), `git.ts` (`gitStatus` store,
-  `fetchGitDiff`), `gitDeco.ts` (`decoFor`/`dirColor`). Routes `GET /api/v1/git/status?workspace_id=`,
-  `GET /api/v1/git/diff?workspace_id=&path=&mode=`.
+  **adjacent** pane (Cmd/Ctrl-click forces a fresh split). A folder that is itself a repository shows
+  under "Repositories inside" as a link to its own section, not as a change.
+- **Where it lives.** `GitView.svelte`, `GitRepoSection.svelte` (`groups`, `openDiff`), `git.ts`
+  (`gitStatus`, `gitRepos`, `gitRepoStatuses`, `fetchGitDiff`), `gitDeco.ts`.
 - **Key behaviors.** Diff mode per group: Staged rows open `staged` (index vs HEAD); everything else
-  `unstaged` (working tree vs index). One path can appear in two groups (staged edit + further
-  worktree edit) — VS Code semantics; the badge disambiguates. A clean repo shows "Working tree
-  clean."; `status.truncated` appends a cap note. Rows only *open* diffs — no checkboxes/stage/commit
-  controls exist server-side.
+  `unstaged` (working tree vs index). One path can appear in two groups — VS Code semantics; the badge
+  disambiguates. A clean repo shows "Working tree clean."; no repository shows "This folder isn't a git
+  repository." and nothing else. Section open/closed state is remembered per workspace (browser storage).
+  A repository git refuses to read (dubious ownership on shared storage) shows the exact
+  `safe.directory` remedy — per repository.
+
+## Several repositories in one workspace
+
+- **What & when.** A folder that holds repositories (a pipeline repo, an analysis repo, a cloned tool),
+  a repository with a nested clone or submodules. Each repository has its own status, branches and
+  history.
+- **How it's used.** The panel lists them — `name · branch · N changed` (↑↓ only when non-zero),
+  nesting indented under the parent, submodules marked, repositories with changes first. Expanding a
+  row shows that repository's section; the one holding the focused file or session expands by itself.
+  The status-strip chip names the focused file's / terminal's / session's repository (`analysis main
+  ●2`), or "N repos" when nothing focused is inside one; clicking it scrolls the panel to that
+  repository. File-tree badges come from the innermost repository, roll-ups stop at a repository's
+  folder, and repository folders get a small mark.
+- **Where it lives.** Daemon `git/repos.rs` (`discover_all`, `note_listed_dir`, `note_agent_repo`,
+  `note_submodules`), `git/service.rs` (`innermost`, `add_found`, per-repository keys/epochs/watchers),
+  `git/http.rs` (`repos`, `pick_repo`). UI `git.ts` (`gitRepos`, `gitRepoStatuses`, `gitIndex`,
+  `onGitNudge`, `gitFocus`), `App.svelte` (the strip chip, watched repositories), `FileTree.svelte`.
+- **Key behaviors.** Discovery never walks the tree: a two-level `.git` probe at open (Quick Open's
+  ignore list skipped, ≤2,000 checks, off the reactor; again on the panel's refresh), file-tree listings
+  that show a `.git`, an agent's folder landing in an unknown repository (one `rev-parse`), and
+  submodules (`.gitmodules`, porcelain-v2 `S` marks) — at most **32** per workspace ("capped" past
+  that). A linked worktree of a known repository is never listed as a peer. Every route takes an
+  optional `repo` (a known top level, or a worktree `git worktree list` reports for one — never an
+  arbitrary path); without it the routes behave exactly as before, and `/git/diff` picks the innermost
+  repository holding the path. A change refreshes only the repository containing it (plus a submodule's
+  superproject); the 12 s backstop covers the primary and the nested repositories a window has open or
+  holds a file of. **Intent: pending** (shipped 2026-09-29).
+
+## History
+
+- **What & when.** What happened in a repository, a file, or a branch — read-only.
+- **How it's used.** The **History** section shows ~20 compact rows (subject, author, relative time;
+  hover gives the message and a short sha) and loads more as you scroll (pages of 50). A commit opens
+  its own tab: subject, body, `author · date · sha` (click the sha to copy), and the files with `+N −M`;
+  a file opens that commit's diff against its parent. **File history** is in the file tree's and file
+  tabs' menus and in Quick Open (with "Source Control" and "History"). A commit can be referenced in a
+  chat — "Reference in chat", or dragged onto an agent like a file — as `commit 3f2a1c9 ("subject")`.
+- **Where it lives.** Daemon `git/history.rs` (`log`, `show`, `compare`), `git/rev.rs`. UI
+  `GitHistoryList.svelte`, `CommitRow.svelte`, `GitDetailView.svelte` (`gitx` surface), `layout.ts`
+  (`GitDetailTab`, diff tabs' `rev`/`repo`/`orig`), `shared/reference.ts` (`referenceCommit`,
+  `composeCommitReference`).
+- **Key behaviors.** `GET /git/log?repo=&path=&rev=&skip=&limit=` (≤50 a page; `path` follows renames);
+  `GET /git/show?repo=&rev=`; `rev=` on `GET /git/diff` (working tree vs the revision, or `mode=commit`
+  for the commit vs its parent). Every revision is validated with `check-ref-format` and resolved with
+  `rev-parse --verify` before use; flags, ranges, blob paths and reflog selectors are refused. Chimaera
+  shows history and never checks out, reverts or resets. **Intent: pending** (shipped 2026-09-29).
 
 ## The diff surface
 
-- **What & when.** The side-by-side viewer the panel (and the session-changes view) opens. Full
-  before/after review with a mode toggle.
-- **How it's used.** Opens as a pane tab keyed by `(path, mode)`; a toolbar toggles Unstaged /
-  Staged / All without changing the tab identity. Selecting text on the working-tree (right) side
-  publishes a reference chip for a chat composer.
+- **What & when.** The side-by-side viewer the panel, the session-changes view, commits and branch
+  changes open.
+- **How it's used.** Opens as a pane tab keyed by `(path, mode[, rev, repo])`; for status diffs a
+  toolbar toggles Unstaged / Staged / All without changing the tab identity (revision diffs show what
+  they were opened as). Selecting text on the working-tree (right) side publishes a reference chip.
 - **Where it lives.** `DiffView.svelte` (CodeMirror `MergeView`). The daemon returns two **full
-  blobs**; the client computes the diff (`git/http.rs` maps modes: `staged`→`HEAD:rel` vs `:rel`;
-  `head`→`HEAD:rel` vs worktree; default `unstaged`→`:rel` vs worktree).
-- **Key behaviors.** Editors are strictly read-only (the diff can't be edited/committed). Binary and
-  over-cap files degrade to a quiet message (each side capped at 2 MB; binary detected by NUL in the
-  first 8000 bytes). The reference-chip bridge is armed only for working-tree comparisons. Reloads on
-  a git epoch bump.
+  blobs**; the client computes the diff.
+- **Key behaviors.** Editors are strictly read-only. Binary and over-cap files degrade to a quiet
+  message (each side capped at 2 MB; binary = NUL in the first 8000 bytes). Reloads when the epoch of
+  the repository holding the file moves.
+
+## Sessions know their branch
+
+- **What & when.** Which repository and branch each session works in — including an agent that
+  entered a worktree mid-session.
+- **How it's used.** Chat sessions show one quiet line above the input (branch, and the worktree
+  folder when it isn't the main checkout; click opens "Changes on this branch"); dashboard cards show
+  the same label in their meta line. Nothing on the rail. The Branches section lists each session under
+  the worktree it is in.
+- **Where it lives.** Daemon `git/session.rs` (the tracker task, `note_hook_cwd`, `session_git`),
+  `git/anchor.rs`, `agents.rs` (the hook's `cwd`), `session_view.rs` (the additive `git` row field and
+  the agent's `cwd_current`). UI `shared/BranchChip.svelte`, `chat/ChatView.svelte`,
+  `dashboard/AgentCard.svelte`.
+- **Key behaviors.** A session's folder is its shell's polled cwd, the `cwd` every claude hook carries,
+  else its spawn folder (codex/gemini TUIs have no hooks and keep their start folder). The tracker
+  resolves it once per folder (`rev-parse`), reads the branch from `HEAD` (no process), and recomputes
+  only when a folder changes or a git epoch moves — never on a timer. It keeps anchors
+  `{repo, worktree, branch, head}` at start, at claude turn ends and at end (in memory; ended sessions
+  ≤128) and serves `GET /sessions/{id}/git` → `{start, current, commits[≤50], rewritten,
+  branch_changed, repo_changed}`. `CreateSession` accepts a `cwd` inside the workspace or one of its
+  worktrees; the Mastermind's `spawn_agent` takes `branch`/`base` (the worker stays in the Mastermind's
+  workspace and runs in that branch's worktree). A command finishing in a terminal marks the terminal's
+  folder dirty, so a `git commit` typed there shows at once. **Intent: pending** (shipped 2026-09-29).
 
 ## Worktrees — create & remove (the only mutations)
 
-- **What & when.** Make a new branch in its own worktree under chimaera's managed root and spawn a
-  session into it, or delete a managed worktree checkout (keeping the branch).
-- **How it's used.** In the Branches header, "+ branch" → pick agent/terminal, type a name,
-  "create + open" → `POST /api/v1/git/worktrees {workspace_id, branch, base?}` creates the worktree,
-  registers it as a workspace, and spawns the session there. Hover a *removable* worktree row → `×`
-  → a `confirm()` → `DELETE /api/v1/git/worktrees {workspace_id, path}`.
-- **Where it lives.** `git.ts` (`createWorktree`/`removeWorktree`), `GitView.svelte`
-  (`spawnInNewBranch`/`remove`); server `git/worktree.rs`.
-- **Key behaviors.** Create is additive — never touches an existing checkout; the daemon rejects
-  names git would refuse (`check-ref-format`), 409s if the branch is already checked out, and asserts
-  path containment under the managed root. Remove is **fenced four ways**: must be under the managed
-  root, not the current workspace, hold no live session, and be clean unless `force` (the UI never
-  sends force). The branch itself survives a remove.
+- **What & when.** Make a new branch in its own worktree under chimaera's managed root (optionally
+  starting an agent there), or delete a managed worktree checkout (keeping the branch).
+- **How it's used.** "+ New branch" in a repository's Branches section → a name, **From** (a local
+  branch; the current one by default), and "Start an agent here" → `POST /api/v1/git/worktrees
+  {workspace_id, branch, base?, repo?}`. A muted line then says what `.worktreeinclude` copied ("Copied
+  .env and 1 more"). A removable worktree offers "Remove worktree" on hover — always visible once
+  merged — → a `confirm()` → `DELETE /api/v1/git/worktrees {workspace_id, path, repo?}`.
+- **Where it lives.** `git.ts` (`createWorktree`/`removeWorktree`), `GitRepoSection.svelte`
+  (`spawnInNewBranch`/`remove`); server `git/worktree.rs`, `git/include.rs`.
+- **Key behaviors.** Create is additive; names go through `check-ref-format`, the base through
+  `rev::resolve_commit`; 409 if the branch is already checked out; path containment under the managed
+  root is asserted. `.worktreeinclude` (Claude Code's file, gitignore syntax) copies files that are both
+  git-ignored and matched — ≤200 files / 64 MB, symlinks never followed or copied, nothing overwritten.
+  Remove is **fenced five ways**: under the managed root, not the current workspace, no live session
+  inside (any surface, including an agent's hook-reported folder), clean, and no commits that are
+  neither pushed nor merged into the main checkout's branch — the last two unless `force` (the UI never
+  sends force). While an agent runs inside a managed worktree it is locked (`chimaera: <session>`) so
+  other tools' clean-up leaves it alone; the lock goes when the last agent leaves, stale chimaera locks
+  are released (or adopted by restored sessions) at daemon start, and other tools' locks are never
+  touched. **Intent: pending** for the base picker, `.worktreeinclude`, locking and the unshared-commits
+  fence (shipped 2026-09-29).
 
-## Branches / worktrees view (the agent↔branch map)
+## Branches (the agent↔branch map)
 
-- **What & when.** Below the changes list: one block per worktree showing which live sessions run in
-  each — jump to a session that lives in another worktree.
-- **Where it lives.** `GitView.svelte` (`worktrees`, session rows), `git.ts` (`gitWorktrees`,
-  `worktreeForPath`). Route `GET /api/v1/git/worktrees?workspace_id=`.
-- **Key behaviors.** The agent↔branch edge is **derived** from each session's `cwd` (longest-root
-  match, so a worktree nested inside the main checkout at `.claude/worktrees/…` attributes
-  correctly). Only actionable worktrees are listed; the rest fold into an "N other worktrees" line.
+- **What & when.** A repository's worktree branches (main checkout first) and which sessions work in
+  each; the local branches without a worktree under a collapsed "Other branches (N)".
+- **How it's used.** A row reads: branch, the worktree folder (muted, when not the main checkout), "N
+  ahead of main", "merged", and the agents' glyphs with their state dots (click one to open that
+  session). Clicking a row opens **Changes on this branch**: everything since the branch left its base
+  — the merge-base diff plus uncommitted work — each file opening its diff against that point. An
+  "Other branches" row opens that branch's history. Read-only: there is no checkout.
+- **Where it lives.** `GitRepoSection.svelte`, `GitDetailView.svelte` (`view: "branch"`); routes
+  `GET /git/worktrees` (additive `merged`, `ahead_of_main`, `behind_main`), `GET /git/branches` (≤100:
+  name, last commit date, upstream, ahead/behind), `GET /git/compare?repo=&base=`.
+- **Key behaviors.** The session↔worktree edge is the daemon's (`session.git.worktree`), not a client
+  guess. Only actionable worktrees are listed (main, current, holding sessions, managed); the rest fold
+  into "N other worktrees". **Intent: pending** (shipped 2026-09-29).
 
 ## Session-scoped changes
 
 - **What & when.** Per-agent review: the files *this* session touched, cross-referenced with live
-  git status. Review exactly what one agent changed.
+  git status.
 - **Where it lives.** `SessionChangesView.svelte`; data is `session.files_touched` × git status.
 - **Key behaviors.** If the session lives in a *linked worktree* (different `workspace_id`), the view
-  fetches that workspace's own status rather than mis-decorating every row "no change". A row with a
-  git change opens the diff; a touched-but-unchanged row (a `·` dot) just opens the file. Read-only.
+  fetches that workspace's own status. A row with a git change opens the diff; a touched-but-unchanged
+  row just opens the file. Read-only. (Status: partial for workspaces with several repositories — it
+  cross-references the primary repository's status only.)
 
 ## Git-binary / repo remediation
 
 - **What & when.** Turns the two common HPC dead-ends into fix flows: git too old/missing, or "dubious
   ownership"/permission on shared storage.
-- **Where it lives.** `GitView.svelte` (`gitBad`/`repoError`/`saveGitPath`), `git.ts` (`gitEnv`); every
-  `/git/status` response carries the git diagnostic + `repo_error`.
-- **Key behaviors.** Git is resolved via the login shell and **gated at ≥ 2.15** (`MIN_GIT` — needs
-  porcelain-v2 + `worktree`); too-old/missing git offers a `git.path` setting input naming how the path
-  was resolved. A "dubious ownership" error extracts the path and prints the exact
-  `git config --global --add safe.directory <path>` remedy. Heavily HPC-shaped. Every git invocation is
-  bounded (a hard timeout that **kills** the child so a wedged NFS mount can't pin a thread, output/entry
-  caps, a concurrency permit). Status publishing bumps a per-workspace epoch on `/ws/events`
-  (invalidate-and-refetch — big path lists stay off the firehose).
+- **Where it lives.** `GitView.svelte` (`gitBad`/`repoError`/`saveGitPath`), `GitRepoSection.svelte`
+  (per repository), `git.ts` (`gitEnv`); every `/git/status` response carries the git diagnostic +
+  `repo_error`.
+- **Key behaviors.** Git is resolved via the login shell and **gated at ≥ 2.15** (`MIN_GIT`);
+  too-old/missing git offers a `git.path` setting input naming how the path was resolved. A "dubious
+  ownership" error extracts the path and prints the exact `git config --global --add safe.directory
+  <path>` remedy. Every git invocation is bounded (a hard timeout that **kills** the child, output/entry
+  caps, a 4-process permit, `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`). Status publishing bumps a
+  per-workspace epoch (and a per-repository one) on `/ws/events` (invalidate-and-refetch — big path lists
+  stay off the firehose).
 
 ---
 

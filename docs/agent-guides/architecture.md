@@ -882,11 +882,19 @@ plugin-free daemon's.
 - **Git** (design pass 2026-07-07 — read-only inspection first, worktree-aware). Shell out to
   system git and parse porcelain (adversarial reviews flagged gitoxide's diff gaps forcing a
   two-backend layer; shelling out is simpler and adequate for read-mostly status/log/diff/show).
-  A `git` service (`chimaera-server/src/git.rs`, modeled on `view_state.rs`) that:
+  A `git` service (the `chimaera-server/src/git/` module — `service.rs` holds the runner,
+  status share and epochs; `http.rs` the routes; see the
+  [server map](../../crates/chimaera-server/AGENTS.md)) that:
   - **Discovers the repo per workspace** and caches it: `git -C <root> rev-parse
-    --show-toplevel --git-common-dir` → repo or `None`. `--git-common-dir` groups all worktrees
-    of one repo — the workspace root may itself be a *linked* worktree (Chimaera is developed in
-    one), so that is the common case, not the edge.
+    --show-toplevel --absolute-git-dir --git-common-dir` → repo or `None`. `--git-common-dir`
+    groups all worktrees of one repo — the workspace root may itself be a *linked* worktree
+    (Chimaera is developed in one), so that is the common case, not the edge. Since 2026-09-29 a
+    workspace can hold **several repositories** (`git/repos.rs`): the one at or around the root
+    plus those below it, found without a tree walk — a two-level `.git` probe at open (≤2,000
+    checks), file-tree listings that show a `.git`, an agent's folder landing in an unknown
+    repository, and submodules — at most 32. A path belongs to the innermost repository; status,
+    the published hash and the single-flight share are keyed per repository, and the git frame
+    carries per-repository epochs, so a change refreshes only the repository containing it.
   - **One status command carries almost everything**: `git --no-optional-locks -C <top> status
     --porcelain=v2 --branch -z --untracked-files=all` — per-path X/Y staged/unstaged codes,
     rename scores, submodule state, *and* the branch header (name, upstream, ahead/behind) in a
@@ -966,7 +974,16 @@ plugin-free daemon's.
     holding sessions are listed; the rest fold into "N other worktrees, no sessions" (managed
     worktrees always show, so the ones you can remove from here are never hidden). Deferred
     from P2: a branch chip on every rail session row (the Branches view already answers "which
-    agent is on which branch"), and scoping status/diffs to a non-active worktree.
+    agent is on which branch"), and scoping status/diffs to a non-active worktree. **P4
+    (2026-09-29)**: sessions know their branch — the daemon's session tracker (`git/session.rs`)
+    resolves each session's current folder (a shell's polled cwd, the `cwd` every claude hook
+    carries, else the spawn folder) to its checkout and reads the branch from `HEAD`, recomputing
+    only on a folder change or an epoch move; the row's additive `git` field replaces the
+    client's longest-root guess. By the maintainer's call the branch shows above the chat input
+    and on dashboard cards, never on the rail. The tracker also keeps session anchors
+    (`git/anchor.rs`) and locks a managed worktree while an agent runs in it. `repo=` scopes
+    the routes to any of the workspace's repositories or their worktrees; history (`git/history.rs`:
+    log, show, `rev=` diffs, "Changes on this branch") is read-only like the rest.
     **P3 (SHIPPED)** orchestration — the Branches section's "+ branch" composer: type a name, pick
     agent/terminal, and the daemon runs `git worktree add -b <branch>` then spawns the session
     INTO it, switching the window to the new worktree's workspace (the session auto-reveals once
