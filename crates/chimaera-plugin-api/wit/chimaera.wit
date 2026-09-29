@@ -106,7 +106,7 @@ interface platform {
     output-remove: func(cx: context, path: string) -> result<_, string>;
 
     /// Publish a data surface (`diagnostics/1`, `output/1`, `sourcemap/1`,
-    /// `knowledge/1`) under `key`: the host checks its shape and cap, keeps
+    /// `knowledge/1`, `references/1`) under `key`: the host checks its shape and cap, keeps
     /// the latest, and tells this workspace's windows. `null` removes it.
     publish: func(cx: context, surface: string, key: string, data: json) -> result<_, string>;
 

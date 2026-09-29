@@ -200,6 +200,17 @@ impl Plugin for Fixture {
                     &json!({"source": "notes.fixture", "output": "output:hello.txt", "state": "ok",
                             "label": "Built", "finished_ms": host::now_ms(), "changed_pages": [1]}),
                 )?;
+                platform::publish(
+                    &cx,
+                    "references/1",
+                    "notes",
+                    &json!({"shapes": [{"kind": "fixture", "pattern": "FX-\\d+"}],
+                            "ids": [{"id": "FX-1", "key": "fx-1", "kind": "fixture",
+                                     "title": "The first fixture id",
+                                     "span": {"path": "notes.fixture", "line": 1, "end_line": 2}},
+                                    {"id": "FX-2", "key": "fx-2", "kind": "fixture",
+                                     "title": "The board", "view": "board"}]}),
+                )?;
                 platform::invalidate(&cx, "board");
                 Ok(None)
             }

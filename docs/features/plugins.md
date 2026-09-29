@@ -584,7 +584,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     `host` through 0.2's and the new `platform` imports; `platform.rs` (the manifest tables,
     their checks, the file patterns, the per-daemon `Platform`), `screens.rs` (the `ui/1`
     check, render / action / file-action / query routes, invalidation at ≤ 4 a second),
-    `surfaces.rs` (`diagnostics/1`, `output/1`, `sourcemap/1`, `knowledge/1`), `output.rs`
+    `surfaces.rs` (`diagnostics/1`, `output/1`, `sourcemap/1`, `knowledge/1`, `references/1`), `output.rs`
     (output folders under the cache dir, the 1 GiB quota, Save to workspace), `pdata.rs`
     (durable state and setting values, capped JSON under `<data>/plugins/.data/`), `files.rs`
     (file events from every write the daemon knows of via `git::mark_path_dirty`, the save

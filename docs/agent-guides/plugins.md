@@ -698,6 +698,7 @@ Data core draws with its own views; `publish` checks the shape:
 | `output/1` | `{source, output, state (building ok errors failed), label?, finished_ms?, changed_pages?, log?}` |
 | `sourcemap/1` | `{output, files: [path], records: [[file, line, page, x, y, width, height]]}`, ≤ 4 MiB, kept in the output folder |
 | `knowledge/1` | the Knowledge snapshot (see the [coordination section](../plugin-platform-plan.md#coordination-the-knowledge-redesign-2026-09-29)), ≤ 4 MiB |
+| `references/1` | ids it answers for: `{shapes: [{kind, pattern}], ids: [{id, key, kind, title, span?: {path, line, end_line}, view?}]}` — 1–16 shapes, each a regex source of ≤ 80 bytes with no groups or anchors; ≤ 5,000 ids a key; ≤ 4 MiB, kept in the output folder. Every id with a `span` or a `view` becomes a chip where its shape matches in chats and Knowledge: hover previews the span, a click opens it (or the plugin's view). `end_line` 0 means to the end of the file |
 
 Paths are workspace-relative or `output:<path>`. A window asks
 `GET /workspaces/{id}/surfaces/{kind}/{version}?file=` and hears a `surface`

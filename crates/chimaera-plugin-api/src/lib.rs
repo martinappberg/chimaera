@@ -357,7 +357,7 @@ pub mod platform {
     }
 
     /// Publish a data surface (`diagnostics/1`, `output/1`, `sourcemap/1`,
-    /// `knowledge/1`) under `key`.
+    /// `knowledge/1`, `references/1`) under `key`.
     pub fn publish(cx: &Context, surface: &str, key: &str, data: &Value) -> Result<(), String> {
         raw::publish(cx, surface, key, &data.to_string())
     }

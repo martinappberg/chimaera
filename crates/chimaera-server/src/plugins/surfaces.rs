@@ -7,9 +7,12 @@
 //!   kept, and a small `{"type":"surface", …}` frame tells that
 //!   workspace's windows to fetch it again.
 //! - `diagnostics/1` and `output/1` are small and live in memory;
-//!   `sourcemap/1` and `knowledge/1` (up to 4 MiB) are written to the
-//!   plugin's output folder (`.surfaces/`) and read back per request, so
-//!   megabytes never sit in the daemon.
+//!   `sourcemap/1`, `knowledge/1` and `references/1` (up to 4 MiB) are
+//!   written to the plugin's output folder (`.surfaces/`) and read back per
+//!   request, so megabytes never sit in the daemon.
+//! - `references/1` is ids a plugin answers for (`\label` keys, issue
+//!   numbers): the client's reference registry turns them into chips in
+//!   chats, previews and the Timeline.
 //! - A plugin keeps at most `KEYS_MAX` keys per surface and workspace.
 
 use std::collections::{BTreeMap, HashMap};
@@ -24,7 +27,13 @@ use serde_json::{json, Value};
 
 use crate::AppState;
 
-pub(crate) const SURFACES: &[&str] = &["diagnostics/1", "output/1", "sourcemap/1", "knowledge/1"];
+pub(crate) const SURFACES: &[&str] = &[
+    "diagnostics/1",
+    "output/1",
+    "sourcemap/1",
+    "knowledge/1",
+    "references/1",
+];
 const KEYS_MAX: usize = 256;
 const KEY_MAX: usize = 512;
 /// Problems per file, and per published key.
@@ -39,6 +48,11 @@ const SMALL_MAX: usize = 512 << 10;
 /// surfaces: the daemon's RSS target is ~150 MB for everything.
 const INLINE_BUDGET: usize = 2 << 20;
 const PAGES_MAX: usize = 2000;
+/// references/1: id shapes per key, ids per key, and a shape's regex
+/// source (the client's registry refuses longer ones, and any group).
+const SHAPES_MAX: usize = 16;
+const REF_IDS_MAX: usize = 5000;
+const PATTERN_MAX: usize = 80;
 
 /// What one surface key holds: the data (small surfaces), or where it was
 /// written (large ones).
@@ -66,7 +80,16 @@ impl Surfaces {
 }
 
 fn large(surface: &str) -> bool {
-    matches!(surface, "sourcemap/1" | "knowledge/1")
+    matches!(surface, "sourcemap/1" | "knowledge/1" | "references/1")
+}
+
+/// Text of 1..=`max` bytes.
+fn short_text(item: &Value, key: &str, path: &str, max: usize) -> Result<(), String> {
+    let s = str_field(item, key, path)?;
+    if s.is_empty() || s.len() > max {
+        return Err(format!("{path}.{key} must be 1–{max} bytes"));
+    }
+    Ok(())
 }
 
 fn str_field<'a>(item: &'a Value, key: &str, path: &str) -> Result<&'a str, String> {
@@ -209,6 +232,60 @@ pub(crate) fn check(surface: &str, data: &Value) -> Result<(), String> {
         "knowledge/1" => {
             if !data.is_object() {
                 return Err("knowledge/1 is an object (the Knowledge snapshot)".into());
+            }
+            Ok(())
+        }
+        "references/1" => {
+            let shapes = data
+                .get("shapes")
+                .and_then(Value::as_array)
+                .ok_or("references/1.shapes must be a list")?;
+            if shapes.is_empty() || shapes.len() > SHAPES_MAX {
+                return Err(format!("references/1: 1–{SHAPES_MAX} shapes per key"));
+            }
+            for (i, shape) in shapes.iter().enumerate() {
+                let at = format!("shapes[{i}]");
+                short_text(shape, "kind", &at, 64)?;
+                // A plain regex source: the client joins every source's
+                // shapes into one scan over chat text, so no groups (and so
+                // no nested quantifiers) and no anchors.
+                let pattern = str_field(shape, "pattern", &at)?;
+                if pattern.is_empty()
+                    || pattern.len() > PATTERN_MAX
+                    || pattern.contains(['(', ')', '^', '$'])
+                {
+                    return Err(format!(
+                        "{at}.pattern is a regex source of 1–{PATTERN_MAX} bytes \
+                         without groups or anchors"
+                    ));
+                }
+            }
+            let ids = data
+                .get("ids")
+                .and_then(Value::as_array)
+                .ok_or("references/1.ids must be a list")?;
+            if ids.len() > REF_IDS_MAX {
+                return Err(format!("references/1: at most {REF_IDS_MAX} ids per key"));
+            }
+            for (i, item) in ids.iter().enumerate() {
+                let at = format!("ids[{i}]");
+                short_text(item, "id", &at, 128)?;
+                short_text(item, "key", &at, 256)?;
+                short_text(item, "kind", &at, 64)?;
+                short_text(item, "title", &at, 500)?;
+                opt_text(item, "view", &at, 64)?;
+                if let Some(span) = item.get("span").filter(|s| !s.is_null()) {
+                    let at = format!("{at}.span");
+                    place(span, "path", &at)?;
+                    let line = span.get("line").and_then(Value::as_u64).unwrap_or(0);
+                    let end = span.get("end_line").and_then(Value::as_u64);
+                    if line == 0 || end.is_none_or(|e| e != 0 && e < line) {
+                        return Err(format!(
+                            "{at} is {{path, line, end_line}}: lines from 1, end_line \
+                             ≥ line (0: to the end)"
+                        ));
+                    }
+                }
             }
             Ok(())
         }
@@ -483,5 +560,60 @@ mod tests {
         )
         .is_err());
         assert!(check("nope/1", &json!({})).is_err());
+    }
+
+    #[test]
+    fn references_are_ids_with_plain_shapes() {
+        let good = json!({
+            "shapes": [{"kind": "label", "pattern": "sec:[a-z0-9-]+|fig:[a-z0-9-]+"}],
+            "ids": [
+                {"id": "sec:intro", "key": "main.tex#sec:intro", "kind": "label",
+                 "title": "Introduction", "span": {"path": "main.tex", "line": 5, "end_line": 9}},
+                {"id": "fig:dose", "key": "fig:dose", "kind": "label", "title": "Dose response",
+                 "view": "document"},
+                {"id": "sec:all", "key": "k", "kind": "label", "title": "t",
+                 "span": {"path": "ch/one.tex", "line": 3, "end_line": 0}},
+            ],
+        });
+        check("references/1", &good).unwrap();
+        for (bad, why) in [
+            (json!({"shapes": [], "ids": []}), "shapes per key"),
+            (
+                json!({"shapes": [{"kind": "x", "pattern": "(a+)+"}], "ids": []}),
+                "without groups",
+            ),
+            (
+                json!({"shapes": [{"kind": "x", "pattern": "^F-\\d+$"}], "ids": []}),
+                "without groups",
+            ),
+            (
+                json!({"shapes": [{"kind": "x", "pattern": "F-\\d+"}],
+                       "ids": [{"id": "F-1", "key": "k", "kind": "x", "title": "t",
+                                "span": {"path": "../etc/passwd", "line": 1, "end_line": 1}}]}),
+                "workspace path",
+            ),
+            (
+                json!({"shapes": [{"kind": "x", "pattern": "F-\\d+"}],
+                       "ids": [{"id": "F-1", "key": "k", "kind": "x", "title": "t",
+                                "span": {"path": "a", "line": 4, "end_line": 2}}]}),
+                "end_line",
+            ),
+            (
+                json!({"shapes": [{"kind": "x", "pattern": "F-\\d+"}],
+                       "ids": [{"id": "", "key": "k", "kind": "x", "title": "t"}]}),
+                "ids[0].id",
+            ),
+        ] {
+            let err = check("references/1", &bad).unwrap_err();
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+        let many: Vec<Value> = (0..5001)
+            .map(|i| json!({"id": format!("F-{i}"), "key": i.to_string(), "kind": "x", "title": "t"}))
+            .collect();
+        assert!(check(
+            "references/1",
+            &json!({"shapes": [{"kind": "x", "pattern": "F-\\d+"}], "ids": many})
+        )
+        .is_err());
     }
 }

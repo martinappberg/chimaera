@@ -753,6 +753,12 @@ world chimaera-plugin {                    // 0.2
   status words' tone (`knowledgeBadStatus`), not from `contradicted` /
   `preliminary`; tile letters from the name; codex hook trust for every codex plugin
   named.
+- `references/1` is the registry's second source (`plugins/references.ts`): an
+  active plugin's published ids become chips in chats and Knowledge beside
+  Knowledge's own, preview their span and open it or the plugin's view (the test
+  fixture publishes `FX-1`; verified live in a Knowledge entry). Agent notes and
+  Mycelium declare only what they use (`[access]`) on branches, released once a
+  chimaera that reads `[access]` is: an older daemon can't parse the table.
 - Left, deliberately (a rewrite, which this phase is not): knowledge/1 itself is
   Mycelium-shaped where the redesign documented it so (findings under `topics[]`,
   decisions and learnings keyed by `fp`, the evidence ledger, the handoff's

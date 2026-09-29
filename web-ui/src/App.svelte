@@ -240,9 +240,11 @@
     registerKnowledgeOpener,
     setKnowledgeRoot,
   } from "./lib/workspace/knowledge";
-  // Registers the active workspace's knowledge as the first id-reference
-  // source (chat chips, previews) — a side-effect import.
+  // Register the active workspace's id-reference sources (chat chips,
+  // previews): its knowledge, then plugins' `references/1` — side-effect
+  // imports.
   import "./lib/knowledge/references";
+  import "./lib/plugins/references";
   import { registerAskAgent } from "./lib/shared/askAgent";
   import {
     activatePluginsWorkspace,

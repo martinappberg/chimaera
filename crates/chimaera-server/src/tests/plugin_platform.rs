@@ -515,6 +515,17 @@ async fn surfaces_are_checked_scoped_and_announced() {
     )
     .await;
     assert_eq!(output["items"][0]["data"]["state"], "ok");
+    // Ids it answers for: what the client's reference registry links.
+    let (_, refs) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/workspaces/{ws}/surfaces/references/1"),
+        None,
+    )
+    .await;
+    assert_eq!(refs["items"][0]["plugin"], PID);
+    assert_eq!(refs["items"][0]["data"]["shapes"][0]["pattern"], "FX-\\d+");
+    assert_eq!(refs["items"][0]["data"]["ids"][1]["view"], "board");
     // Another file, another workspace: nothing.
     let (_, none) = request(
         &state,
