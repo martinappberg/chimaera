@@ -163,6 +163,18 @@ export interface Session {
   background_running?: number | null;
   /** Whether this agent can run as a chat session (drives the toggle). */
   chat_capable?: boolean;
+  /**
+   * Chat rows: a permission or question is waiting on the user, straight
+   * from the conversation's driver rather than the agent record behind
+   * `agent_state`. Either one marks the row the same way (see {@link
+   * awaitsDecision}). Absent on PTY rows and old daemons.
+   */
+  needs_permission?: boolean;
+  /**
+   * A paused row waiting for an agent sign-in on the cloud: that provider's
+   * catalog id (`pro/providers.ts` `pausedConnect`). Absent otherwise.
+   */
+  blocked_provider?: string | null;
 }
 
 /** The one display name for a session, used identically everywhere. */
@@ -202,7 +214,16 @@ export function isMastermind(s: Session): boolean {
  * news" — finished and waiting-for-input sessions wear the unread mark.
  */
 export function needsApproval(s: Session): boolean {
-  return s.agent_state === "needs_permission";
+  return awaitsDecision(s);
+}
+
+/**
+ * The agent is blocked on a permission, plan approval or question: its state
+ * says so, or (chat rows) its driver does through the additive
+ * `needs_permission`, which is only ever true on a live conversation.
+ */
+export function awaitsDecision(s: Session): boolean {
+  return s.agent_state === "needs_permission" || s.needs_permission === true;
 }
 
 /**
@@ -212,7 +233,7 @@ export function needsApproval(s: Session): boolean {
  */
 export function needsAttention(s: Session): boolean {
   return (
-    s.agent_state === "needs_permission" ||
+    awaitsDecision(s) ||
     s.agent_state === "idle_prompt" ||
     s.agent_state === "errored"
   );
@@ -271,6 +292,7 @@ export function dotState(s: Session): string {
     // perpetual green.
     return s.phase === "running" || s.exec_stage === "executing" ? "alive" : "idle";
   }
+  if (awaitsDecision(s)) return "attn";
   switch (s.agent_state) {
     case "running":
       // The hooks tier's inverse liveness check: a claude TUI that claims
@@ -342,6 +364,7 @@ function turnDotTitle(s: Session): string {
     if (s.exec_stage === "executing") return "agent is running a command here";
     return "at the prompt"; // idle: alive but not doing work
   }
+  if (awaitsDecision(s)) return "needs permission";
   switch (s.agent_state) {
     case "running":
       return s.stalled === true ? "agent says working — no output for a while" : "agent working";

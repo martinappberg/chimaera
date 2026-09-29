@@ -1,4 +1,5 @@
 import { gatewayPrefix, gatewayWorkspace } from "./base";
+import { providerLabel } from "../pro/providers";
 
 export interface WorkspacePlacement {
   workspace_id: string;
@@ -56,8 +57,6 @@ export function sessionPause(row: unknown): SessionPause | null {
   return typeof row === "object" && row !== null ? parsePause((row as { pause?: unknown }).pause) : null;
 }
 
-const PROVIDER_NAMES: Record<string, string> = { claude: "Claude", codex: "Codex", gemini: "Gemini" };
-
 /** A paused session, in plain words: a one-line status and, when the person
  *  can do something about it, what. */
 export function pauseLabel(pause: SessionPause | null): { status: string; detail: string | null } {
@@ -69,7 +68,8 @@ export function pauseLabel(pause: SessionPause | null): { status: string; detail
     case "restarting":
       return { status: "Reconnecting after an update…", detail: null };
     case "needs_provider": {
-      const name = pause.provider === null ? "the agent" : (PROVIDER_NAMES[pause.provider] ?? pause.provider);
+      // The catalog name, the same one the connect action and Pro use.
+      const name = pause.provider === null ? "the agent" : providerLabel(pause.provider);
       return { status: `Waiting for ${name} on the cloud machine`, detail: `Sign in to ${name} there from Chimaera Pro, and this continues.` };
     }
     case "stays_on_computer":
