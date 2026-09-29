@@ -12,6 +12,7 @@
   import { pageVisible } from "../shared/visibility";
   import { paid, readIntent, friendlyError, recoverableAccountRestore, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
   import { accountPanel, completesReview, isConfirmedFree, reviewKey } from "../pro/account";
+  import { accountFailure, connectionWarning } from "../pro/status";
   import {
     onProChanged, proStatus, proSignIn, proCancelSignIn, proSignOut, proSignOutEverywhere,
     proHosts, proSetHostKept, proDevices, proRevokeDevice, proBillingCheckout, proBillingPortal, proCancelBilling, proRefreshAccount,
@@ -63,6 +64,8 @@
   const confirmedFree = $derived(isConfirmedFree(status));
   const panel = $derived(accountPanel(status, refreshing));
   const accountNeedsAttention = $derived(panel === "attention");
+  const failure = $derived(accountFailure(status));
+  const warning = $derived(status?.signed_in === true && connectionWarning(status));
   const signInPhase = $derived(status?.sign_in?.phase ?? null);
   const billing = $derived(status?.billing ?? null);
   const billingActive = $derived(billingPending(billing));
@@ -295,6 +298,7 @@
         <PlanBadge plan={paid(status.plan) ? status.plan : null} />
         <button class="text-button" disabled={busy !== null} onclick={() => void load(true)}>Refresh</button>
       </div>
+      {#if warning}<p class="muted small connection-warning" role="status">Connecting to the cloud… Work on this computer continues as usual.</p>{/if}
     {/if}
 
     {#if signInPhase === "waiting"}
@@ -357,7 +361,7 @@
     {:else if panel === "checking"}
       <p class="muted" role="status">Checking your account…</p>
     {:else}
-      <div class="panel" role="status"><h2>Your account needs attention</h2><p class="muted">{friendlyError(error ?? status.error, "We couldn't confirm your account details. Your local work remains available.")}</p>{#if !status.signed_in && signInPhase === null && !recoverableAccountRestore(status.error)}<button disabled={busy !== null} onclick={() => void authenticate(authScreen)}>{authScreen === "sign-up" ? "Try signing up again" : "Sign in again"}</button>{:else if signInPhase === null}<button class="secondary" disabled={busy !== null} onclick={() => void load(true)}>Check again</button>{/if}</div>
+      <div class="panel" role="status"><h2>Your account needs attention</h2><p class="muted">{friendlyError(error ?? failure, "We couldn't confirm your account details. Your local work remains available.")}</p>{#if !status.signed_in && signInPhase === null && !recoverableAccountRestore(failure)}<button disabled={busy !== null} onclick={() => void authenticate(authScreen)}>{authScreen === "sign-up" ? "Try signing up again" : "Sign in again"}</button>{:else if signInPhase === null}<button class="secondary" disabled={busy !== null} onclick={() => void load(true)}>Check again</button>{/if}</div>
     {/if}
 
     {#if status.signed_in}
@@ -365,7 +369,7 @@
       <details class="section" ontoggle={(event) => (securityOpen = event.currentTarget.open)}><summary>Account and devices</summary>{#if securityOpen}<div class="section-body"><AccountDevices {devices} busy={busy !== null} onrevoke={removeSignIn} /><div class="actions"><button class="secondary" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out", proSignOut, "Sign-out couldn't finish. Please try again."); }}>Sign out</button><button class="text-button" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out-all", proSignOutEverywhere, "Sign-out couldn't finish. Please try again."); }}>Sign out everywhere</button></div><p class="muted small">Signing out everywhere also closes the SSH logins held by Pro.</p></div>{/if}</details>
     {/if}
   {/if}
-  {#if (error || status?.error) && !accountNeedsAttention && !billingRecovery}<div class="error" role="alert"><span>{error ?? friendlyError(status?.error, "Part of your Pro connection couldn't refresh. Your local work remains available.")}</span><button class="secondary" disabled={busy !== null} onclick={() => void load(true)}>Try again</button></div>{/if}
+  {#if (error || failure) && !accountNeedsAttention && !billingRecovery}<div class="error" role="alert"><span>{error ?? friendlyError(failure, "Part of your account couldn't refresh. Your local work remains available.")}</span><button class="secondary" disabled={busy !== null} onclick={() => void load(true)}>Try again</button></div>{/if}
   {/if}
 </section>
 
@@ -398,6 +402,7 @@
   .identity > div { flex: 1 1 220px; min-width: 0; }
   .email { overflow-wrap: anywhere; }
   .identity .small, .row .small { display: block; margin-top: 4px; }
+  .connection-warning { margin: -13px 0 25px; }
   .panel { margin: 20px 0; padding: 24px; border: 1px solid var(--edge); border-radius: 10px; }
   .section-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 18px; }
   .plan-heading p { margin-bottom: 0; }

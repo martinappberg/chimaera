@@ -2,6 +2,7 @@ import { derived, readable } from "svelte/store";
 import { asyncDisposer } from "../shared/asyncDisposer";
 import { isBrowserGateway, workbenchPath } from "./base";
 import { isNativeShell, onProChanged, proStatus, type ProStatus } from "./native";
+import { accountFailure } from "../pro/status";
 
 export type PaidPlan = "pro" | "max" | null;
 
@@ -19,7 +20,8 @@ function nativePlan(status: ProStatus & { initializing?: boolean }): AccountPlan
   // answer must not read as a neutral "unknown" that still shows Pro chrome.
   if (!status.available) return "unavailable";
   if (status.initializing || status.sign_in) return "loading";
-  if (status.error !== null) return "unknown";
+  // A connection warning is informational; only a real failure is uncertain.
+  if (accountFailure(status) !== null) return "unknown";
   return status.signed_in ? knownPlan(status.plan) : "free";
 }
 

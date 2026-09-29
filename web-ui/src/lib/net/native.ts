@@ -885,7 +885,12 @@ export interface ProStatus {
   signed_in: boolean;
   email: string | null;
   plan: "pro" | "max" | "none" | null;
+  /** A real account failure. Informational connection progress uses
+   * `connection_warning` (older shells sent two such messages here). */
   error: string | null;
+  /** Optional: the always-on connection is still coming up. Never a failure
+   * and never an entitlement signal. Older shells omit it. */
+  connection_warning?: string | null;
   /** Optional when connected to an older native shell. */
   sign_in?: { phase: "waiting" | "finishing"; expires_at: number } | null;
   /** Native owns verification even when this page is closed. Older shells omit it. */

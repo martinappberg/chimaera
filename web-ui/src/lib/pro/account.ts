@@ -1,11 +1,12 @@
 import type { ProStatus } from "../net/native";
 import { billingNeedsReview, billingPending } from "./billing";
 import { paid } from "./presentation";
+import { accountFailure } from "./status";
 
 /** A confirmed account with no plan (or signed out). Rendering reads the last
  * confirmed status; purchase actions separately require a fresh read. */
 export function isConfirmedFree(status: ProStatus | null): boolean {
-  return status?.available === true && !status.initializing && !status.error
+  return status?.available === true && !status.initializing && accountFailure(status) === null
     && (status.signed_in ? status.plan === "none" : true);
 }
 

@@ -52,6 +52,11 @@ describe("explicit checkout choice", () => {
       expect(explicitCheckoutChoice({ ...free, ...delta }, true, choice)).toBeNull();
     }
   });
+  it("does not let an informational connection message block a confirmed choice", () => {
+    expect(explicitCheckoutChoice({ ...free, connection_warning: "starting" }, true, choice)).toEqual(choice);
+    expect(explicitCheckoutChoice({ ...free, error: "You're signed in. Your Pro connection is preparing; Chimaera will reconnect automatically." }, true, choice)).toEqual(choice);
+    expect(canReviewUpgrade({ ...free, plan: "pro", connection_warning: "starting" }, true)).toBe(true);
+  });
   it("does not start a second checkout while a browser attempt or uncertain result needs attention", () => {
     for (const phase of ["waiting", "confirming", "expired", "failed", "confirmed"] as const) {
       expect(explicitCheckoutChoice({ ...free, billing: attempt(phase) }, true, choice)).toBeNull();

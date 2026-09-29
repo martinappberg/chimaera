@@ -295,6 +295,24 @@ describe("shared paid plan", () => {
     expect(bridge.onProChanged).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps the confirmed plan while the connection behind cloud features comes up", async () => {
+    const account = subscribeAccount();
+    const badge = subscribe();
+    await flush();
+    for (const warning of [
+      { ...status("pro"), connection_warning: "starting" },
+      { ...status("pro"), error: "You're signed in. Your Pro connection is preparing; Chimaera will reconnect automatically." },
+      { ...status("max"), error: "Your account is up to date. The Pro connection is not ready yet; Chimaera will retry automatically." },
+      { ...status("none"), connection_warning: "starting" },
+    ]) {
+      bridge.proStatus.mockResolvedValue(warning);
+      changed();
+      await flush();
+      expect(account.at(-1)).toBe(warning.plan === "none" ? "free" : warning.plan);
+      expect(badge.at(-1)).toBe(warning.plan === "none" ? null : warning.plan);
+    }
+  });
+
   it("requires a confirmed gateway none header before offering a plan", async () => {
     bridge.isNativeShell.mockReturnValue(false);
     gateway.isBrowserGateway.mockReturnValue(true);
