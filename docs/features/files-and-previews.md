@@ -879,7 +879,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   header's words count data rows as the full grid does, so `#row=2-6` shows rows 1–5;
   `#sheet=S&range=A1:F20` for
   spreadsheets, A1 counted from the sheet's corner and placed on the grid through `fs/xlsx`'s
-  used-range `origin`, a range wholly outside the sheet's data saying so; else the first rows);
+  used-range `origin`, a range wholly outside the sheet's data saying so; else the first rows;
+  a table with no rows to show says why where they would be — only the header, an empty file or
+  sheet, the table ending before the slice, a row further in than one read goes — and one that
+  fits the card is counted once, `3 rows`);
   an HTML report (the sandboxed frame on the folder-scoped raw URL, fixed height, expand);
   video/audio (`#t=start,end`, the browser seeks natively); a notebook cell (`#cell=N`, else the
   first cell that drew a figure); a Marp slide (`#slide=N`); a markdown excerpt (`#heading`, else
