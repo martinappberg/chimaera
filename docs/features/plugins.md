@@ -785,3 +785,9 @@ The design's maintainer decisions (2026-09-25) are in the
 
 ### WASM plugins, versions & updates — why it exists
 _Intent for the WASM plugin system: pending capture._
+
+### The plugin platform: trust, screens, programs and tools, LaTeX and Typst — why it exists
+_Intent: pending capture (capture-feature-intent when this `feat:` ships). The maintainer's
+decisions of 2026-09-29 are recorded in the
+[plugin platform plan](../plugin-platform-plan.md#decisions-maintainer-2026-09-29) and the
+[LaTeX and Typst plan](../latex-reports-plan.md#decisions); they are not restated here._
