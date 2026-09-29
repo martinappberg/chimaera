@@ -2,7 +2,8 @@
   import { untrack } from "svelte";
   import { cloudOnboarding } from "../pro/onboarding.svelte";
   import { pageVisible } from "../shared/visibility";
-  import { copyIssue, projectCopyError } from "../pro/presentation";
+  import { copyIssue, projectCopiesSetupLine, projectCopyError } from "../pro/presentation";
+  import { computerSteps, proposedSetup, settleProposal, type ProposalDecision } from "../pro/profile";
   import { proMirrorStatus, proSetNeverMirror, type MirrorStatus, type MirrorWorkspace } from "../net/native";
   let { visible = true, recoveryOnly = false }: { visible?: boolean; recoveryOnly?: boolean } = $props();
   let status = $state<MirrorStatus | null>(null);
@@ -49,6 +50,17 @@
     catch { error = "This change couldn’t be confirmed. Try again before changing another project setting."; }
     finally { busy = null; }
   }
+  /** Set when a decision found the proposal replaced or withdrawn meanwhile:
+   * nothing was saved, and the refreshed row shows what is waiting now. */
+  let proposalChanged = $state<string | null>(null);
+  /** Confirm or dismiss exactly the command shown. Only the user's click
+   * turns an agent's proposal into the setup command the cloud runs. */
+  function decide(workspace: MirrorWorkspace, shown: string, decision: ProposalDecision): void {
+    proposalChanged = null;
+    void act(workspace.workspace_id, async () => {
+      if (await settleProposal(workspace.workspace_id, shown, decision) === "changed") proposalChanged = workspace.workspace_id;
+    });
+  }
   function privacy(workspace: MirrorWorkspace, checkbox: HTMLInputElement): void {
     const value = checkbox.checked; checkbox.checked = workspace.never_mirror;
     void act(workspace.workspace_id, () => proSetNeverMirror(workspace.workspace_id, value));
@@ -82,9 +94,10 @@
   <h3>Project copies</h3>
   {#if !recoveryOnly}<p class="hint">Your files, conversations and supported agent settings stay together across devices. Connected services are authorized separately.</p>{:else}<p class="hint">You can still manage project privacy without an active plan.</p>{/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}
-  {#if !recoveryOnly && status && !status.configured}<p class="hint">Automatic project copying is getting ready. You can keep working here.</p>{/if}
+  {#if !recoveryOnly && projectCopiesSetupLine(status) !== null}<p class="hint" role="status">{projectCopiesSetupLine(status)}</p>{/if}
   {#if status?.workspaces.length === 0}<p class="hint">No project copies to show yet.</p>{/if}
   {#each status?.workspaces ?? [] as workspace (workspace.workspace_id)}
+    {@const steps = computerSteps(workspace.profile)}
     <details>
       <summary><span class="title">{workspace.name}</span><span class="hint">{place(workspace)}</span></summary>
       <div class="project">
@@ -95,6 +108,25 @@
         {#if workspace.git_branches?.length}<p class="hint">Cloud changes are saved in {workspace.git_branches.join(", ")} for you to merge.</p>{/if}
         {#if !recoveryOnly && workspace.blocked_providers?.length}
           <div class="connection-needed"><p class="hint">Connect the agents this project uses so it can continue automatically.</p><button class="btn" onclick={() => cloudOnboarding.request({ providerIds: workspace.blocked_providers!.map(provider => provider.id), workspaceId: workspace.workspace_id, workspaceName: workspace.name })}>Connect agents to continue</button></div>
+        {/if}
+        {#if !recoveryOnly}
+          {@const proposal = proposedSetup(workspace.profile)}
+          {#if proposal !== null}
+            <div class="proposal" role="group" aria-label="Proposed setup command">
+              <p class="lead">Your agent proposed a setup command for the cloud machine</p>
+              <pre class="command">{proposal}</pre>
+              <p class="hint">Once you confirm it, it runs in the project folder before work continues in the cloud.{#if workspace.profile?.setup_command} It replaces the current setup command.{/if}</p>
+              <div class="actions"><button class="btn" disabled={busy !== null} onclick={() => decide(workspace, proposal, "confirm")}>Confirm</button><button class="btn" disabled={busy !== null} onclick={() => decide(workspace, proposal, "dismiss")}>Dismiss</button></div>
+            </div>
+          {/if}
+          {#if proposalChanged === workspace.workspace_id}<p class="hint" role="status">Your agent changed this proposal, so nothing was saved.</p>{/if}
+        {/if}
+        {#if steps.length}
+          <div class="steps">
+            <p class="lead">Steps that need your computer</p>
+            <p class="hint">These weren’t run in the cloud because they need this computer.</p>
+            <ul>{#each steps as step, index (index)}<li>{step}</li>{/each}</ul>
+          </div>
         {/if}
         {#if workspace.mirror}
           {#if workspace.mirror.last_mirrored_at}<p class="hint">Last copied {new Date(workspace.mirror.last_mirrored_at * 1000).toLocaleString()}</p>{/if}
@@ -123,5 +155,16 @@
   .btn:hover:not(:disabled) { background: var(--row-hover); }
   .btn:disabled { opacity: .5; cursor: default; }
   .error { color: var(--warn); font-size: var(--text-xs); overflow-wrap: anywhere; }
+  .proposal { display: flex; flex-direction: column; gap: 8px; }
+  .proposal p { margin: 0; }
+  .lead { font-size: var(--text-xs); color: var(--fg); }
+  /* Agent-written text: shown whole (the user confirms exactly this), never
+     as markup, wrapped and scrollable rather than truncated. */
+  .command { margin: 0; padding: 8px 10px; max-height: 12em; overflow: auto; border: 1px solid var(--edge); border-radius: 6px; font-family: var(--mono); font-size: var(--text-xs); white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .steps { display: flex; flex-direction: column; gap: 6px; }
+  .steps p { margin: 0; }
+  .steps ul { margin: 0; padding-left: 18px; font-family: var(--mono); font-size: var(--text-xs); overflow-wrap: anywhere; user-select: text; }
+  .steps li + li { margin-top: 4px; }
   @media (pointer: coarse) { summary, .btn, .check { min-height: 40px; } .btn { padding: 9px 12px; } }
 </style>

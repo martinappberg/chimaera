@@ -1110,6 +1110,9 @@ export async function proCloudRequest(request: CloudSetupRequest): Promise<Cloud
 
 export interface MirrorProfile {
   setup_command: string | null;
+  /** Additive: a setup command an agent proposed. It never runs until the
+   * user confirms it (`pro/profile.ts`), which makes it `setup_command`. */
+  pending_setup_command?: string | null;
   laptop_only: string[];
   deferred: string[];
   missing_environment: string[];
@@ -1127,6 +1130,9 @@ export interface MirrorWorkspace {
 }
 export interface MirrorStatus {
   configured: boolean; projects_root: string; projects_root_confirmed: boolean; workspaces: MirrorWorkspace[];
+  /** Additive: the account connection lapsed and the app is renewing it
+   * (then `configured` is false too). */
+  renewal_failed?: boolean;
   sessions: { id: string; workspace_id: string; display_name?: string; name: string }[];
 }
 export async function proMirrorStatus(): Promise<MirrorStatus> {

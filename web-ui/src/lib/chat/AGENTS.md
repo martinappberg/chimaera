@@ -303,7 +303,9 @@ for a real transfer); and the additive `{"type":"paused","reason","provider"?}`
 ended, stays mounted (the pane keeps a paused chat row's ChatView), hides the
 replayed "agent exited", disables the composer with `net/placement.ts`
 `pauseLabel` ("Continuing in the cloud…", "Reconnecting after an update…",
-"Waiting for Claude on the cloud machine", "Opening…"), and retries at once
+"Waiting for Claude Code on the cloud machine", "Opening…"; a row naming the
+agent in `blocked_provider` adds **Connect <agent> to continue**, `pro/providers.ts`
+`pausedConnect`), and retries at once
 (`ChatSocket.retrySoon`) when its row stops being paused or changes owner. The connection row appears only for a viewed project (routed row or
 browser view) after a 2 s grace. Browser sockets use `net/base` to preserve
 gateway prefixes. Transfer context echoes render the additive `moved` and `home`

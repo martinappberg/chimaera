@@ -67,6 +67,23 @@ export function providerLabel(id: string): string {
   return catalog.providers.find(provider => provider.id === id)?.label ?? id;
 }
 
+const SAFE_ID = /^[a-zA-Z0-9_-]{1,128}$/;
+
+/** What a paused session waits for, from the daemon's additive
+ * `blocked_provider` on its row: the agent to connect (named from the catalog)
+ * and its project, for the shared connection flow. Null for any row without
+ * one, so a row from an older daemon or a free user's session is unchanged. */
+export function pausedConnect(row: unknown): { providerId: string; label: string; workspaceId?: string } | null {
+  if (typeof row !== "object" || row === null) return null;
+  const { suspended, blocked_provider: providerId, workspace_id: workspaceId } = row as Record<string, unknown>;
+  if (suspended !== true || typeof providerId !== "string" || !SAFE_ID.test(providerId)) return null;
+  return {
+    providerId,
+    label: providerLabel(providerId),
+    ...(typeof workspaceId === "string" && SAFE_ID.test(workspaceId) ? { workspaceId } : {}),
+  };
+}
+
 export function providerStateLabel(provider: CloudProviderStatus): string {
   switch (provider.state) {
     case "signed_in": return "Connected";
@@ -105,11 +122,12 @@ export function connectionError(code: string | null, operation: "connect" | "dis
     case "expired": case "connection_expired": return "This sign-in request expired. Start again for a fresh request.";
     case "canceled": case "connection_canceled": return "Sign-in was canceled. Your existing provider connections haven't changed.";
     case "device_login_unavailable": return "Device sign-in couldn't start. Check your connection and that your provider account allows device sign-in, then try again.";
-    case "device_auth_disabled": return "Device sign-in isn't enabled for this account. Enable it in your provider's security settings, then try again.";
     case "installation_failed": case "install_failed": return "Sign-in couldn’t be prepared for this agent. Try again in a moment.";
     case "installation_unavailable": return "Sign-in isn’t available for this agent right now. Try again later.";
     case "probe_timeout": return "The agent took too long to confirm sign-in. Check the connection again in a moment.";
     case "sign_in_not_confirmed": return "The provider hasn’t confirmed sign-in yet. Open its sign-in flow again to finish.";
+    // Claude's page shows `code#state`; half of it keeps the sign-in waiting.
+    case "authorization_code_incomplete": return "Paste the whole code, including the part after #.";
     case "browser_login_unavailable": return "Guided sign-in isn’t available for this agent right now. Try again later.";
     case "unsupported": case "unsupported_auth": return "This provider doesn’t support guided sign-in for cloud work yet.";
     default: return "The provider couldn't complete sign-in. You can try again without changing your local account.";

@@ -136,7 +136,8 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   drops to "unk" (tooltip "agent says working — no output for a while") — the claim is likely
   stale and the dot says so without touching the record. Every COUNT — the home-screen amber
   rollup, the rail pill, the focus strip, and the window-title prefix — is `needsApproval`
-  (needs_permission only: a permission, plan approval, or question blocking the agent), alive-gated
+  (needs_permission only: a permission, plan approval, or question blocking the agent; a chat
+  row's additive `needs_permission` counts the same, `awaitsDecision`), alive-gated
   because a crashed chat driver stays registered (alive:false, errored) until deleted. Finished and
   waiting-for-input sessions are news, not a number: they wear the unread mark (bold name + accent
   dot, see [notifications.md](notifications.md)). The dashboard's attention lane stays the broader

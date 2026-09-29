@@ -93,7 +93,7 @@ return reopens Pro, including when a new window needed time to mount.
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
 | `CloudSetup.svelte` | Automatic cloud status, bounded visible polling (no manual check), historical project-copy summaries and contextual provider connections; sleeping workers wake only for explicit connection management/use. Opening a repository exists only on the cloud machine's own page, as navigation; the app has none. See [provider map](../pro/AGENTS.md). |
-| `MirrorSettings.svelte` | Native project-copy status and privacy; visibility-gated 15-second status refresh; a pending privacy change is re-sent quietly (≤1/min); copy work still under way reads as a muted hint, only real problems in the warning colour; kept-both rows name the user's versions saved beside each file; blocked-provider rows open the shared connection flow. Setup and idle-session policy stay agent/internal capabilities. |
+| `MirrorSettings.svelte` | Native project-copy status and privacy; visibility-gated 15-second status refresh; a pending privacy change is re-sent quietly (≤1/min); copy work still under way reads as a muted hint, only real problems in the warning colour; `renewal_failed` reads "Reconnecting your account…"; kept-both rows name the user's versions saved beside each file; blocked-provider rows open the shared connection flow. An agent's proposed setup command (`pending_setup_command`) shows once per project, whole, with Confirm/Dismiss (`pro/profile.ts`); `profile.deferred` is a plain "Steps that need your computer" list with no run button. Setup commands are otherwise not edited here, and idle-session policy stays internal. |
 | `ProSettings.svelte` | Dedicated Pro overview content: account identity, plan choices, browser checkout/portal, usage, and progressive connection/privacy/security sections. |
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
 | `agentDocs.ts` | Wire types + `getAgentDocs`/`installAgentDocs` for `/api/v1/agent-docs`. |
@@ -124,7 +124,8 @@ The page describes the requested work without narrating machine power state.
 Native project-copy status remains visible while compute is idle. Project privacy
 shows the last recorded copy and actual blockers; healthy file counts and storage
 quotas are not a task list. Setup commands and idle-session pins are not account
-controls. Generic missing-environment diagnostics are not shown
+controls; the only setup decision here is confirming or dismissing a command an
+agent proposed, and it applies only to the exact command shown. Generic missing-environment diagnostics are not shown
 as missing credentials or instructions without a verified integration requirement.
 After its first connection the provider component remains mounted while hidden
 across readiness changes, so unrelated status refreshes cannot reset sign-in.

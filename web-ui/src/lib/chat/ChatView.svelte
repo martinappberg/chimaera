@@ -17,6 +17,8 @@
   import { attachImageToComposer, insertIntoComposer, registerFollow } from "./composerBus";
   import { isBrowserGateway } from "../net/base";
   import { pauseLabel, placementLabel, sessionPause } from "../net/placement";
+  import { pausedConnect } from "../pro/providers";
+  import { canOpenOnboarding, cloudOnboarding } from "../pro/onboarding.svelte";
   import {
     acquireChat,
     releaseChat,
@@ -1785,6 +1787,9 @@
           : rowPause,
     ).status,
   );
+  /** The agent sign-in this paused conversation waits for on the cloud (the
+   *  row's additive `blocked_provider`); null otherwise. */
+  const connect = $derived(canOpenOnboarding() ? pausedConnect(session) : null);
   /** A paused row coming back (or the project changing where it runs) means
    *  the conversation is reachable now: reconnect at once instead of sitting
    *  out a backoff that grew while it was paused. */
@@ -2729,7 +2734,7 @@
   {/if}
 
   {#if continuing}
-    <div class="connection-status" role="status">{continuingLabel}</div>
+    <div class="connection-status"><span role="status">{continuingLabel}</span>{#if connect !== null}<button type="button" class="connect" onclick={() => cloudOnboarding.request({ providerIds: [connect.providerId], workspaceId: connect.workspaceId })}>Connect {connect.label} to continue</button>{/if}</div>
   {:else if store.waking && !store.connected}
     <div class="connection-status" role="status">Waking the cloud machine…</div>
   {:else if store.asleep && !store.connected}
@@ -2758,6 +2763,10 @@
 <style>
   .placement-note { color: var(--accent); font-size: var(--text-xs); padding: 5px 12px; border-bottom: 1px solid var(--edge); }
   .connection-status { padding: 8px 12px; color: var(--muted); font-size: 12px; text-align: center; }
+  .connection-status .connect { margin-left: 10px; border: 1px solid var(--edge); border-radius: 6px; padding: 3px 9px; color: var(--fg); background: var(--bg); font: inherit; cursor: pointer; }
+  .connection-status .connect:hover { background: var(--row-hover); }
+  .connection-status .connect:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+  @media (pointer: coarse) { .connection-status .connect { min-height: 40px; padding: 6px 12px; } }
   .chat {
     position: relative; /* anchors the rewind dialog + /mcp panel overlays */
     height: 100%;

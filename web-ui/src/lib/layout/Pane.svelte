@@ -8,6 +8,8 @@
   import { registerPane, unregisterPane, zoneWord } from "./dnd";
   import { dirLabel } from "../previews/files";
   import { pauseLabel, placementLabel, sessionPause } from "../net/placement";
+  import { pausedConnect } from "../pro/providers";
+  import { canOpenOnboarding, cloudOnboarding } from "../pro/onboarding.svelte";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
   import { activeModLabel, keyHint } from "../shared/keybindings";
   import PaneTabs from "./PaneTabs.svelte";
@@ -373,7 +375,10 @@
           ? { type: "paused", reason: "stays_on_computer", provider: null }
           : pause,
       )}
-      <div class="hint paused" role="status"><span>{paused.status}</span>{#if paused.detail !== null}<small>{paused.detail}</small>{/if}</div>
+      <!-- Waiting for an agent sign-in on the cloud (the row's additive
+           `blocked_provider`): offer the one thing that unblocks it. -->
+      {@const connect = canOpenOnboarding() ? pausedConnect(s) : null}
+      <div class="hint paused"><span role="status">{paused.status}</span>{#if connect !== null}<button type="button" onclick={() => cloudOnboarding.request({ providerIds: [connect.providerId], workspaceId: connect.workspaceId })}>Connect {connect.label} to continue</button>{:else if paused.detail !== null}<small>{paused.detail}</small>{/if}</div>
     {:else if s.ui === "chat"}
       {@const ChatView = views.chat}
       {#if ChatView !== undefined}
@@ -820,6 +825,28 @@
   }
   .hint.paused small {
     font-size: var(--text-xs);
+  }
+  .hint.paused button {
+    margin-top: 0.35rem;
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    padding: 0.35rem 0.75rem;
+    color: var(--fg);
+    background: var(--bg);
+    font: inherit;
+    cursor: pointer;
+  }
+  .hint.paused button:hover {
+    background: var(--row-hover);
+  }
+  .hint.paused button:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
+  }
+  @media (pointer: coarse) {
+    .hint.paused button {
+      min-height: 40px;
+    }
   }
 
   .hint kbd {

@@ -10,9 +10,9 @@
   import MirrorSettings from "./MirrorSettings.svelte";
   import { asyncDisposer } from "../shared/asyncDisposer";
   import { pageVisible } from "../shared/visibility";
-  import { paid, readIntent, friendlyError, recoverableAccountRestore, alreadySubscribed, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
+  import { paid, readIntent, friendlyError, recoverableAccountRestore, alreadySubscribed, connectionWarningCopy, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
   import { accountErrorBar, accountPanel, completesReview, isConfirmedFree, nearLimit, offersCheck, reviewKey } from "../pro/account";
-  import { accountFailure, connectionWarning, paymentDue } from "../pro/status";
+  import { accountFailure, connectionWarningCode, paymentDue } from "../pro/status";
   import {
     onProChanged, proStatus, proSignIn, proCancelSignIn, proSignOut, proSignOutEverywhere,
     proHosts, proSetHostKept, proDevices, proRevokeDevice, proBillingCheckout, proBillingPortal, proCancelBilling, proRefreshAccount,
@@ -65,7 +65,7 @@
   const panel = $derived(accountPanel(status, checking ? "check" : refreshing ? "background" : "none"));
   const failure = $derived(accountFailure(status));
   const paymentNeeded = $derived(paymentDue(status));
-  const warning = $derived(status?.signed_in === true && connectionWarning(status));
+  const warning = $derived(status?.signed_in === true ? connectionWarningCode(status) : null);
   const signInPhase = $derived(status?.sign_in?.phase ?? null);
   const billing = $derived(status?.billing ?? null);
   const billingActive = $derived(billingPending(billing));
@@ -321,7 +321,7 @@
         <div><span class="email">{status.email}</span><span class="muted small">{subscribed ? "Your account" : paymentNeeded ? "Signed in · Payment needs attention" : confirmedFree ? "Signed in · No active plan" : "Signed in · Checking your plan"}</span></div>
         <PlanBadge plan={paid(status.plan) ? status.plan : null} />
       </div>
-      {#if warning}<p class="muted small connection-warning" role="status">Connecting to the cloud… Work on this computer continues as usual.</p>{/if}
+      {#if warning !== null}<p class="muted small connection-warning" role="status">{connectionWarningCopy(warning)}</p>{/if}
     {/if}
 
     {#if signInPhase === "waiting"}

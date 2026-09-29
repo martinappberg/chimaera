@@ -8,7 +8,7 @@
    */
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import PermissionCard from "../chat/PermissionCard.svelte";
-  import { agentKind, dotState, dotTitle, type Session } from "../workspace/sessions";
+  import { agentKind, awaitsDecision, dotState, dotTitle, type Session } from "../workspace/sessions";
   import type { ChatStore } from "../chat/store.svelte";
 
   interface Props {
@@ -28,11 +28,12 @@
 
   /** The honest one-liner when there is nothing to answer inline. */
   const reason = $derived.by(() => {
+    if (awaitsDecision(session)) {
+      return session.ui === "chat"
+        ? "needs permission"
+        : "needs permission — answer in the terminal";
+    }
     switch (session.agent_state) {
-      case "needs_permission":
-        return session.ui === "chat"
-          ? "needs permission"
-          : "needs permission — answer in the terminal";
       case "idle_prompt":
         return "waiting for your input";
       case "errored":
