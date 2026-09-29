@@ -449,6 +449,8 @@
               <div class="smuted">After the install.</div>
             {:else if detected}
               <div class="smuted">Already set up here — {(plugin && footprint(plugin)) ?? "its files"} found. {plugin?.on ? "" : "Turning it on reads them."}</div>
+            {:else if plugin === null}
+              <div class="smuted">checking…</div>
             {:else if !canSetup}
               <div class="smuted">This plugin has no setup step.</div>
             {:else}

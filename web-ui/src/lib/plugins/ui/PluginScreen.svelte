@@ -16,7 +16,8 @@
   import Spinner from "../../previews/Spinner.svelte";
   import { copyText } from "../../shared/clipboard";
   import { openPath } from "../../shared/openPath";
-  import { referenceNow } from "../../shared/reference";
+  import { get } from "svelte/store";
+  import { referenceNow, referenceTarget } from "../../shared/reference";
   import { openInSystemBrowser } from "../../shared/urlOpen";
   import {
     fetchQuery,
@@ -153,6 +154,11 @@
         return;
       }
       case "ask-agent": {
+        // With no agent session here the reference would land nowhere.
+        if (get(referenceTarget) === null) {
+          say("Start an agent in this workspace, then ask again.");
+          return;
+        }
         const ref = str(payload.file);
         const text = str(payload.text);
         const line = typeof payload.line === "number" ? payload.line : null;
