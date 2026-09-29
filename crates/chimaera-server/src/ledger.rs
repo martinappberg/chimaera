@@ -529,12 +529,17 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
         } else {
             !crate::pro::may_execute(state, &entry.workspace_id)
         };
+        // A returned session whose resume a sign-out or crash cut short is
+        // no hand-off in flight any more: like any session the previous
+        // daemon left, it waits for this life's ownership proof and the
+        // device fallback, instead of answering "moved" forever.
+        let interrupted = entry.suspended && crate::pro::interrupted_return(state, entry);
         if entry.suspended || held {
             let mut deferred = entry.clone();
             deferred.suspended = true;
             if let Err(error) = defer(state, deferred) {
                 tracing::error!(session=%entry.id,%error,"deferred ledger capacity reached");
-            } else if !entry.suspended {
+            } else if !entry.suspended || interrupted {
                 crate::pro::defer_boot_session(state, &entry.id);
             }
             continue;
@@ -842,41 +847,26 @@ pub(crate) async fn resume_deferred_filtered(
     let workspace = crate::lock(&state.workspaces)
         .get(workspace_id)
         .ok_or_else(|| anyhow::anyhow!("unknown workspace"))?;
-    let entries: Vec<_> = crate::lock(&state.deferred_sessions)
+    // A shell that moved to the cloud stays there; it never resumes here.
+    let resumable = |entry: &LedgerEntry| {
+        keep(entry)
+            && !(entry.agent.is_none()
+                && entry
+                    .handoff
+                    .as_ref()
+                    .is_some_and(|handoff| handoff.origin == crate::bundle::Origin::Moved))
+    };
+    let ids: Vec<_> = crate::lock(&state.deferred_sessions)
         .values()
-        .filter(|entry| entry.workspace_id == workspace_id && keep(entry))
-        .cloned()
+        .filter(|entry| entry.workspace_id == workspace_id && resumable(entry))
+        .map(|entry| entry.id.clone())
         .collect();
     state.session_proxy.clear_workspace(workspace_id);
     let mut failure = None;
-    for entry in entries {
-        if entry.agent.is_none()
-            && entry
-                .handoff
-                .as_ref()
-                .is_some_and(|handoff| handoff.origin == crate::bundle::Origin::Moved)
-        {
-            continue;
-        }
-        if state
-            .chat
-            .get(&entry.id)
-            .is_some_and(|session| session.alive)
-            || state
-                .sessions
-                .get(&entry.id)
-                .is_some_and(|session| session.alive)
-        {
-            continue;
-        }
-        match respawn(state, &entry, workspace.clone()).await {
-            Ok(()) => {
-                crate::lock(&state.deferred_sessions).remove(&entry.id);
-            }
-            Err(error) => {
-                tracing::warn!(session = %entry.id, %error, "deferred session could not resume");
-                failure.get_or_insert(error);
-            }
+    for id in ids {
+        if let Err(error) = resume_one(state, &workspace, &id, &resumable).await {
+            tracing::warn!(session = %id, %error, "deferred session could not resume");
+            failure.get_or_insert(error);
         }
     }
     state.changes.notify_waiters();
@@ -896,23 +886,88 @@ pub(crate) async fn resume_deferred_sessions(
         .get(workspace_id)
         .ok_or_else(|| anyhow::anyhow!("unknown workspace"))?;
     for id in ids {
-        let Some(entry) = crate::lock(&state.deferred_sessions)
-            .get(id)
-            .filter(|entry| entry.workspace_id == workspace_id)
-            .cloned()
-        else {
-            continue;
-        };
-        if state.chat.get(id).is_some_and(|s| s.alive)
-            || state.sessions.get(id).is_some_and(|s| s.alive)
-        {
-            continue;
-        }
-        respawn(state, &entry, workspace.clone()).await?;
-        crate::lock(&state.deferred_sessions).remove(id);
+        resume_one(state, &workspace, id, &|_| true).await?;
     }
     state.changes.notify_waiters();
     Ok(())
+}
+
+/// Respawn one deferred session of `workspace` and take it out of the
+/// deferred set, once however many resumers race for it: a return's own
+/// resume can still be respawning a session when sign-out resumes the same
+/// project. Resumers of one session take turns, and each rechecks under its
+/// turn, so a later one finds the session live (or no longer deferred) and
+/// does nothing, or retries after an earlier failure. Without turns both
+/// respawn, and the loser's failed spawn tears down the winner's agent record.
+async fn resume_one(
+    state: &Arc<AppState>,
+    workspace: &crate::workspaces::Workspace,
+    id: &str,
+    keep: &impl Fn(&LedgerEntry) -> bool,
+) -> anyhow::Result<()> {
+    let turn = ResumeTurn::take(state, id);
+    let _turn = turn.wait().await;
+    let Some(entry) = crate::lock(&state.deferred_sessions)
+        .get(id)
+        .filter(|entry| entry.workspace_id == workspace.id && keep(entry))
+        .cloned()
+    else {
+        return Ok(());
+    };
+    if state.chat.get(id).is_some_and(|s| s.alive)
+        || state.sessions.get(id).is_some_and(|s| s.alive)
+    {
+        return Ok(());
+    }
+    respawn(state, &entry, workspace.clone()).await?;
+    crate::lock(&state.deferred_sessions).remove(id);
+    Ok(())
+}
+
+/// One resumer's place in a session's turn (`AppState::resuming`). Dropping
+/// it, also on cancellation, forgets the turn once nobody else holds it.
+struct ResumeTurn<'a> {
+    state: &'a AppState,
+    id: String,
+    turn: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl<'a> ResumeTurn<'a> {
+    fn take(state: &'a AppState, id: &str) -> Self {
+        let turn = Arc::clone(
+            crate::lock(&state.resuming)
+                .entry(id.to_owned())
+                .or_default(),
+        );
+        Self {
+            state,
+            id: id.to_owned(),
+            turn: Some(turn),
+        }
+    }
+
+    async fn wait(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.turn
+            .as_ref()
+            .expect("turn held until drop")
+            .lock()
+            .await
+    }
+}
+
+impl Drop for ResumeTurn<'_> {
+    fn drop(&mut self) {
+        // Every clone and drop happens under this lock, so a single
+        // remaining reference is the map's own: no resumer holds or awaits it.
+        let mut resuming = crate::lock(&self.state.resuming);
+        drop(self.turn.take());
+        if resuming
+            .get(&self.id)
+            .is_some_and(|turn| Arc::strong_count(turn) == 1)
+        {
+            resuming.remove(&self.id);
+        }
+    }
 }
 
 /// Imported/remote histories are bounded just like the live session roster.

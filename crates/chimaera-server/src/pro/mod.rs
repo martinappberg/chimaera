@@ -451,6 +451,26 @@ pub(crate) fn ownership_phase(state: &crate::AppState, workspace: &str) -> Phase
         Some(Ownership::Hydrating { .. } | Ownership::SettingUp { .. }) => Phase::Arriving,
     }
 }
+/// A session a return imported here (it keeps its hand-off record) that
+/// never resumed because a sign-out or crash cut the return's resume short,
+/// in a project no other machine holds or is taking. It is this computer's
+/// interrupted work, so at boot it waits like any session the previous
+/// daemon left (`defer_boot_session`). A cloud machine resumes nothing
+/// without its lease, and an uncertain continuation stays deferred, as the
+/// return itself would have left it.
+pub(crate) fn interrupted_return(
+    state: &crate::AppState,
+    entry: &crate::ledger::LedgerEntry,
+) -> bool {
+    entry.handoff.is_some()
+        && !execution::worker(state)
+        && matches!(
+            crate::lock(&state.pro.ownership).get(&entry.workspace_id),
+            None | Some(Ownership::Local { .. } | Ownership::AwaitingVerification { .. })
+        )
+        && may_execute(state, &entry.workspace_id)
+        && execution::resume_allowed(state, &entry.workspace_id)
+}
 /// Whether this session waits at boot for this life's ownership proof.
 pub(crate) fn restart_deferred(state: &crate::AppState, session_id: &str) -> bool {
     crate::lock(&state.pro.boot_deferred).contains(session_id)

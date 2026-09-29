@@ -96,6 +96,8 @@ pub(crate) struct AppState {
     pub(crate) pro: crate::pro::ProState,
     pub(crate) cloud_providers: crate::cloud::providers::Providers,
     pub(crate) deferred_sessions: Mutex<HashMap<String, crate::ledger::LedgerEntry>>,
+    /// session id -> the turn its resumers take (`ledger::resume_one`).
+    pub(crate) resuming: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub(crate) session_proxy: crate::session_proxy::Store,
     /// session id -> agent wrapper state (kind "agent" sessions only).
     pub(crate) agents: Mutex<HashMap<String, agents::AgentRecord>>,
@@ -306,6 +308,7 @@ impl AppState {
             pro: crate::pro::ProState::new(data_dir.join("pro")),
             cloud_providers: crate::cloud::providers::Providers::default(),
             deferred_sessions: Mutex::new(HashMap::new()),
+            resuming: Mutex::new(HashMap::new()),
             session_proxy: crate::session_proxy::Store::default(),
             agents: Mutex::new(HashMap::new()),
             display_names: Mutex::new(HashMap::new()),

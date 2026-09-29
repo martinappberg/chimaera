@@ -2175,10 +2175,19 @@ async fn finish_hydration_checked(
         "Account changed before project resume"
     );
     if execution::resume_allowed(state, workspace) {
-        crate::ledger::resume_deferred_filtered(state, workspace, |entry| {
-            !super::provider_gate::waits_for_provider(entry, &blocked)
+        // Its own task: this usually runs in the mirror task, which sign-out
+        // aborts (`stop_tasks`), and a respawn cut half way would leave the
+        // returned sessions deferred as "moved". The caller still waits.
+        let owner = state.clone();
+        let workspace = workspace.to_owned();
+        tokio::spawn(async move {
+            crate::ledger::resume_deferred_filtered(&owner, &workspace, |entry| {
+                !super::provider_gate::waits_for_provider(entry, &blocked)
+            })
+            .await
         })
-        .await?;
+        .await
+        .context("project resume stopped")??;
     }
     Ok(())
 }
@@ -2462,6 +2471,115 @@ mod tests {
         );
         assert!(std::fs::read_to_string(&log).unwrap().contains("broken"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+    /// Sign-out aborts the mirror task that finishes a return. The returned
+    /// sessions that finish was respawning start anyway: a respawn cut half
+    /// way would leave them deferred, answering "moved" forever.
+    #[tokio::test]
+    async fn aborting_a_finished_return_still_resumes_its_sessions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-return-abort-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = Arc::new(AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.clone(),
+            root.join("config"),
+        ));
+        lock(&state.workspaces)
+            .import_exact(crate::workspaces::Workspace {
+                id: "w-project".into(),
+                root: root.clone(),
+                name: "Fixture".into(),
+                last_opened_at: super::super::now(),
+                mastermind: None,
+                plugins_on: vec![],
+                cloud_internal: false,
+            })
+            .unwrap();
+        let claude = root.join("claude");
+        std::fs::write(
+            &claude,
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"init\",\"response\":{\"commands\":[]}}}'\n\
+             cat >/dev/null\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        lock(&state.agent_bins).insert(
+            crate::agents::AgentKind::Claude,
+            crate::launcher::AgentDetection {
+                path: Ok(claude),
+                version: Some("9.9.9-fake".into()),
+                managed: false,
+                explicit: true,
+                mtime: None,
+            },
+        );
+        // An enrolled project: each agent launch waits for launch admission.
+        super::super::install_execution_fixture(&state, "w-project", 3).unwrap();
+        lock(&state.pro.ownership).insert("w-project".into(), Ownership::SettingUp { epoch: 3 });
+        crate::ledger::defer(
+            &state,
+            crate::ledger::LedgerEntry {
+                id: "s-returned".into(),
+                suspended: true,
+                handoff: Some(crate::bundle::HandoffResume {
+                    fork: false,
+                    origin: crate::bundle::Origin::Home,
+                    epoch: 3,
+                }),
+                workspace_id: "w-project".into(),
+                cwd: root.clone(),
+                pinned_name: None,
+                cols: 80,
+                rows: 24,
+                theme: "dark".into(),
+                created_at: 1,
+                agent: Some(crate::ledger::LedgerAgent {
+                    kind: crate::agents::AgentKind::Claude,
+                    resume: None,
+                    transcript: None,
+                    native_cwd: None,
+                    title: "Fixture".into(),
+                    ui: chimaera_agent::model::SessionUi::Chat,
+                    model: None,
+                    carryover: None,
+                }),
+            },
+        )
+        .unwrap();
+        let owner = state.clone();
+        let task = tokio::spawn(async move {
+            finish_hydration(&owner, "w-project", 3, 0, async { Ok(()) }).await
+        });
+        // Queued while the finish makes the project Local, so it is handed
+        // over the moment the finish releases it: the resume has started
+        // and waits for this admission when the task is aborted.
+        while super::super::owned_epoch(&state, "w-project").is_none() {
+            tokio::task::yield_now().await;
+        }
+        let admission = state.pro.configuration.lock().await;
+        task.abort();
+        let _ = task.await;
+        drop(admission);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !state.chat.get("s-returned").is_some_and(|chat| chat.alive)
+                || lock(&state.deferred_sessions).contains_key("s-returned")
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the aborted finish's resume completes on its own");
+        state.chat.kill("s-returned");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
     #[test]
     fn three_way_return_preserves_local_conflicts_and_applies_unmodified_files() {

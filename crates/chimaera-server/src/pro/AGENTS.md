@@ -289,7 +289,12 @@ publication) marks the project `release_pending`: the lease loop leaves it alone
 stops no further sessions, keeps its publication, skips release and resumes the
 sessions it stopped; a `release_pending` project resumes its deferred sessions
 locally, without the account. Sign-out does the same for `Transferring`, and on
-a device also for its own `Hydrating`/`SettingUp` return. A device's own
+a device also for its own `Hydrating`/`SettingUp` return and for every project
+whose `Local` ownership it drops that still holds deferred sessions (a
+return's resume runs as its own task, so aborting the mirror task never cuts
+it; `ledger::resume_one` gives each session one resumer at a time). At boot a
+returned session still deferred on a device (`interrupted_return`) waits like
+a restart-deferred one instead of answering "moved" forever. A device's own
 unfinished return retries after 15 s, doubling to two minutes. Failures and
 refusals carry stable codes (`routes::error_code`; mirror row `error_code`).
 
