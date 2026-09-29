@@ -4,7 +4,8 @@
   import HomeActions from "./HomeActions.svelte";
   import { isMac } from "../shared/keys";
   import { paidPlan, proOffered } from "../net/plan";
-  import { isBrowserGateway } from "../net/base";
+  import { gatewayWorkspace, isBrowserGateway } from "../net/base";
+  import { projectWhere, projectWhereLabel } from "../net/placement";
   import ComputeLaunchDialog from "./ComputeLaunchDialog.svelte";
   import CloudProjects from "../pro/CloudProjects.svelte";
   import { keyHint } from "../shared/keybindings";
@@ -894,7 +895,8 @@
           </button>
         {/if}
         <div class="welcome">
-          <h1>{ownAlias === null ? "Workspaces" : hostLabel}</h1>
+          <!-- A project view follows its project: name where it runs now. -->
+          <h1>{ownAlias === null ? "Workspaces" : gatewayWorkspace() !== null ? projectWhereLabel($projectWhere) : hostLabel}</h1>
           <p>{ownAlias === null ? "Pick up where you left off." : "Workspaces and sessions on this machine."}</p>
         </div>
       </div>

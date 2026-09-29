@@ -27,6 +27,7 @@
     type Health,
   } from "./lib/net/api";
   import { linkRtt, linkRttNow, resetLinkRtt, LINK_RTT_BADGE_MS } from "./lib/net/rtt";
+  import { projectWhere, projectWhereLabel } from "./lib/net/placement";
   import { LOCAL_ECHO_MIN_RTT_MS } from "./lib/terminal/localEcho";
   import { healthPollDelayMs, type PollHandle } from "./lib/net/poll";
   import { pageVisible } from "./lib/shared/visibility";
@@ -482,6 +483,12 @@
   /** This window's host alias ("local" for the local daemon). */
   const hostAlias = getHostLabel();
   const isRemoteWindow = hostAlias !== "local";
+  /** A browser view of a project (`/workspace/{id}/`) follows the project
+   *  between the cloud and your computer: its strip names where it runs now,
+   *  not a host, and a link round trip to whichever machine that is means
+   *  nothing to the person reading it. */
+  const projectView = gatewayWorkspace() !== null;
+  const stripHost = $derived(projectView ? projectWhereLabel($projectWhere) : hostAlias);
   /** Set when this window sits on a compute-node daemon (Mode 2 job). */
   const jobCtx = getJobContext();
   /** The key this window's tunnel reports `host-status` under. A job window
@@ -5820,9 +5827,9 @@
         <span class="daemon-host" class:remote={isRemoteWindow} title={health?.hostname}
           >{$computeStatus?.self
             ? `${getHostLabel()} › ${$computeStatus.self.node}`
-            : getHostLabel()}</span
+            : stripHost}</span
         >
-        {#if isRemoteWindow && $linkRtt !== null && $linkRtt >= LINK_RTT_BADGE_MS}
+        {#if isRemoteWindow && !projectView && $linkRtt !== null && $linkRtt >= LINK_RTT_BADGE_MS}
           <!-- Honest latency signal: on a distant host every keystroke echo
                and UI fetch pays at least this — better named than mysterious
                (the remote perf audit's R4). -->
@@ -6244,9 +6251,9 @@
         </button>
       {/if}
       <span class="strip-host" class:remote={isRemoteWindow} title={health?.hostname}
-        >{getHostLabel()}</span
+        >{stripHost}</span
       >
-      {#if isRemoteWindow && $linkRtt !== null && $linkRtt >= LINK_RTT_BADGE_MS}
+      {#if isRemoteWindow && !projectView && $linkRtt !== null && $linkRtt >= LINK_RTT_BADGE_MS}
         <!-- Detached windows ghost keystrokes like any remote window — they
              get the same honest latency signal. -->
         <span

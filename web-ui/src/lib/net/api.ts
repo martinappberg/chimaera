@@ -214,7 +214,7 @@ function gatewayHostLabel(): string {
   const host = gatewayHost();
   if (host === undefined) return "This project";
   if (host.startsWith("device-")) return "Your computer";
-  if (host.startsWith("worker-")) return "Cloud";
+  if (host.startsWith("worker-")) return "The cloud";
   return host === "local" ? "Your computer" : host;
 }
 

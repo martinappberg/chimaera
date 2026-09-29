@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { asleepPlacement, parsePause, parsePlacement, pauseLabel, placementLabel, sessionPause } from "./placement";
+import { get } from "svelte/store";
+import { asleepPlacement, parsePause, parsePlacement, pauseLabel, placementLabel, projectWhere, projectWhereLabel, sessionPause } from "./placement";
 const live = { workspace_id: "w-one", holder_id: "d-home", route_host_id: "device-d-home", epoch: 4, policy_revision: 1, availability: "owned", server_now: "2026-09-28T19:00:00Z", expires_at: "2026-09-28T19:01:30Z" };
 describe("workspace routing authority", () => {
   it("accepts exact current owner without choosing a home or worker", () => {
@@ -119,5 +120,16 @@ describe("where a routed session runs", () => {
   it("says reconnecting once: not in the label while the view's status line says it", () => {
     expect(placementLabel(cloud, false, { reconnectingShown: true })).toBe("In the cloud");
     expect(placementLabel("here", false, { owner: "asleep" })).toBeNull();
+  });
+  it("a project view names where its project runs from the latest placement read", async () => {
+    vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-one/"));
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce(Response.json({ ...live, holder_id: "worker-id", route_host_id: "worker-worker-id" }))
+      .mockResolvedValueOnce(Response.json(live)));
+    await readPlacement();
+    expect(projectWhereLabel(get(projectWhere))).toBe("In the cloud");
+    await readPlacement();
+    expect(projectWhereLabel(get(projectWhere))).toBe("On your computer");
+    expect(projectWhereLabel(null)).toBe("This project");
   });
 });

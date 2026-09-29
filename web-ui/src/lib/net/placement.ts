@@ -1,3 +1,4 @@
+import { writable, type Readable } from "svelte/store";
 import { gatewayPrefix, gatewayWorkspace } from "./base";
 import { providerLabel } from "../pro/providers";
 
@@ -119,6 +120,23 @@ export class PlacementError extends Error {
   constructor(readonly status: number) { super("Your project is reconnecting. This action was not sent."); }
 }
 let pending: { workspace: string; promise: Promise<WorkspacePlacement> } | null = null;
+
+/** Where this browser view's project runs, from the latest placement read
+ *  (every action and socket authentication reads it); null until the first
+ *  answer and outside a project view. Presentation only — routing always
+ *  reads placement afresh. */
+const projectWhereStore = writable<"cloud" | "computer" | null>(null);
+export const projectWhere: Readable<"cloud" | "computer" | null> = { subscribe: projectWhereStore.subscribe };
+function noteProjectWhere(placement: WorkspacePlacement): void {
+  projectWhereStore.set(placement.route_host_id?.startsWith("worker-") ? "cloud" : "computer");
+}
+
+/** A project view's machine in plain words for its status strip and Home:
+ *  it follows the project, so it names where the project runs now. */
+export function projectWhereLabel(where: "cloud" | "computer" | null): string {
+  return where === "cloud" ? IN_THE_CLOUD : where === "computer" ? "On your computer" : "This project";
+}
+
 /** Coalesce simultaneous reads; every later request checks the owner again. */
 export function readPlacement(): Promise<WorkspacePlacement> {
   const workspace = gatewayWorkspace();
@@ -143,6 +161,7 @@ export function readPlacement(): Promise<WorkspacePlacement> {
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
     const placement = parsePlacement(JSON.parse(new TextDecoder().decode(bytes)), workspace);
     if (placement.availability !== "owned") throw new PlacementError(503);
+    noteProjectWhere(placement);
     return placement;
   })();
   pending = { workspace, promise };
