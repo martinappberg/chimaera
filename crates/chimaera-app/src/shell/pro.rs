@@ -463,7 +463,7 @@ async fn activate_snapshot(
         .map(|host| (host.id.clone(), host))
         .collect();
     *lock(&state.pro.client) = Some(client.clone());
-    *lock(&state.pro.error) = connection_error;
+    *lock(&state.pro.error) = connection_error.clone();
 
     let token_app = app.clone();
     let expected = state.pro.generation();
@@ -500,9 +500,6 @@ async fn activate_snapshot(
         let _ = app.emit("pro-changed", ());
     }
     super::power::install(app);
-    if let Err(error) = configure_daemon(&state, &client).await {
-        *lock(&state.pro.error) = Some(error.to_string());
-    }
     let (events, serve) = if has_keeper {
         let (events, serve) = start_keeper(app, client.clone());
         (Some(events), Some(serve))
@@ -511,6 +508,10 @@ async fn activate_snapshot(
     };
     let reconcile_app = app.clone();
     let reconcile = tokio::spawn(async move {
+        // Daemon setup can take minutes (a rebind first publishes and releases
+        // old work). It never delays sign-in's browser answer, startup's
+        // `ready`, or SSH; failures are retried by the loop below.
+        configure_pass(&reconcile_app, &client, expected, connection_error).await;
         // Events carry prompt latency; this bounded, slow reconciliation also
         // discovers provisioning and removals missed while a stream was down.
         let mut ticks = tokio::time::interval_at(
@@ -627,6 +628,30 @@ pub(super) async fn reconcile_account(
     if connection_error.is_none() {
         replace_hosts(app, hosts).await;
     }
+    apply_daemon_setup(app, client, connection_error).await;
+    Ok(())
+}
+
+/// The first daemon setup after activation, off the activation path.
+async fn configure_pass(
+    app: &AppHandle,
+    client: &Client,
+    generation: u64,
+    connection_error: Option<String>,
+) {
+    let state = app.state::<Shell>();
+    // Blocking HTTP requests cannot be cancelled by aborting this task.
+    // Serialize mutations through completion so sign-out's final DELETE wins.
+    let _operation = state.pro.operation.lock().await;
+    if state.pro.generation() != generation {
+        return;
+    }
+    apply_daemon_setup(app, client, connection_error).await;
+}
+
+/// Callers hold `operation` and have checked the account generation.
+async fn apply_daemon_setup(app: &AppHandle, client: &Client, connection_error: Option<String>) {
+    let state = app.state::<Shell>();
     // Account confirmation must survive a keeper that is still starting. The
     // runtime keeps retrying transport setup independently of billing identity.
     let setup = configure_daemon(&state, client).await;
@@ -639,7 +664,6 @@ pub(super) async fn reconcile_account(
         (setup.is_err() || placement.is_err()).then(|| "Your account is up to date. The Pro connection is not ready yet; Chimaera will retry automatically.".into())
     });
     let _ = app.emit("pro-changed", ());
-    Ok(())
 }
 
 /// Publish fresh account identity without waiting for optional daemon setup.
@@ -942,7 +966,9 @@ pub async fn pro_sign_in(
             callback.finish(success).await;
         }
         if success {
-            let _operation = state.pro.operation.lock().await;
+            // Not under `operation`: daemon setup may hold it for minutes. The
+            // return target is generation-bound, so a racing sign-out cannot
+            // route an old account's return (see `take_return`).
             return_to_app(&app, window.label(), generation.unwrap());
         }
     });
