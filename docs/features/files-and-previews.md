@@ -1166,6 +1166,20 @@ _Intent pending — drafted from the maintainer's request, 2026-09-07; questionn
   writing a short row's missing pipes on click, and rendering images inside cells have not
   been confirmed with the maintainer — capture via **capture-feature-intent** when available.
 
+### Why documents read Obsidian's callouts and embed a PDF page in place
+_Intent pending — drafted from the maintainer's request, 2026-09-28; questionnaire not yet run._
+
+- **Problem it solves (from the request).** An Obsidian note's `> [!example]` callout showed
+  as a plain quote with the marker visible ("it is an obsidian doc thing"), and a PDF page
+  the note embedded beside its caption was only a hoverable link, its preview stuck on
+  page 1 with a canvas error. The maintainer: "Should not a specific PDF page not just be
+  hoverable (when in an actual .md reading document) but embed itself in there somehow?
+  This does not apply to agent chat I feel." So documents embed wherever the `!` syntax
+  stands, as Obsidian does; chat keeps its own rules (documents as chips, results embedded).
+- **Pending.** Obsidian's families and colors beside GitHub's (`important` purple, `caution`
+  red), folding as a disclosure, and that a plain link (no `!`) stays a link have not been
+  confirmed with the maintainer — capture via **capture-feature-intent** when available.
+
 ### Finding your place in a deep tree — why it exists
 _Intent pending — drafted from the maintainer's request, 2026-09-06; questionnaire not yet run._
 
