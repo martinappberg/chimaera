@@ -544,6 +544,14 @@ export class ChatStore {
    *  "Reconnecting…" — and ends with the next `ready`, a wake (an accepted
    *  send, `waking`) or a move. */
   asleep = $state(false);
+  /** The first journal replay cannot arrive because the owner sleeps: there
+   *  is nothing to load until a send wakes it (or something else does), so the
+   *  view says so instead of showing a loading line that never ends. A wake
+   *  (`waking`, then `ready`) ends this and the ordinary loading line — with
+   *  the replay behind it — takes over. */
+  get awaitingWake(): boolean {
+    return this.hydrating && this.asleep;
+  }
   /** The conversation is continuing on another machine (a transfer between
    *  this computer and the cloud). The transcript stays; the next `ready`
    *  from wherever it runs now clears this. */
