@@ -523,14 +523,63 @@
       "html": "<div class=\"markdown-alert markdown-alert-note\"><p class=\"markdown-alert-title\">Note</p><p>para</p><ul><li>item</li></ul></div>"
     },
     {
-      "note": "an unknown alert type is a plain quote",
+      "note": "an unknown callout type draws as a note under its own name",
       "md": "> [!FOO]\n> body\n",
-      "html": "<blockquote><p>[!FOO] body</p></blockquote>"
+      "html": "<div class=\"markdown-alert markdown-alert-note\"><p class=\"markdown-alert-title\">Foo</p><p>body</p></div>",
+      "diverges": {
+        "side": "server",
+        "reason": "Obsidian's callouts are read on the client only; the daemon's comrak knows GitHub's five alert types (`> [!NOTE]` … `> [!CAUTION]`) with a plain-text title, so the server fallback (files over 1 MB) shows any other type — and a fold mark — as its own quote or title text"
+      }
     },
     {
       "note": "an alert marker must open the quote",
       "md": "> text\n> [!NOTE]\n",
       "html": "<blockquote><p>text [!NOTE]</p></blockquote>"
+    },
+    {
+      "note": "an Obsidian callout with a title",
+      "md": "> [!example] Applied example\n> A poll calls 1000 people.\n",
+      "html": "<div class=\"markdown-alert markdown-alert-example\"><p class=\"markdown-alert-title\">Applied example</p><p>A poll calls 1000 people.</p></div>",
+      "diverges": {
+        "side": "server",
+        "reason": "Obsidian's callouts are read on the client only; the daemon's comrak knows GitHub's five alert types (`> [!NOTE]` … `> [!CAUTION]`) with a plain-text title, so the server fallback (files over 1 MB) shows any other type — and a fold mark — as its own quote or title text"
+      }
+    },
+    {
+      "note": "an Obsidian alias picks its family and keeps its name",
+      "md": "> [!faq]\n> q\n\n> [!TLDR]\n> t\n",
+      "html": "<div class=\"markdown-alert markdown-alert-question\"><p class=\"markdown-alert-title\">Faq</p><p>q</p></div><div class=\"markdown-alert markdown-alert-abstract\"><p class=\"markdown-alert-title\">Tldr</p><p>t</p></div>",
+      "diverges": {
+        "side": "server",
+        "reason": "Obsidian's callouts are read on the client only; the daemon's comrak knows GitHub's five alert types (`> [!NOTE]` … `> [!CAUTION]`) with a plain-text title, so the server fallback (files over 1 MB) shows any other type — and a fold mark — as its own quote or title text"
+      }
+    },
+    {
+      "note": "a foldable callout is a disclosure",
+      "md": "> [!tip]- Hidden\n> body\n\n> [!NOTE]+\n> shown\n",
+      "html": "<details class=\"markdown-alert markdown-alert-tip\"><summary class=\"markdown-alert-title\">Hidden</summary><p>body</p></details><details class=\"markdown-alert markdown-alert-note\"><summary class=\"markdown-alert-title\">Note</summary><p>shown</p></details>",
+      "diverges": {
+        "side": "server",
+        "reason": "Obsidian's callouts are read on the client only; the daemon's comrak knows GitHub's five alert types (`> [!NOTE]` … `> [!CAUTION]`) with a plain-text title, so the server fallback (files over 1 MB) shows any other type — and a fold mark — as its own quote or title text"
+      }
+    },
+    {
+      "note": "a callout type in another script",
+      "md": "> [!överblick]\n> x\n",
+      "html": "<div class=\"markdown-alert markdown-alert-note\"><p class=\"markdown-alert-title\">Överblick</p><p>x</p></div>",
+      "diverges": {
+        "side": "server",
+        "reason": "Obsidian's callouts are read on the client only; the daemon's comrak knows GitHub's five alert types (`> [!NOTE]` … `> [!CAUTION]`) with a plain-text title, so the server fallback (files over 1 MB) shows any other type — and a fold mark — as its own quote or title text"
+      }
+    },
+    {
+      "note": "a callout inside a callout",
+      "md": "> [!note] Outer\n> > [!bug] Inner\n> > b\n",
+      "html": "<div class=\"markdown-alert markdown-alert-note\"><p class=\"markdown-alert-title\">Outer</p><div class=\"markdown-alert markdown-alert-bug\"><p class=\"markdown-alert-title\">Inner</p><p>b</p></div></div>",
+      "diverges": {
+        "side": "server",
+        "reason": "Obsidian's callouts are read on the client only; the daemon's comrak knows GitHub's five alert types (`> [!NOTE]` … `> [!CAUTION]`) with a plain-text title, so the server fallback (files over 1 MB) shows any other type — and a fold mark — as its own quote or title text"
+      }
     },
     {
       "note": "a footnote",
@@ -618,6 +667,15 @@
       }
     },
     {
+      "note": "a wikilink into a PDF keeps its page, not a heading slug",
+      "md": "see [[paper.pdf#page=34]]\n",
+      "html": "<p>see <a class=\"wikilink\" href=\"paper.pdf#page=34\">paper.pdf#page=34</a></p>",
+      "diverges": {
+        "side": "server",
+        "reason": "wikilinks are read for Obsidian vaults on the client only; the daemon's comrak runs without its wikilink extension, so the server fallback shows them as literal text"
+      }
+    },
+    {
       "note": "a destination's escapes and unicode are href-escaped",
       "md": "[a](/x\\_y) [b](/é) [c](/a b)\n",
       "html": "<p><a href=\"/x_y\">a</a> <a href=\"/%C3%A9\">b</a> [c](/a b)</p>"
@@ -698,9 +756,13 @@
       "html": "<blockquote><p>[!NOTE] body</p></blockquote>"
     },
     {
-      "note": "an alert title is plain text",
+      "note": "a callout title is markdown",
       "md": "> [!NOTE] **Bold** title\n> body\n",
-      "html": "<div class=\"markdown-alert markdown-alert-note\"><p class=\"markdown-alert-title\">**Bold** title</p><p>body</p></div>"
+      "html": "<div class=\"markdown-alert markdown-alert-note\"><p class=\"markdown-alert-title\"><strong>Bold</strong> title</p><p>body</p></div>",
+      "diverges": {
+        "side": "server",
+        "reason": "comrak takes an alert's title as plain text; the client reads it as markdown, as Obsidian does (GitHub itself shows no title)"
+      }
     },
     {
       "note": "a code span across lines",
