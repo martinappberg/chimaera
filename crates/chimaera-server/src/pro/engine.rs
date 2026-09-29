@@ -1802,18 +1802,24 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
                 }
                 (Some(recorded), Some(current)) if current == recorded && settled => {
                     if hosts.is_none() {
+                        let response = transport::request(
+                            &config.keeper_url,
+                            "/v1/hosts",
+                            "GET",
+                            &config.delegation.access_token,
+                            None,
+                        )
+                        .await
+                        .context("Could not reconnect to your saved work")?;
+                        // The account is down: the keeper holds on and says
+                        // so. A quiet wait; the next pass asks again.
+                        if transport::account_unavailable(&response) {
+                            return Ok(());
+                        }
                         hosts = Some(
-                            transport::request(
-                                &config.keeper_url,
-                                "/v1/hosts",
-                                "GET",
-                                &config.delegation.access_token,
-                                None,
-                            )
-                            .await
-                            .context("Could not reconnect to your saved work")?
-                            .json()
-                            .context("Could not read your connected workspaces")?,
+                            response
+                                .json()
+                                .context("Could not read your connected workspaces")?,
                         );
                     }
                     let host = hosts.as_ref().and_then(|hosts| {

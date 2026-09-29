@@ -747,6 +747,14 @@ pub(super) struct Response {
     pub status: u16,
     pub body: Vec<u8>,
 }
+
+/// The keeper's answer while the account is down (503 `account_unavailable`):
+/// transient, never a sign-in problem and never a failed return.
+pub(super) fn account_unavailable(response: &Response) -> bool {
+    response.status == 503
+        && serde_json::from_slice::<serde_json::Value>(&response.body)
+            .is_ok_and(|value| value["error"] == "account_unavailable")
+}
 impl Response {
     pub fn json<T: DeserializeOwned>(self) -> Result<T> {
         ensure!(

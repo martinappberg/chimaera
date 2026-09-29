@@ -110,6 +110,11 @@ pub(super) async fn prepare(
                             && serde_json::from_slice::<serde_json::Value>(&response.body)
                                 .ok()
                                 .is_some_and(|v| v["error"] == "worker_asleep") => {}
+                    // The account is down and the keeper says so: nothing was
+                    // asked of the worker. A quiet wait for the next pass.
+                    Ok(response) if transport::account_unavailable(&response) => {
+                        return Ok(None);
+                    }
                     Ok(response) if matches!(response.status, 502 | 504) => {
                         ambiguous = Some(seen_epoch);
                     }

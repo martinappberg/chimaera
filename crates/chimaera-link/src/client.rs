@@ -655,15 +655,47 @@ impl Client {
             .clone()
             .context("Your connection is being prepared; no keeper is assigned yet")
     }
+    /// A keeper HTTP route. A keeper can refuse a token the account still
+    /// accepts (a stale revocation cache) and answers 503 `account_unavailable`
+    /// while the account is down; neither rotates the one-use refresh token or
+    /// signs out. Only an account that itself answers 401 does.
+    async fn keeper_request(
+        &self,
+        method: Method,
+        segments: &[&str],
+        body: Option<serde_json::Value>,
+    ) -> Result<reqwest::Response> {
+        let url = path(&self.keeper().await?, segments);
+        for attempt in 0..2 {
+            let token = self.access_token().await?;
+            let mut request = self
+                .inner
+                .http
+                .request(method.clone(), url.clone())
+                .bearer_auth(&token);
+            if let Some(body) = &body {
+                request = request.json(body);
+            }
+            let response = request.send().await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                && attempt == 0
+                && self.account_rejects(&token).await?
+            {
+                self.refresh_if_current(&token).await?;
+                continue;
+            }
+            if !response.status().is_success() {
+                bail!("keeper request rejected ({})", response.status().as_u16());
+            }
+            return Ok(response);
+        }
+        bail!("sign in required")
+    }
     /// Rows of a host kind this client does not know are dropped.
     pub async fn hosts(&self) -> Result<Vec<Host>> {
         let hosts: Vec<Host> = json_response(
-            self.request(
-                Method::GET,
-                path(&self.keeper().await?, &["v1", "hosts"]),
-                None,
-            )
-            .await?,
+            self.keeper_request(Method::GET, &["v1", "hosts"], None)
+                .await?,
         )
         .await?;
         Ok(hosts
@@ -676,9 +708,9 @@ impl Client {
     }
     pub async fn add_host_with_ssh(&self, alias: &str, ssh: Option<SshTarget>) -> Result<Host> {
         json_response(
-            self.request(
+            self.keeper_request(
                 Method::POST,
-                path(&self.keeper().await?, &["v1", "hosts"]),
+                &["v1", "hosts"],
                 Some(serde_json::to_value(AddHost {
                     alias: alias.into(),
                     ssh,
@@ -689,21 +721,13 @@ impl Client {
         .await
     }
     pub async fn delete_host(&self, id: &str) -> Result<()> {
-        self.request(
-            Method::DELETE,
-            path(&self.keeper().await?, &["v1", "hosts", id]),
-            None,
-        )
-        .await?;
+        self.keeper_request(Method::DELETE, &["v1", "hosts", id], None)
+            .await?;
         Ok(())
     }
     pub async fn reconnect_host(&self, id: &str) -> Result<()> {
-        self.request(
-            Method::POST,
-            path(&self.keeper().await?, &["v1", "hosts", id, "reconnect"]),
-            None,
-        )
-        .await?;
+        self.keeper_request(Method::POST, &["v1", "hosts", id, "reconnect"], None)
+            .await?;
         Ok(())
     }
     pub async fn devices(&self) -> Result<Vec<Device>> {

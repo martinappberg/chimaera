@@ -30,6 +30,8 @@ struct Account {
     refreshes: AtomicUsize,
     /// Whether the account itself still accepts the current access token.
     account_accepts: std::sync::atomic::AtomicBool,
+    /// What the keeper's `/v1/hosts` answers (see `hosts`).
+    keeper_status: std::sync::atomic::AtomicU16,
 }
 
 fn tokens(prefix: &str) -> Tokens {
@@ -93,6 +95,20 @@ async fn events() -> StatusCode {
     StatusCode::UNAUTHORIZED
 }
 
+/// A keeper HTTP route answering what its account lets it: 503
+/// `account_unavailable` while the account is down, 401 when it refuses.
+async fn hosts(State(state): State<Arc<Account>>) -> Response {
+    match state.keeper_status.load(Ordering::SeqCst) {
+        503 => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"account_unavailable"})),
+        )
+            .into_response(),
+        401 => StatusCode::UNAUTHORIZED.into_response(),
+        _ => Json(json!([])).into_response(),
+    }
+}
+
 async fn start(initial: Tokens) -> (Client, Arc<Account>, tokio::task::JoinHandle<()>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -104,6 +120,7 @@ async fn start(initial: Tokens) -> (Client, Arc<Account>, tokio::task::JoinHandl
         .route("/v1/me", get(me))
         .route("/v1/devices", get(devices))
         .route("/v1/events", get(events))
+        .route("/v1/hosts", get(hosts))
         .with_state(state.clone());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     (
@@ -183,5 +200,31 @@ async fn keeper_refusal_rotates_only_when_the_account_rejects_the_token() {
     account.account_accepts.store(false, Ordering::SeqCst);
     assert!(client.open_socket(&["v1", "events"], true).await.is_err());
     assert_eq!(account.refreshes.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+/// During an account outage the keeper answers 503 `account_unavailable`:
+/// transient, never a refresh or a sign-out. A keeper 401 on an HTTP route
+/// rotates only when the account itself rejects the token, as for sockets.
+#[tokio::test]
+async fn keeper_account_outage_is_transient_on_http_routes() {
+    let (client, account, server) = start(tokens("after")).await;
+    client.me().await.unwrap();
+    account.keeper_status.store(503, Ordering::SeqCst);
+    let error = client.hosts().await.unwrap_err();
+    assert!(!error.is::<AuthorizationRevoked>(), "{error:#}");
+    assert_eq!(account.refreshes.load(Ordering::SeqCst), 0);
+    assert_eq!(client.tokens().await.unwrap().access_token, "after-access");
+    account.keeper_status.store(401, Ordering::SeqCst);
+    account.account_accepts.store(true, Ordering::SeqCst);
+    assert!(client.hosts().await.is_err());
+    assert_eq!(
+        account.refreshes.load(Ordering::SeqCst),
+        0,
+        "the account still accepts this token; the keeper's refusal is its own"
+    );
+    assert_eq!(client.tokens().await.unwrap().access_token, "after-access");
+    account.keeper_status.store(200, Ordering::SeqCst);
+    assert!(client.hosts().await.unwrap().is_empty());
     server.abort();
 }

@@ -656,6 +656,47 @@ async fn a_suspended_cloud_owner_is_woken_and_asked_never_taken_over() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// While the account is down the keeper answers 503 `account_unavailable`:
+/// a return in progress waits quietly (no error for the user, no backoff).
+#[tokio::test]
+async fn an_account_outage_behind_the_keeper_is_a_quiet_wait() {
+    let root = temp("keeper-outage");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let mut config = device(&account.endpoint);
+    config.keeper_url = account.endpoint.clone();
+    let workspace = project(&state, &root, &config, 4);
+    lock(&state.pro.ownership).insert(
+        workspace.id.clone(),
+        Ownership::Remote {
+            epoch: 5,
+            holder: "worker-a".into(),
+        },
+    );
+    *lock(&account.baton) = owned(&workspace.id, "worker-a", 5, "lease-cloud", 3);
+    state.pro.power_suitable.store(true, Ordering::Release);
+    state.pro.awake_since.store(0, Ordering::Release);
+    let outage = json!({"error":"account_unavailable"});
+    let handoff = "/v1/hosts/worker-worker-a/http/api/v1/pro/handoff";
+    account.script("GET", "/v1/hosts", 503, outage.clone());
+    lazy_handback(&state, &config).await.unwrap();
+    account.script(
+        "GET",
+        "/v1/hosts",
+        200,
+        json!([{"id":"worker-worker-a","kind":"worker","status":"connected","alias":"Cloud"}]),
+    );
+    account.script("POST", handoff, 503, outage);
+    lazy_handback(&state, &config).await.unwrap();
+    assert_eq!(account.calls("POST", handoff).len(), 1);
+    assert!(lock(&state.pro.return_backoff).get(&workspace.id).is_none());
+    assert!(lock(&state.pro.status)
+        .get(&workspace.id)
+        .is_none_or(|status| status.error.is_none()));
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 async fn post(state: &Arc<AppState>, path: &str, body: &str) -> (StatusCode, serde_json::Value) {
     use tower::ServiceExt;
     let response = crate::app(state.clone())
