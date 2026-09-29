@@ -610,9 +610,10 @@ export class ViewSwitchConflict extends ApiError {
   }
 }
 
-/** Session ids with a chat⇄terminal view-switch POST in flight. The pane bar's
- *  toggle disables itself for these (App's switchView owns the set) so a second
- *  click can't fire a concurrent switch the server would only 409. */
+/** Session ids with a chat⇄terminal view-switch POST (or its mid-task
+ *  question) in flight. The pane bar's toggle reads as pending for these and
+ *  App's switchView, which owns the set, drops a second click — a concurrent
+ *  switch the server would only 409. */
 export const switchingViews = writable<ReadonlySet<string>>(new Set());
 
 /**
