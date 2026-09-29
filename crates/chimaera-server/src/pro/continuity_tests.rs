@@ -236,8 +236,14 @@ async fn negotiated_execution_publishes_handoff_eligibility_before_snapshot_byte
     std::fs::remove_dir_all(root).unwrap();
 }
 
-/// Send a request and hang up before the reply, as a relay that timed out.
-async fn abandon(address: std::net::SocketAddr, path: &str, body: serde_json::Value) {
+/// Send a request and hang up before the reply, as a relay that timed out,
+/// once `midway` says the work is in progress.
+async fn abandon(
+    address: std::net::SocketAddr,
+    path: &str,
+    body: serde_json::Value,
+    midway: impl Fn() -> bool,
+) {
     use tokio::io::AsyncWriteExt;
     let body = body.to_string();
     let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
@@ -251,7 +257,13 @@ async fn abandon(address: std::net::SocketAddr, path: &str, body: serde_json::Va
         )
         .await
         .unwrap();
-    tokio::time::sleep(StdDuration::from_millis(300)).await;
+    tokio::time::timeout(StdDuration::from_secs(30), async {
+        while !midway() {
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the work never started");
     drop(stream);
 }
 fn leftovers(project: &Path) -> Vec<String> {
@@ -303,12 +315,15 @@ async fn an_abandoned_flush_still_finishes_and_leaves_no_interrupted_git_state()
     let address = listener.local_addr().unwrap();
     let app = crate::app(state.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let policy = format!("/v1/baton/{}/policy", workspace.id);
     abandon(
         address,
         "/api/v1/pro/handoff",
         json!({"workspace_id": workspace.id, "expected_epoch": 4}),
+        || !account.calls("PUT", &policy).is_empty(),
     )
     .await;
+    // The caller left while agents were stopped and the flush was mid-way.
     assert!(matches!(
         lock(&state.pro.ownership).get(&workspace.id),
         Some(Ownership::Transferring { epoch: 4 })

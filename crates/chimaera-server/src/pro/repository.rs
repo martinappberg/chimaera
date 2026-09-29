@@ -468,9 +468,15 @@ async fn publish_refs(
         } else if advance
             && current.as_deref() == Some(&reference)
             && clean
-            && fast_forward_current(root, &reference, &previous, incoming, check).await?
+            && adopt_identical_untracked(root, &previous, incoming, async {
+                fast_forward_current(root, &reference, &previous, incoming, check).await
+            })
+            .await?
         {
             // The prepared ref transaction adopted this exact branch.
+        } else if !reference.starts_with("refs/heads/") {
+            // Remote-tracking refs and tags are the user's own view of other
+            // remotes; a divergent copy from the cloud is not worth keeping.
         } else {
             let kept = format!("{reference}@cloud-{}", &incoming[..12]);
             let existing = optional(root, &["rev-parse", "--verify", &kept]).await?;
@@ -490,6 +496,101 @@ async fn publish_refs(
         }
     }
     Ok(preserved)
+}
+
+/// A fast-forward refuses to overwrite untracked files. Untracked files
+/// identical to the incoming ones are set aside (same filesystem, reserved
+/// staging name) for the fast-forward to write the same bytes, and put back
+/// if it does not happen; any other collision keeps the cloud branch
+/// separate instead of failing the return every pass.
+async fn adopt_identical_untracked(
+    root: &Path,
+    previous: &str,
+    incoming: &str,
+    fast_forward: impl std::future::Future<Output = Result<bool>>,
+) -> Result<bool> {
+    let untracked = transport::git_output(
+        transport::git(root, None).await?,
+        &["ls-files", "-z", "--others", "--exclude-standard"],
+        vec![],
+    )
+    .await?;
+    let untracked: HashSet<&[u8]> = untracked
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .collect();
+    let mut identical = Vec::new();
+    if !untracked.is_empty() {
+        let added = transport::git_output(
+            transport::git(root, None).await?,
+            &[
+                "diff",
+                "-z",
+                "--no-renames",
+                "--name-only",
+                "--diff-filter=AM",
+                previous,
+                incoming,
+            ],
+            vec![],
+        )
+        .await?;
+        for path in added.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+            if !untracked.contains(path) {
+                continue;
+            }
+            let path = std::str::from_utf8(path).context("invalid incoming path")?;
+            let wanted = optional(root, &["rev-parse", &format!("{incoming}:{path}")]).await?;
+            let have = optional(root, &["hash-object", "--no-filters", "--", path]).await?;
+            if wanted.is_none() || wanted != have || identical.len() >= 4096 {
+                return Ok(false);
+            }
+            identical.push(std::path::PathBuf::from(path));
+        }
+    }
+    if identical.is_empty() {
+        return fast_forward.await;
+    }
+    let aside = root.join(format!(
+        "{}untracked-{}",
+        crate::persist::PROJECT_STAGING_PREFIX,
+        &chimaera_core::generate_token()[..16]
+    ));
+    let moved = {
+        let (root, aside, identical) = (root.to_path_buf(), aside.clone(), identical.clone());
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            for relative in &identical {
+                let target = aside.join(relative);
+                std::fs::create_dir_all(target.parent().context("invalid untracked path")?)?;
+                std::fs::rename(root.join(relative), target)?;
+            }
+            Ok(())
+        })
+    };
+    let restore = {
+        let (root, aside) = (root.to_path_buf(), aside.clone());
+        move |adopted: bool| {
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                if !adopted {
+                    for relative in &identical {
+                        let source = aside.join(relative);
+                        if source.exists() && !root.join(relative).exists() {
+                            std::fs::rename(source, root.join(relative))?;
+                        }
+                    }
+                }
+                std::fs::remove_dir_all(&aside)?;
+                Ok(())
+            })
+        }
+    };
+    if let Err(error) = moved.await? {
+        restore(false).await??;
+        return Err(error);
+    }
+    let result = fast_forward.await;
+    restore(matches!(result, Ok(true))).await??;
+    result
 }
 
 async fn advance_unchecked_branch(root: &Path, reference: &str, incoming: &str) -> Result<bool> {
@@ -868,6 +969,58 @@ mod tests {
         ] {
             assert!(safe_url(url), "{url}");
         }
+    }
+    #[tokio::test]
+    async fn untracked_files_collide_with_a_return_only_when_they_differ() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-untracked-return-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "--quiet", "--initial-branch=main"]).await;
+        std::fs::write(root.join("kept.txt"), "base").unwrap();
+        git(&root, &["add", "kept.txt"]).await;
+        git(&root, &["commit", "-qm", "base"]).await;
+        let previous = git(&root, &["rev-parse", "HEAD"]).await;
+        std::fs::write(root.join("created.txt"), "same in both").unwrap();
+        git(&root, &["add", "created.txt"]).await;
+        git(&root, &["commit", "-qm", "cloud"]).await;
+        let incoming = git(&root, &["rev-parse", "HEAD"]).await;
+        git(&root, &["reset", "--quiet", "--hard", &previous]).await;
+        // The same file created on both sides: adopted around the fast-forward,
+        // and put back when the fast-forward does not happen.
+        std::fs::write(root.join("created.txt"), "same in both").unwrap();
+        assert!(
+            !adopt_identical_untracked(&root, &previous, &incoming, async {
+                assert!(!root.join("created.txt").exists(), "set aside for checkout");
+                Ok(false)
+            })
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("created.txt")).unwrap(),
+            "same in both"
+        );
+        // A different local file keeps the cloud's branch separate instead.
+        std::fs::write(root.join("created.txt"), "local version").unwrap();
+        assert!(
+            !adopt_identical_untracked(&root, &previous, &incoming, async {
+                panic!("a differing untracked file must not be fast-forwarded over")
+            })
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("created.txt")).unwrap(),
+            "local version"
+        );
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(crate::persist::PROJECT_STAGING_PREFIX)));
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
     async fn prepared_adoption_blocks_checkout_and_cancellation_releases_our_locks() {

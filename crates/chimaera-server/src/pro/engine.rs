@@ -38,6 +38,10 @@ pub(super) struct Manifest {
     continuation: execution::wire::Continuation,
     profile: super::policy::CloudProfile,
     sessions: Vec<SessionArchive>,
+    /// Additive: project paths this snapshot deliberately left out. Only a
+    /// snapshot that carries this inventory can show that a file is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    left_out: Option<Vec<PathBuf>>,
 }
 #[derive(Serialize, Deserialize)]
 struct SessionArchive {
@@ -792,7 +796,7 @@ async fn snapshot_inner_scoped(
         let branch=transport::git_output(transport::git(&workspace.root,None).await?,&["symbolic-ref","-q","HEAD"],vec![]).await.ok().and_then(|bytes|String::from_utf8(bytes).ok()).map(|text|text.trim().to_string());
         let repository_origin=mirror::repository_origin(&workspace.root).await;
         let repository=super::repository::capture(&workspace.root).await?;
-        let manifest = Manifest {version:1,branch,repository_origin,repository,workspace_id:workspace.id.clone(),root:workspace.root.clone(),name:workspace.name.clone(),epoch,clean,continuation,profile:profile.clone(),sessions:archives};
+        let manifest = Manifest {version:1,branch,repository_origin,repository,workspace_id:workspace.id.clone(),root:workspace.root.clone(),name:workspace.name.clone(),epoch,clean,continuation,profile:profile.clone(),sessions:archives,left_out:report.left_out.clone()};
         tokio::fs::write(handoff.join("manifest.json"), serde_json::to_vec(&manifest)?).await?;
         *phase = "mirror_repository";
         mirror::mirror_repository(&workspace.root, &root.join("repository.git"), &grant).await?;
@@ -806,8 +810,20 @@ async fn snapshot_inner_scoped(
         mirror::push(&shadow, &grant, &["refs/heads/main", "refs/heads/config", "refs/heads/handoff"]).await?;
         *phase = "confirm_checkpoint";
         if config.execution.is_some(){execution::receipt::published(config,&workspace.id,epoch,[&tree_oid,&config_oid,&handoff_oid],continuation).await?;}
-        lock(&state.pro.preferences).entry(workspace.id.clone()).or_default().profile = profile;
-        lock(&state.pro.status).insert(workspace.id.clone(), WorkspaceStatus {report,last_mirrored_at:Some(super::now()),storage_limit_bytes:budget,error:None,blocked_providers:Vec::new()});
+        {
+            // The three-way baseline for a later return is what was actually
+            // published and acknowledged, never a local commit whose push failed.
+            let mut preferences = lock(&state.pro.preferences);
+            let preference = preferences.entry(workspace.id.clone()).or_default();
+            preference.profile = profile;
+            preference.published_tree = Some(tree_oid.clone());
+        }
+        {
+            // The last return's report stays until the next return replaces it.
+            let mut statuses = lock(&state.pro.status);
+            let previous = statuses.remove(&workspace.id).unwrap_or_default();
+            statuses.insert(workspace.id.clone(), WorkspaceStatus {report,last_mirrored_at:Some(super::now()),storage_limit_bytes:budget,error:None,kept_both:previous.kept_both,kept_paths:previous.kept_paths,blocked_providers:Vec::new()});
+        }
         *phase = "persist_snapshot";
         super::persist(state).await?;
         if clean && !sleep.is_some_and(|sleep| sleep.woke(state)) {
@@ -1228,6 +1244,13 @@ async fn hydrate_scoped(
         let has_baseline = old_shadow.is_some();
         if let Some(old_shadow) = &old_shadow {
             tokio::fs::create_dir_all(&baseline).await?;
+            // The last snapshot this computer published successfully. A local
+            // commit whose push failed is newer than anything the other side
+            // saw; using it would silently overwrite edits made since.
+            let published = lock(&state.pro.preferences)
+                .get(workspace)
+                .and_then(|p| p.published_tree.clone());
+            let revision = baseline_revision(old_shadow, published).await?;
             let mut command = transport::git(old_shadow, None).await?;
             command.env("GIT_WORK_TREE", &baseline);
             transport::git_output(
@@ -1236,7 +1259,7 @@ async fn hydrate_scoped(
                     "--work-tree",
                     baseline.to_str().context("invalid baseline path")?,
                     "checkout",
-                    "refs/heads/main",
+                    &revision,
                     "--",
                     ".",
                 ],
@@ -1251,15 +1274,18 @@ async fn hydrate_scoped(
         let local_conflicts = (config.role == Role::Device
             && execution::checkpoint_mode(state, workspace))
         .then(|| state.pro.root.join(workspace).join("local-conflicts"));
-        tokio::task::spawn_blocking(move || {
+        let left_out = manifest.left_out.clone();
+        let kept = tokio::task::spawn_blocking(move || {
             install_tree(
                 &tree,
                 &destination,
                 has_baseline.then_some(baseline).as_deref(),
                 local_conflicts.as_deref(),
+                left_out.as_deref(),
             )
         })
         .await??;
+        super::return_report(state, workspace, kept);
         if let Some(repair) = super::shadow_cache::prepare(&local_shadow, &cache, cache_guard.clone()).await? {
             let configuration = state.pro.configuration.clone().lock_owned().await;
             let owner = state.clone();
@@ -1272,6 +1298,27 @@ async fn hydrate_scoped(
                 ensure!(matches!(lock(&owner.pro.ownership).get(&workspace), Some(Ownership::Hydrating { epoch: current }) if *current == epoch), "Workspace ownership changed during shadow recovery");
                 Ok(())
             }).await?;
+        }
+        // Both sides now share the installed tree: it is the baseline for the
+        // next return until this computer publishes again.
+        if tokio::fs::try_exists(local_shadow.join("HEAD")).await? {
+            let source = cache.to_str().context("invalid cache path")?.to_owned();
+            transport::git_output(
+                transport::git(&local_shadow, None).await?,
+                &["fetch", "--no-tags", &source, "+refs/heads/main:refs/chimaera/baseline"],
+                vec![],
+            )
+            .await?;
+            let installed = transport::git_output(
+                transport::git(&local_shadow, None).await?,
+                &["rev-parse", "--verify", "refs/chimaera/baseline^{commit}"],
+                vec![],
+            )
+            .await?;
+            lock(&state.pro.preferences)
+                .entry(workspace.into())
+                .or_default()
+                .published_tree = Some(String::from_utf8(installed)?.trim().to_owned());
         }
         current()?;
         ensure!(matches!(lock(&state.pro.ownership).get(workspace), Some(Ownership::Hydrating { epoch }) if *epoch == grant.epoch), "Workspace ownership changed during hydration");
@@ -1354,15 +1401,55 @@ async fn hydrate_scoped(
     let _ = tokio::fs::remove_dir_all(stage).await;
     result
 }
+/// The published commit when this shadow still has it, else its main tip
+/// (older state files recorded no publication).
+async fn baseline_revision(shadow: &Path, published: Option<String>) -> Result<String> {
+    if let Some(published) = published {
+        ensure!(
+            published.len() >= 40 && published.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid published baseline"
+        );
+        let mut probe = transport::git(shadow, None).await?;
+        probe.args(["cat-file", "-e", &format!("{published}^{{tree}}")]);
+        if transport::run(probe, vec![], Duration::from_secs(10), 256)
+            .await?
+            .success
+        {
+            return Ok(published);
+        }
+    }
+    Ok("refs/heads/main".to_owned())
+}
+
+/// Three-way install of an incoming tree over the local project. Returns how
+/// many local files were kept alongside an incoming version ("kept both"),
+/// with up to 32 of their paths.
+///
+/// - incoming == baseline: the other side never touched it; local wins.
+/// - local == baseline: only the other side changed it; incoming wins.
+/// - both changed: incoming takes the path, local is preserved.
+/// - absent from incoming: deleted locally only when the incoming snapshot
+///   carries an inventory (`left_out`) that shows it gone, and the local copy
+///   is unchanged since the baseline.
 fn install_tree(
     source: &Path,
     destination: &Path,
     baseline: Option<&Path>,
     local_conflicts: Option<&Path>,
-) -> Result<()> {
+    left_out: Option<&[PathBuf]>,
+) -> Result<(usize, Vec<PathBuf>)> {
+    let mut kept = (0usize, Vec::new());
+    let mut keep = |relative: &Path| {
+        kept.0 += 1;
+        if kept.1.len() < 32 {
+            kept.1.push(relative.to_path_buf());
+        }
+    };
     let mut conflicts = local_conflicts
         .map(super::canonical::Conflicts::open)
         .transpose()?;
+    let left_out: Option<std::collections::HashSet<&Path>> =
+        left_out.map(|paths| paths.iter().map(PathBuf::as_path).collect());
     if let Some(baseline) = baseline {
         let mut pending = vec![(baseline.to_path_buf(), PathBuf::new())];
         let mut count = 0;
@@ -1388,6 +1475,14 @@ fn install_tree(
                 if !kind.is_file() || source.join(&relative).try_exists()? {
                     continue;
                 }
+                // No inventory, or the other side still has it but left it
+                // out of its snapshot: absence is not deletion.
+                if left_out
+                    .as_ref()
+                    .is_none_or(|left_out| left_out.contains(relative.as_path()))
+                {
+                    continue;
+                }
                 let target = destination.join(&relative);
                 let mut cursor = destination.to_path_buf();
                 let safe = relative.components().all(|component| {
@@ -1403,6 +1498,7 @@ fn install_tree(
                     } else if let Some(conflicts) = conflicts.as_mut() {
                         conflicts.preserve(&target, &relative)?;
                         std::fs::remove_file(target)?;
+                        keep(&relative);
                     }
                 }
             }
@@ -1434,15 +1530,22 @@ fn install_tree(
                 std::fs::create_dir_all(&target)?;
                 pending.push((entry.path(), relative));
             } else if kind.is_file() {
-                if target.exists()
-                    && !same_file(&target, &entry.path())?
-                    && !baseline.is_some_and(|root| {
-                        same_file(&target, &root.join(&relative)).unwrap_or(false)
-                    })
-                {
-                    if let Some(conflicts) = conflicts.as_mut() {
+                let base = baseline.map(|root| root.join(&relative));
+                let unchanged_remotely = base.as_ref().is_some_and(|base| {
+                    base.is_file() && same_file(&entry.path(), base).unwrap_or(false)
+                });
+                if target.exists() && !same_file(&target, &entry.path())? {
+                    let unchanged_locally = base
+                        .as_ref()
+                        .is_some_and(|base| same_file(&target, base).unwrap_or(false));
+                    if unchanged_locally {
+                        std::fs::copy(entry.path(), target)?;
+                    } else if unchanged_remotely {
+                        // Only this computer changed it: keep the local edit.
+                    } else if let Some(conflicts) = conflicts.as_mut() {
                         conflicts.preserve(&target, &relative)?;
                         std::fs::copy(entry.path(), target)?;
+                        keep(&relative);
                     } else {
                         let preserved = target.with_file_name(format!(
                             "{}.cloud-{}",
@@ -1450,14 +1553,17 @@ fn install_tree(
                             super::now()
                         ));
                         std::fs::copy(entry.path(), preserved)?;
+                        keep(&relative);
                     }
+                } else if !target.exists() && unchanged_remotely {
+                    // Deleted here, untouched there: the local deletion stands.
                 } else {
                     std::fs::copy(entry.path(), target)?;
                 }
             }
         }
     }
-    Ok(())
+    Ok(kept)
 }
 
 fn chat_at_pause(
@@ -2013,7 +2119,12 @@ mod tests {
             )
             .unwrap();
         }
-        install_tree(&cloud, &local, Some(&base), None).unwrap();
+        assert_eq!(
+            install_tree(&cloud, &local, Some(&base), None, Some(&[]))
+                .unwrap()
+                .0,
+            1
+        );
         assert_eq!(
             std::fs::read_to_string(local.join("same.txt")).unwrap(),
             "cloud"
@@ -2052,7 +2163,8 @@ mod tests {
             std::fs::write(local.join(name), "unpublished local").unwrap();
         }
         std::fs::write(cloud.join("changed"), "canonical cloud").unwrap();
-        install_tree(&cloud, &local, Some(&base), Some(&conflicts)).unwrap();
+        let kept = install_tree(&cloud, &local, Some(&base), Some(&conflicts), Some(&[])).unwrap();
+        assert_eq!(kept.0, 2);
         assert_eq!(
             std::fs::read_to_string(local.join("changed")).unwrap(),
             "canonical cloud"
@@ -2069,6 +2181,111 @@ mod tests {
             std::fs::read_dir(local).unwrap().count(),
             1,
             "conflicts are outside the canonical mirror"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod return_tests {
+    use super::*;
+    fn tree(root: &Path, files: &[(&str, &str)]) -> PathBuf {
+        std::fs::create_dir_all(root).unwrap();
+        for (name, body) in files {
+            std::fs::write(root.join(name), body).unwrap();
+        }
+        root.to_path_buf()
+    }
+    #[test]
+    fn edits_since_the_last_published_snapshot_survive_a_return() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-return-edits-{}",
+            chimaera_core::generate_token()
+        ));
+        // Published T0; the laptop then edited notes (its T1 push failed) and
+        // the cloud, continuing from T0, changed only report.
+        let base = tree(&root.join("base"), &[("notes", "t0"), ("report", "t0")]);
+        let local = tree(
+            &root.join("local"),
+            &[
+                ("notes", "edited after t0"),
+                ("report", "t0"),
+                ("new", "local only"),
+            ],
+        );
+        let cloud = tree(&root.join("cloud"), &[("notes", "t0"), ("report", "cloud")]);
+        let conflicts = root.join("private-conflicts");
+        let kept = install_tree(&cloud, &local, Some(&base), Some(&conflicts), Some(&[])).unwrap();
+        assert_eq!(kept.0, 0, "no conflict: each side changed different files");
+        assert_eq!(
+            std::fs::read_to_string(local.join("notes")).unwrap(),
+            "edited after t0"
+        );
+        assert_eq!(
+            std::fs::read_to_string(local.join("report")).unwrap(),
+            "cloud"
+        );
+        assert_eq!(
+            std::fs::read_to_string(local.join("new")).unwrap(),
+            "local only"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn a_file_left_out_of_the_snapshot_is_never_deleted_locally() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-return-left-out-{}",
+            chimaera_core::generate_token()
+        ));
+        for (label, left_out, deleted) in [
+            (
+                "excluded",
+                Some(vec![PathBuf::from("secret-looking")]),
+                false,
+            ),
+            ("legacy", None, false),
+            ("deleted", Some(vec![]), true),
+        ] {
+            let base = tree(
+                &root.join(label).join("base"),
+                &[("secret-looking", "same")],
+            );
+            let local = tree(
+                &root.join(label).join("local"),
+                &[("secret-looking", "same")],
+            );
+            let cloud = tree(&root.join(label).join("cloud"), &[]);
+            install_tree(&cloud, &local, Some(&base), None, left_out.as_deref()).unwrap();
+            assert_eq!(!local.join("secret-looking").exists(), deleted, "{label}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn the_baseline_is_the_published_commit_not_a_failed_local_one() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-return-baseline-{}",
+            chimaera_core::generate_token()
+        ));
+        let shadow = root.join("working-tree.git");
+        mirror::initialize(&shadow).await.unwrap();
+        let published =
+            mirror::commit_tree(&shadow, &tree(&root.join("t0"), &[("f", "t0")]), "main")
+                .await
+                .unwrap();
+        let unpushed =
+            mirror::commit_tree(&shadow, &tree(&root.join("t1"), &[("f", "t1")]), "main")
+                .await
+                .unwrap();
+        assert_ne!(published, unpushed);
+        assert_eq!(
+            baseline_revision(&shadow, Some(published.clone()))
+                .await
+                .unwrap(),
+            published
+        );
+        assert_eq!(
+            baseline_revision(&shadow, None).await.unwrap(),
+            "refs/heads/main"
         );
         std::fs::remove_dir_all(root).unwrap();
     }

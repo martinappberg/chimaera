@@ -101,6 +101,10 @@ struct Preference {
     privacy_pending: bool,
     #[serde(default)]
     git_branches: Vec<String>,
+    /// The working-tree commit of the last acknowledged publication: the
+    /// three-way baseline when work returns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published_tree: Option<String>,
     #[serde(default)]
     profile: policy::CloudProfile,
 }
@@ -111,6 +115,12 @@ struct WorkspaceStatus {
     last_mirrored_at: Option<u64>,
     storage_limit_bytes: u64,
     error: Option<String>,
+    /// Additive: files the last return kept in both versions, and up to 32
+    /// of their project-relative paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kept_both: Option<usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    kept_paths: Vec<PathBuf>,
     #[serde(skip)]
     blocked_providers: Vec<provider_gate::BlockedProvider>,
 }
@@ -505,6 +515,18 @@ pub(crate) async fn shutdown(state: &std::sync::Arc<crate::AppState>) {
     if let Err(error) = execution::shutdown(state).await {
         tracing::warn!(%error, "Project execution state could not be saved at shutdown");
     }
+}
+
+/// The bounded return report: how many files a return kept in both versions
+/// and which (up to 32, project-relative). `/pro/status` carries it on the
+/// project's mirror row so the Pro page can say "Kept both versions of N files".
+fn return_report(state: &crate::AppState, workspace: &str, kept: (usize, Vec<PathBuf>)) {
+    let mut statuses = crate::lock(&state.pro.status);
+    let status = statuses.entry(workspace.into()).or_default();
+    status.kept_both = (kept.0 > 0).then_some(kept.0);
+    status.kept_paths = kept.1;
+    drop(statuses);
+    state.changes.notify_waiters();
 }
 
 pub(crate) fn active_operations(state: &crate::AppState) -> usize {

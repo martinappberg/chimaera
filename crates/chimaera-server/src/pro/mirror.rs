@@ -16,6 +16,23 @@ pub(super) struct Report {
     pub bytes: u64,
     pub excluded: usize,
     pub too_large: usize,
+    /// Paths present in the project that this snapshot left out. A receiver
+    /// deletes nothing on their account; `None` once the list would exceed
+    /// its bound, which makes every absence ambiguous.
+    #[serde(skip)]
+    pub left_out: Option<Vec<PathBuf>>,
+}
+const LEFT_OUT_LIMIT: usize = 4096;
+impl Report {
+    fn leave_out(&mut self, path: &Path) {
+        if let Some(list) = self.left_out.as_mut() {
+            if list.len() >= LEFT_OUT_LIMIT {
+                self.left_out = None;
+            } else {
+                list.push(path.to_path_buf());
+            }
+        }
+    }
 }
 
 pub(super) async fn initialize(path: &Path) -> Result<()> {
@@ -164,7 +181,8 @@ pub(super) async fn fetch_published(shadow: &Path, credentials: &MirrorCredentia
     Ok(())
 }
 
-pub(super) async fn inventory(root: &Path, shadow: &Path) -> Result<Vec<PathBuf>> {
+/// Paths to copy, plus paths the project's own `.chimaeraignore` keeps out.
+pub(super) async fn inventory(root: &Path, shadow: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut command = transport::git(root, None).await?;
     command.args(["rev-parse", "--is-inside-work-tree"]);
     let repo = transport::run(command, vec![], std::time::Duration::from_secs(5), 256)
@@ -251,24 +269,30 @@ pub(super) async fn inventory(root: &Path, shadow: &Path) -> Result<Vec<PathBuf>
             ignored.insert(PathBuf::from(std::str::from_utf8(p)?));
         }
     }
-    Ok(paths
-        .into_iter()
-        .filter(|path| !ignored.contains(path))
-        .collect())
+    let (kept, ignored): (Vec<_>, Vec<_>) =
+        paths.into_iter().partition(|path| !ignored.contains(path));
+    Ok((kept, ignored))
 }
 
 pub(super) fn copy_tree(
     root: &Path,
     destination: &Path,
-    paths: Vec<PathBuf>,
+    (paths, ignored): (Vec<PathBuf>, Vec<PathBuf>),
     budget: u64,
     max_file: u64,
 ) -> Result<Report> {
     fs::create_dir_all(destination)?;
-    let mut report = Report::default();
+    let mut report = Report {
+        left_out: Some(Vec::new()),
+        ..Report::default()
+    };
+    for relative in &ignored {
+        report.leave_out(relative);
+    }
     for relative in paths {
         if !policy::allowed_path(&relative) {
             report.excluded += 1;
+            report.leave_out(&relative);
             continue;
         }
         let source = root.join(&relative);
@@ -285,14 +309,21 @@ pub(super) fn copy_tree(
         }
         if !safe {
             report.excluded += 1;
+            report.leave_out(&relative);
             continue;
         }
         let metadata = match fs::symlink_metadata(&source) {
             Ok(m) if m.is_file() => m,
-            _ => continue,
+            Ok(_) => {
+                // Symlinks and special files exist but are never mirrored.
+                report.leave_out(&relative);
+                continue;
+            }
+            Err(_) => continue,
         };
         if metadata.len() > max_file.min(policy::MAX_FILE_BYTES) {
             report.too_large += 1;
+            report.leave_out(&relative);
             continue;
         }
         ensure!(
@@ -350,6 +381,7 @@ pub(super) fn copy_tree(
         if secret {
             fs::remove_file(target)?;
             report.excluded += 1;
+            report.leave_out(&relative);
             continue;
         }
         fs::set_permissions(&target, metadata.permissions())?;
@@ -652,7 +684,7 @@ mod tests {
                 .unwrap();
             }
             let paths = inventory(&project, &shadow).await.unwrap();
-            assert!(paths.iter().any(|path| path == Path::new(&staged_name)));
+            assert!(paths.0.iter().any(|path| path == Path::new(&staged_name)));
             let first = root.join("first");
             copy_tree(&project, &first, paths, 10000, 1000).unwrap();
             assert!(!first.join(&staged_name).exists());
