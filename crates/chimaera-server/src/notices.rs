@@ -19,6 +19,10 @@
 //! the instant a turn ends, never flashes a notification, and a turn-end the
 //! agent immediately follows with "waiting on you" arrives as one notice.
 //!
+//! **Not only this computer's sessions.** A Pro return that kept both
+//! versions of changed files feeds the same ring ([`push_kept_both`], a
+//! project event, not a session's).
+//!
 //! Bounded by construction: a small ring of recent notices ([`RING_CAP`]),
 //! replayed to a reconnecting consumer only while fresh ([`REPLAY_MAX_AGE`]);
 //! a fresh consumer (new boot, first poll) starts at the head, so opening
@@ -63,6 +67,13 @@ const AGENT_HOURLY_CAP: usize = 20;
 const HOUR: Duration = Duration::from_secs(60 * 60);
 /// Caps on agent-authored text (the tool validates, this bounds the ring).
 pub(crate) const AGENT_TITLE_MAX: usize = 80;
+/// Bounds on words this feed did not write itself (a project's name, a kept
+/// file's name) before they enter the ring.
+const WORDS_MAX: usize = 480;
+const NAME_MAX: usize = 200;
+/// Kept copies a `kept_both` notice names in its body; the full (bounded)
+/// list rides the additive `kept.paths`.
+const KEPT_NAMED: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,6 +92,10 @@ pub(crate) enum NoticeKind {
     RateLimited,
     /// The agent called the `notify` tool.
     Agent,
+    /// A Pro return kept both versions of files changed on both machines
+    /// (the user's own beside the incoming one), or of a Git branch. A
+    /// project event: `session_id` is a per-project key, not a session.
+    KeptBoth,
 }
 
 impl NoticeKind {
@@ -93,7 +108,8 @@ impl NoticeKind {
             | NoticeKind::Permission
             | NoticeKind::Question
             | NoticeKind::Error
-            | NoticeKind::RateLimited => "notifications.needsYou",
+            | NoticeKind::RateLimited
+            | NoticeKind::KeptBoth => "notifications.needsYou",
         }
     }
 
@@ -107,6 +123,7 @@ impl NoticeKind {
             NoticeKind::Error => "Stopped on an error",
             NoticeKind::RateLimited => "Hit a usage limit",
             NoticeKind::Agent => "Message",
+            NoticeKind::KeptBoth => "Kept both versions",
         }
     }
 
@@ -136,14 +153,27 @@ pub(crate) struct Notice {
     pub(crate) subtitle: String,
     pub(crate) body: String,
     pub(crate) at_ms: u64,
+    /// `kept_both` only: what the return kept (the additive `kept` field).
+    pub(crate) kept: Option<Kept>,
     created: Instant,
+}
+
+/// What a return kept in both versions: `files` counted, `paths` naming up
+/// to 32 of the kept copies (project-relative, as the mirror row's
+/// `kept_paths`), and the other machine's diverged Git branches kept beside
+/// the user's (`<branch>@cloud-<commit>`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct Kept {
+    pub(crate) files: usize,
+    pub(crate) paths: Vec<String>,
+    pub(crate) branches: Vec<String>,
 }
 
 impl Notice {
     /// Wire shape. `age_ms` is measured on THIS daemon's clock, so a
     /// consumer on another machine can judge freshness without clock sync.
     pub(crate) fn to_json(&self, now: Instant) -> Value {
-        json!({
+        let mut value = json!({
             "id": self.id,
             "kind": self.kind,
             "blocking": self.kind.blocking(),
@@ -157,7 +187,11 @@ impl Notice {
             "body": self.body,
             "at_ms": self.at_ms,
             "age_ms": now.saturating_duration_since(self.created).as_millis() as u64,
-        })
+        });
+        if let Some(kept) = &self.kept {
+            value["kept"] = json!(kept);
+        }
+        value
     }
 }
 
@@ -341,6 +375,7 @@ fn emit_edge(
         subtitle,
         body,
         at_ms: crate::session_view::now_ms(),
+        kept: None,
         created: Instant::now(),
     }))
 }
@@ -396,10 +431,134 @@ pub(crate) fn push_agent_notice(
         subtitle,
         body: message,
         at_ms: crate::session_view::now_ms(),
+        kept: None,
         created: Instant::now(),
     });
     state.changes.notify_waiters();
     Ok("Notification sent.".to_string())
+}
+
+/// A Pro return kept both versions of something (see `pro::report_return`):
+/// one notice for the whole return, never one per file. `paths` are the kept
+/// copies (`<name>.mine-<yyyymmdd-hhmm>`, project-relative, up to 32 of
+/// `files`); `branches` the other machine's diverged branches kept beside the
+/// user's. Words say what happened and where the user's version is; the
+/// structured `kept` lets the UI list or open them.
+pub(crate) fn push_kept_both(
+    state: &AppState,
+    workspace_id: &str,
+    files: usize,
+    paths: &[std::path::PathBuf],
+    branches: &[String],
+) -> Option<Arc<Notice>> {
+    if (files == 0 && branches.is_empty()) || !kind_enabled(state, NoticeKind::KeptBoth) {
+        return None;
+    }
+    let project = crate::lock(&state.workspaces)
+        .get(workspace_id)
+        .map(|w| w.name)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "your project".to_string());
+    let project = clip(&project, NAME_MAX);
+    let paths: Vec<String> = paths
+        .iter()
+        .take(32)
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let branches: Vec<String> = branches.iter().take(32).cloned().collect();
+    let plural = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    let what = match (files, branches.len()) {
+        (0, b) => plural(b, "branch", "branches"),
+        (f, 0) => plural(f, "file", "files"),
+        (f, b) => format!(
+            "{} and {}",
+            plural(f, "file", "files"),
+            plural(b, "branch", "branches")
+        ),
+    };
+    // Named by the kept copy's own file name: the one the user will find in
+    // the file tree right beside the incoming version.
+    let named = |items: Vec<&str>, total: usize| {
+        let mut list = items.join(", ");
+        if total > items.len() {
+            list.push_str(&format!(" and {} more", total - items.len()));
+        }
+        list
+    };
+    let mut body = Vec::new();
+    if files > 0 {
+        let names: Vec<&str> = paths
+            .iter()
+            .take(KEPT_NAMED)
+            .map(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(p)
+            })
+            .collect();
+        let list = named(names, files);
+        body.push(if files == 1 {
+            format!("Your version is saved beside it ({list}).")
+        } else {
+            format!("Your versions are saved beside them ({list}).")
+        });
+    }
+    if !branches.is_empty() {
+        let list = named(
+            branches
+                .iter()
+                .take(KEPT_NAMED)
+                .map(String::as_str)
+                .collect(),
+            branches.len(),
+        );
+        body.push(if branches.len() == 1 {
+            format!("The other machine's version is kept as branch {list}.")
+        } else {
+            format!("The other machine's versions are kept as branches {list}.")
+        });
+    }
+    let notice = state.notices.push(Notice {
+        id: 0,
+        kind: NoticeKind::KeptBoth,
+        // A per-project key where consumers expect a session id: a newer
+        // return's notice replaces this project's older one, never another
+        // project's; a click routes by `workspace_id`.
+        session_id: format!("kept-both-{workspace_id}"),
+        workspace_id: Some(workspace_id.to_string()),
+        workspace: Some(project.clone()),
+        agent: None,
+        name: project.clone(),
+        title: format!("Kept both versions of {what}"),
+        subtitle: project,
+        body: clip(&body.join(" "), WORDS_MAX),
+        at_ms: crate::session_view::now_ms(),
+        kept: Some(Kept {
+            files,
+            paths,
+            branches,
+        }),
+        created: Instant::now(),
+    });
+    state.changes.notify_waiters();
+    Some(notice)
+}
+
+/// `text` without control characters, at most `max` chars.
+fn clip(text: &str, max: usize) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(max)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// What an observed state change means for the feed.
@@ -446,7 +605,7 @@ fn still_true(kind: NoticeKind, state: AgentState) -> bool {
         NoticeKind::Permission | NoticeKind::Question => state == AgentState::NeedsPermission,
         NoticeKind::Error => state == AgentState::Errored,
         NoticeKind::RateLimited => state == AgentState::RateLimited,
-        NoticeKind::Agent => false,
+        NoticeKind::Agent | NoticeKind::KeptBoth => false,
     }
 }
 
@@ -865,6 +1024,7 @@ mod tests {
             subtitle: "s".into(),
             body: "b".into(),
             at_ms: 0,
+            kept: None,
             created: Instant::now(),
         }
     }

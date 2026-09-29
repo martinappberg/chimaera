@@ -176,6 +176,55 @@ struct DiskState {
     worker: bool,
     ownership: HashMap<String, Ownership>,
     preferences: HashMap<String, Preference>,
+    /// The last return's kept-both report per project, so the project's row
+    /// still says it after a restart (the kept copies are still on disk).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    kept_both: HashMap<String, KeptRecord>,
+}
+/// A return's kept-both report as persisted: the count, and the kept copies'
+/// project-relative paths (fewer than `files` when bounded, see
+/// [`persisted_kept`]).
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct KeptRecord {
+    files: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<PathBuf>,
+}
+/// Kept-both reports share `state.json`'s 1 MiB cap with ownership state, so
+/// they get a small fixed share of it: a report that would push past it keeps
+/// its count and drops its names, never the ownership write.
+const KEPT_PERSIST_BYTES: usize = 64 * 1024;
+/// A single kept path longer than this is not persisted (its count is).
+const KEPT_PATH_PERSIST_MAX: usize = 1024;
+/// The kept-both reports to persist, bounded by [`KEPT_PERSIST_BYTES`] in
+/// project-id order (so the choice is stable across writes).
+fn persisted_kept(statuses: &HashMap<String, WorkspaceStatus>) -> HashMap<String, KeptRecord> {
+    let mut reports: Vec<_> = statuses
+        .iter()
+        .filter_map(|(id, status)| Some((id, status.kept_both?, &status.kept_paths)))
+        .collect();
+    reports.sort_by(|a, b| a.0.cmp(b.0));
+    let mut budget = KEPT_PERSIST_BYTES;
+    reports
+        .into_iter()
+        .take(128)
+        .map(|(id, files, paths)| {
+            let paths = paths
+                .iter()
+                .filter(|path| path.as_os_str().len() <= KEPT_PATH_PERSIST_MAX)
+                .take_while(|path| {
+                    let cost = path.as_os_str().len() + 8;
+                    let fits = cost <= budget;
+                    if fits {
+                        budget -= cost;
+                    }
+                    fits
+                })
+                .cloned()
+                .collect();
+            (id.clone(), KeptRecord { files, paths })
+        })
+        .collect()
 }
 impl ProState {
     fn cache(&self, workspace: &str) -> anyhow::Result<Arc<AsyncMutex<()>>> {
@@ -260,7 +309,7 @@ impl ProState {
                 (id, owner)
             })
             .collect();
-        let status = disk
+        let mut status: HashMap<String, WorkspaceStatus> = disk
             .provider_blocks
             .into_iter()
             .take(128)
@@ -281,6 +330,14 @@ impl ProState {
                 ))
             })
             .collect();
+        for (id, kept) in disk.kept_both.into_iter().take(128) {
+            if kept.files == 0 || !valid_id(&id) {
+                continue;
+            }
+            let entry = status.entry(id).or_default();
+            entry.kept_both = Some(kept.files);
+            entry.kept_paths = kept.paths.into_iter().take(32).collect();
+        }
         let authority = authority::Authority::load(&root);
         let execution = execution::State::restore(
             &root,
@@ -575,13 +632,18 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
     let projects_root = crate::lock(&state.pro.projects_root).clone();
     let adoptions = crate::lock(&state.pro.adoptions).clone();
     let legacy_pending = crate::lock(&state.pro.legacy_pending).clone();
-    let provider_blocks = crate::lock(&state.pro.status)
-        .iter()
-        .filter(|(_, status)| !status.blocked_providers.is_empty())
-        .take(128)
-        .map(|(id, status)| (id.clone(), status.blocked_providers.clone()))
-        .collect();
+    let (provider_blocks, kept_both) = {
+        let statuses = crate::lock(&state.pro.status);
+        let blocks = statuses
+            .iter()
+            .filter(|(_, status)| !status.blocked_providers.is_empty())
+            .take(128)
+            .map(|(id, status)| (id.clone(), status.blocked_providers.clone()))
+            .collect();
+        (blocks, persisted_kept(&statuses))
+    };
     let bytes = serde_json::to_vec(&DiskState {
+        kept_both,
         provider_blocks,
         legacy_pending,
         import_roots: HashMap::new(),
@@ -733,12 +795,34 @@ pub(crate) async fn shutdown(state: &std::sync::Arc<crate::AppState>) {
 /// and which (up to 32, project-relative). `/pro/status` carries it on the
 /// project's mirror row so the Pro page can say "Kept both versions of N files".
 fn return_report(state: &crate::AppState, workspace: &str, kept: (usize, Vec<PathBuf>)) {
-    let mut statuses = crate::lock(&state.pro.status);
-    let status = statuses.entry(workspace.into()).or_default();
-    status.kept_both = (kept.0 > 0).then_some(kept.0);
-    status.kept_paths = kept.1;
-    drop(statuses);
-    state.changes.notify_waiters();
+    report_return(state, workspace, kept, &[]);
+}
+/// [`return_report`] with the other machine's diverged branches the return
+/// kept beside the user's (`repository::receive`'s `<branch>@cloud-<commit>`
+/// names), so one notice covers the whole return.
+///
+/// The report replaces the previous return's and is persisted with the rest
+/// of the Pro state (`persist`, which the return runs before it resumes
+/// work), so the row keeps saying it across a restart. When the return kept
+/// anything, one `kept_both` notice goes to the notice feed: the native app's
+/// OS notification and browser tabs' in-app alert — a `.mine-…` copy
+/// appearing in the file tree should never be the first the user hears of it.
+fn report_return(
+    state: &crate::AppState,
+    workspace: &str,
+    kept: (usize, Vec<PathBuf>),
+    cloud_branches: &[String],
+) {
+    let (files, paths) = kept;
+    {
+        let mut statuses = crate::lock(&state.pro.status);
+        let status = statuses.entry(workspace.into()).or_default();
+        status.kept_both = (files > 0).then_some(files);
+        status.kept_paths = paths.clone();
+    }
+    if crate::notices::push_kept_both(state, workspace, files, &paths, cloud_branches).is_none() {
+        state.changes.notify_waiters();
+    }
 }
 
 /// Work in flight that an idle decision must wait for: the job reservation
@@ -979,6 +1063,122 @@ mod tests {
         assert!(may_write(&restored, "w-owned"));
         assert_eq!(owned_epoch(&restored, "w-owned"), Some(9));
         std::fs::remove_dir_all(root).unwrap();
+    }
+    /// A return that kept both versions says so once, through the notice
+    /// feed (with the kept copies for the UI), and its report survives a
+    /// restart; a return that kept nothing says nothing.
+    #[tokio::test]
+    async fn a_kept_both_return_notifies_once_and_its_report_survives_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-pro-kept-{}",
+            chimaera_core::generate_token()
+        ));
+        let old = state(&root);
+        let folder = root.join("thesis");
+        std::fs::create_dir_all(&folder).unwrap();
+        let workspace = crate::lock(&old.workspaces).add(folder).unwrap();
+        let head = old.notices.head();
+        let kept: Vec<PathBuf> = [
+            "ch1.md.mine-20260929-1412",
+            "refs/refs.bib.mine-20260929-1412",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        return_report(&old, &workspace.id, (3, kept.clone()));
+        let notices = old.notices.since(head);
+        assert_eq!(notices.len(), 1, "one notice per return, not per file");
+        let wire = notices[0].to_json(std::time::Instant::now());
+        assert_eq!(wire["kind"], "kept_both");
+        assert_eq!(wire["blocking"], false);
+        assert_eq!(wire["workspace_id"], workspace.id.as_str());
+        assert_eq!(wire["title"], "Kept both versions of 3 files");
+        assert_eq!(wire["subtitle"], workspace.name.as_str());
+        assert_eq!(
+            wire["body"],
+            "Your versions are saved beside them (ch1.md.mine-20260929-1412, \
+             refs.bib.mine-20260929-1412 and 1 more)."
+        );
+        assert_eq!(
+            wire["kept"],
+            serde_json::json!({
+                "files": 3,
+                "paths": ["ch1.md.mine-20260929-1412", "refs/refs.bib.mine-20260929-1412"],
+                "branches": [],
+            })
+        );
+        // Not a session: a per-project key a newer return replaces.
+        assert_eq!(
+            wire["session_id"],
+            format!("kept-both-{}", workspace.id).as_str()
+        );
+        // Counts mean approvals: a kept-both return never adds to them.
+        assert!(crate::lock(&old.agents).is_empty());
+
+        persist(&old).await.unwrap();
+        let restored = state(&root);
+        {
+            let statuses = crate::lock(&restored.pro.status);
+            let status = statuses.get(&workspace.id).expect("report restored");
+            assert_eq!(status.kept_both, Some(3));
+            assert_eq!(status.kept_paths, kept);
+        }
+        // A restart replays no notice (the feed never replays history).
+        assert_eq!(restored.notices.since(0).len(), 0);
+
+        // The next return that keeps nothing clears the report, silently.
+        let head = old.notices.head();
+        return_report(&old, &workspace.id, (0, Vec::new()));
+        assert!(old.notices.since(head).is_empty());
+        persist(&old).await.unwrap();
+        let restored = state(&root);
+        assert!(crate::lock(&restored.pro.status)
+            .get(&workspace.id)
+            .is_none_or(|status| status.kept_both.is_none()));
+
+        // Branches kept beside the user's are named in the same one notice.
+        report_return(
+            &old,
+            &workspace.id,
+            (1, vec![PathBuf::from("a.txt.mine-20260929-1500")]),
+            &["main@cloud-1a2b3c4d5e6f".to_owned()],
+        );
+        let notices = old.notices.since(head);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(
+            notices[0].title,
+            "Kept both versions of 1 file and 1 branch"
+        );
+        assert_eq!(
+            notices[0].body,
+            "Your version is saved beside it (a.txt.mine-20260929-1500). The other \
+             machine's version is kept as branch main@cloud-1a2b3c4d5e6f."
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn persisted_kept_reports_stay_within_their_share_of_the_state_file() {
+        let long = PathBuf::from("x".repeat(1000));
+        let statuses: HashMap<String, WorkspaceStatus> = (0..128)
+            .map(|n| {
+                (
+                    format!("w-{n:03}"),
+                    WorkspaceStatus {
+                        kept_both: Some(40),
+                        kept_paths: vec![long.clone(); 32],
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let kept = persisted_kept(&statuses);
+        assert_eq!(kept.len(), 128, "every count is kept");
+        assert!(kept.values().all(|record| record.files == 40));
+        let bytes = serde_json::to_vec(&kept).unwrap().len();
+        assert!(
+            bytes < KEPT_PERSIST_BYTES + 128 * 64,
+            "{bytes} bytes of kept reports"
+        );
     }
     #[tokio::test]
     async fn a_restarted_device_keeps_working_until_another_owner_is_verified() {

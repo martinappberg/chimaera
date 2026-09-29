@@ -28,7 +28,10 @@ export type NoticeKind =
   | "question"
   | "error"
   | "rate_limited"
-  | "agent";
+  | "agent"
+  /** A Chimaera Pro return kept both versions of changed files (a project
+   *  event: `session_id` is a per-project key, `kept` says what was kept). */
+  | "kept_both";
 
 /** One notice, as the daemon words it (`chimaera-server/src/notices.rs`). */
 export interface Notice {
@@ -47,6 +50,10 @@ export interface Notice {
   body: string;
   at_ms: number;
   age_ms: number;
+  /** `kept_both` only: files kept in both versions, up to 32 of the kept
+   *  copies' project-relative paths (`<name>.mine-<yyyymmdd-hhmm>`), and the
+   *  other machine's branches kept beside the user's. */
+  kept?: { files: number; paths: string[]; branches: string[] };
 }
 
 /** What this tab knows when a notice arrives. */

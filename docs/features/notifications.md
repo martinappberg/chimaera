@@ -24,14 +24,17 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
   you), `permission`, `question`, `error`, `rate_limited`, and `agent` (the `notify` tool).
   Each carries the session's display name, its workspace, a state phrase, and a body quoting
   what it was about — how the final reply starts, the permission line ("Bash: rm -rf build"),
-  the question, the error.
+  the question, the error. One project event rides the same feed: `kept_both`, when a Chimaera
+  Pro return kept both versions of files changed on both machines (see
+  [pro.md](pro.md)).
 - **How it's used.** Consumers pull it: the native shell long-polls `GET /api/v1/notices`
   (bearer-authed) once per daemon it has open; browser tabs get `{"type":"notices"}` frames on
   `/ws/events`. Which kinds exist at all is the daemon's `notifications.*` settings (so every
   consumer agrees).
 - **Where it lives.** `notices.rs` (`Notices` store, `run` watcher, `get_notices`,
-  `frame_since`, `push_agent_notice`); the record fields `AgentRecord.notice_note` /
-  `reply_draft` (`agent_state.rs`).
+  `frame_since`, `push_agent_notice`, `push_kept_both`); the record fields
+  `AgentRecord.notice_note` / `reply_draft` (`agent_state.rs`); the kept-both report in
+  `pro/mod.rs` (`report_return`).
 - **Key behaviors.**
   - **One detector, every surface.** Agent state is written by claude hooks, chat protocol
     events, and the transcript watcher (claude chats get two of them), so notices are NOT
@@ -60,6 +63,14 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
   - **The attention set** returned alongside is the live sessions blocked on an approval
     (`needs_permission` — permissions, plan approvals, questions), Mastermind excluded: what
     the Dock badge and the tray count.
+  - **Kept both versions** (`kept_both`, Pro). One notice per return that kept anything:
+    title "Kept both versions of N files", the project as subtitle, a body naming the saved
+    copies ("Your versions are saved beside them (notes.md.mine-20260929-1412, …)"), and an
+    additive `kept: {files, paths, branches}` (up to 32 project-relative copy paths; branches
+    kept as `<branch>@cloud-<commit>`). Not a session's: `session_id` is a per-project key
+    (`kept-both-<workspace_id>`), so a click raises the project's window, and a newer return
+    replaces the project's older alert. Gated by `notifications.needsYou`; never blocking,
+    never counted.
 
 ## Agent-sent notifications (`notify` tool)
 
