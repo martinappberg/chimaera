@@ -89,4 +89,18 @@ describe("paused sessions", () => {
     expect(reasons[1].detail).not.toBeNull();
     expect(reasons[0].detail).toBeNull();
   });
+  it("names any restart by what happens next, not by an update", () => {
+    const restart = pauseLabel({ type: "paused", reason: "restarting", provider: null }).status;
+    expect(restart).toBe("Picking up where you left off…");
+    expect(restart).not.toMatch(/update/i);
+  });
+  it("after sign-out, a conversation the cloud holds is not on its way anywhere", () => {
+    const moving = pauseLabel({ type: "moved", to: "cloud" }).status;
+    const signedOut = pauseLabel({ type: "moved", to: "cloud" }, { signedOut: true }).status;
+    expect(moving).toBe("Continuing in the cloud…");
+    expect(signedOut).toBe("This conversation is in the cloud. Sign in to Chimaera Pro to bring it back.");
+    expect(signedOut).not.toContain("…");
+    // Coming home is unaffected: it does not need the account.
+    expect(pauseLabel({ type: "moved", to: "computer" }, { signedOut: true }).status).toBe("Continuing on your computer…");
+  });
 });

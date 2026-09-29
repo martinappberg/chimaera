@@ -17,6 +17,7 @@
   import { attachImageToComposer, insertIntoComposer, registerFollow } from "./composerBus";
   import { isBrowserGateway } from "../net/base";
   import { pauseLabel, placementLabel, sessionPause } from "../net/placement";
+  import { accountSignedOut } from "../net/plan";
   import { pausedConnect } from "../pro/providers";
   import { canOpenOnboarding, cloudOnboarding } from "../pro/onboarding.svelte";
   import BranchChip from "../shared/BranchChip.svelte";
@@ -2065,6 +2066,7 @@
         : store.pausedFor !== null && !store.connected
           ? store.pausedFor
           : rowPause,
+      { signedOut: $accountSignedOut },
     ).status,
   );
   /** The agent sign-in this paused conversation waits for on the cloud (the

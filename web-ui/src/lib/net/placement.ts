@@ -58,19 +58,26 @@ export function sessionPause(row: unknown): SessionPause | null {
 }
 
 /** A paused session, in plain words: a one-line status and, when the person
- *  can do something about it, what. */
-export function pauseLabel(pause: SessionPause | null): { status: string; detail: string | null } {
+ *  can do something about it, what. `signedOut`: this computer's account is
+ *  signed out, so a conversation the cloud still holds is not on its way
+ *  anywhere — nothing is in progress, and only signing in brings it back. */
+export function pauseLabel(pause: SessionPause | null, { signedOut = false }: { signedOut?: boolean } = {}): { status: string; detail: string | null } {
   if (pause === null) return { status: "Opening…", detail: null };
   if (pause.type === "moved") {
-    return { status: pause.to === "computer" ? "Continuing on your computer…" : "Continuing in the cloud…", detail: null };
+    if (pause.to === "computer") return { status: "Continuing on your computer…", detail: null };
+    return signedOut
+      ? { status: "This conversation is in the cloud. Sign in to Chimaera Pro to bring it back.", detail: null }
+      : { status: "Continuing in the cloud…", detail: null };
   }
   switch (pause.reason) {
     case "restarting":
-      return { status: "Reconnecting after an update…", detail: null };
+      // A daemon restart of any cause (an update, a crash, a reboot after
+      // the battery ran out): say what happens next, not why.
+      return { status: "Picking up where you left off…", detail: null };
     case "needs_provider": {
       // The catalog name, the same one the connect action and Pro use.
       const name = pause.provider === null ? "the agent" : providerLabel(pause.provider);
-      return { status: `Waiting for ${name} on the cloud machine`, detail: `Sign in to ${name} there from Chimaera Pro, and this continues.` };
+      return { status: `Waiting for ${name} in the cloud`, detail: `Sign in to ${name} there from Chimaera Pro, and this continues.` };
     }
     case "stays_on_computer":
       return { status: "This terminal stays on your computer", detail: "It opens again when the project is back on your computer." };
