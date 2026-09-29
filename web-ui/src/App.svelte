@@ -2,7 +2,7 @@
   import { cloudOnboarding } from "./lib/pro/onboarding.svelte";
   import { onMount, tick, untrack } from "svelte";
   import ProNavigation from "./lib/pro/ProNavigation.svelte";
-  import { paidPlan } from "./lib/net/plan";
+  import { paidPlan, proOffered } from "./lib/net/plan";
   import { listenForProReturn } from "./lib/net/proReturn";
   import { isBrowserGateway, gatewayWorkspace } from "./lib/net/base";
   import { runStallDrive, stallDriveSpec } from "./lib/perf/tabSwitchDrive";
@@ -2476,11 +2476,11 @@
       if (detachedWindow && !layout.focusMode) layout = { ...layout, focusMode: true };
     }
     // A phone opens the work itself; the bottom strip can reveal navigation.
-    // Only a phone-width browser view is forced, and the forced value is never
-    // saved: a narrow native window keeps its rail, and the shared layout
-    // other windows restore keeps the user's own choice.
+    // Only a phone-width browser (any daemon, never the native app) is forced,
+    // and the forced value is never saved: a narrow native window keeps its
+    // rail, and the shared layout other windows restore keeps the user's choice.
     forcedFocusRestore = null;
-    if (isBrowserGateway() && matchMedia("(max-width: 700px)").matches && !layout.focusMode) {
+    if (!isNativeShell() && matchMedia("(max-width: 700px)").matches && !layout.focusMode) {
       forcedFocusRestore = layout.focusMode;
       layout = { ...layout, focusMode: true };
     }
@@ -2571,7 +2571,7 @@
       return;
     }
     if (pickerOpen) return;
-    if (homeSettingsOpen && e.key === "Escape") {
+    if (homeSettingsOpen && e.key === "Escape" && !escapeBelongsElsewhere(e.target)) {
       intercept();
       homeSettingsOpen = false;
       return;
@@ -2709,6 +2709,23 @@
     if (t.classList.contains("xterm-helper-textarea")) return false;
     if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement) return true;
     return t.isContentEditable || t.closest(".cm-content") !== null;
+  }
+
+  /**
+   * Escape on the Home settings/Pro surface closes it only when nothing closer
+   * owns the key: a field holding text (Escape there must not close the page
+   * and wipe a pasted sign-in code), a select, an editor, or an open dialog.
+   * An empty field — Settings focuses its search box on open — still closes.
+   * This handler runs in the capture phase, before any of those see the key.
+   */
+  function escapeBelongsElsewhere(t: EventTarget | null): boolean {
+    const choice = ["checkbox", "radio", "button", "submit", "reset", "range", "color", "file"];
+    if (t instanceof HTMLTextAreaElement || (t instanceof HTMLInputElement && !choice.includes(t.type))) return t.value !== "";
+    if (t instanceof HTMLSelectElement) return true;
+    if (!(t instanceof HTMLInputElement) && isEditableTarget(t)) return true;
+    const modal = "dialog[open], [role='dialog'], [role='alertdialog'], [aria-modal='true']";
+    if (t instanceof Element && t.closest(modal) !== null) return true;
+    return document.querySelector("dialog[open], [aria-modal='true']") !== null;
   }
 
   $effect(() => {
@@ -4761,7 +4778,7 @@
          worker: keep it out of the per-workspace live/attention rollups. -->
     {#if homeSettingsOpen}
       <div class="home-settings-shell">
-        <HomeNavigation active={homeSurface} plan={$paidPlan} showPro={isNativeShell() || isBrowserGateway()}
+        <HomeNavigation active={homeSurface} plan={$paidPlan} showPro={isBrowserGateway() || (isNativeShell() && $proOffered === true)}
           onHome={() => (homeSettingsOpen = false)} onPro={openProSurface} onSettings={openSettingsSurface} />
       <div class="home-settings-surface">
         <nav class="home-surface-nav" aria-label="Home navigation">
@@ -5998,11 +6015,6 @@
   .home-settings-back:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
   .home-surface-divider, .home-back-hint { color: var(--muted); }
   .home-back-hint { margin-left: auto; font-size: var(--text-xs); }
-  @media (max-width: 700px) {
-    .home-settings-shell { flex-direction: column; }
-    .home-settings-surface { padding: 16px 14px 14px; gap: 8px; }
-    .home-back-hint { display: none; }
-  }
   .home-settings-content {
     position: relative;
     flex: 1;
@@ -6010,6 +6022,14 @@
     overflow: hidden;
     border: 1px solid var(--edge);
     border-radius: 8px;
+  }
+  /* On a phone the navigation bar above already says where you are: drop
+     the breadcrumb and the card frame so the page gets the whole width. */
+  @media (max-width: 700px) {
+    .home-settings-shell { flex-direction: column; }
+    .home-settings-surface { padding: 0; gap: 0; }
+    .home-surface-nav { display: none; }
+    .home-settings-content { border: 0; border-radius: 0; }
   }
 
   .shell {

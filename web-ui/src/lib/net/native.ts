@@ -877,6 +877,14 @@ export interface ProBillingAttempt {
   error: string | null;
 }
 
+/** One price from the account service; `amount_cents` is in the currency's minor unit. */
+export interface ProPlanPrice {
+  plan: "pro" | "max";
+  interval: "month" | "year";
+  amount_cents: number;
+  currency: string;
+}
+
 /** Account controls are native-shell state, separate from daemon settings. */
 export interface ProStatus {
   initializing?: boolean;
@@ -885,7 +893,18 @@ export interface ProStatus {
   signed_in: boolean;
   email: string | null;
   plan: "pro" | "max" | "none" | null;
+  /** A real account failure. Informational connection progress uses
+   * `connection_warning` (older shells sent two such messages here). */
   error: string | null;
+  /** Optional: the always-on connection is still coming up. Never a failure
+   * and never an entitlement signal. Older shells omit it. */
+  connection_warning?: string | null;
+  /** Optional: the subscription's payment failed and needs the customer's
+   * attention (billing portal). Checkout must never start a second plan. */
+  payment_due?: boolean;
+  /** Optional: the account's current prices. Absent or null means the page
+   * names the plans only; amounts are never built into the app. */
+  plans?: ProPlanPrice[] | null;
   /** Optional when connected to an older native shell. */
   sign_in?: { phase: "waiting" | "finishing"; expires_at: number } | null;
   /** Native owns verification even when this page is closed. Older shells omit it. */
@@ -1069,11 +1088,7 @@ export interface CloudPendingHandoff {
 }
 export interface CloudSetupInfo {
   available?: boolean;
-  host_alias?: string;
   ssh_public_key?: string | null;
-  /** Legacy worker fields; installation alone is never provider readiness. */
-  claude_installed?: boolean;
-  codex_installed?: boolean;
   workspace_id?: string;
   session_id?: string;
   providers?: CloudProviderStatus[];
@@ -1081,7 +1096,6 @@ export interface CloudSetupInfo {
   handoffs?: CloudPendingHandoff[];
 }
 export type CloudSetupRequest = { operation: "info" | "start" | "providers" }
-  | { operation: "onboard"; agent: string }
   | { operation: "provider_connect"; provider_id: string }
   | { operation: "provider_disconnect"; provider_id: string; acknowledge_cloud_work: true }
   | { operation: "provider_submit"; connection_id: string; code: string }
@@ -1111,7 +1125,7 @@ export interface MirrorWorkspace {
 }
 export interface MirrorStatus {
   configured: boolean; projects_root: string; projects_root_confirmed: boolean; workspaces: MirrorWorkspace[];
-  sessions: { id: string; workspace_id: string; display_name?: string; name: string; keep_running?: boolean }[];
+  sessions: { id: string; workspace_id: string; display_name?: string; name: string }[];
 }
 export async function proMirrorStatus(): Promise<MirrorStatus> {
   const t = tauri(); if (t === null) throw new Error("Mirror settings require the native app");
@@ -1120,8 +1134,4 @@ export async function proMirrorStatus(): Promise<MirrorStatus> {
 export async function proSetNeverMirror(workspaceId: string, neverMirror: boolean): Promise<void> {
   const t = tauri(); if (t === null) throw new Error("Mirror settings require the native app");
   await t.core.invoke("pro_set_never_mirror", { workspaceId, neverMirror });
-}
-export async function proMirrorPreference(request: { operation: "projects"; root: string } | { operation: "profile"; workspace_id: string; profile: MirrorProfile } | { operation: "pin"; session_id: string; keep_running: boolean }): Promise<void> {
-  const t = tauri(); if (t === null) throw new Error("Mirror settings require the native app");
-  await t.core.invoke("pro_mirror_preference", { request });
 }

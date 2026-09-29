@@ -16,7 +16,7 @@ export function readIntent(value: string | null, now = Date.now()): PurchaseInte
   } catch { return null; }
 }
 export function cloudCopy(state: string, reason: string | null, _phase?: CloudProvisioningStatus["phase"]): { title: string; detail: string } {
-  if (reason === "provisioning_disabled") return { title: "Cloud access is temporarily unavailable", detail: "Cloud work isn’t available from this service right now. Your local projects remain available." };
+  if (reason === "provisioning_disabled") return { title: "Cloud access is temporarily unavailable", detail: "Cloud work isn’t available yet. Work on this computer continues as usual." };
   if (reason === "beta_invite_required") return { title: "Cloud access is by invitation", detail: "This preview needs an invitation before you can use cloud work." };
   if (reason === "hours_exhausted") return { title: "Cloud allowance used for this month", detail: "Work continues on your computer. Your cloud allowance resets next month." };
   if (reason === "storage_exhausted") return { title: "Cloud copying needs more room", detail: "Your local projects remain available. The latest cloud copy couldn’t fit within your allowance. Review Usage and plan details." };
@@ -38,8 +38,15 @@ export function friendlyError(reason: unknown, fallback: string): string {
   if (/expired|sign.in required|sign in first|authorization revoked/i.test(text)) return "Your sign-in has expired. Sign in again to continue.";
   if (/Could not open.*browser/i.test(text)) return "Your browser couldn't open. Please try again.";
   if (/finishing/i.test(text)) return "Sign-in is finishing. Please wait a moment.";
-  if (/409|use_billing_portal/.test(text)) return "Your account already has a plan. Refresh your account, then choose Manage billing.";
+  if (alreadySubscribed(reason)) return "Your account already has a plan.";
   return fallback;
+}
+
+/** Checkout refused because the account already has a plan; the page re-reads
+ * the account itself instead of asking the user to refresh. */
+export function alreadySubscribed(reason: unknown): boolean {
+  const text = reason instanceof Error ? reason.message : String(reason);
+  return /409|use_billing_portal/.test(text);
 }
 
 /** Service diagnostics are neither UI copy nor a promise of automatic recovery. */
@@ -76,7 +83,7 @@ export function cloudProjectStatus(projects: MirrorStatus | null, workspaceId?: 
   if (!projects) return null;
   const rows = projects.workspaces.filter(p => !p.never_mirror && (!workspaceId || p.workspace_id === workspaceId));
   if (!rows.length) return null;
-  if (!projects.configured) return { title: "Project connection pending", detail: "Existing copies are retained. Automatic project copying hasn’t connected yet.", state: "attention" };
+  if (!projects.configured) return { title: "Getting your projects ready", detail: "Copies start automatically.", state: "active" };
   if (rows.some(p => p.ownership?.state === "hydrating")) return { title: "Restoring your project", detail: "Your files and conversations are being restored here.", state: "active" };
   if (rows.some(p => p.ownership?.state === "transferring")) return { title: "Keeping your work with you", detail: "Chimaera is saving your files and conversation so work can continue.", state: "active" };
   const settingUp = rows.filter(p => p.ownership?.state === "setting_up");
@@ -85,7 +92,7 @@ export function cloudProjectStatus(projects: MirrorStatus | null, workspaceId?: 
   if (rows.some(p => p.ownership?.state === "privacy_disabled")) return { title: "Project copying is disabled", detail: "Review this project's setting in Projects and privacy.", state: "attention" };
   if (rows.some(p => p.mirror?.error || p.privacy_pending)) return { title: "A project needs attention", detail: "Open Projects and privacy below for details. Existing copies are retained.", state: "attention" };
   const copied = rows.filter(p => p.mirror?.last_mirrored_at != null || (typeof p.checkpoint_id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(p.checkpoint_id))).length;
-  if (copied) return { title: "Cloud copies saved", detail: `${copied} ${copied === 1 ? "project has" : "projects have"} a completed cloud copy.${copied < rows.length ? " Copy status for other projects isn’t available on this device yet." : ""}`, state: "quiet" };
+  if (copied) return { title: "Cloud copies saved", detail: `${copied} ${copied === 1 ? "project has" : "projects have"} a completed cloud copy.`, state: "quiet" };
   return { title: "Project copy status", detail: "Your latest copy status isn’t available on this device yet. Existing copies are retained.", state: "quiet" };
 }
 

@@ -32,6 +32,7 @@
   summary::-webkit-details-marker { display: none; }
   summary:hover, .actions[open] summary { color: var(--fg); background: var(--row-active); }
   summary:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+  @media (pointer: coarse), (max-width: 700px) { summary { width: 40px; height: 40px; } .action-list :global(button) { min-height: 40px; } }
   .action-list { position: absolute; z-index: 30; top: calc(100% + 4px); right: 0; min-width: 190px; padding: 5px; border: 1px solid var(--edge); border-radius: 8px; background: var(--overlay-bg); box-shadow: 0 8px 28px color-mix(in srgb, var(--fg) 12%, transparent); }
   .action-list :global(button) { display: block; visibility: visible; width: 100%; margin: 0; padding: 8px 10px; border: 0; border-radius: 4px; background: transparent; color: var(--fg); text-align: left; white-space: nowrap; font: inherit; font-size: var(--text-sm); cursor: pointer; }
   .action-list :global(button:hover) { background: var(--row-hover); }

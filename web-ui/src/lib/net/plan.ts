@@ -2,10 +2,13 @@ import { derived, readable } from "svelte/store";
 import { asyncDisposer } from "../shared/asyncDisposer";
 import { isBrowserGateway, workbenchPath } from "./base";
 import { isNativeShell, onProChanged, proStatus, type ProStatus } from "./native";
+import { accountFailure, paymentDue } from "../pro/status";
 
 export type PaidPlan = "pro" | "max" | null;
 
-export type AccountPlan = "loading" | "unknown" | "free" | "pro" | "max";
+/** `unavailable` = this window can never offer Pro (a build without an account
+ * endpoint, or an ordinary browser); it is static for the process. */
+export type AccountPlan = "loading" | "unknown" | "unavailable" | "free" | "pro" | "max";
 
 function knownPlan(value: unknown): AccountPlan {
   if (value === "pro" || value === "max") return value;
@@ -13,20 +16,40 @@ function knownPlan(value: unknown): AccountPlan {
 }
 
 function nativePlan(status: ProStatus & { initializing?: boolean }): AccountPlan {
+  // Checked first: an endpoint-less build is never initializing, and its
+  // answer must not read as a neutral "unknown" that still shows Pro chrome.
+  if (!status.available) return "unavailable";
   if (status.initializing || status.sign_in) return "loading";
-  if (!status.available || status.error !== null) return "unknown";
-  return status.signed_in ? knownPlan(status.plan) : "free";
+  // A connection warning is informational; only a real failure is uncertain.
+  if (accountFailure(status) !== null) return "unknown";
+  if (!status.signed_in) return "free";
+  const plan = knownPlan(status.plan);
+  // Overdue payment on an account without an active plan is neither a paid
+  // badge nor a "Get Pro" offer; the Pro page explains it.
+  return plan === "free" && paymentDue(status) ? "unknown" : plan;
+}
+
+interface AccountState {
+  plan: AccountPlan;
+  /** Whether Pro is offered at all: null until the first answer. */
+  offered: boolean | null;
 }
 
 /** Account branding only; transport availability never implies entitlement.
  * Each window owns one subscription lifecycle and keeps no account data on disk.
  */
-export const accountPlan = readable<AccountPlan>("loading", (set) => {
+const account = readable<AccountState>({ plan: "loading", offered: null }, (setState) => {
+  // Availability is a build property, so it survives every later refresh
+  // (including the ones that clear the plan back to "loading").
+  let offered: boolean | null = null;
+  const set = (plan: AccountPlan): void => setState({ plan, offered });
   set("loading");
   if (typeof document === "undefined") return;
   const native = isNativeShell();
   const gateway = !native && isBrowserGateway();
-  if (!native && !gateway) { set("unknown"); return; }
+  if (!native && !gateway) { offered = false; set("unavailable"); return; }
+  // An account gateway exists only for Pro; there is nothing to wait for.
+  if (gateway) { offered = true; set("loading"); }
 
   let alive = true;
   let generation = 0;
@@ -56,17 +79,23 @@ export const accountPlan = readable<AccountPlan>("loading", (set) => {
     });
     const deadline = setTimeout(() => controller.abort(), 10_000);
     try {
-      const lookup = native
-        ? proStatus().then(nativePlan)
+      const lookup: Promise<{ plan: AccountPlan; available: boolean }> = native
+        ? proStatus().then((status) => ({ plan: nativePlan(status), available: status.available }))
         : fetch(workbenchPath(), {
           method: "HEAD",
           credentials: "same-origin",
           cache: "no-store",
           redirect: "error",
           signal: controller.signal,
-        }).then((response) => response.ok ? knownPlan(response.headers.get("X-Chimaera-Plan")) : "unknown" as const);
-      const plan = await Promise.race([lookup, cancelled]);
-      if (alive && revision === generation) set(plan);
+        }).then((response) => ({
+          plan: response.ok ? knownPlan(response.headers.get("X-Chimaera-Plan")) : "unknown" as const,
+          available: true,
+        }));
+      const result = await Promise.race([lookup, cancelled]);
+      if (alive && revision === generation) {
+        offered = result.available;
+        set(result.plan);
+      }
     } catch {
       if (alive && revision === generation) set("unknown");
     } finally {
@@ -103,6 +132,13 @@ export const accountPlan = readable<AccountPlan>("loading", (set) => {
     document.removeEventListener("visibilitychange", visibility);
   };
 });
+
+export const accountPlan = derived(account, (state): AccountPlan => state.plan);
+
+/** Gates every Pro entry point (Home, Settings). `null` while the first answer
+ * is pending, so an endpoint-less build never flashes Pro chrome; once known it
+ * holds through later refreshes. */
+export const proOffered = derived(account, (state): boolean | null => state.offered);
 
 /** Existing badge consumers share the account read; unknown is never a paid badge. */
 export const paidPlan = derived(accountPlan, (plan): PaidPlan =>

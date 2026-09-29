@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canDisconnect, canStartConnection, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, nextReadyHandoff, pendingConnection, providerLoginUrl, providersReady, recoverDisconnect, sameConnection, type ProviderHandoff } from "./providers";
+import { canDisconnect, canStartConnection, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, nextReadyHandoff, pendingConnection, providerLabel, providerLoginUrl, providersReady, recoverDisconnect, sameConnection, type ProviderHandoff } from "./providers";
 import type { CloudProviderConnection, CloudProviderStatus } from "../net/native";
 const row = (id: string, state: CloudProviderStatus["state"], category: CloudProviderStatus["category"] = "agent"): CloudProviderStatus => ({ id, label: id, state, category, installed: true, reason: null, checked_at: 1, methods: ["device_code"] });
 describe("provider readiness", () => {
@@ -98,5 +98,12 @@ describe("automatic provider-blocked continuation", () => {
     expect(nextReadyHandoff(connected, [handoff, second], [handoffKey(handoff)], true)).toBe(second);
     const later = {...handoff, expected_epoch: 8};
     expect(nextReadyHandoff(connected, [later], [handoffKey(handoff)], true)).toBe(later);
+  });
+});
+
+describe("provider names", () => {
+  it("names a required provider from the catalog even when the daemon did not list it", () => {
+    expect(providerLabel("claude")).not.toBe("claude");
+    expect(providerLabel("future-provider")).toBe("future-provider");
   });
 });

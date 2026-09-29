@@ -61,6 +61,12 @@ export function nextReadyHandoff(providers: CloudProviderStatus[], handoffs: Pro
     && providersReady(providers, handoff.blocked_providers.map(provider => provider.id)));
 }
 
+/** A provider's display name from the shared catalog, for ids the daemon did
+ * not list (never a raw id when a name is known). */
+export function providerLabel(id: string): string {
+  return catalog.providers.find(provider => provider.id === id)?.label ?? id;
+}
+
 export function providerStateLabel(provider: CloudProviderStatus): string {
   switch (provider.state) {
     case "signed_in": return "Connected";

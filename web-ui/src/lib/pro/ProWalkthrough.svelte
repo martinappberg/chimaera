@@ -90,7 +90,7 @@
   .number { color: color-mix(in srgb, var(--muted) 65%, var(--bg)); font-variant-numeric: tabular-nums; }
   .illustration { margin: 12px 8px 0; }
   svg { display: block; width: 100%; height: auto; }
-  svg text { font-family: inherit; font-size: 8.5px; }
+  svg text { font-family: inherit; font-size: 9.5px; }
   .frame { fill: color-mix(in srgb, var(--fg) 2%, var(--bg)); stroke: color-mix(in srgb, var(--fg) 28%, var(--edge)); stroke-width: 1.2; }
   .screen { fill: var(--bg); stroke: var(--edge); stroke-width: .7; }
   .divider, .file, .thread { stroke: var(--edge); stroke-linecap: round; }
@@ -116,16 +116,10 @@
   h2 { margin: 0 0 10px; font-size: var(--text-md); font-weight: 560; letter-spacing: -.2px; line-height: 1.4; }
   .caption p { margin: 0; color: var(--muted); font-size: var(--text-sm); line-height: 1.75; }
   .provider-note { margin: 16px 0 0; color: var(--muted); font-size: var(--text-xs); line-height: 1.7; }
-  @container (max-width: 680px) {
+  @container (max-width: 820px) {
     ol { grid-template-columns: 1fr; gap: 12px; }
-    li { display: grid; grid-template-columns: minmax(150px, 42%) 1fr; align-items: center; }
-    .place { grid-column: 1 / -1; padding: 17px 20px 0; }
-    .illustration { margin: 4px 8px 12px; }
-    .caption { padding: 15px 20px 18px 8px; }
-  }
-  @container (max-width: 390px) {
-    li { display: block; }
-    .illustration { max-width: 240px; margin: 8px auto 0; }
+    .place { padding: 17px 20px 0; }
+    .illustration { max-width: 300px; margin: 8px auto 0; }
     .caption { padding: 14px 20px 22px; }
   }
 </style>

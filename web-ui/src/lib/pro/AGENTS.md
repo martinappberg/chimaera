@@ -9,15 +9,17 @@ enter UI settings or local storage.
 | `ProView.svelte` | Desktop account surface and browser worker detection; shared project/provider context. |
 | `ProNavigation.svelte` | Quiet workbench Pro entry. |
 | `ProWalkthrough.svelte` | Static, decorative continuity sketches for confirmed free accounts only; repeated project/thread motif, theme tokens, responsive captions. |
-| `CloudProjects.svelte` | Passive cloud-project discovery and explicit per-project local opening. |
+| `CloudProjects.svelte` | Passive cloud-project discovery and explicit per-project local opening; a project refused while mid-step retries on list refreshes (≤15 min, only once its folder is saved, so the picker never reappears). |
 | `ProviderConnections.svelte` | First-agent onboarding, guided connection lifecycle, optional repository providers and exact pending-handoff continuation. |
-| `cloudTransport.ts` | Native/browser request parity; passive GETs, explicit wake intent and focused terminal routing. |
-| `providers.ts` | Readiness and safe provider-link presentation; imports the core provider catalog. |
+| `cloudTransport.ts` | Native/browser request parity; passive GETs, explicit wake intent and focused terminal routing; `isCloudMachine` (passive). |
+| `providers.ts` | Readiness and safe provider-link presentation; imports the core provider catalog (`providerLabel` names an unlisted required provider). |
 | `onboarding.svelte.ts` | Validated shared intent so a paused project opens the same onboarding flow. |
 | `AccountDevices.svelte` / `devices.ts` | Verified installation grouping, separate older sign-ins and named per-sign-in removal confirmation. Names never identify a computer. |
 | `AccountUsage.svelte` / `usage.ts` | Percentage-first account usage; real limits, bounded accessible bars, neutral unknown/zero allowance. |
-| `billing.ts` | Native billing copy, stale-attempt fencing and explicit upgrade-review eligibility; browser return never grants entitlement and raw errors never render. |
+| `billing.ts` | Native billing copy, stale-attempt fencing and explicit upgrade-review eligibility; browser return never grants entitlement and raw errors never render. `planPrice` formats only account-supplied prices. |
 | `presentation.ts` | Account, billing-intent and cloud-state copy; truthful project status and the finite preparation polling cadence. |
+| `account.ts` | The Pro page's panel from the last confirmed status (`accountPanel`), the billing-review key, and when Max is offered (`nearLimit`). |
+| `status.ts` | Reading `ProStatus`: a real `accountFailure` vs an informational `connectionWarning`, and `paymentDue`. |
 
 ## Boundaries
 
@@ -28,7 +30,8 @@ enter UI settings or local storage.
   preparing a named provider's sign-in, never machine startup or shutdown.
   A reachable daemon does not imply an agent is signed in or files are copied.
   Project transfer labels come only from recorded ownership; saved-copy counts
-  require `last_mirrored_at`, and never-mirror projects are excluded. There is no
+  require `last_mirrored_at` or a well-formed recorded `checkpoint_id`, and
+  never-mirror projects are excluded. There is no
   initial-sync or percentage estimate.
 - Preparation checks are sequential and visible-only: 5 seconds for the first
   five minutes, then 30 seconds. Other states use 30 seconds. A provider readiness
@@ -63,10 +66,22 @@ enter UI settings or local storage.
   `crates/chimaera-core/src/cloud-providers.json`, without credentials or a fragment.
   No status or discovery operation carries wake intent.
 
-Pure readiness/transport tests cover these boundaries; real rendered components
-still need light/dark, narrow, keyboard and lifecycle verification per verify-app.
+- Prices are never built into the UI; they come only from optional
+  `ProStatus.plans`. Without them the plan cards name the plans only.
+- Nothing asks the user to refresh or retry what the page can do itself:
+  polls re-check, a pending privacy change is re-sent (≤1/min while visible),
+  a refused checkout for an existing plan re-reads the account. A manual check
+  appears only after polling stopped or a real failure.
 
-Native account status includes optional `initializing` / `initialization_phase`.
+Pure readiness/transport/account tests cover these boundaries and pin relations
+(which states read alike or apart, precedence, no raw errors), never wording.
+Real rendered components still need light/dark, narrow, keyboard and lifecycle
+verification per verify-app.
+
+Native account status includes optional `initializing` / `initialization_phase`,
+`connection_warning` (informational; never a failure or an entitlement signal —
+older shells sent two such messages in `error`, which `status.ts` recognizes),
+`payment_due` (billing, never checkout) and `plans` (display prices).
 Show the keychain/account recovery explanation immediately while startup waits;
 keep sign-in, billing and sign-out mutations behind that startup fence. Older
 native builds omit these fields and retain their existing account behavior.

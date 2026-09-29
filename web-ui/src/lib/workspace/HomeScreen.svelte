@@ -3,7 +3,7 @@
   import HomeNavigation from "./HomeNavigation.svelte";
   import HomeActions from "./HomeActions.svelte";
   import { isMac } from "../shared/keys";
-  import { paidPlan } from "../net/plan";
+  import { paidPlan, proOffered } from "../net/plan";
   import { isBrowserGateway } from "../net/base";
   import ComputeLaunchDialog from "./ComputeLaunchDialog.svelte";
   import CloudProjects from "../pro/CloudProjects.svelte";
@@ -33,6 +33,7 @@
     updateLocalDaemon,
     type ConnectProgress,
     type HostState,
+    type HostStatusEvent,
     type LocalDaemonState,
   } from "../net/native";
   import {
@@ -344,54 +345,72 @@
     unlisteners.push(
       asyncDisposer(
         onHostStatus((e) => {
-          // Managed cloud connections use this event bus too. They are not
-          // machine choices and must not fetch/render internal workspaces here.
-          if (!hosts.some((host) => host.alias === e.alias)) return;
-          hosts = hosts.map((h) =>
-            h.alias === e.alias
-              ? {
-                  ...h,
-                  status: e.status === "connected" ? "connected" : "disconnected",
-                  local_port: e.status === "connected" ? (e.local_port ?? h.local_port) : null,
-                  // Authoritative on every connected event: a reconnect this
-                  // window didn't start may have re-routed the alias.
-                  node: e.status === "connected" ? (e.node ?? null) : h.node,
-                }
-              : h,
-          );
-          // Any terminal transition ends the phase line, whoever ran the connect.
-          phases = mapWithout(phases, e.alias);
-          if (e.status === "down") {
-            remoteWs = mapWithout(remoteWs, e.alias);
-            remoteCompute = mapWithout(remoteCompute, e.alias);
+          if (hosts.some((host) => host.alias === e.alias)) {
+            applyHostStatus(e);
+            return;
           }
-          if (e.status === "error" && e.error !== undefined) {
-            hostErrors = new Map(hostErrors).set(e.alias, e.error);
-          } else if (e.status === "connected") {
-            hostErrors = mapWithout(hostErrors, e.alias);
-            // A connect this window didn't run (startup restore, another
-            // window) still gets its workspace list, so the row is browsable.
-            if (!remoteWs.has(e.alias)) {
-              void remoteWorkspaces(e.alias)
-                .then((list) => {
-                  remoteWs = new Map(remoteWs).set(
-                    e.alias,
-                    [...list].sort(
-                      (a, b) => (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0),
-                    ),
-                  );
-                })
-                .catch(() => {
-                  // dropped again in between; the next transition retries
-                });
-            }
-            if (!remoteCompute.has(e.alias)) void refreshCompute(e.alias);
-          }
+          // Not listed yet: startup restore can report "connected" before the
+          // first list resolves. Re-list and apply the latest event only if the
+          // alias is a real row — managed cloud connections share this bus but
+          // never appear in the list, so they still never fetch workspaces.
+          unlistedStatus.set(e.alias, e);
+          void refreshHosts().then(() => {
+            const latest = unlistedStatus.get(e.alias);
+            if (latest === undefined) return;
+            unlistedStatus.delete(e.alias);
+            if (hosts.some((host) => host.alias === e.alias)) applyHostStatus(latest);
+          });
         }),
       ),
     );
     return () => unlisteners.forEach((u) => u());
   });
+
+  /** The latest status event per alias that arrived before its row was listed. */
+  const unlistedStatus = new Map<string, HostStatusEvent>();
+
+  function applyHostStatus(e: HostStatusEvent): void {
+    hosts = hosts.map((h) =>
+      h.alias === e.alias
+        ? {
+            ...h,
+            status: e.status === "connected" ? "connected" : "disconnected",
+            local_port: e.status === "connected" ? (e.local_port ?? h.local_port) : null,
+            // Authoritative on every connected event: a reconnect this
+            // window didn't start may have re-routed the alias.
+            node: e.status === "connected" ? (e.node ?? null) : h.node,
+          }
+        : h,
+    );
+    // Any terminal transition ends the phase line, whoever ran the connect.
+    phases = mapWithout(phases, e.alias);
+    if (e.status === "down") {
+      remoteWs = mapWithout(remoteWs, e.alias);
+      remoteCompute = mapWithout(remoteCompute, e.alias);
+    }
+    if (e.status === "error" && e.error !== undefined) {
+      hostErrors = new Map(hostErrors).set(e.alias, e.error);
+    } else if (e.status === "connected") {
+      hostErrors = mapWithout(hostErrors, e.alias);
+      // A connect this window didn't run (startup restore, another
+      // window) still gets its workspace list, so the row is browsable.
+      if (!remoteWs.has(e.alias)) {
+        void remoteWorkspaces(e.alias)
+          .then((list) => {
+            remoteWs = new Map(remoteWs).set(
+              e.alias,
+              [...list].sort(
+                (a, b) => (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0),
+              ),
+            );
+          })
+          .catch(() => {
+            // dropped again in between; the next transition retries
+          });
+      }
+      if (!remoteCompute.has(e.alias)) void refreshCompute(e.alias);
+    }
+  }
 
   async function refreshHosts(): Promise<void> {
     try {
@@ -836,7 +855,25 @@
 </script>
 
 <div class="home">
-  <HomeNavigation active="workspaces" plan={$paidPlan} showPro={native || isBrowserGateway()}
+  {#if health !== null}
+    <!-- The mark identifies the DAEMON serving this window (the daemon
+         outlives app reinstalls by design, so this is the version that
+         actually matters — and a dev daemon must say so instead of posing
+         as an ordinary "v0.0.1"). A click is an explicit update check: the
+         toast answers it, "up to date" or "development build" included. -->
+    <button
+      class="version-mark"
+      class:newer={stampNewer !== null}
+      title={stampTitle}
+      onpointerenter={() => (stampNow = Date.now())}
+      onclick={() => void checkForUpdates(true)}
+    >
+      {#if health.version === "0.0.1"}daemon dev·{(health.build ?? "unknown").split(".")[0]}{:else}v{health.version}{/if}{#if stampNewer !== null}<span class="newer-tag"
+          >{` · ${stampNewer} available`}</span
+        >{/if}
+    </button>
+  {/if}
+  <HomeNavigation active="workspaces" plan={$paidPlan} showPro={isBrowserGateway() || (native && $proOffered === true)}
     onHome={() => { if (showBackToHome) void backToHome(); }} {onPro} {onSettings} />
   <div class="inner">
     <header class="masthead">
@@ -912,7 +949,7 @@
       {#if sorted.length === 0}
         <div class="blank">
           <h3>A folder is your workspace.</h3>
-          <p>Open a project to start terminals and agents together. Your files stay where they are.</p>
+          <p>Open a folder to start terminals and agents together. Your files stay where they are.</p>
           <button class="cta" onclick={onOpenFolder}>Open folder</button>
         </div>
       {:else}
@@ -969,16 +1006,16 @@
                     <span class="when">{ago(w.last_opened_at)}</span>
                   </span>
                 </button>
+                {#if live !== undefined && live.live > 0}
+                  <button
+                    class="side stop shown"
+                    title="end this workspace's {live.live} running session{live.live === 1
+                      ? ''
+                      : 's'}"
+                    onclick={() => (confirmStopId = w.id)}>End sessions</button
+                  >
+                {/if}
                 <HomeActions label={`Actions for ${w.name}`}>
-                  {#if live !== undefined && live.live > 0}
-                    <button
-                      class="side stop"
-                      title="end this workspace's {live.live} running session{live.live === 1
-                        ? ''
-                        : 's'}"
-                      onclick={() => (confirmStopId = w.id)}>End sessions</button
-                    >
-                  {/if}
                   {#if !jobScoped}
                     <button
                       class="side"
@@ -1274,10 +1311,19 @@
                             : "not connected"}
                       ></span>
                       <span class="workspace-label">
-                        <span class="host-name"><span class="name">{h.alias}</span>{#if h.via_pro}<span class="via-pro" title="Connected through Chimaera Pro">via Pro</span>{/if}{#if localState?.dev_build}<span class="pill-dev" title="Isolated development daemon">dev</span>{/if}</span>
-                        <span class="phase quiet">
+                        <span class="host-name"><span class="name">{h.alias}</span>{#if h.via_pro}<span class="via-pro" title="Connected through Chimaera Pro">via Pro</span>{/if}{#if localState?.dev_build}<span
+                          class="pill-dev"
+                          title="dev build — every connection targets this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
+                          >dev</span
+                        >{/if}</span>
+                        <span
+                          class="phase quiet"
+                          title={phase === undefined && h.status === "connected" && h.node
+                            ? `${h.alias} spans several login nodes; its daemon runs on ${h.node}, so this connection is pinned there`
+                            : undefined}
+                        >
                           {#if phase !== undefined}{phase}
-                          {:else if h.status === "connected"}Connected{#if h.node} · {shortNode(h.node)}{/if}{#if (h.live_sessions ?? 0) > 0} · {h.live_sessions} live session{h.live_sessions === 1 ? "" : "s"}{/if}
+                          {:else if h.status === "connected"}Connected{#if h.node} · {shortNode(h.node)}{/if}{#if h.local_port !== null} · 127.0.0.1:{h.local_port}{/if}{#if (h.live_sessions ?? 0) > 0} · {h.live_sessions} live session{h.live_sessions === 1 ? "" : "s"}{/if}
                           {:else if h.status === "connecting"}Connecting…
                           {:else}Not connected{#if h.last_connected_at} · Last connected {ago(h.last_connected_at)}{/if}{/if}
                         </span>
@@ -1393,26 +1439,6 @@
         {/if}
       </section>
     {/if}
-    <footer class="home-footer">
-  {#if health !== null}
-    <!-- The mark identifies the DAEMON serving this window (the daemon
-         outlives app reinstalls by design, so this is the version that
-         actually matters — and a dev daemon must say so instead of posing
-         as an ordinary "v0.0.1"). A click is an explicit update check: the
-         toast answers it, "up to date" or "development build" included. -->
-    <button
-      class="version-mark"
-      class:newer={stampNewer !== null}
-      title={stampTitle}
-      onpointerenter={() => (stampNow = Date.now())}
-      onclick={() => void checkForUpdates(true)}
-    >
-      {#if health.version === "0.0.1"}daemon dev·{(health.build ?? "unknown").split(".")[0]}{:else}v{health.version}{/if}{#if stampNewer !== null}<span class="newer-tag"
-          >{` · ${stampNewer} available`}</span
-        >{/if}
-    </button>
-  {/if}
-    </footer>
   </div>
 
   {#if launchOpen && isHostPage}
@@ -1526,7 +1552,9 @@
     background: none;
     padding: 0;
     cursor: pointer;
-    text-align: left;
+    position: fixed;
+    bottom: 12px;
+    right: 16px;
     font-family: var(--mono);
     font-size: var(--text-xs);
     color: var(--muted);
@@ -1734,10 +1762,6 @@
     background: var(--row-hover);
   }
 
-  /* A connected host wears its alias in the accent — the same "this is live"
-     language the rail uses for a remote window's host label. */
-
-
   .row {
     flex: 1;
     min-width: 0;
@@ -1887,7 +1911,7 @@
 
   .side {
     flex: none;
-    visibility: visible;
+    visibility: hidden;
     appearance: none;
     border: none;
     background: none;
@@ -1912,6 +1936,17 @@
 
   .rowwrap:hover .side {
     visibility: visible;
+  }
+
+  /* The stop control stays visible for a running workspace (not hover-gated
+     like the others) — ending live work should never be a hidden gesture. */
+  .side.shown {
+    visibility: visible;
+    color: var(--warn);
+  }
+
+  .side.shown:hover {
+    color: var(--err);
   }
 
   .remote-ws {
@@ -2194,7 +2229,6 @@
     white-space: pre-wrap;
   }
 
-  .home-footer { margin-top: auto; padding-top: 18px; }
   .workspaces .rows { border: 1px solid var(--edge); border-radius: 10px; padding: 5px; }
   .workspace-row, .host-row { padding-right: 8px; }
   .workspace-row .row, .host-row .row { padding: 14px 12px; gap: 14px; }

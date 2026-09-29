@@ -85,13 +85,17 @@ app-build` (never the root `cargo`).
 - **What & when.** Home is workspace-first: **Open folder** registers an existing folder;
   recent workspaces on this machine show their path, live-session or approval state, and last-opened
   time. Remote machines are grouped separately, with their own connection status and workspaces.
-- **How it's used.** A workspace row opens in the launcher; its action menu offers a new window,
-  ending live sessions, or removing the registration (the folder stays untouched). Cmd/Ctrl-click
-  still opens a new window. Remote menus keep **Disconnect** separate from confirmed **End sessions**,
-  **Shut down**, and **Forget machine**. Cluster compute sessions remain on that host's detail page.
+- **How it's used.** A workspace row opens in the launcher. A workspace with live sessions shows a
+  visible **End sessions** beside the row (ending live work is never hidden in a menu); its action
+  menu offers a new window or removing the registration (the folder stays untouched). Cmd/Ctrl-click
+  still opens a new window. Connected remote rows show their loopback port, and a pool alias pinned
+  to one login node says so on hover. Remote menus keep **Disconnect** separate from confirmed
+  **End sessions**, **Shut down**, and **Forget machine**. Cluster compute sessions remain on that
+  host's detail page, their actions revealed on hover. The daemon version stamp sits in the corner.
 - **Navigation.** A quiet column keeps Workspaces, Chimaera Pro, and Settings in the same place across
-  Home's surfaces, collapsing to a compact top bar at narrow widths. Pro is available from native
-  and account-hosted windows; ordinary browser views retain Settings. Opening a folder and using
+  Home's surfaces, collapsing to a compact top bar at narrow widths (where the Settings/Pro page
+  drops its breadcrumb and frame). Pro is available from account-hosted windows and from native
+  windows of builds with an account endpoint; ordinary browser views retain Settings. Opening a folder and using
   local or SSH workspaces never requires a subscription. Cloud-only projects appear only when
   available to the signed-in plan, and require their existing explicit destination-picker flow.
 - **Where it lives.** `web-ui/src/lib/workspace/{HomeScreen,HomeNavigation,HomeActions}.svelte`,

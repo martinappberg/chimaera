@@ -3,6 +3,12 @@ import { isNativeShell, proCloudRequest, type CloudSetupInfo, type CloudSetupReq
 
 /** All passive operations stay GETs without wake intent. Provider connection is
  * the user's explicit authorization to prepare/wake the cloud machine. */
+/** Whether this daemon is a cloud machine: a passive read that never wakes one.
+ * Any other daemon answers `available: false`. */
+export async function isCloudMachine(signal?: AbortSignal): Promise<boolean> {
+  return (await cloudRequest({ operation: "info" }, signal)).available === true;
+}
+
 export async function cloudRequest(request: CloudSetupRequest, signal?: AbortSignal): Promise<CloudSetupInfo> {
   if (isNativeShell()) {
     const result = await proCloudRequest(request);
@@ -29,7 +35,6 @@ export async function cloudRequest(request: CloudSetupRequest, signal?: AbortSig
       return result;
     }
     case "open_provider_browser": throw new Error("Use the provider's secure sign-in link.");
-    case "onboard": path = "/pro/cloud/onboard"; method = "POST"; body = request; break;
     case "project": path = "/pro/cloud/project"; method = "POST"; body = request; break;
   }
   const headers: Record<string, string> = {};

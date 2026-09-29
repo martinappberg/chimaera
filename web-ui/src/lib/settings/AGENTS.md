@@ -25,8 +25,9 @@ the opt-in "teach agents the document dialect" installs over
 owns the text; the confirm dialog shows it verbatim before anything is written.
 
 **Pro is a separate account surface.** `../pro/ProView.svelte` is a singleton
-workbench tab and Home view. Settings starts with a small Chimaera Pro group
-that opens it; Home retains its Pro navigation. Confirmed free/signed-out users
+workbench tab and Home view. When Pro is offered (`net/plan.ts` `proOffered`;
+a build without an account endpoint offers none) Settings starts with a small
+Chimaera Pro group that opens it; Home retains its Pro navigation. Confirmed free/signed-out users
 see a benefit-led Get Pro entry; paid users see Your Chimaera Pro/Max and View
 account. `../net/plan.ts` shares its existing subscription between this entry
 and the badges: loading or failed/unknown entitlement stays neutral, never a
@@ -35,7 +36,9 @@ opens it, without adding a full-width sidebar row for any plan.
 It renders `ProSettings.svelte`, which invokes the native `pro_*` commands.
 The generic Settings form no longer embeds account/billing/onboarding controls.
 An account browser on a cloud worker opens the same provider flow; other hosts
-link to `/account`. Ordinary browser daemons have no Pro entry. Their Cloud machine category remains host-pinned and cookie-authenticated.
+link to `/account`. Ordinary browser daemons have no Pro entry. An account browser
+shows a Cloud category only on the cloud machine's own page (a passive
+`isCloudMachine` read); it remains host-pinned and cookie-authenticated.
 Credentials stay in the app's keychain, never in the schema or this UI.
 Account devices group only verified installation bindings; unbound older sessions
 are collapsed under Other sign-ins, retaining individual removal controls.
@@ -50,8 +53,13 @@ and returns to plan selection after authentication. Checkout requires a separate
 from a confirmed free account. An active account restores its subscriber view.
 Only confirmed free accounts see the illustrated introduction and plan selection.
 Paid accounts see an operational overview without a sales pitch or walkthrough.
-Unknown/startup/error account states stay neutral. Neither a remembered selection
-nor a successful account refresh can trigger checkout. Usage shows percentages
+Unknown/startup/error account states stay neutral; a connection warning is not an
+error. An overdue payment (`payment_due`) shows Payment needs attention with
+Manage billing and never plans or checkout. The page renders from the last
+confirmed status (`pro/account.ts` `accountPanel`) while background reads run, so
+nothing unmounts on `pro-changed` or focus; checkout and the Max review re-read
+the account first when an event is pending. Prices come only from `ProStatus.plans`.
+Neither a remembered selection nor a successful account refresh can trigger checkout. Usage shows percentages
 computed from the account's current allowances, not fixed hour or storage totals. The static introduction shows
 project/conversation continuity; it is not live setup progress or arbitrary
 process migration.
@@ -60,14 +68,15 @@ is hidden or closed. The UI has no checkout polling loop; it displays native
 opening/waiting/confirming/result states and refreshes cached status on events or return.
 Subscriber billing feedback stays inside the account card, preserving cloud and
 provider panels. Account events immediately invalidate older reads; billing
-snapshots cannot roll back to an older attempt or phase. Pro subscribers can
-choose Upgrade to Max, review the interval locally, then explicitly open the
+snapshots cannot roll back to an older attempt or phase. Pro subscribers near
+a limit (`nearLimit`) can choose Upgrade to Max, review the interval locally, then explicitly open the
 hosted price/proration confirmation. Only server-confirmed Max changes the plan. An unconfirmed review return settles
 after a bounded native check with the actual current plan; it never implies that
 the user canceled or that a delayed billing update cannot arrive.
 Only an authoritative active account plan unlocks paid content. Expired/failed
 checkout stays neutral until an explicit Check account succeeds with no plan for
-the same attempt; Return to plans then acknowledges and clears that attempt. A targeted native
+the same attempt; Return to plans then acknowledges and clears that attempt. The
+review is keyed by attempt, phase and plan, so unrelated account events keep it. A targeted native
 return reopens Pro, including when a new window needed time to mount.
 
 ## File map
@@ -80,8 +89,8 @@ return reopens Pro, including when a new window needed time to mount.
 | `AgentsSettings.svelte` | Per-agent binary/model settings (paths, managed installs). |
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
-| `CloudSetup.svelte` | Automatic cloud status, bounded visible polling, historical project-copy summaries and contextual provider connections; sleeping workers wake only for explicit connection management/use. Repository/key details stay secondary. See [provider map](../pro/AGENTS.md). |
-| `MirrorSettings.svelte` | Native project-copy status and privacy; visibility-gated 15-second status refresh; blocked-provider rows open the shared connection flow. Setup and idle-session policy stay agent/internal capabilities. |
+| `CloudSetup.svelte` | Automatic cloud status, bounded visible polling (no manual check), historical project-copy summaries and contextual provider connections; sleeping workers wake only for explicit connection management/use. Opening a repository exists only on the cloud machine's own page, as navigation; the app has none. See [provider map](../pro/AGENTS.md). |
+| `MirrorSettings.svelte` | Native project-copy status and privacy; visibility-gated 15-second status refresh; a pending privacy change is re-sent quietly (≤1/min); blocked-provider rows open the shared connection flow. Setup and idle-session policy stay agent/internal capabilities. |
 | `ProSettings.svelte` | Dedicated Pro overview content: account identity, plan choices, browser checkout/portal, usage, and progressive connection/privacy/security sections. |
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
 | `agentDocs.ts` | Wire types + `getAgentDocs`/`installAgentDocs` for `/api/v1/agent-docs`. |
@@ -118,4 +127,5 @@ After its first connection the provider component remains mounted while hidden
 across readiness changes, so unrelated status refreshes cannot reset sign-in.
 Ordinary connection rows exclude managed cloud workers; they remain available
 through automatic Pro routing. Background plan checks retain the last confirmed
-badge while pending; confirmed sign-out or failed account reads clear it.
+badge while pending; confirmed sign-out or failed account reads clear it, and a
+connection warning never does.
