@@ -21,6 +21,8 @@ import {
   topLevel,
   urlAllowed,
   wikilinkHref,
+  type EmbedSpec,
+  type HNode,
 } from "./render";
 
 /** Every node of a parse as `Name:source`, for shape pins. */
@@ -121,6 +123,9 @@ describe("ids and hrefs", () => {
     expect(wikilinkHref("plot.png", null)).toBe("plot.png");
     expect(wikilinkHref("v1.2", null)).toBe("v1.2.md");
     expect(wikilinkHref("", "Here")).toBe("#here");
+    // Into any other file the fragment is a spot, kept as written.
+    expect(wikilinkHref("MS&E226 notes.pdf", "page=34")).toBe("MS&E226%20notes.pdf#page=34");
+    expect(wikilinkHref("notes", "page=3")).toBe("notes.md#page3");
   });
 
   it("maps an anchor back to its source line for the editor modes", () => {
@@ -204,4 +209,71 @@ describe("incremental parsing renders what a fresh parse does", () => {
       expect(renderFrom(next, base)).toBe(renderHtml(base).html);
     });
   }
+});
+
+/** The string target with cards: an embed as a marker element. */
+class CardTarget extends HtmlTarget {
+  embed(spec: EmbedSpec): HNode {
+    return this.el("card", { "data-target": spec.target, ...(spec.alt === "" ? {} : { "data-alt": spec.alt }) });
+  }
+}
+
+function renderCards(src: string): string {
+  const cx = documentContext(bodyText(src).text);
+  const t = new CardTarget();
+  const root = t.el("div");
+  for (const run of htmlRuns(topLevel(cx), (n) => htmlOfNode(n, cx))) renderRun(root, run, { t, cx });
+  return t.serializeChildren(root).replace(/ data-sourcepos="[^"]*"/g, "");
+}
+
+describe("embeds in a paragraph", () => {
+  it("draws a file embed with a caption beside it as a card, the caption after it", () => {
+    expect(renderCards("![[paper.pdf#page=34]] *Figure: the headline*\n")).toBe(
+      '<p><card data-target="paper.pdf#page=34"></card><em>Figure: the headline</em></p>',
+    );
+    expect(renderCards("![[paper.pdf#page=34]]\nFigure 1\n")).toBe(
+      '<p><card data-target="paper.pdf#page=34"></card>Figure 1</p>',
+    );
+  });
+
+  it("draws an image-syntax file embed mid-sentence in place", () => {
+    expect(renderCards("See ![the data](data.csv) for more.\n")).toBe(
+      '<p>See<card data-target="data.csv" data-alt="the data"></card>for more.</p>',
+    );
+  });
+
+  it("keeps a picture inline and a lone embed a card of its own", () => {
+    expect(renderCards("a ![x](plot.png) b\n")).toBe('<p>a <img src="plot.png" alt="x"> b</p>');
+    expect(renderCards("![[paper.pdf]]\n")).toBe('<p><card data-target="paper.pdf"></card></p>');
+  });
+
+  it("leaves an embed in a heading a link", () => {
+    expect(renderCards("# See ![[paper.pdf]]\n")).toContain('class="wikilink wikilink-embed"');
+  });
+});
+
+describe("callouts", () => {
+  it("folds with the mark: `-` closed, `+` open, none not foldable", () => {
+    const html = renderHtml("> [!tip]- Hidden\n> a\n\n> [!tip]+ Shown\n> b\n\n> [!tip] Plain\n> c\n").html;
+    expect(html).toMatch(/<details class="markdown-alert markdown-alert-tip" data-sourcepos="[^"]*">\s*<summary class="markdown-alert-title">Hidden</);
+    expect(html).toMatch(/<details class="markdown-alert markdown-alert-tip" data-sourcepos="[^"]*" open="">\s*<summary class="markdown-alert-title">Shown</);
+    expect(html).toMatch(/<div class="markdown-alert markdown-alert-tip" data-sourcepos="[^"]*">\s*<p class="markdown-alert-title">Plain</);
+  });
+
+  it("keeps GitHub's colors for GitHub's types and reads Obsidian's aliases", () => {
+    const cls = (md: string) => /markdown-alert-(\w+)/.exec(renderHtml(md).html)?.[1];
+    expect(cls("> [!IMPORTANT]\n> x\n")).toBe("important");
+    expect(cls("> [!caution]\n> x\n")).toBe("caution");
+    expect(cls("> [!hint]\n> x\n")).toBe("tip");
+    expect(cls("> [!error]\n> x\n")).toBe("danger");
+    expect(cls("> [!cite]\n> x\n")).toBe("quote");
+    expect(cls("> [!definition]\n> x\n")).toBe("note");
+  });
+
+  it("titles a callout with markdown, a lone marker line with its type", () => {
+    const html = renderHtml("> [!example] Estimator $\\hat\\beta$\n> body\n\n> [!summary]\n> - a\n").html;
+    expect(html).toContain('<p class="markdown-alert-title">Estimator <span data-math-style="inline">\\hat\\beta</span></p>');
+    expect(html).toContain('<p class="markdown-alert-title">Summary</p>');
+    expect(html).toMatch(/<li[^>]*>a<\/li>/);
+  });
 });

@@ -11,8 +11,13 @@ export { mathOptions, renderMath, safeMathHtml } from "../shared/math";
 // previews' rules: `previews/mdMath.ts` mirrors comrak (the reading render)
 // so a document reads the same in every mode there. Don't "harmonize" one
 // into the other; `streamSegments.ts` mirrors BLOCK_DOLLAR exactly.
+// A closing `$` is followed by whitespace, phrase punctuation, a closing
+// bracket or quote, or a hyphen (`$p$-value`) — never a digit or letter, so
+// `$5 and $10` stays currency. An opening `$` starts the text or follows
+// whitespace or an opening bracket or quote (`($x$)`).
 const INLINE_DOLLAR =
-  /^(\${1,2})(?!\$)((?:\\.|[^\\\n$])+?)\1(?=[\s?!.,:？！。，：]|$)/;
+  /^(\${1,2})(?!\$)((?:\\.|[^\\\n$])+?)\1(?=[\s?!.,:;)\]}'"’”\-？！。，：；）]|$)/;
+const OPENS_INLINE = /[\s([{'"‘“（]/;
 const BLOCK_DOLLAR = /^(\${1,2})\n((?:\\[^]|[^\\])+?)\n\1(?:\n|$)/;
 
 /** Marked tokenizers for the math forms emitted by both supported agents.
@@ -29,7 +34,7 @@ export const markdownMath = {
         while (searchFrom < src.length) {
           const index = src.indexOf("$", searchFrom);
           if (index < 0) return undefined;
-          const startsAtBoundary = index === 0 || src[index - 1] === " ";
+          const startsAtBoundary = index === 0 || OPENS_INLINE.test(src[index - 1]);
           if (startsAtBoundary && INLINE_DOLLAR.test(src.slice(index))) return index;
           searchFrom = index + 1;
           while (src[searchFrom] === "$") searchFrom += 1;

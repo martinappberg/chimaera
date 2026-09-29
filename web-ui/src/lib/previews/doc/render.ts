@@ -18,7 +18,8 @@
  * the view's CSS and its link, anchor, task and line-mapping logic work on
  * either: `data-sourcepos` on every block element (1-based lines of the
  * original file), `user-content-` heading and footnote ids, GitHub alert
- * cards, `span.md-task` boxes, comrak's footnote section. Hrefs are
+ * cards (Obsidian's callouts too, which the daemon leaves as quotes),
+ * `span.md-task` boxes, comrak's footnote section. Hrefs are
  * escaped the way comrak escapes them, and a URL whose scheme ammonia would
  * strip loses its href (or src) here too.
  */
@@ -26,6 +27,7 @@ import DOMPurify from "dompurify";
 import type { SyntaxNode } from "@lezer/common";
 import type { Inline } from "../mdTable";
 import { anchorIds } from "../mdDoc";
+import { CALLOUT_LOOKS } from "./callouts";
 import {
   bodyText,
   blockOf,
@@ -109,15 +111,22 @@ export function hrefFor(url: string): string | null {
 
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
 
+/** The extensions `files.ts` previews as markdown: a fragment into one is
+ *  a heading. */
+const NOTE_EXT = /\.(md|markdown)$/i;
+
 /** Where a wikilink points: the target file (`.md` added to an
- *  extension-less name, as Obsidian reads `[[note]]`) plus the heading's
- *  GitHub slug — an ordinary document link from here on (`docLinks.ts`
- *  resolves it against the document's folder, then by name). */
+ *  extension-less name, as Obsidian reads `[[note]]`) plus its fragment —
+ *  into a note, the heading's GitHub slug; into any other file, the spot as
+ *  written (`[[paper.pdf#page=34]]` opens page 34, as in Obsidian) — an
+ *  ordinary document link from here on (`docLinks.ts` resolves it against
+ *  the document's folder, then by name). */
 export function wikilinkHref(target: string, heading: string | null): string {
-  const fragment = heading === null ? "" : `#${githubSlug(heading)}`;
-  if (target === "") return fragment === "" ? "#" : fragment;
+  if (target === "") return heading === null ? "#" : `#${githubSlug(heading)}`;
   const hasExt = /\.[A-Za-z0-9]*[A-Za-z][A-Za-z0-9]*$/.test(target.split("/").pop() ?? "");
-  return escapeHref(hasExt ? target : `${target}.md`) + fragment;
+  const file = hasExt ? target : `${target}.md`;
+  const fragment = heading === null ? "" : NOTE_EXT.test(file) ? `#${githubSlug(heading)}` : `#${escapeHref(heading)}`;
+  return escapeHref(file) + fragment;
 }
 
 export function isImageTarget(target: string): boolean {
@@ -172,6 +181,56 @@ export function soleEmbed(inline: readonly Inline[]): EmbedSpec | null {
     if (found === null) return null;
   }
   return found;
+}
+
+/** A text inline with its whitespace next to a card taken off (a copy:
+ *  the model's inlines are shared). */
+function trimmed(i: Inline, side: "start" | "end"): Inline | null {
+  if (i.kind !== "text") return i;
+  const text = side === "start" ? i.text.replace(/^[ \t\n]+/, "") : i.text.replace(/[ \t\n]+$/, "");
+  return text === "" ? null : { kind: "text", text };
+}
+
+/** A paragraph's inline run with every embed of a file that is not a
+ *  picture (`![[paper.pdf#page=3]]`, `![](data.csv)`) drawn as its card
+ *  where it stands — Obsidian embeds wherever the syntax is, a caption on
+ *  the same line included — and the text around it drawn as before. A
+ *  picture stays an inline image; a target without cards (the parity
+ *  corpus) draws the run whole, as the daemon does. */
+function renderWithEmbeds<N>(parent: N, inline: readonly Inline[], env: Env<N>): void {
+  const { t } = env;
+  const cards = inline.map((i) => {
+    const spec = i.kind === "image" || (i.kind === "wikilink" && i.embed) ? embedSpecOf(i) : null;
+    return spec !== null && !spec.image ? spec : null;
+  });
+  if (t.embed === undefined || cards.every((c) => c === null)) {
+    renderInline(parent, inline, env);
+    return;
+  }
+  let run: Inline[] = [];
+  const flush = (): void => {
+    const last = run.length > 0 ? trimmed(run[run.length - 1], "end") : null;
+    if (run.length > 0) run = last === null ? run.slice(0, -1) : [...run.slice(0, -1), last];
+    if (run.length > 0) renderInline(parent, run, env);
+    run = [];
+  };
+  let afterCard = false;
+  for (const [k, i] of inline.entries()) {
+    const card = cards[k];
+    if (card !== null) {
+      flush();
+      t.add(parent, t.embed(card));
+      afterCard = true;
+      continue;
+    }
+    // A break right after a card only ended the card's line.
+    if (afterCard && i.kind === "break") continue;
+    const item = afterCard ? trimmed(i, "start") : i;
+    if (item === null) continue;
+    afterCard = false;
+    run.push(item);
+  }
+  flush();
 }
 
 // --- rendering ------------------------------------------------------------------
@@ -331,7 +390,7 @@ export function renderBlock<N>(parent: N, b: Block, env: Env<N>, tight = false):
       const embed = t.embed === undefined ? null : soleEmbed(b.inline);
       const body = (into: N): void => {
         if (embed !== null && t.embed !== undefined) t.add(into, t.embed(embed));
-        else renderInline(into, b.inline, env);
+        else renderWithEmbeds(into, b.inline, env);
       };
       if (tight) {
         body(parent);
@@ -361,9 +420,12 @@ export function renderBlock<N>(parent: N, b: Block, env: Env<N>, tight = false):
       return;
     }
     case "alert": {
-      const d = t.el("div", pos(env, b.from, b.to, { class: `markdown-alert markdown-alert-${b.type}` }));
-      const title = t.el("p", { class: "markdown-alert-title" });
-      t.add(title, t.text(b.title));
+      // A foldable callout is a disclosure: its title the summary.
+      const attrs = pos(env, b.from, b.to, { class: `markdown-alert markdown-alert-${b.type}` });
+      if (b.fold === "+") attrs.open = "";
+      const d = t.el(b.fold === "" ? "div" : "details", attrs);
+      const title = t.el(b.fold === "" ? "p" : "summary", { class: "markdown-alert-title" });
+      renderInline(title, b.title, env);
       t.add(d, title);
       renderBlocks(d, b.children, env);
       t.add(parent, d);
@@ -480,7 +542,7 @@ export function renderFootnotes<N>(parent: N, notes: readonly Footnote[], env: E
 
 // --- the string target (parity corpus) ---------------------------------------------
 
-type HNode = { raw: string } | { tag: string; attrs: Attrs; children: HNode[] };
+export type HNode = { raw: string } | { tag: string; attrs: Attrs; children: HNode[] };
 
 const VOID = new Set(["br", "hr", "img", "input", "wbr", "col", "area"]);
 
@@ -707,7 +769,7 @@ const ALLOWED_TAGS = [
 const ALLOWED_ATTR = [
   "lang", "title", "href", "hreflang", "dir", "cite", "align", "char", "charoff", "span",
   "datetime", "size", "width", "height", "alt", "src", "start", "summary", "colspan", "headers",
-  "rowspan", "scope", "id", "class", "data-math-style", "data-task",
+  "rowspan", "scope", "id", "class", "data-math-style", "data-task", "open",
   // This renderer's own markers, inside a run an HTML block opened.
   "data-wikilink", "data-sourcepos", "data-lang", "aria-hidden", "aria-label",
 ];
@@ -718,6 +780,9 @@ const TAG_ATTRS: Record<string, ReadonlySet<string>> = {
   A: new Set(["href", "hreflang"]),
   BDO: new Set(["dir"]),
   BLOCKQUOTE: new Set(["cite"]),
+  // A folded callout's state (the daemon's ammonia drops it: its
+  // fallback shows only GitHub's five, never folded).
+  DETAILS: new Set(["open"]),
   COL: new Set(["align", "char", "charoff", "span"]),
   COLGROUP: new Set(["align", "char", "charoff", "span"]),
   DEL: new Set(["cite", "datetime"]),
@@ -740,16 +805,12 @@ const ID_TAGS = new Set(["H1", "H2", "H3", "H4", "H5", "H6", "A", "LI"]);
 
 /** The classes a rendered document may carry, per tag (the daemon's
  *  `MARKDOWN_CLASSES`): a document's own HTML can't borrow app chrome. */
+const CALLOUT_CLASSES = new Set(["markdown-alert", ...CALLOUT_LOOKS.map((k) => `markdown-alert-${k}`)]);
 const CLASSES: Record<string, ReadonlySet<string>> = {
-  DIV: new Set([
-    "markdown-alert",
-    "markdown-alert-note",
-    "markdown-alert-tip",
-    "markdown-alert-important",
-    "markdown-alert-warning",
-    "markdown-alert-caution",
-  ]),
+  DIV: CALLOUT_CLASSES,
+  DETAILS: CALLOUT_CLASSES,
   P: new Set(["markdown-alert-title"]),
+  SUMMARY: new Set(["markdown-alert-title"]),
   SPAN: new Set(["md-task"]),
   A: new Set(["anchor", "footnote-backref", "wikilink", "wikilink-embed"]),
   SUP: new Set(["footnote-ref"]),
