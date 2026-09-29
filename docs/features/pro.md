@@ -18,8 +18,9 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    It opens a dedicated account page; ordinary app settings stay separate.
    In an account browser, the cloud machine opens the same agent-connection
    flow; other machines link to the account surface. Ordinary daemon browser
-   windows have no Pro entry. A build with no configured endpoint shows only
-   “Chimaera Pro isn't available in this build.”
+   windows have no Pro entry. A build with no configured endpoint has no Pro
+   entry on Home or in Settings and no plan badge; if the Pro page is reached
+   anyway it shows only “Chimaera Pro isn't available in this build.”
 2. With an endpoint configured, choose **Sign up**, or the smaller
    **Already have an account? Sign in** link. Each opens its corresponding
    identity-provider screen. Complete the system-browser authentication; the app receives an authorization code through its loopback callback.
@@ -42,21 +43,32 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    Work continues locally when you’re back. The three distinct static scenes
    show an open laptop, an agent working above a closed laptop, and a shared
    project across devices; they are explanatory, not setup indicators.
-   Local projects, agents and ordinary SSH remain free. Plan cards show pricing
-   before checkout; **See plans** jumps directly to the comparison.
+   Local projects, agents and ordinary SSH remain free. Plan cards show prices
+   only when the account supplies them (optional `ProStatus.plans`); otherwise
+   they name the plans and say prices are shown at checkout. No price is built
+   into the app. **See plans** jumps directly to the comparison.
    Active subscribers see **Your Chimaera Pro** or **Your Chimaera Max** with
    account, cloud and project controls. They see no sales introduction or plan
    comparison. **Usage and plan details** shows the percentage of cloud work and
-   mirrored-project capacity used, calculated from the service's current limits.
+   project storage used, calculated from the service's current limits.
    Loading, unavailable and unknown account states stay neutral; a remembered
-   plan selection never starts a purchase.
+   plan selection never starts a purchase. The page keeps showing the last
+   confirmed account while background reads run (every `pro-changed`, window
+   focus), so plans, the introduction and the overview never unmount or lose
+   scroll; a purchase re-reads the account first when an update is pending. A
+   connection that is still coming up (optional `ProStatus.connection_warning`,
+   or the two informational messages older shells put in `error`) is one quiet
+   line, never an account failure. An account whose payment needs attention
+   (optional `ProStatus.payment_due`) sees **Payment needs attention** with
+   **Manage billing**, and is never offered plans or checkout.
    The page shows the signed-in email and current plan. Without a plan, choose
    Pro or Max and monthly or yearly billing, then continue to checkout in the
    system browser. Both **Sign up** and **Sign in** remember that
    selection and returns to the plan page after account creation or sign-in.
    Checkout opens only after a separate, explicit purchase action from the
    signed-in account. An existing active plan restores the subscriber view.
-   Existing subscribers can open **Manage billing**. Pro subscribers also see
+   Existing subscribers can open **Manage billing**. Pro subscribers near a limit
+   (80 % of an allowance, a used-up allowance, or exhausted cloud hours) also see
    **Upgrade to Max**: choose monthly or yearly, then **Review upgrade in browser**
    to review the final price, proration and timing before confirming. Opening the
    review leaves the current plan unchanged and preserves any existing trial.
@@ -75,8 +87,10 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    A stopped request can be dismissed or replaced by reopening billing. A timeout or failed
    check offers **Check account** and keeps plan selection hidden. If that fresh
    check confirms no active plan, **Return to plans** explicitly closes the old
-   request before another checkout can start. Older shells
-   without native attempt status retain an explicit account-refresh fallback.
+   request before another checkout can start; unrelated account updates do not
+   withdraw it. A checkout refused because the account already has a plan re-reads
+   the account and shows it. Older shells without native attempt status refresh
+   the account when the window regains focus.
    With an active plan, toggle **Keep connected** for a saved SSH host. A password
    or Duo challenge uses the usual
    host-scoped prompt, with “Asked by your Pro connection” underneath its title.
@@ -99,9 +113,9 @@ for a local integration run.
 
 ## Subscriber branding
 
-An active Pro or Max account wears a small plan badge beside the Home wordmark and in the workspace header. The dedicated Pro page uses the same badge. The workspace badge opens the dedicated Pro page. There is no full-width Pro row in the workspace sidebar; free and signed-out users can still find Pro at the top of Settings and from Home. Settings offers **Get Pro** with a short cross-device benefit for confirmed free or signed-out accounts. Paid accounts see **Your Chimaera Pro** or **Your Chimaera Max** and **View account**. Loading or unknown account state stays neutral. The styling follows the current theme, and an unknown, signed-out or inactive plan shows no paid badge.
+An active Pro or Max account wears a small plan badge beside the Home wordmark and in the workspace header. The dedicated Pro page uses the same badge. The workspace badge opens the dedicated Pro page. There is no full-width Pro row in the workspace sidebar; free and signed-out users can still find Pro at the top of Settings and from Home. Settings offers **Get Pro** with a short cross-device benefit for confirmed free or signed-out accounts. Paid accounts see **Your Chimaera Pro** or **Your Chimaera Max** and **View account**. Loading or unknown account state, and an account whose payment needs attention without an active plan, stay neutral. A connection warning never clears the badge. The styling follows the current theme, and an unknown, signed-out or inactive plan shows no paid badge.
 
-The shared `web-ui/src/lib/net/plan.ts` store exposes confirmed free/paid, loading and unknown account state to Settings, and derives the existing paid badge from the same subscription. It reads native `pro_status` and refreshes on `pro-changed` and visibility return. Account-browser windows instead make a bounded, same-origin `HEAD` request to their existing `/app/{host}/` index. Its optional `X-Chimaera-Plan` response header is `none`, `pro` or `max`, derived from the authenticated account's active or trialing subscription; an absent header or failed request leaves branding neutral. Index responses remain `Cache-Control: no-store`. The browser refreshes once per minute while visible and when returning to the page, without requesting or waking a keeper or worker. Ordinary daemon browser windows make no account request. The badge is presentation only and grants no capabilities.
+The shared `web-ui/src/lib/net/plan.ts` store exposes confirmed free/paid, loading, unknown and unavailable (no endpoint, or an ordinary browser) account state to Settings, derives the existing paid badge from the same subscription, and `proOffered` gates every Pro entry point (null until the first answer, so an endpoint-less build never flashes one). It reads native `pro_status` and refreshes on `pro-changed` and visibility return. Account-browser windows instead make a bounded, same-origin `HEAD` request to their workbench index (`/app/{host}/` or `/workspace/{id}/`). Its optional `X-Chimaera-Plan` response header is `none`, `pro` or `max`, derived from the authenticated account's active or trialing subscription; an absent header or failed request leaves branding neutral. Index responses remain `Cache-Control: no-store`. The browser refreshes once per minute while visible and when returning to the page, without requesting or waking a keeper or worker. Ordinary daemon browser windows make no account request. The badge is presentation only and grants no capabilities.
 
 `web-ui/src/lib/shared/PlanBadge.svelte` supplies the common visual treatment used by Home, the workspace header and `ProSettings.svelte`.
 
@@ -116,9 +130,11 @@ preparation continues without a setup button; visible checks run
 sequentially every five seconds, slowing to thirty seconds after five minutes.
 Hidden views stop checking. Healthy phases do not ask the user to refresh.
 
-A disabled service or uninvited preview account shows that preparation is waiting,
-without an activity animation or a claim that files are synchronizing. A failed
-read or unavailable connection offers a secondary **Check again**. Project status
+A disabled service says cloud work isn't available yet and that work on this
+computer continues; an uninvited preview account says access is by invitation.
+Neither shows an activity animation or claims files are synchronizing. A failed
+read or unavailable connection says so and keeps checking on its own; there is no
+manual check. Project status
 appears only when mirror metadata exists: completed copies, handoff in progress,
 restoration, or setup that needs attention. Saved-copy counts describe completed
 copies, never active synchronization or a promise that every file is current.
@@ -169,17 +185,20 @@ originating project only if that context is still current.
 
 Status reads never wake a sleeping worker. Opening the optional **Agent connections**
 disclosure loads those connections and acquires access automatically. There is no
-separate cloud-start action. Connecting a provider or opening a repository also
-acquires access as part of that user request. Catalog checks are
+separate cloud-start action. Connecting a provider, or opening a repository on
+the cloud machine's own page, also acquires access as part of that user request. Catalog checks are
 single-flight and visibility-gated. Active sign-in checks run sequentially every
 two seconds, stop while hidden, and end at the attempt's finite deadline. Pending
 connection operations keep the worker active only until they finish or expire.
 
-Repository-provider connections remain optional. An HTTPS Git URL clones into the
-worker's persistent projects folder and opens as a workspace. Duplicate names and
-embedded URL credentials are rejected. Only one clone runs at a time; incomplete
-clones are not registered. The cloud machine's SSH public key is under advanced
-connections.
+Repository-provider connections remain optional. On the cloud machine's own page
+(an account browser), an HTTPS Git URL clones into its persistent projects folder
+and navigates to the new project (`/workspace/{id}/` in a project tab). The desktop
+app has no such control: where work runs is never a user choice. Duplicate names
+and embedded URL credentials are rejected. Only one clone runs at a time;
+incomplete clones are not registered. The cloud machine's SSH public key is under
+advanced connections. In an account browser, Settings shows a **Cloud** section
+only on the cloud machine's own page; other daemons have no cloud status to show.
 
 The worker exposes `/api/v1/pro/cloud`, `/api/v1/pro/cloud/providers`, provider
 connect/disconnect routes, connection read/cancel routes, and `/api/v1/pro/cloud/project`.
@@ -206,8 +225,8 @@ Native IPC commands: `pro_status`, `pro_refresh_account`, `pro_billing_checkout`
 `pro_sign_out_everywhere`, `pro_hosts`, `pro_set_host_kept`, `pro_devices`.
 The app broadcasts `pro-changed` when account/host state changes. The panel
 refreshes while visible and catches up when shown again; it does not poll while
-parked. The mirror panel also uses `pro_mirror_status`, `pro_mirror_preference` and
-`pro_set_never_mirror`, backed by authenticated `/api/v1/pro/` daemon routes.
+parked. The mirror panel also uses `pro_mirror_status` and `pro_set_never_mirror`,
+backed by authenticated `/api/v1/pro/` daemon routes.
 
 ## Project mirrors and automatic handoff
 
@@ -222,9 +241,9 @@ idle-session pins are not account controls; Chimaera and its agents manage those
 details. Internal setup/profile and session-pin APIs remain available for their
 scoped workflows.
 **Keep this project on this device** stops local publication and disables account-side
-mirror access. Existing stored data is not silently deleted. Cloud setup commands
-and learned laptop-only commands appear in each project's details. A session's
-**Keep running when idle** pin persists across transfer and daemon restart.
+mirror access. Existing stored data is not silently deleted. If the account side
+has not confirmed it yet, the project says cloud copies are being turned off and
+the page re-sends the change on its own (at most once a minute while visible).
 
 Repository history and working files are separate Git mirrors. Snapshot commits
 use an independent index under the daemon's data directory; they never make WIP
@@ -270,7 +289,10 @@ Opening one on a computer without a local copy asks for an empty destination
 folder through the native picker. Cancellation leaves the cloud copy untouched.
 The confirmed destination is remembered for that project on that computer;
 existing local projects retain their original folders. A missing destination or
-an unrelated nonempty folder fails safely instead of overwriting data. Native
+an unrelated nonempty folder fails safely instead of overwriting data. A project
+refused because it is mid-step in the cloud opens by itself once that step
+finishes: Home retries on each list refresh while visible, for up to 15 minutes,
+and only after its folder is saved so the picker never reappears. Native
 conversation identifiers survive when the local folder differs. The old global
 projects-root preference no longer authorizes automatic imports. Both repository and shadow histories are retained
 within the account quota; source history is never silently pruned. Initial Git
