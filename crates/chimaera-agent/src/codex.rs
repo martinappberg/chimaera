@@ -2036,6 +2036,7 @@ impl CodexMapper {
                 },
                 Some(err),
             ) => {
+                self.read_before_answer.remove(&client_msg_id);
                 // The extension's retry dance: parse the live turn id out of
                 // the error text and steer again, once.
                 let msg = err["message"].as_str().unwrap_or_default();
@@ -2065,25 +2066,15 @@ impl CodexMapper {
                             },
                         }));
                     }
-                    // Not a turn-id mismatch: if the turn ended between our send
-                    // and this steer, re-drive the saved input as a fresh turn
-                    // instead of dropping the already-echoed user message. A
-                    // sibling steer may still be unresolved, so defer by click
-                    // order and let the shared scheduler open only one turn.
-                    None if !self.turn_active => {
-                        self.defer_steer_redrive(order, input, client_msg_id, step)
-                    }
-                    None => {
-                        step.events.push(AgentEvent::Error {
-                            message: format!("steer failed: {msg}"),
-                            fatal: false,
-                        });
-                        // Final failure: the agent never saw this message.
-                        step.events.push(AgentEvent::UserMessageUpdate {
-                            id: client_msg_id,
-                            state: UserMessageState::Dropped,
-                        });
-                    }
+                    // The running turn did not take it: it ended between our
+                    // send and this steer ("no active turn to steer" can beat
+                    // turn/completed), or it can't be steered (a compact or
+                    // review turn — `activeTurnNotSteerable`). The message
+                    // still delivers — it opens the next turn — instead of
+                    // dropping the already-echoed bubble. A sibling steer may
+                    // still be unresolved, so defer by click order and let the
+                    // shared scheduler open only one turn, after this one.
+                    None => self.defer_steer_redrive(order, input, client_msg_id, step),
                 }
             }
             (
@@ -2093,21 +2084,12 @@ impl CodexMapper {
                     retried: true,
                     order,
                 },
-                Some(err),
+                Some(_),
             ) => {
-                if !self.turn_active {
-                    self.defer_steer_redrive(order, input, client_msg_id, step);
-                } else {
-                    step.events.push(AgentEvent::Error {
-                        message: format!("steer failed: {}", err["message"]),
-                        fatal: false,
-                    });
-                    // Retried and still refused: the message was not consumed.
-                    step.events.push(AgentEvent::UserMessageUpdate {
-                        id: client_msg_id,
-                        state: UserMessageState::Dropped,
-                    });
-                }
+                // Refused again after the turn-id retry: the turn keeps moving
+                // under it. Deliver it with the next turn rather than drop it.
+                self.read_before_answer.remove(&client_msg_id);
+                self.defer_steer_redrive(order, input, client_msg_id, step);
             }
             (PendingRpc::Interrupt, Some(err)) => {
                 // "no active turn to interrupt" is a benign race.
@@ -6109,29 +6091,64 @@ mod tests {
         assert_eq!(step.outbound[0]["method"], "turn/steer");
         assert_eq!(step.outbound[0]["params"]["expectedTurnId"], "turn-B");
 
-        // Second failure surfaces instead of looping — and resolves the
-        // still-queued message as dropped, not stranded.
+        // A second failure does not loop, and does not drop the message: it
+        // waits for the next turn instead.
         let id2 = step.outbound[0]["id"].as_u64().unwrap();
         let step = m.on_frame(&json!({
             "id": id2,
             "error": { "message": "expected active turn id `turn-B` but found `turn-C`" },
         }));
-        assert!(step.outbound.is_empty());
-        assert!(matches!(
-            &step.events[0],
-            AgentEvent::Error { fatal: false, .. }
-        ));
+        assert!(step.outbound.is_empty(), "no retry, no turn/start mid-turn");
         assert!(
-            matches!(
-                &step.events[1],
-                AgentEvent::UserMessageUpdate {
-                    state: UserMessageState::Dropped,
-                    ..
-                }
-            ),
-            "final steer failure drops the message: {:?}",
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::UserMessageUpdate { .. })),
+            "the message is neither dropped nor falsely sent: {:?}",
             step.events
         );
+        assert_eq!(m.deferred_steer_redrives.len(), 1);
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-C", "status": "completed" } },
+        }));
+        assert!(step.outbound.iter().any(|o| o["method"] == "turn/start"));
+    }
+
+    /// A turn that can't be steered (compaction, review) refuses the steer
+    /// with a non-mismatch error while it is still running. The message is
+    /// not dropped: it opens the next turn once this one ends.
+    #[test]
+    fn a_refused_steer_waits_for_the_next_turn() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "B".into() }],
+        });
+        let AgentEvent::UserMessage { id: Some(b), .. } = &step.events[0] else {
+            panic!("expected UserMessage");
+        };
+        let b = b.clone();
+        let rpc = step.outbound[0]["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({
+            "id": rpc,
+            "error": { "message": "cannot steer a compact turn" },
+        }));
+        assert!(step.events.is_empty() && step.outbound.is_empty());
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "completed" } },
+        }));
+        let start = step
+            .outbound
+            .iter()
+            .find(|o| o["method"] == "turn/start")
+            .expect("it opens the next turn");
+        assert_eq!(start["params"]["clientUserMessageId"], json!(b));
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == b
+        )));
     }
 
     #[test]

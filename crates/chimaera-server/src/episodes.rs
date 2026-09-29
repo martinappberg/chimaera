@@ -70,7 +70,8 @@ struct TurnAcc {
 struct SessionAcc {
     turn: TurnAcc,
     /// Prompts for the NEXT turn (codex announces TurnStarted after the
-    /// message; claude queues mid-turn sends until the turn ends).
+    /// message; a waiting message that opens a turn resolves `sent` between
+    /// turns).
     next_prompts: Vec<String>,
     /// id → text of queued messages, promoted when `UserMessageUpdate{Sent}`.
     queued: HashMap<String, String>,
@@ -111,7 +112,9 @@ impl ChatEpisodes {
             }
             AgentEvent::UserMessageUpdate { id, state } => {
                 if let Some(text) = acc.queued.remove(id) {
-                    if matches!(state, UserMessageState::Sent) {
+                    // Read at a step INSIDE a running turn: part of this ask,
+                    // like any mid-turn message — never the next headline.
+                    if matches!(state, UserMessageState::Sent) && !acc.turn.open {
                         acc.next_prompts.push(text);
                     }
                 }
@@ -996,6 +999,31 @@ mod tests {
         eps.observe(s, 10, &chunk("ok"));
         let second = eps.observe(s, 11, &completed()).unwrap();
         assert_eq!(second.prompt.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn a_message_read_mid_turn_does_not_title_the_next_turn() {
+        let mut eps = ChatEpisodes::default();
+        let s = "m";
+        eps.observe(s, 1, &user("first", Some("a"), false));
+        eps.observe(s, 2, &started());
+        eps.observe(s, 3, &user("also this", Some("b"), true));
+        // Read at the agent's next step, inside the running turn.
+        eps.observe(
+            s,
+            4,
+            &AgentEvent::UserMessageUpdate {
+                id: "b".into(),
+                state: UserMessageState::Sent,
+            },
+        );
+        let first = eps.observe(s, 5, &completed()).unwrap();
+        assert_eq!(first.prompt.as_deref(), Some("first"));
+        eps.observe(s, 6, &user("next", Some("c"), false));
+        eps.observe(s, 7, &started());
+        eps.observe(s, 8, &chunk("ok"));
+        let next = eps.observe(s, 9, &completed()).unwrap();
+        assert_eq!(next.prompt.as_deref(), Some("next"));
     }
 
     #[test]

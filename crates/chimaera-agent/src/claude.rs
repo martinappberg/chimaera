@@ -789,6 +789,12 @@ struct ClaudeMapper {
     /// CLI, which runs them right after the aborted turn. Process death drops
     /// them (`drain_pending`).
     awaiting_read: VecDeque<String>,
+    /// Waiting messages were just delivered as the next turn's opener (their
+    /// `started`, or the fallback's flush) and that turn's first frame has not
+    /// streamed yet. Model latency makes this seconds long — right after Send
+    /// now especially — and a send in it waits too, like a send in codex's
+    /// `turn_pending` window, instead of opening a turn of its own.
+    turn_starting: bool,
     /// The fallback for a CLI without [`MSG_LIFECYCLE_CAPABILITY`] (and for a
     /// send made before the first `system/init` says which kind this is):
     /// mid-turn messages, FIFO of `(client uuid, stdin content, after_turn)`,
@@ -975,6 +981,7 @@ impl ClaudeMapper {
             departed_background: VecDeque::new(),
             native_queue: None,
             awaiting_read: VecDeque::new(),
+            turn_starting: false,
             queued_sends: VecDeque::new(),
             flushing: Vec::new(),
             interrupt_requested: false,
@@ -1174,6 +1181,7 @@ impl ClaudeMapper {
     /// phantom turn with no start event.
     fn ensure_turn(&mut self, step: &mut DriverStep) {
         if !self.turn_active {
+            self.turn_starting = false;
             self.reset_compaction_for_new_turn();
             self.turn_n += 1;
             self.turn_active = true;
@@ -3182,6 +3190,21 @@ impl ClaudeMapper {
             });
             self.refresh_context_usage(step);
         }
+        self.turn_starting = false;
+        // Backstop for a `started` frame that never came: the result lists
+        // every message the turn consumed (`user_message_uuids`), so one still
+        // marked waiting was read after all.
+        if let Some(consumed) = frame["user_message_uuids"].as_array() {
+            for id in consumed.iter().filter_map(Value::as_str) {
+                if let Some(pos) = self.awaiting_read.iter().position(|q| q == id) {
+                    let id = self.awaiting_read.remove(pos).expect("position exists");
+                    step.events.push(AgentEvent::UserMessageUpdate {
+                        id,
+                        state: UserMessageState::Sent,
+                    });
+                }
+            }
+        }
         // The running turn has ended — however it ended — so NOW flush
         // everything held behind it (the fallback path; see `queued_sends`).
         // Messages already in the CLI's own queue need nothing here: the CLI
@@ -3205,6 +3228,9 @@ impl ClaudeMapper {
     /// end event, so each bubble enters the transcript AFTER the finished
     /// turn, never spliced into its output.
     fn flush_held_at_turn_end(&mut self, step: &mut DriverStep) {
+        if !self.queued_sends.is_empty() {
+            self.turn_starting = true;
+        }
         for (id, content, _after_turn) in std::mem::take(&mut self.queued_sends) {
             step.outbound.push(user_message_frame(&id, content));
             // Stage for the teardown drop-guard until the write is confirmed
@@ -3251,7 +3277,21 @@ impl ClaudeMapper {
         };
         let state = match frame["state"].as_str() {
             Some("started" | "completed") => UserMessageState::Sent,
-            Some("cancelled") => UserMessageState::Cancelled,
+            // Withdrawn by our ✕ (its `cancel_async_message` is still in
+            // flight: this frame lands before the answer). A cancel we did
+            // not ask for — the CLI sweeping its queue — is not the user
+            // taking it back: the message was never delivered, so say so.
+            Some("cancelled") => {
+                let ours = self
+                    .pending_controls
+                    .values()
+                    .any(|p| matches!(p, PendingControl::CancelQueued(q) if q == id));
+                if ours {
+                    UserMessageState::Cancelled
+                } else {
+                    UserMessageState::Dropped
+                }
+            }
             Some("discarded" | "refused") => UserMessageState::Dropped,
             _ => return,
         };
@@ -3264,6 +3304,7 @@ impl ClaudeMapper {
                 // after everything the finished turn wrote. A message folded
                 // into a running turn is not one (the same rule as a steered
                 // codex message).
+                self.turn_starting = true;
                 let preceding = self.last_msg_uuid.replace(id.clone());
                 step.events.push(AgentEvent::Checkpoint {
                     user_message_id: id.clone(),
@@ -3303,8 +3344,8 @@ impl ClaudeMapper {
             self.minted_uuids.pop_front();
         }
         // Mid-turn — or in the gap before the CLI starts a turn with messages
-        // it has not read yet — this one waits too.
-        let queued = self.turn_active || !self.awaiting_read.is_empty();
+        // it has not read yet, or is starting one — this one waits too.
+        let queued = self.turn_active || self.turn_starting || !self.awaiting_read.is_empty();
         step.events.push(AgentEvent::UserMessage {
             text: text.clone(),
             attachments,
@@ -3996,6 +4037,7 @@ impl ClaudeMapper {
         }
         let turn_id = self.turn_id();
         self.turn_active = false;
+        self.turn_starting = false;
         self.settle_compaction_at_turn_end();
         self.interrupt_requested = false;
         // Same per-turn cleanup a real result performs — the interrupted
@@ -5606,6 +5648,71 @@ pub(crate) mod tests {
         assert_eq!(m.queued_sends.len(), 1);
     }
 
+    /// A `cancelled` the user did not ask for (the CLI sweeping its queue)
+    /// is not a pull-back: the message reads "not delivered", never vanishes.
+    #[test]
+    fn native_queue_unrequested_cancel_is_not_delivered() {
+        let mut m = native_mapper_mid_turn();
+        let (b, _) = send_text(&mut m, "B", false);
+        assert!(matches!(
+            &m.on_frame(&lifecycle(&b, "cancelled")).events[..],
+            [AgentEvent::UserMessageUpdate {
+                state: UserMessageState::Dropped,
+                ..
+            }]
+        ));
+    }
+
+    /// Between a waiting message's `started` (it opens the next turn) and
+    /// that turn's first frame, a new send waits too — it neither opens a
+    /// turn of its own nor claims delivery. A `result` listing a message whose
+    /// `started` never came resolves it.
+    #[test]
+    fn native_queue_turn_opening_gap_and_result_backstop() {
+        let mut m = native_mapper_mid_turn();
+        let (b, _) = send_text(&mut m, "B", true);
+        m.on_frame(&json!({
+            "type": "result", "is_error": false,
+            "usage": { "output_tokens": 1 }, "duration_ms": 10,
+        }));
+        m.on_frame(&lifecycle(&b, "started"));
+        let (c, step) = send_text(&mut m, "C", false);
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::UserMessage { queued: true, .. }
+        ));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnStarted { .. })),
+            "no turn of its own"
+        );
+        assert_eq!(step.outbound[0]["priority"], "next");
+        // B's turn streams, then ends listing C as consumed with no `started`.
+        m.on_frame(&json!({
+            "type": "stream_event",
+            "event": { "type": "content_block_delta",
+                       "delta": { "type": "text_delta", "text": "ok" } },
+        }));
+        let step = m.on_frame(&json!({
+            "type": "result", "is_error": false,
+            "usage": { "output_tokens": 1 }, "duration_ms": 10,
+            "user_message_uuids": [b, c],
+        }));
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == c
+        )));
+        assert!(m.awaiting_read.is_empty());
+        // Idle again: a send opens a fresh turn.
+        let (_, step) = send_text(&mut m, "D", false);
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::UserMessage { queued: false, .. }
+        ));
+    }
+
     /// The process died with messages in its queue: they were never read.
     #[test]
     fn native_queue_drops_unread_messages_at_teardown() {
@@ -5847,12 +5954,13 @@ pub(crate) mod tests {
             .unwrap();
         assert!(abort_pos < sent_pos, "abort first, then the flush");
 
-        // The flag is consumed: a later genuine failure stays a failure.
-        m.on_command(AgentCommand::Send {
-            blocks: vec![ContentBlock::Text {
-                text: "again".into(),
-            }],
-        });
+        // The flushed message's turn streams; then the flag is consumed: a
+        // later genuine failure of that turn stays a failure.
+        m.on_frame(&json!({
+            "type": "stream_event",
+            "event": { "type": "content_block_delta",
+                       "delta": { "type": "text_delta", "text": "ok" } },
+        }));
         let step = m.on_frame(&json!({ "type": "result", "is_error": true }));
         assert!(
             step.events.iter().any(|e| matches!(

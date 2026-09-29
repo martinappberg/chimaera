@@ -2610,7 +2610,9 @@ The maintainer noticed that Claude Code reads queued messages inside a running t
 - **claude**:
   - With `msg_lifecycle_v1` on the latest init, a mid-turn send is written at once with `priority: "next"` (`"later"` for `SendAfterTurn`) and waits in `awaiting_read`.
   - `command_lifecycle started` resolves it `sent`. Mid-turn it gets no `Checkpoint`. As a turn opener it gets a `Checkpoint` anchored after the finished turn.
-  - `cancelled` (never started) → `Cancelled`; `discarded`/`refused` → `dropped`. Teardown drops what was never read.
+  - `cancelled` (never started) → `Cancelled` only while our own `cancel_async_message` for it is in flight (the frame lands before the answer). A cancel we did not ask for — the CLI sweeping its queue — is `dropped`, never a silent vanish. `discarded`/`refused` → `dropped`. Teardown drops what was never read.
+  - A turn opener's `started` sets `turn_starting` until that turn's first frame. Model latency makes this gap seconds long, right after Send now especially, and a send inside it waits instead of opening a turn of its own (codex's `turn_pending`). The fallback's flush sets it too.
+  - Backstop for a `started` that never arrives: a `result`'s `user_message_uuids` resolves any listed message still waiting.
   - ✕ → `cancel_async_message`. Send now → interrupt.
   - A send made before the first init is held and handed over when init advertises the queue. A CLI without the capability keeps Pass 13's hold-until-flush, whose flushed messages now take their `Checkpoint` at the flush.
 - **codex**:
@@ -2618,6 +2620,8 @@ The maintainer noticed that Claude Code reads queued messages inside a running t
   - The RPC answer parks it in `unread_steers`; its `userMessage` item resolves it `sent`.
   - Every turn end moves unread steers to `deferred_steer_redrives`. `start_next_queued` now opens the next turn with ALL deferred messages merged into one `turn/start` input, in request order: the first message is the turn and the rewind boundary, and each resolves `sent`.
   - A late steer ack after its turn ended re-drives too, unless the item already arrived (`read_before_answer`).
+  - A steer the running turn refuses without a turn-id mismatch is deferred to the next turn, never dropped. That covers "no active turn to steer" arriving before `turn/completed`, and "cannot steer a compact/review turn" (`activeTurnNotSteerable`). So does a second refusal after the one turn-id retry.
+  - That codex also drops unread steers at a NORMAL completion is inferred from its loop (pending input feeds another round before a turn completes) and from the interrupt probe, not observed. If a later codex carried leftover input into its next turn, re-driving it would deliver it twice. Re-probe on a version bump.
   - `SendAfterTurn` → the next-run FIFO (one per turn, as Pass 21).
   - Send now → `turn/interrupt`; an after-turn entry joins the re-driven batch.
   - ✕ on a steered message is a Notice (it can't be withdrawn).
@@ -2625,6 +2629,10 @@ The maintainer noticed that Claude Code reads queued messages inside a running t
   - Plain Enter reads at the next step. ⌥↩ / Alt+Enter sends after the turn (⇧⌘↩ is Zoom Pane).
   - Captions read "next step" / "after this turn". Send now and ✕ are on every waiting bubble.
   - A block resolved `sent` while a turn runs is `midTurn`, and the turn-end artifact scan looks past it.
+- **Server:**
+  - Rewind (`find_fork_cut`) now tombstones EVERY queued echo before the cut whose delivery is not also before it: a whole batch that opened the cut turn, and messages still waiting.
+  - The "checkpoint right after its own echo" shortcut matches the echo's id. Id-less pre-upgrade echoes still count as their checkpoint's own.
+  - The Timeline (`episodes.rs`) no longer titles the next turn with a message read mid-turn.
 
 #### Gate (Pass 38)
 
