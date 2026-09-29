@@ -1811,6 +1811,8 @@ async fn a_waking_terminal_holds_one_burst_and_refuses_the_rest() {
         assert_ne!(frame["type"], "ready", "the owner is still waking");
         if frame["type"] == "error" {
             assert_eq!(frame["reason"], "waking", "{frame}");
+            // Where the refused typing would have run: a cloud machine.
+            assert_eq!(frame["owner"], "cloud", "{frame}");
             break;
         }
     }

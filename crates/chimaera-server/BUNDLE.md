@@ -107,7 +107,8 @@ the periodic ledger reconcile keeps its cheaper write.
 Clean transfer resumes the same native conversation. Offline takeover requests
 the CLI's native head fork: Claude `--fork-session`, Codex `thread/fork` without
 `lastTurnId`, or Codex TUI `fork <id>`. Native transcript IDs are never rewritten.
-Structured chats receive one attributed `moved`/`home` context message only when
+Structured chats receive one attributed `moved`/`home` context message (`recovered`
+after the other machine stopped responding) only when
 the captured carryover records an interrupted turn or background work. Finished
 conversations resume idle, preserving history without starting a model turn.
 Fresh MCP initialization supplies current-host context for configured cloud
@@ -120,7 +121,7 @@ machines; after an abrupt loss it also asks to check what already happened); an
 idle TUI resumes with no prompt and no model turn. The Mastermind remains
 reactive and receives no automatic turn.
 
-Plain terminals remain on the source laptop. Their moved bundle imports as a
+Plain terminals stay on the user's computer. Their moved bundle imports as a
 paused row, preserving tabs without restarting arbitrary foreground programs.
 Returning a shell home recreates its shell at the recorded cwd. A terminal's cwd
 is kept inside the project (`bundle::clamp_into`): on export a shell that left
@@ -140,7 +141,7 @@ single-session routes still refuse at once.
 
 A paused row is named by its pinned name, else its conversation title, else
 words for where it is shown: on a cloud machine "Terminal on your computer"
-(a moved shell) or "Starting here" (an agent waiting to start); on a computer
+(a moved shell) or "Starting in the cloud" (an agent waiting to start); on a computer
 "Continuing in the cloud" when another owner holds the project, otherwise
 "Paused".
 

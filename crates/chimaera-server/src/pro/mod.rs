@@ -508,6 +508,24 @@ pub(crate) fn ownership_phase(state: &crate::AppState, workspace: &str) -> Phase
         Some(Ownership::Hydrating { .. } | Ownership::SettingUp { .. }) => Phase::Arriving,
     }
 }
+/// Where a project's work runs now, in a client's words: `"cloud"` (a cloud
+/// machine) or `"computer"` (the user's own computer). The additive `owner`
+/// of the `read_only` and `workspace_owned_elsewhere` refusals, so a client
+/// can say "running in the cloud" instead of guessing. A cloud machine's only
+/// other owner is the user's computer and a computer's is the cloud (a second
+/// computer has no viewer yet) — the rule `ws::classify_pause` also applies;
+/// a project arriving here, or verifying after a restart, runs here.
+pub(crate) fn owner_kind(state: &crate::AppState, workspace: &str) -> &'static str {
+    let (here, away) = if execution::worker(state) {
+        ("cloud", "computer")
+    } else {
+        ("computer", "cloud")
+    };
+    match ownership_phase(state, workspace) {
+        Phase::Elsewhere | Phase::Leaving => away,
+        Phase::Here | Phase::Verifying | Phase::Arriving => here,
+    }
+}
 /// Whether this session waits at boot for this life's ownership proof.
 pub(crate) fn restart_deferred(state: &crate::AppState, session_id: &str) -> bool {
     crate::lock(&state.pro.boot_deferred).contains(session_id)
@@ -763,16 +781,18 @@ pub(crate) fn sweep_leftovers(state: &std::sync::Arc<crate::AppState>) {
     });
 }
 
-/// A paused row's name where nothing better exists, in words for where it is
-/// shown: a cloud machine holds terminals that stay with your computer; a
-/// computer shows work the cloud is continuing, or work about to resume.
+/// A paused row's name where nothing better exists, in words that read the
+/// same wherever it is shown (a viewer sees a cloud machine's rows too, so
+/// never "here"): a cloud machine holds terminals that stay with your
+/// computer and agents about to start in the cloud; a computer shows work the
+/// cloud is continuing, or work about to resume.
 pub(crate) fn paused_label(
     state: &crate::AppState,
     entry: &crate::ledger::LedgerEntry,
 ) -> &'static str {
     if execution::worker(state) {
         return if entry.agent.is_some() {
-            "Starting here"
+            "Starting in the cloud"
         } else {
             "Terminal on your computer"
         };
@@ -1015,6 +1035,35 @@ mod tests {
             crate::lock(&state.pro.ownership).insert("w-a".into(), owner);
             assert_eq!(ownership_phase(&state, "w-a"), phase);
         }
+        crate::lock(&state.pro.ownership).insert(
+            "w-a".into(),
+            Ownership::Remote {
+                epoch: 2,
+                holder: "worker-a".into(),
+            },
+        );
+        assert_eq!(
+            owner_kind(&state, "w-a"),
+            "cloud",
+            "a computer's other owner"
+        );
+        assert_eq!(owner_kind(&state, "w-unknown"), "computer", "runs here");
+        crate::lock(&state.pro.ownership).insert("w-a".into(), Ownership::Hydrating { epoch: 3 });
+        assert_eq!(owner_kind(&state, "w-a"), "computer", "arriving here");
+        execution::worker_fixture(&state);
+        assert_eq!(owner_kind(&state, "w-a"), "cloud", "a cloud machine's own");
+        crate::lock(&state.pro.ownership).insert(
+            "w-a".into(),
+            Ownership::Remote {
+                epoch: 4,
+                holder: "d-home".into(),
+            },
+        );
+        assert_eq!(
+            owner_kind(&state, "w-a"),
+            "computer",
+            "a cloud machine's other owner"
+        );
         assert!(!restart_deferred(&state, "s-a"));
         defer_boot_session(&state, "s-a");
         assert!(restart_deferred(&state, "s-a"));

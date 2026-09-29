@@ -131,7 +131,15 @@ cannot be delivered is answered, never dropped: each chat command gets
 composer); typing gets `read_only` with `reason:"reconnecting"`. Every chat
 refusal carries the additive `command` it answers (`send`, `interrupt`,
 `permission`…), and a client restores a draft only for `command:"send"`.
-Nothing is resent automatically.
+Nothing is resent automatically. Every `read_only` refusal (`reason`:
+`watching`, `elsewhere`, `busy`, `waking`, `reconnecting`) and every HTTP
+`409 {"error":"workspace_owned_elsewhere"}` also carry the additive
+`owner: "cloud" | "computer"`: where the project's work runs now, so a client
+can say "running in the cloud" / "running on your computer" without guessing.
+An owning daemon names its recorded owner (the other machine while another
+owner holds the project — a cloud machine's other owner is the user's
+computer, a computer's is the cloud — else itself); a viewing daemon's relay
+names its route's owner (a `worker-` route is the cloud).
 
 A session with no process where a viewer asks is not an exit, and its owning
 daemon says why (additively; older clients ignore both and reconnect):

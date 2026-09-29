@@ -980,9 +980,10 @@ pub(crate) async fn api_proxy(
         if incoming.method() != axum::http::Method::GET
             && id.is_some_and(|id| !crate::ws::session_writable(&state, id))
         {
+            let owner = crate::ws::session_owner(&state, id.unwrap_or_default());
             return (
                 StatusCode::CONFLICT,
-                Json(json!({"error":"workspace_owned_elsewhere"})),
+                Json(json!({"error":"workspace_owned_elsewhere","owner":owner})),
             )
                 .into_response();
         }
@@ -1610,6 +1611,15 @@ impl Link<'_> {
         }
         (text.to_owned(), false)
     }
+    /// Where this socket's owner is: a cloud machine (`worker-` route) or a
+    /// computer — the additive `owner` of this relay's `read_only` refusals.
+    fn owner(&self) -> &'static str {
+        if self.route.host_id.starts_with("worker-") {
+            "cloud"
+        } else {
+            "computer"
+        }
+    }
     /// Where the session continues after its project changed owner.
     fn moved(&self) -> Value {
         let to = match self.state.session_proxy.for_session(&self.session) {
@@ -1635,7 +1645,7 @@ impl Link<'_> {
                 refused,
             )
         } else {
-            json!({"type":"error","code":"read_only","reason":"waking",
+            json!({"type":"error","code":"read_only","reason":"waking","owner":self.owner(),
                 "message":"Waking the cloud machine… That input was not sent."})
         };
         bounded_send(downstream, Down::Text(frame.to_string().into())).await
@@ -1655,7 +1665,7 @@ impl Link<'_> {
                 bounded_send(downstream, Down::Text(answer.to_string().into())).await?;
             }
         } else if refused.peek().is_some() {
-            let frame = json!({"type":"error","code":"read_only","reason":"reconnecting",
+            let frame = json!({"type":"error","code":"read_only","reason":"reconnecting","owner":self.owner(),
                 "message":"Your project is reconnecting. That input was not sent."});
             bounded_send(downstream, Down::Text(frame.to_string().into())).await?;
         }
