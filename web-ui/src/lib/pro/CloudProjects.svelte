@@ -87,6 +87,7 @@
   button { background: transparent; color: var(--fg); border: 1px solid var(--edge); border-radius: 6px; padding: 6px 10px; font: inherit; font-size: var(--text-sm); cursor: pointer; flex: none; }
   button:disabled { opacity: .5; cursor: default; }
   button:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 3px; }
+  @media (pointer: coarse) { button { min-height: 40px; padding: 9px 12px; } }
   .error { color: var(--warn); font-size: var(--text-sm); }
   @media (max-width: 480px) { .project { align-items: flex-start; flex-direction: column; gap: 10px; } }
 </style>

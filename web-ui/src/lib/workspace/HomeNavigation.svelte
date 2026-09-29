@@ -44,12 +44,15 @@
   button:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
   .utilities { margin-top: auto; display: flex; flex-direction: column; gap: 4px; }
   @media (max-width: 700px) {
-    .home-navigation { width: 100%; flex: none; display: grid; grid-template-columns: 1fr auto; gap: 18px 8px; padding: 48px 16px 12px; border-right: 0; border-bottom: 1px solid var(--edge); }
+    .home-navigation { width: 100%; flex: none; display: grid; grid-template-columns: 1fr auto; gap: 14px 8px; padding: 14px 16px 10px; border-right: 0; border-bottom: 1px solid var(--edge); }
+    /* Only the macOS overlay titlebar needs clearance for its traffic lights. */
+    :global(.native-titlebar-overlay) .home-navigation { padding-top: 48px; }
     .brand { padding: 0; }
     .home-link { grid-row: 2; width: fit-content; }
     .utilities { grid-row: 2; grid-column: 2; margin: 0; flex-direction: row; gap: 2px; }
     .utilities button { width: auto; padding: 9px 8px; gap: 6px; }
     .utilities button svg { display: none; }
+    button { min-height: 40px; }
   }
   @media (max-width: 380px) {
     .home-navigation { padding-left: 12px; padding-right: 12px; }

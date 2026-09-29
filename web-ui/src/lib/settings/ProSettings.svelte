@@ -476,6 +476,7 @@
   .error { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 18px; padding: 15px; border-radius: 8px; background: color-mix(in srgb, var(--warn) 8%, transparent); color: var(--warn); }
   .error span { flex: 1; min-width: 160px; }
   @container (max-width: 660px) { .purchase { align-items: flex-start; flex-direction: column; gap: 12px; } }
+  @media (pointer: coarse) { button, summary { min-height: 40px; } .text-button { padding: 8px 0; } }
   @container (max-width: 460px) { .plan-options, .included ul { grid-template-columns: 1fr; } .plan-card, .panel { padding: 21px; } .interval { width: 100%; } .interval button { flex: 1; } }
   @media (max-width: 760px) { .pro { padding: 30px 25px 44px; } .purchase { align-items: flex-start; flex-direction: column; gap: 12px; } }
   @media (max-width: 520px) { .pro { padding: 26px 20px 36px; } .heading { margin-bottom: 27px; } .brand { margin-bottom: 24px; font-size: 21px; } .plan-options, .included ul { grid-template-columns: 1fr; } .plan-card, .panel { padding: 21px; } .interval { width: 100%; } .interval button { flex: 1; } .plan-price { margin-top: 20px; } }

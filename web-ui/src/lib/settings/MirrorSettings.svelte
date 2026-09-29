@@ -96,15 +96,19 @@
 </div>
 <style>
   .mirrors { border-top: 1px solid var(--edge); padding: 18px 14px 0; margin-top: 18px; }
-  h3 { font-size: 13px; margin: 0 0 8px; }
-  .hint { color: var(--muted); font-size: 12px; line-height: 1.55; }
+  h3 { font-size: var(--text-sm); margin: 0 0 8px; }
+  .hint { color: var(--muted); font-size: var(--text-xs); line-height: 1.55; }
   details { border: 1px solid var(--edge); border-radius: 8px; margin: 10px 0; }
   summary { cursor: pointer; padding: 12px; }
+  summary:focus-visible, .btn:focus-visible, input:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
   .title { font-weight: 600; margin-right: 12px; }
   .project { padding: 0 12px 14px; display: flex; flex-direction: column; gap: 10px; }
-  .path { font-family: var(--font-mono); font-size: 11px; color: var(--muted); overflow-wrap: anywhere; margin: 0; }
-  .check { display: flex; gap: 8px; align-items: center; font-size: 12px; }
-  .btn { align-self: flex-start; border: 1px solid var(--edge); border-radius: 5px; background: var(--term-bg); color: var(--fg); padding: 6px 10px; cursor: pointer; }
+  .path { font-family: var(--mono); font-size: var(--text-xs); color: var(--muted); overflow-wrap: anywhere; margin: 0; }
+  .check { display: flex; gap: 8px; align-items: center; font-size: var(--text-xs); }
+  input { accent-color: var(--accent); }
+  .btn { align-self: flex-start; border: 1px solid var(--edge); border-radius: 6px; background: transparent; color: var(--fg); padding: 6px 10px; font: inherit; font-size: var(--text-sm); cursor: pointer; }
+  .btn:hover:not(:disabled) { background: var(--row-hover); }
   .btn:disabled { opacity: .5; cursor: default; }
-  .error { color: var(--warn); font-size: 12px; overflow-wrap: anywhere; }
+  .error { color: var(--warn); font-size: var(--text-xs); overflow-wrap: anywhere; }
+  @media (pointer: coarse) { summary, .btn, .check { min-height: 40px; } .btn { padding: 9px 12px; } }
 </style>

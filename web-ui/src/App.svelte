@@ -6000,11 +6000,6 @@
   .home-settings-back:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
   .home-surface-divider, .home-back-hint { color: var(--muted); }
   .home-back-hint { margin-left: auto; font-size: var(--text-xs); }
-  @media (max-width: 700px) {
-    .home-settings-shell { flex-direction: column; }
-    .home-settings-surface { padding: 16px 14px 14px; gap: 8px; }
-    .home-back-hint { display: none; }
-  }
   .home-settings-content {
     position: relative;
     flex: 1;
@@ -6012,6 +6007,14 @@
     overflow: hidden;
     border: 1px solid var(--edge);
     border-radius: 8px;
+  }
+  /* On a phone the navigation bar above already says where you are: drop
+     the breadcrumb and the card frame so the page gets the whole width. */
+  @media (max-width: 700px) {
+    .home-settings-shell { flex-direction: column; }
+    .home-settings-surface { padding: 0; gap: 0; }
+    .home-surface-nav { display: none; }
+    .home-settings-content { border: 0; border-radius: 0; }
   }
 
   .shell {

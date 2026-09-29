@@ -306,7 +306,7 @@
     </section>
     {:else if connection.phase === "connected"}{#if confirmedSuccess}<p class="connection-success" role="status">{connectingLabel} is connected for cloud work.</p>{/if}{:else}
     <section class="connection" aria-label={`Connect ${connectingLabel}`} tabindex="-1" bind:this={connectionElement}>
-      <div class="heading"><h3>{connection.phase === "failed" ? "Sign-in needs attention" : connection.phase === "expired" ? "Sign-in expired" : connection.phase === "canceled" ? "Sign-in canceled" : `Connect ${connectingLabel}`}</h3>{#if waiting}<span class="phase" role="status">{connection.phase === "preparing" ? "Preparing sign-in…" : connection.phase === "verifying" ? "Confirming connection…" : "Waiting for sign-in"}</span>{/if}</div>
+      <div class="heading">{#if !waiting}<h3>{connection.phase === "failed" ? "Sign-in needs attention" : connection.phase === "expired" ? "Sign-in expired" : connection.phase === "canceled" ? "Sign-in canceled" : `Connect ${connectingLabel}`}</h3>{/if}{#if waiting}<span class="phase" role="status">{connection.phase === "preparing" ? "Preparing sign-in…" : connection.phase === "verifying" ? "Confirming connection…" : "Waiting for sign-in"}</span>{/if}</div>
       {#if ["failed", "expired", "canceled"].includes(connection.phase)}<p class="muted">{connectionError(connection.phase === "failed" ? connection.error_code : connection.phase)}</p><button class="button" disabled={!canStart} onclick={() => void connect(connection!.provider_id)}>Try again</button>
       {:else if connection.phase === "preparing"}<p class="muted" role="status">Preparing {connectingLabel} for sign-in. This happens automatically and may take a moment.</p>
       {:else if connection.phase === "verifying"}<p class="muted" role="status">Confirming your connection with {connectingLabel}…</p>
@@ -347,12 +347,12 @@
 </section>
 
 <style>
-  .connection-success { margin: 18px 0 0; color: var(--success, var(--accent)); font-size: var(--text-sm); }
+  .connection-success { margin: 18px 0 0; color: var(--accent); font-size: var(--text-sm); }
   .authorization { margin-top: 24px; }
   .authorization label { display: block; margin-bottom: 9px; font-size: var(--text-sm); font-weight: 550; }
   .authorization-row { display: flex; gap: 10px; flex-wrap: wrap; }
   .authorization input { flex: 1 1 200px; min-width: 0; padding: 10px 12px; border: 1px solid var(--edge); border-radius: 7px; color: var(--fg); background: var(--bg); font: inherit; }
-  .authorization input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .authorization input:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
   .management { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; padding: 2px 0; background: transparent; border: 0; color: var(--fg); font: inherit; text-align: left; cursor: pointer; }
   .management strong { display: block; font-size: var(--text-sm); font-weight: 550; }
   .management-state { display: block; color: var(--muted); font-size: var(--text-xs); margin-top: 5px; }
@@ -408,4 +408,5 @@
   .repository p { margin: 4px 0 0; }
   .error { color: var(--warn); font-size: var(--text-sm); line-height: 1.65; margin: 15px 0 0; overflow-wrap: anywhere; }
   @media (max-width: 520px) { .provider-card, .connection { padding: 18px; } h2 { font-size: 20px; } .code-row { gap: 10px; } code { font-size: 23px; } }
+  @media (pointer: coarse) { .button, .management, summary { min-height: 40px; } .text-button { min-height: 40px; padding: 8px 0; } }
 </style>
