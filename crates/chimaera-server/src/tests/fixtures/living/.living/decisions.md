@@ -53,3 +53,9 @@ Append-only log of non-obvious decisions and their rationale.
 **Rationale**: Every downstream tool finds the raw matrix by name.
 
 **Tags**: #anndata #provenance
+
+### D-3 — Load lanes at 10k cells (2026-09-19)
+**Date**: 2026-09-19 · **Status**: DECIDED · **Tags**: loading, F-012
+**Context.** F-012 shows doublets plateau past 8k.
+**Decision.** Load 10k cells per lane.
+**Why.** One lane fewer per batch at no doublet cost.
