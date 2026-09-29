@@ -81,6 +81,7 @@ async fn worker(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(if wake { 90 } else { 5 });
     let mut pause = Duration::from_millis(500);
     let mut reconciled: Option<tokio::time::Instant> = None;
+    let mut live_check_failed = false;
     loop {
         let state = app.state::<Shell>();
         if state.pro.generation() != generation {
@@ -102,10 +103,7 @@ async fn worker(
             .values()
             .find(|host| host.kind == HostKind::Worker && host.daemon.is_some())
             .cloned();
-        let hosts = match cached {
-            Some(host) => Ok(vec![host]),
-            None => client.hosts().await,
-        };
+        let hosts = worker_rows(cached, live_check_failed, || client.hosts()).await;
         if let Some(host) = hosts
             .as_ref()
             .ok()
@@ -125,6 +123,7 @@ async fn worker(
                 }
                 return Ok(Some(host));
             }
+            live_check_failed = true;
         }
         if !wake {
             hosts.map_err(|_| "Cloud status is unavailable right now.")?;
@@ -135,6 +134,29 @@ async fn worker(
         }
         tokio::time::sleep(pause).await;
         pause = (pause * 2).min(Duration::from_secs(5));
+    }
+}
+
+/// The worker rows for one poll of the wake wait. The event-fed cache saves an
+/// account read, but with the event stream down a cached row can be stale (a
+/// restarted worker has a new daemon token) and would fail every live check
+/// until the wait times out. After one failed check the account's own list is
+/// read first; the cached row is only a fallback when that read fails.
+async fn worker_rows<F, Fut>(
+    cached: Option<Host>,
+    live_check_failed: bool,
+    read: F,
+) -> anyhow::Result<Vec<Host>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<Host>>>,
+{
+    match cached {
+        Some(host) if !live_check_failed => Ok(vec![host]),
+        cached => match read().await {
+            Ok(hosts) => Ok(hosts),
+            Err(error) => cached.map(|host| vec![host]).ok_or(error),
+        },
     }
 }
 
@@ -459,6 +481,48 @@ fn connection_browser_url(connection: &Value) -> Result<url::Url, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn worker(token: &str) -> Host {
+        Host {
+            id: "w-1".into(),
+            alias: "cloud".into(),
+            kind: HostKind::Worker,
+            status: chimaera_link::HostStatus::Connected,
+            daemon: Some(chimaera_link::Daemon {
+                token: token.into(),
+                build: "b".into(),
+                sessions: 0,
+            }),
+            error: None,
+        }
+    }
+
+    fn token(rows: anyhow::Result<Vec<Host>>) -> String {
+        rows.unwrap()[0].daemon.as_ref().unwrap().token.clone()
+    }
+
+    #[tokio::test]
+    async fn a_cached_worker_row_that_failed_its_live_check_yields_to_the_account() {
+        let unread = || async { unreachable!("a fresh cached row needs no account read") };
+        assert_eq!(
+            token(worker_rows(Some(worker("cached")), false, unread).await),
+            "cached"
+        );
+        let fresh = || async { Ok(vec![worker("fresh")]) };
+        assert_eq!(
+            token(worker_rows(Some(worker("cached")), true, fresh).await),
+            "fresh"
+        );
+        let down = || async { Err(anyhow::anyhow!("account unavailable")) };
+        assert_eq!(
+            token(worker_rows(Some(worker("cached")), true, down).await),
+            "cached"
+        );
+        let fresh = || async { Ok(vec![worker("fresh")]) };
+        assert_eq!(token(worker_rows(None, false, fresh).await), "fresh");
+        let down = || async { Err(anyhow::anyhow!("account unavailable")) };
+        assert!(worker_rows(None, true, down).await.is_err());
+    }
 
     #[test]
     fn successful_handoff_without_content_is_not_a_parse_failure() {
