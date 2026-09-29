@@ -377,11 +377,16 @@ export class Buffer {
   }
 
   private afterChange(ours: boolean): void {
+    const wasDirty = this.dirty;
     this.refreshDirty();
     if (!ours) {
       // The user typed: the merge notice has done its job.
       this.clearNotice();
       this.scheduleAutosave();
+      // Typed or undone back to the disk text: a draft already journaled
+      // holds edits the user took back, and the next open would offer them.
+      // (The buffer's own reload/merge/restore callers clear for themselves.)
+      if (wasDirty && !this.dirty) this.afterClean();
     }
     if (this.dirty) this.scheduleJournal();
   }
@@ -726,7 +731,7 @@ export class Buffer {
       state: this.st,
       dispatch: (tr: Transaction) => {
         this.st = tr.state;
-        this.afterChange(true);
+        this.afterChange(false);
       },
     };
     undo(target);
@@ -850,6 +855,11 @@ export class Buffer {
     if (!this.dirty) {
       this.savedCount++;
       this.afterClean();
+    } else if (this.journalTimer === null) {
+      // Taken back to the old text while the save was in flight (keys typed
+      // meanwhile scheduled their own): unsaved against the new base, and
+      // that edit's clean moment cleared the draft.
+      this.scheduleJournal();
     }
   }
 
@@ -952,6 +962,19 @@ export class Buffer {
     const rec = this.recovered;
     if (rec === null || !this.editable) return;
     this.recovered = null;
+    this.applyDraft(rec);
+    if (this.dirty) {
+      // It is this window's edit now: journal it as ours at once, so an undo
+      // straight back to the disk text drops the record by writer rather
+      // than leaving the old writer's copy to be offered again.
+      void this.journal();
+    } else {
+      // Merged to exactly the disk text: nothing left to recover.
+      this.clearDraft(this.path, { writer: rec.writer, text: rec.text });
+    }
+  }
+
+  private applyDraft(rec: drafts.DraftRecord): void {
     const sameBase =
       (rec.baseHash !== "" && this.baseHash !== null && rec.baseHash === this.baseHash) ||
       (rec.baseText !== null && rec.baseText === this.baseText);
