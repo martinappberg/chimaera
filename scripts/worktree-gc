@@ -24,11 +24,16 @@
 # reuse folders (.claude/worktrees/<name>, ~/.codex/worktrees/<id>/<repo>)
 # for unrelated sessions. Every `git worktree list` entry lands in one group:
 #
-#   ACTIVE  a process has its cwd or an open file inside it; something in it
-#           changed in the last --active-hours; it is `git worktree lock`ed;
-#           or this script runs from it. Never touched.
+#   ACTIVE  a process has its cwd or an open file inside it; it is
+#           `git worktree lock`ed; this script runs from it; or something in
+#           it changed in the last --active-hours — unless its PR is merged
+#           (below). Never touched.
 #   REMOVE  its PR is merged or closed, or its HEAD is already in origin/main;
 #           AND no uncommitted changes AND no unpushed commits AND not ACTIVE.
+#           A merged PR skips the --active-hours wait when the checkout's own
+#           commits (not in origin/main) are all in it: merged, clean and
+#           pushed leaves nothing in progress to protect, and archiving a
+#           session (the Claude app detaches its branch) reads as a fresh change.
 #           `git worktree remove` (never --force), then `git worktree prune`.
 #           The branch is kept.
 #   TRIM    not removable, and idle for more than --idle-hours: its build
@@ -293,22 +298,33 @@ fetch_and_prs() {
 }
 
 # The PR for a branch (or, for a detached HEAD, the PR whose head is that
-# commit): "STATE NUMBER OID". Open beats merged beats closed; newest first.
-pr_for() { # branch head
-  awk -F'\t' -v b="$1" -v h="$2" '
-    (b != "" && $1 == b) || (b == "" && $4 == h) {
+# commit or whose branch still points at it — the Claude app detaches an
+# archived session's branch, and the PR's head may have moved on since):
+# "STATE NUMBER OID". Open beats merged beats closed; newest first.
+pr_for() { # branch head [space-separated local branches at head]
+  awk -F'\t' -v b="$1" -v h="$2" -v at="${3:-}" '
+    BEGIN { n = split(at, a, " "); for (i = 1; i <= n; i++) here[a[i]] = 1 }
+    (b != "" && $1 == b) || (b == "" && ($4 == h || $1 in here)) {
       rank = ($2 == "OPEN") ? 0 : ($2 == "MERGED") ? 1 : 2
       print rank "\t" $3 "\t" $2 "\t" $4 }' "$TMPD/prs" | sort -t "$(printf '\t')" -k1,1n -k2,2nr | head -1 |
     awk -F'\t' '{ print $3 " " $2 " " $4 }'
 }
 
+head_state() { # path → HEAD's commit and the branch it names (none when detached)
+  git -C "$1" rev-parse HEAD 2>/dev/null
+  git -C "$1" symbolic-ref -q HEAD 2>/dev/null
+  return 0
+}
+
 # --------------------------------------------------------------- classify ---
 
 # Writes $TMPD/rows: group \t kb \t branch \t pr \t dirty \t unpushed \t idle \t path \t reason
-# and $TMPD/b.<n> (the build dirs of worktree n) for --apply.
+# and $TMPD/b.<n> (the build dirs of worktree n) for --apply, plus $TMPD/m.<n>
+# (its HEAD) when a merged PR made it removable.
 classify() {
   local n=0 path rpath head branch locked prunable gd sizekb idle_s mt reason group
   local pr prs prn proid dirty unpushed in_base removable why extra lockpid self_rp
+  local recent merged at_head
   self_rp=$(realdir "$CUR")
   local claude_rp="" script_rp
   script_rp=$(realdir "$HERE")
@@ -318,7 +334,7 @@ classify() {
     n=$((n + 1))
     [ "$branch" = "-" ] && branch=""
     : >"$TMPD/b.$n"
-    reason="" group="" sizekb=0 pr="-" dirty="-" unpushed="-" idle="-"
+    reason="" recent="" group="" sizekb=0 pr="-" dirty="-" unpushed="-" idle="-"
     if [ ! -d "$path" ]; then
       printf 'REMOVE\t0\t%s\t-\t-\t-\t-\t%s\t%s\t%s\n' "${branch:-(detached)}" "$path" "directory is gone; git worktree prune clears the entry" "$n" >>"$TMPD/rows"
       continue
@@ -352,15 +368,18 @@ classify() {
       reason="cannot read its files' times: assumed in use"
     else
       reason=$(proc_reason "$rpath")
+      # Settled below: a merged PR overrides a recent change.
       if [ -z "$reason" ] && [ "$idle_s" -lt $((ACTIVE_HOURS * 3600)) ]; then
-        reason="changed $idle ago (< ${ACTIVE_HOURS}h)"
+        recent="changed $idle ago (< ${ACTIVE_HOURS}h)"
       fi
     fi
     [ -n "$reason" ] && group=ACTIVE
 
     # Git state (read-only; GIT_OPTIONAL_LOCKS=0).
     dirty=$(git -C "$path" status --porcelain --untracked-files=normal 2>/dev/null | wc -l | tr -d ' ') || dirty="?"
-    prs=$(pr_for "$branch" "$head")
+    at_head=""
+    [ -n "$branch" ] || at_head=$(git -C "$path" for-each-ref --points-at HEAD --format='%(refname)' refs/heads 2>/dev/null | sed 's|^refs/heads/||' | tr '\n' ' ')
+    prs=$(pr_for "$branch" "$head" "$at_head")
     prn="" proid=""
     if [ -n "$prs" ]; then
       set -- $prs
@@ -382,9 +401,23 @@ classify() {
     git -C "$path" merge-base --is-ancestor HEAD "$BASE" 2>/dev/null && in_base=1
 
     if [ -z "$group" ]; then
-      removable="" why=""
+      removable="" why="" merged=0
+      # This checkout IS the merged PR: it has commits of its own (not in
+      # main), and they all sit in the PR's head — which may have moved on
+      # after this checkout last pushed. A fresh worktree whose HEAD is in main
+      # (at a PR's fork point, or at a fast-forwarded PR head) is not.
+      case "$pr" in
+        MERGED*)
+          if [ "$in_base" = 0 ] && git -C "$path" merge-base --is-ancestor HEAD "$proid" 2>/dev/null; then
+            merged=1
+          fi
+          ;;
+      esac
       if [ "$path" = "$(head -1 "$TMPD/wts" | cut -f1)" ]; then
         why="main checkout"
+        merged=0
+      elif [ "$merged" = 1 ]; then
+        removable="PR #$prn merged"
       elif [ "$in_base" = 1 ]; then
         removable="HEAD is in $BASE"
       else
@@ -410,8 +443,14 @@ classify() {
           removable=""
         fi
       fi
-      if [ -n "$removable" ]; then
+      # A recent change keeps a worktree ACTIVE unless its PR is merged. A
+      # closed PR may be reopened, and a new worktree branched from main has
+      # its HEAD in main before anyone has worked in it.
+      if [ -n "$recent" ] && { [ -z "$removable" ] || [ "$merged" != 1 ]; }; then
+        group=ACTIVE reason=$recent
+      elif [ -n "$removable" ]; then
         group=REMOVE reason="$removable; clean; nothing unpushed"
+        [ "$merged" = 1 ] && head_state "$path" >"$TMPD/m.$n"
       elif [ "$idle_s" -ge $((IDLE_HOURS * 3600)) ] && [ -s "$TMPD/b.$n" ]; then
         group=TRIM reason="idle $idle; $why"
       elif [ "$idle_s" -ge $((IDLE_HOURS * 3600)) ]; then
@@ -480,12 +519,19 @@ codex_stubs() {
 # ------------------------------------------------------------------- apply ---
 
 # Re-check right before acting: processes and mtimes move while we work.
+# A merged PR's worktree does not wait on mtimes (archiving a session bumps
+# them), so for it the check is that HEAD has not moved: no new commit, no
+# other branch checked out.
 still_idle() { # n path rpath
   local mt
   scan_processes
   [ "$PROC_SRC" != none ] || return 1
   [ -z "$(proc_reason "$3")" ] || return 1
   git -C "$HERE" worktree list --porcelain | awk -v p="$2" '$0 == "worktree " p { f = 1; next } /^worktree / { f = 0 } f && /^locked/ { exit 1 }' || return 1
+  if [ -s "$TMPD/m.$1" ]; then
+    [ "$(head_state "$2")" = "$(cat "$TMPD/m.$1")" ]
+    return
+  fi
   mt=$(newest_mtime "$2" "$(cd "$2" && git rev-parse --absolute-git-dir 2>/dev/null)" "$TMPD/b.$1")
   [ -n "$mt" ] && [ $(($(date +%s) - mt)) -ge $((ACTIVE_HOURS * 3600)) ]
 }
