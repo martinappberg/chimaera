@@ -75,6 +75,9 @@ pub(crate) struct GitService {
     pub(super) procs: Arc<Semaphore>,
     /// Per-workspace single-flight + short reuse for status runs.
     status_share: StatusShare,
+    /// Which repository and branch each live session is in, its anchors,
+    /// and the managed-worktree locks held for agents (see `session`).
+    pub(crate) sessions: super::session::SessionGits,
 }
 
 /// A status result from the share: the data, plus whether the run that
@@ -251,6 +254,7 @@ impl GitService {
             resolved_git: Mutex::new(None),
             procs: Arc::new(Semaphore::new(MAX_CONCURRENT_GIT)),
             status_share: StatusShare::new(),
+            sessions: Default::default(),
         }
     }
 
@@ -512,13 +516,20 @@ fn classify_probe_failure(stderr: &str) -> ProbeOutcome {
     }
 }
 
-/// Run `git rev-parse` to resolve the working-tree root and common git dir.
-async fn probe_repo(git: &Path, procs: &Semaphore, root: &Path) -> ProbeOutcome {
+/// Run `git rev-parse` to resolve the working-tree root, this checkout's git
+/// dir, and the common git dir. Public to the module: the session tracker
+/// probes an agent's cwd the same way the workspace probe does.
+pub(super) async fn probe_repo(git: &Path, procs: &Semaphore, root: &Path) -> ProbeOutcome {
     let out = match run_git(
         git,
         procs,
         root,
-        &["rev-parse", "--show-toplevel", "--git-common-dir"],
+        &[
+            "rev-parse",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--git-common-dir",
+        ],
         8 * 1024,
     )
     .await
@@ -531,31 +542,58 @@ async fn probe_repo(git: &Path, procs: &Semaphore, root: &Path) -> ProbeOutcome 
     if !out.success {
         return classify_probe_failure(&out.stderr);
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut lines = text.lines();
-    // A success with no toplevel line is pathological; treat as non-repo.
-    let Some(toplevel) = lines.next().map(str::trim).filter(|l| !l.is_empty()) else {
-        return ProbeOutcome::NotARepo;
-    };
-    let toplevel = PathBuf::from(toplevel);
+    match parse_probe(&String::from_utf8_lossy(&out.stdout), root) {
+        Some(repo) => ProbeOutcome::Repo(repo),
+        None => ProbeOutcome::NotARepo,
+    }
+}
+
+/// Parse `rev-parse --show-toplevel --absolute-git-dir --git-common-dir`
+/// run in `ran_in`. A success with no toplevel line is pathological (a bare
+/// repo, or run inside a `.git` dir): treated as no work tree.
+pub(super) fn parse_probe(text: &str, ran_in: &Path) -> Option<RepoInfo> {
+    let mut lines = text.lines().map(str::trim);
+    let toplevel = PathBuf::from(lines.next().filter(|l| !l.is_empty())?);
+    let git_dir = lines
+        .next()
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| toplevel.join(".git"));
     // `--git-common-dir` prints relative to the CWD we ran in unless it is an
     // absolute path into the main checkout (the linked-worktree case).
-    let common = lines.next().map(str::trim).unwrap_or("");
-    let common_dir = match common {
-        "" => toplevel.join(".git"),
+    let common_dir = match lines.next().unwrap_or("") {
+        "" => git_dir.clone(),
         c => {
             let p = PathBuf::from(c);
             if p.is_absolute() {
                 p
             } else {
-                root.join(p)
+                normalize(&ran_in.join(p))
             }
         }
     };
-    ProbeOutcome::Repo(RepoInfo {
+    Some(RepoInfo {
         toplevel,
         common_dir,
+        git_dir,
     })
+}
+
+/// Lexically fold `.`/`..` components (no filesystem access): a relative
+/// `--git-common-dir` such as `../../.git` joined onto the probe dir must
+/// compare equal to the same dir reached another way.
+pub(super) fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// The bounded output of one git invocation.

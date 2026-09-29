@@ -49,6 +49,10 @@ pub(crate) fn spawn_shell_watch(state: Arc<AppState>, session_id: String) {
             .marks(&session_id)
             .map(|m| m.last_finished_seq())
             .unwrap_or(0);
+        // Shell-integration phase edges (a prompt after a command) wake the
+        // watcher at once, so a `git commit` typed here refreshes git now,
+        // not on the next tick. `None` once the channel closes.
+        let mut phase_rx = state.sessions.marks(&session_id).map(|m| m.phase_watch());
         loop {
             let Some(info) = state.sessions.get(&session_id) else {
                 let named = crate::lock(&state.display_names)
@@ -110,17 +114,43 @@ pub(crate) fn spawn_shell_watch(state: Arc<AppState>, session_id: String) {
 
             // Finished commands since the last tick, metadata only (no
             // output clone) — the notable ones become Timeline entries.
+            let mut finished_any = false;
             if let Some(marks) = state.sessions.marks(&session_id) {
                 let finished = marks.finished_since(cmd_cursor, 16);
                 if let Some(last) = finished.last() {
                     cmd_cursor = last.seq;
+                    finished_any = true;
                 }
                 for meta in &finished {
                     crate::episodes::record_command(&state, &session_id, meta).await;
                 }
             }
+            // A finished command may have changed git (a commit, a checkout,
+            // a pull, a script writing files): mark the terminal's current
+            // folder dirty, which refreshes the repository containing it.
+            if finished_any {
+                let dir = crate::lock(&state.current_cwds)
+                    .get(&session_id)
+                    .cloned()
+                    .or_else(|| state.sessions.get(&session_id).map(|i| i.cwd));
+                if let Some(dir) = dir {
+                    crate::git::mark_path_dirty(&state, &dir.to_string_lossy()).await;
+                }
+            }
 
-            tokio::time::sleep(poll_interval()).await;
+            match phase_rx.as_mut() {
+                Some(rx) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(poll_interval()) => {}
+                        changed = rx.changed() => {
+                            if changed.is_err() {
+                                phase_rx = None;
+                            }
+                        }
+                    }
+                }
+                None => tokio::time::sleep(poll_interval()).await,
+            }
         }
     });
 }

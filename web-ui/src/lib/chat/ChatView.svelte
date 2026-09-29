@@ -2216,6 +2216,7 @@
     onToggleThinking={toggleThinking}
     onInterrupt={interrupt}
     onSetRemoteControl={setRemoteControl}
+    git={session.git ?? null}
   />
 
   <!-- Focusable so keyboard scrolling works in WKWebView (Safari never

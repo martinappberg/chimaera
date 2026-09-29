@@ -17,6 +17,12 @@ use super::service::{configured_git, run_git, GitService, ProbeOutcome};
 /// Cap on each side of a diff; larger files bail to "open the file instead".
 const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
 
+/// Managed worktrees checked for "merged" per worktree listing.
+const MAX_MERGE_CHECKS: usize = 16;
+
+/// Local branches listed (read-only: name, last commit date, upstream).
+const MAX_BRANCHES: usize = 100;
+
 #[derive(Deserialize)]
 pub(crate) struct StatusQuery {
     workspace_id: String,
@@ -149,11 +155,50 @@ pub(crate) async fn worktrees(
     };
     match state.git.worktrees(&git.path, &repo).await {
         Ok(list) => {
-            let managed_root = std::fs::canonicalize(&state.worktrees_root)
-                .unwrap_or_else(|_| state.worktrees_root.clone());
+            let managed_root = {
+                let root = state.worktrees_root.clone();
+                tokio::task::spawn_blocking(move || std::fs::canonicalize(&root).unwrap_or(root))
+                    .await
+                    .unwrap_or_else(|_| state.worktrees_root.clone())
+            };
+            // "Merged" = the worktree's HEAD is contained in the main
+            // checkout's branch: only asked for managed worktrees (the ones
+            // chimaera would remove), a bounded handful per refresh.
+            let base_ref = match list.first() {
+                Some(main) => match (&main.branch, &main.sha) {
+                    (Some(b), _) => Some(format!("refs/heads/{b}")),
+                    (None, Some(sha)) => Some(sha.clone()),
+                    _ => None,
+                },
+                None => None,
+            };
+            let mut merged: Vec<Option<bool>> = vec![None; list.len()];
+            for (i, w) in list.iter().enumerate().take(MAX_MERGE_CHECKS + 1).skip(1) {
+                let (Some(base), Some(sha)) = (&base_ref, &w.sha) else {
+                    continue;
+                };
+                if !w.path.starts_with(&managed_root) || w.path == repo.toplevel {
+                    continue;
+                }
+                if !super::anchor::is_sha(sha) {
+                    continue;
+                }
+                if let Ok(out) = run_git(
+                    &git.path,
+                    &state.git.procs,
+                    &repo.toplevel,
+                    &["merge-base", "--is-ancestor", sha, base],
+                    1024,
+                )
+                .await
+                {
+                    merged[i] = Some(out.success);
+                }
+            }
             let items: Vec<serde_json::Value> = list
                 .iter()
-                .map(|w| {
+                .zip(merged)
+                .map(|(w, merged)| {
                     json!({
                         "path": w.path.to_string_lossy(),
                         "branch": w.branch,
@@ -168,6 +213,9 @@ pub(crate) async fn worktrees(
                         // worktrees it will remove, so the UI shows the control
                         // exactly where the daemon would allow it.
                         "managed": w.path.starts_with(&managed_root),
+                        // Additive: a managed worktree whose HEAD the main
+                        // checkout's branch already contains (null = not asked).
+                        "merged": merged,
                     })
                 })
                 .collect();
@@ -379,6 +427,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_branch_list_with_tracking() {
+        let raw = "main\u{1f}1700000000\u{1f}origin/main\u{1f}[ahead 2, behind 1]\u{1f}*\n\
+                   feat/x\u{1f}1690000000\u{1f}\u{1f}\u{1f} \n\
+                   old\u{1f}1600000000\u{1f}origin/old\u{1f}[gone]\u{1f} \n";
+        let list = parse_branches(raw.as_bytes());
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].name, "main");
+        assert!(list[0].current);
+        assert_eq!((list[0].ahead, list[0].behind), (2, 1));
+        assert_eq!(list[0].upstream.as_deref(), Some("origin/main"));
+        assert_eq!(list[1].name, "feat/x");
+        assert_eq!(list[1].upstream, None);
+        assert!(!list[1].current);
+        assert!(list[2].gone);
+    }
+
+    #[test]
     fn repo_relative_rejects_escapes() {
         let top = Path::new("/repo");
         assert_eq!(
@@ -387,4 +452,136 @@ mod tests {
         );
         assert_eq!(repo_relative(top, "/other/x.rs"), None);
     }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BranchesQuery {
+    workspace_id: String,
+}
+
+/// One local branch.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct BranchInfo {
+    pub(super) name: String,
+    /// Committer time of its tip, seconds since the epoch.
+    pub(super) time: i64,
+    pub(super) upstream: Option<String>,
+    pub(super) ahead: u32,
+    pub(super) behind: u32,
+    /// Its upstream was deleted.
+    pub(super) gone: bool,
+    /// Checked out in the workspace's own checkout.
+    pub(super) current: bool,
+}
+
+/// Parse `for-each-ref --format=%(refname:short)%1f%(committerdate:unix)%1f
+/// %(upstream:short)%1f%(upstream:track)%1f%(HEAD)`, one branch per line.
+pub(super) fn parse_branches(bytes: &[u8]) -> Vec<BranchInfo> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split('\u{1f}');
+            let name = f.next()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let time = f.next().unwrap_or("").trim().parse().unwrap_or(0);
+            let upstream = Some(f.next().unwrap_or("").trim())
+                .filter(|u| !u.is_empty())
+                .map(str::to_string);
+            let track = f.next().unwrap_or("").trim();
+            let current = f.next().unwrap_or("").trim() == "*";
+            let mut ahead = 0;
+            let mut behind = 0;
+            for part in track.trim_matches(|c| c == '[' || c == ']').split(',') {
+                let part = part.trim();
+                if let Some(n) = part.strip_prefix("ahead ") {
+                    ahead = n.trim().parse().unwrap_or(0);
+                } else if let Some(n) = part.strip_prefix("behind ") {
+                    behind = n.trim().parse().unwrap_or(0);
+                }
+            }
+            Some(BranchInfo {
+                name: name.to_string(),
+                time,
+                upstream,
+                ahead,
+                behind,
+                gone: track == "[gone]",
+                current,
+            })
+        })
+        .collect()
+}
+
+/// GET /api/v1/git/branches?workspace_id= — the repository's local
+/// branches, most recently committed first (≤100): name, last commit date,
+/// upstream and how far ahead/behind it. Read-only: there is no checkout.
+pub(crate) async fn branches(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<BranchesQuery>,
+) -> Response {
+    let Some(ws) = crate::lock(&state.workspaces).get(&q.workspace_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown workspace"})),
+        )
+            .into_response();
+    };
+    let git = state.git.resolve_git(configured_git(&state)).await;
+    if !git.adequate {
+        return Json(json!({"repo": false, "branches": []})).into_response();
+    }
+    let Some(repo) = state
+        .git
+        .discover(&git.path, &q.workspace_id, &ws.root)
+        .await
+        .into_repo()
+    else {
+        return Json(json!({"repo": false, "branches": []})).into_response();
+    };
+    let count = format!("--count={}", MAX_BRANCHES + 1);
+    let out = match run_git(
+        &git.path,
+        &state.git.procs,
+        &repo.toplevel,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            &count,
+            "--format=%(refname:short)%1f%(committerdate:unix)%1f%(upstream:short)%1f%(upstream:track)%1f%(HEAD)",
+            "refs/heads",
+        ],
+        512 * 1024,
+    )
+    .await
+    {
+        Ok(out) if out.success => out,
+        Ok(out) => {
+            return Json(json!({"repo": true, "branches": [], "error": out.stderr}))
+                .into_response()
+        }
+        Err(err) => {
+            return Json(json!({"repo": true, "branches": [], "error": err.to_string()}))
+                .into_response()
+        }
+    };
+    let mut list = parse_branches(&out.stdout);
+    let truncated = list.len() > MAX_BRANCHES;
+    list.truncate(MAX_BRANCHES);
+    let items: Vec<serde_json::Value> = list
+        .iter()
+        .map(|b| {
+            json!({
+                "name": b.name,
+                "time": b.time,
+                "upstream": b.upstream,
+                "ahead": b.ahead,
+                "behind": b.behind,
+                "gone": b.gone,
+                "current": b.current,
+            })
+        })
+        .collect();
+    Json(json!({"repo": true, "branches": items, "truncated": truncated})).into_response()
 }

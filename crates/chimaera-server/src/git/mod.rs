@@ -8,21 +8,32 @@
 //! timeout that KILLS the child (a wedged NFS mount must never pin a thread), an
 //! output-size cap, an entry-count cap, and a daemon-wide concurrency permit.
 //!
-//! Inspection is read-only and stores nothing: git state is reconstructible, so
-//! status and diffs are recomputed on demand. The ONLY mutations are worktree
-//! create/remove, and they are confined to the managed root
-//! (`AppState::worktrees_root`) — chimaera never removes a checkout it did not
-//! create, never one a live session is sitting in, and never one with
-//! uncommitted work unless forced.
+//! Inspection is read-only and stores nothing durable: git state is
+//! reconstructible, so status and diffs are recomputed on demand (the
+//! per-session anchors in `session` are bounded, in-memory). The ONLY
+//! mutations are worktree create/remove/lock/unlock, and they are confined
+//! to the managed root (`AppState::worktrees_root`) — chimaera never removes
+//! a checkout it did not create, never one a live session is sitting in,
+//! never one with uncommitted or unshared work unless forced, and never
+//! touches a lock another tool made. It never commits, checks out, resets,
+//! rebases, pushes or merges.
 
+pub(crate) mod anchor;
 mod http;
+mod include;
 mod parse;
+mod repos;
 mod resolve;
+mod rev;
 mod service;
+mod session;
 mod worktree;
 
-pub(crate) use http::{diff, status, worktrees};
+pub(crate) use http::{branches, diff, status, worktrees};
 pub(crate) use service::{
     backstop_poll, git_facts, mark_path_dirty, usable_git_dir, GitService, WatchGuard,
 };
-pub(crate) use worktree::{create_worktree, remove_worktree};
+pub(crate) use session::{session_git, session_turn_end, track_sessions};
+pub(crate) use worktree::{
+    allowed_session_cwd, create_worktree, ensure_branch_worktree, remove_worktree,
+};

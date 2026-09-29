@@ -606,6 +606,15 @@ pub(crate) async fn ingest(
         matches!(event, "SessionStart" | "UserPromptSubmit") && !record.compute_ctx_delivered
     };
 
+    // Every hook payload carries claude's current `cwd`: an agent that
+    // enters a worktree mid-session is shown there (git session tracker).
+    if let Some(cwd) = payload.get("cwd").and_then(|c| c.as_str()) {
+        changed |= state.git.sessions.note_hook_cwd(&id, cwd);
+    }
+    if event == "Stop" {
+        crate::git::session_turn_end(&state, &id);
+    }
+
     if changed {
         state.changes.notify_waiters();
     }

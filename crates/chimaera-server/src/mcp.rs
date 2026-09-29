@@ -407,7 +407,8 @@ fn mastermind_tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "spawn_agent",
-            "description": "Spawn a new worker agent chat session at the workspace root. \
+            "description": "Spawn a new worker agent chat session at the workspace root \
+                            (or, with `branch`, in that branch's own worktree). \
                             State WHY you are spawning it, then send it work with \
                             message_agent. Workers bill as the user's own account.",
             "inputSchema": {
@@ -426,6 +427,16 @@ fn mastermind_tool_defs() -> Vec<Value> {
                     "name": {
                         "type": "string",
                         "description": "Display name for the session (helps the user track it)",
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Run the worker on this git branch, in its own worktree: \
+                                        an existing checkout of the branch is reused, else a new \
+                                        worktree is created (off `base` for a new branch)",
+                    },
+                    "base": {
+                        "type": "string",
+                        "description": "Start point for a NEW branch (default: the current HEAD)",
                     },
                 },
                 "additionalProperties": false,
@@ -1458,15 +1469,52 @@ async fn spawn_agent(
         .and_then(|n| n.as_str())
         .map(|n| head(n.trim(), 200))
         .filter(|n| !n.is_empty());
+    let branch = args
+        .get("branch")
+        .and_then(|b| b.as_str())
+        .map(str::trim)
+        .filter(|b| !b.is_empty());
+    let base = args
+        .get("base")
+        .and_then(|b| b.as_str())
+        .map(str::trim)
+        .filter(|b| !b.is_empty());
+    if base.is_some() && branch.is_none() {
+        return tool_error("`base` needs a `branch`".to_string());
+    }
     // Held across the spawn await: releases only once the session is
     // registered (or the spawn failed), closing the check-then-act window.
     let _slot = match SpawnReservation::acquire(state, &workspace.id) {
         Ok(slot) => slot,
         Err(at) => return spawn_ceiling_error(at),
     };
+    // The worker stays in THIS workspace (so message_agent reaches it) and
+    // runs in the branch's worktree.
+    let place = match branch {
+        None => None,
+        Some(branch) => {
+            match crate::git::ensure_branch_worktree(state, &workspace, branch, base).await {
+                Ok(created) => Some(created),
+                Err((_, msg)) => return tool_error(format!("no worktree for {branch}: {msg}")),
+            }
+        }
+    };
     tracing::info!(mastermind = %agent_id, workspace = %workspace.id, agent = %kind.as_str(),
-        "mastermind act: spawn_agent");
-    match crate::chat::spawn_fresh_chat(
+        branch = ?branch, "mastermind act: spawn_agent");
+    if place.as_ref().is_some_and(|p| p.workspace.is_some()) {
+        // A new worktree registered a workspace: every window's list moves.
+        state.changes.notify_waiters();
+    }
+    let where_ = match &place {
+        Some(p) => format!(
+            "on branch {} in {} worktree {}",
+            p.branch,
+            if p.reused { "its existing" } else { "a new" },
+            p.path.display()
+        ),
+        None => "at the workspace root".to_string(),
+    };
+    match crate::chat::spawn_fresh_chat_at(
         state,
         workspace,
         crate::chat::FreshChat {
@@ -1480,11 +1528,12 @@ async fn spawn_agent(
             mastermind: None,
             fork: None,
         },
+        place.map(|p| p.path),
     )
     .await
     {
         Ok(row) => tool_text(format!(
-            "spawned {} chat session {} [{}] at the workspace root — send it work \
+            "spawned {} chat session {} [{}] {where_} — send it work \
              with message_agent",
             kind.as_str(),
             row["display_name"],

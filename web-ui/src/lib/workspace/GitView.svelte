@@ -11,6 +11,7 @@
   import type { LayoutCtrl } from "../layout/dnd";
   import {
     createWorktree,
+    fetchGitBranches,
     gitEnv,
     gitRepoError,
     gitStatus,
@@ -18,8 +19,8 @@
     notifyWorkspacesChanged,
     refreshGit,
     removeWorktree,
-    worktreeForPath,
     type DiffMode,
+    type GitBranch,
     type GitEntry,
     type GitWorktree,
   } from "./git";
@@ -120,7 +121,10 @@
   const clean = $derived(status !== null && entries.length === 0);
 
   // Branches: each worktree of the repo, and which sessions live in it. The
-  // agent↔branch edge is DERIVED from the session's cwd — nothing is stored.
+  // agent↔branch edge is the daemon's: each session row names the checkout
+  // its current folder is in (`session.git.worktree` — a shell's cwd, an
+  // agent's hook-reported cwd), so an agent that moved into a worktree
+  // mid-session is listed there. Nothing is stored.
   // A single-worktree repo shows nothing here: the header already names the
   // branch, and an empty section is chrome that hasn't earned its pixels.
   const worktrees = $derived($gitWorktrees);
@@ -131,7 +135,7 @@
           wt,
           sessions: [...sessions.values()]
             .filter((s) => s.alive)
-            .filter((s) => worktreeForPath(worktrees, s.cwd_current ?? s.cwd)?.path === wt.path),
+            .filter((s) => s.git?.worktree === wt.path),
         })),
   );
   // Only what you can act on: the worktree you're in, any holding sessions, and
@@ -158,10 +162,25 @@
   let busy = $state(false);
   let actionError = $state<string | null>(null);
   let branchInput = $state<HTMLInputElement | null>(null);
+  // Where a NEW branch starts: one of the local branches ("" = the current
+  // HEAD, what git does by default). Fetched when the composer opens.
+  let baseChoices = $state<GitBranch[]>([]);
+  let newBase = $state("");
 
   function startCompose(): void {
     composing = true;
     actionError = null;
+    newBase = "";
+    if (wsId !== null) {
+      const id = wsId;
+      void fetchGitBranches(id)
+        .then((r) => {
+          if (wsId === id) baseChoices = r.branches ?? [];
+        })
+        .catch(() => {
+          baseChoices = [];
+        });
+    }
     void Promise.resolve().then(() => branchInput?.focus());
   }
 
@@ -171,7 +190,7 @@
     busy = true;
     actionError = null;
     try {
-      const created = await createWorktree(wsId, branch);
+      const created = await createWorktree(wsId, branch, newBase || undefined);
       // The new worktree is its own workspace; spawn the session there and
       // reveal it. `refreshGit` picks up the new branch in the Branches view.
       const session = await createSession(created.workspace.id, newKind);
@@ -446,6 +465,19 @@
                 }}
               />
             </div>
+            {#if baseChoices.length > 0}
+              <!-- A new branch starts from here; an existing branch name is
+                   checked out as it is (git's own rule), whatever this says. -->
+              <label class="compose-base">
+                <span class="compose-base-label">from</span>
+                <select class="compose-select" bind:value={newBase} disabled={busy}>
+                  <option value="">{status?.branch ?? "HEAD"} (current)</option>
+                  {#each baseChoices.filter((b) => !b.current) as b (b.name)}
+                    <option value={b.name}>{b.name}</option>
+                  {/each}
+                </select>
+              </label>
+            {/if}
             <div class="compose-actions">
               <button
                 class="compose-go"
@@ -460,6 +492,7 @@
         {/if}
 
         {#each branches as b (b.wt.path)}
+          {@const removable = b.wt.managed && !b.wt.current && b.sessions.length === 0}
           <div class="wt" class:current={b.wt.current}>
             <div class="wt-head" title={b.wt.path}>
               <span class="wt-branch">
@@ -470,17 +503,26 @@
                 {/if}
               </span>
               {#if b.wt.current}<span class="wt-tag">current</span>{/if}
-              {#if b.wt.locked}<span class="wt-tag muted">locked</span>{/if}
+              {#if b.wt.locked}<span class="wt-tag muted" title="locked — other tools' clean-up leaves it alone">locked</span>{/if}
               {#if b.wt.prunable}<span class="wt-tag muted">prunable</span>{/if}
+              {#if removable && b.wt.merged}
+                <span
+                  class="wt-tag muted"
+                  title={`${status?.branch ?? "the main checkout"} already contains this branch`}>merged</span>
+              {/if}
               {#if b.sessions.length > 0}
                 <span class="wt-count">{b.sessions.length}</span>
               {/if}
               <!-- Remove only where the daemon would allow it: a managed
-                   worktree that is neither the current one nor holding sessions. -->
-              {#if b.wt.managed && !b.wt.current && b.sessions.length === 0}
+                   worktree that is neither the current one nor holding sessions.
+                   A merged one keeps the control visible — it's done. -->
+              {#if removable}
                 <button
                   class="wt-remove"
-                  title="remove this worktree (keeps the branch)"
+                  class:offered={b.wt.merged === true}
+                  title={b.wt.merged
+                    ? "merged — remove this worktree (keeps the branch)"
+                    : "remove this worktree (keeps the branch)"}
                   aria-label="remove worktree"
                   disabled={busy}
                   onclick={() => void remove(b.wt)}>&times;</button>
@@ -770,7 +812,8 @@
       color 0.1s ease,
       background-color 0.1s ease;
   }
-  .wt:hover .wt-remove {
+  .wt:hover .wt-remove,
+  .wt-remove.offered {
     opacity: 0.7;
   }
   .wt-remove:hover {
@@ -856,6 +899,34 @@
     display: flex;
     gap: 0.35rem;
     margin-top: 0.3rem;
+  }
+  .compose-base {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    margin-top: 0.3rem;
+    min-width: 0;
+  }
+  .compose-base-label {
+    flex: none;
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+  .compose-select {
+    flex: 1;
+    min-width: 0;
+    appearance: auto;
+    background: var(--term-bg);
+    color: var(--fg);
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    padding: 0.1rem 0.3rem;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+  }
+  .compose-select:focus {
+    outline: none;
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
   }
   .compose-go,
   .compose-cancel {

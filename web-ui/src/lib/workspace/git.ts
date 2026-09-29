@@ -59,6 +59,8 @@ export interface GitStatus {
   repo: boolean;
   workspace_id: string;
   epoch: number;
+  /** The checkout this status is of (absent on old daemons). */
+  toplevel?: string;
   branch: string | null;
   detached: boolean;
   head: string | null;
@@ -117,6 +119,23 @@ export interface GitWorktree {
   current: boolean;
   /** Created by chimaera under its managed root — the only ones it removes. */
   managed: boolean;
+  /** A managed worktree whose HEAD the main checkout's branch already
+   *  contains (null = not asked: unmanaged, or the current one). */
+  merged?: boolean | null;
+}
+
+/** One local branch (read-only: there is no checkout). */
+export interface GitBranch {
+  name: string;
+  /** Committer time of its tip, seconds since the epoch. */
+  time: number;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  /** Its upstream was deleted. */
+  gone: boolean;
+  /** Checked out in the workspace's own checkout. */
+  current: boolean;
 }
 
 async function json<T>(res: Response): Promise<T> {
@@ -154,10 +173,19 @@ export async function fetchGitWorktrees(
   return json(await api(`/git/worktrees?${q.toString()}`));
 }
 
+export async function fetchGitBranches(
+  workspaceId: string,
+): Promise<{ repo: boolean; branches: GitBranch[]; truncated?: boolean }> {
+  const q = new URLSearchParams({ workspace_id: workspaceId });
+  return json(await api(`/git/branches?${q.toString()}`));
+}
+
 export interface CreatedWorktree {
   worktree: { path: string; branch: string };
   /** The worktree is registered as a workspace, so the branch is openable. */
   workspace: { id: string; root: string; name: string };
+  /** What `.worktreeinclude` copied over (ignored files such as `.env`). */
+  included?: { copied: number; bytes: number; capped: boolean };
 }
 
 /**
@@ -281,26 +309,6 @@ async function refresh(wsId: string): Promise<void> {
       worktreesStore.set([]);
     }
   }
-}
-
-/**
- * The worktree containing `path`, longest root first. The longest match matters:
- * linked worktrees often live INSIDE the main checkout (`.claude/worktrees/…`),
- * so a plain first-match would attribute every session to the main worktree.
- */
-export function worktreeForPath(
-  worktrees: GitWorktree[],
-  path: string | null | undefined,
-): GitWorktree | null {
-  if (!path) return null;
-  let best: GitWorktree | null = null;
-  for (const w of worktrees) {
-    const root = w.path.endsWith("/") ? w.path : `${w.path}/`;
-    if (path === w.path || path.startsWith(root)) {
-      if (best === null || w.path.length > best.path.length) best = w;
-    }
-  }
-  return best;
 }
 
 /**

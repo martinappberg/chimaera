@@ -123,6 +123,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/view", post(chat::switch_view))
         .route("/sessions/{id}/rewind", post(chat::rewind_session))
         .route("/sessions/{id}/fork", post(chat::fork_session))
+        .route("/sessions/{id}/git", get(git::session_git))
         .route("/links", get(links::list_links).put(links::put_link))
         .route("/links/{terminal_id}", delete(links::delete_link))
         .route("/agents", get(launcher::list_agents))
@@ -203,6 +204,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         )
         .route("/git/status", get(git::status))
         .route("/git/diff", get(git::diff))
+        .route("/git/branches", get(git::branches))
         .route(
             "/git/worktrees",
             get(git::worktrees)

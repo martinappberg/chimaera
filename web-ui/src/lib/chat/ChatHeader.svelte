@@ -6,6 +6,8 @@
    * the picks themselves are the host's callbacks (they ride socket.send).
    */
   import SessionGlyph from "../shared/SessionGlyph.svelte";
+  import BranchChip from "../shared/BranchChip.svelte";
+  import type { SessionGit } from "../workspace/sessions";
   import EffortPopover from "./EffortPopover.svelte";
   import { copyText } from "../shared/clipboard";
   import { openInSystemBrowser } from "../shared/urlOpen";
@@ -44,9 +46,12 @@
     /** Turn the agent's Remote Control bridge on/off (claude: the
      *  `remote_control` control; codex answers with a pointer to its daemon). */
     onSetRemoteControl: (enabled: boolean) => void;
+    /** The branch the session is on — only when it is in a repository. */
+    git?: SessionGit | null;
   }
 
   let {
+    git = null,
     store,
     agentKind,
     agentName,
@@ -141,6 +146,9 @@
     <SessionGlyph kind="agent" {agentKind} size={11} />
     <span class="agent-name">{agentName}</span>
   </span>
+  {#if git}
+    <span class="branch"><BranchChip {git} /></span>
+  {/if}
   <div class="menu-host">
     <button
       class="chip pick"
@@ -605,5 +613,12 @@
     .ratelimit {
       animation: none;
     }
+  }
+  /* The branch chip: quiet, and the first thing to shrink. */
+  .branch {
+    display: inline-flex;
+    min-width: 0;
+    max-width: 14em;
+    flex: 0 1 auto;
   }
 </style>

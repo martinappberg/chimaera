@@ -73,6 +73,11 @@ pub(crate) struct CreateSession {
     /// `environment`). Old clients never send it; nothing changes shape.
     #[serde(default)]
     prelude: Option<String>,
+    /// Where the session starts, when not the workspace root: a folder
+    /// inside the workspace or one of its repository's worktrees (validated —
+    /// never an arbitrary path). Old clients never send it.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 /// POST /api/v1/sessions — spawn a shell (kind "shell", the default) or an
@@ -124,6 +129,17 @@ pub(crate) async fn create_session(
         }
     }
 
+    // A requested starting folder must sit inside the workspace or one of
+    // its worktrees; resolved (canonical) before either surface spawns.
+    let start_cwd = match body.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        None => None,
+        Some(raw) => match crate::git::allowed_session_cwd(&state, &workspace, raw).await {
+            Ok(path) if path == workspace.root => None,
+            Ok(path) => Some(path),
+            Err(msg) => return bad_request(msg),
+        },
+    };
+
     // Structured chat surface: an agent driven over stream-json/app-server,
     // not a PTY. It is resolved and spawned here (returning early); the TUI
     // path — shells and terminal agents — flows through spawn::spawn_session
@@ -141,7 +157,7 @@ pub(crate) async fn create_session(
         }
     };
     if chat_ui {
-        return spawn_chat_ui(&state, body, workspace, theme).await;
+        return spawn_chat_ui(&state, body, workspace, theme, start_cwd).await;
     }
 
     let kind = match body.kind {
@@ -196,7 +212,7 @@ pub(crate) async fn create_session(
         workspace,
         id: None,
         name: body.name,
-        cwd: None,
+        cwd: start_cwd,
         cols: body.cols,
         rows: body.rows,
         theme: theme.to_string(),
@@ -233,6 +249,7 @@ async fn spawn_chat_ui(
     body: CreateSession,
     workspace: crate::workspaces::Workspace,
     theme: &str,
+    start_cwd: Option<std::path::PathBuf>,
 ) -> Response {
     let bad_request =
         |msg: String| (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
@@ -283,7 +300,7 @@ async fn spawn_chat_ui(
     // and the Mastermind spawn_agent tool's path). Everything below this
     // point is the resume story: journal seeding + the TUI fallback.
     if body.resume.is_none() {
-        return match crate::chat::spawn_fresh_chat(
+        return match crate::chat::spawn_fresh_chat_at(
             state,
             workspace,
             crate::chat::FreshChat {
@@ -297,6 +314,7 @@ async fn spawn_chat_ui(
                 mastermind: None,
                 fork: None,
             },
+            start_cwd,
         )
         .await
         {
@@ -308,6 +326,11 @@ async fn spawn_chat_ui(
         };
     }
 
+    // A resumed chat reopens where its conversation lives (claude files
+    // transcripts by folder); a different starting folder would lose it.
+    if start_cwd.is_some() {
+        return bad_request("cwd cannot be combined with resume for a chat".to_string());
+    }
     let id = crate::agents::fresh_session_id();
     // Take the path AND its probed version from one detection so the chat
     // driver's version notice reflects the binary it actually spawns.

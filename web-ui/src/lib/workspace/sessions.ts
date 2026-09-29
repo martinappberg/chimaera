@@ -158,6 +158,35 @@ export interface Session {
   background_running?: number | null;
   /** Whether this agent can run as a chat session (drives the toggle). */
   chat_capable?: boolean;
+  /**
+   * The repository checkout this session is in, from its current folder (a
+   * shell's cwd, an agent's hook-reported cwd, else its spawn folder). Null
+   * outside a repository; absent on old daemons.
+   */
+  git?: SessionGit | null;
+}
+
+/** Where a session stands in git (the daemon's session tracker). */
+export interface SessionGit {
+  /** The repository (its main checkout), the same for every worktree. */
+  repo: string;
+  /** The checkout (main or linked worktree) the session is in. */
+  worktree: string;
+  /** The branch there; null when detached or unborn. */
+  branch: string | null;
+  detached: boolean;
+  /** Short sha when detached, else null. */
+  head: string | null;
+}
+
+/** A branch as people read it: the name, `detached <sha>`, or `(unborn)`. */
+export function branchLabel(git: {
+  branch: string | null;
+  detached: boolean;
+  head: string | null;
+}): string {
+  if (git.branch) return git.branch;
+  return git.detached ? `detached ${git.head ?? ""}`.trim() : "(unborn)";
 }
 
 /** The one display name for a session, used identically everywhere. */

@@ -105,6 +105,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // Backstop poll for out-of-band git changes (external editor, terminal
     // `git` commands); event-driven refresh covers the rest. Idle-cheap.
     tokio::spawn(git::backstop_poll(state.clone()));
+    tokio::spawn(git::track_sessions(state.clone()));
 
     // Settings hand-edit watcher: one off-reactor stat every couple of
     // seconds, so the events bus never stats settings.json on the reactor.

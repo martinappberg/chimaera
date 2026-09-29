@@ -375,6 +375,13 @@ impl ChangeBus {
     pub(crate) fn generation(&self) -> u64 {
         self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
+
+    /// The raw wake future, for a loop that must `enable()` it BEFORE
+    /// reading [`Self::generation`] so no change between the two is missed
+    /// (the git session tracker).
+    pub(crate) fn subscribe(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
 }
 
 /// Lock a mutex, recovering from poisoning (our critical sections cannot leave

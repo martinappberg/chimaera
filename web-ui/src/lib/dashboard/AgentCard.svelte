@@ -12,6 +12,7 @@
    * card can't truthfully fill stay empty — never fabricated.
    */
   import SessionGlyph from "../shared/SessionGlyph.svelte";
+  import BranchChip from "../shared/BranchChip.svelte";
   import WorkTray from "../shared/WorkTray.svelte";
   import WorkTrayRow from "../shared/WorkTrayRow.svelte";
   import { basename } from "../previews/files";
@@ -397,6 +398,11 @@
         {touched.length} file{touched.length === 1 ? "" : "s"} · view changes
       </button>
     {/if}
+    {#if session.git}
+      <!-- Only in a repository: the branch (and worktree, on hover) this
+           agent is working on. -->
+      <span class="branch"><BranchChip git={session.git} /></span>
+    {/if}
     <span class="age">{relativeAge(session.created_at)}</span>
     {#if costUsd !== null}
       <span class="cost" title="session cost — from the claude statusline">
@@ -773,6 +779,11 @@
   }
   .compact .meta {
     flex: none;
+  }
+  .meta .branch {
+    display: inline-flex;
+    min-width: 0;
+    max-width: 16em;
   }
   .ctxwrap {
     display: inline-flex;

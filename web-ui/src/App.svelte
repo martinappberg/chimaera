@@ -44,6 +44,7 @@
     ViewSwitchConflict,
     type AgentSpawn,
     type Session,
+    type SessionGit,
     type Workspace,
     isMastermind,
     needsAttention,
@@ -356,6 +357,7 @@
   import { focusOnMount } from "./lib/shared/focusOnMount";
   import Launcher from "./lib/workspace/Launcher.svelte";
   import SessionGlyph from "./lib/shared/SessionGlyph.svelte";
+  import BranchChip from "./lib/shared/BranchChip.svelte";
   import QuickOpen from "./lib/workspace/QuickOpen.svelte";
   import FileTree from "./lib/workspace/FileTree.svelte";
   import SplitTree from "./lib/layout/SplitNode.svelte";
@@ -1066,6 +1068,28 @@
   /** terminal session id -> agent session id (one agent per terminal). */
   const linksByTerminal = $derived(new Map(links.map((l) => [l.terminal_id, l.agent_id])));
   const focusedSessionId = $derived(focusedSessionOf(layout));
+
+  /**
+   * The branch chip a rail row wears: only when the session is somewhere
+   * other than the checkout and branch this workspace shows — a linked
+   * worktree, another branch, another repository. Everyone on the checkout
+   * you're looking at is the common case, and stays quiet.
+   */
+  function railBranch(s: Session): SessionGit | null {
+    const g = s.git;
+    if (!g) return null;
+    const here = $gitStatus;
+    if (
+      here !== null &&
+      here.toplevel === g.worktree &&
+      !g.detached &&
+      !here.detached &&
+      (here.branch ?? null) === g.branch
+    ) {
+      return null;
+    }
+    return g;
+  }
   /** Sessions on screen in this window (each pane's active tab). */
   const visibleSessions = $derived(
     activeWsId !== null && layoutReady ? visibleSessionIds(layout) : [],
@@ -4755,6 +4779,7 @@
 
       <nav class="sessions">
         {#snippet sessionRow(s: Session)}
+          {@const branchHere = railBranch(s)}
           {#if confirmKillId === s.id}
             <div
               class="row confirm"
@@ -4870,9 +4895,15 @@
                        chat agents (no PTY title) show the agent's own
                        post-turn status line instead. -->
                   {#if s.kind === "agent" && s.title && s.title !== displayName(s) && s.title !== s.agent_title}
-                    <span class="title">{s.title}</span>
+                    <span class="title">{#if branchHere}<BranchChip git={branchHere} />{" "}{/if}{s.title}</span>
                   {:else if s.kind === "agent" && s.status_detail && s.status_detail !== displayName(s)}
-                    <span class="title" title={s.status_detail}>{s.status_detail}</span>
+                    <span class="title" title={s.status_detail}
+                      >{#if branchHere}<BranchChip git={branchHere} />{" "}{/if}{s.status_detail}</span
+                    >
+                  {:else if branchHere}
+                    <!-- Somewhere other than the checkout you're looking at:
+                         a worktree, another branch, another repository. -->
+                    <span class="title"><BranchChip git={branchHere} /></span>
                   {/if}
                 </span>
               {/if}
