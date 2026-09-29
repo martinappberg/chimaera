@@ -573,6 +573,24 @@ describe("the journal", () => {
     close(buf, view);
   });
 
+  it("leaves a draft on offer alone when the held edits are saved", async () => {
+    vi.useFakeTimers();
+    const path = `/w/offered-save-${++seq}.txt`;
+    const found = { path, baseHash: "h0", baseText: "x\n", text: "x\noffered\n", updatedMs: 1, writer: "dead-window" };
+    mocks.drafts.find.mockImplementationOnce(async () => found as never);
+    const { buf, view } = fresh(path, "x\n");
+    await vi.waitFor(() => expect(buf.recovered).not.toBeNull());
+    view.type(0, "typed ");
+    mocks.fsWrite.mockResolvedValueOnce({ hash: "h1", mtime: "m1" });
+    expect(await buf.save()).toBe(true);
+    // Only this window's record, or one holding exactly the saved text.
+    expect(mocks.drafts.clear).toHaveBeenLastCalledWith(path, { writer: "this-window", text: "typed x\n" });
+    expect(buf.recovered).toBe(found);
+    expect(buf.journalFailed).toBe(false);
+    buf.discardDraft();
+    close(buf, view);
+  });
+
   it("holds edits typed before the open's draft lookup settles", async () => {
     vi.useFakeTimers();
     const path = `/w/slow-lookup-${++seq}.txt`;
@@ -583,6 +601,7 @@ describe("the journal", () => {
     view.type(0, "typed "); // the lookup is still on a slow link
     await vi.advanceTimersByTimeAsync(JOURNAL_DELAY_MS * 3);
     expect(mocks.drafts.journal).not.toHaveBeenCalled();
+    expect(buf.journalFailed).toBe(true); // held, and shown as such
 
     answer(found); // there WAS a draft: offered, and still not overwritten
     await vi.advanceTimersByTimeAsync(0);

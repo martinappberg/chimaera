@@ -188,6 +188,8 @@ export class Buffer {
   recovered = $state<drafts.DraftRecord | null>(null);
   /** The newest dirty text is journaled nowhere (show it, never imply "safe"). */
   journalFailed = $state(false);
+  /** The open's draft lookup has not settled: the record may be one to offer. */
+  lookingForDraft = $state(false);
   /** View-only paging (files past the edit cap, compressed files). */
   loadedBytes = $state(0);
   totalBytes = $state(0);
@@ -229,8 +231,6 @@ export class Buffer {
   private autosaveTimer: ReturnType<typeof setTimeout> | null = null;
   private noticeTimer: ReturnType<typeof setTimeout> | null = null;
   private journaledText: string | null = null;
-  /** The open's draft lookup has not settled: the record may be one to offer. */
-  private lookingForDraft = false;
   /** Bumped by every journal write and draft clear this buffer issues: a
    *  write that completes after a newer one (or a clear) changes nothing. */
   private journalEpoch = 0;
@@ -922,13 +922,13 @@ export class Buffer {
     if (this.journalTimer !== null) clearTimeout(this.journalTimer);
     this.journalTimer = null;
     if (!this.dirty || this.disposed) return;
-    // The path has ONE record. Until the open's lookup settles, and while the
-    // draft it found is on offer, that record may be the only copy of work
-    // this buffer does not hold: writing these edits over it would leave the
-    // offer in memory alone. Hold them (the lookup's end journals them; a
-    // restore or discard ends the offer), and say they are not backed up.
-    if (this.lookingForDraft) return;
-    if (this.recovered !== null) {
+    // The path has ONE record. Until the open's lookup settles (two requests,
+    // up to a timeout each on a dead link), and while the draft it found is
+    // on offer, that record may be the only copy of work this buffer does not
+    // hold: writing these edits over it would leave the offer in memory
+    // alone. Hold them (the lookup's end journals them; a restore or discard
+    // ends the offer), and say they are not backed up.
+    if (this.lookingForDraft || this.recovered !== null) {
       this.journalFailed = true;
       return;
     }
@@ -959,8 +959,12 @@ export class Buffer {
   /** On open: a journaled draft that differs from the disk is offered, never applied. */
   private async lookForDraft(): Promise<void> {
     this.lookingForDraft = true;
-    const rec = await drafts.find(this.path);
-    this.lookingForDraft = false;
+    let rec: drafts.DraftRecord | null;
+    try {
+      rec = await drafts.find(this.path);
+    } finally {
+      this.lookingForDraft = false;
+    }
     if (this.disposed) return;
     if (rec !== null && rec.text === this.baseText) {
       // Nothing to recover: drop that record, whoever wrote it.
