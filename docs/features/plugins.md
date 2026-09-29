@@ -573,7 +573,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
 - **How to use.** Switch the plugin on in a workspace. Its card gains **Open <view>** for each
   tab it offers, its card sections, and **Settings**. A file it claims opens in its view; the
   bar above has **Text** (and, when two plugins claim it, each one — the choice is remembered
-  per workspace), its status chips and file actions. The dashboard shows its panels after
+  per workspace), its status chips and file actions. Opening such a file where the plugin is
+  installed but off offers **Turn on** in that bar (**Not now** is remembered per workspace;
+  one waiting for trust is left to its card). The dashboard shows its panels after
   Chimaera's own. Settings → **Plugins** lists every installed plugin's settings (host-wide or
   per workspace), with what its output folder uses and **Clear**.
 - **Where it's wired.**

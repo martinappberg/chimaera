@@ -215,17 +215,26 @@ export interface FileClaim {
   view: ViewDecl;
 }
 
+function claimOf(p: WorkspacePlugin, rel: string): FileClaim | null {
+  const kind = p.platform.files.find((f) => f.match.some((m) => matchesPattern(m, rel)));
+  const view = kind && p.platform.views.find((v) => v.id === kind.view && v.slot === "file");
+  return kind && view ? { plugin: p, kind, view } : null;
+}
+
 /** Every active plugin that claims `rel` (`[[files]]`), in the daemon's
  *  order; the first is the default, the rest are the Open with choices. */
 export function claimsFor(plugins: readonly WorkspacePlugin[], rel: string): FileClaim[] {
-  const out: FileClaim[] = [];
-  for (const p of plugins) {
-    if (!p.active) continue;
-    const kind = p.platform.files.find((f) => f.match.some((m) => matchesPattern(m, rel)));
-    const view = kind && p.platform.views.find((v) => v.id === kind.view && v.slot === "file");
-    if (kind && view) out.push({ plugin: p, kind, view });
-  }
-  return out;
+  return plugins.flatMap((p) => (p.active ? (claimOf(p, rel) ?? []) : []));
+}
+
+/** Installed plugins that would open `rel` but are switched off in this
+ *  workspace: the file's one-click Turn on. Only ones a switch alone makes
+ *  active (footprint present, nothing holding them); one waiting for trust
+ *  or faulted is left to its Extensions card, which can ask and explain. */
+export function offersFor(plugins: readonly WorkspacePlugin[], rel: string): FileClaim[] {
+  return plugins.flatMap((p) =>
+    p.installed && !p.on && p.detected && p.hold === null && p.fault === null ? (claimOf(p, rel) ?? []) : [],
+  );
 }
 
 /** The file menu items active plugins add for `rel` (`[[actions]]`). */
@@ -280,6 +289,28 @@ export function rememberOpenWith(wsId: string, label: string, choice: string | n
     localStorage.setItem(OPEN_WITH_KEY, JSON.stringify(all));
   } catch {
     // Private windows and blocked storage: the choice lasts this page.
+  }
+}
+
+const OFFERS_KEY = "chimaera.plugins.offersDeclined";
+
+/** Plugins whose Turn on offer the user answered Not now here. */
+export function declinedOffers(wsId: string): string[] {
+  try {
+    const all = JSON.parse(localStorage.getItem(OFFERS_KEY) ?? "{}") as Record<string, string[]>;
+    return Array.isArray(all[wsId]) ? all[wsId] : [];
+  } catch {
+    return [];
+  }
+}
+
+export function declineOffer(wsId: string, pid: string): void {
+  try {
+    const all = JSON.parse(localStorage.getItem(OFFERS_KEY) ?? "{}") as Record<string, string[]>;
+    all[wsId] = [...new Set([...(Array.isArray(all[wsId]) ? all[wsId] : []), pid])];
+    localStorage.setItem(OFFERS_KEY, JSON.stringify(all));
+  } catch {
+    // Private windows and blocked storage: the answer lasts this page.
   }
 }
 

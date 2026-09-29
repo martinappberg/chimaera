@@ -8,6 +8,7 @@ import {
   EMPTY_PLATFORM,
   matchesPattern,
   normalizePlatform,
+  offersFor,
   pluginViewTitle,
   sizeWords,
   viewsIn,
@@ -135,6 +136,31 @@ describe("what a plugin draws where", () => {
     expect(
       viewsIn(all, "tab").map((v) => `${v.plugin.id}/${v.view.id}`),
     ).toEqual(["latex/board", "other/board"]);
+  });
+
+  it("offers Turn on only where a switch alone would make it open the file", () => {
+    const off = (id: string, over: Partial<WorkspacePlugin> = {}): WorkspacePlugin =>
+      ({
+        ...plugin(id, false),
+        installed: true,
+        on: false,
+        detected: true,
+        hold: null,
+        fault: null,
+        ...over,
+      }) as WorkspacePlugin;
+    const all = [
+      plugin("active"),
+      off("latex"),
+      off("available", { installed: false }),
+      off("held", { hold: { kind: "untrusted" } }),
+      off("faulted", { fault: "needs a newer chimaera" }),
+      off("elsewhere", { detected: false }),
+      off("typst", { platform: EMPTY_PLATFORM }),
+    ];
+    expect(offersFor(all, "ch/one.tex").map((o) => o.plugin.id)).toEqual(["latex"]);
+    expect(offersFor(all, "ch/one.tex")[0].kind.label).toBe("LaTeX");
+    expect(offersFor(all, "notes.md")).toEqual([]);
   });
 
   it("names a tab by its view's title", () => {

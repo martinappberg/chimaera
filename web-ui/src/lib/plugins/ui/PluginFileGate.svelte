@@ -6,13 +6,18 @@
    * plugins claiming it offer the choice, remembered per workspace and file
    * kind. The bar above also carries the claiming plugins' status chips
    * (`slot = "status"`) and every matching file action (`[[actions]]`).
+   * A file no active plugin claims but an installed one switched off here
+   * would gets a one-click Turn on (Not now is remembered per workspace).
    * With none of that, the file shows exactly as it always did.
    */
   import type { Snippet } from "svelte";
-  import { workspacePlugins } from "../store";
+  import { setWorkspacePluginOn, workspacePlugins } from "../store";
   import {
     actionsFor,
     claimsFor,
+    declinedOffers,
+    declineOffer,
+    offersFor,
     openPluginView,
     openWith,
     postFileAction,
@@ -35,6 +40,15 @@
   const rel = $derived(workspaceRelative(wsRoot, path));
   const claims = $derived(rel !== null ? claimsFor(plugins, rel) : []);
   const actions = $derived(rel !== null ? actionsFor(plugins, rel) : []);
+  let declined = $state<string[]>([]);
+  $effect(() => {
+    declined = wsId !== null ? declinedOffers(wsId) : [];
+  });
+  const offer = $derived(
+    rel !== null && claims.length === 0
+      ? (offersFor(plugins, rel).find((o) => !declined.includes(o.plugin.id)) ?? null)
+      : null,
+  );
   const chips = $derived(
     viewsIn(plugins, "status").filter((s) => claims.some((c) => c.plugin.id === s.plugin.id)),
   );
@@ -62,6 +76,26 @@
   let timer: ReturnType<typeof setTimeout> | undefined;
   $effect(() => () => clearTimeout(timer));
 
+  let turning = $state(false);
+
+  async function turnOn(pid: string): Promise<void> {
+    if (turning) return;
+    turning = true;
+    try {
+      await setWorkspacePluginOn(pid, true);
+    } catch (e) {
+      message = { text: e instanceof Error ? e.message : String(e), bad: true };
+    } finally {
+      turning = false;
+    }
+  }
+
+  function notNow(pid: string): void {
+    if (wsId === null) return;
+    declineOffer(wsId, pid);
+    declined = [...declined, pid];
+  }
+
   async function runAction(pid: string, action: string): Promise<void> {
     if (wsId === null || rel === null || running !== null) return;
     running = `${pid}/${action}`;
@@ -79,7 +113,7 @@
   }
 </script>
 
-{#if wsId === null || rel === null || (claims.length === 0 && actions.length === 0)}
+{#if wsId === null || rel === null || (claims.length === 0 && actions.length === 0 && offer === null)}
   {@render children()}
 {:else}
   <div class="gate">
@@ -89,6 +123,15 @@
           <PluginScreen ws={wsId} {wsRoot} plugin={c.plugin.id} view={c.view.id} file={rel} compact />
         </div>
       {/each}
+      {#if offer !== null}
+        <span class="offer">
+          <strong>{offer.plugin.name}</strong> can open this file. It's off in this workspace.
+        </span>
+        <button class="opt small primary" disabled={turning} onclick={() => void turnOn(offer.plugin.id)}
+          >{turning ? "Turning on…" : "Turn on"}</button
+        >
+        <button class="opt small quiet" disabled={turning} onclick={() => notNow(offer.plugin.id)}>Not now</button>
+      {/if}
       {#if message !== null}
         <span class="message" class:bad={message.bad} role="status">{message.text}</span>
       {/if}
@@ -157,9 +200,19 @@
   .spacer {
     flex: 1;
   }
-  .message {
+  .message,
+  .offer {
     font-size: var(--text-xs);
     color: var(--muted);
+  }
+  /* The bar's buttons sit at the switch's size. */
+  .opt.small {
+    font-size: var(--text-xs);
+    padding: 2px 10px;
+  }
+  .offer strong {
+    color: var(--fg);
+    font-weight: 600;
   }
   .message.bad {
     color: var(--err);
