@@ -19,3 +19,9 @@ All future work items for this project are tracked here.
 
 <!-- Add new entries above this line -->
 | Write methods section | medium | complete | writing | 2026-09-15 | Martin | [methods.md](methods.md) |
+
+## T-Lanes — Re-load the pilot lanes at 10k
+
+**Priority**: high · **Status**: open
+
+Follows D-3; needs the batch 3 FASTQs.

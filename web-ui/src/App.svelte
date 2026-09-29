@@ -214,7 +214,16 @@
   import { computeStatus, initCompute, queuedJobCount } from "./lib/workspace/compute";
   import { surfacesOf } from "./lib/layout/surfaces";
   import { activateTimelineWorkspace, onTimelineNudge } from "./lib/workspace/timeline.svelte";
-  import { activateKnowledgeWorkspace } from "./lib/workspace/knowledge";
+  import {
+    activateKnowledgeWorkspace,
+    focusKnowledgeEntry,
+    registerKnowledgeOpener,
+    setKnowledgeRoot,
+  } from "./lib/workspace/knowledge";
+  // Registers the active workspace's knowledge as the first id-reference
+  // source (chat chips, previews) — a side-effect import.
+  import "./lib/knowledge/references";
+  import { registerAskAgent } from "./lib/shared/askAgent";
   import {
     activatePluginsWorkspace,
     attachRequest,
@@ -1029,6 +1038,23 @@
     void activateKnowledgeWorkspace(wsId);
     void activatePluginsWorkspace(wsId);
     eventsSocket?.watch(wsId);
+  });
+
+  $effect(() => {
+    setKnowledgeRoot(workspace?.root ?? null);
+  });
+
+  // Knowledge's two app-level hooks: open an entry beside a pane (a chat's
+  // id chip) and "Ask an agent" (draft into the working agent's composer).
+  $effect(() => {
+    const offOpen = registerKnowledgeOpener((ekey, from) =>
+      openKnowledgeFromPane(from.paneId ?? layout.focusedPaneId, ekey, from.newSplit),
+    );
+    const offAsk = registerAskAgent((text) => askAgentFrom(layout.focusedPaneId, text));
+    return () => {
+      offOpen();
+      offAsk();
+    };
   });
 
   // Mounted file views + visible listing directories are the complete scope of
@@ -2273,6 +2299,58 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
+  /** Knowledge at one entry, beside the source pane (a chat's id chip): an
+   *  open Knowledge tab takes the request (moved beside when it hides behind
+   *  the source or a split was asked for); else the adjacent pane, or a split
+   *  when the source stands alone. The view takes the focus request when it
+   *  shows. */
+  function openKnowledgeFromPane(paneId: string, ekey: string, newSplit: boolean): void {
+    focusKnowledgeEntry(ekey);
+    if (activeWsId === null || !layoutReady) return;
+    const existing = paneForTab(layout.root, { surface: "knowledge" });
+    const source = findPane(layout.root, paneId);
+    const hiddenBehind =
+      existing !== null && existing.paneId === paneId && source !== null && source.active !== existing.index;
+    if (existing !== null && (hiddenBehind || newSplit)) {
+      // Knowledge sits behind the source in its own pane, or the click asked
+      // for a split: move the one Knowledge tab beside the source, so what
+      // the id was clicked in (a chat) stays in view.
+      layout = dropTab(layout, { surface: "knowledge" }, paneId, "right");
+    } else if (existing !== null) {
+      layout = activateTab(layout, existing.paneId, existing.index);
+    } else {
+      const neighbor = newSplit ? null : adjacentPane(layout, paneId);
+      if (neighbor !== null) {
+        layout = openKnowledge(focusPane(layout, neighbor));
+      } else {
+        layout = splitPane(layout, paneId, "row");
+        layout = openKnowledge(layout);
+      }
+    }
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** Knowledge's "Ask an agent": the drafted request lands in the agent the
+   *  user works with, surfaced beside Knowledge when it isn't open. Never
+   *  sends — the user reads the draft first. */
+  function askAgentFrom(paneId: string, text: string): string | null {
+    const target = refTargetSession;
+    if (target === null) return null;
+    if (sessionPaneId(layout, target.id) === null) {
+      layout = splitPane(layout, paneId, "row");
+      layout = openSession(layout, target.id);
+    }
+    if (target.ui === "chat") {
+      const loc = paneForTab(layout.root, { surface: "terminal", sessionId: target.id });
+      if (loc !== null) layout = activateTab(layout, loc.paneId, loc.index);
+      insertIntoComposer(target.id, text, "block");
+    } else {
+      // A terminal input submits on a newline: the draft goes in as one line.
+      typeIntoSession(target.id, text.replace(/\s*\n\s*/g, " "));
+    }
+    return displayNames.get(target.id) ?? displayName(target);
+  }
+
   /** The "N files changed" chip: open (or focus) this session's changes review,
    *  beside the source pane — adjacent pane, or a split when it stands alone. */
   function openChangesFromPane(paneId: string, sessionId: string, newSplit: boolean): void {
@@ -3237,9 +3315,13 @@
   /** Quick-open commands: the workspace surfaces that have no file or session
    *  to match on ("Timeline", "Knowledge", "Extensions" — which "plugins" and
    *  "skills" still find). */
-  const quickOpenCommands = [
+  // Knowledge is offered only while a knowledge plugin is on here (it is
+  // that plugin's view; without one there is nothing to open).
+  const quickOpenCommands = $derived([
     { id: "timeline", label: "Timeline", hint: "what happened", run: openTimelineSurface },
-    { id: "knowledge", label: "Knowledge", hint: "what we know", run: openKnowledgeSurface },
+    ...($knowledgeProviderActive
+      ? [{ id: "knowledge", label: "Knowledge", hint: "what your agents recorded", run: openKnowledgeSurface }]
+      : []),
     {
       id: "plugins",
       label: "Extensions",
@@ -3254,7 +3336,7 @@
       hint: "the workspace's Mastermind panel",
       run: () => setMastermindPanelOpen(true),
     },
-  ];
+  ]);
 
   function focusDirection(dir: FocusDir): void {
     layout = moveFocus(layout, dir);
