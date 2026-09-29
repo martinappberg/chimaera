@@ -53,6 +53,8 @@
   import ComputeBanner from "./ComputeBanner.svelte";
   import { getJobContext, isHomeHub, type Health } from "../net/api";
   import { asyncDisposer } from "../shared/asyncDisposer";
+  import { pageVisible } from "../shared/visibility";
+  import { fetchOwnershipHints } from "./placementHints";
   import { relativeAge } from "./launcher";
   import { checkForUpdates, updateState } from "./update.svelte";
 
@@ -122,6 +124,32 @@
       map.set(s.workspace_id, entry);
     }
     return map;
+  });
+
+  /** Where a project's work runs when that is not (only) here — "In the
+   *  cloud", "Coming home…" — from this daemon's own Pro ownership answer. A
+   *  project the cloud holds otherwise looks idle here. Empty without Pro.
+   *  Read while the page shows (and re-read while Pro answers), never on a
+   *  remote host's Home or in a project view, which have no ownership here. */
+  let placeHints = $state(new Map<string, string>());
+  $effect(() => {
+    if (ownAlias !== null || isBrowserGateway() || !$pageVisible) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const read = async (): Promise<void> => {
+      const answer = await fetchOwnershipHints();
+      if (stopped) return;
+      // An unreadable answer keeps what was known (a blip drops no hint).
+      if (answer !== null) placeHints = answer.hints;
+      // A daemon without Pro has nothing to poll for; a return-to-visible
+      // re-runs this effect and asks once more.
+      if (answer === null || answer.configured) timer = setTimeout(() => void read(), answer === null ? 30_000 : 15_000);
+    };
+    void read();
+    return () => {
+      stopped = true;
+      if (timer !== null) clearTimeout(timer);
+    };
   });
 
   /** Confirm target for workspace removal (one at a time, Escape cancels). */
@@ -958,6 +986,7 @@
         <div class="rows">
           {#each sorted as w (w.id)}
             {@const live = liveByWs.get(w.id)}
+            {@const placeHint = placeHints.get(w.id)}
             {@const wsState = !daemonReachable ? "" : live && live.attn > 0 ? "attn" : live && live.live > 0 ? "alive" : ""}
             {#if confirmStopId === w.id}
               <div class="row confirm" role="alertdialog" aria-label="end sessions?">
@@ -1005,7 +1034,7 @@
                     {:else if live !== undefined && live.live > 0}
                       <span class="session-state" class:stale={!daemonReachable}>{live.live} {daemonReachable ? "live " : ""}session{live.live === 1 ? "" : "s"}{daemonReachable ? "" : " last seen"}</span>
                     {/if}
-                    <span class="when">{ago(w.last_opened_at)}</span>
+                    <span class="when">{#if placeHint !== undefined}{placeHint} · {/if}{ago(w.last_opened_at)}</span>
                   </span>
                 </button>
                 {#if live !== undefined && live.live > 0}

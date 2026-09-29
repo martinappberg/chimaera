@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import type { SeqEvent } from "./chatWs";
 import { ChatStore } from "./store.svelte";
-import { isTransferOrigin, transferNote } from "./transfer";
+import journal from "./transferJournal.fixture.json";
+import { isTransferOrigin, pickupNote, RESTART_NOTE, transferNote } from "./transfer";
 
 // Stand-ins shaped like the daemon's `transfer_context` wording.
 const MOVED = "Chimaera moved this conversation to the cloud. You now run in the cloud.";
@@ -37,6 +38,43 @@ describe("transfer pick-up notes", () => {
     // The agent-facing words never reach the note.
     for (const note of [transferNote("recovered", RECOVERED), transferNote("recovered", RECOVERED_HOME)]) {
       expect(note).not.toMatch(/host|checkpoint|session|saved point/i);
+    }
+  });
+});
+
+/** The Timeline's title for a turn: the prompt as one line, capped at 300
+ *  characters with an ellipsis (`chimaera-server` `timeline::prompt_title`). */
+function timelineTitle(prompt: string): string {
+  const line = prompt.trim().split(/\s+/).join(" ");
+  return line.length <= 300 ? line : `${line.slice(0, 299).trimEnd()}…`;
+}
+
+describe("pickupNote (a surface that holds only the prompt's text)", () => {
+  it("reads the daemon's pick-ups as the chat divider says them", () => {
+    expect(pickupNote(MOVED)).toBe("Continued in the cloud");
+    expect(pickupNote("Chimaera moved this conversation back to the user's computer. You now run on the user's computer, in the same conversation.")).toBe("Back on your computer");
+    expect(pickupNote(RECOVERED)).toBe("Continued in the cloud after this computer stopped responding");
+    expect(pickupNote(RECOVERED, true)).toBe("Continued in the cloud after your computer stopped responding");
+    expect(pickupNote(RECOVERED_HOME)).toBe("Back on your computer after the cloud stopped responding");
+    expect(pickupNote("The Chimaera daemon hosting this session restarted, so this conversation was resumed in a new agent process. Your last turn was cut off before it finished.")).toBe(RESTART_NOTE);
+  });
+
+  it("recognises the real pick-up through the Timeline's capped one-line title", () => {
+    const pickUp = (journal as SeqEvent[]).find((e) => e.ev.type === "user_message" && e.ev.origin === "moved");
+    const title = timelineTitle(pickUp?.ev.text as string);
+    expect(title.endsWith("…")).toBe(true);
+    expect(pickupNote(title)).toBe("Continued in the cloud");
+  });
+
+  it("leaves what a person wrote alone", () => {
+    for (const typed of [
+      "fix the QC filter",
+      "PHONE: hello from the phone",
+      // Talking ABOUT a move is not the daemon's pick-up.
+      "why did Chimaera moved this conversation earlier?",
+      "",
+    ]) {
+      expect(pickupNote(typed)).toBeNull();
     }
   });
 });

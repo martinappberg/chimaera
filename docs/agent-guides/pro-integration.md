@@ -126,6 +126,11 @@ value (`chat::transfer_origin`, `chimaera_agent::model`):
 | `home` | a clean return; back on the user's computer | Back on your computer |
 | `recovered` | either direction, after the other machine stopped responding; continues from the last saved point (usually a forked copy) | the UI's recovery wording |
 
+The Timeline records only a turn's prompt text, not its origin, so the dashboard's "Since you
+left" recognises a pick-up from the message's opening words (`chat/transfer.ts` `pickupNote`)
+and shows the same divider line; keep those opening sentences stable, or carry the origin on the
+Timeline entry.
+
 `restart` (a daemon restart cut the work off) is the other pick-up origin;
 each of the four resets the carryover's ten-minute pick-up clock
 (`model::is_pickup_origin`). `worker` (a Mastermind worker's message) is

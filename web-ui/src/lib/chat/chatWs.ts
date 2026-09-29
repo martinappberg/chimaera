@@ -1,7 +1,7 @@
 import { daemonSocketUrl, isBrowserGateway } from "../net/base";
 import { ownerSuspended, parsePause, sendSocketAuth, type SessionPause } from "../net/placement";
 import { getToken } from "../net/api";
-import { parkUntilAwake, Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
+import { ownerAwake, parkUntilAwake, Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 import { CooperativeQueue } from "./cooperativeQueue";
 
 /**
@@ -191,6 +191,9 @@ export class ChatSocket {
           this.unknownRetries = 0;
           this.waking = false;
           this.asleep = false;
+          // The project answers on this socket: whatever waited for it (a
+          // parked socket, a panel that met "asleep" or "unreachable") reads again.
+          ownerAwake();
           this.deliveries.push({
             kind: "ready",
             session: msg.session as ChatSessionInfo,

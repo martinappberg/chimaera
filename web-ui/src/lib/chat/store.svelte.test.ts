@@ -2061,6 +2061,28 @@ describe("ChatStore unsent text", () => {
     expect(store.asleep).toBe(false);
   });
 
+  it("says so, instead of loading forever, when the owner sleeps before the first replay", () => {
+    const store = new ChatStore();
+    // A fresh store is loading its transcript; nothing has said the owner sleeps.
+    expect(store.hydrating).toBe(true);
+    expect(store.awaitingWake).toBe(false);
+    store.onAsleep();
+    expect(store.awaitingWake).toBe(true);
+    // A dropped socket keeps it (the gateway may close after saying so).
+    store.onDisconnected();
+    expect(store.awaitingWake).toBe(true);
+    // A send wakes it: the ordinary loading line takes over.
+    store.onWaking();
+    expect(store.awaitingWake).toBe(false);
+    expect(store.hydrating).toBe(true);
+    // A transcript that already loaded is never replaced by the note.
+    const loaded = new ChatStore();
+    loaded.apply({ seq: 1, ts: 1, ev: { type: "message_chunk", turn_id: "t1", text: "hi" } } as SeqEvent);
+    loaded.hydrating = false;
+    loaded.onAsleep();
+    expect(loaded.awaitingWake).toBe(false);
+  });
+
   it("a paused owner is a state, cleared when the conversation is live again", () => {
     const store = new ChatStore();
     store.onAsleep();

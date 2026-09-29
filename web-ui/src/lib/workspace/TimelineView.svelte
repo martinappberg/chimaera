@@ -121,6 +121,8 @@
 
     {#if timelineStore.available === false}
       <p class="empty">This daemon has no Timeline yet — update chimaera to see what happened here.</p>
+    {:else if timelineStore.note !== null && timelineStore.entries.length === 0}
+      <p class="empty" role="status">{timelineStore.note}</p>
     {:else if timelineStore.error !== null && timelineStore.entries.length === 0}
       <p class="empty err">{timelineStore.error}</p>
     {:else if timelineStore.entries.length === 0}
@@ -158,7 +160,9 @@
         {:else}
           <span class="end">the beginning of what chimaera kept</span>
         {/if}
-        {#if timelineStore.error !== null}
+        {#if timelineStore.note !== null}
+          <span class="end">{timelineStore.note}</span>
+        {:else if timelineStore.error !== null}
           <span class="err">{timelineStore.error}</span>
         {/if}
       </div>

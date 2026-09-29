@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, isHomeHub, leaveHomeHub, ownerElsewhere, plainError, reclaimHomeHub } from "./api";
+import { ASLEEP_NOTE, ApiError, isHomeHub, leaveHomeHub, ownerElsewhere, plainError, projectStateNote, reclaimHomeHub } from "./api";
 import { placementLabel } from "./placement";
 
 describe("daemon connection codes", () => {
@@ -57,6 +57,25 @@ describe("a project running elsewhere", () => {
 
   it("calls a sleeping cloud machine asleep", () => {
     expect(plainError("worker_asleep")).toBe("The cloud machine is asleep.");
+  });
+});
+
+describe("a project's state, told apart from a failure", () => {
+  it("reads a sleeping or unreachable owner as a quiet note, never an error", () => {
+    expect(projectStateNote(new ApiError(409, "worker_asleep"))).toBe(ASLEEP_NOTE);
+    expect(ASLEEP_NOTE).toBe("Asleep in the cloud. Send a message to wake it.");
+    expect(projectStateNote(new ApiError(503, "project_unavailable"))).toBe("This project isn’t reachable right now.");
+    for (const code of ["remote_unavailable", "workspace_scope_changed", "workspace_unavailable"]) {
+      expect(projectStateNote(new ApiError(503, code))).toBe("Your project is reconnecting.");
+    }
+  });
+
+  it("leaves a real failure to its error styling", () => {
+    expect(projectStateNote(new ApiError(400, "invalid path"))).toBeNull();
+    expect(projectStateNote(new ApiError(403, "outside_project"))).toBeNull();
+    expect(projectStateNote(new ApiError(409, "workspace_owned_elsewhere"))).toBeNull();
+    expect(projectStateNote(new Error("worker_asleep"))).toBeNull();
+    expect(projectStateNote(null)).toBeNull();
   });
 });
 

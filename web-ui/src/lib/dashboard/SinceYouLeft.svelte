@@ -40,7 +40,10 @@
     <button class="link" onclick={dash.onOpenTimeline}>open timeline →</button>
   </div>
 
-  {#if timelineStore.error !== null && timelineStore.entries.length === 0}
+  {#if timelineStore.note !== null && timelineStore.entries.length === 0}
+    <!-- Where the project is (asleep, reconnecting), not a failure. -->
+    <p class="empty" role="status">{timelineStore.note}</p>
+  {:else if timelineStore.error !== null && timelineStore.entries.length === 0}
     <p class="empty err">{timelineStore.error}</p>
   {:else if picked.total === 0}
     <p class="empty">

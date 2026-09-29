@@ -2601,7 +2601,13 @@
     <!-- One real reading column (the Claude Desktop measure): agent prose
          fills it from the left, user bubbles right-align inside it. -->
     <div class="column" bind:this={columnEl}>
-    {#if store.hydrating}
+    {#if store.awaitingWake}
+      <!-- Asleep before the first replay: nothing to load yet, and no spinner
+           for a wait that only a send ends (the footer says the same). -->
+      <div class="empty asleep-note" role="status">
+        <span>The conversation shows once the cloud wakes. Sending a message wakes it.</span>
+      </div>
+    {:else if store.hydrating}
       <div class="empty hydrate" aria-live="polite">
         <SessionGlyph kind="agent" {agentKind} size={18} state="alive" />
         <span>loading recent conversation…</span>
@@ -3325,6 +3331,11 @@
     flex-direction: column;
     align-items: center;
     gap: 8px;
+  }
+  .asleep-note {
+    max-width: 34ch;
+    text-align: center;
+    line-height: 1.5;
   }
   .history-more {
     align-self: center;
