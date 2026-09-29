@@ -38,7 +38,7 @@ pub(super) struct Pro {
     billing: billing::Billing,
     return_target: Mutex<Option<(String, u64)>>,
     delegation: Mutex<Option<chimaera_link::Delegation>>,
-    daemon_stamp: Mutex<Option<(u16, String, bool)>>,
+    daemon_stamp: Mutex<Option<DaemonStamp>>,
     worker_links: tokio::sync::Mutex<HashMap<String, chimaera_link::LinkTunnel>>,
     runtime: tokio::sync::Mutex<Option<Runtime>>,
     pub(super) operation: tokio::sync::Mutex<()>,
@@ -1192,6 +1192,47 @@ mod tests {
         server.await.unwrap();
     }
 
+    fn local_daemon(token: &str) -> crate::daemon::LocalDaemon {
+        crate::daemon::LocalDaemon {
+            port: 7070,
+            token: token.into(),
+            build: None,
+            outdated: false,
+            live_sessions: None,
+        }
+    }
+    fn fixture_account() -> Account {
+        serde_json::from_value(serde_json::json!({"account_id":"a-fixture","email":"fixture@example.invalid","plan":"pro","device_id":"d-fixture","protocol":0,"keeper_url":"https://keeper.example.invalid","limits":{"cloud_hours":1,"storage_bytes":1},"usage":{"cloud_hours":0,"storage_bytes":0},"hours_exhausted":false})).unwrap()
+    }
+    fn fixture_grant(expires_at: &str) -> chimaera_link::Delegation {
+        serde_json::from_value(serde_json::json!({"access_token":"synthetic","expires_at":expires_at,"scope":["baton","mirror","keeper"],"device_id":"d-fixture"})).unwrap()
+    }
+
+    #[test]
+    fn a_restarted_or_reset_daemon_is_set_up_again_with_a_fresh_grant() {
+        let account = fixture_account();
+        let before = DaemonStamp::new(&local_daemon("token-before"), &account);
+        // Same loopback port, new process: its in-memory setup is gone.
+        let after = DaemonStamp::new(&local_daemon("token-after"), &account);
+        assert!(before != after && !before.same_daemon(&after));
+        let mut exhausted = account.clone();
+        exhausted.hours_exhausted = true;
+        let flag = DaemonStamp::new(&local_daemon("token-before"), &exhausted);
+        assert!(before != flag && before.same_daemon(&flag));
+
+        let live = fixture_grant("9999-01-01T00:00:00Z");
+        assert!(
+            reusable_delegation(Some(live.clone()), false).is_some(),
+            "an unchanged daemon keeps the grant it is using"
+        );
+        assert!(
+            reusable_delegation(Some(live), true).is_none(),
+            "a daemon that lost its setup gets a fresh grant"
+        );
+        assert!(reusable_delegation(Some(fixture_grant("2000-01-01T00:00:00Z")), false).is_none());
+        assert!(reusable_delegation(None, false).is_none());
+    }
+
     #[tokio::test]
     async fn ssh_routing_never_waits_for_account_startup() {
         let pro = Pro::new(Some("http://127.0.0.1:1".into()));
@@ -1672,6 +1713,50 @@ fn project_failure(detail: &str) -> &'static str {
         "The project couldn't open here. Its cloud copy is intact. Try again shortly."
     }
 }
+/// Everything the daemon's current setup was derived from. The daemon token
+/// is new on every daemon start, so a same-port restart (which loses the
+/// in-memory setup) is never mistaken for the daemon this shell configured.
+#[derive(Clone, PartialEq, Eq)]
+struct DaemonStamp {
+    port: u16,
+    daemon_token: String,
+    keeper_url: String,
+    hours_exhausted: bool,
+}
+impl DaemonStamp {
+    fn new(local: &crate::daemon::LocalDaemon, account: &Account) -> Self {
+        Self {
+            port: local.port,
+            daemon_token: local.token.clone(),
+            keeper_url: account.keeper_url.clone(),
+            hours_exhausted: account.hours_exhausted,
+        }
+    }
+    fn cleared(local: &crate::daemon::LocalDaemon) -> Self {
+        Self {
+            port: local.port,
+            daemon_token: local.token.clone(),
+            keeper_url: String::new(),
+            hours_exhausted: false,
+        }
+    }
+    fn same_daemon(&self, other: &Self) -> bool {
+        self.port == other.port && self.daemon_token == other.daemon_token
+    }
+}
+
+/// Minting a grant revokes the previous one, so an unchanged daemon that still
+/// holds its setup keeps the grant it is using. A daemon that lost its setup
+/// (restart, reset, or a grant the account may have invalidated) gets a fresh
+/// one, as does any grant too close to expiry to be renewed in time.
+fn reusable_delegation(
+    cached: Option<chimaera_link::Delegation>,
+    daemon_lost_setup: bool,
+) -> Option<chimaera_link::Delegation> {
+    cached.filter(|grant| !daemon_lost_setup && !grant.expires_within(DELEGATION_MARGIN))
+}
+const DELEGATION_MARGIN: Duration = Duration::from_secs(2 * 3600);
+
 async fn configure_daemon(state: &Shell, client: &Client) -> Result<()> {
     let Some(account) = lock(&state.pro.account).clone() else {
         return Ok(());
@@ -1684,8 +1769,9 @@ async fn configure_daemon(state: &Shell, client: &Client) -> Result<()> {
         Some(serde_json::json!({"suitable":suitable})),
     )
     .await?;
+    let local = lock(&state.local).clone();
     if account.keeper_url.is_empty() || account.plan == chimaera_link::Plan::None {
-        let cleared = (lock(&state.local).port, String::new(), false);
+        let cleared = DaemonStamp::cleared(&local);
         if lock(&state.pro.daemon_stamp).as_ref() != Some(&cleared) {
             // The daemon outlives the GUI. A downgrade must revoke its local
             // runtime even when this app process never configured that runtime.
@@ -1711,14 +1797,19 @@ async fn configure_daemon(state: &Shell, client: &Client) -> Result<()> {
         }
         return Ok(());
     }
-    let local = lock(&state.local).clone();
-    let stamp = (
-        local.port,
-        account.keeper_url.clone(),
-        account.hours_exhausted,
-    );
-    if lock(&state.pro.daemon_stamp).as_ref() == Some(&stamp) {
-        return Ok(());
+    let stamp = DaemonStamp::new(&local, &account);
+    let previous = lock(&state.pro.daemon_stamp).clone();
+    let mut lost_setup = previous
+        .as_ref()
+        .is_none_or(|previous| !previous.same_daemon(&stamp));
+    if previous.as_ref() == Some(&stamp) {
+        // The daemon outlives this shell and keeps setup only in memory;
+        // confirm it still holds it instead of trusting the cached stamp.
+        let status = daemon_request(state, "GET", "/pro/status", None).await?;
+        if status["configured"] == true {
+            return Ok(());
+        }
+        lost_setup = true;
     }
     // Both service and daemon must acknowledge the exact new protocol. A legacy
     // fallback would silently remove fencing while still showing a paid account.
@@ -1735,26 +1826,46 @@ async fn configure_daemon(state: &Shell, client: &Client) -> Result<()> {
         capability: capabilities.execution_capability,
     };
     let cached = lock(&state.pro.delegation).clone();
-    let delegation = if let Some(delegation) = cached {
-        delegation
-    } else {
-        client.delegate_daemon().await?
+    let delegation = match reusable_delegation(cached, lost_setup) {
+        Some(delegation) => delegation,
+        None => client.delegate_daemon().await?,
     };
     let endpoint = state
         .pro
         .endpoint
         .clone()
         .context("Pro endpoint unavailable")?;
-    let ack = daemon_request(state,"POST","/pro/configure/execution",Some(serde_json::json!({"endpoint":endpoint,"keeper_url":account.keeper_url,"account_id":account.account_id,"delegation":delegation,"role":"device","hours_exhausted":account.hours_exhausted,"execution":execution}))).await?;
-    chimaera_link::ExecutionConfigureAck::decode(
-        200,
-        &serde_json::to_vec(&ack)?,
-        &execution,
-        None,
-    )?;
+    let configured = async {
+        let ack = daemon_request(state,"POST","/pro/configure/execution",Some(serde_json::json!({"endpoint":endpoint,"keeper_url":account.keeper_url,"account_id":account.account_id,"delegation":delegation,"role":"device","hours_exhausted":account.hours_exhausted,"execution":execution}))).await?;
+        chimaera_link::ExecutionConfigureAck::decode(
+            200,
+            &serde_json::to_vec(&ack)?,
+            &execution,
+            None,
+        )
+    }
+    .await;
+    if let Err(error) = configured {
+        // Never retry with a grant the daemon may have rejected.
+        *lock(&state.pro.delegation) = None;
+        *lock(&state.pro.daemon_stamp) = None;
+        return Err(error);
+    }
     *lock(&state.pro.delegation) = Some(delegation);
     *lock(&state.pro.daemon_stamp) = Some(stamp);
     Ok(())
+}
+
+/// Set the (possibly replaced) local daemon up again right away rather than on
+/// the next 30 s reconciliation, e.g. after an in-app daemon update.
+pub(super) fn reconfigure(app: &AppHandle) {
+    let Some((client, generation)) = app.state::<Shell>().pro.client_now() else {
+        return;
+    };
+    let app = app.clone();
+    tokio::spawn(async move {
+        configure_pass(&app, &client, generation, None).await;
+    });
 }
 // Keeper route IDs are distinct from the account's worker baton holder ID.
 // This translation applies only to the typed worker registration contract.

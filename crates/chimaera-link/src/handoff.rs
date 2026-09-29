@@ -90,6 +90,20 @@ pub struct Delegation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceBinding>,
 }
+impl Delegation {
+    /// True when the grant ends within `margin`, or its expiry is unreadable.
+    /// Reusing such a grant for a new daemon setup would hand the daemon a
+    /// credential it cannot renew in time.
+    pub fn expires_within(&self, margin: std::time::Duration) -> bool {
+        let Ok(expiry) = time::OffsetDateTime::parse(
+            &self.expires_at,
+            &time::format_description::well_known::Rfc3339,
+        ) else {
+            return true;
+        };
+        expiry - time::OffsetDateTime::now_utc() <= margin
+    }
+}
 impl std::fmt::Debug for Delegation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Delegation")
@@ -143,5 +157,26 @@ impl WorkspaceConfigureAck {
     /// An old daemon's 204/missing field never confirms scoped acceptance.
     pub fn confirms(&self, expected: &WorkspaceBinding, root: &std::path::Path) -> bool {
         self.workspace_authority == 1 && &self.workspace == expected && self.workspace_root == root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn grant(expires_at: &str) -> Delegation {
+        Delegation {
+            access_token: "synthetic".into(),
+            expires_at: expires_at.into(),
+            scope: vec!["baton".into(), "mirror".into(), "keeper".into()],
+            device_id: "d-fixture".into(),
+            workspace: None,
+        }
+    }
+    #[test]
+    fn stale_or_unreadable_grants_are_never_reused() {
+        let hour = std::time::Duration::from_secs(3600);
+        assert!(grant("2000-01-01T00:00:00Z").expires_within(hour));
+        assert!(grant("not a timestamp").expires_within(hour));
+        assert!(!grant("9999-01-01T00:00:00Z").expires_within(hour));
     }
 }
