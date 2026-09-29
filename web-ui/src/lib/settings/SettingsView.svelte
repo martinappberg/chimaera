@@ -17,7 +17,7 @@
   import { isBrowserGateway } from "../net/base";
   import { isNativeShell } from "../net/native";
   import BrandMark from "../shared/BrandMark.svelte";
-  import { accountPlan } from "../net/plan";
+  import { accountPlan, proOffered } from "../net/plan";
   import NotificationStatus from "./NotificationStatus.svelte";
   import UpdatesStatus from "./UpdatesStatus.svelte";
   import { APP_MENU, PINNED } from "../shared/keys";
@@ -96,7 +96,12 @@
         if (docsVisible) out.push({ category: cat, defs: [] });
         continue;
       }
-      if (cat === "Cloud machine" || cat === "Chimaera Pro") {
+      if (cat === "Chimaera Pro") {
+        // A build without an account endpoint never shows an account group.
+        if (proVisible && (isBrowserGateway() || $proOffered === true)) out.push({ category: cat, defs: [] });
+        continue;
+      }
+      if (cat === "Cloud machine") {
         if (proVisible) out.push({ category: cat, defs: [] });
         continue;
       }

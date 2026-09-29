@@ -233,6 +233,10 @@
 {/snippet}
 
 <section class="pro" class:subscriber={subscribed} aria-label="Chimaera Pro">
+  {#if status !== null && !status.available}
+    <!-- A build without an account endpoint: one line, nothing to sell or set up. -->
+    <p class="unavailable" role="status">Chimaera Pro isn't available in this build.</p>
+  {:else}
   <header class="heading">
     <div class="brand"><BrandMark size={44} /><span>chimaera</span><span class="product">{subscribed && status?.plan === "max" ? "Max" : "Pro"}</span></div>
     {#if subscribed}
@@ -260,8 +264,6 @@
     <p class="muted" role="status">Loading your account…</p>
   {:else if status.initializing}
     <!-- Account mutations wait for the single startup operation and its keychain fence. -->
-  {:else if !status.available}
-    <div class="panel"><h2>Pro isn't available in this build</h2><p class="muted">Your local workbench and SSH connections are ready to use.</p></div>
   {:else}
     {#if status.signed_in}
       <div class="identity">
@@ -340,10 +342,12 @@
     {/if}
   {/if}
   {#if (error || status?.error) && !accountNeedsAttention && !billingRecovery}<div class="error" role="alert"><span>{error ?? friendlyError(status?.error, "Part of your Pro connection couldn't refresh. Your local work remains available.")}</span><button class="secondary" disabled={busy !== null} onclick={() => void load(true)}>Try again</button></div>{/if}
+  {/if}
 </section>
 
 <style>
   .pro { container-type: inline-size; box-sizing: border-box; max-width: 940px; margin: 0 auto; padding: 44px clamp(18px, 4.5%, 42px) 64px; color: var(--fg); font-size: var(--text-md); }
+  .unavailable { margin: 0; color: var(--muted); }
   .heading { container-type: inline-size; max-width: 660px; margin-bottom: 36px; }
   .subscriber .heading { margin-bottom: 20px; }
   .subscriber .brand { margin-bottom: 24px; }

@@ -13,7 +13,7 @@ const gateway = vi.hoisted(() => ({
 vi.mock("./native", () => bridge);
 vi.mock("./base", () => gateway);
 
-import { accountPlan, paidPlan, type AccountPlan, type PaidPlan } from "./plan";
+import { accountPlan, paidPlan, proOffered, type AccountPlan, type PaidPlan } from "./plan";
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
@@ -279,7 +279,6 @@ describe("shared paid plan", () => {
     }
     for (const unknown of [
       status(null),
-      { ...status(null, false), available: false },
       { ...status("pro"), error: "Account could not be checked" },
       { ...status("none"), error: "Account could not be checked" },
     ]) {
@@ -314,8 +313,60 @@ describe("shared paid plan", () => {
     }
   });
 
+  it("marks an endpoint-less build unavailable before any Pro entry can show, and keeps availability through refreshes", async () => {
+    const offered: Array<boolean | null> = [];
+    const first = deferred<ProStatus>();
+    bridge.proStatus.mockReturnValueOnce(first.promise);
+    const account = subscribeAccount();
+    subscriptions.push(proOffered.subscribe((value) => offered.push(value)));
+    await flush();
+    expect(offered).toEqual([null]);
+    first.resolve({ ...status(null, false), available: false });
+    await flush();
+    expect(account.at(-1)).toBe("unavailable");
+    expect(offered).toEqual([null, false]);
+
+    // A shell with an endpoint is offered even while the keychain prompt waits.
+    bridge.proStatus.mockResolvedValue({ ...status(null, false), initializing: true });
+    changed();
+    await flush();
+    expect(account.at(-1)).toBe("loading");
+    expect(offered.at(-1)).toBe(true);
+    const slow = deferred<ProStatus>();
+    bridge.proStatus.mockReturnValueOnce(slow.promise);
+    changed();
+    await flush();
+    expect(offered.at(-1)).toBe(true);
+    slow.resolve(status("none"));
+    await flush();
+    expect(account.at(-1)).toBe("free");
+    bridge.proStatus.mockRejectedValue(new Error("native unavailable"));
+    changed();
+    await flush();
+    expect(account.at(-1)).toBe("unknown");
+    expect(offered.at(-1)).toBe(true);
+  });
+
+  it("offers Pro in an account gateway before its first plan read", async () => {
+    bridge.isNativeShell.mockReturnValue(false);
+    gateway.isBrowserGateway.mockReturnValue(true);
+    const pending = deferred<Response>();
+    fetcher.mockReturnValueOnce(pending.promise);
+    const offered: Array<boolean | null> = [];
+    subscriptions.push(proOffered.subscribe((value) => offered.push(value)));
+    expect(offered.at(-1)).toBe(true);
+    pending.resolve(response("none"));
+    await flush();
+    expect(offered.at(-1)).toBe(true);
+  });
+
   it("does no account work in an ordinary browser", async () => {
     bridge.isNativeShell.mockReturnValue(false);
+    const account = subscribeAccount();
+    const offered: Array<boolean | null> = [];
+    subscriptions.push(proOffered.subscribe((value) => offered.push(value)));
+    expect(account.at(-1)).toBe("unavailable");
+    expect(offered.at(-1)).toBe(false);
     const values = subscribe();
     visibility("hidden");
     visibility("visible");

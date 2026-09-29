@@ -3,7 +3,7 @@
   import HomeNavigation from "./HomeNavigation.svelte";
   import HomeActions from "./HomeActions.svelte";
   import { isMac } from "../shared/keys";
-  import { paidPlan } from "../net/plan";
+  import { paidPlan, proOffered } from "../net/plan";
   import { isBrowserGateway } from "../net/base";
   import ComputeLaunchDialog from "./ComputeLaunchDialog.svelte";
   import CloudProjects from "../pro/CloudProjects.svelte";
@@ -836,7 +836,7 @@
 </script>
 
 <div class="home">
-  <HomeNavigation active="workspaces" plan={$paidPlan} showPro={native || isBrowserGateway()}
+  <HomeNavigation active="workspaces" plan={$paidPlan} showPro={isBrowserGateway() || (native && $proOffered === true)}
     onHome={() => { if (showBackToHome) void backToHome(); }} {onPro} {onSettings} />
   <div class="inner">
     <header class="masthead">

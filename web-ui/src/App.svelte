@@ -2,7 +2,7 @@
   import { cloudOnboarding } from "./lib/pro/onboarding.svelte";
   import { onMount, tick, untrack } from "svelte";
   import ProNavigation from "./lib/pro/ProNavigation.svelte";
-  import { paidPlan } from "./lib/net/plan";
+  import { paidPlan, proOffered } from "./lib/net/plan";
   import { listenForProReturn } from "./lib/net/proReturn";
   import { isBrowserGateway, gatewayWorkspace } from "./lib/net/base";
   import { runStallDrive, stallDriveSpec } from "./lib/perf/tabSwitchDrive";
@@ -4746,7 +4746,7 @@
          worker: keep it out of the per-workspace live/attention rollups. -->
     {#if homeSettingsOpen}
       <div class="home-settings-shell">
-        <HomeNavigation active={homeSurface} plan={$paidPlan} showPro={isNativeShell() || isBrowserGateway()}
+        <HomeNavigation active={homeSurface} plan={$paidPlan} showPro={isBrowserGateway() || (isNativeShell() && $proOffered === true)}
           onHome={() => (homeSettingsOpen = false)} onPro={openProSurface} onSettings={openSettingsSurface} />
       <div class="home-settings-surface">
         <nav class="home-surface-nav" aria-label="Home navigation">
