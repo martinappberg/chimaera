@@ -1143,7 +1143,10 @@ mod tests {
                 proceed: finish,
             }),
         ));
-        tokio::time::timeout(Duration::from_secs(5), reached_commit)
+        // The finalizer's helper shares the process-wide two-slot Git budget
+        // with every concurrently running test; only reaching the commit
+        // matters here, not how fast.
+        tokio::time::timeout(Duration::from_secs(60), reached_commit)
             .await
             .unwrap()
             .unwrap();

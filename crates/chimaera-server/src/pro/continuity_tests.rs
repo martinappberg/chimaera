@@ -1,5 +1,5 @@
 //! Loopback account fixtures for the ownership, flush and return paths. The
-//! fake records every request; Git endpoints are deliberately absent, so a
+//! fake records every request; its Git endpoints refuse connections, so a
 //! snapshot stops at its first network publication step.
 use super::*;
 use axum::{
@@ -33,21 +33,19 @@ impl FakeAccount {
         let delays = Arc::new(Mutex::new(HashMap::<String, StdDuration>::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let (recorded, current, granted, delayed, origin) = (
+        let (recorded, current, granted, delayed) = (
             requests.clone(),
             baton.clone(),
             grant.clone(),
             delays.clone(),
-            endpoint.clone(),
         );
         let router = Router::new().fallback(any(
             move |method: Method, uri: axum::http::Uri, body: Bytes| {
-                let (recorded, current, granted, delayed, origin) = (
+                let (recorded, current, granted, delayed) = (
                     recorded.clone(),
                     current.clone(),
                     granted.clone(),
                     delayed.clone(),
-                    origin.clone(),
                 );
                 async move {
                     let path = uri.path().to_owned();
@@ -57,7 +55,7 @@ impl FakeAccount {
                     if let Some(delay) = delay {
                         tokio::time::sleep(delay).await;
                     }
-                    respond(&method, &path, &body, &current, &granted, &origin)
+                    respond(&method, &path, &body, &current, &granted)
                 }
             },
         ));
@@ -87,7 +85,6 @@ fn respond(
     body: &serde_json::Value,
     baton: &Mutex<serde_json::Value>,
     grant: &Mutex<Option<(u16, serde_json::Value)>>,
-    origin: &str,
 ) -> Response {
     let segments: Vec<_> = path.trim_start_matches('/').split('/').collect();
     match (method.as_str(), segments.as_slice()) {
@@ -107,8 +104,10 @@ fn respond(
         ("PUT", ["v1", "baton", _, "policy"]) => StatusCode::NO_CONTENT.into_response(),
         ("POST", [_, "mirror", "credentials"]) => Json(json!({
             "workspace_id": body["workspace_id"],
-            "repository_url": format!("{origin}/git/repository.git"),
-            "working_tree_url": format!("{origin}/git/working-tree.git"),
+            // A refused connection fails Git at once; the global two-slot Git
+            // budget is shared with every other test in this process.
+            "repository_url": "http://127.0.0.1:9/git/repository.git",
+            "working_tree_url": "http://127.0.0.1:9/git/working-tree.git",
             "username": "fixture",
             "password": "fixture-password",
             "read_only": body["epoch"].is_null(),

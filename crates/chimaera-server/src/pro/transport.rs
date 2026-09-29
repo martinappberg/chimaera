@@ -20,6 +20,9 @@ use tokio::{
 };
 
 static CHILDREN: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(2)));
+/// Account and keeper requests have their own small budget: a lease renewal
+/// must never queue behind a 16-minute push or fetch holding both Git slots.
+static REQUESTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(6)));
 static MIRROR_GIT: OnceCell<MirrorGit> = OnceCell::const_new();
 static UNCERTAIN_CACHES: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -713,7 +716,8 @@ pub(super) async fn request(
     } else {
         Duration::from_secs(15)
     };
-    let mut output = run(command, input, timeout, JSON_CAP + 4).await?;
+    let permit = Arc::new(REQUESTS.clone().acquire_owned().await?);
+    let mut output = run_reserved(command, input, timeout, JSON_CAP + 4, permit).await?;
     ensure!(
         output.success && output.stdout.len() >= 4,
         "service is unavailable"

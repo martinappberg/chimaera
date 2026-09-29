@@ -399,7 +399,7 @@ async fn reconcile_generation(
         );
         // An expired/replaced executor must install the selected canonical
         // checkpoint, even when it is the same physical worker or home device.
-        let Ok(_job) = state.pro.jobs.try_lock() else {
+        let Ok(job) = state.pro.jobs.clone().try_lock_owned() else {
             return Ok(None);
         };
         lock(&state.pro.ownership).insert(
@@ -407,9 +407,37 @@ async fn reconcile_generation(
             Ownership::AwaitingVerification { epoch: baton.epoch },
         );
         super::persist(state).await?;
-        // The grant's own requires_fork decides; hydrate applies it.
-        Box::pin(hydrate(state, config, workspace, baton.epoch, false, None)).await?;
-        return Ok(super::owned_epoch(state, workspace));
+        // Installing runs as its own owned task: lease renewal for every
+        // other project continues meanwhile. The grant's own requires_fork
+        // decides; hydrate applies it.
+        let owner = state.clone();
+        let config = config.clone();
+        let key = workspace.to_owned();
+        let epoch = baton.epoch;
+        tokio::spawn(async move {
+            super::detached::run(
+                &owner.clone(),
+                ("install", false),
+                &key.clone(),
+                epoch,
+                || None,
+                move || async move {
+                    let _job = job;
+                    if let Err(error) =
+                        install_owned(owner.clone(), config, key.clone(), epoch).await
+                    {
+                        record_error(&owner, &key, &error);
+                        return super::detached::Outcome::refused(
+                            axum::http::StatusCode::CONFLICT,
+                            None,
+                        );
+                    }
+                    super::detached::Outcome::done()
+                },
+            )
+            .await
+        });
+        return Ok(None);
     }
     let body = execution::body(&operation_config, baton.epoch, operation == "acquire");
     if operation_config.execution.is_some() && baton.continuity.is_none() {
@@ -514,6 +542,17 @@ async fn reconcile_generation(
     }
     Ok(Some(grant.epoch))
 }
+/// A named boxed future breaks the reconcile -> hydrate -> reconcile type cycle
+/// for a spawned install.
+fn install_owned(
+    state: Arc<AppState>,
+    config: Configure,
+    workspace: String,
+    epoch: u64,
+) -> futures::future::BoxFuture<'static, Result<()>> {
+    Box::pin(async move { hydrate(&state, &config, &workspace, epoch, false, None).await })
+}
+
 /// Upper bound on how long a device's agent may finish its turn after another
 /// owner was verified. Its input is already refused (`may_write`).
 const VERIFIED_OWNER_PAUSE_WAIT: u64 = 300;
@@ -547,7 +586,30 @@ async fn stop_after_verified_owner(
         }
     }
     lock(&state.pro.remote_since).remove(workspace);
-    suspend_workspace(state, workspace).await
+    // Stopping agents can take seconds each; the renewal loop moves on.
+    let owner = state.clone();
+    let key = workspace.to_owned();
+    tokio::spawn(async move {
+        super::detached::run(
+            &owner.clone(),
+            ("suspend", false),
+            &key.clone(),
+            0,
+            || None,
+            move || async move {
+                if let Err(error) = suspend_workspace(&owner, &key).await {
+                    record_error(&owner, &key, &error);
+                    return super::detached::Outcome::refused(
+                        axum::http::StatusCode::CONFLICT,
+                        None,
+                    );
+                }
+                super::detached::Outcome::done()
+            },
+        )
+        .await
+    });
+    Ok(())
 }
 
 async fn suspend_workspace(state: &Arc<AppState>, workspace: &str) -> Result<()> {
