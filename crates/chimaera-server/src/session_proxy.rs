@@ -29,7 +29,20 @@ const MAX_ROWS: usize = 512;
 const MAX_RESPONSE: usize = 2 * 1024 * 1024;
 const MAX_METADATA: usize = 1024 * 1024;
 const POLL_CONCURRENCY: usize = 4;
+/// Short HTTP work: forwarded requests, roster polls and scope probes.
 static REQUESTS: Semaphore = Semaphore::const_new(32);
+/// Long-lived forwarded sockets (terminals, chats, event feeds) draw on their
+/// own budget, so a window full of open tabs never starves the polls that
+/// keep every row available.
+static SOCKETS: Semaphore = Semaphore::const_new(128);
+/// A positive scope acknowledgment is reused this long for the same project
+/// stamp and epoch. The target still checks scope on every request; the probe
+/// only proves it understands scope at all.
+const ACK_TTL: Duration = Duration::from_secs(15);
+/// A forwarded transfer with no progress this long is abandoned.
+const IDLE_TRANSFER: Duration = Duration::from_secs(120);
+/// Reading or rewriting a small JSON request/response around a forward.
+const ADAPTER_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 pub(crate) struct Store {
@@ -43,6 +56,9 @@ struct Data {
     routes: HashMap<String, Route>,
     rows: HashMap<String, Value>,
     tickets: HashMap<String, Ticket>,
+    /// Recent scope acknowledgments per (host, project): the stamp and epoch
+    /// they proved. Bounded by routes × projects and pruned by age.
+    acks: HashMap<(String, String), (Stamp, u64, std::time::Instant)>,
 }
 impl Data {
     fn mint(&mut self) -> u64 {
@@ -232,6 +248,37 @@ impl Store {
     }
     fn current(&self, route: &Route, workspace: &str) -> bool {
         crate::lock(&self.inner).is_current(route, workspace)
+    }
+    /// A recent probe already proved this exact project registration speaks
+    /// scope: skip the extra round trip for the next request or poll.
+    fn acknowledged(&self, route: &Route, workspace: &str) -> bool {
+        let (Some(stamp), Some(epoch)) = (route.stamp(workspace), route.workspaces.get(workspace))
+        else {
+            return false;
+        };
+        let data = crate::lock(&self.inner);
+        data.is_current(route, workspace)
+            && data
+                .acks
+                .get(&(route.host_id.clone(), workspace.to_owned()))
+                .is_some_and(|(proved, proved_epoch, at)| {
+                    *proved == stamp && proved_epoch == epoch && at.elapsed() < ACK_TTL
+                })
+    }
+    fn acknowledge(&self, route: &Route, workspace: &str) {
+        let (Some(stamp), Some(epoch)) = (route.stamp(workspace), route.workspaces.get(workspace))
+        else {
+            return;
+        };
+        let mut data = crate::lock(&self.inner);
+        if !data.is_current(route, workspace) {
+            return;
+        }
+        data.acks.retain(|_, (_, _, at)| at.elapsed() < ACK_TTL);
+        data.acks.insert(
+            (route.host_id.clone(), workspace.to_owned()),
+            (stamp, *epoch, std::time::Instant::now()),
+        );
     }
     fn for_workspace(&self, workspace: &str) -> Option<Route> {
         crate::lock(&self.inner)
@@ -440,11 +487,13 @@ async fn poll_workspaces(store: &Store, changes: &crate::state::ChangeBus) -> bo
         .map(|(route, workspace)| async move {
             let result = tokio::time::timeout(Duration::from_secs(10), async {
                 let response = request(
+                    store,
                     &route,
                     &workspace,
                     Request::builder()
                         .uri("/api/v1/sessions")
                         .body(Body::empty())?,
+                    Budget::ORDINARY,
                 )
                 .await?;
                 if !response.status().is_success() {
@@ -477,11 +526,62 @@ async fn poll_workspaces(store: &Store, changes: &crate::state::ChangeBus) -> bo
     any_changed
 }
 
-async fn request(route: &Route, workspace: &str, request: Request<Body>) -> Result<Response> {
-    verify_scope(route, workspace).await?;
-    target_request(route, workspace, request).await
+/// How long a forwarded request may wait for its response head, and how long
+/// the upstream connection may sit without progress before that head. After
+/// the head, only [`IDLE_TRANSFER`] applies: a body that keeps moving (a large
+/// download, a `/raw` stream) has no fixed ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Budget {
+    head: Duration,
+    quiet: Duration,
 }
-async fn verify_scope(route: &Route, workspace: &str) -> Result<()> {
+impl Budget {
+    const ORDINARY: Self = Self {
+        head: Duration::from_secs(30),
+        quiet: Duration::from_secs(30),
+    };
+    /// The body streams up before the head; its progress keeps the link alive.
+    const UPLOAD: Self = Self {
+        head: Duration::from_secs(75 * 60),
+        quiet: IDLE_TRANSFER,
+    };
+    /// A command may queue for ten minutes and then run for an hour, silently.
+    const EXEC: Self = Self {
+        head: Duration::from_secs(75 * 60),
+        quiet: Duration::from_secs(75 * 60),
+    };
+    fn for_request(method: &axum::http::Method, path: &str) -> Self {
+        if *method != axum::http::Method::POST {
+            return Self::ORDINARY;
+        }
+        if path == "/fs/upload" {
+            return Self::UPLOAD;
+        }
+        match path
+            .strip_prefix("/sessions/")
+            .and_then(|rest| rest.split_once('/'))
+        {
+            Some((_, "upload")) => Self::UPLOAD,
+            Some((_, "exec")) => Self::EXEC,
+            _ => Self::ORDINARY,
+        }
+    }
+}
+
+async fn request(
+    store: &Store,
+    route: &Route,
+    workspace: &str,
+    request: Request<Body>,
+    budget: Budget,
+) -> Result<Response> {
+    verify_scope(store, route, workspace).await?;
+    target_request(route, workspace, request, budget).await
+}
+async fn verify_scope(store: &Store, route: &Route, workspace: &str) -> Result<()> {
+    if store.acknowledged(route, workspace) {
+        return Ok(());
+    }
     tokio::time::timeout(Duration::from_secs(5), async {
         let response = target_request(
             route,
@@ -489,6 +589,7 @@ async fn verify_scope(route: &Route, workspace: &str) -> Result<()> {
             Request::builder()
                 .uri("/api/v1/health")
                 .body(Body::empty())?,
+            Budget::ORDINARY,
         )
         .await?;
         let epoch = route
@@ -517,12 +618,96 @@ async fn verify_scope(route: &Route, workspace: &str) -> Result<()> {
         axum::body::to_bytes(response.into_body(), 16 * 1024).await?;
         Ok::<_, anyhow::Error>(())
     })
-    .await?
+    .await??;
+    store.acknowledge(route, workspace);
+    Ok(())
 }
+
+/// Upstream socket progress: any byte in either direction pushes the idle
+/// deadline out, so only a transfer that has truly stalled is abandoned.
+struct Progress {
+    start: std::time::Instant,
+    last_ms: std::sync::atomic::AtomicU64,
+    limit_ms: std::sync::atomic::AtomicU64,
+}
+impl Progress {
+    fn new(limit: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            start: std::time::Instant::now(),
+            last_ms: std::sync::atomic::AtomicU64::new(0),
+            limit_ms: std::sync::atomic::AtomicU64::new(limit.as_millis() as u64),
+        })
+    }
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+    fn touch(&self) {
+        self.last_ms.store(self.now_ms(), Ordering::Relaxed);
+    }
+    fn limit(&self, limit: Duration) {
+        self.touch();
+        self.limit_ms
+            .store(limit.as_millis() as u64, Ordering::Relaxed);
+    }
+    /// Time left before the connection counts as stalled.
+    fn remaining(&self) -> Duration {
+        let quiet = self
+            .now_ms()
+            .saturating_sub(self.last_ms.load(Ordering::Relaxed));
+        Duration::from_millis(self.limit_ms.load(Ordering::Relaxed).saturating_sub(quiet))
+    }
+}
+struct ProgressIo {
+    inner: TcpStream,
+    progress: Arc<Progress>,
+}
+impl tokio::io::AsyncRead for ProgressIo {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+        if matches!(poll, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            this.progress.touch();
+        }
+        poll
+    }
+}
+impl tokio::io::AsyncWrite for ProgressIo {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = std::pin::Pin::new(&mut this.inner).poll_write(cx, data);
+        if matches!(poll, std::task::Poll::Ready(Ok(written)) if written > 0) {
+            this.progress.touch();
+        }
+        poll
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 async fn target_request(
     route: &Route,
     workspace: &str,
     mut request: Request<Body>,
+    budget: Budget,
 ) -> Result<Response> {
     let epoch = route
         .workspaces
@@ -543,8 +728,13 @@ async fn target_request(
     let permit = REQUESTS.try_acquire().context("remote request limit")?;
     let stream =
         tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(address)).await??;
+    let progress = Progress::new(budget.quiet);
     let (mut client, connection) =
-        hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+        hyper::client::conn::http1::handshake(TokioIo::new(ProgressIo {
+            inner: stream,
+            progress: Arc::clone(&progress),
+        }))
+        .await?;
     request.headers_mut().remove(header::AUTHORIZATION);
     request.headers_mut().remove(header::COOKIE);
     request.headers_mut().remove(header::HOST);
@@ -558,11 +748,28 @@ async fn target_request(
     request
         .headers_mut()
         .insert(header::CONNECTION, "close".parse()?);
+    let watchdog = Arc::clone(&progress);
     tokio::spawn(async move {
         let _permit = permit;
-        let _ = tokio::time::timeout(Duration::from_secs(120), connection).await;
+        tokio::pin!(connection);
+        loop {
+            let left = watchdog.remaining();
+            if left.is_zero() {
+                // Stalled: dropping the connection fails the pending head or
+                // ends the body stream with an error, and frees the permit.
+                break;
+            }
+            tokio::select! {
+                _ = &mut connection => break,
+                _ = tokio::time::sleep(left) => {}
+            }
+        }
     });
-    Ok(client.send_request(request).await?.map(Body::new))
+    let response = tokio::time::timeout(budget.head, client.send_request(request))
+        .await
+        .context("remote response timed out")??;
+    progress.limit(IDLE_TRANSFER);
+    Ok(response.map(Body::new))
 }
 fn session_id(path: &str) -> Option<&str> {
     let rest = path
@@ -666,11 +873,17 @@ pub(crate) async fn api_proxy(
         }
         return next.run(incoming).await;
     };
-    let result = tokio::time::timeout(Duration::from_secs(30), async {
+    // Each step carries its own bound: small JSON adapters get a short one,
+    // while an upload streams and an exec runs for as long as they progress
+    // under their request budget (a fixed 30 s cap cut both off mid-flight).
+    let budget = Budget::for_request(incoming.method(), &path);
+    let result: Result<Response> = async {
         let alias = route
             .alias(&workspace)
             .context("project path mapping unavailable")?;
-        let (mapped, target_keys) = alias_request(incoming, &path, &alias).await?;
+        let (mapped, target_keys) =
+            tokio::time::timeout(ADAPTER_DEADLINE, alias_request(incoming, &path, &alias))
+                .await??;
         incoming = mapped;
         let path_query = incoming
             .uri()
@@ -680,20 +893,21 @@ pub(crate) async fn api_proxy(
         if !path_query.starts_with("/api/v1/") {
             *incoming.uri_mut() = format!("/api/v1{path_query}").parse()?;
         }
-        let response = request(&route, &workspace, incoming).await?;
-        let response = alias_response(response, &path, &alias, &target_keys).await?;
-        ticket_response(&state, &route, &workspace, &path, response).await
-    })
-    .await;
-    result
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("remote response timed out")))
-        .unwrap_or_else(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error":"remote_unavailable"})),
-            )
-                .into_response()
+        let response = request(&state.session_proxy, &route, &workspace, incoming, budget).await?;
+        tokio::time::timeout(ADAPTER_DEADLINE, async {
+            let response = alias_response(response, &path, &alias, &target_keys).await?;
+            ticket_response(&state, &route, &workspace, &path, response).await
         })
+        .await?
+    }
+    .await;
+    result.unwrap_or_else(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"remote_unavailable"})),
+        )
+            .into_response()
+    })
 }
 impl Route {
     fn alias(&self, workspace: &str) -> Option<crate::workspace_scope::paths::Alias> {
@@ -880,14 +1094,19 @@ pub(crate) async fn ticket_proxy(
         return StatusCode::BAD_REQUEST.into_response();
     };
     *incoming.uri_mut() = uri;
-    match tokio::time::timeout(
-        Duration::from_secs(30),
-        request(&ticket.route, &ticket.workspace, incoming),
+    // The head is bounded; the body (a video, a large download) then streams
+    // for as long as it keeps moving.
+    match request(
+        &state.session_proxy,
+        &ticket.route,
+        &ticket.workspace,
+        incoming,
+        Budget::ORDINARY,
     )
     .await
     {
-        Ok(Ok(response)) => response,
-        _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Ok(response) => response,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
@@ -948,8 +1167,8 @@ async fn socket_route(
     use axum::extract::ws::Message as Down;
     use tokio_tungstenite::tungstenite::Message as Up;
     let result: Result<()> = async {
-        verify_scope(&route, workspace).await?;
-        let _permit = REQUESTS.try_acquire().context("remote stream limit")?;
+        let _permit = SOCKETS.try_acquire().context("remote stream limit")?;
+        verify_scope(&state.session_proxy, &route, workspace).await?;
         let address = route.address.context("remote placement unavailable")?;
         let query = if options.read_only { "?read_only=true" } else if options.wake.as_deref() == Some("interaction") { "?wake=interaction" } else { "" };
         let url = if kind=="events" {format!("ws://{address}/ws/events")} else {format!("ws://{address}/ws/{kind}/{id}{query}")};
@@ -1053,6 +1272,7 @@ mod tests {
             fail_a: AtomicBool,
             b_reads: AtomicUsize,
             b_revision: AtomicUsize,
+            probes: AtomicUsize,
         }
         let target = Arc::new(Target::default());
         let remote = Router::new()
@@ -1060,6 +1280,7 @@ mod tests {
                 "/api/v1/health",
                 get(|State(target): State<Arc<Target>>, headers: HeaderMap| async move {
                     assert_eq!(headers[header::AUTHORIZATION], "Bearer synthetic-poll");
+                    target.probes.fetch_add(1, Ordering::AcqRel);
                     let workspace = &headers[crate::workspace_scope::WORKSPACE_HEADER];
                     if workspace == "w-a" && target.fail_a.load(Ordering::Acquire) {
                         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -1076,13 +1297,17 @@ mod tests {
                 get(|State(target): State<Arc<Target>>, headers: HeaderMap| async move {
                     assert_eq!(headers[header::AUTHORIZATION], "Bearer synthetic-poll");
                     let workspace = headers[crate::workspace_scope::WORKSPACE_HEADER].to_str().unwrap();
+                    // An unreachable owner fails its roster too, not only the probe.
+                    if workspace == "w-a" && target.fail_a.load(Ordering::Acquire) {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
                     let revision = if workspace == "w-b" {
                         target.b_reads.fetch_add(1, Ordering::AcqRel);
                         target.b_revision.load(Ordering::Acquire)
                     } else {
                         0
                     };
-                    Json(json!([{"id":format!("s-{workspace}"),"workspace_id":workspace,"revision":revision}]))
+                    Json(json!([{"id":format!("s-{workspace}"),"workspace_id":workspace,"revision":revision}])).into_response()
                 }),
             )
             .with_state(Arc::clone(&target));
@@ -1122,6 +1347,11 @@ mod tests {
             "unchanged rosters must not refresh the UI"
         );
         assert_eq!(changes.generation(), stable_generation);
+        assert_eq!(
+            target.probes.load(Ordering::Acquire),
+            2,
+            "a recent scope acknowledgment is reused instead of re-probing each poll"
+        );
 
         target.fail_a.store(true, Ordering::Release);
         target.b_revision.store(1, Ordering::Release);
@@ -1153,6 +1383,47 @@ mod tests {
         assert!(!poll_workspaces(&store, &changes).await);
         server.abort();
         let _ = server.await;
+    }
+
+    #[test]
+    fn uploads_and_exec_are_not_cut_off_by_the_ordinary_head_deadline() {
+        use axum::http::Method;
+        assert_eq!(
+            Budget::for_request(&Method::POST, "/fs/upload"),
+            Budget::UPLOAD
+        );
+        assert_eq!(
+            Budget::for_request(&Method::POST, "/sessions/s-1/upload"),
+            Budget::UPLOAD
+        );
+        assert_eq!(
+            Budget::for_request(&Method::POST, "/sessions/s-1/exec"),
+            Budget::EXEC
+        );
+        for (method, path) in [
+            (Method::GET, "/sessions/s-1/exec"),
+            (Method::GET, "/fs/file"),
+            (Method::POST, "/fs/ticket"),
+            (Method::POST, "/sessions"),
+        ] {
+            assert_eq!(Budget::for_request(&method, path), Budget::ORDINARY);
+        }
+        // An upload's body keeps the link alive; only a silent stall ends it.
+        assert!(Budget::UPLOAD.quiet < Budget::UPLOAD.head);
+        assert!(Budget::EXEC.quiet >= Budget::EXEC.head);
+    }
+
+    #[test]
+    fn transfer_progress_extends_the_idle_deadline() {
+        let progress = Progress::new(Duration::from_millis(80));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(progress.remaining() <= Duration::from_millis(30));
+        progress.touch();
+        assert!(progress.remaining() > Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(90));
+        assert!(progress.remaining().is_zero(), "a silent link stalls out");
+        progress.limit(Duration::from_secs(60));
+        assert!(progress.remaining() > Duration::from_secs(59));
     }
 
     #[test]
