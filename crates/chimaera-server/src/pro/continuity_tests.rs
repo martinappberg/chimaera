@@ -1307,3 +1307,137 @@ fn transfer_failures_carry_stable_codes_not_just_words() {
         assert_eq!(error_code(&anyhow::anyhow!(text)), code, "{text}");
     }
 }
+/// Subscribing never interrupts running work: the first v2 enrollment takes
+/// the project's lease around a mid-turn chat, which keeps its process and
+/// receives no second prompt (a restart would resend a billed pickup turn).
+#[cfg(unix)]
+#[tokio::test]
+async fn first_enrollment_keeps_a_mid_turn_chat_on_its_process() {
+    let root = temp("enroll-live");
+    let state = state(&root);
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let workspace = lock(&state.workspaces).add(project).unwrap();
+    let (chat, prompts, starts) = mid_turn_chat(&state, &root, &workspace).await;
+    assert_eq!(starts(), 1);
+
+    // A project this account has never seen: an unenrolled (v1) baton, then
+    // a v2 grant for the upgraded acquire.
+    let account = FakeAccount::start(json!({
+        "workspace_id": workspace.id, "holder_id": null, "epoch": 0,
+        "requires_fork": false, "server_now": "2026-09-28T00:00:00Z", "expires_at": null,
+    }))
+    .await;
+    *lock(&account.grant) = Some((200, owned(&workspace.id, "d-home", 1, "lease-enroll", 1)));
+    let body = json!({
+        "account_id": "a-fixture", "role": "device", "endpoint": account.endpoint,
+        "keeper_url": "", "hours_exhausted": false,
+        "execution": {"version": 1, "installation_id": "i-home",
+            "capability": execution::wire::ExecutionCapability::checkpoint_fork()},
+        "delegation": {"access_token": "synthetic", "expires_at": "2099-01-01T00:00:00Z",
+            "scope": ["baton", "mirror"], "device_id": "d-home"},
+    });
+    let (status, ack) = post(&state, "/api/v1/pro/configure/execution", &body.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{ack}");
+    tokio::time::timeout(StdDuration::from_secs(10), async {
+        while !matches!(
+            lock(&state.pro.ownership).get(&workspace.id),
+            Some(Ownership::Local { epoch: 1 })
+        ) {
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the enrollment took the project's lease");
+    // Anything a restart would do (a new process, a pickup turn) has had
+    // ample time to happen.
+    tokio::time::sleep(StdDuration::from_millis(1500)).await;
+    assert!(state.chat.get(&chat).is_some_and(|c| c.alive));
+    assert_eq!(starts(), 1, "the chat kept its agent process");
+    assert_eq!(prompts(), 1, "no second prompt reached the agent");
+    assert!(!lock(&state.deferred_sessions).contains_key(&chat));
+    // Its process group is this life's managed workload from now on.
+    assert!(lock(&state.pro.preferences)
+        .get(&workspace.id)
+        .is_some_and(|p| p.execution_active));
+    state.chat.kill(&chat);
+    drop(account);
+    drop(state);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A structured Claude chat on a minimal stream-json fake, mid-turn: it got
+/// one prompt and never answers. Returns its id, a count of the user turns
+/// its agent processes received so far, and a count of processes started.
+#[cfg(unix)]
+async fn mid_turn_chat(
+    state: &Arc<AppState>,
+    root: &Path,
+    workspace: &crate::workspaces::Workspace,
+) -> (String, impl Fn() -> usize, impl Fn() -> usize) {
+    use std::os::unix::fs::PermissionsExt;
+    let capture = root.join("agent-stdin");
+    let launches = root.join("agent-starts");
+    let script = root.join("claude");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho $$ >> '{}'\nprintf '%s\\n' '{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"init\",\"response\":{{\"commands\":[]}}}}}}'\ncat >> '{}'\n",
+            launches.display(),
+            capture.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    lock(&state.agent_bins).insert(
+        crate::agents::AgentKind::Claude,
+        crate::launcher::AgentDetection {
+            path: Ok(script),
+            version: Some("9.9.9-fake".into()),
+            managed: false,
+            explicit: false,
+            mtime: None,
+        },
+    );
+    let (status, row) = post(
+        state,
+        "/api/v1/sessions",
+        &json!({"workspace_id": workspace.id, "kind": "agent", "ui": "chat"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    let chat = row["id"].as_str().unwrap().to_owned();
+    state
+        .chat
+        .command(
+            &chat,
+            chimaera_agent::model::AgentCommand::Send {
+                blocks: vec![chimaera_agent::model::ContentBlock::Text {
+                    text: "keep working".into(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    let prompts = move || {
+        std::fs::read_to_string(&capture)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("\"type\":\"user\""))
+            .count()
+    };
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        while prompts() == 0 {
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the chat received its prompt");
+    let starts = move || {
+        std::fs::read_to_string(&launches)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    (chat, prompts, starts)
+}

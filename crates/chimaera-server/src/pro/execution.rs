@@ -608,6 +608,36 @@ pub(super) fn valid_grant(state: &AppState, workspace: &str, epoch: u64) -> bool
         })
 }
 
+/// First enrollment around agents already running here: they stay on their
+/// processes and count as this life's managed workload, exactly as if they
+/// had been launched after enrollment. The next state write records their
+/// process groups (crash evidence a successor probes), and a fence reaches
+/// them by session like any other managed agent.
+pub(super) fn adopt_running(state: &AppState, workspace: &str) {
+    let ids: Vec<_> = lock(&state.session_workspaces)
+        .iter()
+        .filter(|(_, w)| w.as_str() == workspace)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let live = ids
+        .into_iter()
+        .filter(|id| managed_session(state, id))
+        .any(|id| {
+            state.chat.get(&id).is_some_and(|s| s.alive)
+                || state.sessions.get(&id).is_some_and(|s| s.alive)
+        });
+    if !live {
+        return;
+    }
+    let mut preferences = lock(&state.pro.preferences);
+    if preferences.len() >= 128 && !preferences.contains_key(workspace) {
+        return;
+    }
+    let preference = preferences.entry(workspace.to_owned()).or_default();
+    preference.execution_active = true;
+    preference.execution_boot = state.pro.execution.boot.clone();
+}
+
 /// Durable admission precedes spawning. On a crash, same-boot execution remains
 /// closed until a trusted process supervisor proves the old workload stopped.
 pub(crate) async fn prepare_launch(

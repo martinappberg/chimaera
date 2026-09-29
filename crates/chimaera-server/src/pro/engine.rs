@@ -513,14 +513,13 @@ async fn reconcile_generation(
         return Ok(None);
     }
     let body = execution::body(&operation_config, baton.epoch, operation == "acquire");
+    // First enrollment happens around work already running here: its agents
+    // keep their processes (a stop and restart would resend a billed pickup
+    // turn) and become this life's managed workload, recorded as crash
+    // evidence with the state write below.
     if operation_config.execution.is_some() && baton.continuity.is_none() {
-        lock(&state.pro.ownership).insert(
-            workspace.into(),
-            Ownership::AwaitingVerification { epoch: baton.epoch },
-        );
+        execution::adopt_running(state, workspace);
         super::persist(state).await?;
-        suspend_workspace(state, workspace).await?;
-        execution::stop(state, &[workspace.to_owned()]).await?;
     }
     // Never take or extend a lease this worker could not accept: an expired
     // one lets the laptop (or a clean worker) continue instead.

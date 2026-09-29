@@ -79,7 +79,9 @@ downgrade of an enrolled one); only a cloud machine whose latch or state cannot
 be read treats each project with local mirror data as uncertain. Only an
 existing `state.json` that does not parse is damage; an I/O error is retried and
 then treated as unknown without setting the file aside. A device keeps running
-uncertain projects (D1).
+uncertain projects (D1). A project's first enrollment adopts agents already running
+there (`execution::adopt_running`): they keep their processes, count as this
+life's managed workload and get their groups recorded; nothing stops or restarts.
 macOS boot-session UUID and Linux boot ID can distinguish a cold reboot; neither
 authorizes takeover by another device.
 
