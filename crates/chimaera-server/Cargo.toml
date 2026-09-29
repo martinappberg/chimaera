@@ -59,7 +59,13 @@ calamine = "0.36"
 # Read only ZIP central-directory metadata to budget xlsx/xlsm/ods expansion
 # before calamine materializes a workbook. Already present through calamine;
 # this direct edge exposes the preflight API without adding another package.
-zip = { version = "8.6.0", default-features = false }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+# Plugin tool downloads (`plugins/toolchain.rs`): tar archives read entry by
+# entry — the extraction itself is ours (`O_NOFOLLOW`, relative to the
+# folder's descriptor), never `tar::Archive::unpack` — and `.tar.xz`
+# decoded in pure Rust (no C liblzma to cross-build for musl).
+tar = { version = "0.4", default-features = false }
+lzma-rs = "0.3"
 # Gzip tier for fs/file + fs/table (.gz/.bgz previews). BGZF is standard
 # multi-member gzip, which MultiGzDecoder decodes sequentially.
 flate2 = "1.1"

@@ -262,7 +262,7 @@ export class EventsSocket {
             : [],
         });
       } else if (
-        (msg.type === "view" || msg.type === "surface" || msg.type === "plugin") &&
+        (msg.type === "view" || msg.type === "surface" || msg.type === "plugin" || msg.type === "job") &&
         typeof (msg as { plugin?: unknown }).plugin === "string"
       ) {
         this.handlers.onPlatform?.(msg as unknown as PlatformFrame);

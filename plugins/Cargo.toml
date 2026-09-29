@@ -8,7 +8,7 @@
 # the releases the daemon embeds.
 [workspace]
 resolver = "2"
-members = ["api-0.1", "test-fixture", "test-platform"]
+members = ["api-0.1", "test-fixture", "test-platform", "test-privileged"]
 
 [workspace.package]
 version = "0.1.0"

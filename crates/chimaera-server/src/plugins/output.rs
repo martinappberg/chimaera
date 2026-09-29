@@ -188,6 +188,39 @@ fn parent_of(root: &File, rel: &Path) -> Result<(File, std::ffi::OsString), Stri
     Ok((dir, name))
 }
 
+/// Make folder `rel` (and those on its path) beneath the output folder,
+/// never through a link (blocking).
+pub(crate) fn make_dir(dir: &Path, rel: &Path) -> Result<(), String> {
+    let root = open_root(dir)?;
+    if rel.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let (parent, name) = parent_of(&root, rel)?;
+    match rustix::fs::mkdirat(&parent, name.as_os_str(), Mode::from_raw_mode(0o700)) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(e) => return Err(io(rel, e)),
+    }
+    // It must be a folder, not a link someone left there.
+    rustix::fs::openat(&parent, name.as_os_str(), dir_flags(), Mode::empty())
+        .map(drop)
+        .map_err(|e| io(rel, e))
+}
+
+/// Create (or truncate) file `rel` for writing, never through a link
+/// (blocking): a job's log.
+pub(crate) fn create_file(dir: &Path, rel: &Path) -> Result<File, String> {
+    let root = open_root(dir)?;
+    let (parent, name) = parent_of(&root, rel)?;
+    let fd = rustix::fs::openat(
+        &parent,
+        name.as_os_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|e| io(rel, e))?;
+    Ok(File::from(fd))
+}
+
 /// Write `bytes` to `rel` (a temporary name, then a rename: a reader never
 /// sees half a file) (blocking).
 pub(crate) fn write(dir: &Path, rel: &Path, bytes: &[u8]) -> Result<(), String> {

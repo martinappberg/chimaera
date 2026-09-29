@@ -56,6 +56,7 @@ pub mod capabilities;
 pub(crate) mod files;
 pub(crate) mod hostfns;
 pub(crate) mod installed;
+pub(crate) mod jobs;
 pub(crate) mod output;
 pub(crate) mod pdata;
 pub(crate) mod platform;
@@ -65,6 +66,7 @@ pub(crate) mod revoke;
 pub(crate) mod runtime;
 pub(crate) mod screens;
 pub(crate) mod surfaces;
+pub(crate) mod toolchain;
 pub(crate) mod tools;
 pub(crate) mod trust;
 
@@ -229,6 +231,13 @@ pub(crate) struct Manifest {
     /// `[[settings]]` (0.2): its settings, drawn in Settings → Plugins.
     #[serde(default)]
     pub(crate) settings: Vec<platform::SettingDecl>,
+    /// `[[programs]]` (0.2): the programs it may run as jobs (privileged).
+    #[serde(default)]
+    pub(crate) programs: Vec<platform::ProgramDecl>,
+    /// `[[tools]]` (0.2): side programs the host downloads on a click
+    /// (privileged).
+    #[serde(default)]
+    pub(crate) tools: Vec<platform::ToolDecl>,
     /// The behaviour — set by the catalog, never by the TOML.
     #[serde(skip)]
     pub(crate) wasm: Wasm,
@@ -542,10 +551,14 @@ pub(crate) fn validate(m: &Manifest) -> Result<(), String> {
         if !(m.views.is_empty()
             && m.files.is_empty()
             && m.actions.is_empty()
-            && m.settings.is_empty())
+            && m.settings.is_empty()
+            && m.programs.is_empty()
+            && m.tools.is_empty())
         {
             return Err(
-                "[[views]], [[files]], [[actions]] and [[settings]] need api = \"0.2\"".into(),
+                "[[views]], [[files]], [[actions]], [[settings]], [[programs]] and \
+                 [[tools]] need api = \"0.2\""
+                    .into(),
             );
         }
     }
@@ -894,6 +907,15 @@ pub(crate) mod test_catalog {
         )
     }
 
+    /// The privileged fixture (`plugins/test-privileged`): programs, a
+    /// tool download, a long agent tool.
+    pub(crate) fn privileged() -> Arc<Manifest> {
+        add(
+            &dist_test_text("test-privileged/plugin.toml"),
+            dist_test_bytes("test-privileged/plugin.wasm"),
+        )
+    }
+
     pub(crate) fn fixture_manifest() -> String {
         dist_test_text("test-fixture/plugin.toml")
     }
@@ -1141,7 +1163,7 @@ fn manifest_fields(m: &Manifest) -> Value {
         "caps": m.caps.digest(),
         "can": m.caps.lines_json(),
         // The 0.2 tables: its screens, the file kinds it opens, its file
-        // menu items and its settings.
+        // menu items, its settings, its programs and its tools.
         "platform": platform::wire(m),
     })
 }
@@ -1373,6 +1395,10 @@ pub(crate) async fn put_workspace_plugin(
                 .on_event(&state, &m, &id, None, runtime::wit::Event::SwitchedOff)
                 .await;
         }
+    }
+    if !body.on {
+        // Its programs stop with it.
+        state.plugin_platform.jobs.cancel_where(&pid, Some(&id));
     }
     // Either way the plugin starts over here: a fresh instance on next use,
     // and a fault cleared (switching off and on is how the user retries a

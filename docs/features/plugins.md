@@ -483,8 +483,8 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     workspace" · "Reads the Timeline and posts notes to it" · "Sees this workspace's sessions" ·
     "Gives agents 2 tools: post_note · read_notes" · "Fills the Knowledge view" · "Offers an
     agent-side plugin for claude: …" · "Has a setup prompt it sends to an agent you choose". A
-    plugin that runs programs (none yet; the platform's P8) carries a "runs programs" tag and
-    its program lines in the warning tone.
+    plugin that runs programs ([below](#programs-and-tools-the-privileged-tier)) carries a "runs
+    programs" tag and its program lines in the warning tone.
   - **The trust prompt** (`TrustDialog.svelte`) opens when the daemon refuses an install, an
     update, Use previous, a switch or Trust with 409 and what the plugin can do: who asks and
     from where ("github.com/owner/repo", "a local build in /dir"), for an update "It would also"
@@ -612,6 +612,52 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   - Claiming a file kind is on the **Can** list, so a release that claims a new one asks again.
   - The author's guide has every node, prop, surface and limit:
     [docs/agent-guides/plugins.md](../agent-guides/plugins.md#the-platform-api-02).
+
+## Programs and tools (the privileged tier)
+
+- **What & when.** A 0.2 plugin may run programs on your computer (a LaTeX build, a
+  formatter) and download the ones it needs. It names each one in its manifest; nothing else
+  can run. The host runs them as **jobs** under fixed limits, and downloads a **tool** only
+  when you click Install. Shipped as the platform plan's phase P8; no first-party plugin uses it
+  yet (the LaTeX and Typst plugins will).
+- **How to use.** Such a plugin's card says **runs programs** and lists every program under
+  **Can** ("Runs latexmk"; a shell gets "Runs sh: this plugin can run any command on this
+  host"). Before install, **Downloads** says what its tools would fetch and from where ("TeX
+  Live 2026.09 · 152 MB from github.com"). Once installed, its **Tools** section shows each tool
+  with **Install**, **Update** (the plugin names a newer version) and **Remove**. A program you
+  already have wins over the plugin's copy unless the plugin offers a setting to prefer its own.
+- **Where it's wired.**
+  - **Daemon** (`crates/chimaera-server/src/plugins/`): `jobs.rs` (the queue, the limits, the
+    POSIX `sh` preamble that sets them, the captured login environment, process-group kills,
+    logs in the output folder, `job-finished`, the `job` frame, an agent tool's wait) and
+    `toolchain.rs` (the https download with its streamed sha256 and size cap, the safe
+    unpacker, setup steps, the `current` link, Install / Update / Remove); `platform.rs`
+    validates `[[programs]]` and `[[tools]]`; `capabilities.rs` makes them `program` and
+    `download` atoms (privileged); `runtime.rs` holds a tool call that answered `wait` and asks
+    `tool_resume`; switching the plugin off or a block cancels its jobs.
+  - **Routes** (bearer-authed): `GET /plugins/{pid}/tools`, `POST
+    /plugins/{pid}/tools/{tool}/install`, `DELETE /plugins/{pid}/tools/{tool}`, `GET` / `DELETE
+    /workspaces/{id}/jobs/{job}`. `/ws/events` carries `job` frames to that workspace's windows.
+  - **UI**: `PluginTools.svelte` (the Tools section), the card's Downloads line
+    (`platform.ts`'s `downloadWords`).
+- **Rules.**
+  - **Only declared programs, by name.** No path to a binary, no shell between the plugin and
+    the program; a URL that moves (`/latest/`) doesn't validate.
+  - **Limits for every job:** 2 running on the host, 1 per plugin, 8 waiting; 60 s by default,
+    600 s at most, then the whole process group is stopped; 4 GiB of memory, 256 MiB per
+    written file, low CPU and I/O priority; stdout and stderr to 16 MiB logs in the output
+    folder, never in the daemon's memory; the host's own variables (`PATH`, `HOME`, `LD_*`, …)
+    can't be set.
+  - **A tool is checked before it counts:** https only, the declared size and sha256 while it
+    streams; unpacked into an empty folder that refuses `..`, absolute paths, hard links,
+    devices and links that leave it; nothing outside `~/.chimaera/tools/<plugin>/<tool>/`
+    changes (no PATH or rc edits). Two versions stay. Removing the plugin removes its tools.
+  - **The lock covers downloads too:** the lock pins the manifest and the manifest pins each
+    download's sha256, and the lock bump fetches every download and compares.
+  - **The honest limit:** a program can do whatever its arguments allow. That is why programs
+    make a plugin privileged and why its card names each one.
+  - Every job and install is in the plugin's **Activity** log. The author's side:
+    [docs/agent-guides/plugins.md](../agent-guides/plugins.md#programs-jobs-and-tools).
 
 ## Agent plugins & the Skills view
 

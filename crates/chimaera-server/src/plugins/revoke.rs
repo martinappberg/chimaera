@@ -325,6 +325,8 @@ pub(crate) async fn apply(state: &Arc<AppState>) {
         .collect();
     for m in &blocked {
         state.plugin_runtime.forget_plugin(&m.id);
+        // Its programs stop too, wherever they run.
+        state.plugin_platform.jobs.cancel_where(&m.id, None);
         crate::lock(&state.knowledge).forget_provider(&m.id, None);
         super::activity::record(
             state,

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { capabilityLines, manifestFields, newer, parseLock, parseSums, pullRequest, setLockValues } from "./plugin-lock.mjs";
+import { capabilityLines, manifestFields, newer, parseLock, parseSums, pullRequest, setLockValues, toolArtifacts } from "./plugin-lock.mjs";
 
 const LOCK = `# comment
 [[plugin]]
@@ -153,4 +153,41 @@ github = "o/x"
   const access = `${base}\n[access]\ntimeline = "none"\n`;
   assert.notDeepEqual(capabilityLines(access), capabilityLines(base), "even a narrowing is reviewed");
   assert.notDeepEqual(capabilityLines(base.replace('api = "0.1"', 'api = "0.2"')), capabilityLines(base), "the API decides the defaults");
+});
+
+test("tool downloads: every [[tools.artifacts]] with its tool, read strictly", () => {
+  const toml = [
+    'id = "latex"',
+    "[[tools]]",
+    'id = "tinytex"',
+    'version = "2026.09"',
+    "[[tools.artifacts]]",
+    'platform = "linux-x86_64"',
+    'url = "https://github.com/rstudio/tinytex-releases/releases/download/v2026.09/TinyTeX-1.tar.xz"',
+    `sha256 = "${"a".repeat(64)}"`,
+    "size = 159_000_000",
+    "[[tools.artifacts]]",
+    'platform = "macos-aarch64"',
+    "url = 'single-quoted, so not read'",
+    "[[tools.setup]]",
+    'program = "tlmgr"',
+    "[[tools]]",
+    'id = "other"',
+    "[[tools.artifacts]]",
+    'platform = "linux-x86_64"',
+    'url = "https://example.org/other.zip"',
+    `sha256 = "${"b".repeat(64)}"`,
+  ].join("\n");
+  assert.deepEqual(toolArtifacts(toml), [
+    {
+      tool: "tinytex",
+      platform: "linux-x86_64",
+      url: "https://github.com/rstudio/tinytex-releases/releases/download/v2026.09/TinyTeX-1.tar.xz",
+      sha256: "a".repeat(64),
+      size: 159000000,
+    },
+    { tool: "tinytex", platform: "macos-aarch64", url: null, sha256: null, size: null },
+    { tool: "other", platform: "linux-x86_64", url: "https://example.org/other.zip", sha256: "b".repeat(64), size: null },
+  ]);
+  assert.deepEqual(toolArtifacts('id = "notes"\n[adds]\nui = ["x"]\n'), []);
 });

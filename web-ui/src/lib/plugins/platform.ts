@@ -49,14 +49,28 @@ export interface SettingDecl {
   max: number | null;
 }
 
+/** A side program the plugin can download (`[[tools]]`, §8). */
+export interface ToolDecl {
+  id: string;
+  name: string;
+  version: string;
+  programs: string[];
+  home: string | null;
+  /** What Install downloads on this host; null: no build for it. */
+  download: { host: string; size: number | null } | null;
+}
+
 export interface PlatformTables {
   views: ViewDecl[];
   files: FileKindDecl[];
   actions: FileActionDecl[];
   settings: SettingDecl[];
+  /** The programs it may run (`[[programs]]`, §6). */
+  programs: string[];
+  tools: ToolDecl[];
 }
 
-export const EMPTY_PLATFORM: PlatformTables = { views: [], files: [], actions: [], settings: [] };
+export const EMPTY_PLATFORM: PlatformTables = { views: [], files: [], actions: [], settings: [], programs: [], tools: [] };
 
 const SLOTS: readonly Slot[] = ["tab", "panel", "file", "status", "card"];
 const TYPES: readonly SettingType[] = ["bool", "enum", "string", "number", "path"];
@@ -123,7 +137,25 @@ export function normalizePlatform(raw: unknown): PlatformTables {
       max: num(o.max),
     });
   }
-  return { views, files, actions, settings };
+  const tools: ToolDecl[] = [];
+  for (const t of list(r.tools)) {
+    const o = t as Record<string, unknown>;
+    const id = text(o?.id);
+    const name = text(o?.name);
+    const version = text(o?.version);
+    if (id === null || name === null || version === null) continue;
+    const d = o.download as Record<string, unknown> | null | undefined;
+    const host = text(d?.host);
+    tools.push({
+      id,
+      name,
+      version,
+      programs: strings(o.programs),
+      home: text(o.home),
+      download: host !== null ? { host, size: num(d?.size) } : null,
+    });
+  }
+  return { views, files, actions, settings, programs: strings(r.programs), tools };
 }
 
 // --- matching (the daemon's `platform::matches`, mirrored) -----------------
@@ -451,6 +483,68 @@ export async function clearOutput(pid: string): Promise<OutputUse> {
   return body(await api(`/plugins/${encodeURIComponent(pid)}/output`, { method: "DELETE" }));
 }
 
+/** A tool on this host (`GET /plugins/{pid}/tools`): the card's Tools
+ *  section. `current`: the installed version is the declared one. */
+export interface ToolState {
+  tool: string;
+  name: string;
+  version: string;
+  programs: string[];
+  installing: boolean;
+  installed: { version: string; bytes: number; installed_ms: number } | null;
+  current: boolean;
+  download: { host: string; size: number | null } | null;
+}
+
+function toolState(raw: unknown): ToolState | null {
+  const o = (raw ?? {}) as Record<string, unknown>;
+  const tool = text(o.tool);
+  const name = text(o.name);
+  const version = text(o.version);
+  if (tool === null || name === null || version === null) return null;
+  const i = o.installed as Record<string, unknown> | null | undefined;
+  const iv = text(i?.version);
+  const d = o.download as Record<string, unknown> | null | undefined;
+  const host = text(d?.host);
+  return {
+    tool,
+    name,
+    version,
+    programs: strings(o.programs),
+    installing: o.installing === true,
+    installed: iv !== null ? { version: iv, bytes: num(i?.bytes) ?? 0, installed_ms: num(i?.installed_ms) ?? 0 } : null,
+    current: o.current === true,
+    download: host !== null ? { host, size: num(d?.size) } : null,
+  };
+}
+
+const toolsBase = (pid: string): string => `/plugins/${encodeURIComponent(pid)}/tools`;
+
+export async function fetchTools(pid: string): Promise<ToolState[]> {
+  const b = await body<{ tools?: unknown[] }>(await api(toolsBase(pid)));
+  return list(b.tools)
+    .map(toolState)
+    .filter((t): t is ToolState => t !== null);
+}
+
+/** Install or update: download, check, unpack, set up. Answers once it is
+ *  in place (a large download takes a while); the error is the daemon's. */
+export async function installTool(pid: string, tool: string): Promise<void> {
+  await body<unknown>(await api(`${toolsBase(pid)}/${encodeURIComponent(tool)}/install`, { method: "POST" }));
+}
+
+export async function removeTool(pid: string, tool: string): Promise<void> {
+  await body<unknown>(await api(`${toolsBase(pid)}/${encodeURIComponent(tool)}`, { method: "DELETE" }));
+}
+
+/** A tool's one line before install: "TeX Live 2026.09 · 152 MB from
+ *  github.com", or that this host has no build of it. */
+export function downloadWords(t: ToolDecl): string {
+  if (t.download === null) return `${t.name} ${t.version} · no build for this computer`;
+  const size = t.download.size !== null ? ` · ${sizeWords(t.download.size)}` : "";
+  return `${t.name} ${t.version}${size} from ${t.download.host}`;
+}
+
 export interface SettingValue extends SettingDecl {
   value: unknown;
   /** The user set it (else it is the default). */
@@ -481,10 +575,11 @@ export async function putPluginSetting(pid: string, key: string, value: unknown,
 // --- frames -----------------------------------------------------------------
 
 /** A platform frame from `/ws/events`: a view to render again, a surface
- *  to fetch again, or a plugin's own `emit`. Already scoped to the window's
+ *  to fetch again, a plugin's own `emit`, or a job that changed state
+ *  (queued, running, done: `GET /workspaces/{id}/jobs/{job}`'s shape). Already scoped to the window's
  *  workspace by the daemon. */
 export interface PlatformFrame {
-  type: "view" | "surface" | "plugin";
+  type: "view" | "surface" | "plugin" | "job";
   plugin: string;
   workspace: string;
   view?: string;

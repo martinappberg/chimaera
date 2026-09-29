@@ -820,6 +820,21 @@ invalidations coalesces; a 0.1 plugin loads unchanged beside it.
 
 ### P8: programs and tools (the privileged tier)
 
+**Built (2026-09-29).** Where it differs from the text above: a tool's setup steps
+run as ordinary jobs (logs in the output folder, the Activity log names the
+install), not in a visible install terminal; memory is `ulimit -v` alone (the
+`systemd-run --user` cgroup for heavily threaded programs is later); limits are set
+by a fixed POSIX `sh` preamble that `exec`s the program, not by `setrlimit` in the
+daemon; an agent tool whose job outlives the 45 s hold gets the text the plugin gave
+with `wait`, and whether a repeat call joins the running job is the plugin's choice;
+Remove of a plugin removes its tools without asking; the Environment page's "found
+through this prelude" line is not built; the lock check that fetches every tool
+download runs in the lock bump (`.github/scripts/plugin-lock.mjs`), not on every
+CI run. Every program run and download is in the plugin's Activity log. Verified
+against the privileged fixture (`tests/plugin_jobs.rs`, the unpacker's hostile
+corpus in `toolchain.rs`) and live on a Linux host with a headless daemon; not yet
+on an HPC login node.
+
 Jobs and their limits, `job-finished`, long agent tools, tool downloads and setup,
 the Tools section, the privileged fixture, provenance in the lock check.
 

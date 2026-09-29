@@ -213,6 +213,252 @@ impl serde::Serialize for SettingScope {
     }
 }
 
+/// `[[programs]]`: a program the plugin may run as a job, by name only
+/// (resolved by the host on the user's PATH, then in the plugin's tools).
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProgramDecl {
+    pub(crate) name: String,
+    /// The arguments that print its version (the card and `tool-state`).
+    #[serde(default)]
+    pub(crate) version: Vec<String>,
+}
+
+/// Programs that run anything they are given: a plugin declaring one gets
+/// the strongest wording on its card.
+pub(crate) const SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "python", "python3", "perl", "ruby",
+    "node", "env", "xargs",
+];
+
+/// `[[tools]]`: a side program the host downloads on the user's click.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolDecl {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) version: String,
+    /// The `[[programs]]` it provides.
+    pub(crate) programs: Vec<String>,
+    #[serde(default)]
+    pub(crate) home: Option<String>,
+    #[serde(default)]
+    pub(crate) artifacts: Vec<ArtifactDecl>,
+    /// Run once after unpacking, as jobs (programs of this tool only).
+    #[serde(default)]
+    pub(crate) setup: Vec<SetupStep>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArtifactDecl {
+    /// `linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `macos-aarch64`.
+    pub(crate) platform: String,
+    pub(crate) url: String,
+    pub(crate) sha256: String,
+    /// Bytes; the download stops past it.
+    pub(crate) size: u64,
+    /// `tar`, `tar.gz`, `tar.xz`, `zip`, or `none` (the file is the program,
+    /// saved under the tool's first program's name).
+    pub(crate) unpack: String,
+    /// Where its programs are, relative to the unpacked folder.
+    #[serde(default)]
+    pub(crate) bin: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetupStep {
+    pub(crate) program: String,
+    #[serde(default)]
+    pub(crate) args: Vec<String>,
+}
+
+pub(crate) const PLATFORMS: &[&str] = &[
+    "linux-x86_64",
+    "linux-aarch64",
+    "macos-x86_64",
+    "macos-aarch64",
+];
+const UNPACKS: &[&str] = &["tar", "tar.gz", "tar.xz", "zip", "none"];
+/// A tool download's ceiling, whatever it declares.
+pub(crate) const DOWNLOAD_MAX: u64 = 2 << 30;
+const PROGRAMS_MAX: usize = 32;
+const TOOLS_MAX: usize = 8;
+
+/// This host's platform, as artifacts name it.
+pub(crate) fn this_platform() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Some("linux-x86_64"),
+        ("linux", "aarch64") => Some("linux-aarch64"),
+        ("macos", "x86_64") => Some("macos-x86_64"),
+        ("macos", "aarch64") => Some("macos-aarch64"),
+        _ => None,
+    }
+}
+
+impl ToolDecl {
+    /// The artifact for this host, if the tool has one.
+    pub(crate) fn artifact(&self) -> Option<&ArtifactDecl> {
+        let here = this_platform()?;
+        self.artifacts.iter().find(|a| a.platform == here)
+    }
+}
+
+/// A program name: what the host looks up on a PATH, never a path.
+fn valid_program(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.+".contains(&b))
+}
+
+/// The host part of an https URL (`None`: not https, or no host).
+pub(crate) fn https_host(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("https://")?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    let host = host.rsplit('@').next()?;
+    (!host.is_empty() && !host.contains(char::is_whitespace)).then_some(host)
+}
+
+/// `[[programs]]` and `[[tools]]`: consistent, bounded, fixed.
+fn validate_programs(m: &Manifest) -> Result<(), String> {
+    if m.programs.len() > PROGRAMS_MAX || m.tools.len() > TOOLS_MAX {
+        return Err(format!(
+            "at most {PROGRAMS_MAX} programs and {TOOLS_MAX} tools"
+        ));
+    }
+    let mut names = BTreeSet::new();
+    for p in &m.programs {
+        if !valid_program(&p.name) {
+            return Err(format!(
+                "program {:?} must be a name (letters, digits, `_-.+`), never a path",
+                p.name
+            ));
+        }
+        if !names.insert(p.name.as_str()) {
+            return Err(format!("program {:?} is declared twice", p.name));
+        }
+        if p.version.len() > 8 || p.version.iter().any(|a| a.len() > 64) {
+            return Err(format!(
+                "program {}: `version` is a few short arguments",
+                p.name
+            ));
+        }
+    }
+    let mut ids = BTreeSet::new();
+    for t in &m.tools {
+        if !super::valid_id(&t.id) {
+            return Err(format!(
+                "tool id {:?} must be lowercase letters, digits and dashes",
+                t.id
+            ));
+        }
+        if !ids.insert(t.id.as_str()) {
+            return Err(format!("tool {:?} is declared twice", t.id));
+        }
+        short(&format!("tool {}'s name", t.id), &t.name, TITLE_MAX)?;
+        let version_ok = !t.version.is_empty()
+            && t.version.len() <= 64
+            && t.version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-+".contains(&b));
+        if !version_ok {
+            return Err(format!(
+                "tool {}: version {:?} is not a version",
+                t.id, t.version
+            ));
+        }
+        if t.programs.is_empty() {
+            return Err(format!("tool {}: names the programs it provides", t.id));
+        }
+        for p in &t.programs {
+            if !names.contains(p.as_str()) {
+                return Err(format!(
+                    "tool {}: program {p:?} is not in [[programs]] (only declared programs run)",
+                    t.id
+                ));
+            }
+        }
+        if let Some(home) = &t.home {
+            if https_host(home).is_none() {
+                return Err(format!("tool {}: home must be an https URL", t.id));
+            }
+        }
+        if t.artifacts.is_empty() {
+            return Err(format!(
+                "tool {}: lists its downloads ([[tools.artifacts]])",
+                t.id
+            ));
+        }
+        let mut platforms = BTreeSet::new();
+        for a in &t.artifacts {
+            if !PLATFORMS.contains(&a.platform.as_str()) {
+                return Err(format!(
+                    "tool {}: platform {:?} is one of {}",
+                    t.id,
+                    a.platform,
+                    PLATFORMS.join(", ")
+                ));
+            }
+            if !platforms.insert(a.platform.as_str()) {
+                return Err(format!("tool {}: two artifacts for {}", t.id, a.platform));
+            }
+            if https_host(&a.url).is_none() {
+                return Err(format!("tool {}: {} is not an https URL", t.id, a.url));
+            }
+            let moving = [
+                "/latest/",
+                "/latest",
+                "/daily/",
+                "/nightly/",
+                "/main/",
+                "/master/",
+            ];
+            if moving.iter().any(|m| a.url.contains(m)) {
+                return Err(format!(
+                    "tool {}: {} names a moving release; pin a fixed one",
+                    t.id, a.url
+                ));
+            }
+            if a.sha256.len() != 64 || !a.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!("tool {}: every artifact needs its sha256", t.id));
+            }
+            if a.size == 0 || a.size > DOWNLOAD_MAX {
+                return Err(format!(
+                    "tool {}: an artifact's size is 1 byte to {} GiB",
+                    t.id,
+                    DOWNLOAD_MAX >> 30
+                ));
+            }
+            if !UNPACKS.contains(&a.unpack.as_str()) {
+                return Err(format!(
+                    "tool {}: unpack is one of {}",
+                    t.id,
+                    UNPACKS.join(", ")
+                ));
+            }
+            if let Some(bin) = &a.bin {
+                if !plain_relative(bin) {
+                    return Err(format!("tool {}: bin {bin:?} is a relative folder", t.id));
+                }
+            }
+        }
+        for step in &t.setup {
+            if !t.programs.contains(&step.program) {
+                return Err(format!(
+                    "tool {}: a setup step runs {:?}, which the tool doesn't provide",
+                    t.id, step.program
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A name a manifest gives (a view id, an action, a setting key): what
 /// rides a URL segment and a JSON key.
 pub(crate) fn valid_name(name: &str) -> bool {
@@ -260,6 +506,7 @@ fn short(what: &str, text: &str, max: usize) -> Result<(), String> {
 
 /// The 0.2 tables' consistency.
 pub(crate) fn validate(m: &Manifest) -> Result<(), String> {
+    validate_programs(m)?;
     if m.views.len() > VIEWS_MAX
         || m.files.len() > FILE_KINDS_MAX
         || m.actions.len() > ACTIONS_MAX
@@ -434,6 +681,23 @@ pub(crate) fn wire(m: &Manifest) -> Value {
             "match": a.patterns, "label": a.label, "action": a.action, "icon": a.icon,
         })).collect::<Vec<_>>(),
         "settings": m.settings.iter().map(SettingDecl::json).collect::<Vec<_>>(),
+        "programs": m.programs.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+        "tools": m.tools.iter().map(|t| {
+            let a = t.artifact();
+            json!({
+                "id": t.id,
+                "name": t.name,
+                "version": t.version,
+                "programs": t.programs,
+                "home": t.home,
+                // What Install would download here (none: no build for
+                // this host).
+                "download": a.map(|a| json!({
+                    "host": https_host(&a.url),
+                    "size": a.size,
+                })),
+            })
+        }).collect::<Vec<_>>(),
     })
 }
 
@@ -451,6 +715,10 @@ pub(crate) struct Platform {
     pub(crate) files_wake: std::sync::Arc<tokio::sync::Notify>,
     /// The file-events worker is running (`files::spawn_worker`).
     pub(crate) worker: std::sync::atomic::AtomicBool,
+    /// Programs running as jobs, and the ones waiting (`jobs`).
+    pub(crate) jobs: super::jobs::Jobs,
+    /// Tool installs in flight (`toolchain`).
+    pub(crate) installs: super::toolchain::Installs,
 }
 
 impl Platform {
@@ -464,6 +732,8 @@ impl Platform {
             files: Default::default(),
             files_wake: Default::default(),
             worker: Default::default(),
+            jobs: Default::default(),
+            installs: Default::default(),
         }
     }
 }
@@ -475,11 +745,13 @@ pub(crate) async fn forget_plugin(state: &std::sync::Arc<crate::AppState>, plugi
     crate::lock(&p.surfaces).forget_plugin(plugin);
     crate::lock(&p.screens).forget_plugin(plugin);
     crate::lock(&p.files).forget_plugin(plugin);
+    p.jobs.cancel_where(plugin, None);
     let state = state.clone();
     let plugin = plugin.to_string();
     let _ = tokio::task::spawn_blocking(move || {
         super::pdata::forget_plugin(&state, &plugin);
         super::output::forget_plugin(&state, &plugin);
+        super::toolchain::forget_plugin(&state, &plugin);
     })
     .await;
 }
@@ -491,6 +763,9 @@ pub(crate) fn forget_workspace(state: &std::sync::Arc<crate::AppState>, ws: &str
     crate::lock(&p.surfaces).forget_workspace(ws);
     crate::lock(&p.screens).forget_workspace(ws);
     crate::lock(&p.files).forget_workspace(ws);
+    for m in super::catalog(state).iter() {
+        p.jobs.cancel_where(&m.id, Some(ws));
+    }
     let state = state.clone();
     let ws = ws.to_string();
     tokio::task::spawn_blocking(move || {

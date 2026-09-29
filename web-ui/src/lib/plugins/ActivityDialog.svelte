@@ -1,7 +1,8 @@
 <script lang="ts">
   /**
    * A plugin's activity log (the card's "…" → Activity): installs, updates,
-   * trust given and withdrawn, blocks — newest first, in words
+   * trust given and withdrawn, blocks, the programs it ran and the tools it
+   * downloaded — newest first, in words
    * (`activityWords`), fetched when opened. Kept by the daemon after a
    * Remove, so a removed plugin's history is still there.
    */

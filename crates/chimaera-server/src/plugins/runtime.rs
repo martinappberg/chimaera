@@ -447,7 +447,7 @@ impl StderrTail {
 
 /// `text` cut to at most `max` bytes on a char boundary, marked when cut —
 /// never trimmed: what a plugin says reaches the agent byte for byte.
-fn clip(text: &str, max: usize) -> String {
+pub(crate) fn clip(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }
@@ -615,6 +615,7 @@ enum Call {
     OnEvent(wit::Event),
     Render(String, String),
     Action(String, String, String),
+    ToolResume(String, String),
 }
 
 enum Reply {
@@ -655,6 +656,9 @@ async fn invoke(live: &mut Live, cx: &wit::Context, call: Call) -> wasmtime::Res
                 .call_on_action(store, cx, &view, &action, &payload)
                 .await?,
         ),
+        Call::ToolResume(name, job) => {
+            Reply::ToolResult(screens.call_tool_resume(store, cx, &name, &job).await?)
+        }
     })
 }
 
@@ -721,7 +725,7 @@ async fn invoke_v1(
             };
             Reply::Event(exports.call_on_event(store, &cx, &event).await?)
         }
-        Call::Render(..) | Call::Action(..) => Reply::Unsupported,
+        Call::Render(..) | Call::Action(..) | Call::ToolResume(..) => Reply::Unsupported,
     })
 }
 
@@ -1066,7 +1070,20 @@ impl PluginRuntime {
             return tool_error(refused);
         }
         let call = Call::Tool(name.to_string(), args.to_string());
-        match self.run(state, m, ws, Some(session), call).await {
+        let mut answer = self.run(state, m, ws, Some(session), call).await;
+        // A long tool: the call waits (the instance doesn't) for its job,
+        // then the plugin gives the final answer; past the hold, its own
+        // "still running" text stands.
+        if let Ok(Reply::ToolResult(result)) = &answer {
+            if let Some(job) = result.wait.clone() {
+                if super::jobs::tool_wait(state, &m.id, &job).await {
+                    let resume = Call::ToolResume(name.to_string(), job);
+                    answer = self.run(state, m, ws, Some(session), resume).await;
+                }
+            }
+        }
+        match answer {
+            Ok(Reply::Unsupported) => tool_error(format!("{} can't resume a tool", m.name)),
             Ok(Reply::ToolResult(result)) => {
                 let text = clip(&result.text, RESULT_MAX);
                 if result.is_error {

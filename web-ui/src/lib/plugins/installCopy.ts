@@ -217,6 +217,25 @@ export function activityWords(e: ActivityEntry): string {
       return `You switched ${v} back on despite a block${str(e.reason) !== "" ? ` (${str(e.reason)})` : ""}`;
     case "skip":
       return `You skipped ${v}`;
+    case "job": {
+      const args = Array.isArray(e.args) ? e.args.filter((a): a is string => typeof a === "string") : [];
+      const how =
+        e.cancelled === true
+          ? "stopped"
+          : e.timed_out === true
+            ? "ran out of time"
+            : typeof e.exit === "number"
+              ? `exit ${e.exit}`
+              : "ended by a signal";
+      const secs = typeof e.duration_ms === "number" ? `, ${(e.duration_ms / 1000).toFixed(1)} s` : "";
+      return `Ran ${[str(e.program), ...args].join(" ")} (${how}${secs})`;
+    }
+    case "tool-install":
+      return `Downloaded ${str(e.tool)} ${v}${str(e.url) !== "" ? ` from ${str(e.url)}` : ""}`;
+    case "tool-install-failed":
+      return `Couldn't install ${str(e.tool)} ${v}${str(e.error) !== "" ? `: ${str(e.error)}` : ""}`;
+    case "tool-remove":
+      return `Removed its ${str(e.tool)}`;
     default:
       return e.kind;
   }

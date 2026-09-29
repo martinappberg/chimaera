@@ -50,6 +50,15 @@ impl FakeReleases {
         FakeReleases { base, files, hits }
     }
 
+    /// Serve `bytes` at `path` (a tool download, say).
+    pub(super) fn put(&self, path: &str, bytes: Vec<u8>) {
+        lock(&self.files).insert(path.to_string(), bytes);
+    }
+
+    pub(super) fn base(&self) -> &str {
+        &self.base
+    }
+
     /// Requests answered so far.
     pub(super) fn hits(&self) -> usize {
         self.hits.load(std::sync::atomic::Ordering::SeqCst)

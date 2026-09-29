@@ -69,6 +69,11 @@ impl EnvPreludes {
         self.compose(Some(workspace_id), launch)
     }
 
+    /// The host scope alone (a plugin tool's setup, which no workspace owns).
+    pub(crate) fn host_only(&self) -> String {
+        self.compose(None, None)
+    }
+
     /// [`Self::effective`] with the workspace scope explicit: None is the
     /// host scope alone, never "whatever an empty id happens to match".
     fn compose(&self, workspace_id: Option<&str>, launch: Option<&str>) -> String {

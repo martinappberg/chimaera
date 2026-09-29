@@ -39,8 +39,9 @@
   import ActivityDialog from "./ActivityDialog.svelte";
   import TrustDialog from "./TrustDialog.svelte";
   import PluginSettings from "./PluginSettings.svelte";
+  import PluginTools from "./PluginTools.svelte";
   import PluginScreen from "./ui/PluginScreen.svelte";
-  import { openPluginView } from "./platform";
+  import { downloadWords, openPluginView } from "./platform";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
   import { isWebUrl, openInSystemBrowser } from "../shared/urlOpen";
   import {
@@ -524,6 +525,13 @@
       </div>
     {/each}
   {/if}
+  {#if p.installed && p.platform.tools.length > 0}
+    <!-- The side programs it downloads (§8): Install / Update / Remove. -->
+    <div class="card-tools">
+      <h4>Tools</h4>
+      <PluginTools plugin={p.id} name={p.name} canInstall={p.fault === null && p.hold === null} />
+    </div>
+  {/if}
   {#if p.installed && p.platform.settings.length > 0}
     <details class="card-settings">
       <summary>Settings</summary>
@@ -533,7 +541,8 @@
 {/snippet}
 
 {#snippet facts(x: WorkspacePlugin, found: ReturnType<typeof hereLine>)}
-  {#if x.adds.ui.length > 0 || x.adds.agents.length > 0 || x.can.length > 0 || found !== null}
+  {@const downloads = x.installed ? [] : x.platform.tools}
+  {#if x.adds.ui.length > 0 || x.adds.agents.length > 0 || x.can.length > 0 || downloads.length > 0 || found !== null}
     <dl class="facts">
       {#if x.adds.ui.length > 0}
         <dt>For you</dt>
@@ -547,6 +556,15 @@
         <!-- The daemon's own words for what it can do: the trust prompt's list. -->
         <dt>Can</dt>
         <dd>{#each x.can as line, i (i)}<span class:priv={line.privileged}>{line.text}</span>{/each}</dd>
+      {/if}
+      {#if downloads.length > 0}
+        <!-- What its Tools section would download, once installed. -->
+        <dt>Downloads</dt>
+        <dd>
+          {#each downloads as t (t.id)}<span title="Only when you click Install on its Tools section; checked against the sha256 its release names"
+              >{downloadWords(t)}</span
+            >{/each}
+        </dd>
       {/if}
       {#if found !== null}
         <dt>Here</dt>
@@ -1044,6 +1062,21 @@
   .card-section {
     border-top: 1px solid var(--edge);
     padding-top: 12px;
+  }
+  .card-tools {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 12px;
+    border-top: 1px solid var(--edge);
+  }
+  .card-tools > h4 {
+    margin: 0;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
   }
   .card-settings > summary {
     cursor: pointer;

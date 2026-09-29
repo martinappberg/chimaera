@@ -561,9 +561,8 @@ unchanged (its own bindings, `wit-0.1/`), so moving is a choice: bump the
 `chimaera-plugin-api` dependency and `api`, and **declare `[access]`** — in 0.2
 a key left out means none (0.1 implied files, the Timeline with notes, and
 sessions). Every new export has a default, so a 0.1 plugin compiles on 0.2
-unchanged. Programs, side-program downloads and long agent tools (`[[programs]]`,
-`[[tools]]`, `job-*`, `tool-resume`) are the next phase; until then `job-start`
-answers "declares no programs".
+unchanged. Programs, side-program downloads and long agent tools are in
+[their own section](#programs-jobs-and-tools); they make a plugin privileged.
 
 ```toml
 api = "0.2"
@@ -606,8 +605,9 @@ view"), so a release that claims a new kind asks its users again.
 
 `Plugin` gains `render(cx, view, args)` (the view's tree; `args` carries
 `file` for a file view, `width` `narrow`/`wide`, `slot`), `on_action(cx, view,
-action, payload)` (the new tree, or `None` to keep it) and `tool_resume` (the
-next phase). `platform::` has what 0.2 adds:
+action, payload)` (the new tree, or `None` to keep it) and `tool_resume` (a
+long agent tool's final answer, [below](#programs-jobs-and-tools)). `platform::`
+has what 0.2 adds:
 
 | Call | What |
 |---|---|
@@ -618,6 +618,8 @@ next phase). `platform::` has what 0.2 adds:
 | `setting(cx, key)` | a declared setting: the user's value, else its default |
 | `state_keep(cx, key, &value)` | durable state, read back with `host::state_get`; within the same 64 KiB. `state_put` stays memory-only (and makes a kept key memory-only again) |
 | `roots(cx)` | the absolute workspace root and output folder (for arguments a program will need, and for mapping printed paths back) |
+| `job_start(cx, &spec)` · `job_status` · `job_cancel` | run a declared program as a job ([below](#programs-jobs-and-tools)) |
+| `tool_state(cx, tool)` | a declared tool: its version, whether (and which version) is installed here, what Install would download |
 
 ### Screens: `ui/1`
 
@@ -698,10 +700,93 @@ sweep), `settings-changed(key)`, `switched-on`, `switched-off` (on the instance
 it had, before it goes) — each only if declared in `provides.events`, and file
 events debounced per file. Declaring one of the 0.2 events needs `api = "0.2"`.
 
+### Programs, jobs and tools
+
+A plugin may run programs on the host, and download the ones it needs
+([plan](../plugin-platform-plan.md) §6, §8). Either makes it **privileged**: the
+card says "runs programs" and lists each one, a shell (`sh`, `bash`, `python`,
+`node`, `env`, …) gets "Runs sh: this plugin can run any command on this host",
+and a first-party privileged plugin is verified only at the lock's pin, since
+every release is reviewed.
+
+```toml
+[[programs]]               # only declared names run, by name, never a path
+name = "latexmk"
+version = ["-v"]           # the arguments that print its version
+
+[[tools]]                  # a side program the host downloads on the user's click
+id = "tinytex"
+name = "TeX Live (TinyTeX)"
+version = "2026.09"
+programs = ["latexmk", "pdflatex"]   # each also a [[programs]] entry
+home = "https://github.com/rstudio/tinytex-releases"
+
+[[tools.artifacts]]        # one per platform: linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64
+platform = "linux-x86_64"
+url = "https://github.com/…/releases/download/v2026.09/TinyTeX-1.tar.xz"  # https, a fixed release
+sha256 = "…"               # required; checked while it streams
+size = 159_000_000         # the download stops past it (and past 2 GiB)
+unpack = "tar.xz"          # tar | tar.gz | tar.xz | zip | none (the file is the program, named after the tool's first program)
+bin = "TinyTeX/bin/x86_64-linux"     # where its programs are, inside the folder
+
+[[tools.setup]]            # run once after unpacking, as jobs; this tool's programs only
+program = "tlmgr"
+args = ["install", "latexmk"]
+
+[provides]
+events = ["job-finished"]
+```
+
+A URL that moves (`/latest/`, `/daily/`, `/nightly/`, `/main/`, …) doesn't
+validate: the manifest's sha256 must stay true.
+
+**A job** is `platform::job_start(cx, &json!({…}))` with `program` (declared),
+`args` (a list; there is no shell), `cwd` (a workspace path, or `output:` for
+the output folder), `env` (added variables, `UPPER_CASE` names; never `PATH`,
+`HOME`, `SHELL`, `USER`, `LD_*`, `DYLD_*`, `CHIMAERA_*`), `stdin` (≤ 4 MiB,
+else closed), `wall_s` (60 by default, ≤ 600), `label` (the UI's words),
+`priority` (`user`, `agent`, `background`) and `prefer` (`"tool:<id>"`: this
+plugin's own copy even when the user has one; otherwise the user's copy on the
+PATH their terminals get, host and workspace prelude included, wins). It answers
+the job's id at once; the host runs it:
+
+| Limit | What |
+|---|---|
+| Queue | 2 jobs running daemon-wide, 1 per plugin, 8 waiting per plugin (a 9th is refused), by priority then age |
+| Time | `wall_s`, then SIGTERM to the whole process group and SIGKILL 5 s later |
+| Memory, CPU, files | `ulimit -v` 4 GiB, `-t` the wall time plus slack, `-f` 256 MiB per written file; `nice -n 10`, idle I/O where there is `ionice` |
+| Output | `output:.jobs/<id>/stdout.log` and `stderr.log`, 16 MiB each |
+| Switched off, blocked | its jobs are cancelled |
+
+`job_status(cx, id)` answers `{id, state (queued running done), program,
+label, exit, timed_out, cancelled, error, queued_ms, started_ms, finished_ms,
+duration_ms, stdout, stderr}` for this plugin's jobs in this workspace. When
+one ends the plugin hears `job-finished {id, exit, timed_out, duration_ms}`
+(with the 30 s budget, so it can digest a large output), and windows get a
+`job` frame.
+
+**A long agent tool** starts a job and answers `ToolResult::wait(job_id,
+"still building")`. The host holds the agent's call until the job ends (at most
+45 s) and calls `tool_resume(cx, name, job)` for the final answer; past that
+the agent gets the `text` given with `wait`, so say how to check back.
+
+**Tools** install only on the user's click (the card's **Tools** section:
+Install, Update, Remove; before install its **Downloads** line says what and
+from where). The host downloads over https, checks the size and sha256 while it
+streams, unpacks into an empty folder (refusing absolute paths, `..`, hard
+links, devices, links that leave the folder, and writes through a link; ≤ 4 GiB
+and 200,000 entries), runs the setup steps as jobs, and keeps
+`~/.chimaera/tools/<plugin>/<tool>/<version>/` behind a `current` link (two
+versions at most). Nothing outside that folder changes: its `bin` joins only
+this plugin's jobs' PATH. Removing the plugin removes its tools.
+
 ### Testing a 0.2 plugin
 
 `plugins/test-platform` uses every node, import and event once; the daemon's
 `tests/plugin_platform.rs` drives it through the routes (render, actions, file
-actions, query, settings, output, surfaces, file events, a restart). Copy its
-shape: pure logic in functions that take data, the host calls in the daemon's
-tests.
+actions, query, settings, output, surfaces, file events, a restart).
+`plugins/test-privileged` does the same for programs and tools
+(`tests/plugin_jobs.rs`: a job and its event, the limits, the queue, a tool
+served by a local fake host, a wrong checksum, a waiting agent tool). Copy
+their shape: pure logic in functions that take data, the host calls in the
+daemon's tests.

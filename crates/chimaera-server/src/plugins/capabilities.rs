@@ -131,7 +131,7 @@ impl Tier {
     }
 }
 
-/// The atom kinds that make a plugin privileged (P8 adds their atoms).
+/// The atom kinds that make a plugin privileged.
 const PRIVILEGED_KINDS: &[&str] = &["program", "download"];
 
 /// A plugin's capabilities: a set of atoms.
@@ -180,6 +180,26 @@ impl Caps {
         }
         if m.setup.is_some() {
             atoms.insert(atom(&["setup-prompt"]));
+        }
+        // Running programs and downloading them: what makes it privileged.
+        for program in &m.programs {
+            atoms.insert(atom(&["program", &program.name]));
+        }
+        for tool in &m.tools {
+            // Every platform's download: a release that points one at
+            // another host, or another version, asks again.
+            for a in &tool.artifacts {
+                let host = super::platform::https_host(&a.url).unwrap_or("");
+                atoms.insert(atom(&[
+                    "download",
+                    &tool.id,
+                    &tool.name,
+                    &tool.version,
+                    &a.platform,
+                    host,
+                    &a.sha256,
+                ]));
+            }
         }
         // Claiming a kind of file changes how the user's files open.
         for kind in &m.files {
@@ -310,6 +330,58 @@ impl Caps {
         if has(&["setup-prompt"]) {
             plain("Has a setup prompt it sends to an agent you choose, shown in full first".into());
         }
+        let programs: Vec<&str> = of_kind("program")
+            .filter_map(|p| p.get(1).map(String::as_str))
+            .collect();
+        let shells: Vec<&str> = programs
+            .iter()
+            .copied()
+            .filter(|p| super::platform::SHELLS.contains(p))
+            .collect();
+        for shell in &shells {
+            lines.push(Line {
+                text: format!("Runs {shell}: this plugin can run any command on this host"),
+                privileged: true,
+            });
+        }
+        let others: Vec<&str> = programs
+            .iter()
+            .copied()
+            .filter(|p| !shells.contains(p))
+            .collect();
+        if !others.is_empty() {
+            lines.push(Line {
+                text: format!(
+                    "Runs programs on this host: {} (with your permissions, under chimaera's \
+                     time and memory limits)",
+                    others.join(", ")
+                ),
+                privileged: true,
+            });
+        }
+        // One line per tool (its platforms' atoms name the same download).
+        let mut tools_seen: Vec<&str> = Vec::new();
+        for p in of_kind("download") {
+            if let [_, id, name, version, _, host, _] = p.as_slice() {
+                if tools_seen.contains(&id.as_str()) {
+                    continue;
+                }
+                tools_seen.push(id);
+                lines.push(Line {
+                    text: format!(
+                        "Downloads {name} {version} from {host} when you ask, into its own \
+                         folder (nothing else on the system changes)"
+                    ),
+                    privileged: true,
+                });
+            }
+        }
+        let mut plain = |text: String| {
+            lines.push(Line {
+                text,
+                privileged: false,
+            })
+        };
         let kinds: Vec<&str> = of_kind("file-kind")
             .filter_map(|p| p.get(1).map(String::as_str))
             .collect();
@@ -329,6 +401,8 @@ impl Caps {
             "agent-plugin",
             "setup-prompt",
             "file-kind",
+            "program",
+            "download",
         ];
         for p in &parsed {
             let k = p.first().map(String::as_str).unwrap_or("");

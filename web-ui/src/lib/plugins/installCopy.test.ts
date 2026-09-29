@@ -219,6 +219,16 @@ describe("trust words", () => {
     expect(activityWords({ kind: "trust", ts: 1, version: "0.2.0", how: "prompt" })).toBe("You trusted what 0.2.0 can do");
     expect(activityWords({ kind: "trust", ts: 1, version: "0.2.1", how: "subset" })).toBe("Trusted 0.2.1: it asked for nothing new");
     expect(activityWords({ kind: "untrust", ts: 1 })).toBe("You withdrew your trust");
+    expect(activityWords({ kind: "job", ts: 1, program: "latexmk", args: ["-pdf", "main.tex"], exit: 0, duration_ms: 2400 })).toBe(
+      "Ran latexmk -pdf main.tex (exit 0, 2.4 s)",
+    );
+    expect(activityWords({ kind: "job", ts: 1, program: "sleep", args: ["30"], exit: null, timed_out: true })).toBe(
+      "Ran sleep 30 (ran out of time)",
+    );
+    expect(activityWords({ kind: "tool-install", ts: 1, tool: "tinytex", version: "2026.09", url: "https://github.com/x/y.tar.xz" })).toBe(
+      "Downloaded tinytex 2026.09 from https://github.com/x/y.tar.xz",
+    );
+    expect(activityWords({ kind: "tool-remove", ts: 1, tool: "tinytex" })).toBe("Removed its tinytex");
     expect(activityWords({ kind: "future-kind", ts: 1 })).toBe("future-kind");
   });
 });

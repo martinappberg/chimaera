@@ -139,6 +139,21 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             "/plugins/{pid}/settings",
             get(plugins::pdata::get_route).put(plugins::pdata::put_route),
         )
+        // Programs and tools (the privileged tier): a plugin's side
+        // programs (`plugins::toolchain`) and its jobs (`plugins::jobs`).
+        .route("/plugins/{pid}/tools", get(plugins::toolchain::list_route))
+        .route(
+            "/plugins/{pid}/tools/{tool}/install",
+            post(plugins::toolchain::install_route),
+        )
+        .route(
+            "/plugins/{pid}/tools/{tool}",
+            delete(plugins::toolchain::remove_route),
+        )
+        .route(
+            "/workspaces/{id}/jobs/{job}",
+            get(plugins::jobs::status_route).delete(plugins::jobs::cancel_route),
+        )
         // What each agent CLI reports it has here (asked of the agents).
         .route(
             "/workspaces/{id}/agent-plugins",

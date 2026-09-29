@@ -19,6 +19,9 @@
 #       and its `v2` build (the "next release" the update tests serve).
 #   plugins/dist-test/test-platform/{plugin.wasm,plugin.toml}
 #       plugins/test-platform, the 0.2 platform fixture.
+#   plugins/dist-test/test-privileged/{plugin.wasm,plugin.toml}
+#       plugins/test-privileged, the programs-and-tools fixture (its tool's
+#       archive stays in its crate; the tests serve it from a fake host).
 #
 # Run before `cargo test` / `cargo clippy --all-targets` of chimaera-server
 # (its test build embeds plugins/dist-test; CI and `just check` do).

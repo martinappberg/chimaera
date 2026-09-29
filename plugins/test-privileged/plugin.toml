@@ -1,0 +1,81 @@
+# Test-only: built into plugins/dist-test, embedded only by the daemon's
+# test builds. Runs stand-in programs and installs a stand-in tool
+# (fixture-tool-1.0.0.tar.gz, served by the tests from a local server).
+id = "test-privileged"
+name = "Privileged fixture"
+version = "0.1.0"
+summary = "Runs programs and installs a tool, for chimaera's tests."
+description = "A plugin that exists only for chimaera's own tests of plugin programs and tools: jobs under the host's limits, a download checked and unpacked, a setup step, a long agent tool."
+api = "0.2"
+
+[access]
+files = "read"
+
+[provides]
+mcp_tools = ["build"]
+events = ["job-finished"]
+
+[adds]
+ui = ["A Jobs tab"]
+agents = ["1 tool: build"]
+
+[[views]]
+id = "jobs"
+title = "Jobs"
+slot = "tab"
+
+[[programs]]
+name = "sh"
+
+[[programs]]
+name = "echo"
+
+[[programs]]
+name = "sleep"
+
+[[programs]]
+name = "fixture-tool"
+version = ["--version"]
+
+[[tools]]
+id = "fixture-tool"
+name = "Fixture tool"
+version = "1.0.0"
+programs = ["fixture-tool"]
+home = "https://example.invalid/fixture-tool"
+
+[[tools.artifacts]]
+platform = "linux-x86_64"
+url = "https://example.invalid/fixture-tool-1.0.0.tar.gz"
+sha256 = "6c79c8a92fe19b07bd7782b9b59b3520c5cb5fd84f1e8039a8b038535c49d6b9"
+size = 325
+unpack = "tar.gz"
+bin = "bin"
+
+[[tools.artifacts]]
+platform = "linux-aarch64"
+url = "https://example.invalid/fixture-tool-1.0.0.tar.gz"
+sha256 = "6c79c8a92fe19b07bd7782b9b59b3520c5cb5fd84f1e8039a8b038535c49d6b9"
+size = 325
+unpack = "tar.gz"
+bin = "bin"
+
+[[tools.artifacts]]
+platform = "macos-x86_64"
+url = "https://example.invalid/fixture-tool-1.0.0.tar.gz"
+sha256 = "6c79c8a92fe19b07bd7782b9b59b3520c5cb5fd84f1e8039a8b038535c49d6b9"
+size = 325
+unpack = "tar.gz"
+bin = "bin"
+
+[[tools.artifacts]]
+platform = "macos-aarch64"
+url = "https://example.invalid/fixture-tool-1.0.0.tar.gz"
+sha256 = "6c79c8a92fe19b07bd7782b9b59b3520c5cb5fd84f1e8039a8b038535c49d6b9"
+size = 325
+unpack = "tar.gz"
+bin = "bin"
+
+[[tools.setup]]
+program = "fixture-tool"
+args = ["--setup"]

@@ -722,12 +722,6 @@ impl HostState {
             super::output::relative(path)?,
         ))
     }
-
-    fn manifest(&self) -> Result<&super::Manifest, String> {
-        self.manifest
-            .as_deref()
-            .ok_or_else(|| "no manifest is loaded for this instance".to_string())
-    }
 }
 
 /// The platform: what 0.2 adds for a plugin to ask. Bounded here like
@@ -833,19 +827,53 @@ impl platform::Host for HostState {
         json!({"workspace": root, "output": output}).to_string()
     }
 
-    async fn job_start(&mut self, _cx: wit::Context, _spec: String) -> Result<String, String> {
-        let name = self.manifest().map(|m| m.name.clone()).unwrap_or_default();
-        Err(format!("{name} declares no programs ([[programs]])"))
+    async fn job_start(&mut self, _cx: wit::Context, spec: String) -> Result<String, String> {
+        let app = self.scope()?.app.clone();
+        let m = self
+            .manifest
+            .clone()
+            .ok_or_else(|| "no manifest is loaded for this instance".to_string())?;
+        if m.programs.is_empty() {
+            return Err(format!("{} declares no programs ([[programs]])", m.name));
+        }
+        super::jobs::start(&app, &m, &self.workspace, &spec).await
     }
 
     async fn job_status(&mut self, _cx: wit::Context, id: String) -> String {
-        json!({"id": id, "state": "unknown"}).to_string()
+        let Ok(scope) = self.scope() else {
+            return "null".into();
+        };
+        match scope.app.plugin_platform.jobs.get(&id) {
+            Some(job) if job.plugin == self.plugin && job.workspace == self.workspace => {
+                job.json().to_string()
+            }
+            _ => json!({"id": id, "state": "unknown"}).to_string(),
+        }
     }
 
-    async fn job_cancel(&mut self, _cx: wit::Context, _id: String) {}
+    async fn job_cancel(&mut self, _cx: wit::Context, id: String) {
+        let Ok(scope) = self.scope() else {
+            return;
+        };
+        let jobs = &scope.app.plugin_platform.jobs;
+        if let Some(job) = jobs.get(&id) {
+            if job.plugin == self.plugin && job.workspace == self.workspace && !job.is_done() {
+                jobs.cancel(&id);
+            }
+        }
+    }
 
     async fn tool_state(&mut self, _cx: wit::Context, tool: String) -> String {
-        json!({"tool": tool, "declared": false, "installed": false}).to_string()
+        let (Ok(scope), Some(m)) = (self.scope(), self.manifest.clone()) else {
+            return "null".into();
+        };
+        let app = scope.app.clone();
+        match m.tools.iter().find(|t| t.id == tool) {
+            Some(decl) => super::toolchain::tool_json(&app, &m, decl)
+                .await
+                .to_string(),
+            None => json!({"tool": tool, "declared": false, "installed": null}).to_string(),
+        }
     }
 }
 
