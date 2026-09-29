@@ -127,18 +127,38 @@ impl Client {
         let refresh_token = old.refresh_token.clone();
         let client = self.clone();
         tokio::spawn(async move {
-            let response = client
-                .inner
-                .http
-                .post(path(&client.inner.account, &["v1", "oauth", "refresh"]))
-                .json(&RefreshRequest { refresh_token })
-                .send()
-                .await?;
-            if matches!(response.status().as_u16(), 401 | 403) {
+            // One retry with the SAME token covers a request that never
+            // reached the account or a transient account failure. The account
+            // treats a later reuse of an already-rotated token as theft, so a
+            // fresh token is never invented here and a definitive refusal is
+            // never retried.
+            let mut retried = false;
+            let response = loop {
+                let sent = client
+                    .inner
+                    .http
+                    .post(path(&client.inner.account, &["v1", "oauth", "refresh"]))
+                    .timeout(REFRESH_TIMEOUT)
+                    .json(&RefreshRequest {
+                        refresh_token: refresh_token.clone(),
+                    })
+                    .send()
+                    .await;
+                let transient = match &sent {
+                    Ok(response) => refresh_retryable(response.status().as_u16()),
+                    Err(_) => true,
+                };
+                if !transient || retried {
+                    break sent?;
+                }
+                retried = true;
+                tokio::time::sleep(REFRESH_RETRY_DELAY).await;
+            };
+            if refresh_revoked(response.status().as_u16()) {
                 *guard = None;
                 client.inner.token_updates.send_replace(None);
                 *client.inner.keeper.write().await = None;
-                bail!("device authorization revoked");
+                return Err(crate::AuthorizationRevoked.into());
             }
             let tokens: Tokens = json_response(response).await?;
             if tokens.token_type != "Bearer"
@@ -153,6 +173,24 @@ impl Client {
         })
         .await
         .context("credential refresh task stopped")?
+    }
+    /// A keeper can refuse a valid access token for its own reasons (account
+    /// outage, stale revocation cache). Rotating the one-use refresh token then
+    /// is pure risk, so ask the account itself. This read has no side effects.
+    async fn account_rejects(&self, token: &str) -> Result<bool> {
+        let response = self
+            .inner
+            .http
+            .get(path(&self.inner.account, &["v1", "devices"]))
+            .bearer_auth(token)
+            .timeout(REFRESH_TIMEOUT)
+            .send()
+            .await?;
+        match response.status().as_u16() {
+            401 => Ok(true),
+            status if (200..300).contains(&status) => Ok(false),
+            status => bail!("account unavailable ({status})"),
+        }
     }
     async fn request_raw(
         &self,
@@ -702,6 +740,9 @@ impl Client {
                 Err(tokio_tungstenite::tungstenite::Error::Http(response))
                     if response.status().as_u16() == 401 && attempt == 0 =>
                 {
+                    if !self.account_rejects(&token).await? {
+                        bail!("websocket upgrade rejected (401)");
+                    }
                     self.refresh_if_current(&token).await?
                 }
                 // Handshake error bodies may include echoed credentials: report
@@ -932,6 +973,19 @@ async fn serve_connection(client: &Client, port: u16, alias: &str, daemon: &Daem
             }
         }
     }
+}
+/// Bounds how long the token mutex is held: two attempts plus one pause.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
+const REFRESH_RETRY_DELAY: Duration = Duration::from_millis(500);
+/// Timeouts and server failures say nothing about the token itself.
+fn refresh_retryable(status: u16) -> bool {
+    status == 408 || (500..600).contains(&status)
+}
+/// The account answers revoked, expired and replayed refresh tokens with
+/// 400 `invalid_grant`; 401/403 mean the same. Only request timeouts and
+/// rate limiting are transient client errors.
+fn refresh_revoked(status: u16) -> bool {
+    (400..500).contains(&status) && !matches!(status, 408 | 429)
 }
 fn backoff(attempt: u32) -> Duration {
     let ceiling = (500_u64.saturating_mul(1 << attempt.min(5))).min(10_000);

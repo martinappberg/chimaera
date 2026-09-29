@@ -817,8 +817,17 @@ pub async fn pro_refresh_account(app: AppHandle) -> Result<(), String> {
     state.pro.credential_persistence.retry();
     reconcile_account(&app, &client, generation)
         .await
-        .map_err(|_| "Couldn't refresh your account. Check your connection and try again.".into())
+        .map_err(|error| {
+            if error.is::<chimaera_link::AuthorizationRevoked>() {
+                SIGN_IN_EXPIRED.into()
+            } else {
+                "Couldn't refresh your account. Check your connection and try again.".into()
+            }
+        })
 }
+
+/// Shown when the account ended this device's sign-in; only signing in helps.
+const SIGN_IN_EXPIRED: &str = "Your sign-in has expired. Sign in again to continue.";
 
 #[tauri::command]
 pub async fn pro_sign_in(
@@ -1268,8 +1277,10 @@ async fn sign_out(app: &AppHandle, everywhere: bool, expected: Option<u64>) -> R
         if let Some(endpoint) = state.pro.endpoint.clone() {
             tokio::task::spawn_blocking(move || save_tokens(&endpoint, None)).await??;
         }
-        *lock(&state.pro.error) =
-            expected.map(|_| "Your account session expired. Sign in again.".into());
+        // `expected` marks an account-initiated end (revoked, expired or
+        // replayed refresh token). It is final: the reconcile loop, events
+        // and serve were stopped above, so nothing retries in the background.
+        *lock(&state.pro.error) = expected.map(|_| SIGN_IN_EXPIRED.into());
         let _ = app.emit("pro-changed", ());
         Ok::<_, anyhow::Error>(())
     }

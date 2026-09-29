@@ -489,7 +489,15 @@ async fn refresh(
         .remove(&request.refresh_token)
         .is_none_or(|expiry| expiry <= Instant::now())
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        // The account service answers every unknown, expired, revoked or
+        // replayed refresh token with this exact OAuth error (RFC 6749 5.2).
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "invalid_grant".into(),
+            }),
+        )
+            .into_response();
     }
     Json(issue_tokens(&mut data)).into_response()
 }

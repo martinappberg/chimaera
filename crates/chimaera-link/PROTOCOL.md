@@ -17,10 +17,14 @@ Clients do not follow HTTP redirects on authenticated requests.
 
 Every request and WebSocket upgrade uses `Authorization: Bearer <access_token>`
 except the OAuth browser and token endpoints. Tokens never appear in URLs. Missing,
-expired or revoked authentication returns `401` before a WebSocket upgrade. A
-client refreshes once and retries; a second `401` requires sign-in. `403` means the
-account lacks authorization or needs fresh multifactor authentication. Services
-must check account and device ownership on every host and reverse stream lookup.
+expired or revoked authentication returns `401` before a WebSocket upgrade. After an
+**account** `401` a client refreshes once and retries; a second `401` requires
+sign-in. A keeper `401` alone does not justify a rotation: keepers also refuse
+during account outages or with a stale revocation cache, so the client first asks
+the account (`GET /v1/devices`, side-effect free) and refreshes only if the
+account also answers `401`. `403` means the account lacks authorization or needs
+fresh multifactor authentication. Services must check account and device
+ownership on every host and reverse stream lookup.
 
 `me.protocol` is an integer major version. A client implementing v0 rejects any
 other value before using the keeper. Unknown additive fields and event types can
@@ -180,6 +184,17 @@ Refresh rotates the refresh token; clients serialize refresh operations and
 persist **every** replacement pair in the OS keychain. Account tokens never go
 into app JSON settings, logs or the host directory. Local sign-out deletes the
 keychain pair and terminates events, tunnels and reverse serve.
+
+Refresh failures (RFC 6749 §5.2): an unknown, expired, revoked or already-used
+refresh token returns `400 {"error":"invalid_grant"}`. The account treats reuse
+of a rotated token as theft (it revokes the device), so a client must never
+present that token again. Clients therefore treat **every 4xx except 408 and 429**
+as final: clear the pair, publish sign-out, stop background work and ask for a
+new sign-in. A transport error, `408` or `5xx` is retried **once with the same
+token** after a short pause (a response lost after the account committed the
+rotation needs a service-side reuse grace to heal); a second failure, or `429`,
+keeps the session and reports a transient error. The typed client error is
+`AuthorizationRevoked`.
 
 ### CLI device sign-in
 

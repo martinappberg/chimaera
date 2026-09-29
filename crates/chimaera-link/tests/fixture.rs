@@ -98,7 +98,12 @@ async fn oauth_enforces_pkce_single_use_and_refresh_rotation() {
         .send()
         .await
         .unwrap();
-    assert_eq!(replay.status().as_u16(), 401);
+    // Exactly what the account service answers for a replayed token.
+    assert_eq!(replay.status().as_u16(), 400);
+    assert_eq!(
+        replay.json::<ApiError>().await.unwrap().error,
+        "invalid_grant"
+    );
 }
 #[tokio::test]
 async fn wrong_pkce_cannot_exchange_code() {
@@ -460,8 +465,12 @@ async fn revoked_refresh_clears_client_and_publishes_signout() {
     let client = fixture.client();
     let mut watch = client.token_updates();
     fixture.client().sign_out_everywhere().await.unwrap();
-    assert!(client.me().await.is_err());
-    watch.changed().await.unwrap();
+    let error = client.me().await.unwrap_err();
+    assert!(error.is::<AuthorizationRevoked>(), "{error:#}");
+    tokio::time::timeout(Duration::from_secs(5), watch.changed())
+        .await
+        .expect("revocation must publish sign-out")
+        .unwrap();
     assert!(watch.borrow().is_none());
     assert!(client.tokens().await.is_none());
 }
