@@ -4,6 +4,8 @@ import { plainError } from "../net/api";
  *  over the pane for a few seconds — never written into the scrollback. One
  *  entry per session, cleared by its own timer, so this stays tiny. */
 const notes = $state<Record<string, string>>({});
+/** Lasting connection states (waking), shown until the terminal is live. */
+const statuses = $state<Record<string, string>>({});
 const timers = new Map<string, ReturnType<typeof setTimeout>>();
 const SHOWN_MS = 4000;
 
@@ -17,6 +19,8 @@ export function refusalText(reason: string | null, message: string | null): stri
       return "Your project is busy. Wait a moment before typing again.";
     case "reconnecting":
       return "Your project is reconnecting. That input was not sent.";
+    case "waking":
+      return "Waking the cloud machine… That input was not sent.";
     case "elsewhere":
       return "This project is running on another device right now.";
     default:
@@ -37,6 +41,12 @@ export function refuse(id: string, reason: string | null, message: string | null
   );
 }
 
+/** Say a lasting state over the pane until it is cleared (null). */
+export function setTerminalStatus(id: string, status: "waking" | null): void {
+  if (status === null) delete statuses[id];
+  else statuses[id] = "Waking the cloud machine…";
+}
+
 export function refusalFor(id: string): string | null {
-  return notes[id] ?? null;
+  return notes[id] ?? statuses[id] ?? null;
 }

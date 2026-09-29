@@ -1020,6 +1020,9 @@ async fn a_routed_window_with_an_outside_tab_hears_owner_and_local_changes() {
 struct FakeTransport {
     asleep: std::sync::atomic::AtomicBool,
     refuse_wake: std::sync::atomic::AtomicBool,
+    /// Keep a waking owner waking until the test releases it.
+    hold_wake: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
     upgrades: std::sync::Mutex<Vec<String>>,
 }
 impl FakeTransport {
@@ -1044,6 +1047,9 @@ impl FakeTransport {
                                     axum::Json(serde_json::json!({"error":"worker_asleep"})),
                                 )
                                     .into_response();
+                            }
+                            if transport.hold_wake.load(Ordering::Acquire) {
+                                transport.release.notified().await;
                             }
                             transport.asleep.store(false, Ordering::Release);
                         }
@@ -1074,6 +1080,7 @@ struct SleepingChat {
 impl Drop for SleepingChat {
     fn drop(&mut self) {
         self.remote.chat.kill(&self.id);
+        self.remote.sessions.kill(&self.id).ok();
         for state in [&self.remote, &self.local] {
             state
                 .stopping
@@ -1085,6 +1092,12 @@ impl Drop for SleepingChat {
 /// A remote chat whose fake agent writes its stdin to `capture`, served
 /// behind a sleeping fake transport, with a viewing daemon routed to it.
 async fn sleeping_remote_chat(label: &str) -> SleepingChat {
+    sleeping_remote(label, false).await
+}
+
+/// [`sleeping_remote_chat`], or a terminal whose process writes its input
+/// to `capture`.
+async fn sleeping_remote(label: &str, terminal: bool) -> SleepingChat {
     let remote = test_state();
     let local = test_state();
     let workspace = lock(&remote.workspaces)
@@ -1102,19 +1115,40 @@ async fn sleeping_remote_chat(label: &str) -> SleepingChat {
     )
     .unwrap();
     let id = format!("s-{label}");
-    let mut spec = chimaera_agent::driver::SpawnSpec::new(
-        id.clone(),
-        vec![fake.to_string_lossy().into_owned()],
-        workspace.root.clone(),
-    );
-    spec.env.push((
-        "CHIMAERA_TEST_CAPTURE".into(),
-        capture.to_string_lossy().into_owned(),
-    ));
-    remote
-        .chat
-        .spawn(&chimaera_agent::claude::ClaudeAdapter, spec)
-        .unwrap();
+    if terminal {
+        remote
+            .sessions
+            .spawn(chimaera_pty::SpawnOpts {
+                cwd: workspace.root.clone(),
+                name: None,
+                cols: 80,
+                rows: 24,
+                command: Some(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("cat > '{}'", capture.display()),
+                ]),
+                id: Some(id.clone()),
+                env: Vec::new(),
+                env_remove: Vec::new(),
+                scrollback: None,
+            })
+            .unwrap();
+    } else {
+        let mut spec = chimaera_agent::driver::SpawnSpec::new(
+            id.clone(),
+            vec![fake.to_string_lossy().into_owned()],
+            workspace.root.clone(),
+        );
+        spec.env.push((
+            "CHIMAERA_TEST_CAPTURE".into(),
+            capture.to_string_lossy().into_owned(),
+        ));
+        remote
+            .chat
+            .spawn(&chimaera_agent::claude::ClaudeAdapter, spec)
+            .unwrap();
+    }
     lock(&remote.session_workspaces).insert(id.clone(), workspace.id.clone());
     pro::install_execution_fixture(&remote, &workspace.id, 4).unwrap();
     let transport = Arc::new(FakeTransport::default());
@@ -1305,4 +1339,116 @@ async fn a_send_that_cannot_reach_the_owner_is_answered_not_dropped() {
     // The socket survives the refusal and says what it is waiting for.
     assert_eq!(next_json(&mut socket).await["code"], "remote_unavailable");
     assert_eq!(user_turns(&fixture.capture, "LOST_MESSAGE"), 0);
+}
+
+/// While a viewer's first send wakes the owner, the viewer is told so and a
+/// second send is refused with a plain reason instead of being held: once
+/// the owner answers, exactly one message is delivered.
+#[tokio::test]
+async fn a_second_send_while_waking_is_refused_not_queued() {
+    use std::sync::atomic::Ordering;
+    let fixture = sleeping_remote_chat("waking-chat").await;
+    fixture.transport.hold_wake.store(true, Ordering::Release);
+    let mut socket = open_chat(&fixture).await;
+    assert_eq!(next_json(&mut socket).await["code"], "worker_asleep");
+    socket.send(send_text("FIRST_SEND")).await.unwrap();
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "ready", "the owner is still waking");
+        if frame["type"] == "waking" {
+            break;
+        }
+    }
+    socket.send(send_text("SECOND_SEND")).await.unwrap();
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "ready", "the owner is still waking");
+        if frame["code"] == "command_failed" {
+            assert_eq!(frame["reason"], "waking", "{frame}");
+            break;
+        }
+    }
+    fixture.transport.release.notify_one();
+    loop {
+        if next_json(&mut socket).await["type"] == "ready" {
+            break;
+        }
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while user_turns(&fixture.capture, "FIRST_SEND") == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "first send never delivered"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(user_turns(&fixture.capture, "FIRST_SEND"), 1);
+    assert_eq!(user_turns(&fixture.capture, "SECOND_SEND"), 0);
+}
+
+/// A terminal waking its owner holds the typing that woke it and refuses
+/// the rest (with a plain note) until the owner answers: nothing typed
+/// twice is ever run twice.
+#[tokio::test]
+async fn a_waking_terminal_holds_one_burst_and_refuses_the_rest() {
+    use std::sync::atomic::Ordering;
+    let fixture = sleeping_remote("waking-term", true).await;
+    fixture.transport.hold_wake.store(true, Ordering::Release);
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{}/ws/sessions/{}",
+        fixture.local_addr, fixture.id
+    ))
+    .await
+    .unwrap();
+    socket
+        .send(Message::Text(
+            serde_json::json!({"type":"auth","token":"test-token","cols":80,"rows":24})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(next_json(&mut socket).await["code"], "worker_asleep");
+    socket
+        .send(Message::Binary(b"FIRST_BURST\r".to_vec().into()))
+        .await
+        .unwrap();
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "ready", "the owner is still waking");
+        if frame["type"] == "waking" {
+            break;
+        }
+    }
+    socket
+        .send(Message::Binary(b"SECOND_BURST\r".to_vec().into()))
+        .await
+        .unwrap();
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "ready", "the owner is still waking");
+        if frame["type"] == "error" {
+            assert_eq!(frame["reason"], "waking", "{frame}");
+            break;
+        }
+    }
+    fixture.transport.release.notify_one();
+    loop {
+        if next_json(&mut socket).await["type"] == "ready" {
+            break;
+        }
+    }
+    let captured = || std::fs::read_to_string(&fixture.capture).unwrap_or_default();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !captured().contains("FIRST_BURST") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "held typing never delivered"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(captured().matches("FIRST_BURST").count(), 1);
+    assert!(!captured().contains("SECOND_BURST"));
 }

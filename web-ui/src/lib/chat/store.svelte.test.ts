@@ -1862,6 +1862,55 @@ describe("ChatStore unsent text", () => {
     expect(store.moving).toBeNull();
   });
 
+  it("a send that picks a paused project back up shows at once and is never offered twice", () => {
+    const store = new ChatStore();
+    store.onAsleep();
+    store.noteSent("wake up", 1);
+    expect(store.asleep).toBe(false);
+    expect(store.sending).toEqual({ text: "wake up", images: 1 });
+    store.onWaking();
+    expect(store.waking).toBe(true);
+    store.onReady(
+      {
+        id: "s",
+        agent: "claude",
+        alive: true,
+        exit_status: null,
+        native_session_id: null,
+        model: null,
+        current_mode: null,
+        pending_permission: false,
+      },
+      0,
+      0,
+    );
+    expect(store.waking).toBe(false);
+    // Still pending until the agent's echo proves delivery.
+    expect(store.sending).not.toBeNull();
+    store.apply({ seq: 1, ts: 0, ev: { type: "user_message", text: "wake up", id: "u1" } } as SeqEvent);
+    expect(store.sending).toBeNull();
+  });
+
+  it("a live conversation's send shows no extra pending bubble", () => {
+    const store = new ChatStore();
+    store.onReady(
+      {
+        id: "s",
+        agent: "claude",
+        alive: true,
+        exit_status: null,
+        native_session_id: null,
+        model: null,
+        current_mode: null,
+        pending_permission: false,
+      },
+      0,
+      0,
+    );
+    store.noteSent("hello");
+    expect(store.sending).toBeNull();
+  });
+
   it("a conversation paused here is neither moving nor exited, and clears on ready", () => {
     const store = new ChatStore();
     store.onMoved("cloud");

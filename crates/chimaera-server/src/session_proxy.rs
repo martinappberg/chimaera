@@ -1409,6 +1409,9 @@ enum Opened {
     Live(Box<Upstream>),
     /// The owner is asleep and this attempt carried no interaction.
     Sleeping,
+    /// The owner is asleep and this attempt carries interaction: the relay
+    /// says it is waking, then connects (which wakes it).
+    Waking,
 }
 impl Link<'_> {
     /// `None` while this socket's route is current. Once it is not: a
@@ -1429,9 +1432,15 @@ impl Link<'_> {
     async fn open(&self, wake: bool) -> Result<Opened> {
         let reach = verify_scope(&self.state.session_proxy, &self.route, &self.workspace).await?;
         // Viewing never wakes a sleeping owner; only interaction may.
-        if reach == Reach::Sleeping && !wake {
-            return Ok(Opened::Sleeping);
+        match (reach, wake) {
+            (Reach::Sleeping, false) => Ok(Opened::Sleeping),
+            (Reach::Sleeping, true) => Ok(Opened::Waking),
+            (Reach::Awake, _) => self.connect(wake, reach).await,
         }
+    }
+    /// The owner's socket, opened with wake intent when `wake`. A sleeping
+    /// owner gets the wake deadline to resume before it answers.
+    async fn connect(&self, wake: bool, reach: Reach) -> Result<Opened> {
         let address = self.route.address.context("remote placement unavailable")?;
         let query = if self.read_only {
             "?read_only=true"
@@ -1495,6 +1504,19 @@ impl Link<'_> {
         };
         json!({"type":"moved","to":to})
     }
+    /// Answer input that arrived while this socket's wake is pending: it is
+    /// not held (a second send must never become a second turn once the owner
+    /// answers), and the viewer is told why in plain words.
+    async fn refuse_waking(&self, downstream: &mut axum::extract::ws::WebSocket) -> Result<()> {
+        let frame = if self.chat {
+            json!({"type":"error","code":"command_failed","reason":"waking",
+                "message":"Still waking the cloud machine. That was not sent; send it again in a moment."})
+        } else {
+            json!({"type":"error","code":"read_only","reason":"waking",
+                "message":"Waking the cloud machine… That input was not sent."})
+        };
+        bounded_send(downstream, Down::Text(frame.to_string().into())).await
+    }
     /// Answer input that never reached the owner, so nothing vanishes silently.
     async fn refuse(
         &self,
@@ -1549,6 +1571,13 @@ fn unavailable() -> Value {
 fn asleep() -> Value {
     json!({"type":"error","code":"worker_asleep","message":"Your project is paused. Sending a message picks it back up."})
 }
+/// Additive status: the viewer's first input is waking the owner and will be
+/// delivered once it answers. Older clients ignore it.
+fn waking_status() -> Value {
+    json!({"type":"waking"})
+}
+/// A terminal says "waking" at most this often while typing is refused.
+const WAKING_NOTE_EVERY: Duration = Duration::from_secs(1);
 /// The existing per-command refusal: the socket stays up, the client keeps
 /// the unsent text.
 fn not_sent() -> Value {
@@ -1588,6 +1617,10 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
     let mut retry_armed = false;
     let mut ownership = tokio::time::interval(Duration::from_secs(2));
     ownership.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // A wake this socket asked for is pending: the input that asked is held,
+    // anything more is refused until the owner answers.
+    let mut waking = false;
+    let mut noted: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
             Some(result) = futures::future::OptionFuture::from(attempt.as_mut()), if attempt.is_some() => {
@@ -1597,6 +1630,13 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                         upstream = Some(socket);
                         ready = false;
                         backoff = RETRY_MIN;
+                    }
+                    Ok(Opened::Waking) => {
+                        if !waking {
+                            waking = true;
+                            if bounded_send(downstream, Down::Text(waking_status().to_string().into())).await.is_err() { return; }
+                        }
+                        attempt = Some(Box::pin(link.connect(true, Reach::Sleeping)));
                     }
                     Ok(Opened::Sleeping) if !held.frames.is_empty() => {
                         wake = true;
@@ -1615,6 +1655,7 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                         let count = held.take().len();
                         if link.refuse(downstream, count).await.is_err() { return; }
                         wake = false;
+                        waking = false;
                         if told != Some("remote_unavailable") {
                             told = Some("remote_unavailable");
                             if bounded_send(downstream, Down::Text(unavailable().to_string().into())).await.is_err() { return; }
@@ -1646,6 +1687,7 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                     if is_ready && !ready {
                         ready = true;
                         told = None;
+                        waking = false;
                         // Deliver what the viewer typed while connecting, once, in order.
                         if let Some(socket) = upstream.as_mut() {
                             for frame in held.take() {
@@ -1688,6 +1730,14 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                             }
                             let Some(frame) = upward(frame) else { continue };
                             if bounded_send(socket.as_mut(), frame).await.is_err() { return; }
+                        }
+                        _ if input && waking => {
+                            let now = tokio::time::Instant::now();
+                            let say = link.chat || noted.is_none_or(|at| now >= at + WAKING_NOTE_EVERY);
+                            if say {
+                                noted = Some(now);
+                                if link.refuse_waking(downstream).await.is_err() { return; }
+                            }
                         }
                         _ if input => {
                             if !held.push(frame) && link.refuse(downstream, 1).await.is_err() {

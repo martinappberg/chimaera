@@ -48,6 +48,9 @@ export interface ChatSocketHandlers {
   onCommandFailed(message: string): void;
   /** The conversation's project is paused; the next send picks it back up. */
   onAsleep?(): void;
+  /** A send picked the paused project back up: it is waking and the send is
+   *  delivered once it answers. */
+  onWaking?(): void;
   /** The conversation is continuing on another machine: stay mounted and
    *  keep reconnecting; it did not exit. */
   onMoved?(to: "cloud" | "computer"): void;
@@ -74,6 +77,7 @@ type ChatDelivery =
   | { kind: "error"; message: string }
   | { kind: "command_failed"; message: string }
   | { kind: "asleep" }
+  | { kind: "waking" }
   | { kind: "moved"; to: "cloud" | "computer" }
   | { kind: "paused"; pause: SessionPause }
   | { kind: "disconnected" };
@@ -130,6 +134,9 @@ export class ChatSocket {
           break;
         case "asleep":
           this.handlers.onAsleep?.();
+          break;
+        case "waking":
+          this.handlers.onWaking?.();
           break;
         case "moved":
           this.handlers.onMoved?.(delivery.to);
@@ -215,6 +222,9 @@ export class ChatSocket {
           // Sends stop here, before that close lands.
           this.authenticatedSocket = null;
           this.deliveries.push({ kind: "moved", to: msg.to === "computer" ? "computer" : "cloud" });
+          break;
+        case "waking":
+          this.deliveries.push({ kind: "waking" });
           break;
         case "paused": {
           // Not an exit either: the daemon closes this socket next and the

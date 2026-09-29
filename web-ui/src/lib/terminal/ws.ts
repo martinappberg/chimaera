@@ -31,6 +31,9 @@ export interface SessionSocketHandlers {
   /** Input the daemon refused (watching, busy, running elsewhere). The socket
    *  stays; the refusal is said inline, never in the scrollback. */
   onRefused?(reason: string | null, message: string | null): void;
+  /** A lasting connection state to say over the pane (`waking`: the first
+   *  input is waking the project's owner), or null once it is live. */
+  onStatus?(status: "waking" | null): void;
   /**
    * Whether the terminal is currently parked (hidden pooled instance). Read
    * at every (re)connect: a parked attach tells the server to withhold
@@ -91,6 +94,8 @@ export class SessionSocket {
   private unknownRetries = 0;
   /** A wake-carrying reconnect is in flight (at most one per drop). */
   private waking = false;
+  /** This connection's `ready` arrived: the owner hears input now. */
+  private live = false;
   private readonly recon = new Reconnector(() => this.connect());
   private readonly encoder = new TextEncoder();
 
@@ -110,6 +115,7 @@ export class SessionSocket {
     const ws = new WebSocket(daemonSocketUrl(`/ws/sessions/${this.sessionId}${query}`));
     ws.binaryType = "arraybuffer";
     this.ws = ws;
+    this.live = false;
 
     ws.onopen = () => {
       // Parked attach: the server withholds output + snapshot until unpark,
@@ -134,6 +140,8 @@ export class SessionSocket {
     ws.onclose = () => {
       if (this.ws === ws) this.ws = null;
       this.waking = false;
+      this.live = false;
+      this.handlers.onStatus?.(null);
       if (this.closed || this.fatal || this.exited) {
         this.recon.clear();
         return;
@@ -170,6 +178,8 @@ export class SessionSocket {
         this.recon.succeeded();
         this.unknownRetries = 0;
         this.waking = false;
+        this.live = true;
+        this.handlers.onStatus?.(null);
         if (this.sentParkedAuth) {
           // No snapshot follows on a parked connection — never reset the
           // grid for it, and skip the dims reconcile (no dims were sent).
@@ -219,6 +229,11 @@ export class SessionSocket {
         this.sawExited = true;
         this.handlers.onExited(msg.status ?? null);
         break;
+      case "waking":
+        // The typing that asked is held until the owner answers; the rest
+        // is refused (a note says so) and nothing echoes before `ready`.
+        this.handlers.onStatus?.("waking");
+        break;
       case "moved":
       case "paused":
         // Continuing on another machine, or resuming here on its own: not an
@@ -264,13 +279,23 @@ export class SessionSocket {
     return this.ws?.readyState === WebSocket.OPEN && this.authenticatedSocket === this.ws;
   }
 
+  /** Open AND answered by the session (`ready`): typing reaches it now. A
+   *  connection to a paused or waking owner is open but not live, and must
+   *  not predict echo for input the owner has not received. */
+  get isLive(): boolean {
+    return this.isOpen && this.live;
+  }
+
   /** Send raw keyboard input (from term.onData) as a binary frame. */
   sendInput(data: string): void {
     if (this.handlers.readOnly?.()) return;
     if (this.ws?.readyState === WebSocket.OPEN && this.authenticatedSocket === this.ws) {
       this.ws.send(this.encoder.encode(data));
-    } else {
+    } else if (isBrowserGateway()) {
+      // A browser view's socket is down: the keystroke is dropped (never
+      // queued) and a wake-carrying reconnect starts; say so over the pane.
       this.wakeOnInput();
+      if (!this.closed && !this.fatal && !this.exited) this.handlers.onRefused?.("waking", null);
     }
   }
 

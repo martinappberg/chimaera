@@ -533,6 +533,14 @@ export class ChatStore {
   /** The composer's last accepted send, until its echo proves the agent got
    *  it. Plain (not reactive): only the refusal path reads it. */
   private unconfirmedSend: string | null = null;
+  /** A send picked a paused project back up and it is waking; cleared by the
+   *  next `ready`, a disconnect or a move. */
+  waking = $state(false);
+  /** A send accepted while the conversation is not live (paused, waking,
+   *  reconnecting): shown at once as a pending bubble so it is never typed
+   *  twice. Its echo, a refusal (which hands the text back), a move or an
+   *  exit clears it. */
+  sending = $state<{ text: string; images: number } | null>(null);
   fatalError = $state<string | null>(null);
   /** Where the fatal came from. A SOCKET fatal (handshake failure) is
    *  disproved by the next successful `ready` — chatPool recreates a fatal
@@ -710,6 +718,7 @@ export class ChatStore {
   onReady(session: ChatSessionInfo, _replayFrom: number, head: number | undefined): void {
     this.connected = true;
     this.asleep = false;
+    this.waking = false;
     this.moving = null;
     this.pausedFor = null;
     // This handshake succeeded, which is the one fact a socket-level fatal
@@ -743,6 +752,7 @@ export class ChatStore {
   onDisconnected(): void {
     this.connected = false;
     this.asleep = false;
+    this.waking = false;
   }
 
   /** The owner is paused and nothing has asked it to wake yet. */
@@ -750,11 +760,19 @@ export class ChatStore {
     this.asleep = true;
   }
 
+  /** A send picked the paused project back up; it is waking now. */
+  onWaking(): void {
+    this.asleep = false;
+    this.waking = true;
+  }
+
   /** The conversation moved to another machine; it did not exit. */
   onMoved(to: "cloud" | "computer"): void {
     this.connected = false;
     this.moving = to;
     this.pausedFor = null;
+    this.waking = false;
+    this.sending = null;
   }
 
   /** The conversation is paused here and resumes on its own; it did not exit. */
@@ -770,14 +788,19 @@ export class ChatStore {
 
   /** The composer's send was accepted by the socket; keep its text until the
    *  agent's echo proves delivery, so a refusal can hand it back. */
-  noteSent(text: string): void {
+  noteSent(text: string, images = 0): void {
     this.unconfirmedSend = text;
+    // Sending is what picks a paused project back up: stop inviting it.
+    const live = this.connected && !this.waking;
+    this.asleep = false;
+    if (!live) this.sending = { text, images };
   }
 
   /** One command was refused before reaching the agent. Say so, and give an
    *  unconfirmed send's text back to the composer instead of losing it. */
   onCommandFailed(message: string): void {
     this.notice(message, "error");
+    this.sending = null;
     if (this.unconfirmedSend !== null) {
       this.restoredDraft = this.unconfirmedSend;
       this.unconfirmedSend = null;
@@ -794,6 +817,7 @@ export class ChatStore {
   /** The structured driver fell back to its terminal surface. */
   onDegraded(): void {
     this.hydrating = false;
+    this.sending = null;
     this.degraded = true;
     this.touchTranscript();
   }
@@ -801,6 +825,7 @@ export class ChatStore {
   /** The driver closed before (or after) an initial journal replay. */
   onExited(status: number | null): void {
     this.hydrating = false;
+    this.sending = null;
     this.exited = { status };
     this.touchTranscript();
   }
@@ -938,7 +963,10 @@ export class ChatStore {
           : [];
         const origin = typeof ev.origin === "string" ? ev.origin : null;
         // The agent received the user's own send: nothing is left to hand back.
-        if (origin === null) this.unconfirmedSend = null;
+        if (origin === null) {
+          this.unconfirmedSend = null;
+          this.sending = null;
+        }
         if (ev.queued === true && id !== null) {
           // Queued: park it in the pending stack, NOT in the transcript at its
           // mid-turn send position (that splice would split the agent's live

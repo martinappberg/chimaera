@@ -1192,7 +1192,7 @@
     if (accepted) {
       // Kept until the agent's echo: a send the daemon could not deliver
       // (the project was reconnecting) comes back into the composer.
-      store.noteSent(text);
+      store.noteSent(text, images.length);
       // Submission is stronger intent than merely clearing a draft: the user
       // expects to see the delivered/queued bubble and the reply it starts.
       atBottom = true;
@@ -2579,6 +2579,24 @@
         {/each}
       </div>
     {/if}
+    <!-- A send made while the conversation is not live (paused, waking,
+         reconnecting): shown at once, so nobody sends it twice. Its echo
+         replaces it; a refusal hands the text back to the composer. -->
+    {#if store.sending !== null}
+      <div class="pending" aria-live={visible ? "polite" : "off"}>
+        <div class="msg user pending-msg">
+          <div class="bubble-row">
+            <div class="bubble">
+              <UserText text={store.sending.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />
+            </div>
+          </div>
+          <span class="delivery">sending…</span>
+          {#if store.sending.images > 0}
+            <span class="attach">{store.sending.images} image{store.sending.images > 1 ? "s" : ""}</span>
+          {/if}
+        </div>
+      </div>
+    {/if}
     {/if}
 
     {#if hasDeferredActivity || !atBottom}
@@ -2710,6 +2728,8 @@
 
   {#if continuing}
     <div class="connection-status" role="status">{continuingLabel}</div>
+  {:else if store.waking && !store.connected}
+    <div class="connection-status" role="status">Waking the cloud machine…</div>
   {:else if store.asleep && !store.connected}
     <div class="connection-status" role="status">Send a message to pick this conversation back up.</div>
   {:else if reconnectingShown}

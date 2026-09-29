@@ -84,6 +84,31 @@ it("typing into a browser view with its socket down reconnects once with wake in
   session.close();
 });
 
+it("a browser view says the dropped keystroke is waking the project", () => {
+  vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-one/"));
+  vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => {})));
+  const refused = vi.fn();
+  const session = new SessionSocket("s-fixture", { ...quiet, onRefused: refused });
+  Socket.all[0].onopen?.();
+  session.sendInput("a");
+  expect(refused).toHaveBeenCalledWith("waking", null);
+  session.close();
+});
+
+it("waking is a lasting state until the session answers, and input is not live before", () => {
+  const status = vi.fn();
+  const session = new SessionSocket("s-fixture", { ...quiet, onStatus: status });
+  Socket.all[0].onopen?.();
+  expect(session.isOpen).toBe(true);
+  expect(session.isLive).toBe(false);
+  Socket.all[0].onmessage?.({ data: JSON.stringify({ type: "waking" }) });
+  expect(status).toHaveBeenLastCalledWith("waking");
+  Socket.all[0].onmessage?.({ data: JSON.stringify({ type: "ready", cols: 80, rows: 24 }) });
+  expect(status).toHaveBeenLastCalledWith(null);
+  expect(session.isLive).toBe(true);
+  session.close();
+});
+
 it("a native window never reconnects early on typing: its daemon holds the input", () => {
   const session = new SessionSocket("s-fixture", quiet);
   Socket.all[0].readyState = 0;
