@@ -207,8 +207,25 @@ impl Pro {
     pub(super) async fn client_snapshot(&self) -> Option<(Client, u64)> {
         let mut ready = self.ready.subscribe();
         let _ = ready.wait_for(|ready| *ready).await;
+        self.client_now()
+    }
+
+    /// Never waits for account startup (a Keychain prompt or a slow account
+    /// can take minutes). SSH routing uses this: no installed client yet
+    /// means an ordinary SSH connection now, exactly as for a free user.
+    pub(super) fn client_now(&self) -> Option<(Client, u64)> {
         let client = lock(&self.client);
         client.clone().map(|client| (client, self.generation()))
+    }
+}
+
+/// Account startup always ends with `ready`, including when a newer sign-in
+/// or sign-out supersedes it; otherwise every dependent command and device
+/// reconnect would wait for a result that never comes.
+struct ReadyOnExit<'a>(&'a tokio::sync::watch::Sender<bool>);
+impl Drop for ReadyOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
     }
 }
 
@@ -287,6 +304,7 @@ fn restore_account(app: AppHandle) {
     };
     tauri::async_runtime::spawn(async move {
         let state = app.state::<Shell>();
+        let _ready = ReadyOnExit(&state.pro.ready);
         for retry in 0..=recovery::RETRIES.len() {
             if retry > 0 {
                 tokio::time::sleep(Duration::from_secs(recovery::RETRIES[retry - 1])).await;
@@ -1148,6 +1166,25 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn ssh_routing_never_waits_for_account_startup() {
+        let pro = Pro::new(Some("http://127.0.0.1:1".into()));
+        assert!(!*pro.ready.borrow());
+        assert!(pro.client_now().is_none(), "no client yet: plain SSH now");
+        *lock(&pro.client) = Some(Client::new("http://127.0.0.1:1", None).unwrap());
+        assert!(pro.client_now().is_some());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), pro.client_snapshot())
+                .await
+                .is_err(),
+            "account commands still wait for startup"
+        );
+        // A superseded or failed startup still releases every waiter.
+        drop(ReadyOnExit(&pro.ready));
+        assert!(*pro.ready.borrow());
+        assert!(pro.client_snapshot().await.is_some());
+    }
+
     #[test]
     fn device_hosts_never_fall_back_to_ssh_without_an_account_route() {
         assert!(device_fallback::<()>(true).is_err());
@@ -1346,7 +1383,14 @@ pub(super) async fn connection(
     alias: &str,
 ) -> Result<Option<(Client, Host, u64)>, String> {
     let device = state.pro.is_device(alias) || lock(&state.registry).is_link_device(alias);
-    let Some((client, generation)) = state.pro.client_snapshot().await else {
+    // A device has no route but the account, so it waits for startup. An SSH
+    // host never waits: ordinary SSH works whether or not Pro is ready.
+    let snapshot = if device {
+        state.pro.client_snapshot().await
+    } else {
+        state.pro.client_now()
+    };
+    let Some((client, generation)) = snapshot else {
         return device_fallback(device);
     };
     if !state.pro.has_keeper() {
@@ -1363,7 +1407,13 @@ pub(super) async fn connection(
     if !kept && !known {
         return device_fallback(device);
     }
-    let hosts = client.hosts().await.map_err(|error| error.to_string())?;
+    let hosts = match client.hosts().await {
+        Ok(hosts) => hosts,
+        // An account or keeper outage must not strand a host that plain SSH
+        // reaches; the resulting row reads as a direct connection.
+        Err(_) if !device => return Ok(None),
+        Err(_) => return Err(DEVICE_UNREACHABLE.into()),
+    };
     let host = hosts.iter().find(|host| host.alias == alias).cloned();
     {
         let _current = lock(&state.pro.client);
@@ -1381,6 +1431,9 @@ pub(super) async fn connection(
         None => device_fallback(device),
     }
 }
+
+const DEVICE_UNREACHABLE: &str =
+    "Couldn't reach Chimaera Pro to reconnect this computer. It reconnects when Pro is back.";
 
 fn device_fallback<T>(device: bool) -> Result<Option<T>, String> {
     if device {
