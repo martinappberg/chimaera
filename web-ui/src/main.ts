@@ -11,7 +11,14 @@ import "@fontsource/jetbrains-mono/latin-ext-500.css";
 import "@fontsource/jetbrains-mono/latin-ext-600.css";
 import "./app.css";
 import App from "./App.svelte";
+import { installReloadHook } from "./lib/layout/windowReload";
 
+// Before mount: the native Reload Window must still reach a window whose App
+// fails to boot.
+installReloadHook();
+
+// The native Reload Window (menu.rs RELOAD_WINDOW_JS) reads this mount point
+// to tell a page that never booted from an older UI without the hook.
 const target = document.getElementById("app");
 if (!target) {
   throw new Error("missing #app mount point");

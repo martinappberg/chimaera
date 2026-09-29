@@ -65,7 +65,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `notify.rs` | The platform notifier: macOS `UNUserNotificationCenter` + click delegate + dock tile (needs a signed `.app` — unbundled dev builds degrade to none), `notify-rust` on Linux/Windows. Identifiers encode the click route. |
 | `windows.rs` | The per-window registry (round-trips window↔workspace). |
 | `update.rs` | The auto-updater intent chain (consume-once, expiry) + the kept outcome of every signed-update check (`status`/`check`, behind `app_update_status`). |
-| `menu.rs` | The menu bar. |
+| `menu.rs` | The menu bar. Page-owned items reach the focused window as a `menu` event; Reload Window instead evaluates a fixed script (`RELOAD_WINDOW_JS`) that calls the page's reload hook, so a page that never booted (no listener) still reloads. |
 | `tray.rs` | The menu-bar / system-tray status item (`tray-icon` feature). |
 
 ## Invariants / gotchas

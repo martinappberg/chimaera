@@ -284,7 +284,14 @@
     type XwinTransport,
     type XwinWindowInfo,
   } from "./lib/layout/crossWindow";
-  import { chordDigit, fontChord, isMac, matchChord, REFERENCE_CHORD } from "./lib/shared/keys";
+  import {
+    chordDigit,
+    fontChord,
+    isMac,
+    isReloadWindowKey,
+    matchChord,
+    REFERENCE_CHORD,
+  } from "./lib/shared/keys";
   import {
     activeModLabel,
     isCapturing,
@@ -387,8 +394,11 @@
     planAssetNavigation,
     rearmAssetNavigation,
     requestAssetReload,
+    requestWindowReload,
+    cancelWindowReload,
     requireAssetNavigation,
   } from "./lib/layout/assetTransition";
+  import { claimWindowReload } from "./lib/layout/windowReload";
   import { focusOnMount } from "./lib/shared/focusOnMount";
   import Launcher from "./lib/workspace/Launcher.svelte";
   import SessionGlyph from "./lib/shared/SessionGlyph.svelte";
@@ -1560,6 +1570,9 @@
   $effect(() => () => {
     if (assetRearmTimer !== null) clearTimeout(assetRearmTimer);
   });
+  // The native Reload Window (layout/windowReload.ts) reloads through the
+  // gate above while it is mounted, not plainly.
+  $effect(() => claimWindowReload());
 
   // Slurm strip: one probe at boot; the store keeps its own 60s poll gated on
   // "scheduler is slurm" + a visible window (see workspace/compute.ts).
@@ -2765,6 +2778,18 @@
   function onKeydown(e: KeyboardEvent): void {
     // A settings row is recording a chord — the press is the recorder's.
     if (isCapturing()) return;
+    // Reload Window's F5 (native Windows/Linux). The menu accelerator carries
+    // it, but WebView2 reloads on F5 itself (wry leaves its browser
+    // accelerator keys on) and can see the key first: claiming it here lands
+    // both paths in the safety gate — ahead of the modal stand-down, which
+    // would otherwise hand F5 to WebView2's ungated reload. A browser tab
+    // keeps its own F5.
+    if (isNativeShell() && isReloadWindowKey(e)) {
+      e.preventDefault();
+      e.stopPropagation();
+      requestWindowReload();
+      return;
+    }
     // A shown modal owns the keyboard: workbench chords stand down behind it
     // (the picker and Quick Open handle their own chords below).
     if (modalOpen() && !pickerOpen && !quickOpenOpen) return;
@@ -3632,6 +3657,13 @@
       run: () => setMastermindPanelOpen(true),
     },
     ...gitQuickOpenCommands(),
+    {
+      id: "reload-window",
+      label: "Reload Window",
+      aliases: ["refresh"],
+      hint: "a fresh page, same layout",
+      run: requestWindowReload,
+    },
   ]);
 
   /** Git's commands: only where a repository is (git is ambient). */
@@ -6365,6 +6397,7 @@
     blockedDrafts={$volatileChatDrafts.size}
     onReload={requestAssetReload}
     onDismiss={clearChunkFailure}
+    onCancel={cancelWindowReload}
   />
 {/if}
 

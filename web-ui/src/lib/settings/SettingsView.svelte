@@ -208,6 +208,7 @@
     { label: "New terminal", chord: APP_MENU.newTerminal },
     { label: "New agent", chord: APP_MENU.newAgent },
     { label: "New window", chord: APP_MENU.newWindow },
+    { label: "Reload window", chord: APP_MENU.reloadWindow },
   ];
 </script>
 
