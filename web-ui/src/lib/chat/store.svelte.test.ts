@@ -239,8 +239,39 @@ describe("ChatStore pending-send ordering", () => {
       id: "q1",
       text: "meanwhile do X",
       state: "queued",
+      // No `after_turn` on the echo: read at the agent's next step.
+      afterTurn: false,
       checkpoint: { id: "q1", preceding: "p0" },
     });
+  });
+
+  it("a next-step send joins the turn where the agent read it; an after-turn one waits", () => {
+    const events: Record<string, unknown>[] = [
+      { type: "turn_started", turn_id: "t1" },
+      { type: "message_chunk", turn_id: "t1", text: "step one" },
+      { type: "user_message", text: "also check the tests", id: "q1", queued: true },
+      { type: "user_message", text: "then summarize", id: "q2", queued: true, after_turn: true },
+      // The agent reads q1 at its next step — mid-turn, by design.
+      { type: "user_message_update", id: "q1", state: "sent" },
+      { type: "message_chunk", turn_id: "t1", text: "step two" },
+      { type: "turn_completed", turn_id: "t1", usage: { output_tokens: 2 } },
+      { type: "user_message_update", id: "q2", state: "sent" },
+    ];
+    const midTurn = fold(events.slice(0, 6));
+    expect(midTurn.pendingSends).toHaveLength(1);
+    expect(midTurn.pendingSends[0]).toMatchObject({ id: "q2", state: "queued", afterTurn: true });
+    expect(midTurn.blocks.map((b) => b.kind)).toEqual(["message", "user", "message"]);
+    expect(midTurn.blocks[1]).toMatchObject({ kind: "user", id: "q1", text: "also check the tests" });
+
+    const done = fold(events);
+    expect(done.pendingSends).toHaveLength(0);
+    // q1 sits at the step boundary it was read at; q2 after the whole turn.
+    expect(done.blocks.map((b) => b.kind)).toEqual(["message", "user", "message", "turn_end", "user"]);
+    expect(done.blocks[4]).toMatchObject({ kind: "user", id: "q2" });
+    // Pure reducer: a replay of the same journal agrees exactly.
+    const replay = fold(events);
+    expect(replay.blocks).toEqual(done.blocks);
+    expect(fold(events.slice(0, 6)).pendingSends).toEqual(midTurn.pendingSends);
   });
 
   it("appends a delivered send AFTER the full agent message, never splicing it", () => {
@@ -1668,7 +1699,7 @@ describe("ChatStore turn artifacts (the made-this-turn gallery)", () => {
     [1050, { type: "tool_call_update", id: "e1", status: "completed" }],
     [1060, { type: "tool_call", id: "b1", kind: "execute", title: "python plot.py --out figs/umap.png", status: "in_progress" }],
     [1070, { type: "tool_call_update", id: "b1", status: "completed", content: { kind: "output", text: "wrote report/index.html\n" } }],
-    [1080, { type: "message_chunk", turn_id: "t1", text: "Done — see `figs/umap.png` and report/index.html." }],
+    [1080, { type: "message_chunk", turn_id: "t1", text: "Done — the plot and the report are ready." }],
     [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
   ];
 
@@ -1688,6 +1719,32 @@ describe("ChatStore turn artifacts (the made-this-turn gallery)", () => {
     );
     // Replay rebuilds the identical blocks (pure over the journal).
     expect(foldAt(TURN).blocks).toEqual(store.blocks);
+  });
+
+  it("a message the agent read mid-turn does not cut the turn's artifacts", () => {
+    const store = foldAt([
+      ...TURN.slice(0, 4),
+      // Sent while the turn runs; the agent reads it at its next step.
+      [1031, { type: "user_message", text: "also a chart", id: "q1", queued: true }],
+      [1032, { type: "user_message_update", id: "q1", state: "sent" }],
+      ...TURN.slice(4),
+    ]);
+    const user = store.blocks.find((b) => b.kind === "user" && b.id === "q1");
+    expect(user).toMatchObject({ midTurn: true });
+    // notes.md was written BEFORE the mid-turn message and still counts.
+    expect(store.blocks.find((b) => b.kind === "turn_end")).toMatchObject({
+      artifacts: ["/p/notes.md"],
+      startedAtMs: 1010,
+    });
+    // A message that opens the next turn (read between turns) is not mid-turn.
+    const next = foldAt([
+      ...TURN,
+      [2001, { type: "user_message", text: "next", id: "q2", queued: true }],
+      [2002, { type: "user_message_update", id: "q2", state: "sent" }],
+    ]);
+    const opener = next.blocks.find((b) => b.kind === "user" && b.id === "q2");
+    expect(opener).toBeDefined();
+    expect(opener && "midTurn" in opener).toBe(false);
   });
 
   it("a stopped turn keeps what it made; a plain stop adds nothing", () => {
@@ -1712,20 +1769,31 @@ describe("ChatStore turn artifacts (the made-this-turn gallery)", () => {
     expect(plain.blocks.map((b) => b.kind)).toEqual(["message", "notice"]);
   });
 
-  it("shows only what the prose did not: an embedded figure and a linked document are covered", () => {
+  it("shows only what the prose did not: an embedded figure and named files are covered", () => {
     const store = foldAt([
       ...TURN.slice(0, -2),
       [1080, { type: "message_chunk", turn_id: "t1", text: "Done:\n\n![umap](figs/umap.png)\n\nNotes are in notes.md; the report is report/index.html." }],
       [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
     ]);
     const end = store.blocks.find((b) => b.kind === "turn_end");
-    // notes.md is linked by the prose; the figure is embedded; the report is
-    // only named, and a link is not a picture.
-    expect(end).toMatchObject({ kind: "turn_end", artifacts: [], covered: ["/p/notes.md", "figs/umap.png"] });
-    const mentioned = end?.kind === "turn_end" ? end.mentioned : [];
-    expect(mentioned).toContain("report/index.html");
-    expect(mentioned).not.toContain("figs/umap.png");
-    expect(mentioned).not.toContain("notes.md");
+    // The figure is embedded; notes.md and the report are named, and a named
+    // file previews on a rest in the prose as its chip would.
+    expect(end).toMatchObject({
+      kind: "turn_end",
+      artifacts: [],
+      mentioned: [],
+      covered: ["/p/notes.md", "report/index.html", "figs/umap.png"],
+    });
+  });
+
+  it("a named figure is covered, an unnamed one stays", () => {
+    const store = foldAt([
+      ...TURN.slice(0, -2),
+      [1080, { type: "message_chunk", turn_id: "t1", text: "The UMAP is in figs/umap.png." }],
+      [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+    ]);
+    const end = store.blocks.find((b) => b.kind === "turn_end");
+    expect(end).toMatchObject({ artifacts: ["/p/notes.md"], mentioned: ["report/index.html"], covered: ["figs/umap.png"] });
   });
 
   it("a name covers the shallowest file only, and silence covers nothing", () => {
@@ -1751,6 +1819,27 @@ describe("ChatStore turn artifacts (the made-this-turn gallery)", () => {
       artifacts: ["/p/docs/notes.md"],
       covered: ["/p/notes.md"],
     });
+  });
+
+  it("lists at most 24 tool-written files", () => {
+    const tools: [number, Record<string, unknown>][] = [];
+    for (let i = 0; i < 30; i++) {
+      tools.push([1020 + i * 2, { type: "tool_call", id: `w${i}`, kind: "edit", title: `Write out/t${i}.csv`, locations: [`/p/out/t${i}.csv`], status: "in_progress" }]);
+      tools.push([1021 + i * 2, { type: "tool_call_update", id: `w${i}`, status: "completed" }]);
+    }
+    const store = foldAt([
+      [1000, { type: "user_message", text: "split the table", attachments: 0 }],
+      [1010, { type: "turn_started", turn_id: "t1" }],
+      ...tools,
+      [1900, { type: "message_chunk", turn_id: "t1", text: "Split it." }],
+      [2000, { type: "turn_completed", turn_id: "t1", usage: {} }],
+    ]);
+    const end = store.blocks.find((b) => b.kind === "turn_end");
+    const artifacts = end?.kind === "turn_end" ? end.artifacts : [];
+    // The first 24, in the order they were written.
+    expect(artifacts).toHaveLength(24);
+    expect(artifacts[0]).toBe("/p/out/t0.csv");
+    expect(artifacts[23]).toBe("/p/out/t23.csv");
   });
 
   it("every name in a long reply covers its file", () => {

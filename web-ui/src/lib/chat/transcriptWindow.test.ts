@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   advanceTailWindow,
   autoPageEarlier,
+  keepInReach,
   pageEarlier,
   pageAround,
   pageLater,
@@ -177,6 +178,27 @@ describe("scroll prefetch", () => {
   });
 });
 
+describe("keeping the rows near the reader", () => {
+  it("keeps a page write from discarding rows within reach, never widening past the expanded range", () => {
+    // Paging earlier from [500, 692): the plain cap would drop [628, 692).
+    const earlier = pageEarlier({ start: 500, end: 692 }, 2000);
+    expect(earlier.settled).toEqual({ start: 436, end: 628 });
+    // The reader's rows run to 660: they stay; the rest past them still goes.
+    expect(keepInReach(earlier, { start: 540, end: 660 })).toEqual({ start: 436, end: 660 });
+    // Rows in reach beyond what the page ever held cannot widen it.
+    expect(keepInReach(earlier, { start: 540, end: 900 })).toEqual({ start: 436, end: 692 });
+    // Nothing near the reader mounted: the plain cap.
+    expect(keepInReach(earlier, null)).toEqual(earlier.settled);
+  });
+
+  it("mirrors for a later page, which discards from the top", () => {
+    const later = pageLater({ start: 500, end: 692 }, 2000);
+    expect(later.settled).toEqual({ start: 564, end: 756 });
+    expect(keepInReach(later, { start: 530, end: 640 })).toEqual({ start: 530, end: 756 });
+    expect(keepInReach(later, { start: 100, end: 640 })).toEqual({ start: 500, end: 756 });
+  });
+});
+
 describe("history spacer", () => {
   it("stands in for the modelled earlier history, none once it is all mounted", () => {
     expect(spacerTarget(0, 20)).toBe(0);
@@ -200,5 +222,11 @@ describe("history spacer", () => {
     expect(spacerNeedsRebalance(10000, 10000)).toBe(false);
     expect(spacerNeedsRebalance(7000, 10000)).toBe(true);
     expect(spacerNeedsRebalance(16000, 10000)).toBe(true);
+    // Small drifts wait: every re-size moves the scrollbar thumb.
+    expect(spacerNeedsRebalance(8000, 10000)).toBe(false);
+    expect(spacerNeedsRebalance(14000, 10000)).toBe(false);
+    expect(spacerNeedsRebalance(100, 40)).toBe(false);
+    // …but an empty spacer under a real target is always sized.
+    expect(spacerNeedsRebalance(0, 150)).toBe(true);
   });
 });

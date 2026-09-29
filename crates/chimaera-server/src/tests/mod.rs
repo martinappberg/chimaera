@@ -36,5 +36,6 @@ mod support;
 mod upload;
 mod validate;
 mod view_state;
+mod voice;
 mod workspaces;
 mod ws;

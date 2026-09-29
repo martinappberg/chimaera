@@ -45,6 +45,7 @@ mod timeline;
 mod update;
 mod upload;
 mod view_state;
+mod voice;
 mod workspaces;
 mod ws;
 

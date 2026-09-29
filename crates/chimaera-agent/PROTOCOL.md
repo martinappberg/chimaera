@@ -828,7 +828,10 @@ Replay is self-correcting: the journal carries the queued echo and the
 update through the same reducer, so queued-then-sent renders exactly once
 and queued-never-sent replays dropped.
 
-Emission points, per driver:
+Emission points, per driver (**superseded by Pass 38 for both drivers**: a
+mid-turn send is now read at the agent's next step and resolves `sent` when it
+is read — claude on `command_lifecycle started`, codex on the steer's
+`userMessage` item):
 
 - **claude** — a mid-turn send echoes `queued:true` and its uuid joins a
   FIFO (`queued_sends`); the CLI queues the stdin frame natively. When the
@@ -1180,7 +1183,10 @@ whole held batch: writes each message to stdin AND resolves each
   still-streaming turn — and the CLI never receives our sends mid-turn, so it
   can't coalesce them into a bare result or a phantom empty turn.
 - This is also more faithful to the official client, whose queued messages wait
-  for the current turn to finish rather than steering into it.
+  for the current turn to finish rather than steering into it. **[Wrong for
+  claude 2.1.283 — see Pass 38: the CLI reads a queued message at the agent's
+  next step. Hold-until-flush survives only as the fallback for a CLI without
+  `msg_lifecycle_v1`.]**
 
 Deleted with the guess: the per-result FIFO pop, the **idle-flush** (+
 `idle_flush_grace`, `IDLE_FLUSH_GRACE_TICKS` usage in claude — the const stays
@@ -1656,7 +1662,12 @@ the journaled ask, and emits the timeout notice. This preserves exact behavior
 through tab remount, WebSocket reconnect, daemon replay, and older journals
 that have no field.
 
-## Pass 21 (2026-07-17 — Codex native queue vs explicit Steer). ADOPTED.
+## Pass 21 (2026-07-17 — Codex native queue vs explicit Steer). ADOPTED; default SUPERSEDED by Pass 38.
+
+> Pass 38: the Codex TUI and desktop app STEER a mid-turn message by default
+> (queueing for the next turn is the alternate action), and 0.157.1 does have
+> an experimental app-server queue (`thread/queue/*`). Chimaera now steers on
+> Enter and keeps this pass's FIFO for `SendAfterTurn`.
 
 The official Codex manual names two distinct host actions while a run is active:
 **Queue** saves a follow-up for the next run; **Steer** adds it to the current
@@ -2551,3 +2562,85 @@ An execute `ToolCall` (claude `Bash`/`PowerShell`, codex command executions) now
 ## Pass 37 (2026-09-26 — daemon-side, no CLI wire change; one live turn each on claude 2.1.283 and codex 0.157.1): a sent image's saved copy rides the echo. ADOPTED.
 
 `ContentBlock::Image` gains an additive `path: Option<String>` and `UserMessage` an additive `attachment_paths: Vec<String>`. The daemon's `/ws/chat` ingress (`upload::save_send_images`) saves each image of a `Send` into the session's upload landing pad and stamps `path` (a client-supplied value is always discarded first; `validate_ingress` bounds it at `COMMAND_PATH_MAX` for programmatic callers). Both drivers copy the stamped paths into the echo through the shared `model::image_paths` and never hand `path` to the agent: claude's stream-json `image` block and codex's `data:` URL input are byte-identical to before (pinned by `send_echo_carries_saved_image_paths_but_the_cli_gets_only_pixels` and `idle_send_starts_turn_with_images_and_native_skills`). `None` / empty is skipped on serialization, so old clients' frames and old journals are unchanged (`saved_image_paths_are_additive_on_both_wire_directions`). `attachment_paths` can be shorter than `attachments` (a failed save; Remote Control and transcript-seeded messages carry none). Live: one image + "reply with one word: the background color" per agent through the isolated daemon — claude answered "Blue", codex "Red", and both bubbles showed the saved copy. Consumer: the web UI's `AttachmentStrip`.
+
+## Pass 38 (2026-09-28 — live probes claude 2.1.283 + codex 0.157.1): a message sent mid-turn is read at the agent's next step. ADOPTED.
+
+The maintainer noticed that Claude Code reads queued messages inside a running turn and has a "send now". Both CLIs were probed directly (a Haiku stream-json client and a raw `codex app-server` client, a `sleep` tool call with two messages sent during it), and both official clients turned out to read a mid-turn message at the agent's next step, several together. Chimaera held Claude's until the turn ended (Pass 13) and queued Codex's for the next turn (Pass 21). Maintainer decision: **both agents read a mid-turn send at the next step; ⌥↩ sends one for after the turn; every waiting bubble has Send now and ✕.**
+
+#### Claude 2.1.283
+
+- **`system/init` advertises `capabilities`** — this build: `interrupt_receipt_v1`, `interrupt_cancel_queued_v1`, `msg_lifecycle_v1`, `mcp_read_resource_v1`, `mcp_tool_ui_meta_v1`. Init is re-sent at every turn start.
+- **A stdin `user` frame may carry `priority: "now" | "next" | "later"`** (zod `G(["now","next","later"]).optional()` on the SDK user message). Absent = `"next"` for stdin (the enqueue default `priority ?? "next"`).
+- **`next` is read mid-turn.** Two messages written during `sleep 8` got `command_lifecycle queued` at once and `started` — both, back to back — the moment the tool result landed. The agent answered "DONE BANANA CHERRY" in the SAME turn: one `result`, `user_message_uuids: [A, B, C]`.
+- **`later` waits for the turn**, then every waiting message starts together as ONE turn: `started` B, C right after A's `result` and before the next `system/init`; the new turn's frames carry `user_message_uuid: C`, `user_message_uuids: [B, C]`.
+- **`{type:"command_lifecycle", command_uuid, state}`** is emitted on stdout with no opt-in. States: `queued | started | completed | cancelled | discarded | refused`. For a stdin frame with a `uuid`, `started` is exactly the moment the model reads it. A folded message emits `completed` BEFORE its turn's `result`, a turn opener AFTER it. A message consumed by an aborted turn reports `cancelled` after `started` — it was read; do not re-send.
+- **`interrupt` keeps the queue.** Its answer is `{still_queued: [B, C]}`. The aborted turn's result is `error_during_execution`, `terminal_reason: aborted_tools`, then A `cancelled`, then B and C `started` together as the next turn. This matches Pass 14's policy natively. `cancel_queued: true` would sweep them instead; unused.
+- **`cancel_async_message {message_uuid}`** withdraws a queued message: `command_lifecycle cancelled` lands first, then `{cancelled: true}`. After the agent took it, the answer is `{cancelled: false}`.
+- **`priority: "now"`.**
+  - Sent 0.5 s into a `sleep`, it aborted the tool at once (`terminal_reason: aborted_tools`, an empty `result`) and ran as a fresh turn.
+  - Sent after the Bash turned into a task (`task_started`), it waited for the command to finish instead of backgrounding it. The other queued message then folded into the NEW turn rather than riding with it.
+  - Re-sending a queued message under its own `uuid` with `"now"` (after `cancel_async_message`) is silently dropped as a duplicate. There is no promote-in-place control request.
+  - **So Chimaera's Send now is an interrupt.** It is predictable, it batches, and it is the CLI's own first send-now semantics ("interrupts the current turn and sends all queued messages at once").
+- The changelog confirms the design: "Added a send-now key (ctrl+enter, or ctrl+x ctrl+s) that interrupts the current turn and sends all queued messages at once; sent and queued messages show in gray until the model receives them", later "Changed send now … to move running tools to the background instead of cancelling the turn".
+- Not adopted:
+  - `system/turn_preempted`: needs `rapidFollowupPreempt` on initialize; explicit `now`/`later` never produce it.
+  - `user_message_uuid(s)` on assistant frames and results.
+  - `background_tasks` before an interrupt.
+
+#### Codex 0.157.1
+
+- **Steering is the default everywhere.**
+  - `codex features list` → `steer removed true`.
+  - The TUI tip reads "Press {composer.queue} to queue a message when a task is running; otherwise it sends immediately".
+  - The desktop app's `followUpQueueMode: queue|steer` defaults to `steer` (the VS Code extension defaults to `queue`), and its queued rows have "Send now".
+- **`turn/steer` answers at once** (`{turnId}`); that is acceptance, not reading. The steer's **`userMessage` item (`item/started`/`item/completed`, `clientId` = our `clientUserMessageId`) lands at the next step**: two steers sent 0.3 s into a `sleep 8` both appeared right after its `commandExecution` completed, and the reply was "DONE BANANA CHERRY" in the same turn.
+- **An interrupt DROPS accepted-but-unread steers.** `turn/completed {status: interrupted}` arrives with no item and no signal for them, and nothing runs them. The Codex TUI re-submits them itself ("Model interrupted to submit steer instructions").
+  - Re-driving them as a fresh `turn/start` (+ a steer in its start window) delivered each exactly once, with no duplicate of the dropped ones.
+  - A steer sent right after `turn/started` still waited for the next step, which is why Chimaera merges re-driven messages into ONE `turn/start` input.
+  - The interrupted `commandExecution` keeps running and completes later, inside the next turn.
+- **An experimental server-side queue exists**: `thread/queue/{add,list,update,delete,reorder,start}` plus `thread/queue/changed`, and a `codex queue` CLI. Not adopted: this pass's FIFO keeps queueing client-side as before.
+
+#### Chimaera mapping
+
+- **Wire (additive, `tests/wire_contract.rs`):**
+  - `AgentCommand::SendAfterTurn{blocks}` / `{type:"send_after_turn"}`
+  - `AgentCommand::SendNow{id}` / `{type:"send_now"}`
+  - `UserMessage.after_turn` (only with `queued`)
+  - `SteerQueued` stays accepted for old clients.
+- **claude**:
+  - With `msg_lifecycle_v1` on the latest init, a mid-turn send is written at once with `priority: "next"` (`"later"` for `SendAfterTurn`) and waits in `awaiting_read`.
+  - `command_lifecycle started` resolves it `sent`. Mid-turn it gets no `Checkpoint`. As a turn opener it gets a `Checkpoint` anchored after the finished turn.
+  - `cancelled` (never started) → `Cancelled` only while our own `cancel_async_message` for it is in flight (the frame lands before the answer). A cancel we did not ask for — the CLI sweeping its queue — is `dropped`, never a silent vanish. `discarded`/`refused` → `dropped`. Teardown drops what was never read.
+  - A turn opener's `started` sets `turn_starting` until that turn's first frame. Model latency makes this gap seconds long, right after Send now especially, and a send inside it waits instead of opening a turn of its own (codex's `turn_pending`). The fallback's flush sets it too.
+  - Backstop for a `started` that never arrives: a `result`'s `user_message_uuids` resolves any listed message still waiting.
+  - ✕ → `cancel_async_message`. Send now → interrupt, including in the `turn_starting` gap.
+  - A send made before the first init is held and handed over when init advertises the queue. A CLI without the capability keeps Pass 13's hold-until-flush, whose flushed messages now take their `Checkpoint` at the flush.
+- **codex**:
+  - A mid-turn send steers at once (in the `turn/start` window: once `turn/started` lands).
+  - The RPC answer parks it in `unread_steers`; its `userMessage` item resolves it `sent`.
+  - Every turn end moves unread steers to `deferred_steer_redrives`. `start_next_queued` now opens the next turn with ALL deferred messages merged into one `turn/start` input, in request order: the first message is the turn and the rewind boundary, and each resolves `sent`.
+  - A late steer ack after its turn ended re-drives too, unless the item already arrived (`read_before_answer`).
+  - A steer the running turn refuses without a turn-id mismatch is deferred to the next turn, never dropped. That covers "no active turn to steer" arriving before `turn/completed`, and "cannot steer a compact/review turn" (`activeTurnNotSteerable`). So does a second refusal after the one turn-id retry.
+  - That codex also drops unread steers at a NORMAL completion is inferred from its loop (pending input feeds another round before a turn completes) and from the interrupt probe, not observed. If a later codex carried leftover input into its next turn, re-driving it would deliver it twice. Re-probe on a version bump.
+  - `SendAfterTurn` → the next-run FIFO (one per turn, as Pass 21).
+  - Send now → `turn/interrupt`; an after-turn entry joins the re-driven batch.
+  - ✕ on a steered message is a Notice (it can't be withdrawn).
+  - Decline feedback (`dispatch_input`) also rides `turn/steer`, but it has no bubble (its echo has no id). Its ack stays final, as before: it is never parked as unread or re-driven, so a Stop right after a deny-with-feedback does not start a new turn. A refusal while the turn runs is an Error notice.
+- **UI**:
+  - Plain Enter reads at the next step. ⌥↩ / Alt+Enter sends after the turn (⇧⌘↩ is Zoom Pane).
+  - Captions read "next step" / "after this turn". Send now and ✕ are on every waiting bubble.
+  - A block resolved `sent` while a turn runs is `midTurn`, and the turn-end artifact scan looks past it.
+- **Server:**
+  - Rewind (`find_fork_cut`) now tombstones EVERY queued echo before the cut whose delivery is not also before it: a whole batch that opened the cut turn, and messages still waiting.
+  - The "checkpoint right after its own echo" shortcut matches the echo's id. Id-less pre-upgrade echoes still count as their checkpoint's own.
+  - The Timeline (`episodes.rs`) no longer titles the next turn with a message read mid-turn.
+
+#### Gate (Pass 38)
+
+- **Hermetic tests:**
+  - claude: `native_queue_*`, `held_sends_hand_over_when_init_advertises_the_queue`, and the updated `send_command_emits_user_message_checkpoint_and_turn_start`.
+  - codex: `mid_turn_send_steers_and_resolves_when_read`, `unread_steers_reopen_the_next_turn_together`, `send_now_interrupts_and_the_waiting_messages_open_the_next_turn`, `late_ack_for_an_unread_steer_redrives_it_first`, and the updated Pass 21 cases.
+  - `send_after_turn_and_send_now_commands_are_additive`, and the store's mid-turn artifact test.
+- **Live, isolated daemon:**
+  - claude (Haiku): two messages read after `sleep 15` inside the turn; Send now stopped a 40 s command and the message ran next; ⌥↩ LIME ran after the turn; ✕ withdrew PLUM, which never reached the agent; reload replayed identically.
+  - codex (gpt-6-astra): two steers read after a 30 s command, same turn; ⌥↩ LIME opened the next turn; Send now re-drove the dropped steer as the next turn ("FINISHED PAPAYA").
