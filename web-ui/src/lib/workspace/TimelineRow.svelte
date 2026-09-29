@@ -25,6 +25,7 @@
     type TimelineGroup,
   } from "./timelineModel";
   import { relPath } from "../dashboard/dash";
+  import { resolveReference } from "../shared/references";
 
   interface Props {
     group: TimelineGroup;
@@ -42,6 +43,17 @@
     onDeliver?: (entry: TimelineEntry) => void;
     /** The row's own delivery state text (the caller owns the request). */
     deliverState?: string | null;
+  }
+
+  /** Open a knowledge id (a finding a turn recorded) through the
+   *  references registry — its entry in Knowledge, beside this view; the
+   *  Knowledge overview when nothing resolves it. `key` picks the entry an
+   *  id names when several do. */
+  function openRef(id: string, key?: string): void {
+    const found = resolveReference(id);
+    const t = (key !== undefined ? found.find((x) => x.key.endsWith(`:${key}`)) : undefined) ?? found[0];
+    if (t !== undefined) t.open({ paneId: null, newSplit: false });
+    else onOpenKnowledge?.();
   }
 
   let {
@@ -188,7 +200,7 @@
         class="name link"
         class:err={k?.to === "contradicted"}
         class:good={k?.to === "supported" || k?.to === "robust"}
-        onclick={onOpenKnowledge}
+        onclick={() => (k !== undefined ? openRef(k.id, k.key) : onOpenKnowledge?.())}
         title="open in Knowledge">{k?.id}</button
       >
       <span class="title">
@@ -248,12 +260,15 @@
         {/if}
         {#if evidence.recorded !== null}
           {@const r = evidence.recorded}
-          <button class="pill" onclick={onOpenKnowledge} title="open in Knowledge">
-            recorded
-            {#if r.findings.length > 0}<span class="mono">{r.findings.join(" · ")}</span>{/if}
+          <span class="pill">
+            <button class="pill-open" onclick={onOpenKnowledge} title="open in Knowledge">recorded</button>
+            {#each r.findings as fid, i (i)}
+              {#if i > 0}<span class="mono">·</span>{/if}
+              <button class="mono pill-id" onclick={() => openRef(fid)} title="open {fid} in Knowledge">{fid}</button>
+            {/each}
             {#if r.learnings > 0}· {r.learnings} learning{r.learnings === 1 ? "" : "s"}{/if}
             {#if r.decisions > 0}· {r.decisions} decision{r.decisions === 1 ? "" : "s"}{/if}
-          </button>
+          </span>
         {/if}
         {#if first.via === "mastermind"}
           <span class="via" title="this prompt was relayed by the workspace Mastermind">via Mastermind</span>
@@ -483,8 +498,25 @@
     border-radius: 999px;
     white-space: nowrap;
   }
-  .pill:hover {
-    background: color-mix(in srgb, var(--accent) 20%, transparent);
+  .pill {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+    cursor: default;
+  }
+  .pill-open,
+  .pill-id {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+  }
+  .pill-open:hover,
+  .pill-id:hover {
+    text-decoration: underline;
   }
   .pill .mono {
     font-size: var(--text-xs);

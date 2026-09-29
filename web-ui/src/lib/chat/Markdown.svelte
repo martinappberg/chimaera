@@ -59,12 +59,13 @@
   import { activateUrl, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { safeDecodeUri } from "../previews/files";
-  import { mount, unmount } from "svelte";
+  import { mount, unmount, untrack } from "svelte";
   import { parseSizeHint, splitTarget } from "../shared/embed/embed";
   import { mountEmbed } from "../shared/embed/mount.svelte";
   import type { EmbedResolver } from "./embeds";
   import { chipLabels, embedsAsChip } from "./artifacts";
   import { refFragment, type HoverTargets } from "./hoverTargets";
+  import { linkReferences, referenceMatcher, referenceSources } from "../shared/references";
   import ProseChip from "./ProseChip.svelte";
   import type { Reveal } from "../shared/reveal";
   import { openPath } from "../shared/openPath";
@@ -107,6 +108,15 @@
     embeds,
     hoverTargets,
   }: Props = $props();
+
+  /** Ids to chips (knowledge entries and any other reference source):
+   *  only with a hover registry to hold them, on settled content. */
+  const refMatcher = $derived(hoverTargets !== undefined ? referenceMatcher($referenceSources) : null);
+
+  function linkRefs(root: HTMLElement): void {
+    if (hoverTargets === undefined || refMatcher === null) return;
+    linkReferences(root, refMatcher, hoverTargets.refs);
+  }
 
   /** Embed slots this component built, each with the (hidden) placeholder
    *  it stands beside and its card. The placeholder belongs to the rendered
@@ -419,6 +429,14 @@
       }
       return;
     }
+    // An id chip this component built (never one agent HTML forged: the
+    // registry holds only elements linkReferences made).
+    const chip = hoverTargets?.refs.chipAt(target);
+    if (chip !== null && chip !== undefined) {
+      e.preventDefault();
+      chip.targets[0].open({ paneId: null, newSplit: e.metaKey || e.ctrlKey });
+      return;
+    }
     const node = target?.closest?.(".md-path");
     if (node !== null && node !== undefined && stamps.has(node)) {
       // An anchor would navigate the SPA away; a validated path opens a pane.
@@ -460,6 +478,12 @@
   function onKeydown(e: KeyboardEvent) {
     if (e.key !== "Enter" && e.key !== " ") return;
     const target = e.target as Element | null;
+    const chip = hoverTargets?.refs.chipAt(target);
+    if (chip !== null && chip !== undefined) {
+      e.preventDefault();
+      chip.targets[0].open({ paneId: null, newSplit: e.metaKey || e.ctrlKey });
+      return;
+    }
     const node = target?.closest?.(".md-path");
     if (node === null || node === undefined || !stamps.has(node)) return;
     e.preventDefault();
@@ -838,7 +862,10 @@
       cancelIdleStamp = null;
       const batch = unstamped.splice(0);
       const attached = batch.filter((root) => root.isConnected);
-      for (const root of attached) stampPaths(root);
+      for (const root of attached) {
+        stampPaths(root);
+        linkRefs(root);
+      }
       // After every stamp, so the batch's layout reads flush once.
       for (const root of attached) markTableRegions(root);
     };
@@ -941,8 +968,17 @@
     lastSettledHtml = current;
     decorateCopyTargets(el);
     stampPaths(el);
+    linkRefs(el);
     markTableRegions(el);
     upgradeEmbeds(el);
+  });
+
+  // A reference source arrived or changed (the workspace's knowledge loaded
+  // after this message rendered): link what settled content now names.
+  $effect(() => {
+    const m = refMatcher; // dep
+    if (m === null || streaming || el === null) return;
+    untrack(() => linkRefs(el as HTMLElement));
   });
 
   // A turn ended (the resolver dropped its misses): a settled block that

@@ -212,3 +212,16 @@ export function linkReferences(
   }
   return made;
 }
+
+/** The targets a bare id names, from the first source whose shape it
+ *  matches whole and that resolves it (a Timeline row's "F-228"). */
+export function resolveReference(id: string, all: ReadonlyMap<string, RefSource> = get(sources)): RefTarget[] {
+  for (const source of all.values()) {
+    for (const s of source.shapes) {
+      if (!usable(s.pattern) || !new RegExp(`^(?:${s.pattern})$`).test(id)) continue;
+      const found = source.lookup(id, s.kind);
+      if (found.length > 0) return found;
+    }
+  }
+  return [];
+}
