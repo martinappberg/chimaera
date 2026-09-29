@@ -311,9 +311,15 @@ effects. Process groups do not contain deliberately detached descendants.
 
 `GET /v2/capabilities` returns execution_authority 2, the exact default capability,
 supported_execution_capabilities, failover_grace_seconds 30, installation_binding
-1, workspace_placement 2 and checkpoint_receipts 1. Native
-clients keep the stable installation proof in the account/origin-specific
-keychain; the daemon receives only its opaque installation ID.
+1, workspace_placement 2 and checkpoint_receipts 1. Clients decode the advertised
+capabilities leniently and then compare each exactly with what they implement.
+They use the service default when they implement it; otherwise their own
+preference (`checkpoint_fork_v1`, then `managed_v1`) among the listed ones. No
+capability in common, or a 404 for the route, is `ServiceUnsupported`: no
+execution configuration and no legacy fallback. `failover_grace_seconds` is
+informational to clients today. Native clients keep the stable installation
+proof in the account/origin-specific keychain; the daemon receives only its
+opaque installation ID.
 `POST /api/v1/pro/configure/execution` takes ordinary Configure plus
 `execution:{version:1,installation_id,capability}` and optional workspace_root
 for a workspace-bound worker. Its 200 response must exactly match

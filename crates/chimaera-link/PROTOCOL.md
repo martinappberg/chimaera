@@ -27,10 +27,21 @@ fresh multifactor authentication. Services must check account and device
 ownership on every host and reverse stream lookup.
 
 `me.protocol` is an integer major version. A client implementing v0 rejects any
-other value before using the keeper. Unknown additive fields and event types can
-be ignored. Breaking changes require a new major version. JSON uses UTF-8.
-Errors use HTTP status codes and optionally `{ "error": "stable_error_code" }`.
-REST response bodies are limited to 1 MiB; control frames to 128 KiB.
+other value before using the keeper (typed `ServiceUnsupported`). Breaking
+changes require a new major version. JSON uses UTF-8. Errors use HTTP status
+codes and optionally `{ "error": "stable_error_code" }`. REST response bodies are
+limited to 1 MiB; control frames to 128 KiB.
+
+**Additive evolution.** Services may add response fields and new enum values at
+any time. Clients decode service responses without `deny_unknown_fields` and map
+an unknown enum value (plan, worker state/reason/phase, host kind/status,
+placement availability, continuation) to `Unknown`, which they treat as "not
+actionable" rather than failing the whole response. Host rows of an unknown
+kind are dropped; unknown event and reverse-serve message types are ignored. Only
+acknowledgments from the local daemon stay exact (an old daemon that ignores a
+field must never look like it accepted it). A service that lacks a required
+route (404 on `/v2/capabilities`, or a 404 without the documented error code)
+is reported as `ServiceUnsupported`, never as a transient failure.
 
 ## Account routes
 
@@ -305,9 +316,13 @@ finishing its sending half must expect the receiving half to close too.
 At most 16 data frames may be queued per direction. Stop reading the source when
 that fills; never add an unbounded channel or accumulate a complete response.
 Enforce transport limits before decoding. Each device has at most 128 concurrent
-streams (including pending reverse opens). A loopback tunnel binds only
-`127.0.0.1`, keeps one stable ephemeral port, and opens a new WebSocket per accepted
-TCP socket. A failed stream must not destroy the listener or other streams.
+streams (including pending reverse opens); the client enforces this per signed-in
+device across all of its forward tunnels and reverse streams together. A loopback
+tunnel binds only `127.0.0.1`, keeps one stable ephemeral port, and opens a new
+WebSocket per accepted TCP socket. A failed stream must not destroy the listener
+or other streams, and neither does a failed `accept()` (descriptor exhaustion,
+a reset before accept): the listener backs off briefly and continues. The native
+app raises its open-file soft limit at startup (macOS starts GUI apps at 256).
 
 Every socket, control and data, sends WebSocket ping at most 20 seconds apart.
 Reply to ping with pong; 60 seconds without a pong makes the link dead. Bound
@@ -334,10 +349,20 @@ The keeper pairs the sockets. A stream id expires after 15 seconds and can be
 consumed once. Bind it to account, device and current control-connection generation;
 knowing another account's id must never authorize a stream. Close notifies with
 `{"type":"close","stream_id":"..."}`. Unknown/expired streams return `404`.
+A control message the device cannot act on affects at most one stream: an
+unknown or malformed message is ignored, a duplicate `open` id is ignored, and
+an `open` beyond the per-device quota is left unanswered (the keeper expires it).
+None of these closes the control connection.
 
-Dropping/replacing the control connection closes its pending and active streams,
-clears the in-memory daemon token and marks the device host offline. Reconnect
-re-registers metadata. Signing out revokes both data and control sockets.
+Dropping/replacing the control connection closes its pending and active streams
+and clears the in-memory daemon token. The service keeper then removes the
+device host (`host_removed`); the loopback fixture marks it offline. Clients
+handle both. Reconnect re-registers metadata. Signing out revokes both data and
+control sockets.
+
+The events connection is kept alive for as long as its consumer exists. A
+consumer that stays full for 10 seconds is not abandoned: the client drops that
+connection and reconnects, and the reconnect snapshot replaces what was missed.
 
 ## Fixture and conformance
 

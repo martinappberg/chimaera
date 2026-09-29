@@ -57,5 +57,23 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    #[cfg(unix)]
+    raise_open_file_limit();
     shell::run();
+}
+
+/// macOS starts GUI apps with a 256-descriptor soft limit. Every forwarded
+/// terminal, chat or file view through a Pro connection costs two sockets,
+/// so a busy workbench can exhaust it and lose its connections. Raise the
+/// soft limit toward the hard limit (macOS rejects values above 10240).
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+    const WANTED: u64 = 8192;
+    if let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) {
+        let target = WANTED.min(hard);
+        if soft < target && setrlimit(Resource::RLIMIT_NOFILE, target, hard).is_err() {
+            tracing::debug!("could not raise the open-file limit from {soft}");
+        }
+    }
 }

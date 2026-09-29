@@ -9,6 +9,9 @@ pub enum PlacementAvailability {
     Unowned,
     Expired,
     PrivacyDisabled,
+    /// A newer availability; never routable by this client.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -214,18 +217,60 @@ mod tests {
     }
 }
 
+/// A capability as the service advertises it. Decoded leniently (a service
+/// may add fields), then compared exactly against what this client
+/// implements; the daemon acknowledgment itself stays exact.
+#[derive(Clone, Debug, Deserialize)]
+pub struct AdvertisedCapability {
+    pub version: u16,
+    pub boundary: String,
+    pub expired_takeover: bool,
+}
+impl AdvertisedCapability {
+    fn exact(&self) -> Option<crate::ExecutionCapability> {
+        let capability = crate::ExecutionCapability {
+            version: self.version,
+            boundary: self.boundary.clone(),
+            expired_takeover: self.expired_takeover,
+        };
+        capability.supported().then_some(capability)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ExecutionCapabilities {
     pub execution_authority: u16,
-    pub execution_capability: crate::ExecutionCapability,
+    pub execution_capability: AdvertisedCapability,
+    /// Every capability the service accepts; older services omit it.
+    #[serde(default)]
+    pub supported_execution_capabilities: Vec<AdvertisedCapability>,
     pub installation_binding: u16,
     pub workspace_placement: u16,
     pub checkpoint_receipts: u16,
 }
 impl ExecutionCapabilities {
+    /// The service's default when this client implements it; otherwise this
+    /// client's preferred capability among those the service also accepts
+    /// (automatic recovery first). `None`: nothing in common.
+    pub fn selected(&self) -> Option<crate::ExecutionCapability> {
+        self.execution_capability.exact().or_else(|| {
+            let offered: Vec<_> = self
+                .supported_execution_capabilities
+                .iter()
+                .take(16)
+                .filter_map(AdvertisedCapability::exact)
+                .collect();
+            [
+                crate::ExecutionCapability::checkpoint_fork(),
+                crate::ExecutionCapability::managed(),
+            ]
+            .into_iter()
+            .find(|preferred| offered.contains(preferred))
+        })
+    }
     pub fn supported(&self) -> bool {
         self.execution_authority == 2
-            && self.execution_capability.supported()
+            && self.selected().is_some()
             && self.installation_binding == 1
             && self.workspace_placement == 2
             && self.checkpoint_receipts == 1

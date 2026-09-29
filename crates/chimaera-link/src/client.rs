@@ -38,6 +38,9 @@ struct Inner {
     tls: Arc<rustls::ClientConfig>,
     tokens: Arc<Mutex<Option<Tokens>>>,
     token_updates: watch::Sender<Option<Tokens>>,
+    /// One device's concurrent streams (forward tunnels and reverse serve
+    /// together), matching the keeper's per-device quota.
+    streams: Arc<Semaphore>,
 }
 impl Client {
     /// Does not contact the endpoint. No background work starts before the
@@ -66,6 +69,7 @@ impl Client {
                 tls: Arc::new(tls),
                 tokens: Arc::new(Mutex::new(tokens)),
                 token_updates,
+                streams: Arc::new(Semaphore::new(MAX_STREAMS)),
             }),
         })
     }
@@ -275,17 +279,23 @@ impl Client {
         )
         .await
     }
+    /// `ServiceUnsupported` when the service lacks the route or shares no
+    /// capability with this client; never a fallback to legacy execution.
     pub async fn execution_capabilities(&self) -> Result<crate::ExecutionCapabilities> {
-        let value: crate::ExecutionCapabilities = json_response(
-            self.request(
+        let response = self
+            .request_raw(
                 Method::GET,
                 path(&self.inner.account, &["v2", "capabilities"]),
                 None,
             )
-            .await?,
-        )
-        .await?;
-        anyhow::ensure!(value.supported(), "managed execution is unavailable");
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(crate::ServiceUnsupported.into());
+        }
+        let value: crate::ExecutionCapabilities = json_response(response).await?;
+        if !value.supported() {
+            return Err(crate::ServiceUnsupported.into());
+        }
         Ok(value)
     }
     pub async fn installation_recovery(
@@ -343,7 +353,7 @@ impl Client {
             if error.is_some_and(|error| error.error == "workspace_not_found") {
                 return Ok(crate::WorkspacePlacement::unowned(workspace));
             }
-            bail!("account request rejected (404)");
+            return Err(crate::ServiceUnsupported.into());
         }
         let value: crate::WorkspacePlacement = json_response(response).await?;
         value.validate(workspace)?;
@@ -485,7 +495,7 @@ impl Client {
         interval: BillingInterval,
         callback: Option<&DesktopBillingCallback>,
     ) -> Result<BillingSession> {
-        if plan == Plan::None {
+        if !matches!(plan, Plan::Pro | Plan::Max) {
             bail!("choose Pro or Max");
         }
         let mut body =
@@ -615,7 +625,7 @@ impl Client {
         )
         .await?;
         if account.protocol != PROTOCOL_VERSION {
-            bail!("unsupported link protocol {}", account.protocol);
+            return Err(crate::ServiceUnsupported.into());
         }
         let keeper = if account.keeper_url.is_empty() {
             None
@@ -645,8 +655,9 @@ impl Client {
             .clone()
             .context("Your connection is being prepared; no keeper is assigned yet")
     }
+    /// Rows of a host kind this client does not know are dropped.
     pub async fn hosts(&self) -> Result<Vec<Host>> {
-        json_response(
+        let hosts: Vec<Host> = json_response(
             self.request(
                 Method::GET,
                 path(&self.keeper().await?, &["v1", "hosts"]),
@@ -654,7 +665,11 @@ impl Client {
             )
             .await?,
         )
-        .await
+        .await?;
+        Ok(hosts
+            .into_iter()
+            .filter(|host| host.kind != HostKind::Unknown)
+            .collect())
     }
     pub async fn add_host(&self, alias: &str) -> Result<Host> {
         self.add_host_with_ssh(alias, None).await
@@ -792,8 +807,18 @@ impl Client {
                             },
                             message = rx.next() => match message {
                                 Some(Ok(Message::Text(text))) => {
-                                    if let Ok(event) = serde_json::from_str::<Event>(&text) {
-                                        tokio::time::timeout(Duration::from_secs(10), out.send(Ok(event))).await?.map_err(|_| anyhow!("events consumer closed"))?;
+                                    let event = match serde_json::from_str::<Event>(&text) {
+                                        Ok(Event::Unknown) | Err(_) => continue,
+                                        Ok(Event::Host { host }) if host.kind == HostKind::Unknown => continue,
+                                        Ok(event) => event,
+                                    };
+                                    match tokio::time::timeout(Duration::from_secs(10), out.send(Ok(event))).await {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(_)) => return Ok(()),
+                                        // Never abandon a slow consumer: drop this
+                                        // connection instead; the reconnect snapshot
+                                        // replaces whatever it missed.
+                                        Err(_) => bail!("events consumer slow"),
                                     }
                                 }
                                 Some(Ok(Message::Ping(data))) => { tokio::time::timeout(Duration::from_secs(10), tx.send(Message::Pong(data))).await??; }
@@ -813,17 +838,10 @@ impl Client {
                 if out.is_closed() {
                     break;
                 }
+                // Only a closed consumer ends this task. A full queue skips the
+                // report; the reconnect snapshot tells the consumer the rest.
                 if let Err(error) = result {
-                    if !matches!(
-                        tokio::time::timeout(
-                            Duration::from_secs(10),
-                            out.send(Err(error.to_string()))
-                        )
-                        .await,
-                        Ok(Ok(()))
-                    ) {
-                        break;
-                    }
+                    let _ = out.try_send(Err(error.to_string()));
                 }
                 // Password answers belong to their connection, never to a later
                 // prompt with a reused identifier after a reconnect.
@@ -872,12 +890,21 @@ impl LinkTunnel {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let local_port = listener.local_addr()?.port();
         let task = tokio::spawn(async move {
-            let limits = Arc::new(Semaphore::new(MAX_STREAMS));
+            let limits = client.inner.streams.clone();
             let mut streams = JoinSet::new();
+            let mut failures = 0_u32;
             loop {
                 tokio::select! {
                     result = listener.accept() => {
-                        let Ok((tcp, _)) = result else { break; };
+                        // Descriptor exhaustion (EMFILE) or a connection reset
+                        // before accept must not close the stable port or its
+                        // other streams; back off so it cannot spin.
+                        let Ok((tcp, _)) = result else {
+                            failures = failures.saturating_add(1);
+                            tokio::time::sleep(Duration::from_millis(25 << failures.min(6))).await;
+                            continue;
+                        };
+                        failures = 0;
                         let Ok(permit) = limits.clone().try_acquire_owned() else { drop(tcp); continue; };
                         let client = client.clone(); let host_id = host_id.clone();
                         streams.spawn(async move {
@@ -941,6 +968,7 @@ async fn serve_connection(client: &Client, port: u16, alias: &str, daemon: &Daem
     .await?;
     let mut streams = JoinSet::new();
     let mut active = std::collections::HashMap::new();
+    let limits = client.inner.streams.clone();
     let mut ping = tokio::time::interval_at(
         Instant::now() + Duration::from_secs(20),
         Duration::from_secs(20),
@@ -949,11 +977,17 @@ async fn serve_connection(client: &Client, port: u16, alias: &str, daemon: &Daem
     loop {
         tokio::select! {
             message = socket.next() => match message {
-                Some(Ok(Message::Text(text))) => match serde_json::from_str::<ServeEvent>(&text)? {
+                // Anything this client cannot act on concerns at most one
+                // stream: an unknown or malformed message, a duplicate id or an
+                // open beyond the per-device quota is ignored (the keeper
+                // expires an unanswered open), never the whole connection.
+                Some(Ok(Message::Text(text))) => match serde_json::from_str::<ServeEvent>(&text).unwrap_or(ServeEvent::Unknown) {
                     ServeEvent::Open { stream_id } => {
-                        if active.len() >= MAX_STREAMS || active.contains_key(&stream_id) { bail!("serve stream limit or duplicate id"); }
+                        if active.contains_key(&stream_id) { continue; }
+                        let Ok(permit) = limits.clone().try_acquire_owned() else { continue; };
                         let client = client.clone(); let key = stream_id.clone();
                         let abort = streams.spawn(async move {
+                            let _permit = permit;
                             let result = async {
                                 let socket = client.open_socket(&["v1", "serve", &stream_id], false).await?;
                                 let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))).await??;
@@ -964,7 +998,7 @@ async fn serve_connection(client: &Client, port: u16, alias: &str, daemon: &Daem
                         active.insert(key, abort);
                     }
                     ServeEvent::Close { stream_id } => { if let Some(task) = active.remove(&stream_id) { task.abort(); } }
-                    ServeEvent::Registered { .. } => {}
+                    ServeEvent::Registered { .. } | ServeEvent::Unknown => {}
                 },
                 Some(Ok(Message::Ping(data))) => { tokio::time::timeout(Duration::from_secs(10), socket.send(Message::Pong(data))).await??; }
                 Some(Ok(Message::Pong(_))) => { last_pong = Instant::now(); }

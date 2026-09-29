@@ -52,6 +52,9 @@ pub(super) struct Pro {
     recovery: recovery::Recovery<Client>,
     placements: Mutex<HashMap<String, chimaera_link::WorkspacePlacement>>,
     verified_routes: Mutex<placements::Verified>,
+    /// After the service reported that it does not support this version,
+    /// recheck no more often than this.
+    unsupported_until: Mutex<Option<std::time::Instant>>,
 }
 
 struct Runtime {
@@ -106,6 +109,11 @@ pub(super) mod code {
     pub const CONNECTION_RETRYING: &str = "connection_retrying";
     /// The account could not be reached just now; local work is unaffected.
     pub const ACCOUNT_UNREACHABLE: &str = "account_unreachable";
+    /// Error (not informational): the Pro service does not support this app
+    /// version, so project continuity is off until one side updates. Local
+    /// work, SSH and the account itself are unaffected; nothing is retried
+    /// more often than every ten minutes.
+    pub const SERVICE_UNSUPPORTED: &str = "service_unsupported";
 }
 
 #[derive(Serialize)]
@@ -147,6 +155,7 @@ impl Pro {
             recovery: recovery::Recovery::default(),
             placements: Mutex::new(HashMap::new()),
             verified_routes: Mutex::new(placements::Verified::default()),
+            unsupported_until: Mutex::new(None),
         }
     }
 
@@ -561,7 +570,11 @@ async fn activate_snapshot(
                 if state.pro.generation() == expected
                     && !error.is::<chimaera_link::AuthorizationRevoked>()
                 {
-                    *lock(&state.pro.warning) = Some(code::ACCOUNT_UNREACHABLE);
+                    if error.is::<chimaera_link::ServiceUnsupported>() {
+                        *lock(&state.pro.error) = Some(code::SERVICE_UNSUPPORTED.into());
+                    } else {
+                        *lock(&state.pro.warning) = Some(code::ACCOUNT_UNREACHABLE);
+                    }
                     let _ = reconcile_app.emit("pro-changed", ());
                 }
             }
@@ -581,53 +594,63 @@ fn start_keeper(
     client: Client,
 ) -> (tokio::task::JoinHandle<()>, chimaera_link::Serve) {
     let state = app.state::<Shell>();
-    let mut connection = client.events();
     let event_app = app.clone();
+    let event_client = client.clone();
     let events = tokio::spawn(async move {
-        while let Some(event) = connection.events.recv().await {
-            match event {
-                Ok(Event::Host { host }) => apply_host(&event_app, host).await,
-                Ok(Event::HostRemoved { host_id }) => {
-                    let removed = lock(&event_app.state::<Shell>().pro.hosts).remove(&host_id);
-                    if let Some(mut host) = removed {
-                        host.status = HostStatus::Offline;
-                        host.daemon = None;
-                        host_signal(&event_app, &host).await;
+        // The link keeps one events connection alive for as long as this
+        // consumer exists; if its channel ever closes anyway, open a new one
+        // so keeper password/Duo prompts keep reaching this computer.
+        loop {
+            let mut connection = event_client.events();
+            while let Some(event) = connection.events.recv().await {
+                match event {
+                    Ok(Event::Host { host }) => apply_host(&event_app, host).await,
+                    Ok(Event::HostRemoved { host_id }) => {
+                        let removed = lock(&event_app.state::<Shell>().pro.hosts).remove(&host_id);
+                        if let Some(mut host) = removed {
+                            host.status = HostStatus::Offline;
+                            host.daemon = None;
+                            host_signal(&event_app, &host).await;
+                        }
+                        let _ = event_app.emit("pro-changed", ());
                     }
-                    let _ = event_app.emit("pro-changed", ());
-                }
-                Ok(Event::Prompt {
-                    id,
-                    host_id,
-                    prompt,
-                    echo: _,
-                }) => {
-                    let host = lock(&event_app.state::<Shell>().pro.hosts)
-                        .get(&host_id)
-                        .cloned();
-                    if let Some(host) = host {
-                        crate::askpass::relay_keeper(
-                            &event_app,
-                            host.alias,
-                            host_id,
-                            id,
-                            prompt,
-                            connection.commands.clone(),
-                        );
+                    Ok(Event::Prompt {
+                        id,
+                        host_id,
+                        prompt,
+                        echo: _,
+                    }) => {
+                        let host = lock(&event_app.state::<Shell>().pro.hosts)
+                            .get(&host_id)
+                            .cloned();
+                        if let Some(host) = host {
+                            crate::askpass::relay_keeper(
+                                &event_app,
+                                host.alias,
+                                host_id,
+                                id,
+                                prompt,
+                                connection.commands.clone(),
+                            );
+                        }
                     }
-                }
-                Ok(Event::PromptClosed { id }) => {
-                    crate::askpass::close_keeper(&event_app, Some(&id))
-                }
-                Err(_) => {
-                    // The connection reconnects by itself; prompts on the
-                    // dropped connection can no longer be answered.
-                    crate::askpass::close_keeper(&event_app, None);
-                    *lock(&event_app.state::<Shell>().pro.warning) =
-                        Some(code::CONNECTION_RETRYING);
-                    let _ = event_app.emit("pro-changed", ());
+                    Ok(Event::PromptClosed { id }) => {
+                        crate::askpass::close_keeper(&event_app, Some(&id))
+                    }
+                    Err(_) => {
+                        // The connection reconnects by itself; prompts on the
+                        // dropped connection can no longer be answered.
+                        crate::askpass::close_keeper(&event_app, None);
+                        *lock(&event_app.state::<Shell>().pro.warning) =
+                            Some(code::CONNECTION_RETRYING);
+                        let _ = event_app.emit("pro-changed", ());
+                    }
+                    // The link drops event types it does not know.
+                    Ok(Event::Unknown) => {}
                 }
             }
+            crate::askpass::close_keeper(&event_app, None);
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
     let local = lock(&state.local).clone();
@@ -705,10 +728,16 @@ async fn apply_daemon_setup(
         Ok(())
     };
     // A fresh authenticated account read supersedes earlier startup or
-    // sign-in failures; setup trouble is informational and retried.
-    *lock(&state.pro.error) = None;
-    *lock(&state.pro.warning) = connection_error
-        .or_else(|| (setup.is_err() || placement.is_err()).then_some(code::CONNECTION_RETRYING));
+    // sign-in failures; setup trouble is informational and retried, except
+    // a service that cannot support this version at all.
+    let unsupported = setup
+        .as_ref()
+        .is_err_and(|error| error.is::<chimaera_link::ServiceUnsupported>());
+    *lock(&state.pro.error) = unsupported.then(|| code::SERVICE_UNSUPPORTED.into());
+    *lock(&state.pro.warning) = connection_error.or_else(|| {
+        (!unsupported && (setup.is_err() || placement.is_err()))
+            .then_some(code::CONNECTION_RETRYING)
+    });
     let _ = app.emit("pro-changed", ());
 }
 
@@ -1657,7 +1686,8 @@ pub async fn pro_hosts(state: tauri::State<'_, Shell>) -> Result<Vec<KeptHost>, 
                 kind: match host.kind {
                     HostKind::Device => "device",
                     HostKind::Worker => "worker",
-                    HostKind::Ssh => "ssh",
+                    // The link never returns rows of an unknown kind.
+                    HostKind::Ssh | HostKind::Unknown => "ssh",
                 }
                 .into(),
             });
@@ -1671,7 +1701,7 @@ fn status_name(status: &HostStatus) -> &'static str {
         HostStatus::Connected => "connected",
         HostStatus::Connecting => "connecting",
         HostStatus::Prompting => "prompting",
-        HostStatus::Offline => "offline",
+        HostStatus::Offline | HostStatus::Unknown => "offline",
     }
 }
 
@@ -1997,6 +2027,7 @@ fn reusable_delegation(
     cached.filter(|grant| !daemon_lost_setup && !grant.expires_within(DELEGATION_MARGIN))
 }
 const DELEGATION_MARGIN: Duration = Duration::from_secs(2 * 3600);
+const UNSUPPORTED_RECHECK: Duration = Duration::from_secs(600);
 
 async fn configure_daemon(state: &Shell, client: &Client) -> Result<()> {
     let Some(account) = lock(&state.pro.account).clone() else {
@@ -2054,7 +2085,19 @@ async fn configure_daemon(state: &Shell, client: &Client) -> Result<()> {
     }
     // Both service and daemon must acknowledge the exact new protocol. A legacy
     // fallback would silently remove fencing while still showing a paid account.
-    let capabilities = client.execution_capabilities().await?;
+    if lock(&state.pro.unsupported_until).is_some_and(|until| std::time::Instant::now() < until) {
+        return Err(chimaera_link::ServiceUnsupported.into());
+    }
+    let capabilities = match client.execution_capabilities().await {
+        Ok(capabilities) => capabilities,
+        Err(error) => {
+            if error.is::<chimaera_link::ServiceUnsupported>() {
+                *lock(&state.pro.unsupported_until) =
+                    Some(std::time::Instant::now() + UNSUPPORTED_RECHECK);
+            }
+            return Err(error);
+        }
+    };
     let endpoint = state
         .pro
         .endpoint
@@ -2064,7 +2107,9 @@ async fn configure_daemon(state: &Shell, client: &Client) -> Result<()> {
     let execution = chimaera_link::ExecutionConfiguration {
         version: 1,
         installation_id: Some(identity.installation_id),
-        capability: capabilities.execution_capability,
+        capability: capabilities
+            .selected()
+            .ok_or(chimaera_link::ServiceUnsupported)?,
     };
     let cached = lock(&state.pro.delegation).clone();
     let delegation = match reusable_delegation(cached, lost_setup) {

@@ -7,12 +7,17 @@ pub const MAX_CONTROL_FRAME: usize = 128 * 1024;
 pub const MAX_IN_FLIGHT: usize = 16;
 pub const MAX_STREAMS: usize = 128;
 
+/// Service enums gain values additively (PROTOCOL.md). A value this client
+/// does not know decodes as `Unknown` instead of failing the whole response;
+/// callers treat it as "not something I can act on".
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Plan {
     None,
     Pro,
     Max,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -25,6 +30,8 @@ pub enum WorkerState {
     Sleeping,
     Limited,
     Error,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -36,6 +43,8 @@ pub enum WorkerReason {
     StorageExhausted,
     SpendLimitReached,
     ProvisioningFailed,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Account-confirmed preparation stage, not an estimate or daemon readiness.
@@ -45,6 +54,8 @@ pub enum WorkerPhase {
     Keeper,
     Worker,
     Connecting,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,7 +83,10 @@ pub struct BillingPortalTarget {
 }
 impl BillingPortalTarget {
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.plan != Plan::None, "choose Pro or Max");
+        anyhow::ensure!(
+            matches!(self.plan, Plan::Pro | Plan::Max),
+            "choose Pro or Max"
+        );
         Ok(())
     }
 }
@@ -215,6 +229,9 @@ pub enum HostKind {
     Ssh,
     Device,
     Worker,
+    /// Never delivered to callers: `hosts()` and events drop such rows.
+    #[serde(other)]
+    Unknown,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -223,6 +240,9 @@ pub enum HostStatus {
     Connecting,
     Prompting,
     Offline,
+    /// Treated as not connected.
+    #[serde(other)]
+    Unknown,
 }
 // Intentionally no Debug: the daemon token must never appear in logs.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -312,6 +332,9 @@ pub enum Event {
     PromptClosed {
         id: String,
     },
+    /// An event type this client does not know; ignored.
+    #[serde(other)]
+    Unknown,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -326,9 +349,19 @@ pub enum ServeCommand {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServeEvent {
-    Registered { host_id: String },
-    Open { stream_id: String },
-    Close { stream_id: String },
+    Registered {
+        host_id: String,
+    },
+    Open {
+        stream_id: String,
+    },
+    Close {
+        stream_id: String,
+    },
+    /// A control message this client does not know; ignored, never a reason
+    /// to drop the whole reverse connection.
+    #[serde(other)]
+    Unknown,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApiError {

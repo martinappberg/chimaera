@@ -77,8 +77,11 @@ impl ExecutionConfigureAck {
         Ok(value)
     }
 }
+// Service responses below accept additive fields (PROTOCOL.md); the daemon
+// acknowledgments (`ExecutionConfigureAck`, `ExecutionRecoveryAck`) and the
+// capability they echo stay exact, because an old daemon that ignores a field
+// must never look like it accepted it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Continuity {
     pub version: u16,
     pub mode: String,
@@ -86,7 +89,6 @@ pub struct Continuity {
     pub preferred_installation_id: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ExecutionLease {
     pub id: String,
     pub sequence: u64,
@@ -96,11 +98,12 @@ pub struct ExecutionLease {
 pub enum Continuation {
     Idle,
     Interrupted,
+    /// Unknown evidence is uncertain, never a blind replay.
     #[default]
+    #[serde(other)]
     Uncertain,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Checkpoint {
     pub id: String,
     pub sequence: u64,
@@ -114,8 +117,8 @@ pub struct Checkpoint {
 
 /// A short-lived one-use recovery credential. It can only publish a stopped
 /// snapshot and release one old grant; it is never a daemon Configure token.
+/// The client validates every field it uses (`Client::installation_recovery`).
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ExecutionRecoveryGrant {
     pub access_token: String,
     pub expires_at: String,

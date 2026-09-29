@@ -65,7 +65,7 @@ chimaera-remote = { path = "../chimaera-remote" }
 # the daemon is the Linux musl binary inside WSL2, so the whole server stack
 # (and its PTY/unix surface) must stay out of that build.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["signal"] }
+nix = { version = "0.31", features = ["signal", "resource"] }
 chimaera-server = { path = "../chimaera-server" }
 
 # macOS notifications: UNUserNotificationCenter (the modern API — click
