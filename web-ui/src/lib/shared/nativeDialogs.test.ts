@@ -11,9 +11,6 @@ const sources = import.meta.glob<string>(["/src/**/*.{svelte,ts}", "!/src/**/*.t
   eager: true,
 });
 
-// Replaced with an inline confirm by the git-collaboration branch (#219).
-const PENDING = new Set(["/src/lib/workspace/GitView.svelte"]);
-
 // A bare or `window.`/`globalThis.`-qualified call; a method (`.confirm(`),
 // a `javascript:alert(…)` string, or a name quoted in prose is not one.
 const CALL = /(?<![\w$.:#'"`])(?:window\.|globalThis\.)?(confirm|alert|prompt)\s*\(/g;
@@ -33,7 +30,6 @@ describe("native dialogs", () => {
   it("are never called — the native app never shows them", () => {
     const calls: string[] = [];
     for (const [file, raw] of Object.entries(sources)) {
-      if (PENDING.has(file)) continue;
       const src = withoutComments(raw);
       for (const m of src.matchAll(CALL)) {
         // A module's own function of that name (ArtifactGallery's `confirm`).
