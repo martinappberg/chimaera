@@ -667,7 +667,8 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   `chat_switching` (double-click → 409). On term→chat, native or earlier Chimaera history is imported
   before the transition marker, so the chat reopens with its transcript rather than only “continued
   in chat”; a terminal resurrected after daemon restart uses its durable resume handle even before a
-  fresh transcript hook arrives. A busy `Running` agent needs `force` (409). **Billing note:**
+  fresh transcript hook arrives. A busy `Running` agent needs `force` (409); the UI then asks in an
+  in-app `ConfirmDialog` ("Open as chat?", Enter switches, Escape keeps the turn). **Billing note:**
   the TUI side bills like an interactive session; the chat side drives the structured protocol. This
   is also the **`/login` recovery** path (see [Composing & sending](#composing--sending)): an
   expired-auth session flips to its TUI so claude's native auth flow can run.
