@@ -200,5 +200,9 @@ describe("history spacer", () => {
     expect(spacerNeedsRebalance(10000, 10000)).toBe(false);
     expect(spacerNeedsRebalance(7000, 10000)).toBe(true);
     expect(spacerNeedsRebalance(16000, 10000)).toBe(true);
+    // Small drifts wait: every re-size moves the scrollbar thumb.
+    expect(spacerNeedsRebalance(8000, 10000)).toBe(false);
+    expect(spacerNeedsRebalance(14000, 10000)).toBe(false);
+    expect(spacerNeedsRebalance(100, 40)).toBe(false);
   });
 });

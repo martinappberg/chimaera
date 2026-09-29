@@ -44,16 +44,32 @@
   window.__scrollCost = [];
   t.addEventListener('scroll', (e) => { window.__scrollCost.push(performance.now() - e.timeStamp); }, { passive: true });
   const rowsOf = () => t.querySelectorAll(".column > [data-block-uid]");
+  // Row tops miss a shift INSIDE a tall row (a figure resolving above the
+  // paragraph being read): `fine` tracks the blocks within visible rows too,
+  // by element identity.
+  const ids = new WeakMap();
+  let nextId = 1;
+  const idOf = (el) => { let id = ids.get(el); if (id === undefined) { id = nextId++; ids.set(el, id); } return id; };
+  const FINE = "p, h1, h2, h3, h4, li, pre, blockquote, .md-embed, .md-table, hr";
   function sample() {
     const r = t.getBoundingClientRect();
     const pos = {};
+    const fine = {};
     for (const row of rowsOf()) {
       const b = row.getBoundingClientRect();
-      if (b.bottom > r.top && b.top < r.bottom) pos[row.dataset.blockUid] = b.top - r.top;
+      if (b.bottom > r.top && b.top < r.bottom) {
+        pos[row.dataset.blockUid] = b.top - r.top;
+        for (const el of row.querySelectorAll(FINE)) {
+          if (el.parentElement?.closest(".md-embed, li, blockquote") != null) continue;
+          const e = el.getBoundingClientRect();
+          if (e.height > 0 && e.bottom > r.top && e.top < r.bottom) fine[idOf(el)] = e.top - r.top;
+        }
+      }
     }
     const first = t.querySelector(".column > [data-block-index]");
     window.__log.push({
       t: performance.now(),
+      fine,
       st: t.scrollTop,
       sh: t.scrollHeight,
       ch: t.clientHeight,
@@ -63,9 +79,26 @@
       sp: (() => { const e = t.querySelector('.history-spacer'); return e ? (parseFloat(e.style.height || '0') + parseFloat(e.style.marginBottom || '0')) : null; })(),
       colTop: Math.round(t.querySelector('.column').getBoundingClientRect().top - t.getBoundingClientRect().top),
     });
-    if (!window.__stop) requestAnimationFrame(sample);
+    if (!window.__stop) requestAnimationFrame(afterFrame);
   }
-  requestAnimationFrame(sample);
+  // Sample what the frame PAINTS: the app absorbs a card that grew above the
+  // reader in its ResizeObserver, after layout and before paint. A sample in
+  // rAF (before that layout) or in a later task (after a network reply grew a
+  // card, before the next frame absorbs it) reads states never painted — a
+  // jump and its correction one frame apart. So sample inside the frame's own
+  // ResizeObserver pass, after the chat's (observers run in creation order,
+  // and this one is created later): a dummy resized every frame guarantees a
+  // callback per frame.
+  const tickEl = document.createElement("div");
+  tickEl.style.cssText = "position:fixed;left:0;top:0;height:1px;width:1px;pointer-events:none;opacity:0";
+  document.body.appendChild(tickEl);
+  let flip = false;
+  new ResizeObserver(() => sample()).observe(tickEl);
+  const afterFrame = () => {
+    flip = !flip;
+    tickEl.style.width = flip ? "2px" : "1px";
+  };
+  requestAnimationFrame(afterFrame);
   window.__snaps = [];
   window.__snap = (label) => {
     const tr = document.querySelector(".chat.visible .transcript");

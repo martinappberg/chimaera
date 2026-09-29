@@ -118,6 +118,32 @@ export async function resolveTargets(
 
 type Waiter = (r: TargetResult | null) => void;
 const waiting = new Map<string, Waiter[]>();
+/** Recent hits by path. A card remounted by transcript paging or a tab
+ *  switch then draws its reserved box at once, from the same `/raw` ticket
+ *  (the browser's cached bytes), instead of a placeholder that grows a
+ *  round trip later — over a tunnel to a cluster, a visible pop per card
+ *  per page. Brief (far inside the daemon's ticket lifetime) and bounded;
+ *  misses are never kept, and a disk change asks afresh (`fresh`). */
+const recent = new Map<string, { r: TargetInfo; at: number }>();
+const RECENT_TTL_MS = 60_000;
+const RECENT_CAP = 256;
+
+function remember(path: string, r: TargetResult | null): void {
+  recent.delete(path);
+  if (r === null || isMissing(r)) return;
+  if (recent.size >= RECENT_CAP) {
+    const oldest = recent.keys().next().value;
+    if (oldest !== undefined) recent.delete(oldest);
+  }
+  recent.set(path, { r, at: Date.now() });
+}
+
+/** A recent answer for an ABSOLUTE path, synchronously; null when there is
+ *  none still fresh. */
+export function peekFile(path: string): TargetInfo | null {
+  const hit = recent.get(path);
+  return hit !== undefined && Date.now() - hit.at < RECENT_TTL_MS ? hit.r : null;
+}
 /** Paths whose request is on the wire: later askers join it. */
 const inflight = new Set<string>();
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -151,7 +177,9 @@ async function flush(): Promise<void> {
     inflight.delete(path);
     const ws = waiting.get(path);
     waiting.delete(path);
-    for (const w of ws ?? []) w(results?.[pathTarget(path)] ?? null);
+    const r = results?.[pathTarget(path)] ?? null;
+    if (results !== null) remember(path, r);
+    for (const w of ws ?? []) w(r);
   }
   if (waiting.size > 0 && flushTimer === null) flushTimer = setTimeout(() => void flush(), 0);
 }
@@ -160,10 +188,13 @@ async function flush(): Promise<void> {
  * Resolve one ABSOLUTE filesystem path (a tool location, a card's refresh
  * after a disk change) — a real path, never a link target: `#`, `?` and `%`
  * are part of the name (`pathTarget`). Coalesced with every other card
- * asking in the same frame. Null when the daemon could not answer
- * (unreachable): unknown, not missing.
+ * asking in the same frame; a recent hit answers at once unless `fresh`
+ * (a refresh after the file changed). Null when the daemon could not
+ * answer (unreachable): unknown, not missing.
  */
-export function resolveFile(path: string): Promise<TargetResult | null> {
+export function resolveFile(path: string, opts: { fresh?: boolean } = {}): Promise<TargetResult | null> {
+  const hit = opts.fresh === true ? null : peekFile(path);
+  if (hit !== null) return Promise.resolve(hit);
   return new Promise((resolve) => {
     const ws = waiting.get(path);
     if (ws !== undefined) ws.push(resolve);

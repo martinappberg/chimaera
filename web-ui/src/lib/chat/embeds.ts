@@ -41,6 +41,19 @@ export class EmbedResolver {
     return [ctx.workspaceId ?? "", ...bases, "", target].join("\u0000");
   }
 
+  /** A still-fresh answer for `target`, synchronously: a card remounted by
+   *  transcript paging mounts with it and reserves its final box at once. */
+  peek(target: string): TargetResult | null {
+    if (this.#disposed) return null;
+    const ctx = this.#context();
+    const bases = resolveBases(ctx, target.split("#")[0] ?? target);
+    if (bases.length === 0) return null;
+    const hit = this.#cache.get(this.#key(ctx, target, bases));
+    if (hit === undefined) return null;
+    const ttl = "missing" in hit.r ? MISS_TTL_MS : HIT_TTL_MS;
+    return Date.now() - hit.at < ttl ? hit.r : null;
+  }
+
   /**
    * The answer for one target as written (fragment allowed; the daemon
    * ignores it). Null when it could not be asked (no directory known for a

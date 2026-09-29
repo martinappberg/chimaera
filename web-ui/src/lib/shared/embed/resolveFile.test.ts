@@ -6,7 +6,7 @@ vi.mock("../../net/api", () => ({
   ApiError: class extends Error {},
 }));
 
-import { pathTarget, resolveFile } from "./embed";
+import { pathTarget, peekFile, resolveFile } from "./embed";
 
 /** What the daemon's `target_path` does to a target before resolving it:
  *  cut at `#`/`?`, trim, unwrap `<…>`, then decode `%XX`. */
@@ -70,5 +70,33 @@ describe("resolveFile", () => {
     expect(a).toMatchObject({ path: "/scratch/run#2/plot.png" });
     expect(b).toMatchObject({ path: "/data/50%25/x.png" });
     expect(c).toMatchObject({ path: "/plain/y.png" });
+  });
+
+  it("answers a remount from a recent hit, and a refresh afresh", async () => {
+    let version = "v1";
+    mocks.api.mockImplementation(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as { targets: string[] };
+      const results: Record<string, unknown> = {};
+      for (const t of body.targets) {
+        results[t] = t.includes("gone")
+          ? { missing: true }
+          : { path: daemonReads(t), kind: "file", size: 1, version, mtime_ms: 1, mime: "image/png", width: 4, height: 3 };
+      }
+      return new Response(JSON.stringify({ results }));
+    });
+    expect(peekFile("/figs/remount.png")).toBeNull();
+    await resolveFile("/figs/remount.png");
+    expect(peekFile("/figs/remount.png")).toMatchObject({ version: "v1", width: 4 });
+    expect(await resolveFile("/figs/remount.png")).toMatchObject({ version: "v1" });
+    expect(mocks.api).toHaveBeenCalledTimes(1);
+
+    version = "v2";
+    expect(await resolveFile("/figs/remount.png", { fresh: true })).toMatchObject({ version: "v2" });
+    expect(peekFile("/figs/remount.png")).toMatchObject({ version: "v2" });
+    expect(mocks.api).toHaveBeenCalledTimes(2);
+
+    // A miss is never kept: the file may be written any moment.
+    await resolveFile("/figs/gone.png");
+    expect(peekFile("/figs/gone.png")).toBeNull();
   });
 });
