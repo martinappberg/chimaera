@@ -70,6 +70,14 @@ both designs; the plugin would have held about 1,500 lines of parsers, and movin
 them out needed a new WIT world, a plan and digest protocol, a consent dialog, two
 repositories and an install step for every user. Plugins stay what they are for.
 
+Re-checked on 2026-09-29 against `main` after the plugin hardening that followed
+(martinappberg/chimaera#199, martinappberg/chimaera#200, martinappberg/chimaera#205):
+the WIT world is still `chimaera:plugin@0.1.0`, and a plugin still cannot start a
+program, draw a view, read outside the workspace, or hold a call past 5 s (30 s for
+Knowledge). Every one of those is what a build needs, so the answer stands. The
+format list in [what core gets](#what-core-gets-and-what-it-does-not) is where a
+plugin point for third-party formats would attach if one is ever wanted.
+
 ## The short version
 
 - **Open a `.tex` or `.typ` file and it works.** Source and PDF side by side, with no
