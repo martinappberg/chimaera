@@ -1013,17 +1013,37 @@ pub(crate) async fn api_proxy(
         .await?
     }
     .await;
-    // A read of a path outside the project that its owner does not have (or
-    // may not show) is this computer's own file: answer it here.
+    // A read of a path outside the project: the owner's own file when it may
+    // show it; this computer's file when the owner has nothing there (or
+    // cannot be reached); and when the owner has a different file at that
+    // path that it may not show, a plain answer instead of this computer's
+    // same-named file standing in for it.
     if let Some(local) = fallback {
-        let owner_declined = result.as_ref().map_or(true, |response| {
-            matches!(
-                response.status(),
-                StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
-            )
-        });
-        if owner_declined {
-            return next.run(local).await;
+        match result {
+            Err(_) => return next.run(local).await,
+            Ok(response) if response.status() == StatusCode::NOT_FOUND => {
+                return next.run(local).await
+            }
+            Ok(response) if response.status() == StatusCode::FORBIDDEN => {
+                let (parts, body) = response.into_parts();
+                let bytes = axum::body::to_bytes(body, 16 * 1024)
+                    .await
+                    .unwrap_or_default();
+                let reason = serde_json::from_slice::<Value>(&bytes)
+                    .ok()
+                    .and_then(|value| value["error"].as_str().map(str::to_owned));
+                if reason.as_deref() == Some("outside_project") {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({"error":"on_other_machine"})),
+                    )
+                        .into_response();
+                }
+                // An older owner refuses every outside path alike.
+                drop(parts);
+                return next.run(local).await;
+            }
+            Ok(response) => return response,
         }
     }
     result.unwrap_or_else(|_| {

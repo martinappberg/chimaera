@@ -703,15 +703,15 @@ async fn a_routed_window_keeps_this_computers_files_outside_the_project_local() 
     )
     .await;
     assert_eq!((status, body.as_str()), (StatusCode::OK, "owner copy"));
-    // This computer's own files and folders outside the project stay here.
+    // Both daemons share this test's filesystem, so the owner has a file at
+    // this outside path too: the window says so instead of showing this
+    // computer's same-named file in its place (the fake-owner test below
+    // covers the owner having nothing there).
     let (status, body) = call(Method::GET, "/fs/file", &own, Body::empty()).await;
-    assert_eq!(
-        (status, body.as_str()),
-        (StatusCode::OK, "this computer's file")
-    );
-    let (status, body) = call(Method::GET, "/fs/list", &elsewhere, Body::empty()).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body.contains("own.txt"), "{body}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("on_other_machine"), "{body}");
+    assert!(!body.contains("this computer's file"), "{body}");
+    // Saving where the folder exists on this computer stays here.
     let (status, _) = call(
         Method::PUT,
         "/fs/file",
@@ -738,6 +738,118 @@ async fn a_routed_window_keeps_this_computers_files_outside_the_project_local() 
             .stopping
             .store(true, std::sync::atomic::Ordering::Release);
     }
+}
+
+/// A routed window's read of a file outside the project: the owner's copy
+/// when it may show it; this computer's own file when the owner has nothing
+/// there; and when the owner has a different file at that path it may not
+/// show, a plain answer — never this computer's same-named file in its place.
+#[tokio::test]
+async fn an_outside_read_the_owner_cannot_show_never_serves_this_computers_file() {
+    use axum::{extract::Query, http::HeaderMap, response::IntoResponse, routing::get, Router};
+    let local = test_state();
+    let workspace = lock(&local.workspaces)
+        .add(test_dir("other-machine-viewer").canonicalize().unwrap())
+        .unwrap();
+    let elsewhere = test_dir("other-machine-home").canonicalize().unwrap();
+    for name in ["mine.txt", "theirs.txt", "old-owner.txt"] {
+        std::fs::write(elsewhere.join(name), format!("this computer's {name}")).unwrap();
+    }
+    let owner = Router::new()
+        .route(
+            "/api/v1/health",
+            get(|headers: HeaderMap| async move {
+                let mut response = StatusCode::OK.into_response();
+                for name in [
+                    crate::workspace_scope::WORKSPACE_HEADER,
+                    crate::workspace_scope::EPOCH_HEADER,
+                ] {
+                    response.headers_mut().insert(name, headers[name].clone());
+                }
+                response
+                    .headers_mut()
+                    .insert("x-chimaera-scope-version", "1".parse().unwrap());
+                response
+            }),
+        )
+        .route(
+            "/api/v1/fs/file",
+            get(
+                |Query(query): Query<std::collections::HashMap<String, String>>| async move {
+                    let path = query.get("path").cloned().unwrap_or_default();
+                    let refuse = |status: StatusCode, error: &str| {
+                        (status, axum::Json(serde_json::json!({ "error": error }))).into_response()
+                    };
+                    if path.starts_with("/project/") {
+                        "owner copy".into_response()
+                    } else if path.ends_with("theirs.txt") {
+                        refuse(StatusCode::FORBIDDEN, "outside_project")
+                    } else if path.ends_with("old-owner.txt") {
+                        // An owner from before this distinction refuses alike.
+                        refuse(StatusCode::FORBIDDEN, "workspace_scope_changed")
+                    } else {
+                        refuse(StatusCode::NOT_FOUND, "not_found")
+                    }
+                },
+            ),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let owner_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, owner).await.unwrap() });
+    assert_eq!(
+        request(
+            &local,
+            Method::POST,
+            "/api/v1/pro/placements",
+            Some(serde_json::json!({
+                "host_id":"worker-fake","endpoint":format!("http://{owner_addr}"),
+                "token":"fixture","workspace_id":workspace.id,"epoch":4
+            })),
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let read = |path: std::path::PathBuf| {
+        let query = crate::workspace_scope::paths::encode_query(&[(
+            "path".into(),
+            path.to_string_lossy().into_owned(),
+        )]);
+        let request = Request::builder()
+            .uri(format!("/api/v1/fs/file?{query}"))
+            .header(header::AUTHORIZATION, "Bearer test-token")
+            .header("x-chimaera-viewer-workspace", &workspace.id)
+            .body(Body::empty())
+            .unwrap();
+        let local = local.clone();
+        async move {
+            let response = app(local).oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+    assert_eq!(
+        read(workspace.root.join("note.txt")).await,
+        (StatusCode::OK, "owner copy".to_owned())
+    );
+    assert_eq!(
+        read(elsewhere.join("mine.txt")).await,
+        (StatusCode::OK, "this computer's mine.txt".to_owned())
+    );
+    let (status, body) = read(elsewhere.join("theirs.txt")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"error":"on_other_machine"})
+    );
+    assert_eq!(
+        read(elsewhere.join("old-owner.txt")).await,
+        (StatusCode::OK, "this computer's old-owner.txt".to_owned())
+    );
+    local
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// A window watching a project that runs on another daemon gets that

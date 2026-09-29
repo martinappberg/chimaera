@@ -264,6 +264,8 @@ const PLAIN_ERRORS: Record<string, string> = {
   workspace_scope_changed: "Your project is reconnecting.",
   workspace_unavailable: "Your project is reconnecting.",
   worker_asleep: "Your project is paused.",
+  on_other_machine: "This file is on the other machine and can't be opened here.",
+  outside_project: "This file is outside the project.",
 };
 
 /** A daemon error message in plain words (known codes mapped, else as-is). */

@@ -357,10 +357,16 @@ stays on your computer" (plain shells) or "Opening this conversation…" (agents
 elsewhere, the window's event stream merges only that project's sessions, file
 changes, Git and Timeline updates from the owner; the owner's settings, recents,
 notices and update status never replace this computer's. An owner change never
-closes the window's connection. Files outside the project (your home folder, a
-download) are read and saved on this computer even while the project's own
-paths go to its owner; a conversation's pasted images and links to the owner's
-files are read from the owner.
+closes the window's connection. The project's own paths go to its owner. A
+file outside the project is saved on this computer when its folder exists here.
+Reading one asks the owner first: a conversation's pasted images come from the
+owner; a path where the owner has nothing is this computer's own file (your home
+folder, a download) and opens from here; and a path where the owner has a
+different file it may not show (a report an agent wrote to `/tmp` on the cloud
+machine, say) reads "This file is on the other machine" rather than showing this
+computer's file of the same name. The owner never shows anything outside the
+project but the project's own pasted images, and says only whether it has
+something at such a path, never what.
 
 The terminal toolbar (shown only for a viewed project) supports **Just
 watching**. A phone-width browser view starts there with the sidebar collapsed

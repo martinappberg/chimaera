@@ -300,18 +300,41 @@ async fn scoped_http_viewer_reads_only_registered_project_and_keeps_content_unch
                 .into_owned(),
         )]),
     );
+    // Outside the project: the owner says whether it has a file there (so a
+    // viewer never shows its own same-named file in its place), never what.
+    let (status, bytes) = scoped(
+        &state,
+        &one.id,
+        4,
+        Method::GET,
+        &format!("/api/v1/fs/file?{query}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let refusal: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(refusal, json!({"error":"outside_project"}));
+    let missing = workspace_scope::paths::encode_query(&[(
+        "path".into(),
+        other
+            .root
+            .join("never-written.txt")
+            .to_string_lossy()
+            .into_owned(),
+    )]);
+    let (status, bytes) = scoped(
+        &state,
+        &one.id,
+        4,
+        Method::GET,
+        &format!("/api/v1/fs/file?{missing}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(
-        scoped(
-            &state,
-            &one.id,
-            4,
-            Method::GET,
-            &format!("/api/v1/fs/file?{query}"),
-            None
-        )
-        .await
-        .0,
-        StatusCode::FORBIDDEN
+        serde_json::from_slice::<Value>(&bytes).unwrap(),
+        json!({"error":"not_found"})
     );
     #[cfg(unix)]
     {
