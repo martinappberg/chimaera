@@ -26,10 +26,13 @@ owns the text; the confirm dialog shows it verbatim before anything is written.
 
 **Pro is a separate account surface.** `../pro/ProView.svelte` is a singleton
 workbench tab and Home view. When Pro is offered (`net/plan.ts` `proOffered`;
-a build without an account endpoint offers none) Settings starts with a small
-Chimaera Pro group that opens it; Home retains its Pro navigation. Confirmed free/signed-out users
-see a benefit-led Get Pro entry; paid users see Your Chimaera Pro/Max and View
-account. `../net/plan.ts` shares its existing subscription between this entry
+a build without an account endpoint offers none) Settings ends with a small
+Chimaera Pro group that opens it (Pro is an optional add-on, so it follows every
+working section, and its entry is neutral for every plan, never accent-tinted);
+Home retains its Pro navigation. Confirmed free/signed-out users see a short
+optional-benefit Get Pro entry; paid users see Your Chimaera Pro/Max and View
+account. The Keyboard section carries its reference chords inside it, so a
+group after it never splits them off. `../net/plan.ts` shares its existing subscription between this entry
 and the badges: loading or failed/unknown entitlement stays neutral, never a
 sales prompt or an active-plan claim. There is no extra poll or cloud wake. A paid workspace plan badge also
 opens it, without adding a full-width sidebar row for any plan.
