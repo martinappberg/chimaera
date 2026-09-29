@@ -60,10 +60,13 @@ from scheduling, before hydrate's own fence), and re-runs once recorded old
 process groups exit.
 Clean release waits for observed termination, durable publication and an exact
 immutable keeper receipt. Each managed launch persists active execution
-evidence, and every state write records the live managed agents' process groups
-(≤64 per project). A graceful stop clears the evidence once they exit; a
-same-boot successor after a crash probes the recorded groups and waits only for
-survivors (re-probed every lease tick); without recorded groups a device
+evidence, and every state write (plus two writes shortly after each managed
+launch) records the live managed agents' process groups with their leaders'
+start times (≤64 per project). A graceful stop clears the evidence once they
+exit; a same-boot successor after a crash probes the recorded groups and waits
+only for survivors (re-probed every lease tick): a group that vanished, belongs
+to another user (EPERM), or whose leader started at another time (a reused id)
+is gone; without recorded groups a device
 proceeds and a worker stays fenced, and a worker never acquires or renews a lease
 it could not accept. A separate enrollment latch rejects lost ordinary state or
 protocol downgrade; an unreadable `state.json` fails closed (kept as

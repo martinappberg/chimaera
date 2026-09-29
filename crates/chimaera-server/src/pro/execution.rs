@@ -33,7 +33,7 @@ pub(super) struct State {
     pub(super) latched: Mutex<std::collections::HashSet<String>>,
     /// Previous-life process groups not yet proven gone, per workspace. An
     /// empty list means no evidence exists (worker only; see `restore`).
-    unclean: Mutex<HashMap<String, Vec<u32>>>,
+    unclean: Mutex<HashMap<String, Vec<(u32, u64)>>>,
     /// Projects whose enrollment record was lost (see `restore`). Each stays
     /// managed and publishes nothing until an authoritative read restores its
     /// policy; a worker also runs nothing there. Bounded to 128.
@@ -649,6 +649,16 @@ pub(crate) async fn prepare_launch(
         crate::pro::may_execute(state, workspace),
         "execution authority changed during durable launch admission"
     );
+    // The caller spawns right after this returns; record the new child's
+    // group (and its start time) shortly after instead of at the next state
+    // write, so a crash in between leaves evidence a successor can probe.
+    let owner = state.clone();
+    tokio::spawn(async move {
+        for delay in [250, 2_000] {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            let _ = crate::pro::persist(&owner).await;
+        }
+    });
     Ok(())
 }
 

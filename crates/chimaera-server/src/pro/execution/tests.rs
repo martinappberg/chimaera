@@ -252,12 +252,18 @@ async fn same_boot_crash_never_turns_empty_registry_into_stopped_evidence() {
         .spawn()
         .unwrap();
     let mut preferences = lock(&state.pro.preferences).clone();
+    let started = restart::leader_start(child.id() as i32).unwrap();
     preferences.get_mut("w-a").unwrap().execution_groups = vec![child.id()];
+    preferences.get_mut("w-a").unwrap().execution_starts = vec![started];
     for worker in [false, true] {
         let restored = State::restore(&state.pro.root, &preferences, worker, false);
-        assert_eq!(lock(&restored.unclean)["w-a"], vec![child.id()]);
+        assert_eq!(lock(&restored.unclean)["w-a"], vec![(child.id(), started)]);
     }
-    lock(&state.pro.execution.unclean).insert("w-a".into(), vec![child.id()]);
+    // The same id with another start time is a reused group, not old work.
+    preferences.get_mut("w-a").unwrap().execution_starts = vec![started + 1];
+    let restored = State::restore(&state.pro.root, &preferences, false, false);
+    assert!(!lock(&restored.unclean).contains_key("w-a"));
+    lock(&state.pro.execution.unclean).insert("w-a".into(), vec![(child.id(), started)]);
     reprobe(&state);
     assert!(!quiescent(&state, "w-a"), "a live old group blocks handoff");
     child.kill().unwrap();
@@ -441,7 +447,10 @@ async fn graceful_same_boot_restart_does_not_fence_but_a_crash_probes_survivors(
     // A crash here leaves a live recorded group: a successor must wait for it.
     let crashed = crate::pro::ProState::new(state.pro.root.clone());
     assert_eq!(
-        lock(&crashed.execution.unclean)["w-a"],
+        lock(&crashed.execution.unclean)["w-a"]
+            .iter()
+            .map(|(group, _)| *group)
+            .collect::<Vec<_>>(),
         vec![agent.pid.unwrap()]
     );
     // A graceful stop proves the agents exited and clears the evidence.

@@ -113,6 +113,10 @@ struct Preference {
     /// probe after a crash (bounded to 64 per workspace).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     execution_groups: Vec<u32>,
+    /// The start time of each recorded group's leader (same order; 0 when
+    /// unknown), so a reused group id is not mistaken for old work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    execution_starts: Vec<u64>,
     #[serde(default)]
     execution_identity: Option<execution::wire::Identity>,
     #[serde(default)]
