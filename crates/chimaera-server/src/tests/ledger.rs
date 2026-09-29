@@ -306,9 +306,11 @@ async fn journal_budget_spares_chats_the_ledger_resurrects() {
 }
 
 /// Laptop first across a restart: a Pro-managed project's previous sessions
+/// Laptop first across a restart: a Pro-managed project's previous agents
 /// wait for this daemon life to verify ownership (so a project the cloud took
 /// over never resumes a stale turn here), then resume anyway when the account
-/// cannot confirm in time. A verified other owner keeps them suspended.
+/// cannot confirm in time. A verified other owner keeps them suspended. Plain
+/// shells never wait: they come back at boot.
 #[tokio::test]
 async fn restart_deferred_sessions_resume_unless_another_owner_is_verified() {
     for remote in [false, true] {
@@ -316,43 +318,71 @@ async fn restart_deferred_sessions_resume_unless_another_owner_is_verified() {
         let state = test_state_with_data_dir(0, data.clone());
         let root = std::fs::canonicalize(test_dir("ledger-verification-root")).unwrap();
         let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
+        preset_agent(
+            &state,
+            agents::AgentKind::Claude,
+            Ok(write_fake_claude("ledger-verification-fake")),
+            Some("9.9.9-fake"),
+        );
         // Enrolled earlier; this life has not renewed its lease yet.
         pro::install_execution_fixture(&state, &workspace.id, 3).unwrap();
         pro::expire_execution_fixture(&state, &workspace.id);
+        let entry = |id: &str, agent: Option<ledger::LedgerAgent>| ledger::LedgerEntry {
+            suspended: false,
+            handoff: None,
+            id: id.to_string(),
+            workspace_id: workspace.id.clone(),
+            cwd: root.clone(),
+            pinned_name: None,
+            cols: 80,
+            rows: 24,
+            theme: "dark".to_string(),
+            created_at: 0,
+            agent,
+        };
+        let chat = ledger::LedgerAgent {
+            kind: agents::AgentKind::Claude,
+            resume: None,
+            transcript: None,
+            native_cwd: None,
+            title: "claude".to_string(),
+            ui: chimaera_agent::model::SessionUi::Chat,
+            model: None,
+            carryover: None,
+        };
         let boot = ledger::BootLedger {
-            sessions: vec![ledger::LedgerEntry {
-                suspended: false,
-                handoff: None,
-                id: "s-restart-shell".to_string(),
-                workspace_id: workspace.id.clone(),
-                cwd: root.clone(),
-                pinned_name: None,
-                cols: 80,
-                rows: 24,
-                theme: "dark".to_string(),
-                created_at: 0,
-                agent: None,
-            }],
+            sessions: vec![
+                entry("s-restart-shell", None),
+                entry("s-restart-chat", Some(chat)),
+            ],
             links: std::collections::HashMap::new(),
             written_at: 1_750_000_000,
         };
         ledger::restore(&state, boot).await;
-        assert!(state.sessions.list().is_empty(), "waits for verification");
-        assert!(lock(&state.deferred_sessions).contains_key("s-restart-shell"));
+        assert!(
+            state.sessions.get("s-restart-shell").is_some(),
+            "a plain shell never waits"
+        );
+        assert!(
+            !state.chat.contains("s-restart-chat"),
+            "waits for verification"
+        );
+        assert!(lock(&state.deferred_sessions).contains_key("s-restart-chat"));
         if remote {
             pro::install_remote_owner_fixture(&state, &workspace.id, 4);
         }
         pro::resume_unverified(&state).await;
         assert_eq!(
-            state.sessions.get("s-restart-shell").is_some(),
+            state.chat.contains("s-restart-chat"),
             !remote,
             "remote={remote}"
         );
         assert_eq!(
-            lock(&state.deferred_sessions).contains_key("s-restart-shell"),
+            lock(&state.deferred_sessions).contains_key("s-restart-chat"),
             remote
         );
         let _ = state.sessions.kill("s-restart-shell");
+        state.chat.kill("s-restart-chat");
         state
             .stopping
             .store(true, std::sync::atomic::Ordering::Release);
