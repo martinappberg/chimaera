@@ -20,6 +20,7 @@ use super::{lock, Shell};
 pub(super) mod agents;
 mod auth;
 pub(super) mod billing;
+mod catalog;
 mod credentials;
 mod installation;
 mod machine;
@@ -59,6 +60,8 @@ pub(super) struct Pro {
     unsupported_until: Mutex<Option<std::time::Instant>>,
     /// Whether an agent was connected in the cloud at the last catalog read.
     pub(super) agents: agents::Agents,
+    /// Public display prices, read before (or without) a signed-in account.
+    catalog: catalog::Catalog,
 }
 
 struct Runtime {
@@ -96,8 +99,10 @@ pub struct Status {
     /// Additive: the plan has ended and this RFC 3339 time is how long its
     /// cloud work can still be brought home; null otherwise.
     returning_until: Option<String>,
-    /// Additive: the account's offers, passed through when the service
-    /// supplies them; clients never hardcode prices.
+    /// Additive: the offers to display, passed through when the service
+    /// supplies them; clients never hardcode prices. A signed-in account's own
+    /// list wins; otherwise the service's public catalog (`GET /v1/plans`),
+    /// which is how a signed-out page shows prices.
     plans: Option<Vec<chimaera_link::PlanPrice>>,
     sign_in: Option<auth::Status>,
     billing: Option<billing::Status>,
@@ -175,6 +180,7 @@ impl Pro {
             verified_routes: Mutex::new(placements::Verified::default()),
             unsupported_until: Mutex::new(None),
             agents: agents::Agents::default(),
+            catalog: catalog::Catalog::default(),
         }
     }
 
@@ -223,7 +229,10 @@ impl Pro {
             returning_until: account
                 .as_ref()
                 .and_then(|account| account.returning_until.clone()),
-            plans: account.as_ref().and_then(|account| account.plans.clone()),
+            plans: account
+                .as_ref()
+                .and_then(|account| account.plans.clone())
+                .or_else(|| self.catalog.prices()),
             sign_in: self.sign_in.status(),
             billing: self.billing.status(),
             limits: account.as_ref().map(|account| account.limits.clone()),
@@ -231,6 +240,25 @@ impl Pro {
             hours_exhausted: account
                 .as_ref()
                 .is_some_and(|account| account.hours_exhausted),
+        }
+    }
+
+    /// Whether a status read should start a public-catalog fetch: an endpoint
+    /// is configured, no account has answered (signed out, or `/v1/me` not yet
+    /// back), and the last answer is stale or was never had. Never waits.
+    fn wants_public_plans(&self) -> bool {
+        self.endpoint.is_some()
+            && lock(&self.account).is_none()
+            && self.catalog.due(std::time::Instant::now())
+    }
+
+    /// One best-effort read of the public catalog. Without an endpoint there
+    /// is no network work at all. True when the prices the page would show
+    /// changed, so the caller can tell open windows.
+    async fn refresh_plans(&self) -> bool {
+        match &self.endpoint {
+            Some(endpoint) => catalog::refresh(endpoint, &self.catalog).await,
+            None => false,
         }
     }
 
@@ -376,7 +404,23 @@ fn replace_small_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
 }
 
 pub(super) fn start(app: AppHandle) {
+    // A signed-out page shows prices from the public catalog; the account
+    // restore below does not wait for it (and it never waits for the account).
+    refresh_plans(&app);
     restore_account(app);
+}
+
+/// Reads the public plan catalog in the background and tells open windows
+/// when the prices they would show changed. The status never waits for it;
+/// a failure is silent (no prices, or the last ones, stay), and a fresh
+/// answer is reused for five minutes.
+fn refresh_plans(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if app.state::<Shell>().pro.refresh_plans().await {
+            let _ = app.emit("pro-changed", ());
+        }
+    });
 }
 
 fn restore_account(app: AppHandle) {
@@ -997,8 +1041,15 @@ pub(super) async fn refresh_serve(state: &Shell) {
 }
 
 #[tauri::command]
-pub async fn pro_status(state: tauri::State<'_, Shell>) -> Result<Status, String> {
-    Ok(state.pro.status_snapshot())
+pub async fn pro_status(app: AppHandle) -> Result<Status, String> {
+    let state = app.state::<Shell>();
+    let status = state.pro.status_snapshot();
+    // A stale or failed catalog read is retried from here, in the background:
+    // this answer is the snapshot above, and the change arrives as `pro-changed`.
+    if state.pro.wants_public_plans() {
+        refresh_plans(&app);
+    }
+    Ok(status)
 }
 
 #[tauri::command]
@@ -1468,6 +1519,109 @@ mod tests {
         assert_eq!(wire["plan"], "none");
     }
 
+    fn offer(
+        plan: chimaera_link::Plan,
+        interval: chimaera_link::BillingInterval,
+        amount_cents: u64,
+    ) -> chimaera_link::PlanPrice {
+        chimaera_link::PlanPrice {
+            plan,
+            interval,
+            amount_cents,
+            currency: "usd".into(),
+        }
+    }
+
+    /// The signed-out page's prices come from the public catalog; the status
+    /// carries them without an account, and a signed-in answer that has its
+    /// own list wins.
+    #[tokio::test]
+    async fn a_signed_out_status_carries_the_public_catalog_and_the_account_list_wins() {
+        use chimaera_link::{
+            BillingInterval::{Month, Year},
+            Plan as Tier,
+        };
+        let (endpoint, server) = catalog::stub_service(vec![(
+            "200 OK",
+            r#"{"plans":[{"plan":"pro","interval":"month","amount_cents":111,"currency":"usd"},
+                {"plan":"max","interval":"year","amount_cents":222,"currency":"usd"}]}"#,
+        )])
+        .await;
+        let pro = Pro::new(Some(endpoint));
+        pro.ready.send_replace(true);
+        assert!(pro.status_snapshot().plans.is_none());
+        assert!(pro.wants_public_plans());
+        assert!(
+            pro.refresh_plans().await,
+            "the prices the page shows changed"
+        );
+        let catalog_plans = vec![offer(Tier::Pro, Month, 111), offer(Tier::Max, Year, 222)];
+        let status = pro.status_snapshot();
+        assert!(!status.signed_in && status.error.is_none());
+        assert!(status.connection_warning.is_none());
+        assert_eq!(status.plans, Some(catalog_plans.clone()));
+        let wire = serde_json::to_value(&status).unwrap();
+        assert_eq!(wire["plans"][0]["amount_cents"], 111);
+        assert!(!pro.wants_public_plans(), "fresh for five minutes");
+        // A signed-in answer without a list keeps showing the catalog's.
+        *lock(&pro.account) = Some(fixture_account());
+        assert_eq!(pro.status_snapshot().plans, Some(catalog_plans));
+        assert!(!pro.wants_public_plans(), "an answered account asks no one");
+        // Its own list takes precedence.
+        let mut own = fixture_account();
+        own.plans = Some(vec![offer(Tier::Pro, Month, 7)]);
+        *lock(&pro.account) = Some(own);
+        assert_eq!(
+            pro.status_snapshot().plans,
+            Some(vec![offer(Tier::Pro, Month, 7)])
+        );
+        // Signing out drops the account's list; the catalog is still held.
+        *lock(&pro.account) = None;
+        assert_eq!(
+            pro.status_snapshot().plans.map(|plans| plans.len()),
+            Some(2)
+        );
+        assert_eq!(server.await.unwrap(), ["GET /v1/plans HTTP/1.1"]);
+    }
+
+    /// An older account has no catalog route; an unreachable one is no
+    /// different. Neither is an error or a warning: the page just names the
+    /// plans without amounts.
+    #[tokio::test]
+    async fn a_missing_or_unreachable_catalog_is_no_prices_and_never_an_error() {
+        let (endpoint, server) =
+            catalog::stub_service(vec![("404 Not Found", r#"{"error":"not_found"}"#)]).await;
+        let pro = Pro::new(Some(endpoint));
+        pro.ready.send_replace(true);
+        assert!(!pro.refresh_plans().await);
+        let status = pro.status_snapshot();
+        assert!(status.plans.is_none() && status.error.is_none());
+        assert!(status.connection_warning.is_none() && status.available);
+        server.await.unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let pro = Pro::new(Some(closed));
+        pro.ready.send_replace(true);
+        assert!(!pro.refresh_plans().await);
+        let status = pro.status_snapshot();
+        assert!(status.plans.is_none() && status.error.is_none());
+        assert!(status.connection_warning.is_none());
+        assert!(
+            !pro.wants_public_plans(),
+            "a failed read waits before retrying"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_an_endpoint_there_is_no_catalog_work() {
+        let pro = Pro::new(None);
+        assert!(!pro.wants_public_plans());
+        assert!(!pro.refresh_plans().await);
+        assert!(pro.status_snapshot().plans.is_none());
+    }
+
     #[test]
     fn a_lapsed_plan_or_missing_keeper_pauses_setup_without_signing_out() {
         let mut account = fixture_account();
@@ -1740,6 +1894,9 @@ async fn sign_out(app: &AppHandle, everywhere: bool, expected: Option<u64>) -> R
             _ => signout::clear(),
         }
         let _ = app.emit("pro-changed", ());
+        // The signed-out page shows the public catalog's prices: this reads it
+        // again unless a fresh answer is already held.
+        refresh_plans(app);
         // Signed out here either way; the code tells the page the rest
         // finishes on its own, which is not a failure to retry.
         anyhow::ensure!(!unfinished, code::SIGN_OUT_PENDING);

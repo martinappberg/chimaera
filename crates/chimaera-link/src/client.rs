@@ -647,6 +647,29 @@ impl Client {
         *self.inner.keeper.write().await = keeper;
         Ok(account)
     }
+    /// The public plan catalog, `GET /v1/plans` (`{"plans": [...] | null}`). It
+    /// carries no credentials (no bearer is sent even when this client holds
+    /// tokens), so it answers before anyone has signed in, and it never touches
+    /// the token or keeper state. `Ok(None)` means there are no offers to show:
+    /// the service has no catalog yet, or an older account has no such route
+    /// (404). Any other failure is an error the caller may retry later; it is
+    /// never a sign-in problem.
+    pub async fn plans(&self) -> Result<Option<Vec<PlanPrice>>> {
+        self.plans_within(PLANS_TIMEOUT).await
+    }
+    async fn plans_within(&self, timeout: Duration) -> Result<Option<Vec<PlanPrice>>> {
+        let response = self
+            .inner
+            .http
+            .get(path(&self.inner.account, &["v1", "plans"]))
+            .timeout(timeout)
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(json_response::<PlanCatalog>(response).await?.plans)
+    }
     async fn keeper(&self) -> Result<Url> {
         if let Some(keeper) = self.inner.keeper.read().await.clone() {
             return Ok(keeper);
@@ -1051,6 +1074,8 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(45);
 const REFRESH_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// Bounds the side-effect-free account check behind a keeper `401`.
 const ACCOUNT_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
+/// The public catalog is presentation only: a slow answer is just no prices.
+const PLANS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Whether a refresh request provably never reached the account: the
 /// connection itself (DNS, TCP or TLS) was never established. Anything later,
 /// including a timeout, may follow a committed rotation.
@@ -1151,6 +1176,124 @@ mod tests {
         let error = refresh_error(&silent).await;
         assert!(error.is_timeout(), "{error}");
         assert!(!refresh_never_sent(&error));
+        server.abort();
+    }
+
+    /// One canned answer on a loopback port; yields the request head it saw.
+    async fn answering(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let read = socket.read(&mut request).await.unwrap();
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+            String::from_utf8_lossy(&request[..read]).into_owned()
+        });
+        (endpoint, server)
+    }
+
+    /// The catalog answers before anyone signs in: no credentials go out (not
+    /// even a held token), and it reads exactly like `/v1/me`'s `plans`.
+    #[tokio::test]
+    async fn the_public_catalog_needs_no_credentials_and_reads_like_the_account_list() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (endpoint, server) = answering(
+            "200 OK",
+            r#"{"plans":[{"plan":"pro","interval":"month","amount_cents":111,"currency":"USD"},
+                {"plan":"team","interval":"month","amount_cents":1,"currency":"usd"},
+                {"plan":"max","interval":"year","amount_cents":"lots","currency":"usd"}]}"#,
+        )
+        .await;
+        let client = Client::new(
+            &endpoint,
+            Some(Tokens {
+                access_token: "held-access".into(),
+                refresh_token: "held-refresh".into(),
+                token_type: "Bearer".into(),
+                expires_in: 900,
+            }),
+        )
+        .unwrap();
+        let plans = client.plans().await.unwrap();
+        assert_eq!(
+            plans,
+            Some(vec![PlanPrice {
+                plan: Plan::Pro,
+                interval: BillingInterval::Month,
+                amount_cents: 111,
+                currency: "usd".into(),
+            }])
+        );
+        let head = server.await.unwrap().to_ascii_lowercase();
+        assert!(head.starts_with("get /v1/plans "), "{head}");
+        assert!(!head.contains("authorization"), "{head}");
+        assert!(client.tokens().await.is_some(), "no token state is touched");
+    }
+
+    /// An older account (no route) and an empty catalog are both "no prices";
+    /// only a real failure is an error, and none of them is a sign-in problem.
+    #[tokio::test]
+    async fn no_route_or_an_empty_catalog_is_no_prices_and_a_failure_is_an_error() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for (status, body) in [
+            ("404 Not Found", r#"{"error":"not_found"}"#),
+            ("200 OK", r#"{"plans":null}"#),
+            ("200 OK", "{}"),
+            ("200 OK", r#"{"plans":{"pro":1}}"#),
+        ] {
+            let (endpoint, server) = answering(status, body).await;
+            let plans = Client::new(&endpoint, None).unwrap().plans().await;
+            assert_eq!(plans.unwrap(), None, "{status} {body}");
+            server.await.unwrap();
+        }
+        // An empty list is a catalog that offers nothing, not an error.
+        let (endpoint, server) = answering("200 OK", r#"{"plans":[]}"#).await;
+        let plans = Client::new(&endpoint, None).unwrap().plans().await;
+        assert_eq!(plans.unwrap(), Some(Vec::new()));
+        server.await.unwrap();
+        for (status, body) in [
+            ("500 Internal Server Error", "{}"),
+            ("302 Found", "{}"),
+            ("200 OK", "not json"),
+        ] {
+            let (endpoint, server) = answering(status, body).await;
+            let plans = Client::new(&endpoint, None).unwrap().plans().await;
+            assert!(plans.is_err(), "{status} {body}");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silent_catalog_times_out_instead_of_hanging() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(socket);
+        });
+        let client = Client::new(&endpoint, None).unwrap();
+        let error = client
+            .plans_within(Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout),
+            "{error}"
+        );
         server.abort();
     }
 

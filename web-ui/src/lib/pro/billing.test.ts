@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ProBillingAttempt, ProStatus } from "../net/native";
-import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling, planPrice, planPrices } from "./billing";
+import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling, planMultiple, planPrice, planPrices } from "./billing";
 const attempt = (phase: ProBillingAttempt["phase"], kind: ProBillingAttempt["kind"] = "checkout"): ProBillingAttempt => ({ id: 7, kind, phase, expires_at: 123, error: "private failure token=never-render-this" });
 // Copy is free to change: these tests pin the pending/check/success flags and
 // which outcomes read alike or apart, never the wording.
@@ -148,6 +148,41 @@ describe("plan prices", () => {
       const value = [{ plan: "pro", interval: "month", ...entry }] as unknown as Parameters<typeof planPrice>[0];
       expect(planPrice(value, "pro", "month", "en-US")).toBeNull();
     }
+  });
+});
+
+describe("plan multiple", () => {
+  // Synthetic amounts: only their ratio matters, and none is a real price.
+  const offer = (plan: "pro" | "max", interval: "month" | "year", amount_cents: number, currency = "usd") => ({ plan, interval, amount_cents, currency });
+  it("says how many times Max costs Pro from the account's own amounts", () => {
+    expect(planMultiple([offer("pro", "month", 400), offer("max", "month", 1500)], "month", "en-US")).toBe("3.75× Pro");
+    expect(planMultiple([offer("pro", "month", 400), offer("max", "month", 1600)], "month", "en-US")).toBe("4× Pro");
+    expect(planMultiple([offer("pro", "month", 400), offer("max", "month", 1400)], "month", "en-US")).toBe("3.5× Pro");
+    // Two decimals at most.
+    expect(planMultiple([offer("pro", "month", 300), offer("max", "month", 1000)], "month", "en-US")).toBe("3.33× Pro");
+  });
+  it("compares month with month and year with year", () => {
+    const plans = [offer("pro", "month", 400), offer("max", "month", 1500), offer("pro", "year", 4000), offer("max", "year", 16000)];
+    expect(planMultiple(plans, "month", "en-US")).toBe("3.75× Pro");
+    expect(planMultiple(plans, "year", "en-US")).toBe("4× Pro");
+    // A missing side of the same interval is never filled from the other interval.
+    expect(planMultiple(plans.slice(0, 3), "year", "en-US")).toBeNull();
+  });
+  it("is hidden unless both amounts are present, positive and comparable", () => {
+    for (const absent of [undefined, null, []]) expect(planMultiple(absent, "month", "en-US")).toBeNull();
+    expect(planMultiple([offer("max", "month", 1500)], "month", "en-US")).toBeNull();
+    expect(planMultiple([offer("pro", "month", 400)], "month", "en-US")).toBeNull();
+    expect(planMultiple([offer("pro", "month", 0), offer("max", "month", 1500)], "month", "en-US")).toBeNull();
+    expect(planMultiple([offer("pro", "month", 400), offer("max", "month", 0)], "month", "en-US")).toBeNull();
+    expect(planMultiple([offer("pro", "month", 400), offer("max", "month", 1500, "eur")], "month", "en-US")).toBeNull();
+    expect(planMultiple([offer("pro", "month", -400), offer("max", "month", 1500)], "month", "en-US")).toBeNull();
+    expect(planMultiple([offer("pro", "month", 400.5), offer("max", "month", 1500)], "month", "en-US")).toBeNull();
+    // Not "more than Pro" (equal or cheaper) reads as no comparison at all.
+    expect(planMultiple([offer("pro", "month", 400), offer("max", "month", 400)], "month", "en-US")).toBeNull();
+    expect(planMultiple([offer("pro", "month", 400), offer("max", "month", 200)], "month", "en-US")).toBeNull();
+  });
+  it("accepts the same currency in any letter case", () => {
+    expect(planMultiple([offer("pro", "month", 400, "USD"), offer("max", "month", 1600, "usd")], "month", "en-US")).toBe("4× Pro");
   });
 });
 

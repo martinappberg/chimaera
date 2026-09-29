@@ -5,7 +5,7 @@
   import PlanBadge from "../shared/PlanBadge.svelte";
   import ProWalkthrough from "../pro/ProWalkthrough.svelte";
   import AccountUsage from "../pro/AccountUsage.svelte";
-  import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling, planPrices } from "../pro/billing";
+  import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling, planMultiple, planPrices } from "../pro/billing";
   import { onMount, tick, untrack } from "svelte";
   import MirrorSettings from "./MirrorSettings.svelte";
   import ConfirmDialog from "../shared/ConfirmDialog.svelte";
@@ -82,6 +82,8 @@
   const prices = $derived(planPrices(status?.plans));
   const price = (plan: PaidPlan, every: BillingInterval): string | null => prices?.[plan][every] ?? null;
   const priced = $derived(prices !== null);
+  /** "3.75× Pro" on the Max card, from the same account amounts; null hides it. */
+  const maxMultiple = $derived(priced ? planMultiple(status?.plans, interval) : null);
   const canReturnToPlans = $derived(billingRecovery && confirmedFree && reviewed !== null && reviewed === reviewKey(status));
   const errorBar = $derived(accountErrorBar(panel, error, failure, billingRecovery));
   /** A browser sign-in that ended without signing in: one quiet line; the
@@ -405,7 +407,7 @@
               <span class="plan-top"><span class="plan-name">{choice.name}</span><span class="selection-mark" aria-hidden="true"></span></span>
               <span class="plan-purpose">{choice.purpose}</span>
               <span class="plan-detail">{choice.detail}</span>
-              {#if priced}<span class="plan-price"><span class="price">{price(choice.plan, interval)}</span><span class="price-period">/ {interval === "year" ? "year" : "month"}</span></span>{/if}
+              {#if priced}<span class="plan-price"><span class="price">{price(choice.plan, interval)}</span><span class="price-period">/ {interval === "year" ? "year" : "month"}</span>{#if choice.plan === "max" && maxMultiple}<span class="price-period plan-multiple">{maxMultiple}</span>{/if}</span>{/if}
               <span class="plan-note">{choice.capacity}</span>
             </button>
           {/each}
@@ -510,9 +512,10 @@
   .selected .selection-mark { border: 4px solid var(--fg); }
   .plan-purpose { margin-top: 18px; font-size: var(--text-md); font-weight: 550; }
   .plan-detail { flex: 1; margin-top: 8px; color: var(--muted); font-size: var(--text-sm); font-weight: 400; line-height: 1.7; }
-  .plan-price { display: flex; align-items: baseline; gap: 7px; margin-top: 24px; }
+  .plan-price { display: flex; flex-wrap: wrap; align-items: baseline; gap: 7px; margin-top: 24px; }
   .price { font-size: 32px; font-weight: 550; letter-spacing: -.8px; }
   .price-period { color: var(--muted); font-size: var(--text-sm); font-weight: 400; }
+  .plan-multiple { margin-left: 3px; }
   .plan-note { margin-top: 7px; color: var(--muted); font-size: var(--text-xs); font-weight: 400; }
   .included { padding: 24px 0; border-bottom: 1px solid var(--edge); }
   .included ul { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 30px; padding-left: 16px; margin: 14px 0 0; font-size: var(--text-sm); line-height: 1.6; }

@@ -16,7 +16,9 @@ fixtures. An HTTPS account cannot redirect a bearer token to an HTTP keeper.
 Clients do not follow HTTP redirects on authenticated requests.
 
 Every request and WebSocket upgrade uses `Authorization: Bearer <access_token>`
-except the OAuth browser and token endpoints. Tokens never appear in URLs. Missing,
+except the OAuth browser and token endpoints and the public `GET /v1/plans`
+(which takes no credential; a client never sends one it holds). Tokens never
+appear in URLs. Missing,
 expired or revoked authentication returns `401` before a WebSocket upgrade. After an
 **account** `401` a client refreshes once and retries; a second `401` requires
 sign-in. A keeper `401` alone does not justify a rotation: keepers also refuse
@@ -52,6 +54,7 @@ is reported as `ServiceUnsupported`, never as a transient failure.
 | Method and path | Request | Response |
 | --- | --- | --- |
 | `GET /v1/me` | — | Account below; for a paid account it also marks the keeper as in use (it is not a free status probe) |
+| `GET /v1/plans` | — (no credentials) | Public `{plans}` catalog below; answers before sign-in |
 | `GET /v1/devices` | — | Device array below |
 | `DELETE /v1/devices/{id}` | — | `204`; revoke that device and its connections |
 | `POST /v1/sign-out-everywhere` | — | `204`; revoke all devices, close held SSH logins and all link sockets |
@@ -171,7 +174,23 @@ Optional additive fields, omitted by older services:
   amount in minor units and `currency` an ISO 4217 code. Clients never hardcode
   prices; without this list they show plan names only. An entry a client cannot
   interpret (a new plan or interval, a malformed amount) is dropped, never
-  failing the whole account read. Device rows are
+  failing the whole account read.
+
+**Public plan catalog.** `GET /v1/plans` is the same offers list without an
+account, so a signed-out page can show prices. It takes no credential: a client
+never sends a bearer it holds, and the route answers before anyone has signed
+in. The body is `{"plans":[...]}` with the same
+`{plan,interval,amount_cents,currency}` entries as `/v1/me`'s `plans` (a
+client reads them identically: an entry it cannot interpret is dropped, and it
+shows all four prices or none), or `{"plans":null}` before the service's first
+successful catalog fetch. A priced answer carries
+`Cache-Control: public, max-age=300`; a null answer and every error are
+`no-store`. A `404` from an older service means no prices: never an error and
+never a sign-in problem. A client treats the catalog as presentation only: it
+asks at most every five minutes, waits for it in no other operation, and prefers
+the `plans` of its own account once `/v1/me` has answered with one.
+
+Device rows are
 `{id,name,last_seen,this}` with `last_seen` an RFC 3339 timestamp and `this` true
 only for the requesting device. Device tokens are account credentials; daemon
 tokens below are separate, host-specific credentials.

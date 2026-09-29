@@ -56,9 +56,16 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    show an open laptop, an agent working above a closed laptop, and a shared
    project across devices; they are explanatory, not setup indicators.
    Local projects, agents and ordinary SSH remain free. Plan cards show prices
-   only when the account supplies them (optional `ProStatus.plans`); otherwise
-   they name the plans and say prices are shown at checkout. No price is built
-   into the app. **See plans** jumps directly to the comparison.
+   only when the service supplies them (optional `ProStatus.plans`); otherwise
+   they name the plans and say prices are shown at checkout. Before sign-in the
+   prices come from the service's public catalog (`GET /v1/plans`, no
+   credential), read in the background at app start and again after a sign-out
+   or when its five-minute answer has gone stale; a signed-in account's own list
+   takes precedence, and an older service without the route just shows no
+   prices. The Max card says how many times more it costs than Pro
+   (`planMultiple`, month against month, year against year), computed from the
+   same amounts. No price is built into the app. **See plans** jumps directly
+   to the comparison.
    Active subscribers see **Your Chimaera Pro** or **Your Chimaera Max** with
    account, cloud and project controls. They see no sales introduction or plan
    comparison. **Usage and plan details** shows the percentage of cloud work and
@@ -286,7 +293,8 @@ code), `connection_warning` (informational fixed code: `connection_preparing`,
 retries), `payment_due` (the account reports a payment problem),
 `returning_until` (an RFC 3339 time, or null: an ended plan's cloud work can be
 brought home until then) and `plans` (the
-account's offers with amounts, when the service supplies them; prices are never
+offers with amounts, when the service supplies them: the signed-in account's
+own list, else the public catalog from `GET /v1/plans`; prices are never
 hardcoded). `error` is `service_unsupported` when the Pro service does not
 support this app version; project continuity then stays off (rechecked every ten
 minutes) while local work, SSH and the account itself are unaffected.

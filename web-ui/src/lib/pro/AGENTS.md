@@ -17,7 +17,7 @@ enter UI settings or local storage.
 | `onboarding.svelte.ts` | Validated shared intent so a paused project opens the same onboarding flow; `canOpenOnboarding` (native app or account browser view) gates the paused-session connect action, since a plain browser tab has no Pro page. |
 | `AccountDevices.svelte` / `devices.ts` | Verified installation grouping, separate older sign-ins and named per-sign-in removal confirmation. Names never identify a computer. |
 | `AccountUsage.svelte` / `usage.ts` | Percentage-first account usage; real limits, bounded accessible bars, neutral unknown/zero allowance. |
-| `billing.ts` | Native billing copy, stale-attempt fencing and explicit upgrade-review eligibility; browser return never grants entitlement and raw errors never render. `planPrice` formats only account-supplied prices; `planPrices` is all four or none. |
+| `billing.ts` | Native billing copy, stale-attempt fencing and explicit upgrade-review eligibility; browser return never grants entitlement and raw errors never render. `planPrice` formats only service-supplied prices; `planPrices` is all four or none; `planMultiple` is the Max card's "3.75× Pro" (Max ÷ Pro for one interval, from the same amounts; null unless both are positive, in one currency, and Max is more). |
 | `presentation.ts` | Account, billing-intent and cloud-state copy; truthful project status (`copyIssue`: `pending`, `checkpoint_pending` and `ownership_unverified` are quiet progress, never attention; `cloud_setup_failed` is a problem that names the setup log; a `setting_up` project is progress unless its setup failed or it waits on an agent), `projectPlace` (who runs a project, in plain words), `signInNoteCopy` (the quiet line for an ended browser sign-in), `cloudCopy`'s remembered agent fact (true claims connected agents, false names the step while asleep, unknown claims nothing), `projectCopiesSetupLine` (`renewal_failed` reads "Reconnecting your account…"), `connectionWarningCopy` (one quiet line per connection state) and the finite preparation polling cadence. |
 | `account.ts` | The Pro page's panel from the last confirmed status (`accountPanel`: background reads never change it; only a check the user asked for shows checking), the error bar and whether it offers a check (`accountErrorBar`, `offersCheck`), the billing-review key, and when Max is offered (`nearLimit`). |
 | `status.ts` | Reading `ProStatus`: a real `accountFailure` vs an informational `connectionWarningCode` (older shells' two `error` messages map to `connection_preparing`/`connection_retrying`), `signInNote` (an ended browser sign-in: `sign_in_timed_out`, `sign_in_incomplete`, `browser_unavailable`, never an account failure), `paymentDue`, and `rechecksItself` (a failure the app rechecks on its own). |
@@ -71,8 +71,9 @@ enter UI settings or local storage.
   No status or discovery operation carries wake intent.
 
 - Prices are never built into the UI; they come only from optional
-  `ProStatus.plans`, and only when all four (Pro/Max, monthly/yearly) are
-  valid. Otherwise no amount shows anywhere: the cards name the plans and the
+  `ProStatus.plans` (the signed-in account's list, else the native shell's read
+  of the service's public catalog, so a signed-out page shows them too), and
+  only when all four (Pro/Max, monthly/yearly) are valid. Otherwise no amount shows anywhere: the cards name the plans and the
   heading and purchase line say prices are shown at checkout.
 - Nothing asks the user to refresh or retry what the page can do itself:
   polls re-check, a pending privacy change is re-sent (≤1/min while visible),
