@@ -644,6 +644,177 @@ async fn unavailable_logical_project_never_falls_back_to_stale_local_files() {
         .store(true, std::sync::atomic::Ordering::Release);
 }
 
+/// A window watching a project that runs on another daemon gets that
+/// project's frames merged into its own events stream — never the owner's
+/// settings, recents or notices — and its socket survives an owner change.
+#[tokio::test]
+async fn events_for_a_routed_project_merge_only_its_frames_and_survive_an_owner_change() {
+    use std::sync::atomic::Ordering;
+    let remote = test_state();
+    let local = test_state();
+    let workspace = lock(&remote.workspaces)
+        .add(test_dir("events-remote").canonicalize().unwrap())
+        .unwrap();
+    let mut viewing = workspace.clone();
+    viewing.root = test_dir("events-local").canonicalize().unwrap();
+    lock(&local.workspaces)
+        .import_exact(viewing.clone())
+        .unwrap();
+    let note = workspace.root.join("note.txt");
+    std::fs::write(&note, "v0").unwrap();
+    pro::install_execution_fixture(&remote, &workspace.id, 4).unwrap();
+    // A session on the owner, so it can raise a notice of its own.
+    let shell = remote
+        .sessions
+        .spawn(chimaera_pty::SpawnOpts {
+            cwd: workspace.root.clone(),
+            name: None,
+            cols: 80,
+            rows: 24,
+            command: None,
+            id: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            scrollback: None,
+        })
+        .unwrap()
+        .id;
+    lock(&remote.session_workspaces).insert(shell.clone(), workspace.id.clone());
+    lock(&remote.agents).insert(
+        shell.clone(),
+        agents::AgentRecord::new("key".into(), agents::AgentKind::Claude),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = listener.local_addr().unwrap();
+    let router = app(remote.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let register = |host: &'static str, epoch: u64| {
+        let local = local.clone();
+        let workspace = workspace.id.clone();
+        async move {
+            request(
+                &local,
+                Method::POST,
+                "/api/v1/pro/placements",
+                Some(serde_json::json!({
+                    "host_id":host,"endpoint":format!("http://{remote_addr}"),
+                    "token":"test-token","workspace_id":workspace,"epoch":epoch
+                })),
+            )
+            .await
+            .0
+        }
+    };
+    assert_eq!(register("worker-events", 4).await, StatusCode::NO_CONTENT);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    let router = app(local.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{local_addr}/ws/events"))
+        .await
+        .unwrap();
+    socket
+        .send(Message::Text(
+            serde_json::json!({"type":"auth","token":"test-token"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let viewer_note = viewing.root.join("note.txt").to_string_lossy().into_owned();
+    socket
+        .send(Message::Text(
+            serde_json::json!({"type":"watch","workspace_id":workspace.id,"files":[viewer_note],"dirs":[]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    // Owner-side changes that must never reach this window...
+    let (status, _) = request(
+        &remote,
+        Method::PUT,
+        "/api/v1/settings",
+        Some(serde_json::json!({"test.owner_marker":"owner-only"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    remote.recents_epoch.fetch_add(7, Ordering::Relaxed);
+    // ...and one that must: the project's own file changing on its owner.
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut writes = 0;
+    let mut noticed = false;
+    'fs: loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no fs frame for the owner's change; saw {seen:?}"
+        );
+        writes += 1;
+        std::fs::write(&note, format!("v{writes}")).unwrap();
+        if !noticed {
+            noticed =
+                crate::notices::push_agent_notice(&remote, &shell, None, "owner notice").is_ok();
+            remote.changes.notify_waiters();
+        }
+        let wait = tokio::time::Instant::now() + std::time::Duration::from_millis(700);
+        while let Ok(Some(Ok(Message::Text(text)))) =
+            tokio::time::timeout_at(wait, futures::StreamExt::next(&mut socket)).await
+        {
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            seen.push(frame["type"].as_str().unwrap_or_default().to_owned());
+            assert_ne!(frame["type"], "error", "{frame}");
+            assert_ne!(
+                frame["type"], "notices",
+                "owner notices never reach this window"
+            );
+            if frame["type"] == "settings" {
+                assert!(
+                    frame["settings"].get("test.owner_marker").is_none(),
+                    "the owner's settings must not replace this window's"
+                );
+            }
+            if frame["type"] == "recents" {
+                assert_ne!(frame["epoch"], 7, "the owner's recents epoch leaked");
+            }
+            if frame["type"] == "fs"
+                && frame["files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|path| path == viewer_note.as_str())
+            {
+                break 'fs;
+            }
+        }
+    }
+    assert!(noticed, "the owner raised a notice while viewed");
+
+    // The project changes owner. The window's own socket stays and keeps
+    // serving this daemon's frames.
+    assert_eq!(register("worker-other", 5).await, StatusCode::NO_CONTENT);
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    let (status, _) = request(
+        &local,
+        Method::PUT,
+        "/api/v1/settings",
+        Some(serde_json::json!({"test.viewer_marker":"still-here"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "error", "{frame}");
+        if frame["type"] == "settings" && frame["settings"]["test.viewer_marker"] == "still-here" {
+            break;
+        }
+    }
+    remote.sessions.kill(&shell).ok();
+    for state in [&remote, &local] {
+        state.stopping.store(true, Ordering::Release);
+    }
+}
+
 /// An in-process stand-in for the account transport in front of a real
 /// daemon: while "asleep" it answers health for the owner (marked sleeping)
 /// and refuses socket upgrades that carry no interaction, exactly as the

@@ -285,6 +285,13 @@ impl Store {
             (stamp, *epoch, std::time::Instant::now()),
         );
     }
+    /// Whether this project currently runs on another registered owner.
+    pub(crate) fn routed(&self, workspace: &str) -> bool {
+        crate::lock(&self.inner)
+            .routes
+            .values()
+            .any(|route| route.workspaces.contains_key(workspace))
+    }
     fn for_workspace(&self, workspace: &str) -> Option<Route> {
         crate::lock(&self.inner)
             .routes
@@ -1507,126 +1514,175 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
         }
     }
 }
-pub(crate) async fn events(
-    state: &AppState,
-    workspace: &str,
-    watch: Value,
-    downstream: &mut axum::extract::ws::WebSocket,
-) -> bool {
-    let Some(route) = state.session_proxy.for_workspace(workspace) else {
-        return false;
-    };
-    socket_route(
-        state,
-        route,
-        workspace,
-        "",
-        "events",
-        &SocketOptions::default(),
-        json!({"type":"auth"}),
-        Some(watch),
-        downstream,
-    )
-    .await;
-    true
+/// One project's live frames from its current owner, merged into a window's
+/// own `/ws/events` loop. The window's daemon stays authoritative for
+/// everything else: the owner's settings, recents, notices, updates and
+/// plugin frames describe the owner's machine and are never forwarded, and
+/// the feed ending (an owner change, a sleeping owner) never closes the
+/// window's socket — its loop simply starts another feed.
+pub(crate) enum FeedFrame {
+    /// A path-only invalidation, already in this window's paths.
+    Fs(Value),
+    /// The project's Git epoch on its owner.
+    Git(u64),
+    /// The project's Timeline epoch on its owner.
+    Timeline(u64),
 }
-#[allow(clippy::too_many_arguments)]
-async fn socket_route(
-    state: &AppState,
-    route: Route,
-    workspace: &str,
-    id: &str,
-    kind: &str,
-    options: &SocketOptions,
-    mut auth: Value,
-    initial_watch: Option<Value>,
-    downstream: &mut axum::extract::ws::WebSocket,
-) {
-    use axum::extract::ws::Message as Down;
-    use tokio_tungstenite::tungstenite::Message as Up;
-    let result: Result<()> = async {
-        let _permit = SOCKETS.try_acquire().context("remote stream limit")?;
-        let reach = verify_scope(&state.session_proxy, &route, workspace).await?;
-        let wake = !options.read_only && options.wake.as_deref() == Some("interaction");
-        // Viewing never wakes a sleeping owner; only interaction may.
-        if reach == Reach::Sleeping && !wake { bail!("owner asleep"); }
-        let address = route.address.context("remote placement unavailable")?;
-        let query = if options.read_only { "?read_only=true" } else if wake { "?wake=interaction" } else { "" };
-        let url = if kind=="events" {format!("ws://{address}/ws/events")} else {format!("ws://{address}/ws/{kind}/{id}{query}")};
-        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default().max_message_size(Some(10 * 1024 * 1024)).max_frame_size(Some(10 * 1024 * 1024));
-        let connect = if reach == Reach::Sleeping { WAKE_DEADLINE } else { Duration::from_secs(15) };
-        let (mut upstream, _) = tokio::time::timeout(connect, tokio_tungstenite::connect_async_with_config(url, Some(config), false)).await??;
-        let epoch=route.workspaces.get(workspace).context("workspace route missing")?;
-        auth["workspace_id"]=json!(workspace); auth["epoch"]=json!(epoch); auth["viewer_root"]=json!("L3Byb2plY3Q");
-        auth["token"] = json!(route.token);
-        bounded_send(&mut upstream, Up::Text(auth.to_string().into())).await?;
-        let alias=route.alias(workspace).context("project mapping unavailable")?;
-        if let Some(mut watch)=initial_watch { map_watch(&alias,&mut watch); bounded_send(&mut upstream,Up::Text(watch.to_string().into())).await?; }
-
-        let mut ownership = tokio::time::interval(Duration::from_secs(2));
-        ownership.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = ownership.tick() => if !state.session_proxy.current(&route, workspace) { bail!("placement changed"); },
-                next = upstream.next() => match next {
-                    Some(Ok(Up::Text(text))) => {
-                        let mut value:Value=serde_json::from_str(&text)?;
-                        if kind=="events" {map_event(&alias,&mut value);} else if kind=="sessions" && value["type"]=="ready" {alias.session(&mut value);}
-                        bounded_send(downstream,Down::Text(value.to_string().into())).await?;
-                    },
-                    Some(Ok(Up::Binary(bytes))) => bounded_send(downstream, Down::Binary(bytes)).await?,
-                    Some(Ok(Up::Ping(bytes))) => bounded_send(&mut upstream, Up::Pong(bytes)).await?,
-                    Some(Ok(Up::Close(_))) | None => break,
-                    Some(Err(error)) => return Err(error.into()),
-                    _ => {},
-                },
-                next = downstream.recv() => match next {
-                    Some(Ok(Down::Text(text))) => {
-                        if !state.session_proxy.current(&route, workspace) {bail!("placement changed");}
-                        if kind=="events" {
-                            let mut watch:Value=serde_json::from_str(&text)?;
-                            if watch["type"]!="watch" || watch["workspace_id"].as_str().is_some_and(|id|id!=workspace) {break;}
-                            map_watch(&alias,&mut watch);
-                            bounded_send(&mut upstream,Up::Text(watch.to_string().into())).await?;
-                        } else {bounded_send(&mut upstream,Up::Text(text.to_string().into())).await?;}
-                    },
-                    Some(Ok(Down::Binary(bytes))) => {if !state.session_proxy.current(&route, workspace) {bail!("placement changed");} bounded_send(&mut upstream, Up::Binary(bytes)).await?;},
-                    Some(Ok(Down::Ping(bytes))) => bounded_send(downstream, Down::Pong(bytes)).await?,
-                    Some(Ok(Down::Close(_))) | None => break,
-                    Some(Err(error)) => return Err(error.into()),
-                    _ => {},
-                },
+pub(crate) struct Feed {
+    pub(crate) workspace: String,
+    paths: tokio::sync::watch::Sender<(Vec<String>, Vec<String>)>,
+    frames: tokio::sync::mpsc::Receiver<FeedFrame>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Drop for Feed {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+impl Feed {
+    /// Viewing is passive: a feed never wakes a sleeping owner.
+    pub(crate) fn start(
+        state: Arc<AppState>,
+        workspace: String,
+        files: Vec<String>,
+        dirs: Vec<String>,
+    ) -> Self {
+        let (paths, watched) = tokio::sync::watch::channel((files, dirs));
+        let (sender, frames) = tokio::sync::mpsc::channel(16);
+        let task = tokio::spawn({
+            let workspace = workspace.clone();
+            async move {
+                // Returning drops `sender`: the loop sees the feed end.
+                let _ = feed(&state, &workspace, watched, sender).await;
             }
+        });
+        Self {
+            workspace,
+            paths,
+            frames,
+            task,
         }
-        Ok(())
-    }.await;
-    if result.is_err() {
-        let _ = bounded_send(downstream, Down::Text(json!({"type":"error","code":"remote_unavailable","message":"Session host is unavailable"}).to_string().into())).await;
+    }
+    /// The window's mounted previews and listed folders, in its own paths.
+    pub(crate) fn watch(&self, files: Vec<String>, dirs: Vec<String>) {
+        let _ = self.paths.send((files, dirs));
+    }
+    /// `None` once the feed ended.
+    pub(crate) async fn next(&mut self) -> Option<FeedFrame> {
+        self.frames.recv().await
+    }
+}
+async fn feed(
+    state: &AppState,
+    workspace: &str,
+    mut paths: tokio::sync::watch::Receiver<(Vec<String>, Vec<String>)>,
+    frames: tokio::sync::mpsc::Sender<FeedFrame>,
+) -> Result<()> {
+    let route = state
+        .session_proxy
+        .for_workspace(workspace)
+        .context("project route retired")?;
+    let _permit = SOCKETS.try_acquire().context("remote stream limit")?;
+    if verify_scope(&state.session_proxy, &route, workspace).await? == Reach::Sleeping {
+        bail!("owner asleep");
+    }
+    let address = route.address.context("remote placement unavailable")?;
+    let alias = route
+        .alias(workspace)
+        .context("project mapping unavailable")?;
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(10 * 1024 * 1024))
+        .max_frame_size(Some(10 * 1024 * 1024));
+    let (mut upstream, _) = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio_tungstenite::connect_async_with_config(
+            format!("ws://{address}/ws/events"),
+            Some(config),
+            false,
+        ),
+    )
+    .await??;
+    let epoch = route
+        .workspaces
+        .get(workspace)
+        .context("workspace route missing")?;
+    let auth = json!({"type":"auth","token":route.token,"workspace_id":workspace,
+        "epoch":epoch,"viewer_root":"L3Byb2plY3Q"});
+    bounded_send(&mut upstream, Up::Text(auth.to_string().into())).await?;
+    let registration = |(files, dirs): &(Vec<String>, Vec<String>)| {
+        let map = |paths: &[String]| paths.iter().map(|p| alias.input(p)).collect::<Vec<_>>();
+        json!({"type":"watch","workspace_id":workspace,"files":map(files),"dirs":map(dirs)})
+    };
+    let initial = registration(&paths.borrow_and_update());
+    bounded_send(&mut upstream, Up::Text(initial.to_string().into())).await?;
+    let mut ownership = tokio::time::interval(Duration::from_secs(2));
+    ownership.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = ownership.tick() => {
+                if !state.session_proxy.current(&route, workspace) {
+                    return Ok(());
+                }
+            }
+            changed = paths.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                let watch = registration(&paths.borrow_and_update());
+                bounded_send(&mut upstream, Up::Text(watch.to_string().into())).await?;
+            }
+            next = upstream.next() => match next {
+                Some(Ok(Up::Text(text))) => {
+                    let Ok(mut value) = serde_json::from_str::<Value>(&text) else { continue };
+                    match value["type"].as_str() {
+                        Some("sessions") => {
+                            // The same rows the roster poll installs, just
+                            // sooner; the merged local snapshot stays the one
+                            // authority, so a tab whose session lives only
+                            // on this computer is never pruned.
+                            alias.response("/sessions", &mut value["sessions"]);
+                            let rows = serde_json::from_value(value["sessions"].take()).unwrap_or_default();
+                            if state.session_proxy.install_workspace(&route, workspace, rows) {
+                                state.changes.notify_waiters();
+                            }
+                        }
+                        Some("fs") => {
+                            map_fs(&alias, &mut value);
+                            frames.send(FeedFrame::Fs(value)).await?;
+                        }
+                        Some("git") => {
+                            if let Some(epoch) = value["epochs"][workspace].as_u64() {
+                                frames.send(FeedFrame::Git(epoch)).await?;
+                            }
+                        }
+                        Some("timeline") => {
+                            if let Some(epoch) = value["epochs"][workspace].as_u64() {
+                                frames.send(FeedFrame::Timeline(epoch)).await?;
+                            }
+                        }
+                        // The owner's connection for this project changed:
+                        // end, and let the window's loop start afresh.
+                        Some("error") => return Ok(()),
+                        // Settings, recents, notices, updates and plugin
+                        // frames describe the owner's machine, not this window.
+                        _ => {}
+                    }
+                }
+                Some(Ok(Up::Ping(bytes))) => bounded_send(&mut upstream, Up::Pong(bytes)).await?,
+                Some(Ok(Up::Close(_))) | None => return Ok(()),
+                Some(Err(error)) => return Err(error.into()),
+                _ => {}
+            },
+        }
     }
 }
 
-fn map_watch(alias: &crate::workspace_scope::paths::Alias, value: &mut Value) {
-    for key in ["files", "dirs"] {
+fn map_fs(alias: &crate::workspace_scope::paths::Alias, value: &mut Value) {
+    for key in ["files", "removed", "dirs", "removed_dirs"] {
         if let Some(paths) = value[key].as_array_mut() {
             for path in paths {
                 if let Some(raw) = path.as_str() {
-                    *path = json!(alias.input(raw));
-                }
-            }
-        }
-    }
-}
-fn map_event(alias: &crate::workspace_scope::paths::Alias, value: &mut Value) {
-    if value["type"] == "sessions" {
-        alias.response("/sessions", &mut value["sessions"]);
-    }
-    if value["type"] == "fs" {
-        for key in ["files", "removed", "dirs", "removed_dirs"] {
-            if let Some(paths) = value[key].as_array_mut() {
-                for path in paths {
-                    if let Some(raw) = path.as_str() {
-                        *path = json!(alias.output(raw));
-                    }
+                    *path = json!(alias.output(raw));
                 }
             }
         }
