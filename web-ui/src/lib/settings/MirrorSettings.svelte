@@ -2,7 +2,7 @@
   import { untrack } from "svelte";
   import { cloudOnboarding } from "../pro/onboarding.svelte";
   import { pageVisible } from "../shared/visibility";
-  import { copyIssue, projectCopyError } from "../pro/presentation";
+  import { copyIssue, projectCopiesSetupLine, projectCopyError } from "../pro/presentation";
   import { computerSteps, proposedSetup, settleProposal, type ProposalDecision } from "../pro/profile";
   import { proMirrorStatus, proSetNeverMirror, type MirrorStatus, type MirrorWorkspace } from "../net/native";
   let { visible = true, recoveryOnly = false }: { visible?: boolean; recoveryOnly?: boolean } = $props();
@@ -94,7 +94,7 @@
   <h3>Project copies</h3>
   {#if !recoveryOnly}<p class="hint">Your files, conversations and supported agent settings stay together across devices. Connected services are authorized separately.</p>{:else}<p class="hint">You can still manage project privacy without an active plan.</p>{/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}
-  {#if !recoveryOnly && status && !status.configured}<p class="hint">Automatic project copying is getting ready. You can keep working here.</p>{/if}
+  {#if !recoveryOnly && projectCopiesSetupLine(status) !== null}<p class="hint" role="status">{projectCopiesSetupLine(status)}</p>{/if}
   {#if status?.workspaces.length === 0}<p class="hint">No project copies to show yet.</p>{/if}
   {#each status?.workspaces ?? [] as workspace (workspace.workspace_id)}
     {@const steps = computerSteps(workspace.profile)}

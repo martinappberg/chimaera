@@ -1130,6 +1130,9 @@ export interface MirrorWorkspace {
 }
 export interface MirrorStatus {
   configured: boolean; projects_root: string; projects_root_confirmed: boolean; workspaces: MirrorWorkspace[];
+  /** Additive: the account connection lapsed and the app is renewing it
+   * (then `configured` is false too). */
+  renewal_failed?: boolean;
   sessions: { id: string; workspace_id: string; display_name?: string; name: string }[];
 }
 export async function proMirrorStatus(): Promise<MirrorStatus> {

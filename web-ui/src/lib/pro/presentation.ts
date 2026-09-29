@@ -59,6 +59,9 @@ const COPY_ERROR_CODES: Record<string, string> = {
   git_too_old: "Git on this computer is too old for cloud copies. Update Git and the copies resume on their own.",
   conversation_not_saved: "A conversation couldn’t be included in the latest project copy. Your work remains on this device.",
   root_setup_required: "Project setup didn’t finish. Your saved work is intact, but this project can’t continue in the cloud yet.",
+  // The saved setup command failed on the cloud machine; its output is kept
+  // in the project's setup log there.
+  cloud_setup_failed: "Project setup on the cloud machine didn’t finish. Your files are safe; open the project’s setup log for details.",
   cache_recovery_needed: "The cloud copy needs a repair. Chimaera rebuilds it from the last saved copy on its own.",
   previous_processes_running: "Waiting for this project’s earlier agents to finish before it continues.",
   ownership_changed: "This project moved. Chimaera is catching up with where it runs now.",
@@ -96,6 +99,26 @@ export function projectCopyError(reason: string, code?: string | null): string {
 }
 
 
+/** The line under Project copies while automatic copying is not set up on
+ * this computer; null once it is. A lapsed account connection is renewed by
+ * the app on its own, so it reads as quiet progress with nothing to press. */
+export function projectCopiesSetupLine(projects: Pick<MirrorStatus, "configured" | "renewal_failed"> | null): string | null {
+  if (projects === null || projects.configured) return null;
+  return projects.renewal_failed === true ? "Reconnecting your account…" : "Automatic project copying is getting ready. You can keep working here.";
+}
+
+/** One quiet line for an informational connection state (`status.ts`
+ * `connectionWarningCode`). The app recovers each by itself; none offers a
+ * button, and none is an account failure. */
+export function connectionWarningCopy(code: string | null): string {
+  switch (code) {
+    case "connection_retrying": return "Reconnecting to the cloud… Work on this computer continues as usual.";
+    case "account_unreachable": return "Your account can’t be reached right now. Work on this computer continues as usual.";
+    // connection_preparing, and any code a newer app sends.
+    default: return "Connecting to the cloud… Work on this computer continues as usual.";
+  }
+}
+
 /** Faster startup checks are finite, sequential in CloudSetup, and never wake compute. */
 export function cloudPollDelay(preparing: boolean, elapsedMs: number): number {
   return preparing && elapsedMs < 5 * 60_000 ? 5000 : 30_000;
@@ -112,6 +135,7 @@ export function cloudProjectStatus(projects: MirrorStatus | null, workspaceId?: 
   if (!projects) return null;
   const rows = projects.workspaces.filter(p => !p.never_mirror && (!workspaceId || p.workspace_id === workspaceId));
   if (!rows.length) return null;
+  if (!projects.configured && projects.renewal_failed === true) return { title: "Reconnecting your account…", detail: "Copies continue once it’s back. Work on this computer continues as usual.", state: "active" };
   if (!projects.configured) return { title: "Getting your projects ready", detail: "Copies start automatically.", state: "active" };
   if (rows.some(p => p.ownership?.state === "hydrating")) return { title: "Restoring your project", detail: "Your files and conversations are being restored here.", state: "active" };
   if (rows.some(p => p.ownership?.state === "transferring")) return { title: "Keeping your work with you", detail: "Chimaera is saving your files and conversation so work can continue.", state: "active" };

@@ -49,6 +49,11 @@ export async function cloudRequest(request: CloudSetupRequest, signal?: AbortSig
       const details = await response.json().catch(() => null);
       if (details?.error === "provider_busy") throw new Error("provider_busy");
     }
+    // A half-pasted code leaves the sign-in waiting, so it can be pasted again.
+    if (request.operation === "provider_submit" && response.status === 409) {
+      const details = await response.json().catch(() => null);
+      if (details?.error === "authorization_code_incomplete") throw new Error("authorization_code_incomplete");
+    }
     throw new Error("This cloud operation couldn't finish. Please try again.");
   }
   return response.status === 204 ? {} : await response.json() as CloudSetupInfo;

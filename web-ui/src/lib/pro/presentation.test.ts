@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { MirrorStatus, MirrorWorkspace } from "../net/native";
-import { paid, readIntent, cloudCopy, cloudPollDelay, cloudProjectStatus, copyIssue, friendlyError, projectCopyError, alreadySubscribed, recoverableAccountRestore } from "./presentation";
+import { paid, readIntent, cloudCopy, cloudPollDelay, cloudProjectStatus, connectionWarningCopy, copyIssue, friendlyError, projectCopiesSetupLine, projectCopyError, alreadySubscribed, recoverableAccountRestore } from "./presentation";
 
 // Copy is free to change; these tests pin which states read alike or apart,
 // what takes precedence, and that nothing from a raw error reaches the page.
@@ -130,6 +130,31 @@ describe("cloud preparation progress", () => {
     expect(copyIssue(row("saved", 123).mirror)).toBe("none");
     expect(copyIssue(null)).toBe("none");
     expect(copyIssue(undefined)).toBe("none");
+  });
+  it("explains a failed cloud setup on its own, as a problem", () => {
+    const setup = (): MirrorWorkspace => { const r = row("saved", 123); r.mirror!.error = "project setup failed"; r.mirror!.error_code = "cloud_setup_failed"; return r; };
+    expect(copyIssue(setup().mirror)).toBe("problem");
+    expect(cloudProjectStatus(mirror([setup()]))?.state).toBe("attention");
+    const text = projectCopyError("project setup failed", "cloud_setup_failed");
+    expect(text).not.toBe(projectCopyError("project setup failed"));
+    expect(text).not.toBe(projectCopyError("x", "root_setup_required"));
+  });
+  it("reads a lapsed account connection as quiet progress, apart from first setup", () => {
+    const renewing = { ...mirror([row("saved", 123)]), configured: false, renewal_failed: true };
+    const starting = { ...mirror([row("saved", 123)]), configured: false };
+    expect(cloudProjectStatus(renewing)?.state).toBe("active");
+    expect(cloudProjectStatus(renewing)?.title).not.toBe(cloudProjectStatus(starting)?.title);
+    expect(projectCopiesSetupLine(renewing)).not.toBeNull();
+    expect(projectCopiesSetupLine(renewing)).not.toBe(projectCopiesSetupLine(starting));
+    expect(projectCopiesSetupLine(mirror([]))).toBeNull();
+    expect(projectCopiesSetupLine({ ...mirror([]), renewal_failed: true })).toBeNull();
+    expect(projectCopiesSetupLine(null)).toBeNull();
+  });
+  it("gives each connection state its own quiet line", () => {
+    const lines = ["connection_preparing", "connection_retrying", "account_unreachable"].map(connectionWarningCopy);
+    expect(new Set(lines).size).toBe(3);
+    for (const line of lines) expect(line).not.toBe("");
+    expect(connectionWarningCopy("a_newer_code")).toBe(connectionWarningCopy("connection_preparing"));
   });
   it("limits rapid visible preparation checks to five minutes and keeps passive states slow", () => {
     expect(cloudPollDelay(true, 0)).toBe(5000);

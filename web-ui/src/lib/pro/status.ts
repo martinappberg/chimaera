@@ -1,10 +1,11 @@
 import type { ProStatus } from "../net/native";
 
 /** Informational messages older native shells reported through `error` while
- * the always-on connection came up. Newer shells send `connection_warning`. */
-const LEGACY_WARNINGS: ReadonlySet<string> = new Set([
-  "You're signed in. Your Pro connection is preparing; Chimaera will reconnect automatically.",
-  "Your account is up to date. The Pro connection is not ready yet; Chimaera will retry automatically.",
+ * the always-on connection came up, and the code newer shells send instead in
+ * `connection_warning`. */
+const LEGACY_WARNINGS: ReadonlyMap<string, string> = new Map([
+  ["You're signed in. Your Pro connection is preparing; Chimaera will reconnect automatically.", "connection_preparing"],
+  ["Your account is up to date. The Pro connection is not ready yet; Chimaera will retry automatically.", "connection_retrying"],
 ]);
 
 type StatusFields = Pick<ProStatus, "error" | "connection_warning">;
@@ -27,8 +28,13 @@ export function paymentDue(status: Pick<ProStatus, "signed_in" | "payment_due"> 
   return status?.signed_in === true && status.payment_due === true;
 }
 
-/** The connection behind cloud features is still coming up. Local work and the
- * account itself are unaffected, so this is shown quietly, with no action. */
-export function connectionWarning(status: StatusFields | null | undefined): boolean {
-  return Boolean(status?.connection_warning) || (status?.error != null && LEGACY_WARNINGS.has(status.error));
+/** Which informational connection state the account is in, if any:
+ * `connection_preparing`, `connection_retrying`, `account_unreachable`, or a
+ * newer shell's code (older shells' two messages in `error` map to the first
+ * two). Local work and the account itself are unaffected, so each shows as one
+ * quiet line (`presentation.ts` `connectionWarningCopy`) with no action, and
+ * none is a failure or an entitlement signal. Null when there is none. */
+export function connectionWarningCode(status: StatusFields | null | undefined): string | null {
+  if (status?.connection_warning) return status.connection_warning;
+  return status?.error != null ? LEGACY_WARNINGS.get(status.error) ?? null : null;
 }

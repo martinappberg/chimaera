@@ -231,7 +231,11 @@
       if (!result.connection) throw new Error("missing connection");
       connection = result.connection;
       if (connection.phase === "connected") void load();
-    } catch { if (alive && request === mutation) connectionNotice = "The code couldn't be confirmed. Check sign-in status, or start again for a fresh code."; }
+    } catch (cause) {
+      if (alive && request === mutation) connectionNotice = cause instanceof Error && cause.message === "authorization_code_incomplete"
+        ? connectionError("authorization_code_incomplete")
+        : "The code couldn't be confirmed. Check sign-in status, or start again for a fresh code.";
+    }
     finally { if (alive && request === mutation) busy = null; }
   }
   async function copyCode(): Promise<void> {

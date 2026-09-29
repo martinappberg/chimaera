@@ -62,6 +62,11 @@ describe("cloud disconnection", () => {
     expect(connectionError("external_auth_unverified", "disconnect")).toContain("managed outside Chimaera");
     expect(connectionError("provider_busy", "disconnect")).toContain("in progress");
   });
+  it("tells a half-pasted code apart from a failed sign-in", () => {
+    expect(connectionError("authorization_code_incomplete")).not.toBe(connectionError("unknown_code"));
+    expect(connectionError("authorization_code_incomplete")).not.toBe(connectionError("sign_in_not_confirmed"));
+    expect(connectionError("device_auth_disabled")).toBe(connectionError("unknown_code"));
+  });
   it("does not keep old success claims after an external connection change or a failed refresh", () => {
     expect(connectionSuccessCurrent(attempt("disconnected", "disconnect"), [row("codex", "needs_sign_in")], true)).toBe(true);
     expect(connectionSuccessCurrent(attempt("disconnected", "disconnect"), [row("codex", "signed_in")], true)).toBe(false);

@@ -82,3 +82,13 @@ it("submits an authorization code only to its owned connection without navigatio
   expect(JSON.parse(options.body)).toEqual({ code: "synthetic-code#state" });
   expect(dispatchEvent).not.toHaveBeenCalled();
 });
+
+it("carries only the bounded incomplete-code refusal back from a code submission", async () => {
+  const request = { operation: "provider_submit", connection_id: "attempt-1", code: "synthetic-code" } as const;
+  mocks.api.mockResolvedValueOnce(Response.json({ error: "authorization_code_incomplete" }, { status: 409 }));
+  await expect(cloudRequest(request)).rejects.toThrow("authorization_code_incomplete");
+  for (const [error, status] of [["connection_not_waiting", 409], ["SECRET raw stderr", 409], ["authorization_code_incomplete", 400]] as const) {
+    mocks.api.mockResolvedValueOnce(Response.json({ error }, { status }));
+    await expect(cloudRequest(request)).rejects.toThrow("This cloud operation couldn't finish. Please try again.");
+  }
+});
