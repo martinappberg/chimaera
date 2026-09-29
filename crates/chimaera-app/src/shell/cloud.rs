@@ -57,9 +57,6 @@ pub enum Request {
         workspace_id: String,
         expected_epoch: u64,
     },
-    Onboard {
-        agent: String,
-    },
     Project {
         url: String,
         name: Option<String>,
@@ -211,7 +208,6 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
     let wake = matches!(
         request,
         Request::Start
-            | Request::Onboard { .. }
             | Request::Project { .. }
             | Request::ProviderConnect { .. }
             | Request::ProviderDisconnect { .. }
@@ -293,10 +289,6 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
             "hydrate".into(),
             Some(json!({"workspace_id":workspace_id,"expected_epoch":expected_epoch})),
         ),
-        Request::Onboard { agent } if provider_definition(&agent).is_some() => {
-            ("cloud/onboard".into(), Some(json!({"agent":agent})))
-        }
-        Request::Onboard { .. } => return Err("This provider is not supported yet.".into()),
         Request::Project { url, name }
             if url.len() <= 4096 && name.as_ref().is_none_or(|name| name.len() <= 80) =>
         {
@@ -355,6 +347,9 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
                 // This fixed code is mapped to copy by the typed UI. Never
                 // forward arbitrary provider errors or CLI output.
                 Some("provider_busy") => "provider_busy",
+                // Half a pasted `code#state`: the attempt stays open, the UI
+                // asks for the whole code.
+                Some("authorization_code_incomplete") => "authorization_code_incomplete",
                 _ => SETUP_FAILED,
             }
             .into());
