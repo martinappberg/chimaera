@@ -360,8 +360,11 @@
   }
 
   async function startDictation() {
-    const start = el?.selectionStart ?? caret;
-    const end = el?.selectionEnd ?? start;
+    // An unfocused textarea's selection is wherever it was last left (0 for
+    // a restored draft): words then go at the end, like picking up a thought.
+    const focused = el !== null && document.activeElement === el;
+    const start = focused ? el!.selectionStart : draft.length;
+    const end = focused ? el!.selectionEnd : start;
     dictating = { original: draft, before: draft.slice(0, start), after: draft.slice(end) };
     if (!(await dictation.start({ keyterms: voiceTerms }))) restoreDraft();
   }
@@ -373,7 +376,7 @@
     const parts = dictationParts(d.before, d.after, dictation.finals, "");
     draft = joinParts(parts);
     dictating = null;
-    focusAt(parts.before.length + parts.finals.length);
+    placeCaret(parts.before.length + parts.finals.length);
   }
 
   /** Discard: the draft exactly as it was before the mic opened. */
@@ -382,7 +385,15 @@
     if (d === null) return;
     dictating = null;
     draft = d.original;
-    focusAt(d.before.length);
+    placeCaret(d.before.length);
+  }
+
+  /** The caret after dictation — focused only when the composer still has
+   *  focus: a recording that ends in a hidden tab, or while the user works in
+   *  another pane, must not pull focus back here. */
+  function placeCaret(position: number) {
+    if (el !== null && document.activeElement === el) focusAt(position);
+    else caret = position;
   }
 
   /** Stop and keep the words — then send, for Enter. */
@@ -665,6 +676,12 @@
   }
 
   function submit() {
+    // The send button mid-dictation means "stop and send": the words settle
+    // first (finishDictation then calls back here).
+    if (dictating !== null) {
+      if (dictation.state !== "finishing") void finishDictation(true);
+      return;
+    }
     const text = draft.trim();
     if (text.length === 0 && images.length === 0) return;
     // Dialog-only slash commands get native UI, not a dead-end CLI reply;

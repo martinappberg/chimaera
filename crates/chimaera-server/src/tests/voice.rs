@@ -234,6 +234,53 @@ async fn voice_cancel_discards() {
     server.abort();
 }
 
+/// A service that answers every upgrade with `status`; counts the attempts.
+async fn refusing(status: &'static str, attempts: Arc<Mutex<usize>>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut tcp, _)) = listener.accept().await else {
+                return;
+            };
+            *attempts.lock().unwrap() += 1;
+            let mut buf = [0u8; 4096];
+            let _ = tcp.read(&mut buf).await;
+            let reply = format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\n\r\n");
+            let _ = tcp.write_all(reply.as_bytes()).await;
+        }
+    });
+    format!("ws://{addr}")
+}
+
+#[tokio::test]
+async fn voice_bad_request_is_refused_not_retried() {
+    let _turn = SERIAL.lock().await;
+    let attempts = Arc::new(Mutex::new(0));
+    *voice::SERVICE_FOR_TESTS.lock().unwrap() =
+        Some(refusing("400 Bad Request", attempts.clone()).await);
+    let (url, server) = daemon().await;
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let send = |v: serde_json::Value| WsMessage::text(v.to_string());
+    socket
+        .send(send(
+            serde_json::json!({"type": "auth", "token": "test-token"}),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(send(serde_json::json!({"type": "start"})))
+        .await
+        .unwrap();
+    let error = frame(&mut socket).await;
+    assert_eq!(error["code"], "refused");
+    assert_eq!(frame(&mut socket).await["type"], "done");
+    assert_eq!(*attempts.lock().unwrap(), 1);
+    *voice::SERVICE_FOR_TESTS.lock().unwrap() = None;
+    server.abort();
+}
+
 #[tokio::test]
 async fn voice_refused_login_is_reported() {
     let _turn = SERIAL.lock().await;

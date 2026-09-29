@@ -1,29 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { dictationParts, insertDictation, joinParts, joinSpoken, PauseDetector } from "./voice.svelte";
+import { dictationParts, joinParts, joinSpoken, PauseDetector } from "./voice.svelte";
 import { DICTATION_LANGUAGES } from "./voiceLanguages";
-
-describe("insertDictation", () => {
-  it("fills an empty draft", () => {
-    expect(insertDictation("", 0, "run the tests")).toEqual({ draft: "run the tests", caret: 13 });
-  });
-
-  it("spaces the words from what's around them, like typed words", () => {
-    expect(insertDictation("please", 6, "run it")).toEqual({ draft: "please run it", caret: 13 });
-    expect(insertDictation("and commit", 0, "run it")).toEqual({
-      draft: "run it and commit",
-      caret: 6,
-    });
-    expect(insertDictation("please  now", 7, "run it")).toEqual({
-      draft: "please run it now",
-      caret: 13,
-    });
-  });
-
-  it("clamps a stale caret into the draft", () => {
-    expect(insertDictation("abc", 99, "d")).toEqual({ draft: "abc d", caret: 5 });
-    expect(insertDictation("abc", -4, "d")).toEqual({ draft: "d abc", caret: 1 });
-  });
-});
 
 describe("dictationParts", () => {
   it("adds nothing until words arrive", () => {

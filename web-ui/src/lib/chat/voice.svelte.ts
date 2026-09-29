@@ -67,24 +67,6 @@ export function joinParts(p: DictationParts): string {
   return p.before + p.finals + p.gap + p.interim + p.after;
 }
 
-/**
- * Put dictated `text` into `draft` at `at`, spaced from its neighbors so it
- * reads as typed words. Returns the new draft and the caret after the text.
- */
-export function insertDictation(
-  draft: string,
-  at: number,
-  text: string,
-): { draft: string; caret: number } {
-  const pos = Math.max(0, Math.min(at, draft.length));
-  const before = draft.slice(0, pos);
-  const after = draft.slice(pos);
-  const lead = before.length > 0 && !/\s$/.test(before) ? " " : "";
-  const trail = after.length > 0 && !/^\s/.test(after) ? " " : "";
-  const inserted = `${lead}${text}${trail}`;
-  return { draft: before + inserted + after, caret: pos + lead.length + text.length };
-}
-
 /** Whether the daemon's host can dictate (it has the claude.ai login the
  *  speech service needs), asked once per window and again after a
  *  recording fails on the login — so an always-on mic hides itself where
@@ -108,8 +90,28 @@ export function recheckHost(): Promise<void> {
     })
     .finally(() => {
       hostCheckInFlight = null;
+      if (!hostCheck.available) recheckOnReturn();
     });
   return hostCheckInFlight;
+}
+
+let recheckArmed = false;
+
+/** No dictation here (yet): ask again when the user comes back to this
+ *  window — after signing in elsewhere, or once a restarting daemon is back.
+ *  One armed listener pair; nothing runs while the window stays away. */
+function recheckOnReturn(): void {
+  if (recheckArmed || typeof window === "undefined") return;
+  recheckArmed = true;
+  const again = () => {
+    if (document.visibilityState !== "visible") return;
+    window.removeEventListener("focus", again);
+    document.removeEventListener("visibilitychange", again);
+    recheckArmed = false;
+    void recheckHost();
+  };
+  window.addEventListener("focus", again);
+  document.addEventListener("visibilitychange", again);
 }
 
 /**
@@ -146,6 +148,9 @@ const MAX_QUEUED_CHUNKS = 300;
 /** How long `finish()` waits for the daemon's `done` before settling for
  *  what it has (the daemon's own finalize wait is 5 s). */
 const FINISH_TIMEOUT_MS = 8000;
+/** Chunks kept between phrases, so a phrase that opens on the first sound
+ *  still gets the syllable before it: ~300 ms. */
+const PREROLL_CHUNKS = 3;
 /** Loudest 100 ms (raw RMS) under which a recording was silence: a working
  *  mic in a quiet room still reads ~0.001–0.01; a muted one (a closed
  *  laptop's built-in mic) reads ~0. */
@@ -166,6 +171,8 @@ export class PauseDetector {
    *  talking still gets corrected every so often. */
   static readonly LONG_PHRASE_MS = 10_000;
   static readonly SHORT_PAUSE_MS = 400;
+  /** Whether the last chunk fed was silence. */
+  silent = true;
   private recent: number[] = [];
   private speechMs = 0;
   private silenceMs = 0;
@@ -176,6 +183,7 @@ export class PauseDetector {
     if (this.recent.length > 30) this.recent.shift();
     const loudest = Math.max(...this.recent);
     const silent = rms < Math.max(0.008, loudest * 0.12);
+    this.silent = silent;
     if (!silent) {
       this.speechMs += PauseDetector.CHUNK_MS;
       this.silenceMs = 0;
@@ -318,8 +326,10 @@ export class Dictation {
   device = $state("");
 
   /** This recording's phrases in order; the last is the one being spoken
-   *  unless it is closing. */
+   *  unless it is closing (then the next opens when speech resumes). */
   private phrases: Phrase[] = [];
+  /** Audio since the last phrase closed, until the next one opens. */
+  private preroll: ArrayBuffer[] = [];
   private keyterms: string[] = [];
   private pauses = new PauseDetector();
   private capture: Capture | null = null;
@@ -345,6 +355,7 @@ export class Dictation {
     this.device = "";
     this.keyterms = opts.keyterms;
     this.pauses = new PauseDetector();
+    this.preroll = [];
     this.phrases = [this.phrase(generation)];
     try {
       const capture = await startCapture(
@@ -413,13 +424,22 @@ export class Dictation {
     // Speech RMS sits well under 0.3; a square-root curve lifts quiet
     // talking into view without pinning loud speech at the top.
     this.levels = [...this.levels.slice(1), Math.min(1, Math.sqrt(level * 6))];
+    const pause = this.pauses.feed(level);
     const current = this.phrases.at(-1);
-    if (current === undefined) return;
-    current.send(pcm);
-    if (this.pauses.feed(level) && this.state === "listening" && current.text !== "") {
-      current.finalize();
-      this.phrases.push(this.phrase(generation));
+    if (current === undefined || current.closing) {
+      // Between phrases a stream opens only once speech resumes — a
+      // recording that ends in silence opens none — and takes the last few
+      // chunks along so its first syllable isn't clipped.
+      this.preroll.push(pcm);
+      if (this.preroll.length > PREROLL_CHUNKS) this.preroll.shift();
+      if (this.pauses.silent || this.state !== "listening") return;
+      const next = this.phrase(generation);
+      this.phrases.push(next);
+      for (const chunk of this.preroll.splice(0)) next.send(chunk);
+      return;
     }
+    current.send(pcm);
+    if (pause && this.state === "listening" && current.text !== "") current.finalize();
   }
 
   /**
@@ -473,6 +493,7 @@ export class Dictation {
     void capture?.stop();
     for (const p of this.phrases) p.close();
     this.phrases = [];
+    this.preroll = [];
     this.state = "idle";
     this.interim = "";
   }

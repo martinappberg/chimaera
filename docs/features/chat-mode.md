@@ -100,7 +100,7 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   misheard start) stands until its stream is finalized, and only the finalize pass is accurate —
   so a recording finalizes each phrase at a pause (≥ 0.8 s after ≥ 0.6 s of speech; 0.4 s once a
   phrase passes 10 s; silence judged against the speaker's own recent loudness) and speaks on
-  into a fresh stream, which also picks its language anew. The corrected phrase lands about a
+  into a fresh stream (opened when speech resumes), which also picks its language anew. The corrected phrase lands about a
   second after you pause, in the settled style. The **Dictate** chord (⌃⇧D on macOS, the Codex app's; unbound
   elsewhere, where `Mod+d` is Split Right) toggles it from a focused composer only. Right-click
   the mic to pick the microphone (`chat.voiceMicrophone`, stored by name — device ids are

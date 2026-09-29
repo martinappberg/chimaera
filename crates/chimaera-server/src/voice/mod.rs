@@ -464,8 +464,15 @@ impl Session {
                             }
                         }
                         Err(upstream::ConnectError::Rejected(status)) if status == 401 || status == 403 => {
+                            login::forget();
                             let message = "Claude's speech service refused the login — run /login in a Claude chat.";
                             send(socket, json!({ "type": "error", "code": "auth", "message": message })).await;
+                            return End::Failed;
+                        }
+                        // A refusal that retrying can't change (a bad request,
+                        // an unknown endpoint) — not the network's fault.
+                        Err(e @ upstream::ConnectError::Rejected(status)) if status < 500 && status != 429 => {
+                            send(socket, json!({ "type": "error", "code": "refused", "message": e.to_string() })).await;
                             return End::Failed;
                         }
                         Err(e) if !self.retried && !self.heard_any => {
@@ -474,7 +481,8 @@ impl Session {
                             retry_at = Some(Instant::now() + RETRY_PAUSE);
                         }
                         Err(e) => {
-                            send(socket, json!({ "type": "error", "code": "network", "message": e.to_string() })).await;
+                            let code = if matches!(e, upstream::ConnectError::Rejected(_)) { "refused" } else { "network" };
+                            send(socket, json!({ "type": "error", "code": code, "message": e.to_string() })).await;
                             return End::Failed;
                         }
                     }

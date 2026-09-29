@@ -84,7 +84,7 @@
   import { measureShift, selectAnchor, type ReadingAnchor } from "./readingAnchor";
   import { blockWeight, HistoryWeights } from "./heightModel";
   import { activeTheme, getSetting, setSetting } from "../settings/store.svelte";
-  import { voiceProblem } from "./voice.svelte";
+  import { hostCanDictate, voiceProblem } from "./voice.svelte";
   import { keyHint } from "../shared/keybindings";
 
   interface Props {
@@ -1270,7 +1270,9 @@
           store.notice(`Unknown option “${args.trim()}” — use on or off.`, "info");
           return true;
         }
-        if (arg === "off" || (arg === "" && getSetting("chat.voice"))) {
+        // Bare /voice turns it off only when the mic is actually there: where
+        // it's hidden (no login on this host), /voice says why instead.
+        if (arg === "off" || (arg === "" && getSetting("chat.voice") && hostCanDictate())) {
           setSetting("chat.voice", false);
           store.notice("Voice dictation off.", "info");
           return true;

@@ -84,13 +84,51 @@ struct Oauth {
     expires_at: Option<u64>,
 }
 
+/// How long a read login is reused: a dictation opens a stream per spoken
+/// phrase, and on macOS each read is a `security` process (claude caches
+/// its own keychain read for 30 s too).
+const CACHE_FOR: Duration = Duration::from_secs(30);
+
+struct Cached {
+    token: String,
+    expires_at: Option<u64>,
+    read_at: std::time::Instant,
+}
+
+static CACHE: std::sync::Mutex<Option<Cached>> = std::sync::Mutex::new(None);
+
 /// The current claude.ai access token.
 pub(crate) async fn access_token() -> Result<String, LoginError> {
     if let Some(token) = env_nonempty("CLAUDE_CODE_OAUTH_TOKEN") {
         return Ok(token);
     }
+    if let Some(token) = cached(now_ms()) {
+        return Ok(token);
+    }
     let stored = read_store().await?.ok_or(LoginError::NoLogin)?;
-    token_from(&stored, now_ms())
+    let (token, expires_at) = token_from(&stored, now_ms())?;
+    *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Cached {
+        token: token.clone(),
+        expires_at,
+        read_at: std::time::Instant::now(),
+    });
+    Ok(token)
+}
+
+/// Drop the cached login — the service refused it, so the next stream reads
+/// whatever claude holds now.
+pub(crate) fn forget() {
+    *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+fn cached(now_ms: u64) -> Option<String> {
+    let guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = guard.as_ref()?;
+    let fresh = entry.read_at.elapsed() < CACHE_FOR
+        && entry
+            .expires_at
+            .is_none_or(|at| now_ms + (EXPIRY_MARGIN.as_millis() as u64) < at);
+    fresh.then(|| entry.token.clone())
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -107,8 +145,8 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The usable token in a credential store document.
-fn token_from(document: &str, now_ms: u64) -> Result<String, LoginError> {
+/// The usable token in a credential store document, with its expiry.
+fn token_from(document: &str, now_ms: u64) -> Result<(String, Option<u64>), LoginError> {
     let store: Store = serde_json::from_str(document).map_err(|_| {
         LoginError::Unreadable("the stored login isn't in the format claude writes".to_string())
     })?;
@@ -123,7 +161,7 @@ fn token_from(document: &str, now_ms: u64) -> Result<String, LoginError> {
             return Err(LoginError::Expired);
         }
     }
-    Ok(token)
+    Ok((token, oauth.expires_at))
 }
 
 /// claude's config dir: `CLAUDE_CONFIG_DIR`, else `~/.claude`
@@ -152,6 +190,7 @@ async fn read_file_store() -> Result<Option<String>, LoginError> {
     let Some(path) = config_dir().map(|d| d.join(".credentials.json")) else {
         return Ok(None);
     };
+    let shown = path.display().to_string();
     let read = tokio::task::spawn_blocking(move || -> std::io::Result<Option<String>> {
         use std::io::Read;
         let file = match std::fs::File::open(&path) {
@@ -165,7 +204,7 @@ async fn read_file_store() -> Result<Option<String>, LoginError> {
     })
     .await
     .map_err(|e| LoginError::Unreadable(e.to_string()))?;
-    read.map_err(|e| LoginError::Unreadable(format!("~/.claude/.credentials.json: {e}")))
+    read.map_err(|e| LoginError::Unreadable(format!("{shown}: {e}")))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -272,7 +311,7 @@ mod tests {
         };
         assert_eq!(
             token_from(&doc("2000000"), 1_000_000).unwrap(),
-            "sk-ant-oat01-abc"
+            ("sk-ant-oat01-abc".to_string(), Some(2_000_000))
         );
         assert!(matches!(
             token_from(&doc("1000000"), 1_000_000),
@@ -297,12 +336,31 @@ mod tests {
         ));
         assert_eq!(
             token_from(r#"{"claudeAiOauth":{"accessToken":"t"}}"#, u64::MAX / 2).unwrap(),
-            "t"
+            ("t".to_string(), None)
         );
         assert!(matches!(
             token_from("not json", 0),
             Err(LoginError::Unreadable(_))
         ));
+    }
+
+    #[test]
+    fn cache() {
+        let put = |expires_at| {
+            *CACHE.lock().unwrap() = Some(Cached {
+                token: "t".to_string(),
+                expires_at,
+                read_at: std::time::Instant::now(),
+            })
+        };
+        put(Some(10_000_000));
+        assert_eq!(cached(1_000_000).as_deref(), Some("t"));
+        // Within the expiry margin the cached token is stale: read again.
+        assert_eq!(cached(9_950_000), None);
+        put(None);
+        assert_eq!(cached(u64::MAX / 2).as_deref(), Some("t"));
+        forget();
+        assert_eq!(cached(0), None);
     }
 
     #[test]
