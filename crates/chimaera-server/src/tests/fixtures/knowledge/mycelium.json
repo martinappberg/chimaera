@@ -1,11 +1,55 @@
 {
+  "conventions": [
+    {
+      "id": "C-1",
+      "key": "conventions/C-1",
+      "span": {
+        "end_line": 4,
+        "line": 3,
+        "path": ".living/conventions.md"
+      },
+      "title": "Heavy objects live on scratch"
+    }
+  ],
   "counts": {
-    "decisions": 4,
-    "findings": 4,
+    "conventions": 1,
+    "decisions": 5,
+    "findings": 5,
     "learnings": 4,
-    "open": 6
+    "open": 7,
+    "questions": 3,
+    "sessions": 1,
+    "todos": 4
   },
   "decisions": [
+    {
+      "alternatives": [],
+      "consequences": "",
+      "context": "F-012 shows doublets plateau past 8k.",
+      "date": "2026-09-19",
+      "decision": "Load 10k cells per lane.",
+      "fp": "D-83edfdb8641d",
+      "id": "D-3",
+      "line": 57,
+      "rationale": "One lane fewer per batch at no doublet cost.",
+      "refs": [
+        {
+          "id": "F-012",
+          "kind": "finding"
+        }
+      ],
+      "span": {
+        "end_line": 61,
+        "line": 57,
+        "path": ".living/decisions.md"
+      },
+      "stated": "DECIDED",
+      "tags": [
+        "loading",
+        "F-012"
+      ],
+      "title": "Load lanes at 10k cells"
+    },
     {
       "alternatives": [
         "Keep S14 with a batch covariate — it still dominated PC1"
@@ -17,6 +61,11 @@
       "fp": "D-d69260ddbe89",
       "line": 31,
       "rationale": "38% mitochondrial reads; no rescue possible.",
+      "span": {
+        "end_line": 43,
+        "line": 31,
+        "path": ".living/decisions.md"
+      },
       "tags": [
         "qc",
         "exclusion"
@@ -35,6 +84,11 @@
       "fp": "D-8dbedeae346a",
       "line": 15,
       "rationale": "scran corrects composition bias and scales to the atlas.",
+      "span": {
+        "end_line": 29,
+        "line": 15,
+        "path": ".living/decisions.md"
+      },
       "tags": [
         "normalisation",
         "scran"
@@ -43,6 +97,12 @@
     },
     {
       "alternatives": [],
+      "cites": [
+        {
+          "kind": "path",
+          "text": "$SCRATCH/atlas/"
+        }
+      ],
       "consequences": "",
       "context": "Home quota is 15G; the atlas object alone is 11G.",
       "date": "2026-07-28",
@@ -50,6 +110,11 @@
       "fp": "D-bba3ba23d889",
       "line": 7,
       "rationale": "",
+      "span": {
+        "end_line": 13,
+        "line": 7,
+        "path": ".living/decisions.md"
+      },
       "tags": [
         "storage"
       ],
@@ -64,6 +129,11 @@
       "fp": "D-e2912cc172c5",
       "line": 45,
       "rationale": "Every downstream tool finds the raw matrix by name.",
+      "span": {
+        "end_line": 55,
+        "line": 45,
+        "path": ".living/decisions.md"
+      },
       "tags": [
         "anndata",
         "provenance"
@@ -78,13 +148,89 @@
       "path": "MYCELIUM.md"
     }
   ],
+  "id_shapes": [
+    {
+      "kind": "finding",
+      "pattern": "F-\\d{1,4}"
+    },
+    {
+      "kind": "decision",
+      "pattern": "D-\\d{1,4}"
+    },
+    {
+      "kind": "convention",
+      "pattern": "C-\\d{1,3}"
+    },
+    {
+      "kind": "learning",
+      "pattern": "L-\\d{1,4}"
+    },
+    {
+      "kind": "todo",
+      "pattern": "T-\\d*[A-Za-z][A-Za-z0-9]*"
+    }
+  ],
+  "labels": {
+    "kinds": {
+      "convention": "convention",
+      "decision": "decision",
+      "finding": "finding",
+      "learning": "learning",
+      "session": "session",
+      "todo": "to-do"
+    },
+    "sections": {
+      "asks": "Waiting on you",
+      "changed": "What changed",
+      "conventions": "Conventions",
+      "decisions": "Decisions",
+      "findings": "Findings",
+      "learnings": "Watch out for",
+      "left_off": "Where we left off",
+      "open_work": "Open work",
+      "overview": "Overview",
+      "sessions": "Sessions",
+      "tidy": "Tidy up",
+      "todos": "To do"
+    },
+    "source": "Mycelium",
+    "status_note": "The status is what the agent wrote when it recorded the finding. Mycelium's template describes a ladder — preliminary (one evidence row), supported (two or more that agree), robust (three or more across datasets or projects), contradicted (any row against it) — but the agent applies it; Chimaera shows what was written and never rates a finding.",
+    "status_words": [
+      {
+        "rank": 1,
+        "tone": "neutral",
+        "word": "preliminary"
+      },
+      {
+        "rank": 2,
+        "tone": "good",
+        "word": "supported"
+      },
+      {
+        "rank": 3,
+        "tone": "good",
+        "word": "robust"
+      },
+      {
+        "rank": 0,
+        "tone": "bad",
+        "word": "contradicted"
+      }
+    ]
+  },
   "learnings": [
     {
       "category": "edge-case",
       "date": "2026-08-11",
       "fp": "L-8b5579f003db",
+      "id": "L-4",
       "line": 48,
       "resolution": "Run EmptyDrops per lane.",
+      "span": {
+        "end_line": 58,
+        "line": 48,
+        "path": ".living/learnings.md"
+      },
       "tags": [
         "droplets",
         "qc"
@@ -97,8 +243,14 @@
       "category": "failure",
       "date": "2026-08-04",
       "fp": "L-d68f5335321b",
+      "id": "L-3",
       "line": 35,
       "resolution": "Request 128G for arrays above 150k cells.",
+      "span": {
+        "end_line": 46,
+        "line": 35,
+        "path": ".living/learnings.md"
+      },
       "tags": [
         "slurm",
         "memory"
@@ -109,10 +261,22 @@
     },
     {
       "category": "gotcha",
+      "cites": [
+        {
+          "kind": "script",
+          "text": "test_markers.py"
+        }
+      ],
       "date": "2026-08-02",
       "fp": "L-d407379e8c29",
+      "id": "L-2",
       "line": 13,
       "resolution": "Filter after subsetting the marker panel.",
+      "span": {
+        "end_line": 33,
+        "line": 13,
+        "path": ".living/learnings.md"
+      },
       "tags": [
         "scanpy",
         "filtering"
@@ -125,8 +289,14 @@
       "category": "tip",
       "date": "",
       "fp": "L-e8e451d5b3a3",
+      "id": "L-5",
       "line": 60,
       "resolution": "Persist `obsp` between sweeps.",
+      "span": {
+        "end_line": 70,
+        "line": 60,
+        "path": ".living/learnings.md"
+      },
       "tags": [
         "performance"
       ],
@@ -146,6 +316,17 @@
       "Regress out batch before mito QC"
     ],
     "path": ".mycelium/last-session.md",
+    "sources": [
+      {
+        "path": ".mycelium/last-session.md",
+        "written_ms": 1789000000000
+      }
+    ],
+    "span": {
+      "end_line": 25,
+      "line": 1,
+      "path": ".mycelium/last-session.md"
+    },
     "worked_on": "- Re-ran QC on batches 1-2 with MAD cutoffs\n- Drafted the methods section",
     "written_ms": 1789000000000
   },
@@ -153,64 +334,185 @@
   "questions": [
     {
       "finding": "F-003",
+      "key": "batch-effects/F-003",
       "text": "Is batch 2 confounded with tissue source?"
     },
     {
       "finding": "F-001",
+      "key": "exhaustion/F-001",
       "text": "Does the cluster persist after checkpoint therapy?"
     },
     {
       "finding": "F-002",
+      "key": "exhaustion/F-002",
       "text": "Is the melanoma association a cohort artefact?"
     }
   ],
   "schema": 1,
+  "sessions": [
+    {
+      "branch": "qc-mad",
+      "date": "2026-09-15",
+      "duration": "1h 20m",
+      "files": "6",
+      "id": "2026-09-15-001",
+      "log": ".living/log/2026-09-15-001-qc.md",
+      "outputs": "F-003",
+      "status": "complete",
+      "summary": "Re-ran QC with MAD cutoffs"
+    }
+  ],
+  "tidy": [
+    {
+      "ask": "todo/TODO_REGISTRY.md keeps these to-dos as ## sections below its registry table instead of as rows in it: T-Lanes. Add a registry row for each (Item, Priority, Status, Category, Date, Author, File) that summarizes it and names its section, so mycelium's registry lists it; keep each section as its writeup.",
+      "kind": "off-index",
+      "refs": [
+        {
+          "id": "T-Lanes",
+          "kind": "todo"
+        }
+      ],
+      "text": "1 to-do is kept as ## sections below the registry table in todo/TODO_REGISTRY.md, not as rows in it: T-Lanes."
+    },
+    {
+      "ask": "These entries are written as ## headings, which mycelium's index and tools (### entries only) don't see: Keep the atlas objects on scratch (.living/decisions.md:7). Change each to a ### heading, keeping its id, title and date as written.",
+      "kind": "off-index",
+      "text": "1 entry is written as ## headings, which mycelium's index (### entries) doesn't see: Keep the atlas objects on scratch."
+    }
+  ],
   "todos": [
     {
       "author": "Martin",
       "category": "validation",
+      "cites": [
+        {
+          "kind": "doc",
+          "text": "compare-public-data.md"
+        }
+      ],
+      "closed": false,
       "date": "2026-08-01",
       "file": "todo/compare-public-data.md",
       "item": "Compare with public datasets",
+      "key": "todo/r1",
       "priority": "idea",
-      "status": "open"
+      "source": "table",
+      "span": {
+        "end_line": 16,
+        "line": 16,
+        "path": "todo/TODO_REGISTRY.md"
+      },
+      "status": "open",
+      "title": "Compare with public datasets"
     },
     {
       "author": "Martin",
       "category": "analysis",
+      "cites": [
+        {
+          "kind": "doc",
+          "text": "rerun-qc.md"
+        }
+      ],
+      "closed": false,
       "date": "2026-08-21",
       "file": "todo/rerun-qc.md",
       "item": "Re-run QC with MAD cutoffs",
+      "key": "todo/r2",
       "priority": "high",
-      "status": "in-progress"
+      "source": "table",
+      "span": {
+        "end_line": 17,
+        "line": 17,
+        "path": "todo/TODO_REGISTRY.md"
+      },
+      "status": "in-progress",
+      "title": "Re-run QC with MAD cutoffs"
     },
     {
       "author": "Martin",
       "category": "data",
+      "closed": false,
       "date": "2026-09-02",
       "file": "",
       "item": "Get batch 3 FASTQs",
+      "key": "todo/r3",
       "priority": "critical",
-      "status": "blocked"
+      "source": "table",
+      "span": {
+        "end_line": 18,
+        "line": 18,
+        "path": "todo/TODO_REGISTRY.md"
+      },
+      "status": "blocked",
+      "title": "Get batch 3 FASTQs"
     },
     {
       "author": "Martin",
       "category": "writing",
+      "cites": [
+        {
+          "kind": "doc",
+          "text": "methods.md"
+        }
+      ],
+      "closed": true,
       "date": "2026-09-15",
       "file": "todo/methods.md",
       "item": "Write methods section",
+      "key": "todo/r4",
       "priority": "medium",
-      "status": "complete"
+      "source": "table",
+      "span": {
+        "end_line": 21,
+        "line": 21,
+        "path": "todo/TODO_REGISTRY.md"
+      },
+      "status": "complete",
+      "title": "Write methods section"
+    },
+    {
+      "author": "",
+      "category": "",
+      "closed": false,
+      "date": "",
+      "file": "",
+      "id": "T-Lanes",
+      "item": "Re-load the pilot lanes at 10k\n\nFollows D-3; needs the batch 3 FASTQs.",
+      "key": "todo/T-Lanes",
+      "priority": "high",
+      "refs": [
+        {
+          "id": "D-3",
+          "kind": "decision"
+        }
+      ],
+      "source": "section",
+      "span": {
+        "end_line": 27,
+        "line": 23,
+        "path": "todo/TODO_REGISTRY.md"
+      },
+      "status": "open",
+      "title": "Re-load the pilot lanes at 10k"
     }
   ],
   "topics": [
     {
+      "date": "2026-09-10",
       "description": "How sequencing batch shifts expression estimates across runs.",
       "findings": [
         {
+          "cites": [
+            {
+              "kind": "doc",
+              "text": "../log/2026-09-10-001-qc.md"
+            }
+          ],
           "claim": "Batch 2 inflates the mitochondrial fraction",
           "id": "F-003",
           "implications": "Regress out batch before comparing mito-based QC across runs.",
+          "key": "batch-effects/F-003",
           "ledger": [
             {
               "dataset": "pbmc-10k",
@@ -233,6 +535,13 @@
           "questions": [
             "Is batch 2 confounded with tissue source?"
           ],
+          "span": {
+            "end_line": 25,
+            "line": 11,
+            "path": ".living/findings/batch-effects.md"
+          },
+          "stated": "supported",
+          "statement": "Libraries sequenced in batch 2 show a ~4% higher mitochondrial read fraction than batch 1 after QC.",
           "status": "supported",
           "tags": [
             "qc",
@@ -245,9 +554,21 @@
           "claim": "Doublet rate scales with loading density",
           "id": "F-004",
           "implications": "",
+          "key": "batch-effects/F-004",
           "ledger": [],
           "line": 27,
           "questions": [],
+          "span": {
+            "end_line": 38,
+            "line": 27,
+            "path": ".living/findings/batch-effects.md"
+          },
+          "state": {
+            "by": "F-012",
+            "kind": "corrected"
+          },
+          "stated": "preliminary",
+          "statement": "Doublets rise roughly linearly with cells loaded per lane.",
           "status": "preliminary",
           "tags": [
             "doublets",
@@ -260,12 +581,88 @@
       "slug": "batch-effects"
     },
     {
+      "date": "2026-09-18",
+      "description": "How deep libraries need to be sequenced.",
+      "findings": [
+        {
+          "addenda": [
+            {
+              "date": "2026-09-20",
+              "kind": "resolution",
+              "label": "RESOLVED (2026-09-20)",
+              "line": 15,
+              "span": {
+                "end_line": 17,
+                "line": 15,
+                "path": ".living/findings/depth.md"
+              },
+              "text": "The next run loaded 10k per lane as decided.",
+              "title": ""
+            }
+          ],
+          "amends": [
+            {
+              "id": "F-004",
+              "kind": "corrects"
+            }
+          ],
+          "cites": [
+            {
+              "kind": "job",
+              "text": "51973032"
+            },
+            {
+              "kind": "script",
+              "text": "scripts/doublets.py"
+            },
+            {
+              "kind": "data",
+              "text": "data/lanes.tsv"
+            }
+          ],
+          "claim": "Doublet rate does not scale with loading past 8k cells per lane",
+          "date": "2026-09-18",
+          "id": "F-012",
+          "implications": "",
+          "key": "depth/F-012",
+          "ledger": [],
+          "line": 9,
+          "questions": [],
+          "refs": [
+            {
+              "id": "F-004",
+              "kind": "finding"
+            },
+            {
+              "id": "D-3",
+              "kind": "decision"
+            }
+          ],
+          "span": {
+            "end_line": 17,
+            "line": 9,
+            "path": ".living/findings/depth.md"
+          },
+          "state": {
+            "kind": "resolved"
+          },
+          "status": "unknown",
+          "tags": [],
+          "updated": "2026-09-18"
+        }
+      ],
+      "path": ".living/findings/depth.md",
+      "slug": "depth"
+    },
+    {
+      "date": "2026-08-30",
       "description": "T-cell exhaustion signatures in tumour infiltrates.",
       "findings": [
         {
           "claim": "TOX marks terminal exhaustion",
           "id": "F-001",
           "implications": "Call terminal exhaustion on TOX, not PD1 alone.",
+          "key": "exhaustion/F-001",
           "ledger": [
             {
               "dataset": "melanoma",
@@ -296,6 +693,13 @@
           "questions": [
             "Does the cluster persist after checkpoint therapy?"
           ],
+          "span": {
+            "end_line": 26,
+            "line": 11,
+            "path": ".living/findings/exhaustion.md"
+          },
+          "stated": "robust",
+          "statement": "A TOX+ PD1-high cluster appears in every tumour cohort.",
           "status": "robust",
           "tags": [
             "tcell",
@@ -307,6 +711,7 @@
           "claim": "TCF7 predicts response",
           "id": "F-002",
           "implications": "",
+          "key": "exhaustion/F-002",
           "ledger": [
             {
               "dataset": "melanoma",
@@ -330,6 +735,13 @@
             "Is the melanoma association a cohort artefact?",
             "Is batch 2 confounded with tissue source?"
           ],
+          "span": {
+            "end_line": 40,
+            "line": 28,
+            "path": ".living/findings/exhaustion.md"
+          },
+          "stated": "contradicted",
+          "statement": "TCF7+ CD8 fraction predicts checkpoint response.",
           "status": "contradicted",
           "tags": [],
           "updated": "2026-08-30"
