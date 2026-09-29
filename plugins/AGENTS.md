@@ -22,7 +22,7 @@ Writing one: [docs/agent-guides/plugins.md](../docs/agent-guides/plugins.md).
 | Path | What |
 |---|---|
 | `plugins.lock` | One `[[plugin]]` per first-party plugin: `id`, `name` and `summary` (what an available card shows before any install), `version` (the pinned release), `repo` (`owner/name`), `sha256_wasm`, `sha256_toml` (that release's `SHA256SUMS`), and `tier` + `caps` — what the maintainers approved it to do (`sandboxed` / `privileged`, and its capability digest; `chimaera plugin caps plugin.toml` prints both for a release's manifest). A sandboxed update keeps the badge only while its digest is `caps`; a privileged plugin is verified only at the pin (docs/plugin-platform-plan.md §2). The daemon embeds it (`include_str!`, parsed with toml in `crates/chimaera-server/src/plugins/mod.rs`): each entry is listed as available until installed, and a first-party install fetches `https://github.com/<repo>/releases/download/v<version>/{SHA256SUMS,plugin.toml,plugin.wasm}` and refuses bytes that don't match both the release's `SHA256SUMS` and these sha256s. A bump is automatic — `.github/workflows/plugin-lock.yml` (below) — and CI-gated. `plugins::tests::every_locked_release_is_what_the_lock_says` checks each locked release (downloaded into `dist-test/`) against it: both sha256s, id, version, name, `[release] github` equal to `repo`, the gates, that it says what it adds, and that `tier` and `caps` are its manifest's. |
-| pre-release pins | A pinned release can be a GitHub **pre-release** that isn't "latest" (Agent notes 0.1.4 and Mycelium 0.2.1, 2026-09-29: their `[access]` is a table a released daemon can't parse). This lock downloads it by tag; every daemon's release checker and the lock bot read `releases/latest` and don't see it — the bot only moves a pin forward. Once the chimaera that pins it is released, mark it latest: `gh release edit vX.Y.Z --repo <repo> --prerelease=false --latest`. The plugin repos' release workflow publishes one by hand (`workflow_dispatch`, `prerelease: true`). |
+| pre-release pins | A pinned release can be a GitHub **pre-release** that isn't "latest" (Agent notes 0.1.4 and Mycelium 0.2.1, 2026-09-29: their `[access]` is a table a released daemon can't parse). This lock downloads it by tag; every daemon's release checker and the lock bot read `releases/latest` and don't see it — the bot only moves a pin forward. Once a chimaera release that pins it is out, `release.yml`'s `plugin-pins` job (`.github/scripts/plugin-pins.mjs`) makes it a full release and its repository's latest (by hand: `gh release edit vX.Y.Z --repo <repo> --prerelease=false --latest`). The plugin repos' release workflow publishes one by hand (`workflow_dispatch`, `prerelease: true`). |
 | `revoked.json`, `revocation-keys.txt` | The kill switch (`crates/chimaera-server/src/plugins/revoke.rs`): the list of blocked plugin builds (id, versions and/or `plugin.wasm` sha256s, `hard` or `soft`, a reason), embedded in every build, and the Ed25519 public keys (plus `threshold`) whose signatures make the live copy — this file on `main`, fetched daily — count. With no key listed only the embedded list counts. Block a build: add its entry and raise `serial` (a host refuses a list older than its own), then `node scripts/revocations.mjs sign --key <your private key>` (writes `revoked.sig`), commit both, and ship a release for hosts that never fetch; `keygen` makes a maintainer's key (its private half never enters the repository), `verify` checks the current signatures. |
 | `Cargo.toml`, `Cargo.lock` | The workspace: `api-0.1`, `test-fixture`, `test-platform`, `test-privileged`; `chimaera-plugin-api` by path; a small release profile. |
 | `api-0.1/` | **Frozen**: the 0.1 guest API (`chimaera-plugin-api-v0-1`, reading `crates/chimaera-plugin-api/wit-0.1`), which `test-fixture` depends on renamed as `chimaera-plugin-api` — the host's proof that a 0.1 plugin still loads. Never edit it. |
@@ -103,14 +103,16 @@ version again replaces it in place).
    status, so auto-merge never fires) and a merge made with it doesn't start
    `release.yml`, so the workflow writes with a token of the maintainer's: a
    fine-grained personal access token on the maintainer's account (so the PR
-   author passes the CLA allowlist), repository access *only*
-   `martinappberg/chimaera`, permissions **Contents: Read and write** and
-   **Pull requests: Read and write**, saved as the repository secret
-   `PLUGIN_LOCK_TOKEN`. Without it a run only reports the bump it would make
-   (a warning). Replace it before it expires. The same secret lets
+   author passes the CLA allowlist), repository access `martinappberg/chimaera`
+   and every plugin repository in the lock, permissions **Contents: Read and
+   write** and **Pull requests: Read and write**, saved as the repository
+   secret `PLUGIN_LOCK_TOKEN`. Without it a run only reports the bump it would
+   make (a warning). Replace it before it expires. The same secret lets
    `.github/workflows/pr-auto-update.yml` bring pull requests with
    auto-merge up to date with `main` (update-branch needs the same two
-   permissions).
+   permissions), and `release.yml`'s `plugin-pins` job publish the plugin
+   pre-releases a new chimaera release pins (Contents on the plugin
+   repositories; a new plugin repository needs adding to the token).
 
 ## Rules
 
