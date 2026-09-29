@@ -105,13 +105,16 @@
     clearSelection,
     composeAgentPathReference,
     composeChatQuote,
+    composeCommitReference,
     composeSelectionReference,
     composeShellPathReference,
     needsCropUpload,
     composeTerminalReference,
     referenceTarget,
     composeProvenanceSuffix,
+    setCommitReferenceHandler,
     setReferenceHandler,
+    type CommitSelection,
     setSelection,
     workspaceRelative,
   } from "./lib/shared/reference";
@@ -212,9 +215,12 @@
     gitRepoStatuses,
     gitStatus,
     onGitNudge,
+    openFileHistory,
+    openRepoHistory,
     repoForPath,
     revealRepo,
     setGitFocus,
+    setGitOpener,
     workspacesChanged,
     type DiffMode,
     type GitStatus,
@@ -1634,6 +1640,8 @@
     setPathOpener(openPathInLayout);
     setChatLinkContext(linkContext);
     setReferenceHandler(referenceSelection);
+    setCommitReferenceHandler(referenceCommitNow);
+    setGitOpener((tab) => openGitFromPane(layout.focusedPaneId, tab, false));
     setUploadPathInserter(insertUploadedPath);
     // OS-desktop file drags: window-level so the navigate-away default is
     // dead EVERYWHERE, not just over accepting panes.
@@ -1833,6 +1841,8 @@
       window.removeEventListener("drop", onWindowDrop);
       stopChordHints();
       setReferenceHandler(null);
+      setCommitReferenceHandler(null);
+      setGitOpener(null);
       setUploadPathInserter(null);
       setPathOpener(null);
       setChatLinkContext(null);
@@ -2330,6 +2340,55 @@
       }
     }
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** Open (or focus) any git view beside `paneId` — the openDiffFrom rule:
+   *  the adjacent pane, or a fresh split when there is none / `newSplit`. */
+  function openGitFromPane(paneId: string, tab: Tab, newSplit: boolean): void {
+    const existing = paneForTab(layout.root, tab);
+    if (existing !== null) {
+      layout = activateTab(layout, existing.paneId, existing.index);
+    } else {
+      const neighbor = newSplit ? null : adjacentPane(layout, paneId);
+      if (neighbor !== null) {
+        layout = openTab(focusPane(layout, neighbor), tab);
+      } else {
+        layout = splitPane(layout, paneId, "row");
+        layout = openTab(layout, tab);
+      }
+    }
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** A commit dropped on an agent's pane: referenced there like a file (a
+   *  shell gets the short sha). */
+  function referenceCommitDrop(paneId: string, tab: Tab): void {
+    if (tab.surface !== "gitx" || tab.view !== "commit" || tab.sha === undefined) return;
+    const p = findPane(layout.root, paneId);
+    const active = p?.tabs[p.active];
+    if (active === undefined || active.surface !== "terminal") return;
+    const s = sessionsById.get(active.sessionId);
+    if (s === undefined || !s.alive) return;
+    const text =
+      s.kind === "agent"
+        ? composeCommitReference(
+            { kind: "commit", sha: tab.sha, subject: tab.title ?? "", repo: tab.repo },
+            workspace?.root ?? null,
+          )
+        : `${tab.sha.slice(0, 7)} `;
+    typeIntoSession(active.sessionId, text);
+  }
+
+  /** "Reference in chat" on a commit: it lands in the agent references go to
+   *  (surfaced first, beside the focused pane when it isn't open). */
+  function referenceCommitNow(sel: CommitSelection): void {
+    const target = refTargetSession;
+    if (target === null) return;
+    if (sessionPaneId(layout, target.id) === null) {
+      layout = splitPane(layout, layout.focusedPaneId, "row");
+      layout = openSession(layout, target.id);
+    }
+    typeIntoSession(target.id, composeCommitReference(sel, workspace?.root ?? null));
   }
 
   /** The "N files changed" chip: open (or focus) this session's changes review,
@@ -3296,7 +3355,7 @@
   /** Quick-open commands: the workspace surfaces that have no file or session
    *  to match on ("Timeline", "Knowledge", "Extensions" — which "plugins" and
    *  "skills" still find). */
-  const quickOpenCommands = [
+  const quickOpenCommands = $derived([
     { id: "timeline", label: "Timeline", hint: "what happened", run: openTimelineSurface },
     { id: "knowledge", label: "Knowledge", hint: "what we know", run: openKnowledgeSurface },
     {
@@ -3313,7 +3372,28 @@
       hint: "the workspace's Mastermind panel",
       run: () => setMastermindPanelOpen(true),
     },
-  ];
+    ...gitQuickOpenCommands(),
+  ]);
+
+  /** Git's commands: only where a repository is (git is ambient). */
+  function gitQuickOpenCommands() {
+    if ($gitRepos.length === 0) return [];
+    const file = focusedFilePath;
+    return [
+      { id: "git", label: "Source Control", aliases: ["git", "changes"], hint: "changes and branches", run: openGitPanel },
+      { id: "git-history", label: "History", aliases: ["log", "commits"], hint: "recent commits", run: () => openRepoHistory() },
+      ...(file !== null && repoForPath($gitRepos, file) !== null
+        ? [
+            {
+              id: "git-file-history",
+              label: "File history",
+              hint: basename(file),
+              run: () => openFileHistory(file),
+            },
+          ]
+        : []),
+    ];
+  }
 
   function focusDirection(dir: FocusDir): void {
     layout = moveFocus(layout, dir);
@@ -3888,6 +3968,12 @@
     openDiffFrom(paneId, path, mode, newSplit) {
       openDiffFromPane(paneId, path, mode, newSplit);
     },
+    openGitFrom(paneId, tab, newSplit) {
+      openGitFromPane(paneId, tab, newSplit);
+    },
+    beginGitDrag(e, tab, onClick) {
+      beginDrag(e, tab, onClick);
+    },
     revealWorktreeSession(sessionId, workspaceId) {
       void revealWorktreeSession(sessionId, workspaceId);
     },
@@ -4242,7 +4328,12 @@
     // (file previews and Finder/dir payloads), link targets for shell-
     // terminal drags. Drives the partitioned zone previews (the band region
     // is reserved, never flashed over).
-    const refPath = tab.surface === "file" || tab.surface === "finder" ? tab.path : undefined;
+    const refPath =
+      tab.surface === "file" || tab.surface === "finder"
+        ? tab.path
+        : tab.surface === "gitx" && tab.view === "commit"
+          ? tab.sha
+          : undefined;
     const armed = new Set<string>();
     const linkTargets = linkTargetsFor(tab);
     const linkSessions = linkSessionsFor(tab);
@@ -4270,6 +4361,7 @@
             // Drag-to-reference: type into the session, never open a tab.
             if (tab.surface === "file") referenceFileDrop(spot.paneId, tab.path, "file");
             else if (tab.surface === "finder") referenceFileDrop(spot.paneId, tab.path, "dir");
+            else if (tab.surface === "gitx") referenceCommitDrop(spot.paneId, tab);
             return;
           }
           if (spot.kind === "link") {
@@ -4431,6 +4523,9 @@
           ? (basename(tab.path) || "Finder")
           : tab.surface === "diff"
             ? `${basename(tab.path)} (diff)`
+            : tab.surface === "gitx"
+              ? (tab.title ??
+                (tab.view === "commit" ? "Commit" : tab.view === "branch" ? "Changes on this branch" : "History"))
             : tab.surface === "git"
               ? "Source Control"
               : tab.surface === "changes"

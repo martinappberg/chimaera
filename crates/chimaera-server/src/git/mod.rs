@@ -19,6 +19,7 @@
 //! rebases, pushes or merges.
 
 pub(crate) mod anchor;
+mod history;
 mod http;
 mod include;
 mod parse;
@@ -29,6 +30,7 @@ mod service;
 mod session;
 mod worktree;
 
+pub(crate) use history::{compare, log, show};
 pub(crate) use http::{branches, diff, repos, status, worktrees};
 pub(crate) use repos::note_listed_dir;
 pub(crate) use service::{

@@ -30,8 +30,17 @@
     /** The comparison this tab was opened at. */
     mode: DiffMode;
     wsId: string | null;
+    /** A revision: the working tree against it (mode "rev") or that commit
+     *  against its parent (mode "commit"). */
+    rev?: string;
+    /** Which of the workspace's repositories (top level or a worktree's). */
+    repo?: string;
+    /** A renamed file's earlier path (mode "commit"). */
+    orig?: string;
   }
-  let { path, mode, wsId }: Props = $props();
+  let { path, mode, wsId, rev, repo, orig }: Props = $props();
+  /** Revision diffs are what they were opened as: no status toggle. */
+  const fixed = $derived(rev !== undefined);
 
   const MODES: { id: DiffMode; label: string; title: string }[] = [
     { id: "unstaged", label: "Unstaged", title: "working tree vs index" },
@@ -139,7 +148,7 @@
     destroy();
     // Only the working tree's line numbers match the file on disk, so the
     // reference bridge is armed for those comparisons only.
-    const bIsWorkingTree = m !== "staged";
+    const bIsWorkingTree = m !== "staged" && m !== "commit";
     const bExtensions = bIsWorkingTree
       ? [
           ...baseExtensions(),
@@ -182,7 +191,7 @@
     loading = true;
     error = null;
     try {
-      const d = await fetchGitDiff(id, p, m);
+      const d = await fetchGitDiff(id, p, m, { rev, repo, orig });
       if (seq !== loadSeq) return;
       diff = d;
       if (d.binary || d.too_large || d.a === d.b) destroy();
@@ -268,6 +277,7 @@
     {#if diff?.added}<span class="dtag added">added</span>{/if}
     {#if diff?.deleted}<span class="dtag deleted">deleted</span>{/if}
     <span class="spacer"></span>
+    {#if !fixed}
     <div class="modes" role="group" aria-label="comparison">
       {#each MODES as m (m.id)}
         <button
@@ -278,6 +288,7 @@
         >
       {/each}
     </div>
+    {/if}
   </header>
 
   <div class="merge-host" class:hidden={showsMessage} bind:this={host}></div>

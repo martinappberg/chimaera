@@ -15,6 +15,7 @@
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import BranchChip from "../shared/BranchChip.svelte";
+  import { openBranchChanges } from "../workspace/git";
   import { insertIntoComposer, registerFollow } from "./composerBus";
   import {
     acquireChat,
@@ -2761,7 +2762,9 @@
     <!-- One line: the branch on the left; the right side is kept free for
          the session record's same-file notice. -->
     <div class="branch-line">
-      <span class="branch-slot"><BranchChip git={session.git} /></span>
+      <span class="branch-slot"
+        ><BranchChip git={session.git} onOpen={() => session.git && openBranchChanges(session.git)} /></span
+      >
       <span class="branch-line-end"></span>
     </div>
   {/if}

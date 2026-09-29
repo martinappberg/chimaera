@@ -13,6 +13,7 @@
    */
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import BranchChip from "../shared/BranchChip.svelte";
+  import { openBranchChanges } from "../workspace/git";
   import WorkTray from "../shared/WorkTray.svelte";
   import WorkTrayRow from "../shared/WorkTrayRow.svelte";
   import { basename } from "../previews/files";
@@ -401,7 +402,12 @@
     {#if session.git}
       <!-- Only in a repository: the branch (and worktree, on hover) this
            agent is working on. -->
-      <span class="branch"><BranchChip git={session.git} /></span>
+      <span class="branch"
+        ><BranchChip
+          git={session.git}
+          onOpen={() => session.git && openBranchChanges(session.git)}
+        /></span
+      >
     {/if}
     <span class="age">{relativeAge(session.created_at)}</span>
     {#if costUsd !== null}

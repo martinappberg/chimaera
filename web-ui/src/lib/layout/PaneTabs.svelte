@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { gitRepos, openFileHistory, repoForPath } from "../workspace/git";
   /**
    * The pane's always-present top bar (~26px): type glyph + tab name per
    * tab (active emphasized by WEIGHT, not color), pane controls at the
@@ -394,7 +395,15 @@
     if (tab.surface === "plugins") return "Extensions";
     if (tab.surface === "finder") return basename(tab.path) || "Finder";
     if (tab.surface === "git") return "Source Control";
-    if (tab.surface === "diff") return `${basename(tab.path)} (diff)`;
+    if (tab.surface === "diff") {
+      if (tab.mode === "commit" && tab.rev) return `${basename(tab.path)} @ ${tab.rev.slice(0, 7)}`;
+      return `${basename(tab.path)} (diff)`;
+    }
+    if (tab.surface === "gitx") {
+      if (tab.view === "commit") return tab.title ?? `Commit ${tab.sha?.slice(0, 7) ?? ""}`;
+      if (tab.view === "branch") return tab.title ? `Changes · ${tab.title}` : "Changes on this branch";
+      return tab.path ? `History · ${basename(tab.path)}` : tab.title ? `History · ${tab.title}` : "History";
+    }
     if (tab.surface === "changes") {
       const n = names.get(tab.sessionId) ?? sessions.get(tab.sessionId)?.name;
       return n !== undefined ? `Changes · ${n}` : "Changes";
@@ -643,6 +652,9 @@
           ? [{ label: "Download", onSelect: () => void fsDownload(tab.path) } as ContextMenuEntry]
           : []),
         { label: "Copy Path", onSelect: () => void copyPath(tab.path) },
+        ...(repoForPath($gitRepos, tab.path) !== null
+          ? [{ label: "File history", onSelect: () => openFileHistory(tab.path) } as ContextMenuEntry]
+          : []),
         "separator",
         ...move,
         ...close,
@@ -779,6 +791,13 @@
                 stroke-linejoin="round"
               />
               <path d="M3.6 6.2h1.8M10.6 6.2h1.8M11.5 5.3v1.8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+            </svg>
+          {:else if tab.surface === "gitx"}
+            <!-- A commit: a dot on a line (the history glyph's grammar). -->
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>{tab.view === "commit" ? "commit" : tab.view === "branch" ? "changes on this branch" : "history"}</title>
+              <path d="M8 1.5v4M8 10.5v4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+              <circle cx="8" cy="8" r="2.5" fill="none" stroke="currentColor" stroke-width="1.3" />
             </svg>
           {:else if tab.surface === "changes"}
             <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">

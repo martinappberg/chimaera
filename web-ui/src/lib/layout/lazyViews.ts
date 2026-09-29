@@ -7,6 +7,7 @@ export type PaneViewKind =
   | "file"
   | "finder"
   | "diff"
+  | "gitx"
   | "git"
   | "changes"
   | "dashboard"
@@ -33,6 +34,7 @@ const loaders: Record<PaneViewKind, () => Promise<PaneViewModule>> = {
   file: () => import("../previews/FileView.svelte"),
   finder: () => import("../previews/FinderView.svelte"),
   diff: () => import("../previews/DiffView.svelte"),
+  gitx: () => import("../workspace/GitDetailView.svelte"),
   git: () => import("../workspace/GitView.svelte"),
   changes: () => import("../workspace/SessionChangesView.svelte"),
   dashboard: () => import("../dashboard/DashboardView.svelte"),
@@ -51,6 +53,7 @@ const viewChunkPrefixes: Record<PaneViewKind, string> = {
   file: "FileView-",
   finder: "FinderView-",
   diff: "DiffView-",
+  gitx: "GitDetailView-",
   git: "GitView-",
   changes: "SessionChangesView-",
   dashboard: "DashboardView-",

@@ -9,7 +9,8 @@
  * and the changes panel all read it. Kept out of the layout tree so it survives
  * tab drags and pane restructuring (same reasoning as editing.ts).
  */
-import { writable, derived, type Readable } from "svelte/store";
+import { writable, derived, get, type Readable } from "svelte/store";
+import type { DiffTab, GitDetailTab } from "../layout/layout";
 
 import { api, ApiError } from "../net/api";
 
@@ -90,7 +91,10 @@ export interface GitStatus {
   repo_error?: string;
 }
 
-export type DiffMode = "unstaged" | "staged" | "head";
+/** The comparisons a diff can show: the status ones (unstaged / staged /
+ *  head), the working tree against a revision ("rev"), or one commit against
+ *  its parent ("commit"). */
+export type DiffMode = "unstaged" | "staged" | "head" | "rev" | "commit";
 
 export interface GitDiff {
   path: string;
@@ -126,6 +130,10 @@ export interface GitWorktree {
   /** A managed worktree whose HEAD the main checkout's branch already
    *  contains (null = not asked: unmanaged, or the current one). */
   merged?: boolean | null;
+  /** Commits it has that the main checkout's branch lacks (null for the main
+   *  checkout itself). */
+  ahead_of_main?: number | null;
+  behind_main?: number | null;
 }
 
 /** One local branch (read-only: there is no checkout). */
@@ -205,9 +213,118 @@ export async function fetchGitDiff(
   workspaceId: string,
   path: string,
   mode: DiffMode,
-  opts: { repo?: string } = {},
+  opts: { repo?: string; rev?: string; orig?: string } = {},
 ): Promise<GitDiff> {
-  return json(await api(`/git/diff?${gitQuery(workspaceId, { path, mode, repo: opts.repo })}`));
+  return json(
+    await api(
+      `/git/diff?${gitQuery(workspaceId, {
+        path,
+        mode: mode === "rev" ? undefined : mode,
+        repo: opts.repo,
+        rev: opts.rev,
+        orig: opts.orig,
+      })}`,
+    ),
+  );
+}
+
+/** One commit of a history page. */
+export interface GitCommit {
+  sha: string;
+  parents: string[];
+  author: string;
+  /** Author time, seconds since the epoch. */
+  time: number;
+  subject: string;
+  /** The message after the subject (capped), for the row's hover. */
+  body?: string;
+}
+
+export interface GitLogPage {
+  toplevel: string;
+  path?: string | null;
+  commits: GitCommit[];
+  has_more: boolean;
+  /** The branch has no commits yet. */
+  unborn?: boolean;
+}
+
+/** One page of history (≤50): a repository's, one file's (renames
+ *  followed), or from a branch/revision. */
+export async function fetchGitLog(
+  workspaceId: string,
+  opts: { repo?: string; path?: string; rev?: string; skip?: number; limit?: number } = {},
+): Promise<GitLogPage> {
+  return json(
+    await api(
+      `/git/log?${gitQuery(workspaceId, {
+        repo: opts.repo,
+        path: opts.path,
+        rev: opts.rev,
+        skip: opts.skip ? String(opts.skip) : undefined,
+        limit: opts.limit ? String(opts.limit) : undefined,
+      })}`,
+    ),
+  );
+}
+
+/** One file a commit (or a branch) changed. */
+export interface GitChangedFile {
+  path: string;
+  rel: string;
+  orig: string | null;
+  orig_rel: string | null;
+  /** A M D R C T, or "?" for untracked work on a branch. */
+  status: string;
+  added: number | null;
+  removed: number | null;
+  binary: boolean;
+}
+
+export interface GitCommitDetail {
+  toplevel: string;
+  sha: string;
+  parents: string[];
+  author: string;
+  time: number;
+  committer: string;
+  commit_time: number;
+  subject: string;
+  body: string;
+  files: GitChangedFile[];
+  truncated: boolean;
+}
+
+export async function fetchGitShow(
+  workspaceId: string,
+  rev: string,
+  repo?: string,
+): Promise<GitCommitDetail> {
+  return json(await api(`/git/show?${gitQuery(workspaceId, { rev, repo })}`));
+}
+
+/** "Changes on this branch": everything since it left its base. */
+export interface GitBranchChanges {
+  toplevel: string;
+  /** What it is compared against (a branch name), or null when there is
+   *  none and only uncommitted work shows. */
+  base: string | null;
+  merge_base: string | null;
+  /** The revision each file's diff opens against. */
+  diff_from: string;
+  head: string | null;
+  /** Commits on the branch since it left the base. */
+  ahead: number | null;
+  files: GitChangedFile[];
+  truncated: boolean;
+}
+
+export async function fetchGitCompare(
+  workspaceId: string,
+  repo?: string,
+  base?: string,
+): Promise<GitBranchChanges> {
+  return json(await api(`/git/compare?${gitQuery(workspaceId, { repo, base })}`));
 }
 
 export async function fetchGitWorktrees(
@@ -229,7 +346,7 @@ export interface CreatedWorktree {
   /** The worktree is registered as a workspace, so the branch is openable. */
   workspace: { id: string; root: string; name: string };
   /** What `.worktreeinclude` copied over (ignored files such as `.env`). */
-  included?: { copied: number; bytes: number; capped: boolean };
+  included?: { copied: number; bytes: number; capped: boolean; names?: string[] };
 }
 
 /**
@@ -630,4 +747,48 @@ export function repoForPath(repos: GitRepo[], path: string | null | undefined): 
     }
   }
   return best;
+}
+
+// ---- opening git views from anywhere ---------------------------------------
+
+type GitOpener = (tab: DiffTab | GitDetailTab) => void;
+let gitOpener: GitOpener | null = null;
+
+/** App-level wiring: how a git view opens from a surface without a pane
+ *  controller (the chat's branch line, menus, Quick Open). */
+export function setGitOpener(fn: GitOpener | null): void {
+  gitOpener = fn;
+}
+
+/** Open a git view beside the focused pane. */
+export function openGitView(tab: DiffTab | GitDetailTab): void {
+  gitOpener?.(tab);
+}
+
+/** A file's history (renames followed), from the repository holding it. */
+export function openFileHistory(path: string): void {
+  const r = repoForPath(get(reposStore), path);
+  const repo = r !== null && (r.kind === "nested" || r.kind === "submodule") ? r.path : null;
+  openGitView({
+    surface: "gitx",
+    view: "history",
+    repo,
+    path,
+    title: path.split("/").filter(Boolean).pop() ?? path,
+  });
+}
+
+/** "Changes on this branch" for the checkout a session works in. */
+export function openBranchChanges(git: { worktree: string; branch: string | null }): void {
+  openGitView({
+    surface: "gitx",
+    view: "branch",
+    repo: git.worktree,
+    title: git.branch ?? (git.worktree.split("/").filter(Boolean).pop() ?? git.worktree),
+  });
+}
+
+/** The active workspace's history (its primary repository, or `repo`). */
+export function openRepoHistory(repo: string | null = null): void {
+  openGitView({ surface: "gitx", view: "history", repo });
 }

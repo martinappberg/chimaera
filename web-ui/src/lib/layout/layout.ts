@@ -59,6 +59,35 @@ export interface DiffTab {
   /** Absolute path of the file being diffed. */
   path: string;
   mode: DiffMode;
+  /** A revision: the working tree against it (mode "rev"), or that commit
+   *  against its parent (mode "commit"). Absent for status diffs. */
+  rev?: string;
+  /** Which of the workspace's repositories (its top level, or a worktree's). */
+  repo?: string;
+  /** A renamed file's path before the commit (mode "commit"). */
+  orig?: string;
+}
+/**
+ * Git history surfaces, one kind with a `view`: a commit (its message and
+ * files), a history (a repository's, one file's, or one branch's commits), or
+ * "Changes on this branch" (everything since a branch left its base).
+ * Keyed by what they show so re-opening focuses the existing tab.
+ */
+export interface GitDetailTab {
+  surface: "gitx";
+  view: "commit" | "history" | "branch";
+  /** The repository (top level, or a worktree's); null = the workspace's own. */
+  repo: string | null;
+  /** view "commit": the full sha. */
+  sha?: string;
+  /** view "history": one file's history. */
+  path?: string;
+  /** view "history": start from this branch/revision. */
+  rev?: string;
+  /** view "branch": compare against this base (the daemon picks otherwise). */
+  base?: string;
+  /** A label for the tab ("feat/x", "qc.py", a subject). */
+  title?: string;
 }
 /** The source-control (changes) panel — a singleton view like settings. */
 export interface GitTab {
@@ -113,6 +142,7 @@ export type Tab =
   | SettingsTab
   | FinderTab
   | DiffTab
+  | GitDetailTab
   | GitTab
   | ChangesTab
   | DashboardTab
@@ -128,7 +158,15 @@ export function tabKey(t: Tab): string {
   if (t.surface === "finder") return `d:${t.id}`;
   // `g:`, not `d:` — the Finder owns the `d:` namespace, and two surfaces
   // sharing a key prefix would alias inside the no-duplicates set.
-  if (t.surface === "diff") return `g:${t.mode}:${t.path}`;
+  if (t.surface === "diff") {
+    return t.rev !== undefined || t.repo !== undefined
+      ? `g:${t.mode}|${t.rev ?? ""}|${t.repo ?? ""}:${t.path}`
+      : `g:${t.mode}:${t.path}`;
+  }
+  // `x:` — git history views, keyed by what they show.
+  if (t.surface === "gitx") {
+    return `x:${t.view}|${t.repo ?? ""}|${t.sha ?? ""}|${t.path ?? ""}|${t.rev ?? ""}|${t.base ?? ""}`;
+  }
   if (t.surface === "git") return "v:git";
   if (t.surface === "dashboard") return "v:dashboard";
   // Explicit keys: the trailing fallthrough is settings', and a new singleton
@@ -1286,13 +1324,19 @@ type STab =
   | { f: string; pv?: 1 }
   | { v: string }
   | { d: string; di: string }
-  | { gd: string; dm?: string }
+  | { gd: string; dm?: string; gr?: string; go?: string; gp?: string }
+  | { gx: string; xr?: string; xs?: string; xp?: string; xv?: string; xb?: string; xt?: string }
   | { cs: string }
   | { w: string; wo: number; wi: string; wp: string };
 
 /** Coerce a persisted diff mode, defaulting to unstaged. */
 function diffModeOf(x: unknown): DiffMode {
-  return x === "staged" || x === "head" ? x : "unstaged";
+  return x === "staged" || x === "head" || x === "rev" || x === "commit" ? x : "unstaged";
+}
+
+/** A persisted optional string, bounded. */
+function optStr(x: unknown, max = 4096): string | undefined {
+  return typeof x === "string" && x.length > 0 && x.length <= max ? x : undefined;
 }
 interface SPane {
   t: "p";
@@ -1321,7 +1365,23 @@ function serNode(node: LayoutNode): SNode {
         if (t.surface === "terminal") return { s: t.sessionId };
         if (t.surface === "file") return t.preview === true ? { f: t.path, pv: 1 } : { f: t.path };
         if (t.surface === "finder") return { d: t.path, di: t.id };
-        if (t.surface === "diff") return { gd: t.path, dm: t.mode };
+        if (t.surface === "diff") {
+          const d: STab = { gd: t.path, dm: t.mode };
+          if (t.rev !== undefined) d.gr = t.rev;
+          if (t.repo !== undefined) d.gp = t.repo;
+          if (t.orig !== undefined) d.go = t.orig;
+          return d;
+        }
+        if (t.surface === "gitx") {
+          const x: STab = { gx: t.view };
+          if (t.repo !== null) x.xr = t.repo;
+          if (t.sha !== undefined) x.xs = t.sha;
+          if (t.path !== undefined) x.xp = t.path;
+          if (t.rev !== undefined) x.xv = t.rev;
+          if (t.base !== undefined) x.xb = t.base;
+          if (t.title !== undefined) x.xt = t.title;
+          return x;
+        }
         if (t.surface === "git") return { v: "git" };
         if (t.surface === "dashboard") return { v: "dashboard" };
         if (t.surface === "timeline") return { v: "timeline" };
@@ -1381,7 +1441,27 @@ function deserNode(
         const id = typeof t.di === "string" && t.di.length > 0 ? t.di : uid();
         tab = { surface: "finder", id, path: t.d };
       } else if (typeof t.gd === "string" && t.gd.length > 0 && t.gd.length <= 4096) {
-        tab = { surface: "diff", path: t.gd, mode: diffModeOf(t.dm) };
+        const d: DiffTab = { surface: "diff", path: t.gd, mode: diffModeOf(t.dm) };
+        const rev = optStr(t.gr, 256);
+        const repo = optStr(t.gp);
+        const orig = optStr(t.go);
+        if (rev !== undefined) d.rev = rev;
+        if (repo !== undefined) d.repo = repo;
+        if (orig !== undefined) d.orig = orig;
+        tab = d;
+      } else if (t.gx === "commit" || t.gx === "history" || t.gx === "branch") {
+        const x: GitDetailTab = { surface: "gitx", view: t.gx, repo: optStr(t.xr) ?? null };
+        const sha = optStr(t.xs, 64);
+        const path = optStr(t.xp);
+        const rev = optStr(t.xv, 256);
+        const base = optStr(t.xb, 256);
+        const title = optStr(t.xt, 200);
+        if (sha !== undefined) x.sha = sha;
+        if (path !== undefined) x.path = path;
+        if (rev !== undefined) x.rev = rev;
+        if (base !== undefined) x.base = base;
+        if (title !== undefined) x.title = title;
+        tab = x;
       } else if (t.v === "git") {
         tab = { surface: "git" };
       } else if (t.v === "dashboard") {

@@ -469,6 +469,15 @@ pub(crate) struct DiffQuery {
     /// One of the workspace's repositories (see [`pick_repo`]).
     #[serde(default)]
     repo: Option<String>,
+    /// A revision (branch, tag, sha, `HEAD~1`): validated with
+    /// `check-ref-format` and resolved with `rev-parse --verify`. With the
+    /// default mode it is the working tree against that revision; with
+    /// `mode=commit` it is that commit against its first parent.
+    #[serde(default)]
+    rev: Option<String>,
+    /// `mode=commit` on a renamed file: its path before the commit.
+    #[serde(default)]
+    orig: Option<String>,
 }
 
 /// GET /api/v1/git/diff?workspace_id=&path=&mode= — the two blob versions for a
@@ -518,17 +527,80 @@ pub(crate) async fn diff(
     };
 
     let mode = q.mode.as_deref().unwrap_or("unstaged");
-    let (a_spec, a_label, b_from_worktree, b_label) = match mode {
-        "staged" => (Some(format!("HEAD:{rel}")), "HEAD", false, "staged"),
-        "head" => (Some(format!("HEAD:{rel}")), "HEAD", true, "working tree"),
-        // "unstaged" (default): index vs working tree.
-        _ => (Some(format!(":{rel}")), "index", true, "working tree"),
-    };
-    let b_spec = if b_from_worktree {
-        None
-    } else {
-        Some(format!(":{rel}"))
-    };
+    let rev = q.rev.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    let (a_spec, a_label, b_spec, b_label): (Option<String>, String, Option<String>, String) =
+        match rev {
+            Some(rev) => {
+                let Some(sha) =
+                    super::rev::resolve_commit(&git.path, &state.git.procs, &repo.toplevel, rev)
+                        .await
+                else {
+                    return bad_request(&format!("unknown revision {rev:?}"));
+                };
+                let short: String = sha.chars().take(7).collect();
+                if mode == "commit" {
+                    // The commit against its first parent (a root commit
+                    // against nothing: the whole file is added).
+                    let parent_spec = format!("{sha}^");
+                    let parent = super::rev::resolve_commit(
+                        &git.path,
+                        &state.git.procs,
+                        &repo.toplevel,
+                        &parent_spec,
+                    )
+                    .await;
+                    let before_rel = q
+                        .orig
+                        .as_deref()
+                        .and_then(|o| repo_relative(&repo.toplevel, o))
+                        .unwrap_or_else(|| rel.clone());
+                    let a_label = parent
+                        .as_ref()
+                        .map(|p| p.chars().take(7).collect::<String>())
+                        .unwrap_or_else(|| "nothing".to_string());
+                    (
+                        parent.map(|p| format!("{p}:{before_rel}")),
+                        a_label,
+                        Some(format!("{sha}:{rel}")),
+                        short,
+                    )
+                } else {
+                    // The working tree against the revision.
+                    let label = if super::anchor::is_sha(rev) {
+                        short
+                    } else {
+                        rev.to_string()
+                    };
+                    (
+                        Some(format!("{sha}:{rel}")),
+                        label,
+                        None,
+                        "working tree".to_string(),
+                    )
+                }
+            }
+            None => match mode {
+                "staged" => (
+                    Some(format!("HEAD:{rel}")),
+                    "HEAD".into(),
+                    Some(format!(":{rel}")),
+                    "staged".into(),
+                ),
+                "head" => (
+                    Some(format!("HEAD:{rel}")),
+                    "HEAD".into(),
+                    None,
+                    "working tree".into(),
+                ),
+                // "unstaged" (default): index vs working tree.
+                _ => (
+                    Some(format!(":{rel}")),
+                    "index".into(),
+                    None,
+                    "working tree".into(),
+                ),
+            },
+        };
 
     // Fetch both sides (a = base, b = target). A missing object is a valid
     // outcome: no HEAD blob = added; no worktree file = deleted.
@@ -620,7 +692,7 @@ fn is_binary(bytes: &[u8]) -> bool {
 /// never match it lexically. Resolve the input the same way before comparing;
 /// a deleted file has no canonical form, so fall back to resolving its parent
 /// and re-attaching the file name, and finally to the raw path.
-fn repo_relative(toplevel: &Path, abs: &str) -> Option<String> {
+pub(super) fn repo_relative(toplevel: &Path, abs: &str) -> Option<String> {
     let raw = Path::new(abs);
     let resolved = std::fs::canonicalize(raw).ok().or_else(|| {
         let parent = raw.parent()?;

@@ -8,7 +8,14 @@
   import { tick, untrack } from "svelte";
   import { basename, dirLabel, dirname, fsDownload, fsList, type FsEntry } from "../previews/files";
   import { getSetting } from "../settings/store.svelte";
-  import { gitIndex, gitStatus, type GitEntry } from "./git";
+  import {
+    gitIndex,
+    gitRepos,
+    gitStatus,
+    openFileHistory,
+    repoForPath,
+    type GitEntry,
+  } from "./git";
   import { decoFor, dirColor } from "./gitDeco";
   import { fsCreateOp, fsEpoch, fsRenameOp, lastFsMutation, requestDelete } from "./fsEvents";
   import { clearDiskDirs, lastDiskChange, setDiskDirs } from "./diskWatch";
@@ -856,6 +863,10 @@
         ? [{ label: "Download", onSelect: () => void fsDownload(entry.path) } as ContextMenuEntry]
         : []),
       { label: "Copy Path", onSelect: () => void copyPath(entry.path) },
+      // Only inside a repository: git is ambient, never an offer.
+      ...(entry.kind === "file" && repoForPath($gitRepos, entry.path) !== null
+        ? [{ label: "File history", onSelect: () => openFileHistory(entry.path) } as ContextMenuEntry]
+        : []),
       "separator",
       {
         label: "Delete…",

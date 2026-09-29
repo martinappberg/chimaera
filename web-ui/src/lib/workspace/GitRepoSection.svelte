@@ -14,20 +14,26 @@
     createWorktree,
     fetchGitBranches,
     fetchGitWorktrees,
+    gitSectionOpen,
     notifyWorkspacesChanged,
     refreshGit,
+    rememberGitSection,
     removeWorktree,
     type DiffMode,
     type GitBranch,
+    type GitCommit,
     type GitEntry,
     type GitStatus,
     type GitWorktree,
   } from "./git";
   import { decoFor } from "./gitDeco";
+  import { relTime } from "./gitFormat";
   import { midTruncate } from "../previews/files";
-  import { createSession, type Session, type SessionKind } from "./sessions";
+  import { baseName, createSession, dotState, dotTitle, displayName, type Session } from "./sessions";
+  import Chevron from "../shared/Chevron.svelte";
   import FileIcon from "../shared/FileIcon.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
+  import GitHistoryList from "./GitHistoryList.svelte";
 
   interface Props {
     wsId: string | null;
@@ -120,47 +126,134 @@
   });
   const worktrees = $derived(givenWorktrees ?? ownWorktrees);
 
-  // Branches: each worktree of the repo, and which sessions live in it. The
-  // agent↔branch edge is the daemon's: each session row names the checkout
-  // its current folder is in (`session.git.worktree` — a shell's cwd, an
-  // agent's hook-reported cwd), so an agent that moved into a worktree
-  // mid-session is listed there. Nothing is stored.
-  // A single-worktree repo shows no rows here: the header already names the
-  // branch, and an empty section is chrome that hasn't earned its pixels.
+  // Sections under Changes: Branches (open by default) and History (closed
+  // until asked for), remembered per workspace and repository.
+  const sectionKey = $derived(repo ?? ".");
+  let branchesOpen = $state(true);
+  let historyOpen = $state(false);
+  let otherOpen = $state(false);
+  $effect(() => {
+    branchesOpen = gitSectionOpen(wsId, `${sectionKey}:branches`, true);
+    historyOpen = gitSectionOpen(wsId, `${sectionKey}:history`, false);
+  });
+  function toggleBranches(): void {
+    branchesOpen = !branchesOpen;
+    rememberGitSection(wsId, `${sectionKey}:branches`, branchesOpen);
+  }
+  function toggleHistory(): void {
+    historyOpen = !historyOpen;
+    rememberGitSection(wsId, `${sectionKey}:history`, historyOpen);
+  }
+
+  // Branches: each worktree of the repo (the main checkout first), and which
+  // sessions live in it. The agent↔branch edge is the daemon's: each session
+  // row names the checkout its current folder is in (`session.git.worktree`
+  // — a shell's cwd, an agent's hook-reported cwd), so an agent that moved
+  // into a worktree mid-session is listed there. Nothing is stored.
+  const mainBranch = $derived(worktrees[0]?.branch ?? null);
   const allBranches = $derived(
-    worktrees.length < 2
-      ? []
-      : worktrees.map((wt) => ({
-          wt,
-          sessions: [...sessions.values()]
-            .filter((s) => s.alive)
-            .filter((s) => s.git?.worktree === wt.path),
-        })),
+    worktrees.map((wt, i) => ({
+      wt,
+      main: i === 0,
+      sessions: [...sessions.values()]
+        .filter((s) => s.alive)
+        .filter((s) => s.git?.worktree === wt.path),
+    })),
   );
-  // Only what you can act on: the worktree you're in, any holding sessions, and
-  // any Chimaera created (managed — those you can remove here). A repo can carry
-  // dozens of the user's own stale worktrees (this one does); listing them all
+  // Only what you can act on: the main checkout, the one you're in, any
+  // holding sessions, and any Chimaera created (managed — removable here). A
+  // repo can carry dozens of the user's own stale worktrees; listing them all
   // is chrome that hasn't earned its pixels, so the rest fold into a count.
   const branches = $derived(
-    allBranches.filter((b) => b.wt.current || b.sessions.length > 0 || b.wt.managed),
+    allBranches.filter((b) => b.main || b.wt.current || b.sessions.length > 0 || b.wt.managed),
   );
   const otherWorktrees = $derived(allBranches.length - branches.length);
+
+  // Local branches with no worktree: read-only, under "Other branches".
+  let localBranches = $state<GitBranch[]>([]);
+  $effect(() => {
+    if (!branchesOpen || wsId === null) return;
+    const id = wsId;
+    const top = repo;
+    void status.repo_epoch;
+    void status.epoch;
+    let live = true;
+    void fetchGitBranches(id, top ?? undefined)
+      .then((r) => {
+        if (live) localBranches = r.branches ?? [];
+      })
+      .catch(() => {
+        if (live) localBranches = [];
+      });
+    return () => {
+      live = false;
+    };
+  });
+  const checkedOut = $derived(new Set(worktrees.map((w) => w.branch).filter((b) => b !== null)));
+  const otherBranches = $derived(localBranches.filter((b) => !checkedOut.has(b.name)));
+
+  function branchName(wt: GitWorktree): string {
+    if (wt.branch) return wt.branch;
+    return wt.detached ? `No branch (at ${wt.head ?? "?"})` : "No commits yet";
+  }
 
   function openDiff(e: MouseEvent, entry: GitEntry, mode: DiffMode): void {
     ctrl.openDiffFrom(paneId, entry.path, mode, e.metaKey || e.ctrlKey);
   }
 
+  /** A branch row: "Changes on this branch" beside the panel. */
+  function openBranch(e: MouseEvent, wt: GitWorktree, main: boolean): void {
+    ctrl.openGitFrom(
+      paneId,
+      {
+        surface: "gitx",
+        view: "branch",
+        // The main checkout is the repository itself; another worktree is
+        // named by its folder (the daemon validates it as this repo's).
+        repo: main ? repo : wt.path,
+        title: wt.branch ?? baseName(wt.path),
+      },
+      e.metaKey || e.ctrlKey,
+    );
+  }
+
+  /** A local branch without a worktree: its history. */
+  function openBranchHistory(e: MouseEvent, b: GitBranch): void {
+    ctrl.openGitFrom(
+      paneId,
+      { surface: "gitx", view: "history", repo, rev: b.name, title: b.name },
+      e.metaKey || e.ctrlKey,
+    );
+  }
+
+  function openCommit(c: GitCommit, e: MouseEvent): void {
+    ctrl.openGitFrom(
+      paneId,
+      { surface: "gitx", view: "commit", repo, sha: c.sha, title: c.subject },
+      e.metaKey || e.ctrlKey,
+    );
+  }
+
+  function dragCommit(c: GitCommit, e: PointerEvent): void {
+    ctrl.beginGitDrag(
+      e,
+      { surface: "gitx", view: "commit", repo, sha: c.sha, title: c.subject },
+      () => openCommit(c, e as unknown as MouseEvent),
+    );
+  }
+
   // ---- worktree orchestration (the panel's only mutations) ------------------
 
-  // The composer: pick "terminal" or an agent, type a branch, and Chimaera
-  // creates the worktree + spawns the session into it. Kept collapsed until the
-  // "+ branch" affordance is clicked so the panel stays quiet. It lives in a
-  // repository's own section, so which repository is never in doubt.
+  // The composer: a name, where it starts, and whether an agent starts there.
+  // Chimaera creates the worktree (and the agent). Collapsed until "+ New
+  // branch" is clicked; it lives in a repository's own section, so which
+  // repository is never in doubt.
   let composing = $state(false);
   let newBranch = $state("");
-  let newKind = $state<SessionKind>("agent");
+  let startAgent = $state(true);
   let busy = $state(false);
   let actionError = $state<string | null>(null);
+  let copiedNote = $state<string | null>(null);
   let branchInput = $state<HTMLInputElement | null>(null);
   // Where a NEW branch starts: one of the local branches ("" = the current
   // HEAD, what git does by default). Fetched when the composer opens.
@@ -170,7 +263,9 @@
   function startCompose(): void {
     composing = true;
     actionError = null;
+    copiedNote = null;
     newBase = "";
+    if (!branchesOpen) toggleBranches();
     if (wsId !== null) {
       const id = wsId;
       void fetchGitBranches(id, repo ?? undefined)
@@ -184,6 +279,12 @@
     void Promise.resolve().then(() => branchInput?.focus());
   }
 
+  function copiedWords(names: string[], copied: number): string | null {
+    if (copied <= 0) return null;
+    const first = names[0] ?? "a file";
+    return copied === 1 ? `Copied ${first}` : `Copied ${first} and ${copied - 1} more`;
+  }
+
   async function spawnInNewBranch(): Promise<void> {
     const branch = newBranch.trim();
     if (busy || wsId === null || branch === "") return;
@@ -191,14 +292,17 @@
     actionError = null;
     try {
       const created = await createWorktree(wsId, branch, newBase || undefined, repo ?? undefined);
-      // The new worktree is its own workspace; spawn the session there and
-      // reveal it. `refreshGit` picks up the new branch in the Branches view.
-      const session = await createSession(created.workspace.id, newKind);
+      copiedNote = copiedWords(created.included?.names ?? [], created.included?.copied ?? 0);
       notifyWorkspacesChanged();
       refreshGit();
-      onOpenSession(session.id, created.workspace.id);
       composing = false;
       newBranch = "";
+      if (startAgent) {
+        // The new worktree is its own workspace; start the agent there and
+        // reveal it.
+        const session = await createSession(created.workspace.id, "agent");
+        onOpenSession(session.id, created.workspace.id);
+      }
     } catch (e) {
       actionError = e instanceof Error ? e.message : "failed to create the worktree";
     } finally {
@@ -292,25 +396,21 @@
 
 {#if worktrees.length >= 1}
   <div class="group branches">
-    <div class="gtitle">
-      <span>Branches</span>
-      {#if branches.length > 0}<span class="gcount">{branches.length}</span>{/if}
+    <div class="sec">
+      <button class="sec-toggle" aria-expanded={branchesOpen} onclick={toggleBranches}>
+        <Chevron open={branchesOpen} size={9} />
+        <span>Branches</span>
+      </button>
       <span class="spacer"></span>
-      <button class="gt-action" title="new branch in its own worktree" onclick={startCompose}>
-        + branch
+      <button class="gt-action" title="a new branch in its own worktree" onclick={startCompose}>
+        + New branch
       </button>
     </div>
 
-    {#if composing}
-      <!-- Create a worktree for a new branch and spawn a session into it. -->
-      <div class="compose">
-        <div class="compose-row">
-          <div class="seg" role="group" aria-label="session kind">
-            <button class="seg-btn" class:on={newKind === "agent"} onclick={() => (newKind = "agent")}
-              >agent</button>
-            <button class="seg-btn" class:on={newKind === "shell"} onclick={() => (newKind = "shell")}
-              >terminal</button>
-          </div>
+    {#if branchesOpen}
+      {#if composing}
+        <!-- Create a worktree for a new branch (and, by choice, an agent in it). -->
+        <div class="compose">
           <input
             class="compose-input"
             bind:this={branchInput}
@@ -328,12 +428,8 @@
               }
             }}
           />
-        </div>
-        {#if baseChoices.length > 0}
-          <!-- A new branch starts from here; an existing branch name is
-               checked out as it is (git's own rule), whatever this says. -->
           <label class="compose-base">
-            <span class="compose-base-label">from</span>
+            <span class="compose-base-label">From</span>
             <select class="compose-select" bind:value={newBase} disabled={busy}>
               <option value="">{status.branch ?? "HEAD"} (current)</option>
               {#each baseChoices.filter((b) => !b.current) as b (b.name)}
@@ -341,76 +437,107 @@
               {/each}
             </select>
           </label>
-        {/if}
-        <div class="compose-actions">
-          <button
-            class="compose-go"
-            disabled={busy || newBranch.trim() === ""}
-            onclick={() => void spawnInNewBranch()}>{busy ? "creating…" : "create + open"}</button>
-          <button class="compose-cancel" disabled={busy} onclick={() => (composing = false)}>cancel</button>
+          <label class="compose-check">
+            <input type="checkbox" bind:checked={startAgent} disabled={busy} />
+            <span>Start an agent here</span>
+          </label>
+          <div class="compose-actions">
+            <button
+              class="compose-go"
+              disabled={busy || newBranch.trim() === ""}
+              onclick={() => void spawnInNewBranch()}>{busy ? "Creating…" : "Create"}</button>
+            <button class="compose-cancel" disabled={busy} onclick={() => (composing = false)}>Cancel</button>
+          </div>
         </div>
-      </div>
-    {/if}
-    {#if actionError !== null}
-      <div class="wt-error" role="alert">{actionError}</div>
-    {/if}
+      {/if}
+      {#if actionError !== null}
+        <div class="wt-error" role="alert">{actionError}</div>
+      {/if}
+      {#if copiedNote !== null}
+        <div class="wt-note-line">{copiedNote}</div>
+      {/if}
 
-    {#each branches as b (b.wt.path)}
-      {@const removable = b.wt.managed && !b.wt.current && b.sessions.length === 0}
-      <div class="wt" class:current={b.wt.current}>
-        <div class="wt-head" title={b.wt.path}>
-          <span class="wt-branch">
-            {#if b.wt.detached}
-              <span class="detached">detached</span> <span class="sha">{b.wt.head ?? "?"}</span>
-            {:else}
-              {b.wt.branch ?? "(unborn)"}
+      {#each branches as b (b.wt.path)}
+        {@const removable = b.wt.managed && !b.wt.current && b.sessions.length === 0}
+        {@const ahead = b.wt.ahead_of_main ?? 0}
+        <div class="wt" class:current={b.wt.current}>
+          <button
+            class="wt-head"
+            title={`${b.wt.path} — changes on this branch${b.wt.locked ? " · locked while an agent works here" : ""}`}
+            onclick={(e) => openBranch(e, b.wt, b.main)}
+          >
+            <span class="wt-branch" class:detached={b.wt.detached}>{branchName(b.wt)}</span>
+            {#if !b.main}<span class="wt-folder">{baseName(b.wt.path)}</span>{/if}
+            {#if !b.main && ahead > 0 && mainBranch}
+              <span class="wt-note">{ahead} ahead of {mainBranch}</span>
             {/if}
-          </span>
-          {#if b.wt.current}<span class="wt-tag">current</span>{/if}
-          {#if b.wt.locked}<span class="wt-tag muted" title="locked — other tools' clean-up leaves it alone">locked</span>{/if}
-          {#if b.wt.prunable}<span class="wt-tag muted">prunable</span>{/if}
-          {#if removable && b.wt.merged}
-            <span
-              class="wt-tag muted"
-              title={`${status.branch ?? "the main checkout"} already contains this branch`}>merged</span>
-          {/if}
-          {#if b.sessions.length > 0}
-            <span class="wt-count">{b.sessions.length}</span>
-          {/if}
-          <!-- Remove only where the daemon would allow it: a managed
-               worktree that is neither the current one nor holding sessions.
-               A merged one keeps the control visible — it's done. -->
+            {#if removable && b.wt.merged}<span class="wt-note">merged</span>{/if}
+          </button>
+          {#each b.sessions as s (s.id)}
+            <button
+              class="wt-agent"
+              title={`${names.get(s.id) ?? displayName(s)} — ${dotTitle(s)}`}
+              onclick={() => onOpenSession(s.id, s.workspace_id)}
+            >
+              <SessionGlyph kind={s.kind} agentKind={s.agent_kind} state={dotState(s)} size={11} />
+            </button>
+          {/each}
+          <!-- Remove only where the daemon would allow it: a managed worktree
+               that is neither the current one nor holding sessions. A merged
+               one keeps the action visible — it's done. -->
           {#if removable}
             <button
               class="wt-remove"
               class:offered={b.wt.merged === true}
-              title={b.wt.merged
-                ? "merged — remove this worktree (keeps the branch)"
-                : "remove this worktree (keeps the branch)"}
-              aria-label="remove worktree"
+              title="remove this worktree (the branch is kept)"
               disabled={busy}
-              onclick={() => void remove(b.wt)}>&times;</button>
+              onclick={() => void remove(b.wt)}>Remove worktree</button>
           {/if}
         </div>
-        {#each b.sessions as s (s.id)}
-          <button
-            class="wt-session"
-            title={s.cwd_current ?? s.cwd}
-            onclick={() => onOpenSession(s.id, s.workspace_id)}
-          >
-            <SessionGlyph kind={s.kind} agentKind={s.agent_kind} size={10} title={s.kind} />
-            <span class="wt-session-name">{names.get(s.id) ?? s.name}</span>
+      {/each}
+      {#if otherWorktrees > 0}
+        <div class="wt-more">
+          {otherWorktrees} other worktree{otherWorktrees === 1 ? "" : "s"}, no sessions
+        </div>
+      {/if}
+      {#if otherBranches.length > 0}
+        <div class="other">
+          <button class="sec-toggle sub" aria-expanded={otherOpen} onclick={() => (otherOpen = !otherOpen)}>
+            <Chevron open={otherOpen} size={9} />
+            <span>Other branches ({otherBranches.length})</span>
           </button>
-        {/each}
-      </div>
-    {/each}
-    {#if otherWorktrees > 0}
-      <div class="wt-more">
-        {otherWorktrees} other worktree{otherWorktrees === 1 ? "" : "s"}, no sessions
-      </div>
+          {#if otherOpen}
+            {#each otherBranches as b (b.name)}
+              <button class="ob" title={`${b.name} — its history`} onclick={(e) => openBranchHistory(e, b)}>
+                <span class="ob-name">{b.name}</span>
+                <span class="ob-time">{relTime(b.time)}</span>
+              </button>
+            {/each}
+          {/if}
+        </div>
+      {/if}
     {/if}
   </div>
 {/if}
+
+<div class="group history">
+  <div class="sec">
+    <button class="sec-toggle" aria-expanded={historyOpen} onclick={toggleHistory}>
+      <Chevron open={historyOpen} size={9} />
+      <span>History</span>
+    </button>
+  </div>
+  {#if historyOpen}
+    <GitHistoryList
+      {wsId}
+      {repo}
+      initial={20}
+      refreshKey={repo === null ? status.epoch : status.repo_epoch}
+      onOpen={openCommit}
+      onDragStart={dragCommit}
+    />
+  {/if}
+</div>
 
 <style>
   .spacer {
@@ -418,9 +545,6 @@
   }
   .detached {
     color: var(--warn);
-  }
-  .sha {
-    opacity: 0.8;
   }
 
   .group {
@@ -504,24 +628,75 @@
     line-height: 1;
   }
 
-  /* Branches: one block per worktree, with the sessions living in it. */
-  .branches {
+  /* Branches and History: collapsible sections under Changes. */
+  .branches,
+  .history {
     margin-top: 0.35rem;
     border-top: 1px solid var(--edge);
     padding-top: 0.2rem;
   }
-
-  .wt {
-    padding: 0.1rem 0.7rem 0.25rem;
-  }
-
-  .wt-head {
+  .sec {
     display: flex;
     align-items: center;
-    gap: 0.35rem;
-    min-height: calc(var(--text-sm) + 7px);
+    gap: 0.4rem;
+    padding: 0.2rem 0.7rem 0.15rem 0.45rem;
+  }
+  .sec-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0.1rem 0.2rem;
+    border-radius: 4px;
+    font: inherit;
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .sec-toggle:hover {
+    color: var(--fg);
+  }
+  .sec-toggle.sub {
+    text-transform: none;
+    letter-spacing: 0;
+    padding-left: 0.45rem;
   }
 
+  /* One row per worktree branch: name, folder, how far ahead, the agents
+     working there, and — when done — a quiet way to remove it. */
+  .wt {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0 0.7rem 0 0.45rem;
+    min-height: calc(var(--text-sm) + 9px);
+  }
+  .wt:hover {
+    background: var(--row-hover);
+  }
+  .wt-head {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: baseline;
+    gap: 0.45rem;
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0.15rem 0.25rem;
+    font: inherit;
+    text-align: left;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .wt-head:focus-visible {
+    outline: 1px solid var(--focus-ring);
+    outline-offset: -1px;
+  }
   .wt-branch {
     font-family: var(--mono);
     font-size: var(--text-sm);
@@ -529,42 +704,84 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    min-width: 0;
   }
-  .wt.current .wt-branch {
+  .wt.current .wt-branch,
+  .wt-head:hover .wt-branch {
     color: var(--fg);
   }
-
-  .wt-tag {
+  .wt-folder,
+  .wt-note {
     flex: none;
     font-size: var(--text-xs);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    padding: 0.03rem 0.28rem;
-    border-radius: 3px;
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-  }
-  .wt-tag.muted {
     color: var(--muted);
-    background: var(--row-hover);
+    opacity: 0.85;
+    white-space: nowrap;
   }
-
-  .wt-count {
-    flex: none;
-    margin-left: auto;
+  .wt-folder {
     font-family: var(--mono);
+    opacity: 0.65;
+  }
+  .wt-agent {
+    flex: none;
+    display: inline-flex;
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0.1rem;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .wt-agent:hover {
+    background: var(--row-active);
+  }
+  .wt-remove {
+    flex: none;
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0.05rem 0.2rem;
+    font: inherit;
     font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
     color: var(--muted);
+    cursor: pointer;
+    border-radius: 3px;
+    opacity: 0;
+    transition: opacity 0.1s ease;
+  }
+  .wt:hover .wt-remove,
+  .wt-remove.offered {
+    opacity: 0.85;
+  }
+  .wt-remove:hover {
+    opacity: 1;
+    color: var(--fg);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .wt-remove:focus-visible {
+    opacity: 1;
+    outline: 1px solid var(--focus-ring);
   }
 
-  .wt-session {
+  .wt-more,
+  .wt-note-line {
+    padding: 0.15rem 0.7rem 0.2rem 0.95rem;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    opacity: 0.8;
+  }
+
+  .other {
+    padding-top: 0.1rem;
+  }
+  .ob {
     display: flex;
     align-items: center;
-    gap: 0.35rem;
+    gap: 0.4rem;
     width: 100%;
-    padding: 0 0.7rem 0 0.9rem;
     min-height: calc(var(--text-sm) + 7px);
+    padding: 0 0.7rem 0 1.6rem;
     appearance: none;
     border: none;
     background: none;
@@ -573,50 +790,23 @@
     cursor: pointer;
     color: var(--muted);
   }
-  .wt-session:hover {
+  .ob:hover {
     background: var(--row-hover);
     color: var(--fg);
   }
-
-  .wt-session-name {
+  .ob-name {
+    flex: 1;
+    min-width: 0;
+    font-family: var(--mono);
     font-size: var(--text-sm);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-
-  .wt-remove {
+  .ob-time {
     flex: none;
-    appearance: none;
-    border: none;
-    background: none;
-    color: var(--muted);
-    cursor: pointer;
-    font-size: var(--text-lg);
-    line-height: 1;
-    padding: 0 0.15rem;
-    border-radius: 3px;
-    opacity: 0;
-    transition:
-      opacity 0.1s ease,
-      color 0.1s ease,
-      background-color 0.1s ease;
-  }
-  .wt:hover .wt-remove,
-  .wt-remove.offered {
-    opacity: 0.7;
-  }
-  .wt-remove:hover {
-    opacity: 1;
-    color: var(--git-deleted);
-    background: var(--row-hover);
-  }
-
-  .wt-more {
-    padding: 0.15rem 0.7rem 0.2rem;
     font-size: var(--text-xs);
-    color: var(--muted);
-    opacity: 0.7;
+    font-variant-numeric: tabular-nums;
   }
 
   /* The gtitle action ("+ branch") sits at the section header's right. */
@@ -640,34 +830,17 @@
   }
 
   .compose {
-    padding: 0.25rem 0.7rem 0.4rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    padding: 0.25rem 0.7rem 0.45rem 0.95rem;
   }
-  .compose-row {
+  .compose-check {
     display: flex;
     align-items: center;
     gap: 0.35rem;
-  }
-  .seg {
-    flex: none;
-    display: flex;
-    gap: 1px;
-    background: var(--edge);
-    border-radius: 5px;
-    overflow: hidden;
-  }
-  .seg-btn {
-    appearance: none;
-    border: none;
-    background: var(--term-bg);
-    font: inherit;
     font-size: var(--text-xs);
     color: var(--muted);
-    cursor: pointer;
-    padding: 0.14rem 0.4rem;
-  }
-  .seg-btn.on {
-    background: var(--row-active);
-    color: var(--fg);
   }
   .compose-input {
     flex: 1;
@@ -688,13 +861,11 @@
   .compose-actions {
     display: flex;
     gap: 0.35rem;
-    margin-top: 0.3rem;
   }
   .compose-base {
     display: flex;
     align-items: center;
     gap: 0.35rem;
-    margin-top: 0.3rem;
     min-width: 0;
   }
   .compose-base-label {

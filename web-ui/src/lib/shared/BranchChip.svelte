@@ -40,7 +40,17 @@
 {/snippet}
 
 {#if onOpen}
-  <button type="button" class="branch-chip link" title={`${tip} — changes on this branch`} onclick={onOpen}>
+  <!-- stopPropagation: the chip sits inside clickable cards (the dashboard
+       card opens its session); the chip's own destination wins. -->
+  <button
+    type="button"
+    class="branch-chip link"
+    title={`${tip} — changes on this branch`}
+    onclick={(e) => {
+      e.stopPropagation();
+      onOpen?.();
+    }}
+  >
     {@render body()}
   </button>
 {:else}

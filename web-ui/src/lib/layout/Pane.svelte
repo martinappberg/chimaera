@@ -420,9 +420,18 @@
   {:else if tab.surface === "diff"}
     {@const DiffView = views.diff}
     {#if DiffView !== undefined}
-      <DiffView path={tab.path} mode={tab.mode} {wsId} />
+      <DiffView path={tab.path} mode={tab.mode} rev={tab.rev} repo={tab.repo} orig={tab.orig} {wsId} />
     {:else if viewErrors.diff}
       {@render loadFailure("diff", "diff view")}
+    {:else}
+      <Spinner />
+    {/if}
+  {:else if tab.surface === "gitx"}
+    {@const GitDetailView = views.gitx}
+    {#if GitDetailView !== undefined}
+      <GitDetailView {wsId} paneId={node.id} {ctrl} {tab} />
+    {:else if viewErrors.gitx}
+      {@render loadFailure("gitx", "history view")}
     {:else}
       <Spinner />
     {/if}
