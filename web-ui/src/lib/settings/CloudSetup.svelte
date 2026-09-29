@@ -1,12 +1,12 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
   import { api } from "../net/api";
-  import { workbenchPath } from "../net/base";
+  import { gatewayWorkspace, workbenchPath } from "../net/base";
   import ProviderConnections from "../pro/ProviderConnections.svelte";
   import { cloudRequest } from "../pro/cloudTransport";
   import { pageVisible } from "../shared/visibility";
   import { cloudCopy, cloudPollDelay, cloudProjectStatus, friendlyError } from "../pro/presentation";
-  import { connectHost, openWindow, isNativeShell, proCloudStatus, proMirrorStatus, writeClipboard, type MirrorStatus, type CloudSetupInfo, type CloudSetupRequest, type CloudProvisioningStatus } from "../net/native";
+  import { isNativeShell, proCloudStatus, proMirrorStatus, writeClipboard, type MirrorStatus, type CloudSetupInfo, type CloudSetupRequest, type CloudProvisioningStatus } from "../net/native";
 
   let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady }: { visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void } = $props();
   let info = $state<CloudSetupInfo | null>(null);
@@ -18,7 +18,6 @@
   let advanced = $state(false);
   let generation = 0;
   let alive = true;
-  let refreshing = $state(false);
   let actionGeneration = 0;
   let connectionChecked = $state(false);
   let providersMounted = $state(false);
@@ -52,7 +51,6 @@
       return;
     }
     const current = ++generation;
-    refreshing = true;
     const task = (async () => {
       try {
         let reachable = false;
@@ -82,7 +80,7 @@
           status = { state: "error", reason: null }; info = null; projects = null; connectionChecked = true;
           error = "Cloud availability couldn’t refresh. Your local work is still available.";
         }
-      } finally { if (alive) refreshing = false; }
+      }
     })();
     refreshFlight = task;
     void task.finally(() => { if (refreshFlight === task) refreshFlight = null; });
@@ -114,14 +112,16 @@
       if (!alive || action !== actionGeneration) return;
       if (request.operation === "start") generation += 1;
       if (result.available !== undefined) info = result;
-      if (result.workspace_id) {
-        if (browser) {
+      // Only the cloud machine's own page opens a repository there; it is
+      // navigation to the new project, never a way to move work.
+      if (result.workspace_id && browser) {
+        if (gatewayWorkspace() !== null) {
+          // A project tab is bound to its path; a fragment would reopen the old one.
+          location.assign(`/workspace/${encodeURIComponent(result.workspace_id)}/`);
+        } else {
           const params = new URLSearchParams({ ws: result.workspace_id, win: `w-${crypto.randomUUID()}` });
           location.assign(`${workbenchPath()}#${params}`);
           location.reload();
-        } else if (result.host_alias) {
-          await connectHost(result.host_alias);
-          await openWindow(result.host_alias, result.workspace_id, true);
         }
       }
       if (!alive || action !== actionGeneration) return;
@@ -139,8 +139,8 @@
 <section class="cloud" aria-label="Cloud status">
   <div class="machine" class:attention={needsCheck}>
     <div class="heading"><div><span class="eyebrow">Your cloud</span><h2>{browser ? connected ? "Available when you need it" : connectionChecked ? "Cloud access is temporarily unavailable" : "Checking availability…" : status ? copy.title : "Checking availability…"}</h2></div><span class="status-mark" class:connected={available} class:preparing aria-hidden="true">{#if available}<svg viewBox="0 0 24 24"><path d="m6 12 4 4 8-8" /></svg>{:else}<svg viewBox="0 0 24 24"><path d="M7 17a4 4 0 0 1-1-7.9 6 6 0 0 1 11.4-1.5A4.7 4.7 0 0 1 18 17H7Z" /></svg>{/if}</span></div>
-    <p class="hint" role="status">{browser ? connected ? "Agents connected here can keep working while your computer sleeps." : connectionChecked ? "We couldn’t reach your projects and agent connections. Try again in a moment." : "Checking access to your projects and agent connections." : status ? copy.detail : "Your projects and conversations stay together across devices."}</p>
-    {#if needsCheck}<div class="recovery"><button class="text-button" disabled={busy !== null || refreshing} onclick={() => void refresh()}>{refreshing ? "Checking…" : "Check again"}</button>{#if browser}<a class="account-link" href="/account">Open your account →</a>{/if}</div>{/if}
+    <p class="hint" role="status">{browser ? connected ? "Agents connected here can keep working while your computer sleeps." : connectionChecked ? "We couldn’t reach your projects and agent connections. We’ll keep checking." : "Checking access to your projects and agent connections." : status ? copy.detail : "Your projects and conversations stay together across devices."}</p>
+    {#if needsCheck && browser}<div class="recovery"><a class="account-link" href="/account">Open your account →</a></div>{/if}
   </div>
   {#if projectStatus}
     <div class="project-status" class:attention={projectStatus.state === "attention"} role="status"><span class="project-dot" class:active={projectStatus.state === "active"} aria-hidden="true"></span><div><h3>{projectStatus.title}</h3><p class="hint">{projectStatus.detail}</p></div></div>
@@ -157,8 +157,8 @@
       <ProviderConnections visible={visible && connected} {requiredProviders} {contextLabel} {workspaceId} {onReady} compact />
     </div>
   {/if}
-  {#if connected}
-    <details class="advanced" ontoggle={(event) => (advanced = event.currentTarget.open)}><summary>Repositories and advanced connections</summary>{#if advanced}<p class="hint">For a project that starts in the cloud, open a Git repository here. Private repositories may need the optional repository connection above.</p><form onsubmit={(event) => { event.preventDefault(); void act("project", { operation: "project", url: repository.trim() }); }}><label for="cloud-repository">Repository URL</label><div class="clone-row"><input id="cloud-repository" type="url" placeholder="https://github.com/you/project" bind:value={repository} required disabled={busy !== null} /><button class="btn" disabled={busy !== null || !repository.trim()}>{busy === "project" ? "Opening repository…" : "Open repository"}</button></div></form>{#if info?.ssh_public_key}<details><summary>SSH public key</summary><p class="hint">Use this public key only if your Git host or connection needs it.</p><textarea aria-label="Cloud SSH public key" readonly value={info.ssh_public_key} rows="3"></textarea><button class="btn" onclick={() => void copyKey()}>{copied ? "Copied" : "Copy public key"}</button></details>{/if}{/if}</details>
+  {#if connected && (browser || info?.ssh_public_key)}
+    <details class="advanced" ontoggle={(event) => (advanced = event.currentTarget.open)}><summary>{browser ? "Repositories and advanced connections" : "Advanced connections"}</summary>{#if advanced}{#if browser}<p class="hint">For a project that starts in the cloud, open a Git repository here. Private repositories may need the optional repository connection above.</p><form onsubmit={(event) => { event.preventDefault(); void act("project", { operation: "project", url: repository.trim() }); }}><label for="cloud-repository">Repository URL</label><div class="clone-row"><input id="cloud-repository" type="url" placeholder="https://github.com/you/project" bind:value={repository} required disabled={busy !== null} /><button class="btn" disabled={busy !== null || !repository.trim()}>{busy === "project" ? "Opening repository…" : "Open repository"}</button></div></form>{/if}{#if info?.ssh_public_key}<details><summary>SSH public key</summary><p class="hint">Use this public key only if your Git host or connection needs it.</p><textarea aria-label="Cloud SSH public key" readonly value={info.ssh_public_key} rows="3"></textarea><button class="btn" onclick={() => void copyKey()}>{copied ? "Copied" : "Copy public key"}</button></details>{/if}{/if}</details>
   {/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}
 </section>
