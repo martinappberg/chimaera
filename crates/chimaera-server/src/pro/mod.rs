@@ -171,28 +171,47 @@ impl ProState {
         // Construction already happens on the daemon's startup blocking path.
         // A capped record can gate restore without needing an account token.
         let path = root.join("state.json");
-        let loaded = match std::fs::File::open(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Some(DiskState::default())
-            }
-            Err(_) => None,
-            Ok(file) => {
-                use std::io::Read;
-                let mut bytes = Vec::new();
-                file.take(1024 * 1024 + 1)
-                    .read_to_end(&mut bytes)
-                    .ok()
-                    .filter(|_| bytes.len() <= 1024 * 1024)
-                    .and_then(|_| serde_json::from_slice::<DiskState>(&bytes).ok())
+        let read = || -> std::io::Result<Option<Vec<u8>>> {
+            use std::io::Read;
+            let file = match std::fs::File::open(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                other => other?,
+            };
+            let mut bytes = Vec::new();
+            file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+            Ok(Some(bytes))
+        };
+        // Only an existing file that does not parse (or exceeds its cap) is
+        // damage. An I/O error (an NFS home briefly answering EIO/ESTALE) is
+        // retried; if it persists the state is unknown and fails closed, but
+        // the file is left in place.
+        let mut attempts = 0;
+        let bytes = loop {
+            match read() {
+                Err(_) if attempts < 4 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                result => break result,
             }
         };
-        // Unreadable ownership state fails closed: every enrolled project is
-        // verified again rather than silently losing its fences. The damaged
-        // copy is kept (one slot) instead of being overwritten.
-        let damaged = loaded.is_none();
-        if damaged {
-            let _ = std::fs::rename(&path, root.join("state.json.damaged"));
-        }
+        let (loaded, unknown) = match bytes {
+            Ok(None) => (Some(DiskState::default()), false),
+            Ok(Some(bytes)) => {
+                let parsed = (bytes.len() <= 1024 * 1024)
+                    .then(|| serde_json::from_slice::<DiskState>(&bytes).ok())
+                    .flatten();
+                // Unreadable ownership state fails closed: enrolled projects
+                // are verified again rather than silently losing their fences.
+                // The damaged copy is kept (one slot) instead of overwritten.
+                if parsed.is_none() {
+                    let _ = std::fs::rename(&path, root.join("state.json.damaged"));
+                }
+                let damaged = parsed.is_none();
+                (parsed, damaged)
+            }
+            Err(_) => (None, true),
+        };
         let disk = loaded.unwrap_or_default();
         let legacy_pending = disk
             .legacy_pending
@@ -239,7 +258,7 @@ impl ProState {
             &root,
             &disk.preferences,
             disk.worker || crate::cloud::enabled(),
-            damaged,
+            unknown,
         );
         Self {
             root,

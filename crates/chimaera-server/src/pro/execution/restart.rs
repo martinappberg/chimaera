@@ -13,7 +13,7 @@ impl State {
         root: &Path,
         preferences: &HashMap<String, super::super::Preference>,
         worker: bool,
-        damaged: bool,
+        state_unknown: bool,
     ) -> Self {
         let loaded = (|| -> Result<HashSet<String>> {
             let file = match std::fs::File::open(root.join("execution-authority.json")) {
@@ -33,18 +33,21 @@ impl State {
             );
             Ok(latch.workspaces.into_iter().collect())
         })();
-        // A project is uncertain when the enrollment record may once have
-        // covered it but its policy is gone: a latched project without a
-        // policy, or, when the latch or the state itself is unreadable, every
-        // project this daemon has local mirror data or preferences for. Only
-        // those projects stop publishing until the account confirms their
-        // policy again; everything else keeps its ordinary behavior.
-        let unknown = loaded.is_err() || damaged;
+        // A project is uncertain when the enrollment latch names it but its
+        // policy is gone (the ordinary state was lost). Only those projects
+        // stop publishing until the account confirms their policy again; an
+        // unenrolled project never becomes managed. A cloud machine whose
+        // latch or state cannot be read at all cannot tell which of its
+        // projects were enrolled, and it runs only cloud projects, so there
+        // each project with local mirror data or preferences waits too. (A
+        // device needs no such guess: the account itself refuses a legacy
+        // downgrade of an enrolled project.)
+        let unknown = loaded.is_err() || state_unknown;
         let mut latched = loaded.unwrap_or_default();
         let lacking = |id: &String| preferences.get(id).is_none_or(|p| p.continuity.is_none());
         let mut uncertain: HashSet<String> =
             latched.iter().filter(|id| lacking(id)).cloned().collect();
-        if unknown {
+        if unknown && worker {
             uncertain.extend(preferences.keys().filter(|id| lacking(id)).cloned());
             if let Ok(entries) = std::fs::read_dir(root) {
                 uncertain.extend(

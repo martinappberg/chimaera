@@ -634,9 +634,13 @@ pub(crate) async fn prepare_launch(
     );
     {
         let mut preferences = lock(&state.pro.preferences);
-        let preference = preferences
-            .get_mut(workspace)
-            .context("managed project identity unavailable")?;
+        // An uncertain project (its record was lost) may have no preference
+        // row yet; its launch still records evidence rather than failing.
+        ensure!(
+            preferences.len() < 128 || preferences.contains_key(workspace),
+            "managed project identity unavailable"
+        );
+        let preference = preferences.entry(workspace.to_owned()).or_default();
         preference.execution_active = true;
         preference.execution_boot = state.pro.execution.boot.clone();
     }

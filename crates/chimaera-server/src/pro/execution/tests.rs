@@ -318,15 +318,33 @@ fn lost_enrollment_records_make_only_those_projects_uncertain() {
     assert!(lease_valid(&restarted, "w-b"));
     drop(restarted);
 
-    // Unreadable state: only projects with local mirror data are uncertain.
+    // Nothing readable at all: a computer never makes an unenrolled project
+    // managed (the account refuses an enrolled one's downgrade itself), and
+    // an uncertain project still launches agents there.
     std::fs::write(state.pro.root.join("state.json"), b"not json").unwrap();
     std::fs::write(state.pro.root.join("execution-authority.json"), b"not json").unwrap();
     std::fs::create_dir_all(state.pro.root.join("w-mirrored")).unwrap();
     let restarted = restart(&root);
-    assert!(managed(&restarted, "w-mirrored"));
-    assert!(!managed(&restarted, "w-never-mirrored"));
+    assert!(!managed(&restarted, "w-mirrored"));
     assert!(lease_valid(&restarted, "w-never-mirrored"));
+    lock(&restarted.pro.execution.uncertain).insert("w-new".into());
+    lock(&restarted.pro.ownership).insert("w-new".into(), Ownership::Local { epoch: 1 });
+    assert!(crate::pro::may_execute(&restarted, "w-new"));
     drop(restarted);
+    // A cloud machine cannot tell which of its projects were enrolled: each
+    // one with local mirror data waits for the account.
+    let empty = HashMap::new();
+    let worker = State::restore(&state.pro.root, &empty, true, true);
+    assert!(lock(&worker.uncertain).contains("w-mirrored"));
+    assert!(!lock(&worker.uncertain).contains("w-never-mirrored"));
+    // A read error (here: the path is a directory) is not damage: the file
+    // is not set aside and no unenrolled project becomes managed.
+    let _ = std::fs::remove_file(state.pro.root.join("state.json"));
+    let _ = std::fs::remove_file(state.pro.root.join("state.json.damaged"));
+    std::fs::create_dir_all(state.pro.root.join("state.json")).unwrap();
+    let unreadable = crate::pro::ProState::new(state.pro.root.clone());
+    assert!(!state.pro.root.join("state.json.damaged").exists());
+    assert!(!lock(&unreadable.execution.uncertain).contains("w-mirrored"));
     std::fs::remove_dir_all(root).unwrap();
 }
 

@@ -65,10 +65,14 @@ it could not accept. A separate enrollment latch rejects lost ordinary state or
 protocol downgrade; an unreadable `state.json` fails closed (kept as
 `state.json.damaged`). `state.json` is written (durably) before the latch.
 Failing closed is per project (`execution::uncertain`): a latched project
-without its policy, or, when the latch or state is unreadable, each project with
-local mirror data or preferences, stays managed and publishes nothing (a worker
-also runs nothing there) until an authoritative read restores its policy. Other
-projects are unaffected, and a device keeps running uncertain projects (D1).
+without its policy stays managed and publishes nothing (a worker also runs
+nothing there) until an authoritative read restores its policy. An unenrolled
+project never becomes managed on a device (the account itself refuses a legacy
+downgrade of an enrolled one); only a cloud machine whose latch or state cannot
+be read treats each project with local mirror data as uncertain. Only an
+existing `state.json` that does not parse is damage; an I/O error is retried and
+then treated as unknown without setting the file aside. A device keeps running
+uncertain projects (D1).
 macOS boot-session UUID and Linux boot ID can distinguish a cold reboot; neither
 authorizes takeover by another device.
 
