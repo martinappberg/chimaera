@@ -29,6 +29,8 @@ struct Seen {
 
 /// A speech service that answers the way claude's client expects: an
 /// utterance while audio flows, and the last words after `CloseStream`.
+// tungstenite's handshake callback returns its own large error response.
+#[allow(clippy::result_large_err)]
 async fn stand_in(seen: Arc<Mutex<Seen>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

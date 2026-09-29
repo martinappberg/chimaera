@@ -88,8 +88,39 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   send) instead flips the session to its real TUI (the [view switch](#view-switch-rewind-and-branch)),
   where claude's own `/login` runs the native auth flow (OAuth / setup-token / SSO); chimaera
   never touches the credentials. Sign in there, toggle back to chat.
+- **Voice dictation (`/voice`).** Chimaera's own dictation, the same in Claude and Codex chats:
+  `/voice hold` (hold Space to record, let go to insert), `/voice tap` (Space in an empty composer
+  starts, the next Space sends), `/voice off`; a bare `/voice` toggles. The modes and words are
+  Claude Code's own `/voice` — neither CLI's `/voice` runs over the chat protocols (Claude's is
+  TUI-only; Codex's is a spoken realtime conversation, not dictation). Turning it on checks the
+  daemon host's claude.ai login (`GET /api/v1/voice`) and asks for the microphone, so a missing
+  login or a denied mic says so at once. Hold rides the OS key repeat: a Space press types its
+  space as usual and only its first auto-repeat takes the space back and starts recording — typing
+  never trips it; keyup or losing focus finishes. While recording, a strip above the input shows a
+  level dot and the words as they form; Esc cancels, Enter finishes and sends, and a mic button
+  beside send does the same by click. The text lands at the caret, spaced like typed words. A
+  hidden tab finishes into the draft; an unmounted composer discards. Settings → Chat holds the
+  mode (`chat.voice`) and the dictation language (`chat.voiceLanguage`: the browser's language when
+  the service takes it — the 20 languages Claude Code dictates — else English).
+  **The audio path:** the window records (an AudioWorklet box-filters to 16 kHz mono PCM16, ~100 ms
+  chunks; the mic is held only while recording) and streams to the daemon's `/ws/voice`, which
+  relays to Claude's speech-to-text service (`wss://api.anthropic.com/api/ws/speech_to_text/voice_stream`,
+  the one Claude Code's `/voice` uses) with the claude.ai login `claude` keeps on the daemon's
+  host — so a daemon on a login node with no microphone still dictates, and the speech crosses
+  the ssh tunnel first. Chimaera reads that login and never refreshes it (claude's refresh tokens
+  rotate); an expired login says to send any Claude message, which renews it. The relay is one
+  socket per recording, first-frame authed, ≤ 4 at once daemon-wide, 10 min per recording, ~30 s
+  of audio buffered while the service connects (one reconnect before any words), KeepAlive every
+  8 s, and after `CloseStream` it waits ≤ 5 s for the last words (1.5 s if nothing comes).
+  Keyterms (workspace and cwd names, agent names) bias recognition. It is the daemon's one TLS
+  client (rustls on `ring`, the host's trust roots, `https_proxy` CONNECT), since curl can't carry
+  a two-way stream. The Mac app declares `NSMicrophoneUsageDescription` and the hardened
+  runtime's `audio-input` entitlement; a plain browser needs https or localhost for the mic.
 - **Where.** `Composer.svelte`, `composer.ts`, `ChatView.svelte` (`sendNow`, `onSlash`, `composerCommands`),
   `composerBus.ts` (other surfaces drop references into the draft). Uses `fsValidate`/`fsQuickOpen`.
+  Dictation: `voice.svelte.ts` (the `Dictation` controller, `voiceProblem`), `voiceCapture.ts`,
+  `VoiceStrip.svelte`, `voiceLanguages.ts`; the daemon's `crates/chimaera-server/src/voice/`
+  (`mod.rs` the relay, `upstream.rs` the TLS/proxy connector, `login.rs` the login read).
 
 ## Header controls
 
@@ -623,6 +654,9 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 
 ## Status: partial
 
+- Voice dictation's claude.ai login read (`voice/login.rs`) is not written yet: every host
+  currently answers "needs a Claude.ai login". A dev build pointed at a stand-in service
+  (`CHIMAERA_VOICE_STREAM_URL`) dictates end to end.
 - Chat sessions survive a *disconnect* **and a daemon restart** — the ledger resurrects them live
   (resuming the native conversation, carrying the pinned title, the Remote Control bridge and
   ultracode; a turn or background work the restart cut off is handed back to the agent in one
@@ -850,3 +884,11 @@ _Captured 2026-09-26 (from the maintainer, in-session, PR #174)._
 - **How settled it is (intended vs provisional):** **all provisional** — an addition. The tile sizes, the preview overlay, the short upload names and how the daemon keeps the copies are all free to change if improved.
 - **Keep (the two design goals the maintainer marked):** attachments stay **compact** (they must not take a lot of space in the composer or the transcript), and your attachments keep reading **like the agent's files** (the figure-strip language of the turn-end block). These are goals, not a locked implementation: any look that meets them is fine.
 - **Deliberately open:** nothing further stated.
+
+### Voice dictation (`/voice`) — why it exists
+_Captured 2026-09-28 from the maintainer's own words in the session that built it; the settled/open questions are still pending._
+
+- **Problem it solves (verbatim):** "We need Chimera voice mode in all the agents. The slash voice. Uh, it should work for both Codex and Claude."
+- **Choices the maintainer made:** dictation for both agents (not a spoken conversation), on **Claude's dictation service** rather than the browser's built-in speech recognition — and approved chimaera reading the claude.ai login for it ("I appove the token use").
+- **Codex (verbatim):** "I think for Codex though, are you sure there is no voice mode ? like what if you open from the terminal ? If not then it should be excluded". Codex's own `/voice` is a spoken realtime conversation, not dictation; dictation is offered in Codex chats because the words only become composer text — whether to hide it there is pending.
+- **How settled it is / what must not change:** _pending_.

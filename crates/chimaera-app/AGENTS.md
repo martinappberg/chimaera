@@ -33,7 +33,8 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | File | What it owns |
 |---|---|
 | `main.rs` | The 3-role argv dispatch (order is load-bearing). |
-| `Entitlements.plist` | macOS hardened-runtime exception for Wasmtime's executable plugin memory, applied by `tauri.conf.json` to the binary that also runs `--daemon`. |
+| `Entitlements.plist` | macOS hardened-runtime entitlements, applied by `tauri.conf.json` to the binary that also runs `--daemon`: Wasmtime's executable plugin memory, and `audio-input` for voice dictation's microphone. |
+| `Info.plist` | Merged into the bundle's by the Tauri bundler: `NSMicrophoneUsageDescription` (voice dictation records in the web view; macOS kills an app that opens the mic without it). |
 | `command_manifest.rs` | Shared daemon/wizard command vocabulary for build-time permission generation and exact runtime daemon grants. |
 | `shell.rs` | Module root: app-global `Shell` state, `WindowScope`, `lock`, and the Tauri `Builder` assembly (`run`). Closing the last non-Home window opens local Home; closing the last local Home exits, while explicit Quit preserves restore state. Re-exports `open_ui_window`. |
 | `shell/commands.rs` | The IPC command surface (`#[tauri::command]` fns wired into `generate_handler!`) — thin delegators. |

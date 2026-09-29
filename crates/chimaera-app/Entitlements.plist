@@ -6,5 +6,9 @@
          code with mmap/mprotect, not MAP_JIT, so allow-jit alone is insufficient. -->
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
     <true/>
+    <!-- Voice dictation's microphone: the hardened runtime denies audio
+         input without it (Info.plist carries the usage description). -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
 </dict>
 </plist>
