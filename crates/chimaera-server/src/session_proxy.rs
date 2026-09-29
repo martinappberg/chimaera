@@ -53,6 +53,10 @@ const WORKER_STATE_HEADER: &str = "x-chimaera-worker-state";
 pub(crate) struct Store {
     inner: Mutex<Data>,
     started: AtomicBool,
+    /// Events feeds that ended because their project's route changed: what a
+    /// test waits for instead of sleeping past a tick.
+    #[cfg(test)]
+    pub(crate) feeds_retired: std::sync::atomic::AtomicUsize,
 }
 #[derive(Default)]
 struct Data {
@@ -730,18 +734,26 @@ impl Progress {
         self.start.elapsed().as_millis() as u64
     }
     fn touch(&self) {
-        self.last_ms.store(self.now_ms(), Ordering::Relaxed);
+        self.touch_at(self.now_ms());
+    }
+    /// The clock is a parameter below so tests drive it exactly.
+    fn touch_at(&self, now_ms: u64) {
+        self.last_ms.store(now_ms, Ordering::Relaxed);
     }
     fn limit(&self, limit: Duration) {
-        self.touch();
+        self.limit_at(self.now_ms(), limit);
+    }
+    fn limit_at(&self, now_ms: u64, limit: Duration) {
+        self.touch_at(now_ms);
         self.limit_ms
             .store(limit.as_millis() as u64, Ordering::Relaxed);
     }
     /// Time left before the connection counts as stalled.
     fn remaining(&self) -> Duration {
-        let quiet = self
-            .now_ms()
-            .saturating_sub(self.last_ms.load(Ordering::Relaxed));
+        self.remaining_at(self.now_ms())
+    }
+    fn remaining_at(&self, now_ms: u64) -> Duration {
+        let quiet = now_ms.saturating_sub(self.last_ms.load(Ordering::Relaxed));
         Duration::from_millis(self.limit_ms.load(Ordering::Relaxed).saturating_sub(quiet))
     }
 }
@@ -2007,10 +2019,27 @@ async fn feed(
     bounded_send(&mut upstream, Up::Text(initial.to_string().into())).await?;
     let mut ownership = tokio::time::interval(Duration::from_secs(2));
     ownership.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let retired = || {
+        let gone = !state.session_proxy.current(&route, workspace);
+        #[cfg(test)]
+        if gone {
+            state
+                .session_proxy
+                .feeds_retired
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        gone
+    };
     loop {
         tokio::select! {
+            // A registration notifies at once; the tick backs up missed edges.
+            _ = state.changes.notified() => {
+                if retired() {
+                    return Ok(());
+                }
+            }
             _ = ownership.tick() => {
-                if !state.session_proxy.current(&route, workspace) {
+                if retired() {
                     return Ok(());
                 }
             }
@@ -2305,14 +2334,17 @@ mod tests {
     #[test]
     fn transfer_progress_extends_the_idle_deadline() {
         let progress = Progress::new(Duration::from_millis(80));
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(progress.remaining() <= Duration::from_millis(30));
-        progress.touch();
-        assert!(progress.remaining() > Duration::from_millis(50));
-        std::thread::sleep(Duration::from_millis(90));
-        assert!(progress.remaining().is_zero(), "a silent link stalls out");
-        progress.limit(Duration::from_secs(60));
-        assert!(progress.remaining() > Duration::from_secs(59));
+        progress.touch_at(0);
+        assert_eq!(progress.remaining_at(50), Duration::from_millis(30));
+        progress.touch_at(50);
+        assert_eq!(progress.remaining_at(60), Duration::from_millis(70));
+        assert!(
+            progress.remaining_at(140).is_zero(),
+            "a silent link stalls out"
+        );
+        progress.limit_at(140, Duration::from_secs(60));
+        assert_eq!(progress.remaining_at(140), Duration::from_secs(60));
+        assert_eq!(progress.remaining_at(150), Duration::from_millis(59_990));
     }
 
     #[test]

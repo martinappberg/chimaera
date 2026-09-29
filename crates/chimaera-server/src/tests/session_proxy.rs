@@ -1069,9 +1069,17 @@ async fn events_for_a_routed_project_merge_only_its_frames_and_survive_an_owner_
     assert!(noticed, "the owner raised a notice while viewed");
 
     // The project changes owner. The window's own socket stays and keeps
-    // serving this daemon's frames.
+    // serving this daemon's frames once its feed for the old owner has ended.
+    let retired = local.session_proxy.feeds_retired.load(Ordering::Acquire);
     assert_eq!(register("worker-other", 5).await, StatusCode::NO_CONTENT);
-    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while local.session_proxy.feeds_retired.load(Ordering::Acquire) == retired {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the old owner's feed never ended"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     let (status, _) = request(
         &local,
         Method::PUT,
