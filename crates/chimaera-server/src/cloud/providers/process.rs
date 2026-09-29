@@ -50,9 +50,13 @@ pub(super) fn command(bin: &Path, args: &[&str], cwd: &Path) -> tokio::process::
         .current_dir(cwd)
         // The worker's explicit provider home owns auth. A different ambient
         // desktop HOME/config override must never redirect an auth mutation.
+        // Claude keeps its default layout under that HOME (`~/.claude.json`
+        // beside `~/.claude/`), exactly what its sessions read: a
+        // CLAUDE_CONFIG_DIR here would move its global config to
+        // `~/.claude/.claude.json`, so sign-in and sessions would disagree.
         .env("HOME", cwd)
         .env("CODEX_HOME", cwd.join(".codex"))
-        .env("CLAUDE_CONFIG_DIR", cwd.join(".claude"))
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("GH_CONFIG_DIR", cwd.join(".config/gh"))
         .env("XDG_CONFIG_HOME", cwd.join(".config"))
         .stdin(Stdio::null())

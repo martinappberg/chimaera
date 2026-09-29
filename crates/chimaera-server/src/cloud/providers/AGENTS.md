@@ -52,6 +52,8 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
 - Passive status never installs, logs in, starts a model turn, or wakes compute.
   Readiness is auth configuration reported by the official CLI, not a promise
   about its billing, quota or model entitlement. Never read credential files.
+  Provider CLIs run with `HOME` set to the worker's provider home and Claude in
+  its default layout there (no `CLAUDE_CONFIG_DIR`), exactly as its sessions read it.
 - Codex uses only auth app-server requests: initialize, account/read with
   `refreshToken:false`, and explicit account/login/start with
   `type:"chatgptDeviceCode"`. Claude uses `auth status --json` and explicit
