@@ -432,7 +432,13 @@ export class Hydrator {
   settle(fresh: readonly Node[]): void {
     this.highlighter.add(this.fences.splice(0));
     this.math.add(mathSpans(fresh));
-    this.opts.folds?.adopt(fresh);
+    this.adoptFolds(fresh);
+  }
+
+  /** Give the foldable callouts in freshly drawn `nodes` the document's
+   *  remembered folds — in or out of the page (idempotent). */
+  adoptFolds(nodes: readonly Node[]): void {
+    this.opts.folds?.adopt(nodes);
   }
 
   /** Re-lay out every diagram under `root` for a theme change. */

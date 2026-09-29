@@ -12,12 +12,13 @@ export { mathOptions, renderMath, safeMathHtml } from "../shared/math";
 // so a document reads the same in every mode there. Don't "harmonize" one
 // into the other; `streamSegments.ts` mirrors BLOCK_DOLLAR exactly.
 // A closing `$` is followed by whitespace, phrase punctuation, a closing
-// bracket or quote, or a hyphen (`$p$-value`) — never a digit or letter, so
-// `$5 and $10` stays currency. An opening `$` starts the text or follows
-// whitespace or an opening bracket or quote (`($x$)`).
+// bracket or quote, a dash (`$p$-value`) or a slash — never a digit or
+// letter, so `$5 and $10` stays currency. An opening `$` starts the text or
+// follows whitespace, an opening bracket or quote (`($x$)`), a dash or a
+// slash (`$x$-$y$`, `$a$/$b$`; a `$5-$10` range still has no closing `$`).
 const INLINE_DOLLAR =
-  /^(\${1,2})(?!\$)((?:\\.|[^\\\n$])+?)\1(?=[\s?!.,:;)\]}'"’”\-？！。，：；）]|$)/;
-const OPENS_INLINE = /[\s([{'"‘“（]/;
+  /^(\${1,2})(?!\$)((?:\\.|[^\\\n$])+?)\1(?=[\s?!.,:;)\]}'"’”\-–—/？！。，：；）]|$)/;
+const OPENS_INLINE = /[\s([{'"‘“（\-–—/]/;
 const BLOCK_DOLLAR = /^(\${1,2})\n((?:\\[^]|[^\\])+?)\n\1(?:\n|$)/;
 
 /** Marked tokenizers for the math forms emitted by both supported agents.

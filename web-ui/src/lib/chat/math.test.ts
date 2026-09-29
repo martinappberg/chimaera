@@ -33,6 +33,7 @@ describe("markdownMath", () => {
       ["a small $p$-value", 1],
       ['the "$k$" in $k$-means', 2],
       ["one line\n$x$ starts the next", 1],
+      ["the $x$-$y$ plane and $a$/$b$", 4],
     ] as const) {
       const html = parser.parse(text, { async: false }) as string;
       expect(html.match(/<math/g), text).toHaveLength(n);
@@ -48,7 +49,7 @@ describe("markdownMath", () => {
   });
 
   it("keeps currency ranges and glued dollars literal", () => {
-    for (const text of ["costs $5-$10 today", "pay $5 (or $10)", "a$x$b"]) {
+    for (const text of ["costs $5-$10 today", "pay $5 (or $10)", "a$x$b", "$HOME/$USER here", "$5–$10 and $20"]) {
       const html = parser.parse(text, { async: false }) as string;
       expect(html, text).not.toContain("<math");
     }

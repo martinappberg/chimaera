@@ -191,22 +191,28 @@ function trimmed(i: Inline, side: "start" | "end"): Inline | null {
   return text === "" ? null : { kind: "text", text };
 }
 
+/** The card an inline reference draws as in a paragraph: an embed of a
+ *  file that is not a picture. */
+function cardOf(i: Inline): EmbedSpec | null {
+  if (i.kind !== "image" && !(i.kind === "wikilink" && i.embed)) return null;
+  const spec = embedSpecOf(i);
+  return spec !== null && !spec.image ? spec : null;
+}
+
 /** A paragraph's inline run with every embed of a file that is not a
  *  picture (`![[paper.pdf#page=3]]`, `![](data.csv)`) drawn as its card
  *  where it stands — Obsidian embeds wherever the syntax is, a caption on
  *  the same line included — and the text around it drawn as before. A
- *  picture stays an inline image; a target without cards (the parity
- *  corpus) draws the run whole, as the daemon does. */
+ *  picture stays an inline image. Drawn whole, as the daemon does, by a
+ *  target without cards (the parity corpus) and for a run holding raw HTML
+ *  (a tag is drawn with its partner, never split around a card). */
 function renderWithEmbeds<N>(parent: N, inline: readonly Inline[], env: Env<N>): void {
   const { t } = env;
-  const cards = inline.map((i) => {
-    const spec = i.kind === "image" || (i.kind === "wikilink" && i.embed) ? embedSpecOf(i) : null;
-    return spec !== null && !spec.image ? spec : null;
-  });
-  if (t.embed === undefined || cards.every((c) => c === null)) {
+  if (t.embed === undefined || inline.some((i) => i.kind === "html") || !inline.some((i) => cardOf(i) !== null)) {
     renderInline(parent, inline, env);
     return;
   }
+  const cards = inline.map(cardOf);
   let run: Inline[] = [];
   const flush = (): void => {
     const last = run.length > 0 ? trimmed(run[run.length - 1], "end") : null;

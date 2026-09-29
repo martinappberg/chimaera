@@ -247,6 +247,12 @@ describe("embeds in a paragraph", () => {
     expect(renderCards("![[paper.pdf]]\n")).toBe('<p><card data-target="paper.pdf"></card></p>');
   });
 
+  it("never splits a run holding raw HTML around a card", () => {
+    const html = renderCards("<span>see ![[paper.pdf]] here</span>\n");
+    expect(html).not.toContain("<card");
+    expect(html).toContain('class="wikilink wikilink-embed"');
+  });
+
   it("leaves an embed in a heading a link", () => {
     expect(renderCards("# See ![[paper.pdf]]\n")).toContain('class="wikilink wikilink-embed"');
   });
@@ -268,6 +274,18 @@ describe("callouts", () => {
     expect(cls("> [!error]\n> x\n")).toBe("danger");
     expect(cls("> [!cite]\n> x\n")).toBe("quote");
     expect(cls("> [!definition]\n> x\n")).toBe("note");
+  });
+
+  it("ends a title at its line: a trailing hard break is the line's", () => {
+    for (const md of ["> [!note] Title  \n> body\n", "> [!note] Title\\\n> body\n"]) {
+      expect(renderHtml(md).html).toContain('<p class="markdown-alert-title">Title</p>');
+    }
+  });
+
+  it("titles as plain text when a node begins inside the marker", () => {
+    expect(renderHtml("> [!note](see below)\n> body\n").html).toContain(
+      '<p class="markdown-alert-title">(see below)</p>',
+    );
   });
 
   it("titles a callout with markdown, a lone marker line with its type", () => {

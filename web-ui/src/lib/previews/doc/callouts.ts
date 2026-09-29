@@ -15,6 +15,8 @@
  * stylesheet that draws a callout: the reading view and the exported page.
  */
 
+import { parseSourcepos } from "../mdDoc";
+
 /** A callout's family: the class suffix and the look. */
 export type CalloutLook =
   | "note"
@@ -55,10 +57,11 @@ const ALIASES: Readonly<Record<string, CalloutLook>> = {
 };
 
 /** Glyph paths (24-unit, stroked), drawn as a mask in the title's color. */
+const INFO_GLYPH = "<circle cx='12' cy='12' r='9'/><path d='M12 8h.01M11 12h1v4h1'/>";
 const ICONS: Readonly<Record<CalloutLook, string>> = {
-  note: "<circle cx='12' cy='12' r='9'/><path d='M12 8h.01M11 12h1v4h1'/>",
+  note: INFO_GLYPH,
   abstract: "<path d='M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2M9 3h6v4H9zM9 12h6M9 16h4'/>",
-  info: "<circle cx='12' cy='12' r='9'/><path d='M12 8h.01M11 12h1v4h1'/>",
+  info: INFO_GLYPH,
   todo: "<circle cx='12' cy='12' r='9'/><path d='M9 12l2 2l4-4'/>",
   tip: "<path d='M3 12h1m8-9v1m8 8h1M5.6 5.6l.7.7m12.1-.7-.7.7M9 16a5 5 0 1 1 6 0a3.5 3.5 0 0 0-1 3a2 2 0 0 1-4 0a3.5 3.5 0 0 0-1-3M9.7 17h4.6'/>",
   success: "<path d='M5 12l5 5L20 7'/>",
@@ -148,9 +151,12 @@ const FOLDABLE = "details.markdown-alert";
 
 /** A drawn callout's first source line (its `data-sourcepos`). */
 function firstLine(d: Element): number | null {
-  const n = parseInt(d.getAttribute("data-sourcepos") ?? "", 10);
-  return Number.isNaN(n) ? null : n;
+  return parseSourcepos(d.getAttribute("data-sourcepos"))?.start ?? null;
 }
+
+/** Past this many followed drawings, the ones gone from memory are swept
+ *  as the next is followed (a live block draws again on every reveal). */
+const SWEEP_AT = 64;
 
 /**
  * A document's callout folds as its reader left them, by each callout's
@@ -183,6 +189,7 @@ export class CalloutFolds {
     this.followed.add(d);
     const open = this.state.get(line);
     if (open !== undefined) d.open = open;
+    if (this.drawn.size >= SWEEP_AT) for (const ref of this.drawn) if (ref.deref() === undefined) this.drawn.delete(ref);
     this.drawn.add(new WeakRef(d));
     d.addEventListener("toggle", () => this.toggled(d));
   }

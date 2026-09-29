@@ -1063,6 +1063,8 @@ function finish(view: EditorView, root: HTMLElement): void {
   decorateCopyTargets(root);
   for (const img of root.querySelectorAll("img")) img.addEventListener("load", () => view.requestMeasure());
   const h = hydratorFor(view);
+  // Folds now, attached or not: the block's height is its reader twin's.
+  h.adoptFolds([root]);
   // Fences paint and equations typeset once the node is in the page (a
   // detached node is skipped), before CodeMirror measures it.
   queueMicrotask(() => {

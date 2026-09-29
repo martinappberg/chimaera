@@ -37,7 +37,6 @@ import { decodeEntities, unescapeBackslashes } from "./entities";
 import { docParser } from "./parser";
 import { CALLOUT_MARKER, calloutLook, defaultCalloutTitle, type CalloutLook } from "./callouts";
 
-
 interface Span {
   /** Source offsets of the block (lines come from the LineIndex). */
   from: number;
@@ -515,6 +514,23 @@ function blankBetween(cx: DocContext, a: number, b: number): boolean {
   return false;
 }
 
+/** A callout's title: the marker line after the marker, as markdown.
+ *  As plain text when a node begins inside the marker (`[!note](x)` reads
+ *  as a link to lezer, as a title `(x)` to comrak); a break ending the
+ *  line is the line's, not the title's. */
+function calloutTitle(para: SyntaxNode, from: number, to: number, cx: DocContext): Inline[] {
+  for (let k = para.firstChild; k !== null && k.from < from; k = k.nextSibling) {
+    if (k.to > from) {
+      const text = decodeEntities(unescapeBackslashes(cx.doc.sliceString(from, to).trim()));
+      return text === "" ? [] : [{ kind: "text", text }];
+    }
+  }
+  const title = inlineOf(para, from, to, cx.doc, cx.inline);
+  while (title.length > 0 && title[title.length - 1].kind === "break") title.pop();
+  trimEdges(title);
+  return title;
+}
+
 /** The blocks of a container node (its children minus markers). */
 function children(node: SyntaxNode, cx: DocContext): Block[] {
   const out: Block[] = [];
@@ -644,10 +660,7 @@ export function blockOf(node: SyntaxNode, cx: DocContext): Block | null {
       for (let c = node.firstChild; c !== null; c = c.nextSibling) {
         if (c.from < markerEnd) {
           if (c.name === "Paragraph") {
-            if (lineEnd > titleFrom) {
-              title = inlineOf(c, titleFrom, lineEnd, cx.doc, cx.inline);
-              trimEdges(title);
-            }
+            if (lineEnd > titleFrom) title = calloutTitle(c, titleFrom, lineEnd, cx);
             if (c.to > markerEnd) {
               const p = paragraph(c, markerEnd, cx);
               if (p.kind === "paragraph" && p.inline.length > 0) blocks.push(p);
