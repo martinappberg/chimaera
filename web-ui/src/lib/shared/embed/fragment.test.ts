@@ -6,6 +6,7 @@ import {
   fragmentReveal,
   parseEmbedFragment,
   rangeOutside,
+  tableCounts,
   tableSlice,
   tableWindow,
 } from "./fragment";
@@ -239,5 +240,70 @@ describe("tableSlice / tableWindow", () => {
     expect(rangeOutside(r("A:B"), [3, 2])).toBe(true);
     expect(rangeOutside(r("5:9"), [3, 2])).toBe(false);
     expect(rangeOutside(r("B2:C3"), [0, 0])).toBe(false);
+  });
+});
+
+describe("tableCounts", () => {
+  const cols = ["track_id", "cell_group", "bigwig_path"];
+  const rows = (n: number) => Array.from({ length: n }, (_, i) => [`t${i}`, "g", "p"]);
+  const whole = { numbered: false, first: 1, hasHeader: true, sheet: false };
+  const sliced = { ...whole, numbered: true };
+
+  it("says a header-only file has no data rows instead of drawing blank space", () => {
+    const page = { columns: cols, rows: [], truncated: false, total_rows: 0, est_rows: null };
+    expect(tableCounts(page, whole)).toEqual({ foot: "0 rows", empty: "no data rows — only the header" });
+    // A row slice of it says the same: there is nothing past the header.
+    expect(tableCounts(page, { ...sliced, first: 4 }).empty).toBe("no data rows — only the header");
+  });
+
+  it("says an empty file or sheet is empty", () => {
+    const page = { columns: [], rows: [], truncated: false, total_rows: 0 };
+    expect(tableCounts(page, whole).empty).toBe("the file is empty");
+    expect(tableCounts({ columns: [], rows: [], truncated: false }, { ...whole, sheet: true }).empty).toBe(
+      "the sheet is empty",
+    );
+    // Header-less (BED): the preset names come back as columns, but no rows.
+    expect(tableCounts({ ...page, columns: ["chrom", "start"] }, { ...whole, hasHeader: false }).empty).toBe(
+      "the file is empty",
+    );
+  });
+
+  it("counts a table that fits the card once", () => {
+    expect(tableCounts({ columns: cols, rows: rows(3), truncated: false, total_rows: 3 }, whole)).toEqual({
+      foot: "3 rows",
+      empty: null,
+    });
+    expect(tableCounts({ columns: cols, rows: rows(1), truncated: false, total_rows: 1 }, whole).foot).toBe("1 row");
+    // fs/xlsx has no totals: a page that is not truncated is the whole sheet.
+    expect(tableCounts({ columns: cols, rows: rows(4), truncated: false }, { ...whole, sheet: true }).foot).toBe(
+      "4 rows",
+    );
+  });
+
+  it("says how much of a longer table the card shows", () => {
+    expect(tableCounts({ columns: cols, rows: rows(10), truncated: true, total_rows: 20_000 }, whole).foot).toBe(
+      "first 10 · 20,000 rows",
+    );
+    expect(
+      tableCounts({ columns: cols, rows: rows(10), truncated: true, total_rows: null, est_rows: 1_234_567.4 }, whole)
+        .foot,
+    ).toBe("first 10 · ~1,234,567 rows");
+    expect(tableCounts({ columns: cols, rows: rows(10), truncated: true }, whole).foot).toBe("first 10 · more rows");
+    expect(tableCounts({ columns: cols, rows: rows(3), truncated: false, total_rows: 40 }, sliced).foot).toBe(
+      "3 shown · 40 rows",
+    );
+  });
+
+  it("says why a slice came back empty", () => {
+    const past = { columns: cols, rows: [], truncated: false, total_rows: 12 };
+    expect(tableCounts(past, { ...sliced, first: 40 })).toEqual({ foot: "12 rows", empty: "the table ends at row 12" });
+    const deep = { columns: cols, rows: [], truncated: false, total_rows: null, est_rows: 2e6, scan_limited: true };
+    expect(tableCounts(deep, { ...sliced, first: 1_500_000 }).empty).toBe(
+      "row 1,500,000 is further in than one read goes — open the table to get there",
+    );
+    // fs/xlsx: a range below the sheet's data, no total to name.
+    expect(tableCounts({ columns: cols, rows: [], truncated: false }, { ...sliced, sheet: true }).empty).toBe(
+      "no rows there",
+    );
   });
 });

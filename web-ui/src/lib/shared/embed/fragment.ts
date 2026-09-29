@@ -7,13 +7,15 @@
  * in a link, and in the pane a card opens. What lives here is only what a
  * card needs on top of it: a heading anchor (anything else), RFC 7111's
  * open end (`row=5-*`, which a Locator does not keep), the header's words
- * for the piece shown, and the rows a table slice fetches.
+ * for the piece shown, the rows a table slice fetches, and how a table card
+ * counts what came back.
  *
  * Pure: no DOM, no network (fragment.test.ts).
  */
 
 import { lineAnchor, revealOf } from "../fileRef";
 import { a1Column, a1ToBlock, clockLabel, parseLocator } from "../locator";
+import type { TablePage } from "../../previews/files";
 import type { Locator, Reveal } from "../reveal";
 
 /** A region (`#xywh=`), as the locator reads it. */
@@ -201,4 +203,53 @@ export function tableWindow(
   const last = slice.toEnd === true ? first + peek - 1 : toData(slice.endRow ?? slice.row);
   const limit = Math.min(cap, Math.max(1, last - first + 1));
   return { offset: first, limit };
+}
+
+// --- a table card's counts -------------------------------------------------------------
+
+const rowCount = (n: number) => `${n.toLocaleString("en-US")} ${n === 1 ? "row" : "rows"}`;
+
+/**
+ * A table card's count line, and what it says where the rows would be when
+ * the page came back without any: a header over blank space reads as a
+ * load that never finished. `numbered` is a card showing a `row=`/`cell=`/
+ * `range=` slice and `first` the number its first row carries; `sheet`, a
+ * spreadsheet's card.
+ */
+export function tableCounts(
+  page: Pick<TablePage, "columns" | "rows" | "truncated" | "total_rows" | "est_rows" | "scan_limited">,
+  o: { numbered: boolean; first: number; hasHeader: boolean; sheet: boolean },
+): { foot: string; empty: string | null } {
+  const n = page.rows.length;
+  const total = page.total_rows ?? null;
+  const est = page.est_rows ?? null;
+  const of =
+    total !== null
+      ? rowCount(total)
+      : est !== null
+        ? `~${rowCount(Math.round(est))}`
+        : page.truncated
+          ? "more rows"
+          : rowCount(n);
+  if (n > 0) {
+    if (o.numbered) return { foot: `${n.toLocaleString("en-US")} shown · ${of}`, empty: null };
+    // A table that fits the card is counted once, not "first 3 · 3 rows".
+    const all = total !== null ? n >= total : est === null && !page.truncated;
+    return { foot: all ? of : `first ${n.toLocaleString("en-US")} · ${of}`, empty: null };
+  }
+  if (o.numbered && page.scan_limited === true) {
+    // The daemon's scan budget ran out short of the slice; the full grid
+    // resumes from where it stopped.
+    const row = o.first.toLocaleString("en-US");
+    return { foot: of, empty: `row ${row} is further in than one read goes — open the table to get there` };
+  }
+  if (o.numbered && total !== 0) {
+    const end = total !== null ? `the table ends at row ${total.toLocaleString("en-US")}` : "no rows there";
+    return { foot: of, empty: end };
+  }
+  const what = o.sheet ? "the sheet" : "the file";
+  return {
+    foot: of,
+    empty: page.columns.length > 0 && o.hasHeader ? "no data rows — only the header" : `${what} is empty`,
+  };
 }
