@@ -522,7 +522,14 @@ pub(crate) async fn restore(state: &Arc<AppState>, boot: BootLedger) {
     let mut respawned = 0usize;
     let mut retired = 0usize;
     for entry in &boot.sessions {
-        if entry.suspended || !crate::pro::may_restore(state, &entry.workspace_id) {
+        // Only agents wait for this life's ownership proof; a plain shell is
+        // never managed and comes back unless its project runs elsewhere.
+        let held = if entry.agent.is_some() {
+            !crate::pro::may_restore(state, &entry.workspace_id)
+        } else {
+            !crate::pro::may_execute(state, &entry.workspace_id)
+        };
+        if entry.suspended || held {
             let mut deferred = entry.clone();
             deferred.suspended = true;
             if let Err(error) = defer(state, deferred) {

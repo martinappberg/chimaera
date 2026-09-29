@@ -54,6 +54,10 @@ managed: not signalled by fences, not awaited by stops, never evidence. Sessions
 a previous daemon left running wait for this life's lease (`may_restore`); on a
 device `resume_unverified` resumes the restart-deferred ones after one minute
 when the account cannot confirm, unless another owner was verified meanwhile.
+Plain shells never wait at boot. The fallback leaves alone projects the account
+answered for this life and projects with a checkpoint install scheduled (fenced
+from scheduling, before hydrate's own fence), and re-runs once recorded old
+process groups exit.
 Clean release waits for observed termination, durable publication and an exact
 immutable keeper receipt. Each managed launch persists active execution
 evidence, and every state write records the live managed agents' process groups

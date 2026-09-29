@@ -64,6 +64,12 @@ pub(crate) struct ProState {
     configuration: Arc<AsyncMutex<()>>,
     caches: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     boot_deferred: Mutex<std::collections::HashSet<String>>,
+    /// Projects whose checkpoint install is scheduled or running: fenced from
+    /// the moment it is scheduled, before its own Hydrating fence exists.
+    installing: Mutex<std::collections::HashSet<String>>,
+    /// Projects the account answered for since this daemon started; the
+    /// unverified-resume fallback leaves those to the verified path.
+    answered: Mutex<std::collections::HashSet<String>>,
     operations: detached::Operations,
     drain: Mutex<Option<drain::Drain>>,
     /// Serializes drain requests; see `drain::start`.
@@ -297,6 +303,8 @@ impl ProState {
             configuration: Arc::new(AsyncMutex::new(())),
             caches: Mutex::new(HashMap::new()),
             boot_deferred: Mutex::new(Default::default()),
+            installing: Mutex::new(Default::default()),
+            answered: Mutex::new(Default::default()),
             operations: Default::default(),
             drain: Mutex::new(None),
             drain_gate: AsyncMutex::new(()),
@@ -351,8 +359,11 @@ pub(crate) fn may_write(state: &crate::AppState, workspace: &str) -> bool {
             | Ownership::Transferring { .. },
         ) => false,
         // Unverified after a restart, wake or failed flush: a device keeps
-        // working until an authenticated read shows another owner.
-        Some(Ownership::AwaitingVerification { .. }) => !execution::worker(state),
+        // working until an authenticated read shows another owner, unless a
+        // checkpoint install is already scheduled (before its own fence).
+        Some(Ownership::AwaitingVerification { .. }) => {
+            !execution::worker(state) && !crate::lock(&state.pro.installing).contains(workspace)
+        }
         _ => true,
     }
 }
@@ -418,6 +429,37 @@ pub(crate) async fn resume_unverified(state: &std::sync::Arc<crate::AppState>) {
     if execution::worker(state) {
         return;
     }
+    let waiting = resume_unverified_once(state).await;
+    if waiting.is_empty() {
+        return;
+    }
+    // Re-run the fallback once the recorded groups exit (bounded to 10 min).
+    crate::lock(&state.pro.boot_deferred).extend(waiting);
+    let owner = state.clone();
+    tokio::spawn(async move {
+        for _ in 0..120 {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if owner.stopping.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            execution::reprobe(&owner);
+            let cleared = crate::lock(&owner.pro.boot_deferred).iter().any(|id| {
+                crate::lock(&owner.deferred_sessions)
+                    .get(id)
+                    .is_some_and(|entry| !execution::unclean(&owner, &entry.workspace_id))
+            });
+            if cleared {
+                let left = resume_unverified_once(&owner).await;
+                if left.is_empty() {
+                    return;
+                }
+                crate::lock(&owner.pro.boot_deferred).extend(left);
+            }
+        }
+    });
+}
+/// One fallback pass; returns the sessions still waiting on old processes.
+async fn resume_unverified_once(state: &std::sync::Arc<crate::AppState>) -> Vec<String> {
     let pending: Vec<String> = crate::lock(&state.pro.boot_deferred).drain().collect();
     let mut workspaces: HashMap<String, Vec<String>> = HashMap::new();
     for id in pending {
@@ -428,14 +470,28 @@ pub(crate) async fn resume_unverified(state: &std::sync::Arc<crate::AppState>) {
             workspaces.entry(workspace).or_default().push(id);
         }
     }
+    let mut waiting = Vec::new();
     for (workspace, ids) in workspaces {
-        if !may_execute(state, &workspace) || execution::unclean(state, &workspace) {
+        // The account answered for this project (the verified path decides),
+        // or a checkpoint install is replacing its files: not ours to resume.
+        if crate::lock(&state.pro.answered).contains(&workspace)
+            || crate::lock(&state.pro.installing).contains(&workspace)
+        {
+            continue;
+        }
+        if execution::unclean(state, &workspace) {
+            // Old processes may still run: retry once they are proven gone.
+            waiting.extend(ids);
+            continue;
+        }
+        if !may_execute(state, &workspace) {
             continue;
         }
         if let Err(error) = crate::ledger::resume_deferred_sessions(state, &workspace, &ids).await {
             tracing::warn!(%error, "Interrupted sessions could not resume");
         }
     }
+    waiting
 }
 pub(crate) fn validate_execution_scope(
     state: &crate::AppState,

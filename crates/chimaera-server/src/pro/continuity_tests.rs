@@ -950,6 +950,117 @@ async fn an_unreleased_sleep_flush_waits_for_the_wake_and_resumes_locally() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+fn shell_entry(id: &str, workspace: &crate::workspaces::Workspace) -> crate::ledger::LedgerEntry {
+    crate::ledger::LedgerEntry {
+        id: id.into(),
+        suspended: false,
+        handoff: None,
+        workspace_id: workspace.id.clone(),
+        cwd: workspace.root.clone(),
+        pinned_name: None,
+        cols: 80,
+        rows: 24,
+        theme: "dark".into(),
+        created_at: 0,
+        agent: None,
+    }
+}
+
+/// A checkpoint install is fenced from the moment it is scheduled (before
+/// hydrate's own fence), and the unverified boot fallback never resumes a
+/// stale turn in a project the account already answered for.
+#[tokio::test]
+async fn a_scheduled_install_fences_at_once_and_the_boot_fallback_leaves_it_alone() {
+    let root = temp("install-fence");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let config = device(&account.endpoint);
+    let workspace = project(&state, &root, &config, 4);
+    *lock(&state.pro.runtime) = Some(config.clone());
+    // Restarted; meanwhile the cloud worked on and released a newer
+    // checkpoint, which this computer must install.
+    lock(&state.pro.ownership).insert(
+        workspace.id.clone(),
+        Ownership::AwaitingVerification { epoch: 4 },
+    );
+    let mut cloud = owned(&workspace.id, "worker-a", 5, "lease-cloud", 3);
+    cloud["holder_id"] = json!(null);
+    cloud["expires_at"] = json!(null);
+    cloud["checkpoint"] = checkpoint(5);
+    *lock(&account.baton) = cloud;
+    lock(&account.delays).insert("/v2/mirror/credentials".into(), StdDuration::from_secs(3));
+    assert!(crate::pro::may_write(&state, &workspace.id));
+    reconcile(&state, &config, &workspace.id).await.unwrap();
+    assert!(
+        !crate::pro::may_write(&state, &workspace.id),
+        "fenced from the moment the install is scheduled"
+    );
+    // A turn a previous daemon left behind waits for the verified path.
+    let stale = "s-stale-boot-turn";
+    let mut entry = shell_entry(stale, &workspace);
+    entry.suspended = true;
+    crate::ledger::defer(&state, entry).unwrap();
+    crate::pro::defer_boot_session(&state, stale);
+    crate::pro::resume_unverified(&state).await;
+    assert!(
+        state.sessions.get(stale).is_none(),
+        "the fallback leaves an answered project alone"
+    );
+    // The install fails here (no Git service) and lifts its early fence.
+    tokio::time::timeout(StdDuration::from_secs(60), async {
+        while lock(&state.pro.installing).contains(&workspace.id) {
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the install ends and lifts its early fence");
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A plain shell is never managed: it comes back at boot even while the
+/// project's agents wait for this life's ownership proof.
+#[tokio::test]
+async fn plain_shells_come_back_at_boot_while_agents_wait() {
+    let root = temp("boot-shell");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let config = device(&account.endpoint);
+    let workspace = project(&state, &root, &config, 4);
+    lock(&state.pro.ownership).insert(
+        workspace.id.clone(),
+        Ownership::AwaitingVerification { epoch: 4 },
+    );
+    assert!(!crate::pro::may_restore(&state, &workspace.id));
+    let shell = "s-boot-shell";
+    let agent = "s-boot-agent";
+    let mut waiting = shell_entry(agent, &workspace);
+    waiting.agent = Some(crate::ledger::LedgerAgent {
+        kind: crate::agents::AgentKind::Claude,
+        resume: None,
+        transcript: None,
+        native_cwd: None,
+        title: "claude".into(),
+        ui: chimaera_agent::model::SessionUi::Term,
+        model: None,
+        carryover: None,
+    });
+    crate::ledger::restore(
+        &state,
+        crate::ledger::BootLedger {
+            sessions: vec![shell_entry(shell, &workspace), waiting],
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(state.sessions.get(shell).is_some_and(|s| s.alive));
+    assert!(lock(&state.deferred_sessions).contains_key(agent));
+    assert!(!lock(&state.deferred_sessions).contains_key(shell));
+    state.sessions.kill(shell).ok();
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// Signing out while this computer's own return is unfinished must not leave
 /// the project fenced: no account is left to finish it.
 #[tokio::test]

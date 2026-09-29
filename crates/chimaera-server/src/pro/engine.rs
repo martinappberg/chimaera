@@ -310,6 +310,14 @@ async fn reconcile_generation(
         generation == state.pro.generation.load(Ordering::Acquire),
         "Account changed during project transfer"
     );
+    {
+        // The account answered: from now on the verified path decides what
+        // resumes here, not the unverified boot fallback.
+        let mut answered = lock(&state.pro.answered);
+        if answered.len() < 128 || answered.contains(workspace) {
+            answered.insert(workspace.to_owned());
+        }
+    }
     execution::observe(state, config, &baton)?;
     if baton.continuity.is_some() {
         super::persist(state).await?;
@@ -460,11 +468,18 @@ async fn reconcile_generation(
         let Ok(job) = state.pro.jobs.clone().try_lock_owned() else {
             return Ok(None);
         };
+        // Fenced from the moment the install is scheduled: canonical files
+        // are about to replace this project's, so nothing new may start (and
+        // no stale boot-deferred turn may resume) before hydrate's own fence.
+        lock(&state.pro.installing).insert(workspace.to_owned());
         lock(&state.pro.ownership).insert(
             workspace.into(),
             Ownership::AwaitingVerification { epoch: baton.epoch },
         );
-        super::persist(state).await?;
+        if let Err(error) = super::persist(state).await {
+            lock(&state.pro.installing).remove(workspace);
+            return Err(error);
+        }
         // Installing runs as its own owned task: lease renewal for every
         // other project continues meanwhile. The grant's own requires_fork
         // decides; hydrate applies it.
@@ -481,9 +496,9 @@ async fn reconcile_generation(
                 || None,
                 move || async move {
                     let _job = job;
-                    if let Err(error) =
-                        install_owned(owner.clone(), config, key.clone(), epoch).await
-                    {
+                    let result = install_owned(owner.clone(), config, key.clone(), epoch).await;
+                    lock(&owner.pro.installing).remove(&key);
+                    if let Err(error) = result {
                         record_error(&owner, &key, &error);
                         return super::detached::Outcome::refused(
                             axum::http::StatusCode::CONFLICT,
