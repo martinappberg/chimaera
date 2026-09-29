@@ -12,7 +12,10 @@ versions and updates) and
 The maps: the API crate [chimaera-plugin-api](../../crates/chimaera-plugin-api/AGENTS.md),
 the lock and the test fixture [plugins/](../../plugins/AGENTS.md). The first-party
 plugins, each its own repository and the worked examples here: [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes) and
-[chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium).
+[chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium) (API 0.1, sandboxed), and
+[chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex) and
+[chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst) (API 0.2, privileged: file
+views, programs, a downloaded tool, long agent tools).
 
 ## The rules that don't bend
 

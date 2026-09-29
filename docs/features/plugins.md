@@ -24,7 +24,7 @@ records, admission, the admin policy, holds), `revoke.rs` (the kill switch), `ac
 activity log) — plus `agent_probe.rs` and `notes.rs`;
 the interface `crates/chimaera-plugin-api` (the WIT world and its Rust bindings,
 [map](../../crates/chimaera-plugin-api/AGENTS.md)); the first-party plugins in their own
-repositories, [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes) and [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium), whose releases
+repositories, [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes), [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium), [chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex) and [chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst), whose releases
 `plugins/plugins.lock` pins — the lock is all the daemon carries of them
 ([map](../../plugins/AGENTS.md)); the CLI `crates/chimaera/src/plugin.rs`; UI
 `web-ui/src/lib/plugins/` ([map](../../web-ui/src/lib/plugins/AGENTS.md)) — the `plugins`
