@@ -12,6 +12,8 @@
    * card can't truthfully fill stay empty — never fabricated.
    */
   import SessionGlyph from "../shared/SessionGlyph.svelte";
+  import BranchChip from "../shared/BranchChip.svelte";
+  import { openBranchChanges } from "../workspace/git";
   import WorkTray from "../shared/WorkTray.svelte";
   import WorkTrayRow from "../shared/WorkTrayRow.svelte";
   import { basename } from "../previews/files";
@@ -26,6 +28,7 @@
     type Session,
   } from "../workspace/sessions";
   import { isUnread } from "../workspace/unread.svelte";
+  import SameFileNotice from "../workspace/SameFileNotice.svelte";
   import { inlineMarkdown } from "../shared/inlineMarkdown";
   import type { BackgroundTask, ChatBlock, ChatStore } from "../chat/store.svelte";
   import { provenanceOf, provenanceTitle , relPath as sharedRelPath} from "./dash";
@@ -302,6 +305,9 @@
     <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
     <div class="now" title={nowLine}>{@html inlineMarkdown(nowLine)}</div>
   {/if}
+  <!-- Another live session wrote a file this one wrote (warn-toned, click
+       opens it); renders nothing otherwise. -->
+  <SameFileNotice sessionId={session.id} {visible} />
 
   {#if planEntries.length > 0}
     <div class="plan">
@@ -396,6 +402,16 @@
       >
         {touched.length} file{touched.length === 1 ? "" : "s"} · view changes
       </button>
+    {/if}
+    {#if session.git}
+      <!-- Only in a repository: the branch (and worktree, on hover) this
+           agent is working on. -->
+      <span class="branch"
+        ><BranchChip
+          git={session.git}
+          onOpen={() => session.git && openBranchChanges(session.git)}
+        /></span
+      >
     {/if}
     <span class="age">{relativeAge(session.created_at)}</span>
     {#if costUsd !== null}
@@ -773,6 +789,11 @@
   }
   .compact .meta {
     flex: none;
+  }
+  .meta .branch {
+    display: inline-flex;
+    min-width: 0;
+    max-width: 16em;
   }
   .ctxwrap {
     display: inline-flex;

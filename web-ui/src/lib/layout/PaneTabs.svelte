@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { gitRepos, openFileHistory, repoForPath } from "../workspace/git";
   /**
    * The pane's always-present top bar (~26px): type glyph + tab name per
    * tab (active emphasized by WEIGHT, not color), pane controls at the
@@ -11,7 +12,7 @@
    * A terminal's glyph carries its session-state color.
    */
   import { untrack } from "svelte";
-  import { tabKey, type PaneNode, type Tab } from "./layout";
+  import { isPreviewTab, tabKey, type PaneNode, type Tab } from "./layout";
   import { TAB_FADE_PX, revealTabScrollLeft, tabFadeWidths, tabInView, type TabBounds } from "./tabScroll";
   import type { Session } from "../workspace/sessions";
   import {
@@ -394,9 +395,18 @@
     if (tab.surface === "timeline") return "Timeline";
     if (tab.surface === "knowledge") return "Knowledge";
     if (tab.surface === "plugins") return "Extensions";
+    if (tab.surface === "sessions") return "All sessions";
     if (tab.surface === "finder") return basename(tab.path) || "Finder";
     if (tab.surface === "git") return "Source Control";
-    if (tab.surface === "diff") return `${basename(tab.path)} (diff)`;
+    if (tab.surface === "diff") {
+      if (tab.mode === "commit" && tab.rev) return `${basename(tab.path)} @ ${tab.rev.slice(0, 7)}`;
+      return `${basename(tab.path)} (diff)`;
+    }
+    if (tab.surface === "gitx") {
+      if (tab.view === "commit") return tab.title ?? `Commit ${tab.sha?.slice(0, 7) ?? ""}`;
+      if (tab.view === "branch") return tab.title ? `Changes · ${tab.title}` : "Changes on this branch";
+      return tab.path ? `History · ${basename(tab.path)}` : tab.title ? `History · ${tab.title}` : "History";
+    }
     if (tab.surface === "changes") {
       const n = names.get(tab.sessionId) ?? sessions.get(tab.sessionId)?.name;
       return n !== undefined ? `Changes · ${n}` : "Changes";
@@ -645,12 +655,21 @@
           ? [{ label: "Download", onSelect: () => void fsDownload(tab.path) } as ContextMenuEntry]
           : []),
         { label: "Copy Path", onSelect: () => void copyPath(tab.path) },
+        ...(repoForPath($gitRepos, tab.path) !== null
+          ? [{ label: "File history", onSelect: () => openFileHistory(tab.path) } as ContextMenuEntry]
+          : []),
         "separator",
         ...move,
         ...close,
       ];
     }
-    return [...move, ...close];
+    return [
+      ...(isPreviewTab(tab)
+        ? [{ label: "Keep Open", onSelect: () => ctrl.pinTab(node.id, i) } as ContextMenuEntry, "separator" as const]
+        : []),
+      ...move,
+      ...close,
+    ];
   }
 </script>
 
@@ -719,9 +738,9 @@
           }}
           ondblclick={() => {
             if (renamingTab === tabKey(tab)) return;
-            // VS Code: double-clicking a PREVIEW (italic) file tab pins it;
+            // VS Code: double-clicking a PREVIEW (italic) tab pins it;
             // otherwise the pane zooms (the long-standing gesture).
-            if (tab.surface === "file" && tab.preview === true) {
+            if (isPreviewTab(tab)) {
               ctrl.pinTab(node.id, i);
             } else {
               ctrl.zoomPane(node.id);
@@ -782,6 +801,13 @@
               />
               <path d="M3.6 6.2h1.8M10.6 6.2h1.8M11.5 5.3v1.8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
             </svg>
+          {:else if tab.surface === "gitx"}
+            <!-- A commit: a dot on a line (the history glyph's grammar). -->
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>{tab.view === "commit" ? "commit" : tab.view === "branch" ? "changes on this branch" : "history"}</title>
+              <path d="M8 1.5v4M8 10.5v4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+              <circle cx="8" cy="8" r="2.5" fill="none" stroke="currentColor" stroke-width="1.3" />
+            </svg>
           {:else if tab.surface === "changes"}
             <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
               <title>changes</title>
@@ -824,6 +850,12 @@
                 stroke-linejoin="round"
               />
             </svg>
+          {:else if tab.surface === "sessions"}
+            <!-- Stacked rows: every past session. -->
+            <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <title>all sessions</title>
+              <path d="M3 4h10M3 8h10M3 12h6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+            </svg>
           {:else if tab.surface === "plugins"}
             <!-- Extensions: three cells and a plus (plugins/glyph.ts), at its
                  own 12px pixel grid. -->
@@ -863,7 +895,7 @@
                  active weight's width, so activation never resizes a tab. -->
             <span
               class="tab-name"
-              class:preview={tab.surface === "file" && tab.preview === true}
+              class:preview={isPreviewTab(tab)}
               class:unread
               data-label={label(tab)}
               style:color={fDeco ? fDeco.color : undefined}>{label(tab)}</span

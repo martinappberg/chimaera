@@ -45,7 +45,7 @@ use crate::AppState;
 /// output, virtualenvs, and pipeline scratch (`.snakemake`, nextflow's
 /// `work/`). Matched by name at any depth; everything else (including other
 /// dotfiles — `.gitignore` is a real quick-open target) is indexed.
-const IGNORED_DIRS: &[&str] = &[
+pub(crate) const IGNORED_DIRS: &[&str] = &[
     ".git",
     "node_modules",
     "target",

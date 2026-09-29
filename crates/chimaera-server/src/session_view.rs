@@ -175,6 +175,9 @@ pub(crate) fn session_json(
 /// bindings) -> session_workspaces -> agents -> display_names ->
 /// current_cwds -> exec_status.
 pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
+    // The git session tracker's facts, taken (and its lock dropped) before
+    // any row lock below.
+    let git_rows = state.git.sessions.rows();
     let sessions = state.sessions.list();
     let chats = state.chat.list();
     // Mastermind bindings (workspace id -> session id), taken — and dropped —
@@ -269,7 +272,29 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
         ));
     }
     rows.sort_by_key(|(created, _)| *created);
-    rows.into_iter().map(|(_, row)| row).collect()
+    rows.into_iter()
+        .map(|(_, mut row)| {
+            // Additive: `git` ({repo, worktree, branch, detached, head} or
+            // null outside a repository), and an agent's hook-reported cwd
+            // as its `cwd_current` (a shell's polled cwd is already there).
+            if let serde_json::Value::Object(map) = &mut row {
+                let facts = map
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .and_then(|id| git_rows.get(id));
+                if let Some(cwd) = facts.and_then(|f| f.hook_cwd.as_ref()) {
+                    if map.get("kind").and_then(|k| k.as_str()) == Some("agent") {
+                        map.insert("cwd_current".to_string(), json!(cwd));
+                    }
+                }
+                map.insert(
+                    "git".to_string(),
+                    facts.map_or(serde_json::Value::Null, |f| f.git.clone()),
+                );
+            }
+            row
+        })
+        .collect()
 }
 
 /// How long a built events-bus sessions frame stays reusable within one

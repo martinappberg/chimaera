@@ -54,6 +54,9 @@ pub(crate) struct SpawnSpec {
     /// scopes only.
     pub(crate) prelude: Option<String>,
     pub(crate) kind: SpawnKind,
+    /// Who started it, for an agent session's history record (shells keep
+    /// none).
+    pub(crate) started_by: crate::history::StartedBy,
 }
 
 /// Why a spawn could not happen.
@@ -269,7 +272,11 @@ pub(crate) async fn spawn_session(
             crate::lock(&state.session_themes).insert(info.id.clone(), spec.theme.clone());
             let mut polled = None;
             if spawned_agent.is_some() {
-                crate::agents::spawn_agent_watch(state.clone(), info.id.clone());
+                crate::agents::spawn_agent_watch(
+                    state.clone(),
+                    info.id.clone(),
+                    spec.started_by.clone(),
+                );
             } else {
                 // Prime the display name (a fresh shell sits at the root, so
                 // it is the shell itself) and start the naming watcher.

@@ -7,7 +7,7 @@ use serde_json::json;
 const MAX_STATUS_ENTRIES: usize = 5000;
 
 /// A discovered repository for one workspace.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RepoInfo {
     /// Working-tree root of THIS workspace's checkout. `--show-toplevel` gives
     /// the right directory whether the workspace opened the main checkout or a
@@ -16,6 +16,69 @@ pub(crate) struct RepoInfo {
     /// `--git-common-dir`, shared by every worktree of the repo. The stable
     /// repo identity: it names the managed-worktree directory (see `repo_key`).
     pub(super) common_dir: PathBuf,
+    /// This checkout's own git dir (`--absolute-git-dir`): where its `HEAD`
+    /// and a linked worktree's `locked` file live. Equal to `common_dir` for
+    /// a main checkout; `<common>/worktrees/<name>` for a linked one.
+    pub(super) git_dir: PathBuf,
+}
+
+impl RepoInfo {
+    /// The repository a checkout belongs to, as a path a person recognizes:
+    /// the main checkout for a `.git` common dir (so every worktree of one
+    /// repo names the same repo), the checkout itself for a submodule or an
+    /// unusual layout, and the common dir for a bare repository.
+    pub(crate) fn repo_path(&self) -> PathBuf {
+        if self.common_dir.file_name().is_some_and(|n| n == ".git") {
+            if let Some(parent) = self.common_dir.parent() {
+                return parent.to_path_buf();
+            }
+        }
+        if self.git_dir == self.common_dir {
+            return self.toplevel.clone();
+        }
+        self.common_dir.clone()
+    }
+}
+
+/// What a checkout's `HEAD` names: a branch, a detached commit, or nothing
+/// readable. Read from the `HEAD` file itself — no git process — so a
+/// session's branch chip costs one small file read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HeadRef {
+    Branch(String),
+    Detached(String),
+    Unknown,
+}
+
+/// Parse the contents of a `HEAD` file (`ref: refs/heads/x` or a sha).
+pub(super) fn parse_head(bytes: &[u8]) -> HeadRef {
+    let text = String::from_utf8_lossy(bytes);
+    let line = text.lines().next().unwrap_or("").trim();
+    if let Some(reference) = line.strip_prefix("ref:") {
+        let reference = reference.trim();
+        return match reference.strip_prefix("refs/heads/") {
+            Some(branch) if !branch.is_empty() => HeadRef::Branch(branch.to_string()),
+            _ => HeadRef::Unknown,
+        };
+    }
+    if line.len() >= 7 && line.len() <= 64 && line.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return HeadRef::Detached(line.to_string());
+    }
+    HeadRef::Unknown
+}
+
+/// Read `<git_dir>/HEAD` (blocking; callers run it off the reactor). Capped:
+/// a `HEAD` is one short line, so anything longer is not one.
+pub(super) fn read_head_blocking(git_dir: &std::path::Path) -> HeadRef {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(git_dir.join("HEAD")) else {
+        return HeadRef::Unknown;
+    };
+    let mut buf = Vec::with_capacity(128);
+    if file.take(1024).read_to_end(&mut buf).is_err() {
+        return HeadRef::Unknown;
+    }
+    parse_head(&buf)
 }
 
 /// One entry of `git worktree list --porcelain`.
@@ -24,6 +87,8 @@ pub(super) struct WorktreeInfo {
     pub(super) path: PathBuf,
     /// Short HEAD sha.
     pub(super) head: Option<String>,
+    /// Full HEAD sha (for merge checks; the wire carries the short one).
+    pub(super) sha: Option<String>,
     /// Short branch name (`refs/heads/x` -> `x`); `None` when detached.
     pub(super) branch: Option<String>,
     pub(super) detached: bool,
@@ -56,6 +121,7 @@ pub(super) fn parse_worktrees(bytes: &[u8]) -> Vec<WorktreeInfo> {
         let Some(w) = current.as_mut() else { continue };
         if let Some(sha) = line.strip_prefix("HEAD ") {
             w.head = Some(sha.trim().chars().take(7).collect());
+            w.sha = Some(sha.trim().to_string());
         } else if let Some(reference) = line.strip_prefix("branch ") {
             w.branch = Some(
                 reference
@@ -111,9 +177,16 @@ pub(super) struct Entry {
     unstaged: bool,
     untracked: bool,
     conflicted: bool,
+    /// Porcelain v2's `<sub>` field starts with `S`: the path is a submodule.
+    pub(super) submodule: bool,
 }
 
 impl Entry {
+    /// The repo-relative path.
+    pub(super) fn rel(&self) -> &str {
+        &self.rel
+    }
+
     fn changed(rel: String, orig_rel: Option<String>, x: char, y: char) -> Self {
         Entry {
             rel,
@@ -124,6 +197,7 @@ impl Entry {
             unstaged: y != '.',
             untracked: false,
             conflicted: false,
+            submodule: false,
         }
     }
     pub(super) fn untracked(rel: String) -> Self {
@@ -136,6 +210,7 @@ impl Entry {
             unstaged: true,
             untracked: true,
             conflicted: false,
+            submodule: false,
         }
     }
 }
@@ -211,14 +286,21 @@ fn parse_changed(tok: &str, skip_fields: usize, orig_rel: Option<String>) -> Opt
     let body = tok.get(2..)?; // drop the "<T> " prefix
     let mut it = body.splitn(skip_fields + 2, ' ');
     let xy = it.next()?;
-    for _ in 0..skip_fields {
-        it.next()?;
+    // The first field after XY is `<sub>`: "N..." or "S<c><m><u>".
+    let mut submodule = false;
+    for i in 0..skip_fields {
+        let field = it.next()?;
+        if i == 0 {
+            submodule = field.starts_with('S');
+        }
     }
     let path = it.next()?.to_string();
     let mut chars = xy.chars();
     let x = chars.next()?;
     let y = chars.next()?;
-    Some(Entry::changed(path, orig_rel, x, y))
+    let mut entry = Entry::changed(path, orig_rel, x, y);
+    entry.submodule = submodule;
+    Some(entry)
 }
 
 fn parse_header(tok: &str, data: &mut StatusData) {
@@ -304,6 +386,8 @@ pub(super) fn status_json(
                 "unstaged": e.unstaged,
                 "untracked": e.untracked,
                 "conflicted": e.conflicted,
+                // Additive: the path is a submodule (porcelain v2 `S` mark).
+                "submodule": e.submodule,
             })
         })
         .collect();
@@ -311,6 +395,8 @@ pub(super) fn status_json(
         "repo": true,
         "workspace_id": ws_id,
         "epoch": epoch,
+        // Additive: the checkout this status is of.
+        "toplevel": repo.toplevel.to_string_lossy(),
         "branch": d.branch,
         "detached": d.detached,
         "head": d.head,
@@ -368,6 +454,7 @@ mod tests {
 
         let conflict = &data.entries[3];
         assert!(conflict.conflicted);
+        assert!(!changed.submodule);
 
         let untracked = &data.entries[4];
         assert_eq!(untracked.rel, "untracked.txt");
@@ -384,6 +471,17 @@ mod tests {
         let unborn = parse_status(b"# branch.oid (initial)\0# branch.head main\0", false);
         assert_eq!(unborn.head, None);
         assert_eq!(unborn.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn marks_submodule_entries() {
+        let data = parse_status(
+            b"1 .M SC.. 160000 160000 160000 aaa bbb vendor/tool\0",
+            false,
+        );
+        assert_eq!(data.entries.len(), 1);
+        assert!(data.entries[0].submodule);
+        assert_eq!(data.entries[0].rel(), "vendor/tool");
     }
 
     #[test]

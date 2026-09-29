@@ -611,6 +611,7 @@ async fn respawn(
         // durable prelude scopes (host ⊕ workspace) only.
         prelude: None,
         kind,
+        started_by: crate::history::StartedBy::Restart,
     };
     match crate::spawn::spawn_session(state, spec).await {
         Ok(_) => Ok(()),
