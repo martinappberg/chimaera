@@ -416,11 +416,13 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Grant one daemon window the shell bridge on one exact loopback origin and
 /// make that origin its sole navigation target. The capability identifier is
 /// always fresh because Tauri's runtime authority is additive and rejects an
-/// identifier collision.
+/// identifier collision. `local`: the origin is this computer's own daemon
+/// (window scope without a host alias), the only UI given account commands.
 pub(super) fn authorize_daemon_origin(
     app: &AppHandle,
     window_label: &str,
     port: u16,
+    local: bool,
 ) -> tauri::Result<()> {
     let shell = app.state::<Shell>();
     if lock(&shell.allowed_daemon_ports).get(window_label) == Some(&port) {
@@ -435,7 +437,15 @@ pub(super) fn authorize_daemon_origin(
     for permission in DAEMON_UI_CORE_PERMISSIONS {
         capability = capability.permission(*permission);
     }
-    for command in crate::command_manifest::DAEMON_UI_COMMANDS {
+    let account: &[&str] = if local {
+        crate::command_manifest::LOCAL_ACCOUNT_COMMANDS
+    } else {
+        &[]
+    };
+    for command in crate::command_manifest::DAEMON_UI_COMMANDS
+        .iter()
+        .chain(account)
+    {
         capability = capability.permission(format!("allow-{}", command.replace('_', "-")));
     }
     app.add_capability(capability)?;
@@ -457,7 +467,7 @@ pub(super) fn authorize_scope_origin(
         .map(|(label, _)| label.clone())
         .collect();
     for label in labels {
-        authorize_daemon_origin(app, &label, port)?;
+        authorize_daemon_origin(app, &label, port, scope_alias.is_none())?;
     }
     Ok(())
 }
@@ -715,7 +725,7 @@ pub(crate) fn navigate_home_hub(
         &HOME_NAV_SEQ.fetch_add(1, Ordering::Relaxed).to_string(),
     );
 
-    authorize_daemon_origin(app, window.label(), port)?;
+    authorize_daemon_origin(app, window.label(), port, alias.is_none())?;
     {
         let mut windows = lock(&shell.windows);
         let scope = windows
@@ -1050,7 +1060,6 @@ pub fn run() {
             pro::billing::pro_cancel_billing,
             pro::pro_take_return,
             pro::pro_mirror_status,
-            pro::pro_mirror_preference,
             pro::pro_set_never_mirror,
             pro::pro_sign_in,
             pro::pro_cancel_sign_in,
