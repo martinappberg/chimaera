@@ -621,3 +621,24 @@ body.dragging {
   border: 2px solid transparent;
   background-clip: content-box;
 }
+
+/* Id chips (shared/references.ts): an id a reference source answers for
+   (a knowledge plugin's entries), in the Knowledge reader and chat
+   transcripts — hover previews the entry, a click opens it. Text-like, so
+   prose keeps its rhythm. */
+.kchip {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  color: var(--accent);
+  border-bottom: 1px dotted color-mix(in srgb, var(--accent) 55%, transparent);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.kchip:hover {
+  border-bottom-style: solid;
+}
+.kchip:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+  border-radius: 2px;
+}

@@ -119,6 +119,27 @@ impl Stamp {
             .find(|(path, _, _)| path == rel)
             .map(|(_, mtime, _)| *mtime)
     }
+
+    /// What was read, as one short token (FNV-1a over each file's path,
+    /// mtime and length). An entry's body is read from its file, never the
+    /// snapshot, so a reworded paragraph re-reads to the same snapshot; this
+    /// on the wire makes the view's bytes differ whenever the files did.
+    fn digest(&self) -> String {
+        fn eat(h: &mut u64, bytes: &[u8]) {
+            for b in bytes {
+                *h ^= u64::from(*b);
+                *h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for (path, mtime, len) in &self.files {
+            eat(&mut h, path.as_bytes());
+            eat(&mut h, &[0]);
+            eat(&mut h, &mtime.to_le_bytes());
+            eat(&mut h, &len.to_le_bytes());
+        }
+        format!("{h:016x}")
+    }
 }
 
 /// The provider's current snapshot.
@@ -307,8 +328,18 @@ async fn ask(state: &Arc<AppState>, ws: &str) -> Answer {
     }
 }
 
-/// (entry id, kind, the workspace-relative file it lives in).
-type EntryIds = Vec<(String, &'static str, String)>;
+/// One entry of a snapshot, as the Timeline tracks it.
+struct EntryRef {
+    /// Unique within the snapshot: the provider's `key` (a finding's
+    /// `<topic>/<id>`), a decision's or learning's `fp`, else the id.
+    key: String,
+    /// What the Timeline shows ("F-228"; "" for an id-less entry).
+    id: String,
+    kind: &'static str,
+    /// The workspace-relative file it lives in (its span's), "" when the
+    /// provider didn't say — then it is never credited to a turn.
+    file: String,
+}
 
 /// The items of the array `key` in a snapshot object (none when absent).
 fn items<'a>(v: &'a Value, key: &str) -> impl Iterator<Item = &'a Value> {
@@ -319,45 +350,70 @@ fn text<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-/// Every entry id in a knowledge snapshot, with the file it lives in, and
-/// the findings' statuses. The snapshot is the Knowledge view's shape:
-/// `topics[].{path, findings[].{id, status}}`, `decisions[].fp`,
-/// `learnings[].fp`. Ids repeat in real repositories (`### F-027 addendum:`
-/// under F-027, a number reused): the FIRST entry with an id is the one
-/// meant — its status is the finding's (an addendum's "unrated" must not
-/// read as a move), and a repeat is neither news nor a second credit.
-fn ids_of(k: &Value) -> (EntryIds, HashMap<String, String>) {
-    let mut ids = Vec::new();
+/// The file an entry's span names ("" without one).
+fn span_path(v: &Value) -> String {
+    v.get("span")
+        .map(|s| text(s, "path"))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Every entry of a knowledge snapshot (`knowledge/1`: `topics[].findings[]`,
+/// `decisions[]`, `learnings[]`), keyed by what the provider says is unique,
+/// with the file each lives in, and the findings' statuses by key. A
+/// provider without keys (before `knowledge/1` said them) is keyed by id:
+/// ids repeat in real repositories, and then the FIRST entry with an id is
+/// the one meant — its status is the finding's, and a repeat is neither news
+/// nor a second credit. Core names no provider's files: an entry's file is
+/// its span's, or its topic's for a finding.
+fn ids_of(k: &Value) -> (Vec<EntryRef>, HashMap<String, String>) {
+    let mut out = Vec::new();
     let mut seen = HashSet::new();
     let mut statuses = HashMap::new();
     for topic in items(k, "topics") {
         for f in items(topic, "findings") {
             let id = text(f, "id");
-            if id.is_empty() || !seen.insert(id.to_string()) {
+            let key = match text(f, "key") {
+                "" => id,
+                key => key,
+            };
+            if key.is_empty() || !seen.insert(key.to_string()) {
                 continue;
             }
-            ids.push((id.to_string(), "finding", text(topic, "path").to_string()));
-            statuses.insert(id.to_string(), text(f, "status").to_string());
+            let file = match span_path(f) {
+                p if p.is_empty() => text(topic, "path").to_string(),
+                p => p,
+            };
+            out.push(EntryRef {
+                key: key.to_string(),
+                id: id.to_string(),
+                kind: "finding",
+                file,
+            });
+            statuses.insert(key.to_string(), text(f, "status").to_string());
         }
     }
-    for (list, kind, file) in [
-        ("decisions", "decision", ".living/decisions.md"),
-        ("learnings", "learning", ".living/learnings.md"),
-    ] {
+    for (list, kind) in [("decisions", "decision"), ("learnings", "learning")] {
         for e in items(k, list) {
             let fp = text(e, "fp");
             if !fp.is_empty() && seen.insert(fp.to_string()) {
-                ids.push((fp.to_string(), kind, file.to_string()));
+                out.push(EntryRef {
+                    key: fp.to_string(),
+                    id: text(e, "id").to_string(),
+                    kind,
+                    file: span_path(e),
+                });
             }
         }
     }
-    (ids, statuses)
+    (out, statuses)
 }
 
-fn claim_of(k: &Value, id: &str) -> String {
+/// A finding's claim by its key (the provider's, else its id).
+fn claim_of(k: &Value, key: &str) -> String {
     items(k, "topics")
         .flat_map(|t| items(t, "findings"))
-        .find(|f| text(f, "id") == id)
+        .find(|f| text(f, "key") == key || (text(f, "key").is_empty() && text(f, "id") == key))
         .map(|f| timeline::cap(text(f, "claim"), 200))
         .unwrap_or_default()
 }
@@ -468,7 +524,7 @@ fn take_baseline(state: &AppState, ws: &str, now: &Current) {
         .entry(ws.to_string())
         .or_insert(Baseline {
             build: now.build.clone(),
-            ids: ids.into_iter().map(|(id, _, _)| id).collect(),
+            ids: ids.into_iter().map(|e| e.key).collect(),
             statuses,
         });
 }
@@ -516,7 +572,7 @@ pub(crate) async fn recorded_since_last_check(
             ws.to_string(),
             Baseline {
                 build: build.clone(),
-                ids: ids.iter().map(|(id, _, _)| id.clone()).collect(),
+                ids: ids.iter().map(|e| e.key.clone()).collect(),
                 statuses: statuses.clone(),
             },
         )
@@ -533,27 +589,44 @@ pub(crate) async fn recorded_since_last_check(
 
     let mut recorded = Recorded::default();
     let mut unattributed_findings = Vec::new();
-    for (id, kind, file) in &ids {
-        if previous.ids.contains(id) {
+    for e in &ids {
+        if previous.ids.contains(&e.key) {
             continue;
         }
-        if sole && fresh(file) {
-            match *kind {
-                "finding" => recorded.findings.push(id.clone()),
+        if sole && !e.file.is_empty() && fresh(&e.file) {
+            match e.kind {
+                "finding" => recorded.findings.push(if e.id.is_empty() {
+                    e.key.clone()
+                } else {
+                    e.id.clone()
+                }),
                 "decision" => recorded.decisions += 1,
                 _ => recorded.learnings += 1,
             }
-            recorded.fps.push(id.clone());
-        } else if *kind == "finding" {
-            unattributed_findings.push(id.clone());
+            // The join key for "recorded by": the entry's key.
+            recorded.fps.push(e.key.clone());
+        } else if e.kind == "finding" {
+            unattributed_findings.push(e);
         }
     }
-    // Confidence moves: their own Timeline entries (never via `unknown`), in
-    // id order so one check's moves always land in the same sequence.
+    let display = |key: &str| -> String {
+        ids.iter()
+            .find(|e| e.key == key)
+            .map(|e| {
+                if e.id.is_empty() {
+                    e.key.clone()
+                } else {
+                    e.id.clone()
+                }
+            })
+            .unwrap_or_else(|| key.to_string())
+    };
+    // Status moves: their own Timeline entries (never via `unknown`), in
+    // key order so one check's moves always land in the same sequence.
     let mut moves: Vec<(&String, &String)> = statuses.iter().collect();
     moves.sort();
-    for (id, to) in moves {
-        let Some(from) = previous.statuses.get(id) else {
+    for (key, to) in moves {
+        let Some(from) = previous.statuses.get(key) else {
             continue;
         };
         if from == to || from == "unknown" || to == "unknown" {
@@ -566,36 +639,78 @@ pub(crate) async fn recorded_since_last_check(
         }
         entry.knowledge = Some(KnowledgeChange {
             change: "status".into(),
-            id: id.clone(),
+            id: display(key),
+            key: Some(key.clone()),
             from: Some(from.clone()),
             to: to.clone(),
-            claim: claim_of(&k, id),
+            claim: claim_of(&k, key),
         });
         state.timeline.append(ws, entry).await;
     }
-    for id in unattributed_findings.into_iter().take(NEW_FINDINGS_MAX) {
+    for e in unattributed_findings.into_iter().take(NEW_FINDINGS_MAX) {
         let mut entry = Entry::new(Kind::Knowledge);
         entry.knowledge = Some(KnowledgeChange {
             change: "new".into(),
-            id: id.clone(),
+            id: display(&e.key),
+            key: Some(e.key.clone()),
             from: None,
-            to: statuses.get(&id).cloned().unwrap_or_default(),
-            claim: claim_of(&k, &id),
+            to: statuses.get(&e.key).cloned().unwrap_or_default(),
+            claim: claim_of(&k, &e.key),
         });
         state.timeline.append(ws, entry).await;
     }
     (!recorded.fps.is_empty()).then_some(recorded)
 }
 
+/// Whether `rel` is a regular file inside `root`, at most 1 MiB — a
+/// symlink only when it stays inside the project (the common CLAUDE.md →
+/// AGENTS.md).
+fn guidance_file(root: &Path, rel: &str) -> bool {
+    let path = root.join(rel);
+    let inside = std::fs::canonicalize(&path)
+        .ok()
+        .zip(std::fs::canonicalize(root).ok())
+        .is_some_and(|(target, root)| target.starts_with(root));
+    inside && std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() <= 1024 * 1024)
+}
+
+/// The provider's own guidance files (its snapshot's `guidance`: its
+/// protocol file, say) that exist in the project — workspace-relative, at
+/// most a few — ahead of the ones every project has. Core names none.
+fn provider_guidance(root: &Path, k: &Value) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    items(k, "guidance")
+        .filter_map(|g| {
+            let path = text(g, "path");
+            if !seen.insert(path) {
+                return None;
+            }
+            let rel = Path::new(path);
+            let plain = !path.is_empty()
+                && rel.is_relative()
+                && rel
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)));
+            (plain && guidance_file(root, path)).then(|| {
+                let label = match text(g, "label") {
+                    "" => path,
+                    l => l,
+                };
+                json!({
+                    "path": path,
+                    "label": timeline::cap(label, 80),
+                    "description": timeline::cap(text(g, "description"), 200),
+                })
+            })
+        })
+        .take(8)
+        .collect()
+}
+
 /// The guidance agents are already handed + claude's per-project memory.
 fn guidance(root: &Path) -> Vec<Value> {
     let mut out = Vec::new();
     for (file, label, fallback) in [
-        (
-            "MYCELIUM.md",
-            "MYCELIUM.md",
-            "How agents record knowledge here",
-        ),
         (
             "AGENTS.md",
             "AGENTS.md",
@@ -604,20 +719,13 @@ fn guidance(root: &Path) -> Vec<Value> {
         ("CLAUDE.md", "CLAUDE.md", "What claude is told"),
     ] {
         let path = root.join(file);
-        // Follow a symlink only when it stays inside the project (the common
-        // CLAUDE.md → AGENTS.md); one pointing elsewhere is not listed.
-        let inside = std::fs::canonicalize(&path)
-            .ok()
-            .zip(std::fs::canonicalize(root).ok())
-            .is_some_and(|(target, root)| target.starts_with(root));
-        let Ok(meta) = std::fs::metadata(&path) else {
-            continue;
-        };
-        if !inside || !meta.is_file() || meta.len() > 1024 * 1024 {
+        // Follow a symlink only when it stays inside the project; one
+        // pointing elsewhere is not listed.
+        if !guidance_file(root, file) {
             continue;
         }
-        // A thin adapter (mycelium's, a one-line @-include, or a symlink)
-        // says where it points rather than pretending to be the guidance.
+        // A thin adapter (a one-line @-include, or a symlink) says where it
+        // points rather than pretending to be the guidance.
         let link = std::fs::read_link(&path)
             .ok()
             .and_then(|t| t.file_name().map(|n| n.to_string_lossy().into_owned()));
@@ -626,8 +734,6 @@ fn guidance(root: &Path) -> Vec<Value> {
             .unwrap_or_default();
         let description = if let Some(target) = link.filter(|t| t != file) {
             format!("{fallback} → {target}")
-        } else if head.contains("MYCELIUM:BEGIN") && file != "MYCELIUM.md" {
-            format!("{fallback} → MYCELIUM.md")
         } else if head.trim().lines().any(|l| l.trim() == "@AGENTS.md") {
             format!("{fallback} → AGENTS.md")
         } else {
@@ -734,28 +840,40 @@ pub(crate) async fn get_knowledge(
     let body = tokio::task::spawn_blocking(move || {
         // The provider's snapshot as it serialized it: the wire the view reads.
         let mut body = (*now.knowledge).clone();
-        let annotate = |v: &mut Value, key: &str| {
-            if let Some(id) = v.get(key).and_then(Value::as_str) {
-                if let Some((sid, name)) = by.get(id) {
-                    v["recorded_by"] = json!({"sid": sid, "name": name});
-                }
+        // Credits are keyed by the entry's key; ones the Timeline wrote
+        // before keys existed name a finding by its id.
+        let annotate = |v: &mut Value, keys: &[&str]| {
+            let hit = keys
+                .iter()
+                .filter_map(|k| v.get(*k).and_then(Value::as_str))
+                .find_map(|id| by.get(id).cloned());
+            if let Some((sid, name)) = hit {
+                v["recorded_by"] = json!({"sid": sid, "name": name});
             }
         };
         if let Some(topics) = body.get_mut("topics").and_then(Value::as_array_mut) {
             for t in topics {
                 if let Some(fs) = t.get_mut("findings").and_then(Value::as_array_mut) {
-                    fs.iter_mut().for_each(|f| annotate(f, "id"));
+                    fs.iter_mut().for_each(|f| annotate(f, &["key", "id"]));
                 }
             }
         }
         for list in ["decisions", "learnings"] {
             if let Some(items) = body.get_mut(list).and_then(Value::as_array_mut) {
-                items.iter_mut().for_each(|e| annotate(e, "fp"));
+                items.iter_mut().for_each(|e| annotate(e, &["fp"]));
+            }
+        }
+        // The provider's guidance files first, then the ones every project has.
+        let mut all = provider_guidance(&root, &body);
+        for g in guidance {
+            if !all.iter().any(|x| x["path"] == g["path"]) {
+                all.push(g);
             }
         }
         body["schema"] = json!(1);
         body["provider"] = json!(now.provider);
-        body["guidance"] = json!(guidance);
+        body["guidance"] = json!(all);
+        body["read"] = json!(now.files.digest());
         // `error` is the daemon's word that the provider couldn't answer,
         // never a field of the provider's own.
         if let Some(fields) = body.as_object_mut() {
@@ -788,10 +906,11 @@ pub(crate) async fn get_knowledge(
 mod tests {
     use super::*;
 
-    /// A real `.living/` files addenda under their finding's id: the first
-    /// entry is the finding (its status counts), repeats are counted once.
+    /// Without provider keys, ids repeat (an addendum filed under its
+    /// finding's id, a number reused): the first entry is the finding (its
+    /// status counts), repeats are counted once.
     #[test]
-    fn a_repeated_id_is_its_first_entry() {
+    fn a_repeated_id_without_keys_is_its_first_entry() {
         let k = json!({
             "topics": [
                 {"path": ".living/findings/a.md", "findings": [
@@ -807,10 +926,73 @@ mod tests {
             "learnings": [{"fp": "l1"}],
         });
         let (ids, statuses) = ids_of(&k);
-        let names: Vec<&str> = ids.iter().map(|(id, _, _)| id.as_str()).collect();
+        let names: Vec<&str> = ids.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(names, ["F-027", "F-028", "d1", "l1"]);
-        assert_eq!(ids[0].2, ".living/findings/a.md");
+        assert_eq!(ids[0].file, ".living/findings/a.md");
         assert_eq!(statuses["F-027"], "supported");
         assert_eq!(claim_of(&k, "F-027"), "the finding");
+        // Without a span, a decision's file is unknown: never credited.
+        assert_eq!(ids[2].file, "");
+    }
+
+    /// With provider keys, a reused id is two entries, each in the file its
+    /// span names.
+    #[test]
+    fn provider_keys_keep_a_reused_id_apart() {
+        let k = json!({
+            "topics": [
+                {"path": "a.md", "findings": [
+                    {"id": "F-177", "key": "a/F-177", "status": "unknown", "claim": "one",
+                     "span": {"path": "a.md", "line": 3, "end_line": 9}},
+                ]},
+                {"path": "b.md", "findings": [
+                    {"id": "F-177", "key": "b/F-177", "status": "supported", "claim": "two"},
+                ]},
+            ],
+            "decisions": [{"fp": "d1", "id": "D-9", "span": {"path": "log/d.md", "line": 1, "end_line": 4}}],
+        });
+        let (ids, statuses) = ids_of(&k);
+        let keys: Vec<&str> = ids.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, ["a/F-177", "b/F-177", "d1"]);
+        assert_eq!(ids[0].id, "F-177");
+        assert_eq!(ids[1].file, "b.md");
+        assert_eq!(ids[2].file, "log/d.md");
+        assert_eq!(ids[2].id, "D-9");
+        assert_eq!(statuses["b/F-177"], "supported");
+        assert_eq!(claim_of(&k, "b/F-177"), "two");
+    }
+
+    /// The read digest moves with any file's mtime or length, and only then.
+    #[test]
+    fn the_read_digest_follows_the_files() {
+        let stamp = |mtime: u64, len: u64| Stamp {
+            files: vec![("a.md".into(), 1, 10), ("b.md".into(), mtime, len)],
+        };
+        assert_eq!(stamp(5, 7).digest(), stamp(5, 7).digest());
+        assert_ne!(stamp(5, 7).digest(), stamp(6, 7).digest());
+        assert_ne!(stamp(5, 7).digest(), stamp(5, 8).digest());
+        assert_eq!(stamp(5, 7).digest().len(), 16);
+    }
+
+    /// The provider's guidance files are listed only when they are plain,
+    /// workspace-relative files that exist.
+    #[test]
+    fn provider_guidance_lists_only_real_files_inside() {
+        let dir =
+            std::env::temp_dir().join(format!("chimaera-guidance-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("PROTOCOL.md"), "x").unwrap();
+        let k = json!({"guidance": [
+            {"path": "PROTOCOL.md", "label": "PROTOCOL.md", "description": "how agents record"},
+            {"path": "PROTOCOL.md", "label": "again"},
+            {"path": "missing.md", "label": "missing"},
+            {"path": "../outside.md"},
+            {"path": "/etc/hosts"},
+        ]});
+        let g = provider_guidance(&dir, &k);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(g.len(), 1, "a repeated path is listed once");
+        assert_eq!(g[0]["path"], "PROTOCOL.md");
+        assert_eq!(g[0]["description"], "how agents record");
     }
 }

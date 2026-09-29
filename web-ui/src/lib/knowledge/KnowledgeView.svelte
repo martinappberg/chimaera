@@ -1,41 +1,44 @@
 <script lang="ts">
   /**
-   * Knowledge — what the agents recorded (design §5): a read-only view with
-   * a fixed, plain-words shape over the structured provider (mycelium's
-   * .living/) plus the guidance & memory files. Sections are named for the
-   * question they answer; an empty section doesn't render; without a
-   * provider the view is Guidance & memory plus one card offering the single
-   * action that fills it (attach mycelium). One search box, client-side.
+   * Knowledge — what the agents recorded, through the knowledge plugin that
+   * provides it (docs/knowledge-redesign-plan.md). It exists only while such
+   * a plugin is on; without one this tab says so in one line.
    *
-   * Everything here is agent- or file-written: one-liners through
-   * inlineMarkdown, bodies through the sanitized Markdown. Chimaera never
-   * writes knowledge — "open file" is the user's correction path.
+   * Overview first (where we left off · waiting on you · what changed · open
+   * work), then each kind as a list with a reader beside it: an entry's body
+   * is its own markdown, as written; every id is a chip that previews on
+   * hover and opens on click; a status is shown only as the agent wrote it.
+   * The words (section names, status vocabulary) are the plugin's. Nothing
+   * here writes a file: "open in file" and "Ask an agent" are the ways to
+   * change what's recorded.
    */
-  import { tick } from "svelte";
-  import Markdown from "../chat/Markdown.svelte";
+  import { untrack } from "svelte";
   import type { LayoutCtrl } from "../layout/dnd";
-  import { inlineMarkdown } from "../shared/inlineMarkdown";
+  import { HoverPreviews } from "../previews/doc/hoverController.svelte";
+  import { activeTheme } from "../settings/store.svelte";
+  import { askAgent } from "../shared/askAgent";
+  import { resolveTargets } from "../shared/embed/embed";
+  import { referenceMatcher, referenceSources, ReferenceChips } from "../shared/references";
+  import { requestReveal } from "../shared/reveal";
   import { pageVisible } from "../shared/visibility";
-  import { formatMessageTimestamp } from "../shared/time";
-  import { knowledge, knowledgeAvailable, knowledgeError, refreshKnowledge } from "../workspace/knowledge";
-  import { timelineStore } from "../workspace/timeline.svelte";
-  import { knowledgeProviderActive, openAttachSheet } from "../plugins/store";
-  import FindingRow from "./FindingRow.svelte";
-  import Ladder from "./Ladder.svelte";
   import {
-    LADDER_LEGEND,
-    byDateDesc,
-    categoryTone,
-    statusMoves,
-    searchKnowledge,
-    sectionNav,
-    todoTone,
-    type SectionKey,
-  } from "./model";
+    knowledgeAvailable,
+    knowledgeError,
+    knowledgeFocus,
+    refreshKnowledge,
+    takeKnowledgeFocus,
+  } from "../workspace/knowledge";
+  import { knowledgePlugin, knowledgeProviderActive, openAttachSheet } from "../plugins/store";
+  import { searchEntries, type Entry } from "./entries";
+  import EntryList from "./EntryList.svelte";
+  import EntryReader from "./EntryReader.svelte";
+  import { filtersFor, listGroups, SECTION_KIND, type ListGroup, type Section } from "./list";
+  import Overview from "./Overview.svelte";
+  import { isoDay, providerLabels, shortStatusNote } from "./overview";
+  import { knowledgeLookup } from "./store";
+  import TidyList from "./TidyList.svelte";
 
   interface Props {
-    /** Accepted for symmetry with the other workspace singletons; the
-     *  knowledge store already follows the active workspace. */
     wsId?: string | null;
     wsRoot: string | null;
     paneId: string;
@@ -44,30 +47,48 @@
     visible?: boolean;
   }
 
-  let { wsRoot, paneId, ctrl, visible = true }: Props = $props();
+  let { wsId = null, wsRoot, paneId, ctrl, visible = true }: Props = $props();
 
+  type View = "overview" | Section | "tidy";
+  const SECTIONS: Section[] = ["findings", "decisions", "learnings", "conventions", "todos", "sessions"];
+
+  let view = $state<View>("overview");
   let query = $state("");
+  let selected = $state<string | null>(null);
+  /** On narrow panes the reader replaces the list while this is set. */
+  let reading = $state(false);
+  let history = $state<string[]>([]);
+  let hpos = $state(-1);
+  let filters = $state<Record<string, string>>({});
+  let unfolded = $state<Set<string>>(new Set());
   let root = $state<HTMLDivElement | null>(null);
-  let section = $state<"all" | SectionKey>("all");
-  /** The one expanded finding, decision and learning (each by its `key`:
-   *  ids and fingerprints may repeat in a real repository). */
-  let openFinding = $state<string | null>(null);
-  let openDecision = $state<string | null>(null);
-  let openLearning = $state<string | null>(null);
+  let listBox = $state<HTMLDivElement | null>(null);
+  let searchEl = $state<HTMLInputElement | null>(null);
+  let width = $state(1200);
 
-  const raw = $derived($knowledge);
-  const shown = $derived(raw !== null ? searchKnowledge(raw, query) : null);
-  const nav = $derived(shown !== null ? sectionNav(shown) : []);
-  const providerActive = $derived($knowledgeProviderActive && raw?.provider !== null);
-  const show = (k: SectionKey): boolean => section === "all" || section === k;
-  // A section whose rows vanished (search, a new workspace) falls back.
+  const lookup = $derived($knowledgeLookup);
+  const k = $derived(lookup?.k ?? null);
+  const idx = $derived(lookup?.idx ?? null);
+  const labels = $derived(k !== null ? providerLabels(k) : null);
+  const statusNote = $derived(labels?.status_note || "A status is shown as it was written; Chimaera never rates.");
+  const providerActive = $derived($knowledgeProviderActive && k !== null);
+  const narrow = $derived(width < 820);
+  const chips = new ReferenceChips();
+  /** Ids to chips: every registered reference source (this snapshot first). */
+  const matcher = $derived(referenceMatcher($referenceSources));
+
+  let now = $state(Date.now());
   $effect(() => {
-    if (section !== "all" && !nav.some((n) => n.key === section)) section = "all";
+    if (!visible || !$pageVisible) return;
+    now = Date.now();
+    const t = setInterval(() => (now = Date.now()), 60_000);
+    return () => clearInterval(t);
   });
+  const today = $derived(isoDay(now));
+  const weekStart = $derived(isoDay(now - 6 * 86_400_000));
 
-  // Refetch on return: knowledge changes land at episode ends (the timeline
-  // nudge covers those), but a hand edit in another window doesn't nudge —
-  // a focus return is the cheap moment to catch it.
+  // Refetch on return: a hand edit in another window doesn't nudge the
+  // Timeline — a focus return is the cheap moment to catch it.
   let wasVisible = false;
   let primed = false;
   $effect(() => {
@@ -77,388 +98,457 @@
     wasVisible = on;
   });
 
-  let now = $state(Date.now());
   $effect(() => {
-    if (!visible || !$pageVisible) return;
-    now = Date.now();
-    const t = setInterval(() => (now = Date.now()), 60_000);
-    return () => clearInterval(t);
+    const el = root;
+    if (el === null) return;
+    const ro = new ResizeObserver(() => (width = el.clientWidth));
+    ro.observe(el);
+    width = el.clientWidth;
+    return () => ro.disconnect();
   });
+
+  // ---- counts, lists ---------------------------------------------------------
+
+  const counts = $derived.by(() => {
+    const c: Record<string, number> = {};
+    if (idx === null) return c;
+    for (const s of SECTIONS) c[s] = 0;
+    for (const e of idx.entries) {
+      const s = SECTIONS.find((x) => SECTION_KIND[x] === e.kind);
+      if (s === undefined) continue;
+      if (e.kind === "todo" && e.todo?.closed) continue;
+      c[s] += 1;
+    }
+    return c;
+  });
+  const navSections = $derived(SECTIONS.filter((s) => (idx?.entries.some((e) => e.kind === SECTION_KIND[s]) ?? false)));
+
+  const searching = $derived(query.trim() !== "");
+  const listSection = $derived<Section | null>(SECTIONS.includes(view as Section) ? (view as Section) : null);
+  /** The browse state: a section's list, or search results across kinds. */
+  const browse = $derived.by((): { section: Section | "search"; groups: ListGroup[]; filters: ReturnType<typeof filtersFor>; filter: string } | null => {
+    if (idx === null) return null;
+    if (listSection !== null) {
+      const kind = SECTION_KIND[listSection];
+      const all = idx.entries.filter((e) => e.kind === kind);
+      const matched = searchEntries(all, query);
+      const fs = filtersFor(listSection, matched, weekStart);
+      const fid = filters[listSection] ?? "all";
+      const f = fs.find((x) => x.id === fid) ?? fs[0];
+      return { section: listSection, groups: listGroups(listSection, matched.filter(f.test)), filters: fs, filter: f.id };
+    }
+    if (searching) {
+      const matched = searchEntries(idx.entries, query);
+      const groups: ListGroup[] = [];
+      for (const s of SECTIONS) {
+        const of = matched.filter((e) => e.kind === SECTION_KIND[s]);
+        if (of.length === 0) continue;
+        for (const g of listGroups(s, of)) {
+          groups.push({ ...g, key: `${s}:${g.key}`, title: g.title || (labels?.sections[s] ?? s), folded: false });
+        }
+      }
+      return { section: "search", groups, filters: [], filter: "all" };
+    }
+    return null;
+  });
+  const order = $derived(browse?.groups.flatMap((g) => g.entries.map((e) => e.ekey)) ?? []);
+  const entry = $derived<Entry | null>(selected !== null ? (idx?.byKey.get(selected) ?? null) : null);
+
+  // ---- navigation ------------------------------------------------------------
+
+  function show(v: View): void {
+    view = v;
+    reading = false;
+    if (SECTIONS.includes(v as Section) && !narrow) {
+      // Land on the first entry so the reader is never empty on a wide pane.
+      queueMicrotask(() => {
+        if (order.length > 0 && (selected === null || !order.includes(selected))) open(order[0], false);
+      });
+    }
+  }
+
+  /** Read an entry: switch to its section, select it, remember it. */
+  function open(ekey: string, remember = true): void {
+    const e = idx?.byKey.get(ekey);
+    if (e === undefined) return;
+    const s = SECTIONS.find((x) => SECTION_KIND[x] === e.kind);
+    if (s !== undefined && view !== s && !searching) view = s;
+    // A search that hides it would make the jump do nothing visible.
+    if (searching && !searchEntries([e], query).length) query = "";
+    selected = ekey;
+    reading = true;
+    if (remember && history[hpos] !== ekey) {
+      history = [...history.slice(0, hpos + 1), ekey].slice(-100);
+      hpos = history.length - 1;
+    }
+    queueMicrotask(() => {
+      const row = listBox?.querySelector(`[data-ekey="${CSS.escape(ekey)}"]`);
+      row?.scrollIntoView({ block: "nearest" });
+    });
+  }
+
+  function back(): void {
+    if (hpos <= 0) return;
+    hpos -= 1;
+    open(history[hpos], false);
+  }
+
+  function forward(): void {
+    if (hpos >= history.length - 1) return;
+    hpos += 1;
+    open(history[hpos], false);
+  }
 
   function abs(p: string): string {
     return p.startsWith("/") || p.startsWith("~") || wsRoot === null ? p : `${wsRoot}/${p}`;
   }
-  function openFile(p: string): void {
-    ctrl.openFileFrom(paneId, abs(p), false);
+
+  function openFile(path: string, line: number, end: number): void {
+    const p = abs(path);
+    if (line > 0) requestReveal(p, end > line ? { line, endLine: end } : { line });
+    ctrl.openFileFrom(paneId, p, false);
   }
 
-  /** An open question links to its finding (the first with that id):
-   *  expand it and scroll there. */
-  async function revealFinding(id: string): Promise<void> {
-    const key = raw?.topics.flatMap((t) => t.findings).find((f) => f.id === id)?.key;
-    if (key === undefined) return;
-    if (section !== "all" && section !== "found") section = "all";
-    // A search that hides it would make the click do nothing visible.
-    if (!shown?.topics.some((t) => t.findings.some((f) => f.key === key))) query = "";
-    openFinding = key;
-    await tick();
-    // This view's copy: another pane (or a parked workspace) may hold one too.
-    root?.querySelector(`[id="finding-${CSS.escape(key)}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" });
+  function openSession(sid: string): void {
+    if (wsId !== null) ctrl.revealWorktreeSession(sid, wsId);
   }
 
-  const moves = $derived(statusMoves(timelineStore.entries, now));
+  // A chip, a Timeline row, the dashboard asked for an entry: take it when
+  // this tab shows and the snapshot is in.
+  $effect(() => {
+    const req = $knowledgeFocus;
+    if (req === null || !visible || idx === null) return;
+    untrack(() => {
+      const ekey = takeKnowledgeFocus();
+      if (ekey !== null) open(ekey);
+    });
+  });
 
-  const handoffAge = $derived(
-    raw?.left_off?.written_ms ? formatMessageTimestamp(raw.left_off.written_ms, now) : null,
-  );
+  // ---- keyboard ----------------------------------------------------------------
 
-  const counts = $derived(shown?.counts ?? null);
-  /** A failed refresh over a snapshot it gave before, or over nothing. */
-  const hasSnapshot = $derived(
-    raw !== null &&
-      (raw.left_off !== null ||
-        raw.topics.length + raw.decisions.length + raw.learnings.length + raw.todos.length + raw.questions.length > 0),
-  );
+  function onKey(e: KeyboardEvent): void {
+    const t = e.target as HTMLElement | null;
+    const typing = t !== null && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+    if (typing) {
+      if (e.key === "Escape" && t === searchEl) {
+        query = "";
+        searchEl?.blur();
+      } else if (e.key === "Enter" && t === searchEl && idx !== null) {
+        // An id jumps straight to its entry; anything else reads the first hit.
+        const hit = idx.byId.get(query.trim().toUpperCase())?.[0] ?? (order[0] !== undefined ? idx.byKey.get(order[0]) : undefined);
+        if (hit !== undefined) {
+          open(hit.ekey);
+          searchEl?.blur();
+        }
+      } else if (e.key === "ArrowDown" && t === searchEl && order.length > 0) {
+        e.preventDefault();
+        open(order[0]);
+        listBox?.querySelector<HTMLElement>(`[data-ekey="${CSS.escape(order[0])}"]`)?.focus();
+      }
+      return;
+    }
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === "/") {
+      e.preventDefault();
+      searchEl?.focus();
+    } else if (e.key === "[") {
+      back();
+    } else if (e.key === "]") {
+      forward();
+    } else if ((e.key === "j" || e.key === "k" || e.key === "ArrowDown" || e.key === "ArrowUp") && order.length > 0) {
+      e.preventDefault();
+      const i = selected !== null ? order.indexOf(selected) : -1;
+      const down = e.key === "j" || e.key === "ArrowDown";
+      const next = order[Math.max(0, Math.min(order.length - 1, i < 0 ? 0 : i + (down ? 1 : -1)))];
+      open(next);
+      listBox?.querySelector<HTMLElement>(`[data-ekey="${CSS.escape(next)}"]`)?.focus();
+    } else if (e.key === "Escape" && narrow && reading) {
+      reading = false;
+    }
+  }
+
+  // ---- chips: preview on hover, open on click ------------------------------
+
+  $effect(() => {
+    const el = root;
+    if (el === null) return;
+    const h = new HoverPreviews({
+      root: el,
+      layer: () => el,
+      docPath: () => "",
+      mode: () => "reading",
+      text: () => null,
+      links: () => ({ wsRoot, workspaceId: wsId }),
+      ask: (ref) =>
+        resolveTargets([ref.target], "/").then(
+          (r) => r[ref.target] ?? null,
+          () => null,
+        ),
+      theme: () => untrack(() => activeTheme().kind),
+      fontSize: () => 14,
+      targetOf: (node) => chips.hoverTarget(node),
+      anchors: false,
+      standalone: true,
+    });
+    return () => h.destroy();
+  });
+
+  /** A chip: this snapshot's entries open here; another source's target
+   *  opens where that source says. */
+  function follow(t: { key: string; open: (from: { paneId: string | null; newSplit: boolean }) => void }, newSplit: boolean): void {
+    if (idx?.byKey.has(t.key)) open(t.key);
+    else t.open({ paneId, newSplit });
+  }
+
+  function onClick(e: MouseEvent): void {
+    const hit = chips.chipAt(e.target);
+    if (hit === null) return;
+    e.preventDefault();
+    follow(hit.targets[0], e.metaKey || e.ctrlKey);
+  }
+
+  function onChipKey(e: KeyboardEvent): void {
+    if (e.key !== "Enter") return;
+    const hit = chips.chipAt(e.target);
+    if (hit === null) return;
+    e.preventDefault();
+    e.stopPropagation();
+    follow(hit.targets[0], false);
+  }
+
+  const hasSnapshot = $derived(k !== null && (k.left_off !== null || (idx?.entries.length ?? 0) > 0));
+  const headline = $derived.by(() => {
+    if (k === null) return "";
+    const parts: string[] = [];
+    const n = (x: number, one: string, many: string): string => `${x} ${x === 1 ? one : many}`;
+    if ((counts.findings ?? 0) > 0) parts.push(n(counts.findings, "finding", "findings"));
+    if ((counts.decisions ?? 0) > 0) parts.push(n(counts.decisions, "decision", "decisions"));
+    if ((counts.learnings ?? 0) > 0) parts.push(n(counts.learnings, "learning", "learnings"));
+    if ((counts.todos ?? 0) > 0) parts.push(`${counts.todos} open to-do${counts.todos === 1 ? "" : "s"}`);
+    return parts.join(" · ");
+  });
 </script>
 
-<div class="knowledge" bind:this={root}>
-  <div class="inner">
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="knowledge" bind:this={root} onkeydown={onKey} onclick={onClick} onkeydowncapture={onChipKey}>
+  {#if !$knowledgeProviderActive}
+    <div class="off">
+      <h1>Knowledge</h1>
+      <p>Knowledge shows what your agents record through a knowledge plugin. None is switched on in this workspace.</p>
+      {#if $knowledgePlugin !== null}
+        {@const kp = $knowledgePlugin}
+        <button class="opt" onclick={() => openAttachSheet(kp.id)}>Use {kp.name} for Knowledge →</button>
+      {:else}
+        <p>Extensions lists the plugins that provide one.</p>
+      {/if}
+    </div>
+  {:else if $knowledgeAvailable === false}
+    <p class="off">This daemon has no Knowledge yet — update chimaera to read what your agents record.</p>
+  {:else if $knowledgeError !== null && k === null}
+    <p class="off err">{$knowledgeError}</p>
+  {:else if k === null || idx === null || labels === null}
+    <p class="off">loading…</p>
+  {:else}
     <header class="head">
       <div class="titles">
         <h1>Knowledge</h1>
-        {#if raw !== null && providerActive && counts !== null}
-          <p class="sub">
-            What your agents have recorded in this project —
-            <span class="mono">{counts.findings}</span> finding{counts.findings === 1 ? "" : "s"} ·
-            <span class="mono">{counts.decisions}</span> decision{counts.decisions === 1 ? "" : "s"} ·
-            <span class="mono">{counts.learnings}</span> learning{counts.learnings === 1 ? "" : "s"}{#if raw.todos.length > 0}{" · "}<span
-                class="mono">{raw.todos.length}</span> to do{/if}{#if raw.questions.length > 0}{" · "}<span
-                class="mono">{raw.questions.length}</span> open question{raw.questions.length === 1 ? "" : "s"}{/if}
-          </p>
-        {:else}
-          <p class="sub">What your agents are told — and what they could record here.</p>
-        {/if}
+        <p class="sub">
+          {headline || "Nothing recorded yet — agents record findings, decisions and learnings as they work."}
+          {#if labels.source}<span class="source mono">{labels.source}</span>{/if}
+        </p>
       </div>
-      <div class="tools">
-        {#if raw !== null && providerActive && raw.provider}
-          <span class="chip mono">{raw.provider} · .living/ · read-only</span>
-        {/if}
-        {#if raw !== null && (providerActive || raw.guidance.length > 0)}
-          <label class="search">
-            <span class="sr">Search knowledge</span>
-            <input
-              type="search"
-              placeholder={providerActive ? "Search findings, decisions, learnings…" : "Search…"}
-              bind:value={query}
-              spellcheck="false"
-            />
-          </label>
-        {/if}
-      </div>
+      <label class="search">
+        <span class="sr">Search knowledge</span>
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"
+          ><circle cx="7" cy="7" r="5" /><path d="m11 11 3.5 3.5" /></svg
+        >
+        <input
+          bind:this={searchEl}
+          type="search"
+          placeholder="Find an entry, an id like F-12, a path…"
+          bind:value={query}
+          spellcheck="false"
+          autocomplete="off"
+        />
+        <kbd>/</kbd>
+      </label>
     </header>
 
-    {#if $knowledgeAvailable === false}
-      <p class="empty">This daemon has no Knowledge yet — update chimaera to read what your agents record.</p>
-    {:else if $knowledgeError !== null && raw === null}
-      <p class="empty err">{$knowledgeError}</p>
-    {:else if raw === null || shown === null}
-      <p class="empty">loading…</p>
-    {:else}
-      {#if providerActive && raw.error !== null}
-        <!-- Quiet: the provider is still the provider, it just couldn't
-             read this time. What it said is the plugin's own words. -->
-        <p class="stale">
-          {#if hasSnapshot}
-            Showing what {raw.provider} read last — it couldn't refresh just now.
-          {:else}
-            {raw.provider} couldn't read this project just now.
-          {/if}
-          <span class="why">{raw.error}</span>
-        </p>
-      {/if}
-      {#if raw.warnings.length > 0}
-        <div class="warnings">
-          {#each raw.warnings as w, i (i)}<div>{w}</div>{/each}
-        </div>
-      {/if}
-
-      <div class="grid" class:solo={!providerActive}>
-        {#if providerActive}
-          <nav class="nav" aria-label="Sections">
-            <button class="nrow" class:on={section === "all"} aria-current={section === "all"} onclick={() => (section = "all")}>
-              Everything
-            </button>
-            {#each nav as n (n.key)}
-              <button class="nrow" class:on={section === n.key} aria-current={section === n.key} onclick={() => (section = n.key)}>
-                {n.label}
-                {#if n.count !== null}<span class="count mono">{n.count}</span>{/if}
-              </button>
-            {/each}
-            <div class="legend">
-              <div class="lbl">How sure</div>
-              {#each LADDER_LEGEND as l (l.status)}
-                <div class="lrow"><Ladder status={l.status} />{l.text}</div>
-              {/each}
-              <div class="lnote">Set by {raw.provider} from each finding's evidence, never by hand.</div>
-            </div>
-          </nav>
-        {/if}
-
-        <div class="sections">
-          {#if !providerActive}
-            <!-- No structured provider: one card, one action. -->
-            <div class="attach-card">
-              <div class="atitle">Want findings, decisions and learnings here?</div>
-              <p>
-                Your agents can record them as they work with mycelium — structured entries in your repo's
-                <span class="mono">.living/</span>, with evidence-derived confidence. Chimaera reads them; nothing is curated.
-              </p>
-              <button class="opt primary" onclick={() => openAttachSheet("mycelium")}>Use mycelium for Knowledge →</button>
-            </div>
-          {/if}
-
-          {#if providerActive && shown.left_off !== null && show("left")}
-            {@const lo = shown.left_off}
-            <section aria-labelledby="k-left">
-              <h2 id="k-left" class="lbl">Where we left off</h2>
-              <div class="card left">
-                <div class="col">
-                  <div class="ctitle">Current state</div>
-                  <div class="md lead"><Markdown text={lo.current || lo.worked_on || "—"} {visible} /></div>
-                </div>
-                <div class="col">
-                  {#if lo.next.length > 0}
-                    <div class="ctitle">Next steps</div>
-                    <ol class="next">
-                      {#each lo.next as n, i (i)}
-                        <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
-                        <li>{@html inlineMarkdown(n)}</li>
-                      {/each}
-                    </ol>
-                  {/if}
-                  {#each lo.blockers as b, i (i)}
-                    <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
-                    <div class="blocked">Blocked: {@html inlineMarkdown(b)}</div>
-                  {/each}
-                </div>
-                <div class="cfoot">
-                  <span>
-                    Handoff{#if lo.by} written by <span class="mono">{lo.by.name}</span>{/if}{#if handoffAge} · {handoffAge}{/if}
-                  </span>
-                  <button class="link" onclick={() => openFile(lo.path)}>open handoff</button>
-                </div>
-              </div>
-            </section>
-          {/if}
-
-          {#if providerActive && shown.topics.length > 0 && show("found")}
-            <section aria-labelledby="k-found" class="found">
-              <h2 id="k-found" class="lbl">What we found</h2>
-              {#each shown.topics as t (t.key)}
-                <div class="topic">
-                  <div class="thead">
-                    <span class="mono tslug">{t.slug}</span>
-                    <span class="tdesc">{t.description}</span>
-                  </div>
-                  <div class="card list">
-                    {#each t.findings as f (f.key)}
-                      <FindingRow
-                        finding={f}
-                        topic={t.slug}
-                        open={openFinding === f.key}
-                        badge={moves.get(f.id) ?? null}
-                        onToggle={() => (openFinding = openFinding === f.key ? null : f.key)}
-                        onOpenFile={() => openFile(t.path)}
-                        filePath={t.path}
-                        {visible}
-                      />
-                    {/each}
-                  </div>
-                </div>
-              {/each}
-            </section>
-          {/if}
-
-          {#if providerActive && shown.decisions.length > 0 && show("decided")}
-            <section aria-labelledby="k-decided">
-              <h2 id="k-decided" class="lbl">What we decided</h2>
-              <div class="rows">
-                {#each byDateDesc(shown.decisions) as d (d.key)}
-                  <div class="drow-wrap">
-                    <button class="drow" aria-expanded={openDecision === d.key} onclick={() => (openDecision = openDecision === d.key ? null : d.key)}>
-                      <span class="mono muted date">{d.date}</span>
-                      <span class="dbody">
-                        <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
-                        <span class="dtitle">{@html inlineMarkdown(d.title)}</span>
-                        {#if d.decision}
-                          <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
-                          <span class="dtext">{@html inlineMarkdown(d.decision)}</span>
-                        {/if}
-                        {#if d.alternatives.length > 0}
-                          <span class="dalt">instead of {d.alternatives.join(" · ")}</span>
-                        {/if}
-                      </span>
-                      <span class="mono muted by">{d.recorded_by?.name ?? ""}</span>
-                    </button>
-                    {#if openDecision === d.key}
-                      <div class="detail">
-                        {#if d.context}<div class="block"><div class="lbl small">Context</div><div class="md"><Markdown text={d.context} {visible} /></div></div>{/if}
-                        {#if d.rationale}<div class="block"><div class="lbl small">Why</div><div class="md"><Markdown text={d.rationale} {visible} /></div></div>{/if}
-                        {#if d.consequences}<div class="block"><div class="lbl small">Consequences</div><div class="md"><Markdown text={d.consequences} {visible} /></div></div>{/if}
-                        <div class="foot">
-                          <button class="link mono" onclick={() => openFile(".living/decisions.md")}>.living/decisions.md</button>
-                          {#if d.line > 0}<span class="muted">line {d.line}</span>{/if}
-                        </div>
-                      </div>
-                    {/if}
-                  </div>
-                {/each}
-              </div>
-            </section>
-          {/if}
-
-          {#if providerActive && shown.learnings.length > 0 && show("watch")}
-            <section aria-labelledby="k-watch">
-              <h2 id="k-watch" class="lbl">Watch out for</h2>
-              <div class="watch">
-                {#each byDateDesc(shown.learnings) as l (l.key)}
-                  <button class="lcard" class:open={openLearning === l.key} aria-expanded={openLearning === l.key} onclick={() => (openLearning = openLearning === l.key ? null : l.key)}>
-                    <span class="lhead">
-                      <span class="cat mono {categoryTone(l.category)}">{l.category}</span>
-                      {#if l.tags.length > 0}<span class="ltags mono">{l.tags.join(" · ")}</span>{/if}
-                    </span>
-                    <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
-                    <span class="ltitle">{@html inlineMarkdown(l.title)}</span>
-                    {#if l.why}
-                      <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
-                      <span class="lwhy">{@html inlineMarkdown(l.why)}</span>
-                    {/if}
-                    {#if openLearning === l.key}
-                      <span class="lmore">
-                        {#if l.what}<span class="block"><span class="lbl small">What happened</span><span class="md"><Markdown text={l.what} {visible} /></span></span>{/if}
-                        {#if l.resolution}<span class="block"><span class="lbl small">Resolution</span><span class="md"><Markdown text={l.resolution} {visible} /></span></span>{/if}
-                        <span class="foot">
-                          <span class="mono muted">{l.date}</span>
-                          {#if l.recorded_by}<span class="muted">recorded by <span class="mono">{l.recorded_by.name}</span></span>{/if}
-                          <span
-                            class="link mono"
-                            role="link"
-                            tabindex="0"
-                            onclick={(e) => {
-                              e.stopPropagation();
-                              openFile(".living/learnings.md");
-                            }}
-                            onkeydown={(e) => {
-                              if (e.key === "Enter") {
-                                e.stopPropagation();
-                                openFile(".living/learnings.md");
-                              }
-                            }}>.living/learnings.md</span
-                          >
-                        </span>
-                      </span>
-                    {/if}
-                  </button>
-                {/each}
-              </div>
-            </section>
-          {/if}
-
-          {#if providerActive && shown.todos.length + shown.questions.length > 0 && show("open")}
-            <section aria-labelledby="k-open">
-              <h2 id="k-open" class="lbl">To do &amp; questions</h2>
-              <div class="open" class:two={shown.todos.length > 0 && shown.questions.length > 0}>
-                {#if shown.todos.length > 0}
-                  <div class="ocol">
-                    <div class="ctitle">To do</div>
-                    {#each shown.todos as t, i (i)}
-                      <div class="trow">
-                        <span class="mono muted prio">{t.priority}</span>
-                        <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
-                        <span class="titem">{@html inlineMarkdown(t.item)}</span>
-                        <span class="tstatus {todoTone(t.status)}">{t.status}</span>
-                      </div>
-                    {/each}
-                    <div class="foot pad">
-                      <button class="link mono" onclick={() => openFile("todo/TODO_REGISTRY.md")}>todo/TODO_REGISTRY.md</button>
-                    </div>
-                  </div>
-                {/if}
-                {#if shown.questions.length > 0}
-                  <div class="ocol">
-                    <div class="ctitle">Open questions</div>
-                    {#each shown.questions as q, i (i)}
-                      <div class="qrow">
-                        <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
-                        <span class="qtext">{@html inlineMarkdown(q.text)}</span>
-                        {#if q.finding}
-                          <button class="link mono" onclick={() => void revealFinding(q.finding)}>{q.finding}</button>
-                        {/if}
-                      </div>
-                    {/each}
-                  </div>
-                {/if}
-              </div>
-            </section>
-          {/if}
-
-          {#if shown.guidance.length > 0 && show("guide")}
-            <section aria-labelledby="k-guide">
-              <h2 id="k-guide" class="lbl">Guidance & memory</h2>
-              <div class="guide">
-                {#each shown.guidance as g (g.path)}
-                  <button class="gcard" onclick={() => openFile(g.path)} title={g.path}>
-                    <span class="mono glabel">{g.label}</span>
-                    {#if g.description}<span class="gdesc">{g.description}</span>{/if}
-                  </button>
-                {/each}
-              </div>
-            </section>
-          {:else if !providerActive && shown.guidance.length === 0}
-            <p class="empty">No AGENTS.md, CLAUDE.md or agent memory here yet.</p>
-          {/if}
-
-          {#if providerActive && query.trim() !== "" && nav.length === 0}
-            <p class="empty">Nothing matches “{query.trim()}”.</p>
-          {/if}
-        </div>
-      </div>
+    {#if providerActive && k.error !== null}
+      <p class="stale">
+        {#if hasSnapshot}Showing what {k.provider} read last — it couldn't refresh just now.{:else}{k.provider} couldn't read this
+          project just now.{/if}
+        <span class="why">{k.error}</span>
+      </p>
     {/if}
-  </div>
+
+    <div class="body" class:narrow>
+      <nav class="nav" aria-label="Knowledge sections">
+        <button class="nrow" aria-current={view === "overview" && !searching} onclick={() => ((query = ""), show("overview"))}>
+          {labels.sections.overview}
+        </button>
+        {#each navSections as s (s)}
+          <button class="nrow" aria-current={view === s} onclick={() => show(s)}>
+            {labels.sections[s] ?? s}
+            <span class="count mono">{counts[s]}</span>
+          </button>
+        {/each}
+        {#if k.tidy.length > 0}
+          <span class="sep"></span>
+          <button class="nrow tidy" aria-current={view === "tidy"} onclick={() => ((query = ""), show("tidy"))}>
+            {labels.sections.tidy}
+            <span class="count mono hot">{k.tidy.length}</span>
+          </button>
+        {/if}
+        {#if !narrow}
+          <div class="legend">
+            <div class="lh">Status</div>
+            <p title={statusNote}>{shortStatusNote(statusNote)}</p>
+          </div>
+        {/if}
+      </nav>
+
+      <div class="main">
+        {#if browse !== null && (listSection !== null || searching)}
+          <div class="browse" class:reading>
+            <div class="listbox" bind:this={listBox}>
+              <EntryList
+                label={browse.section === "search" ? "Search results" : (labels.sections[browse.section] ?? browse.section)}
+                groups={browse.groups}
+                filters={browse.filters}
+                filter={browse.filter}
+                onFilter={(id) => {
+                  if (listSection !== null) filters = { ...filters, [listSection]: id };
+                }}
+                {idx}
+                {labels}
+                {selected}
+                onSelect={(ekey) => open(ekey)}
+                {unfolded}
+                onUnfold={(key) => (unfolded = new Set([...unfolded, key]))}
+                {query}
+              />
+            </div>
+            <div class="readerbox">
+              {#if entry !== null}
+                <EntryReader
+                  {entry}
+                  {k}
+                  {idx}
+                  {matcher}
+                  {labels}
+                  {chips}
+                  {wsRoot}
+                  {wsId}
+                  canBack={hpos > 0}
+                  canForward={hpos < history.length - 1}
+                  onBack={back}
+                  onForward={forward}
+                  onOpen={(ekey) => open(ekey)}
+                  onOpenFile={openFile}
+                  onOpenSession={openSession}
+                  onClose={narrow ? () => (reading = false) : undefined}
+                />
+              {:else}
+                <p class="pick">Pick an entry to read it here. <span class="keys">j / k to move · / to search</span></p>
+              {/if}
+            </div>
+          </div>
+        {:else if view === "tidy"}
+          <div class="pad">
+            <TidyList
+              rows={k.tidy}
+              {idx}
+              title={labels.sections.tidy}
+              onAsk={(text) => askAgent({ text })}
+              onOpen={(ekey) => open(ekey)}
+            />
+          </div>
+        {:else}
+          <div class="pad">
+            <Overview
+              {k}
+              {idx}
+              {matcher}
+              {labels}
+              {chips}
+              {wsRoot}
+              {wsId}
+              {today}
+              {now}
+              onOpen={(ekey) => open(ekey)}
+              onOpenFile={openFile}
+              onSection={(s) => show(s)}
+            />
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/if}
 </div>
 
 <style>
   .knowledge {
     position: absolute;
     inset: 0;
-    overflow-y: auto;
-    background: var(--bg);
-    container-type: inline-size;
-  }
-  .inner {
-    max-width: 1180px;
-    margin: 0 auto;
-    padding: 26px 36px 48px;
     display: flex;
     flex-direction: column;
-    gap: 22px;
+    background: var(--bg);
+    color: var(--fg);
+    container-type: inline-size;
+    overflow: hidden;
   }
-
+  .off {
+    margin: 0;
+    padding: 36px;
+    max-width: 640px;
+    font-size: var(--text-sm);
+    color: var(--muted);
+    line-height: 1.55;
+  }
+  .off h1 {
+    color: var(--fg);
+    margin-bottom: 8px;
+  }
+  .off p {
+    margin: 0 0 14px;
+  }
+  .err {
+    color: var(--err);
+  }
+  .opt {
+    border: 1px solid var(--edge);
+    background: var(--overlay-bg);
+    color: var(--fg);
+    border-radius: 8px;
+    padding: 7px 14px;
+    font: inherit;
+    font-size: var(--text-sm);
+    cursor: pointer;
+  }
+  .opt:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
   .head {
     display: flex;
     align-items: flex-end;
-    gap: 24px;
+    gap: 12px 24px;
     flex-wrap: wrap;
+    padding: 20px 28px 14px;
+    border-bottom: 1px solid var(--edge);
+    flex: none;
   }
   .titles {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 4px;
     min-width: 0;
+    flex: 1 1 320px;
   }
   h1 {
     margin: 0;
-    font-size: 22px;
+    font-size: 20px;
     font-weight: 600;
     letter-spacing: -0.01em;
   }
@@ -466,31 +556,58 @@
     margin: 0;
     font-size: var(--text-sm);
     color: var(--muted);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    align-items: baseline;
+  }
+  .source {
+    font-size: 11px;
+    border: 1px solid var(--edge);
+    border-radius: 999px;
+    padding: 1px 8px;
+    white-space: nowrap;
   }
   .mono {
     font-family: var(--mono);
-    font-size: 0.95em;
-  }
-  .muted {
-    color: var(--muted);
-  }
-  .tools {
-    margin-left: auto;
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    flex-wrap: wrap;
-  }
-  .chip {
-    font-size: 11.5px;
-    color: var(--muted);
-    padding: 3px 9px;
-    border: 1px solid var(--edge);
-    border-radius: 999px;
-    white-space: nowrap;
   }
   .search {
+    position: relative;
     display: flex;
+    align-items: center;
+    flex: 0 1 340px;
+    min-width: 200px;
+    color: var(--muted);
+  }
+  .search svg {
+    position: absolute;
+    left: 10px;
+    pointer-events: none;
+  }
+  .search input {
+    width: 100%;
+    border: 1px solid var(--edge);
+    background: var(--overlay-bg);
+    color: var(--fg);
+    border-radius: 8px;
+    padding: 7px 30px 7px 30px;
+    font: inherit;
+    font-size: var(--text-sm);
+  }
+  .search input:focus {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 0;
+  }
+  .search kbd {
+    position: absolute;
+    right: 8px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    border: 1px solid var(--edge);
+    border-radius: 4px;
+    padding: 0 5px;
+    color: var(--muted);
+    pointer-events: none;
   }
   .sr {
     position: absolute;
@@ -499,587 +616,169 @@
     overflow: hidden;
     clip: rect(0 0 0 0);
   }
-  .search input {
-    width: 280px;
-    max-width: 60vw;
-    border: 1px solid var(--edge);
-    background: var(--overlay-bg);
-    color: var(--fg);
-    border-radius: 8px;
-    padding: 7px 12px;
-    font: inherit;
-    font-size: var(--text-sm);
-  }
-  .search input::placeholder {
-    color: var(--muted);
-    opacity: 0.8;
-  }
-
-  .empty {
-    margin: 0;
-    font-size: var(--text-sm);
-    color: var(--muted);
-    line-height: 1.5;
-  }
-  .err {
-    color: var(--err);
-  }
   .stale {
     margin: 0;
+    padding: 6px 28px;
     font-size: var(--text-xs);
     color: var(--muted);
-    line-height: 1.5;
+    border-bottom: 1px solid var(--edge);
   }
   .stale .why {
     display: block;
     font-family: var(--mono);
     overflow-wrap: anywhere;
   }
-  .warnings {
-    font-size: var(--text-xs);
-    color: var(--warn);
-    line-height: 1.5;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-
-  .grid {
+  .body {
+    flex: 1;
+    min-height: 0;
     display: grid;
-    grid-template-columns: 196px minmax(0, 1fr);
-    gap: 40px;
-    align-items: start;
-  }
-  .grid.solo {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: 184px minmax(0, 1fr);
   }
   .nav {
+    border-right: 1px solid var(--edge);
+    padding: 12px 10px;
+    overflow-y: auto;
     display: flex;
     flex-direction: column;
-    gap: 2px;
-    position: sticky;
-    top: 0;
+    gap: 1px;
   }
   .nrow {
     display: flex;
-    align-items: center;
+    align-items: baseline;
     gap: 8px;
-    text-align: left;
-    appearance: none;
-    border: none;
+    width: 100%;
+    border: 0;
     background: none;
-    padding: 7px 10px;
-    border-radius: 6px;
+    color: var(--fg);
     font: inherit;
     font-size: var(--text-sm);
-    color: var(--muted);
+    text-align: left;
+    padding: 6px 10px;
+    border-radius: 6px;
     cursor: pointer;
   }
   .nrow:hover {
-    color: var(--fg);
     background: var(--row-hover);
   }
-  .nrow.on {
+  .nrow[aria-current="true"] {
     background: var(--row-active);
-    color: var(--fg);
-    font-weight: 500;
+    font-weight: 550;
+  }
+  .nrow.tidy {
+    color: var(--muted);
   }
   .count {
     margin-left: auto;
-    font-size: 11.5px;
+    font-size: 11px;
     color: var(--muted);
+    font-weight: 400;
+  }
+  .count.hot {
+    color: var(--warn);
+  }
+  .sep {
+    border-top: 1px solid var(--edge);
+    margin: 8px 4px;
   }
   .legend {
-    margin-top: 22px;
-    padding: 12px 10px 0;
-    border-top: 1px solid var(--edge);
-    display: flex;
-    flex-direction: column;
-    gap: 7px;
-    font-size: var(--text-xs);
+    margin: 18px 10px 0;
+    font-size: 11.5px;
+    line-height: 1.45;
     color: var(--muted);
   }
-  .lrow {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-  }
-  .lnote {
-    line-height: 1.45;
-    padding-top: 4px;
-    opacity: 0.85;
-  }
-  /* After the base .grid/.nav/.legend rules: same specificity, so an earlier
-     block lost to them and the narrow view kept a sticky, see-through nav
-     over the findings. */
-  @container (max-width: 820px) {
-    .grid {
-      grid-template-columns: minmax(0, 1fr);
-      gap: 22px;
-    }
-    .nav {
-      position: static;
-      flex-direction: row;
-      flex-wrap: wrap;
-    }
-    .legend {
-      display: none;
-    }
-  }
-
-  .lbl {
-    margin: 0;
-    font-size: 11px;
+  .legend .lh {
+    font-size: 10.5px;
+    font-weight: 600;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: var(--muted);
-    font-weight: 600;
+    margin-bottom: 4px;
   }
-  .lbl.small {
-    font-size: 10.5px;
-  }
-
-  .sections {
-    display: flex;
-    flex-direction: column;
-    gap: 34px;
-    min-width: 0;
-    max-width: 920px;
-  }
-  section {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-  section.found {
-    gap: 18px;
-  }
-
-  .attach-card {
-    background: var(--overlay-bg);
-    border: 1px solid var(--edge);
-    border-radius: 12px;
-    padding: 18px 20px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    align-items: flex-start;
-    max-width: 640px;
-  }
-  .atitle {
-    font-size: var(--text-md);
-    font-weight: 600;
-  }
-  .attach-card p {
+  .legend p {
     margin: 0;
-    font-size: var(--text-sm);
-    color: var(--muted);
-    line-height: 1.5;
   }
-  .attach-card .opt {
-    margin-top: 4px;
-  }
-
-  .card {
-    background: var(--overlay-bg);
-    border: 1px solid var(--edge);
-    border-radius: 12px;
-  }
-  .card.left {
-    padding: 18px 22px;
-    display: grid;
-    grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
-    gap: 28px;
-  }
-  @container (max-width: 760px) {
-    .card.left {
-      grid-template-columns: minmax(0, 1fr);
-    }
-  }
-  .card.list {
+  .main {
+    min-width: 0;
+    min-height: 0;
     overflow: hidden;
+    position: relative;
   }
-  .col {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    min-width: 0;
+  .pad {
+    height: 100%;
+    overflow-y: auto;
+    padding: 20px 28px 48px;
   }
-  .ctitle {
-    font-size: var(--text-xs);
-    color: var(--muted);
-    font-weight: 600;
-  }
-  .md {
-    font-size: var(--text-md);
-    line-height: 1.5;
-  }
-  .md.lead {
-    font-size: 15px;
-    line-height: 1.55;
-  }
-  .md :global(p) {
-    margin: 0 0 0.5em;
-  }
-  .md :global(p:last-child) {
-    margin-bottom: 0;
-  }
-  .next {
-    margin: 0;
-    padding-left: 18px;
-    font-size: var(--text-md);
-    line-height: 1.7;
-  }
-  .next :global(code),
-  .blocked :global(code),
-  .dtitle :global(code),
-  .dtext :global(code),
-  .ltitle :global(code),
-  .lwhy :global(code),
-  .titem :global(code),
-  .qtext :global(code) {
-    font-family: var(--mono);
-    font-size: 0.92em;
-  }
-  .blocked {
-    font-size: var(--text-sm);
-    color: var(--warn);
-    background: color-mix(in srgb, var(--warn) 9%, transparent);
-    padding: 7px 10px;
-    border-radius: 6px;
-    margin-top: 2px;
-    line-height: 1.45;
-  }
-  .cfoot {
-    grid-column: 1 / -1;
-    display: flex;
-    gap: 10px;
-    font-size: var(--text-xs);
-    color: var(--muted);
-    border-top: 1px solid var(--edge);
-    padding-top: 12px;
-  }
-  .cfoot .link {
-    margin-left: auto;
-  }
-
-  .topic {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .thead {
-    display: flex;
-    align-items: baseline;
-    gap: 12px;
-    padding-bottom: 6px;
-  }
-  .tslug {
-    font-size: 12.5px;
-    font-weight: 600;
-  }
-  .tdesc {
-    font-size: var(--text-sm);
-    color: var(--muted);
-  }
-
-  .rows {
-    display: flex;
-    flex-direction: column;
-  }
-  .drow-wrap {
-    border-top: 1px solid var(--edge);
-  }
-  .drow {
-    width: 100%;
-    appearance: none;
-    border: none;
-    background: none;
-    font: inherit;
-    color: var(--fg);
-    text-align: left;
-    cursor: pointer;
+  .browse {
     display: grid;
-    grid-template-columns: 96px minmax(0, 1fr) auto;
-    column-gap: 18px;
-    padding: 13px 6px;
-    margin: 0 -6px;
-    width: calc(100% + 12px);
-    border-radius: 8px;
-    transition: background-color 0.12s ease;
+    grid-template-columns: minmax(300px, 42%) minmax(0, 1fr);
+    height: 100%;
   }
-  .drow:hover {
-    background: var(--row-hover);
+  .listbox {
+    overflow-y: auto;
+    border-right: 1px solid var(--edge);
+    min-height: 0;
   }
-  @container (max-width: 760px) {
-    .drow {
-      grid-template-columns: minmax(0, 1fr);
-      row-gap: 4px;
-    }
+  .readerbox {
+    overflow-y: auto;
+    min-height: 0;
+    padding: 18px 28px 60px;
   }
-  .date {
-    font-size: var(--text-xs);
-    padding-top: 2px;
-  }
-  .dbody {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    min-width: 0;
-  }
-  .dtitle {
-    font-size: var(--text-md);
-    font-weight: 600;
-  }
-  .dtext {
-    font-size: var(--text-md);
-    line-height: 1.5;
-  }
-  .dalt {
-    font-size: var(--text-xs);
+  .pick {
+    margin: 40px 0;
     color: var(--muted);
+    font-size: var(--text-sm);
+    text-align: center;
   }
-  .by {
+  .keys {
+    display: block;
+    margin-top: 6px;
     font-size: var(--text-xs);
-  }
-  .detail {
-    margin: 0 0 14px 96px;
-    background: color-mix(in srgb, var(--fg) 3%, transparent);
-    border-radius: 10px;
-    padding: 14px 18px;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    animation: rise 0.18s ease;
-  }
-  @container (max-width: 760px) {
-    .detail {
-      margin-left: 0;
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .detail {
-      animation: none;
-    }
-  }
-  .block {
-    display: flex;
-    flex-direction: column;
-    gap: 5px;
-  }
-  .foot {
-    display: flex;
-    gap: 14px;
-    font-size: var(--text-xs);
-    align-items: baseline;
-  }
-  .foot.pad {
-    padding-top: 8px;
-  }
-  .link {
-    appearance: none;
-    border: none;
-    background: none;
-    padding: 0;
-    font: inherit;
-    font-size: var(--text-xs);
-    color: var(--accent);
-    cursor: pointer;
-  }
-  .link:hover {
-    text-decoration: underline;
   }
 
-  .watch {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 12px;
-  }
-  @container (max-width: 760px) {
-    .watch {
-      grid-template-columns: minmax(0, 1fr);
-    }
-  }
-  .lcard {
-    appearance: none;
-    font: inherit;
-    color: var(--fg);
-    text-align: left;
-    cursor: pointer;
-    background: var(--overlay-bg);
-    border: 1px solid var(--edge);
-    border-radius: 10px;
-    padding: 14px 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 7px;
-    min-width: 0;
-    transition: border-color 0.12s ease;
-  }
-  .lcard:hover,
-  .lcard.open {
-    border-color: color-mix(in srgb, var(--accent) 45%, var(--edge));
-  }
-  .lhead {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .cat {
-    font-size: 11px;
-    padding: 1px 8px;
-    border-radius: 999px;
-    color: var(--muted);
-    border: 1px solid var(--edge);
-  }
-  .cat.warn {
-    color: var(--warn);
-    background: color-mix(in srgb, var(--warn) 10%, transparent);
-    border-color: transparent;
-  }
-  .cat.err {
-    color: var(--err);
-    background: color-mix(in srgb, var(--err) 10%, transparent);
-    border-color: transparent;
-  }
-  .cat.accent {
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    border-color: transparent;
-  }
-  .ltags {
-    margin-left: auto;
-    font-size: 11px;
-    color: var(--muted);
-    opacity: 0.8;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .ltitle {
-    font-size: var(--text-md);
-    font-weight: 600;
-    line-height: 1.4;
-  }
-  .lwhy {
-    font-size: var(--text-sm);
-    color: var(--muted);
-    line-height: 1.5;
-  }
-  .lmore {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    padding-top: 6px;
-    border-top: 1px solid var(--edge);
-    margin-top: 2px;
-    font-size: var(--text-sm);
-  }
-  .lmore .block {
-    display: flex;
-  }
-
-  .open {
-    display: grid;
+  /* Narrow panes: the nav becomes a strip, and the reader replaces the list. */
+  .body.narrow {
     grid-template-columns: minmax(0, 1fr);
-    gap: 28px;
+    grid-template-rows: auto minmax(0, 1fr);
   }
-  .open.two {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  .body.narrow .nav {
+    flex-direction: row;
+    border-right: 0;
+    border-bottom: 1px solid var(--edge);
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 6px 10px;
+    gap: 2px;
+    /* the strip scrolls by wheel/drag; the scrollbar itself would be noise */
+    scrollbar-width: none;
   }
-  @container (max-width: 760px) {
-    .open.two {
-      grid-template-columns: minmax(0, 1fr);
-    }
+  .body.narrow .nav::-webkit-scrollbar {
+    display: none;
   }
-  .ocol {
-    display: flex;
-    flex-direction: column;
-  }
-  .ocol .ctitle {
-    padding-bottom: 8px;
-  }
-  .trow {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 0;
-    border-top: 1px solid var(--edge);
-    font-size: var(--text-md);
-  }
-  .prio {
-    width: 52px;
-    flex: none;
-    font-size: 11px;
-  }
-  .titem {
-    flex: 1;
-    min-width: 0;
-  }
-  .tstatus {
-    flex: none;
-    font-size: 11.5px;
-    color: var(--muted);
-  }
-  .tstatus.warn {
-    color: var(--warn);
-    background: color-mix(in srgb, var(--warn) 10%, transparent);
-    padding: 1px 8px;
-    border-radius: 999px;
-  }
-  .tstatus.accent {
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    padding: 1px 8px;
-    border-radius: 999px;
-  }
-  .qrow {
-    display: flex;
-    align-items: baseline;
-    gap: 10px;
-    padding: 10px 0;
-    border-top: 1px solid var(--edge);
-    font-size: var(--text-md);
-  }
-  .qtext {
-    flex: 1;
-    min-width: 0;
-  }
-
-  .guide {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
-    gap: 10px;
-  }
-  .gcard {
-    appearance: none;
-    font: inherit;
-    color: var(--fg);
-    text-align: left;
-    cursor: pointer;
-    background: none;
-    border: 1px solid var(--edge);
-    border-radius: 10px;
-    padding: 12px 14px;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    min-width: 0;
-    transition: border-color 0.12s ease;
-  }
-  .gcard:hover {
-    border-color: color-mix(in srgb, var(--accent) 45%, var(--edge));
-  }
-  .glabel {
-    font-size: 12.5px;
-    font-weight: 600;
-    overflow: hidden;
-    text-overflow: ellipsis;
+  .body.narrow .nrow {
+    width: auto;
     white-space: nowrap;
   }
-  .gdesc {
-    font-size: 12.5px;
-    color: var(--muted);
-    line-height: 1.4;
+  .body.narrow .sep {
+    border-top: 0;
+    border-left: 1px solid var(--edge);
+    margin: 4px 4px;
+  }
+  .body.narrow .browse {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .body.narrow .browse.reading .listbox {
+    display: none;
+  }
+  .body.narrow .browse:not(.reading) .readerbox {
+    display: none;
+  }
+  .body.narrow .listbox {
+    border-right: 0;
+  }
+  .body.narrow .pad,
+  .body.narrow .readerbox {
+    padding: 14px 16px 40px;
+  }
+  .head:has(~ .body.narrow) {
+    padding: 14px 16px 10px;
   }
 </style>

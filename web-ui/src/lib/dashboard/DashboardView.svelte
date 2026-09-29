@@ -23,6 +23,7 @@
   import SinceYouLeft from "./SinceYouLeft.svelte";
   import WhereThingsStand from "./WhereThingsStand.svelte";
   import ActivityLine from "./ActivityLine.svelte";
+  import GuidanceRow from "./GuidanceRow.svelte";
   import { acquireChat, releaseChat } from "../chat/chatPool";
   import type { ChatStore } from "../chat/store.svelte";
   import type { ChatSocket } from "../chat/chatWs";
@@ -466,6 +467,14 @@
             notesActive={$workspacePlugins?.plugins.some((p) => p.id === "agent-notes" && p.active) === true}
             onOpenKnowledge={dash.onOpenKnowledge}
             onOpenExtensions={dash.onOpenExtensions}
+          />
+        {/if}
+
+        {#if $knowledge !== null && $knowledge.guidance.length > 0}
+          <GuidanceRow
+            guidance={$knowledge.guidance}
+            onOpen={(p) =>
+              ctrl.openFileFrom(paneId, p.startsWith("/") || p.startsWith("~") || wsRoot === null ? p : `${wsRoot}/${p}`, false)}
           />
         {/if}
 

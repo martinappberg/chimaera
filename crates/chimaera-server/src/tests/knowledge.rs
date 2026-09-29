@@ -196,7 +196,7 @@ async fn the_provider_answers_unchanged_for_its_own_stamp() {
     assert_eq!(decisions[1], FIXED_MTIME_SECS * 1000);
     assert!(decisions[2].as_u64().unwrap() > 0);
     assert_eq!(stamp["refused"], serde_json::json!([]));
-    assert_eq!(data["counts"]["findings"], 4);
+    assert_eq!(data["counts"]["findings"], 5);
 
     // A file that changes moves the stamp: the next ask reads again.
     let root = lock(&state.workspaces).get(&ws).unwrap().root;

@@ -8,6 +8,7 @@
  */
 
 import { pathTarget } from "../shared/embed/embed";
+import { ReferenceChips } from "../shared/references";
 import type { FileRef } from "../shared/fileRef";
 import type { HostTarget } from "../previews/doc/hoverController.svelte";
 
@@ -22,6 +23,9 @@ export interface ChatHoverTarget {
 
 export class HoverTargets {
   readonly #map = new WeakMap<Element, ChatHoverTarget>();
+  /** Id chips the transcript built (shared/references.ts): a knowledge
+   *  entry's id, previewed and opened through its source. */
+  readonly refs = new ReferenceChips();
 
   set(el: Element, t: ChatHoverTarget): void {
     this.#map.set(el, t);
@@ -34,7 +38,7 @@ export class HoverTargets {
   /** The controller's question: what `el` previews, or null. */
   targetOf(el: Element): HostTarget | null {
     const t = this.#map.get(el);
-    if (t === undefined) return null;
+    if (t === undefined) return this.refs.hoverTarget(el);
     return {
       target: {
         kind: "file",
