@@ -253,6 +253,22 @@ async fn chat_command(
     .await?
 }
 
+/// A session paused for a transfer (or held while its project runs
+/// elsewhere) continues on another machine: it did not exit. The additive
+/// `moved` frame tells the viewer to keep the conversation mounted and follow
+/// it; older clients ignore the frame and simply reconnect. Only Pro transfer
+/// and ownership paths ever populate either registry.
+fn moved_frame(state: &AppState, id: &str) -> Option<serde_json::Value> {
+    let transferring = crate::lock(&state.chat_switching)
+        .get(id)
+        .map(String::as_str)
+        == Some("transfer");
+    let paused = transferring || crate::lock(&state.deferred_sessions).contains_key(id);
+    paused.then(|| {
+        json!({"type":"moved","to": if crate::pro::is_worker(state) { "computer" } else { "cloud" }})
+    })
+}
+
 pub(crate) fn session_writable(state: &AppState, id: &str) -> bool {
     let workspace = crate::lock(&state.session_workspaces).get(id).cloned();
     workspace.is_none_or(|workspace| crate::pro::may_execute(state, &workspace))
@@ -330,8 +346,22 @@ async fn handle(
         }
     };
     let mut attachment = match attach_res {
+        // A stopped process still registered for a moment after a transfer
+        // stop is not an exit to replay: the viewer follows the session.
+        Ok(attachment) if !attachment.info.alive && moved_frame(&state, &id).is_some() => {
+            if let Some(frame) = moved_frame(&state, &id) {
+                let _ = send_json(&mut socket, &frame).await;
+            }
+            return;
+        }
         Ok(attachment) => attachment,
         Err(err) => {
+            // Paused for a transfer: not an exit, and its last screen is not
+            // its last words. The viewer follows it to its new owner.
+            if let Some(frame) = moved_frame(&state, &id) {
+                let _ = send_json(&mut socket, &frame).await;
+                return;
+            }
             // A session that died before this client could attach (fast
             // agent failures — a missing API key kills codex in ~400ms)
             // still gets an honest pane: replay the final screen once,
@@ -550,6 +580,20 @@ async fn handle(
             },
             event = attachment.events.recv(), if events_open => match event {
                 Ok(event) => {
+                    // Stopped for a transfer: say it moved (after its final
+                    // output), not that it exited. A scoped viewer whose
+                    // project connection changed hears that first: it must
+                    // re-read where the project runs before following it.
+                    if matches!(event, chimaera_pty::SessionEvent::Exited { .. }) {
+                        if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) {
+                            scope_changed(&mut socket).await;
+                            return;
+                        }
+                        if let Some(frame) = moved_frame(&state, &id) {
+                            let _ = send_ordered_json(&mut socket, &mut batch, &frame).await;
+                            return;
+                        }
+                    }
                     let resized_to = match &event {
                         chimaera_pty::SessionEvent::Resized { cols, rows } => Some((*cols, *rows)),
                         _ => None,
@@ -615,12 +659,9 @@ async fn handle(
                             }
                             // Session is gone; flush the batched tail (its
                             // last words), tell the client, and hang up.
-                            let _ = send_ordered_json(
-                                &mut socket,
-                                &mut batch,
-                                &json!({"type": "exited", "status": null}),
-                            )
-                            .await;
+                            let gone = moved_frame(&state, &id)
+                                .unwrap_or_else(|| json!({"type": "exited", "status": null}));
+                            let _ = send_ordered_json(&mut socket, &mut batch, &gone).await;
                             return;
                         }
                         if !interacted { crate::activity::record(&state, &id); interacted = true; }
@@ -890,6 +931,14 @@ async fn handle_chat(
         return;
     }
 
+    // A conversation paused for a transfer continues elsewhere: never greet
+    // the viewer with its stopped driver (`alive:false` reads as "exited").
+    if !state.chat.get(&id).is_some_and(|chat| chat.alive) {
+        if let Some(frame) = moved_frame(&state, &id) {
+            let _ = send_json(&mut socket, &frame).await;
+            return;
+        }
+    }
     // Replay may read the journal file — keep it off the reactor.
     let attachment = {
         let state = state.clone();
@@ -984,15 +1033,22 @@ async fn handle_chat(
                     // - a PTY already under this id: it degraded/toggled to a
                     //   terminal.
                     // - otherwise: the session genuinely exited.
+                    // - stopped for a transfer: it moved, it did not exit
+                    //   (a scoped viewer whose connection changed hears that
+                    //   first, to re-read where the project runs).
+                    if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) {
+                        scope_changed(&mut socket).await;
+                        return;
+                    }
                     let switching = crate::lock(&state.chat_switching).get(&id).cloned();
-                    let frame = match switching.as_deref() {
+                    let frame = moved_frame(&state, &id).unwrap_or_else(|| match switching.as_deref() {
                         Some("term") => json!({"type": "degraded"}),
                         Some(_) => json!({"type": "error", "code": "unknown_session",
                                           "message": "session switching"}),
                         None if state.sessions.get(&id).is_some() => json!({"type": "degraded"}),
                         None => json!({"type": "exited",
                                        "status": state.chat.get(&id).and_then(|c| c.exit_status)}),
-                    };
+                    });
                     let _ = send_json(&mut socket, &frame).await;
                     return;
                 }

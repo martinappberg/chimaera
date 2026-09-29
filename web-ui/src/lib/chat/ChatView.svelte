@@ -1764,6 +1764,17 @@
    *  running tools → working (between steps). */
   const agentBusy = $derived(store.running || store.compacting);
   const RECONNECTING_GRACE_MS = 2000;
+  /** The conversation is moving between this computer and the cloud: its
+   *  row is paused here, or its socket said it moved and it has not been
+   *  reached where it runs now. Not an exit — the transcript stays mounted. */
+  const continuing = $derived(session.suspended === true || (store.moving !== null && !store.connected));
+  const continuingLabel = $derived(
+    store.moving === "computer"
+      ? "Continuing on your computer…"
+      : store.moving === "cloud"
+        ? "Continuing in the cloud…"
+        : "Opening this conversation…",
+  );
   /** A project viewed from another device (a routed row, or a browser view of
    *  a project). An ordinary local chat never grows connection chrome. */
   const viewed = $derived(typeof session.placement === "object" || isBrowserGateway());
@@ -2481,7 +2492,7 @@
     {/if}
     {#if store.degraded}
       <div class="notice">continued in terminal — this pane will switch</div>
-    {:else if store.exited !== null}
+    {:else if store.exited !== null && !continuing}
       <div class="notice">
         agent exited{store.exited.status !== null ? ` (status ${store.exited.status})` : ""}
       </div>
@@ -2675,7 +2686,9 @@
     </div>
   {/if}
 
-  {#if store.asleep && !store.connected}
+  {#if continuing}
+    <div class="connection-status" role="status">{continuingLabel}</div>
+  {:else if store.asleep && !store.connected}
     <div class="connection-status" role="status">Send a message to pick this conversation back up.</div>
   {:else if reconnectingShown}
     <div class="connection-status" role="status">Reconnecting…</div>
@@ -2683,7 +2696,8 @@
   <Composer
     sessionId={session.id}
     running={agentBusy}
-    disabled={store.exited !== null || store.degraded}
+    disabled={continuing || store.exited !== null || store.degraded}
+    disabledReason={continuing ? continuingLabel : undefined}
     slashCommands={composerCommands}
     workspaceId={session.workspace_id ?? null}
     {terminals}

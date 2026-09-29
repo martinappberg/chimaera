@@ -72,6 +72,7 @@ function makeSocket(sessionId: string, store: ChatStore): ChatSocket {
     // reconnecting and the user keeps their transcript and their text.
     onCommandFailed: (message: string) => store.onCommandFailed(message),
     onAsleep: () => store.onAsleep(),
+    onMoved: (to: "cloud" | "computer") => store.onMoved(to),
     onDisconnected: () => store.onDisconnected(),
     lastSeq: () => store.lastSeq,
   });

@@ -48,6 +48,9 @@ export interface ChatSocketHandlers {
   onCommandFailed(message: string): void;
   /** The conversation's project is paused; the next send picks it back up. */
   onAsleep?(): void;
+  /** The conversation is continuing on another machine: stay mounted and
+   *  keep reconnecting; it did not exit. */
+  onMoved?(to: "cloud" | "computer"): void;
   /** The socket dropped and is reconnecting; the UI is no longer live. */
   onDisconnected(): void;
   /** Highest seq applied so far — sent with auth so reconnects replay only the gap. */
@@ -67,6 +70,7 @@ type ChatDelivery =
   | { kind: "error"; message: string }
   | { kind: "command_failed"; message: string }
   | { kind: "asleep" }
+  | { kind: "moved"; to: "cloud" | "computer" }
   | { kind: "disconnected" };
 
 /**
@@ -121,6 +125,9 @@ export class ChatSocket {
           break;
         case "asleep":
           this.handlers.onAsleep?.();
+          break;
+        case "moved":
+          this.handlers.onMoved?.(delivery.to);
           break;
         case "disconnected":
           this.handlers.onDisconnected();
@@ -193,6 +200,13 @@ export class ChatSocket {
             kind: "exited",
             status: (msg.status as number | null) ?? null,
           });
+          break;
+        case "moved":
+          // Continuing elsewhere: never `ended`. The daemon closes this
+          // socket next and the ordinary reconnect follows the new owner.
+          // Sends stop here, before that close lands.
+          this.authenticatedSocket = null;
+          this.deliveries.push({ kind: "moved", to: msg.to === "computer" ? "computer" : "cloud" });
           break;
         case "error":
           // Connection states, never fatal: the socket stays (or reconnects)

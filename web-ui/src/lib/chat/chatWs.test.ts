@@ -32,6 +32,7 @@ function handlers(): ChatSocketHandlers & Record<string, ReturnType<typeof vi.fn
     onError: vi.fn(),
     onCommandFailed: vi.fn(),
     onAsleep: vi.fn(),
+    onMoved: vi.fn(),
     onDisconnected: vi.fn(),
     lastSeq: () => 0,
   } as unknown as ChatSocketHandlers & Record<string, ReturnType<typeof vi.fn>>;
@@ -63,6 +64,23 @@ it("attaching is passive and a paused owner is a state, not an error", async () 
   expect(h.onAsleep).toHaveBeenCalledOnce();
   expect(h.onError).not.toHaveBeenCalled();
   expect(socket.healthy).toBe(true);
+  socket.close();
+});
+
+it("a moved conversation stays healthy and reconnects to follow it", async () => {
+  const h = handlers();
+  const socket = new ChatSocket("s-chat", h);
+  Socket.all[0].onopen?.();
+  Socket.all[0].frame({ type: "moved", to: "computer" });
+  // Nothing may be sent into a socket that is about to close.
+  expect(socket.send({ type: "send", blocks: [] })).toBe(false);
+  Socket.all[0].close();
+  await drain();
+  expect(h.onMoved).toHaveBeenCalledWith("computer");
+  expect(h.onExited).not.toHaveBeenCalled();
+  expect(socket.healthy).toBe(true);
+  await vi.advanceTimersByTimeAsync(2000);
+  expect(Socket.all.length).toBeGreaterThan(1);
   socket.close();
 });
 

@@ -40,6 +40,18 @@ it("a viewer adopts server dimensions and never sends input, resize or wake inte
   session.close();
 });
 
+it("a moved terminal is not exited: it keeps reconnecting to follow the session", () => {
+  const exited = vi.fn();
+  const session = new SessionSocket("s-fixture", { ...quiet, onExited: exited });
+  Socket.all[0].onopen?.();
+  Socket.all[0].onmessage?.({ data: JSON.stringify({ type: "moved", to: "cloud" }) });
+  Socket.all[0].close();
+  vi.advanceTimersByTime(2000);
+  expect(exited).not.toHaveBeenCalled();
+  expect(Socket.all.length).toBeGreaterThan(1);
+  session.close();
+});
+
 it("opening a terminal is passive everywhere", () => {
   const session = new SessionSocket("s-fixture", quiet);
   expect(Socket.all[0].url).not.toContain("wake=");

@@ -1,6 +1,122 @@
 use super::support::*;
 use crate::*;
 
+/// Stopping a session for a transfer (what a Pro handoff export does: mark
+/// it transferring, park its ledger entry, stop the process) must tell every
+/// attached view that it moved — not that it exited — both on the live
+/// socket and on every reconnect until it runs somewhere again.
+#[tokio::test]
+async fn ws_sessions_stopped_for_a_transfer_say_moved_not_exited() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    async fn next_json<S>(socket: &mut S) -> serde_json::Value
+    where
+        S: futures::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        loop {
+            if let WsMessage::Text(text) = next_ws_frame(socket).await {
+                return serde_json::from_str(&text).unwrap();
+            }
+        }
+    }
+    let state = test_state();
+    let cwd = test_dir("ws-moved");
+    let terminal = state
+        .sessions
+        .spawn(chimaera_pty::SpawnOpts {
+            cwd: cwd.clone(),
+            name: None,
+            cols: 80,
+            rows: 24,
+            command: None,
+            id: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            scrollback: None,
+        })
+        .expect("spawn session")
+        .id;
+    let chat = "s-moved-chat".to_string();
+    state
+        .chat
+        .spawn(
+            &chimaera_agent::claude::ClaudeAdapter,
+            chimaera_agent::driver::SpawnSpec::new(
+                chat.clone(),
+                vec![write_fake_claude("ws-moved-agent")
+                    .to_string_lossy()
+                    .into_owned()],
+                cwd.clone(),
+            ),
+        )
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let connect = |path: String| async move {
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}{path}"))
+            .await
+            .unwrap();
+        socket
+            .send(WsMessage::text(
+                serde_json::json!({"type": "auth", "token": "test-token", "last_seq": 0})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        socket
+    };
+    for (id, path) in [
+        (terminal.clone(), format!("/ws/sessions/{terminal}")),
+        (chat.clone(), format!("/ws/chat/{chat}")),
+    ] {
+        let mut socket = connect(path.clone()).await;
+        assert_eq!(next_json(&mut socket).await["type"], "ready");
+        let guard = crate::chat::ChatSwitchGuard::acquire(&state, &id, "transfer").unwrap();
+        crate::ledger::defer(
+            &state,
+            crate::ledger::LedgerEntry {
+                id: id.clone(),
+                suspended: true,
+                handoff: None,
+                workspace_id: "w-moving".into(),
+                cwd: cwd.clone(),
+                pinned_name: None,
+                cols: 80,
+                rows: 24,
+                theme: "dark".into(),
+                created_at: 0,
+                agent: None,
+            },
+        )
+        .unwrap();
+        if id == chat {
+            state.chat.kill(&id);
+        } else {
+            state.sessions.kill(&id).unwrap();
+        }
+        loop {
+            let frame = next_json(&mut socket).await;
+            assert_ne!(frame["type"], "exited", "{path}: a move is not an exit");
+            if frame["type"] == "moved" {
+                assert_eq!(frame["to"], "cloud");
+                break;
+            }
+        }
+        drop(guard);
+        // Reconnecting while the session runs elsewhere keeps saying so,
+        // never replaying a stopped driver as `ready {alive:false}`.
+        let mut again = connect(path.clone()).await;
+        let frame = next_json(&mut again).await;
+        assert_eq!(frame["type"], "moved", "{path}: {frame}");
+    }
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
+}
+
 #[tokio::test]
 async fn ws_agent_plugins_invalidation_without_session_changes() {
     use futures::SinkExt;

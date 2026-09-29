@@ -215,6 +215,10 @@ export class SessionSocket {
         this.sawExited = true;
         this.handlers.onExited(msg.status ?? null);
         break;
+      case "moved":
+        // Continuing on another machine: not an exit. Keep the screen; the
+        // daemon closes this socket and the ordinary reconnect follows it.
+        break;
       case "error":
         if (msg.code === "read_only") { this.handlers.onError(msg.message ?? "Just watching"); break; }
         if (msg.code === "remote_unavailable" || msg.code === "worker_asleep" || msg.code === "workspace_scope_changed") { break; }

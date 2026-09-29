@@ -518,6 +518,10 @@ export class ChatStore {
   /** The project's owner is paused; the next send picks it back up. Cleared
    *  by the next `ready` or disconnect. */
   asleep = $state(false);
+  /** The conversation is continuing on another machine (a transfer between
+   *  this computer and the cloud). The transcript stays; the next `ready`
+   *  from wherever it runs now clears this. */
+  moving = $state<"cloud" | "computer" | null>(null);
   /** Text of a send the daemon refused before the agent received it, waiting
    *  to go back into the composer ({@link takeRestoredDraft}). */
   restoredDraft = $state<string | null>(null);
@@ -701,6 +705,7 @@ export class ChatStore {
   onReady(session: ChatSessionInfo, _replayFrom: number, head: number | undefined): void {
     this.connected = true;
     this.asleep = false;
+    this.moving = null;
     // This handshake succeeded, which is the one fact a socket-level fatal
     // claimed was impossible; a journal fatal says nothing about the socket.
     if (this.fatalSource === "socket") this.clearFatal();
@@ -737,6 +742,12 @@ export class ChatStore {
   /** The owner is paused and nothing has asked it to wake yet. */
   onAsleep(): void {
     this.asleep = true;
+  }
+
+  /** The conversation moved to another machine; it did not exit. */
+  onMoved(to: "cloud" | "computer"): void {
+    this.connected = false;
+    this.moving = to;
   }
 
   /** The composer's send was accepted by the socket; keep its text until the

@@ -1835,6 +1835,33 @@ describe("ChatStore unsent text", () => {
     expect(store.takeRestoredDraft()).toBe("mine");
   });
 
+  it("a move keeps the transcript and clears when the conversation is reached again", () => {
+    const store = fold([
+      { type: "user_message", text: "keep me", id: "u1" },
+      { type: "exited", status: null },
+    ]);
+    const before = store.blocks.length;
+    store.onMoved("cloud");
+    expect(store.moving).toBe("cloud");
+    expect(store.connected).toBe(false);
+    expect(store.blocks.length).toBe(before);
+    store.onReady(
+      {
+        id: "s",
+        agent: "claude",
+        alive: true,
+        exit_status: null,
+        native_session_id: null,
+        model: null,
+        current_mode: null,
+        pending_permission: false,
+      },
+      2,
+      2,
+    );
+    expect(store.moving).toBeNull();
+  });
+
   it("a paused owner is a state, cleared when the conversation is live again", () => {
     const store = new ChatStore();
     store.onAsleep();
