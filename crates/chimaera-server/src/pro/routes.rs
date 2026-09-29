@@ -228,6 +228,7 @@ async fn configure_inner(
     if same && state.pro.configured.load(Ordering::Acquire) {
         let response = configure_ack(&config, accepted.as_ref().map(|v| v.ack()));
         *lock(&state.pro.runtime) = Some(config);
+        state.pro.delegation_refused.store(false, Ordering::Release);
         return response;
     }
     if let Err(error) = stop_tasks(&state).await {
@@ -253,6 +254,7 @@ async fn configure_inner(
         }
     }
     *lock(&state.pro.runtime) = Some(config);
+    state.pro.delegation_refused.store(false, Ordering::Release);
     state.pro.configured.store(true, Ordering::Release);
     engine::start(state.clone());
     // Only a worker is fenced by lease expiry; a device has nothing to watch.
@@ -319,8 +321,12 @@ pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_jso
     let preferences = lock(&state.pro.preferences).clone();
     let ownership = lock(&state.pro.ownership).clone();
     let statuses = lock(&state.pro.status).clone();
+    // A delegation the account refused, or one that expired unrenewed, can do
+    // nothing: report the daemon as not configured (and why, additively) so
+    // the native app mints a fresh one instead of trusting its cached stamp.
+    let renewal_failed = super::delegation_lapsed(&state);
     Json(
-        json!({"configured":state.pro.configured.load(Ordering::Acquire),"workspace_configuration":authority.acknowledgment(),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().filter(|workspace| authority.allows(&workspace.id)).take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"continuity":preferences.get(&workspace.id).and_then(|p|p.continuity.as_ref()),"execution_allowed":super::may_execute(&state,&workspace.id),"execution_uncertain":preferences.get(&workspace.id).is_some_and(|p|p.execution_uncertain),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"profile":preferences.get(&workspace.id).map(|p|&p.profile)})).collect::<Vec<_>>()}),
+        json!({"configured":state.pro.configured.load(Ordering::Acquire) && !renewal_failed,"renewal_failed":renewal_failed,"workspace_configuration":authority.acknowledgment(),"projects_root":super::projects_root(&state),"projects_root_confirmed":lock(&state.pro.projects_root).is_some(),"sessions":sessions,"workspaces":workspaces.into_iter().filter(|workspace| authority.allows(&workspace.id)).take(128).map(|workspace|json!({"workspace_id":workspace.id,"name":workspace.name,"root":workspace.root,"never_mirror":preferences.get(&workspace.id).is_some_and(|p|p.never_mirror),"privacy_pending":preferences.get(&workspace.id).is_some_and(|p|p.privacy_pending),"ownership":ownership.get(&workspace.id),"continuity":preferences.get(&workspace.id).and_then(|p|p.continuity.as_ref()),"execution_allowed":super::may_execute(&state,&workspace.id),"execution_uncertain":preferences.get(&workspace.id).is_some_and(|p|p.execution_uncertain),"mirror":statuses.get(&workspace.id),"blocked_providers":statuses.get(&workspace.id).map(|status|status.blocked_providers.clone()).unwrap_or_default(),"git_branches":preferences.get(&workspace.id).map(|p|&p.git_branches),"profile":preferences.get(&workspace.id).map(|p|&p.profile)})).collect::<Vec<_>>()}),
     )
 }
 pub(crate) async fn privacy(

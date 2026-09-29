@@ -133,6 +133,11 @@ delegation bearer returns the same token with a new expiry under the same cap.
 Renewal never extends the parent device's authorization lifetime. Daemons renew
 hourly with jitter, keep credentials only in memory, and stop authenticated
 background work on definitive 401/403. Network failure preserves local work.
+The daemon also renews at once (then at most once a minute) after any account
+request answered 401. When renewal is refused (401/403) or the delegation has
+expired unrenewed, `GET /api/v1/pro/status` answers `configured: false` with an
+additive `renewal_failed: true`, and the native app mints and configures a new
+delegation; a successful renewal or a new configuration clears it.
 
 The operation-scoped, account-wide token can access only baton, mirror and keeper transport operations,
 plus its own renewal. It cannot read `/v1/me`, enumerate or revoke devices, access

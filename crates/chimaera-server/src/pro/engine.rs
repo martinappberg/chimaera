@@ -132,6 +132,8 @@ pub(super) fn start(state: Arc<AppState>) {
         let state = task_state;
         let mut last_mirror = 0;
         let mut renewed = super::now();
+        let mut next_renewal = 0;
+        let mut unauthorized = false;
         loop {
             if state.stopping.load(Ordering::Relaxed)
                 || generation != state.pro.generation.load(Ordering::Acquire)
@@ -141,22 +143,18 @@ pub(super) fn start(state: Arc<AppState>) {
             let Some(config) = lock(&state.pro.runtime).clone() else {
                 return;
             };
-            if super::now().saturating_sub(renewed) >= 3600 {
-                if let Ok(response) =
-                    account(&config, "/v1/delegations/renew", "POST", Some(&json!({}))).await
-                {
-                    if let Ok(delegation) = response.json::<super::protocol::Delegation>() {
-                        if authority::install_renewal(
-                            &state,
-                            generation,
-                            &config.delegation,
-                            delegation,
-                        ) {
-                            renewed = super::now();
-                        }
-                    }
+            // Hourly, and at once after the account refused this credential
+            // (then at most once a minute while it keeps failing).
+            if (super::now().saturating_sub(renewed) >= 3600 || unauthorized)
+                && super::now() >= next_renewal
+            {
+                if renew_delegation(&state, &config, generation).await {
+                    renewed = super::now();
+                } else {
+                    next_renewal = super::now() + 60;
                 }
             }
+            unauthorized = false;
             // Previous-life processes that have exited release their fence.
             execution::reprobe(&state);
             let workspaces = lock(&state.workspaces).list();
@@ -176,6 +174,9 @@ pub(super) fn start(state: Arc<AppState>) {
                     continue;
                 }
                 if let Err(error) = reconcile(&state, &config, &workspace.id).await {
+                    unauthorized |= error
+                        .chain()
+                        .any(|cause| cause.to_string() == transport::UNAUTHORIZED);
                     record_error(&state, &workspace.id, &error);
                 }
             }
@@ -229,6 +230,41 @@ pub(super) fn start(state: Arc<AppState>) {
         old.abort();
     }
 }
+/// Renews this daemon's delegation. A definitive refusal (401/403) marks it
+/// refused so `/pro/status` tells the native app to mint a new one; a
+/// transport failure only retries later.
+pub(super) async fn renew_delegation(
+    state: &AppState,
+    config: &Configure,
+    generation: u64,
+) -> bool {
+    match account(config, "/v1/delegations/renew", "POST", Some(&json!({}))).await {
+        Ok(response) if matches!(response.status, 401 | 403) => {
+            state.pro.delegation_refused.store(true, Ordering::Release);
+            state.changes.notify_waiters();
+            false
+        }
+        Ok(response) => {
+            let installed =
+                response
+                    .json::<super::protocol::Delegation>()
+                    .is_ok_and(|delegation| {
+                        authority::install_renewal(
+                            state,
+                            generation,
+                            &config.delegation,
+                            delegation,
+                        )
+                    });
+            if installed {
+                state.pro.delegation_refused.store(false, Ordering::Release);
+            }
+            installed
+        }
+        Err(_) => false,
+    }
+}
+
 fn record_error(state: &AppState, workspace: &str, error: &anyhow::Error) {
     let message: String = error.to_string().chars().take(256).collect();
     let mut statuses = lock(&state.pro.status);

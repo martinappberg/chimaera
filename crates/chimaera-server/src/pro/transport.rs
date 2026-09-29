@@ -755,8 +755,13 @@ pub(super) fn account_unavailable(response: &Response) -> bool {
         && serde_json::from_slice::<serde_json::Value>(&response.body)
             .is_ok_and(|value| value["error"] == "account_unavailable")
 }
+/// The error a 401 answer becomes: the account no longer accepts this
+/// daemon's credential (the lease loop renews it at once, see `engine`).
+pub(super) const UNAUTHORIZED: &str = "service request returned HTTP 401";
+
 impl Response {
     pub fn json<T: DeserializeOwned>(self) -> Result<T> {
+        ensure!(self.status != 401, UNAUTHORIZED);
         ensure!(
             (200..300).contains(&self.status),
             "service request returned HTTP {}",

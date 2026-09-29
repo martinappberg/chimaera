@@ -68,6 +68,9 @@ pub(crate) struct ProState {
     power_suitable: AtomicBool,
     /// Wakes the lease loop at once: a resumed machine renews before fencing.
     renew_now: tokio::sync::Notify,
+    /// The account refused this daemon's delegation (401/403 on renewal):
+    /// `/pro/status` reports it so the native app mints a new one.
+    delegation_refused: AtomicBool,
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -292,6 +295,7 @@ impl ProState {
             awake_since: AtomicU64::new(now()),
             power_suitable: AtomicBool::new(false),
             renew_now: tokio::sync::Notify::new(),
+            delegation_refused: AtomicBool::new(false),
         }
     }
 }
@@ -354,6 +358,28 @@ pub(crate) use execution::remote_owner_fixture as install_remote_owner_fixture;
 pub(crate) fn managed_execution(state: &crate::AppState, workspace: &str) -> bool {
     execution::managed(state, workspace)
 }
+/// This daemon's delegation can no longer act: the account refused it, or it
+/// expired without a renewal. Only meaningful while configured.
+pub(super) fn delegation_lapsed(state: &crate::AppState) -> bool {
+    if state
+        .pro
+        .delegation_refused
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return true;
+    }
+    crate::lock(&state.pro.runtime)
+        .as_ref()
+        .and_then(|config| {
+            time::OffsetDateTime::parse(
+                &config.delegation.expires_at,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .ok()
+        })
+        .is_some_and(|expires| expires <= time::OffsetDateTime::now_utc())
+}
+
 pub(crate) fn may_execute(state: &crate::AppState, workspace: &str) -> bool {
     may_write(state, workspace) && execution::allows(state, workspace)
 }

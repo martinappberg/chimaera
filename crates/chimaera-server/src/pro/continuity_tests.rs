@@ -697,6 +697,73 @@ async fn an_account_outage_behind_the_keeper_is_a_quiet_wait() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+async fn status(state: &Arc<AppState>) -> serde_json::Value {
+    use tower::ServiceExt;
+    let response = crate::app(state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/pro/status")
+                .header("Authorization", "Bearer fixture")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// A delegation the account refuses, or one that expired unrenewed, makes
+/// `/pro/status` say the daemon is not configured, so the native app mints a
+/// fresh one; a successful renewal clears it.
+#[tokio::test]
+async fn a_refused_or_lapsed_delegation_asks_for_setup_again() {
+    let root = temp("delegation");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let mut config = device(&account.endpoint);
+    *lock(&state.pro.runtime) = Some(config.clone());
+    state.pro.configured.store(true, Ordering::Release);
+    let generation = state.pro.generation.load(Ordering::Acquire);
+    let reply = status(&state).await;
+    assert_eq!(
+        (reply["configured"].clone(), reply["renewal_failed"].clone()),
+        (json!(true), json!(false))
+    );
+    account.script(
+        "POST",
+        "/v1/delegations/renew",
+        401,
+        json!({"error":"unauthorized"}),
+    );
+    assert!(!renew_delegation(&state, &config, generation).await);
+    let reply = status(&state).await;
+    assert_eq!(
+        (reply["configured"].clone(), reply["renewal_failed"].clone()),
+        (json!(false), json!(true))
+    );
+    account.script(
+        "POST",
+        "/v1/delegations/renew",
+        200,
+        json!({"access_token":"renewed","expires_at":"2099-02-01T00:00:00Z","scope":["baton","mirror"],"device_id":"d-home"}),
+    );
+    assert!(renew_delegation(&state, &config, generation).await);
+    assert_eq!(status(&state).await["configured"], true);
+    // Expired without a renewal: the same answer.
+    config.delegation.expires_at = "2000-01-01T00:00:00Z".into();
+    *lock(&state.pro.runtime) = Some(config);
+    let reply = status(&state).await;
+    assert_eq!(
+        (reply["configured"].clone(), reply["renewal_failed"].clone()),
+        (json!(false), json!(true))
+    );
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 async fn post(state: &Arc<AppState>, path: &str, body: &str) -> (StatusCode, serde_json::Value) {
     use tower::ServiceExt;
     let response = crate::app(state.clone())
