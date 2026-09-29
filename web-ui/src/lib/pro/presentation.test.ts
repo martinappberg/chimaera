@@ -108,7 +108,8 @@ describe("cloud preparation progress", () => {
     expect(new Set([starting?.title, restoringStatus?.title, cloudProjectStatus(mirror([moving]))?.title, cloudProjectStatus(mirror([checking]))?.title]).size).toBe(4);
     expect(cloudProjectStatus({...mirror([restoring]), configured: false})).toEqual(starting);
     const privacy = {...row("saved", 123), privacy_pending: true};
-    expect(cloudProjectStatus(mirror([privacy]))?.state).toBe("attention");
+    // Turning copies off is progress the system finishes, never a problem to fix.
+    expect(cloudProjectStatus(mirror([privacy]))?.state).toBe("active");
     const failed = row("saved", 123); failed.mirror!.error = "private diagnostic";
     const detail = cloudProjectStatus(mirror([failed]));
     expect(detail?.state).toBe("attention"); expect(detail?.detail).not.toContain("private diagnostic");
