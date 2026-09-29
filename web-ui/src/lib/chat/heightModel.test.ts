@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { blockWeight, HistoryWeights } from "./heightModel";
+import { blockWeight, HistoryWeights, tailWeights } from "./heightModel";
 import type { ChatBlock } from "./store.svelte";
 
 const message = (text: string, uid = 1): ChatBlock =>
@@ -55,6 +55,26 @@ describe("block height model", () => {
     const user = (attachmentPaths: string[]): ChatBlock =>
       ({ uid: 5, kind: "user", text: "look", attachments: attachmentPaths.length, attachmentPaths, checkpoint: null, id: null, origin: null, forkSeq: 0 }) as ChatBlock;
     expect(blockWeight(user(["/u/image-1.png"]), null, 100) - blockWeight(user([]), null, 100)).toBe(5.5);
+  });
+});
+
+describe("tail weights", () => {
+  const blocks = [message("x".repeat(100), 1), tool(2), tool(3), message("x".repeat(300), 4)];
+
+  it("sums the stretch from a block to the end and maps a weight back", () => {
+    const tail = tailWeights(blocks, 1, 100);
+    expect(tail.total).toBe(1 + 0 + 4);
+    expect(tail.at(0)).toBe(1);
+    expect(tail.at(1)).toBe(3);
+    expect(tail.at(1e9)).toBe(3);
+    expect(tailWeights(blocks, 4, 100).total).toBe(0);
+  });
+
+  it("re-weighs a block that grew since the last ask", () => {
+    const live = [message("x".repeat(100), 1), message("short", 2)];
+    const before = tailWeights(live, 1, 100).total;
+    live[1] = message("x".repeat(1000), 2);
+    expect(tailWeights(live, 1, 100).total).toBeGreaterThan(before + 5);
   });
 });
 

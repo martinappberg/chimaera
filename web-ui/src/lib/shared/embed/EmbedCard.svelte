@@ -170,6 +170,18 @@
     void load();
   });
 
+  // A recent answer only reserved the box: the file may have been
+  // rewritten since (an agent re-plotting under the same name), and the
+  // disk watch reports changes from mount on. Ask once more when near.
+  let revalidated = false;
+  $effect(() => {
+    if (!near || revalidated || fetched !== null || info !== null || recentInfo === null) return;
+    revalidated = true;
+    void resolveFile(path, { fresh: true }).then((r) => {
+      if (r !== null && fetched === null) fetched = r;
+    });
+  });
+
   /** A missing file may be written after the prose that embeds it (an
    *  agent announces the plot, then saves it): look again whenever the card
    *  comes back on screen, at most every few seconds. */

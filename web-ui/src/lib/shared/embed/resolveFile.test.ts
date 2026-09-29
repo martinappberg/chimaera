@@ -99,4 +99,32 @@ describe("resolveFile", () => {
     await resolveFile("/figs/gone.png");
     expect(peekFile("/figs/gone.png")).toBeNull();
   });
+
+  it("never answers a fresh ask with a request sent before it", async () => {
+    let version = "v1";
+    const gates: (() => void)[] = [];
+    mocks.api.mockImplementation(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as { targets: string[] };
+      const answered = version;
+      await new Promise<void>((r) => gates.push(r));
+      const results: Record<string, unknown> = {};
+      for (const t of body.targets) {
+        results[t] = { path: daemonReads(t), kind: "file", size: 1, version: answered, mtime_ms: 1, mime: "image/png" };
+      }
+      return new Response(JSON.stringify({ results }));
+    });
+    const early = resolveFile("/figs/inflight.png");
+    await vi.waitFor(() => expect(gates.length).toBe(1));
+    // The file changes while that request is on the wire.
+    version = "v2";
+    const joined = resolveFile("/figs/inflight.png");
+    const fresh = resolveFile("/figs/inflight.png", { fresh: true });
+    gates[0]();
+    expect(await early).toMatchObject({ version: "v1" });
+    expect(await joined).toMatchObject({ version: "v1" });
+    await vi.waitFor(() => expect(gates.length).toBe(2));
+    gates[1]();
+    expect(await fresh).toMatchObject({ version: "v2" });
+    expect(peekFile("/figs/inflight.png")).toMatchObject({ version: "v2" });
+  });
 });

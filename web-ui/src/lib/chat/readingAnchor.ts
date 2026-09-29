@@ -69,9 +69,19 @@ function* boxedChildren(el: HTMLElement): Generator<HTMLElement> {
   }
 }
 
+/** Cards size themselves after they mount (a figure's box arrives with its
+ *  resolve answer, a PDF page settles its shape once it loads). One
+ *  straddling the edge is a poor anchor: holding its top still lets its
+ *  growth push down the text below it, the text being read. */
+const CARD = ".md-embed, .embed-card";
+
 /** The element inside `row` at the viewport's top edge: the first child
- *  reaching below it, descended into while it straddles the edge. */
-function edgeNode(row: HTMLElement, viewportTop: number): HTMLElement {
+ *  reaching below it, descended into while it straddles the edge — or, when
+ *  that is a card, the first element after it that starts in view (the card
+ *  then resizes into the space above). The card itself when nothing after
+ *  it in the row starts in view. */
+function edgeNode(row: HTMLElement, viewportTop: number, viewportBottom: number): HTMLElement {
+  const path: HTMLElement[] = [row];
   let node = row;
   for (let depth = 0; depth < 6 && !node.matches(LEAF); depth++) {
     let next: HTMLElement | null = null;
@@ -83,7 +93,21 @@ function edgeNode(row: HTMLElement, viewportTop: number): HTMLElement {
     }
     if (next === null) break;
     node = next;
+    path.push(node);
     if (node.getBoundingClientRect().top >= viewportTop) break;
+  }
+  if (!node.matches(CARD) || node.getBoundingClientRect().top >= viewportTop) return node;
+  for (let level = path.length - 1; level > 0; level--) {
+    let past = false;
+    for (const sibling of boxedChildren(path[level - 1])) {
+      if (!past) {
+        past = sibling === path[level];
+        continue;
+      }
+      const top = sibling.getBoundingClientRect().top;
+      if (top < viewportTop) continue;
+      return top < viewportBottom ? sibling : node;
+    }
   }
   return node;
 }
@@ -92,7 +116,8 @@ function edgeNode(row: HTMLElement, viewportTop: number): HTMLElement {
  *  (binary search: the column stacks its children vertically). */
 export function selectAnchor(scroller: HTMLElement, column: HTMLElement): ReadingAnchor | null {
   const children = column.children;
-  const viewportTop = scroller.getBoundingClientRect().top;
+  const view = scroller.getBoundingClientRect();
+  const viewportTop = view.top;
   let lo = 0;
   let hi = children.length;
   while (lo < hi) {
@@ -110,9 +135,20 @@ export function selectAnchor(scroller: HTMLElement, column: HTMLElement): Readin
     if (isRow(children[i])) node = children[i] as HTMLElement;
   }
   if (node === null) return null;
+  let edge =
+    node.getBoundingClientRect().top < viewportTop ? edgeNode(node, viewportTop, view.bottom) : node;
+  if (edge.matches(CARD) && edge.getBoundingClientRect().top < viewportTop) {
+    // A card closing its row at the edge: the next row, if it starts in
+    // view, is the steadier anchor (see CARD).
+    let next = node.nextElementSibling;
+    while (next !== null && !isRow(next)) next = next.nextElementSibling;
+    if (next !== null && isRow(next) && next.getBoundingClientRect().top < view.bottom) {
+      node = next;
+      edge = next;
+    }
+  }
   const index = numberAttr(node, "data-block-index");
   const rowOffset = offsetWithin(node, column);
-  const edge = node.getBoundingClientRect().top < viewportTop ? edgeNode(node, viewportTop) : node;
   return {
     row: node,
     uid: numberAttr(node, "data-block-uid"),
@@ -135,15 +171,23 @@ export function rowsInReach(
   const view = scroller.getBoundingClientRect();
   const top = view.top - reach;
   const bottom = view.bottom + reach;
+  const children = column.children;
+  // The first child reaching below `top` (the column stacks vertically).
+  let lo = 0;
+  let hi = children.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (children[mid].getBoundingClientRect().bottom > top) hi = mid;
+    else lo = mid + 1;
+  }
   let start: number | null = null;
   let end: number | null = null;
-  for (const child of column.children) {
+  for (let i = lo; i < children.length; i++) {
+    const child = children[i];
     if (!isRow(child)) continue;
     const index = numberAttr(child, "data-block-index");
     if (index === null) continue;
-    const rect = child.getBoundingClientRect();
-    if (rect.bottom <= top) continue;
-    if (rect.top >= bottom) break;
+    if (child.getBoundingClientRect().top >= bottom) break;
     start ??= index;
     end = numberAttr(child, "data-block-end") ?? index;
   }

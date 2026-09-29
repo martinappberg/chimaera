@@ -41,17 +41,23 @@ export class EmbedResolver {
     return [ctx.workspaceId ?? "", ...bases, "", target].join("\u0000");
   }
 
-  /** A still-fresh answer for `target`, synchronously: a card remounted by
-   *  transcript paging mounts with it and reserves its final box at once. */
-  peek(target: string): TargetResult | null {
+  /** Where `target` is asked (null: it cannot be — disposed, or no
+   *  directory known for a relative path) and its still-fresh answer. */
+  #lookup(target: string): { key: string; bases: string[]; fresh: TargetResult | null } | null {
     if (this.#disposed) return null;
     const ctx = this.#context();
     const bases = resolveBases(ctx, target.split("#")[0] ?? target);
     if (bases.length === 0) return null;
-    const hit = this.#cache.get(this.#key(ctx, target, bases));
-    if (hit === undefined) return null;
-    const ttl = "missing" in hit.r ? MISS_TTL_MS : HIT_TTL_MS;
-    return Date.now() - hit.at < ttl ? hit.r : null;
+    const key = this.#key(ctx, target, bases);
+    const hit = this.#cache.get(key);
+    const ttl = hit !== undefined && "missing" in hit.r ? MISS_TTL_MS : HIT_TTL_MS;
+    return { key, bases, fresh: hit !== undefined && Date.now() - hit.at < ttl ? hit.r : null };
+  }
+
+  /** A still-fresh answer for `target`, synchronously: a card remounted by
+   *  transcript paging mounts with it and reserves its final box at once. */
+  peek(target: string): TargetResult | null {
+    return this.#lookup(target)?.fresh ?? null;
   }
 
   /**
@@ -60,16 +66,10 @@ export class EmbedResolver {
    * relative path, the daemon unreachable): unknown, not missing.
    */
   resolve(target: string): Promise<TargetResult | null> {
-    if (this.#disposed) return Promise.resolve(null);
-    const ctx = this.#context();
-    const bases = resolveBases(ctx, target.split("#")[0] ?? target);
-    if (bases.length === 0) return Promise.resolve(null);
-    const key = this.#key(ctx, target, bases);
-    const hit = this.#cache.get(key);
-    if (hit !== undefined) {
-      const ttl = "missing" in hit.r ? MISS_TTL_MS : HIT_TTL_MS;
-      if (Date.now() - hit.at < ttl) return Promise.resolve(hit.r);
-    }
+    const found = this.#lookup(target);
+    if (found === null) return Promise.resolve(null);
+    if (found.fresh !== null) return Promise.resolve(found.fresh);
+    const { key, bases } = found;
     return new Promise((resolve) => {
       const q = this.#queue.get(key);
       if (q !== undefined) q.waiters.push(resolve);

@@ -258,6 +258,8 @@ export function pageAround(index: number, total: number): TranscriptWindow {
 export function spacerNeedsRebalance(current: number, target: number): boolean {
   if (current < 0) return true;
   if (target <= 0) return current > 0;
-  if (Math.abs(current - target) < 200) return false;
+  // An empty spacer under a real target starves the next page (it drives
+  // the spacer negative, rows past the scroll origin) however small.
+  if (current > 0 && Math.abs(current - target) < 200) return false;
   return current < target * 0.75 || current > target * 1.5;
 }

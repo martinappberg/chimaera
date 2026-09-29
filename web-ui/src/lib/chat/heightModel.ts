@@ -100,6 +100,36 @@ export function blockWeight(
   }
 }
 
+/** Weights of the blocks from `from` to the end, NOT cached: that stretch
+ *  includes the live tail (a reply still streaming, a run not yet folded),
+ *  which the prefix sums below must never freeze. `at` maps a weight into
+ *  the stretch back to its block (the index `from` counts from). */
+export function tailWeights(
+  blocks: readonly ChatBlock[],
+  from: number,
+  charsPerLine: number,
+): { total: number; at(weight: number): number } {
+  const start = Math.max(0, Math.min(from, blocks.length));
+  const prefix = [0];
+  for (let i = start; i < blocks.length; i++) {
+    const weight = blockWeight(blocks[i], i > 0 ? blocks[i - 1] : null, charsPerLine);
+    prefix.push(prefix[prefix.length - 1] + weight);
+  }
+  return {
+    total: prefix[prefix.length - 1],
+    at(weight: number): number {
+      let lo = 0;
+      let hi = prefix.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (prefix[mid] <= weight) lo = mid;
+        else hi = mid - 1;
+      }
+      return start + Math.min(lo, Math.max(0, prefix.length - 2));
+    },
+  };
+}
+
 /** Prefix sums of {@link blockWeight} over the reducer's blocks, extended
  *  incrementally. Rebuilt when the array's front moved (a cap trim or a
  *  journal reset) or the measure changed. Rows that already have a prefix

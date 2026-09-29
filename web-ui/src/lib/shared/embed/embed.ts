@@ -144,8 +144,10 @@ export function peekFile(path: string): TargetInfo | null {
   const hit = recent.get(path);
   return hit !== undefined && Date.now() - hit.at < RECENT_TTL_MS ? hit.r : null;
 }
-/** Paths whose request is on the wire: later askers join it. */
-const inflight = new Set<string>();
+/** Paths whose request is on the wire, with the askers it will answer: a
+ *  later ask joins it, unless `fresh` — the file changed since it was sent,
+ *  so that one waits for a request of its own. */
+const inflight = new Map<string, Waiter[]>();
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 /** Long enough to gather every card a render mounts (a replayed chat
  *  mounts dozens at once), short enough not to be seen. */
@@ -166,7 +168,10 @@ async function flush(): Promise<void> {
   flushTimer = null;
   const batch = [...waiting.keys()].filter((p) => !inflight.has(p)).slice(0, RESOLVE_MAX);
   if (batch.length === 0) return;
-  for (const path of batch) inflight.add(path);
+  for (const path of batch) {
+    inflight.set(path, waiting.get(path) ?? []);
+    waiting.delete(path);
+  }
   let results: Record<string, TargetResult> | null;
   try {
     results = await resolveTargets(batch.map(pathTarget), "/");
@@ -174,9 +179,8 @@ async function flush(): Promise<void> {
     results = null;
   }
   for (const path of batch) {
+    const ws = inflight.get(path);
     inflight.delete(path);
-    const ws = waiting.get(path);
-    waiting.delete(path);
     const r = results?.[pathTarget(path)] ?? null;
     if (results !== null) remember(path, r);
     for (const w of ws ?? []) w(r);
@@ -196,6 +200,11 @@ export function resolveFile(path: string, opts: { fresh?: boolean } = {}): Promi
   const hit = opts.fresh === true ? null : peekFile(path);
   if (hit !== null) return Promise.resolve(hit);
   return new Promise((resolve) => {
+    const sent = opts.fresh === true ? undefined : inflight.get(path);
+    if (sent !== undefined) {
+      sent.push(resolve);
+      return;
+    }
     const ws = waiting.get(path);
     if (ws !== undefined) ws.push(resolve);
     else waiting.set(path, [resolve]);

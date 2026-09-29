@@ -89,7 +89,7 @@
     type PagePlan,
   } from "./transcriptWindow";
   import { measureShift, rowsInReach, selectAnchor, type ReadingAnchor } from "./readingAnchor";
-  import { blockWeight, HistoryWeights } from "./heightModel";
+  import { blockWeight, HistoryWeights, tailWeights } from "./heightModel";
   import { activeTheme, getSetting } from "../settings/store.svelte";
 
   interface Props {
@@ -389,19 +389,18 @@
     const el = transcriptEl;
     if (el === null) return;
     if (renderEnd >= store.blocks.length) setLater(0, true);
-    else setLater(laterPx - (el.scrollHeight - before));
+    // Never below the model of what is still unmounted: a running total
+    // that undershot (figures weigh more than their estimate) ran out with
+    // pages to go, the reader met the scroll range's end early, and the last
+    // page then moved the end — and the thumb — thousands of px away.
+    else setLater(Math.max(laterPx - (el.scrollHeight - before), laterTarget()));
   }
 
   /** The later spacer's modelled size: the unmounted rows after the window
    *  at the mounted window's px per unit. */
   function laterTarget(): number {
-    const total = store.blocks.length;
-    if (renderEnd >= total) return 0;
-    const cpl = charsPerLine();
-    const generation = historyGeneration();
-    const all = historyWeights.upTo(store.blocks, total, cpl, generation);
-    const before = historyWeights.upTo(store.blocks, renderEnd, cpl, generation);
-    return spacerTarget(all - before, historyPxPerWeight());
+    if (renderEnd >= store.blocks.length) return 0;
+    return spacerTarget(tailWeights(store.blocks, renderEnd, charsPerLine()).total, historyPxPerWeight());
   }
 
   /** Persist the reading position relative to the rendered rows — the spacer
@@ -490,8 +489,12 @@
    *  large). Keyed like the weights, so a trim, reset or reflow restarts it. */
   let paged = { key: "", px: 0, weight: 0 };
 
+  function pagedKey(): string {
+    return `${historyGeneration()}|${Math.round(charsPerLine())}`;
+  }
+
   function notePagedHeight(weight: number, px: number): void {
-    const key = `${historyGeneration()}|${Math.round(charsPerLine())}`;
+    const key = pagedKey();
     if (paged.key !== key) paged = { key, px: 0, weight: 0 };
     if (weight <= 0 || px <= 0) return;
     paged.px += px;
@@ -501,9 +504,8 @@
   /** Px per model unit for the unmounted history: the paged measurements
    *  once there are a few screens of them, else the mounted window. */
   function historyPxPerWeight(): number {
-    const key = `${historyGeneration()}|${Math.round(charsPerLine())}`;
     const nominal = chatFontSize * chatLineHeight;
-    if (paged.key !== key || paged.weight < 60) return windowPxPerWeight();
+    if (paged.key !== pagedKey() || paged.weight < 60) return windowPxPerWeight();
     return Math.min(nominal * 2.5, Math.max(nominal * 0.4, paged.px / paged.weight));
   }
 
@@ -586,6 +588,7 @@
     if (!store.hydrating) return;
     untrack(() => {
       setSpacer(0);
+      setLater(0, true);
       spacerSizedFor = "";
       readingAnchor = null;
     });
@@ -628,15 +631,13 @@
   function farJump(el: HTMLElement, view: DOMRect, rows: DOMRect): boolean {
     const reach = el.clientHeight * PREFETCH_VIEWPORTS;
     const total = store.blocks.length;
-    const cpl = charsPerLine();
-    const generation = historyGeneration();
     let index: number;
     /** A drag to the very end of the track means the conversation's end —
      *  not the last page's first rows at the viewport's top, which left a
      *  figure-heavy tail screens short of the bottom. */
     let toEnd = false;
     if (renderStart > 0 && spacerPx > 0 && rows.top - view.bottom >= reach) {
-      const earlier = historyWeights.upTo(store.blocks, renderStart, cpl, generation);
+      const earlier = historyWeights.upTo(store.blocks, renderStart, charsPerLine(), historyGeneration());
       // Map by the spacer's own proportion, not the model's px scale: it has
       // absorbed real page heights since it was sized, and its two ends must
       // still mean block 0 and the window's first block.
@@ -646,13 +647,9 @@
     } else if (renderEnd < total && laterPx > 0 && view.top - rows.bottom >= reach) {
       // The same below: the later spacer's ends mean the window's end and
       // the live edge.
-      const all = historyWeights.upTo(store.blocks, total, cpl, generation);
-      const before = historyWeights.upTo(store.blocks, renderEnd, cpl, generation);
+      const later = tailWeights(store.blocks, renderEnd, charsPerLine());
       const fraction = Math.min(1, Math.max(0, (view.top - rows.bottom) / laterPx));
-      index = Math.min(
-        total - 1,
-        Math.max(renderEnd, historyWeights.indexAt(before + fraction * (all - before))),
-      );
+      index = Math.min(total - 1, later.at(fraction * later.total));
       toEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 2;
     } else {
       return false;
@@ -3039,10 +3036,11 @@
      overflowing transcript — and it fills the viewport when short, so
      .empty can center in it. */
   .column {
+    --row-gap: 3px;
     flex: 1 0 auto;
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: var(--row-gap);
     width: 100%;
     max-width: var(--chat-column);
     margin: 0 auto;
@@ -3573,11 +3571,11 @@
     place-items: center;
     width: 24px;
     height: 24px;
-    /* No net height in the column (its own plus the column's 3px gap): it
+    /* No net height in the column (its own plus the column's gap): it
        appears and goes as the reader leaves and reaches the bottom, and a
        row coming and going there clamped scrollTop — a snap on every
        arrival at the live edge. */
-    margin-top: -27px;
+    margin-top: calc(-24px - var(--row-gap));
     padding: 0;
     font: inherit;
     font-size: var(--text-lg);

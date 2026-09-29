@@ -139,6 +139,7 @@ function writeFixture() {
     fs.mkdirSync(d, { recursive: true });
     return d;
   };
+  dir("out");
   if (fs.existsSync(path.join(FIXTURE, "figs", `fig_${FIGS - 1}.png`))) return;
   const figs = dir("figs");
   for (let i = 0; i < FIGS; i++) {
@@ -157,7 +158,6 @@ function writeFixture() {
     const rows = ["gene,log2fc,padj", ...Array.from({ length: 200 }, (_, j) => `G${j},${(rand() * 4 - 2).toFixed(3)},${rand().toExponential(3)}`)];
     fs.writeFileSync(path.join(tables, `table_${i}.csv`), rows.join("\n"));
   }
-  dir("out");
 }
 
 const fig = () => `${FIXTURE}/figs/fig_${Math.floor(rand() * FIGS)}.png`;

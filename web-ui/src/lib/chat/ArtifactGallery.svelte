@@ -188,7 +188,8 @@
         setState(doc.path, fileStateAfter(doc.info, end));
         continue;
       }
-      void resolveFile(doc.path).then((r) => {
+      // Fresh: whether it changed after the turn is the question.
+      void resolveFile(doc.path, { fresh: true }).then((r) => {
         if (r !== null) setState(doc.path, fileStateAfter(r, end));
       });
     }
