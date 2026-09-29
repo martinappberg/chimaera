@@ -1146,8 +1146,30 @@ pub(crate) async fn ticket_proxy(
     }
 }
 
+type Upstream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+use axum::extract::ws::Message as Down;
+use tokio_tungstenite::tungstenite::Message as Up;
+
+/// Typing a viewer did before the owner's terminal answered.
+const HELD_TERMINAL_BYTES: usize = 64 * 1024;
+/// Chat commands a viewer sent before the owner's chat answered. One maximum
+/// structured command is ~10 MiB (images), so the byte bound admits one.
+const HELD_CHAT_COMMANDS: usize = 4;
+const HELD_CHAT_BYTES: usize = 11 * 1024 * 1024;
+/// Owner-socket retry pacing while nobody is typing.
+const RETRY_MIN: Duration = Duration::from_secs(2);
+const RETRY_MAX: Duration = Duration::from_secs(30);
+/// Frames larger than this are replay batches, never a `ready` frame.
+const READY_SCAN_BYTES: usize = 64 * 1024;
+
 /// Caller has consumed and authenticated the local first frame. Remote tokens
 /// replace only that frame's token; application messages remain byte-for-byte.
+///
+/// The viewer's socket stays open while the owner is unreachable or asleep:
+/// attaching is passive, and the first real input (a keystroke, a chat
+/// command, a permission answer) is held and carries wake intent. Held input
+/// is delivered exactly once after the owner's `ready`, or answered with a
+/// visible refusal when it cannot be delivered; nothing is resent.
 pub(crate) async fn socket(
     state: &AppState,
     id: &str,
@@ -1159,11 +1181,331 @@ pub(crate) async fn socket(
     let Some((route, workspace)) = state.session_proxy.for_session(id) else {
         return false;
     };
-    socket_route(
-        state, route, &workspace, id, kind, options, auth, None, downstream,
-    )
-    .await;
+    let Ok(_permit) = SOCKETS.try_acquire() else {
+        let _ = bounded_send(downstream, Down::Text(unavailable().to_string().into())).await;
+        return true;
+    };
+    let link = Link {
+        state,
+        alias: route.alias(&workspace),
+        route,
+        workspace,
+        session: id.to_owned(),
+        path: format!("/ws/{kind}/{id}"),
+        auth,
+        read_only: options.read_only,
+        chat: kind == "chat",
+    };
+    let wake = !options.read_only && options.wake.as_deref() == Some("interaction");
+    relay(&link, wake, downstream).await;
     true
+}
+
+/// One viewer socket's fixed route to one session on its current owner.
+struct Link<'a> {
+    state: &'a AppState,
+    route: Route,
+    workspace: String,
+    session: String,
+    path: String,
+    auth: Value,
+    read_only: bool,
+    chat: bool,
+    alias: Option<crate::workspace_scope::paths::Alias>,
+}
+enum Opened {
+    Live(Box<Upstream>),
+    /// The owner is asleep and this attempt carried no interaction.
+    Sleeping,
+}
+impl Link<'_> {
+    fn current(&self) -> bool {
+        self.state
+            .session_proxy
+            .current(&self.route, &self.workspace)
+    }
+    async fn open(&self, wake: bool) -> Result<Opened> {
+        let reach = verify_scope(&self.state.session_proxy, &self.route, &self.workspace).await?;
+        // Viewing never wakes a sleeping owner; only interaction may.
+        if reach == Reach::Sleeping && !wake {
+            return Ok(Opened::Sleeping);
+        }
+        let address = self.route.address.context("remote placement unavailable")?;
+        let query = if self.read_only {
+            "?read_only=true"
+        } else if wake {
+            "?wake=interaction"
+        } else {
+            ""
+        };
+        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(10 * 1024 * 1024))
+            .max_frame_size(Some(10 * 1024 * 1024));
+        let deadline = match reach {
+            Reach::Awake => Duration::from_secs(15),
+            Reach::Sleeping => WAKE_DEADLINE,
+        };
+        let (mut upstream, _) = tokio::time::timeout(
+            deadline,
+            tokio_tungstenite::connect_async_with_config(
+                format!("ws://{address}{}{query}", self.path),
+                Some(config),
+                false,
+            ),
+        )
+        .await??;
+        let epoch = self
+            .route
+            .workspaces
+            .get(&self.workspace)
+            .context("workspace route missing")?;
+        let mut auth = self.auth.clone();
+        auth["workspace_id"] = json!(self.workspace);
+        auth["epoch"] = json!(epoch);
+        auth["viewer_root"] = json!("L3Byb2plY3Q");
+        auth["token"] = json!(self.route.token);
+        bounded_send(&mut upstream, Up::Text(auth.to_string().into())).await?;
+        Ok(Opened::Live(Box::new(upstream)))
+    }
+    /// The owner's frame for the viewer, byte-for-byte except a terminal
+    /// `ready`'s paths, and whether it is the `ready` that opens delivery.
+    fn downstream_text(&self, text: &str) -> (String, bool) {
+        if text.len() <= READY_SCAN_BYTES {
+            if let Ok(mut value) = serde_json::from_str::<Value>(text) {
+                if value["type"] == "ready" {
+                    if let (false, Some(alias)) = (self.chat, &self.alias) {
+                        alias.session(&mut value);
+                        return (value.to_string(), true);
+                    }
+                    return (text.to_owned(), true);
+                }
+            }
+        }
+        (text.to_owned(), false)
+    }
+    /// Where the session continues after its project changed owner.
+    fn moved(&self) -> Value {
+        let to = match self.state.session_proxy.for_session(&self.session) {
+            Some((route, _)) if route.host_id.starts_with("worker-") => "cloud",
+            Some(_) => "computer",
+            None if crate::pro::is_worker(self.state) => "cloud",
+            None => "computer",
+        };
+        json!({"type":"moved","to":to})
+    }
+    /// Answer input that never reached the owner, so nothing vanishes silently.
+    async fn refuse(
+        &self,
+        downstream: &mut axum::extract::ws::WebSocket,
+        count: usize,
+    ) -> Result<()> {
+        if self.chat {
+            for _ in 0..count {
+                bounded_send(downstream, Down::Text(not_sent().to_string().into())).await?;
+            }
+        } else if count > 0 {
+            let frame = json!({"type":"error","code":"read_only","reason":"reconnecting",
+                "message":"Your project is reconnecting. That input was not sent."});
+            bounded_send(downstream, Down::Text(frame.to_string().into())).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Input held until the owner's socket is ready. Bounded per socket.
+struct Held {
+    chat: bool,
+    frames: std::collections::VecDeque<Down>,
+    bytes: usize,
+}
+impl Held {
+    fn push(&mut self, frame: Down) -> bool {
+        let size = match &frame {
+            Down::Text(text) => text.len(),
+            Down::Binary(bytes) => bytes.len(),
+            _ => 0,
+        };
+        let fits = if self.chat {
+            self.frames.len() < HELD_CHAT_COMMANDS && self.bytes + size <= HELD_CHAT_BYTES
+        } else {
+            self.bytes + size <= HELD_TERMINAL_BYTES
+        };
+        if fits {
+            self.bytes += size;
+            self.frames.push_back(frame);
+        }
+        fits
+    }
+    fn take(&mut self) -> std::collections::VecDeque<Down> {
+        self.bytes = 0;
+        std::mem::take(&mut self.frames)
+    }
+}
+fn unavailable() -> Value {
+    json!({"type":"error","code":"remote_unavailable","message":"Your project is reconnecting."})
+}
+fn asleep() -> Value {
+    json!({"type":"error","code":"worker_asleep","message":"Your project is paused. Sending a message picks it back up."})
+}
+/// The existing per-command refusal: the socket stays up, the client keeps
+/// the unsent text.
+fn not_sent() -> Value {
+    json!({"type":"error","code":"command_failed","message":"Not sent. Your project is reconnecting."})
+}
+fn upward(frame: Down) -> Option<Up> {
+    match frame {
+        Down::Text(text) => Some(Up::Text(text.as_str().into())),
+        Down::Binary(bytes) => Some(Up::Binary(bytes)),
+        _ => None,
+    }
+}
+async fn next_up(
+    upstream: &mut Option<Box<Upstream>>,
+) -> Option<Result<Up, tokio_tungstenite::tungstenite::Error>> {
+    match upstream {
+        Some(socket) => socket.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::ws::WebSocket) {
+    let mut held = Held {
+        chat: link.chat,
+        frames: Default::default(),
+        bytes: 0,
+    };
+    let mut upstream: Option<Box<Upstream>> = None;
+    let mut ready = false;
+    // The last connection status told to the viewer, sent once per change.
+    let mut told: Option<&'static str> = None;
+    let mut attempt: Option<futures::future::BoxFuture<'_, Result<Opened>>> =
+        Some(Box::pin(link.open(wake)));
+    let mut backoff = RETRY_MIN;
+    let retry = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(retry);
+    let mut retry_armed = false;
+    let mut ownership = tokio::time::interval(Duration::from_secs(2));
+    ownership.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            Some(result) = futures::future::OptionFuture::from(attempt.as_mut()), if attempt.is_some() => {
+                attempt = None;
+                match result {
+                    Ok(Opened::Live(socket)) => {
+                        upstream = Some(socket);
+                        ready = false;
+                        backoff = RETRY_MIN;
+                    }
+                    Ok(Opened::Sleeping) if !held.frames.is_empty() => {
+                        wake = true;
+                        attempt = Some(Box::pin(link.open(true)));
+                    }
+                    Ok(Opened::Sleeping) => {
+                        if told != Some("worker_asleep") {
+                            told = Some("worker_asleep");
+                            if bounded_send(downstream, Down::Text(asleep().to_string().into())).await.is_err() { return; }
+                        }
+                        retry.as_mut().reset(tokio::time::Instant::now() + RETRY_MAX);
+                        retry_armed = true;
+                    }
+                    Err(_) => {
+                        // A failed wake attempt answers what it was carrying.
+                        let count = held.take().len();
+                        if link.refuse(downstream, count).await.is_err() { return; }
+                        wake = false;
+                        if told != Some("remote_unavailable") {
+                            told = Some("remote_unavailable");
+                            if bounded_send(downstream, Down::Text(unavailable().to_string().into())).await.is_err() { return; }
+                        }
+                        retry.as_mut().reset(tokio::time::Instant::now() + backoff);
+                        retry_armed = true;
+                        backoff = (backoff * 2).min(RETRY_MAX);
+                    }
+                }
+            }
+            _ = &mut retry, if retry_armed => {
+                retry_armed = false;
+                attempt = Some(Box::pin(link.open(wake)));
+            }
+            _ = ownership.tick() => {
+                if !link.current() {
+                    let count = held.take().len();
+                    let _ = link.refuse(downstream, count).await;
+                    let _ = bounded_send(downstream, Down::Text(link.moved().to_string().into())).await;
+                    return;
+                }
+            }
+            next = next_up(&mut upstream) => match next {
+                Some(Ok(Up::Text(text))) => {
+                    let (frame, is_ready) = link.downstream_text(&text);
+                    if bounded_send(downstream, Down::Text(frame.into())).await.is_err() { return; }
+                    if is_ready && !ready {
+                        ready = true;
+                        told = None;
+                        // Deliver what the viewer typed while connecting, once, in order.
+                        if let Some(socket) = upstream.as_mut() {
+                            for frame in held.take() {
+                                let Some(frame) = upward(frame) else { continue };
+                                if bounded_send(socket.as_mut(), frame).await.is_err() { return; }
+                            }
+                        }
+                    }
+                }
+                Some(Ok(Up::Binary(bytes))) => {
+                    if bounded_send(downstream, Down::Binary(bytes)).await.is_err() { return; }
+                }
+                Some(Ok(Up::Ping(bytes))) => {
+                    if let Some(socket) = upstream.as_mut() {
+                        let _ = bounded_send(socket.as_mut(), Up::Pong(bytes)).await;
+                    }
+                }
+                Some(Ok(Up::Close(_))) | None | Some(Err(_)) => {
+                    // The owner ended this connection (exit, restart, owner
+                    // change). The viewer reconnects and is routed afresh.
+                    let count = held.take().len();
+                    let _ = link.refuse(downstream, count).await;
+                    return;
+                }
+                _ => {}
+            },
+            next = downstream.recv() => match next {
+                Some(Ok(frame @ (Down::Text(_) | Down::Binary(_)))) => {
+                    // A terminal's text frames are grid control (resize, park);
+                    // everything a chat sends is the user acting.
+                    let input = link.chat || matches!(frame, Down::Binary(_));
+                    match upstream.as_mut() {
+                        Some(socket) if ready => {
+                            if !link.current() {
+                                let _ = link.refuse(downstream, usize::from(input)).await;
+                                let _ = bounded_send(downstream, Down::Text(link.moved().to_string().into())).await;
+                                return;
+                            }
+                            let Some(frame) = upward(frame) else { continue };
+                            if bounded_send(socket.as_mut(), frame).await.is_err() { return; }
+                        }
+                        _ if input => {
+                            if !held.push(frame) && link.refuse(downstream, 1).await.is_err() {
+                                return;
+                            }
+                            // The first real input carries wake intent; an
+                            // in-flight passive attempt upgrades when it
+                            // reports the owner asleep.
+                            if upstream.is_none() && attempt.is_none() {
+                                wake = true;
+                                retry_armed = false;
+                                attempt = Some(Box::pin(link.open(true)));
+                            }
+                        }
+                        // Grid control before the owner answers: the auth frame
+                        // already carries the grid; the ready reconcile fixes drift.
+                        _ => {}
+                    }
+                }
+                Some(Ok(Down::Close(_))) | None | Some(Err(_)) => return,
+                _ => {}
+            },
+        }
+    }
 }
 pub(crate) async fn events(
     state: &AppState,

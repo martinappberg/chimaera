@@ -643,3 +643,298 @@ async fn unavailable_logical_project_never_falls_back_to_stale_local_files() {
         .stopping
         .store(true, std::sync::atomic::Ordering::Release);
 }
+
+/// An in-process stand-in for the account transport in front of a real
+/// daemon: while "asleep" it answers health for the owner (marked sleeping)
+/// and refuses socket upgrades that carry no interaction, exactly as the
+/// transport contract says. A wake-marked upgrade resumes the owner.
+#[derive(Default)]
+struct FakeTransport {
+    asleep: std::sync::atomic::AtomicBool,
+    refuse_wake: std::sync::atomic::AtomicBool,
+    upgrades: std::sync::Mutex<Vec<String>>,
+}
+impl FakeTransport {
+    fn serve(self: &Arc<Self>, daemon: Arc<AppState>) -> axum::Router {
+        use axum::response::IntoResponse;
+        use std::sync::atomic::Ordering;
+        let transport = self.clone();
+        app(daemon).layer(axum::middleware::from_fn(
+            move |request: Request<Body>, next: axum::middleware::Next| {
+                let transport = transport.clone();
+                async move {
+                    let path = request.uri().path().to_owned();
+                    let query = request.uri().query().unwrap_or_default().to_owned();
+                    if path.starts_with("/ws/") {
+                        transport.upgrades.lock().unwrap().push(query.clone());
+                        if transport.asleep.load(Ordering::Acquire) {
+                            if !query.contains("wake=interaction")
+                                || transport.refuse_wake.load(Ordering::Acquire)
+                            {
+                                return (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    axum::Json(serde_json::json!({"error":"worker_asleep"})),
+                                )
+                                    .into_response();
+                            }
+                            transport.asleep.store(false, Ordering::Release);
+                        }
+                    } else if path == "/api/v1/health" && transport.asleep.load(Ordering::Acquire) {
+                        let mut response = axum::Json(serde_json::json!({"pid":1})).into_response();
+                        response
+                            .headers_mut()
+                            .insert("x-chimaera-worker-state", "sleeping".parse().unwrap());
+                        return response;
+                    }
+                    next.run(request).await
+                }
+            },
+        ))
+    }
+}
+
+struct SleepingChat {
+    remote: Arc<AppState>,
+    local: Arc<AppState>,
+    workspace: String,
+    id: String,
+    capture: PathBuf,
+    transport: Arc<FakeTransport>,
+    transport_addr: std::net::SocketAddr,
+    local_addr: std::net::SocketAddr,
+}
+impl Drop for SleepingChat {
+    fn drop(&mut self) {
+        self.remote.chat.kill(&self.id);
+        for state in [&self.remote, &self.local] {
+            state
+                .stopping
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// A remote chat whose fake agent writes its stdin to `capture`, served
+/// behind a sleeping fake transport, with a viewing daemon routed to it.
+async fn sleeping_remote_chat(label: &str) -> SleepingChat {
+    let remote = test_state();
+    let local = test_state();
+    let workspace = lock(&remote.workspaces)
+        .add(test_dir(&format!("{label}-remote")).canonicalize().unwrap())
+        .unwrap();
+    let mut viewing = workspace.clone();
+    viewing.root = test_dir(&format!("{label}-local")).canonicalize().unwrap();
+    lock(&local.workspaces).import_exact(viewing).unwrap();
+    let capture = workspace.root.join("agent-stdin.txt");
+    let fake = write_fake_claude(&format!("{label}-agent"));
+    let script = std::fs::read_to_string(&fake).unwrap();
+    std::fs::write(
+        &fake,
+        script.replace("cat >/dev/null", "cat > \"$CHIMAERA_TEST_CAPTURE\""),
+    )
+    .unwrap();
+    let id = format!("s-{label}");
+    let mut spec = chimaera_agent::driver::SpawnSpec::new(
+        id.clone(),
+        vec![fake.to_string_lossy().into_owned()],
+        workspace.root.clone(),
+    );
+    spec.env.push((
+        "CHIMAERA_TEST_CAPTURE".into(),
+        capture.to_string_lossy().into_owned(),
+    ));
+    remote
+        .chat
+        .spawn(&chimaera_agent::claude::ClaudeAdapter, spec)
+        .unwrap();
+    lock(&remote.session_workspaces).insert(id.clone(), workspace.id.clone());
+    pro::install_execution_fixture(&remote, &workspace.id, 4).unwrap();
+    let transport = Arc::new(FakeTransport::default());
+    transport
+        .asleep
+        .store(true, std::sync::atomic::Ordering::Release);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let transport_addr = listener.local_addr().unwrap();
+    let router = transport.serve(remote.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (status, error) = request(
+        &local,
+        Method::POST,
+        "/api/v1/pro/placements",
+        Some(serde_json::json!({
+            "host_id":"worker-sleepy","endpoint":format!("http://{transport_addr}"),
+            "token":"test-token","workspace_id":workspace.id,"epoch":4
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{error}");
+    // The roster poll is a passive read: the transport answers it and the
+    // session becomes routable without anything waking.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !session_view::sessions_json(&local)
+        .iter()
+        .any(|row| row["id"] == id.as_str())
+    {
+        assert!(tokio::time::Instant::now() < deadline, "row never appeared");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    let router = app(local.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    SleepingChat {
+        remote,
+        local,
+        workspace: workspace.id,
+        id,
+        capture,
+        transport,
+        transport_addr,
+        local_addr,
+    }
+}
+
+async fn next_json<S>(socket: &mut S) -> serde_json::Value
+where
+    S: futures::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    loop {
+        if let Message::Text(text) = next_ws_frame(socket).await {
+            return serde_json::from_str(&text).unwrap();
+        }
+    }
+}
+
+async fn open_chat(
+    fixture: &SleepingChat,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{}/ws/chat/{}",
+        fixture.local_addr, fixture.id
+    ))
+    .await
+    .unwrap();
+    socket
+        .send(Message::Text(
+            serde_json::json!({"type":"auth","token":"test-token","last_seq":0})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    socket
+}
+
+/// User turns the fake agent received carrying `text` (the driver's own
+/// title request also quotes the text, so count only user messages).
+fn user_turns(capture: &std::path::Path, text: &str) -> usize {
+    std::fs::read_to_string(capture)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(r#""type":"user""#) && line.contains(text))
+        .count()
+}
+
+fn send_text(text: &str) -> Message {
+    Message::Text(
+        serde_json::json!({"type":"send","blocks":[{"type":"text","text":text}]})
+            .to_string()
+            .into(),
+    )
+}
+
+#[tokio::test]
+async fn a_viewer_send_wakes_a_sleeping_owner_once_and_an_owner_change_says_moved() {
+    let fixture = sleeping_remote_chat("wake-chat").await;
+    let mut socket = open_chat(&fixture).await;
+    // Opening the conversation is passive: the owner stays asleep.
+    let first = next_json(&mut socket).await;
+    assert_eq!(first["type"], "error");
+    assert_eq!(first["code"], "worker_asleep");
+    assert!(
+        fixture.transport.upgrades.lock().unwrap().is_empty(),
+        "attaching never tried to reach, or wake, the owner"
+    );
+    // The first real input carries wake intent and is delivered after ready.
+    socket.send(send_text("WAKE_MESSAGE")).await.unwrap();
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "exited");
+        assert_ne!(frame["code"], "command_failed", "{frame}");
+        if frame["type"] == "ready" {
+            break;
+        }
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let delivered = user_turns(&fixture.capture, "WAKE_MESSAGE");
+        if delivered > 0 {
+            assert_eq!(delivered, 1, "delivered once");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "held send never delivered"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        *fixture.transport.upgrades.lock().unwrap(),
+        vec!["wake=interaction".to_string()],
+        "one connection, opened by the interaction"
+    );
+
+    // The project moves to another owner under the established socket: the
+    // viewer is told the session continues, never that it exited.
+    let (status, _) = request(
+        &fixture.local,
+        Method::POST,
+        "/api/v1/pro/placements",
+        Some(serde_json::json!({
+            "host_id":"worker-next","endpoint":format!("http://{}", fixture.transport_addr),
+            "token":"test-token","workspace_id":fixture.workspace,"epoch":5
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "exited", "a move is not an exit");
+        if frame["type"] == "moved" {
+            assert_eq!(frame["to"], "cloud");
+            break;
+        }
+    }
+    assert_eq!(
+        user_turns(&fixture.capture, "WAKE_MESSAGE"),
+        1,
+        "nothing is resent across the change"
+    );
+}
+
+#[tokio::test]
+async fn a_send_that_cannot_reach_the_owner_is_answered_not_dropped() {
+    let fixture = sleeping_remote_chat("refused-chat").await;
+    fixture
+        .transport
+        .refuse_wake
+        .store(true, std::sync::atomic::Ordering::Release);
+    let mut socket = open_chat(&fixture).await;
+    assert_eq!(next_json(&mut socket).await["code"], "worker_asleep");
+    socket.send(send_text("LOST_MESSAGE")).await.unwrap();
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "ready");
+        if frame["code"] == "command_failed" {
+            break;
+        }
+    }
+    // The socket survives the refusal and says what it is waiting for.
+    assert_eq!(next_json(&mut socket).await["code"], "remote_unavailable");
+    assert_eq!(user_turns(&fixture.capture, "LOST_MESSAGE"), 0);
+}

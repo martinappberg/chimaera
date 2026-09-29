@@ -515,6 +515,15 @@ export class ChatStore {
   exited = $state<null | { status: number | null }>(null);
   degraded = $state(false);
   connected = $state(false);
+  /** The project's owner is paused; the next send picks it back up. Cleared
+   *  by the next `ready` or disconnect. */
+  asleep = $state(false);
+  /** Text of a send the daemon refused before the agent received it, waiting
+   *  to go back into the composer ({@link takeRestoredDraft}). */
+  restoredDraft = $state<string | null>(null);
+  /** The composer's last accepted send, until its echo proves the agent got
+   *  it. Plain (not reactive): only the refusal path reads it. */
+  private unconfirmedSend: string | null = null;
   fatalError = $state<string | null>(null);
   /** Where the fatal came from. A SOCKET fatal (handshake failure) is
    *  disproved by the next successful `ready` — chatPool recreates a fatal
@@ -691,6 +700,7 @@ export class ChatStore {
 
   onReady(session: ChatSessionInfo, _replayFrom: number, head: number | undefined): void {
     this.connected = true;
+    this.asleep = false;
     // This handshake succeeded, which is the one fact a socket-level fatal
     // claimed was impossible; a journal fatal says nothing about the socket.
     if (this.fatalSource === "socket") this.clearFatal();
@@ -721,6 +731,35 @@ export class ChatStore {
   /** The socket dropped; we are no longer live until the next `ready`. */
   onDisconnected(): void {
     this.connected = false;
+    this.asleep = false;
+  }
+
+  /** The owner is paused and nothing has asked it to wake yet. */
+  onAsleep(): void {
+    this.asleep = true;
+  }
+
+  /** The composer's send was accepted by the socket; keep its text until the
+   *  agent's echo proves delivery, so a refusal can hand it back. */
+  noteSent(text: string): void {
+    this.unconfirmedSend = text;
+  }
+
+  /** One command was refused before reaching the agent. Say so, and give an
+   *  unconfirmed send's text back to the composer instead of losing it. */
+  onCommandFailed(message: string): void {
+    this.notice(message, "error");
+    if (this.unconfirmedSend !== null) {
+      this.restoredDraft = this.unconfirmedSend;
+      this.unconfirmedSend = null;
+    }
+  }
+
+  /** Hand the refused text to exactly one composer. */
+  takeRestoredDraft(): string | null {
+    const draft = this.restoredDraft;
+    this.restoredDraft = null;
+    return draft;
   }
 
   /** The structured driver fell back to its terminal surface. */
@@ -869,6 +908,8 @@ export class ChatStore {
           ? (ev.attachment_paths as unknown[]).filter((p): p is string => typeof p === "string")
           : [];
         const origin = typeof ev.origin === "string" ? ev.origin : null;
+        // The agent received the user's own send: nothing is left to hand back.
+        if (origin === null) this.unconfirmedSend = null;
         if (ev.queued === true && id !== null) {
           // Queued: park it in the pending stack, NOT in the transcript at its
           // mid-turn send position (that splice would split the agent's live

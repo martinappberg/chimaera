@@ -1189,6 +1189,9 @@
     // composer keeps the draft.
     const accepted = sendNow(text, images);
     if (accepted) {
+      // Kept until the agent's echo: a send the daemon could not deliver
+      // (the project was reconnecting) comes back into the composer.
+      store.noteSent(text);
       // Submission is stronger intent than merely clearing a draft: the user
       // expects to see the delivered/queued bubble and the reply it starts.
       atBottom = true;
@@ -1196,6 +1199,13 @@
     }
     return accepted;
   }
+
+  // A refused send's text goes back into this chat's composer, once.
+  $effect(() => {
+    if (store.restoredDraft === null) return;
+    const draft = store.takeRestoredDraft();
+    if (draft !== null && draft.length > 0) insertIntoComposer(session.id, draft);
+  });
 
   /** One never-lose-a-click path for every interactive AgentCommand. A closed
    *  socket cannot queue locally (replay would make that ambiguous), so keep
@@ -2665,8 +2675,10 @@
     </div>
   {/if}
 
-  {#if reconnectingShown}
-    <div class="connection-action"><span>Waiting for this session’s host</span><button type="button" onclick={() => socket.wake()}>Reconnect and wake</button></div>
+  {#if store.asleep && !store.connected}
+    <div class="connection-status" role="status">Send a message to pick this conversation back up.</div>
+  {:else if reconnectingShown}
+    <div class="connection-status" role="status">Reconnecting…</div>
   {/if}
   <Composer
     sessionId={session.id}
@@ -2687,8 +2699,7 @@
 
 <style>
   .placement-note { color: var(--accent); font-size: 11px; padding: 5px 12px; border-bottom: 1px solid var(--edge); }
-  .connection-action { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 10px; padding: 8px 12px; color: var(--muted); font-size: 12px; }
-  .connection-action button { min-height: 36px; border: 1px solid var(--edge); border-radius: 6px; background: var(--rail-bg); color: var(--fg); padding: 6px 10px; cursor: pointer; }
+  .connection-status { padding: 8px 12px; color: var(--muted); font-size: 12px; text-align: center; }
   .chat {
     position: relative; /* anchors the rewind dialog + /mcp panel overlays */
     height: 100%;

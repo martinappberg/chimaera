@@ -75,7 +75,6 @@
   <div class="terminal-access" role="toolbar" aria-label="Terminal access">
     {#if remote}<span class="cloud-chip">Cloud{available ? "" : " · unavailable"}</span>{/if}
     <span>{watching ? "Just watching" : "Terminal control"}</span>
-    {#if remote && !available && !watching}<button type="button" onclick={() => refreshAccess(sessionId)}>Reconnect and wake</button>{/if}
     <button type="button" aria-pressed={!watching} onclick={toggleAccess}>{watching ? "Take control" : "Just watch"}</button>
   </div>
 {/if}
