@@ -298,6 +298,9 @@ async fn me(State(keeper): State<FakeKeeper>) -> Json<Account> {
             storage_bytes: 0,
         },
         hours_exhausted: false,
+        payment_due: None,
+        subscription_status: None,
+        plans: None,
     })
 }
 async fn hosts(State(keeper): State<FakeKeeper>) -> Json<Vec<Host>> {

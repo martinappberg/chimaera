@@ -558,6 +558,9 @@ mod tests {
                 storage_bytes: 0,
             },
             hours_exhausted: false,
+            payment_due: None,
+            subscription_status: None,
+            plans: None,
         };
         assert!(!confirms("own", Some(&Plan::Pro), &account));
         account.plan = Plan::Pro;

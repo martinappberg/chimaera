@@ -38,11 +38,11 @@ async fn list(state: &Shell) -> Result<Vec<CloudProject>> {
         result.projects.len() <= 128,
         "Cloud project list exceeds limit"
     );
-    if result.projects.is_empty() {
-        if let Some(error) = result.error {
-            anyhow::bail!("{error}");
-        }
-    }
+    // The daemon's listing error is diagnostic text, not UI copy.
+    anyhow::ensure!(
+        !result.projects.is_empty() || result.error.is_none(),
+        "Cloud projects are unavailable right now."
+    );
     Ok(result.projects)
 }
 #[tauri::command]
@@ -53,7 +53,9 @@ pub async fn pro_cloud_projects(
     if state.pro.client().await.is_none() {
         return Ok(Vec::new());
     }
-    let rows = list(&state).await.map_err(|error| error.to_string())?;
+    let rows = list(&state)
+        .await
+        .map_err(|_| "Cloud projects are unavailable right now.")?;
     if generation != state.pro.generation() {
         return Ok(Vec::new());
     }

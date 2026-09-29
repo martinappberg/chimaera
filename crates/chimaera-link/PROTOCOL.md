@@ -138,7 +138,20 @@ Account example (limits are supplied by the account, never hardcoded by clients)
 ```
 
 `plan` is `none`, `pro` or `max`; cloud-hour usage is a nonnegative number,
-limits and byte counts are nonnegative integers. Device rows are
+limits and byte counts are nonnegative integers.
+
+Optional additive fields, omitted by older services:
+
+- `payment_due` (bool): the subscription needs a payment update. A service may
+  instead send `subscription_status` (the billing provider's status); clients
+  treat `past_due` and `unpaid` as payment due. A lapsed payment otherwise
+  reads as `plan:"none"`.
+- `plans`: the account's current offers,
+  `[{plan:"pro"|"max",interval:"month"|"year",amount_cents,currency}]` with the
+  amount in minor units and `currency` an ISO 4217 code. Clients never hardcode
+  prices; without this list they show plan names only. An entry a client cannot
+  interpret (a new plan or interval, a malformed amount) is dropped, never
+  failing the whole account read. Device rows are
 `{id,name,last_seen,this}` with `last_seen` an RFC 3339 timestamp and `this` true
 only for the requesting device. Device tokens are account credentials; daemon
 tokens below are separate, host-specific credentials.

@@ -34,6 +34,8 @@ pub(super) struct Pro {
     pub hosts: Mutex<HashMap<String, Host>>,
     device_aliases: Mutex<HashSet<String>>,
     error: Mutex<Option<String>>,
+    /// Informational connection state; never a failure the user must act on.
+    warning: Mutex<Option<&'static str>>,
     sign_in: auth::SignIn,
     billing: billing::Billing,
     return_target: Mutex<Option<(String, u64)>>,
@@ -75,12 +77,35 @@ pub struct Status {
     signed_in: bool,
     email: Option<String>,
     plan: Option<chimaera_link::Plan>,
+    /// A failure that needs the user (sign in again, unlock the credential
+    /// store) or a fixed code the UI maps to copy. Never informational.
     error: Option<String>,
+    /// Additive: informational fixed code (see `code`); work continues and
+    /// Chimaera retries on its own. Never shown as a failure or used to
+    /// decide plan branding.
+    connection_warning: Option<&'static str>,
+    /// Additive: the subscription needs a payment update.
+    payment_due: bool,
+    /// Additive: the account's offers, passed through when the service
+    /// supplies them; clients never hardcode prices.
+    plans: Option<Vec<chimaera_link::PlanPrice>>,
     sign_in: Option<auth::Status>,
     billing: Option<billing::Status>,
     limits: Option<chimaera_link::Limits>,
     usage: Option<chimaera_link::Usage>,
     hours_exhausted: bool,
+}
+
+/// Fixed status codes. The UI maps each to plain copy; raw network, daemon
+/// or keeper error text never reaches Pro status.
+pub(super) mod code {
+    /// Signed in; the Pro connection is still coming online.
+    pub const CONNECTION_PREPARING: &str = "connection_preparing";
+    /// The account is current; project setup or the live connection is
+    /// retrying on its own.
+    pub const CONNECTION_RETRYING: &str = "connection_retrying";
+    /// The account could not be reached just now; local work is unaffected.
+    pub const ACCOUNT_UNREACHABLE: &str = "account_unreachable";
 }
 
 #[derive(Serialize)]
@@ -105,6 +130,7 @@ impl Pro {
             hosts: Mutex::new(HashMap::new()),
             device_aliases: Mutex::new(HashSet::new()),
             error: Mutex::new(None),
+            warning: Mutex::new(None),
             sign_in: auth::SignIn::default(),
             billing: billing::Billing::default(),
             return_target: Mutex::new(None),
@@ -156,6 +182,11 @@ impl Pro {
                 .filter(|_| signed_in)
                 .map(str::to_owned)
                 .or_else(|| lock(&self.error).clone()),
+            connection_warning: (*lock(&self.warning)).filter(|_| signed_in),
+            payment_due: account
+                .as_ref()
+                .is_some_and(chimaera_link::Account::needs_payment),
+            plans: account.as_ref().and_then(|account| account.plans.clone()),
             sign_in: self.sign_in.status(),
             billing: self.billing.status(),
             limits: account.as_ref().map(|account| account.limits.clone()),
@@ -388,7 +419,7 @@ fn restore_account(app: AppHandle) {
     });
 }
 
-async fn account_snapshot(client: &Client) -> Result<(Account, Vec<Host>, Option<String>)> {
+async fn account_snapshot(client: &Client) -> Result<(Account, Vec<Host>, Option<&'static str>)> {
     let account = client.me().await?;
     // Account authentication is independent of keeper provisioning. A valid
     // login must remain signed in while that optional connection comes online.
@@ -397,7 +428,7 @@ async fn account_snapshot(client: &Client) -> Result<(Account, Vec<Host>, Option
     } else {
         match client.hosts().await {
             Ok(hosts) => (hosts, None),
-            Err(_) => (Vec::new(), Some("You're signed in. Your Pro connection is preparing; Chimaera will reconnect automatically.".into())),
+            Err(_) => (Vec::new(), Some(code::CONNECTION_PREPARING)),
         }
     };
     Ok((account, hosts, connection_error))
@@ -418,7 +449,7 @@ async fn activate_snapshot(
     app: &AppHandle,
     client: Client,
     updates: tokio::sync::watch::Receiver<Option<Tokens>>,
-    snapshot: Result<(Account, Vec<Host>, Option<String>)>,
+    snapshot: Result<(Account, Vec<Host>, Option<&'static str>)>,
 ) -> Result<()> {
     let state = app.state::<Shell>();
     let endpoint = state.pro.endpoint.clone().context("endpoint unavailable")?;
@@ -465,7 +496,8 @@ async fn activate_snapshot(
         .map(|host| (host.id.clone(), host))
         .collect();
     *lock(&state.pro.client) = Some(client.clone());
-    *lock(&state.pro.error) = connection_error.clone();
+    *lock(&state.pro.error) = None;
+    *lock(&state.pro.warning) = connection_error;
 
     let token_app = app.clone();
     let expected = state.pro.generation();
@@ -525,8 +557,11 @@ async fn activate_snapshot(
             ticks.tick().await;
             if let Err(error) = reconcile_account(&reconcile_app, &client, expected).await {
                 let state = reconcile_app.state::<Shell>();
-                if state.pro.generation() == expected {
-                    *lock(&state.pro.error) = Some(error.to_string());
+                // A revoked sign-in is ended by the credential writer.
+                if state.pro.generation() == expected
+                    && !error.is::<chimaera_link::AuthorizationRevoked>()
+                {
+                    *lock(&state.pro.warning) = Some(code::ACCOUNT_UNREACHABLE);
                     let _ = reconcile_app.emit("pro-changed", ());
                 }
             }
@@ -584,9 +619,12 @@ fn start_keeper(
                 Ok(Event::PromptClosed { id }) => {
                     crate::askpass::close_keeper(&event_app, Some(&id))
                 }
-                Err(error) => {
+                Err(_) => {
+                    // The connection reconnects by itself; prompts on the
+                    // dropped connection can no longer be answered.
                     crate::askpass::close_keeper(&event_app, None);
-                    *lock(&event_app.state::<Shell>().pro.error) = Some(error);
+                    *lock(&event_app.state::<Shell>().pro.warning) =
+                        Some(code::CONNECTION_RETRYING);
                     let _ = event_app.emit("pro-changed", ());
                 }
             }
@@ -639,7 +677,7 @@ async fn configure_pass(
     app: &AppHandle,
     client: &Client,
     generation: u64,
-    connection_error: Option<String>,
+    connection_error: Option<&'static str>,
 ) {
     let state = app.state::<Shell>();
     // Blocking HTTP requests cannot be cancelled by aborting this task.
@@ -652,7 +690,11 @@ async fn configure_pass(
 }
 
 /// Callers hold `operation` and have checked the account generation.
-async fn apply_daemon_setup(app: &AppHandle, client: &Client, connection_error: Option<String>) {
+async fn apply_daemon_setup(
+    app: &AppHandle,
+    client: &Client,
+    connection_error: Option<&'static str>,
+) {
     let state = app.state::<Shell>();
     // Account confirmation must survive a keeper that is still starting. The
     // runtime keeps retrying transport setup independently of billing identity.
@@ -662,9 +704,11 @@ async fn apply_daemon_setup(app: &AppHandle, client: &Client, connection_error: 
     } else {
         Ok(())
     };
-    *lock(&state.pro.error) = connection_error.or_else(|| {
-        (setup.is_err() || placement.is_err()).then(|| "Your account is up to date. The Pro connection is not ready yet; Chimaera will retry automatically.".into())
-    });
+    // A fresh authenticated account read supersedes earlier startup or
+    // sign-in failures; setup trouble is informational and retried.
+    *lock(&state.pro.error) = None;
+    *lock(&state.pro.warning) = connection_error
+        .or_else(|| (setup.is_err() || placement.is_err()).then_some(code::CONNECTION_RETRYING));
     let _ = app.emit("pro-changed", ());
 }
 
@@ -741,7 +785,13 @@ pub(super) async fn apply_host(app: &AppHandle, host: Host) {
         }
         hosts.insert(host.id.clone(), host.clone());
     }
-    *lock(&state.pro.error) = None;
+    // A live host event proves the keeper connection works again.
+    lock(&state.pro.warning).take_if(|warning| {
+        matches!(
+            *warning,
+            code::CONNECTION_PREPARING | code::CONNECTION_RETRYING
+        )
+    });
     host_signal(app, &host).await;
     let _ = app.emit("pro-changed", ());
 }
@@ -952,7 +1002,9 @@ pub async fn pro_sign_in(
                 })
                 .await
                 .context("Sign-in could not be completed. Choose Try again.")?;
-            activate(&app, client).await?;
+            activate(&app, client)
+                .await
+                .context("Sign-in could not be completed. Choose Try again.")?;
             Ok::<_, anyhow::Error>(state.pro.generation())
         }
         .await;
@@ -1237,6 +1289,52 @@ mod tests {
     }
 
     #[test]
+    fn informational_connection_state_never_reads_as_a_failure() {
+        let pro = Pro::new(Some("http://127.0.0.1:1".into()));
+        pro.ready.send_replace(true);
+        *lock(&pro.warning) = Some(code::CONNECTION_RETRYING);
+        assert!(
+            pro.status_snapshot().connection_warning.is_none(),
+            "a signed-out status carries no connection state"
+        );
+        *lock(&pro.client) = Some(
+            Client::new(
+                "http://127.0.0.1:1",
+                Some(Tokens {
+                    access_token: "fixture-access".into(),
+                    refresh_token: "fixture-refresh".into(),
+                    token_type: "Bearer".into(),
+                    expires_in: 900,
+                }),
+            )
+            .unwrap(),
+        );
+        let mut account = fixture_account();
+        account.subscription_status = Some("past_due".into());
+        account.plans = Some(vec![chimaera_link::PlanPrice {
+            plan: chimaera_link::Plan::Pro,
+            interval: chimaera_link::BillingInterval::Month,
+            amount_cents: 1,
+            currency: "usd".into(),
+        }]);
+        *lock(&pro.account) = Some(account);
+        let status = pro.status_snapshot();
+        assert!(status.error.is_none());
+        assert_eq!(status.connection_warning, Some(code::CONNECTION_RETRYING));
+        assert!(status.payment_due);
+        let wire = serde_json::to_value(&status).unwrap();
+        assert_eq!(wire["connection_warning"], code::CONNECTION_RETRYING);
+        assert_eq!(wire["payment_due"], true);
+        assert_eq!(wire["plans"][0]["amount_cents"], 1);
+        // Older services omit the additions; the fields stay present and empty.
+        *lock(&pro.account) = Some(fixture_account());
+        *lock(&pro.warning) = None;
+        let wire = serde_json::to_value(pro.status_snapshot()).unwrap();
+        assert!(wire["connection_warning"].is_null() && wire["plans"].is_null());
+        assert_eq!(wire["payment_due"], false);
+    }
+
+    #[test]
     fn a_lapsed_plan_or_missing_keeper_pauses_setup_without_signing_out() {
         let mut account = fixture_account();
         assert!(setup_available(&account));
@@ -1367,7 +1465,7 @@ mod tests {
         let (account, hosts, warning) = account_snapshot(&client).await.unwrap();
         assert_eq!(account.plan, chimaera_link::Plan::Pro);
         assert!(hosts.is_empty());
-        assert!(warning.unwrap().starts_with("You're signed in."));
+        assert_eq!(warning, Some(code::CONNECTION_PREPARING));
         assert!(client.tokens().await.is_some());
         server.await.unwrap();
     }
@@ -1488,6 +1586,7 @@ async fn sign_out(app: &AppHandle, everywhere: bool, expected: Option<u64>) -> R
         // replayed refresh token). It is final: the reconcile loop, events
         // and serve were stopped above, so nothing retries in the background.
         *lock(&state.pro.error) = expected.map(|_| SIGN_IN_EXPIRED.into());
+        *lock(&state.pro.warning) = None;
         let _ = app.emit("pro-changed", ());
         Ok::<_, anyhow::Error>(())
     }
@@ -1526,7 +1625,10 @@ async fn revoke_this_device(client: Option<&Client>, device: Option<&str>) -> bo
 pub async fn pro_hosts(state: tauri::State<'_, Shell>) -> Result<Vec<KeptHost>, String> {
     let client = state.pro.client().await.ok_or("Sign in first")?;
     let hosts = if state.pro.has_keeper() {
-        client.hosts().await.map_err(|error| error.to_string())?
+        client
+            .hosts()
+            .await
+            .map_err(|_| "Your connections couldn't be loaded right now.")?
     } else {
         Vec::new()
     };
@@ -1650,7 +1752,7 @@ pub async fn pro_set_host_kept(app: AppHandle, alias: String, kept: bool) -> Res
     if kept {
         let (hostname, user, port) = chimaera_remote::ssh_destination(&alias)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|_| "Couldn't read this host's SSH settings.")?;
         let host = client
             .add_host_with_ssh(
                 &alias,
@@ -1661,10 +1763,10 @@ pub async fn pro_set_host_kept(app: AppHandle, alias: String, kept: bool) -> Res
                 }),
             )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|_| HOST_UPDATE_FAILED)?;
         apply_host(&app, host).await;
     } else {
-        let hosts = client.hosts().await.map_err(|error| error.to_string())?;
+        let hosts = client.hosts().await.map_err(|_| HOST_UPDATE_FAILED)?;
         for host in hosts.iter().filter(|host| host.alias == alias) {
             if host.kind != HostKind::Ssh {
                 return Err("Device connections are managed by signing out that device".into());
@@ -1672,7 +1774,7 @@ pub async fn pro_set_host_kept(app: AppHandle, alias: String, kept: bool) -> Res
             client
                 .delete_host(&host.id)
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|_| HOST_UPDATE_FAILED)?;
             lock(&state.pro.hosts).remove(&host.id);
         }
     }
@@ -1697,8 +1799,10 @@ pub async fn pro_devices(state: tauri::State<'_, Shell>) -> Result<Vec<Device>, 
         .ok_or("Sign in first")?
         .devices()
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|_| "Your sign-ins couldn't be loaded right now.".into())
 }
+
+const HOST_UPDATE_FAILED: &str = "Couldn't update this connection right now. Try again shortly.";
 
 #[tauri::command]
 pub async fn pro_revoke_device(app: AppHandle, device_id: String) -> Result<(), String> {
@@ -2234,7 +2338,7 @@ pub async fn pro_mirror_status(
 ) -> Result<serde_json::Value, String> {
     let mut status = daemon_request(&state, "GET", "/pro/status", None)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| "Project status is unavailable right now.")?;
     let placements = lock(&state.pro.placements);
     for row in status["workspaces"].as_array_mut().into_iter().flatten() {
         if let Some(placement) = row["workspace_id"]
@@ -2269,9 +2373,10 @@ pub async fn pro_set_never_mirror(
                 .pro
                 .client()
                 .await
-                .context("Sign in to enable the cloud mirror")?
+                .context("Sign in first")?
                 .enable_mirror(&workspace_id)
-                .await?;
+                .await
+                .context(PRIVACY_FAILED)?;
         }
         // Stop local publishing first. If account deletion fails, the local
         // privacy flag remains true and the UI reports that cloud policy could
@@ -2282,22 +2387,31 @@ pub async fn pro_set_never_mirror(
             "/pro/privacy",
             Some(serde_json::json!({"workspace_id":workspace_id,"never_mirror":never_mirror})),
         )
-        .await?;
+        .await
+        .context(PRIVACY_FAILED)?;
         if never_mirror {
             state
                 .pro
                 .client()
                 .await
-                .context("Sign in to disable the cloud mirror")?
+                .context(PRIVACY_PENDING)?
                 .disable_handoff_policy(&workspace_id)
-                .await?;
-            daemon_request(&state, "PUT", "/pro/privacy", Some(serde_json::json!({"workspace_id":workspace_id,"never_mirror":true,"confirmed":true}))).await?;
+                .await
+                .context(PRIVACY_PENDING)?;
+            daemon_request(&state, "PUT", "/pro/privacy", Some(serde_json::json!({"workspace_id":workspace_id,"never_mirror":true,"confirmed":true}))).await.context(PRIVACY_PENDING)?;
         }
         Ok::<_, anyhow::Error>(())
     }
     .await
+    // Only the outermost fixed context reaches the UI, never service text.
     .map_err(|error| error.to_string())
 }
+
+const PRIVACY_FAILED: &str = "Couldn't change this project's setting. Try again shortly.";
+/// Copying already stopped on this computer; only the account's
+/// confirmation is outstanding.
+const PRIVACY_PENDING: &str =
+    "This project now stays on this computer. Chimaera couldn't confirm that with your account yet.";
 
 #[derive(serde::Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
