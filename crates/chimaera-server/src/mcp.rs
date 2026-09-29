@@ -1512,10 +1512,6 @@ async fn spawn_agent(
     };
     tracing::info!(mastermind = %agent_id, workspace = %workspace.id, agent = %kind.as_str(),
         branch = ?branch, "mastermind act: spawn_agent");
-    if place.as_ref().is_some_and(|p| p.workspace.is_some()) {
-        // A new worktree registered a workspace: every window's list moves.
-        state.changes.notify_waiters();
-    }
     let where_ = match &place {
         Some(p) => format!(
             "on branch {} in {} worktree {}",

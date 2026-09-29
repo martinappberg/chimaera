@@ -201,6 +201,9 @@ describes.
   convention to learn.
 - **Offer removal once a branch is merged**, through the existing remove and its checks.
   Never remove a dirty or unpushed worktree without `force`.
+- **A new branch never moves the window.** Creating a worktree registers no
+  workspace; "Start an agent here" starts the agent in the current workspace with
+  the worktree as its folder (maintainer, 2026-09-29).
 - **Start agents in a worktree:**
   - `CreateSession` accepts a `cwd` inside one of the workspace's worktrees.
   - The Mastermind's `spawn_agent` gains `branch` and `base`. Today it always starts at

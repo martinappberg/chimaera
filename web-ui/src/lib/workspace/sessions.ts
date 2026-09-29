@@ -527,6 +527,10 @@ export interface AgentSpawn {
   /** Explicit surface choice (the launcher's "open" vs its terminal button).
    *  Omitted = the agents.defaultView setting decides. */
   ui?: "chat" | "term";
+  /** Start in this folder instead of the workspace root: one of the
+   *  workspace's worktrees (a branch's own checkout). The session stays in
+   *  its workspace; only where it works changes. */
+  cwd?: string;
 }
 
 export async function createSession(
@@ -571,6 +575,7 @@ export async function createSession(
       extras.ui = "chat";
     }
   }
+  if (spawn.cwd !== undefined && spawn.cwd !== "") extras.cwd = spawn.cwd;
   // Every spawn (shell AND agent) carries the UI's current scheme: the
   // daemon's shims inject it so TUIs boot themed to match. The SETTINGS
   // store resolves it (appearance.theme system|light|dark → mode), so an

@@ -370,15 +370,18 @@ export async function fetchGitBranches(
 
 export interface CreatedWorktree {
   worktree: { path: string; branch: string };
-  /** The worktree is registered as a workspace, so the branch is openable. */
-  workspace: { id: string; root: string; name: string };
+  /** Always null: a worktree stays part of the workspace it was made from
+   *  (kept for the wire's shape). */
+  workspace: null;
   /** What `.worktreeinclude` copied over (ignored files such as `.env`). */
   included?: { copied: number; bytes: number; capped: boolean; names?: string[] };
 }
 
 /**
- * Create a worktree for `branch` under the daemon's managed root and register it
- * as a workspace. Additive — it never touches an existing checkout. The daemon
+ * Create a worktree for `branch` under the daemon's managed root. It stays part
+ * of this workspace (a Branches row, a folder an agent can start in); nothing
+ * is registered and no window moves. Additive — it never touches an existing
+ * checkout. The daemon
  * rejects names git would refuse, and 409s if that branch is already checked out.
  * `repo` picks one of the workspace's repositories (the root's when omitted).
  */

@@ -127,12 +127,19 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   starting an agent there), or delete a managed worktree checkout (keeping the branch).
 - **How it's used.** "+ New branch" in a repository's Branches section → a name, **From** (a local
   branch; the current one by default), and "Start an agent here" → `POST /api/v1/git/worktrees
-  {workspace_id, branch, base?, repo?}`. A muted line then says what `.worktreeinclude` copied ("Copied
-  .env and 1 more"). A removable worktree offers "Remove worktree" on hover — always visible once
+  {workspace_id, branch, base?, repo?}`, then (with the box ticked) `POST /api/v1/sessions
+  {workspace_id, kind:"agent", cwd:<worktree>}` — the agent starts in THIS workspace with the branch's
+  worktree as its folder, and the window, file tree and panes stay exactly where they were. A muted
+  line then says what `.worktreeinclude` copied ("Copied .env and 1 more"). A removable worktree offers "Remove worktree" on hover — always visible once
   merged — → a `confirm()` → `DELETE /api/v1/git/worktrees {workspace_id, path, repo?}`.
 - **Where it lives.** `git.ts` (`createWorktree`/`removeWorktree`), `GitRepoSection.svelte`
   (`spawnInNewBranch`/`remove`); server `git/worktree.rs`, `git/include.rs`.
-- **Key behaviors.** Create is additive; names go through `check-ref-format`, the base through
+- **Key behaviors.** A worktree is a dimension of the workspace it was made from, never a workspace of
+  its own: create registers nothing (the answer's `workspace` is always null) and never moves a
+  window; the branch shows as a Branches row, and "Changes on this branch" is how its files are
+  reviewed. Opening it as its own window stays possible like any folder, and a removal drops such a
+  registration. (Maintainer, 2026-09-29: the whole window jumping to a new branch "feels bad UI UX" —
+  "that one agent could be in just that branch".) Create is additive; names go through `check-ref-format`, the base through
   `rev::resolve_commit`; 409 if the branch is already checked out; path containment under the managed
   root is asserted. `.worktreeinclude` (Claude Code's file, gitignore syntax) copies files that are both
   git-ignored and matched — ≤200 files / 64 MB, symlinks never followed or copied, nothing overwritten.

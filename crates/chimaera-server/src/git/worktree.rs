@@ -85,9 +85,6 @@ async fn branch_exists(git: &Path, procs: &Semaphore, dir: &Path, branch: &str) 
 pub(crate) struct Created {
     pub(crate) path: PathBuf,
     pub(crate) branch: String,
-    /// The workspace registered for it (so the branch is openable as a
-    /// window); `None` when an existing checkout was reused.
-    pub(crate) workspace: Option<crate::workspaces::Workspace>,
     pub(crate) included: IncludeReport,
     pub(crate) reused: bool,
 }
@@ -99,9 +96,10 @@ fn refuse(status: StatusCode, message: impl Into<String>) -> Refusal {
 }
 
 /// Create a worktree for `branch` under the managed root (off `base`, or
-/// HEAD, when the branch is new), copy what `.worktreeinclude` names, and
-/// register it as a workspace. Additive: it never touches an existing
-/// checkout. `ws_id` is the workspace whose git epoch announces the change.
+/// HEAD, when the branch is new) and copy what `.worktreeinclude` names. It
+/// stays a dimension of the workspace `ws_id` names (whose git epoch
+/// announces the change); nothing is registered. Additive: it never touches
+/// an existing checkout.
 async fn create_in(
     state: &Arc<AppState>,
     ws_id: &str,
@@ -190,19 +188,17 @@ async fn create_in(
         return Err(refuse(StatusCode::CONFLICT, out.stderr));
     }
 
-    // The new worktree is a folder: register it so it can be opened as a window.
+    // A worktree is a dimension of the workspace it was made from, never a
+    // workspace of its own: nothing is registered, so no window moves and the
+    // home screen gains no entry. Opening it as its own window stays possible
+    // like any folder (POST /workspaces), and a removal still drops such a
+    // registration (see `remove_worktree`).
     let canonical = {
         let raw = path.clone();
         tokio::task::spawn_blocking(move || std::fs::canonicalize(&raw).unwrap_or(raw))
             .await
             .unwrap_or_else(|_| path.clone())
     };
-    let workspace = crate::lock(&state.workspaces)
-        .add(canonical.clone())
-        .map_err(|err| {
-            tracing::warn!(%err, "worktree created but workspace registration failed");
-            refuse(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-        })?;
 
     // Ignored files the repo asks to carry over (`.env` and the like).
     let included = copy_included(git, procs, &repo.toplevel, &canonical).await;
@@ -217,7 +213,6 @@ async fn create_in(
     Ok(Created {
         path: canonical,
         branch: branch.to_string(),
-        workspace: Some(workspace),
         included,
         reused: false,
     })
@@ -257,7 +252,6 @@ pub(crate) async fn ensure_branch_worktree(
             return Ok(Created {
                 path: existing.path.clone(),
                 branch: branch.to_string(),
-                workspace: None,
                 included: IncludeReport::default(),
                 reused: true,
             });
@@ -281,10 +275,11 @@ pub(crate) struct CreateWorktree {
 }
 
 /// POST /api/v1/git/worktrees — create a worktree for `branch` under the managed
-/// root and register it as a workspace, so the new branch is immediately a
-/// window you can open (its own tree, status and diffs). Additive: it never
-/// touches an existing checkout. The answer's additive `included` reports
-/// what `.worktreeinclude` copied.
+/// root. It stays part of the workspace it was made from (a Branches row, a
+/// place an agent can start in); the window never moves and no workspace is
+/// registered, so `workspace` in the answer is always null (kept for the
+/// wire's shape). Additive: it never touches an existing checkout. The
+/// answer's additive `included` reports what `.worktreeinclude` copied.
 pub(crate) async fn create_worktree(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateWorktree>,
@@ -322,18 +317,12 @@ pub(crate) async fn create_worktree(
     )
     .await
     {
-        Ok(created) => {
-            let workspace = created
-                .workspace
-                .as_ref()
-                .map(|w| json!({"id": w.id, "root": w.root, "name": w.name}));
-            Json(json!({
-                "worktree": {"path": created.path.to_string_lossy(), "branch": created.branch},
-                "workspace": workspace,
-                "included": created.included.json(),
-            }))
-            .into_response()
-        }
+        Ok(created) => Json(json!({
+            "worktree": {"path": created.path.to_string_lossy(), "branch": created.branch},
+            "workspace": null,
+            "included": created.included.json(),
+        }))
+        .into_response(),
         Err((status, message)) => (status, Json(json!({"error": message}))).into_response(),
     }
 }

@@ -293,15 +293,15 @@
     try {
       const created = await createWorktree(wsId, branch, newBase || undefined, repo ?? undefined);
       copiedNote = copiedWords(created.included?.names ?? [], created.included?.copied ?? 0);
-      notifyWorkspacesChanged();
       refreshGit();
       composing = false;
       newBranch = "";
       if (startAgent) {
-        // The new worktree is its own workspace; start the agent there and
-        // reveal it.
-        const session = await createSession(created.workspace.id, "agent");
-        onOpenSession(session.id, created.workspace.id);
+        // The branch is where the agent works, not where the window goes: it
+        // starts in THIS workspace with the new worktree as its folder, and
+        // the file tree, panes and everything else stay where they are.
+        const session = await createSession(wsId, "agent", null, null, { cwd: created.worktree.path });
+        onOpenSession(session.id, wsId);
       }
     } catch (e) {
       actionError = e instanceof Error ? e.message : "failed to create the worktree";
