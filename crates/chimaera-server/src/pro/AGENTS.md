@@ -245,8 +245,16 @@ copies.
 The sleep flush (`/pro/sleep {deadline_ms?}`) preempts the periodic pass, flushes
 projects in parallel as owned tasks (live agents first), releases within the
 remaining deadline only, and reports `pending` flushes that continue after it
-answers. `/pro/wake` advances `sleep_generation`: a running flush then keeps its
-publication, skips release and returns the project itself. Failures and
+answers. A sleep flush that did not hand over (release out of time, or a failed
+publication) marks the project `release_pending`: the lease loop leaves it alone
+(no renewal, no resume) so the lease lapses. `/pro/wake` advances
+`sleep_generation` and turns every `Transferring` project into
+`AwaitingVerification` (writable on a device) at once; a running flush then
+stops no further sessions, keeps its publication, skips release and resumes the
+sessions it stopped; a `release_pending` project resumes its deferred sessions
+locally, without the account. Sign-out does the same for `Transferring`, and on
+a device also for its own `Hydrating`/`SettingUp` return. A device's own
+unfinished return retries after 15 s, doubling to two minutes. Failures and
 refusals carry stable codes (`routes::error_code`; mirror row `error_code`).
 
 Structured pause checks accept authoritative completed-turn/idle agent state even when a provider emits no textual idle status, but reject queued input, active turns, and background work (explicit permission/action waits remain safe pause points).

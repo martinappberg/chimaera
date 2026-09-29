@@ -55,6 +55,10 @@ pub(crate) struct ProState {
     /// keeps its publication but never releases a project after the wake.
     sleep_generation: AtomicU64,
     sleeping: Mutex<std::collections::HashSet<String>>,
+    /// Projects a sleep flush stopped but did not hand over (its release ran
+    /// out of time, or the flush failed): no renewal or resume happens inside
+    /// the sleep window; the next wake returns them to this computer locally.
+    release_pending: Mutex<std::collections::HashSet<String>>,
     /// The last bytes written, so an unchanged tick costs no disk sync.
     persistence: AsyncMutex<Option<Vec<u8>>>,
     configuration: Arc<AsyncMutex<()>>,
@@ -288,6 +292,7 @@ impl ProState {
             jobs: Arc::new(AsyncMutex::new(())),
             sleep_generation: AtomicU64::new(0),
             sleeping: Mutex::new(Default::default()),
+            release_pending: Mutex::new(Default::default()),
             persistence: AsyncMutex::new(None),
             configuration: Arc::new(AsyncMutex::new(())),
             caches: Mutex::new(HashMap::new()),

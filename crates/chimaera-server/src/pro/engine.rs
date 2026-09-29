@@ -297,6 +297,11 @@ async fn reconcile_generation(
         super::projects::account_matches(state, workspace),
         "This project belongs to another account"
     );
+    // Stopped for sleep and not handed over: renewing now would keep the lease
+    // from lapsing (delaying the cloud) and could resume agents before sleep.
+    if lock(&state.pro.release_pending).contains(workspace) {
+        return Ok(None);
+    }
     let baton: Baton = account(config, &execution::path(config, workspace, ""), "GET", None)
         .await?
         .json()?;
@@ -858,6 +863,10 @@ async fn snapshot_inner_scoped(
     }
     let staging = root.join(format!("stage-{}", chimaera_core::generate_token()));
     tokio::fs::create_dir_all(&staging).await?;
+    let woke = || sleep.is_some_and(|sleep| sleep.woke(state));
+    // Sessions this flush stopped; a wake returns them to this computer.
+    let stopped_ids = std::sync::Mutex::new(Vec::<String>::new());
+    let mut published = false;
     let result = async {
         let agent_ids=sessions(state,&workspace.id);
         let continuation=continuation(state,&workspace.id);
@@ -868,12 +877,15 @@ async fn snapshot_inner_scoped(
             *phase = "stop_sessions";
             lock(&state.pro.ownership).insert(workspace.id.clone(),Ownership::Transferring{epoch});super::persist(state).await?;
             for id in &session_ids {
+                // Woken mid-flush: stop no further sessions.
+                if woke() { break; }
                 let Some(path)=crate::bundle::export_for_mirror(state.clone(),id,crate::bundle::ExportMode::Stop).await? else {continue;};
+                lock(&stopped_ids).push(id.clone());
                 let target=staging.join(format!("stopped-{id}.zip"));tokio::fs::rename(path,&target).await?;stopped.insert(id.clone(),target);
             }
         }
         *phase = "stop_execution";
-        if clean && config.execution.is_some(){execution::stop(state,std::slice::from_ref(&workspace.id)).await?;}
+        if clean && config.execution.is_some() && !woke() {execution::stop(state,std::slice::from_ref(&workspace.id)).await?;}
         *phase = "inventory";
         let paths = mirror::inventory(&workspace.root, &shadow).await?;
         let project = workspace.root.clone(); let destination = staging.join("tree");
@@ -946,7 +958,8 @@ async fn snapshot_inner_scoped(
         }
         *phase = "persist_snapshot";
         super::persist(state).await?;
-        if clean && !sleep.is_some_and(|sleep| sleep.woke(state)) {
+        published = true;
+        if clean && !woke() {
             *phase = "release";
             // Before sleep, the account's short publication fence is not
             // waited out past the deadline: an unreleased lease simply lapses
@@ -956,13 +969,43 @@ async fn snapshot_inner_scoped(
             });
             release::after_publication(config, &workspace.id, epoch, budget, || {
                 generation == state.pro.generation.load(Ordering::Acquire)
-                    && !sleep.is_some_and(|sleep| sleep.woke(state))
+                    && !woke()
                     && matches!(lock(&state.pro.ownership).get(&workspace.id), Some(Ownership::Transferring { epoch: current }) if *current == epoch)
             }).await?;
         }
         Ok::<_,anyhow::Error>(())
     }.await;
     let _ = tokio::fs::remove_dir_all(staging).await;
+    let stopped_ids = stopped_ids.into_inner().unwrap_or_default();
+    if clean && woke() {
+        // The computer woke during this flush: whatever publication did, the
+        // project stays here and the sessions it stopped continue locally,
+        // without waiting for the account.
+        if !stopped_ids.is_empty() {
+            if let Err(error) =
+                crate::ledger::resume_deferred_sessions(state, &workspace.id, &stopped_ids).await
+            {
+                tracing::warn!(%error, "Could not resume sessions after waking");
+            }
+        }
+        return result;
+    }
+    if clean && sleep.is_some() && !config.recovery {
+        // Inside the sleep window a flush never renews or resumes (that would
+        // restart agents seconds before sleep and keep the lease from lapsing):
+        // published but unreleased, the cloud continues once the lease lapses;
+        // failed, the project waits. Either way the next wake returns it here.
+        if result.is_err()
+            && matches!(lock(&state.pro.ownership).get(&workspace.id), Some(Ownership::Transferring { epoch: current }) if *current == epoch)
+        {
+            lock(&state.pro.release_pending).insert(workspace.id.clone());
+            if published {
+                tracing::info!("Project published before sleep; its release will lapse");
+                return Ok(());
+            }
+        }
+        return result;
+    }
     if result.is_err() && clean && !config.recovery {
         // A failed flush must not strand a stopped laptop agent, but a changed
         // account must never recover using the previous account's credentials.
@@ -1906,9 +1949,17 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
                     if backoff.len() >= 128 && !backoff.contains_key(&workspace) {
                         backoff.clear();
                     }
+                    // This computer's own unfinished return keeps its project
+                    // fenced here, so it retries quickly (15 s doubling to two
+                    // minutes); moving cloud work home can wait longer.
+                    let (first, most) = if holder.is_none() {
+                        (15, 120)
+                    } else {
+                        (120, RETURN_BACKOFF_MAX)
+                    };
                     let delay = backoff
                         .get(&workspace)
-                        .map_or(120, |(_, delay)| (delay * 2).min(RETURN_BACKOFF_MAX));
+                        .map_or(first, |(_, delay)| (delay * 2).min(most));
                     backoff.insert(workspace.clone(), (super::now() + delay, delay));
                 }
                 record_error(state, &workspace, &error);

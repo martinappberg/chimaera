@@ -294,17 +294,47 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     state.pro.configured.store(false, Ordering::Release);
     // Known remote ownership remains fenced across sign-out and restart. A
     // local or interrupted local transfer becomes ordinary local work: signing
-    // out publishes nothing more, but never stops this computer's agents.
-    lock(&state.pro.ownership).retain(|_, owner| !matches!(owner, Ownership::Local { .. }));
-    for owner in lock(&state.pro.ownership).values_mut() {
-        if let Ownership::Transferring { epoch } = owner {
-            *owner = Ownership::AwaitingVerification { epoch: *epoch };
+    // out publishes nothing more, but never stops this computer's agents. On a
+    // personal computer that includes a return this computer itself started
+    // (Hydrating/SettingUp): no account is left to finish it, so it must not
+    // stay fenced. Sessions a transfer stopped continue here.
+    let device = !execution::worker(&state);
+    lock(&state.pro.release_pending).clear();
+    let returned: Vec<String> = {
+        let mut ownership = lock(&state.pro.ownership);
+        ownership.retain(|_, owner| !matches!(owner, Ownership::Local { .. }));
+        let mut returned = Vec::new();
+        for (id, owner) in ownership.iter_mut() {
+            match owner {
+                Ownership::Transferring { epoch } => {
+                    *owner = Ownership::AwaitingVerification { epoch: *epoch };
+                    returned.push(id.clone());
+                }
+                Ownership::Hydrating { epoch } | Ownership::SettingUp { epoch } if device => {
+                    *owner = Ownership::AwaitingVerification { epoch: *epoch };
+                    returned.push(id.clone());
+                }
+                _ => {}
+            }
         }
+        returned
+    };
+    if let Err(error) = super::persist(&state).await {
+        return failure(error);
     }
-    match super::persist(&state).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => failure(error),
+    if device && !returned.is_empty() {
+        let owner = state.clone();
+        tokio::spawn(async move {
+            for workspace in returned {
+                if let Err(error) =
+                    crate::ledger::resume_deferred_workspace(&owner, &workspace).await
+                {
+                    tracing::warn!(%error, "Could not resume a project's sessions after sign-out");
+                }
+            }
+        });
     }
+    StatusCode::NO_CONTENT.into_response()
 }
 pub(crate) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let authority = lock(&state.pro.authority).clone();
@@ -577,23 +607,42 @@ pub(crate) async fn wake(State(state): State<Arc<AppState>>) -> Response {
     // A flush still running for the sleep that just ended keeps its
     // publication but will not release; it returns the project itself.
     state.pro.sleep_generation.fetch_add(1, Ordering::AcqRel);
-    {
-        let sleeping = lock(&state.pro.sleeping).clone();
+    // Every project a sleep flush holds is this computer's again at once: a
+    // flush still running keeps its publication, skips the release and
+    // resumes what it stopped itself; one that finished without handing over
+    // resumes its stopped sessions here, without waiting for the account.
+    let returned: Vec<String> = {
+        let pending: std::collections::HashSet<String> =
+            lock(&state.pro.release_pending).drain().collect();
         let mut ownership = lock(&state.pro.ownership);
         let authority = lock(&state.pro.authority).clone();
-        for (_, owner) in ownership
-            .iter_mut()
-            .filter(|(id, _)| authority.allows(id) && !sleeping.contains(*id))
-        {
+        let mut returned = Vec::new();
+        for (id, owner) in ownership.iter_mut().filter(|(id, _)| authority.allows(id)) {
             if let Ownership::Transferring { epoch } = owner {
                 *owner = Ownership::AwaitingVerification { epoch: *epoch };
+                if pending.contains(id) {
+                    returned.push(id.clone());
+                }
             }
         }
+        returned
+    };
+    if let Err(error) = super::persist(&state).await {
+        return failure(error);
     }
-    match super::persist(&state).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => failure(error),
+    if !returned.is_empty() {
+        let owner = state.clone();
+        tokio::spawn(async move {
+            for workspace in returned {
+                if let Err(error) =
+                    crate::ledger::resume_deferred_workspace(&owner, &workspace).await
+                {
+                    tracing::warn!(%error, "Could not resume a project's sessions after waking");
+                }
+            }
+        });
     }
+    StatusCode::NO_CONTENT.into_response()
 }
 pub(crate) async fn hydrate(
     State(state): State<Arc<AppState>>,

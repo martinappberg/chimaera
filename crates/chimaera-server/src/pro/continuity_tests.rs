@@ -824,6 +824,10 @@ async fn a_sleep_flush_preempts_the_periodic_pass_and_answers_within_its_deadlin
         post(&state, "/api/v1/pro/wake", "").await.0,
         StatusCode::NO_CONTENT
     );
+    assert!(
+        !lock(&state.pro.sleeping).is_empty() && crate::pro::may_write(&state, &workspace.id),
+        "the project is this computer's again at once, while its flush still runs"
+    );
     tokio::time::timeout(StdDuration::from_secs(60), async {
         while !lock(&state.pro.sleeping).is_empty()
             || matches!(
@@ -849,6 +853,120 @@ async fn a_sleep_flush_preempts_the_periodic_pass_and_answers_within_its_deadlin
         post(&state, "/api/v1/pro/sleep", "").await.0,
         StatusCode::OK
     );
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A sleep flush that could not hand the project over never renews or resumes
+/// inside the sleep window (that would restart agents seconds before sleep and
+/// keep the lease from lapsing); the wake returns the project and the sessions
+/// the flush stopped to this computer at once, without the account.
+#[tokio::test]
+async fn an_unreleased_sleep_flush_waits_for_the_wake_and_resumes_locally() {
+    let root = temp("sleep-pending");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let config = device(&account.endpoint);
+    let workspace = project(&state, &root, &config, 4);
+    *lock(&account.baton) = owned(&workspace.id, "d-home", 4, "lease-fixture", 1);
+    *lock(&state.pro.runtime) = Some(config.clone());
+    // The fixture has no Git service: publication fails inside the window.
+    // (Git helper slots are process-wide, so under a parallel test run the
+    // flush may outlive the reply; wait for it to end either way.)
+    let (status, _) = post(&state, "/api/v1/pro/sleep", r#"{"deadline_ms":20000}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    tokio::time::timeout(StdDuration::from_secs(120), async {
+        while !lock(&state.pro.sleeping).is_empty() {
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the flush ends");
+    assert!(lock(&state.pro.release_pending).contains(&workspace.id));
+    let renewals = |account: &FakeAccount| {
+        account
+            .calls("POST", &format!("/v2/baton/{}/renew", workspace.id))
+            .len()
+            + account
+                .calls("POST", &format!("/v2/baton/{}/acquire", workspace.id))
+                .len()
+    };
+    assert_eq!(
+        renewals(&account),
+        0,
+        "nothing renewed inside the sleep window"
+    );
+    assert!(matches!(
+        lock(&state.pro.ownership).get(&workspace.id),
+        Some(Ownership::Transferring { epoch: 4 })
+    ));
+    let reads = lock(&account.requests).len();
+    reconcile(&state, &config, &workspace.id).await.unwrap();
+    assert_eq!(
+        lock(&account.requests).len(),
+        reads,
+        "the lease loop leaves a stopped-for-sleep project alone"
+    );
+    // A session the flush stopped (here a terminal, to need no agent CLI).
+    let stopped = "s-stopped-for-sleep";
+    crate::ledger::defer(
+        &state,
+        crate::ledger::LedgerEntry {
+            id: stopped.into(),
+            suspended: true,
+            handoff: None,
+            workspace_id: workspace.id.clone(),
+            cwd: workspace.root.clone(),
+            pinned_name: None,
+            cols: 80,
+            rows: 24,
+            theme: "dark".into(),
+            created_at: 0,
+            agent: None,
+        },
+    )
+    .unwrap();
+    // The computer wakes with the account unreachable: the project and its
+    // stopped session come back here anyway.
+    lock(&account.delays).insert(
+        format!("/v2/baton/{}", workspace.id),
+        StdDuration::from_secs(60),
+    );
+    assert_eq!(
+        post(&state, "/api/v1/pro/wake", "").await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(crate::pro::may_write(&state, &workspace.id));
+    tokio::time::timeout(StdDuration::from_secs(10), async {
+        while !state.sessions.get(stopped).is_some_and(|s| s.alive) {
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the stopped session resumed locally");
+    assert_eq!(renewals(&account), 0);
+    state.sessions.kill(stopped).ok();
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Signing out while this computer's own return is unfinished must not leave
+/// the project fenced: no account is left to finish it.
+#[tokio::test]
+async fn sign_out_never_keeps_this_computers_own_return_fenced() {
+    let root = temp("signout-return");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let config = device(&account.endpoint);
+    let workspace = project(&state, &root, &config, 4);
+    *lock(&state.pro.runtime) = Some(config);
+    lock(&state.pro.ownership).insert(workspace.id.clone(), Ownership::Hydrating { epoch: 5 });
+    assert!(!crate::pro::may_write(&state, &workspace.id));
+    assert_eq!(
+        delete(&state, "/api/v1/pro/configure").await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(crate::pro::may_write(&state, &workspace.id));
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }

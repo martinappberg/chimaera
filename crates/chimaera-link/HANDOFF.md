@@ -326,9 +326,16 @@ not wait out the account's publication fence past the deadline (an unreleased
 lease lapses and the cloud continues from the acknowledged checkpoint). The
 reply is `{handoff, failed:[{workspace_id, error:<code>}]}`, plus
 `reason:"deadline", pending:[workspace_id]` when flushes are still finishing on
-their own. `POST /api/v1/pro/wake` advances a sleep generation: a flush still
-running keeps its publication but never releases after the wake and returns the
-project to this computer itself.
+their own. A flush that could not hand its project over (its release ran out
+of time, or publication failed) never renews the lease or resumes agents inside
+the sleep window: an unreleased lease lapses and the cloud continues from the
+acknowledged checkpoint. `POST /api/v1/pro/wake` advances a sleep generation and
+returns every project a sleep flush holds to this computer at once (writable
+immediately): a flush still running keeps its publication, stops no further
+sessions, never releases and resumes the sessions it stopped; one that finished
+without handing over resumes its stopped sessions right away. Neither waits for
+the account. Signing out does the same for any transfer or return this computer
+itself started.
 
 `POST /api/v1/pro/drain {deadline_ms?}` is the public half of a fenced cloud
 suspension. It takes the job reservation, stops new periodic passes, refuses new
