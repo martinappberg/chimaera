@@ -693,6 +693,17 @@ async fn hydrate_owned(state: Arc<AppState>, mut request: Hydrate) -> detached::
         Ok(root) => root,
         Err(error) => return outcome(error),
     };
+    // Running here with some sessions waiting for a provider: after sign-in
+    // resume the ready ones; nothing is fetched or reinstalled.
+    if config.role == super::protocol::Role::Worker
+        && lock(&state.workspaces).get(&request.workspace_id).is_some()
+        && matches!(lock(&state.pro.ownership).get(&request.workspace_id),Some(Ownership::Local{epoch}) if *epoch==request.expected_epoch)
+        && lock(&state.pro.status)
+            .get(&request.workspace_id)
+            .is_some_and(|status| !status.blocked_providers.is_empty())
+    {
+        return result(super::provider_gate::resume_ready(&state, &request.workspace_id).await);
+    }
     if lock(&state.workspaces).get(&request.workspace_id).is_some()
         && matches!(lock(&state.pro.ownership).get(&request.workspace_id),Some(Ownership::SettingUp{epoch}) if *epoch==request.expected_epoch)
     {

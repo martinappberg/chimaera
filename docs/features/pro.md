@@ -183,9 +183,10 @@ not revoke tokens at GitHub. Revoking the GitHub CLI application at GitHub can
 also affect other devices. Failed or unknown verification stays recoverable and
 never reports a completed disconnection. Reconnecting is a separate user action.
 
-A paused handoff names the specific providers its sessions need. **Connect agents
-to continue** opens the same flow with that project context. Every required agent
-must be confirmed by a fresh catalog before that existing staged transfer continues
+A conversation that waits for an agent sign-in names that agent; the project and
+every other conversation and terminal continue meanwhile. **Connect agents
+to continue** opens the same flow with that project context. Each waiting agent
+must be confirmed by a fresh catalog before its conversations continue
 automatically. The UI tries each workspace/epoch once, sequentially, and offers
 **Try again** after a failure. The daemon verifies ownership and provider state
 again; the UI cannot release the setup fence or infer a new move. A canceled

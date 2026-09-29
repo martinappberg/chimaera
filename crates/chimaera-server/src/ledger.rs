@@ -823,6 +823,18 @@ pub(crate) async fn resume_deferred_workspace(
     state: &Arc<AppState>,
     workspace_id: &str,
 ) -> anyhow::Result<()> {
+    resume_deferred_filtered(state, workspace_id, |_| true).await
+}
+
+/// Like [`resume_deferred_workspace`], for the entries `keep` accepts (a
+/// provider still signing in holds only its own sessions back). One session
+/// that fails to resume does not stop the others; the first error is
+/// returned after every session was tried.
+pub(crate) async fn resume_deferred_filtered(
+    state: &Arc<AppState>,
+    workspace_id: &str,
+    keep: impl Fn(&LedgerEntry) -> bool,
+) -> anyhow::Result<()> {
     if !crate::pro::may_execute(state, workspace_id) {
         anyhow::bail!("workspace ownership has not been verified");
     }
@@ -831,10 +843,11 @@ pub(crate) async fn resume_deferred_workspace(
         .ok_or_else(|| anyhow::anyhow!("unknown workspace"))?;
     let entries: Vec<_> = crate::lock(&state.deferred_sessions)
         .values()
-        .filter(|entry| entry.workspace_id == workspace_id)
+        .filter(|entry| entry.workspace_id == workspace_id && keep(entry))
         .cloned()
         .collect();
     state.session_proxy.clear_workspace(workspace_id);
+    let mut failure = None;
     for entry in entries {
         if entry.agent.is_none()
             && entry
@@ -855,11 +868,18 @@ pub(crate) async fn resume_deferred_workspace(
         {
             continue;
         }
-        respawn(state, &entry, workspace.clone()).await?;
-        crate::lock(&state.deferred_sessions).remove(&entry.id);
+        match respawn(state, &entry, workspace.clone()).await {
+            Ok(()) => {
+                crate::lock(&state.deferred_sessions).remove(&entry.id);
+            }
+            Err(error) => {
+                tracing::warn!(session = %entry.id, %error, "deferred session could not resume");
+                failure.get_or_insert(error);
+            }
+        }
     }
     state.changes.notify_waiters();
-    Ok(())
+    failure.map_or(Ok(()), Err)
 }
 
 /// Resume only the named restart-deferred sessions of one workspace.

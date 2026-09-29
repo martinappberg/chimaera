@@ -225,15 +225,24 @@ profile as instructions for the returning agent under its usual permissions;
 the daemon never replays those commands automatically.
 
 Cloud resume additionally checks the providers named by actual deferred ledger
-agents after setup, using fresh bounded worker-local readiness probes. Every
-required provider must be installed and signed in; another provider's login,
-unknown provider ids, timeouts and missing evidence cannot satisfy the gate.
-The workspace remains `SettingUp` until all checks succeed. The local status
+agents after setup, using fresh bounded worker-local readiness probes, per
+session: a provider must be installed and signed in to resume its own sessions;
+another provider's login, unknown provider ids, timeouts and missing evidence
+cannot satisfy it. A provider that is not ready holds back only its sessions
+(`provider_gate::waits_for_provider`): the project becomes `Local` and every
+other session, terminal and idle conversation resumes; the waiting sessions
+stay paused rows with an additive `blocked_provider` naming it. The local status
 row exposes additive `blocked_providers: [{id,state,reason}]` and its mirror
 error is `cloud_provider_not_ready`; the same bounded rows feed cloud-provider
-onboarding and session-scoped MCP guidance without probes. Nonsecret blocked
-rows survive daemon restart only beside a persisted `SettingUp` fence; cached
-readiness never grants permission to resume. An explicit hydrate retry against the recorded epoch reuses staged
+onboarding (`handoffs`, now also for a `Local` project, with its epoch) and
+session-scoped MCP guidance without probes. Nonsecret blocked rows survive a
+daemon restart beside a persisted `SettingUp` or restart-verification fence;
+cached readiness never grants permission to resume. After sign-in the page's
+`POST /pro/hydrate {workspace_id, expected_epoch}` re-checks (fresh) and
+resumes the now-ready sessions (`provider_gate::resume_ready`); nothing is
+fetched or reinstalled. One session failing to resume never stops the others.
+For a project still in `SettingUp`, an explicit hydrate retry against the
+recorded epoch reuses staged
 files and repeats setup/readiness without fetching another snapshot. It never
 starts authentication or transfers provider credentials. Account replacement,
 ownership changes and cancellation retain the fence. Personal-device and

@@ -143,7 +143,9 @@ support:
 6. Keep [ProviderConnections](../../../../../web-ui/src/lib/pro/ProviderConnections.svelte)
    driven by returned catalog rows, labels, categories and methods rather than a
    new hard-coded provider card. General onboarding needs one connected agent;
-   handoff requires every provider used by that project's deferred agents.
+   each deferred session resumes once its own provider is ready (a provider not
+   signed in holds back only its sessions; the project and everything else
+   continue).
    Unsupported required IDs must remain visible and blocked, never silently
    substituted with a connected provider.
 7. Cover unknown IDs, malformed status, missing runtime, denied/expired login,

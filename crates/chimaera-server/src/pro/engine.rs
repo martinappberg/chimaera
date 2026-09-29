@@ -581,10 +581,10 @@ async fn reconcile_generation(
         }
         return Ok(Some(grant.epoch));
     }
-    if config.role == Role::Worker
-        && (!matches!(previous, Some(Ownership::Local { .. }))
-            || !super::provider_gate::required(state, workspace).is_empty())
-    {
+    // A project running here with sessions still waiting for a provider stays
+    // Local; those sessions resume through `provider_gate::resume_ready`
+    // after sign-in, not by re-probing every lease tick.
+    if config.role == Role::Worker && !matches!(previous, Some(Ownership::Local { .. })) {
         ensure!(
             generation == state.pro.generation.load(Ordering::Acquire),
             "Account changed while verifying project ownership"
@@ -2069,10 +2069,9 @@ async fn finish_hydration_checked(
             && matches!(lock(&state.pro.ownership).get(workspace),Some(Ownership::SettingUp {epoch:current}) if *current==epoch),
         "Project ownership changed during setup"
     );
-    if let Err(error) = super::provider_gate::record(state, workspace, blocked) {
-        super::persist(state).await?;
-        return Err(error);
-    }
+    // A provider that is not signed in holds back only its own sessions: the
+    // project and every other conversation continue (paused rows name it).
+    super::provider_gate::record(state, workspace, blocked.clone());
     {
         let mut ownership = lock(&state.pro.ownership);
         ensure!(
@@ -2082,9 +2081,11 @@ async fn finish_hydration_checked(
         ownership.insert(workspace.into(), Ownership::Local { epoch });
     }
     super::persist(state).await?;
-    if let Some(status) = lock(&state.pro.status).get_mut(workspace) {
-        status.error = None;
-        status.error_code = None;
+    if blocked.is_empty() {
+        if let Some(status) = lock(&state.pro.status).get_mut(workspace) {
+            status.error = None;
+            status.error_code = None;
+        }
     }
     // Each managed child takes this lock for durable launch admission. Release
     // it before restoring sessions; their admission rechecks the current grant.
@@ -2094,7 +2095,10 @@ async fn finish_hydration_checked(
         "Account changed before project resume"
     );
     if execution::resume_allowed(state, workspace) {
-        crate::ledger::resume_deferred_workspace(state, workspace).await?;
+        crate::ledger::resume_deferred_filtered(state, workspace, |entry| {
+            !super::provider_gate::waits_for_provider(entry, &blocked)
+        })
+        .await?;
     }
     Ok(())
 }

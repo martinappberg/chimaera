@@ -211,14 +211,24 @@ fn missing_provider_keeps_staged_files_and_explicit_retry_resumes_real_pty() {
         *lock(&state.pro.runtime)=Some(Configure{recovery:false,
 execution:None,account_id:None,role:Role::Worker,endpoint:origin,keeper_url:String::new(),hours_exhausted:false,delegation:super::super::protocol::Delegation{workspace:None,access_token:"fixture".into(),expires_at:String::new(),scope:vec!["baton".into(),"mirror".into()],device_id:"worker-fixture".into()}});
         crate::ledger::defer(&state,entry(AgentKind::Claude)).unwrap();
+        // A terminal in the same project needs no provider at all.
+        let mut terminal=entry(AgentKind::Claude);terminal.id="s-terminal".into();terminal.agent=None;terminal.cwd=root.join("project");
+        crate::ledger::defer(&state,terminal).unwrap();
         let source=root.join("project/preserved.txt");std::fs::write(&source,"installed source").unwrap();
-        let error=finish_hydration(&state,"w-project",3,0,async{Ok(())}).await.unwrap_err();
-        assert_eq!(error.to_string(),"cloud_provider_not_ready");
-        assert!(!super::super::may_write(&state,"w-project"));
-        assert!(!launched.exists());assert!(state.sessions.list().is_empty());
-        assert_eq!(super::super::cloud_provider_blocks(&state)[0]["blocked_providers"][0]["id"],"claude");
+        // One provider not signed in holds back only its own session: the
+        // project runs here and every other session continues.
+        finish_hydration(&state,"w-project",3,0,async{Ok(())}).await.unwrap();
+        assert!(super::super::may_write(&state,"w-project"));
+        assert_eq!(super::super::owned_epoch(&state,"w-project"),Some(3));
+        assert!(!launched.exists());
+        assert!(state.sessions.get("s-terminal").is_some_and(|s|s.alive));
+        assert!(lock(&state.deferred_sessions).contains_key("s-claude"));
+        let blocks=super::super::cloud_provider_blocks(&state);
+        assert_eq!(blocks[0]["blocked_providers"][0]["id"],"claude");
+        assert_eq!(blocks[0]["expected_epoch"],3);
+        let row=crate::session_view::sessions_json(&state).into_iter().find(|row|row["id"]=="s-claude").unwrap();
+        assert_eq!(row["blocked_provider"],"claude");
         let restored = AppState::new("fixture".into(), "fixture".into(), 4242, 0, root.join("project"), root.join("project/config"));
-        assert!(!super::super::may_write(&restored,"w-project"));
         assert_eq!(lock(&restored.pro.status).get("w-project").unwrap().blocked_providers[0].id,"claude");
         drop(restored);
         std::fs::write(&source,"preserved through retry").unwrap();
@@ -233,7 +243,7 @@ execution:None,account_id:None,role:Role::Worker,endpoint:origin,keeper_url:Stri
         assert_eq!(ready.status(),axum::http::StatusCode::NO_CONTENT);
         assert_eq!(super::super::owned_epoch(&state,"w-project"),Some(3));
         assert!(lock(&state.deferred_sessions).is_empty());
-        assert_eq!(state.sessions.list().len(),1);
+        assert_eq!(state.sessions.list().len(),2);
         tokio::time::timeout(Duration::from_secs(3),async{while !launched.exists(){tokio::time::sleep(Duration::from_millis(10)).await;}}).await.unwrap();
         assert_eq!(std::fs::read_to_string(&source).unwrap(),"preserved through retry");
         assert!(lock(&paths).iter().all(|path|path=="/v1/baton/w-project"||path=="/v1/baton/w-project/renew"));

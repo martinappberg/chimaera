@@ -17,7 +17,9 @@ mod shadow_cache;
 mod transport;
 pub(crate) use drain::{cancel as cancel_drain, start as drain};
 pub(crate) use policy::CloudProfile;
-pub(crate) use provider_gate::{cloud_provider_blocks, workspace_provider_blocks};
+pub(crate) use provider_gate::{
+    blocking_provider, cloud_provider_blocks, workspace_provider_blocks,
+};
 pub(crate) use routes::*;
 tokio::task_local! { static PROFILE_SETUP: (String, u64); }
 
@@ -261,8 +263,10 @@ impl ProState {
             .take(128)
             .filter_map(|(id, blocks)| {
                 let blocked_providers = provider_gate::restored(blocks);
-                (matches!(ownership.get(&id), Some(Ownership::SettingUp { .. }))
-                    && !blocked_providers.is_empty())
+                (matches!(
+                    ownership.get(&id),
+                    Some(Ownership::SettingUp { .. } | Ownership::AwaitingVerification { .. })
+                ) && !blocked_providers.is_empty())
                 .then_some((
                     id,
                     WorkspaceStatus {

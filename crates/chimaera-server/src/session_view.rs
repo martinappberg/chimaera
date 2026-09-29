@@ -299,7 +299,13 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     for entry in &deferred {
         if !rows.iter().any(|(_, row)| row["id"] == entry.id) {
             let label = crate::pro::paused_label(state, entry);
-            rows.push((entry.created_at, crate::bundle::paused_row(entry, label)));
+            let mut row = crate::bundle::paused_row(entry, label);
+            // Additive: the provider this paused session waits for (its
+            // project otherwise runs), so the page can say what to connect.
+            if let Some(provider) = crate::pro::blocking_provider(state, entry) {
+                row["blocked_provider"] = json!(provider);
+            }
+            rows.push((entry.created_at, row));
         }
     }
     for remote in state.session_proxy.rows() {
