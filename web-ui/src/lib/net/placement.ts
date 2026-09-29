@@ -1,5 +1,6 @@
 import { writable, type Readable } from "svelte/store";
 import { gatewayPrefix, gatewayWorkspace } from "./base";
+import { ownerAwake } from "./reconnect";
 import { providerLabel } from "../pro/providers";
 
 export interface WorkspacePlacement {
@@ -121,20 +122,41 @@ export class PlacementError extends Error {
 }
 let pending: { workspace: string; promise: Promise<WorkspacePlacement> } | null = null;
 
+/** Where this browser view's project runs and whether it is asleep there. */
+export interface ProjectWhere {
+  where: "cloud" | "computer";
+  asleep: boolean;
+}
+
 /** Where this browser view's project runs, from the latest placement read
  *  (every action and socket authentication reads it); null until the first
  *  answer and outside a project view. Presentation only — routing always
  *  reads placement afresh. */
-const projectWhereStore = writable<"cloud" | "computer" | null>(null);
-export const projectWhere: Readable<"cloud" | "computer" | null> = { subscribe: projectWhereStore.subscribe };
+const projectWhereStore = writable<ProjectWhere | null>(null);
+export const projectWhere: Readable<ProjectWhere | null> = { subscribe: projectWhereStore.subscribe };
+let lastSuspended = false;
 function noteProjectWhere(placement: WorkspacePlacement): void {
-  projectWhereStore.set(placement.route_host_id?.startsWith("worker-") ? "cloud" : "computer");
+  const asleep = placement.availability === "suspended";
+  const where = placement.route_host_id?.startsWith("worker-") ? "cloud" : "computer";
+  projectWhereStore.update((now) => (now?.where === where && now.asleep === asleep ? now : { where, asleep }));
+  lastSuspended = asleep;
+  // The owner answers again: sockets parked while it slept dial once.
+  if (!asleep) ownerAwake();
+}
+
+/** The latest placement read of this project view said its owner is asleep
+ *  (`suspended`). A socket that drops meanwhile parks instead of retrying. */
+export function ownerSuspended(): boolean {
+  return gatewayWorkspace() !== null && lastSuspended;
 }
 
 /** A project view's machine in plain words for its status strip and Home:
- *  it follows the project, so it names where the project runs now. */
-export function projectWhereLabel(where: "cloud" | "computer" | null): string {
-  return where === "cloud" ? IN_THE_CLOUD : where === "computer" ? "On your computer" : "This project";
+ *  it follows the project, so it names where the project runs now. `state`
+ *  adds "· asleep" for a sleeping owner (the status strip). */
+export function projectWhereLabel(project: ProjectWhere | null, { state = false }: { state?: boolean } = {}): string {
+  if (project === null) return "This project";
+  const where = project.where === "cloud" ? IN_THE_CLOUD : "On your computer";
+  return state && project.asleep ? where + ASLEEP : where;
 }
 
 /** Coalesce simultaneous reads; every later request checks the owner again. */

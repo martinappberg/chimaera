@@ -484,11 +484,12 @@
   const hostAlias = getHostLabel();
   const isRemoteWindow = hostAlias !== "local";
   /** A browser view of a project (`/workspace/{id}/`) follows the project
-   *  between the cloud and your computer: its strip names where it runs now,
-   *  not a host, and a link round trip to whichever machine that is means
-   *  nothing to the person reading it. */
+   *  between the cloud and your computer: its strip names where it runs now
+   *  ("In the cloud · asleep" while its owner sleeps), not a host, and a link
+   *  round trip to whichever machine that is means nothing to the person
+   *  reading it. */
   const projectView = gatewayWorkspace() !== null;
-  const stripHost = $derived(projectView ? projectWhereLabel($projectWhere) : hostAlias);
+  const stripHost = $derived(projectView ? projectWhereLabel($projectWhere, { state: true }) : hostAlias);
   /** Set when this window sits on a compute-node daemon (Mode 2 job). */
   const jobCtx = getJobContext();
   /** The key this window's tunnel reports `host-status` under. A job window

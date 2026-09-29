@@ -411,6 +411,7 @@
           focused={focused && active}
           fontSize={node.fontSize}
           placement={placementLabel(s.placement, s.placement_available, { owner: terminalStatus(s.id) })}
+          reach={`${typeof s.placement === "object" ? s.placement.remote : "here"}|${s.placement_available !== false}`}
         />
       {:else if viewErrors.terminal}
         {@render loadFailure("terminal", "terminal view")}

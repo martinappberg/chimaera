@@ -125,11 +125,18 @@ it("an asleep owner is a lasting state that outlives a dropped socket", () => {
   Socket.all[0].onmessage?.({ data: JSON.stringify({ type: "error", code: "worker_asleep", message: "asleep" }) });
   expect(status).toHaveBeenLastCalledWith("asleep");
   expect(error).not.toHaveBeenCalled();
-  // A gateway may close after saying so: the reconnect must not flicker.
+  // A gateway may close after saying so: the status must not flicker, and
+  // no retry timer runs against a sleeping owner.
   Socket.all[0].close();
   expect(status).toHaveBeenLastCalledWith("asleep");
-  vi.advanceTimersByTime(2000);
+  expect(session.waitingForOwner).toBe(true);
+  vi.advanceTimersByTime(10 * 60_000);
+  expect(Socket.all).toHaveLength(1);
+  // Its row says the owner answers again: dial once, passively.
+  session.retrySoon();
   const next = Socket.all.at(-1)!;
+  expect(Socket.all).toHaveLength(2);
+  expect(next.url).not.toContain("wake=");
   next.onopen?.();
   next.onmessage?.({ data: JSON.stringify({ type: "waking" }) });
   expect(status).toHaveBeenLastCalledWith("waking");
@@ -137,5 +144,20 @@ it("an asleep owner is a lasting state that outlives a dropped socket", () => {
   expect(status).toHaveBeenLastCalledWith(null);
   next.close();
   expect(status).toHaveBeenLastCalledWith(null);
+  session.close();
+});
+
+it("a keystroke into a terminal waiting on a sleeping owner dials once with wake intent", () => {
+  const refused = vi.fn();
+  const session = new SessionSocket("s-fixture", { ...quiet, onRefused: refused });
+  Socket.all[0].onopen?.();
+  Socket.all[0].onmessage?.({ data: JSON.stringify({ type: "error", code: "worker_asleep" }) });
+  Socket.all[0].close();
+  session.sendInput("a");
+  session.sendInput("b");
+  expect(Socket.all).toHaveLength(2);
+  expect(Socket.all[1].url).toContain("?wake=interaction");
+  expect(refused).toHaveBeenCalledWith("waking", null);
+  expect(session.waitingForOwner).toBe(false);
   session.close();
 });

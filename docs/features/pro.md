@@ -378,7 +378,12 @@ chat says "Reconnecting…" (only for a viewed project, after a short grace) or
 "Asleep in the cloud. Send a message to wake it." while the cloud machine is
 asleep, and its header reads "In the cloud · asleep"; a terminal says "Asleep in
 the cloud. Press a key to wake it." Asleep holds across dropped connections
-until something wakes it, so a retry never flickers through "Reconnecting…".
+until something wakes it, and nothing retries against a sleeping cloud
+machine: a chat or terminal whose connection drops while it sleeps waits with
+no timer until you send or type (which wakes it) or the project answers again
+(its row becomes reachable, or a browser view's placement reads it awake). A
+browser view of a sleeping project still opens: the account reports it as
+`suspended`, which is routed like any owner and never woken by reading.
 
 **Moving between devices is not an exit.** When a conversation moves between
 this computer and the cloud, every open view is told it *moved*: the chat stays

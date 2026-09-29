@@ -2070,11 +2070,13 @@
   /** The agent sign-in this paused conversation waits for on the cloud (the
    *  row's additive `blocked_provider`); null otherwise. */
   const connect = $derived(canOpenOnboarding() ? pausedConnect(session) : null);
-  /** A paused row coming back (or the project changing where it runs) means
-   *  the conversation is reachable now: reconnect at once instead of sitting
-   *  out a backoff that grew while it was paused. */
+  /** A paused row coming back, the project changing where it runs, or its
+   *  owner becoming reachable (a sleeping cloud machine woke) means the
+   *  conversation is reachable now: reconnect at once instead of sitting out
+   *  a backoff — or, for a socket waiting on a sleeping owner, instead of
+   *  waiting for a send. */
   const reachKey = $derived(
-    `${session.suspended === true}|${rowPause?.type ?? ""}|${typeof session.placement === "object" ? session.placement.remote : "here"}`,
+    `${session.suspended === true}|${rowPause?.type ?? ""}|${typeof session.placement === "object" ? session.placement.remote : "here"}|${session.placement_available !== false}`,
   );
   let lastReachKey: string | null = null;
   $effect(() => {

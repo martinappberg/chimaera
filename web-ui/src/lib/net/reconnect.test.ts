@@ -9,6 +9,8 @@ import {
   Reconnector,
   reconnectingSockets,
   nudgeReconnectors,
+  ownerAwake,
+  parkUntilAwake,
   retryDelayMs,
 } from "./reconnect";
 
@@ -203,5 +205,29 @@ describe("Reconnector under a hidden document", () => {
     expect(retries).toBe(3);
     r.cancel();
     r.clear();
+  });
+});
+
+describe("sockets waiting on a sleeping owner", () => {
+  it("run no timer, dial once each when the owner answers, and a left wait is forgotten", () => {
+    vi.useFakeTimers();
+    try {
+      const first = vi.fn();
+      const left = vi.fn();
+      parkUntilAwake(first);
+      const leave = parkUntilAwake(left);
+      leave();
+      expect(vi.getTimerCount()).toBe(0);
+      ownerAwake(() => 0.5);
+      vi.advanceTimersByTime(1_000);
+      expect(first).toHaveBeenCalledOnce();
+      expect(left).not.toHaveBeenCalled();
+      // Dialed once: a second sign does not dial it again.
+      ownerAwake(() => 0);
+      vi.advanceTimersByTime(1_000);
+      expect(first).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

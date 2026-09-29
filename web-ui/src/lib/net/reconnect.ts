@@ -99,6 +99,32 @@ export function nudgeReconnectors(rand: () => number = Math.random): void {
   for (const r of [...down]) r.nudge(Math.round(rand() * NUDGE_SPREAD_MS));
 }
 
+/** Sockets parked because their project's owner (a cloud machine) is
+ *  asleep. No timer runs for them: retrying a sleeping owner on a backoff
+ *  only churns (each attempt is answered "asleep" again). A user action dials
+ *  its own socket with wake intent; {@link ownerAwake} dials them all. */
+const parked = new Set<() => void>();
+
+/** Park one socket until its owner answers again; returns the unpark (call
+ *  it when the socket dials, or closes for good). */
+export function parkUntilAwake(retry: () => void): () => void {
+  parked.add(retry);
+  return () => {
+    parked.delete(retry);
+  };
+}
+
+/** A sign the owner answers again (a placement read says owned, a project
+ *  view's events socket is up, a row became reachable): dial every parked
+ *  socket once, passively, each on its own 0–2s slot out of the caller's
+ *  stack. One that finds the owner still asleep parks again. */
+export function ownerAwake(rand: () => number = Math.random): void {
+  for (const retry of [...parked]) {
+    parked.delete(retry);
+    setTimeout(retry, Math.round(rand() * NUDGE_SPREAD_MS));
+  }
+}
+
 /**
  * One document-lifetime listener, armed lazily on the first schedule():
  * module-scoped (not component-scoped) on purpose — the sockets it serves

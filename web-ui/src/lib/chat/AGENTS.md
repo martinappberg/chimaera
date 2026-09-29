@@ -324,7 +324,10 @@ dropped socket reconnects once with `?wake=interaction` and returns false (the
 composer keeps the draft). Socket states that are not errors: `worker_asleep` →
 `store.asleep` ("Asleep in the cloud. Send a message to wake it.", and the
 header's "In the cloud · asleep" instead of "· reconnecting"; it survives a
-dropped socket and ends with an accepted send, `waking`, a move or `ready`);
+dropped socket and ends with an accepted send, `waking`, a move or `ready`; a
+socket that drops meanwhile waits with no retry timer until a send dials it with
+wake intent or `retrySoon` / `ownerAwake` dials it passively — `reachKey`
+includes the row's `placement_available`);
 the additive `{"type":"moved","to"}` → `store.moving` (only
 for a real transfer); and the additive `{"type":"paused","reason","provider"?}`
 → `store.pausedFor` (restarting / needs_provider / importing): the chat is NOT

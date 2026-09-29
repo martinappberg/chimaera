@@ -1,7 +1,7 @@
-import { sendSocketAuth } from "../net/placement";
+import { ownerSuspended, sendSocketAuth } from "../net/placement";
 import { daemonSocketUrl, isBrowserGateway } from "../net/base";
 import { getToken } from "../net/api";
-import { Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
+import { parkUntilAwake, Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 
 export interface SessionSocketHandlers {
   readOnly?(): boolean;
@@ -103,6 +103,10 @@ export class SessionSocket {
    *  socket's: it outlives a dropped connection (a gateway may close after
    *  saying so) and ends with a wake, a move or the next `ready`. */
   private asleep = false;
+  /** Set while this socket is down because its owner is asleep: no retry
+   *  timer runs; a keystroke (with wake intent) or a sign the owner answers
+   *  again dials it. Calling it leaves the waiting set. */
+  private leaveSleepWait: (() => void) | null = null;
   private readonly recon = new Reconnector(() => this.connect());
   private readonly encoder = new TextEncoder();
 
@@ -117,6 +121,7 @@ export class SessionSocket {
 
   private connect(interaction = false): void {
     if (this.closed) return;
+    this.stopSleepWait();
     const readOnly = this.handlers.readOnly?.() ?? false;
     const query = readOnly ? "?read_only=true" : interaction && !this.handlers.parked?.() ? "?wake=interaction" : "";
     const ws = new WebSocket(daemonSocketUrl(`/ws/sessions/${this.sessionId}${query}`));
@@ -148,24 +153,64 @@ export class SessionSocket {
       if (this.ws === ws) this.ws = null;
       this.waking = false;
       this.live = false;
+      // A project view's placement read may say the owner sleeps before any
+      // frame did (a gateway can close without one).
+      if (!this.asleep && !this.closed && !this.fatal && !this.exited && ownerSuspended()) this.asleep = true;
       this.handlers.onStatus?.(this.asleep ? "asleep" : null);
       if (this.closed || this.fatal || this.exited) {
         this.recon.clear();
         return;
       }
       this.handlers.onDrop?.();
+      if (this.asleep) {
+        this.waitForOwner();
+        return;
+      }
       this.recon.schedule();
     };
   }
 
+  /** The owner is asleep: retrying on a backoff would only hear "asleep"
+   *  again. Wait with no timer until a keystroke or {@link retrySoon} /
+   *  `ownerAwake` dials. */
+  private waitForOwner(): void {
+    this.recon.cancel();
+    this.recon.clear();
+    this.stopSleepWait();
+    this.leaveSleepWait = parkUntilAwake(() => {
+      this.leaveSleepWait = null;
+      if (!this.closed && !this.fatal && !this.exited && this.ws === null) this.connect();
+    });
+  }
+
+  private stopSleepWait(): void {
+    this.leaveSleepWait?.();
+    this.leaveSleepWait = null;
+  }
+
+  /** Waiting for a sleeping owner (no socket, no retry timer). */
+  get waitingForOwner(): boolean {
+    return this.leaveSleepWait !== null;
+  }
+
+  /** Its row says the owner may answer again (reachable, or a new owner):
+   *  a socket waiting for it dials now (passively); one sitting out a
+   *  backoff retries at once. */
+  retrySoon(): void {
+    if (this.closed || this.fatal || this.exited) return;
+    if (this.leaveSleepWait !== null) this.connect();
+    else this.recon.nudge(0);
+  }
+
   /**
-   * Keystrokes into a browser view whose socket is down: reconnect now, once,
-   * carrying wake intent. The keystrokes themselves are not queued. Native
-   * windows never need this: their daemon keeps the socket open and holds
-   * early typing itself while a paused owner wakes.
+   * Keystrokes into a browser view whose socket is down, or into any socket
+   * waiting for a sleeping owner: reconnect now, once, carrying wake intent.
+   * The keystrokes themselves are not queued. A native window's open socket
+   * never needs this: its daemon holds early typing itself while the owner
+   * wakes.
    */
   private wakeOnInput(): void {
-    if (!isBrowserGateway() || this.closed || this.fatal || this.exited || this.waking) return;
+    if (!(isBrowserGateway() || this.leaveSleepWait !== null) || this.closed || this.fatal || this.exited || this.waking) return;
     if (this.handlers.readOnly?.() ?? false) return;
     this.waking = true;
     this.asleep = false;
@@ -312,9 +357,10 @@ export class SessionSocket {
     if (this.handlers.readOnly?.()) return;
     if (this.ws?.readyState === WebSocket.OPEN && this.authenticatedSocket === this.ws) {
       this.ws.send(this.encoder.encode(data));
-    } else if (isBrowserGateway()) {
-      // A browser view's socket is down: the keystroke is dropped (never
-      // queued) and a wake-carrying reconnect starts; say so over the pane.
+    } else if (isBrowserGateway() || this.leaveSleepWait !== null) {
+      // A browser view's socket is down, or it waits for a sleeping owner:
+      // the keystroke is dropped (never queued) and a wake-carrying
+      // reconnect starts; say so over the pane.
       this.wakeOnInput();
       if (!this.closed && !this.fatal && !this.exited) this.handlers.onRefused?.("waking", null);
     }
@@ -383,6 +429,7 @@ export class SessionSocket {
   /** Permanently close the socket (no reconnect). */
   close(): void {
     this.closed = true;
+    this.stopSleepWait();
     this.recon.cancel();
     this.recon.clear();
     this.dropSocket();
