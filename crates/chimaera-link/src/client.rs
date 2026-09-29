@@ -131,11 +131,13 @@ impl Client {
         let refresh_token = old.refresh_token.clone();
         let client = self.clone();
         tokio::spawn(async move {
-            // One retry with the SAME token covers a request that never
-            // reached the account or a transient account failure. The account
-            // treats a later reuse of an already-rotated token as theft, so a
-            // fresh token is never invented here and a definitive refusal is
-            // never retried.
+            // The account rotates on receipt and treats a later reuse of the
+            // old token as theft (it revokes the device). Only a connection
+            // that was never established provably left the token unused, so
+            // that is the one case retried with the same token. A timeout, a
+            // reset after sending or a server error may follow a committed
+            // rotation: report it as transient and keep the session instead
+            // of presenting the token again at once.
             let mut retried = false;
             let response = loop {
                 let sent = client
@@ -148,15 +150,13 @@ impl Client {
                     })
                     .send()
                     .await;
-                let transient = match &sent {
-                    Ok(response) => refresh_retryable(response.status().as_u16()),
-                    Err(_) => true,
-                };
-                if !transient || retried {
-                    break sent?;
+                match sent {
+                    Err(error) if refresh_never_sent(&error) && !retried => {
+                        retried = true;
+                        tokio::time::sleep(REFRESH_RETRY_DELAY).await;
+                    }
+                    sent => break sent.context("credential refresh unavailable")?,
                 }
-                retried = true;
-                tokio::time::sleep(REFRESH_RETRY_DELAY).await;
             };
             if refresh_revoked(response.status().as_u16()) {
                 *guard = None;
@@ -164,7 +164,11 @@ impl Client {
                 *client.inner.keeper.write().await = None;
                 return Err(crate::AuthorizationRevoked.into());
             }
-            let tokens: Tokens = json_response(response).await?;
+            let status = response.status();
+            if !status.is_success() {
+                bail!("credential refresh unavailable ({})", status.as_u16());
+            }
+            let tokens: Tokens = json_response_body(response).await?;
             if tokens.token_type != "Bearer"
                 || tokens.access_token.is_empty()
                 || tokens.refresh_token.is_empty()
@@ -187,7 +191,7 @@ impl Client {
             .http
             .get(path(&self.inner.account, &["v1", "devices"]))
             .bearer_auth(token)
-            .timeout(REFRESH_TIMEOUT)
+            .timeout(ACCOUNT_CHECK_TIMEOUT)
             .send()
             .await?;
         match response.status().as_u16() {
@@ -1015,18 +1019,26 @@ async fn serve_connection(client: &Client, port: u16, alias: &str, daemon: &Daem
         }
     }
 }
-/// Bounds how long the token mutex is held: two attempts plus one pause.
-const REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
+/// Longer than an ordinary account request so a slow but successful rotation
+/// is still received; an abandoned one may already have consumed the token.
+/// The token mutex is held for at most one refused connect (the client's
+/// connect timeout), one pause and this.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(45);
 const REFRESH_RETRY_DELAY: Duration = Duration::from_millis(500);
-/// Timeouts and server failures say nothing about the token itself.
-fn refresh_retryable(status: u16) -> bool {
-    status == 408 || (500..600).contains(&status)
+/// Bounds the side-effect-free account check behind a keeper `401`.
+const ACCOUNT_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
+/// Whether a refresh request provably never reached the account: the
+/// connection itself (DNS, TCP or TLS) was never established. Anything later,
+/// including a timeout, may follow a committed rotation.
+fn refresh_never_sent(error: &reqwest::Error) -> bool {
+    error.is_connect()
 }
 /// The account answers revoked, expired and replayed refresh tokens with
-/// 400 `invalid_grant`; 401/403 mean the same. Only request timeouts and
-/// rate limiting are transient client errors.
+/// 400 `invalid_grant`; 401/403 mean the same. A missing route (404, e.g. a
+/// deploy in progress), a request timeout and rate limiting say nothing about
+/// the token, and neither does any 5xx.
 fn refresh_revoked(status: u16) -> bool {
-    (400..500).contains(&status) && !matches!(status, 408 | 429)
+    (400..500).contains(&status) && !matches!(status, 404 | 408 | 429)
 }
 fn backoff(attempt: u32) -> Duration {
     let ceiling = (500_u64.saturating_mul(1 << attempt.min(5))).min(10_000);
@@ -1064,4 +1076,67 @@ where
     )
     .await?
     .map_err(|_| anyhow!("websocket send failed"))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    async fn refresh_error(endpoint: &str) -> reqwest::Error {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = Client::new(endpoint, None).unwrap();
+        client
+            .inner
+            .http
+            .post(path(&client.inner.account, &["v1", "oauth", "refresh"]))
+            .timeout(Duration::from_millis(400))
+            .json(&RefreshRequest {
+                refresh_token: "fixture".into(),
+            })
+            .send()
+            .await
+            .unwrap_err()
+    }
+
+    /// The same-token retry rests on this: only a refused connection proves
+    /// the account never saw the one-use token.
+    #[tokio::test]
+    async fn only_a_connection_never_established_counts_as_unsent() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let refused = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        assert!(refresh_never_sent(&refresh_error(&refused).await));
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let dropped = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+        });
+        assert!(!refresh_never_sent(&refresh_error(&dropped).await));
+        server.await.unwrap();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let silent = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(socket);
+        });
+        let error = refresh_error(&silent).await;
+        assert!(error.is_timeout(), "{error}");
+        assert!(!refresh_never_sent(&error));
+        server.abort();
+    }
+
+    #[test]
+    fn only_token_answers_revoke() {
+        for status in [400, 401, 403, 410] {
+            assert!(refresh_revoked(status), "{status}");
+        }
+        for status in [200, 404, 408, 429, 500, 502, 503, 504] {
+            assert!(!refresh_revoked(status), "{status}");
+        }
+    }
 }

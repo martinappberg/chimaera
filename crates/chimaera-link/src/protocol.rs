@@ -387,7 +387,7 @@ mod tests {
         assert!(account(serde_json::json!({"subscription_status":"past_due"})).needs_payment());
         assert!(!account(serde_json::json!({"subscription_status":"active"})).needs_payment());
         let offered = account(serde_json::json!({"plans":[
-            {"plan":"pro","interval":"month","amount_cents":800,"currency":"USD"},
+            {"plan":"pro","interval":"month","amount_cents":12345,"currency":"USD"},
             {"plan":"team","interval":"month","amount_cents":1,"currency":"usd"},
             {"plan":"max","interval":"fortnight","amount_cents":1,"currency":"usd"},
             {"plan":"max","interval":"year","amount_cents":"lots","currency":"usd"},
@@ -399,7 +399,7 @@ mod tests {
             Some(vec![PlanPrice {
                 plan: Plan::Pro,
                 interval: BillingInterval::Month,
-                amount_cents: 800,
+                amount_cents: 12345,
                 currency: "usd".into(),
             }])
         );

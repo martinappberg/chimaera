@@ -470,6 +470,9 @@ async fn run_flight(
 /// Why a keeper-routed connect failed. Only `Transport` (the account or
 /// keeper could not be reached, or its route did not answer) may fall back to
 /// direct SSH; a keeper-side login failure must not trigger a second prompt.
+/// Once the keeper has accepted a reconnect it may be showing a password or
+/// Duo prompt, so every later failure of that flight is `Final`.
+#[derive(Debug)]
 enum LinkFailure {
     Transport(String),
     Final(String),
@@ -495,36 +498,25 @@ async fn run_link_flight(
     let state = app.state::<Shell>();
     let alias = host.alias.clone();
     let transport = |_| LinkFailure::Transport("Chimaera Pro is unreachable".into());
-    if state.pro.generation() != generation {
+    let current = || state.pro.generation() == generation;
+    if !current() {
         return Err("Account changed while connecting".into());
     }
-    if reconnect || host.status != chimaera_link::HostStatus::Connected {
+    // Only a reconnect the keeper refused may fall back to direct SSH. After
+    // it accepted, the keeper owns the login (and may be prompting), so an
+    // account/keeper hiccup or a slow daemon is waited out instead.
+    let accepted = reconnect || host.status != chimaera_link::HostStatus::Connected;
+    if accepted {
         client.reconnect_host(&host.id).await.map_err(transport)?;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
-        // The keeper may wait minutes for a password or Duo answer; poll its
-        // row with backoff instead of twice a second for the whole wait.
-        let mut pause = std::time::Duration::from_millis(500);
-        loop {
-            if state.pro.generation() != generation {
-                return Err("Account changed while connecting".into());
-            }
-            let hosts = client.hosts().await.map_err(transport)?;
-            host = hosts
-                .into_iter()
-                .find(|candidate| candidate.id == host.id)
-                .ok_or_else(|| LinkFailure::Transport("Host is no longer kept connected".into()))?;
-            if host.status == chimaera_link::HostStatus::Connected && host.daemon.is_some() {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(host
-                    .error
-                    .unwrap_or_else(|| "Pro connection timed out".into())
-                    .into());
-            }
-            tokio::time::sleep(pause).await;
-            pause = (pause * 2).min(std::time::Duration::from_secs(3));
-        }
+        let deadline = tokio::time::Instant::now() + KEEPER_LOGIN_WAIT;
+        host = await_keeper_login(
+            || client.hosts(),
+            &host.id,
+            current,
+            deadline,
+            KEEPER_POLL_FIRST,
+        )
+        .await?;
     }
     let existing = {
         let mut tunnels = state.tunnels.lock().await;
@@ -539,7 +531,13 @@ async fn run_link_flight(
     let new = if existing.is_none() {
         let link = chimaera_link::LinkTunnel::bind(client, host.id.clone())
             .await
-            .map_err(transport)?;
+            .map_err(|error| {
+                if accepted {
+                    LinkFailure::Final("Chimaera Pro is unreachable".into())
+                } else {
+                    transport(error)
+                }
+            })?;
         Some(Tunnel::link(&host, link).map_err(|error| error.to_string())?)
     } else {
         None
@@ -550,10 +548,21 @@ async fn run_link_flight(
                 .map(|tunnel| (tunnel.local_port, tunnel.manifest.token.clone()))
         })
         .ok_or("Host is unavailable")?;
-    if !chimaera_remote::http_alive_authed(port, &token).await {
-        return Err(LinkFailure::Transport(
-            "Pro connected, but the host daemon did not answer".into(),
-        ));
+    let probe_deadline = tokio::time::Instant::now() + KEEPER_PROBE_WAIT;
+    let mut pause = KEEPER_POLL_FIRST;
+    while !chimaera_remote::http_alive_authed(port, &token).await {
+        let unanswered = "Pro connected, but the host daemon did not answer";
+        if !accepted {
+            return Err(LinkFailure::Transport(unanswered.into()));
+        }
+        if !current() {
+            return Err("Account changed while connecting".into());
+        }
+        if tokio::time::Instant::now() >= probe_deadline {
+            return Err(unanswered.into());
+        }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(KEEPER_POLL_MAX);
     }
     authorize_scope_origin(app, Some(&alias), port).map_err(|error| error.to_string())?;
     let old = {
@@ -585,6 +594,58 @@ async fn run_link_flight(
         .ok_or("Host disconnected while connecting")?;
     reopen_windows(app, &alias, port, &token);
     Ok(reply)
+}
+
+/// A keeper login can wait minutes for a password or Duo answer.
+const KEEPER_LOGIN_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
+/// A freshly connected daemon can take a moment to answer through the route.
+const KEEPER_PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+const KEEPER_POLL_FIRST: std::time::Duration = std::time::Duration::from_millis(500);
+const KEEPER_POLL_MAX: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Waits for the keeper's row of a host whose reconnect it accepted. Polls
+/// with backoff instead of twice a second for the whole wait. A failed read
+/// says nothing about the login the keeper holds, so it never ends the wait
+/// early and never yields `Transport`: a direct SSH attempt now would raise a
+/// second password/Duo prompt.
+async fn await_keeper_login<F, Fut>(
+    mut read: F,
+    id: &str,
+    current: impl Fn() -> bool,
+    deadline: tokio::time::Instant,
+    first_pause: std::time::Duration,
+) -> Result<chimaera_link::Host, LinkFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<chimaera_link::Host>>>,
+{
+    let mut pause = first_pause;
+    let mut last_error = None;
+    loop {
+        if !current() {
+            return Err("Account changed while connecting".into());
+        }
+        match read().await {
+            Ok(hosts) => {
+                let host = hosts
+                    .into_iter()
+                    .find(|candidate| candidate.id == id)
+                    .ok_or("Host is no longer kept connected")?;
+                if host.status == chimaera_link::HostStatus::Connected && host.daemon.is_some() {
+                    return Ok(host);
+                }
+                last_error = host.error;
+            }
+            Err(error) => tracing::debug!("Pro connection status unavailable: {error:#}"),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(last_error
+                .unwrap_or_else(|| "Pro connection timed out".into())
+                .into());
+        }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(KEEPER_POLL_MAX);
+    }
 }
 
 pub(super) fn keeper_state(host: &chimaera_link::Host, tunnel: Option<&Tunnel>) -> HostState {
@@ -721,8 +782,78 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use super::{claim_connect_flight, connected_status, reusable_tunnel_port};
+    use super::{
+        await_keeper_login, claim_connect_flight, connected_status, reusable_tunnel_port,
+        LinkFailure,
+    };
     use crate::shell::lock;
+    use chimaera_link::{Daemon, Host, HostKind, HostStatus};
+    use std::time::Duration;
+
+    fn row(status: HostStatus, daemon: bool) -> Host {
+        Host {
+            id: "h-1".into(),
+            alias: "Sherlock".into(),
+            kind: HostKind::Ssh,
+            status,
+            daemon: daemon.then(|| Daemon {
+                token: "t".into(),
+                build: "b".into(),
+                sessions: 0,
+            }),
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_reads_during_an_accepted_login_are_waited_out() {
+        let mut script = vec![
+            Err(anyhow::anyhow!("account unavailable")),
+            Ok(vec![row(HostStatus::Prompting, false)]),
+            Err(anyhow::anyhow!("keeper unavailable")),
+            Ok(vec![row(HostStatus::Connected, true)]),
+        ]
+        .into_iter();
+        let host = await_keeper_login(
+            || std::future::ready(script.next().expect("polled past the script")),
+            "h-1",
+            || true,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("the login completes");
+        assert_eq!(host.status, HostStatus::Connected);
+    }
+
+    #[tokio::test]
+    async fn an_accepted_login_never_falls_back_to_direct_ssh() {
+        let reads = std::cell::Cell::new(0);
+        let failure = await_keeper_login(
+            || {
+                reads.set(reads.get() + 1);
+                std::future::ready(Err(anyhow::anyhow!("account unavailable")))
+            },
+            "h-1",
+            || true,
+            tokio::time::Instant::now() + Duration::from_millis(40),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("the wait ends at its deadline");
+        assert!(matches!(failure, LinkFailure::Final(_)), "{failure:?}");
+        assert!(reads.get() > 1, "failed reads are retried");
+        let gone = await_keeper_login(
+            || std::future::ready(Ok(Vec::new())),
+            "h-1",
+            || true,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("the row is gone");
+        assert!(matches!(gone, LinkFailure::Final(_)), "{gone:?}");
+    }
 
     #[test]
     fn tunnel_port_is_reused_only_for_the_same_source_build() {

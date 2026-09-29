@@ -38,7 +38,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `shell.rs` | Module root: app-global `Shell` state, `WindowScope`, `lock`, and the Tauri `Builder` assembly (`run`). Closing the last non-Home window opens local Home; closing the last local Home exits, while explicit Quit preserves restore state. Re-exports `open_ui_window`. |
 | `shell/commands.rs` | The IPC command surface (`#[tauri::command]` fns wired into `generate_handler!`) — thin delegators. |
 | `shell/connect.rs` | The `connect` flight state machine (one coalesced ssh attempt per host; a flight for a wedge suspect — or with no live tunnel — first clears a wedged ControlMaster, before the old tunnel's teardown — both masters for an alias routed to its daemon's login node) + the host-row wire vocabulary (`HostState` — incl. `node`, the login node a pool alias is pinned to — /`HostStatus`, and the `routing` progress phase) + `with_hosts`, the app's single path to hosts.json (serialized, off the reactor via `spawn_blocking`; the CLI writes it directly in crates/chimaera/src/connect.rs). |
-| `shell/cloud.rs` | Passive cloud/provider readiness, explicit bounded connection/retry actions, shared-catalog authentication URL validation, memory-only Claude authorization-code submission and explicitly acknowledged cloud-provider disconnection under the account-operation fence, and exact terminal focus only for legacy provider adapters. Account credentials remain in Rust. Polls never wake a worker. `pro_cloud_status` passes through optional account-confirmed preparing phases (`keeper`, `worker`, `connecting`); these are not daemon/provider readiness. |
+| `shell/cloud.rs` | Passive cloud/provider readiness, explicit bounded connection/retry actions, shared-catalog authentication URL validation, memory-only Claude authorization-code submission and explicitly acknowledged cloud-provider disconnection under the account-operation fence, and exact terminal focus only for legacy provider adapters. Account credentials remain in Rust. Polls never wake a worker. A wake wait uses the keeper-fed worker row until it fails a live check, then reads the account's host list first (the cached row is the fallback when that read fails), so a stale row with the event stream down cannot time out every wake. `pro_cloud_status` passes through optional account-confirmed preparing phases (`keeper`, `worker`, `connecting`); these are not daemon/provider readiness. |
 | `shell/power.rs` | System sleep/wake notifications (macOS IOKit, Linux logind delay inhibitor, Windows power callbacks). `/pro/sleep` carries `{deadline_ms}`: the platform's real budget (25 s, logind's `InhibitDelayMaxUSec`, 1.2 s) minus a margin. Reports AC power; the daemon applies the hand-back gate. Never waits for Pro startup. |
 | `shell/pro.rs` | Optional account runtime: endpoint in app.json, OS-keychain tokens, PKCE loopback sign-in, bounded keeper cache/events, reverse local-daemon sharing, daemon setup (`configure_daemon`, `DaemonStamp`), sign-out, the fixed status codes (`code`), and account IPC. No endpoint means no keychain access or network work. |
 | `shell/pro/billing.rs` | Native-owned checkout/portal attempts, exact provider-origin validation, cancellation, and authenticated plan confirmation independent of page visibility. |
@@ -48,7 +48,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `shell/pro/machine.rs` | Friendly device label from macOS ComputerName; never an identity or network-hostname grouping key. |
 | `shell/pro/store.rs` | Credential namespace keys: isolated previews bind session entries to their canonical config directory; legacy unbound entries are never imported or deleted. |
 | `shell/pro/recovery.rs` | Generation-fenced startup candidate retention and coalesced retry ownership; account probe failures do not force new authentication. |
-| `shell/pro/credentials.rs` | Coalesced, generation-fenced credential-store writes with finite retries; persistence failures retain valid memory sessions, and only true revocation (the link's `AuthorizationRevoked`: any refresh 4xx except 408/429) signs out. |
+| `shell/pro/credentials.rs` | Coalesced, generation-fenced credential-store writes with finite retries; persistence failures retain valid memory sessions, and only true revocation (the link's `AuthorizationRevoked`: any refresh 4xx except 404/408/429) signs out. |
 | `shell/pro/auth.rs` | In-memory sign-in attempt lifecycle, cancellation/retry fences and bounded loopback callback parsing. |
 | `assets/sign-in.html` | Credential-free browser return page; success is sent only after native account activation. |
 | `shell/tunnel.rs` | App-only SSH / keeper transport wrapper. Both expose one loopback daemon endpoint; keep chimaera-link out of the daemon dependency graph. |
@@ -127,13 +127,19 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   `service_unsupported`); additive `connection_warning` is an informational
   code (`connection_preparing`, `connection_retrying`, `account_unreachable`)
   cleared by a live keeper host event; additive `payment_due` and `plans` come
-  from the account's optional `/v1/me` fields. IPC errors are fixed sentences.
+  from the account's optional `/v1/me` fields. `plan` is only `none`, `pro`,
+  `max` or null: a plan this client cannot name (`Plan::Unknown`) reports null,
+  the neutral state, and checkout accepts only Pro or Max. IPC errors are fixed sentences.
   **SSH never hangs on Pro**: routing reads `client_now()` (no installed client
   means ordinary SSH now); a kept SSH host waits at most `KEPT_STARTUP_WAIT`
   (10 s) so launch restore still goes through the keeper without a new login;
   only device aliases wait for readiness unbounded. A kept SSH
   host whose keeper route fails in transit (`LinkFailure::Transport`) connects
   directly; keeper-side login failures stay errors so nobody is prompted twice.
+  The fallback exists only until the keeper accepts `reconnect_host`: from then
+  it may be showing a password/Duo prompt, so failed host reads are waited out
+  (`KEEPER_LOGIN_WAIT`, 180 s) and a daemon that does not answer yet is
+  re-probed (`KEEPER_PROBE_WAIT`, 30 s); every later failure is `Final`.
 - **Daemon setup is off the activation path.** Activation installs the account,
   keeper events and the reconcile loop and returns (the browser is answered
   then); the loop's first pass configures the daemon. `DaemonStamp` includes the
