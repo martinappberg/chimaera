@@ -4,9 +4,13 @@
    * and for writes that must show exactly what they write (`detail`, a
    * scrollable verbatim block that widens the dialog).
    * Scrim + dialog per the AskpassModal/FolderPicker pattern; focus lands on
-   * Cancel (the safe default), Escape cancels, Enter activates the focused
-   * button. A failure keeps the dialog open with an inline error, so the
-   * caller passes `error` instead of closing.
+   * Cancel (the safe default) unless `enterConfirms`, Escape cancels, Enter
+   * activates the focused button. A failure keeps the dialog open with an
+   * inline error, so the caller passes `error` instead of closing.
+   *
+   * Use this (or ask inline), never `window.confirm`/`alert`/`prompt`: the
+   * native app's web view doesn't implement them (wry leaves WKWebView's
+   * JavaScript panels unhandled), so `confirm()` answers false unseen.
   */
   import { focusOnMount } from "./focusOnMount";
   import { modalFocus } from "./modalFocus";
@@ -21,6 +25,9 @@
     error?: string | null;
     /** Verbatim text shown in a scrollable monospace block. */
     detail?: string | null;
+    /** Initial focus on the confirm button, so Enter confirms — the default
+     *  button of the `window.confirm` this replaces. Tab still reaches cancel. */
+    enterConfirms?: boolean;
     onConfirm(): void;
     onCancel(): void;
   }
@@ -32,6 +39,7 @@
     danger = false,
     error = null,
     detail = null,
+    enterConfirms = false,
     onConfirm,
     onCancel,
   }: Props = $props();
@@ -45,6 +53,10 @@
     if (e.key === "Escape") {
       e.stopPropagation();
       onCancel();
+    } else if (e.key === "Enter" && e.repeat) {
+      // A held Enter that opened this dialog (a keyboard-activated trigger)
+      // auto-repeats into it: never let the repeat answer for the user.
+      e.preventDefault();
     }
   }}
 >
@@ -68,8 +80,10 @@
       <div class="error">{error}</div>
     {/if}
     <div class="actions">
-      <button class="opt quiet" use:focusOnMount onclick={onCancel}>cancel</button>
-      <button class="opt confirm" class:danger onclick={onConfirm}>{confirmLabel}</button>
+      <button class="opt quiet" use:focusOnMount={!enterConfirms} onclick={onCancel}>cancel</button>
+      <button class="opt confirm" class:danger use:focusOnMount={enterConfirms} onclick={onConfirm}
+        >{confirmLabel}</button
+      >
     </div>
   </div>
 </div>

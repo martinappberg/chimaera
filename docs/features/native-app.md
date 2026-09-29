@@ -193,11 +193,12 @@ app-build` (never the root `cargo`).
 - **Menu bar** (`menu.rs`): the macOS **Chimaera** submenu (About · **Settings…** ⌘, · Services ·
   Hide/Hide Others/Show All · Quit), **File** (New Window ⇧⌘N · New Terminal ⌘T · New Agent ⇧⌘T ·
   Close View ⌘W · Close Window; +Settings…/Quit on Windows/Linux, which have no app submenu),
-  **Edit**, **View** (fullscreen), **Window** (Minimize · Zoom · on macOS Bring All to Front, and —
+  **Edit**, **View** (Reload Window ⌘R — F5 on Windows/Linux · Toggle Full Screen), **Window** (Minimize · Zoom · on macOS Bring All to Front, and —
   registered as the app's Windows menu — AppKit's live list of every window by title, so any one,
   minimized or not, is a click away), and **Help** (About, non-macOS only). Items the page
   owns — `close-view`/`new-terminal`/`new-agent`/`settings` — are `emit_to`'d as a `menu` event to the
-  focused window (`onMenu` in `App.svelte`, via `native.ts`); New Window is handled shell-side.
+  focused window (`onMenu` in `App.svelte`, via `native.ts`); New Window is handled shell-side, and
+  Reload Window evaluates a fixed script in the focused window instead (see below).
   **Settings** is daemon-scoped: it opens the settings surface for the focused window's daemon (a
   remote window → the remote daemon's settings), same as the in-UI gear.
 - **System tray / menu-bar status item** (`tray.rs`, `tray-icon` feature): a persistent icon whose
@@ -209,6 +210,36 @@ app-build` (never the root `cargo`).
   On macOS the menu also carries the **Keep Awake** check item (see Caffeinate). The menu is rebuilt
   via `tray::rebuild` on the events that change it (a window opens/closes/renames, caffeinate flips).
   Enabling the feature pulls **libayatana-appindicator** into the Linux bundle (a packaging dependency).
+
+## Reload Window
+
+- **What & when.** Reloads the focused window's page, keeping its layout: for a window that has gone
+  stale (Home not listing a workspace another client created) or after rebuilding the UI against a
+  debug daemon (which reads `web-ui/dist` from disk), without quitting the app.
+- **How it's used.** View › **Reload Window**, ⌘R on macOS and **F5** on Windows/Linux: Ctrl+R is the
+  shell's reverse history search there (the terminal owns bare Ctrl), and Ctrl+Shift+R is the pinned
+  reference chord. The browser UI offers the same action as the Quick Open command "Reload Window"
+  and leaves ⌘R/F5 to the browser. Settings › Keyboard lists the chord under "chimaera app menu".
+- **Where it lives.** `menu.rs` (`reload-window`, `RELOAD_WINDOW_CHORD`, `RELOAD_WINDOW_JS`);
+  `web-ui/src/lib/layout/windowReload.ts` (the `window.__chimaeraReloadWindow` hook, installed by
+  `main.ts` before App mounts), `layout/assetTransition.ts` (`requestWindowReload` /
+  `cancelWindowReload`, reason `manual`), `AssetTransitionNotice.svelte`, the Quick Open command in
+  `App.svelte`, and `APP_MENU.reloadWindow` in `shared/keys.ts`. No IPC command: the shell evaluates
+  its script through the webview and the command lockstep is untouched.
+- **Key behaviors.** The reload rides the asset-transition gate (see
+  [files-and-previews.md](files-and-previews.md#rendered-previews)), never a native webview reload:
+  WKWebView/wry skip the beforeunload prompt, so unsaved file edits and memory-only chat drafts
+  **hold** it behind a notice ("the reload waits for unsaved work") offering *reload anyway* and
+  *cancel*; it proceeds on its own once the work is saved. The window's id survives in
+  sessionStorage (`chimaera.win`, `layout/viewState.ts`), so its view-state restores the same tabs
+  and focus. A pending build/connection transition keeps its
+  reason and target. Asking again while a reload is requested is a no-op (a held key must not
+  re-issue a navigation in flight); the plain path ignores repeats within a second. The shell
+  script calls the hook when it exists; a page with no interface mounted (a failed load, a UI
+  build half-written) reloads plainly, and a rendered interface without the hook (an older daemon's
+  UI) is left alone because it may hold edits it cannot report. The Windows WSL wizard window is
+  skipped. On Windows the page also claims F5 itself, because WebView2's own browser accelerator
+  keys (on in wry) would otherwise reload ungated.
 
 ## Caffeinate
 
@@ -234,6 +265,8 @@ app-build` (never the root `cargo`).
 - **The unsaved-edits guard on close and quit** has unit-tested decisions (the shell's `Guard`,
   the page's dialog controller) and CI's bundle builds, but has not yet been hand-driven in the
   app; the macOS `applicationShouldTerminate:` hook (Dock › Quit, logout) is compile-checked only.
+- **Reload Window** was hand-driven on macOS (⌘R, the held and cancelled notice, a page that never
+  booted); its F5 path on Linux (GTK accelerator) and Windows (WebView2) is compile-checked only.
 
 ---
 
@@ -258,6 +291,20 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
   itself and its teardown UX are additions that can be improved.
 - **Do not change:** the disconnect vs end-sessions vs shut-down distinction; detached daemon
   outlives the app; human host labels.
+
+### Reload Window — why it exists
+_Captured 2026-09-29 (from the maintainer)._
+
+- **Problem it solves.** A window whose page went stale (Home not picking up a workspace created
+  via the API) or that needed the rebuilt UI from a debug daemon could only be fixed by quitting
+  and relaunching the app. Mostly a developer/debug convenience rather than an everyday user
+  feature.
+- **How settled it is.** **Core:** a reload never drops unsaved edits or unsent drafts (it goes
+  through the safety gate), and the layout comes back. **Additions** (free to improve): the menu
+  placement, the chords and the notice wording.
+- **Deliberate / non-obvious.** F5 instead of Ctrl+R off macOS was chosen so terminals keep Ctrl+R
+  (reverse history search) — today's best pick, not a contract.
+- **Do not change (or: open to change):** open to change, apart from the core safety promise.
 
 ### Dock activation and closing the last window
 _Captured 2026-09-25 (from the maintainer)._
