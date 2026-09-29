@@ -413,7 +413,8 @@ is the first such surface today; the platform generalizes the idea.
 
 | Surface | Shape | Core draws it as |
 |---|---|---|
-| `knowledge/1` | today's snapshot, now a documented schema | the Knowledge view, "Where things stand" |
+| `knowledge/1` | today's snapshot, now a documented schema: every entry has a unique `key` and a `span {path, line, end_line}`; the snapshot carries `labels` (every word core shows) and `id_shapes` ([coordination](#coordination-the-knowledge-redesign-2026-09-29)) | the Knowledge view, "Where things stand", id chips |
+| `references/1` | id shapes and the ids they name: `{shapes: [{kind, pattern}], ids: [{id, key, kind, title, span?, view?}]}`, at most 5,000 ids | chips for those ids in chats, previews and the Timeline, a hover preview from `span`, a click that opens `span` or the plugin's `view` |
 | `diagnostics/1` | per file: `{severity, line, column?, end_line?, message, context?, source}`, at most 200 | editor marks, the problems list, an **Ask agent** action |
 | `output/1` | per source file: the output file, its state (`building`, `ok`, `errors`, `failed`), a label, when it finished, and the pages that changed since the previous output | the file view's result pane and status chip; a "3 pages changed" chip on the Timeline turn that wrote the source |
 | `sourcemap/1` | per output: source line ↔ output page and box, at most 4 MiB | jumps both ways, selections as source references, change marks |
@@ -426,7 +427,16 @@ is the first such surface today; the platform generalizes the idea.
   diagnostics, and **Ask agent** types one precise reference.
 - `knowledge/1` loses its Mycelium-shaped assumptions in core
   ([generalizing core](#generalizing-core-what-names-a-plugin-today)): the snapshot
-  itself says which guidance files to show and where each id lives.
+  itself says where each entry lives (`span`), what core calls things (`labels`)
+  and which ids it answers for (`id_shapes`). It still arrives through the
+  `knowledge` export, unchanged in 0.2; `publish("knowledge/1", …)` is an
+  optional push a provider may use later.
+- **Ids become links through one client registry.** Core's chip layer asks
+  reference sources, never a plugin: the Knowledge snapshot (its `id_shapes`
+  and keys) is the first source, and any plugin that publishes `references/1`
+  is another (a LaTeX plugin's `\label` and `\cite` keys, an issue tracker's
+  numbers). A token becomes a chip only if a source has that exact id;
+  a plugin switched off takes its chips with it.
 
 ## 5. Files: kinds, actions and events
 
@@ -717,12 +727,13 @@ world chimaera-plugin {                    // 0.2
 
 | Where | What | Replaced by |
 |---|---|---|
-| `knowledge.rs` `ids_of` | maps decisions and learnings to `.living/decisions.md` and `.living/learnings.md` | the snapshot carries each id's file |
-| `knowledge.rs` guidance | lists `MYCELIUM.md` and looks for `MYCELIUM:BEGIN` | the snapshot names its guidance files |
+| `knowledge.rs` `ids_of` | maps decisions and learnings to `.living/decisions.md` and `.living/learnings.md` | each entry's `key` and `span.path` (the Knowledge redesign does it) |
+| `knowledge.rs` guidance | lists `MYCELIUM.md` and looks for `MYCELIUM:BEGIN` | Guidance & memory moves to the dashboard (the Knowledge redesign); a provider's own guidance file is named in its snapshot |
 | `knowledge.rs` `empty_body` | Mycelium's keys (`topics`, `decisions`, …) | `knowledge/1`'s documented empty shape |
 | `web-ui/…/workspace/knowledge.ts` | the wire types are Mycelium's schema | `knowledge/1`'s types |
-| `web-ui/…/plugins/store.ts` | `myceliumPlugin`, `openAttachSheet("mycelium")` | the provider, whichever plugin it is |
+| `web-ui/…/plugins/store.ts` | `myceliumPlugin`, `openAttachSheet("mycelium")` | the active plugin with `provides.knowledge`, whichever it is (the Knowledge redesign does it) |
 | `AttachSheet.svelte` | Mycelium-specific strings | the manifest's `setup` and `recommends` text |
+| Knowledge's words | section names and status words written in core | `knowledge/1`'s `labels` |
 | `installCopy.ts` | hard-coded tile letters | derived from the name |
 | `MastermindDock.svelte`, `DashboardView.svelte` | the `agent-notes` id | a panel slot and a surface |
 | `agent_probe.rs` hook trust | uses only the first codex agent plugin | every one the manifest names |
@@ -815,6 +826,9 @@ The first privileged plugins, in their own repositories
 
 Agent notes and Mycelium on 0.2 with the pieces in [section 12](#12-todays-plugins-inherit-it);
 the [generalizing core](#generalizing-core-what-names-a-plugin-today) table emptied.
+The Knowledge rows empty through the redesign's fields (`key`, `span`, `labels`,
+`id_shapes`), not a rewrite; P10 then adds `references/1` as the registry's
+second source ([coordination](#coordination-the-knowledge-redesign-2026-09-29)).
 
 | Phase | What | Size |
 |---|---|---|
@@ -826,6 +840,60 @@ the [generalizing core](#generalizing-core-what-names-a-plugin-today) table empt
 
 P6 first, because it protects users today. P7 and P8 are independent after P6 and can
 run in parallel. P9 needs both. P10 needs P7.
+
+## Coordination: the Knowledge redesign (2026-09-29)
+
+The Knowledge redesign (branch `claude/knowledge-redesign`,
+`docs/knowledge-redesign-plan.md`) and this platform meet in four places. What
+the redesign should build so that the two fit, decided here for both:
+
+1. **Knowledge is the `knowledge/1` surface: core draws it, the plugin owns its
+   data and words.** Not a `ui/1` screen (a reader, virtualized lists and
+   previews inside chats need core's components). Core never branches on a
+   plugin's id, its file names or its status words: which plugin is the
+   provider is "the active plugin with `provides.knowledge`"; every visible
+   word (section names, status vocabulary, the legend, the source chip) comes
+   from `labels`; tones use the `ui/1` set (`neutral`, `accent`, `good`, `warn`,
+   `bad`). The lists stay the documented kinds (findings, decisions,
+   learnings, conventions, to-dos, questions, sessions, asks, tidy, where we
+   left off): a provider fills the ones it has. Status is shown as written
+   (`stated`); rank and tone only when the plugin's `labels` give them.
+2. **Transport stays the `knowledge` export**, unchanged in WIT 0.2 (stamp in,
+   snapshot out, 30 s, 4 MiB). A provider may stay on `api = "0.1"`. One that
+   moves to `api = "0.2"` must declare `[access] files = "read"` (0.2 grants
+   nothing unsaid), which changes its capability digest: its lock bump then
+   waits for a maintainer, who sets `caps` from `chimaera plugin caps`.
+3. **Spans are one shape everywhere:** `{path, line, end_line}`,
+   workspace-relative, 1-based, inclusive (as `diagnostics/1`). Core reads the
+   slice through the ordinary file routes; bodies never ride a surface.
+4. **Ids to chips go through a client registry** (`shared/references.ts`): a
+   source is `{shapes, lookup(id) → targets}`, a target `{key, kind, title,
+   span?, open}`. The Knowledge snapshot registers first (its `id_shapes` and
+   keys; a click opens Knowledge at the key); `references/1` publishers
+   register later (P10) with no change to the chip layer. Chat, markdown
+   previews and the Timeline ask the registry, never the Knowledge store.
+
+Shared pieces:
+
+- **Ask an agent** is one function (`shared/askAgent.ts`, `{text, file?,
+  line?, end_line?}` → a draft in a chat's composer). The redesign's Tidy up
+  and `ui/1`'s built-in `ask-agent` action both call it.
+- **Rows, badges, key–value, callouts and file cards** the redesign builds go
+  in `web-ui/src/lib/shared/`, with `ui/1`'s prop names (`title`, `subtitle`,
+  `badges`, `tone`, `text`), so the `ui/1` renderer draws with them too.
+- **The dashboard**: core cards first (Knowledge's card from `knowledge/1`,
+  Guidance & memory), then active plugins' `panel` views
+  (`dashboard/PluginPanels.svelte`, one insert in `DashboardView.svelte`).
+
+Who edits what until both land: the redesign owns
+`web-ui/src/lib/knowledge/*`, `web-ui/src/lib/workspace/knowledge.ts`,
+`crates/chimaera-server/src/knowledge.rs`, `AttachSheet.svelte` and the
+attach-sheet and `myceliumPlugin` part of `plugins/store.ts`; this platform
+does not touch them. This platform adds to `plugins/store.ts` (trust fields,
+`platform` on `WorkspacePlugin`), `net/events.ts` (platform frames),
+`App.svelte` (their handler), the layout (a plugin tab), `FileView`,
+`PluginCard` and Settings, and one insert in `DashboardView.svelte`. Whichever
+lands second merges the other in; the overlaps are additive.
 
 ## 16. Risks
 
