@@ -653,6 +653,24 @@ async fn laptop_first_sign_out_and_unreachable_account_keep_local_work_running()
     .await;
     assert_eq!(status, StatusCode::OK, "{shell}");
     let shell = shell["id"].as_str().unwrap().to_owned();
+    // The route starts the user's own login shell, whose startup time is not
+    // this test's business; typed input goes to a hermetic plain shell.
+    let typed = state
+        .sessions
+        .spawn(chimaera_pty::SpawnOpts {
+            cwd: project.root.clone(),
+            name: None,
+            cols: 80,
+            rows: 24,
+            command: Some(vec!["/bin/sh".into()]),
+            id: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            scrollback: None,
+        })
+        .unwrap()
+        .id;
+    lock(&state.session_workspaces).insert(typed.clone(), project.id.clone());
     let captured = project.root.join("chat-input.txt");
     let fake = write_fake_claude("laptop-first-agent");
     let script = std::fs::read_to_string(&fake).unwrap();
@@ -688,10 +706,11 @@ async fn laptop_first_sign_out_and_unreachable_account_keep_local_work_running()
         StatusCode::NO_CONTENT
     );
     assert!(state.sessions.get(&shell).is_some_and(|s| s.alive));
+    assert!(state.sessions.get(&typed).is_some_and(|s| s.alive));
     assert!(state.chat.get("s-laptop-chat").is_some_and(|s| s.alive));
 
     let (mut terminal, _) =
-        tokio_tungstenite::connect_async(format!("ws://{address}/ws/sessions/{shell}"))
+        tokio_tungstenite::connect_async(format!("ws://{address}/ws/sessions/{typed}"))
             .await
             .unwrap();
     terminal
@@ -723,11 +742,7 @@ async fn laptop_first_sign_out_and_unreachable_account_keep_local_work_running()
     ))
     .await
     .unwrap();
-    // The ordinary route starts the user's login shell, whose startup files
-    // can be slow on a loaded machine; the input is buffered meanwhile.
-    // Some interactive shell setups discard typeahead while they start, so
-    // the idempotent command is repeated until it lands.
-    tokio::time::timeout(std::time::Duration::from_secs(45), async {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
         let mut tick = 0u32;
         while !project.root.join("LOCAL_AFTER_SIGN_OUT").exists()
             || !std::fs::read_to_string(&captured)
@@ -752,7 +767,7 @@ async fn laptop_first_sign_out_and_unreachable_account_keep_local_work_running()
             "local input must still be accepted: terminal={} chat={:?} shell_alive={} chat_alive={}",
             project.root.join("LOCAL_AFTER_SIGN_OUT").exists(),
             std::fs::read_to_string(&captured).ok(),
-            state.sessions.get(&shell).is_some_and(|s| s.alive),
+            state.sessions.get(&typed).is_some_and(|s| s.alive),
             state.chat.get("s-laptop-chat").is_some_and(|s| s.alive),
         )
     });
@@ -764,6 +779,7 @@ async fn laptop_first_sign_out_and_unreachable_account_keep_local_work_running()
 
     state.chat.kill("s-laptop-chat");
     let _ = state.sessions.kill(&shell);
+    let _ = state.sessions.kill(&typed);
     server.abort();
     let _ = server.await;
     state
