@@ -1486,6 +1486,8 @@ mod tests {
             interval: chimaera_link::BillingInterval::Month,
             amount_cents: 1,
             currency: "usd".into(),
+            cloud_time_multiple: Some(2),
+            storage_multiple: None,
         }]);
         *lock(&pro.account) = Some(account);
         let status = pro.status_snapshot();
@@ -1496,6 +1498,9 @@ mod tests {
         assert_eq!(wire["connection_warning"], code::CONNECTION_RETRYING);
         assert_eq!(wire["payment_due"], true);
         assert_eq!(wire["plans"][0]["amount_cents"], 1);
+        // The plan's multiples ride through unchanged; an unstated one has no key.
+        assert_eq!(wire["plans"][0]["cloud_time_multiple"], 2);
+        assert!(wire["plans"][0].get("storage_multiple").is_none());
         // Older services omit the additions; the fields stay present and empty.
         *lock(&pro.account) = Some(fixture_account());
         *lock(&pro.warning) = None;
@@ -1529,6 +1534,8 @@ mod tests {
             interval,
             amount_cents,
             currency: "usd".into(),
+            cloud_time_multiple: None,
+            storage_multiple: None,
         }
     }
 
@@ -1544,7 +1551,8 @@ mod tests {
         let (endpoint, server) = catalog::stub_service(vec![(
             "200 OK",
             r#"{"plans":[{"plan":"pro","interval":"month","amount_cents":111,"currency":"usd"},
-                {"plan":"max","interval":"year","amount_cents":222,"currency":"usd"}]}"#,
+                {"plan":"max","interval":"year","amount_cents":222,"currency":"usd",
+                 "cloud_time_multiple":5,"storage_multiple":3}]}"#,
         )])
         .await;
         let pro = Pro::new(Some(endpoint));
@@ -1555,13 +1563,18 @@ mod tests {
             pro.refresh_plans().await,
             "the prices the page shows changed"
         );
-        let catalog_plans = vec![offer(Tier::Pro, Month, 111), offer(Tier::Max, Year, 222)];
+        let mut stated = offer(Tier::Max, Year, 222);
+        stated.cloud_time_multiple = Some(5);
+        stated.storage_multiple = Some(3);
+        let catalog_plans = vec![offer(Tier::Pro, Month, 111), stated];
         let status = pro.status_snapshot();
         assert!(!status.signed_in && status.error.is_none());
         assert!(status.connection_warning.is_none());
         assert_eq!(status.plans, Some(catalog_plans.clone()));
         let wire = serde_json::to_value(&status).unwrap();
         assert_eq!(wire["plans"][0]["amount_cents"], 111);
+        assert_eq!(wire["plans"][1]["cloud_time_multiple"], 5);
+        assert_eq!(wire["plans"][1]["storage_multiple"], 3);
         assert!(!pro.wants_public_plans(), "fresh for five minutes");
         // A signed-in answer without a list keeps showing the catalog's.
         *lock(&pro.account) = Some(fixture_account());
@@ -1732,7 +1745,7 @@ mod tests {
                     .unwrap()
                     .starts_with("GET /v1/me ");
                 let (status, body) = if me {
-                    ("200 OK", serde_json::json!({"account_id":"fixture","email":"fixture@example.invalid","plan":"pro","device_id":"fixture-device","protocol":0,"keeper_url":keeper,"limits":{"cloud_hours":100,"storage_bytes":20000000000u64},"usage":{"cloud_hours":0,"storage_bytes":0},"hours_exhausted":false}).to_string())
+                    ("200 OK", serde_json::json!({"account_id":"fixture","email":"fixture@example.invalid","plan":"pro","device_id":"fixture-device","protocol":0,"keeper_url":keeper,"limits":{"cloud_hours":40,"storage_bytes":4000000000u64},"usage":{"cloud_hours":0,"storage_bytes":0},"hours_exhausted":false}).to_string())
                 } else {
                     ("503 Service Unavailable", "{}".into())
                 };

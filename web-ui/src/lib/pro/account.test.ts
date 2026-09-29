@@ -42,12 +42,12 @@ describe("Pro page panel", () => {
 });
 
 describe("Max offer", () => {
-  const limits = { cloud_hours: 100, storage_bytes: 1000 };
+  const limits = { cloud_hours: 40, storage_bytes: 1000 };
   it("appears only near or at a limit", () => {
     expect(nearLimit(null)).toBe(false);
-    expect(nearLimit({ usage: { cloud_hours: 10, storage_bytes: 100 }, limits })).toBe(false);
+    expect(nearLimit({ usage: { cloud_hours: 4, storage_bytes: 100 }, limits })).toBe(false);
     expect(nearLimit({ usage: null, limits })).toBe(false);
-    expect(nearLimit({ usage: { cloud_hours: 80, storage_bytes: 0 }, limits })).toBe(true);
+    expect(nearLimit({ usage: { cloud_hours: 32, storage_bytes: 0 }, limits })).toBe(true);
     expect(nearLimit({ usage: { cloud_hours: 0, storage_bytes: 950 }, limits })).toBe(true);
     expect(nearLimit({ usage: { cloud_hours: 0, storage_bytes: 0 }, limits, hours_exhausted: true })).toBe(true);
   });

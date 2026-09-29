@@ -62,10 +62,16 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    credential), read in the background at app start and again after a sign-out
    or when its five-minute answer has gone stale; a signed-in account's own list
    takes precedence, and an older service without the route just shows no
-   prices. The Max card says how many times more it costs than Pro
-   (`planMultiple`, month against month, year against year), computed from the
-   same amounts. No price is built into the app. **See plans** jumps directly
-   to the comparison.
+   prices. The Max card's last line says how many times more cloud time and
+   storage it gives than Pro, as whole numbers from the service (optional
+   `cloud_time_multiple` and `storage_multiple` on the plan's entries, the same
+   on both intervals, so the monthly/yearly toggle never changes it: "5× the
+   cloud time and storage of Pro" when the two are equal, each number named
+   when they differ, only the one the service states otherwise;
+   `maxCapacityNote`). Pro's card and an older service without the multiples
+   keep the generic line under each plan. No absolute allowance is shown or
+   built into the app, and no price is either. **See plans** jumps directly to
+   the comparison.
    Active subscribers see **Your Chimaera Pro** or **Your Chimaera Max** with
    account, cloud and project controls. They see no sales introduction or plan
    comparison. **Usage and plan details** shows the percentage of cloud work and
@@ -293,9 +299,11 @@ code), `connection_warning` (informational fixed code: `connection_preparing`,
 retries), `payment_due` (the account reports a payment problem),
 `returning_until` (an RFC 3339 time, or null: an ended plan's cloud work can be
 brought home until then) and `plans` (the
-offers with amounts, when the service supplies them: the signed-in account's
-own list, else the public catalog from `GET /v1/plans`; prices are never
-hardcoded). `error` is `service_unsupported` when the Pro service does not
+offers with amounts and each plan's optional whole-number `cloud_time_multiple`
+and `storage_multiple` relative to Pro, when the service supplies them: the
+signed-in account's own list, else the public catalog from `GET /v1/plans`;
+prices and multiples are never hardcoded, and the list carries no absolute
+allowance). `error` is `service_unsupported` when the Pro service does not
 support this app version; project continuity then stays off (rechecked every ten
 minutes) while local work, SSH and the account itself are unaffected.
 

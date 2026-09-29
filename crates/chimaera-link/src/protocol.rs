@@ -184,12 +184,31 @@ impl Account {
 
 /// One offered plan price. Amounts are minor units of `currency` (ISO 4217,
 /// lowercase), exactly as the account supplies them.
+///
+/// `cloud_time_multiple` and `storage_multiple` say how many times the plan's
+/// monthly cloud time and storage are the Pro plan's, as whole numbers (Pro's
+/// own entries carry 1). The list carries no absolute allowance; a subscribed
+/// account's own `Limits` stay on the account. Additive: an older service omits
+/// them, and a value that is not a positive integer reads as absent without
+/// dropping the row (a multiple is presentation, the price still shows).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanPrice {
     pub plan: Plan,
     pub interval: BillingInterval,
     pub amount_cents: u64,
     pub currency: String,
+    #[serde(
+        default,
+        deserialize_with = "multiple",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cloud_time_multiple: Option<u32>,
+    #[serde(
+        default,
+        deserialize_with = "multiple",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub storage_multiple: Option<u32>,
 }
 impl PlanPrice {
     fn valid(&self) -> bool {
@@ -198,6 +217,20 @@ impl PlanPrice {
             && self.currency.len() == 3
             && self.currency.bytes().all(|byte| byte.is_ascii_lowercase())
     }
+}
+/// A multiple is a positive whole number that fits `u32`; anything else (zero,
+/// a string, a fraction, a negative, null, an oversized number) is "not
+/// stated", never an error, so one odd number cannot take a price off the page.
+fn multiple<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|times| u32::try_from(times).ok())
+        .filter(|times| *times > 0))
 }
 /// The public catalog, `GET /v1/plans`: the same offers list as
 /// `Account::plans`, read identically, without an account. `plans` is null
@@ -471,10 +504,115 @@ mod tests {
                 interval: BillingInterval::Month,
                 amount_cents: 12345,
                 currency: "usd".into(),
+                cloud_time_multiple: None,
+                storage_multiple: None,
             }])
         );
         assert_eq!(account(serde_json::json!({"plans":{"pro":1}})).plans, None);
         assert_eq!(account(serde_json::json!({"plans":null})).plans, None);
+    }
+    fn offer(extra: serde_json::Value) -> PlanPrice {
+        let mut row = serde_json::json!({
+            "plan":"pro","interval":"month","amount_cents":111,"currency":"usd"
+        });
+        row.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let read = account(serde_json::json!({"plans":[row]}));
+        let mut rows = read.plans.expect("the row is kept");
+        assert_eq!(rows.len(), 1, "a multiple never drops a price row");
+        rows.remove(0)
+    }
+    #[test]
+    fn plan_multiples_are_kept_when_present_and_the_row_reads_without_them() {
+        let both = offer(serde_json::json!({"cloud_time_multiple":5,"storage_multiple":3}));
+        assert_eq!(
+            (both.cloud_time_multiple, both.storage_multiple),
+            (Some(5), Some(3))
+        );
+        assert_eq!(both.amount_cents, 111);
+        // Older services omit both; a service may state only one.
+        let neither = offer(serde_json::json!({}));
+        assert_eq!(
+            (neither.cloud_time_multiple, neither.storage_multiple),
+            (None, None)
+        );
+        let time_only = offer(serde_json::json!({"cloud_time_multiple":4}));
+        assert_eq!(
+            (time_only.cloud_time_multiple, time_only.storage_multiple),
+            (Some(4), None)
+        );
+        // Absent stays absent toward the page, so an older page sees no new key.
+        let wire = serde_json::to_value(&neither).unwrap();
+        assert!(
+            wire.get("cloud_time_multiple").is_none() && wire.get("storage_multiple").is_none()
+        );
+        let wire = serde_json::to_value(&both).unwrap();
+        assert_eq!(wire["cloud_time_multiple"], 5);
+        assert_eq!(wire["storage_multiple"], 3);
+        // The list states no absolute allowance, and none is passed through.
+        let wire = serde_json::to_value(&both).unwrap();
+        assert!(wire.get("cloud_hours").is_none() && wire.get("storage_bytes").is_none());
+        let stray = offer(serde_json::json!({"cloud_hours":7,"storage_bytes":9000}));
+        let wire = serde_json::to_value(&stray).unwrap();
+        assert!(wire.get("cloud_hours").is_none() && wire.get("storage_bytes").is_none());
+        // Pro's own entries carry 1.
+        let one = offer(serde_json::json!({"cloud_time_multiple":1,"storage_multiple":1}));
+        assert_eq!(
+            (one.cloud_time_multiple, one.storage_multiple),
+            (Some(1), Some(1))
+        );
+    }
+    #[test]
+    fn a_malformed_multiple_reads_as_absent_and_never_drops_the_row() {
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!("lots"),
+            serde_json::json!("5"),
+            serde_json::json!(-1),
+            serde_json::json!(2.5),
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!([1]),
+            serde_json::json!(u64::from(u32::MAX) + 1),
+            serde_json::json!(u64::MAX),
+        ] {
+            let read = offer(serde_json::json!({"cloud_time_multiple":bad,"storage_multiple":bad}));
+            assert_eq!(
+                (read.cloud_time_multiple, read.storage_multiple),
+                (None, None),
+                "{bad}"
+            );
+            assert_eq!(read.amount_cents, 111, "{bad}");
+        }
+        // One bad field leaves the other intact.
+        let mixed = offer(serde_json::json!({"cloud_time_multiple":"lots","storage_multiple":5}));
+        assert_eq!(
+            (mixed.cloud_time_multiple, mixed.storage_multiple),
+            (None, Some(5))
+        );
+        let edge = offer(serde_json::json!({"cloud_time_multiple":u32::MAX}));
+        assert_eq!(edge.cloud_time_multiple, Some(u32::MAX));
+    }
+    #[test]
+    fn the_public_catalog_carries_multiples_like_the_account_offers() {
+        let rows = serde_json::json!([
+            {"plan":"pro","interval":"month","amount_cents":111,"currency":"usd",
+             "cloud_time_multiple":1,"storage_multiple":1},
+            {"plan":"max","interval":"year","amount_cents":1110,"currency":"usd",
+             "cloud_time_multiple":4,"storage_multiple":"lots"}
+        ]);
+        let catalog: PlanCatalog =
+            serde_json::from_value(serde_json::json!({"plans": rows})).unwrap();
+        assert_eq!(
+            catalog.plans,
+            account(serde_json::json!({"plans": rows})).plans
+        );
+        let plans = catalog.plans.unwrap();
+        assert_eq!(plans[0].cloud_time_multiple, Some(1));
+        assert_eq!(plans[0].storage_multiple, Some(1));
+        assert_eq!(plans[1].cloud_time_multiple, Some(4));
+        assert_eq!(plans[1].storage_multiple, None);
     }
     #[test]
     fn the_public_catalog_reads_exactly_like_the_account_offers() {

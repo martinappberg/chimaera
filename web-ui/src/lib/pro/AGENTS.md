@@ -17,7 +17,7 @@ enter UI settings or local storage.
 | `onboarding.svelte.ts` | Validated shared intent so a paused project opens the same onboarding flow; `canOpenOnboarding` (native app or account browser view) gates the paused-session connect action, since a plain browser tab has no Pro page. |
 | `AccountDevices.svelte` / `devices.ts` | Verified installation grouping, separate older sign-ins and named per-sign-in removal confirmation. Names never identify a computer. |
 | `AccountUsage.svelte` / `usage.ts` | Percentage-first account usage; real limits, bounded accessible bars, neutral unknown/zero allowance. |
-| `billing.ts` | Native billing copy, stale-attempt fencing and explicit upgrade-review eligibility; browser return never grants entitlement and raw errors never render. `planPrice` formats only service-supplied prices; `planPrices` is all four or none; `planMultiple` is the Max card's "3.75× Pro" (Max ÷ Pro for one interval, from the same amounts; null unless both are positive, in one currency, and Max is more). |
+| `billing.ts` | Native billing copy, stale-attempt fencing and explicit upgrade-review eligibility; browser return never grants entitlement and raw errors never render. `planPrice` formats only service-supplied prices; `planPrices` is all four or none; `planMultiples` reads Max's whole-number multiples of Pro's cloud time and storage from its catalog entries (each a safe integer of at least 2, else null); `maxCapacityNote` is the Max card's capacity line built from them ("5× the cloud time and storage of Pro", each number named when the two differ, only the stated one otherwise, null when the service states none so the card keeps its generic line). The app never learns an absolute allowance: multiples, like prices, are never literals. |
 | `presentation.ts` | Account, billing-intent and cloud-state copy; truthful project status (`copyIssue`: `pending`, `checkpoint_pending` and `ownership_unverified` are quiet progress, never attention; `cloud_setup_failed` is a problem that names the setup log; a `setting_up` project is progress unless its setup failed or it waits on an agent), `projectPlace` (who runs a project, in plain words), `signInNoteCopy` (the quiet line for an ended browser sign-in), `cloudCopy`'s remembered agent fact (true claims connected agents, false names the step while asleep, unknown claims nothing), `projectCopiesSetupLine` (`renewal_failed` reads "Reconnecting your account…"), `connectionWarningCopy` (one quiet line per connection state) and the finite preparation polling cadence. |
 | `account.ts` | The Pro page's panel from the last confirmed status (`accountPanel`: background reads never change it; only a check the user asked for shows checking), the error bar and whether it offers a check (`accountErrorBar`, `offersCheck`), the billing-review key, and when Max is offered (`nearLimit`). |
 | `status.ts` | Reading `ProStatus`: a real `accountFailure` vs an informational `connectionWarningCode` (older shells' two `error` messages map to `connection_preparing`/`connection_retrying`), `signInNote` (an ended browser sign-in: `sign_in_timed_out`, `sign_in_incomplete`, `browser_unavailable`, never an account failure), `paymentDue`, and `rechecksItself` (a failure the app rechecks on its own). |
@@ -75,6 +75,14 @@ enter UI settings or local storage.
   of the service's public catalog, so a signed-out page shows them too), and
   only when all four (Pro/Max, monthly/yearly) are valid. Otherwise no amount shows anywhere: the cards name the plans and the
   heading and purchase line say prices are shown at checkout.
+- Plan capacity (`cloud_time_multiple`, `storage_multiple` on the same entries,
+  additive) is likewise the service's numbers only, and only ever a whole-number
+  multiple relative to Pro: the app shows and builds in no absolute allowance
+  (a plan's real hours and storage are private to the service). The Max card's last
+  line is `maxCapacityNote(...) ?? <generic line>`, independent of the billing
+  interval (both intervals of a plan carry the same pair); Pro's card and an
+  older service keep the generic line. The Max card compares usage with Pro's,
+  never price with price.
 - Nothing asks the user to refresh or retry what the page can do itself:
   polls re-check, a pending privacy change is re-sent (≤1/min while visible),
   a refused checkout for an existing plan re-reads the account. A manual check
@@ -96,7 +104,8 @@ window to bring cloud work home: `status.ts` `grantedPlan` reads the plan as non
 while it is set, so the paid badge, subscriber view and upgrade review never
 follow an ended plan; the page shows one quiet line, `presentation.ts`
 `returningLine`, and the code `return_window_ended` reads as a plain sentence
-wherever it arrives) and `plans` (display prices).
+wherever it arrives) and `plans` (display prices, each with the plan's optional
+whole-number `cloud_time_multiple` and `storage_multiple` relative to Pro).
 Show the keychain/account recovery explanation immediately while startup waits;
 keep sign-in, billing and sign-out mutations behind that startup fence. Older
 native builds omit these fields and retain their existing account behavior.

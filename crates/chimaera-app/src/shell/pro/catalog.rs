@@ -153,6 +153,8 @@ mod tests {
             interval,
             amount_cents,
             currency: "usd".into(),
+            cloud_time_multiple: None,
+            storage_multiple: None,
         }
     }
 

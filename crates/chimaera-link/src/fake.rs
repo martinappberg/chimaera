@@ -293,8 +293,8 @@ async fn me(State(keeper): State<FakeKeeper>) -> Json<Account> {
         protocol: PROTOCOL_VERSION,
         keeper_url: keeper.endpoint,
         limits: Limits {
-            cloud_hours: 100,
-            storage_bytes: 20_000_000_000,
+            cloud_hours: 40,
+            storage_bytes: 4_000_000_000,
         },
         usage: Usage {
             cloud_hours: 0.0,

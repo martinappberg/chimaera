@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ProBillingAttempt, ProStatus } from "../net/native";
-import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling, planMultiple, planPrice, planPrices } from "./billing";
+import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling, maxCapacityNote, planMultiples, planPrice, planPrices } from "./billing";
 const attempt = (phase: ProBillingAttempt["phase"], kind: ProBillingAttempt["kind"] = "checkout"): ProBillingAttempt => ({ id: 7, kind, phase, expires_at: 123, error: "private failure token=never-render-this" });
 // Copy is free to change: these tests pin the pending/check/success flags and
 // which outcomes read alike or apart, never the wording.
@@ -151,38 +151,85 @@ describe("plan prices", () => {
   });
 });
 
-describe("plan multiple", () => {
-  // Synthetic amounts: only their ratio matters, and none is a real price.
-  const offer = (plan: "pro" | "max", interval: "month" | "year", amount_cents: number, currency = "usd") => ({ plan, interval, amount_cents, currency });
-  it("says how many times Max costs Pro from the account's own amounts", () => {
-    expect(planMultiple([offer("pro", "month", 400), offer("max", "month", 1500)], "month", "en-US")).toBe("3.75× Pro");
-    expect(planMultiple([offer("pro", "month", 400), offer("max", "month", 1600)], "month", "en-US")).toBe("4× Pro");
-    expect(planMultiple([offer("pro", "month", 400), offer("max", "month", 1400)], "month", "en-US")).toBe("3.5× Pro");
-    // Two decimals at most.
-    expect(planMultiple([offer("pro", "month", 300), offer("max", "month", 1000)], "month", "en-US")).toBe("3.33× Pro");
+describe("plan multiples", () => {
+  // Synthetic multiples: only their relations matter. The list carries no
+  // absolute allowance, so none appears here or anywhere in the app.
+  type Row = Parameters<typeof planMultiples>[0];
+  const offer = (plan: "pro" | "max", cloud?: unknown, storage?: unknown, interval: "month" | "year" = "month") => ({
+    plan, interval, amount_cents: 100, currency: "usd", cloud_time_multiple: cloud, storage_multiple: storage,
   });
-  it("compares month with month and year with year", () => {
-    const plans = [offer("pro", "month", 400), offer("max", "month", 1500), offer("pro", "year", 4000), offer("max", "year", 16000)];
-    expect(planMultiple(plans, "month", "en-US")).toBe("3.75× Pro");
-    expect(planMultiple(plans, "year", "en-US")).toBe("4× Pro");
-    // A missing side of the same interval is never filled from the other interval.
-    expect(planMultiple(plans.slice(0, 3), "year", "en-US")).toBeNull();
+  const catalog = (cloud?: unknown, storage?: unknown): Row => [
+    offer("pro", 1, 1), offer("pro", 1, 1, "year"), offer("max", cloud, storage), offer("max", cloud, storage, "year"),
+  ] as unknown as Row;
+  const note = (plans: Row) => maxCapacityNote(plans, "en-US");
+
+  it("reads Max's whole-number multiples of Pro", () => {
+    expect(planMultiples(catalog(5, 3))).toEqual({ cloud: 5, storage: 3 });
+    expect(planMultiples(catalog(4, undefined))).toEqual({ cloud: 4, storage: null });
+    expect(planMultiples(catalog(undefined, 3))).toEqual({ cloud: null, storage: 3 });
+    // Any Max entry will do: the yearly one carries it when the monthly does not.
+    const yearOnly = [offer("max", undefined, undefined), offer("max", 5, 3, "year")] as unknown as Row;
+    expect(planMultiples(yearOnly)).toEqual({ cloud: 5, storage: 3 });
+    // Each number is read on its own, from whichever entry states it.
+    const split = [offer("max", 5, undefined), offer("max", undefined, 3, "year")] as unknown as Row;
+    expect(planMultiples(split)).toEqual({ cloud: 5, storage: 3 });
+    // Pro's entries never stand in for Max's.
+    expect(planMultiples([offer("pro", 5, 3)] as unknown as Row)).toEqual({ cloud: null, storage: null });
   });
-  it("is hidden unless both amounts are present, positive and comparable", () => {
-    for (const absent of [undefined, null, []]) expect(planMultiple(absent, "month", "en-US")).toBeNull();
-    expect(planMultiple([offer("max", "month", 1500)], "month", "en-US")).toBeNull();
-    expect(planMultiple([offer("pro", "month", 400)], "month", "en-US")).toBeNull();
-    expect(planMultiple([offer("pro", "month", 0), offer("max", "month", 1500)], "month", "en-US")).toBeNull();
-    expect(planMultiple([offer("pro", "month", 400), offer("max", "month", 0)], "month", "en-US")).toBeNull();
-    expect(planMultiple([offer("pro", "month", 400), offer("max", "month", 1500, "eur")], "month", "en-US")).toBeNull();
-    expect(planMultiple([offer("pro", "month", -400), offer("max", "month", 1500)], "month", "en-US")).toBeNull();
-    expect(planMultiple([offer("pro", "month", 400.5), offer("max", "month", 1500)], "month", "en-US")).toBeNull();
-    // Not "more than Pro" (equal or cheaper) reads as no comparison at all.
-    expect(planMultiple([offer("pro", "month", 400), offer("max", "month", 400)], "month", "en-US")).toBeNull();
-    expect(planMultiple([offer("pro", "month", 400), offer("max", "month", 200)], "month", "en-US")).toBeNull();
+
+  it("counts only a safe integer of at least 2; 1, 0 and malformed values are not a multiple", () => {
+    expect(planMultiples(catalog(1, 1))).toEqual({ cloud: null, storage: null });
+    for (const bad of [0, -3, 1.5, 2.5, "5", "lots", null, undefined, true, [5], {}, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(planMultiples(catalog(bad, bad)), String(bad)).toEqual({ cloud: null, storage: null });
+    }
+    // One bad number leaves the other intact.
+    expect(planMultiples(catalog("5", 3))).toEqual({ cloud: null, storage: 3 });
+    expect(planMultiples(catalog(5, 0))).toEqual({ cloud: 5, storage: null });
+    for (const absent of [undefined, null, []]) expect(planMultiples(absent)).toEqual({ cloud: null, storage: null });
+    expect(planMultiples([null, 3, "max"] as unknown as Row)).toEqual({ cloud: null, storage: null });
   });
-  it("accepts the same currency in any letter case", () => {
-    expect(planMultiple([offer("pro", "month", 400, "USD"), offer("max", "month", 1600, "usd")], "month", "en-US")).toBe("4× Pro");
+
+  it("says one shared multiple once, and two different ones each", () => {
+    expect(note(catalog(5, 5))).toBe("5× the cloud time and storage of Pro");
+    expect(note(catalog(5, 3))).toBe("5× the cloud time and 3× the storage of Pro");
+    expect(note(catalog(3, 5))).toBe("3× the cloud time and 5× the storage of Pro");
+  });
+
+  it("names only the one number the service states", () => {
+    expect(note(catalog(4, undefined))).toBe("4× the cloud time of Pro");
+    expect(note(catalog(4, null))).toBe("4× the cloud time of Pro");
+    expect(note(catalog(undefined, 3))).toBe("3× the storage of Pro");
+    // A number that is not a multiple is left out, not shown as 1× or 0×.
+    expect(note(catalog(4, 1))).toBe("4× the cloud time of Pro");
+    expect(note(catalog(0, 3))).toBe("3× the storage of Pro");
+    expect(note(catalog("5", 3))).toBe("3× the storage of Pro");
+  });
+
+  it("states nothing when there is nothing to compare, so the generic line stays", () => {
+    expect(note(catalog(1, 1))).toBeNull();
+    expect(note(catalog(0, 0))).toBeNull();
+    expect(note(catalog("5", "3"))).toBeNull();
+    expect(note(catalog())).toBeNull();
+    for (const absent of [undefined, null, []]) expect(note(absent)).toBeNull();
+    // An older service: prices only, no multiples anywhere.
+    const older = [offer("pro"), offer("pro", undefined, undefined, "year"), offer("max"), offer("max", undefined, undefined, "year")] as unknown as Row;
+    expect(note(older)).toBeNull();
+    // Only Pro's entries state anything: Max is not compared with itself.
+    expect(note([offer("pro", 5, 3)] as unknown as Row)).toBeNull();
+  });
+
+  it("does not depend on the billing interval", () => {
+    const rows = catalog(5, 3) as unknown as Array<{ interval: string }>;
+    const month = rows.filter(row => row.interval === "month") as unknown as Row;
+    const year = rows.filter(row => row.interval === "year") as unknown as Row;
+    expect(note(month)).toBe(note(year));
+    expect(note(month)).not.toBeNull();
+  });
+
+  it("writes the number the way the reader's locale does, with no decimals", () => {
+    expect(maxCapacityNote(catalog(1200, 1200), "en-US")).toBe("1,200× the cloud time and storage of Pro");
+    expect(maxCapacityNote(catalog(5, 5), "de-DE")).toBe("5× the cloud time and storage of Pro");
+    expect(maxCapacityNote(catalog(5, 3), "not a locale")).toBeNull();
   });
 });
 

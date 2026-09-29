@@ -149,7 +149,7 @@ Account example (limits are supplied by the account, never hardcoded by clients)
   "device_id": "d_example",
   "protocol": 0,
   "keeper_url": "https://keeper.example.invalid",
-  "limits": { "cloud_hours": 100, "storage_bytes": 20000000000 },
+  "limits": { "cloud_hours": 40, "storage_bytes": 4000000000 },
   "usage": { "cloud_hours": 2.5, "storage_bytes": 1200000 },
   "hours_exhausted": false
 }
@@ -174,18 +174,27 @@ Optional additive fields, omitted by older services:
   amount in minor units and `currency` an ISO 4217 code. Clients never hardcode
   prices; without this list they show plan names only. An entry a client cannot
   interpret (a new plan or interval, a malformed amount) is dropped, never
-  failing the whole account read.
+  failing the whole account read. Each entry may also carry
+  `cloud_time_multiple` and `storage_multiple` (positive integers): how many
+  times the plan's monthly cloud time and storage are Pro's, rounded to a whole
+  number and never below 1 (Pro's own entries carry 1), identical on both
+  intervals of a plan. The list carries no absolute allowance, only these
+  multiples relative to Pro; a subscribed account's own `limits` stay on
+  `/v1/me`. Both are optional and omitted by older services; a value that is
+  not a positive integer (zero, a string, a fraction, a negative, null) reads as
+  absent for that field and never drops the entry.
 
 **Public plan catalog.** `GET /v1/plans` is the same offers list without an
 account, so a signed-out page can show prices. It takes no credential: a client
 never sends a bearer it holds, and the route answers before anyone has signed
 in. The body is `{"plans":[...]}` with the same
-`{plan,interval,amount_cents,currency}` entries as `/v1/me`'s `plans` (a
-client reads them identically: an entry it cannot interpret is dropped, and it
-shows all four prices or none), or `{"plans":null}` before the service's first
-successful catalog fetch. A priced answer carries
-`Cache-Control: public, max-age=300`; a null answer and every error are
-`no-store`. A `404` from an older service means no prices: never an error and
+`{plan,interval,amount_cents,currency}` entries as `/v1/me`'s `plans`, with the
+same optional `cloud_time_multiple` and `storage_multiple` (a client reads them
+identically: an entry it cannot interpret is dropped, and it shows all four
+prices or none; an older service without the multiples leaves them absent), or
+`{"plans":null}` before the service's first successful catalog fetch. A priced
+answer carries `Cache-Control: public, max-age=300`; a null answer and every
+error are `no-store`. A `404` from an older service means no prices: never an error and
 never a sign-in problem. A client treats the catalog as presentation only: it
 asks at most every five minutes, waits for it in no other operation, and prefers
 the `plans` of its own account once `/v1/me` has answered with one.

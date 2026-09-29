@@ -877,12 +877,18 @@ export interface ProBillingAttempt {
   error: string | null;
 }
 
-/** One price from the account service; `amount_cents` is in the currency's minor unit. */
+/** One price from the account service; `amount_cents` is in the currency's minor unit.
+ * `cloud_time_multiple` and `storage_multiple` say how many times the plan's
+ * monthly cloud time and storage are Pro's, whole numbers (the same pair on
+ * both intervals, 1 on Pro's own entries); older services omit them. The list
+ * carries no absolute allowance. */
 export interface ProPlanPrice {
   plan: "pro" | "max";
   interval: "month" | "year";
   amount_cents: number;
   currency: string;
+  cloud_time_multiple?: number | null;
+  storage_multiple?: number | null;
 }
 
 /** Account controls are native-shell state, separate from daemon settings. */

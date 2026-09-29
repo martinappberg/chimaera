@@ -309,7 +309,7 @@ async fn credentials(
         password,
         expires_at: timestamp(900),
         read_only: request.epoch.is_none(),
-        storage_limit_bytes: 20_000_000_000,
+        storage_limit_bytes: 4_000_000_000,
         max_file_bytes: 100_000_000,
     })
     .into_response()

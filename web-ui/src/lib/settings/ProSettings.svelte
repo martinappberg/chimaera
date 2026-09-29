@@ -5,7 +5,7 @@
   import PlanBadge from "../shared/PlanBadge.svelte";
   import ProWalkthrough from "../pro/ProWalkthrough.svelte";
   import AccountUsage from "../pro/AccountUsage.svelte";
-  import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling, planMultiple, planPrices } from "../pro/billing";
+  import { billingCopy, billingPending, billingNeedsReview, explicitCheckoutChoice, canReviewUpgrade, latestBilling, maxCapacityNote, planPrices } from "../pro/billing";
   import { onMount, tick, untrack } from "svelte";
   import MirrorSettings from "./MirrorSettings.svelte";
   import ConfirmDialog from "../shared/ConfirmDialog.svelte";
@@ -82,8 +82,6 @@
   const prices = $derived(planPrices(status?.plans));
   const price = (plan: PaidPlan, every: BillingInterval): string | null => prices?.[plan][every] ?? null;
   const priced = $derived(prices !== null);
-  /** "3.75× Pro" on the Max card, from the same account amounts; null hides it. */
-  const maxMultiple = $derived(priced ? planMultiple(status?.plans, interval) : null);
   const canReturnToPlans = $derived(billingRecovery && confirmedFree && reviewed !== null && reviewed === reviewKey(status));
   const errorBar = $derived(accountErrorBar(panel, error, failure, billingRecovery));
   /** A browser sign-in that ended without signing in: one quiet line; the
@@ -403,12 +401,14 @@
         </div>
         <div class="plan-options" role="group" aria-label="Choose Pro or Max">
           {#each planChoices as choice (choice.plan)}
+            <!-- Max says how many times more cloud time and storage it gives than Pro (whole numbers from the service, the same on both intervals); Pro and a service that states none keep the generic line. -->
+            {@const maxNote = maxCapacityNote(status?.plans)}
             <button class="plan-card" class:selected={selected === choice.plan} aria-pressed={selected === choice.plan} onclick={() => selectPlan(choice.plan)}>
               <span class="plan-top"><span class="plan-name">{choice.name}</span><span class="selection-mark" aria-hidden="true"></span></span>
               <span class="plan-purpose">{choice.purpose}</span>
               <span class="plan-detail">{choice.detail}</span>
-              {#if priced}<span class="plan-price"><span class="price">{price(choice.plan, interval)}</span><span class="price-period">/ {interval === "year" ? "year" : "month"}</span>{#if choice.plan === "max" && maxMultiple}<span class="price-period plan-multiple">{maxMultiple}</span>{/if}</span>{/if}
-              <span class="plan-note">{choice.capacity}</span>
+              {#if priced}<span class="plan-price"><span class="price">{price(choice.plan, interval)}</span><span class="price-period">/ {interval === "year" ? "year" : "month"}</span></span>{/if}
+              <span class="plan-note" class:stated={maxNote !== null}>{(choice.plan === "max" ? maxNote : null) ?? choice.capacity}</span>
             </button>
           {/each}
         </div>
@@ -515,8 +515,9 @@
   .plan-price { display: flex; flex-wrap: wrap; align-items: baseline; gap: 7px; margin-top: 24px; }
   .price { font-size: 32px; font-weight: 550; letter-spacing: -.8px; }
   .price-period { color: var(--muted); font-size: var(--text-sm); font-weight: 400; }
-  .plan-multiple { margin-left: 3px; }
-  .plan-note { margin-top: 7px; color: var(--muted); font-size: var(--text-xs); font-weight: 400; }
+  .plan-note { margin-top: 7px; color: var(--muted); font-size: var(--text-xs); font-weight: 400; line-height: 1.5; }
+  /* Max's stated line (two different multiples) wraps in the narrow two-column layout; both notes then hold two lines so the two prices stay level. Wider, one line fits and nothing is held; one column resets below. */
+  @container (max-width: 640px) { .plan-note.stated { min-height: 3em; } }
   .included { padding: 24px 0; border-bottom: 1px solid var(--edge); }
   .included ul { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 30px; padding-left: 16px; margin: 14px 0 0; font-size: var(--text-sm); line-height: 1.6; }
   .included li::marker { color: var(--muted); font-size: .7em; }
@@ -555,7 +556,7 @@
   .error span { flex: 1; min-width: 160px; }
   @container (max-width: 660px) { .purchase { align-items: flex-start; flex-direction: column; gap: 12px; } }
   @media (pointer: coarse) { button, summary { min-height: 40px; } .text-button { padding: 8px 0; } }
-  @container (max-width: 460px) { .plan-options, .included ul { grid-template-columns: 1fr; } .plan-card, .panel { padding: 21px; } .interval { width: 100%; } .interval button { flex: 1; } }
+  @container (max-width: 460px) { .plan-options, .included ul { grid-template-columns: 1fr; } .plan-card, .panel { padding: 21px; } .plan-note.stated { min-height: 0; } .interval { width: 100%; } .interval button { flex: 1; } }
   @media (max-width: 760px) { .pro { padding: 30px 25px 44px; } .purchase { align-items: flex-start; flex-direction: column; gap: 12px; } }
-  @media (max-width: 520px) { .pro { padding: 26px 20px 36px; } .heading { margin-bottom: 27px; } .brand { margin-bottom: 24px; font-size: 21px; } .plan-options, .included ul { grid-template-columns: 1fr; } .plan-card, .panel { padding: 21px; } .interval { width: 100%; } .interval button { flex: 1; } .plan-price { margin-top: 20px; } }
+  @media (max-width: 520px) { .pro { padding: 26px 20px 36px; } .heading { margin-bottom: 27px; } .brand { margin-bottom: 24px; font-size: 21px; } .plan-options, .included ul { grid-template-columns: 1fr; } .plan-card, .panel { padding: 21px; } .interval { width: 100%; } .interval button { flex: 1; } .plan-price { margin-top: 20px; } .plan-note.stated { min-height: 0; } }
 </style>

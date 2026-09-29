@@ -44,7 +44,13 @@ Invariants:
 - `Client::plans` reads the public catalog (`GET /v1/plans`) with no bearer even
   when the client holds tokens, so it works signed out and never touches token or
   keeper state; a 404 (older service) is `Ok(None)`, other failures are ordinary
-  errors, never a sign-in problem. Prices are presentation only.
+  errors, never a sign-in problem. Prices are presentation only. So are a
+  `PlanPrice`'s optional `cloud_time_multiple` / `storage_multiple` (how many
+  times Pro's monthly cloud time and storage the plan gives, whole numbers,
+  same pair on both intervals, omitted by older services): a value that is not
+  a positive `u32` (zero included) reads as `None` and never drops the row. The
+  list carries no absolute allowance and this crate never learns one; only a
+  subscribed account's own `limits` state numbers.
 - One stream quota per client (forward tunnels and reverse serve together). A
   failed `accept()` backs off and continues; one serve message the client cannot
   act on never drops the control connection. The events task ends only when its

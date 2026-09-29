@@ -1232,12 +1232,60 @@ mod tests {
                 interval: BillingInterval::Month,
                 amount_cents: 111,
                 currency: "usd".into(),
+                cloud_time_multiple: None,
+                storage_multiple: None,
             }])
         );
         let head = server.await.unwrap().to_ascii_lowercase();
         assert!(head.starts_with("get /v1/plans "), "{head}");
         assert!(!head.contains("authorization"), "{head}");
         assert!(client.tokens().await.is_some(), "no token state is touched");
+    }
+
+    /// The catalog's multiples survive the HTTP read when present and valid; an
+    /// older service without them, and a malformed value, leave the price row
+    /// standing with the multiple unstated.
+    #[tokio::test]
+    async fn the_public_catalog_reads_multiples_present_absent_and_malformed() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (endpoint, server) = answering(
+            "200 OK",
+            r#"{"plans":[
+                {"plan":"pro","interval":"month","amount_cents":111,"currency":"usd",
+                 "cloud_time_multiple":1,"storage_multiple":1},
+                {"plan":"pro","interval":"year","amount_cents":1110,"currency":"usd"},
+                {"plan":"max","interval":"month","amount_cents":222,"currency":"usd",
+                 "cloud_time_multiple":"lots","storage_multiple":-5},
+                {"plan":"max","interval":"year","amount_cents":2220,"currency":"usd",
+                 "cloud_time_multiple":5,"storage_multiple":null}]}"#,
+        )
+        .await;
+        let plans = Client::new(&endpoint, None)
+            .unwrap()
+            .plans()
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        let multiples: Vec<_> = plans
+            .iter()
+            .map(|price| {
+                (
+                    price.amount_cents,
+                    price.cloud_time_multiple,
+                    price.storage_multiple,
+                )
+            })
+            .collect();
+        assert_eq!(
+            multiples,
+            vec![
+                (111, Some(1), Some(1)),
+                (1110, None, None),
+                (222, None, None),
+                (2220, Some(5), None),
+            ]
+        );
     }
 
     /// An older account (no route) and an empty catalog are both "no prices";

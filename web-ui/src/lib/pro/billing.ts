@@ -99,20 +99,50 @@ export function planPrices(plans: ProPlanPrice[] | null | undefined, locale?: st
   return table as PlanPrices;
 }
 
-/** How many times Max costs Pro for one billing interval ("3.75× Pro"), from the
- * account's own amounts (month against month, year against year); never a
- * literal. Two decimals at most, trailing zeros trimmed. Null when either
- * amount is missing, malformed or zero, when the two are in different
- * currencies, or when Max is not actually more than Pro. */
-export function planMultiple(plans: ProPlanPrice[] | null | undefined, interval: "month" | "year", locale?: string): string | null {
-  const find = (plan: "pro" | "max") => Array.isArray(plans) ? plans.find(value => value?.plan === plan && value.interval === interval) : undefined;
-  const pro = find("pro"), max = find("max");
-  if (!pro || !max || typeof pro.currency !== "string" || typeof max.currency !== "string"
-    || pro.currency.toUpperCase() !== max.currency.toUpperCase()) return null;
-  for (const amount of [pro.amount_cents, max.amount_cents]) if (!Number.isSafeInteger(amount) || amount <= 0) return null;
-  const ratio = Math.round((max.amount_cents / pro.amount_cents) * 100) / 100;
-  if (!Number.isFinite(ratio) || ratio <= 1) return null;
-  try { return `${new Intl.NumberFormat(locale, { minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(ratio)}× Pro`; } catch { return null; }
+/** How many times Max's monthly cloud time and storage are Pro's, as the
+ * service states them (whole numbers relative to Pro; no absolute allowance
+ * ever reaches the app). Null where a number is missing, malformed or not above
+ * Pro's (1 is Pro's own). */
+export interface PlanMultiples {
+  cloud: number | null;
+  storage: number | null;
+}
+
+/** A multiple worth saying: a safe integer of at least 2 ("1x" is Pro itself,
+ * and zero, a string or a fraction is not a multiple the service meant). */
+const isMultiple = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 2;
+
+/** Max's multiples of Pro. Both intervals of a plan carry the same pair, so
+ * each number is read from the first Max entry that states it validly. */
+export function planMultiples(plans: ProPlanPrice[] | null | undefined): PlanMultiples {
+  const multiples: PlanMultiples = { cloud: null, storage: null };
+  if (!Array.isArray(plans)) return multiples;
+  for (const entry of plans) {
+    if (entry?.plan !== "max") continue;
+    if (multiples.cloud === null && isMultiple(entry.cloud_time_multiple)) multiples.cloud = entry.cloud_time_multiple;
+    if (multiples.storage === null && isMultiple(entry.storage_multiple)) multiples.storage = entry.storage_multiple;
+  }
+  return multiples;
+}
+
+/** The Max card's capacity line: how many times more cloud time and storage it
+ * gives than Pro, whole numbers from the service. One shared multiple reads
+ * once ("5× the cloud time and storage of Pro"); two different ones each name
+ * their own; one alone names only that. Null when the service states none (an
+ * older service), so the caller keeps its generic line. Nothing here is an
+ * absolute amount, and none is built into the app. */
+export function maxCapacityNote(plans: ProPlanPrice[] | null | undefined, locale?: string): string | null {
+  const { cloud, storage } = planMultiples(plans);
+  if (cloud === null && storage === null) return null;
+  try {
+    const times = (value: number): string => `${new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }).format(value)}×`;
+    if (cloud !== null && storage !== null) {
+      return cloud === storage
+        ? `${times(cloud)} the cloud time and storage of Pro`
+        : `${times(cloud)} the cloud time and ${times(storage)} the storage of Pro`;
+    }
+    return cloud !== null ? `${times(cloud)} the cloud time of Pro` : `${times(storage as number)} the storage of Pro`;
+  } catch { return null; }
 }
 
 /** Delayed snapshots cannot roll a newer attempt or its terminal result backward. */
