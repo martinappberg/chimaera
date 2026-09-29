@@ -2216,9 +2216,8 @@ async fn reconcile_placements(state: &Shell, client: &Client) -> Result<()> {
                 Err(error) => return Observation::Unverified { epoch: None, error },
             };
             lock(&state.pro.placements).insert(id.to_owned(), placement.clone());
-            if placement.availability != chimaera_link::PlacementAvailability::Owned
-                || placement.holder_id.as_deref() == Some(&account.device_id)
-            {
+            // A suspended owner keeps ownership and stays routable.
+            if !placement.routable() || placement.holder_id.as_deref() == Some(&account.device_id) {
                 return Observation::Retire;
             }
             // The owner is known but not reachable right now (its connection
@@ -2255,7 +2254,16 @@ async fn reconcile_placements(state: &Shell, client: &Client) -> Result<()> {
                     .get(&host.id)
                     .context("project connection unavailable")?
                     .local_port;
-                verify_project_target(port, &daemon.token, id, placement.epoch).await?;
+                if let Err(error) =
+                    verify_project_target(port, &daemon.token, id, placement.epoch).await
+                {
+                    // A frozen owner cannot answer the full check; its transport vouches.
+                    if placement.availability != chimaera_link::PlacementAvailability::Suspended {
+                        return Err(error);
+                    }
+                    placements::verify_sleeping_owner(port, &daemon.token, id, placement.epoch)
+                        .await?;
+                }
                 daemon_request(
                     state,
                     "POST",

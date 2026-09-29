@@ -9,6 +9,10 @@ pub enum PlacementAvailability {
     Unowned,
     Expired,
     PrivacyDisabled,
+    /// The owner (a cloud machine) is suspended but keeps ownership: still
+    /// routable. Passive reads never wake it; a send or a permission answer
+    /// carries wake intent and does. Its lease reads expired by design.
+    Suspended,
     /// A newer availability; never routable by this client.
     #[serde(other)]
     Unknown,
@@ -53,6 +57,14 @@ impl WorkspacePlacement {
                 .unwrap_or_default(),
             expires_at: None,
         }
+    }
+    /// Whether the account routes this project to its owner: an owned lease,
+    /// or an owner that is suspended but keeps ownership.
+    pub fn routable(&self) -> bool {
+        matches!(
+            self.availability,
+            PlacementAvailability::Owned | PlacementAvailability::Suspended
+        )
     }
     pub fn validate(&self, workspace: &str) -> Result<()> {
         ensure!(
@@ -111,6 +123,20 @@ impl WorkspacePlacement {
                         .is_some_and(|value| !value.is_empty() && value.len() <= 64),
                 "workspace lease missing"
             );
+        } else if self.availability == PlacementAvailability::Suspended {
+            // A paused owner: its lease lapsed by design, its route stays.
+            let holder = self
+                .holder_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("workspace owner missing"))?;
+            if let Some(route) = self.route_host_id.as_deref() {
+                ensure!(
+                    route.strip_prefix("worker-") == Some(holder)
+                        || route.strip_prefix("device-") == Some(holder),
+                    "workspace route does not match owner"
+                );
+            }
+            ensure!(self.epoch > 0, "workspace lease missing");
         } else {
             ensure!(
                 self.route_host_id.is_none(),
@@ -201,6 +227,23 @@ mod tests {
         assert!(value.validate("w-project").is_err());
         value.route_host_id = None;
         value.validate("w-project").unwrap();
+    }
+    /// A suspended owner keeps its route although its lease reads expired.
+    #[test]
+    fn a_suspended_owner_stays_routable_with_a_lapsed_lease() {
+        let value: WorkspacePlacement = serde_json::from_value(serde_json::json!({"workspace_id":"w-project","holder_id":"cloud-1","route_host_id":"worker-cloud-1","epoch":4,"policy_revision":2,"availability":"suspended","preferred_installation_id":"i-home","checkpoint_id":"c-one","server_now":"2026-09-28T19:30:00Z","expires_at":"2026-09-28T19:01:30Z"})).unwrap();
+        assert_eq!(value.availability, PlacementAvailability::Suspended);
+        value.validate("w-project").unwrap();
+        assert!(value.routable());
+        let mut wrong = value.clone();
+        wrong.route_host_id = Some("worker-other".into());
+        assert!(wrong.validate("w-project").is_err());
+        let mut ownerless = value.clone();
+        ownerless.holder_id = None;
+        assert!(ownerless.validate("w-project").is_err());
+        let mut newer = value;
+        newer.availability = PlacementAvailability::Unknown;
+        assert!(!newer.routable());
     }
     #[test]
     fn installation_proof_is_canonical_bounded_and_not_debuggable() {

@@ -1205,3 +1205,32 @@ async fn a_send_that_cannot_reach_the_owner_is_answered_not_dropped() {
     assert_eq!(next_json(&mut socket).await["code"], "remote_unavailable");
     assert_eq!(user_turns(&fixture.capture, "LOST_MESSAGE"), 0);
 }
+
+/// A permission (or question) answered from another device while the owner
+/// is suspended wakes it exactly like a send: the answer carries wake intent.
+#[tokio::test]
+async fn a_permission_answer_to_a_suspended_owner_wakes_it() {
+    let fixture = sleeping_remote_chat("wake-permission").await;
+    let mut socket = open_chat(&fixture).await;
+    assert_eq!(next_json(&mut socket).await["code"], "worker_asleep");
+    assert!(fixture.transport.upgrades.lock().unwrap().is_empty());
+    socket
+        .send(Message::Text(
+            serde_json::json!({"type":"permission","request_id":"ask-1","option_id":"allow_once"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    loop {
+        let frame = next_json(&mut socket).await;
+        if frame["type"] == "ready" {
+            break;
+        }
+    }
+    assert_eq!(
+        *fixture.transport.upgrades.lock().unwrap(),
+        vec!["wake=interaction".to_string()],
+        "the answer opened the connection with wake intent"
+    );
+}
