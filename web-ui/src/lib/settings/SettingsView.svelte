@@ -18,6 +18,8 @@
   import { isNativeShell } from "../net/native";
   import BrandMark from "../shared/BrandMark.svelte";
   import { accountPlan, proOffered } from "../net/plan";
+  import { isCloudMachine } from "../pro/cloudTransport";
+  import { pageVisible } from "../shared/visibility";
   import NotificationStatus from "./NotificationStatus.svelte";
   import UpdatesStatus from "./UpdatesStatus.svelte";
   import { APP_MENU, PINNED } from "../shared/keys";
@@ -37,9 +39,21 @@
     if (isNativeShell() || isBrowserGateway()) out.unshift("Chimaera Pro");
     const at = out.indexOf("Agents");
     out.splice(at >= 0 ? at + 1 : out.length, 0, "Environment", "Documents");
-    if (isBrowserGateway()) out.splice(out.indexOf("Keyboard"), 0, "Cloud machine");
+    if (isBrowserGateway()) out.splice(out.indexOf("Keyboard"), 0, "Cloud");
     return out;
   })();
+
+  /** The Cloud section belongs to a cloud machine's own page. Another daemon
+   * behind the gateway (a laptop being viewed) has no cloud status to show. */
+  let cloudMachine = $state(false);
+  $effect(() => {
+    if (!isBrowserGateway() || cloudMachine || !tabVisible || !$pageVisible) return;
+    const controller = new AbortController();
+    void isCloudMachine(controller.signal)
+      .then((value) => { if (!controller.signal.aborted) cloudMachine = value; })
+      .catch(() => { /* Passive; the next time Settings shows it asks again. */ });
+    return () => controller.abort();
+  });
 
   let tab = $state<"ui" | "json">("ui");
   let query = $state("");
@@ -81,7 +95,7 @@
   const DOC_KEYWORDS = ["documents", "markdown", "agents.md", "skill", "claude", "teach", "check"];
   const docsVisible = $derived(q === "" || DOC_KEYWORDS.some((k) => k.includes(q)));
 
-  const PRO_KEYWORDS = ["chimaera pro", "chimaera max", "sessions", "files", "account", "sign in", "plan", "kept", "connected", "devices", "sign out", "cloud machine", "github", "repository", "ssh public key"];
+  const PRO_KEYWORDS = ["chimaera pro", "chimaera max", "sessions", "files", "account", "sign in", "plan", "kept", "connected", "devices", "sign out", "cloud", "github", "repository", "ssh public key"];
   const proVisible = $derived(q === "" || PRO_KEYWORDS.some((keyword) => keyword.includes(q)));
 
   /** Rows grouped by category, registry order, empty groups dropped. */
@@ -101,8 +115,8 @@
         if (proVisible && (isBrowserGateway() || $proOffered === true)) out.push({ category: cat, defs: [] });
         continue;
       }
-      if (cat === "Cloud machine") {
-        if (proVisible) out.push({ category: cat, defs: [] });
+      if (cat === "Cloud") {
+        if (proVisible && cloudMachine) out.push({ category: cat, defs: [] });
         continue;
       }
       const defs = visible.filter((d) => d.category === cat);
@@ -272,7 +286,7 @@
             <section data-section={group.category}>
               <DocumentsSettings />
             </section>
-          {:else if group.category === "Cloud machine"}
+          {:else if group.category === "Cloud"}
             <section data-section={group.category}>
               <CloudSetup visible={tabVisible} />
             </section>
