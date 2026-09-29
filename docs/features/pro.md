@@ -163,7 +163,9 @@ authentication check remains unknown.
 Codex uses a one-time device code and the provider's secure browser page. Claude
 Code opens its own browser sign-in page and returns a one-time code to the same
 connection panel. Its official CLI completes authentication; no temporary project
-or terminal window opens. The code is used once and never saved by Chimaera.
+or terminal window opens. The code is used once and never saved by Chimaera; it
+must be pasted whole (Claude shows `code#state`), and half of one keeps the
+sign-in waiting with its own error (`authorization_code_incomplete`).
 A new attempt brings its guide into view; background status updates never scroll
 or reload the page. Installation remains automatic and separate from sign-in.
 Users can cancel or retry an expired request in place. Sign-in is confirmed by the provider CLI on the cloud
@@ -183,14 +185,15 @@ not revoke tokens at GitHub. Revoking the GitHub CLI application at GitHub can
 also affect other devices. Failed or unknown verification stays recoverable and
 never reports a completed disconnection. Reconnecting is a separate user action.
 
-A conversation that waits for an agent sign-in names that agent; the project and
-every other conversation and terminal continue meanwhile. **Connect agents
+A conversation that waits for an agent sign-in names that agent (its paused row
+carries an additive `blocked_provider`); the project and every other conversation
+and terminal continue meanwhile. **Connect agents
 to continue** opens the same flow with that project context. Each waiting agent
 must be confirmed by a fresh catalog before its conversations continue
 automatically. The UI tries each workspace/epoch once, sequentially, and offers
 **Try again** after a failure. The daemon verifies ownership and provider state
 again; the UI cannot release the setup fence or infer a new move. A canceled
-connection leaves the project paused. A successful continuation returns to the
+connection leaves those conversations paused. A successful continuation returns to the
 originating project only if that context is still current.
 
 Status reads never wake a sleeping worker. Opening the optional **Agent connections**
