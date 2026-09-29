@@ -79,15 +79,33 @@ async fn worker(
             .map_err(|_| "The cloud is unavailable right now. Try again shortly.")?;
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(if wake { 90 } else { 5 });
+    let mut pause = Duration::from_millis(500);
+    let mut reconciled: Option<tokio::time::Instant> = None;
     loop {
         let state = app.state::<Shell>();
         if state.pro.generation() != generation {
             return Err("Account changed during cloud setup".into());
         }
-        if wake {
+        // Only an account without a keeper yet needs the account read: it
+        // starts the keeper's event stream once one is assigned. At most
+        // every 10 s, never a full reconciliation per poll.
+        if wake
+            && !state.pro.has_keeper()
+            && reconciled.is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
+        {
             let _ = pro::reconcile_account(app, client, generation).await;
+            reconciled = Some(tokio::time::Instant::now());
         }
-        let hosts = client.hosts().await;
+        // Keeper events keep these rows current; the REST read covers a
+        // keeper that is still being assigned or an event stream that is down.
+        let cached = super::lock(&state.pro.hosts)
+            .values()
+            .find(|host| host.kind == HostKind::Worker && host.daemon.is_some())
+            .cloned();
+        let hosts = match cached {
+            Some(host) => Ok(vec![host]),
+            None => client.hosts().await,
+        };
         if let Some(host) = hosts
             .as_ref()
             .ok()
@@ -115,7 +133,8 @@ async fn worker(
         if tokio::time::Instant::now() >= deadline {
             return Err("Cloud machine is still starting. Try again shortly.".into());
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(Duration::from_secs(5));
     }
 }
 

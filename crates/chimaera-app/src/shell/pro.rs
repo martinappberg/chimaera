@@ -238,7 +238,7 @@ impl Pro {
         self.credential_generation.load(Ordering::SeqCst)
     }
 
-    fn has_keeper(&self) -> bool {
+    pub(super) fn has_keeper(&self) -> bool {
         lock(&self.account).as_ref().is_some_and(keeper_available)
     }
 

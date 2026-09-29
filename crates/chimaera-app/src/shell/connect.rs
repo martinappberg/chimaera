@@ -501,6 +501,9 @@ async fn run_link_flight(
     if reconnect || host.status != chimaera_link::HostStatus::Connected {
         client.reconnect_host(&host.id).await.map_err(transport)?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
+        // The keeper may wait minutes for a password or Duo answer; poll its
+        // row with backoff instead of twice a second for the whole wait.
+        let mut pause = std::time::Duration::from_millis(500);
         loop {
             if state.pro.generation() != generation {
                 return Err("Account changed while connecting".into());
@@ -519,7 +522,8 @@ async fn run_link_flight(
                     .unwrap_or_else(|| "Pro connection timed out".into())
                     .into());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(std::time::Duration::from_secs(3));
         }
     }
     let existing = {
