@@ -864,6 +864,7 @@ dependencies = [
  "hyper-util",
  "libproc",
  "mime_guess",
+ "nix 0.31.3",
  "rust-embed",
  "rustix",
  "semver",

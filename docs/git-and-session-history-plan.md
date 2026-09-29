@@ -313,17 +313,48 @@ Parts 1 and 2 are independent and can proceed in parallel.
 Each phase follows the repository's shipping rules: verified live, a feature page,
 and captured intent for each `feat:`.
 
-## Open decisions
+## How it looks and feels
 
-1. **Where the session list lives:** a pane surface opened from Recents' **All
-   sessions** (recommended), or a section of the workspace dashboard.
-2. **Where activity lives:** an Activity page in Settings covering all workspaces
-   (sessions, tokens and time; no dollars), plus one line per workspace on its
-   dashboard (decided), or the dashboard only.
-3. **Discovery depth at open:** two levels below the root (recommended), one level,
-   or only what the file tree and agents reveal.
-4. **The local branch list:** read-only with no checkout (recommended), or leave
-   branches to worktrees only.
+The maintainer asked for the best UI that is not annoying: easy to understand,
+interesting, and not over-engineered. These rules decided every surface above, and
+a review rejects a change that breaks them.
+
+1. **Ambient, not a mode.** Git and history show where you already look, only when
+   they apply, and vanish without a repository. No new rail rows, nothing that
+   opens by itself.
+2. **Quiet by default, detail on demand.** One muted line; a click for more. Color
+   only for meaning: a warning tone for conflicts and for two sessions writing one
+   file. No count badges, no pill per state.
+3. **Plain words.** "Changes on this branch", not "diff vs merge-base"; "No branch
+   (at 3f2a1c9)", not "detached HEAD"; ↑↓ explained in words on hover.
+4. **Nothing is a dead end.** A commit opens its files, a file its diff, a session
+   its conversation, a branch its changes, a commit count its commits.
+5. **Reuse, don't invent.** Existing rows, section headers, glyphs, pane tabs,
+   DiffView, reference chips and Quick Open; theme tokens, light and dark.
+6. **Never nag.** No "uncommitted changes" warnings, no `git init` offer, no toasts
+   for background work, no confirm dialogs beyond the guarded worktree removal.
+7. **Progressive disclosure.** One repository looks exactly like before; several
+   collapse to one line each, the focused one open.
+8. **Found without clutter.** Quick Open commands (Source Control, History, File
+   history, All sessions, Activity) instead of new buttons.
+
+Placement the maintainer decided: the session's branch shows on one small line
+just above the chat input (chat sessions) and on dashboard cards, never on the
+rail; the same-file notice shares that line, on its right. Activity leads with
+sessions and tokens and shows no dollar figures.
+
+## Decisions (maintainer, 2026-09-29)
+
+1. **The session list** is a pane surface opened from Recents' **All sessions** and
+   from Quick Open.
+2. **Activity** is a Settings page covering all workspaces (sessions, tokens and
+   time; no dollars), plus one line per workspace on its dashboard.
+3. **Discovery** looks two levels below the root when a workspace opens; deeper
+   repositories appear as the file tree and agents reveal them.
+4. **The local branch list** is read-only, with no checkout.
+5. **Recents can be archived** (one, or all with an inline Undo). Archive only hides;
+   archived conversations stay in All sessions under **Archived**, and resuming one
+   unarchives it.
 
 ## Out of scope
 
