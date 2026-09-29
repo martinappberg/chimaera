@@ -507,7 +507,9 @@
       {#if buf.journalFailed}
         <span
           class="bar-warn"
-          title="The unsaved text could not be written to the browser's storage or to the daemon — save when you can."
+          title={buf.recovered !== null
+            ? "Held back so the recovered draft above stays recoverable — restore or discard it, or save, to protect these edits."
+            : "The unsaved text could not be written to the browser's storage or to the daemon — save when you can."}
           >draft not backed up</span
         >
       {/if}
