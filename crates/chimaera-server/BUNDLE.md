@@ -122,9 +122,21 @@ reactive and receives no automatic turn.
 
 Plain terminals remain on the source laptop. Their moved bundle imports as a
 paused row, preserving tabs without restarting arbitrary foreground programs.
-Returning a shell home recreates its shell at the recorded cwd. Plain terminals
-are never managed processes: a fence never signals them and a stop never waits
-for them; a verified other owner only refuses their input.
+Returning a shell home recreates its shell at the recorded cwd. A terminal's cwd
+is kept inside the project (`bundle::clamp_into`): on export a shell that left
+the project (`cd ~`) records the project root, and on import a folder the
+destination lacks (ignored build output, an empty folder) becomes the nearest
+existing folder inside the project. A terminal never fails a move. Plain
+terminals are never managed processes: a fence never signals them and a stop
+never waits for them; a verified other owner only refuses their input.
+
+A project copy never fails because of one conversation. One that cannot be
+exported yet (a fresh TUI with no transcript, an archive over the file limit or
+the project's remaining quota) is left out of that copy; in a clean handoff it
+is stopped and kept on the source as a paused row with its identity, resuming
+when the project is back. Project copies wait up to 30 s for one of the two
+bundle slots instead of failing when several projects flush at once; the
+single-session routes still refuse at once.
 
 A paused row is named by its pinned name, else its conversation title, else
 words for where it is shown: on a cloud machine "Terminal on your computer"

@@ -1061,6 +1061,50 @@ async fn plain_shells_come_back_at_boot_while_agents_wait() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// One conversation that cannot be saved yet (a fresh terminal agent with no
+/// transcript) never fails the project's copy: the files still go.
+#[tokio::test]
+async fn an_unsaveable_conversation_never_fails_the_project_copy() {
+    let root = temp("unsaveable");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let config = device(&account.endpoint);
+    let workspace = project(&state, &root, &config, 4);
+    *lock(&account.baton) = owned(&workspace.id, "d-home", 4, "lease-fixture", 1);
+    let agent = state
+        .sessions
+        .spawn(chimaera_pty::SpawnOpts {
+            cwd: workspace.root.clone(),
+            name: None,
+            cols: 80,
+            rows: 24,
+            command: Some(vec!["/bin/sleep".into(), "30".into()]),
+            id: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            scrollback: None,
+        })
+        .unwrap();
+    lock(&state.agents).insert(
+        agent.id.clone(),
+        crate::agent_state::AgentRecord::new("k".into(), crate::agent_state::AgentKind::Claude),
+    );
+    lock(&state.session_workspaces).insert(agent.id.clone(), workspace.id.clone());
+    // The fixture has no Git service: the copy fails only when it publishes.
+    let error = snapshot(&state, &config, &workspace.id, false)
+        .await
+        .unwrap_err();
+    assert_ne!(
+        super::super::routes::error_code(&error),
+        "conversation_not_saved",
+        "{error:#}"
+    );
+    assert!(state.sessions.get(&agent.id).is_some_and(|s| s.alive));
+    state.sessions.kill(&agent.id).ok();
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// Signing out while this computer's own return is unfinished must not leave
 /// the project fenced: no account is left to finish it.
 #[tokio::test]

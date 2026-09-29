@@ -2,6 +2,63 @@ use super::support::*;
 use crate::*;
 use bundle::{ExportMode, ImportOptions, Origin};
 
+/// A terminal that wandered outside its project (`cd ~`) or into a folder the
+/// destination lacks (ignored build output) never fails the move: it opens in
+/// the nearest folder that exists inside the project.
+#[tokio::test]
+async fn a_wandering_terminal_never_fails_a_project_move() {
+    let _serial = crate::bundle::TEST_SERIAL.lock().await;
+    let source = test_state();
+    let root = std::fs::canonicalize(test_dir("wandering-project")).unwrap();
+    std::fs::create_dir_all(root.join("target/debug")).unwrap();
+    let (_, workspace) = request(
+        &source,
+        Method::POST,
+        "/api/v1/workspaces",
+        Some(serde_json::json!({"root":root})),
+    )
+    .await;
+    let workspace_id = workspace["id"].as_str().unwrap().to_owned();
+    for (label, polled) in [
+        ("outside", std::env::temp_dir()),
+        ("ignored", root.join("target/debug")),
+    ] {
+        let (status, session) = request(
+            &source,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({"workspace_id":workspace_id})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+        let id = session["id"].as_str().unwrap().to_owned();
+        lock(&source.current_cwds).insert(id.clone(), polled);
+        let path = bundle::export(source.clone(), &id, ExportMode::Snapshot)
+            .await
+            .unwrap();
+        // The destination has the project but not its ignored build folder.
+        let destination =
+            std::fs::canonicalize(test_dir(&format!("wandering-destination-{label}"))).unwrap();
+        let target = test_state();
+        let imported = bundle::import(
+            target.clone(),
+            &path,
+            ImportOptions {
+                destination_root: Some(destination.clone()),
+                defer_start: true,
+                fork: false,
+                origin: Origin::Moved,
+                epoch: 1,
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{label}: {error:#}"));
+        let entry = lock(&target.deferred_sessions)[&imported.id].clone();
+        assert_eq!(entry.cwd, destination, "{label}");
+        source.sessions.kill(&id).ok();
+    }
+}
+
 #[tokio::test]
 async fn bundle_preserves_shell_identity_and_defers_moved_terminal() {
     let _serial = crate::bundle::TEST_SERIAL.lock().await;

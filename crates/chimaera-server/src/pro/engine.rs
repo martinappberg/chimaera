@@ -703,20 +703,7 @@ async fn suspend_workspace(state: &Arc<AppState>, workspace: &str) -> Result<()>
                 // first native conversation id exists. Preserve its ledger
                 // identity; absence of an exportable handle cannot authorize a
                 // second writer to continue running.
-                if let Some(mut entry) = crate::ledger::snapshot(state)
-                    .0
-                    .into_iter()
-                    .find(|entry| entry.id == id)
-                {
-                    entry.suspended = true;
-                    entry.handoff = None;
-                    lock(&state.deferred_sessions).insert(id.clone(), entry);
-                }
-                if state.chat.get(&id).is_some() {
-                    state.chat.kill(&id);
-                } else {
-                    let _ = state.sessions.kill(&id);
-                }
+                park_here(state, &id).await;
             }
         }
     }
@@ -727,6 +714,29 @@ async fn suspend_workspace(state: &Arc<AppState>, workspace: &str) -> Result<()>
     })
     .await??;
     Ok(())
+}
+
+/// Stops an agent that cannot be exported and keeps it here as a paused row
+/// with its identity (it resumes when the project is this computer's again).
+/// A terminal is never stopped.
+async fn park_here(state: &Arc<AppState>, id: &str) {
+    if !(state.chat.get(id).is_some() || lock(&state.agents).contains_key(id)) {
+        return;
+    }
+    if let Some(mut entry) = crate::ledger::snapshot(state)
+        .0
+        .into_iter()
+        .find(|entry| entry.id == id)
+    {
+        entry.suspended = true;
+        entry.handoff = None;
+        lock(&state.deferred_sessions).insert(id.to_owned(), entry);
+    }
+    if state.chat.get(id).is_some() {
+        state.chat.kill(id);
+    } else {
+        let _ = state.sessions.kill(id);
+    }
 }
 
 /// Running agents make a project worth handing to the cloud before sleep.
@@ -896,7 +906,20 @@ async fn snapshot_inner_scoped(
             for id in &session_ids {
                 // Woken mid-flush: stop no further sessions.
                 if woke() { break; }
-                let Some(path)=crate::bundle::export_for_mirror(state.clone(),id,crate::bundle::ExportMode::Stop).await? else {continue;};
+                let path = match crate::bundle::export_for_mirror(state.clone(),id,crate::bundle::ExportMode::Stop).await {
+                    Ok(Some(path)) => path,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        // One conversation that cannot travel (no transcript
+                        // yet, too large) never fails the project: it stays
+                        // here, stopped and paused with its identity, for
+                        // when the project comes back.
+                        tracing::warn!(category = snapshot_diagnostics::category(&error), "A conversation stays paused here instead of moving");
+                        park_here(state, id).await;
+                        lock(&stopped_ids).push(id.clone());
+                        continue;
+                    }
+                };
                 lock(&stopped_ids).push(id.clone());
                 let target=staging.join(format!("stopped-{id}.zip"));tokio::fs::rename(path,&target).await?;stopped.insert(id.clone(),target);
             }
@@ -922,12 +945,27 @@ async fn snapshot_inner_scoped(
         let handoff = staging.join("handoff"); tokio::fs::create_dir_all(handoff.join("bundles")).await?;
         let mut archives = Vec::new(); let mut archive_bytes = 0u64;
         for id in session_ids {
-            let Some(path) = (if clean {stopped.remove(&id)} else {crate::bundle::export_for_mirror(state.clone(), &id, crate::bundle::ExportMode::Snapshot).await?}) else {continue;};
-            has_agents |= agent_ids.contains(&id);
+            let path = if clean {
+                stopped.remove(&id)
+            } else {
+                // A conversation that cannot be saved right now is left out of
+                // this copy (and kept running); the project's files still go.
+                crate::bundle::export_for_mirror(state.clone(), &id, crate::bundle::ExportMode::Snapshot).await.unwrap_or_else(|error| {
+                    tracing::warn!(category = snapshot_diagnostics::category(&error), "A conversation was left out of this project copy");
+                    None
+                })
+            };
+            let Some(path) = path else {continue;};
             let length = tokio::fs::metadata(&path).await?.len();
-            if length > max_file { let _ = tokio::fs::remove_file(path).await; anyhow::bail!("session archive exceeds mirror file limit"); }
+            // Too large for the copy: leave that conversation out (a moved
+            // one stays paused here), never fail the project.
+            if length > max_file || archive_bytes + length + report.bytes + config_report.bytes > budget {
+                let _ = tokio::fs::remove_file(path).await;
+                tracing::warn!("A conversation was too large for the project copy");
+                continue;
+            }
+            has_agents |= agent_ids.contains(&id);
             archive_bytes = archive_bytes.saturating_add(length);
-            ensure!(archive_bytes + report.bytes + config_report.bytes <= budget, "workspace and conversations exceed mirror storage quota");
             let archive = format!("bundles/{id}.zip");
             tokio::fs::rename(path, handoff.join(&archive)).await?;
             archives.push(SessionArchive {id,archive});

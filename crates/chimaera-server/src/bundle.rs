@@ -267,6 +267,20 @@ pub(crate) async fn export_for_mirror(
     export_inner(state, id, mode, true, true).await
 }
 
+/// A terminal's working folder, kept inside the project: the nearest folder
+/// that exists at or above `cwd` within `root`, or `root` itself when the
+/// shell wandered outside it (`cd ~`) or its folder is gone. A terminal never
+/// makes a whole project's move fail. Blocking: call off the reactor.
+pub(crate) fn clamp_into(root: &Path, cwd: &Path) -> PathBuf {
+    if !cwd.starts_with(root) {
+        return root.to_path_buf();
+    }
+    cwd.ancestors()
+        .take_while(|folder| folder.starts_with(root))
+        .find(|folder| folder.is_dir())
+        .map_or_else(|| root.to_path_buf(), Path::to_path_buf)
+}
+
 /// What a terminal agent's successor needs to know about its process: whether
 /// a turn was in flight (running, or parked on a permission question). A TUI
 /// idle at its prompt carries nothing, so it resumes without a new turn.
@@ -296,7 +310,15 @@ async fn export_inner(
     skip_unstarted: bool,
     durable: bool,
 ) -> Result<Option<PathBuf>> {
-    let _permit = OPERATIONS.try_acquire().context("bundle operation limit")?;
+    // A project's own save waits briefly for a slot (several projects flush in
+    // parallel before sleep); a one-off request is refused at once as before.
+    let _permit = if skip_unstarted {
+        tokio::time::timeout(Duration::from_secs(30), OPERATIONS.acquire())
+            .await
+            .context("bundle operation limit")??
+    } else {
+        OPERATIONS.try_acquire().context("bundle operation limit")?
+    };
     if !valid_id(id) {
         bail!("invalid session ID");
     }
@@ -321,6 +343,10 @@ async fn export_inner(
     let workspace = crate::lock(&state.workspaces)
         .get(&entry.workspace_id)
         .context("unknown workspace")?;
+    if entry.agent.is_none() {
+        let (root, cwd) = (workspace.root.clone(), entry.cwd.clone());
+        entry.cwd = tokio::task::spawn_blocking(move || clamp_into(&root, &cwd)).await?;
+    }
     // Reject a missing native handle before stopping anything. A snapshot may
     // race an append; the checked copy below then asks the caller to retry.
     let mut paused = if skip_unstarted && mode == ExportMode::Stop && state.chat.get(id).is_some() {
@@ -578,6 +604,14 @@ fn open_archive(path: &Path) -> Result<Opened> {
     let mut entry =
         LedgerEntry::from_json(&manifest.session).context("invalid session identity")?;
     entry.suspended = true;
+    // A terminal that wandered outside its project (an older sender did not
+    // clamp) starts at the project root instead of failing the move.
+    if entry.agent.is_none()
+        && entry.cwd.is_absolute()
+        && !entry.cwd.starts_with(&manifest.workspace.root)
+    {
+        entry.cwd = manifest.workspace.root.clone();
+    }
     if !valid_id(&entry.id)
         || !valid_id(&entry.workspace_id)
         || entry.workspace_id != manifest.workspace.id
@@ -745,6 +779,7 @@ async fn import_inner(
         let destination = destination.clone();
         let old_root = opened.manifest.workspace.root.clone();
         let old_cwd = opened.entry.cwd.clone();
+        let terminal = opened.entry.agent.is_none();
         let (root, cwd) = tokio::task::spawn_blocking(move || -> Result<(PathBuf, PathBuf)> {
             let root = std::fs::canonicalize(&destination)
                 .context("destination root must already exist")?;
@@ -754,8 +789,15 @@ async fn import_inner(
             let relative = old_cwd
                 .strip_prefix(&old_root)
                 .context("session cwd escapes original root")?;
-            let cwd = std::fs::canonicalize(root.join(relative))
-                .context("destination cwd must already exist")?;
+            // A terminal's folder may not exist here (ignored build output,
+            // an empty folder): it opens in the nearest one that does.
+            let target = if terminal {
+                clamp_into(&root, &root.join(relative))
+            } else {
+                root.join(relative)
+            };
+            let cwd =
+                std::fs::canonicalize(target).context("destination cwd must already exist")?;
             if !cwd.starts_with(&root) || !cwd.is_dir() {
                 bail!("destination cwd escapes project root");
             }
@@ -868,6 +910,9 @@ async fn import_inner(
         tokio::task::spawn_blocking(move || -> Result<(LedgerEntry, Option<Value>)> {
             let canonical = std::fs::canonicalize(&workspace.root)
                 .context("workspace root must exist at its original path before import")?;
+            if opened.entry.agent.is_none() {
+                opened.entry.cwd = clamp_into(&workspace.root, &opened.entry.cwd);
+            }
             if canonical != workspace.root || !opened.entry.cwd.is_dir() {
                 bail!("bundle paths must exist without remapping");
             }
