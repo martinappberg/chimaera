@@ -12,14 +12,15 @@ enter UI settings or local storage.
 | `CloudProjects.svelte` | Passive cloud-project discovery and explicit per-project local opening; a project refused while mid-step retries on list refreshes (≤15 min, only once its folder is saved, so the picker never reappears). |
 | `ProviderConnections.svelte` | First-agent onboarding, guided connection lifecycle, optional repository providers and exact pending-handoff continuation. |
 | `cloudTransport.ts` | Native/browser request parity; passive GETs, explicit wake intent and focused terminal routing; `isCloudMachine` (passive). |
-| `providers.ts` | Readiness and safe provider-link presentation; imports the core provider catalog (`providerLabel` names an unlisted required provider). |
+| `providers.ts` | Readiness and safe provider-link presentation; imports the core provider catalog (`providerLabel` names an unlisted required provider; `pausedConnect` reads a paused row's additive `blocked_provider` for the pane's and chat's **Connect <agent> to continue**). |
+| `profile.ts` | A project's cloud profile decisions: `proposedSetup` (an agent's `pending_setup_command`), `computerSteps` (`profile.deferred`), and `settleProposal`, which re-reads `GET /pro/profile`, applies Confirm/Dismiss only to the proposal shown and writes every field back (the PUT replaces the whole profile and takes no revision); a 409 mid-copy is re-sent a few times. |
 | `onboarding.svelte.ts` | Validated shared intent so a paused project opens the same onboarding flow. |
 | `AccountDevices.svelte` / `devices.ts` | Verified installation grouping, separate older sign-ins and named per-sign-in removal confirmation. Names never identify a computer. |
 | `AccountUsage.svelte` / `usage.ts` | Percentage-first account usage; real limits, bounded accessible bars, neutral unknown/zero allowance. |
 | `billing.ts` | Native billing copy, stale-attempt fencing and explicit upgrade-review eligibility; browser return never grants entitlement and raw errors never render. `planPrice` formats only account-supplied prices; `planPrices` is all four or none. |
-| `presentation.ts` | Account, billing-intent and cloud-state copy; truthful project status (`copyIssue`: `pending`, `checkpoint_pending` and `ownership_unverified` are quiet progress, never attention) and the finite preparation polling cadence. |
+| `presentation.ts` | Account, billing-intent and cloud-state copy; truthful project status (`copyIssue`: `pending`, `checkpoint_pending` and `ownership_unverified` are quiet progress, never attention; `cloud_setup_failed` is a problem that names the setup log), `projectCopiesSetupLine` (`renewal_failed` reads "Reconnecting your account…"), `connectionWarningCopy` (one quiet line per connection state) and the finite preparation polling cadence. |
 | `account.ts` | The Pro page's panel from the last confirmed status (`accountPanel`: background reads never change it; only a check the user asked for shows checking), the error bar and whether it offers a check (`accountErrorBar`, `offersCheck`), the billing-review key, and when Max is offered (`nearLimit`). |
-| `status.ts` | Reading `ProStatus`: a real `accountFailure` vs an informational `connectionWarning`, `paymentDue`, and `rechecksItself` (a failure the app rechecks on its own). |
+| `status.ts` | Reading `ProStatus`: a real `accountFailure` vs an informational `connectionWarningCode` (older shells' two `error` messages map to `connection_preparing`/`connection_retrying`), `paymentDue`, and `rechecksItself` (a failure the app rechecks on its own). |
 
 ## Boundaries
 
@@ -47,7 +48,10 @@ enter UI settings or local storage.
   stored. Native browser/terminal actions send only a connection ID.
 - Claude browser authorization stays in the connection panel. The one-time reply
   is cleared from the input on submit, cancellation, hide or teardown and sent
-  only to its current attempt; it is never saved in browser storage. Installation
+  only to its current attempt; it is never saved in browser storage. Half of a
+  `code#state` reply is refused with `authorization_code_incomplete` (the
+  attempt keeps waiting); the browser transport carries only that code back,
+  and the panel asks for the whole code. Installation
   remains automatic and does not navigate to its internal workspace.
 - Provider and connection polls are single-flight and visibility-gated. The
   connection effect depends on primitive ID/deadline/active-state values so
@@ -82,8 +86,10 @@ Real rendered components still need light/dark, narrow, keyboard and lifecycle
 verification per verify-app.
 
 Native account status includes optional `initializing` / `initialization_phase`,
-`connection_warning` (informational; never a failure or an entitlement signal —
-older shells sent two such messages in `error`, which `status.ts` recognizes),
+`connection_warning` (informational: `connection_preparing`,
+`connection_retrying`, `account_unreachable`, one quiet line each with no button;
+never a failure or an entitlement signal — older shells sent two such messages
+in `error`, which `status.ts` recognizes),
 `payment_due` (billing, never checkout) and `plans` (display prices).
 Show the keychain/account recovery explanation immediately while startup waits;
 keep sign-in, billing and sign-out mutations behind that startup fence. Older

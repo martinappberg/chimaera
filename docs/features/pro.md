@@ -62,9 +62,10 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    confirmed account while background reads run (every `pro-changed`, window
    focus), so plans, the introduction and the overview never unmount or lose
    scroll; a purchase re-reads the account first when an update is pending. A
-   connection that is still coming up (optional `ProStatus.connection_warning`,
-   or the two informational messages older shells put in `error`) is one quiet
-   line, never an account failure. An account whose payment needs attention
+   connection that is still coming up, retrying, or cannot reach the account
+   just now (optional `ProStatus.connection_warning`, or the two informational
+   messages older shells put in `error`) is one quiet line for that state, with
+   no button, never an account failure. An account whose payment needs attention
    (optional `ProStatus.payment_due`) sees **Payment needs attention** with
    **Manage billing**, and is never offered plans or checkout.
    The page shows the signed-in email and current plan. Without a plan, choose
@@ -187,8 +188,10 @@ never reports a completed disconnection. Reconnecting is a separate user action.
 
 A conversation that waits for an agent sign-in names that agent (its paused row
 carries an additive `blocked_provider`); the project and every other conversation
-and terminal continue meanwhile. **Connect agents
-to continue** opens the same flow with that project context. Each waiting agent
+and terminal continue meanwhile. The paused conversation or terminal itself offers
+**Connect <agent> to continue** (the name from the provider catalog), and Projects
+and privacy offers **Connect agents to continue**; both open the same flow with
+that project context. Each waiting agent
 must be confirmed by a fresh catalog before its conversations continue
 automatically. The UI tries each workspace/epoch once, sequentially, and offers
 **Try again** after a failure. The daemon verifies ownership and provider state
@@ -265,21 +268,32 @@ all app windows close. Only signing out removes it (see step 5 above). A lapsed
 payment or a keeper still being assigned pauses new setup but leaves the daemon's
 setup and local work alone; the account refuses cloud copies without a plan. A
 daemon that restarts or loses its setup is set up again with a fresh credential,
-immediately after an in-app daemon update and otherwise within 30 seconds.
+immediately after an in-app daemon update and otherwise within 30 seconds. While
+the daemon's credential has lapsed (`renewal_failed` on `/pro/status`), Projects
+and privacy reads "Reconnecting your account…" with nothing to press; the app
+renews it on its own.
 Quitting the app keeps the daemon copying, but other devices cannot open this
 computer's projects while the app is closed: offering the daemon to them belongs
 to the running app.
 
 Pro → **Projects and privacy** shows privacy, the last recorded copy, and actual
 problems such as an incomplete copy or a required provider connection. Healthy
-file counts, storage quotas, generic environment diagnostics and setup commands
-are not account controls; Chimaera and its agents manage those details. There
+file counts, storage quotas and generic environment diagnostics are not account
+controls, and setup commands are not edited there; Chimaera and its agents manage
+those details. The two exceptions are decisions only the user makes. A setup
+command an agent proposed (`profile.pending_setup_command`) shows once per
+project, whole, in monospace, as "Your agent proposed a setup command for the
+cloud machine" with **Confirm** (it becomes the project's `setup_command`) and
+**Dismiss** (the proposal is cleared). Steps kept for this computer
+(`profile.deferred`) are listed under **Steps that need your computer**, a plain
+list with no run button. There
 is no per-session placement pin: neither the native shell nor the daemon (the old `PUT /pro/keep-running` route is gone) offers one.
 **Keep this project on this device** stops local publication and disables account-side
 mirror access. Existing stored data is not silently deleted. A command that
 needs your computer is never run on a cloud machine: the agent is told it was not
 run there, and it is kept as a pending step for the project (`profile.deferred` on
-its status row) for you to run on your computer; nothing runs it later by itself.
+its status row), listed for you under **Steps that need your computer**; nothing
+runs it later by itself.
 If the account side
 has not confirmed a privacy change yet, the project says cloud copies are being turned off
 and the page re-sends the change on its own (at most once a minute while visible).
@@ -298,7 +312,7 @@ The daemon renews a workspace ownership lease independently of mirror jobs: acco
 
 Agents running in the cloud receive a current-host brief through MCP initialization. On the user's own computer an agent gets no brief at all, unless its project came back from the cloud while this daemon was running; then the brief says work runs on the computer again and replaces the earlier cloud assumptions. Structured conversations with an interrupted turn or background work also receive it in their transfer pickup message. Finished structured conversations resume idle without starting a model turn merely because they moved or returned. Their fresh MCP context is available when the user next asks them to work. The brief identifies device or cloud execution, the registered project root, OS/architecture needed for builds, headless limitations, and fresh cached provider observations. Guidance about the cloud machine's resource capacity appears only in a cloud brief. Absent or expired observations remain unknown; generating context never probes, logs in, wakes compute or sends a turn. Both MCP initialization and read_cloud_profile use this same projection, and returning to a device replaces stale cloud assumptions. Generated context omits topology, routing IDs, raw diagnostics, hardware allocations and credentials. User-owned profile content remains untrusted project data; missing variable names do not prove a dependency is unavailable. Agents should inspect actual tools and failures, use compatible headless or lower-resource alternatives within existing permissions, preserve completed work, and explain only meaningful progress or the specific user action needed. This prompt is product guidance, not an authorization or confidentiality boundary: agents can inspect their permitted environment and may infer where they run. It does not guarantee compliance or prevent all inference. Ordinary Claude and Codex terminal sessions receive the same MCP context under the same rule; a terminal session whose turn was cut off by the move starts with one short "Continuing here" line, and an idle one resumes without starting a turn.
 
-`read_cloud_profile` and `update_cloud_profile` operate only on the authenticated session's registered project. Updates require the current revision, reject unknown fields and credential-shaped content, and are capped at 32 KiB. They keep ordinary agent permissions, and deferred laptop steps remain guidance. An agent can keep or clear the confirmed `setup_command`, but a new command it saves is only a proposal (`pending_setup_command`, additive on `GET /api/v1/pro/profile`): it never runs until the user confirms it in Chimaera Pro, which saves it as `setup_command` through `PUT /api/v1/pro/profile`. An update that leaves the command alone keeps an earlier proposal waiting, and the tool's result says `awaiting_confirmation`. Saving a profile never runs a command or wakes a machine. Implementation: [`mcp/cloud_context.rs`](../../crates/chimaera-server/src/mcp/cloud_context.rs).
+`read_cloud_profile` and `update_cloud_profile` operate only on the authenticated session's registered project. Updates require the current revision, reject unknown fields and credential-shaped content, and are capped at 32 KiB. They keep ordinary agent permissions, and deferred laptop steps remain guidance. An agent can keep or clear the confirmed `setup_command`, but a new command it saves is only a proposal (`pending_setup_command`, additive on `GET /api/v1/pro/profile`): it never runs until the user confirms it in Projects and privacy, which saves it as `setup_command` through `PUT /api/v1/pro/profile`. That route replaces the whole profile and takes no revision, so the page ([`pro/profile.ts`](../../web-ui/src/lib/pro/profile.ts)) re-reads the profile, applies **Confirm** or **Dismiss** only if the stored proposal is still the one shown (otherwise nothing is saved and the row says the proposal changed), and writes every field back, so a save never drops another proposal, a deferred step or a field it does not know. A save refused while the project is being copied (409) is re-sent a few times on its own. An update that leaves the command alone keeps an earlier proposal waiting, and the tool's result says `awaiting_confirmation`. Saving a profile never runs a command or wakes a machine. Implementation: [`mcp/cloud_context.rs`](../../crates/chimaera-server/src/mcp/cloud_context.rs).
 
 The app's system sleep hook tells the daemon how long it has before the computer sleeps (`POST /api/v1/pro/sleep {deadline_ms}`): 23 seconds of macOS's 25-second wait, logind's configured delay minus a margin on Linux, and under a second on Windows. The daemon's flush fits the deadline it is given. It preempts the periodic mirror pass, stops agents and publishes every project in parallel (projects with running agents first), and never leaves a half transfer: a flush that outlives the deadline finishes or recovers on its own. The publication fence is not waited out past the deadline; an unreleased lease lapses and the cloud continues from the acknowledged checkpoint. Waking before a flush finishes keeps the project on the computer. A failed flush leaves the lease takeover path available.
 
@@ -369,9 +383,14 @@ or "Continuing on your computer…" (composer disabled for that reason), and
 reconnects to wherever it runs next — at once when its row comes back, not after
 a retry delay. Only a real transfer says so. A session that is only paused says
 why instead: "Reconnecting after an update…" (a daemon restart on the machine
-that owns the project), "Waiting for Claude on the cloud machine" (its agent is
-not signed in there yet; the Pro page does that once), or "Opening…" (its
-transfer is starting it). A paused plain terminal reads "This terminal stays on
+that owns the project), "Waiting for Claude Code on the cloud machine" (its
+agent is not signed in there yet; when the row names the agent with
+`blocked_provider`, the view offers **Connect Claude Code to continue**, which
+opens that sign-in in Chimaera Pro), or "Opening…" (its transfer is starting it).
+A conversation waiting on a permission or question is marked wherever an agent
+waiting for approval is (the approval count, the attention lane, its dot),
+whether its row says so through `agent_state` or the chat row's additive
+`needs_permission`. A paused plain terminal reads "This terminal stays on
 your computer". A new tunnel or credential for the same owner is not a move:
 views just reconnect.
 

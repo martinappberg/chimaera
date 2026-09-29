@@ -139,7 +139,8 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
 - **Counts mean approvals.** Every number — the rail's workspace pill, the window title's
   `(N)`, the focus strip's "N awaiting approval", the Home screen's per-workspace badge, the
   Dock badge, the tray's per-window "— N awaiting approval" — counts only live sessions in
-  `needs_permission` (`needsApproval` in `workspace/sessions.ts`). Finished and
+  `needs_permission`, or chat rows whose additive `needs_permission` is true
+  (`needsApproval` in `workspace/sessions.ts`). Finished and
   waiting-for-input sessions are news, not a number.
 - **Unread is the news cue.** A session whose turn finished (or ended waiting for input)
   while it wasn't focused wears a bold full-ink name plus a small accent dot — on the rail
