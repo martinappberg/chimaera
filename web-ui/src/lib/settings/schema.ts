@@ -15,6 +15,7 @@
 
 import { ACTIONS, parseChord } from "../shared/keys";
 import { themesOfKind, type ThemeDef } from "./themes";
+import { DICTATION_LANGUAGES } from "../chat/voiceLanguages";
 
 /** Value types a setting can carry (mirrors the JSON representation). */
 export type SettingValue = boolean | number | string | string[];
@@ -131,6 +132,8 @@ export type SettingsMap = {
   "chat.remoteControlAtStart": boolean;
   "chat.toolSummaries": boolean;
   "chat.resumeAfterRestart": boolean;
+  "chat.voice": "off" | "hold" | "tap";
+  "chat.voiceLanguage": string;
   "update.autoCheck": boolean;
   "keys.modifier": "auto" | "cmd" | "ctrl-shift" | "alt";
 } & Record<KeyBindingId, string>;
@@ -749,6 +752,33 @@ const DEFS = {
     type: "boolean",
     default: true,
     scope: "daemon",
+  },
+  "chat.voice": {
+    title: "Voice Dictation",
+    category: "Chat",
+    description:
+      "Speak into any chat composer, Claude or Codex — the same switch as `/voice`. Hold: hold Space to record and let go to insert the words. Tap: in an empty composer, tap Space to start and tap it again to send. Your speech goes to Claude's speech-to-text service (the one Claude Code's own /voice uses) with the claude.ai login on the daemon's host; the microphone is only on while you're recording.",
+    type: "enum",
+    default: "off",
+    options: [
+      { value: "off", label: "Off" },
+      { value: "hold", label: "Hold Space" },
+      { value: "tap", label: "Tap Space" },
+    ],
+    scope: "client",
+  },
+  "chat.voiceLanguage": {
+    title: "Dictation Language",
+    category: "Chat",
+    description:
+      "The language you dictate in. Match Browser uses this browser's language when Claude's speech service takes it, else English.",
+    type: "enum",
+    default: "auto",
+    options: [
+      { value: "auto", label: "Match Browser" },
+      ...DICTATION_LANGUAGES.map((l) => ({ value: l.code, label: l.name })),
+    ],
+    scope: "client",
   },
   "daemon.restoreSessions": {
     title: "Restore Sessions on Restart",

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { tick } from "svelte";
+  import { tick, untrack } from "svelte";
   import { fsQuickOpen, parentName, type QuickOpenEntry } from "../previews/files";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
@@ -18,6 +18,9 @@
     type ImageAttachment,
   } from "./images";
   import { loadDraft, saveDraft } from "./drafts";
+  import { getSetting } from "../settings/store.svelte";
+  import { Dictation, insertDictation } from "./voice.svelte";
+  import VoiceStrip from "./VoiceStrip.svelte";
   import {
     slashChoices as choicesForSlash,
     slashContextAt,
@@ -57,6 +60,8 @@
     /** Non-empty draft/attachment state. The transcript uses this to suspend
      *  live-following while the user is actively composing. */
     onDraftState(active: boolean): void;
+    /** Words dictation should favor (project and agent names). */
+    voiceTerms?: string[];
   }
 
   let {
@@ -73,6 +78,7 @@
     onCycleMode,
     onSlash,
     onDraftState,
+    voiceTerms = [],
   }: Props = $props();
 
   const uid = $props.id();
@@ -304,6 +310,159 @@
     });
   });
 
+  // --- voice dictation (/voice) -------------------------------------------------
+  // Hold mode rides the OS key repeat: a Space press types its space as usual,
+  // and only its first auto-repeat — a held key — takes the space back and
+  // starts recording, so typing never trips it. Keyup (or losing focus)
+  // finishes. Tap mode starts on Space in an empty composer, and the next
+  // Space sends, as in Claude Code.
+  const dictation = new Dictation();
+  const voiceMode = $derived(getSetting("chat.voice"));
+  const voiceOn = $derived(voiceMode !== "off" && !disabled);
+  let voiceOrigin = $state<"hold" | "tap" | "button" | null>(null);
+  /** The draft and selection just before a Space press that may become a hold. */
+  let spaceDown: { draft: string; start: number; end: number } | null = null;
+  /** A hold is in progress: its repeats are swallowed until keyup even if the
+   *  recording ended early (a relay error), or they'd type a run of spaces. */
+  let spaceHeld = false;
+
+  const voiceHint = $derived(
+    voiceOrigin === "hold"
+      ? "release Space to insert · Esc cancels"
+      : voiceOrigin === "tap"
+        ? "Space sends · Esc cancels"
+        : "click the mic to insert · Esc cancels",
+  );
+
+  async function startDictation(origin: "hold" | "tap" | "button") {
+    voiceOrigin = origin;
+    if (!(await dictation.start({ keyterms: voiceTerms })) && voiceOrigin === origin) {
+      voiceOrigin = null;
+    }
+  }
+
+  /** Stop, and put the words at the caret — then send, for tap mode's second
+   *  Space and Enter. */
+  async function finishDictation(send: boolean) {
+    const text = await dictation.finish();
+    voiceOrigin = null;
+    if (text === null) return;
+    if (text.length === 0) {
+      if (dictation.error === null) {
+        dictation.report("Didn't catch anything — try again a little closer to the mic.");
+      }
+      return;
+    }
+    const next = insertDictation(draft, el?.selectionStart ?? caret, text);
+    draft = next.draft;
+    focusAt(next.caret);
+    if (send) {
+      await tick();
+      submit();
+    }
+  }
+
+  function cancelDictation() {
+    dictation.cancel();
+    voiceOrigin = null;
+  }
+
+  function toggleDictation() {
+    if (!dictation.active) void startDictation("button");
+    else if (dictation.state !== "finishing") void finishDictation(false);
+  }
+
+  /** Dictation's keys: Space (start/finish), Esc (cancel), Enter (finish and
+   *  send) while recording. True = consumed. */
+  function voiceKey(e: KeyboardEvent): boolean {
+    const plainSpace = e.key === " " && !e.metaKey && !e.ctrlKey && !e.altKey;
+    if (spaceHeld && plainSpace) {
+      e.preventDefault();
+      return true;
+    }
+    if (dictation.active) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        cancelDictation();
+        return true;
+      }
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        if (dictation.state !== "finishing") void finishDictation(true);
+        return true;
+      }
+      if (plainSpace) {
+        e.preventDefault();
+        if (!e.repeat && voiceOrigin !== "hold" && dictation.state !== "finishing") {
+          void finishDictation(voiceOrigin === "tap");
+        }
+        return true;
+      }
+      return false;
+    }
+    if (!voiceOn || !plainSpace || el === null) return false;
+    if (voiceMode === "tap") {
+      if (e.repeat || draft.trim().length > 0 || images.length > 0) return false;
+      e.preventDefault();
+      void startDictation("tap");
+      return true;
+    }
+    if (!e.repeat) {
+      spaceDown = { draft, start: el.selectionStart, end: el.selectionEnd };
+      return false;
+    }
+    const down = spaceDown;
+    if (down === null) return false;
+    spaceDown = null;
+    e.preventDefault();
+    // Take back the space the press typed (only if that is all that changed).
+    if (draft === `${down.draft.slice(0, down.start)} ${down.draft.slice(down.end)}`) {
+      draft = down.draft;
+    }
+    focusAt(down.start);
+    spaceHeld = true;
+    void startDictation("hold");
+    return true;
+  }
+
+  function onKeyup(e: KeyboardEvent) {
+    trackCaret();
+    if (e.key === " ") {
+      spaceDown = null;
+      spaceHeld = false;
+      if (voiceOrigin === "hold" && dictation.active && dictation.state !== "finishing") {
+        void finishDictation(false);
+      }
+    }
+  }
+
+  /** A held Space whose keyup lands elsewhere must still end the recording. */
+  function onBlur() {
+    spaceDown = null;
+    spaceHeld = false;
+    if (voiceOrigin === "hold" && dictation.active && dictation.state !== "finishing") {
+      void finishDictation(false);
+    }
+  }
+
+  // A hidden tab keeps what was said: finish into the draft. Untracked, so the
+  // state change this makes doesn't re-run the effect.
+  $effect(() => {
+    if (visible && !disabled) return;
+    untrack(() => {
+      if (dictation.active && dictation.state !== "finishing") void finishDictation(false);
+    });
+  });
+
+  // An unmounted composer can't take the words: stop and release the mic.
+  $effect(() => () => dictation.cancel());
+
+  $effect(() => {
+    if (dictation.error === null || dictation.active) return;
+    const timer = setTimeout(() => dictation.clearError(), 8000);
+    return () => clearTimeout(timer);
+  });
+
   /** Escape-dismissed slash token text — suppresses the popover for exactly
    *  that token so Escape closes it without clearing a mid-draft message;
    *  typing on (the token text changes) brings it back. */
@@ -507,6 +666,7 @@
     // action. WebKit (the Tauri shell's WKWebView) fires the committing Enter
     // after compositionend with isComposing=false but keyCode 229 — check both.
     if (e.isComposing || e.keyCode === 229) return;
+    if (voiceKey(e)) return;
     if (popover !== null) {
       const items =
         popover === "slash"
@@ -665,6 +825,18 @@
   {#if attachmentError !== null}
     <div class="attachment-error" role="status">{attachmentError}</div>
   {/if}
+  {#if dictation.active}
+    <VoiceStrip
+      state={dictation.state}
+      level={dictation.level}
+      finals={dictation.finals}
+      interim={dictation.interim}
+      hint={voiceHint}
+      onCancel={cancelDictation}
+    />
+  {:else if dictation.error !== null}
+    <div class="attachment-error" role="status">{dictation.error}</div>
+  {/if}
 
   <div class="input-row">
     <button
@@ -684,7 +856,8 @@
       bind:this={el}
       bind:value={draft}
       onkeydown={onKeydown}
-      onkeyup={trackCaret}
+      onkeyup={onKeyup}
+      onblur={onBlur}
       onselect={trackCaret}
       oninput={trackCaret}
       onpaste={onPaste}
@@ -693,14 +866,47 @@
       aria-controls="{uid}-pop"
       aria-autocomplete="list"
       aria-activedescendant={popover !== null ? `${uid}-opt-${selected}` : undefined}
+      class:voice={voiceOn}
       placeholder={disabled
         ? "chat ended"
         : running
           ? "queue a follow-up for the next run (Esc to stop)"
-          : "message the agent… (Enter to send · / commands · @ files)"}
+          : voiceMode === "hold"
+            ? "message the agent… (Enter to send · / commands · @ files · hold Space to talk)"
+            : voiceMode === "tap"
+              ? "message the agent… (Enter to send · / commands · @ files · tap Space to talk)"
+              : "message the agent… (Enter to send · / commands · @ files)"}
       rows={1}
       {disabled}
     ></textarea>
+    {#if voiceOn}
+      <button
+        type="button"
+        class="mic"
+        class:live={dictation.active}
+        aria-pressed={dictation.active}
+        aria-label={dictation.active ? "stop dictating and insert the words" : "dictate"}
+        title={dictation.active
+          ? "stop and insert the words"
+          : voiceMode === "hold"
+            ? "dictate — or hold Space"
+            : "dictate — or tap Space in an empty message"}
+        disabled={dictation.state === "finishing"}
+        onmousedown={(e) => e.preventDefault()}
+        onclick={toggleDictation}
+      >
+        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+          <rect x="5.5" y="1.75" width="5" height="8" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.5" />
+          <path
+            d="M3.5 7.5a4.5 4.5 0 0 0 9 0M8 12v2.25"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+          />
+        </svg>
+      </button>
+    {/if}
     <!-- The action button morphs with the turn: send when idle, stop while the
          agent works. Enter-to-send and Esc-to-stop keep working unchanged;
          mousedown is swallowed so a click never steals the textarea's focus
@@ -855,6 +1061,10 @@
   textarea:focus {
     border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
   }
+  /* Room for the mic beside the action button. */
+  textarea.voice {
+    padding-right: 66px;
+  }
   textarea:disabled {
     opacity: 0.5;
   }
@@ -896,6 +1106,41 @@
     color: var(--muted);
     opacity: 0.55;
     cursor: default;
+  }
+  /* Quiet until recording: then it takes the recording red. */
+  .mic {
+    position: absolute;
+    right: 35px;
+    bottom: 5px;
+    width: 26px;
+    height: 26px;
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: none;
+    color: var(--muted);
+    cursor: pointer;
+    transition:
+      color 0.12s ease,
+      background-color 0.12s ease,
+      border-color 0.12s ease;
+  }
+  .mic:hover:not(:disabled) {
+    color: var(--fg);
+    background: var(--row-hover);
+  }
+  .mic.live {
+    color: var(--err);
+    background: color-mix(in srgb, var(--err) 12%, transparent);
+    border-color: color-mix(in srgb, var(--err) 45%, var(--edge));
+  }
+  .mic:disabled {
+    cursor: default;
+    opacity: 0.6;
   }
   .stop {
     background: color-mix(in srgb, var(--accent) 12%, transparent);

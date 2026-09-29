@@ -83,7 +83,8 @@
   } from "./transcriptWindow";
   import { measureShift, selectAnchor, type ReadingAnchor } from "./readingAnchor";
   import { blockWeight, HistoryWeights } from "./heightModel";
-  import { activeTheme, getSetting } from "../settings/store.svelte";
+  import { activeTheme, getSetting, setSetting } from "../settings/store.svelte";
+  import { dictationLanguage, voiceProblem, type VoiceMode } from "./voice.svelte";
 
   interface Props {
     session: Session;
@@ -1258,6 +1259,24 @@
   function onSlash(name: string, args = ""): boolean {
     const arg = args.trim().toLowerCase();
     switch (name) {
+      case "voice": {
+        // Chimaera's own /voice, the same in every agent's chat: Claude Code's
+        // modes and words (hold / tap / off), dictated through Claude's
+        // speech service — neither CLI's /voice can run over the chat
+        // protocol, and Codex's is a spoken conversation, not dictation.
+        if (arg !== "" && arg !== "hold" && arg !== "tap" && arg !== "off") {
+          store.notice(`Unknown mode: "${args.trim()}". Use hold, tap, or off.`, "info");
+          return true;
+        }
+        const current = getSetting("chat.voice");
+        if (arg === "off" || (arg === "" && current !== "off")) {
+          setSetting("chat.voice", "off");
+          store.notice("Voice mode disabled.", "info");
+          return true;
+        }
+        void enableVoice(arg === "" ? "hold" : (arg as VoiceMode));
+        return true;
+      }
       case "rename": {
         // The agent CLIs can't rename their own thread from here (claude
         // punts, codex has no such command) — but chimaera owns the session
@@ -1371,6 +1390,36 @@
         return false;
     }
   }
+
+  /** Turn dictation on — after the checks /voice makes in Claude Code: a
+   *  login the speech service takes (on the daemon's host) and a microphone
+   *  this window may use (its permission prompt comes now, not mid-word). */
+  async function enableVoice(mode: VoiceMode) {
+    const problem = await voiceProblem();
+    if (problem !== null) {
+      store.notice(problem, "error");
+      return;
+    }
+    setSetting("chat.voice", mode);
+    const how =
+      mode === "tap"
+        ? "Tap Space (with the message empty) to start, tap again to send."
+        : "Hold Space to record.";
+    store.notice(
+      `Voice mode enabled (${mode}). ${how} Dictation language: ${dictationLanguage().name} (Settings → Chat to change).`,
+      "info",
+    );
+  }
+
+  /** Words dictation should favor: where this chat works, and who it's with. */
+  const voiceTerms = $derived.by(() => {
+    const ctx = linkContext();
+    const base = (p: string | null | undefined) =>
+      p ? (p.replace(/\/+$/, "").split("/").pop() ?? "") : "";
+    return ["Chimaera", "Claude", "Codex", base(ctx.root), base(ctx.cwd)].filter(
+      (t) => t.length > 0,
+    );
+  });
 
   function setUltracode(enabled: boolean): boolean {
     return sendCommand({ type: "set_ultracode", enabled }, "ultracode change not sent");
@@ -1538,6 +1587,15 @@
       });
     }
     native.push({ name: "usage", description: "plan usage limits — chimaera panel" });
+    native.push({
+      name: "voice",
+      description: "toggle voice dictation (hold/tap/off) — Claude's speech service",
+      options: [
+        { value: "hold", label: "hold", description: "hold Space to record" },
+        { value: "tap", label: "tap", description: "tap Space to start, again to send" },
+        { value: "off", label: "off", description: "turn voice dictation off" },
+      ],
+    });
     if (agentKind === "claude" && store.remoteControlAvailable) {
       native.push({
         name: "remote-control",
@@ -2654,6 +2712,7 @@
     {focused}
     {visible}
     {onSubmit}
+    {voiceTerms}
     onDraftState={(active) => (composerEngaged = active)}
     onInterrupt={interrupt}
     onCycleMode={cycleMode}
