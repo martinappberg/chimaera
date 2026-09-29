@@ -405,14 +405,28 @@ pub(crate) async fn worktrees(
                     }
                 }
             }
-            let merged: Vec<Option<bool>> = list
-                .iter()
-                .zip(&vs_main)
-                .map(|(w, counts)| {
-                    let managed = w.path.starts_with(&managed_root) && w.path != repo.toplevel;
-                    counts.filter(|_| managed).map(|(_, ahead)| ahead == 0)
-                })
-                .collect();
+            // "merged" means the branch had commits of its own and the main
+            // branch now holds them all. A brand-new branch (nothing on it
+            // yet) is also "0 ahead", but it is not merged: it says nothing.
+            let mut merged: Vec<Option<bool>> = Vec::with_capacity(list.len());
+            for (w, counts) in list.iter().zip(&vs_main) {
+                let managed = w.path.starts_with(&managed_root) && w.path != repo.toplevel;
+                let value = match counts.filter(|_| managed) {
+                    None => None,
+                    Some((_, ahead)) if ahead > 0 => Some(false),
+                    Some(_) => Some(
+                        !branch_is_new(
+                            &state,
+                            &git.path,
+                            &repo.toplevel,
+                            w.branch.as_deref(),
+                            w.sha.as_deref(),
+                        )
+                        .await,
+                    ),
+                };
+                merged.push(value);
+            }
             let items: Vec<serde_json::Value> = list
                 .iter()
                 .zip(merged)
@@ -769,6 +783,51 @@ mod tests {
 }
 
 /// Parse `rev-list --left-right --count A...B` ("<left>\t<right>").
+/// Whether `branch` has never moved since it was created — its reflog holds
+/// only the creation entry — at `sha`. Cached by (branch, sha); an unknown
+/// answer (no reflog, a failed run) reads as not new, the old behavior.
+async fn branch_is_new(
+    state: &AppState,
+    git: &Path,
+    dir: &Path,
+    branch: Option<&str>,
+    sha: Option<&str>,
+) -> bool {
+    let (Some(branch), Some(sha)) = (branch, sha) else {
+        return false;
+    };
+    let key = (branch.to_string(), sha.to_string());
+    if let Some(hit) = crate::lock(&state.git.fresh_branches).get(&key).copied() {
+        return hit;
+    }
+    let refname = format!("refs/heads/{branch}");
+    let answer = match run_git(
+        git,
+        &state.git.procs,
+        dir,
+        &["reflog", "show", "-n", "2", "--format=%H", &refname, "--"],
+        4096,
+    )
+    .await
+    {
+        Ok(out) if out.success => {
+            let entries: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+            entries.len() == 1 && entries[0] == sha
+        }
+        _ => false,
+    };
+    let mut cache = crate::lock(&state.git.fresh_branches);
+    if cache.len() >= super::service::VS_MAIN_CAP {
+        cache.clear();
+    }
+    cache.insert(key, answer);
+    answer
+}
+
 pub(super) fn parse_left_right(text: &str) -> Option<(u64, u64)> {
     let mut it = text.split_whitespace();
     let left = it.next()?.parse().ok()?;

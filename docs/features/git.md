@@ -64,7 +64,7 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   arbitrary path); without it the routes behave exactly as before, and `/git/diff` picks the innermost
   repository holding the path. A change refreshes only the repository containing it (plus a submodule's
   superproject); the 12 s backstop covers the primary and the nested repositories a window has open or
-  holds a file of. **Intent: pending** (shipped 2026-09-29).
+  holds a file of. Intent: see [the 2026-09-29 entry](#full-git-support--why-it-exists).
 
 ## History
 
@@ -83,7 +83,7 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   `GET /git/show?repo=&rev=`; `rev=` on `GET /git/diff` (working tree vs the revision, or `mode=commit`
   for the commit vs its parent). Every revision is validated with `check-ref-format` and resolved with
   `rev-parse --verify` before use; flags, ranges, blob paths and reflog selectors are refused. Chimaera
-  shows history and never checks out, reverts or resets. **Intent: pending** (shipped 2026-09-29).
+  shows history and never checks out, reverts or resets. Intent: see [the 2026-09-29 entry](#full-git-support--why-it-exists).
 
 ## The diff surface
 
@@ -119,7 +119,7 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   branch_changed, repo_changed}`. `CreateSession` accepts a `cwd` inside the workspace or one of its
   worktrees; the Mastermind's `spawn_agent` takes `branch`/`base` (the worker stays in the Mastermind's
   workspace and runs in that branch's worktree). A command finishing in a terminal marks the terminal's
-  folder dirty, so a `git commit` typed there shows at once. **Intent: pending** (shipped 2026-09-29).
+  folder dirty, so a `git commit` typed there shows at once. Intent: see [the 2026-09-29 entry](#full-git-support--why-it-exists).
 
 ## Worktrees — create & remove (the only mutations)
 
@@ -149,16 +149,17 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   sends force). While an agent runs inside a managed worktree it is locked (`chimaera: <session>`) so
   other tools' clean-up leaves it alone; the lock goes when the last agent leaves, stale chimaera locks
   are released (or adopted by restored sessions) at daemon start, and other tools' locks are never
-  touched. **Intent: pending** for the base picker, `.worktreeinclude`, locking and the unshared-commits
+  touched. Intent for the base picker, `.worktreeinclude`, locking and the unshared-commits
   fence (shipped 2026-09-29).
 
 ## Branches (the agent↔branch map)
 
 - **What & when.** A repository's worktree branches (main checkout first) and which sessions work in
   each; the local branches without a worktree under a collapsed "Other branches (N)".
-- **How it's used.** A row reads: branch, the worktree folder (muted, when not the main checkout), "N
-  ahead of main", "merged", and the agents' glyphs with their state dots (click one to open that
-  session). Clicking a row opens **Changes on this branch**: everything since the branch left its base
+- **How it's used.** A row reads: branch, the worktree folder (muted, only when its name differs from
+  the branch), "N ahead of main", "merged" (only once the branch had commits of its own and main holds
+  them all — a brand-new branch says nothing; `http.rs` `branch_is_new` reads the branch's reflog), and
+  the agents' glyphs with their state dots (click one to open that session). Clicking a row opens **Changes on this branch**: everything since the branch left its base
   — the merge-base diff plus uncommitted work — each file opening its diff against that point. An
   "Other branches" row opens that branch's history. Read-only: there is no checkout.
 - **Where it lives.** `GitRepoSection.svelte`, `GitDetailView.svelte` (`view: "branch"`); routes
@@ -166,7 +167,7 @@ repos,branches,log,show,compare}`, `GET/POST/DELETE /api/v1/git/worktrees`,
   name, last commit date, upstream, ahead/behind), `GET /git/compare?repo=&base=`.
 - **Key behaviors.** The session↔worktree edge is the daemon's (`session.git.worktree`), not a client
   guess. Only actionable worktrees are listed (main, current, holding sessions, managed); the rest fold
-  into "N other worktrees". **Intent: pending** (shipped 2026-09-29).
+  into "N other worktrees". Intent: see [the 2026-09-29 entry](#full-git-support--why-it-exists).
 
 ## Session-scoped changes
 
@@ -217,3 +218,27 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
   there's a clear improvement** — the maintainer's rule: don't be too strict about additions.
 - **Do not change casually:** event-driven refresh (never poll); worktree-as-dimension. The
   read-only boundary itself is open to revisit if committing from the UI earns its keep.
+
+### Full git support — why it exists
+_Captured 2026-09-29 from the maintainer, in the session that built it (his words quoted)._
+
+- **Problem it solves:** "this is just so we have full git support in chimaera platform" — the core
+  git pieces that were missing (several repositories in one workspace, history, diffs against any
+  revision, sessions that know their branch, worktree polish).
+- **How settled it is:**
+  - **Core bet — git stays optional and never pushy.** "I dont want tooo much of git to become a
+    thing, where you are like forced to write PRs etc … it is just a good natural extension but a lot
+    of people will use chimaera for different things." Everything works without a repository; nothing
+    prompts to commit, branch, open a pull request or `git init`; not every turn is committed.
+  - **Core bet — a branch is where an agent works, not where the window goes.** Starting an agent on
+    a new branch moving the whole window "feels bad UI UX … that one agent could be in just that
+    branch". A worktree stays a dimension of its workspace.
+  - **Additions (deliberate today, improvable):** "nested repos matter"; the branch shows on the line
+    above a chat's input and on dashboard cards, and on the rail only for an agent working in a
+    separate worktree ("if it is not in worktree then we don't display anything"); a brand-new branch
+    says nothing rather than "merged"; Remove worktree says so in short prose ("not overly clear, same
+    word length") and never deletes the branch; git views open as preview tabs.
+- **Deliberately open / left out:** a commit, stage or push UI (agents and the terminal change git);
+  deleting branches; working with other people, forge integrations and commit trailers, which are
+  planned separately.
+- **Do not change:** the two core bets above. The rest is open to improvement.

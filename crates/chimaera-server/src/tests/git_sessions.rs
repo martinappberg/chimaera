@@ -406,7 +406,8 @@ async fn worktree_remove_refuses_unshared_commits_and_lists_merged() {
             .cloned()
             .unwrap()
     };
-    assert_eq!(row("feat/fresh")["merged"], true);
+    // A brand-new branch has nothing of its own yet: not "merged".
+    assert_eq!(row("feat/fresh")["merged"], false);
     assert_eq!(row("feat/busy")["merged"], false);
     assert_eq!(
         row("feat/busy")["ahead_of_main"],
@@ -442,6 +443,24 @@ async fn worktree_remove_refuses_unshared_commits_and_lists_merged() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+
+    // Once main holds the branch's own commits, it reads "merged".
+    git_in(&repo, &["merge", "-q", "--ff-only", "feat/busy"]);
+    let (_, list) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/git/worktrees?workspace_id={ws}"),
+        None,
+    )
+    .await;
+    let busy_row = list["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["branch"] == "feat/busy")
+        .cloned()
+        .unwrap();
+    assert_eq!(busy_row["merged"], true, "{list}");
 }
 
 /// The read-only local branch list: most recently committed first, with

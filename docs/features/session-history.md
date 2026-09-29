@@ -149,6 +149,22 @@ reads an ended session's record; the same-file line rides the claude hook answer
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-### Session history & activity — _Intent pending_
+### Session history & activity — why it exists
+_Captured 2026-09-29 from the maintainer, in the session that built it (his words quoted)._
 
-Not yet captured; waits for the capture-feature-intent questionnaire.
+- **Problem it solves:** knowing "who is doing what work, is it in worktrees, what runs,
+  traceability, accounting", and for agent transcripts "what have they done" — a lasting record of
+  every session, with or without git.
+- **How settled it is (all additions — deliberate today, improvable):**
+  - **Activity, not dollars:** "rename to activity and rather than dollars" — sessions, tokens and
+    time; claude's cost is API-priced and means nothing to a subscriber, so it stays out of the UI (the
+    CSV keeps it).
+  - **Archiving Recents:** "can recents chat be archived as well? like you can choose to archive all,
+    or you can right click and archive specific chats" — archive only hides; resuming an archived
+    conversation unarchives it (maintainer: yes).
+  - **Where All sessions lives:** revealed from Recent on hover rather than a standing row ("if you look
+    at Recent it will pop up on hover or something").
+- **Deliberately open / left out:** budgets and alerts; sharing records or transcripts with other
+  people (planned separately).
+- **Do not change:** nothing here is frozen; the record's append-only, bounded storage follows the
+  daemon rules, not this feature.

@@ -104,6 +104,9 @@ pub(crate) struct GitService {
     /// against the main checkout's branch. Two commits never change their
     /// distance, so a refresh re-runs `rev-list` only when one of them moved.
     pub(super) vs_main: Mutex<HashMap<(String, String), (u64, u64)>>,
+    /// (branch, sha) -> the branch never moved since it was created (a
+    /// brand-new branch is not "merged", whatever its distance says).
+    pub(super) fresh_branches: Mutex<HashMap<(String, String), bool>>,
 }
 
 /// Entries the ahead/behind cache keeps before it starts over.
@@ -305,6 +308,7 @@ impl GitService {
             status_share: StatusShare::new(),
             sessions: Default::default(),
             vs_main: Mutex::new(HashMap::new()),
+            fresh_branches: Mutex::new(HashMap::new()),
         }
     }
 
