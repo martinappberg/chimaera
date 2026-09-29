@@ -75,7 +75,9 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
 - A provider has at most one unfinished credential writer. Cancel clears the
   action immediately but retains that reservation until owned process-group/PTY
   exit is observed. The cancel endpoint waits up to four seconds; uncertain
-  cleanup fails closed with `cleanup_failed`. Retained finished attempts are
+  cleanup fails closed with `cleanup_failed` and keeps the provider reserved only
+  until the old login terminal and process group are gone (re-checked every 5 s,
+  at most ten minutes; `release_when_gone`), then releases it. Retained finished attempts are
   capped at 24 and expire on the next explicit connection request.
 - Cancellation stops the CLI process and device polling. It does not revoke a
   vendor code already issued (that code expires at the provider), or sign out an
