@@ -87,6 +87,9 @@ function fresh(path: string, text: string, hash = "h0", mtime = "m0") {
   return { buf, view };
 }
 
+/** Let a just-opened buffer's draft lookup settle (real timers only). */
+const lookupSettled = () => new Promise((r) => setTimeout(r, 0));
+
 function close(buf: Buffer, view: FakeView): void {
   buf.detach(view as unknown as EditorView);
   releaseBuffer(buf);
@@ -424,6 +427,7 @@ describe("the journal", () => {
   it("never marks text journaled when its write lands after a save cleared the draft", async () => {
     const path = `/w/late-journal-${++seq}.txt`;
     const { buf, view } = fresh(path, "x");
+    await lookupSettled();
     view.type(1, "a"); // "xa"
     type Result = { local: boolean; remote: "ok" };
     let land!: (r: Result) => void;
@@ -453,7 +457,8 @@ describe("the journal", () => {
     const path = `/w/flush-${++seq}.txt`;
     const { buf, view } = fresh(path, "x");
     view.type(1, "y");
-    await buf.journal();
+    await lookupSettled(); // held while it ran, then journaled at its end
+    expect(mocks.drafts.journal).toHaveBeenCalledTimes(1);
     await buf.journal(); // unchanged: the memo skips it
     expect(mocks.drafts.journal).toHaveBeenCalledTimes(1);
     await buf.journal(true); // the flush always writes
@@ -538,6 +543,71 @@ describe("the journal", () => {
     expect(buf.dirty).toBe(true); // "a\n" is unsaved against the saved "ba\n"
     await vi.advanceTimersByTimeAsync(JOURNAL_DELAY_MS);
     expect(mocks.drafts.journal).toHaveBeenLastCalledWith(expect.objectContaining({ text: "a\n" }), false);
+    buf.discard();
+    close(buf, view);
+  });
+
+  it("never journals over a recovered draft still on offer, until it is discarded", async () => {
+    vi.useFakeTimers();
+    const path = `/w/offered-${++seq}.txt`;
+    const found = { path, baseHash: "h0", baseText: "x\n", text: "x\noffered\n", updatedMs: 1, writer: "dead-window" };
+    mocks.drafts.find.mockImplementationOnce(async () => found as never);
+    const { buf, view } = fresh(path, "x\n");
+    await vi.waitFor(() => expect(buf.recovered).not.toBeNull());
+
+    // Typing instead of restoring: writing it would overwrite the path's one
+    // record — the offer's only copy — so it is held, and shown as such.
+    view.type(0, "typed ");
+    await vi.advanceTimersByTimeAsync(JOURNAL_DELAY_MS);
+    await buf.journal(true); // nor the hide/pagehide flush
+    expect(mocks.drafts.journal).not.toHaveBeenCalled();
+    expect(buf.journalFailed).toBe(true);
+
+    // Discarded: the offer's record goes, and the held edits are journaled at once.
+    buf.discardDraft();
+    expect(mocks.drafts.clear).toHaveBeenLastCalledWith(path, { writer: "dead-window", text: "x\noffered\n" });
+    expect(mocks.drafts.journal).toHaveBeenCalledWith(expect.objectContaining({ text: "typed x\n" }), false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(buf.journalFailed).toBe(false);
+    buf.discard();
+    close(buf, view);
+  });
+
+  it("leaves a draft on offer alone when the held edits are saved", async () => {
+    vi.useFakeTimers();
+    const path = `/w/offered-save-${++seq}.txt`;
+    const found = { path, baseHash: "h0", baseText: "x\n", text: "x\noffered\n", updatedMs: 1, writer: "dead-window" };
+    mocks.drafts.find.mockImplementationOnce(async () => found as never);
+    const { buf, view } = fresh(path, "x\n");
+    await vi.waitFor(() => expect(buf.recovered).not.toBeNull());
+    view.type(0, "typed ");
+    mocks.fsWrite.mockResolvedValueOnce({ hash: "h1", mtime: "m1" });
+    expect(await buf.save()).toBe(true);
+    // Only this window's record, or one holding exactly the saved text.
+    expect(mocks.drafts.clear).toHaveBeenLastCalledWith(path, { writer: "this-window", text: "typed x\n" });
+    expect(buf.recovered).toBe(found);
+    expect(buf.journalFailed).toBe(false);
+    buf.discardDraft();
+    close(buf, view);
+  });
+
+  it("holds edits typed before the open's draft lookup settles", async () => {
+    vi.useFakeTimers();
+    const path = `/w/slow-lookup-${++seq}.txt`;
+    const found = { path, baseHash: "h0", baseText: "x\n", text: "x\noffered\n", updatedMs: 1, writer: "dead-window" };
+    let answer!: (r: typeof found) => void;
+    mocks.drafts.find.mockImplementationOnce(() => new Promise<typeof found>((r) => (answer = r)) as never);
+    const { buf, view } = fresh(path, "x\n");
+    view.type(0, "typed "); // the lookup is still on a slow link
+    await vi.advanceTimersByTimeAsync(JOURNAL_DELAY_MS * 3);
+    expect(mocks.drafts.journal).not.toHaveBeenCalled();
+    expect(buf.journalFailed).toBe(true); // held, and shown as such
+
+    answer(found); // there WAS a draft: offered, and still not overwritten
+    await vi.advanceTimersByTimeAsync(0);
+    expect(buf.recovered).toEqual(found);
+    expect(mocks.drafts.journal).not.toHaveBeenCalled();
+    expect(buf.journalFailed).toBe(true);
     buf.discard();
     close(buf, view);
   });

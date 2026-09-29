@@ -341,6 +341,15 @@
 
   const elsewhere = $derived(presence.elsewhere.has(buf.path));
 
+  /** Why "draft not backed up": held on purpose, or the journal failed. */
+  const unbackedWhy = $derived(
+    buf.recovered !== null
+      ? "Held back so the recovered draft above stays recoverable — restore or discard it, or save, to protect these edits."
+      : buf.lookingForDraft
+        ? "Held back while checking for an earlier unsaved draft of this file, which these edits would overwrite."
+        : "The unsaved text could not be written to the browser's storage or to the daemon — save when you can.",
+  );
+
   function recoveredWhen(ms: number): string {
     if (!Number.isFinite(ms) || ms <= 0) return "an earlier session";
     const d = new Date(ms);
@@ -507,7 +516,7 @@
       {#if buf.journalFailed}
         <span
           class="bar-warn"
-          title="The unsaved text could not be written to the browser's storage or to the daemon — save when you can."
+          title={unbackedWhy}
           >draft not backed up</span
         >
       {/if}
