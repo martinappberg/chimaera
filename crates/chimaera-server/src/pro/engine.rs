@@ -2106,55 +2106,102 @@ async fn run_profile_steps(
         .get(workspace)
         .map(|preference| preference.profile.clone())
         .unwrap_or_default();
-    let commands: Vec<String> = profile.setup_command.into_iter().collect();
-    if commands.is_empty() {
+    let Some(command) = profile.setup_command else {
         return Ok(());
-    }
-    let workspace_record = lock(&state.workspaces)
+    };
+    let root = lock(&state.workspaces)
         .get(workspace)
-        .context("unknown workspace")?;
-    let row = crate::spawn::spawn_session(
-        state,
-        crate::spawn::SpawnSpec {
-            native_cwd: None,
-            workspace: workspace_record,
-            id: None,
-            name: Some(
-                if config.role == Role::Worker {
-                    "Cloud setup"
-                } else {
-                    "Deferred laptop steps"
-                }
-                .into(),
-            ),
-            cwd: None,
-            cols: None,
-            rows: None,
-            theme: "dark".into(),
-            title_hint: None,
-            prelude: None,
-            kind: crate::spawn::SpawnKind::Shell,
-            fork_head: false,
-        },
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("could not create project setup terminal"))?;
-    let id = row["id"]
-        .as_str()
-        .context("setup terminal has no identity")?;
-    for command in commands {
-        ensure!(
-            super::may_write(state, workspace),
-            "Account changed before project setup execution"
-        );
-        let outcome =
-            crate::exec::run_exec(state, id, command.clone(), Some(600_000), Some(15_000))
-                .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        if outcome.record.exit_code != Some(0) || outcome.timed_out {
-            anyhow::bail!("project setup needs attention in its terminal");
+        .context("unknown workspace")?
+        .root;
+    ensure!(
+        super::may_write(state, workspace),
+        "Account changed before project setup execution"
+    );
+    // Setup is the system's job, not a terminal the user must watch: it runs
+    // in the background in the user's login shell; a failure leaves one plain
+    // status line and its output tail in the project's setup log.
+    let log = state.pro.root.join(workspace).join("setup.log");
+    // Boxed: this runs inside the hydrate future, which callers hold inline.
+    Box::pin(run_setup_command(&root, &command, &log)).await
+}
+
+/// How long a project's setup may run, and how much of its output is kept.
+const SETUP_DEADLINE: Duration = Duration::from_secs(600);
+const SETUP_LOG_BYTES: usize = 64 * 1024;
+
+async fn run_setup_command(root: &Path, command: &str, log: &Path) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let mut child = tokio::process::Command::new(crate::launcher::login_shell())
+        .args(["-lc", command])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .context("project setup could not start")?;
+    let group = child.id();
+    let tail = std::sync::Mutex::new(Vec::<u8>::new());
+    let keep = |bytes: &[u8]| {
+        let mut tail = lock(&tail);
+        tail.extend_from_slice(bytes);
+        if tail.len() > SETUP_LOG_BYTES {
+            let excess = tail.len() - SETUP_LOG_BYTES;
+            tail.drain(..excess);
         }
-    }
+    };
+    let (mut stdout, mut stderr) = (child.stdout.take(), child.stderr.take());
+    let drain = |stream: Option<tokio::process::ChildStdout>| async {
+        let Some(mut stream) = stream else { return };
+        let mut block = vec![0u8; 8192];
+        while let Ok(count) = stream.read(&mut block).await {
+            if count == 0 {
+                break;
+            }
+            keep(&block[..count]);
+        }
+    };
+    let drain_err = |stream: Option<tokio::process::ChildStderr>| async {
+        let Some(mut stream) = stream else { return };
+        let mut block = vec![0u8; 8192];
+        while let Ok(count) = stream.read(&mut block).await {
+            if count == 0 {
+                break;
+            }
+            keep(&block[..count]);
+        }
+    };
+    let finished = tokio::time::timeout(SETUP_DEADLINE, async {
+        let (_, _, status) =
+            tokio::join!(drain(stdout.take()), drain_err(stderr.take()), child.wait());
+        status
+    })
+    .await;
+    let succeeded = match finished {
+        Ok(Ok(status)) => status.success(),
+        _ => {
+            // Timed out: stop the whole setup process group.
+            if let Some(group) = group.and_then(|id| i32::try_from(id).ok()) {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(group),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            let _ = child.kill().await;
+            false
+        }
+    };
+    let output = std::mem::take(&mut *lock(&tail));
+    let log = log.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Some(parent) = log.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(log, output)
+    })
+    .await;
+    ensure!(succeeded, "project setup did not finish");
     Ok(())
 }
 
@@ -2300,6 +2347,30 @@ mod tests {
         );
         drop(restarted);
         drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    /// A project's cloud setup runs in the background, never as a terminal
+    /// the user has to watch; a failure leaves a status code and a log.
+    #[tokio::test]
+    async fn cloud_setup_runs_in_the_background_without_a_terminal() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-setup-background-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("setup.log");
+        run_setup_command(&root, "echo installed > marker; echo done", &log)
+            .await
+            .unwrap();
+        assert!(root.join("marker").exists(), "ran in the project root");
+        let error = run_setup_command(&root, "echo broken; exit 3", &log)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            super::super::routes::error_code(&error),
+            "cloud_setup_failed"
+        );
+        assert!(std::fs::read_to_string(&log).unwrap().contains("broken"));
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

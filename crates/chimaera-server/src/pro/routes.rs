@@ -58,6 +58,8 @@ pub(super) fn error_code(error: &anyhow::Error) -> &'static str {
         "credential_in_history"
     } else if has("root_setup_required") {
         "root_setup_required"
+    } else if has("project setup") {
+        "cloud_setup_failed"
     } else if has("Mirror helper cleanup could not be verified") {
         "cache_recovery_needed"
     } else if has("session archive")
