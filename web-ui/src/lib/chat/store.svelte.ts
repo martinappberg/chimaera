@@ -1930,7 +1930,7 @@ export class ChatStore {
     const embedded = proseEmbedTargets(prose);
     // A reply is short and cheap to scan whole, and a name it uses must
     // cover its file whatever its position — only resolve candidates
-    // (shell names, un-embedded figures) keep the small cap.
+    // (shell names) keep the small cap.
     const named = artifactMentions(prose, PROSE_NAMES_MAX);
     const covered = new Set<string>();
     /** The remainder of `candidates` once the prose's embeds and names have

@@ -29,7 +29,7 @@
   import { isMissing, resolveFile, type TargetInfo, type TargetResult } from "../shared/embed/embed";
   import type { OpenPathOptions, PathKind } from "../shared/openPath";
   import { lastDiskChange, releaseDiskFile, retainDiskFile } from "../workspace/diskWatch";
-  import { artifactShape, chipLabels, fileStateAfter, foldedChips, writtenDuring, type FileState } from "./artifacts";
+  import { chipLabels, fileStateAfter, foldedChips, isArtifactPath, writtenDuring, type FileState } from "./artifacts";
   import type { EmbedResolver } from "./embeds";
   import type { HoverTargets } from "./hoverTargets";
 
@@ -158,7 +158,7 @@
   const files = $derived.by((): Written[] => {
     const all: Written[] = paths.map((p) => ({ path: p, info: null }));
     for (const c of confirmed) all.push({ path: c.path, info: c });
-    return all.filter((f) => artifactShape(f.path) !== null).slice(0, MAX_FILES);
+    return all.filter((f) => isArtifactPath(f.path)).slice(0, MAX_FILES);
   });
   /** Folding is only worth it past one extra chip's worth: "+1 more"
    *  costs the room the chip would. */

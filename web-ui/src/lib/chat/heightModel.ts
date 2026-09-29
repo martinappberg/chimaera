@@ -89,8 +89,11 @@ export function blockWeight(
       return block.resolved ? 2 + 2 * block.questions.length : 0;
     case "turn_end":
       // The written-files line (a chip per file, wrapping to a second line
-      // past a handful); a bare turn end renders nothing.
-      return block.artifacts.length > 0 || block.mentioned.length > 0 ? 2 : 0;
+      // past a handful); a bare turn end renders nothing. Shell mentions
+      // alone are only candidates — a `head data.csv` confirms nothing —
+      // so they weigh half.
+      if (block.artifacts.length > 0) return 2;
+      return block.mentioned.length > 0 ? 1 : 0;
     case "usage":
       return 4;
     case "notice":

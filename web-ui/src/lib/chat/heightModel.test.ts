@@ -38,7 +38,7 @@ describe("block height model", () => {
     expect(blockWeight(tool(2), tool(1), 100)).toBe(0);
     expect(blockWeight(turnEnd([]), null, 100)).toBe(0);
     expect(blockWeight(turnEnd(["/a.png"]), null, 100)).toBe(2);
-    expect(blockWeight(turnEnd([], ["figs/a.png"]), null, 100)).toBe(2);
+    expect(blockWeight(turnEnd([], ["figs/a.png"]), null, 100)).toBe(1);
   });
 
   it("puts a run of thoughts and tool calls on the one line its fold renders", () => {

@@ -1,5 +1,5 @@
 /**
- * What counts as a turn's "made this turn" file, and the cheap honest
+ * What counts as a turn's "written this turn" file, and the cheap honest
  * signal for the ones no edit tool reported. Pure (artifacts.test.ts): the
  * chat reducer runs it at every turn end, replay included.
  *
