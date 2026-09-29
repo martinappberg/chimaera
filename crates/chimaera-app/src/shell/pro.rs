@@ -184,7 +184,13 @@ impl Pro {
             available: self.endpoint.is_some(),
             signed_in,
             email: account.as_ref().map(|account| account.email.clone()),
-            plan: account.as_ref().map(|account| account.plan.clone()),
+            // A plan this client cannot name (a newer tier) reads as the
+            // neutral "not known yet" state; the UI's plan vocabulary is
+            // exactly none/pro/max, so it never sees "unknown".
+            plan: account
+                .as_ref()
+                .map(|account| account.plan.clone())
+                .filter(|plan| *plan != chimaera_link::Plan::Unknown),
             error: self
                 .credential_persistence
                 .warning(self.generation())
@@ -1361,6 +1367,12 @@ mod tests {
         let wire = serde_json::to_value(pro.status_snapshot()).unwrap();
         assert!(wire["connection_warning"].is_null() && wire["plans"].is_null());
         assert_eq!(wire["payment_due"], false);
+        assert_eq!(wire["plan"], "pro");
+        let mut newer = fixture_account();
+        newer.plan = chimaera_link::Plan::Unknown;
+        *lock(&pro.account) = Some(newer);
+        let wire = serde_json::to_value(pro.status_snapshot()).unwrap();
+        assert!(wire["plan"].is_null(), "an unnamed plan stays neutral");
     }
 
     #[test]

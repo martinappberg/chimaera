@@ -207,7 +207,7 @@ async fn open_billing(
         .ok_or("Sign in before opening billing.")?;
     if checkout
         .as_ref()
-        .is_some_and(|(plan, _)| *plan == Plan::None)
+        .is_some_and(|(plan, _)| !matches!(plan, Plan::Pro | Plan::Max))
     {
         return Err("Choose Pro or Max.".into());
     }
