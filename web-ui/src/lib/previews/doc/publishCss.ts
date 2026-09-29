@@ -16,33 +16,7 @@
  * font files, nothing to fetch.
  */
 
-/** Alert glyphs (the reading view's, as masks painted in the title's color). */
-const ICONS: Record<string, string> = {
-  note: "%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 8h.01M11 12h1v4h1'/%3E",
-  tip: "%3Cpath d='M3 12h1m8-9v1m8 8h1M5.6 5.6l.7.7m12.1-.7-.7.7M9 16a5 5 0 1 1 6 0a3.5 3.5 0 0 0-1 3a2 2 0 0 1-4 0a3.5 3.5 0 0 0-1-3M9.7 17h4.6'/%3E",
-  important:
-    "%3Cpath d='M18 4a3 3 0 0 1 3 3v8a3 3 0 0 1-3 3h-5l-5 3v-3H6a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3zM12 8v3M12 14v.01'/%3E",
-  warning:
-    "%3Cpath d='M12 9v4M10.4 3.6L2.3 17.1a1.9 1.9 0 0 0 1.6 2.9h16.2a1.9 1.9 0 0 0 1.6-2.9L13.6 3.6a1.9 1.9 0 0 0-3.2 0zM12 16h.01'/%3E",
-  caution:
-    "%3Cpath d='M12.8 2.6l8.6 8.6a1.1 1.1 0 0 1 0 1.6l-8.6 8.6a1.1 1.1 0 0 1-1.6 0l-8.6-8.6a1.1 1.1 0 0 1 0-1.6l8.6-8.6a1.1 1.1 0 0 1 1.6 0zM12 8v4M12 16h.01'/%3E",
-};
-const ALERT_TINT: Record<string, string> = {
-  note: "var(--syn-func)",
-  tip: "var(--syn-string)",
-  important: "var(--rate)",
-  warning: "var(--warn)",
-  caution: "var(--err)",
-};
-
-function alertRules(): string {
-  return Object.keys(ICONS)
-    .map(
-      (k) =>
-        `.markdown-alert-${k}{--md-alert:${ALERT_TINT[k]};--md-alert-icon:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E${ICONS[k]}%3C/svg%3E")}`,
-    )
-    .join("\n");
-}
+import { calloutRules } from "./callouts";
 
 /** `tokens`: a light theme's CSS custom properties; `highlight`: the code
  *  highlighter's class rules (they read the `--syn-*` tokens). */
@@ -106,12 +80,17 @@ body{margin:0;color:var(--fg);font-family:var(--ui-font);font-size:16px;line-hei
 .md-doc ul>li.md-task-item{list-style:none}
 .md-doc ul>li.md-task-item>.md-task:first-child,.md-doc ul>li.md-task-item>p:first-child>.md-task:first-child{margin-left:-1.35em;margin-right:.43em}
 .md-doc .md-task-text{color:var(--muted);text-decoration:line-through;text-decoration-color:color-mix(in srgb,var(--muted) 70%,transparent)}
-.markdown-alert{--md-alert:var(--syn-func);margin:.9em 0;padding:.55em 1em .6em;border-left:3px solid color-mix(in srgb,var(--md-alert) 75%,transparent);border-radius:0 8px 8px 0;background:color-mix(in srgb,var(--md-alert) 7%,transparent)}
-${alertRules()}
+.markdown-alert{margin:.9em 0;padding:.55em 1em .6em;border-left:3px solid color-mix(in srgb,var(--md-alert) 75%,transparent);border-radius:0 8px 8px 0;background:color-mix(in srgb,var(--md-alert) 7%,transparent)}
+${calloutRules("")}
 .markdown-alert-title{display:flex;align-items:center;gap:.45em;margin:0 0 .25em;font-weight:600;font-size:.94em;color:var(--md-alert)}
 .markdown-alert-title::before{content:"";flex:none;width:1.05em;height:1.05em;background:currentColor;-webkit-mask:var(--md-alert-icon) center/contain no-repeat;mask:var(--md-alert-icon) center/contain no-repeat}
 .markdown-alert>:last-child{margin-bottom:0}
 .markdown-alert>.markdown-alert-title+*{margin-top:0}
+summary.markdown-alert-title{cursor:pointer;list-style:none}
+summary.markdown-alert-title::-webkit-details-marker{display:none}
+summary.markdown-alert-title::after{content:"";flex:none;width:.85em;height:.85em;background:currentColor;opacity:.8;-webkit-mask:var(--md-fold-icon) center/contain no-repeat;mask:var(--md-fold-icon) center/contain no-repeat;transform:rotate(-90deg)}
+details.markdown-alert[open]>summary.markdown-alert-title::after{transform:none}
+details.markdown-alert:not([open])>summary.markdown-alert-title{margin-bottom:0}
 .md-doc section.footnotes{margin-top:2.2em;padding-top:.6em;border-top:1px solid var(--edge);font-size:.88em;color:color-mix(in srgb,var(--fg) 75%,var(--muted))}
 .md-doc .footnote-ref a,.md-doc a.footnote-backref{font-variant-numeric:tabular-nums}
 .md-doc .md-crop{display:block;position:relative;overflow:hidden;max-width:100%}
