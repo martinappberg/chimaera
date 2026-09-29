@@ -192,7 +192,8 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
   splice output already rendered or crowd the fixed composer. The reducer
   appends it to `blocks` at the current end only when `user_message_update`
   resolves it `sent` — possibly mid-turn, which is where the agent read it
-  (several waiting messages are read together); `cancelled` removes it;
+  (several waiting messages are read together; such a block is `midTurn`, and
+  the turn-end artifact scan looks past it to the turn's real opener); `cancelled` removes it;
   `dropped` marks it "not delivered" until dismissed. `send_after_turn` (the
   composer's ⌥↩ / Alt+Enter, yielding to any app action the user binds to the
   same keys — ⇧⌘↩ is Zoom Pane) holds a message until the turn ends: its echo carries `after_turn`, kept as `afterTurn` (caption "after

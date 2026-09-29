@@ -271,6 +271,9 @@ export type ChatBlock = BlockIdentity &
       origin: string | null;
       /** Inclusive journal boundary for a portable fork through this row. */
       forkSeq: number;
+      /** The agent read it inside a running turn (a waiting send taken at a
+       *  step boundary), so it joined that turn instead of opening one. */
+      midTurn?: true;
     }
   | {
       kind: "message";
@@ -1009,6 +1012,7 @@ export class ChatStore {
               checkpoint: pending.checkpoint,
               id: pending.id,
               forkSeq: entry.seq,
+              ...(this.running ? { midTurn: true as const } : {}),
             }),
           );
           this.userIndex.set(pending.id, this.blocks.length - 1);
@@ -1913,8 +1917,9 @@ export class ChatStore {
     for (let i = this.blocks.length - 1; i >= 0; i--) {
       const b = this.blocks[i];
       // Every user block here is delivered (queued sends live in pendingSends),
-      // so a user block IS this turn's opening boundary — stop the scan.
-      if (b.kind === "user" || b.kind === "turn_end") break;
+      // so a user block is this turn's opening boundary — stop the scan —
+      // unless the agent read it mid-turn: the turn it joined began earlier.
+      if ((b.kind === "user" && b.midTurn !== true) || b.kind === "turn_end") break;
       if (b.kind === "message") {
         prose.push(b.text);
         continue;

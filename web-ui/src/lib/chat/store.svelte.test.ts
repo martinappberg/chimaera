@@ -1721,6 +1721,32 @@ describe("ChatStore turn artifacts (the made-this-turn gallery)", () => {
     expect(foldAt(TURN).blocks).toEqual(store.blocks);
   });
 
+  it("a message the agent read mid-turn does not cut the turn's artifacts", () => {
+    const store = foldAt([
+      ...TURN.slice(0, 4),
+      // Sent while the turn runs; the agent reads it at its next step.
+      [1031, { type: "user_message", text: "also a chart", id: "q1", queued: true }],
+      [1032, { type: "user_message_update", id: "q1", state: "sent" }],
+      ...TURN.slice(4),
+    ]);
+    const user = store.blocks.find((b) => b.kind === "user" && b.id === "q1");
+    expect(user).toMatchObject({ midTurn: true });
+    // notes.md was written BEFORE the mid-turn message and still counts.
+    expect(store.blocks.find((b) => b.kind === "turn_end")).toMatchObject({
+      artifacts: ["/p/notes.md"],
+      startedAtMs: 1010,
+    });
+    // A message that opens the next turn (read between turns) is not mid-turn.
+    const next = foldAt([
+      ...TURN,
+      [2001, { type: "user_message", text: "next", id: "q2", queued: true }],
+      [2002, { type: "user_message_update", id: "q2", state: "sent" }],
+    ]);
+    const opener = next.blocks.find((b) => b.kind === "user" && b.id === "q2");
+    expect(opener).toBeDefined();
+    expect(opener && "midTurn" in opener).toBe(false);
+  });
+
   it("a stopped turn keeps what it made; a plain stop adds nothing", () => {
     const stopped = foldAt([
       ...TURN.slice(0, -1),

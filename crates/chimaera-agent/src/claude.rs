@@ -365,6 +365,20 @@ impl ClaudeChat {
         Ok(uuid)
     }
 
+    /// A mid-turn message for the CLI's own queue, with the driver's exact
+    /// frame (`priority` `"next"` or `"later"`); returns its uuid.
+    pub async fn send_queued_text(&mut self, text: &str, priority: &str) -> Result<String> {
+        let uuid = crate::model::fresh_uuid();
+        self.io
+            .send(&queued_message_frame(
+                &uuid,
+                json!([{ "type": "text", "text": text }]),
+                priority,
+            ))
+            .await?;
+        Ok(uuid)
+    }
+
     /// Next raw protocol frame. `Ok(None)` = the CLI exited.
     pub async fn recv(&mut self, timeout: Duration) -> Result<Option<Value>> {
         self.io.recv(timeout).await
