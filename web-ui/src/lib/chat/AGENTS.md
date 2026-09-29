@@ -346,4 +346,8 @@ daemon's transfer pick-up (a user message with origin `moved`, `home` or `recove
 as `TransferNote.svelte`: one line ("Continued in the cloud · 5m ago", "Back on
 your computer", or "… after this computer stopped responding" when it
 is tagged `recovered`, its direction read from the daemon's sentence — `transfer.ts`) with the agent-facing
-text behind "Show what the agent was told".
+text behind "Show what the agent was told". A surface that holds only the prompt's text, not the
+origin tag (the Timeline's "Since you left" rows), recognises the pick-up from its opening words
+with `pickupNote` and shows the same short line instead of quoting the agent-facing text.
+`store.awaitingWake` (`hydrating && asleep`) replaces the loading line with one quiet sentence while
+the owner sleeps before the first replay; a wake (`waking`) hands back to the ordinary loading line.
