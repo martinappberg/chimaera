@@ -295,6 +295,22 @@ describe("shared paid plan", () => {
     expect(bridge.onProChanged).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps an overdue account neutral: no Get Pro offer and no paid badge without a plan", async () => {
+    const account = subscribeAccount();
+    const badge = subscribe();
+    await flush();
+    bridge.proStatus.mockResolvedValue({ ...status("none"), payment_due: true });
+    changed();
+    await flush();
+    expect(account.at(-1)).toBe("unknown");
+    expect(badge.at(-1)).toBeNull();
+    bridge.proStatus.mockResolvedValue({ ...status("pro"), payment_due: true });
+    changed();
+    await flush();
+    expect(account.at(-1)).toBe("pro");
+    expect(badge.at(-1)).toBe("pro");
+  });
+
   it("keeps the confirmed plan while the connection behind cloud features comes up", async () => {
     const account = subscribeAccount();
     const badge = subscribe();

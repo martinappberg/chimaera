@@ -16,6 +16,11 @@ export function accountFailure(status: StatusFields | null | undefined): string 
   return error !== null && LEGACY_WARNINGS.has(error) ? null : error;
 }
 
+/** A failed or overdue payment. It is resolved in billing, never by checkout. */
+export function paymentDue(status: Pick<ProStatus, "signed_in" | "payment_due"> | null | undefined): boolean {
+  return status?.signed_in === true && status.payment_due === true;
+}
+
 /** The connection behind cloud features is still coming up. Local work and the
  * account itself are unaffected, so this is shown quietly, with no action. */
 export function connectionWarning(status: StatusFields | null | undefined): boolean {

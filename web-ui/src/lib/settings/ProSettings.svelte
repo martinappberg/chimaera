@@ -12,7 +12,7 @@
   import { pageVisible } from "../shared/visibility";
   import { paid, readIntent, friendlyError, recoverableAccountRestore, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
   import { accountPanel, completesReview, isConfirmedFree, reviewKey } from "../pro/account";
-  import { accountFailure, connectionWarning } from "../pro/status";
+  import { accountFailure, connectionWarning, paymentDue } from "../pro/status";
   import {
     onProChanged, proStatus, proSignIn, proCancelSignIn, proSignOut, proSignOutEverywhere,
     proHosts, proSetHostKept, proDevices, proRevokeDevice, proBillingCheckout, proBillingPortal, proCancelBilling, proRefreshAccount,
@@ -65,6 +65,7 @@
   const panel = $derived(accountPanel(status, refreshing));
   const accountNeedsAttention = $derived(panel === "attention");
   const failure = $derived(accountFailure(status));
+  const paymentNeeded = $derived(paymentDue(status));
   const warning = $derived(status?.signed_in === true && connectionWarning(status));
   const signInPhase = $derived(status?.sign_in?.phase ?? null);
   const billing = $derived(status?.billing ?? null);
@@ -187,7 +188,9 @@
     await act("sign-in", () => proSignIn(screenHint), "Your browser couldn't open. Please try again.");
   }
   async function openBilling(target?: { plan: PaidPlan; interval: BillingInterval }): Promise<void> {
-    if (busy !== null || billingActive || !status?.signed_in || !subscribed || status.initializing) return;
+    // An overdue payment is settled in the billing portal even without an active plan.
+    if (busy !== null || billingActive || !status?.signed_in || !(subscribed || paymentNeeded) || status.initializing) return;
+    if (target && !subscribed) return;
     if (target) {
       busy = "upgrade";
       const fresh = await ensureFresh();
@@ -246,6 +249,14 @@
   }
 </script>
 
+{#snippet paymentNotice(action: boolean)}
+  <div class="panel notice payment" role="status">
+    <h2>Payment needs attention</h2>
+    <p>Update your payment details in billing to keep your plan. Work on this computer continues as usual.</p>
+    {#if action}<button disabled={busy !== null || billingActive} onclick={() => void openBilling()}>{busy === "billing" ? "Opening billing…" : "Manage billing"}</button>{/if}
+  </div>
+{/snippet}
+
 {#snippet billingNotice()}
     {#if billingMessage}
       <div class="panel notice" role="status">
@@ -268,7 +279,7 @@
     <div class="brand"><BrandMark size={44} /><span>chimaera</span><span class="product">{subscribed && status?.plan === "max" ? "Max" : "Pro"}</span></div>
     {#if subscribed}
       <h1>Your Chimaera {status?.plan === "max" ? "Max" : "Pro"}</h1>
-    {:else if billingActive || billingRecovery}
+    {:else if billingActive || billingRecovery || panel === "payment"}
       <h1>Your Chimaera account</h1>
     {:else if offerPlans}
       <h1>Your work, wherever you are.</h1>
@@ -294,7 +305,7 @@
   {:else}
     {#if status.signed_in}
       <div class="identity">
-        <div><span class="email">{status.email}</span><span class="muted small">{subscribed ? "Your account" : confirmedFree ? "Signed in · No active plan" : "Signed in · Checking your plan"}</span></div>
+        <div><span class="email">{status.email}</span><span class="muted small">{subscribed ? "Your account" : paymentNeeded ? "Signed in · Payment needs attention" : confirmedFree ? "Signed in · No active plan" : "Signed in · Checking your plan"}</span></div>
         <PlanBadge plan={paid(status.plan) ? status.plan : null} />
         <button class="text-button" disabled={busy !== null} onclick={() => void load(true)}>Refresh</button>
       </div>
@@ -336,8 +347,9 @@
       {#key status.email}<CloudSetup {visible} {requiredProviders} {contextLabel} {workspaceId} {onReady} />{/key}
       <section class="panel plan-current" aria-label="Current plan">
         <div class="section-heading"><div><span class="section-label">Your plan</span><h2>Chimaera {status.plan === "max" ? "Max" : "Pro"}</h2></div><button class="secondary" disabled={busy !== null || billingActive} onclick={() => void openBilling()}>{busy === "billing" ? "Opening billing…" : "Manage billing"}</button></div>
+        {#if paymentNeeded}{@render paymentNotice(false)}{/if}
         {@render billingNotice()}
-        {#if status.plan === "pro"}
+        {#if status.plan === "pro" && !paymentNeeded}
           <div class="upgrade-entry">
             <div><h3>More room for your work</h3><p class="small muted">Max includes more cloud time and mirrored storage, with the same workflow.</p></div>
             <button class="secondary" aria-expanded={upgradeOpen} disabled={busy !== null || billingActive || !canReviewUpgrade(status, true)} onclick={() => (upgradeOpen = !upgradeOpen)}>{billing?.kind === "plan_change" && billing.phase === "unconfirmed" ? "Review upgrade again" : "Upgrade to Max"}</button>
@@ -356,6 +368,8 @@
       </section>
       <details class="section" ontoggle={(event) => (connectionsOpen = event.currentTarget.open)}><summary>Connected machines</summary>{#if connectionsOpen}<div class="section-body"><p class="muted small">Add your remote hosts on Home. Keep a connection available through Pro here.</p>{#if hosts.length === 0}<p class="muted">No machines to show yet.</p>{/if}{#each hosts as host (host.alias)}<div class="row"><div><span>{host.alias}</span><span class="muted small">{host.status === "prompting" ? "Waiting for authentication" : host.status === "connecting" ? "Connecting…" : host.status === "connected" ? "Connected" : "Offline"}</span></div>{#if host.kind === "ssh"}<label class="keep"><input type="checkbox" checked={host.kept} disabled={busy !== null} onchange={(event) => setKept(host, event.currentTarget)} />Keep connected</label>{/if}</div>{/each}</div>{/if}</details>
       <details class="section" ontoggle={(event) => (mirrorsOpen = event.currentTarget.open)}><summary>Projects and privacy</summary>{#if mirrorsOpen}<MirrorSettings visible={visible && mirrorsOpen} />{/if}</details>
+    {:else if panel === "payment"}
+      {@render paymentNotice(true)}
     {:else if panel === "billing"}
       <!-- The native attempt continues while this surface is hidden or closed. -->
     {:else if panel === "checking"}
@@ -435,6 +449,8 @@
   .free-note strong { display: block; color: var(--fg); font-weight: 500; margin-bottom: 3px; }
   .notice { background: color-mix(in srgb, var(--accent) 5%, transparent); }
   .message { border-radius: 7px; padding: 12px 15px; }
+  .payment { border-color: color-mix(in srgb, var(--warn) 35%, var(--edge)); background: color-mix(in srgb, var(--warn) 5%, transparent); }
+  .payment h2 { color: var(--warn); }
   .plan-current .section-label { margin-bottom: 8px; }
   .plan-current :global(.panel.notice) { padding: 16px 0; margin: 18px 0 0; border: 0; border-top: 1px solid var(--edge); border-radius: 0; background: transparent; }
   .plan-current :global(.panel.notice h2) { font-size: var(--text-md); }

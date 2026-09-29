@@ -1,12 +1,12 @@
 import type { ProBillingAttempt, ProStatus } from "../net/native";
 
 import type { PlanChoice } from "./presentation";
-import { accountFailure } from "./status";
+import { accountFailure, paymentDue } from "./status";
 
 /** Called only by an explicit purchase action; remembered drafts are never authority. */
 export function explicitCheckoutChoice(status: ProStatus | null, fresh: boolean, selected: PlanChoice): PlanChoice | null {
   if (!fresh || !status?.available || !status.signed_in || status.initializing || accountFailure(status) !== null
-    || status.sign_in != null || status.plan !== "none" || billingPending(status.billing)
+    || status.sign_in != null || status.plan !== "none" || paymentDue(status) || billingPending(status.billing)
     || billingNeedsReview(status.billing, false)) return null;
   return { ...selected };
 }

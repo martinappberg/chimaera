@@ -891,6 +891,9 @@ export interface ProStatus {
   /** Optional: the always-on connection is still coming up. Never a failure
    * and never an entitlement signal. Older shells omit it. */
   connection_warning?: string | null;
+  /** Optional: the subscription's payment failed and needs the customer's
+   * attention (billing portal). Checkout must never start a second plan. */
+  payment_due?: boolean;
   /** Optional when connected to an older native shell. */
   sign_in?: { phase: "waiting" | "finishing"; expires_at: number } | null;
   /** Native owns verification even when this page is closed. Older shells omit it. */

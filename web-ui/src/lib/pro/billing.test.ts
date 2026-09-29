@@ -52,6 +52,10 @@ describe("explicit checkout choice", () => {
       expect(explicitCheckoutChoice({ ...free, ...delta }, true, choice)).toBeNull();
     }
   });
+  it("never opens checkout while a payment needs attention", () => {
+    expect(explicitCheckoutChoice({ ...free, payment_due: true }, true, choice)).toBeNull();
+    expect(explicitCheckoutChoice({ ...free, payment_due: false }, true, choice)).toEqual(choice);
+  });
   it("does not let an informational connection message block a confirmed choice", () => {
     expect(explicitCheckoutChoice({ ...free, connection_warning: "starting" }, true, choice)).toEqual(choice);
     expect(explicitCheckoutChoice({ ...free, error: "You're signed in. Your Pro connection is preparing; Chimaera will reconnect automatically." }, true, choice)).toEqual(choice);

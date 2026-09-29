@@ -1,18 +1,18 @@
 import type { ProStatus } from "../net/native";
 import { billingNeedsReview, billingPending } from "./billing";
 import { paid } from "./presentation";
-import { accountFailure } from "./status";
+import { accountFailure, paymentDue } from "./status";
 
 /** A confirmed account with no plan (or signed out). Rendering reads the last
  * confirmed status; purchase actions separately require a fresh read. */
 export function isConfirmedFree(status: ProStatus | null): boolean {
   return status?.available === true && !status.initializing && accountFailure(status) === null
-    && (status.signed_in ? status.plan === "none" : true);
+    && !paymentDue(status) && (status.signed_in ? status.plan === "none" : true);
 }
 
 /** The Pro page's main area. Derived from the last confirmed status so a
  * background read never unmounts plans, the walkthrough or the overview. */
-export type AccountPanel = "loading" | "unavailable" | "initializing" | "plans" | "subscriber" | "billing" | "checking" | "attention";
+export type AccountPanel = "loading" | "unavailable" | "initializing" | "plans" | "payment" | "subscriber" | "billing" | "checking" | "attention";
 
 export function accountPanel(status: ProStatus | null, refreshing: boolean): AccountPanel {
   if (status === null) return "loading";
@@ -22,6 +22,8 @@ export function accountPanel(status: ProStatus | null, refreshing: boolean): Acc
   const billing = billingPending(status.billing) || billingNeedsReview(status.billing, subscribed);
   if (isConfirmedFree(status) && !billing) return "plans";
   if (subscribed) return "subscriber";
+  // A lapsed payment is fixed in billing; it never falls back to plan choice.
+  if (paymentDue(status) && accountFailure(status) === null) return "payment";
   if (billing) return "billing";
   // Only an uncertain account waits on a read; confirmed states stay put.
   return refreshing ? "checking" : "attention";

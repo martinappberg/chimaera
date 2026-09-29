@@ -37,6 +37,20 @@ describe("Pro page panel", () => {
   });
 });
 
+describe("payment needs attention", () => {
+  it("routes an overdue account to billing instead of plan choice", () => {
+    const due = { ...free, payment_due: true };
+    expect(isConfirmedFree(due)).toBe(false);
+    for (const refreshing of [false, true]) expect(accountPanel(due, refreshing)).toBe("payment");
+    expect(accountPanel({ ...due, plan: "pro" }, false)).toBe("subscriber");
+    expect(accountPanel({ ...due, error: "sign in required" }, false)).toBe("attention");
+  });
+  it("ignores the flag when absent or signed out", () => {
+    expect(accountPanel({ ...free, payment_due: false }, false)).toBe("plans");
+    expect(accountPanel({ ...free, signed_in: false, email: null, plan: null, payment_due: true }, false)).toBe("plans");
+  });
+});
+
 describe("billing review", () => {
   it("keys a review by attempt, phase and plan so unrelated events keep it", () => {
     const failed = { ...free, billing: attempt("failed") };

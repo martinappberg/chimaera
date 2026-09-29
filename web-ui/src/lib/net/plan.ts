@@ -2,7 +2,7 @@ import { derived, readable } from "svelte/store";
 import { asyncDisposer } from "../shared/asyncDisposer";
 import { isBrowserGateway, workbenchPath } from "./base";
 import { isNativeShell, onProChanged, proStatus, type ProStatus } from "./native";
-import { accountFailure } from "../pro/status";
+import { accountFailure, paymentDue } from "../pro/status";
 
 export type PaidPlan = "pro" | "max" | null;
 
@@ -22,7 +22,11 @@ function nativePlan(status: ProStatus & { initializing?: boolean }): AccountPlan
   if (status.initializing || status.sign_in) return "loading";
   // A connection warning is informational; only a real failure is uncertain.
   if (accountFailure(status) !== null) return "unknown";
-  return status.signed_in ? knownPlan(status.plan) : "free";
+  if (!status.signed_in) return "free";
+  const plan = knownPlan(status.plan);
+  // Overdue payment on an account without an active plan is neither a paid
+  // badge nor a "Get Pro" offer; the Pro page explains it.
+  return plan === "free" && paymentDue(status) ? "unknown" : plan;
 }
 
 interface AccountState {
