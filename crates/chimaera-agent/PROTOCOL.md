@@ -2669,8 +2669,11 @@ escalation (an interactive shell ignores SIGTERM but exits on hangup).
 --test-threads=1`), twice. Every Codex live test passed both times (collab
 subagents, echo turn, fork/rollback/compact, handshake, steer/settings/account,
 turn summary, driver stack end to end): 8/8 on the second run with both changes.
-The Claude live tests could not run: the account hit its session limit
+The Claude live tests could not run then: the account hit its session limit
 ("You've hit your session limit · resets 11pm"), so every Claude turn aborted
-at the provider (3 non-turn Claude tests passed). The Claude driver is
-unchanged in this pass; the transport change affects both drivers and needs
-one Claude live run once the limit resets.
+at the provider (3 non-turn Claude tests passed). After the reset, the Claude
+half ran on its own (`… --ignored --test-threads=1 claude`) against Claude
+2.1.283 with the transport change: 14/14 passed (every `claude_*` protocol
+test, `driver_stack_end_to_end_against_real_claude` and
+`driver_stop_ends_claudes_detached_background_work`), so the gate is complete
+for both drivers.
