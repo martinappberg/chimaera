@@ -1,26 +1,33 @@
 <script lang="ts">
   import {
+    fetchGitRepos,
     fetchGitStatus,
+    fetchSessionGit,
     gitEnv,
+    gitRepos,
+    gitRepoStatuses,
     gitStatus,
+    openGitView,
+    repoForPath,
     type DiffMode,
     type GitEntry,
+    type GitRepo,
     type GitStatus,
+    type SessionGitStory,
   } from "./git";
+  import CommitRow from "./CommitRow.svelte";
   import { decoFor } from "./gitDeco";
-  import { workspaceRelative } from "../shared/reference";
   import { displayName, type Session } from "./sessions";
   import type { LayoutCtrl } from "../layout/dnd";
-  import FileIcon from "../shared/FileIcon.svelte";
+  import SessionEdits from "./SessionEdits.svelte";
 
   /**
-   * Session-scoped changes review: the files THIS agent touched (its
-   * hook-derived files_touched list), cross-referenced with the workspace's
-   * live git status. Each row opens the same side-by-side diff the Source
-   * Control panel uses (ctrl.openDiffFrom), so this is purely a session-scoped
-   * entry point onto main's git service — no duplicated diff plumbing, and it
-   * inherits the resolved git.path. Files with no current git change still
-   * open in a viewer.
+   * What this session changed, one view with or without git: the files THIS
+   * agent touched (its files_touched list plus what its edit record names),
+   * each with its edit count (`SessionEdits`). A file with an uncommitted git
+   * change opens the same side-by-side diff the Source Control panel uses
+   * (ctrl.openDiffFrom — main's git service, the resolved git.path); any
+   * other file opens the agent's own edits for it, in order.
    */
   interface Props {
     session: Session;
@@ -72,12 +79,169 @@
       ? activeStatus
       : ownStatus,
   );
-  /** Absolute path -> its git entry, for the touched files. */
+
+  /** Several repositories in one workspace: a touched file takes the status
+   *  of the innermost repository holding it. The active workspace's list and
+   *  statuses come from the git store; another workspace's are fetched here.
+   *  At most 8 nested repositories are asked, only those holding a touched
+   *  file. */
+  const REPOS_ASKED_MAX = 8;
+  const sameWs = $derived(
+    activeStatus !== null && activeStatus.workspace_id === session.workspace_id,
+  );
+  let ownRepos = $state<GitRepo[]>([]);
+  $effect(() => {
+    const wsId = session.workspace_id;
+    if (sameWs) {
+      ownRepos = [];
+      return;
+    }
+    let cancelled = false;
+    void fetchGitRepos(wsId).then(
+      (list) => {
+        if (!cancelled) ownRepos = list.repos ?? [];
+      },
+      () => {
+        if (!cancelled) ownRepos = [];
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  });
+  const repos = $derived(sameWs ? $gitRepos : ownRepos);
+  /** The nested repositories (below the root) holding a touched file. */
+  const nestedWithFiles = $derived.by(() => {
+    const out = new Set<string>();
+    for (const p of session.files_touched ?? []) {
+      const r = repoForPath(repos, p);
+      if (r !== null && (r.kind === "nested" || r.kind === "submodule")) out.add(r.path);
+      if (out.size >= REPOS_ASKED_MAX) break;
+    }
+    return [...out];
+  });
+  let fetchedStatuses = $state<Map<string, GitStatus>>(new Map());
+  $effect(() => {
+    const wsId = session.workspace_id;
+    void session.files_touched?.length;
+    void status?.repo_epoch;
+    const wanted = nestedWithFiles.filter((top) => !(sameWs && $gitRepoStatuses.has(top)));
+    if (wanted.length === 0) return;
+    let cancelled = false;
+    void Promise.all(
+      wanted.map((top) =>
+        fetchGitStatus(wsId, top).then(
+          (st) => [top, st] as const,
+          () => null,
+        ),
+      ),
+    ).then((pairs) => {
+      if (cancelled) return;
+      const next = new Map<string, GitStatus>();
+      for (const pair of pairs) if (pair !== null && pair[1].repo) next.set(pair[0], pair[1]);
+      fetchedStatuses = next;
+    });
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  /** An agent started on a new branch works in that branch's worktree —
+   *  a checkout of one of these repositories, but not one of them (it lives
+   *  under chimaera's managed root). Its files take that worktree's status,
+   *  and their diffs open against it. */
+  const ownWorktree = $derived.by(() => {
+    const wt = session.git?.worktree ?? null;
+    if (wt === null || repos.some((r) => r.path === wt)) return null;
+    return wt;
+  });
+  let worktreeStatus = $state<GitStatus | null>(null);
+  $effect(() => {
+    const wsId = session.workspace_id;
+    const wt = ownWorktree;
+    void session.files_touched?.length;
+    void status?.repo_epoch;
+    if (wt === null) {
+      worktreeStatus = null;
+      return;
+    }
+    let cancelled = false;
+    void fetchGitStatus(wsId, wt).then(
+      (st) => {
+        if (!cancelled) worktreeStatus = st.repo ? st : null;
+      },
+      () => {
+        if (!cancelled) worktreeStatus = null;
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  /** Absolute path -> its git entry, for the touched files: the primary
+   *  repository's entries, then each nested one's (innermost wins), then
+   *  the session's own worktree's. */
   const byPath = $derived.by(() => {
     const m = new Map<string, GitEntry>();
     for (const e of status?.entries ?? []) m.set(e.path, e);
+    for (const top of nestedWithFiles) {
+      const st = (sameWs ? $gitRepoStatuses.get(top) : undefined) ?? fetchedStatuses.get(top);
+      for (const e of st?.entries ?? []) m.set(e.path, e);
+    }
+    for (const e of worktreeStatus?.entries ?? []) m.set(e.path, e);
     return m;
   });
+  const inRepo = $derived(status !== null || nestedWithFiles.length > 0 || worktreeStatus !== null);
+
+  /** Open a touched file's git diff — against the session's own worktree
+   *  when the file lives there. */
+  function openEntryDiff(path: string, entry: GitEntry, e: MouseEvent): void {
+    const wt = ownWorktree;
+    const newSplit = e.metaKey || e.ctrlKey;
+    if (wt !== null && (path === wt || path.startsWith(`${wt}/`))) {
+      ctrl.openGitFrom(
+        paneId,
+        { surface: "diff", path, mode: modeFor(entry), repo: wt, ...(e.detail >= 2 ? { preview: false } : {}) },
+        newSplit,
+      );
+      return;
+    }
+    ctrl.openDiffFrom(paneId, path, modeFor(entry), newSplit, e.detail >= 2);
+  }
+
+  /** The commits this session made (its git story), refetched as it writes
+   *  and as its repository moves. Nothing is asked outside a repository. */
+  let story = $state<SessionGitStory | null>(null);
+  $effect(() => {
+    const id = session.id;
+    void session.files_touched?.length;
+    void status?.repo_epoch;
+    const branch = session.git?.branch;
+    if (session.git == null) {
+      story = null;
+      return;
+    }
+    void branch;
+    let cancelled = false;
+    void fetchSessionGit(id).then(
+      (g) => {
+        if (!cancelled) story = g;
+      },
+      () => {
+        if (!cancelled) story = null;
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  });
+  const commits = $derived(story?.commits ?? []);
+  function openCommit(c: { sha: string; subject: string }): void {
+    const repo = story?.current?.worktree ?? story?.start?.worktree ?? null;
+    openGitView({ surface: "gitx", view: "commit", repo, sha: c.sha, title: c.subject });
+  }
+
   /** Touched files, newest first (files_touched is oldest-first on the wire). */
   const files = $derived([...(session.files_touched ?? [])].reverse());
   const base = $derived(wsRoot ?? session.cwd_current ?? session.cwd);
@@ -86,14 +250,6 @@
    *  a purely-staged change diffs staged, everything else diffs the worktree. */
   function modeFor(e: GitEntry): DiffMode {
     return e.staged && !e.unstaged && !e.untracked && !e.conflicted ? "staged" : "unstaged";
-  }
-  function rel(path: string): string {
-    return base !== null ? workspaceRelative(path, base) : path;
-  }
-  function open(e: MouseEvent, path: string): void {
-    const entry = byPath.get(path);
-    if (entry !== undefined) ctrl.openDiffFrom(paneId, path, modeFor(entry), e.metaKey || e.ctrlKey);
-    else ctrl.openFileFrom(paneId, path, e.metaKey || e.ctrlKey);
   }
 </script>
 
@@ -113,25 +269,49 @@
     </div>
   {/if}
 
-  {#if files.length === 0}
-    <div class="empty">this agent hasn't changed any files yet</div>
-  {:else}
-    <div class="list">
-      {#each files as path (path)}
-        {@const entry = byPath.get(path)}
-        {@const deco = entry !== undefined ? decoFor(entry) : null}
-        <button class="row" title={path} onclick={(e) => open(e, path)}>
-          <span class="glyph"><FileIcon {path} size={14} /></span>
-          <span class="name">{rel(path)}</span>
-          {#if deco !== null}
-            <span class="badge" style:color={deco.color} title={deco.label}>{deco.letter}</span>
-          {:else}
-            <span class="badge quiet" title="no current git change">·</span>
-          {/if}
-        </button>
+  {#if commits.length > 0}
+    <!-- The commits this session made lead, rows like History's. -->
+    <section class="commits" aria-label="Commits this session made">
+      <div class="sub">
+        Committed {commits.length}{story?.truncated ? "+" : ""}{#if story?.rewritten}<span
+            class="muted"
+          >
+            · history was rewritten since it started</span
+          >{/if}
+      </div>
+      {#each commits as c (c.sha)}
+        <CommitRow
+          commit={{ sha: c.sha, parents: [], author: "", time: c.time, subject: c.subject }}
+          onOpen={() => openCommit(c)}
+        />
       {/each}
-    </div>
+    </section>
   {/if}
+
+  <!-- The files, each with its edit count: a click opens the git diff when
+       the file has an uncommitted change, else the agent's own edits for it,
+       in order — one list, with or without git. -->
+  <div class="list">
+    <SessionEdits
+      sessionId={session.id}
+      wsId={session.workspace_id}
+      wsRoot={base}
+      paths={files}
+      repo={inRepo}
+      gitMark={(p) => {
+        const entry = byPath.get(p);
+        return entry !== undefined ? decoFor(entry) : null;
+      }}
+      onOpenDiff={(p, e) => {
+        const entry = byPath.get(p);
+        if (entry === undefined) return false;
+        openEntryDiff(p, entry, e);
+        return true;
+      }}
+      onOpenFile={(p, e) => ctrl.openFileFrom(paneId, p, e.metaKey || e.ctrlKey)}
+      refreshKey={session.files_touched?.length ?? 0}
+    />
+  </div>
 </div>
 
 <style>
@@ -140,6 +320,8 @@
     display: flex;
     flex-direction: column;
     min-height: 0;
+    overflow-y: auto;
+    scrollbar-width: thin;
     background: var(--bg);
     color: var(--fg);
   }
@@ -150,6 +332,10 @@
     gap: 10px;
     padding: 8px 14px;
     border-bottom: 1px solid var(--edge);
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--bg);
   }
   .title {
     font-weight: 600;
@@ -172,60 +358,19 @@
     font-family: var(--mono, monospace);
     font-size: 0.92em;
   }
-  .empty {
-    padding: 20px;
-    text-align: center;
-    color: var(--muted);
-    font-size: var(--text-sm);
-  }
   .list {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-    scrollbar-width: thin;
     padding: 6px 8px;
   }
-  .row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-    padding: 4px 8px;
-    border: none;
-    border-radius: 5px;
-    background: none;
-    color: var(--fg);
-    font: inherit;
-    font-size: var(--text-sm);
-    text-align: left;
-    cursor: pointer;
-    transition: background-color 0.12s ease;
+  .commits {
+    padding: 6px 8px 2px;
+    border-bottom: 1px solid var(--edge);
   }
-  .row:hover {
-    background: var(--row-hover);
-  }
-  .glyph {
-    flex: none;
-    display: inline-flex;
-    align-items: center;
-  }
-  .name {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-family: var(--mono, monospace);
-  }
-  .badge {
-    flex: none;
-    width: 1.2em;
-    text-align: center;
-    font-family: var(--mono, monospace);
-    font-weight: 600;
-  }
-  .badge.quiet {
+  .sub {
+    padding: 2px 6px 4px;
     color: var(--muted);
-    font-weight: 400;
+    font-size: var(--text-sm);
+  }
+  .muted {
+    color: var(--muted);
   }
 </style>

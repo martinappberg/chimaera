@@ -141,6 +141,7 @@
     <SessionGlyph kind="agent" {agentKind} size={11} />
     <span class="agent-name">{agentName}</span>
   </span>
+
   <div class="menu-host">
     <button
       class="chip pick"

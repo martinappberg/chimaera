@@ -9,7 +9,7 @@
  */
 
 import type { DiffMode } from "../workspace/git";
-import type { Side, SplitDir, Tab, Zone } from "./layout";
+import type { DiffTab, GitDetailTab, Side, SplitDir, Tab, Zone } from "./layout";
 
 export type DropSpot =
   | { kind: "zone"; paneId: string; zone: Zone }
@@ -67,9 +67,10 @@ export interface DragPayload {
   tab?: Tab;
   label: string;
   /**
-   * Absolute path this payload can REFERENCE. Its presence is what arms the
-   * "@ reference" band — payloads opt in explicitly (file previews and
-   * Finder/dir drags do) instead of dnd hard-coding surfaces.
+   * What this payload can REFERENCE: an absolute path (file previews,
+   * Finder/dir drags) or a commit's sha (history rows, commit tabs). Its
+   * presence is what arms the "@ reference" band — payloads opt in
+   * explicitly instead of dnd hard-coding surfaces; dnd never reads it.
    */
   refPath?: string;
 }
@@ -141,7 +142,18 @@ export interface LayoutCtrl {
    * `newSplit` (Cmd/Ctrl) is set — so the panel stays visible BESIDE the diff it
    * opened (deliberately unlike `openFileFrom`, which opens in the active pane).
    */
-  openDiffFrom(paneId: string, path: string, mode: DiffMode, newSplit: boolean): void;
+  openDiffFrom(paneId: string, path: string, mode: DiffMode, newSplit: boolean, keep?: boolean): void;
+  /**
+   * Open a git view surfaced FROM `paneId` beside it (the openDiffFrom rule):
+   * a revision diff, a commit, a history, or "Changes on this branch". It
+   * opens as a preview tab (the next single click replaces it) unless the
+   * tab carries `preview: false` (a double-click keeps it).
+   */
+  openGitFrom(paneId: string, tab: DiffTab | GitDetailTab, newSplit: boolean): void;
+  /** Start dragging a commit (a history row, a commit tab): dropped on an
+   *  agent's pane it is referenced there, like a file; `onClick` is the
+   *  no-drag release. */
+  beginGitDrag(e: PointerEvent, tab: GitDetailTab, onClick: () => void): void;
   /**
    * Focus a session that may live in ANOTHER workspace (a worktree branch):
    * switch to its workspace if needed, then open it. Used by the git panel's

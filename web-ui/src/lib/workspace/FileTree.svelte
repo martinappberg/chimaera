@@ -8,7 +8,14 @@
   import { tick, untrack } from "svelte";
   import { basename, dirLabel, dirname, fsDownload, fsList, type FsEntry } from "../previews/files";
   import { getSetting } from "../settings/store.svelte";
-  import { gitIndex, gitStatus, type GitEntry } from "./git";
+  import {
+    gitIndex,
+    gitRepos,
+    gitStatus,
+    openFileHistory,
+    repoForPath,
+    type GitEntry,
+  } from "./git";
   import { decoFor, dirColor } from "./gitDeco";
   import { fsCreateOp, fsEpoch, fsRenameOp, lastFsMutation, requestDelete } from "./fsEvents";
   import { clearDiskDirs, lastDiskChange, setDiskDirs } from "./diskWatch";
@@ -856,6 +863,10 @@
         ? [{ label: "Download", onSelect: () => void fsDownload(entry.path) } as ContextMenuEntry]
         : []),
       { label: "Copy Path", onSelect: () => void copyPath(entry.path) },
+      // Only inside a repository: git is ambient, never an offer.
+      ...(entry.kind === "file" && repoForPath($gitRepos, entry.path) !== null
+        ? [{ label: "File history", onSelect: () => openFileHistory(entry.path) } as ContextMenuEntry]
+        : []),
       "separator",
       {
         label: "Delete…",
@@ -1191,6 +1202,24 @@
           class:symlink={entry.symlink}
           class:broken={entry.broken}
           style:color={entry.broken ? undefined : gDeco ? gDeco.color : undefined}>{entry.name}</span>
+        {#if entry.kind === "dir" && $gitIndex.repoRoots.has(entry.path)}
+          <!-- A repository of its own: a quiet mark (its changes are its own,
+               in its own section of the Source Control panel). -->
+          <span class="repo-mark" title="a git repository" aria-label="git repository">
+            <svg viewBox="0 0 16 16" width="9" height="9" aria-hidden="true">
+              <path
+                d="M5 3v7.5M5 12.5v.5M11 3v3a2.5 2.5 0 0 1-2.5 2.5H5"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+              />
+              <circle cx="5" cy="12.6" r="1.6" fill="none" stroke="currentColor" stroke-width="1.5" />
+              <circle cx="5" cy="2.4" r="1.6" fill="none" stroke="currentColor" stroke-width="1.5" />
+              <circle cx="11" cy="2.4" r="1.6" fill="none" stroke="currentColor" stroke-width="1.5" />
+            </svg>
+          </span>
+        {/if}
         {#if gDeco}
           <span class="git-badge" style:color={gDeco.color} title={gDeco.label}
             >{gDeco.letter}</span>
@@ -1746,6 +1775,15 @@
     font-variant-numeric: tabular-nums;
     line-height: 1;
   }
+  .repo-mark {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    margin-left: 0.25rem;
+    color: var(--muted);
+    opacity: 0.7;
+  }
+
   .git-dot {
     flex: none;
     margin-left: auto;

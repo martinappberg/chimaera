@@ -19,7 +19,7 @@
   import { LanguageDescription, syntaxHighlighting } from "@codemirror/language";
   import { languages } from "@codemirror/language-data";
   import { codeHighlight, makeCodeTheme } from "./cm";
-  import { fetchGitDiff, gitStatus, type DiffMode, type GitDiff } from "../workspace/git";
+  import { fetchGitDiff, gitRepoStatuses, gitStatus, type DiffMode, type GitDiff } from "../workspace/git";
   import { basename } from "./files";
   import { getSetting } from "../settings/store.svelte";
   import { clearSelection, setSelection } from "../shared/reference";
@@ -30,8 +30,17 @@
     /** The comparison this tab was opened at. */
     mode: DiffMode;
     wsId: string | null;
+    /** A revision: the working tree against it (mode "rev") or that commit
+     *  against its parent (mode "commit"). */
+    rev?: string;
+    /** Which of the workspace's repositories (top level or a worktree's). */
+    repo?: string;
+    /** A renamed file's earlier path (mode "commit"). */
+    orig?: string;
   }
-  let { path, mode, wsId }: Props = $props();
+  let { path, mode, wsId, rev, repo, orig }: Props = $props();
+  /** Revision diffs are what they were opened as: no status toggle. */
+  const fixed = $derived(rev !== undefined);
 
   const MODES: { id: DiffMode; label: string; title: string }[] = [
     { id: "unstaged", label: "Unstaged", title: "working tree vs index" },
@@ -55,7 +64,7 @@
   const settingsCompartment = new Compartment();
   let loadSeq = 0;
   // Plain (non-reactive) so writing it inside the epoch effect cannot loop.
-  let lastEpoch = -1;
+  let lastKey: string | null = null;
   const selOwner = {};
 
   /** Nothing to render in the merge host: a message takes the surface instead. */
@@ -139,7 +148,7 @@
     destroy();
     // Only the working tree's line numbers match the file on disk, so the
     // reference bridge is armed for those comparisons only.
-    const bIsWorkingTree = m !== "staged";
+    const bIsWorkingTree = m !== "staged" && m !== "commit";
     const bExtensions = bIsWorkingTree
       ? [
           ...baseExtensions(),
@@ -182,7 +191,7 @@
     loading = true;
     error = null;
     try {
-      const d = await fetchGitDiff(id, p, m);
+      const d = await fetchGitDiff(id, p, m, { rev, repo, orig });
       if (seq !== loadSeq) return;
       diff = d;
       if (d.binary || d.too_large || d.a === d.b) destroy();
@@ -220,16 +229,30 @@
   });
 
   // Keep the diff live: an agent write, a save, or a terminal `git` command
-  // bumps the workspace epoch, and the view refetches.
+  // bumps the workspace epoch (or, for a file in a repository below the
+  // root, that repository's own), and the view refetches.
+  const liveKey = $derived.by((): string | null => {
+    const primary = $gitStatus?.epoch;
+    let inner: number | undefined;
+    let innerLen = -1;
+    for (const [top, st] of $gitRepoStatuses) {
+      if (path.startsWith(`${top}/`) && top.length > innerLen) {
+        innerLen = top.length;
+        inner = st.repo_epoch;
+      }
+    }
+    if (primary === undefined && inner === undefined) return null;
+    return `${primary ?? "-"}:${inner ?? "-"}`;
+  });
   $effect(() => {
-    const epoch = $gitStatus?.epoch ?? -1;
-    if (epoch < 0) return;
-    if (lastEpoch < 0) {
-      lastEpoch = epoch;
+    const key = liveKey;
+    if (key === null) return;
+    if (lastKey === null) {
+      lastKey = key;
       return;
     }
-    if (epoch !== lastEpoch) {
-      lastEpoch = epoch;
+    if (key !== lastKey) {
+      lastKey = key;
       const id = wsId;
       const el = host;
       if (id !== null && el !== null) untrack(() => void load(id, path, viewMode));
@@ -254,6 +277,7 @@
     {#if diff?.added}<span class="dtag added">added</span>{/if}
     {#if diff?.deleted}<span class="dtag deleted">deleted</span>{/if}
     <span class="spacer"></span>
+    {#if !fixed}
     <div class="modes" role="group" aria-label="comparison">
       {#each MODES as m (m.id)}
         <button
@@ -264,6 +288,7 @@
         >
       {/each}
     </div>
+    {/if}
   </header>
 
   <div class="merge-host" class:hidden={showsMessage} bind:this={host}></div>

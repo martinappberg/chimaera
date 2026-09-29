@@ -20,6 +20,7 @@ import {
   openTimeline,
   openKnowledge,
   openPlugins,
+  openSessionsList,
   openSettings,
   openChanges,
   openBrowser,
@@ -47,6 +48,8 @@ import {
   soloLayout,
   adoptTabs,
   allTabs,
+  openTabAs,
+  isPreviewTab,
 } from "./layout";
 
 // Pure layout-tree logic — the single most refactor-fragile pure module in the
@@ -77,6 +80,7 @@ describe("tabKey", () => {
     expect(tabKey({ surface: "timeline" })).toBe("v:timeline");
     expect(tabKey({ surface: "knowledge" })).toBe("v:knowledge");
     expect(tabKey({ surface: "plugins" })).toBe("v:plugins");
+    expect(tabKey({ surface: "sessions" })).toBe("v:sessions");
     // diff uses `g:` (NOT `d:`) so it can't alias a Finder in the dedupe set.
     expect(tabKey({ surface: "diff", path: "/a", mode: "head" } as unknown as Tab)).toBe(
       "g:head:/a",
@@ -140,15 +144,17 @@ describe("opening surfaces", () => {
     expect(pane.tabs[0]).toEqual({ surface: "dashboard" });
   });
 
-  it("timeline, knowledge and plugins are singletons that coexist with settings and round-trip", () => {
+  it("timeline, knowledge, plugins and all sessions are singletons that coexist with settings and round-trip", () => {
     let l = openTimeline(defaultLayout());
     l = openTimeline(l);
     l = openKnowledge(l);
     l = openKnowledge(l);
     l = openPlugins(l);
     l = openPlugins(l);
+    l = openSessionsList(l);
+    l = openSessionsList(l);
     l = openSettings(l);
-    expect(tabCount(l)).toBe(4);
+    expect(tabCount(l)).toBe(5);
     const restored = deserializeLayout(serializeLayout(l));
     expect(restored).not.toBeNull();
     const pane = panes(restored!.root)[0];
@@ -156,6 +162,7 @@ describe("opening surfaces", () => {
       { surface: "timeline" },
       { surface: "knowledge" },
       { surface: "plugins" },
+      { surface: "sessions" },
       { surface: "settings" },
     ]);
   });
@@ -539,5 +546,46 @@ describe("visibleSessionIds", () => {
     expect(visibleSessionIds(l)).toEqual(["s-c"]);
     // A non-session tab on top hides the session under it.
     expect(visibleSessionIds(openDashboard(defaultLayout()))).toEqual([]);
+  });
+});
+
+describe("git views open as preview tabs", () => {
+  const commit = (sha: string) => ({ surface: "gitx" as const, view: "commit" as const, repo: null, sha, title: sha });
+
+  it("single clicks reuse one slot; a keep opens a second tab", () => {
+    let l = openTabAs(defaultLayout(), commit("aaa"), true);
+    l = openTabAs(l, commit("bbb"), true);
+    expect(tabCount(l)).toBe(1);
+    const only = panes(l.root)[0].tabs[0];
+    expect(only).toMatchObject({ sha: "bbb", preview: true });
+    // Keeping the preview pins it in place; the next preview appends.
+    l = openTabAs(l, commit("bbb"), false);
+    expect(isPreviewTab(panes(l.root)[0].tabs[0])).toBe(false);
+    l = openTabAs(l, commit("ccc"), true);
+    expect(tabCount(l)).toBe(2);
+  });
+
+  it("one preview slot per pane, whatever it previews", () => {
+    let l = openFile(defaultLayout(), "/r/a.txt", true);
+    l = openTabAs(l, { surface: "diff", path: "/r/b.txt", mode: "unstaged" }, true);
+    expect(tabCount(l)).toBe(1);
+    l = openFile(l, "/r/c.txt", true);
+    expect(tabCount(l)).toBe(1);
+    expect(panes(l.root)[0].tabs[0]).toMatchObject({ surface: "file", path: "/r/c.txt", preview: true });
+  });
+
+  it("a preview open never demotes a kept tab", () => {
+    let l = openTabAs(defaultLayout(), commit("aaa"), false);
+    l = openTabAs(l, commit("aaa"), true);
+    expect(isPreviewTab(panes(l.root)[0].tabs[0])).toBe(false);
+  });
+
+  it("the preview flag round-trips serialization", () => {
+    let l = openTabAs(defaultLayout(), commit("aaa"), true);
+    l = openTabAs(l, { surface: "diff", path: "/r/b.txt", mode: "commit", rev: "aaa" }, false);
+    const restored = deserializeLayout(serializeLayout(l));
+    expect(restored).not.toBeNull();
+    const tabs = panes(restored!.root)[0].tabs;
+    expect(tabs.map(isPreviewTab)).toEqual([true, false]);
   });
 });

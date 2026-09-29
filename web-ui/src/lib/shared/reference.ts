@@ -63,7 +63,32 @@ export interface ChatSelection {
   view?: object;
 }
 
+/** A commit, referenced like a file: the agent gets its short sha and
+ *  subject (enough for `git show`), and the repository when it isn't the
+ *  workspace's own. */
+export interface CommitSelection {
+  kind: "commit";
+  sha: string;
+  subject: string;
+  /** The repository's top level; null = the workspace's own. */
+  repo: string | null;
+}
+
 export type SelectionSource = FileSelection | TerminalSelection | ChatSelection;
+
+type CommitReferenceHandler = (sel: CommitSelection) => void;
+let commitHandler: CommitReferenceHandler | null = null;
+
+/** App-level wiring for commit references (a commit is not a text
+ *  selection: it is referenced whole, from a button or a drop). */
+export function setCommitReferenceHandler(fn: CommitReferenceHandler | null): void {
+  commitHandler = fn;
+}
+
+/** Reference a commit in the agent references land in right now. */
+export function referenceCommit(sel: CommitSelection): void {
+  commitHandler?.(sel);
+}
 
 /**
  * The one live selection eligible for referencing (last writer wins across
@@ -121,6 +146,28 @@ export function referenceNow(owner: unknown, sel: SelectionSource): void {
 }
 
 // --- pure composers -----------------------------------------------------------
+
+/**
+ * A commit reference for an agent: `commit 3f2a1c9 ("fix: rounding")`, with
+ * ` in <repo>` (workspace-relative) when the commit belongs to a repository
+ * other than the workspace's own. Quotes in the subject are softened so the
+ * reference reads as one unit; a trailing space lets typing continue.
+ */
+export function composeCommitReference(
+  sel: CommitSelection,
+  root: string | null,
+): string {
+  const short = sel.sha.slice(0, 7);
+  const subject = sel.subject.replace(/"/g, "'").trim();
+  const title = subject.length > 72 ? `${subject.slice(0, 71)}…` : subject;
+  let where = "";
+  if (sel.repo !== null) {
+    const rel =
+      root !== null && sel.repo.startsWith(`${root}/`) ? sel.repo.slice(root.length + 1) : sel.repo;
+    if (rel !== "" && sel.repo !== root) where = ` in ${rel}`;
+  }
+  return title !== "" ? `commit ${short} ("${title}")${where} ` : `commit ${short}${where} `;
+}
 
 /** Selection excerpt budget (~200 chars, per the bridge spec). */
 export const SELECTION_MAX = 200;
