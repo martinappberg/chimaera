@@ -134,6 +134,10 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   only device aliases wait for readiness unbounded. A kept SSH
   host whose keeper route fails in transit (`LinkFailure::Transport`) connects
   directly; keeper-side login failures stay errors so nobody is prompted twice.
+  The fallback exists only until the keeper accepts `reconnect_host`: from then
+  it may be showing a password/Duo prompt, so failed host reads are waited out
+  (`KEEPER_LOGIN_WAIT`, 180 s) and a daemon that does not answer yet is
+  re-probed (`KEEPER_PROBE_WAIT`, 30 s); every later failure is `Final`.
 - **Daemon setup is off the activation path.** Activation installs the account,
   keeper events and the reconcile loop and returns (the browser is answered
   then); the loop's first pass configures the daemon. `DaemonStamp` includes the

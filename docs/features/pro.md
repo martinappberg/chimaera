@@ -390,7 +390,10 @@ windows of any width keep full control, and free users never see this toolbar.
 - SSH never hangs on Pro: a saved SSH host connects directly while Pro starts
   (a kept host waits at most 10 seconds first, so the usual Pro route needs no
   new login), and a kept host whose Pro route is unreachable falls back to a
-  direct connection (its row then reads as direct). Computers reached only
+  direct connection (its row then reads as direct). Once the always-on
+  connection has started signing in to the host (it may be showing a password
+  or Duo prompt), a brief account or connection hiccup is waited out instead,
+  so the user is never asked to log in twice. Computers reached only
   through Pro wait for it.
 - Viewing a project owned elsewhere survives a failed check (account or keeper
   unreachable, owner asleep or reconnecting) for up to 150 seconds on the last
