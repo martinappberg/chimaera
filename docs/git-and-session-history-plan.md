@@ -170,8 +170,9 @@ The change is additive.
   The session's repository is the innermost one containing that cwd. This covers an
   agent that enters a worktree mid-session (claude's `EnterWorktree`, `claude -w`, a
   plain `cd`).
-- **Show the branch** on rail rows, dashboard cards and the chat header, only when the
-  session is in a repository. `architecture.md` planned this chip and deferred it.
+- **Show the branch** above the chat input for chat sessions, and on dashboard cards,
+  only when the session is in a repository; never on the rail. `architecture.md`
+  planned this chip and deferred it.
 - **Record an anchor** `{repo, worktree, branch, head}` at session start and end, for
   Part 2.
   - Commits made during the session show up as HEAD moving. Nothing requires or

@@ -463,8 +463,26 @@ struct FsEntry {
 
 /// GET /api/v1/fs/list?path=<path>&hidden=<bool> — full directory listing
 /// (dirs and files) for the file tree.
-pub(crate) async fn list(Query(query): Query<DirsQuery>) -> Response {
-    blocking_json(move || list_entries(&query.path, query.hidden)).await
+pub(crate) async fn list(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DirsQuery>,
+) -> Response {
+    // A listing that shows a `.git` names a repository for free (the git
+    // service's third discovery source); the folder is handed over after.
+    let saw_git: Arc<std::sync::Mutex<Option<PathBuf>>> = Arc::default();
+    let seen = saw_git.clone();
+    let response = blocking_json(move || {
+        let mut found = None;
+        let body = list_entries(&query.path, query.hidden, &mut found);
+        *crate::lock(&seen) = found;
+        body
+    })
+    .await;
+    let found = crate::lock(&saw_git).take();
+    if let Some(dir) = found {
+        crate::git::note_listed_dir(&state, &dir).await;
+    }
+    response
 }
 
 /// List all entries of a directory: dirs first then files, each group sorted
@@ -472,7 +490,11 @@ pub(crate) async fn list(Query(query): Query<DirsQuery>) -> Response {
 /// entries (including broken symlinks) skipped; capped at [`MAX_DIR_ENTRIES`].
 /// Unlike `list_dirs` this needs each entry's size + mtime, so it stats — the
 /// cap is what bounds that on a huge directory.
-fn list_entries(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
+fn list_entries(
+    raw: &str,
+    hidden: bool,
+    saw_git: &mut Option<PathBuf>,
+) -> anyhow::Result<serde_json::Value> {
     let path = canonical(raw)?;
     if !path.is_dir() {
         anyhow::bail!("{} is not a directory", path.display());
@@ -485,6 +507,9 @@ fn list_entries(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
     for entry in read {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
+        if name == ".git" {
+            *saw_git = Some(path.clone());
+        }
         if !hidden && name.starts_with('.') {
             continue;
         }

@@ -208,6 +208,7 @@ struct LiveSession {
     id: String,
     cwd: PathBuf,
     agent: bool,
+    workspace: Option<String>,
 }
 
 /// Every live session and its current folder. Each registry lock is taken
@@ -218,6 +219,7 @@ fn live_sessions(state: &AppState) -> (Vec<LiveSession>, BTreeSet<String>) {
     let agents: BTreeSet<String> = crate::lock(&state.agents).keys().cloned().collect();
     let polled = crate::lock(&state.current_cwds).clone();
     let hooks = crate::lock(&state.git.sessions.hook_cwds).clone();
+    let workspaces = crate::lock(&state.session_workspaces).clone();
     // Mid view-switch a session sits in neither registry for a moment; it
     // is still live (its record must not end and restart).
     let switching: BTreeSet<String> = crate::lock(&state.chat_switching).keys().cloned().collect();
@@ -236,6 +238,7 @@ fn live_sessions(state: &AppState) -> (Vec<LiveSession>, BTreeSet<String>) {
             id: info.id.clone(),
             cwd,
             agent,
+            workspace: workspaces.get(&info.id).cloned(),
         });
     }
     for info in chats.iter().filter(|c| c.alive) {
@@ -250,6 +253,7 @@ fn live_sessions(state: &AppState) -> (Vec<LiveSession>, BTreeSet<String>) {
             id: info.id.clone(),
             cwd,
             agent: true,
+            workspace: workspaces.get(&info.id).cloned(),
         });
     }
     (out, switching)
@@ -343,6 +347,11 @@ async fn pass(state: &Arc<AppState>, seen_epochs: &mut HashMap<String, u64>) {
                 } else {
                     None
                 };
+                // A folder landing in a repository its workspace didn't know
+                // (deeper than the open-time probe): the workspace knows it now.
+                if let (Some(repo), Some(ws)) = (&repo, &session.workspace) {
+                    super::repos::note_agent_repo(state, ws, repo);
+                }
                 Tracked {
                     cwd: session.cwd.clone(),
                     repo,
@@ -602,8 +611,9 @@ async fn linked_git_dir(worktree: &Path) -> Option<PathBuf> {
 
 /// At daemon start (after the ledger restored its sessions): release every
 /// chimaera lock under the managed root whose session is not alive — the
-/// daemon that made it went away without unlocking. Bounded walk; symlinks
-/// never followed; other tools' locks untouched.
+/// daemon that made it went away without unlocking — and adopt the ones a
+/// restored session holds, so they are released when it leaves. Bounded
+/// walk; symlinks never followed; other tools' locks untouched.
 async fn reconcile_locks(state: &Arc<AppState>) {
     let git = state.git.resolve_git(configured_git(state)).await;
     if !git.adequate {
@@ -628,6 +638,9 @@ async fn reconcile_locks(state: &Arc<AppState>) {
     .unwrap_or_default();
     for (worktree, id) in found {
         if crate::chat::session_alive(state, &id) {
+            // A session the ledger brought back: the tracker owns this lock
+            // again, and releases it once no agent runs inside.
+            crate::lock(&state.git.sessions.locks).insert(worktree, id);
             continue;
         }
         tracing::info!(worktree = %worktree.display(), session = %id, "releasing a stale chimaera worktree lock");

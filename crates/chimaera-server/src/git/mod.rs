@@ -29,7 +29,8 @@ mod service;
 mod session;
 mod worktree;
 
-pub(crate) use http::{branches, diff, status, worktrees};
+pub(crate) use http::{branches, diff, repos, status, worktrees};
+pub(crate) use repos::note_listed_dir;
 pub(crate) use service::{
     backstop_poll, git_facts, mark_path_dirty, usable_git_dir, GitService, WatchGuard,
 };

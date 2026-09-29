@@ -177,9 +177,16 @@ pub(super) struct Entry {
     unstaged: bool,
     untracked: bool,
     conflicted: bool,
+    /// Porcelain v2's `<sub>` field starts with `S`: the path is a submodule.
+    pub(super) submodule: bool,
 }
 
 impl Entry {
+    /// The repo-relative path.
+    pub(super) fn rel(&self) -> &str {
+        &self.rel
+    }
+
     fn changed(rel: String, orig_rel: Option<String>, x: char, y: char) -> Self {
         Entry {
             rel,
@@ -190,6 +197,7 @@ impl Entry {
             unstaged: y != '.',
             untracked: false,
             conflicted: false,
+            submodule: false,
         }
     }
     pub(super) fn untracked(rel: String) -> Self {
@@ -202,6 +210,7 @@ impl Entry {
             unstaged: true,
             untracked: true,
             conflicted: false,
+            submodule: false,
         }
     }
 }
@@ -277,14 +286,21 @@ fn parse_changed(tok: &str, skip_fields: usize, orig_rel: Option<String>) -> Opt
     let body = tok.get(2..)?; // drop the "<T> " prefix
     let mut it = body.splitn(skip_fields + 2, ' ');
     let xy = it.next()?;
-    for _ in 0..skip_fields {
-        it.next()?;
+    // The first field after XY is `<sub>`: "N..." or "S<c><m><u>".
+    let mut submodule = false;
+    for i in 0..skip_fields {
+        let field = it.next()?;
+        if i == 0 {
+            submodule = field.starts_with('S');
+        }
     }
     let path = it.next()?.to_string();
     let mut chars = xy.chars();
     let x = chars.next()?;
     let y = chars.next()?;
-    Some(Entry::changed(path, orig_rel, x, y))
+    let mut entry = Entry::changed(path, orig_rel, x, y);
+    entry.submodule = submodule;
+    Some(entry)
 }
 
 fn parse_header(tok: &str, data: &mut StatusData) {
@@ -370,6 +386,8 @@ pub(super) fn status_json(
                 "unstaged": e.unstaged,
                 "untracked": e.untracked,
                 "conflicted": e.conflicted,
+                // Additive: the path is a submodule (porcelain v2 `S` mark).
+                "submodule": e.submodule,
             })
         })
         .collect();
@@ -436,6 +454,7 @@ mod tests {
 
         let conflict = &data.entries[3];
         assert!(conflict.conflicted);
+        assert!(!changed.submodule);
 
         let untracked = &data.entries[4];
         assert_eq!(untracked.rel, "untracked.txt");
@@ -452,6 +471,17 @@ mod tests {
         let unborn = parse_status(b"# branch.oid (initial)\0# branch.head main\0", false);
         assert_eq!(unborn.head, None);
         assert_eq!(unborn.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn marks_submodule_entries() {
+        let data = parse_status(
+            b"1 .M SC.. 160000 160000 160000 aaa bbb vendor/tool\0",
+            false,
+        );
+        assert_eq!(data.entries.len(), 1);
+        assert!(data.entries[0].submodule);
+        assert_eq!(data.entries[0].rel(), "vendor/tool");
     }
 
     #[test]

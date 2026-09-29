@@ -26,6 +26,183 @@ const MAX_BRANCHES: usize = 100;
 #[derive(Deserialize)]
 pub(crate) struct StatusQuery {
     workspace_id: String,
+    /// One of the workspace's repositories (its top level); the one at or
+    /// around the root when absent — the pre-several-repositories behavior.
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+/// Linked worktrees are looked for in at most this many known repositories
+/// when a `repo=` names none of them directly.
+const MAX_WORKTREE_LOOKUPS: usize = 8;
+
+/// The repository a request names. `repo` must be one the workspace knows —
+/// its primary, one found below its root, or a worktree `git worktree list`
+/// reports for one of those — never an arbitrary path (git never runs inside
+/// a folder before it is validated). Absent, it is the primary, exactly as
+/// before: `Ok(outcome)` of the root's probe.
+pub(super) async fn pick_repo(
+    state: &AppState,
+    git: &Path,
+    ws: &crate::workspaces::Workspace,
+    repo: Option<&str>,
+) -> Result<ProbeOutcome, Response> {
+    let primary = state.git.discover(git, &ws.id, &ws.root).await;
+    let Some(raw) = repo.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(primary);
+    };
+    let wanted = std::path::PathBuf::from(raw);
+    let unknown = || bad_request("not one of this workspace's repositories");
+    if !wanted.is_absolute() {
+        return Err(unknown());
+    }
+    if let Some(p) = primary.repo() {
+        if p.toplevel == wanted {
+            return Ok(primary);
+        }
+    }
+    if let Some(found) = state.git.found_repo(&ws.id, &wanted) {
+        return Ok(ProbeOutcome::Repo(found));
+    }
+    // A worktree of a known repository (a branch row's "changes on this
+    // branch"): only what git lists for a repository we already trust.
+    let mut known: Vec<RepoInfo> = primary.repo().cloned().into_iter().collect();
+    known.extend(
+        state
+            .git
+            .known_toplevels(&ws.id)
+            .into_iter()
+            .filter_map(|t| state.git.found_repo(&ws.id, &t)),
+    );
+    for repo in known.iter().take(MAX_WORKTREE_LOOKUPS) {
+        let Ok(list) = state.git.worktrees(git, repo).await else {
+            continue;
+        };
+        if list.iter().any(|w| w.path == wanted) {
+            if let ProbeOutcome::Repo(info) =
+                super::service::probe_repo(git, &state.git.procs, &wanted).await
+            {
+                if info.toplevel == wanted && info.common_dir == repo.common_dir {
+                    return Ok(ProbeOutcome::Repo(info));
+                }
+            }
+        }
+    }
+    Err(unknown())
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ReposQuery {
+    workspace_id: String,
+    /// Probe again (the panel's refresh button).
+    #[serde(default)]
+    refresh: bool,
+}
+
+/// GET /api/v1/git/repos?workspace_id=&refresh= — the workspace's
+/// repositories: the one at or around its root, then those below it (a
+/// bounded two-level probe at open, file-tree listings, agents' folders,
+/// submodules), at most 32. Each: top level, path in the workspace, kind
+/// (`root` | `enclosing` | `nested` | `submodule`), the repository it sits
+/// in, and its branch (read from `HEAD`, no process). Change counts come
+/// from each repository's own `GET /git/status?repo=`.
+pub(crate) async fn repos(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ReposQuery>,
+) -> Response {
+    let Some(ws) = crate::lock(&state.workspaces).get(&q.workspace_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown workspace {}", q.workspace_id)})),
+        )
+            .into_response();
+    };
+    let git = state.git.resolve_git(configured_git(&state)).await;
+    if !git.adequate {
+        return Json(json!({
+            "workspace_id": q.workspace_id,
+            "git_ok": false,
+            "git": git.json(),
+            "repos": [],
+            "capped": false,
+            "epoch": state.git.epoch(&q.workspace_id),
+        }))
+        .into_response();
+    }
+    let listing = super::repos::discover_all(&state, &git.path, &ws, q.refresh).await;
+    let mut entries: Vec<(RepoInfo, super::repos::RepoKind)> = Vec::new();
+    if let Some(p) = listing.primary.repo() {
+        let kind = if p.toplevel == ws.root {
+            super::repos::RepoKind::Root
+        } else {
+            super::repos::RepoKind::Enclosing
+        };
+        entries.push((p.clone(), kind));
+    }
+    entries.extend(listing.found.iter().map(|f| (f.info.clone(), f.kind)));
+    let git_dirs: Vec<std::path::PathBuf> =
+        entries.iter().map(|(r, _)| r.git_dir.clone()).collect();
+    let heads = tokio::task::spawn_blocking(move || {
+        git_dirs
+            .iter()
+            .map(|d| super::parse::read_head_blocking(d))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    let tops: Vec<std::path::PathBuf> = entries.iter().map(|(r, _)| r.toplevel.clone()).collect();
+    let items: Vec<serde_json::Value> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (repo, kind))| {
+            let (branch, detached, head) = match heads.get(i) {
+                Some(super::parse::HeadRef::Branch(b)) => (Some(b.clone()), false, None),
+                Some(super::parse::HeadRef::Detached(sha)) => {
+                    (None, true, Some(sha.chars().take(7).collect::<String>()))
+                }
+                _ => (None, false, None),
+            };
+            // The repository this one sits in (the innermost other one
+            // containing it), for the panel's nesting and submodule marks.
+            let parent = tops
+                .iter()
+                .filter(|t| **t != repo.toplevel && repo.toplevel.starts_with(t))
+                .max_by_key(|t| t.as_os_str().len())
+                .map(|t| t.to_string_lossy().into_owned());
+            let rel = match kind {
+                super::repos::RepoKind::Enclosing => None,
+                _ => repo.toplevel.strip_prefix(&ws.root).ok().map(|r| {
+                    let r = r.to_string_lossy().into_owned();
+                    if r.is_empty() {
+                        ".".to_string()
+                    } else {
+                        r
+                    }
+                }),
+            };
+            json!({
+                "path": repo.toplevel.to_string_lossy(),
+                "rel": rel,
+                "kind": kind.as_str(),
+                "submodule": *kind == super::repos::RepoKind::Submodule,
+                "parent": parent,
+                "branch": branch,
+                "detached": detached,
+                "head": head,
+                "epoch": state.git.repo_epoch(&q.workspace_id, &repo.toplevel),
+            })
+        })
+        .collect();
+    Json(json!({
+        "workspace_id": q.workspace_id,
+        "git_ok": true,
+        "git": git.json(),
+        "repos": items,
+        "capped": listing.capped,
+        "primary_error": listing.primary.error(),
+        "epoch": state.git.epoch(&q.workspace_id),
+    }))
+    .into_response()
 }
 
 /// GET /api/v1/git/status?workspace_id= — the repo's status, or `{repo:false}`.
@@ -58,11 +235,11 @@ pub(crate) async fn status(
         }))
         .into_response();
     }
-    let repo = match state
-        .git
-        .discover(&git.path, &q.workspace_id, &ws.root)
-        .await
-    {
+    let picked = match pick_repo(&state, &git.path, &ws, q.repo.as_deref()).await {
+        Ok(outcome) => outcome,
+        Err(refusal) => return refusal,
+    };
+    let repo = match picked {
         ProbeOutcome::Repo(repo) => repo,
         // Not a repo, or git couldn't read one (dubious ownership, a wedged
         // filesystem). `repo_error` is the reason for the latter — the client
@@ -101,14 +278,27 @@ pub(crate) async fn status(
                 // editor, a terminal `git` command) and bump the epoch; read
                 // the epoch after, so THIS response is already current and
                 // the caller won't refetch.
-                state.git.publish(&q.workspace_id, &shared.data)
+                state.git.publish(&q.workspace_id, &repo, &shared.data)
             };
             if bumped {
                 state.changes.notify_waiters();
             }
+            // Submodules the status marks become repositories of the
+            // workspace (they may sit deeper than the open-time probe).
+            let subs: Vec<String> = shared
+                .data
+                .entries
+                .iter()
+                .filter(|e| e.submodule)
+                .map(|e| e.rel().to_string())
+                .collect();
+            if !subs.is_empty() {
+                super::repos::note_submodules(&state, &ws, &repo.toplevel, subs).await;
+            }
             let mut body = status_json(&q.workspace_id, epoch, &repo, &shared.data);
             body["git_ok"] = json!(true);
             body["git"] = git.json();
+            body["repo_epoch"] = json!(state.git.repo_epoch(&q.workspace_id, &repo.toplevel));
             Json(body).into_response()
         }
         Err(err) => {
@@ -121,6 +311,7 @@ pub(crate) async fn status(
             body["error"] = json!(err.to_string());
             body["git_ok"] = json!(true);
             body["git"] = git.json();
+            body["repo_epoch"] = json!(state.git.repo_epoch(&q.workspace_id, &repo.toplevel));
             Json(body).into_response()
         }
     }
@@ -145,12 +336,11 @@ pub(crate) async fn worktrees(
         // Too old to list worktrees; the status endpoint carries the diagnostic.
         return Json(json!({"repo": false, "worktrees": []})).into_response();
     }
-    let Some(repo) = state
-        .git
-        .discover(&git.path, &q.workspace_id, &ws.root)
-        .await
-        .into_repo()
-    else {
+    let picked = match pick_repo(&state, &git.path, &ws, q.repo.as_deref()).await {
+        Ok(outcome) => outcome,
+        Err(refusal) => return refusal,
+    };
+    let Some(repo) = picked.into_repo() else {
         return Json(json!({"repo": false, "worktrees": []})).into_response();
     };
     match state.git.worktrees(&git.path, &repo).await {
@@ -161,9 +351,10 @@ pub(crate) async fn worktrees(
                     .await
                     .unwrap_or_else(|_| state.worktrees_root.clone())
             };
-            // "Merged" = the worktree's HEAD is contained in the main
-            // checkout's branch: only asked for managed worktrees (the ones
-            // chimaera would remove), a bounded handful per refresh.
+            // Against the main checkout's branch, per other worktree (a
+            // bounded handful per refresh): how far ahead/behind it is, and
+            // — for a managed one, the only kind chimaera removes — whether
+            // the main branch already contains it ("merged").
             let base_ref = match list.first() {
                 Some(main) => match (&main.branch, &main.sha) {
                     (Some(b), _) => Some(format!("refs/heads/{b}")),
@@ -172,33 +363,42 @@ pub(crate) async fn worktrees(
                 },
                 None => None,
             };
-            let mut merged: Vec<Option<bool>> = vec![None; list.len()];
+            let mut vs_main: Vec<Option<(u64, u64)>> = vec![None; list.len()];
             for (i, w) in list.iter().enumerate().take(MAX_MERGE_CHECKS + 1).skip(1) {
                 let (Some(base), Some(sha)) = (&base_ref, &w.sha) else {
                     continue;
                 };
-                if !w.path.starts_with(&managed_root) || w.path == repo.toplevel {
-                    continue;
-                }
                 if !super::anchor::is_sha(sha) {
                     continue;
                 }
+                let range = format!("{base}...{sha}");
                 if let Ok(out) = run_git(
                     &git.path,
                     &state.git.procs,
                     &repo.toplevel,
-                    &["merge-base", "--is-ancestor", sha, base],
+                    &["rev-list", "--left-right", "--count", &range],
                     1024,
                 )
                 .await
                 {
-                    merged[i] = Some(out.success);
+                    if out.success {
+                        vs_main[i] = parse_left_right(&String::from_utf8_lossy(&out.stdout));
+                    }
                 }
             }
+            let merged: Vec<Option<bool>> = list
+                .iter()
+                .zip(&vs_main)
+                .map(|(w, counts)| {
+                    let managed = w.path.starts_with(&managed_root) && w.path != repo.toplevel;
+                    counts.filter(|_| managed).map(|(_, ahead)| ahead == 0)
+                })
+                .collect();
             let items: Vec<serde_json::Value> = list
                 .iter()
                 .zip(merged)
-                .map(|(w, merged)| {
+                .zip(vs_main)
+                .map(|((w, merged), counts)| {
                     json!({
                         "path": w.path.to_string_lossy(),
                         "branch": w.branch,
@@ -216,6 +416,11 @@ pub(crate) async fn worktrees(
                         // Additive: a managed worktree whose HEAD the main
                         // checkout's branch already contains (null = not asked).
                         "merged": merged,
+                        // Additive: commits this worktree has that the main
+                        // checkout's branch lacks, and the reverse (null for
+                        // the main checkout itself, or not asked).
+                        "ahead_of_main": counts.map(|(_, ahead)| ahead),
+                        "behind_main": counts.map(|(behind, _)| behind),
                     })
                 })
                 .collect();
@@ -261,6 +466,9 @@ pub(crate) struct DiffQuery {
     /// `unstaged` (default), `staged`, or `head`.
     #[serde(default)]
     mode: Option<String>,
+    /// One of the workspace's repositories (see [`pick_repo`]).
+    #[serde(default)]
+    repo: Option<String>,
 }
 
 /// GET /api/v1/git/diff?workspace_id=&path=&mode= — the two blob versions for a
@@ -281,12 +489,20 @@ pub(crate) async fn diff(
     if !git.adequate {
         return git_too_old(&git);
     }
-    let Some(repo) = state
-        .git
-        .discover(&git.path, &q.workspace_id, &ws.root)
-        .await
-        .into_repo()
-    else {
+    let picked = match pick_repo(&state, &git.path, &ws, q.repo.as_deref()).await {
+        Ok(outcome) => outcome,
+        Err(refusal) => return refusal,
+    };
+    // No `repo`: the innermost known repository holding the path (a file
+    // in a nested repository diffs against ITS history), else the primary.
+    let picked = match (q.repo.as_deref(), picked) {
+        (None, outcome) => match state.git.innermost(&q.workspace_id, Path::new(&q.path)) {
+            Some((inner, _)) => ProbeOutcome::Repo(inner),
+            None => outcome,
+        },
+        (Some(_), outcome) => outcome,
+    };
+    let Some(repo) = picked.into_repo() else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "not a git repository"})),
@@ -427,6 +643,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_left_right_counts() {
+        assert_eq!(parse_left_right("3\t2\n"), Some((3, 2)));
+        assert_eq!(parse_left_right("0 0"), Some((0, 0)));
+        assert_eq!(parse_left_right("garbage"), None);
+    }
+
+    #[test]
     fn parses_branch_list_with_tracking() {
         let raw = "main\u{1f}1700000000\u{1f}origin/main\u{1f}[ahead 2, behind 1]\u{1f}*\n\
                    feat/x\u{1f}1690000000\u{1f}\u{1f}\u{1f} \n\
@@ -454,9 +677,19 @@ mod tests {
     }
 }
 
+/// Parse `rev-list --left-right --count A...B` ("<left>\t<right>").
+pub(super) fn parse_left_right(text: &str) -> Option<(u64, u64)> {
+    let mut it = text.split_whitespace();
+    let left = it.next()?.parse().ok()?;
+    let right = it.next()?.parse().ok()?;
+    Some((left, right))
+}
+
 #[derive(Deserialize)]
 pub(crate) struct BranchesQuery {
     workspace_id: String,
+    #[serde(default)]
+    repo: Option<String>,
 }
 
 /// One local branch.
@@ -532,12 +765,11 @@ pub(crate) async fn branches(
     if !git.adequate {
         return Json(json!({"repo": false, "branches": []})).into_response();
     }
-    let Some(repo) = state
-        .git
-        .discover(&git.path, &q.workspace_id, &ws.root)
-        .await
-        .into_repo()
-    else {
+    let picked = match pick_repo(&state, &git.path, &ws, q.repo.as_deref()).await {
+        Ok(outcome) => outcome,
+        Err(refusal) => return refusal,
+    };
+    let Some(repo) = picked.into_repo() else {
         return Json(json!({"repo": false, "branches": []})).into_response();
     };
     let count = format!("--count={}", MAX_BRANCHES + 1);

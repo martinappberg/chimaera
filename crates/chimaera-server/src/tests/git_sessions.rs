@@ -319,6 +319,7 @@ async fn worktree_create_honors_base_and_worktreeinclude() {
     let wt = PathBuf::from(body["worktree"]["path"].as_str().unwrap());
     assert_eq!(git_in(&wt, &["rev-parse", "HEAD"]), first);
     assert_eq!(body["included"]["copied"], 2, "{body}");
+    assert_eq!(body["included"]["names"].as_array().unwrap().len(), 2);
     assert_eq!(
         std::fs::read_to_string(wt.join(".env")).unwrap(),
         "TOKEN=x\n"
@@ -371,6 +372,13 @@ async fn worktree_remove_refuses_unshared_commits_and_lists_merged() {
     };
     assert_eq!(row("feat/fresh")["merged"], true);
     assert_eq!(row("feat/busy")["merged"], false);
+    assert_eq!(
+        row("feat/busy")["ahead_of_main"],
+        1,
+        "one commit main lacks"
+    );
+    assert_eq!(row("feat/fresh")["ahead_of_main"], 0);
+    assert!(row("main")["ahead_of_main"].is_null());
     assert!(
         row("main")["merged"].is_null(),
         "only managed rows are asked"

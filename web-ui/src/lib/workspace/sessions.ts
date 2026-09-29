@@ -179,14 +179,21 @@ export interface SessionGit {
   head: string | null;
 }
 
-/** A branch as people read it: the name, `detached <sha>`, or `(unborn)`. */
+/** A branch as people read it: the name, "No branch (at 3f2a1c9)" for a
+ *  detached HEAD, or "No commits yet" on an unborn branch — plain words, no
+ *  git jargon. */
 export function branchLabel(git: {
   branch: string | null;
   detached: boolean;
   head: string | null;
 }): string {
   if (git.branch) return git.branch;
-  return git.detached ? `detached ${git.head ?? ""}`.trim() : "(unborn)";
+  return git.detached ? `No branch (at ${git.head ?? "?"})` : "No commits yet";
+}
+
+/** The last path component. */
+export function baseName(path: string): string {
+  return path.split("/").filter(Boolean).pop() ?? path;
 }
 
 /** The one display name for a session, used identically everywhere. */

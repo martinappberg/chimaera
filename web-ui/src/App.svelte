@@ -44,7 +44,6 @@
     ViewSwitchConflict,
     type AgentSpawn,
     type Session,
-    type SessionGit,
     type Workspace,
     isMastermind,
     needsAttention,
@@ -205,12 +204,20 @@
   } from "./lib/shared/editing";
   import {
     activateGitWorkspace,
+    aheadBehindWords,
     gitEnv,
+    gitExpandedRepos,
     gitRepoError,
+    gitRepos,
+    gitRepoStatuses,
     gitStatus,
     onGitNudge,
+    repoForPath,
+    revealRepo,
+    setGitFocus,
     workspacesChanged,
     type DiffMode,
+    type GitStatus,
   } from "./lib/workspace/git";
   import { computeStatus, initCompute, queuedJobCount } from "./lib/workspace/compute";
   import { surfacesOf } from "./lib/layout/surfaces";
@@ -357,7 +364,6 @@
   import { focusOnMount } from "./lib/shared/focusOnMount";
   import Launcher from "./lib/workspace/Launcher.svelte";
   import SessionGlyph from "./lib/shared/SessionGlyph.svelte";
-  import BranchChip from "./lib/shared/BranchChip.svelte";
   import QuickOpen from "./lib/workspace/QuickOpen.svelte";
   import FileTree from "./lib/workspace/FileTree.svelte";
   import SplitTree from "./lib/layout/SplitNode.svelte";
@@ -1042,6 +1048,19 @@
     eventsSocket?.watchFs(files, dirs);
   });
 
+  // The repositories below the root this window is looking at — sections
+  // open in the Source Control panel, and those holding a mounted file. Only
+  // these ride the daemon's 12 s git backstop; the rest refresh on events.
+  $effect(() => {
+    const below = $gitRepos.filter((r) => r.kind === "nested" || r.kind === "submodule");
+    const watched = new Set<string>($gitExpandedRepos);
+    for (const f of $diskWatchFiles) {
+      const r = repoForPath(below, f);
+      if (r) watched.add(r.path);
+    }
+    eventsSocket?.watchGitRepos([...watched]);
+  });
+
   // A worktree create/remove changed the daemon's workspace registry: re-fetch
   // the list so the home screen and switcher stay honest (a removed worktree's
   // workspace disappears; a created one appears).
@@ -1069,27 +1088,6 @@
   const linksByTerminal = $derived(new Map(links.map((l) => [l.terminal_id, l.agent_id])));
   const focusedSessionId = $derived(focusedSessionOf(layout));
 
-  /**
-   * The branch chip a rail row wears: only when the session is somewhere
-   * other than the checkout and branch this workspace shows — a linked
-   * worktree, another branch, another repository. Everyone on the checkout
-   * you're looking at is the common case, and stays quiet.
-   */
-  function railBranch(s: Session): SessionGit | null {
-    const g = s.git;
-    if (!g) return null;
-    const here = $gitStatus;
-    if (
-      here !== null &&
-      here.toplevel === g.worktree &&
-      !g.detached &&
-      !here.detached &&
-      (here.branch ?? null) === g.branch
-    ) {
-      return null;
-    }
-    return g;
-  }
   /** Sessions on screen in this window (each pane's active tab). */
   const visibleSessions = $derived(
     activeWsId !== null && layoutReady ? visibleSessionIds(layout) : [],
@@ -1116,6 +1114,43 @@
     return () => window.removeEventListener("focus", onFocus);
   });
   const focusedFilePath = $derived(focusedFileOf(layout));
+
+  /**
+   * The status strip's branch chip follows focus: the repository holding the
+   * focused file, else the focused session's checkout (or folder). Nothing
+   * focused inside one: the workspace's own repository, or — a folder of
+   * several — how many there are.
+   */
+  const gitFocusPath = $derived.by((): string | null => {
+    const s = focusedSessionId !== null ? sessionsById.get(focusedSessionId) : undefined;
+    return focusedFilePath ?? s?.git?.worktree ?? s?.cwd_current ?? s?.cwd ?? null;
+  });
+  // The Source Control panel auto-expands the repository holding this.
+  $effect(() => {
+    setGitFocus(gitFocusPath);
+  });
+  const stripGit = $derived.by(
+    (): { status: GitStatus; label: string | null; path: string | null } | null => {
+      const repos = $gitRepos;
+      if (repos.length > 1) {
+        const repo = repoForPath(repos, gitFocusPath);
+        if (repo !== null) {
+          const status =
+            repo.kind === "root" || repo.kind === "enclosing"
+              ? $gitStatus
+              : ($gitRepoStatuses.get(repo.path) ?? null);
+          if (status !== null && status.repo) {
+            const name = repo.path.split("/").filter(Boolean).pop() ?? repo.path;
+            return { status, label: repo.kind === "root" ? null : name, path: repo.path };
+          }
+        }
+        return null;
+      }
+      return $gitStatus !== null ? { status: $gitStatus, label: null, path: null } : null;
+    },
+  );
+  /** Repositories in the workspace, for the "N repos" chip. */
+  const stripRepoCount = $derived($gitRepos.length);
   /** Open file tabs' display titles (basename, disambiguated by parent dir). */
   const fileTitles = $derived(fileTabTitles(allFilePaths(layout)));
   const zoomedPane = $derived(
@@ -4779,7 +4814,6 @@
 
       <nav class="sessions">
         {#snippet sessionRow(s: Session)}
-          {@const branchHere = railBranch(s)}
           {#if confirmKillId === s.id}
             <div
               class="row confirm"
@@ -4895,15 +4929,9 @@
                        chat agents (no PTY title) show the agent's own
                        post-turn status line instead. -->
                   {#if s.kind === "agent" && s.title && s.title !== displayName(s) && s.title !== s.agent_title}
-                    <span class="title">{#if branchHere}<BranchChip git={branchHere} />{" "}{/if}{s.title}</span>
+                    <span class="title">{s.title}</span>
                   {:else if s.kind === "agent" && s.status_detail && s.status_detail !== displayName(s)}
-                    <span class="title" title={s.status_detail}
-                      >{#if branchHere}<BranchChip git={branchHere} />{" "}{/if}{s.status_detail}</span
-                    >
-                  {:else if branchHere}
-                    <!-- Somewhere other than the checkout you're looking at:
-                         a worktree, another branch, another repository. -->
-                    <span class="title"><BranchChip git={branchHere} /></span>
+                    <span class="title" title={s.status_detail}>{s.status_detail}</span>
                   {/if}
                 </span>
               {/if}
@@ -5224,13 +5252,18 @@
         {/if}
         </span>
         <span class="daemon-tools">
-        {#if $gitStatus !== null}
+        {#if stripGit !== null}
+          {@const gs = stripGit.status}
           <!-- Always-on orientation: what branch you're on and how dirty the
-               tree is; one click opens the source-control panel. -->
+               tree is; one click opens the source-control panel. With several
+               repositories it names the one holding what's focused. -->
           <button
             class="daemon-git"
-            onclick={openGitPanel}
-            title={`${$gitStatus.detached ? `detached at ${$gitStatus.head ?? "?"}` : ($gitStatus.branch ?? "unborn branch")}${$gitStatus.upstream ? ` · ${$gitStatus.upstream}` : ""} — open source control`}
+            onclick={() => {
+              openGitPanel();
+              if (stripGit.path !== null) revealRepo(stripGit.path);
+            }}
+            title={`${stripGit.label ? `${stripGit.label}: ` : ""}${gs.detached ? `detached at ${gs.head ?? "?"}` : (gs.branch ?? "unborn branch")}${gs.upstream ? ` · ${gs.upstream}` : ""} — open source control`}
           >
             <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
               <path
@@ -5244,18 +5277,36 @@
               <circle cx="5" cy="2.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
               <circle cx="11" cy="2.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
             </svg>
+            {#if stripGit.label}<span class="dg-repo">{stripGit.label}</span>{/if}
             <span class="dg-branch"
-              >{$gitStatus.detached
-                ? ($gitStatus.head ?? "detached")
-                : ($gitStatus.branch ?? "unborn")}</span
+              >{gs.detached
+                ? `No branch (at ${gs.head ?? "?"})`
+                : (gs.branch ?? "No commits yet")}</span
             >
-            {#if $gitStatus.ahead > 0}<span class="dg-ab">↑{$gitStatus.ahead}</span>{/if}
-            {#if $gitStatus.behind > 0}<span class="dg-ab">↓{$gitStatus.behind}</span>{/if}
-            {#if $gitStatus.counts.total > 0}
-              <span class="dg-dirty" title="{$gitStatus.counts.total} changed">
-                ●{$gitStatus.counts.total}
+            {#if gs.ahead > 0}<span class="dg-ab" title={aheadBehindWords(gs.ahead, 0, gs.upstream)}>↑{gs.ahead}</span>{/if}
+            {#if gs.behind > 0}<span class="dg-ab" title={aheadBehindWords(0, gs.behind, gs.upstream)}>↓{gs.behind}</span>{/if}
+            {#if gs.counts.total > 0}
+              <span class="dg-dirty" title="{gs.counts.total} changed">
+                ●{gs.counts.total}
               </span>
             {/if}
+          </button>
+        {:else if stripRepoCount > 1}
+          <!-- A folder of repositories with nothing focused inside one. -->
+          <button class="daemon-git" onclick={openGitPanel} title="{stripRepoCount} repositories — open source control">
+            <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <path
+                d="M5 4v5.2M11 4v2a2.4 2.4 0 0 1-2.4 2.4H5"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+              />
+              <circle cx="5" cy="12" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <circle cx="5" cy="2.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <circle cx="11" cy="2.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+            </svg>
+            <span class="dg-branch">{stripRepoCount} repos</span>
           </button>
         {:else if $gitEnv?.ok === false}
           <!-- No repo shown because git itself can't run (too old / missing).
@@ -6844,6 +6895,15 @@
      never ellipsize it — the bar wraps instead, now that it can. */
   .daemon-git.bad .dg-branch {
     max-width: none;
+  }
+
+  /* With several repositories the chip names the focused one first. */
+  .dg-repo {
+    color: var(--muted);
+    max-width: 10em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   /* The branch's width budget scales with the rail (roughly what the old 50%

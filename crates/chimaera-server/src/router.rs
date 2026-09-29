@@ -205,6 +205,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/git/status", get(git::status))
         .route("/git/diff", get(git::diff))
         .route("/git/branches", get(git::branches))
+        .route("/git/repos", get(git::repos))
         .route(
             "/git/worktrees",
             get(git::worktrees)

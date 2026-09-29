@@ -14,6 +14,7 @@
   } from "./paths";
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
+  import BranchChip from "../shared/BranchChip.svelte";
   import { insertIntoComposer, registerFollow } from "./composerBus";
   import {
     acquireChat,
@@ -2216,7 +2217,6 @@
     onToggleThinking={toggleThinking}
     onInterrupt={interrupt}
     onSetRemoteControl={setRemoteControl}
-    git={session.git ?? null}
   />
 
   <!-- Focusable so keyboard scrolling works in WKWebView (Safari never
@@ -2751,6 +2751,18 @@
         aria-label="dismiss suggestion"
         onclick={() => (store.promptSuggestion = null)}>×</button
       >
+    </div>
+  {/if}
+
+  {#if session.git}
+    <!-- Only in a repository: which branch (and, on hover, which worktree)
+         this conversation works on — one quiet line above the input, never a
+         prompt to do anything with git. -->
+    <!-- One line: the branch on the left; the right side is kept free for
+         the session record's same-file notice. -->
+    <div class="branch-line">
+      <span class="branch-slot"><BranchChip git={session.git} /></span>
+      <span class="branch-line-end"></span>
     </div>
   {/if}
 
@@ -3299,6 +3311,27 @@
   }
   .cancel-btn:hover {
     color: var(--err);
+  }
+  .branch-line {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-width: 0;
+    padding: 4px 14px 0;
+  }
+  .branch-slot {
+    display: inline-flex;
+    min-width: 0;
+    flex: 0 1 auto;
+  }
+  .branch-line-end {
+    display: inline-flex;
+    min-width: 0;
+    flex: 0 1 auto;
+  }
+  .branch-line-end:empty {
+    display: none;
   }
   .suggestion-row {
     display: flex;

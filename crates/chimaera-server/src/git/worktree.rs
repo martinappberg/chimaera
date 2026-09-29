@@ -274,6 +274,10 @@ pub(crate) struct CreateWorktree {
     /// Start point for a NEW branch; HEAD when omitted.
     #[serde(default)]
     base: Option<String>,
+    /// Which of the workspace's repositories (its top level); the one at or
+    /// around the root when absent.
+    #[serde(default)]
+    repo: Option<String>,
 }
 
 /// POST /api/v1/git/worktrees — create a worktree for `branch` under the managed
@@ -296,12 +300,11 @@ pub(crate) async fn create_worktree(
     if !git.adequate {
         return git_too_old(&git);
     }
-    let Some(repo) = state
-        .git
-        .discover(&git.path, &body.workspace_id, &ws.root)
-        .await
-        .into_repo()
-    else {
+    let picked = match super::http::pick_repo(&state, &git.path, &ws, body.repo.as_deref()).await {
+        Ok(outcome) => outcome,
+        Err(refusal) => return refusal,
+    };
+    let Some(repo) = picked.into_repo() else {
         return bad_request("not a git repository");
     };
     let base = body
@@ -343,6 +346,9 @@ pub(crate) struct RemoveWorktree {
     /// Remove even with uncommitted changes.
     #[serde(default)]
     force: bool,
+    /// Which of the workspace's repositories the worktree belongs to.
+    #[serde(default)]
+    repo: Option<String>,
 }
 
 /// Does the checkout at `target` hold commits that exist nowhere else — on
@@ -415,12 +421,11 @@ pub(crate) async fn remove_worktree(
     if !git.adequate {
         return git_too_old(&git);
     }
-    let Some(repo) = state
-        .git
-        .discover(&git.path, &body.workspace_id, &ws.root)
-        .await
-        .into_repo()
-    else {
+    let picked = match super::http::pick_repo(&state, &git.path, &ws, body.repo.as_deref()).await {
+        Ok(outcome) => outcome,
+        Err(refusal) => return refusal,
+    };
+    let Some(repo) = picked.into_repo() else {
         return bad_request("not a git repository");
     };
     let (target, managed) = {
@@ -619,13 +624,24 @@ pub(crate) async fn allowed_session_cwd(
     }
     let git = state.git.resolve_git(configured_git(state)).await;
     if git.adequate {
-        if let Some(repo) = state
+        // The worktrees of the workspace's repositories (the primary first;
+        // a bounded handful of the ones below the root).
+        let mut repos: Vec<RepoInfo> = state
             .git
             .discover(&git.path, &workspace.id, &workspace.root)
             .await
             .into_repo()
-        {
-            if let Ok(list) = state.git.worktrees(&git.path, &repo).await {
+            .into_iter()
+            .collect();
+        repos.extend(
+            state
+                .git
+                .known_toplevels(&workspace.id)
+                .into_iter()
+                .filter_map(|t| state.git.found_repo(&workspace.id, &t)),
+        );
+        for repo in repos.iter().take(8) {
+            if let Ok(list) = state.git.worktrees(&git.path, repo).await {
                 if list.iter().any(|w| canonical.starts_with(&w.path)) {
                     return Ok(canonical);
                 }

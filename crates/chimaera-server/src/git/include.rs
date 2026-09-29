@@ -26,11 +26,21 @@ pub(crate) struct IncludeReport {
     pub(crate) bytes: u64,
     /// Matched files left behind because a bound was reached.
     pub(crate) capped: bool,
+    /// The first few copied paths (repo-relative), for "Copied .env and 1 more".
+    pub(crate) names: Vec<String>,
 }
+
+/// Names reported back per create.
+const REPORTED_NAMES: usize = 3;
 
 impl IncludeReport {
     pub(super) fn json(&self) -> serde_json::Value {
-        serde_json::json!({"copied": self.copied, "bytes": self.bytes, "capped": self.capped})
+        serde_json::json!({
+            "copied": self.copied,
+            "bytes": self.bytes,
+            "capped": self.capped,
+            "names": self.names,
+        })
     }
 }
 
@@ -398,6 +408,9 @@ fn copy_matching(
             Ok(n) => {
                 report.copied += 1;
                 report.bytes += n;
+                if report.names.len() < REPORTED_NAMES {
+                    report.names.push(rel.to_string_lossy().into_owned());
+                }
             }
             Err(err) => {
                 tracing::debug!(%err, file = %from.display(), ".worktreeinclude copy failed");
