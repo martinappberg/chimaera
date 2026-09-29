@@ -661,11 +661,11 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 > be "helpfully" changed without asking.
 
 ### Quoting part of a reply back to the agent — why it exists
-_Captured 2026-09-28 from the maintainer's own words in the session that built it; the settled/open questions are still pending._
+_Captured 2026-09-28 from the maintainer, in the session that built it._
 
 - **Why (maintainer, verbatim):** "Can we make it so even in the chat one can refer certain parts of a response (to the current agent)" — asked over a screenshot of part of a reply's table selected in the transcript. "Even in the chat": file views and terminals already had the context bridge's "reference in agent"; the transcript did not.
 - **What the request fixed in scope:** the reference goes to the current agent — the chat the passage was selected in — never to another one.
-- _Settled vs. free-to-change, and what must not be "fixed": pending — not yet asked._
+- **How settled it is (addition, not a core bet):** "This is just nice UI / UX open to change." The chip, its wording, the blockquote format, the muted quote in sent bubbles and where the quote lands in the draft are all free to improve; nothing here is a do-not-change.
 
 ### The turn-end block — "Written this turn" / "Also written" — why it exists
 _Captured 2026-09-26 from the maintainer's own words in the session that shipped it (PR #171); the settled/open questions are still pending._
