@@ -916,6 +916,30 @@ pub(crate) async fn api_proxy(
         }
         return next.run(incoming).await;
     };
+    // A window's active project picks the owner only for paths that belong
+    // to it; this computer's own files outside the project stay here.
+    let mut fallback = None;
+    if id.is_none() && path.starts_with("/fs/") {
+        let (parts, body) = incoming.into_parts();
+        let (body, bytes) = if fs_json_body(&parts.method, &path) {
+            let Ok(bytes) = axum::body::to_bytes(body, MAX_METADATA).await else {
+                return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+            };
+            (Body::from(bytes.clone()), Some(bytes))
+        } else {
+            (body, None)
+        };
+        let json = bytes
+            .as_ref()
+            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
+        let arguments = fs_arguments(&parts.uri, json.as_ref());
+        match fs_answerer(&parts.method, &path, arguments, route.alias(&workspace)).await {
+            Answerer::Owner => {}
+            Answerer::Local => return next.run(Request::from_parts(parts, body)).await,
+            Answerer::OwnerThenLocal => fallback = Some(replay(&parts, bytes.as_ref())),
+        }
+        incoming = Request::from_parts(parts, body);
+    }
     // Each step carries its own bound: small JSON adapters get a short one,
     // while an upload streams and an exec runs for as long as they progress
     // under their request budget (a fixed 30 s cap cut both off mid-flight).
@@ -944,6 +968,19 @@ pub(crate) async fn api_proxy(
         .await?
     }
     .await;
+    // A read of a path outside the project that its owner does not have (or
+    // may not show) is this computer's own file: answer it here.
+    if let Some(local) = fallback {
+        let owner_declined = result.as_ref().map_or(true, |response| {
+            matches!(
+                response.status(),
+                StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+            )
+        });
+        if owner_declined {
+            return next.run(local).await;
+        }
+    }
     result.unwrap_or_else(|_| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -951,6 +988,109 @@ pub(crate) async fn api_proxy(
         )
             .into_response()
     })
+}
+
+/// Who answers a project-window `/fs/*` request.
+enum Answerer {
+    /// The project's own paths (and anything with no path at all).
+    Owner,
+    /// A write outside the project whose folder exists on this computer.
+    Local,
+    /// A read outside the project: the owner first (a conversation that runs
+    /// there links its own files and saved images), else this computer.
+    OwnerThenLocal,
+}
+/// Filesystem routes whose small JSON body names their paths.
+fn fs_json_body(method: &axum::http::Method, path: &str) -> bool {
+    (*method == axum::http::Method::POST
+        && matches!(
+            path,
+            "/fs/ticket"
+                | "/fs/mkdir"
+                | "/fs/create"
+                | "/fs/rename"
+                | "/fs/copy"
+                | "/fs/move"
+                | "/fs/delete"
+                | "/fs/validate"
+                | "/fs/resolve_targets"
+        ))
+        || (*method == axum::http::Method::PUT && path == "/fs/drafts")
+}
+/// Every filesystem path a request names, for choosing who answers only: the
+/// answering daemon validates each one again.
+fn fs_arguments(uri: &axum::http::Uri, body: Option<&Value>) -> Vec<String> {
+    let mut arguments = Vec::new();
+    if let Ok(Query(query)) = Query::<Vec<(String, String)>>::try_from_uri(uri) {
+        arguments.extend(
+            query
+                .into_iter()
+                .filter(|(key, _)| key == "path" || key == "dir")
+                .map(|(_, value)| value),
+        );
+    }
+    if let Some(body) = body {
+        for key in ["path", "from", "to", "base"] {
+            if let Some(value) = body[key].as_str() {
+                arguments.push(value.to_owned());
+            }
+        }
+        if let Some(bases) = body["bases"].as_array() {
+            arguments.extend(bases.iter().filter_map(Value::as_str).map(str::to_owned));
+        }
+    }
+    arguments
+}
+async fn fs_answerer(
+    method: &axum::http::Method,
+    path: &str,
+    arguments: Vec<String>,
+    alias: Option<crate::workspace_scope::paths::Alias>,
+) -> Answerer {
+    let Some(alias) = alias else {
+        return Answerer::Owner;
+    };
+    // Compound resolvers: the owner answers what it may read and leaves the
+    // rest unresolved.
+    if matches!(path, "/fs/validate" | "/fs/resolve_targets")
+        || arguments.is_empty()
+        || arguments
+            .iter()
+            .any(|argument| alias.input(argument) != *argument)
+    {
+        return Answerer::Owner;
+    }
+    let reading = matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD)
+        || (*method == axum::http::Method::POST && path == "/fs/ticket");
+    if reading {
+        return Answerer::OwnerThenLocal;
+    }
+    // A write goes where its folder exists: this computer's own files stay
+    // here, while a path from the owner's machine (a link in a conversation
+    // that runs there) goes to the owner.
+    let here = tokio::task::spawn_blocking(move || {
+        arguments.iter().all(|argument| {
+            crate::fs::expand_tilde(argument).is_ok_and(|path| {
+                path.is_absolute() && path.parent().is_some_and(std::path::Path::is_dir)
+            })
+        })
+    })
+    .await
+    .unwrap_or(false);
+    if here {
+        Answerer::Local
+    } else {
+        Answerer::Owner
+    }
+}
+/// The same small request again, for this computer to answer.
+fn replay(parts: &axum::http::request::Parts, body: Option<&bytes::Bytes>) -> Request<Body> {
+    let mut request = Request::new(body.cloned().map_or_else(Body::empty, Body::from));
+    *request.method_mut() = parts.method.clone();
+    *request.uri_mut() = parts.uri.clone();
+    *request.version_mut() = parts.version;
+    *request.headers_mut() = parts.headers.clone();
+    request
 }
 impl Route {
     fn alias(&self, workspace: &str) -> Option<crate::workspace_scope::paths::Alias> {

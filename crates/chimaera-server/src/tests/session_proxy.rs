@@ -644,6 +644,98 @@ async fn unavailable_logical_project_never_falls_back_to_stale_local_files() {
         .store(true, std::sync::atomic::Ordering::Release);
 }
 
+/// A window whose project runs elsewhere still reads and saves this
+/// computer's own files outside the project here, while the project's own
+/// paths (and its document checker) go to the owner.
+#[tokio::test]
+async fn a_routed_window_keeps_this_computers_files_outside_the_project_local() {
+    let remote = test_state();
+    let local = test_state();
+    let workspace = lock(&remote.workspaces)
+        .add(test_dir("fs-owner").canonicalize().unwrap())
+        .unwrap();
+    std::fs::write(workspace.root.join("note.txt"), "owner copy").unwrap();
+    let mut viewing = workspace.clone();
+    viewing.root = test_dir("fs-viewer").canonicalize().unwrap();
+    std::fs::write(viewing.root.join("note.txt"), "stale local copy").unwrap();
+    lock(&local.workspaces)
+        .import_exact(viewing.clone())
+        .unwrap();
+    pro::install_execution_fixture(&remote, &workspace.id, 4).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = listener.local_addr().unwrap();
+    let router = app(remote.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    assert_eq!(request(&local,Method::POST,"/api/v1/pro/placements",Some(serde_json::json!({"host_id":"worker-fs","endpoint":format!("http://{remote_addr}"),"token":"test-token","workspace_id":workspace.id,"epoch":4}))).await.0,StatusCode::NO_CONTENT);
+    let elsewhere = test_dir("fs-viewer-home").canonicalize().unwrap();
+    let own = elsewhere.join("own.txt");
+    std::fs::write(&own, "this computer's file").unwrap();
+    let call = |method: Method, route: &str, path: &std::path::Path, body: Body| {
+        let query = crate::workspace_scope::paths::encode_query(&[(
+            "path".into(),
+            path.to_string_lossy().into_owned(),
+        )]);
+        let request = Request::builder()
+            .method(method)
+            .uri(format!("/api/v1{route}?{query}"))
+            .header(header::AUTHORIZATION, "Bearer test-token")
+            .header("x-chimaera-viewer-workspace", &workspace.id)
+            .body(body)
+            .unwrap();
+        let local = local.clone();
+        async move {
+            let response = app(local).oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+    // The project's own file comes from where the project runs.
+    let (status, body) = call(
+        Method::GET,
+        "/fs/file",
+        &viewing.root.join("note.txt"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "owner copy"));
+    // This computer's own files and folders outside the project stay here.
+    let (status, body) = call(Method::GET, "/fs/file", &own, Body::empty()).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::OK, "this computer's file")
+    );
+    let (status, body) = call(Method::GET, "/fs/list", &elsewhere, Body::empty()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("own.txt"), "{body}");
+    let (status, _) = call(
+        Method::PUT,
+        "/fs/file",
+        &own,
+        Body::from("saved on this computer"),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    assert_eq!(
+        std::fs::read_to_string(&own).unwrap(),
+        "saved on this computer"
+    );
+    // The reading view's checker works for a project file too.
+    let (status, body) = call(
+        Method::GET,
+        "/fs/check_document",
+        &viewing.root.join("note.txt"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for state in [&remote, &local] {
+        state
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// A window watching a project that runs on another daemon gets that
 /// project's frames merged into its own events stream — never the owner's
 /// settings, recents or notices — and its socket survives an owner change.

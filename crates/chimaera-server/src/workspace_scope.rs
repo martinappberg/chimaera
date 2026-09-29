@@ -221,6 +221,51 @@ impl Scope {
         .await??;
         Ok(())
     }
+    /// Which of `paths` a viewer of this project may READ: anything inside the
+    /// project, plus the images its own conversations saved (a chat's pasted
+    /// pictures live in the owner's uploads folder, outside the project).
+    /// Writes keep the strict [`Scope::paths`] rule.
+    pub(crate) async fn readable(&self, state: &AppState, paths: Vec<String>) -> Result<Vec<bool>> {
+        ensure!(
+            paths.len() <= 2048 && paths.iter().all(|p| p.len() <= 4096),
+            "path budget exceeded"
+        );
+        let root = crate::lock(&state.workspaces)
+            .get(&self.workspace_id)
+            .context("unknown workspace")?
+            .root;
+        let uploads: Vec<std::path::PathBuf> = crate::lock(&state.session_workspaces)
+            .iter()
+            .filter(|(_, workspace)| **workspace == self.workspace_id)
+            .map(|(session, _)| state.uploads_root.join(session))
+            .collect();
+        let _permit = crate::fs::FILESYSTEM_WORK.acquire().await?;
+        tokio::task::spawn_blocking(move || {
+            let root = root.canonicalize()?;
+            // A conversation that never saved an image has no folder.
+            let uploads: Vec<_> = uploads
+                .iter()
+                .filter_map(|dir| dir.canonicalize().ok())
+                .collect();
+            Ok::<_, anyhow::Error>(
+                paths
+                    .iter()
+                    .map(|path| {
+                        within(&root, path).unwrap_or(false)
+                            || uploads.iter().any(|dir| within(dir, path).unwrap_or(false))
+                    })
+                    .collect(),
+            )
+        })
+        .await?
+    }
+    async fn read(&self, state: &AppState, path: String) -> Result<()> {
+        ensure!(
+            self.readable(state, vec![path]).await?.first() == Some(&true),
+            "path outside workspace"
+        );
+        Ok(())
+    }
 }
 /// Resolve existing symlinks and the nearest existing parent of a new file.
 /// `..` is rejected before walking nonexistent parents, so it cannot escape later.
@@ -431,8 +476,8 @@ async fn scoped_request(
         ) | ("PUT", "/links" | "/fs/drafts")
     );
     let mut target_keys = HashMap::new();
-    let body = if needs_body {
-        let (parts, stream) = request.into_parts();
+    let (mut parts, stream) = request.into_parts();
+    let (mut body, stream) = if needs_body {
         let bytes = match tokio::time::timeout(
             std::time::Duration::from_secs(30),
             axum::body::to_bytes(stream, MAX_JSON),
@@ -452,22 +497,28 @@ async fn scoped_request(
                 target_keys = alias.request_body(&mut body);
             }
         }
-        let mut parts = parts;
-        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-        request = Request::from_parts(
-            parts,
-            Body::from(serde_json::to_vec(&body).unwrap_or_default()),
-        );
-        body
+        (body, None)
     } else {
-        Value::Null
+        (Value::Null, Some(stream))
     };
-    if validate_resource(&state, &scope, &method, &path, &query, &body)
+    // Validation may narrow a compound body (unreadable candidates dropped),
+    // so the forwarded body is built from what it approved.
+    if validate_resource(&state, &scope, &method, &path, &query, &mut body)
         .await
         .is_err()
     {
         return denied(StatusCode::FORBIDDEN);
     }
+    let mut request = match stream {
+        Some(stream) => Request::from_parts(parts, stream),
+        None => {
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            Request::from_parts(
+                parts,
+                Body::from(serde_json::to_vec(&body).unwrap_or_default()),
+            )
+        }
+    };
     // Recheck after filesystem/JSON work; a lease may have changed while awaiting.
     if scope.validate(&state).is_err() {
         return denied(StatusCode::CONFLICT);
@@ -520,7 +571,7 @@ async fn validate_resource(
     method: &Method,
     path: &str,
     query: &HashMap<String, String>,
-    body: &Value,
+    body: &mut Value,
 ) -> Result<()> {
     let read = *method == Method::GET || *method == Method::HEAD;
     if read
@@ -628,7 +679,8 @@ async fn validate_resource(
         );
         return Ok(());
     }
-    if (read
+    // Reads may also open the images this project's own conversations saved.
+    if read
         && matches!(
             path,
             "/fs/dirs"
@@ -639,8 +691,22 @@ async fn validate_resource(
                 | "/fs/xlsx"
                 | "/fs/notebook"
                 | "/fs/draft"
-        ))
-        || (method == Method::PUT && path == "/fs/file")
+                | "/fs/check_document"
+        )
+    {
+        return scope
+            .read(state, query.get("path").context("path missing")?.clone())
+            .await;
+    }
+    if method == Method::POST && path == "/fs/ticket" {
+        return scope
+            .read(
+                state,
+                body["path"].as_str().context("path missing")?.to_owned(),
+            )
+            .await;
+    }
+    if (method == Method::PUT && path == "/fs/file")
         || (method == Method::DELETE && path == "/fs/draft")
         || (method == Method::POST && path == "/fs/upload")
     {
@@ -654,11 +720,7 @@ async fn validate_resource(
             )
             .await;
     }
-    if method == Method::POST
-        && matches!(
-            path,
-            "/fs/ticket" | "/fs/mkdir" | "/fs/create" | "/fs/delete"
-        )
+    if method == Method::POST && matches!(path, "/fs/mkdir" | "/fs/create" | "/fs/delete")
         || method == Method::PUT && path == "/fs/drafts"
     {
         return scope
@@ -682,65 +744,109 @@ async fn validate_resource(
             )
             .await;
     }
-    // Compound resolvers can read multiple candidates, including fallback roots.
-    // Every base and candidate must independently remain inside this project.
+    // Compound resolvers read many candidates at once, and a conversation's
+    // links legitimately include paths outside the project (a pasted image,
+    // a file on the viewer's own machine). Every candidate and base still
+    // stays inside what this viewer may read: the others are dropped and
+    // resolve as unknown, instead of refusing the whole batch.
     if method == Method::POST && matches!(path, "/fs/validate" | "/fs/resolve_targets") {
-        if !body["workspace_id"].is_null() {
-            same(scope, body["workspace_id"].as_str())?;
+        return keep_readable_candidates(state, scope, path, body).await;
+    }
+    anyhow::bail!("route unavailable for workspace viewer")
+}
+async fn keep_readable_candidates(
+    state: &AppState,
+    scope: &Scope,
+    path: &str,
+    body: &mut Value,
+) -> Result<()> {
+    if !body["workspace_id"].is_null() {
+        same(scope, body["workspace_id"].as_str())?;
+    }
+    let base = body["base"].as_str().context("base missing")?;
+    let mut bases = vec![base.to_owned()];
+    if let Some(more) = body["bases"].as_array() {
+        for p in more {
+            bases.push(p.as_str().context("invalid base")?.to_owned());
         }
-        let base = body["base"].as_str().context("base missing")?;
-        let mut bases = vec![base.to_owned()];
-        if let Some(more) = body["bases"].as_array() {
-            for p in more {
-                bases.push(p.as_str().context("invalid base")?.to_owned());
-            }
-        }
-        let key = if path == "/fs/validate" {
-            "candidates"
-        } else {
-            "targets"
-        };
-        let candidates = body[key].as_array().context("candidates missing")?;
-        ensure!(
-            candidates.len() <= 200 && bases.len() <= 9,
-            "path budget exceeded"
-        );
-        let mut paths = bases.clone();
-        for candidate in candidates {
-            let candidate = candidate.as_str().context("invalid candidate")?;
-            let candidate = if path == "/fs/resolve_targets" {
-                let Some(decoded) = crate::embed::target_path(candidate) else {
-                    continue;
-                };
-                decoded
-            } else {
-                candidate.to_owned()
+    }
+    let key = if path == "/fs/validate" {
+        "candidates"
+    } else {
+        "targets"
+    };
+    let candidates = body[key].as_array().context("candidates missing")?.clone();
+    ensure!(
+        candidates.len() <= 200 && bases.len() <= 9,
+        "path budget exceeded"
+    );
+    // Per candidate: whether it is relative, and every path it would read.
+    let mut reads: Vec<(bool, Vec<String>)> = Vec::with_capacity(candidates.len());
+    for candidate in &candidates {
+        let candidate = candidate.as_str().context("invalid candidate")?;
+        let candidate = if path == "/fs/resolve_targets" {
+            // Not a filesystem target (a URL, a mail link): nothing to read.
+            let Some(decoded) = crate::embed::target_path(candidate) else {
+                reads.push((false, Vec::new()));
+                continue;
             };
-            let expanded = crate::fs::expand_tilde(&candidate)?;
-            if expanded.is_absolute() {
-                paths.push(expanded.to_string_lossy().into_owned());
-            } else {
-                for base in &bases {
-                    paths.push(
-                        Path::new(base)
-                            .join(&expanded)
-                            .to_string_lossy()
-                            .into_owned(),
-                    );
-                    if path == "/fs/validate" && body["strict"] != true {
-                        if let Some(rest) = candidate
-                            .strip_prefix("a/")
-                            .or_else(|| candidate.strip_prefix("b/"))
-                        {
-                            paths.push(Path::new(base).join(rest).to_string_lossy().into_owned());
-                        }
-                    }
+            decoded
+        } else {
+            candidate.to_owned()
+        };
+        let expanded = crate::fs::expand_tilde(&candidate)?;
+        if expanded.is_absolute() {
+            reads.push((false, vec![expanded.to_string_lossy().into_owned()]));
+            continue;
+        }
+        let mut paths = Vec::new();
+        for base in &bases {
+            paths.push(
+                Path::new(base)
+                    .join(&expanded)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            if path == "/fs/validate" && body["strict"] != true {
+                if let Some(rest) = candidate
+                    .strip_prefix("a/")
+                    .or_else(|| candidate.strip_prefix("b/"))
+                {
+                    paths.push(Path::new(base).join(rest).to_string_lossy().into_owned());
                 }
             }
         }
-        return scope.paths(state, paths).await;
+        reads.push((true, paths));
     }
-    anyhow::bail!("route unavailable for workspace viewer")
+    let mut all = bases.clone();
+    for (_, paths) in &reads {
+        all.extend(paths.iter().cloned());
+    }
+    let readable = scope.readable(state, all).await?;
+    let bases_readable = readable[..bases.len()].iter().all(|ok| *ok);
+    let mut cursor = bases.len();
+    let mut kept = Vec::new();
+    for (candidate, (relative, paths)) in candidates.into_iter().zip(reads) {
+        let fine = readable[cursor..cursor + paths.len()].iter().all(|ok| *ok);
+        cursor += paths.len();
+        if fine && (!relative || bases_readable) {
+            kept.push(candidate);
+        }
+    }
+    body[key] = Value::Array(kept);
+    if !bases_readable {
+        // Only absolute candidates remain; never hand the resolver a base
+        // outside the project to fall back on.
+        let root = crate::lock(&state.workspaces)
+            .get(&scope.workspace_id)
+            .context("unknown workspace")?
+            .root;
+        body["base"] = json!(root);
+        if let Some(map) = body.as_object_mut() {
+            map.remove("bases");
+        }
+    }
+    Ok(())
 }
 pub(crate) fn sessions(state: &AppState, scope: &Scope) -> Vec<Value> {
     let alias = scope.alias(state).ok().flatten();
@@ -786,8 +892,9 @@ pub(crate) async fn ticket_middleware(
     let path = crate::lock(&state.tickets).lookup(ticket);
     if scope.validate(&state).is_err()
         || match path {
+            // A ticket only ever reads.
             Some(path) => scope
-                .paths(&state, vec![path.to_string_lossy().into_owned()])
+                .read(&state, path.to_string_lossy().into_owned())
                 .await
                 .is_err(),
             None => true,

@@ -343,26 +343,115 @@ async fn scoped_http_viewer_reads_only_registered_project_and_keeps_content_unch
             StatusCode::FORBIDDEN
         );
     }
-    for route in ["validate", "resolve_targets"] {
-        let body = if route == "validate" {
-            json!({"base":"/project","candidates":["~/outside-project"]})
+    // A compound resolver answers for what it may read and leaves the rest
+    // unresolved: one link outside the project never blanks every card, and
+    // never reads outside. A base outside the project is never used.
+    let outside = other
+        .root
+        .join("private.txt")
+        .to_string_lossy()
+        .into_owned();
+    for (route, base) in [
+        ("validate", "/project"),
+        ("resolve_targets", "/project"),
+        ("resolve_targets", "/"),
+    ] {
+        let key = if route == "validate" {
+            "candidates"
         } else {
-            json!({"base":"/project","targets":["~/outside-project"]})
+            "targets"
         };
-        assert_eq!(
-            scoped(
-                &state,
-                &one.id,
-                4,
-                Method::POST,
-                &format!("/api/v1/fs/{route}"),
-                Some(body)
-            )
-            .await
-            .0,
-            StatusCode::FORBIDDEN
+        let (status, bytes) = scoped(
+            &state,
+            &one.id,
+            4,
+            Method::POST,
+            &format!("/api/v1/fs/{route}"),
+            Some(json!({"base":base,key:["~/outside-project", outside, "/project/note.txt"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{route} {base}");
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("outside-project"), "{route}: {text}");
+        assert!(!text.contains("private.txt"), "{route}: {text}");
+        assert!(
+            text.contains("/project/note.txt"),
+            "{route} {base} resolves the project's own file: {text}"
         );
     }
+    // A conversation's saved images are readable by this project's viewers,
+    // and only this project's.
+    for (session, workspace) in [("s-own-chat", &one.id), ("s-other-chat", &other.id)] {
+        lock(&state.session_workspaces).insert(session.into(), workspace.clone());
+        std::fs::create_dir_all(state.uploads_root.join(session)).unwrap();
+        std::fs::write(state.uploads_root.join(session).join("pic.png"), "png").unwrap();
+    }
+    let picture = |session: &str| {
+        let path = state
+            .uploads_root
+            .join(session)
+            .join("pic.png")
+            .to_string_lossy()
+            .into_owned();
+        format!(
+            "/api/v1/fs/file?{}",
+            workspace_scope::paths::encode_query(&[("path".into(), path)])
+        )
+    };
+    assert_eq!(
+        scoped(
+            &state,
+            &one.id,
+            4,
+            Method::GET,
+            &picture("s-own-chat"),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        scoped(
+            &state,
+            &one.id,
+            4,
+            Method::GET,
+            &picture("s-other-chat"),
+            None
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    // Reading a saved image never grants writing next to it.
+    assert_eq!(
+        scoped(
+            &state,
+            &one.id,
+            4,
+            Method::PUT,
+            &picture("s-own-chat"),
+            Some(json!("overwrite"))
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    // The reading view's document checker is part of the project surface.
+    assert_eq!(
+        scoped(
+            &state,
+            &one.id,
+            4,
+            Method::GET,
+            "/api/v1/fs/check_document?path=%2Fproject%2Fnote.txt",
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
     assert_eq!(
         scoped(&state, &one.id, 3, Method::GET, "/api/v1/workspaces", None)
             .await
