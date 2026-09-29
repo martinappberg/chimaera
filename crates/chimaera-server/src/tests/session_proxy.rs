@@ -357,6 +357,30 @@ async fn retiring_stale_project_preserves_live_sibling_on_shared_host() {
     assert_eq!(scoped.status(), StatusCode::FORBIDDEN);
     // This read is also what a newly started native shell sees: no remembered
     // tunnel state is needed, and no token, URL or filesystem root is disclosed.
+    // A preview the healthy project minted before its sibling is retired must
+    // keep working afterwards: retirement is per project, not per host.
+    let proof = viewing
+        .root
+        .join("proof.txt")
+        .to_string_lossy()
+        .into_owned();
+    let minted = app(local.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/fs/ticket")
+                .header(header::AUTHORIZATION, "Bearer test-token")
+                .header("x-chimaera-viewer-workspace", &healthy.id)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::json!({"path":proof}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(minted.status(), StatusCode::OK);
+    let minted: serde_json::Value =
+        serde_json::from_slice(&minted.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let preview = format!("/raw/{}", minted["ticket"].as_str().unwrap());
     let (status, inventory) = request(&local, Method::GET, "/api/v1/pro/placements", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(inventory.as_array().unwrap().len(), 2);
@@ -404,6 +428,24 @@ async fn retiring_stale_project_preserves_live_sibling_on_shared_host() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        b"still on the current owner"[..]
+    );
+    let response = app(local.clone())
+        .oneshot(
+            Request::builder()
+                .uri(&preview)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "sibling preview survives"
+    );
     assert_eq!(
         response.into_body().collect().await.unwrap().to_bytes(),
         b"still on the current owner"[..]

@@ -38,10 +38,26 @@ pub(crate) struct Store {
 }
 #[derive(Default)]
 struct Data {
+    /// Mints route stamps; never reused, so a retired stamp cannot revive.
     generation: u64,
     routes: HashMap<String, Route>,
     rows: HashMap<String, Value>,
     tickets: HashMap<String, Ticket>,
+}
+impl Data {
+    fn mint(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.generation
+    }
+    /// Whether a captured route still names this project's live registration.
+    fn is_current(&self, route: &Route, workspace: &str) -> bool {
+        let Some(stamp) = route.stamp(workspace) else {
+            return false;
+        };
+        self.routes
+            .get(&route.host_id)
+            .is_some_and(|live| live.address.is_some() && live.stamp(workspace) == Some(stamp))
+    }
 }
 #[derive(Clone)]
 struct Ticket {
@@ -50,6 +66,9 @@ struct Ticket {
     upstream: String,
     expires: std::time::Instant,
 }
+/// What a captured connection or ticket proves about its project's route:
+/// the host transport and that one project's registration.
+type Stamp = (u64, u64);
 #[derive(Clone)]
 struct Route {
     host_id: String,
@@ -57,7 +76,17 @@ struct Route {
     token: String,
     workspaces: HashMap<String, u64>,
     roots: HashMap<String, std::path::PathBuf>,
-    generation: u64,
+    /// Per project: registering, re-registering or retiring one project on a
+    /// shared transport never closes a sibling's sockets or preview tickets.
+    generations: HashMap<String, u64>,
+    /// Changes only with this host's endpoint or credential, which retires
+    /// every project's captured connections at once.
+    transport: u64,
+}
+impl Route {
+    fn stamp(&self, workspace: &str) -> Option<Stamp> {
+        Some((self.transport, *self.generations.get(workspace)?))
+    }
 }
 #[derive(Deserialize)]
 pub(crate) struct Registration {
@@ -142,14 +171,14 @@ impl Store {
                 bail!("placement workspace limit");
             }
         }
-        data.generation = data.generation.wrapping_add(1);
-        let generation = data.generation;
+        let generation = data.mint();
+        let workspace = request.workspace_id;
         for existing in data.routes.values_mut() {
             if existing.host_id != request.host_id
-                && existing.workspaces.remove(&request.workspace_id).is_some()
+                && existing.workspaces.remove(&workspace).is_some()
             {
-                existing.roots.remove(&request.workspace_id);
-                existing.generation = generation;
+                existing.roots.remove(&workspace);
+                existing.generations.remove(&workspace);
             }
         }
         data.routes.retain(|_, route| !route.workspaces.is_empty());
@@ -162,37 +191,47 @@ impl Store {
                 token: String::new(),
                 workspaces: HashMap::new(),
                 roots: HashMap::new(),
-                generation: 0,
+                generations: HashMap::new(),
+                transport: generation,
             });
-        if route.address == Some(address)
-            && route.token == request.token
-            && route.workspaces.get(&request.workspace_id) == Some(&request.epoch)
-            && route.roots.get(&request.workspace_id) == Some(&local_root)
-        {
-            return Ok(());
+        if route.address != Some(address) || route.token != request.token {
+            route.address = Some(address);
+            route.token = request.token;
+            route.transport = generation;
         }
-        route.address = Some(address);
-        route.token = request.token;
-        route.roots.insert(request.workspace_id.clone(), local_root);
-        route.workspaces.insert(request.workspace_id, request.epoch);
-        route.generation = generation;
+        if route.workspaces.get(&workspace) != Some(&request.epoch)
+            || route.roots.get(&workspace) != Some(&local_root)
+            || !route.generations.contains_key(&workspace)
+        {
+            route.roots.insert(workspace.clone(), local_root);
+            route.workspaces.insert(workspace.clone(), request.epoch);
+            route.generations.insert(workspace.clone(), generation);
+        }
+        // A project that moved between registered hosts must not keep its rows
+        // pointing at the previous owner until the next roster poll.
+        let host = route.host_id.clone();
+        for row in data.rows.values_mut() {
+            if row["workspace_id"].as_str() == Some(workspace.as_str())
+                && row["placement"]["remote"].as_str() != Some(host.as_str())
+            {
+                row["placement"] = json!({"remote": host});
+            }
+        }
         Ok(())
     }
-    fn for_session(&self, id: &str) -> Option<Route> {
+    fn for_session(&self, id: &str) -> Option<(Route, String)> {
         let data = crate::lock(&self.inner);
         let row = data.rows.get(id)?;
         let host = row["placement"]["remote"].as_str()?;
+        let workspace = row["workspace_id"].as_str()?;
         let route = data.routes.get(host)?;
         route
-            .workspaces
-            .contains_key(row["workspace_id"].as_str()?)
-            .then(|| route.clone())
+            .generations
+            .contains_key(workspace)
+            .then(|| (route.clone(), workspace.to_owned()))
     }
-    fn current(&self, route: &Route) -> bool {
-        crate::lock(&self.inner)
-            .routes
-            .get(&route.host_id)
-            .is_some_and(|r| r.generation == route.generation && r.address.is_some())
+    fn current(&self, route: &Route, workspace: &str) -> bool {
+        crate::lock(&self.inner).is_current(route, workspace)
     }
     fn for_workspace(&self, workspace: &str) -> Option<Route> {
         crate::lock(&self.inner)
@@ -225,14 +264,12 @@ impl Store {
     }
     pub(crate) fn clear_workspace(&self, workspace: &str) {
         let mut data = crate::lock(&self.inner);
-        data.generation = data.generation.wrapping_add(1);
-        let generation = data.generation;
         data.rows
             .retain(|_, row| row["workspace_id"].as_str() != Some(workspace));
         for route in data.routes.values_mut() {
             if route.workspaces.remove(workspace).is_some() {
                 route.roots.remove(workspace);
-                route.generation = generation;
+                route.generations.remove(workspace);
             }
         }
         // A retired last project must not permanently occupy a bounded host
@@ -241,11 +278,7 @@ impl Store {
     }
     fn install_workspace(&self, route: &Route, workspace: &str, rows: Vec<Value>) -> bool {
         let mut data = crate::lock(&self.inner);
-        if data
-            .routes
-            .get(&route.host_id)
-            .is_none_or(|current| current.generation != route.generation)
-        {
+        if !data.is_current(route, workspace) {
             return false;
         }
         let outside = data
@@ -295,11 +328,7 @@ impl Store {
     }
     fn unavailable_workspace(&self, route: &Route, workspace: &str) -> bool {
         let mut data = crate::lock(&self.inner);
-        if data
-            .routes
-            .get(&route.host_id)
-            .is_none_or(|current| current.generation != route.generation)
-        {
+        if !data.is_current(route, workspace) {
             return false;
         }
         let mut changed = false;
@@ -358,12 +387,11 @@ pub(crate) async fn remove(
         return StatusCode::BAD_REQUEST;
     };
     let mut data = crate::lock(&state.session_proxy.inner);
-    data.generation = data.generation.wrapping_add(1);
-    let generation = data.generation;
+    let generation = data.mint();
     if let Some(route) = data.routes.get_mut(&host_id) {
         route.address = None;
         route.token.clear();
-        route.generation = generation;
+        route.transport = generation;
     }
     for row in data.rows.values_mut() {
         if row["placement"]["remote"].as_str() == Some(&host_id) {
@@ -781,7 +809,7 @@ async fn ticket_response(
             cached.workspace == workspace
                 && cached.upstream == upstream
                 && cached.route.host_id == route.host_id
-                && cached.route.generation == route.generation
+                && cached.route.stamp(workspace) == route.stamp(workspace)
         }) {
             cached.expires = now + Duration::from_secs(600);
             value["ticket"] = json!(local);
@@ -831,7 +859,11 @@ pub(crate) async fn ticket_proxy(
     let Some(ticket) = ticket else {
         return next.run(incoming).await;
     };
-    if ticket.expires <= std::time::Instant::now() || !state.session_proxy.current(&ticket.route) {
+    if ticket.expires <= std::time::Instant::now()
+        || !state
+            .session_proxy
+            .current(&ticket.route, &ticket.workspace)
+    {
         return StatusCode::GONE.into_response();
     }
     let suffix = pieces
@@ -869,17 +901,7 @@ pub(crate) async fn socket(
     auth: Value,
     downstream: &mut axum::extract::ws::WebSocket,
 ) -> bool {
-    let Some(route) = state.session_proxy.for_session(id) else {
-        return false;
-    };
-    let workspace = {
-        let data = crate::lock(&state.session_proxy.inner);
-        data.rows
-            .get(id)
-            .and_then(|row| row["workspace_id"].as_str())
-            .map(str::to_owned)
-    };
-    let Some(workspace) = workspace else {
+    let Some((route, workspace)) = state.session_proxy.for_session(id) else {
         return false;
     };
     socket_route(
@@ -944,7 +966,7 @@ async fn socket_route(
         ownership.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                _ = ownership.tick() => if !state.session_proxy.current(&route) { bail!("placement changed"); },
+                _ = ownership.tick() => if !state.session_proxy.current(&route, workspace) { bail!("placement changed"); },
                 next = upstream.next() => match next {
                     Some(Ok(Up::Text(text))) => {
                         let mut value:Value=serde_json::from_str(&text)?;
@@ -959,7 +981,7 @@ async fn socket_route(
                 },
                 next = downstream.recv() => match next {
                     Some(Ok(Down::Text(text))) => {
-                        if !state.session_proxy.current(&route) {bail!("placement changed");}
+                        if !state.session_proxy.current(&route, workspace) {bail!("placement changed");}
                         if kind=="events" {
                             let mut watch:Value=serde_json::from_str(&text)?;
                             if watch["type"]!="watch" || watch["workspace_id"].as_str().is_some_and(|id|id!=workspace) {break;}
@@ -967,7 +989,7 @@ async fn socket_route(
                             bounded_send(&mut upstream,Up::Text(watch.to_string().into())).await?;
                         } else {bounded_send(&mut upstream,Up::Text(text.to_string().into())).await?;}
                     },
-                    Some(Ok(Down::Binary(bytes))) => {if !state.session_proxy.current(&route) {bail!("placement changed");} bounded_send(&mut upstream, Up::Binary(bytes)).await?;},
+                    Some(Ok(Down::Binary(bytes))) => {if !state.session_proxy.current(&route, workspace) {bail!("placement changed");} bounded_send(&mut upstream, Up::Binary(bytes)).await?;},
                     Some(Ok(Down::Ping(bytes))) => bounded_send(downstream, Down::Pong(bytes)).await?,
                     Some(Ok(Down::Close(_))) | None => break,
                     Some(Err(error)) => return Err(error.into()),
@@ -1172,6 +1194,20 @@ mod tests {
             "w-a",
             vec![json!({"id":"s-a","workspace_id":"w-a"})]
         ));
+        // A slow result for B from before B's own owner changed cannot mark
+        // the new owner's rows unavailable.
+        store
+            .register(
+                Registration {
+                    host_id: "worker-shared".into(),
+                    endpoint: "http://127.0.0.1:1234".into(),
+                    token: "fixture".into(),
+                    workspace_id: "w-b".into(),
+                    epoch: 5,
+                },
+                "/project".into(),
+            )
+            .unwrap();
         assert!(!store.unavailable_workspace(&route, "w-b"));
         assert_eq!(store.rows()[0]["placement_available"], true);
     }
@@ -1195,7 +1231,7 @@ mod tests {
             let captured = store.for_workspace("w-retired").unwrap();
             store.clear_workspace("w-retired");
             assert!(store.inventory().is_empty());
-            assert!(!store.current(&captured));
+            assert!(!store.current(&captured, "w-retired"));
         }
         let mut previous = None;
         for _ in 0..3 {
@@ -1212,7 +1248,10 @@ mod tests {
                 )
                 .unwrap();
             if let Some(old) = &previous {
-                assert!(!store.current(old), "retired generation must not revive");
+                assert!(
+                    !store.current(old, "w-reused"),
+                    "retired generation must not revive"
+                );
             }
             previous = store.for_workspace("w-reused");
             store.clear_workspace("w-reused");
@@ -1234,29 +1273,88 @@ mod tests {
         }
     }
     #[test]
-    fn shared_route_retirement_changes_generation_once_and_steady_polls_do_not() {
+    fn sibling_projects_on_a_shared_host_keep_their_own_generations() {
         let store = Store::default();
-        let registration = |workspace: &str| Registration {
+        let registration = |workspace: &str, epoch: u64, token: &str| Registration {
             host_id: "worker-shared".into(),
             endpoint: "http://127.0.0.1:1234".into(),
-            token: "fixture".into(),
+            token: token.into(),
             workspace_id: workspace.into(),
-            epoch: 9,
+            epoch,
         };
-        store.register(registration("w-a"), "/a".into()).unwrap();
-        store.register(registration("w-b"), "/b".into()).unwrap();
-        let old = store.for_workspace("w-b").unwrap();
+        store
+            .register(registration("w-a", 9, "fixture"), "/a".into())
+            .unwrap();
+        store
+            .register(registration("w-b", 9, "fixture"), "/b".into())
+            .unwrap();
+        let b = store.for_workspace("w-b").unwrap();
+        // Registering, re-registering and retiring a sibling never closes B.
+        store
+            .register(registration("w-c", 9, "fixture"), "/c".into())
+            .unwrap();
         store.clear_workspace("w-a");
-        assert!(!store.current(&old));
-        let current = store.for_workspace("w-b").unwrap();
+        store.clear_workspace("w-c");
         for _ in 0..3 {
-            store.register(registration("w-b"), "/b".into()).unwrap();
-            store.clear_workspace("w-a");
+            store
+                .register(registration("w-b", 9, "fixture"), "/b".into())
+                .unwrap();
             assert!(
-                store.current(&current),
+                store.current(&b, "w-b"),
                 "unchanged polling must not reconnect healthy viewers"
             );
         }
+        // B's own owner change (a new epoch) retires only B's captured state.
+        store
+            .register(registration("w-a", 9, "fixture"), "/a".into())
+            .unwrap();
+        let a = store.for_workspace("w-a").unwrap();
+        store
+            .register(registration("w-b", 10, "fixture"), "/b".into())
+            .unwrap();
+        assert!(!store.current(&b, "w-b"));
+        assert!(store.current(&a, "w-a"));
+        // A new endpoint credential retires every project on that host.
+        let a = store.for_workspace("w-a").unwrap();
+        let b = store.for_workspace("w-b").unwrap();
+        store
+            .register(registration("w-b", 10, "rotated"), "/b".into())
+            .unwrap();
+        assert!(!store.current(&a, "w-a"));
+        assert!(!store.current(&b, "w-b"));
+        // A captured route never vouches for a project it did not carry.
+        assert!(!store.current(&store.for_workspace("w-b").unwrap(), "w-z"));
+    }
+
+    #[test]
+    fn a_project_moving_between_hosts_rehomes_its_rows_at_once() {
+        let store = Store::default();
+        let registration = |host: &str, epoch: u64| Registration {
+            host_id: host.into(),
+            endpoint: "http://127.0.0.1:1234".into(),
+            token: "fixture".into(),
+            workspace_id: "w-moving".into(),
+            epoch,
+        };
+        store
+            .register(registration("device-home", 3), "/p".into())
+            .unwrap();
+        let home = store.for_workspace("w-moving").unwrap();
+        assert!(store.install_workspace(
+            &home,
+            "w-moving",
+            vec![json!({"id":"s-moving","workspace_id":"w-moving"})]
+        ));
+        store
+            .register(registration("worker-cloud", 4), "/p".into())
+            .unwrap();
+        assert_eq!(store.rows()[0]["placement"]["remote"], "worker-cloud");
+        let (route, workspace) = store.for_session("s-moving").unwrap();
+        assert_eq!(
+            (route.host_id.as_str(), workspace.as_str()),
+            ("worker-cloud", "w-moving")
+        );
+        assert!(!store.current(&home, "w-moving"));
     }
     #[test]
     fn destination_and_epoch_checks_prevent_route_confusion() {
