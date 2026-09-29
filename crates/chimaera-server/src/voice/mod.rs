@@ -178,7 +178,7 @@ async fn relay(socket: &mut WebSocket, state: &AppState) {
         _ => return,
     };
     let Some(_slot) = Slot::take() else {
-        return fail(socket, "busy", "too many recordings at once on this host").await;
+        return fail(socket, "busy", "Too many recordings at once on this host.").await;
     };
 
     let base = service_override();
@@ -330,6 +330,11 @@ struct Session {
     close_sent: bool,
     safety_deadline: Option<Instant>,
     no_data_deadline: Option<Instant>,
+    /// For the one log line per recording: how much audio, how loud its
+    /// loudest frame (RMS, 0..1), how many utterances were heard.
+    audio_bytes: usize,
+    loudest: f32,
+    utterances: usize,
 }
 
 impl Session {
@@ -346,6 +351,9 @@ impl Session {
             close_sent: false,
             safety_deadline: None,
             no_data_deadline: None,
+            audio_bytes: 0,
+            loudest: 0.0,
+            utterances: 0,
         }
     }
 
@@ -371,6 +379,7 @@ impl Session {
     /// without an endpoint for it.
     async fn promote(&mut self, socket: &mut WebSocket) {
         if !self.pending.is_empty() {
+            self.utterances += 1;
             let text = std::mem::take(&mut self.pending);
             send(socket, json!({ "type": "final", "text": text })).await;
         }
@@ -383,9 +392,41 @@ impl Session {
             End::Finished => "finished",
             End::Cancelled => "cancelled",
             End::Failed => "error",
-            End::ClientGone => return,
+            End::ClientGone => "window closed",
         };
+        // Never the words, never the login: just enough to tell a silent
+        // microphone from a refused stream.
+        tracing::info!(
+            "voice: recording {reason} — {:.1} s of audio, loudest RMS {:.4}{}, {} utterance(s)",
+            self.audio_bytes as f64 / 32_000.0,
+            self.loudest,
+            if self.audio_bytes > 0 && self.loudest < 0.0005 {
+                " (silent)"
+            } else {
+                ""
+            },
+            self.utterances,
+        );
+        if matches!(end, End::ClientGone) {
+            return;
+        }
         send(socket, json!({ "type": "done", "reason": reason })).await;
+    }
+
+    fn measure(&mut self, audio: &[u8]) {
+        self.audio_bytes += audio.len();
+        let samples = audio.len() / 2;
+        if samples == 0 {
+            return;
+        }
+        let sum: f64 = audio
+            .chunks_exact(2)
+            .map(|s| {
+                let v = f64::from(i16::from_le_bytes([s[0], s[1]])) / 32768.0;
+                v * v
+            })
+            .sum();
+        self.loudest = self.loudest.max((sum / samples as f64).sqrt() as f32);
     }
 
     async fn drive(&mut self, socket: &mut WebSocket) -> End {
@@ -422,7 +463,7 @@ impl Session {
                             }
                         }
                         Err(upstream::ConnectError::Rejected(status)) if status == 401 || status == 403 => {
-                            let message = "Claude's speech service refused this login — sign in again with /login in a Claude chat";
+                            let message = "Claude's speech service refused the login — run /login in a Claude chat.";
                             send(socket, json!({ "type": "error", "code": "auth", "message": message })).await;
                             return End::Failed;
                         }
@@ -446,6 +487,7 @@ impl Session {
                         if self.close_sent {
                             continue;
                         }
+                        self.measure(&audio);
                         match up.as_mut() {
                             Some(stream) => {
                                 if stream.send(UpMessage::Binary(audio)).await.is_err() {

@@ -79,8 +79,42 @@ function moduleUrl(): string {
 }
 
 export interface Capture {
+  /** The input actually recording, as the system names it. */
+  device: string;
   /** Emit the partial last chunk, then release the microphone. */
   stop(): Promise<void>;
+}
+
+export interface Microphone {
+  id: string;
+  label: string;
+}
+
+/** The pseudo-inputs Chromium lists beside the real ones ("default", the
+ *  Windows "communications" alias) — duplicates of a real device. */
+const ALIAS_IDS = new Set(["default", "communications"]);
+
+async function audioInputs(): Promise<Microphone[]> {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  return devices
+    .filter((d) => d.kind === "audioinput" && !ALIAS_IDS.has(d.deviceId))
+    .map((d) => ({ id: d.deviceId, label: d.label }));
+}
+
+/**
+ * This machine's microphones, by name. Names are withheld until the page
+ * has been granted the microphone once, so an unnamed list asks first.
+ * Chosen inputs are remembered by NAME: device ids are per origin, and a
+ * daemon's origin (its port) changes between runs.
+ */
+export async function listMicrophones(): Promise<Microphone[]> {
+  if (!microphoneSupported()) throw insecure();
+  let inputs = await audioInputs();
+  if (inputs.length > 0 && inputs.every((d) => d.label === "")) {
+    await checkMicrophone();
+    inputs = await audioInputs();
+  }
+  return inputs.filter((d) => d.label !== "");
 }
 
 /** A capture failure in words for the composer. */
@@ -103,7 +137,7 @@ function captureError(e: unknown): CaptureError {
   const name = e instanceof DOMException ? e.name : "";
   if (name === "NotAllowedError" || name === "SecurityError") {
     return new CaptureError(
-      "Microphone access is denied. Allow it for this page (in the Mac app: System Settings → Privacy & Security → Microphone), then try again.",
+      "Microphone access is off — allow it in System Settings → Privacy & Security → Microphone.",
       "denied",
     );
   }
@@ -111,14 +145,14 @@ function captureError(e: unknown): CaptureError {
     return new CaptureError("No microphone found.", "no_device");
   }
   if (name === "NotReadableError") {
-    return new CaptureError("The microphone is in use by another app or couldn't be opened.", "failed");
+    return new CaptureError("Couldn't open the microphone — another app may be using it.", "failed");
   }
-  return new CaptureError(`Couldn't start the microphone: ${String(e)}`, "failed");
+  return new CaptureError(`Couldn't start the microphone (${String(e)}).`, "failed");
 }
 
 function insecure(): CaptureError {
   return new CaptureError(
-    "This page can't use a microphone — browsers allow it only over https or localhost.",
+    "Browsers allow the microphone only over https or localhost.",
     "insecure",
   );
 }
@@ -136,14 +170,24 @@ export async function checkMicrophone(): Promise<void> {
   for (const track of stream.getTracks()) track.stop();
 }
 
+/**
+ * Record from `microphone` (a name from `listMicrophones`; empty or no longer
+ * present = the system default input).
+ */
 export async function startCapture(
   onChunk: (pcm: ArrayBuffer, level: number) => void,
+  microphone = "",
 ): Promise<Capture> {
   if (!microphoneSupported()) throw insecure();
+  let deviceId: string | undefined;
+  if (microphone !== "") {
+    deviceId = (await audioInputs().catch(() => [])).find((d) => d.label === microphone)?.id;
+  }
   let stream: MediaStream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: {
+        ...(deviceId !== undefined ? { deviceId: { exact: deviceId } } : {}),
         channelCount: 1,
         echoCancellation: true,
         noiseSuppression: true,
@@ -153,6 +197,7 @@ export async function startCapture(
   } catch (e) {
     throw captureError(e);
   }
+  const device = stream.getAudioTracks()[0]?.label || "the default microphone";
   let context: AudioContext | null = null;
   try {
     context = new AudioContext();
@@ -177,6 +222,7 @@ export async function startCapture(
     const ctx = context;
     let stopped = false;
     return {
+      device,
       async stop() {
         if (stopped) return;
         stopped = true;

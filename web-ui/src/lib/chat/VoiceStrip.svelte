@@ -3,20 +3,20 @@
 
   interface Props {
     state: DictationState;
-    /** 0..1 microphone level. */
-    level: number;
+    /** The last few 0..1 input levels, oldest first — the waveform. */
+    levels: readonly number[];
     finals: string;
     interim: string;
-    /** What ends the recording, in words ("release Space to insert"). */
-    hint: string;
+    /** The input recording, as the system names it ("" until it opens). */
+    device: string;
     onCancel(): void;
   }
 
-  let { state, level, finals, interim, hint, onCancel }: Props = $props();
+  let { state, levels, finals, interim, device, onCancel }: Props = $props();
 
-  /** The strip is one line of context, not a transcript: the tail is what
-   *  matters (CSS clips the rest from the left), so the DOM never holds a
-   *  long recording's whole text. */
+  /** One line of context, not a transcript: the tail is what matters (CSS
+   *  clips the rest from the left), so the DOM never holds a long
+   *  recording's whole text. */
   const TAIL = 400;
   const shown = $derived.by(() => {
     const total = finals.length + (finals && interim ? 1 : 0) + interim.length;
@@ -25,31 +25,37 @@
     const room = TAIL - interim.length - (interim ? 1 : 0);
     return { finals: finals.slice(-room), interim };
   });
-
-  const label = $derived(
-    state === "starting" ? "Starting mic…" : state === "finishing" ? "Transcribing…" : "Listening",
+  const status = $derived(
+    state === "starting" ? "Starting…" : state === "finishing" ? "Transcribing…" : "Listening…",
   );
 </script>
 
-<div class="voice-strip" class:finishing={state === "finishing"} class:starting={state === "starting"}>
-  <span class="meter" aria-hidden="true" style:--level={state === "listening" ? level : 0}>
-    <span class="halo"></span>
-    <span class="dot"></span>
+<div
+  class="voice-strip"
+  class:quiet={state !== "listening"}
+  title={device ? `Recording from ${device}` : undefined}
+>
+  <span class="bars" aria-hidden="true">
+    {#each levels as level, i (i)}
+      <span class="bar" style:--level={state === "listening" ? level : 0}></span>
+    {/each}
   </span>
-  <span class="label" role="status" aria-live="polite">{label}</span>
-  <span class="words"
+  <span class="words" role="status" aria-live="polite"
     ><span class="line"
-      >{#if shown.finals}<span class="final">{shown.finals}</span>{/if}{#if shown.finals && shown.interim}{" "}{/if}{#if shown.interim}<span
-          class="interim">{shown.interim}</span
-        >{/if}</span
+      >{#if shown.finals || shown.interim}{#if shown.finals}<span class="final">{shown.finals}</span
+          >{/if}{#if shown.finals && shown.interim}{" "}{/if}{#if shown.interim}<span class="interim"
+            >{shown.interim}</span
+          >{/if}{:else}<span class="status">{status}</span>{/if}</span
     ></span
   >
-  <span class="hint">{hint}</span>
+  {#if state === "finishing" && (shown.finals || shown.interim)}
+    <span class="status trailing">Transcribing…</span>
+  {/if}
   <button
     type="button"
     class="cancel"
-    aria-label="cancel dictation"
-    title="cancel dictation (Esc)"
+    aria-label="discard dictation"
+    title="Discard (Esc)"
     onmousedown={(e) => e.preventDefault()}
     onclick={onCancel}
   >
@@ -63,62 +69,41 @@
   .voice-strip {
     display: flex;
     align-items: center;
-    gap: 8px;
-    min-height: 26px;
+    gap: 10px;
+    min-height: 28px;
     margin: 0 2px 6px;
-    padding: 3px 4px 3px 8px;
-    border: 1px solid color-mix(in srgb, var(--err) 30%, var(--edge));
+    padding: 3px 4px 3px 10px;
+    border: 1px solid color-mix(in srgb, var(--err) 28%, var(--edge));
     border-radius: 8px;
-    background: color-mix(in srgb, var(--err) 5%, transparent);
+    background: color-mix(in srgb, var(--err) 4%, transparent);
     font-size: var(--text-sm);
     line-height: 1.35;
     box-sizing: border-box;
   }
-  .voice-strip.finishing,
-  .voice-strip.starting {
+  .voice-strip.quiet {
     border-color: var(--edge);
     background: color-mix(in srgb, var(--fg) 3%, transparent);
   }
-  /* A red dot with a halo that swells with the input level: transform only,
-     so the meter composites instead of repainting. */
-  .meter {
-    position: relative;
+  /* The waveform: each bar is one recent 100 ms level, scaled on the
+     compositor (transform only) — a flat row means the mic hears nothing. */
+  .bars {
     flex: none;
-    width: 14px;
-    height: 14px;
     display: inline-flex;
     align-items: center;
-    justify-content: center;
+    gap: 2px;
+    height: 14px;
   }
-  .dot {
-    position: relative;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
+  .bar {
+    width: 3px;
+    height: 14px;
+    border-radius: 2px;
     background: var(--err);
-  }
-  .halo {
-    position: absolute;
-    inset: 0;
-    border-radius: 50%;
-    background: color-mix(in srgb, var(--err) 28%, transparent);
-    transform: scale(calc(0.55 + var(--level, 0) * 0.75));
+    transform: scaleY(calc(0.18 + var(--level, 0) * 0.82));
     transition: transform 90ms linear;
   }
-  .starting .dot {
+  .quiet .bar {
     background: var(--muted);
-  }
-  .finishing .dot {
-    background: var(--accent);
-  }
-  .starting .halo,
-  .finishing .halo {
-    background: none;
-  }
-  .label {
-    flex: none;
-    color: var(--fg);
-    font-weight: 500;
+    opacity: 0.6;
   }
   /* Newest words stay in view: an rtl box overflows (and ellipsizes) at its
      left edge, and the isolated ltr line inside keeps the text itself in
@@ -139,12 +124,12 @@
   .final {
     color: var(--fg);
   }
-  .interim {
+  .interim,
+  .status {
     color: var(--muted);
   }
-  .hint {
+  .trailing {
     flex: none;
-    color: var(--muted);
     font-size: var(--text-xs);
   }
   .cancel {
@@ -165,13 +150,8 @@
     color: var(--fg);
     background: var(--row-hover);
   }
-  @media (max-width: 520px) {
-    .hint {
-      display: none;
-    }
-  }
   @media (prefers-reduced-motion: reduce) {
-    .halo {
+    .bar {
       transition: none;
     }
   }

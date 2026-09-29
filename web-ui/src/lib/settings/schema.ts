@@ -132,7 +132,8 @@ export type SettingsMap = {
   "chat.remoteControlAtStart": boolean;
   "chat.toolSummaries": boolean;
   "chat.resumeAfterRestart": boolean;
-  "chat.voice": "off" | "hold" | "tap";
+  "chat.voice": boolean;
+  "chat.voiceMicrophone": string;
   "chat.voiceLanguage": string;
   "update.autoCheck": boolean;
   "keys.modifier": "auto" | "cmd" | "ctrl-shift" | "alt";
@@ -757,14 +758,19 @@ const DEFS = {
     title: "Voice Dictation",
     category: "Chat",
     description:
-      "Speak into any chat composer, Claude or Codex — the same switch as `/voice`. Hold: hold Space to record and let go to insert the words. Tap: in an empty composer, tap Space to start and tap it again to send. Your speech goes to Claude's speech-to-text service (the one Claude Code's own /voice uses) with the claude.ai login on the daemon's host; the microphone is only on while you're recording.",
-    type: "enum",
-    default: "off",
-    options: [
-      { value: "off", label: "Off" },
-      { value: "hold", label: "Hold Space" },
-      { value: "tap", label: "Tap Space" },
-    ],
+      "A mic button in every chat composer, Claude or Codex: click it (or press the Dictate shortcut) and speak, click again and the words land in your message; Enter sends, Esc discards. `/voice on|off` flips this too. Your speech goes to Claude's speech-to-text service (the one Claude Code's own /voice uses) with the claude.ai login on the daemon's host, so the button only shows where that login exists; the microphone is on only while you're dictating.",
+    type: "boolean",
+    default: true,
+    scope: "client",
+  },
+  "chat.voiceMicrophone": {
+    title: "Dictation Microphone",
+    category: "Chat",
+    description:
+      "The input dictation records from, by the name your system gives it. Empty uses the system default input. Right-click the mic button to pick from the microphones this machine has.",
+    type: "string",
+    default: "",
+    placeholder: "system default",
     scope: "client",
   },
   "chat.voiceLanguage": {

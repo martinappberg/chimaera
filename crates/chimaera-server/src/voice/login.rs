@@ -58,13 +58,13 @@ impl std::fmt::Display for LoginError {
         match self {
             LoginError::NoLogin => write!(
                 f,
-                "Voice dictation uses Claude's speech service and needs a Claude.ai login on this host. Sign in with /login in a Claude chat."
+                "Dictation needs a Claude.ai login on this host — run /login in a Claude chat."
             ),
             LoginError::Expired => write!(
                 f,
-                "Claude's login on this host has expired. Send a message in any Claude chat (Claude renews it), then try again."
+                "Claude's login has expired — send any Claude chat a message to renew it."
             ),
-            LoginError::Unreadable(why) => write!(f, "Could not read Claude's login on this host: {why}"),
+            LoginError::Unreadable(why) => write!(f, "Couldn't read Claude's login: {why}"),
         }
     }
 }

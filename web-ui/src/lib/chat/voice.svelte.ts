@@ -1,6 +1,6 @@
 /**
- * Voice dictation for the chat composer — Chimaera's `/voice`, the same for
- * Claude and Codex chats. The words come from Claude's speech-to-text
+ * Voice dictation for the chat composer — its mic button (and `/voice on|off`),
+ * the same for Claude and Codex chats. The words come from Claude's speech-to-text
  * service (the one Claude Code's own `/voice` uses), reached through the
  * daemon's `/ws/voice` relay with the claude.ai login on the daemon's host;
  * the microphone is this window's (`voiceCapture.ts`).
@@ -15,9 +15,6 @@ import { api, getToken } from "../net/api";
 import { getSetting } from "../settings/store.svelte";
 import { checkMicrophone, startCapture, type Capture, CaptureError } from "./voiceCapture";
 import { DICTATION_LANGUAGES } from "./voiceLanguages";
-
-/** The `/voice` modes, spelled as Claude Code spells them. */
-export type VoiceMode = "hold" | "tap";
 
 
 /** The language a recording asks for: the setting, or this browser's own
@@ -55,6 +52,33 @@ export function insertDictation(
   return { draft: before + inserted + after, caret: pos + lead.length + text.length };
 }
 
+/** Whether the daemon's host can dictate (it has the claude.ai login the
+ *  speech service needs), asked once per window and again after a
+ *  recording fails on the login — so an always-on mic hides itself where
+ *  dictation can't work, and comes back after a sign-in. */
+let hostCheck = $state<{ asked: boolean; available: boolean }>({ asked: false, available: false });
+let hostCheckInFlight: Promise<void> | null = null;
+
+export function hostCanDictate(): boolean {
+  if (!hostCheck.asked) void recheckHost();
+  return hostCheck.available;
+}
+
+export function recheckHost(): Promise<void> {
+  hostCheckInFlight ??= api("/voice", { signal: AbortSignal.timeout(8000) })
+    .then(async (res) => {
+      const body = res.ok ? ((await res.json()) as { available?: boolean }) : {};
+      hostCheck = { asked: true, available: body.available === true };
+    })
+    .catch(() => {
+      hostCheck = { asked: true, available: false };
+    })
+    .finally(() => {
+      hostCheckInFlight = null;
+    });
+  return hostCheckInFlight;
+}
+
 /**
  * Can this window dictate right now? Resolves with the reason it can't, in
  * words for a notice — null when it can. Asks for the microphone (so the
@@ -64,12 +88,13 @@ export function insertDictation(
 export async function voiceProblem(): Promise<string | null> {
   try {
     const res = await api("/voice", { signal: AbortSignal.timeout(8000) });
-    if (res.status === 404) return "This daemon is too old for voice dictation — update chimaera on this host.";
-    if (!res.ok) return `Couldn't check voice dictation (HTTP ${res.status}).`;
+    if (res.status === 404) return "This host's chimaera is too old for dictation — update it.";
+    if (!res.ok) return `Couldn't check dictation (HTTP ${res.status}).`;
     const body = (await res.json()) as { available?: boolean; reason?: string };
-    if (body.available !== true) return body.reason ?? "Voice dictation isn't available on this host.";
+    hostCheck = { asked: true, available: body.available === true };
+    if (body.available !== true) return body.reason ?? "Dictation isn't available on this host.";
   } catch (e) {
-    return `Couldn't check voice dictation: ${String(e)}`;
+    return `Couldn't check dictation: ${String(e)}`;
   }
   try {
     await checkMicrophone();
@@ -81,22 +106,32 @@ export async function voiceProblem(): Promise<string | null> {
 
 export type DictationState = "idle" | "starting" | "listening" | "finishing";
 
+/** Bars in the listening strip's waveform. */
+const WAVE_BARS = 5;
 /** Audio held client-side until the relay socket opens: ~30 s at 100 ms. */
 const MAX_QUEUED_CHUNKS = 300;
 /** How long `finish()` waits for the daemon's `done` before settling for
  *  what it has (the daemon's own finalize wait is 5 s). */
 const FINISH_TIMEOUT_MS = 8000;
+/** Loudest 100 ms (raw RMS) under which a recording was silence: a working
+ *  mic in a quiet room still reads ~0.001–0.01; a muted one (a closed
+ *  laptop's built-in mic) reads ~0. */
+const SILENT_RMS = 0.0005;
+/** The relay's error codes that mean the login, not the recording, failed. */
+const LOGIN_CODES = new Set(["no_login", "expired", "unreadable", "auth"]);
 
 export class Dictation {
   state = $state<DictationState>("idle");
-  /** 0..1 input level for the meter, per ~100 ms. */
-  level = $state(0);
+  /** The last few 0..1 input levels (one per ~100 ms), oldest first. */
+  levels = $state<number[]>(new Array(WAVE_BARS).fill(0));
   /** Settled utterances, joined. */
   finals = $state("");
   /** The utterance being heard now. */
   interim = $state("");
   /** The last failure, for the composer to show. */
   error = $state<string | null>(null);
+  /** The input recording now, as the system names it. */
+  device = $state("");
 
   private ws: WebSocket | null = null;
   private opened = false;
@@ -106,6 +141,8 @@ export class Dictation {
   private generation = 0;
   /** Resolves a pending `finish()` (done, closed, or cancelled). */
   private settle: (() => void) | null = null;
+  /** Loudest chunk this recording (raw RMS). */
+  private peak = 0;
 
   get active(): boolean {
     return this.state !== "idle";
@@ -119,17 +156,23 @@ export class Dictation {
     this.error = null;
     this.finals = "";
     this.interim = "";
-    this.level = 0;
+    this.levels = new Array(WAVE_BARS).fill(0);
+    this.peak = 0;
+    this.device = "";
     this.queue = [];
     this.opened = false;
     this.open(generation, opts.keyterms);
     try {
-      const capture = await startCapture((pcm, level) => this.onAudio(generation, pcm, level));
+      const capture = await startCapture(
+        (pcm, level) => this.onAudio(generation, pcm, level),
+        getSetting("chat.voiceMicrophone"),
+      );
       if (generation !== this.generation) {
         void capture.stop();
         return false;
       }
       this.capture = capture;
+      this.device = capture.device;
       if (this.state === "starting") this.state = "listening";
       return true;
     } catch (e) {
@@ -157,7 +200,7 @@ export class Dictation {
     };
     ws.onmessage = (ev: MessageEvent) => {
       if (generation !== this.generation || typeof ev.data !== "string") return;
-      let msg: { type?: string; text?: string; message?: string };
+      let msg: { type?: string; text?: string; message?: string; code?: string };
       try {
         msg = JSON.parse(ev.data) as typeof msg;
       } catch {
@@ -172,7 +215,8 @@ export class Dictation {
           this.interim = "";
           break;
         case "error":
-          this.error = msg.message ?? "voice dictation failed";
+          this.error = msg.message ?? "Dictation failed.";
+          if (msg.code !== undefined && LOGIN_CODES.has(msg.code)) void recheckHost();
           break;
         case "done":
           this.settle?.();
@@ -187,7 +231,7 @@ export class Dictation {
         this.settle();
       } else if (this.state !== "idle") {
         // The relay ended the recording itself (an error, the length cap).
-        this.error ??= "voice dictation stopped — the connection to chimaera closed";
+        this.error ??= "Dictation stopped — lost the connection to chimaera.";
         this.end();
       }
     };
@@ -195,8 +239,10 @@ export class Dictation {
 
   private onAudio(generation: number, pcm: ArrayBuffer, level: number): void {
     if (generation !== this.generation) return;
-    // RMS of speech sits well under 0.3; stretch it so the meter moves.
-    this.level = Math.min(1, level * 4);
+    this.peak = Math.max(this.peak, level);
+    // Speech RMS sits well under 0.3; a square-root curve lifts quiet
+    // talking into view without pinning loud speech at the top.
+    this.levels = [...this.levels.slice(1), Math.min(1, Math.sqrt(level * 6))];
     const ws = this.ws;
     if (ws !== null && this.opened && ws.readyState === WebSocket.OPEN) {
       ws.send(pcm);
@@ -213,7 +259,6 @@ export class Dictation {
     if (this.state === "idle" || this.state === "finishing") return null;
     const generation = this.generation;
     this.state = "finishing";
-    this.level = 0;
     const capture = this.capture;
     this.capture = null;
     await capture?.stop();
@@ -241,13 +286,14 @@ export class Dictation {
     }
     if (generation !== this.generation) return null;
     const text = joinSpoken(this.finals, this.interim);
+    if (text === "" && this.error === null) {
+      this.error =
+        this.peak < SILENT_RMS && this.device !== ""
+          ? `No sound from ${this.device} — right-click the mic to switch.`
+          : "Didn't catch that.";
+    }
     this.end();
     return text;
-  }
-
-  /** Show a composer-side outcome (nothing heard) where failures show. */
-  report(message: string): void {
-    this.error = message;
   }
 
   clearError(): void {
@@ -283,7 +329,6 @@ export class Dictation {
     this.opened = false;
     this.settle = null;
     this.state = "idle";
-    this.level = 0;
     this.interim = "";
   }
 }

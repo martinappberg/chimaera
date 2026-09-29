@@ -84,7 +84,8 @@
   import { measureShift, selectAnchor, type ReadingAnchor } from "./readingAnchor";
   import { blockWeight, HistoryWeights } from "./heightModel";
   import { activeTheme, getSetting, setSetting } from "../settings/store.svelte";
-  import { dictationLanguage, voiceProblem, type VoiceMode } from "./voice.svelte";
+  import { voiceProblem } from "./voice.svelte";
+  import { keyHint } from "../shared/keybindings";
 
   interface Props {
     session: Session;
@@ -1260,21 +1261,21 @@
     const arg = args.trim().toLowerCase();
     switch (name) {
       case "voice": {
-        // Chimaera's own /voice, the same in every agent's chat: Claude Code's
-        // modes and words (hold / tap / off), dictated through Claude's
-        // speech service — neither CLI's /voice can run over the chat
-        // protocol, and Codex's is a spoken conversation, not dictation.
-        if (arg !== "" && arg !== "hold" && arg !== "tap" && arg !== "off") {
-          store.notice(`Unknown mode: "${args.trim()}". Use hold, tap, or off.`, "info");
+        // Chimaera's /voice shows or hides the composer's mic — the chat's
+        // voice mode, the same for every agent, dictated through Claude's
+        // speech service. Claude Code's own modes (hold / tap — push-to-talk
+        // on Space) are a terminal's; here they just mean "on".
+        const on = arg === "on" || arg === "hold" || arg === "tap";
+        if (arg !== "" && !on && arg !== "off") {
+          store.notice(`Unknown option “${args.trim()}” — use on or off.`, "info");
           return true;
         }
-        const current = getSetting("chat.voice");
-        if (arg === "off" || (arg === "" && current !== "off")) {
-          setSetting("chat.voice", "off");
-          store.notice("Voice mode disabled.", "info");
+        if (arg === "off" || (arg === "" && getSetting("chat.voice"))) {
+          setSetting("chat.voice", false);
+          store.notice("Voice dictation off.", "info");
           return true;
         }
-        void enableVoice(arg === "" ? "hold" : (arg as VoiceMode));
+        void enableVoice();
         return true;
       }
       case "rename": {
@@ -1394,21 +1395,15 @@
   /** Turn dictation on — after the checks /voice makes in Claude Code: a
    *  login the speech service takes (on the daemon's host) and a microphone
    *  this window may use (its permission prompt comes now, not mid-word). */
-  async function enableVoice(mode: VoiceMode) {
+  async function enableVoice() {
     const problem = await voiceProblem();
     if (problem !== null) {
       store.notice(problem, "error");
       return;
     }
-    setSetting("chat.voice", mode);
-    const how =
-      mode === "tap"
-        ? "Tap Space (with the message empty) to start, tap again to send."
-        : "Hold Space to record.";
-    store.notice(
-      `Voice mode enabled (${mode}). ${how} Dictation language: ${dictationLanguage().name} (Settings → Chat to change).`,
-      "info",
-    );
+    setSetting("chat.voice", true);
+    const chord = keyHint("dictate");
+    store.notice(`Voice dictation on — click the mic${chord ? ` or press ${chord}` : ""} to talk.`, "info");
   }
 
   /** Words dictation should favor: where this chat works, and who it's with. */
@@ -1589,11 +1584,10 @@
     native.push({ name: "usage", description: "plan usage limits — chimaera panel" });
     native.push({
       name: "voice",
-      description: "toggle voice dictation (hold/tap/off) — Claude's speech service",
+      description: "voice dictation: show or hide the mic (on/off) — Claude's speech service",
       options: [
-        { value: "hold", label: "hold", description: "hold Space to record" },
-        { value: "tap", label: "tap", description: "tap Space to start, again to send" },
-        { value: "off", label: "off", description: "turn voice dictation off" },
+        { value: "on", label: "on", description: "the mic button dictates into the message" },
+        { value: "off", label: "off", description: "hide the mic" },
       ],
     });
     if (agentKind === "claude" && store.remoteControlAvailable) {

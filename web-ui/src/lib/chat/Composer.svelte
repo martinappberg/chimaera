@@ -18,8 +18,11 @@
     type ImageAttachment,
   } from "./images";
   import { loadDraft, saveDraft } from "./drafts";
-  import { getSetting } from "../settings/store.svelte";
-  import { Dictation, insertDictation } from "./voice.svelte";
+  import { getSetting, setSetting } from "../settings/store.svelte";
+  import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
+  import { keyHintSuffix, matchAction } from "../shared/keybindings";
+  import { Dictation, hostCanDictate, insertDictation } from "./voice.svelte";
+  import { CaptureError, listMicrophones } from "./voiceCapture";
   import VoiceStrip from "./VoiceStrip.svelte";
   import {
     slashChoices as choicesForSlash,
@@ -310,49 +313,23 @@
     });
   });
 
-  // --- voice dictation (/voice) -------------------------------------------------
-  // Hold mode rides the OS key repeat: a Space press types its space as usual,
-  // and only its first auto-repeat — a held key — takes the space back and
-  // starts recording, so typing never trips it. Keyup (or losing focus)
-  // finishes. Tap mode starts on Space in an empty composer, and the next
-  // Space sends, as in Claude Code.
+  // --- voice dictation ------------------------------------------------------------
+  // The mic button IS voice mode in chat: click to talk, click again to put the
+  // words at the caret (Enter: stop and send; Esc: discard), or the Dictate
+  // chord while this composer has focus. Typing is never taken over — the
+  // hold-Space push-to-talk is a terminal's answer to having no buttons, and
+  // stays with the agents' own TUIs. Right-click picks the microphone.
   const dictation = new Dictation();
-  const voiceMode = $derived(getSetting("chat.voice"));
-  const voiceOn = $derived(voiceMode !== "off" && !disabled);
-  let voiceOrigin = $state<"hold" | "tap" | "button" | null>(null);
-  /** The draft and selection just before a Space press that may become a hold. */
-  let spaceDown: { draft: string; start: number; end: number } | null = null;
-  /** A hold is in progress: its repeats are swallowed until keyup even if the
-   *  recording ended early (a relay error), or they'd type a run of spaces. */
-  let spaceHeld = false;
+  const voiceOn = $derived(getSetting("chat.voice") && !disabled && hostCanDictate());
 
-  const voiceHint = $derived(
-    voiceOrigin === "hold"
-      ? "release Space to insert · Esc cancels"
-      : voiceOrigin === "tap"
-        ? "Space sends · Esc cancels"
-        : "click the mic to insert · Esc cancels",
-  );
-
-  async function startDictation(origin: "hold" | "tap" | "button") {
-    voiceOrigin = origin;
-    if (!(await dictation.start({ keyterms: voiceTerms })) && voiceOrigin === origin) {
-      voiceOrigin = null;
-    }
+  async function startDictation() {
+    await dictation.start({ keyterms: voiceTerms });
   }
 
-  /** Stop, and put the words at the caret — then send, for tap mode's second
-   *  Space and Enter. */
+  /** Stop, and put the words at the caret — then send, for Enter. */
   async function finishDictation(send: boolean) {
     const text = await dictation.finish();
-    voiceOrigin = null;
-    if (text === null) return;
-    if (text.length === 0) {
-      if (dictation.error === null) {
-        dictation.report("Didn't catch anything — try again a little closer to the mic.");
-      }
-      return;
-    }
+    if (text === null || text.length === 0) return;
     const next = insertDictation(draft, el?.selectionStart ?? caret, text);
     draft = next.draft;
     focusAt(next.caret);
@@ -362,87 +339,67 @@
     }
   }
 
-  function cancelDictation() {
-    dictation.cancel();
-    voiceOrigin = null;
-  }
-
   function toggleDictation() {
-    if (!dictation.active) void startDictation("button");
+    if (!dictation.active) void startDictation();
     else if (dictation.state !== "finishing") void finishDictation(false);
   }
 
-  /** Dictation's keys: Space (start/finish), Esc (cancel), Enter (finish and
-   *  send) while recording. True = consumed. */
+  /** Dictation's keys: the Dictate chord, and while recording Esc (discard)
+   *  and Enter (stop and send). True = consumed. */
   function voiceKey(e: KeyboardEvent): boolean {
-    const plainSpace = e.key === " " && !e.metaKey && !e.ctrlKey && !e.altKey;
-    if (spaceHeld && plainSpace) {
+    if (voiceOn && matchAction(e)?.id === "dictate") {
       e.preventDefault();
+      toggleDictation();
       return true;
     }
-    if (dictation.active) {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        cancelDictation();
-        return true;
-      }
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        if (dictation.state !== "finishing") void finishDictation(true);
-        return true;
-      }
-      if (plainSpace) {
-        e.preventDefault();
-        if (!e.repeat && voiceOrigin !== "hold" && dictation.state !== "finishing") {
-          void finishDictation(voiceOrigin === "tap");
-        }
-        return true;
-      }
-      return false;
-    }
-    if (!voiceOn || !plainSpace || el === null) return false;
-    if (voiceMode === "tap") {
-      if (e.repeat || draft.trim().length > 0 || images.length > 0) return false;
+    if (!dictation.active) return false;
+    if (e.key === "Escape") {
       e.preventDefault();
-      void startDictation("tap");
+      dictation.cancel();
       return true;
     }
-    if (!e.repeat) {
-      spaceDown = { draft, start: el.selectionStart, end: el.selectionEnd };
-      return false;
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      if (dictation.state !== "finishing") void finishDictation(true);
+      return true;
     }
-    const down = spaceDown;
-    if (down === null) return false;
-    spaceDown = null;
+    return false;
+  }
+
+  /** Right-click the mic: this machine's microphones, the chosen one checked. */
+  async function openMicMenu(e: MouseEvent) {
     e.preventDefault();
-    // Take back the space the press typed (only if that is all that changed).
-    if (draft === `${down.draft.slice(0, down.start)} ${down.draft.slice(down.end)}`) {
-      draft = down.draft;
-    }
-    focusAt(down.start);
-    spaceHeld = true;
-    void startDictation("hold");
-    return true;
-  }
-
-  function onKeyup(e: KeyboardEvent) {
-    trackCaret();
-    if (e.key === " ") {
-      spaceDown = null;
-      spaceHeld = false;
-      if (voiceOrigin === "hold" && dictation.active && dictation.state !== "finishing") {
-        void finishDictation(false);
+    e.stopPropagation();
+    const { clientX: x, clientY: y } = e;
+    const chosen = getSetting("chat.voiceMicrophone");
+    const pick = (name: string) => () => setSetting("chat.voiceMicrophone", name);
+    let entries: ContextMenuEntry[];
+    try {
+      const mics = await listMicrophones();
+      entries = [
+        { label: "System default", checked: chosen === "", onSelect: pick("") },
+        ...(mics.length > 0 ? (["separator"] as const) : []),
+        ...mics.map((m) => ({ label: m.label, checked: m.label === chosen, onSelect: pick(m.label) })),
+      ];
+      if (chosen !== "" && !mics.some((m) => m.label === chosen)) {
+        entries.push({
+          label: `${chosen} (not connected)`,
+          checked: true,
+          disabled: true,
+          hint: "dictation uses the system default until it's back",
+          onSelect: () => {},
+        });
       }
+    } catch (err) {
+      entries = [
+        {
+          label: err instanceof CaptureError ? err.message : `Couldn't list microphones: ${String(err)}`,
+          disabled: true,
+          onSelect: () => {},
+        },
+      ];
     }
-  }
-
-  /** A held Space whose keyup lands elsewhere must still end the recording. */
-  function onBlur() {
-    spaceDown = null;
-    spaceHeld = false;
-    if (voiceOrigin === "hold" && dictation.active && dictation.state !== "finishing") {
-      void finishDictation(false);
-    }
+    contextMenu.openAtPoint(x, y, entries);
   }
 
   // A hidden tab keeps what was said: finish into the draft. Untracked, so the
@@ -828,11 +785,11 @@
   {#if dictation.active}
     <VoiceStrip
       state={dictation.state}
-      level={dictation.level}
+      levels={dictation.levels}
       finals={dictation.finals}
       interim={dictation.interim}
-      hint={voiceHint}
-      onCancel={cancelDictation}
+      device={dictation.device}
+      onCancel={() => dictation.cancel()}
     />
   {:else if dictation.error !== null}
     <div class="attachment-error" role="status">{dictation.error}</div>
@@ -856,8 +813,7 @@
       bind:this={el}
       bind:value={draft}
       onkeydown={onKeydown}
-      onkeyup={onKeyup}
-      onblur={onBlur}
+      onkeyup={trackCaret}
       onselect={trackCaret}
       oninput={trackCaret}
       onpaste={onPaste}
@@ -871,11 +827,7 @@
         ? "chat ended"
         : running
           ? "queue a follow-up for the next run (Esc to stop)"
-          : voiceMode === "hold"
-            ? "message the agent… (Enter to send · / commands · @ files · hold Space to talk)"
-            : voiceMode === "tap"
-              ? "message the agent… (Enter to send · / commands · @ files · tap Space to talk)"
-              : "message the agent… (Enter to send · / commands · @ files)"}
+          : "message the agent… (Enter to send · / commands · @ files)"}
       rows={1}
       {disabled}
     ></textarea>
@@ -885,26 +837,33 @@
         class="mic"
         class:live={dictation.active}
         aria-pressed={dictation.active}
-        aria-label={dictation.active ? "stop dictating and insert the words" : "dictate"}
+        aria-label={dictation.active ? "insert the dictated words" : "dictate"}
         title={dictation.active
-          ? "stop and insert the words"
-          : voiceMode === "hold"
-            ? "dictate — or hold Space"
-            : "dictate — or tap Space in an empty message"}
+          ? "Insert — Enter sends, Esc discards"
+          : `Dictate${keyHintSuffix("dictate")} — right-click to choose the microphone`}
         disabled={dictation.state === "finishing"}
         onmousedown={(e) => e.preventDefault()}
         onclick={toggleDictation}
+        oncontextmenu={openMicMenu}
       >
-        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
-          <rect x="5.5" y="1.75" width="5" height="8" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.5" />
-          <path
-            d="M3.5 7.5a4.5 4.5 0 0 0 9 0M8 12v2.25"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linecap="round"
-          />
-        </svg>
+        {#if dictation.active}
+          <!-- Recording: the button is "done" — a stop square, like the
+               send button's stop while an agent runs. -->
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+            <rect x="4" y="4" width="8" height="8" rx="1.5" fill="currentColor" />
+          </svg>
+        {:else}
+          <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+            <rect x="5.5" y="1.75" width="5" height="8" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.5" />
+            <path
+              d="M3.5 7.5a4.5 4.5 0 0 0 9 0M8 12v2.25"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+            />
+          </svg>
+        {/if}
       </button>
     {/if}
     <!-- The action button morphs with the turn: send when idle, stop while the
