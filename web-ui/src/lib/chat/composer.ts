@@ -113,7 +113,7 @@ export interface SkillBlock extends Record<string, unknown> {
   path: string;
 }
 
-function regexEscape(text: string): string {
+export function regexEscape(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
