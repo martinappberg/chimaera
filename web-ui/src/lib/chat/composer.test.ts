@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  draftWithInsert,
   skillBlocksForText,
   slashChoices,
   slashContextAt,
@@ -68,5 +69,22 @@ describe("Codex skill blocks", () => {
     expect(skillBlocksForText("/skill-creator", commands)).toEqual([
       { type: "skill", name: "skill-creator", path: "/skills/create.md" },
     ]);
+  });
+});
+
+describe("draftWithInsert", () => {
+  it("joins inline text after a space", () => {
+    expect(draftWithInsert("", "@a.ts ", "inline")).toBe("@a.ts ");
+    expect(draftWithInsert("see", "@a.ts ", "inline")).toBe("see @a.ts ");
+    expect(draftWithInsert("see ", "@a.ts ", "inline")).toBe("see @a.ts ");
+  });
+  it("starts a block on its own paragraph", () => {
+    const quote = "> q\n\n";
+    expect(draftWithInsert("", quote, "block")).toBe(quote);
+    expect(draftWithInsert("  \n", quote, "block")).toBe(quote);
+    expect(draftWithInsert("why", quote, "block")).toBe(`why\n\n${quote}`);
+    expect(draftWithInsert("why  ", quote, "block")).toBe(`why\n\n${quote}`);
+    expect(draftWithInsert("why\n", quote, "block")).toBe(`why\n\n${quote}`);
+    expect(draftWithInsert(`> p\n\n`, quote, "block")).toBe(`> p\n\n${quote}`);
   });
 });

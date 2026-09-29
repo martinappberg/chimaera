@@ -157,6 +157,7 @@ async fn the_provider_answers_unchanged_for_its_own_stamp() {
         .await
         .unwrap()
         .expect("a first snapshot");
+    let data = data.expect("under the cap, and JSON");
     eprintln!(
         "knowledge, first ask (compile + instantiate + read): {:?}",
         started.elapsed()
@@ -181,7 +182,10 @@ async fn the_provider_answers_unchanged_for_its_own_stamp() {
         "knowledge, another workspace (instantiate + read): {:?}",
         started.elapsed()
     );
-    assert_eq!(first_there.map(|(_, data)| data), Some(data.clone()));
+    assert_eq!(
+        first_there.and_then(|(_, data)| data.ok()),
+        Some(data.clone())
+    );
 
     // The stamp names every file read, with its mtime and length.
     let files = stamp["files"].as_array().unwrap();
@@ -206,6 +210,7 @@ async fn the_provider_answers_unchanged_for_its_own_stamp() {
         .await
         .unwrap()
         .expect("a changed tree is re-read");
+    let data = data.unwrap();
     assert_ne!(moved, stamp);
     assert_eq!(data["counts"]["learnings"], 5);
 }
@@ -222,7 +227,7 @@ async fn a_sole_turn_is_credited_and_a_shared_one_is_not() {
     let root = lock(&state.workspaces).get(&ws).unwrap().root;
     let worker = inject_silent_agent(&state, "wa");
     lock(&state.session_workspaces).insert(worker.clone(), ws.clone());
-    crate::knowledge::prime(&state, &worker).await;
+    crate::knowledge::prime_workspace(&state, &ws).await;
     let start = crate::timeline::now_ms();
 
     let learnings = root.join(".living/learnings.md");
@@ -237,9 +242,10 @@ async fn a_sole_turn_is_credited_and_a_shared_one_is_not() {
     );
     std::fs::write(&topic, text).unwrap();
 
-    let recorded = crate::knowledge::recorded_since_last_check(&state, &ws, &worker, Some(start))
-        .await
-        .expect("the sole turn is credited");
+    let recorded =
+        crate::knowledge::recorded_since_last_check(&state, &ws, &worker, "wa", Some(start), true)
+            .await
+            .expect("the sole turn is credited");
     assert_eq!((recorded.learnings, recorded.decisions), (1, 0));
     assert!(recorded.findings.is_empty(), "{recorded:?}");
     assert_eq!(recorded.fps.len(), 1);
@@ -269,11 +275,16 @@ async fn a_sole_turn_is_credited_and_a_shared_one_is_not() {
     assert_eq!(status.sid.as_deref(), Some(worker.as_str()));
 
     // Nothing new since: nothing credited.
-    assert!(
-        crate::knowledge::recorded_since_last_check(&state, &ws, &worker, Some(start))
-            .await
-            .is_none()
-    );
+    assert!(crate::knowledge::recorded_since_last_check(
+        &state,
+        &ws,
+        &worker,
+        "wa",
+        Some(start),
+        true
+    )
+    .await
+    .is_none());
 
     // A hook-less terminal agent in the workspace may have written too: a
     // new finding is recorded, unattributed.
@@ -290,7 +301,7 @@ async fn a_sole_turn_is_credited_and_a_shared_one_is_not() {
     text.push_str("\n## F-009: Exhaustion is reversible early\n**Status:** preliminary\n");
     std::fs::write(&topic, text).unwrap();
     assert!(
-        crate::knowledge::recorded_since_last_check(&state, &ws, &worker, Some(start))
+        crate::knowledge::recorded_since_last_check(&state, &ws, &worker, "wa", Some(start), true)
             .await
             .is_none(),
         "not credited while another agent may have written"
@@ -401,6 +412,7 @@ async fn a_symlinked_topic_is_refused_warned_about_and_stamped() {
         .await
         .unwrap()
         .expect("a snapshot");
+    let data = data.unwrap();
     assert_eq!(
         stamp["refused"],
         serde_json::json!([".living/findings/linked.md"])
@@ -413,4 +425,417 @@ async fn a_symlinked_topic_is_refused_warned_about_and_stamped() {
         "{warnings:?}"
     );
     assert!(!data.to_string().contains("F-777"), "{data}");
+}
+
+/// The host's fixture as a Knowledge provider (`test-knowledge`): its
+/// `knowledge` export is steered by the `knowledge` state key (see
+/// `plugins/test-fixture`), and counts its asks under `asked`.
+fn knowledge_fixture() {
+    let manifest = crate::plugins::test_catalog::fixture_manifest()
+        .replace("id = \"test-fixture\"", "id = \"test-knowledge\"")
+        .replace("[provides]", "[provides]\nknowledge = \"fixture\"");
+    crate::plugins::test_catalog::add(&manifest, crate::plugins::test_catalog::fixture_wasm());
+}
+
+/// A workspace with `test-knowledge` switched on and a claude TUI session
+/// (a silent PTY) in it.
+async fn provider_workspace(state: &Arc<AppState>, label: &str, key: &str) -> (String, String) {
+    knowledge_fixture();
+    let ws = make_workspace(state, label).await;
+    let sid = inject_silent_agent(state, key);
+    lock(&state.session_workspaces).insert(sid.clone(), ws.clone());
+    let (status, out) = request(
+        state,
+        Method::PUT,
+        &format!("/api/v1/workspaces/{ws}/plugins/test-knowledge"),
+        Some(serde_json::json!({"on": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    (ws, sid)
+}
+
+/// What the fixture's next `knowledge` ask does (null: answer normally).
+async fn provider_mode(state: &Arc<AppState>, sid: &str, key: &str, mode: serde_json::Value) {
+    let (is_err, text) = mcp_tool_call(
+        state,
+        sid,
+        key,
+        "state",
+        serde_json::json!({"key": "knowledge", "value": mode}),
+    )
+    .await;
+    assert!(!is_err, "{text}");
+}
+
+fn asked(state: &Arc<AppState>, ws: &str) -> u64 {
+    lock(&state.plugin_state)
+        .get("test-knowledge", ws, "asked")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+fn draft(start_ts: u64, end_ts: u64) -> crate::episodes::Draft {
+    crate::episodes::Draft {
+        prompt: Some("record what you found".into()),
+        text: "Recorded it.".into(),
+        files: Vec::new(),
+        tools: 1,
+        start_ts,
+        end_ts,
+        end: "finished",
+        duration_ms: None,
+    }
+}
+
+async fn knowledge_of(state: &Arc<AppState>, ws: &str) -> serde_json::Value {
+    let (status, body) = request(
+        state,
+        Method::GET,
+        &format!("/api/v1/workspaces/{ws}/knowledge"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+/// Claude waits on a hook's answer (10 s): the Knowledge work a turn start
+/// or end sets off must not stand in front of it, however slow the
+/// provider. The turn still lands on the Timeline once the provider gives
+/// up — unattributed.
+#[tokio::test]
+async fn a_claude_hook_answers_before_a_slow_knowledge_provider() {
+    let state = test_state();
+    let (ws, sid) = provider_workspace(&state, "knowledge-slow-hook", "kh").await;
+    provider_mode(&state, &sid, "kh", serde_json::json!("loop")).await;
+    state
+        .plugin_runtime
+        .set_budget_for_tests(std::time::Duration::from_millis(1500));
+
+    for payload in [
+        serde_json::json!({"hook_event_name": "UserPromptSubmit", "prompt": "find the batch effect"}),
+        serde_json::json!({"hook_event_name": "Stop", "last_assistant_message": "Found it."}),
+    ] {
+        let started = std::time::Instant::now();
+        assert_eq!(post_hook(&state, &sid, "kh", payload).await, StatusCode::OK);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(700),
+            "the hook waited on the provider: {:?}",
+            started.elapsed()
+        );
+    }
+    state.episode_queue.settled(&ws).await;
+    let entries = state.timeline.latest(&ws, 10).await;
+    let episode = entries
+        .iter()
+        .find(|e| e.kind == crate::timeline::Kind::Episode)
+        .expect("the turn is on the Timeline");
+    assert_eq!(episode.sid.as_deref(), Some(sid.as_str()));
+    assert_eq!(episode.title.as_deref(), Some("find the batch effect"));
+    assert!(episode.evidence.as_ref().unwrap().recorded.is_none());
+    state.sessions.kill(&sid).ok();
+}
+
+/// Turn ends are queued, never awaited by whoever saw them (the chat
+/// signal task relays every chat's events): recording returns at once
+/// while the provider takes its whole budget, and the entries land in the
+/// order the turns ended — a crash behind the session's last turn.
+#[tokio::test]
+async fn turn_ends_land_in_order_behind_a_slow_provider() {
+    let state = test_state();
+    let (ws, sid) = provider_workspace(&state, "knowledge-slow-order", "ko").await;
+    provider_mode(&state, &sid, "ko", serde_json::json!("loop")).await;
+    state
+        .plugin_runtime
+        .set_budget_for_tests(std::time::Duration::from_millis(400));
+    let now = crate::timeline::now_ms();
+    let started = std::time::Instant::now();
+    crate::episodes::record(&state, &sid, draft(now - 3000, now - 2000), "protocol");
+    crate::episodes::record(&state, &sid, draft(now - 1000, now), "protocol");
+    crate::episodes::record_exit(
+        &state,
+        &sid,
+        &chimaera_agent::driver::DriverExit::ProtocolError("pipe closed".into()),
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(100),
+        "{:?}",
+        started.elapsed()
+    );
+    state.episode_queue.settled(&ws).await;
+    let mut entries = state.timeline.latest(&ws, 10).await;
+    entries.reverse();
+    let order: Vec<(crate::timeline::Kind, u64)> = entries.iter().map(|e| (e.kind, e.ts)).collect();
+    assert_eq!(order.len(), 3, "{order:?}");
+    assert_eq!(
+        (order[0], order[1].1, order[2].0),
+        (
+            (crate::timeline::Kind::Episode, now - 2000),
+            now,
+            crate::timeline::Kind::Session
+        ),
+        "{order:?}"
+    );
+    state.sessions.kill(&sid).ok();
+}
+
+/// What the files hold when a turn's check runs may be a LATER turn's:
+/// a turn whose session has another turn end queued behind it, or is mid
+/// a turn again, is never credited.
+#[tokio::test]
+async fn a_turn_is_not_credited_once_its_session_moved_on() {
+    let state = test_state();
+    let ws = mycelium_workspace(&state).await;
+    let root = lock(&state.workspaces).get(&ws).unwrap().root;
+    let worker = inject_silent_agent(&state, "wm");
+    lock(&state.session_workspaces).insert(worker.clone(), ws.clone());
+    crate::knowledge::prime_workspace(&state, &ws).await;
+    let learnings = root.join(".living/learnings.md");
+    let learn = |title: &str| {
+        let mut body = std::fs::read_to_string(&learnings).unwrap();
+        body.push_str(&format!(
+            "\n### [2026-09-28] {title}\n\n**Category**: tip\n"
+        ));
+        std::fs::write(&learnings, body).unwrap();
+    };
+    let recorded = |e: &crate::timeline::Entry| {
+        e.evidence
+            .as_ref()
+            .and_then(|ev| ev.recorded.as_ref())
+            .map(|r| r.learnings)
+    };
+
+    // The control: one turn, alone — credited.
+    let start = crate::timeline::now_ms();
+    learn("Pin the reference genome");
+    crate::episodes::record(&state, &worker, draft(start, start + 10), "protocol");
+    state.episode_queue.settled(&ws).await;
+    assert_eq!(recorded(&state.timeline.latest(&ws, 1).await[0]), Some(1));
+
+    // Two turn ends queued back to back: the first can't be told apart.
+    let start = crate::timeline::now_ms();
+    learn("Batch before you normalize");
+    crate::episodes::record(&state, &worker, draft(start, start + 10), "protocol");
+    crate::episodes::record(&state, &worker, draft(start + 20, start + 30), "protocol");
+    state.episode_queue.settled(&ws).await;
+    let two = state.timeline.latest(&ws, 2).await;
+    assert_eq!((recorded(&two[1]), recorded(&two[0])), (None, None));
+
+    // Mid a turn again when the check runs: not credited either.
+    let start = crate::timeline::now_ms();
+    learn("Seeds go in the config");
+    lock(&state.agents).get_mut(&worker).unwrap().state = crate::agent_state::AgentState::Running;
+    crate::episodes::record(&state, &worker, draft(start, start + 10), "protocol");
+    state.episode_queue.settled(&ws).await;
+    assert_eq!(recorded(&state.timeline.latest(&ws, 1).await[0]), None);
+    state.sessions.kill(&worker).ok();
+}
+
+/// A queue that fell behind catches up without the provider: the turn ends
+/// with 16 or more waiting behind them are appended as they are, and the
+/// baseline is dropped so nothing is credited across the gap.
+#[tokio::test]
+async fn a_backed_up_queue_catches_up_without_asking_the_provider() {
+    let state = test_state();
+    let (ws, sid) = provider_workspace(&state, "knowledge-backlog", "kb").await;
+    let before = asked(&state, &ws);
+    let now = crate::timeline::now_ms();
+    for i in 0..18 {
+        crate::episodes::record(&state, &sid, draft(now + i * 10, now + i * 10 + 5), "hooks");
+    }
+    state.episode_queue.settled(&ws).await;
+    let entries = state.timeline.latest(&ws, 50).await;
+    assert_eq!(entries.len(), 18);
+    assert!(
+        entries.windows(2).all(|w| w[0].ts > w[1].ts),
+        "in the order the turns ended"
+    );
+    assert_eq!(
+        asked(&state, &ws) - before,
+        16,
+        "the first two skipped the provider"
+    );
+    assert!(crate::knowledge::has_baseline(&state, &ws));
+    state.sessions.kill(&sid).ok();
+}
+
+/// A provider that can't answer (refuses, a snapshot that isn't a JSON
+/// object, one over the size cap) is still the provider: the route serves
+/// the last snapshot it gave with an `error` — or empty lists, naming it —
+/// never `provider: null` (which offers to switch it on).
+#[tokio::test]
+async fn a_failing_provider_serves_its_last_snapshot_with_the_error() {
+    let state = test_state();
+    let (ws, sid) = provider_workspace(&state, "knowledge-failing", "kf").await;
+    let first = knowledge_of(&state, &ws).await;
+    assert_eq!(first["provider"], "fixture");
+    assert_eq!(first["fixture_version"], "0.1.0");
+    assert!(first.get("error").is_none(), "{first}");
+    assert_eq!(
+        asked(&state, &ws),
+        1,
+        "one ask answers the route and primes"
+    );
+    assert!(crate::knowledge::has_baseline(&state, &ws));
+
+    for (mode, says) in [
+        (serde_json::json!("error"), "the fixture refuses to read"),
+        (serde_json::json!("array"), "snapshot is not a JSON object"),
+        (
+            serde_json::json!({"big": 5 << 20}),
+            "over the 4 MiB it may be",
+        ),
+    ] {
+        provider_mode(&state, &sid, "kf", mode).await;
+        let body = knowledge_of(&state, &ws).await;
+        assert_eq!(body["provider"], "fixture", "{says}");
+        assert_eq!(
+            body["fixture_version"], "0.1.0",
+            "the last snapshot, still: {says}"
+        );
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(error.contains(says), "{error}");
+    }
+
+    // Nothing answered yet in another workspace: empty lists, still named.
+    let (other, osid) = provider_workspace(&state, "knowledge-failing-cold", "kc").await;
+    provider_mode(&state, &osid, "kc", serde_json::json!("error")).await;
+    let body = knowledge_of(&state, &other).await;
+    assert_eq!(body["provider"], "fixture");
+    assert_eq!(body["topics"], serde_json::json!([]));
+    assert!(
+        body["error"].as_str().unwrap().contains("refuses"),
+        "{body}"
+    );
+    for s in [sid, osid] {
+        state.sessions.kill(&s).ok();
+    }
+}
+
+/// Switched off, the provider's snapshot goes with it (a large one is
+/// megabytes, per workspace), and the route says there is no provider.
+#[tokio::test]
+async fn switching_the_provider_off_drops_its_snapshot() {
+    let state = test_state();
+    let (ws, sid) = provider_workspace(&state, "knowledge-evict", "ke").await;
+    knowledge_of(&state, &ws).await;
+    assert!(lock(&state.knowledge).holds(&ws));
+    let (status, _) = request(
+        &state,
+        Method::PUT,
+        &format!("/api/v1/workspaces/{ws}/plugins/test-knowledge"),
+        Some(serde_json::json!({"on": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!lock(&state.knowledge).holds(&ws));
+    assert!(!crate::knowledge::has_baseline(&state, &ws));
+    let body = knowledge_of(&state, &ws).await;
+    assert_eq!(body["provider"], serde_json::Value::Null);
+    assert!(body.get("error").is_none(), "{body}");
+    state.sessions.kill(&sid).ok();
+}
+
+fn reads(state: &Arc<AppState>, ws: &str) -> u64 {
+    lock(&state.plugin_state)
+        .get("test-knowledge", ws, "reads")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// A refused snapshot keeps its stamp: while the tree is unchanged the
+/// provider answers "unchanged" and it's refused again unread — an
+/// oversized `.living/` isn't re-parsed on every refetch and turn end.
+/// A readable snapshot again clears it.
+#[tokio::test]
+async fn a_refused_snapshot_is_not_read_again_while_its_tree_is_unchanged() {
+    let state = test_state();
+    let (ws, sid) = provider_workspace(&state, "knowledge-refused-stamp", "kr").await;
+    provider_mode(&state, &sid, "kr", serde_json::json!({"big": 5 << 20})).await;
+    for _ in 0..3 {
+        let body = knowledge_of(&state, &ws).await;
+        assert!(
+            body["error"].as_str().unwrap().contains("over the 4 MiB"),
+            "{body}"
+        );
+    }
+    assert_eq!(reads(&state, &ws), 1, "read once, refused three times");
+    provider_mode(&state, &sid, "kr", serde_json::Value::Null).await;
+    let body = knowledge_of(&state, &ws).await;
+    assert!(body.get("error").is_none(), "{body}");
+    assert_eq!(body["fixture_version"], "0.1.0");
+    state.sessions.kill(&sid).ok();
+}
+
+/// `error` on the wire is the daemon's word that the provider couldn't
+/// answer: a provider's own field of that name never reaches the view, and
+/// a provider's refusal is clipped before it does.
+#[tokio::test]
+async fn the_error_field_is_the_daemons_and_bounded() {
+    let state = test_state();
+    let (ws, sid) = provider_workspace(&state, "knowledge-error-field", "kx").await;
+    provider_mode(
+        &state,
+        &sid,
+        "kx",
+        serde_json::json!({"extra": {"error": "not the daemon's"}}),
+    )
+    .await;
+    let body = knowledge_of(&state, &ws).await;
+    assert!(body.get("error").is_none(), "{body}");
+    provider_mode(
+        &state,
+        &sid,
+        "kx",
+        serde_json::json!({"error_len": 100_000}),
+    )
+    .await;
+    let body = knowledge_of(&state, &ws).await;
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        error.len() <= 1024 && error.ends_with('…'),
+        "{}",
+        error.len()
+    );
+    state.sessions.kill(&sid).ok();
+}
+
+/// A job that panics costs that job, not the workspace's queue: the jobs
+/// behind it get a new worker and land.
+#[tokio::test]
+async fn a_panicking_episode_job_does_not_wedge_the_queue() {
+    let state = test_state();
+    let ws = make_workspace(&state, "episodes-panic").await;
+    let sid = inject_silent_agent(&state, "kp");
+    lock(&state.session_workspaces).insert(sid.clone(), ws.clone());
+    let now = crate::timeline::now_ms();
+    state.episode_queue.push_panic(&state, &ws);
+    crate::episodes::record(&state, &sid, draft(now - 10, now), "protocol");
+    state.episode_queue.settled(&ws).await;
+    let entries = state.timeline.latest(&ws, 5).await;
+    assert_eq!(entries.len(), 1, "the turn behind the panic landed");
+    assert_eq!(entries[0].kind, crate::timeline::Kind::Episode);
+    state.sessions.kill(&sid).ok();
+}
+
+/// A turn start queues nothing where no plugin is switched on (no provider
+/// can answer there): the chat relay's hot path stays a lock check.
+#[tokio::test]
+async fn a_turn_start_queues_nothing_without_a_plugin_switched_on() {
+    let state = test_state();
+    let ws = make_workspace(&state, "episodes-no-plugin").await;
+    let sid = inject_silent_agent(&state, "kn");
+    lock(&state.session_workspaces).insert(sid.clone(), ws.clone());
+    crate::episodes::turn_started(&state, &sid);
+    assert!(!state.episode_queue.busy(&ws));
+    knowledge_fixture();
+    lock(&state.workspaces)
+        .set_plugin_on(&ws, "test-knowledge", true)
+        .unwrap();
+    crate::episodes::turn_started(&state, &sid);
+    assert!(state.episode_queue.busy(&ws), "no baseline yet: primed");
+    state.episode_queue.settled(&ws).await;
+    assert!(crate::knowledge::has_baseline(&state, &ws));
+    state.sessions.kill(&sid).ok();
 }

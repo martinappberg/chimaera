@@ -113,6 +113,12 @@
   );
 
   const counts = $derived(shown?.counts ?? null);
+  /** A failed refresh over a snapshot it gave before, or over nothing. */
+  const hasSnapshot = $derived(
+    raw !== null &&
+      (raw.left_off !== null ||
+        raw.topics.length + raw.decisions.length + raw.learnings.length + raw.todos.length + raw.questions.length > 0),
+  );
 </script>
 
 <div class="knowledge" bind:this={root}>
@@ -158,6 +164,18 @@
     {:else if raw === null || shown === null}
       <p class="empty">loading…</p>
     {:else}
+      {#if providerActive && raw.error !== null}
+        <!-- Quiet: the provider is still the provider, it just couldn't
+             read this time. What it said is the plugin's own words. -->
+        <p class="stale">
+          {#if hasSnapshot}
+            Showing what {raw.provider} read last — it couldn't refresh just now.
+          {:else}
+            {raw.provider} couldn't read this project just now.
+          {/if}
+          <span class="why">{raw.error}</span>
+        </p>
+      {/if}
       {#if raw.warnings.length > 0}
         <div class="warnings">
           {#each raw.warnings as w, i (i)}<div>{w}</div>{/each}
@@ -505,6 +523,17 @@
   }
   .err {
     color: var(--err);
+  }
+  .stale {
+    margin: 0;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    line-height: 1.5;
+  }
+  .stale .why {
+    display: block;
+    font-family: var(--mono);
+    overflow-wrap: anywhere;
   }
   .warnings {
     font-size: var(--text-xs);

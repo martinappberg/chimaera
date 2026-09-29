@@ -643,11 +643,13 @@ pub(crate) async fn ingest(
                 _ => None,
             }
         };
-        if event == "UserPromptSubmit" {
-            crate::knowledge::prime(&state, &id).await;
-        }
+        // Queued, so the hook answers first: the Knowledge check asks a
+        // plugin, and claude waits on this answer (a 10 s hook timeout).
         if let Some(draft) = draft {
-            crate::episodes::record(&state, &id, draft, "hooks").await;
+            crate::episodes::record(&state, &id, draft, "hooks");
+        }
+        if event == "UserPromptSubmit" {
+            crate::episodes::turn_started(&state, &id);
         }
     }
 

@@ -696,6 +696,10 @@ cells, a media moment, a notebook cell, a slide — as a locator fragment
 fragments open at their spot from any link), with the pixels attached in chat or uploaded to
 the session's landing pad for a terminal agent. See
 [pointing at part of a file](../features/files-and-previews.md#pointing-at-part-of-a-file).
+Wave 4 (2026-09-28, "refer certain parts of a response to the current agent"): a selection in a
+chat transcript quotes into that same chat's composer as a Markdown blockquote (lines kept — a
+chat composer never submits on a newline, and the quote is never typed into a PTY); it never
+targets another agent. See the [chat-mode page](../features/chat-mode.md#the-transcript).
 
 **Clickable paths — the bridge's return direction (author, 2026-07-06):** agents produce
 files; opening them should be one click, both ways of detecting them:

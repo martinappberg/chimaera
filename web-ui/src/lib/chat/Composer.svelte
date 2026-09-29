@@ -19,6 +19,7 @@
   } from "./images";
   import { loadDraft, saveDraft } from "./drafts";
   import {
+    draftWithInsert,
     slashChoices as choicesForSlash,
     slashContextAt,
     type ComposerCommand,
@@ -34,6 +35,9 @@
     /** Registers this composer for workbench insert flows (references,
      *  provenance tags) when set. */
     sessionId: string | null;
+    /** The mounting view's token, so an insert meant for this view (a quote
+     *  of its own transcript) finds it when the chat is mounted twice. */
+    view?: object;
     running: boolean;
     disabled: boolean;
     slashCommands: ComposerCommand[];
@@ -61,6 +65,7 @@
 
   let {
     sessionId,
+    view,
     running,
     disabled,
     slashCommands,
@@ -283,15 +288,19 @@
     }
   }
 
-  // Workbench insert flows (selection references, provenance tags) land in
-  // the draft exactly like they would type into a PTY's input — appended,
-  // never submitted.
+  // Workbench insert flows (selection references, provenance tags, quoted
+  // passages) land in the draft exactly like they would type into a PTY's
+  // input — appended, never submitted.
   $effect(() => {
     if (sessionId === null) return;
-    return registerComposer(sessionId, (text) => {
-      draft = draft.length > 0 && !draft.endsWith(" ") ? `${draft} ${text}` : draft + text;
-      focusAt(draft.length);
-    });
+    return registerComposer(
+      sessionId,
+      (text, placement) => {
+        draft = draftWithInsert(draft, text, placement);
+        focusAt(draft.length);
+      },
+      view,
+    );
   });
 
   // Workbench attach flow (an image dropped from the OS desktop onto this
