@@ -2,7 +2,7 @@
   import { untrack } from "svelte";
   import { cloudOnboarding } from "../pro/onboarding.svelte";
   import { pageVisible } from "../shared/visibility";
-  import { projectCopyError } from "../pro/presentation";
+  import { copyIssue, projectCopyError } from "../pro/presentation";
   import { proMirrorStatus, proSetNeverMirror, type MirrorStatus, type MirrorWorkspace } from "../net/native";
   let { visible = true, recoveryOnly = false }: { visible?: boolean; recoveryOnly?: boolean } = $props();
   let status = $state<MirrorStatus | null>(null);
@@ -100,7 +100,7 @@
           {#if workspace.mirror.last_mirrored_at}<p class="hint">Last copied {new Date(workspace.mirror.last_mirrored_at * 1000).toLocaleString()}</p>{/if}
           {#if workspace.mirror.kept_both}<p class="hint kept" role="status">{keptBoth(workspace.mirror)}</p>{/if}
           {#if workspace.mirror.too_large}<p class="error" role="status">Some files are too large to include in the cloud copy. They remain available on this device.</p>{/if}
-          {#if workspace.mirror.error && workspace.mirror.error !== "cloud_provider_not_ready"}<p class="error" role="status">{projectCopyError(workspace.mirror.error, workspace.mirror.error_code)}</p>{/if}
+          {#if workspace.mirror.error && workspace.mirror.error !== "cloud_provider_not_ready"}<p class={copyIssue(workspace.mirror) === "progress" ? "hint" : "error"} role="status">{projectCopyError(workspace.mirror.error, workspace.mirror.error_code)}</p>{/if}
         {/if}
       </div>
     </details>

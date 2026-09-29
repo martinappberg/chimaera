@@ -1,4 +1,4 @@
-import type { CloudProvisioningStatus, MirrorStatus, ProAuthScreenHint } from "../net/native";
+import type { CloudProvisioningStatus, MirrorStatus, MirrorWorkspace, ProAuthScreenHint } from "../net/native";
 
 export type PaidPlan = "pro" | "max";
 export type BillingInterval = "month" | "year";
@@ -65,6 +65,17 @@ const COPY_ERROR_CODES: Record<string, string> = {
   pending: "Copying…",
   checkpoint_pending: "Saving the latest copy…",
 };
+/** Codes for work still under way, not a problem: the next copy or ownership
+ * check clears them without the user, so they read quietly and never make a
+ * project "need attention". */
+const PROGRESS_CODES: ReadonlySet<string> = new Set(["pending", "checkpoint_pending", "ownership_unverified"]);
+
+/** What a project's recorded copy error means: nothing, progress, or a problem. */
+export function copyIssue(mirror: MirrorWorkspace["mirror"] | undefined): "none" | "progress" | "problem" {
+  if (!mirror?.error) return "none";
+  return mirror.error_code != null && PROGRESS_CODES.has(mirror.error_code) ? "progress" : "problem";
+}
+
 export function projectCopyError(reason: string, code?: string | null): string {
   if (code && COPY_ERROR_CODES[code]) return COPY_ERROR_CODES[code];
   switch (reason) {
@@ -106,7 +117,7 @@ export function cloudProjectStatus(projects: MirrorStatus | null, workspaceId?: 
   if (settingUp.length) return { title: "Project setup needs attention", detail: settingUp.some(p => p.blocked_providers?.length) ? "This project is paused. Its agent connection and continuation status are shown below." : "The project is paused until its setup succeeds.", state: "attention" };
   if (rows.some(p => p.ownership?.state === "awaiting_verification")) return { title: "Checking your project", detail: "Chimaera is checking where you left off before continuing.", state: "active" };
   if (rows.some(p => p.ownership?.state === "privacy_disabled")) return { title: "Project copying is disabled", detail: "Review this project's setting in Projects and privacy.", state: "attention" };
-  if (rows.some(p => p.mirror?.error || p.privacy_pending)) return { title: "A project needs attention", detail: "Open Projects and privacy below for details. Existing copies are retained.", state: "attention" };
+  if (rows.some(p => copyIssue(p.mirror) === "problem" || p.privacy_pending)) return { title: "A project needs attention", detail: "Open Projects and privacy below for details. Existing copies are retained.", state: "attention" };
   const copied = rows.filter(p => p.mirror?.last_mirrored_at != null || (typeof p.checkpoint_id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(p.checkpoint_id))).length;
   if (copied) return { title: "Cloud copies saved", detail: `${copied} ${copied === 1 ? "project has" : "projects have"} a completed cloud copy.`, state: "quiet" };
   return { title: "Project copy status", detail: "Your latest copy status isn’t available on this device yet. Existing copies are retained.", state: "quiet" };

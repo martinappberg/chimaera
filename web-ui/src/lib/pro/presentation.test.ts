@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { MirrorStatus, MirrorWorkspace } from "../net/native";
-import { paid, readIntent, cloudCopy, cloudPollDelay, cloudProjectStatus, friendlyError, projectCopyError, alreadySubscribed, recoverableAccountRestore } from "./presentation";
+import { paid, readIntent, cloudCopy, cloudPollDelay, cloudProjectStatus, copyIssue, friendlyError, projectCopyError, alreadySubscribed, recoverableAccountRestore } from "./presentation";
 
 // Copy is free to change; these tests pin which states read alike or apart,
 // what takes precedence, and that nothing from a raw error reaches the page.
@@ -112,6 +112,23 @@ describe("cloud preparation progress", () => {
     const failed = row("saved", 123); failed.mirror!.error = "private diagnostic";
     const detail = cloudProjectStatus(mirror([failed]));
     expect(detail?.state).toBe("attention"); expect(detail?.detail).not.toContain("private diagnostic");
+  });
+  it("reads copy work still under way as quiet progress, never as a project needing attention", () => {
+    const coded = (code: string | null): MirrorWorkspace => { const r = row("saved", 123); r.mirror!.error = "diagnostic"; r.mirror!.error_code = code; return r; };
+    const saved = cloudProjectStatus(mirror([row("saved", 123)]));
+    for (const code of ["pending", "checkpoint_pending", "ownership_unverified"]) {
+      expect(copyIssue(coded(code).mirror)).toBe("progress");
+      expect(cloudProjectStatus(mirror([coded(code)]))).toEqual(saved);
+      // A real problem elsewhere still takes precedence.
+      expect(cloudProjectStatus(mirror([coded(code), { ...coded("git_too_old"), workspace_id: "other" }]))?.state).toBe("attention");
+    }
+    for (const code of ["git_too_old", "credential_in_history", "conversation_not_saved", "other", null]) {
+      expect(copyIssue(coded(code).mirror)).toBe("problem");
+      expect(cloudProjectStatus(mirror([coded(code)]))?.state).toBe("attention");
+    }
+    expect(copyIssue(row("saved", 123).mirror)).toBe("none");
+    expect(copyIssue(null)).toBe("none");
+    expect(copyIssue(undefined)).toBe("none");
   });
   it("limits rapid visible preparation checks to five minutes and keeps passive states slow", () => {
     expect(cloudPollDelay(true, 0)).toBe(5000);
