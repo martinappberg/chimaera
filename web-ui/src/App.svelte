@@ -2476,9 +2476,10 @@
       if (detachedWindow && !layout.focusMode) layout = { ...layout, focusMode: true };
     }
     // A phone opens the work itself; the bottom strip can reveal navigation.
-    // Only a phone-width browser (any daemon, never the native app) is forced,
-    // and the forced value is never saved: a narrow native window keeps its
-    // rail, and the shared layout other windows restore keeps the user's choice.
+    // Only browsers are forced, by width alone when the layout loads (any
+    // daemon, signed in or not); a native window never is, whatever its width.
+    // The forced value is never saved, so the layout other windows restore
+    // keeps the user's own choice (net/AGENTS.md).
     forcedFocusRestore = null;
     if (!isNativeShell() && matchMedia("(max-width: 700px)").matches && !layout.focusMode) {
       forcedFocusRestore = layout.focusMode;
