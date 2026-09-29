@@ -32,7 +32,7 @@ export function cloudCopy(state: string, reason: string | null, _phase?: CloudPr
 }
 export function friendlyError(reason: unknown, fallback: string): string {
   const text = reason instanceof Error ? reason.message : String(reason);
-  if (text === "service_unsupported") return "Your Pro service doesn’t support this version of Chimaera yet. Cloud features wait until it does; your local work, connections and account are unaffected.";
+  if (text === "service_unsupported") return "Your Pro service doesn’t support this version of Chimaera yet. Cloud features resume on their own once it does; your local work, connections and account are unaffected.";
   if (text === "account_restore_locked") return "Chimaera couldn’t read your saved sign-in. Unlock your computer’s credential store, then choose Check again.";
   if (text === "account_restore_unavailable") return "Chimaera couldn’t confirm your saved sign-in yet. Check your connection, then choose Check again. Your local work remains available.";
   if (text === "account_credentials_unsaved") return "You’re signed in, but Chimaera couldn’t save your session securely. Check your computer’s credential store and free disk space, then choose Check again. You may need to sign in again after restarting the app.";

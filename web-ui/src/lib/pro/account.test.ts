@@ -1,33 +1,37 @@
 import { describe, expect, it } from "vitest";
 import type { ProBillingAttempt, ProStatus } from "../net/native";
-import { accountPanel, completesReview, isConfirmedFree, nearLimit, reviewKey } from "./account";
+import { accountErrorBar, accountPanel, completesReview, isConfirmedFree, nearLimit, offersCheck, reviewKey, type AccountPanel, type AccountRead } from "./account";
 
 const free: ProStatus = { available: true, signed_in: true, email: "fixture@example.invalid", plan: "none", error: null };
 const attempt = (phase: ProBillingAttempt["phase"], id = 7): ProBillingAttempt => ({ id, kind: "checkout", phase, expires_at: 123, error: null });
+const reads: AccountRead[] = ["none", "background", "check"];
 
 describe("Pro page panel", () => {
-  it("keeps confirmed plans and subscriber views mounted while a background read runs", () => {
-    for (const refreshing of [false, true]) {
-      expect(accountPanel(free, refreshing)).toBe("plans");
-      expect(accountPanel({ ...free, signed_in: false, email: null, plan: null }, refreshing)).toBe("plans");
-      expect(accountPanel({ ...free, plan: "pro" }, refreshing)).toBe("subscriber");
-      expect(accountPanel({ ...free, plan: "max" }, refreshing)).toBe("subscriber");
+  it("keeps confirmed plans and subscriber views mounted through any read", () => {
+    for (const read of reads) {
+      expect(accountPanel(free, read)).toBe("plans");
+      expect(accountPanel({ ...free, signed_in: false, email: null, plan: null }, read)).toBe("plans");
+      expect(accountPanel({ ...free, plan: "pro" }, read)).toBe("subscriber");
+      expect(accountPanel({ ...free, plan: "max" }, read)).toBe("subscriber");
+      expect(accountPanel({ ...free, plan: "pro", error: "service_unsupported" }, read)).toBe("subscriber");
     }
   });
-  it("shows a checking state only for an uncertain account", () => {
-    const uncertain = { ...free, plan: null };
-    expect(accountPanel(uncertain, true)).toBe("checking");
-    expect(accountPanel(uncertain, false)).toBe("attention");
-    expect(accountPanel({ ...free, error: "account_restore_unavailable" }, false)).toBe("attention");
+  it("holds an uncertain account's attention panel through background reads", () => {
+    for (const uncertain of [{ ...free, plan: null }, { ...free, error: "account_restore_unavailable" }, { ...free, error: "service_unsupported" }]) {
+      expect(accountPanel(uncertain, "none")).toBe("attention");
+      expect(accountPanel(uncertain, "background")).toBe(accountPanel(uncertain, "none"));
+      // Only a check the user asked for replaces it while it runs.
+      expect(accountPanel(uncertain, "check")).toBe("checking");
+    }
   });
   it("routes startup, endpoint-less builds and billing attempts ahead of plans", () => {
-    expect(accountPanel(null, true)).toBe("loading");
-    expect(accountPanel({ ...free, available: false }, false)).toBe("unavailable");
-    expect(accountPanel({ ...free, initializing: true }, false)).toBe("initializing");
+    for (const read of reads) expect(accountPanel(null, read)).toBe("loading");
+    expect(accountPanel({ ...free, available: false }, "none")).toBe("unavailable");
+    expect(accountPanel({ ...free, initializing: true }, "check")).toBe("initializing");
     for (const phase of ["opening", "waiting", "confirming", "expired", "failed", "confirmed"] as const) {
-      expect(accountPanel({ ...free, billing: attempt(phase) }, false)).toBe("billing");
+      expect(accountPanel({ ...free, billing: attempt(phase) }, "none")).toBe("billing");
     }
-    expect(accountPanel({ ...free, billing: attempt("canceled") }, false)).toBe("plans");
+    expect(accountPanel({ ...free, billing: attempt("canceled") }, "none")).toBe("plans");
   });
   it("never treats a stale or failed account as confirmed free", () => {
     expect(isConfirmedFree(null)).toBe(false);
@@ -58,13 +62,13 @@ describe("payment needs attention", () => {
   it("routes an overdue account to billing instead of plan choice", () => {
     const due = { ...free, payment_due: true };
     expect(isConfirmedFree(due)).toBe(false);
-    for (const refreshing of [false, true]) expect(accountPanel(due, refreshing)).toBe("payment");
-    expect(accountPanel({ ...due, plan: "pro" }, false)).toBe("subscriber");
-    expect(accountPanel({ ...due, error: "sign in required" }, false)).toBe("attention");
+    for (const read of reads) expect(accountPanel(due, read)).toBe("payment");
+    expect(accountPanel({ ...due, plan: "pro" }, "none")).toBe("subscriber");
+    expect(accountPanel({ ...due, error: "sign in required" }, "background")).toBe("attention");
   });
   it("ignores the flag when absent or signed out", () => {
-    expect(accountPanel({ ...free, payment_due: false }, false)).toBe("plans");
-    expect(accountPanel({ ...free, signed_in: false, email: null, plan: null, payment_due: true }, false)).toBe("plans");
+    expect(accountPanel({ ...free, payment_due: false }, "none")).toBe("plans");
+    expect(accountPanel({ ...free, signed_in: false, email: null, plan: null, payment_due: true }, "none")).toBe("plans");
   });
 });
 
@@ -85,5 +89,30 @@ describe("billing review", () => {
     expect(completesReview({ ...failed, plan: "pro" }, 7)).toBe(false);
     expect(completesReview({ ...failed, error: "failed" }, 7)).toBe(false);
     expect(completesReview({ ...free, billing: attempt("waiting") }, 7)).toBe(false);
+  });
+});
+
+describe("account problems and manual checks", () => {
+  const panels: AccountPanel[] = ["loading", "initializing", "plans", "payment", "subscriber", "billing"];
+  it("offers a check except for a failure the app rechecks on its own", () => {
+    expect(offersCheck(null, null)).toBe(true);
+    expect(offersCheck(null, "account_restore_unavailable")).toBe(true);
+    expect(offersCheck(null, "service_unsupported")).toBe(false);
+    // A read that failed here can always be retried.
+    expect(offersCheck("read failed", "service_unsupported")).toBe(true);
+  });
+  it("hides the error bar while a check runs or a panel already explains the problem", () => {
+    for (const panel of ["attention", "checking"] as const) {
+      expect(accountErrorBar(panel, "read failed", "sign in required", false)).toBeNull();
+    }
+    expect(accountErrorBar("subscriber", "read failed", null, true)).toBeNull();
+    for (const panel of panels) expect(accountErrorBar(panel, null, null, false)).toBeNull();
+  });
+  it("shows a self-rechecking failure without a retry and other problems with one", () => {
+    for (const panel of panels) {
+      expect(accountErrorBar(panel, null, "service_unsupported", false)).toEqual({ check: false });
+      expect(accountErrorBar(panel, null, "account_credentials_unsaved", false)).toEqual({ check: true });
+      expect(accountErrorBar(panel, "read failed", null, false)).toEqual({ check: true });
+    }
   });
 });

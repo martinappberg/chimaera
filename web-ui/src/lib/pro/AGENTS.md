@@ -18,8 +18,8 @@ enter UI settings or local storage.
 | `AccountUsage.svelte` / `usage.ts` | Percentage-first account usage; real limits, bounded accessible bars, neutral unknown/zero allowance. |
 | `billing.ts` | Native billing copy, stale-attempt fencing and explicit upgrade-review eligibility; browser return never grants entitlement and raw errors never render. `planPrice` formats only account-supplied prices. |
 | `presentation.ts` | Account, billing-intent and cloud-state copy; truthful project status and the finite preparation polling cadence. |
-| `account.ts` | The Pro page's panel from the last confirmed status (`accountPanel`), the billing-review key, and when Max is offered (`nearLimit`). |
-| `status.ts` | Reading `ProStatus`: a real `accountFailure` vs an informational `connectionWarning`, and `paymentDue`. |
+| `account.ts` | The Pro page's panel from the last confirmed status (`accountPanel`: background reads never change it; only a check the user asked for shows checking), the error bar and whether it offers a check (`accountErrorBar`, `offersCheck`), the billing-review key, and when Max is offered (`nearLimit`). |
+| `status.ts` | Reading `ProStatus`: a real `accountFailure` vs an informational `connectionWarning`, `paymentDue`, and `rechecksItself` (a failure the app rechecks on its own). |
 
 ## Boundaries
 
@@ -71,7 +71,8 @@ enter UI settings or local storage.
 - Nothing asks the user to refresh or retry what the page can do itself:
   polls re-check, a pending privacy change is re-sent (≤1/min while visible),
   a refused checkout for an existing plan re-reads the account. A manual check
-  appears only after polling stopped or a real failure.
+  appears only after polling stopped or a real failure, never for
+  `service_unsupported` (the app rechecks it every ten minutes).
 
 Pure readiness/transport/account tests cover these boundaries and pin relations
 (which states read alike or apart, precedence, no raw errors), never wording.

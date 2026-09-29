@@ -11,7 +11,7 @@
   import { asyncDisposer } from "../shared/asyncDisposer";
   import { pageVisible } from "../shared/visibility";
   import { paid, readIntent, friendlyError, recoverableAccountRestore, alreadySubscribed, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
-  import { accountPanel, completesReview, isConfirmedFree, nearLimit, reviewKey } from "../pro/account";
+  import { accountErrorBar, accountPanel, completesReview, isConfirmedFree, nearLimit, offersCheck, reviewKey } from "../pro/account";
   import { accountFailure, connectionWarning, paymentDue } from "../pro/status";
   import {
     onProChanged, proStatus, proSignIn, proCancelSignIn, proSignOut, proSignOutEverywhere,
@@ -38,6 +38,9 @@
    * rendering never does, so background reads cannot unmount the page. */
   let accountFresh = $state(false);
   let refreshing = $state(false);
+  /** A check the user asked for. Only it shows "checking"; background reads
+   * keep whatever the last status showed. */
+  let checking = $state(false);
   let hosts = $state<ProHost[]>([]);
   let devices = $state<ProDevice[]>([]);
   let deviceAccount: string | null = null;
@@ -59,8 +62,7 @@
   let alive = true;
   const subscribed = $derived(status?.signed_in === true && paid(status.plan));
   const confirmedFree = $derived(isConfirmedFree(status));
-  const panel = $derived(accountPanel(status, refreshing));
-  const accountNeedsAttention = $derived(panel === "attention");
+  const panel = $derived(accountPanel(status, checking ? "check" : refreshing ? "background" : "none"));
   const failure = $derived(accountFailure(status));
   const paymentNeeded = $derived(paymentDue(status));
   const warning = $derived(status?.signed_in === true && connectionWarning(status));
@@ -74,6 +76,7 @@
   const price = (plan: PaidPlan, every: BillingInterval): string | null => planPrice(status?.plans, plan, every);
   const priced = $derived(planChoices.every(choice => price(choice.plan, interval) !== null));
   const canReturnToPlans = $derived(billingRecovery && confirmedFree && reviewed !== null && reviewed === reviewKey(status));
+  const errorBar = $derived(accountErrorBar(panel, error, failure, billingRecovery));
 
   function showPlans(): void {
     plansElement?.scrollIntoView({ block: "start", behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
@@ -115,6 +118,11 @@
     } finally {
       if (alive && request === generation) refreshing = false;
     }
+  }
+  async function check(): Promise<void> {
+    if (checking) return;
+    checking = true;
+    try { await load(true); } finally { checking = false; }
   }
   /** A purchase acts on a current read; a pending account event is read first. */
   async function ensureFresh(): Promise<boolean> {
@@ -377,7 +385,7 @@
     {:else if panel === "checking"}
       <p class="muted" role="status">Checking your account…</p>
     {:else}
-      <div class="panel" role="status"><h2>Your account needs attention</h2><p class="muted">{friendlyError(error ?? failure, "We couldn't confirm your account details. Your local work remains available.")}</p>{#if !status.signed_in && signInPhase === null && !recoverableAccountRestore(failure)}<button disabled={busy !== null} onclick={() => void authenticate(authScreen)}>{authScreen === "sign-up" ? "Try signing up again" : "Sign in again"}</button>{:else if signInPhase === null}<button class="secondary" disabled={busy !== null} onclick={() => void load(true)}>Check again</button>{/if}</div>
+      <div class="panel" role="status"><h2>Your account needs attention</h2><p class="muted">{friendlyError(error ?? failure, "We couldn't confirm your account details. Your local work remains available.")}</p>{#if !status.signed_in && signInPhase === null && !recoverableAccountRestore(failure)}<button disabled={busy !== null} onclick={() => void authenticate(authScreen)}>{authScreen === "sign-up" ? "Try signing up again" : "Sign in again"}</button>{:else if signInPhase === null && offersCheck(error, failure)}<button class="secondary" disabled={busy !== null || checking} onclick={() => void check()}>Check again</button>{/if}</div>
     {/if}
 
     {#if status.signed_in}
@@ -385,7 +393,7 @@
       <details class="section" ontoggle={(event) => (securityOpen = event.currentTarget.open)}><summary>Account and devices</summary>{#if securityOpen}<div class="section-body"><AccountDevices {devices} busy={busy !== null} onrevoke={removeSignIn} /><div class="actions"><button class="secondary" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out", proSignOut, "Sign-out couldn't finish. Please try again."); }}>Sign out</button><button class="text-button" disabled={busy !== null} onclick={() => { remember(null); void act("sign-out-all", proSignOutEverywhere, "Sign-out couldn't finish. Please try again."); }}>Sign out everywhere</button></div><p class="muted small">Signing out everywhere also closes the cluster logins Pro keeps connected.</p></div>{/if}</details>
     {/if}
   {/if}
-  {#if (error || failure) && !accountNeedsAttention && !billingRecovery}<div class="error" role="alert"><span>{error ?? friendlyError(failure, "Part of your account couldn't refresh. Your local work remains available.")}</span><button class="secondary" disabled={busy !== null} onclick={() => void load(true)}>Try again</button></div>{/if}
+  {#if errorBar}<div class="error" role="alert"><span>{error ?? friendlyError(failure, "Part of your account couldn't refresh. Your local work remains available.")}</span>{#if errorBar.check}<button class="secondary" disabled={busy !== null || checking} onclick={() => void check()}>{checking ? "Checking…" : "Try again"}</button>{/if}</div>{/if}
   {/if}
 </section>
 

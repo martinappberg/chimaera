@@ -57,7 +57,10 @@ Unknown/startup/error account states stay neutral; a connection warning is not a
 error. An overdue payment (`payment_due`) shows Payment needs attention with
 Manage billing and never plans or checkout. The page renders from the last
 confirmed status (`pro/account.ts` `accountPanel`) while background reads run, so
-nothing unmounts on `pro-changed` or focus; checkout and the Max review re-read
+nothing unmounts on `pro-changed` or focus; an account needing attention keeps
+that panel too, and only Check again shows checking (the error bar hides
+meanwhile). `service_unsupported` shows its explanation with no manual check,
+since the app rechecks it itself. Checkout and the Max review re-read
 the account first when an event is pending. Prices come only from `ProStatus.plans`.
 Neither a remembered selection nor a successful account refresh can trigger checkout. Usage shows percentages
 computed from the account's current allowances, not fixed hour or storage totals. The static introduction shows
