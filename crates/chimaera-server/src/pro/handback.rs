@@ -25,6 +25,7 @@ pub(super) async fn prepare(
     tokio::time::timeout(Duration::from_secs(105), async {
         let mut seen_epoch = initial_epoch;
         let mut ambiguous = None;
+        let mut rejected = None;
         loop {
             ensure!(current(), "Account or project changed during return");
             let operation_config = execution::effective(state, config, workspace)?;
@@ -54,6 +55,11 @@ pub(super) async fn prepare(
                 return Ok(Some(baton.epoch));
             }
             if baton.holder_id.as_deref() != Some(holder) {
+                return Ok(None);
+            }
+            // A refusal is final for this pass unless the worker woke into a
+            // new epoch meanwhile; the next pass tries again (no re-POST loop).
+            if rejected == Some(baton.epoch) {
                 return Ok(None);
             }
             seen_epoch = baton.epoch;
@@ -95,6 +101,7 @@ pub(super) async fn prepare(
                         }
                         // The rejected request did not move work. Refresh ownership
                         // immediately, before the resumed worker becomes idle again.
+                        rejected = Some(seen_epoch);
                     }
                     Ok(response)
                         if response.status == 503
@@ -161,6 +168,9 @@ mod tests {
         }
         if f.mode == "canceled" {
             f.state.pro.generation.fetch_add(1, Ordering::SeqCst);
+            return (StatusCode::CONFLICT, Json(json!({})));
+        }
+        if f.mode == "refused" {
             return (StatusCode::CONFLICT, Json(json!({})));
         }
         if f.mode == "wake" && epoch == 3 {
@@ -287,6 +297,12 @@ mod tests {
             }
             assert_eq!(posts, [3]);
         }
+    }
+    #[tokio::test]
+    async fn a_bare_refusal_is_final_for_the_pass() {
+        let (result, posts) = run("refused").await;
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(posts, [3], "no re-POST loop against an unchanged epoch");
     }
     #[tokio::test]
     async fn remote_release_cannot_resume_the_old_local_history() {

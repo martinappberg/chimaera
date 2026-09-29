@@ -384,7 +384,11 @@ async fn reconcile_generation(
     } else {
         "acquire"
     };
-    if operation == "acquire" && execution::checkpoint_mode(state, workspace) {
+    // Re-acquiring the epoch this device itself held (its own clean release,
+    // or its own lease that lapsed while it kept working) continues its own
+    // newer files and conversations: no checkpoint install, no fork.
+    let own_epoch = config.role == Role::Device && execution::held_here(state, config, &baton);
+    if operation == "acquire" && execution::checkpoint_mode(state, workspace) && !own_epoch {
         ensure!(
             baton.checkpoint.is_some(),
             "a durable project checkpoint is not available yet"
@@ -399,7 +403,8 @@ async fn reconcile_generation(
             Ownership::AwaitingVerification { epoch: baton.epoch },
         );
         super::persist(state).await?;
-        Box::pin(hydrate(state, config, workspace, baton.epoch, true, None)).await?;
+        // The grant's own requires_fork decides; hydrate applies it.
+        Box::pin(hydrate(state, config, workspace, baton.epoch, false, None)).await?;
         return Ok(super::owned_epoch(state, workspace));
     }
     let body = execution::body(&operation_config, baton.epoch, operation == "acquire");
@@ -419,17 +424,27 @@ async fn reconcile_generation(
             || (!state.pro.execution.invalid && !execution::unclean(state, workspace)),
         "previous managed processes are still stopping"
     );
+    let was_fenced = execution::fenced(state, workspace);
     let request_start = execution::RequestStart::now();
-    let grant: Baton = account(
+    let response = account(
         &operation_config,
         &execution::path(&operation_config, workspace, operation),
         "POST",
         Some(&body),
     )
     .await
-    .context("Could not renew project ownership")?
-    .json()
-    .context("Could not confirm project ownership")?;
+    .context("Could not renew project ownership")?;
+    // The account's reconnect grace after a lapsed lease is a normal wait,
+    // not a failure; the next tick asks again while local work continues.
+    if response.status == 409
+        && serde_json::from_slice::<serde_json::Value>(&response.body)
+            .is_ok_and(|value| value["error"] == "takeover_grace")
+    {
+        return Ok(None);
+    }
+    let grant: Baton = response
+        .json()
+        .context("Could not confirm project ownership")?;
     ensure!(
         grant.workspace_id == workspace && grant.holder_id.as_deref() == Some(holder),
         "baton grant names another owner"
@@ -487,7 +502,8 @@ async fn reconcile_generation(
         generation == state.pro.generation.load(Ordering::Acquire),
         "Account changed during project transfer"
     );
-    if !matches!(previous, Some(Ownership::Local { .. }))
+    // A renewal after a same-epoch fence resumes what the fence preserved.
+    if (!matches!(previous, Some(Ownership::Local { .. })) || was_fenced)
         && execution::resume_allowed(state, workspace)
     {
         crate::ledger::resume_deferred_workspace(state, workspace).await?;
@@ -1435,41 +1451,29 @@ pub(super) fn at_pause(state: &AppState, workspace: &str) -> bool {
         }
     })
 }
+/// A device waits this long between automatic attempts to finish one return.
+const RETURN_BACKOFF_MAX: u64 = 1800;
+
 pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> Result<()> {
-    if config.delegation.workspace.is_some() {
+    if config.delegation.workspace.is_some() || config.role != Role::Device {
         return Ok(());
     }
-    if config.role != Role::Device
-        || (config.execution.is_none()
-            && (!state.pro.power_suitable.load(Ordering::Acquire)
-                || super::now().saturating_sub(state.pro.awake_since.load(Ordering::Acquire))
-                    < 300))
-    {
-        return Ok(());
-    }
-    let remote: Vec<_> = lock(&state.pro.ownership)
+    // Moving live cloud work home waits until this computer has been awake
+    // and on power for a while (both protocol versions); work the cloud is
+    // not running returns at once (laptop first).
+    let settled = state.pro.power_suitable.load(Ordering::Acquire)
+        && super::now().saturating_sub(state.pro.awake_since.load(Ordering::Acquire)) >= 300;
+    let candidates: Vec<_> = lock(&state.pro.ownership)
         .iter()
         .filter_map(|(id, owner)| match owner {
-            Ownership::Remote { epoch, holder } => Some((id.clone(), *epoch, holder.clone())),
+            Ownership::Remote { epoch, holder } => Some((id.clone(), *epoch, Some(holder.clone()))),
+            Ownership::Hydrating { epoch } => Some((id.clone(), *epoch, None)),
             _ => None,
         })
         .take(128)
         .collect();
-    if remote.is_empty() {
-        return Ok(());
-    }
-    let hosts: Vec<super::protocol::Host> = transport::request(
-        &config.keeper_url,
-        "/v1/hosts",
-        "GET",
-        &config.delegation.access_token,
-        None,
-    )
-    .await
-    .context("Could not reconnect to your saved work")?
-    .json()
-    .context("Could not read your connected workspaces")?;
-    for (workspace, epoch, holder) in remote {
+    let mut hosts: Option<Vec<super::protocol::Host>> = None;
+    for (workspace, epoch, holder) in candidates {
         // Only a project already registered on this device may return automatically.
         // Discovery and old global-folder preferences never authorize adoption.
         if lock(&state.workspaces).get(&workspace).is_none()
@@ -1485,15 +1489,78 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
         {
             continue;
         }
-        let Some(host) = hosts.iter().find(|host| {
-            host.worker_holder() == Some(holder.as_str()) && host.status == "connected"
-        }) else {
+        if lock(&state.pro.return_backoff)
+            .get(&workspace)
+            .is_some_and(|(next, _)| *next > super::now())
+        {
             continue;
-        };
+        }
         let result = async {
-            let Some(epoch) =
-                handback::prepare(state, config, &workspace, host, &holder, epoch).await?
-            else {
+            let operation_config = execution::effective(state, config, &workspace)?;
+            let baton: Baton = account(
+                &operation_config,
+                &execution::path(&operation_config, &workspace, ""),
+                "GET",
+                None,
+            )
+            .await
+            .context("Could not check where your work is running")?
+            .json()
+            .context("Could not confirm where your work is running")?;
+            ensure!(baton.workspace_id == workspace, "baton workspace mismatch");
+            execution::observe(state, config, &baton)?;
+            let mine = baton.holder_id.as_deref() == Some(&config.delegation.device_id);
+            let target = match (&holder, baton.holder_id.as_deref()) {
+                // Released by the cloud: nothing runs there, hydrate now.
+                (_, None) => Some(baton.epoch),
+                // A return this device already acquired did not finish.
+                (None, Some(_)) if mine && baton.epoch == epoch => Some(epoch),
+                (None, _) => None,
+                // The cloud's lease lapsed (it stopped or lost the account):
+                // take the project home from its last acknowledged checkpoint.
+                (Some(_), Some(_)) if !mine && execution::expired(&baton) => Some(baton.epoch),
+                (Some(recorded), Some(current)) if current == recorded && settled => {
+                    if hosts.is_none() {
+                        hosts = Some(
+                            transport::request(
+                                &config.keeper_url,
+                                "/v1/hosts",
+                                "GET",
+                                &config.delegation.access_token,
+                                None,
+                            )
+                            .await
+                            .context("Could not reconnect to your saved work")?
+                            .json()
+                            .context("Could not read your connected workspaces")?,
+                        );
+                    }
+                    let host = hosts.as_ref().and_then(|hosts| {
+                        hosts
+                            .iter()
+                            .find(|host| {
+                                host.worker_holder() == Some(current) && host.status == "connected"
+                            })
+                            .cloned()
+                    });
+                    match host {
+                        Some(host) => {
+                            handback::prepare(
+                                state,
+                                config,
+                                &workspace,
+                                &host,
+                                current,
+                                baton.epoch,
+                            )
+                            .await?
+                        }
+                        None => None,
+                    }
+                }
+                _ => None,
+            };
+            let Some(epoch) = target else {
                 return Ok::<_, anyhow::Error>(());
             };
             hydrate(state, config, &workspace, epoch, false, None)
@@ -1505,9 +1572,24 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
             Ok(())
         }
         .await;
-        if let Err(error) = result {
-            record_error(state, &workspace, &error);
-            tracing::warn!(phase="automatic_return", error=%error, "Project return did not complete");
+        match result {
+            Ok(()) => {
+                lock(&state.pro.return_backoff).remove(&workspace);
+            }
+            Err(error) => {
+                {
+                    let mut backoff = lock(&state.pro.return_backoff);
+                    if backoff.len() >= 128 && !backoff.contains_key(&workspace) {
+                        backoff.clear();
+                    }
+                    let delay = backoff
+                        .get(&workspace)
+                        .map_or(120, |(_, delay)| (delay * 2).min(RETURN_BACKOFF_MAX));
+                    backoff.insert(workspace.clone(), (super::now() + delay, delay));
+                }
+                record_error(state, &workspace, &error);
+                tracing::warn!(phase="automatic_return", error=%error, "Project return did not complete");
+            }
         }
     }
     Ok(())

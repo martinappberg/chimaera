@@ -210,6 +210,43 @@ pub(super) fn observe(state: &AppState, config: &Configure, baton: &Baton) -> Re
     Ok(())
 }
 
+/// Server-relative expiry: the account's own clock decides, never ours.
+pub(super) fn expired(baton: &Baton) -> bool {
+    match (
+        baton.expires_at.as_deref().map(timestamp),
+        timestamp(&baton.server_now),
+    ) {
+        (Some(Ok(expires)), Ok(now)) => expires <= now,
+        (None, _) => true,
+        _ => false,
+    }
+}
+/// This installation held exactly this epoch and nobody acquired it since
+/// (every acquisition advances the epoch). Its own processes and files are the
+/// newest state, so re-acquiring needs no hydration and no fork.
+pub(super) fn held_here(state: &AppState, config: &Configure, baton: &Baton) -> bool {
+    lock(&state.pro.preferences)
+        .get(&baton.workspace_id)
+        .and_then(|p| p.execution_identity.as_ref())
+        .is_some_and(|identity| {
+            identity.epoch == baton.epoch
+                && identity.holder_id == config.delegation.device_id
+                && identity.endpoint == config.endpoint
+                && Some(&identity.account_id) == config.account_id.as_ref()
+                && baton
+                    .holder_id
+                    .as_deref()
+                    .is_none_or(|holder| holder == config.delegation.device_id)
+        })
+}
+/// A worker's watchdog fenced this epoch; a later renewal of the same epoch
+/// must resume what the fence preserved.
+pub(super) fn fenced(state: &AppState, workspace: &str) -> bool {
+    lock(&state.pro.execution.proofs)
+        .get(workspace)
+        .is_some_and(|proof| proof.stopped)
+}
+
 fn timestamp(value: &str) -> Result<i128> {
     ensure!(
         value.len() <= 64 && (value.ends_with('Z') || value.ends_with("+00:00")),

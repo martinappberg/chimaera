@@ -15,6 +15,8 @@ pub(super) struct FakeAccount {
     pub endpoint: String,
     pub requests: Arc<Mutex<Vec<(String, String, serde_json::Value)>>>,
     pub baton: Arc<Mutex<serde_json::Value>>,
+    /// The reply to acquire/renew: a status and body (a grant or a refusal).
+    pub grant: Arc<Mutex<Option<(u16, serde_json::Value)>>>,
     pub delays: Arc<Mutex<HashMap<String, StdDuration>>>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -66,6 +68,7 @@ impl FakeAccount {
             endpoint,
             requests,
             baton,
+            grant,
             delays,
             server,
         }
@@ -83,17 +86,22 @@ fn respond(
     path: &str,
     body: &serde_json::Value,
     baton: &Mutex<serde_json::Value>,
-    grant: &Mutex<Option<serde_json::Value>>,
+    grant: &Mutex<Option<(u16, serde_json::Value)>>,
     origin: &str,
 ) -> Response {
     let segments: Vec<_> = path.trim_start_matches('/').split('/').collect();
     match (method.as_str(), segments.as_slice()) {
         ("GET", [_, "baton", _]) => Json(lock(baton).clone()).into_response(),
         ("POST", [_, "baton", _, "acquire" | "renew"]) => match lock(grant).clone() {
-            Some(grant) => {
+            Some((200, grant)) => {
                 *lock(baton) = grant.clone();
                 Json(grant).into_response()
             }
+            Some((status, body)) => (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT),
+                Json(body),
+            )
+                .into_response(),
             None => StatusCode::CONFLICT.into_response(),
         },
         ("PUT", ["v1", "baton", _, "policy"]) => StatusCode::NO_CONTENT.into_response(),
@@ -331,6 +339,134 @@ async fn an_abandoned_flush_still_finishes_and_leaves_no_interrupted_git_state()
     );
     assert_eq!(leftovers(&mirror), Vec::<String>::new());
     server.abort();
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn checkpoint(epoch: u64) -> serde_json::Value {
+    json!({
+        "id": "cp-fixture",
+        "sequence": 1,
+        "source_holder_id": "d-home",
+        "source_epoch": epoch,
+        "working_tree_oid": "a".repeat(40),
+        "config_oid": "b".repeat(40),
+        "handoff_oid": "c".repeat(40),
+        "continuation": "idle",
+    })
+}
+
+#[tokio::test]
+async fn reacquiring_its_own_epoch_continues_local_work_without_install_or_fork() {
+    for (label, holder, expires) in [
+        ("released", None, None),
+        ("lapsed", Some("d-home"), Some("2026-09-28T00:00:00Z")),
+    ] {
+        let root = temp(label);
+        let state = state(&root);
+        let account = FakeAccount::start(json!({})).await;
+        let config = device(&account.endpoint);
+        let workspace = project(&state, &root, &config, 4);
+        // The daemon restarted (or woke from sleep) after this epoch.
+        lock(&state.pro.ownership).insert(
+            workspace.id.clone(),
+            Ownership::AwaitingVerification { epoch: 4 },
+        );
+        let mut current = owned(&workspace.id, "d-home", 4, "lease-fixture", 1);
+        current["holder_id"] = json!(holder);
+        current["expires_at"] = json!(expires);
+        current["server_now"] = json!("2026-09-28T00:05:00Z");
+        current["checkpoint"] = checkpoint(4);
+        *lock(&account.baton) = current;
+        // The account treats a lapsed own lease as a takeover (requires_fork).
+        let mut grant = owned(&workspace.id, "d-home", 5, "lease-next", 1);
+        grant["requires_fork"] = json!(holder.is_some());
+        grant["checkpoint"] = checkpoint(4);
+        *lock(&account.grant) = Some((200, grant));
+        reconcile(&state, &config, &workspace.id).await.unwrap();
+        assert!(
+            matches!(
+                lock(&state.pro.ownership).get(&workspace.id),
+                Some(Ownership::Local { epoch: 5 })
+            ),
+            "{label}"
+        );
+        assert!(
+            account.calls("POST", "/v2/mirror/credentials").is_empty(),
+            "{label}: no checkpoint is fetched or installed over newer local work"
+        );
+        assert!(!lock(&state.pro.preferences)[&workspace.id].execution_uncertain);
+        assert!(!execution::recovery_context(&state, &workspace.id));
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_reconnect_grace_after_a_lapsed_lease_is_a_quiet_wait() {
+    let root = temp("grace");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let config = device(&account.endpoint);
+    let workspace = project(&state, &root, &config, 4);
+    lock(&state.pro.ownership).insert(
+        workspace.id.clone(),
+        Ownership::AwaitingVerification { epoch: 4 },
+    );
+    let mut current = owned(&workspace.id, "d-home", 4, "lease-fixture", 1);
+    current["server_now"] = json!("2026-09-28T00:01:40Z");
+    current["checkpoint"] = checkpoint(4);
+    *lock(&account.baton) = current.clone();
+    *lock(&account.grant) = Some((409, json!({"error":"takeover_grace","baton":current})));
+    reconcile(&state, &config, &workspace.id).await.unwrap();
+    assert!(crate::pro::may_execute(&state, &workspace.id));
+    assert!(lock(&state.pro.status)
+        .get(&workspace.id)
+        .is_none_or(|status| status.error.is_none()));
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_device_takes_back_a_lapsed_cloud_lease_but_waits_to_move_live_cloud_work() {
+    let root = temp("lapsed-worker");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let mut config = device(&account.endpoint);
+    config.keeper_url = account.endpoint.clone();
+    let workspace = project(&state, &root, &config, 4);
+    lock(&state.pro.ownership).insert(
+        workspace.id.clone(),
+        Ownership::Remote {
+            epoch: 5,
+            holder: "worker-a".into(),
+        },
+    );
+    let mut cloud = owned(&workspace.id, "worker-a", 5, "lease-cloud", 3);
+    cloud["checkpoint"] = checkpoint(5);
+    // Live cloud work and a computer that just woke on battery: no move.
+    *lock(&account.baton) = cloud.clone();
+    lazy_handback(&state, &config).await.unwrap();
+    assert!(account.calls("GET", "/v1/hosts").is_empty());
+    assert!(account.calls("POST", "/v2/mirror/credentials").is_empty());
+    // The cloud's lease lapsed: nothing runs there, so the project returns
+    // without waiting for power or a keeper route.
+    cloud["server_now"] = json!("2026-09-28T00:05:00Z");
+    *lock(&account.baton) = cloud;
+    lazy_handback(&state, &config).await.unwrap();
+    assert!(
+        !account.calls("POST", "/v2/mirror/credentials").is_empty(),
+        "the return started from the last acknowledged checkpoint"
+    );
+    // The fixture cannot serve Git, so this attempt fails and backs off.
+    assert!(lock(&state.pro.return_backoff).contains_key(&workspace.id));
+    let attempts = account.calls("POST", "/v2/mirror/credentials").len();
+    lazy_handback(&state, &config).await.unwrap();
+    assert_eq!(
+        account.calls("POST", "/v2/mirror/credentials").len(),
+        attempts,
+        "a failed return is retried with backoff, not every pass"
+    );
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }

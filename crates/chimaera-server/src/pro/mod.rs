@@ -56,6 +56,7 @@ pub(crate) struct ProState {
     boot_deferred: Mutex<std::collections::HashSet<String>>,
     operations: detached::Operations,
     remote_since: Mutex<HashMap<String, u64>>,
+    return_backoff: Mutex<HashMap<String, (u64, u64)>>,
     awake_since: AtomicU64,
     power_suitable: AtomicBool,
 }
@@ -231,6 +232,7 @@ impl ProState {
             boot_deferred: Mutex::new(Default::default()),
             operations: Default::default(),
             remote_since: Mutex::new(HashMap::new()),
+            return_backoff: Mutex::new(HashMap::new()),
             awake_since: AtomicU64::new(now()),
             power_suitable: AtomicBool::new(false),
         }
