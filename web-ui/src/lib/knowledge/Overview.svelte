@@ -175,7 +175,7 @@
       <h2 id="ov-work" class="lbl">
         {labels.sections.open_work}
         <span class="n">{work.open} open{#if work.progress > 0} · {work.progress} in progress{/if}{#if work.blocked > 0} · {work.blocked} blocked{/if}</span>
-        <button class="more" onclick={() => onSection("todos")}>All to-dos →</button>
+        <button class="more" onclick={() => onSection("todos")}>{labels.sections.todos} →</button>
       </h2>
       <div class="rows">
         {#each work.items as e (e.ekey)}

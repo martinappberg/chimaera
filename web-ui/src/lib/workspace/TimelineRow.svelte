@@ -119,12 +119,17 @@
           : first.job?.state === "COMPLETED"
             ? { mark: "✓", tone: "accent", title: "COMPLETED" }
             : { mark: "○", tone: "muted", title: first.job?.state ?? "ended" };
-      case "knowledge":
-        return first.knowledge?.to === "contradicted"
-          ? { mark: "◇", tone: "err", title: "contradicted" }
-          : first.knowledge?.to === "preliminary"
-            ? { mark: "◆", tone: "muted", title: first.knowledge.to }
-            : { mark: "◆", tone: "accent", title: first.knowledge?.to ?? "recorded" };
+      case "knowledge": {
+        // The provider's own tone for the word; core rates none.
+        const to = first.knowledge?.to;
+        const tone = statusTone(to);
+        const title = to ?? "recorded";
+        return tone === "bad"
+          ? { mark: "◇", tone: "err", title }
+          : tone === "good" || tone === "accent"
+            ? { mark: "◆", tone: "accent", title }
+            : { mark: "◆", tone: "muted", title };
+      }
       case "session":
         return { mark: "✕", tone: "err", title: "the session ended unexpectedly" };
       case "note":

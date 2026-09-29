@@ -7,6 +7,7 @@ import {
   canReinstall,
   checkedWords,
   footprint,
+  footprints,
   hereLine,
   installedOutcome,
   installLine,
@@ -113,6 +114,11 @@ describe("the card's words", () => {
   it("the Here line says only what means something", () => {
     expect(footprint(myc())).toBe(".living/");
     expect(footprint(myc({ detect: ["MYCELIUM.md"] }))).toBe("MYCELIUM.md");
+    expect(footprints(myc({ detect: [".living/INDEX.md", ".living/findings", "MYCELIUM.md"] }))).toEqual([
+      ".living/",
+      "MYCELIUM.md",
+    ]);
+    expect(footprints(myc({ detect: [] }))).toEqual([]);
     expect(hereLine(myc({ on: true, detected: true, active: true }), { findings: 1, decisions: 0 })).toEqual({
       text: "using .living/ in this workspace · 1 finding · 0 decisions",
       kind: "using",

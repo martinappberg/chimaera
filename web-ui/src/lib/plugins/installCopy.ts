@@ -65,10 +65,19 @@ export function stateWords(p: WorkspacePlugin): string {
 /** The folder or file a plugin's footprint names, as a person would say
  *  it: `.living/INDEX.md` → `.living/`, `MYCELIUM.md` stays. */
 export function footprint(p: WorkspacePlugin): string | null {
-  const first = p.detect[0];
-  if (first === undefined) return null;
-  const slash = first.indexOf("/");
-  return slash > 0 ? first.slice(0, slash + 1) : first;
+  return footprints(p)[0] ?? null;
+}
+
+/** Every folder or file its footprint names, once each, in the manifest's
+ *  order: what its setup leaves in a workspace. */
+export function footprints(p: WorkspacePlugin): string[] {
+  const out: string[] = [];
+  for (const rel of p.detect) {
+    const slash = rel.indexOf("/");
+    const top = slash > 0 ? rel.slice(0, slash + 1) : rel;
+    if (!out.includes(top)) out.push(top);
+  }
+  return out;
 }
 
 const plural = (n: number, one: string): string => `${n} ${one}${n === 1 ? "" : "s"}`;

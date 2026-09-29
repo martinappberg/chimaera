@@ -40,9 +40,14 @@ export function jobFailed(state: string | undefined): boolean {
   return JOB_BAD_PREFIXES.some((p) => s.startsWith(p));
 }
 
+/** Whether a knowledge status is bad news, in the provider's own words (its
+ *  status words carry a tone: `knowledgeBadStatus`). Core names no status. */
+export type BadStatus = (to: string) => boolean;
+const NO_BAD_STATUS: BadStatus = () => false;
+
 /** Bad news: a failed command, a failed job, a crashed session, an errored
- *  turn, or a finding that was contradicted. */
-export function isBadNews(e: TimelineEntry): boolean {
+ *  turn, or an entry whose status the provider calls bad. */
+export function isBadNews(e: TimelineEntry, badStatus: BadStatus = NO_BAD_STATUS): boolean {
   switch (e.kind) {
     case "command":
       return e.command !== undefined && e.command.exit !== undefined && e.command.exit !== 0;
@@ -53,7 +58,7 @@ export function isBadNews(e: TimelineEntry): boolean {
     case "episode":
       return e.end === "errored";
     case "knowledge":
-      return e.knowledge?.to === "contradicted";
+      return e.knowledge?.to !== undefined && badStatus(e.knowledge.to);
     default:
       return false;
   }
@@ -70,7 +75,10 @@ function startOf(e: TimelineEntry): number {
  * entry (crash/exit) closes that session's chain. Every other kind is its
  * own row. Output is newest first.
  */
-export function groupTimeline(entries: readonly TimelineEntry[]): TimelineGroup[] {
+export function groupTimeline(
+  entries: readonly TimelineEntry[],
+  badStatus: BadStatus = NO_BAD_STATUS,
+): TimelineGroup[] {
   const asc = [...entries].sort((a, b) => a.ts - b.ts || a.seq - b.seq);
   const groups: TimelineGroup[] = [];
   const open = new Map<string, TimelineGroup>();
@@ -83,21 +91,21 @@ export function groupTimeline(entries: readonly TimelineEntry[]): TimelineGroup[
         g.ts = Math.max(g.ts, e.ts);
         g.seq = Math.max(g.seq, e.seq);
         g.followUps = g.entries.length - 1;
-        g.bad = g.bad || isBadNews(e);
+        g.bad = g.bad || isBadNews(e, badStatus);
         continue;
       }
-      const fresh = single(e);
+      const fresh = single(e, badStatus);
       open.set(e.sid, fresh);
       groups.push(fresh);
       continue;
     }
     if (e.kind === "session" && e.sid !== undefined) open.delete(e.sid);
-    groups.push(single(e));
+    groups.push(single(e, badStatus));
   }
   return groups.sort((a, b) => b.ts - a.ts || b.seq - a.seq);
 }
 
-function single(e: TimelineEntry): TimelineGroup {
+function single(e: TimelineEntry, badStatus: BadStatus): TimelineGroup {
   return {
     key: `${e.kind}:${e.seq}`,
     kind: e.kind,
@@ -108,7 +116,7 @@ function single(e: TimelineEntry): TimelineGroup {
     startTs: startOf(e),
     seq: e.seq,
     followUps: 0,
-    bad: isBadNews(e),
+    bad: isBadNews(e, badStatus),
   };
 }
 
@@ -126,9 +134,10 @@ export function sinceYouLeft(
   entries: readonly TimelineEntry[],
   baselineSeq: number,
   limit = 8,
+  badStatus: BadStatus = NO_BAD_STATUS,
 ): { rows: TimelineGroup[]; total: number } {
   const fresh = entries.filter((e) => e.seq > baselineSeq);
-  const groups = badNewsFirst(groupTimeline(fresh));
+  const groups = badNewsFirst(groupTimeline(fresh, badStatus));
   return { rows: groups.slice(0, limit), total: groups.length };
 }
 

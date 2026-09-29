@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * "Use mycelium for Knowledge" — the one sheet, live-checked steps
+   * "Use <plugin> for Knowledge" — the one sheet, live-checked steps
    * (design §6.2): 0 install the plugin itself when it isn't on this host
    * yet (the card's Install x.y.z flow), 1 the agent plugins it requires or
    * recommends, for the agents installed here (requirementsModel.ts — the
@@ -16,7 +16,7 @@
   import { focusOnMount } from "../shared/focusOnMount";
   import { modalFocus } from "../shared/modalFocus";
   import { refreshKnowledge } from "../workspace/knowledge";
-  import { installedOutcome, installTitle, pinnedVersion, type Outcome } from "./installCopy";
+  import { footprint, footprints, installedOutcome, installTitle, pinnedVersion, type Outcome } from "./installCopy";
   import { agentsForSetup, hooksAwaitingTrust, requirementsModel, sheetText, type AgentsState, type RequirementRow } from "./requirementsModel";
   import {
     agentInstallContinuation,
@@ -46,6 +46,8 @@
   let { wsId, pluginId, onOpenSession, onClose }: Props = $props();
 
   let plugin = $state<WorkspacePlugin | null>(null);
+  /** What its setup leaves here, from the manifest's footprint. */
+  const written = $derived(plugin !== null ? footprints(plugin) : []);
   let agents = $state<AgentPlugins | null>(null);
   /** null = still checking; false = the daemon predates agent probes. */
   let agentsAvailable = $state<boolean | null>(null);
@@ -320,7 +322,7 @@
   >
     <header class="head">
       <h1 id="attach-title">Use {plugin?.name ?? pluginId} for Knowledge</h1>
-      <p>Your agents record findings, decisions and learnings as they work; chimaera shows them. Each step is checked live.</p>
+      <p>{plugin?.summary ? `${plugin.summary} ` : ""}Each step is checked live.</p>
     </header>
 
     {#if loadError !== null && plugin === null}
@@ -414,8 +416,8 @@
                     <span class="hcmd">
                       <span class="mono">{basename(h.command) || h.key}</span>
                       {#if h.trust === "modified"}<span class="hnote warn-text">changed since you last trusted it</span>{/if}
-                      {#if pluginId === "mycelium" && h.event === "Stop"}
-                        <span class="hnote warn-text">can keep a turn going until .living/ is updated</span>
+                      {#if h.event === "Stop"}
+                        <span class="hnote warn-text">can keep a turn going</span>
                       {/if}
                     </span>
                   </div>
@@ -446,14 +448,15 @@
             {#if notInstalled}
               <div class="smuted">After the install.</div>
             {:else if detected}
-              <div class="smuted">Already set up here — {plugin?.detect[0] ?? "its files"} found. {plugin?.on ? "" : "Turning it on reads them."}</div>
+              <div class="smuted">Already set up here — {(plugin && footprint(plugin)) ?? "its files"} found. {plugin?.on ? "" : "Turning it on reads them."}</div>
             {:else if !canSetup}
               <div class="smuted">This plugin has no setup step.</div>
             {:else}
               <div class="smuted">
-                Sends <span class="fg">“{plugin?.setup?.prompt}”</span> to a new agent session. It writes
-                <span class="mono">.living/</span>, <span class="mono">MYCELIUM.md</span> and small
-                <span class="mono">CLAUDE.md</span> / <span class="mono">AGENTS.md</span> adapters — you review them in git, nothing is committed.
+                Sends <span class="fg">“{plugin?.setup?.prompt}”</span> to a new agent session.
+                {#if written.length > 0}It writes
+                  {#each written as w, i (w)}<span class="mono">{w}</span>{i < written.length - 2 ? ", " : i === written.length - 2 ? " and " : ""}{/each}
+                  and may touch other files —{:else}Whatever it writes,{/if} you review it in git; nothing is committed.
               </div>
               <div class="runwith">
                 <label for="attach-agent">Run it with</label>
@@ -476,7 +479,10 @@
     {/if}
 
     <footer class="foot">
-      <span class="fnote">Knowledge fills as soon as <span class="mono">.living/</span> appears.</span>
+      <span class="fnote"
+        >{#if plugin && footprint(plugin)}Knowledge fills as soon as <span class="mono">{footprint(plugin)}</span> appears.{:else}Knowledge
+          fills once the setup has run.{/if}</span
+      >
       {#if error !== null}<span class="err">{error}</span>{/if}
       <button class="opt quiet" use:focusOnMount onclick={onClose}>Cancel</button>
       <button

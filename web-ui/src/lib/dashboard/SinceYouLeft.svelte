@@ -11,6 +11,7 @@
   import { timelineStore, type SeenMark } from "../workspace/timeline.svelte";
   import TimelineRow from "../workspace/TimelineRow.svelte";
   import { formatClock, formatDuration, sinceYouLeft } from "../workspace/timelineModel";
+  import { knowledgeBadStatus } from "../knowledge/store";
   import type { DashCtx } from "./dash";
 
   interface Props {
@@ -29,7 +30,7 @@
   let { dash, baseline, sessions, names, wsRoot, paneId, ctrl, now }: Props = $props();
 
   const LIMIT = 8;
-  const picked = $derived(sinceYouLeft(timelineStore.entries, baseline?.seq ?? 0, LIMIT));
+  const picked = $derived(sinceYouLeft(timelineStore.entries, baseline?.seq ?? 0, LIMIT, $knowledgeBadStatus));
   const away = $derived(baseline !== null && baseline.ts > 0 ? formatDuration(now - baseline.ts) : null);
 </script>
 

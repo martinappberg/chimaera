@@ -738,12 +738,28 @@ world chimaera-plugin {                    // 0.2
 | `MastermindDock.svelte`, `DashboardView.svelte` | the `agent-notes` id | a panel slot and a surface |
 | `agent_probe.rs` hook trust | uses only the first codex agent plugin | every one the manifest names |
 
-After the Knowledge redesign merged (2026-09-29): `ids_of` reads each entry's `key`
-(no `.living/` paths), core no longer lists `MYCELIUM.md` (guidance is the
-dashboard's `GuidanceRow`, from the snapshot), and `store.ts` picks the provider by
-`provides.knowledge` (`knowledgePlugin`). In P10 so far: the card's tile letters come
-from the plugin's name, and codex hook trust accepts the hooks of every codex plugin
-the manifest names, required or recommended. The other rows are P10's.
+**Status (P10, 2026-09-29).** No core code branches on a plugin's id any more:
+
+- Done by the Knowledge redesign: `ids_of` reads each entry's `key`; guidance is the
+  snapshot's (the dashboard's `GuidanceRow`); `store.ts` picks the provider by
+  `provides.knowledge` (`knowledgePlugin`).
+- Done in P10: `empty_body` is knowledge/1's full documented empty shape (no words,
+  no id shapes); the attach sheet speaks from the manifest (its `summary`, the
+  footprints its `detect` names, a Stop hook described as any Stop hook); the
+  dashboard's empty state names the installed knowledge plugin by its own summary
+  or none (the `agent-notes` check is gone; the Mastermind dock never named it: its
+  inbox is core's `tell_mastermind`); Knowledge shows the provider's `labels.source`,
+  never its id; the Timeline's bad news and status glyph come from the provider's
+  status words' tone (`knowledgeBadStatus`), not from `contradicted` /
+  `preliminary`; tile letters from the name; codex hook trust for every codex plugin
+  named.
+- Left, deliberately (a rewrite, which this phase is not): knowledge/1 itself is
+  Mycelium-shaped where the redesign documented it so (findings under `topics[]`,
+  decisions and learnings keyed by `fp`, the evidence ledger, the handoff's
+  slots), the Timeline's status-change entries compare the normalized `status`,
+  and a few words have no `labels` field yet (to-do status and priority words, the
+  reader's no-span fallback headings). A second knowledge provider is the moment
+  to generalize them, with its snapshot as the test.
 
 ## 13. Host limits, new and old
 
