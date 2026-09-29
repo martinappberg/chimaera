@@ -388,6 +388,95 @@ stay byte-identical where their inputs don't use the new shapes.
 Backlinks are computed in the client from `refs` (no extra wire). Deep
 links (Timeline, dashboard, chat chips) address an entry by `key`.
 
+### Wire spec — what plugin 0.2.0 adds
+
+Exact shapes, additive to 0.1.3. Omitted means absent-when-empty
+(`skip_serializing_if`), so a 0.1.3-shaped input serializes the fields
+0.1.3 did plus only what it newly has. Line numbers are 1-based and
+inclusive; paths workspace-relative.
+
+- **`Span`** = `{path, line, end}` — the entry's heading line to its last
+  line (trailing blank lines excluded). For a to-do table row, `line ==
+  end` (the row).
+- **`Ref`** = `{kind, id}` — `kind` ∈ `finding | decision | convention |
+  learning | todo`; `id` as written (`F-171`, `D-152`, `C-12`, `L-40`,
+  `T-DAChromatin`). An entry never lists its own id; order of first
+  appearance; ≤ 50.
+- **`Cite`** = `{kind, text}` — `kind` ∈ `script` (`.py .R .r .sh .ipynb
+  .smk .nf .jl .pl .rs .ts .js .sql`), `data` (`.h5ad .h5 .tsv .csv .txt.gz
+  .parquet .yaml .yml .json .bed .bam .vcf .gz .rds .loom .zarr .mtx .npz
+  .pkl .xlsx`), `figure` (`.png .pdf .svg .jpg .jpeg`), `doc` (`.md`),
+  `path` (any other `/`-containing path-like token in backticks), `job`
+  (a Slurm job id: digits after `job`/`jobs`/`JobID`, 5–10 digits),
+  `commit` (7–40 hex with a digit and a letter, after
+  `commit`/`sha`/`SHA`/`@`). Found in code spans and plain text;
+  deduplicated; ≤ 30.
+- **`State`** = `{kind, by?}` — `kind` ∈ `superseded | corrected | retracted
+  | suspect | resolved`; `by` the id that did it when known. Only from what
+  the text says: `⛔ SUPERSEDED BY D-125` / `SUPERSEDED by F-177` (in the
+  heading or the entry's first lines) → `superseded`; `RETRACTED` in the
+  heading or a Status → `retracted`; `⚠️ SUSPECT` → `suspect`; the newest
+  follow-up of kind `resolution` → `resolved`; another entry's `amends`
+  of kind `corrects` → `corrected` (inverse, below). An explicit marker on
+  the entry wins over an inverse.
+- **`Amend`** = `{kind, id}` — `kind` ∈ `corrects | supersedes | retracts`,
+  from `This CORRECTS F-171`, `corrects F-171`, `supersedes D-121`,
+  `retracts F-037` (any case, `**`/`.` tolerated). The plugin applies the
+  inverse `State` to the target (`corrects` → `corrected`, `supersedes` →
+  `superseded`, `retracts` → `retracted`, `by` = this entry's id). A target
+  id that names several findings resolves to the one in the same topic,
+  else to none.
+
+Per kind:
+
+| On | Adds |
+|---|---|
+| finding | `key` (`<slug>/<id>`, `~2`, `~3` for a repeat in one file), `stated` (the Status field's text, markdown stripped, verbatim otherwise; `""` when none), `date` (a trailing `(YYYY-MM-DD)` in the heading, else `**Date**:`, else `""`), `span`, `refs`, `cites`, `state?`, `amends?` |
+| addendum | `kind` (`addendum | correction | resolution | update`), `date`, `stated`, `span` |
+| decision | `id` (explicit in the heading — `D-157`, `D1` → `D-1` — else Mycelium's positional `D-<n>` only when no entry in the file has an explicit id, else `""`), `stated`, `span`, `refs`, `cites`, `state?`, `amends?` |
+| learning | `id` (same rule, `L-`), `span`, `refs`, `cites` |
+| todo | `key` (`todo/<id>` or `todo/r<row>` for an id-less table row, `todo/s<n>` for an id-less section), `id` (`#50`, `T-DAChromatin`, or `""`), `title` (the item's first sentence, markdown stripped, ≤ 160 chars), `closed` (bool), `source` (`table | section`), `span`, `refs` |
+| question | `key` (the raising finding's `key`) |
+| left_off | `span` (the chosen handoff, whole file), `sources` (every handoff found, newest first: `{path, written_ms, session_id?, host?}`) |
+| topic | `date` (frontmatter `last_updated`, else `""`) |
+| snapshot | `conventions`, `sessions`, `asks`, `tidy`, `id_shapes`, `labels`; `counts` gains `todos` (open), `questions`, `conventions`, `sessions` |
+
+- **`conventions[]`** = `{key, id, title, status, span, refs, cites}` from
+  `.living/conventions.md` `##` sections (`id` = a leading `C-N`, `title`
+  the rest) and `.living/generated-conventions/*/convention.md`
+  (frontmatter `id`, `title`, `status`); file order, ≤ 400.
+- **`sessions[]`** = `{id, date, branch, duration, files, summary, outputs,
+  status, log}` from `.living/log/LOG_REGISTRY.md` rows (`log` = the Log
+  cell's link, workspace-relative); newest first, ≤ 400.
+- **`asks[]`** = `{text, date, source: {kind, id, key}, span}` — sentences
+  that put something to the user ("put to the user", "for the user",
+  "user decision", "user's call", "PARKED USER DECISION", "not yet
+  decided", "awaiting the user") from the chosen handoff (any date) and
+  from findings and decisions dated within 14 days of the newest dated
+  entry; `text` is the sentence (≤ 300 chars, markdown stripped); newest
+  first, ≤ 20.
+- **`tidy[]`** = `{kind, text, refs, ask}` — factual inconsistencies only,
+  never a status judgment: `duplicate-id` (a finding or explicit decision
+  id naming more than one entry — one row per kind listing them), `off-index`
+  (to-dos kept as sections outside the registry table; entries Mycelium's
+  index can't see, like undated `## D-108`), `handoff-stub` (the shared
+  handoff is the Stop hook's fallback while a hand-written run handoff
+  exists), `duplicate-todo` (two open to-dos with the same title). `ask` is
+  the full request an agent would need, naming files and ids.
+- **`id_shapes[]`** = `{kind, pattern}` — the id shapes this snapshot
+  answers for, as JavaScript-compatible regex sources without anchors:
+  `F-\d{1,4}`, `D-\d{1,4}`, `C-\d{1,3}`, `L-\d{1,4}`, `T-[A-Za-z][A-Za-z0-9]*`.
+- **`labels`** = `{source, sections: {left_off, asks, changed, open_work,
+  findings, decisions, learnings, conventions, todos, sessions, tidy},
+  status_words: [{word, rank, tone}], status_note}` — the plugin's words
+  (principle 10); `rank` 1–3 for the ladder, `0` for none; `tone` ∈
+  `neutral | good | warn | bad`.
+
+The existing fields keep their meaning; values change only where parsing
+improves (more to-dos, real decision dates, the newest handoff).
+`status` stays the Mycelium word the Status starts with, else `unknown` —
+the Timeline's status moves read it; `stated` is what the UI shows.
+
 ## Plugin work — `chimaera-plugin-mycelium` 0.2.0
 
 Parsing that matches what agents write, all with fixtures cut from real
