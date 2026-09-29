@@ -42,7 +42,7 @@ hard-resets and rebuilds.
 | `heightModel.ts` | Content-based height model for unmounted blocks (kind + rendered text length — link targets and markup never show — a settled run of thoughts and tool calls on the one line its fold renders, the live tail's unfolded run a line each, and inline embeds as the cards they render), in relative units the view calibrates against the pages it has measured; `HistoryWeights` keeps incremental prefix sums (rebuilt per epoch/trim/measure) and maps a spacer position back to a block. Own vitest suite. |
 | `ChatHeader.svelte` | The header row: model / mode / effort pickers, usage + `/mcp` entry, the Remote Control chip + popover (state dot, open-on-claude.ai / copy link / on-off; reads `store.remoteControl` + `remoteControlAvailable`, sends `set_remote_control` through the host), session identity (always names which agent — Claude or Codex). |
 | `EffortPopover.svelte` | The reasoning-effort ladder picker (uses the agent-native vocabulary verbatim — never relabel `xhigh`). |
-| `Composer.svelte` / `composer.ts` | Input chrome plus the pure slash-context, argument-completion, and Codex skill-block helpers (covered by `composer.test.ts`). Slash discovery is whitespace-boundary aware; path fragments must stay ordinary text. |
+| `Composer.svelte` / `composer.ts` | Input chrome plus the pure slash-context, argument-completion, and Codex skill-block helpers (covered by `composer.test.ts`). Slash discovery is whitespace-boundary aware; path fragments must stay ordinary text. Enter sends (mid-turn: read at the agent's next step); the after-turn chord calls `onSubmit(…, afterTurn=true)` — see the queued-send invariant below. |
 | `uploadTokens.ts` / `uploadChips.ts` / `ComposerMentions.svelte` | A dropped file's mention reads as its name in the draft, where it was referenced (`@/…/uploads/s-…/plot.png` → `@plot.png`): every text entering the composer (inserts, the loaded draft, a paste) is collapsed, every text leaving it (the send, a copy or cut, the saved draft) expanded, so the agent gets exactly the text a drop always typed; typed and picked mentions are never rewritten. `uploadTokens.ts` is pure (own vitest suite): recognition by text (so undo/redo/paste bring one back), `snapRange`, `keepsTokens` (would an edit glue text onto one?), `settleEdit` (the after-the-fact fix). `uploadChips.ts` is the textarea attachment that makes a short form one unit — caret snapping, arrow/Backspace/Delete over it, a space before text typed or pasted against its end, the gluing space-delete refused — every change through `execCommand` so native undo stays whole (never `execCommand("undo")`: WebKit merges typing runs into one undo group). `ComposerMentions` paints every `@` mention as a pill UNDER the textarea (a mirror that copies the field's computed padding/type and follows its scroll — the textarea keeps glyphs, caret, IME, undo) and shows an upload pill's landed path on hover (hidden while a completion popover is open). |
 | `Markdown.svelte` / `MathText.svelte` / `math.ts` | Render agent prose and plain user-message LaTeX (`$`/`$$` and Codex's `\(`/`\[` forms) as KaTeX MathML under one bounded policy — the policy itself (`mathOptions`/`renderMath`/`safeMathHtml`: KaTeX trust off → DOMPurify, memoized) lives in `../shared/math.ts` (a leaf the markdown file previews load on demand; `math.ts` re-exports it), while the CHAT delimiter dialect (`$` at word boundaries, Codex's `\(`/`\[`) stays here and is deliberately distinct from the previews' comrak-mirroring `previews/mdMath.ts`. **Sanitize untrusted/replayed content** (marked/KaTeX → DOMPurify, KaTeX trust off, `<style>` forbidden, external links `noopener`); Markdown also stamps validated file paths as clickable. **Local images are embeds**: inside this component's sanitize calls only (a flag around `DOMPurify.sanitize`; the hook is global), a schemeless `<img>` src moves to `data-md-embed` before the HTML reaches the DOM (never a request against the app's origin); `upgradeEmbeds` then mounts an EmbedCard (`mountEmbed`) — or, for a document (`artifacts.ts` `embedsAsChip`: markdown unless `#slide=`, docx, pptx), a `ProseChip` in an inline slot — in a slot it builds BESIDE the hidden placeholder — never replacing it, since a top-level node of the settled `{@html}` is what its teardown walks — on the settled render and on each closed segment after its word wrap (the open tail keeps a quiet placeholder box, so a card never churns per chunk). A slot is retired (card destroyed, slot removed) once its placeholder leaves the DOM; stamping, anchors and reveal spans skip `.md-embed`. **Streaming renders incrementally** (see the pipeline section below): closed segments parse once, only the open tail re-renders per chunk, and settle swaps in one canonical full parse. Post-render it also marks overflowing `.md-table` hosts and fence code boxes keyboard-reachable (`shared/scrollRegion.ts` — attribute writes only, never overwriting or stripping what the sanitized content brought; at the idle stamp pass, reveal completion and settle, never the open tail). |
 | `tables.ts` / `markedExtensions.ts` | `tables.ts` hosts every GFM table in a `.md-table` scroll container at render time (why in the HTML string rather than a post-render DOM wrap is in the file); the CSS side is the "Markdown tables" recipe in `web-ui/src/app.css` (shared with the file preview's reading view and the live editor's table widget: scroller, rhythm, borders, alignment, numerals, and hosted cells keeping whole tokens — chat overrides three `--md-table-*` spacing tokens on its root), and chat's one delta — headers stay one line; a raw-HTML `<table>` has no host, so it keeps the root's squeeze-to-fit wrapping — lives in `Markdown.svelte`. The host emits no `tabindex`: whether it overflows is only known after layout, so `Markdown.svelte` marks it post-render. `markedExtensions.ts` is the ONE list of chat marked extensions, consumed by the component and by the parity pins in `streamSegments.test.ts`. Own pin: `tables.test.ts`. |
@@ -185,23 +185,28 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
 - **Never lose a user action to a closed socket.** `socket.send` returns `false`
   when not OPEN — respect it (the composer keeps the draft; `store.connected`
   tracks liveness). Reconnect replays the gap; don't invent a client-side queue.
-- **A queued send is NOT a transcript block.** Queued/undelivered user messages
-  live in `store.pendingSends` (rendered at the scrollable transcript tail), never
-  in `blocks` — so a mid-turn send can't splice into a running turn's output or
-  crowd the fixed composer. The reducer moves
-  an entry into `blocks` (appended at the end) only when `user_message_update`
-  resolves it `sent`; `cancelled` removes it; `dropped` marks it "not delivered"
-  and it stays in the stack until dismissed. A **Stop never drops the queue** —
-  the driver aborts only the current turn and the held messages resolve `sent`
-  right after, so `dropped` means genuinely undeliverable (agent died). The ✕ on
-  any pending bubble rides `socket.send({type:"cancel_queued", id})`: it pulls
-  back a queued send, dismisses a dropped one (the driver's tombstone
-  `Cancelled` makes that survive replay), and no-ops for one already delivered.
-  Codex rows additionally expose `socket.send({type:"steer_queued", id})`:
-  that removes only the selected FIFO entry and maps it to `turn/steer`; plain
-  Enter remains queue-for-next-turn.
-  All pure reducer, so replay rebuilds the identical order — see
-  `store.svelte.test.ts`.
+- **A queued send is NOT a transcript block until the agent reads it.**
+  A mid-turn send (plain Enter) is read at the agent's NEXT STEP — between tool
+  calls, both agents; until then it lives in `store.pendingSends` (a faded
+  bubble at the scrollable transcript tail), never in `blocks`, so it can't
+  splice output already rendered or crowd the fixed composer. The reducer
+  appends it to `blocks` at the current end only when `user_message_update`
+  resolves it `sent` — possibly mid-turn, which is where the agent read it
+  (several waiting messages are read together; such a block is `midTurn`, and
+  the turn-end artifact scan looks past it to the turn's real opener); `cancelled` removes it;
+  `dropped` marks it "not delivered" until dismissed. `send_after_turn` (the
+  composer's ⌥↩ / Alt+Enter, yielding to any app action the user binds to the
+  same keys — ⇧⌘↩ is Zoom Pane) holds a message until the turn ends: its echo carries `after_turn`, kept as `afterTurn` (caption "after
+  this turn" vs "next step"). Every waiting bubble offers **Send now**
+  (`{type:"send_now", id}`: the daemon interrupts the turn and every waiting
+  message is read at once) and ✕ (`{type:"cancel_queued", id}`: pulls back a
+  waiting send, dismisses a dropped one — the driver's tombstone `Cancelled`
+  survives replay — and no-ops, or answers a Notice, once read). A **Stop
+  never drops the queue** — the driver aborts only the turn and the waiting
+  messages resolve `sent` right after, so `dropped` means genuinely
+  undeliverable (agent died). `steer_queued` is wire-only for old clients;
+  the UI never sends it. All pure reducer, so replay rebuilds the identical
+  order — see `store.svelte.test.ts`.
 - **The seq contract is the daemon's.** Trust `lastSeq`/`head` from the wire; do
   not renumber. A gap is healed by reconnect replay, not by client bookkeeping.
 - **Inactive UI is not an inactive agent.** A hidden retained chat freezes its

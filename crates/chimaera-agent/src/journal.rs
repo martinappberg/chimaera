@@ -1129,6 +1129,7 @@ mod tests {
                 attachment_paths: Vec::new(),
                 id: None,
                 queued: false,
+                after_turn: false,
                 origin: None,
             },
             AgentEvent::TurnStarted {

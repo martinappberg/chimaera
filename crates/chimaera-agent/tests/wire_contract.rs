@@ -11,8 +11,9 @@
 
 use chimaera_agent::journal::SeqEvent;
 use chimaera_agent::model::{
-    AgentCommand, AgentEvent, CompactionPhase, PermissionOption, PermissionOptionKind, Question,
-    RemoteControlSnapshot, RemoteControlState, ToolKind, ToolStatus, UserMessageState,
+    AgentCommand, AgentEvent, CompactionPhase, ContentBlock, PermissionOption,
+    PermissionOptionKind, Question, RemoteControlSnapshot, RemoteControlState, ToolKind,
+    ToolStatus, UserMessageState,
 };
 use serde_json::json;
 
@@ -104,6 +105,7 @@ fn user_message_delivery_fields_are_additive() {
             attachment_paths: Vec::new(),
             id: None,
             queued: false,
+            after_turn: false,
             origin: None,
         })
         .unwrap(),
@@ -116,10 +118,26 @@ fn user_message_delivery_fields_are_additive() {
             attachment_paths: Vec::new(),
             id: Some("u1".into()),
             queued: true,
+            after_turn: false,
             origin: None,
         })
         .unwrap(),
         json!({ "type": "user_message", "text": "hi", "id": "u1", "queued": true })
+    );
+    // A message held for after the turn says so; false never serializes.
+    assert_eq!(
+        serde_json::to_value(AgentEvent::UserMessage {
+            text: "hi".into(),
+            attachments: 0,
+            attachment_paths: Vec::new(),
+            id: Some("u1".into()),
+            queued: true,
+            after_turn: true,
+            origin: None,
+        })
+        .unwrap(),
+        json!({ "type": "user_message", "text": "hi", "id": "u1", "queued": true,
+                "after_turn": true })
     );
     // An old journal line (no id/queued) still parses.
     let old: AgentEvent =
@@ -132,6 +150,7 @@ fn user_message_delivery_fields_are_additive() {
             attachment_paths: Vec::new(),
             id: None,
             queued: false,
+            after_turn: false,
             origin: None,
         }
     );
@@ -271,6 +290,33 @@ fn steer_queued_command_is_additive() {
 
 /// `interrupted` is additive the same way: false vanishes from the wire, old
 /// lines deserialize false, and only a deliberate user stop sets it.
+/// `send_after_turn` and `send_now` are appended commands: their frames
+/// round-trip, and a plain `send` keeps its exact shape.
+#[test]
+fn send_after_turn_and_send_now_commands_are_additive() {
+    let cmd: AgentCommand =
+        serde_json::from_str(r#"{"type":"send_after_turn","blocks":[{"type":"text","text":"x"}]}"#)
+            .unwrap();
+    assert_eq!(
+        cmd,
+        AgentCommand::SendAfterTurn {
+            blocks: vec![ContentBlock::Text { text: "x".into() }],
+        }
+    );
+    assert_eq!(cmd.send_blocks().map(Vec::len), Some(1));
+    assert!(cmd.retained_send_bytes().is_some(), "held like any send");
+    let cmd: AgentCommand = serde_json::from_str(r#"{"type":"send_now","id":"u1"}"#).unwrap();
+    assert_eq!(cmd, AgentCommand::SendNow { id: "u1".into() });
+    assert_eq!(
+        serde_json::to_value(&cmd).unwrap(),
+        json!({ "type": "send_now", "id": "u1" })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentCommand::Send { blocks: Vec::new() }).unwrap(),
+        json!({ "type": "send", "blocks": [] })
+    );
+}
+
 #[test]
 fn turn_aborted_interrupted_flag_is_additive() {
     assert_eq!(
@@ -574,6 +620,7 @@ fn remote_control_wire_shapes_are_additive() {
             attachment_paths: Vec::new(),
             id: None,
             queued: false,
+            after_turn: false,
             origin: Some("remote".into()),
         })
         .unwrap(),

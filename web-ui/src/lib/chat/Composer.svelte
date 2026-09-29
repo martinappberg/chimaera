@@ -22,6 +22,7 @@
   import { getSetting, setSetting } from "../settings/store.svelte";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
   import { keyHintSuffix, matchAction } from "../shared/keybindings";
+  import { displayChord, matchChord, type ParsedChord } from "../shared/keys";
   import { Dictation, dictationParts, hostCanDictate, joinParts } from "./voice.svelte";
   import { CaptureError, listMicrophones } from "./voiceCapture";
   import VoiceMeter from "./VoiceMeter.svelte";
@@ -65,8 +66,10 @@
      *  mounted, but invisible running chrome must stay still. */
     visible?: boolean;
     /** Returns whether the message was accepted (false during reconnect, so
-     *  the composer keeps the draft instead of losing it). */
-    onSubmit(text: string, images: ImageAttachment[]): boolean;
+     *  the composer keeps the draft instead of losing it). `afterTurn`: the
+     *  after-this-turn chord sent it — hold it until the running turn ends
+     *  rather than have the agent read it at its next step. */
+    onSubmit(text: string, images: ImageAttachment[], afterTurn?: boolean): boolean;
     onInterrupt(): void;
     /** Shift+Tab: advance to the next permission mode (agent-TUI parity). */
     onCycleMode(): void;
@@ -420,13 +423,14 @@
     else caret = position;
   }
 
-  /** Stop and keep the words — then send, for Enter. */
-  async function finishDictation(send: boolean) {
+  /** Stop and keep the words — then send, for Enter (or the after-turn
+   *  chord, which keeps its meaning through the stop). */
+  async function finishDictation(send: boolean, afterTurn = false) {
     const text = await dictation.finish();
     settleDictation();
     if (send && text !== null && text.length > 0) {
       await tick();
-      submit();
+      submit(afterTurn);
     }
   }
 
@@ -456,7 +460,9 @@
     }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      if (dictation.state !== "finishing") void finishDictation(true);
+      // The after-turn chord keeps its meaning through the stop.
+      const afterTurn = matchChord(e, AFTER_TURN_CHORD) !== null && matchAction(e) === null;
+      if (dictation.state !== "finishing") void finishDictation(true, afterTurn);
       return true;
     }
     return false;
@@ -706,11 +712,11 @@
     if (el !== null) caret = el.selectionStart;
   }
 
-  function submit() {
+  function submit(afterTurn = false) {
     // The send button mid-dictation means "stop and send": the words settle
     // first (finishDictation then calls back here).
     if (dictating !== null) {
-      if (dictation.state !== "finishing") void finishDictation(true);
+      if (dictation.state !== "finishing") void finishDictation(true, afterTurn);
       return;
     }
     const text = expandUploadMentions(draft, uploadTokens).trim();
@@ -728,11 +734,38 @@
     // Only clear the draft if the send was actually accepted — during a
     // reconnect window the socket is not OPEN and the message would otherwise
     // vanish silently.
-    if (onSubmit(text, images)) {
+    if (onSubmit(text, images, afterTurn)) {
       clearSubmittedDraft();
       images = [];
     }
   }
+
+  // Send after this turn: ⌥↩ / Alt+Enter — concrete modifiers, not the
+  // rebindable `Mod` (the Codex desktop app's ⇧⌘↩ is Zoom Pane here). No
+  // default action uses it under any base modifier; one the user binds to
+  // it wins (App's capture-phase handler takes it first), and then the
+  // chord is neither matched nor advertised.
+  const AFTER_TURN_KEYS = "Alt+Enter";
+  const AFTER_TURN_CHORD: ParsedChord = {
+    meta: false,
+    ctrl: false,
+    alt: true,
+    shift: false,
+    key: "Enter",
+  };
+  /** The chord's label while it is ours ("" while an app action owns it).
+   *  matchAction reads the live keys.* settings, so a rebind updates it. */
+  const afterTurnHint = $derived(
+    matchAction(
+      new KeyboardEvent("keydown", {
+        key: "Enter",
+        code: "Enter",
+        altKey: AFTER_TURN_CHORD.alt,
+      }),
+    ) === null
+      ? displayChord(AFTER_TURN_KEYS, "auto")
+      : "",
+  );
 
   function onKeydown(e: KeyboardEvent) {
     // IME composition: Enter/arrows select a conversion candidate, not a chat
@@ -787,6 +820,13 @@
     if (e.key === "Tab" && e.shiftKey) {
       e.preventDefault();
       onCycleMode();
+      return;
+    }
+    // Also only reached with no popover open — there Enter, with or without
+    // modifiers, accepts a completion.
+    if (matchChord(e, AFTER_TURN_CHORD) !== null && matchAction(e) === null) {
+      e.preventDefault();
+      submit(true);
       return;
     }
     if (e.key === "Enter" && !e.shiftKey) {
@@ -944,7 +984,9 @@
             ? "Starting the mic…"
             : "Listening…"
           : running
-            ? "queue a follow-up for the next run (Esc to stop)"
+            ? afterTurnHint !== ""
+              ? `add to this turn… (${afterTurnHint} after it ends · Esc to stop)`
+              : "add to this turn… (Esc to stop)"
             : "message the agent… (Enter to send · / commands · @ files)"}
       rows={1}
       {disabled}
@@ -1021,7 +1063,7 @@
           title="send message (Enter)"
           disabled={draft.trim().length === 0 && images.length === 0}
           onmousedown={(e) => e.preventDefault()}
-          onclick={submit}
+          onclick={() => submit()}
         >
           <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
             <path

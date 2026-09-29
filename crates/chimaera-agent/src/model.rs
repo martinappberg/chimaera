@@ -215,11 +215,17 @@ pub enum AgentEvent {
         /// Absent on pre-upgrade journals and transcript-seeded messages.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
-        /// The agent has NOT consumed this message yet (both drivers hold
-        /// mid-turn follow-ups; codex can explicitly promote one via Steer).
-        /// Resolved by a `UserMessageUpdate`; default false = delivered.
+        /// The agent has NOT read this message yet: it was sent while a turn
+        /// was running and waits for the agent's next step (or, with
+        /// `after_turn`, for the turn to end). Resolved by a
+        /// `UserMessageUpdate`; default false = delivered.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         queued: bool,
+        /// A queued message the user asked to hold until the running turn
+        /// ends (`SendAfterTurn`), rather than have the agent read at its
+        /// next step. Only meaningful with `queued`. Additive.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        after_turn: bool,
         /// Where a message the user did NOT type in this workbench came from:
         /// `"remote"` = a Remote Control client (phone / claude.ai) injected
         /// it through the agent's own bridge, so it never crossed chimaera's
@@ -701,8 +707,9 @@ pub struct BackgroundTaskClose {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UserMessageState {
-    /// The agent consumed it (claude flushed it after the current turn; codex
-    /// opened its queued turn or steered it).
+    /// The agent read it: it joined the running turn at a step boundary, or
+    /// opened the next turn (claude: the CLI's `command_lifecycle` `started`;
+    /// codex: the steered `userMessage` item, or the turn it opened).
     Sent,
     /// The agent never saw it (the driver died with a held queue, or a codex
     /// steer failed for good).
@@ -806,13 +813,14 @@ pub enum AgentCommand {
     ReconnectMcp {
         server: String,
     },
-    /// Pull back a still-queued user message before the agent consumes it
+    /// Pull back a still-queued user message before the agent reads it
     /// (`id` = the queued `UserMessage.id`). Honored only while the message is
-    /// genuinely queued: both drivers remove it from their held FIFO and emit
-    /// `UserMessageUpdate{Cancelled}`. Once the
-    /// agent has already taken the message, the driver answers with a `Notice`
-    /// instead (it can't be un-said). APPENDED last: strictly additive, so a
-    /// pre-upgrade client that never sends it is unaffected.
+    /// genuinely waiting: claude withdraws it from the CLI's queue
+    /// (`cancel_async_message`), codex removes it from its next-run FIFO, and
+    /// both emit `UserMessageUpdate{Cancelled}`. A message the agent already
+    /// holds for its next step (a codex steer) or has read can't be un-said:
+    /// the driver answers with a `Notice` instead. APPENDED last: strictly
+    /// additive, so a pre-upgrade client that never sends it is unaffected.
     CancelQueued {
         id: String,
     },
@@ -820,7 +828,9 @@ pub enum AgentCommand {
     /// The Codex driver maps this to `turn/steer`; if the run ended before
     /// the command arrived, the selected message opens the next turn instead.
     /// Claude has no separate queue-vs-steer control and ignores this command.
-    /// APPENDED last so existing command tags and clients remain untouched.
+    /// Kept for older clients: the UI now offers `SendNow`, and a plain mid-
+    /// turn `Send` already steers. APPENDED last so existing command tags and
+    /// clients remain untouched.
     SteerQueued {
         id: String,
     },
@@ -834,6 +844,20 @@ pub enum AgentCommand {
         enabled: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+    },
+    /// `Send`, but held until the running turn ends instead of being read at
+    /// the agent's next step (claude: `priority:"later"`; codex: the
+    /// next-run FIFO). Idle, it is an ordinary send. APPENDED last: additive.
+    SendAfterTurn {
+        blocks: Vec<ContentBlock>,
+    },
+    /// Deliver a queued message now (`id` = its `UserMessage.id`): end the
+    /// running turn so it — and every other message still waiting — is read
+    /// at once. Both drivers interrupt the turn; the waiting messages then
+    /// open the next turn together. A no-op once the message was read.
+    /// APPENDED last: additive.
+    SendNow {
+        id: String,
     },
 }
 
@@ -876,7 +900,7 @@ impl AgentCommand {
     /// callers such as the workspace Mastermind MCP.
     pub fn validate_ingress(&self) -> Result<(), CommandValidationError> {
         match self {
-            Self::Send { blocks } => {
+            Self::Send { blocks } | Self::SendAfterTurn { blocks } => {
                 check_command_len("send blocks", blocks.len(), COMMAND_BLOCKS_MAX)?;
                 let mut images = 0usize;
                 let mut skills = 0usize;
@@ -988,7 +1012,7 @@ impl AgentCommand {
             Self::SetMcpEnabled { server, .. } | Self::ReconnectMcp { server } => {
                 check_command_len("MCP server", server.len(), COMMAND_MCP_SERVER_MAX)?;
             }
-            Self::CancelQueued { id } | Self::SteerQueued { id } => {
+            Self::CancelQueued { id } | Self::SteerQueued { id } | Self::SendNow { id } => {
                 check_command_len("queued message id", id.len(), COMMAND_ID_MAX)?;
             }
             Self::SetRemoteControl { name, .. } => {
@@ -1006,14 +1030,27 @@ impl AgentCommand {
         Ok(())
     }
 
+    /// The content of a send, whichever way it is delivered.
+    pub fn send_blocks(&self) -> Option<&Vec<ContentBlock>> {
+        match self {
+            Self::Send { blocks } | Self::SendAfterTurn { blocks } => Some(blocks),
+            _ => None,
+        }
+    }
+
+    /// [`Self::send_blocks`], mutably (the daemon saves image copies into it).
+    pub fn send_blocks_mut(&mut self) -> Option<&mut Vec<ContentBlock>> {
+        match self {
+            Self::Send { blocks } | Self::SendAfterTurn { blocks } => Some(blocks),
+            _ => None,
+        }
+    }
+
     /// Heap bytes this command can leave resident while waiting for the agent
     /// to consume it. Only sends retain bulk payloads; the other variants are
     /// independently leaf-capped and live only in the bounded command channel.
     pub fn retained_send_bytes(&self) -> Option<usize> {
-        let blocks = match self {
-            Self::Send { blocks } => blocks,
-            _ => return None,
-        };
+        let blocks = self.send_blocks()?;
         let mut bytes = std::mem::size_of_val(blocks.as_slice());
         for block in blocks {
             bytes = bytes.saturating_add(match block {
@@ -1741,6 +1778,7 @@ mod tests {
             attachment_paths: vec!["/u/image-1.png".into()],
             id: None,
             queued: false,
+            after_turn: false,
             origin: None,
         };
         let json = serde_json::to_value(&with).unwrap();
