@@ -1,7 +1,8 @@
 #![cfg(feature = "fixtures")]
 //! The refresh contract against the account service's real answers: 400
-//! `invalid_grant` for revoked/expired/replayed tokens, transient failures
-//! retried once with the same token, and keeper refusals never rotating a
+//! `invalid_grant` for revoked/expired/replayed tokens (a rotated token is
+//! consumed on receipt), transient failures that keep the session without
+//! presenting the token again at once, and keeper refusals never rotating a
 //! token the account still accepts.
 use axum::{
     extract::State,
@@ -13,13 +14,18 @@ use axum::{
 use chimaera_link::{AuthorizationRevoked, Client, Tokens};
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
+    net::SocketAddr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
 };
-use tokio::net::TcpListener;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 
 #[derive(Default)]
 struct Account {
@@ -27,6 +33,8 @@ struct Account {
     /// Scripted refresh statuses, consumed in order; then success.
     refresh_script: Mutex<Vec<u16>>,
     refresh_tokens_seen: Mutex<Vec<String>>,
+    /// Refresh tokens already rotated; presenting one again is theft.
+    consumed: Mutex<HashSet<String>>,
     refreshes: AtomicUsize,
     /// Whether the account itself still accepts the current access token.
     account_accepts: std::sync::atomic::AtomicBool,
@@ -41,24 +49,34 @@ fn tokens(prefix: &str) -> Tokens {
     }
 }
 
+fn invalid_grant() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error":"invalid_grant"})),
+    )
+        .into_response()
+}
+
 async fn refresh(State(state): State<Arc<Account>>, Json(body): Json<Value>) -> Response {
     state.refreshes.fetch_add(1, Ordering::SeqCst);
+    let presented = body["refresh_token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     state
         .refresh_tokens_seen
         .lock()
         .unwrap()
-        .push(body["refresh_token"].as_str().unwrap_or_default().into());
+        .push(presented.clone());
     let scripted = {
         let mut script = state.refresh_script.lock().unwrap();
         (!script.is_empty()).then(|| script.remove(0))
     };
     match scripted {
-        Some(400) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":"invalid_grant"})),
-        )
-            .into_response(),
+        Some(400) => invalid_grant(),
         Some(status) => StatusCode::from_u16(status).unwrap().into_response(),
+        // Rotation commits on receipt, before the reply is written.
+        None if !state.consumed.lock().unwrap().insert(presented) => invalid_grant(),
         None => Json(tokens("after")).into_response(),
     }
 }
@@ -94,9 +112,19 @@ async fn events() -> StatusCode {
 }
 
 async fn start(initial: Tokens) -> (Client, Arc<Account>, tokio::task::JoinHandle<()>) {
+    let (account, state, server) = serve_account().await;
+    (
+        Client::new(&format!("http://{account}"), Some(initial)).unwrap(),
+        state,
+        server,
+    )
+}
+
+async fn serve_account() -> (SocketAddr, Arc<Account>, tokio::task::JoinHandle<()>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let address = listener.local_addr().unwrap();
+    let endpoint = format!("http://{address}");
     let state = Arc::new(Account::default());
     *state.endpoint.lock().unwrap() = endpoint.clone();
     let router = Router::new()
@@ -106,11 +134,54 @@ async fn start(initial: Tokens) -> (Client, Arc<Account>, tokio::task::JoinHandl
         .route("/v1/events", get(events))
         .with_state(state.clone());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    (
-        Client::new(&endpoint, Some(initial)).unwrap(),
-        state,
-        server,
-    )
+    (address, state, server)
+}
+
+/// Relays to the account, but the first refresh loses its reply after the
+/// account committed the rotation: the connection drops once the answer
+/// arrives, exactly like a timeout or a network change mid-request.
+async fn lossy_proxy(upstream: SocketAddr) -> (String, tokio::task::JoinHandle<()>) {
+    const REFRESH: &[u8] = b"POST /v1/oauth/refresh";
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let lost = Arc::new(AtomicBool::new(false));
+    let task = tokio::spawn(async move {
+        while let Ok((mut device, _)) = listener.accept().await {
+            let lost = lost.clone();
+            tokio::spawn(async move {
+                let Ok(mut account) = TcpStream::connect(upstream).await else {
+                    return;
+                };
+                let (mut up, mut down) = ([0_u8; 16 * 1024], [0_u8; 16 * 1024]);
+                let mut lose = false;
+                loop {
+                    tokio::select! {
+                        read = device.read(&mut up) => {
+                            let Ok(n @ 1..) = read else { return };
+                            if up[..n].windows(REFRESH.len()).any(|w| w == REFRESH)
+                                && !lost.swap(true, Ordering::SeqCst)
+                            {
+                                lose = true;
+                            }
+                            if account.write_all(&up[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                        read = account.read(&mut down) => {
+                            let Ok(n @ 1..) = read else { return };
+                            if lose {
+                                return;
+                            }
+                            if device.write_all(&down[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (endpoint, task)
 }
 
 #[tokio::test]
@@ -134,11 +205,14 @@ async fn invalid_grant_clears_credentials_and_publishes_sign_out() {
 }
 
 #[tokio::test]
-async fn transient_refresh_failure_retries_once_with_the_same_token() {
+async fn an_answered_failure_keeps_the_session_for_a_later_refresh() {
     let (client, account, server) = start(tokens("before")).await;
     account.refresh_script.lock().unwrap().push(503);
+    let error = client.me().await.unwrap_err();
+    assert!(!error.is::<AuthorizationRevoked>(), "{error:#}");
+    // The account answered, so it may have rotated: no immediate replay.
+    assert_eq!(account.refreshes.load(Ordering::SeqCst), 1);
     client.me().await.unwrap();
-    assert_eq!(account.refreshes.load(Ordering::SeqCst), 2);
     assert_eq!(
         *account.refresh_tokens_seen.lock().unwrap(),
         vec!["before-refresh".to_string(), "before-refresh".to_string()]
@@ -151,21 +225,42 @@ async fn transient_refresh_failure_retries_once_with_the_same_token() {
 }
 
 #[tokio::test]
-async fn persistent_outage_and_rate_limits_keep_the_session() {
-    for script in [vec![503, 502], vec![429], vec![408, 500]] {
+async fn outages_deploys_and_rate_limits_keep_the_session() {
+    for status in [500, 502, 503, 504, 404, 408, 429] {
         let (client, account, server) = start(tokens("before")).await;
-        let attempts = script.len();
-        *account.refresh_script.lock().unwrap() = script;
+        account.refresh_script.lock().unwrap().push(status);
         let error = client.me().await.unwrap_err();
-        assert!(!error.is::<AuthorizationRevoked>(), "{error:#}");
+        assert!(!error.is::<AuthorizationRevoked>(), "{status}: {error:#}");
         assert_eq!(
             client.tokens().await.unwrap().refresh_token,
             "before-refresh",
-            "a transient failure never signs out"
+            "{status} never signs out"
         );
-        assert_eq!(account.refreshes.load(Ordering::SeqCst), attempts);
+        assert_eq!(account.refreshes.load(Ordering::SeqCst), 1, "{status}");
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn a_refresh_whose_reply_is_lost_is_not_replayed() {
+    let (upstream, account, server) = serve_account().await;
+    let (endpoint, proxy) = lossy_proxy(upstream).await;
+    let client = Client::new(&endpoint, Some(tokens("before"))).unwrap();
+    let updates = client.token_updates();
+    let error = client.me().await.unwrap_err();
+    assert!(!error.is::<AuthorizationRevoked>(), "{error:#}");
+    // The account rotated on receipt; presenting the old token again would
+    // read as theft and revoke this device.
+    assert_eq!(account.refreshes.load(Ordering::SeqCst), 1);
+    assert!(account.consumed.lock().unwrap().contains("before-refresh"));
+    assert_eq!(
+        client.tokens().await.unwrap().refresh_token,
+        "before-refresh",
+        "an unknown outcome is not a sign-out"
+    );
+    assert!(!updates.has_changed().unwrap());
+    proxy.abort();
+    server.abort();
 }
 
 #[tokio::test]

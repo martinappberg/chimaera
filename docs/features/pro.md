@@ -380,9 +380,12 @@ windows of any width keep full control, and free users never see this toolbar.
   explains how to check the credential store and retry; an unsaved session may
   require sign-in again after restarting. The account answers a revoked, expired
   or replayed refresh token with `400 invalid_grant`; the app treats that, and
-  any other refresh refusal except a timeout or rate limit, as the end of the
-  sign-in and never presents that token again. A network failure retries the
-  refresh once with the same token and keeps the session. Daemon bearer tokens
+  any other refresh refusal except a missing route (404, as during a deploy), a
+  timeout or a rate limit, as the end of the sign-in and never presents that
+  token again. Those, server errors and network failures keep the session. Only
+  a connection that never reached the account retries at once with the same
+  token; after a timeout or a lost reply the account may already have rotated
+  it, so the app waits for the next refused request instead. Daemon bearer tokens
   remain in memory and do not enter `hosts.json`.
 - SSH never hangs on Pro: a saved SSH host connects directly while Pro starts
   (a kept host waits at most 10 seconds first, so the usual Pro route needs no

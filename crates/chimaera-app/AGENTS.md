@@ -48,7 +48,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `shell/pro/machine.rs` | Friendly device label from macOS ComputerName; never an identity or network-hostname grouping key. |
 | `shell/pro/store.rs` | Credential namespace keys: isolated previews bind session entries to their canonical config directory; legacy unbound entries are never imported or deleted. |
 | `shell/pro/recovery.rs` | Generation-fenced startup candidate retention and coalesced retry ownership; account probe failures do not force new authentication. |
-| `shell/pro/credentials.rs` | Coalesced, generation-fenced credential-store writes with finite retries; persistence failures retain valid memory sessions, and only true revocation (the link's `AuthorizationRevoked`: any refresh 4xx except 408/429) signs out. |
+| `shell/pro/credentials.rs` | Coalesced, generation-fenced credential-store writes with finite retries; persistence failures retain valid memory sessions, and only true revocation (the link's `AuthorizationRevoked`: any refresh 4xx except 404/408/429) signs out. |
 | `shell/pro/auth.rs` | In-memory sign-in attempt lifecycle, cancellation/retry fences and bounded loopback callback parsing. |
 | `assets/sign-in.html` | Credential-free browser return page; success is sent only after native account activation. |
 | `shell/tunnel.rs` | App-only SSH / keeper transport wrapper. Both expose one loopback daemon endpoint; keep chimaera-link out of the daemon dependency graph. |

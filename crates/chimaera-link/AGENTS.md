@@ -29,11 +29,14 @@ Invariants:
   Today neither the account service nor the worker supervisor uses this
   surface (the supervisor configures `configure/execution` with an unbound
   worker grant); treat it as a dormant contract, not the worker path.
-- Refresh: every 4xx from `/v1/oauth/refresh` except 408/429 is final
+- Refresh: every 4xx from `/v1/oauth/refresh` except 404/408/429 is final
   (`AuthorizationRevoked`, credentials cleared, `None` published); the service
   answers `400 invalid_grant` and treats reuse of a rotated token as theft.
-  Transport errors, 408 and 5xx retry once with the same token. A keeper 401
-  rotates only after the account itself rejects the access token.
+  Only a connection never established (`reqwest::Error::is_connect`) retries
+  once with the same token; a timeout, a reply lost after sending, 404, 408,
+  429 and 5xx keep the session without presenting the token again in that
+  operation (the account may already have rotated it). A keeper 401 rotates
+  only after the account itself rejects the access token.
 - Service responses evolve additively: no `deny_unknown_fields` on
   service-originated types, `#[serde(other)] Unknown` on service enums, unknown
   host kinds/events/serve messages ignored. Daemon acknowledgments stay exact.

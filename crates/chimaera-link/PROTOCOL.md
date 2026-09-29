@@ -212,13 +212,21 @@ keychain pair and terminates events, tunnels and reverse serve.
 Refresh failures (RFC 6749 §5.2): an unknown, expired, revoked or already-used
 refresh token returns `400 {"error":"invalid_grant"}`. The account treats reuse
 of a rotated token as theft (it revokes the device), so a client must never
-present that token again. Clients therefore treat **every 4xx except 408 and 429**
-as final: clear the pair, publish sign-out, stop background work and ask for a
-new sign-in. A transport error, `408` or `5xx` is retried **once with the same
-token** after a short pause (a response lost after the account committed the
-rotation needs a service-side reuse grace to heal); a second failure, or `429`,
-keeps the session and reports a transient error. The typed client error is
-`AuthorizationRevoked`.
+present that token again. Clients therefore treat **every 4xx except 404, 408
+and 429** as final: clear the pair, publish sign-out, stop background work and
+ask for a new sign-in. The typed client error is `AuthorizationRevoked`.
+
+Everything else keeps the session and reports a transient error: `404` (a
+missing route during a deploy), `408`, `429`, any `5xx`, a timeout, a
+connection lost after sending and an unreadable success body. The account may
+already have committed the rotation in any of these, so the client does not
+present the token again within that operation; the next refresh happens only
+when a later request is refused. The one immediate retry with the **same
+token** (after a short pause) is a connection that was never established (DNS,
+TCP or TLS), which provably never reached the account. The refresh request
+allows 45 seconds, longer than an ordinary request, so a slow but successful
+rotation is still received. A reply lost after a committed rotation leaves the
+client holding a consumed token; healing that needs a service-side reuse grace.
 
 ### CLI device sign-in
 
