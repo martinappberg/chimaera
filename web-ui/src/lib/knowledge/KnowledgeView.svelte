@@ -399,10 +399,10 @@
             <span class="count mono hot">{k.tidy.length}</span>
           </button>
         {/if}
-        {#if !narrow && labels.status_note}
+        {#if !narrow}
           <div class="legend">
             <div class="lh">Status</div>
-            <p>{labels.status_note} Shown as written — Chimaera never rates.</p>
+            <p>{labels.status_note || "A status is shown as it was written; Chimaera never rates."}</p>
           </div>
         {/if}
       </nav>

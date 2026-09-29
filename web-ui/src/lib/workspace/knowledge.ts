@@ -202,6 +202,7 @@ export interface Convention {
   id: string;
   title: string;
   status: string;
+  date: string;
   span: Span | null;
   refs: Ref[];
   cites: Cite[];
@@ -557,6 +558,7 @@ export function normalizeKnowledge(raw: unknown): Knowledge {
     id: str(c.id),
     title: str(c.title),
     status: str(c.status),
+    date: str(c.date),
     span: span(c.span),
     refs: refs(c.refs),
     cites: cites(c.cites),

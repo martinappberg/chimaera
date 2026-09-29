@@ -151,6 +151,15 @@
   const bodyless = $derived(e.span === null && (fallback.trim() === "" || fallback.trim() === e.title.trim()));
 
   const crumb = $derived(e.kind === "finding" ? e.topic : word(e.kind));
+  /** The note beside a status: the provider's first sentence (the legend
+   *  carries all of it). */
+  const shortNote = $derived(labels.status_note.match(/^[^.!?]*[.!?]/)?.[0] ?? labels.status_note);
+  /** A follow-up written inside the finding's own lines is already in its
+   *  body: listed, not drawn twice. */
+  function insideEntry(sp: { path: string; line: number; end_line: number } | null): boolean {
+    const own = e.span;
+    return sp !== null && own !== null && sp.path === own.path && sp.line >= own.line && sp.end_line <= own.end_line;
+  }
 </script>
 
 <article class="reader" aria-label="{word(e.kind)} {shownId}">
@@ -236,7 +245,7 @@
       <h3>Status</h3>
       <div class="status">
         <StatusMark stated={e.stated} {labels} />
-        <span class="note">{labels.status_note}</span>
+        {#if shortNote}<span class="note">{shortNote}</span>{/if}
       </div>
       {#if e.finding !== undefined && e.finding.ledger.length > 0}
         <div class="ledger" title="Evidence ledger rows, as recorded">
@@ -340,6 +349,7 @@
                 <button class="link small" onclick={() => onOpenFile(sp.path, sp.line, sp.end_line)}>line {sp.line} ↗</button>
               {/if}
             </div>
+            {#if !insideEntry(a.span)}
             {#key e.ekey + ":" + i}
               <EntryBody
                 span={a.span}
@@ -352,6 +362,7 @@
                 owner={k}
               />
             {/key}
+            {/if}
           </div>
         {/each}
       </div>
