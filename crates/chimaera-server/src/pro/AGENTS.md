@@ -166,8 +166,10 @@ folder; webview arguments contain only a workspace ID. A fresh folder must
 already exist, be writable and empty, and lie outside another project/repository.
 The selection is checked before cloud hand-back and immediately before install.
 Recorded directory identity prevents missing/replaced folders from being silently
-recreated. The local configure request accepts additive `account_id`; personal
-devices supply it and worker callers may omit it. Each new adoption binds its
+recreated. The local configure request carries `account_id`: it is required
+whenever execution is negotiated (every current device and worker
+configuration, `execution::validate_configuration`); only a legacy v1 configure
+may omit it. Each new adoption binds its
 folder to the account endpoint and account ID, so signing into another account
 cannot reuse a colliding project's local path. Discovery/configuration snapshots
 pair runtime and generation under the configuration lock. Unstarted failed choices can be replaced explicitly; started imports
@@ -249,6 +251,9 @@ cached readiness never grants permission to resume. After sign-in the page's
 `POST /pro/hydrate {workspace_id, expected_epoch}` re-checks (fresh) and
 resumes the now-ready sessions (`provider_gate::resume_ready`); nothing is
 fetched or reinstalled. One session failing to resume never stops the others.
+Live cloud work moves home only after this computer has been awake on power
+for five minutes (`lazy_handback`); a development build may shorten that with
+`CHIMAERA_PRO_SETTLE_SECS` for the loopback harness, release builds ignore it.
 A worker asked to hydrate the epoch it already verifiably holds (same holder,
 same epoch, managed or not) only re-verifies it with the account: its running
 agents are not stopped and nothing is reinstalled; a managed project with
