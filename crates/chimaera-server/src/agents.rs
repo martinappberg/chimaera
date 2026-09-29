@@ -506,13 +506,7 @@ pub(crate) async fn ingest(
         {
             record.turn_complete_at = Some(crate::session_view::now_ms());
         }
-        let Some(home) = state
-            .codex_config_path
-            .parent()
-            .map(std::path::Path::to_path_buf)
-        else {
-            return Json(json!({})).into_response();
-        };
+        let home = crate::codex_notify::codex_home(&state).await;
         let (known, native_cwd) = crate::lock(&state.agents)
             .get(&id)
             .map(|record| {

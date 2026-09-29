@@ -39,11 +39,13 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   into Recents; a row resumes when its native handle was captured, otherwise its tooltip honestly
   says that this specific row must start fresh. A finished Codex chat carries its `ChatInfo` thread id
   into Recents before the chat registry entry is removed.
-- **Codex terminal identity.** After the first completed turn, a generated `notify` wrapper captures
+- **Codex terminal identity (Pro-configured projects).** After the first completed turn, a generated `notify` wrapper captures
   the native thread id and chains the user's configured notify command with the original payload.
   The daemon checks the rollout header's id and cwd before recording it and again on restart.
   A missing rollout retires the row into Recents without promising resumption. The hook has only a
-  completion event, so terminal Codex attention remains unknown. Config and rollouts honor `CODEX_HOME`.
+  completion event, so terminal Codex attention remains unknown. Config and rollouts honor `CODEX_HOME`,
+  including one the login shell exports. In other projects a Codex TUI's argv is unchanged and it
+  retires into Recents on restart as before.
 - **How it's used.** No route — this is boot/shutdown lifecycle, gated by `daemon.restoreSessions`
   (default true). A graceful stop also writes a **handoff** (port + token) so a successor daemon rebinds
   the same port with the same token — ssh forwards stay valid and every client heals with a plain

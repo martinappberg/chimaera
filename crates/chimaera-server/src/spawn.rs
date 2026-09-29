@@ -236,7 +236,7 @@ pub(crate) async fn spawn_session(
                 argv.push(mcp.to_string_lossy().into_owned());
             }
             if agent_kind == AgentKind::Codex {
-                argv.extend(crate::codex_notify::args(state, &id, &key).await);
+                argv.extend(crate::codex_notify::args_in(state, &workspace.id, &id, &key).await);
             }
             if !codex_plugin_tools.is_empty()
                 || (agent_kind == AgentKind::Codex

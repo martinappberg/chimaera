@@ -101,6 +101,9 @@ async fn tui_mcp(
     .unwrap();
     let args = std::fs::read_to_string(&capture).unwrap();
     assert_eq!(args.contains("mcp_servers.chimaera.url="), enabled);
+    // The notify hook (pause state, restart resume) is a Pro-project feature:
+    // elsewhere a Codex TUI keeps its argv and the user's own notify.
+    assert_eq!(args.contains("notify=["), enabled);
     assert!(!args.contains("update_cloud_profile"));
     assert_eq!(
         std::fs::read_to_string(&present).unwrap(),
