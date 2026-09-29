@@ -85,6 +85,10 @@ if [ "$(uname -s)" = "Darwin" ]; then
   plutil -insert CFBundleShortVersionString -string "0.0.1" "$DEV_PLIST"
   plutil -insert CFBundleVersion -string "0.0.1" "$DEV_PLIST"
   plutil -insert NSHighResolutionCapable -bool true "$DEV_PLIST"
+  # The bundle's own usage strings (crates/chimaera-app/Info.plist): macOS
+  # kills an app that opens the microphone (voice dictation) without one.
+  MIC_USAGE="$(plutil -extract NSMicrophoneUsageDescription raw "$ROOT/crates/chimaera-app/Info.plist")"
+  plutil -insert NSMicrophoneUsageDescription -string "$MIC_USAGE" "$DEV_PLIST"
   # Seal the wrapper as a real (ad-hoc) bundle signature. The linker's own
   # signature covers only the executable ("Info.plist=not bound"), and
   # macOS's notification center refuses such a bundle outright — no prompt,
