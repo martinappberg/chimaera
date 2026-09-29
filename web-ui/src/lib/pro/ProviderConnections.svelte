@@ -281,7 +281,7 @@
       </article>
     {/each}
   </div>
-  {#each required.filter(id => !agents.some(p => p.id === id)) as id (id)}<p class="error">{providerLabel(id)} isn’t available in the cloud yet. This project waits on your computer.</p>{/each}
+  {#each [...new Set(required.filter(id => !agents.some(p => p.id === id)))] as id (id)}<p class="error">{providerLabel(id)} isn’t available in the cloud yet. This project waits on your computer.</p>{/each}
 
   {/if}
 
