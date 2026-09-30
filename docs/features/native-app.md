@@ -207,8 +207,8 @@ app-build` (never the root `cargo`).
   and Quit. Closing the final window exits the app rather than leaving a windowless tray process. The icon is a real **brand-mark template**
   (a C-in-hexagon monogram, black on transparent) that macOS tints to the menu-bar theme
   (`icon_as_template`) — not the full app icon, which the template mask would render as a solid blob.
-  On macOS the menu also carries the **Keep Awake** check item (see Caffeinate). The menu is rebuilt
-  via `tray::rebuild` on the events that change it (a window opens/closes/renames, caffeinate flips).
+  The menu is rebuilt via `tray::rebuild` on the events that change it (a window opens/closes/renames,
+  an approval count moves).
   Enabling the feature pulls **libayatana-appindicator** into the Linux bundle (a packaging dependency).
 
 ## Reload Window
@@ -240,22 +240,6 @@ app-build` (never the root `cargo`).
   UI) is left alone because it may hold edits it cannot report. The Windows WSL wizard window is
   skipped. On Windows the page also claims F5 itself, because WebView2's own browser accelerator
   keys (on in wry) would otherwise reload ungated.
-
-## Caffeinate
-
-- A **macOS-only, local-only** whole-machine keep-awake toggle, reachable from **two surfaces** kept in
-  sync: a coffee-cup button in the rail's bottom bar (shown only when
-  `isNativeShell() && isMac && getHostLabel() === "local"` — a remote window's work runs on the remote
-  host, so caffeinating this laptop is pointless; and macOS is where the lid-close keep-awake it exists
-  for applies) **and** the tray's **Keep Awake** check item + the icon filling in when armed. Armed =
-  the machine won't idle-, display-, or system-sleep. Both surfaces call one shared core
-  (`shell::apply_caffeinate`) that holds a single power assertion (the **keepawake** crate: macOS
-  IOKit) as a guard in `Shell` — dropped to disarm, and on quit, so it never outlives the app. The
-  state broadcasts (`caffeinate-changed`), which the in-window toggle and the tray (`tray::rebuild`)
-  both listen to, so flipping it from either surface updates the other. IPC commands remain
-  `set_caffeinate(on)` / `caffeinate_state()`. **macOS caveat, surfaced in the tooltip:**
-  lid-closed-awake additionally requires **AC power** — Apple hard-blocks clamshell wake on battery,
-  which no app can override.
 
 ## Status: partial
 
