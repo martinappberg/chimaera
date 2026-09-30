@@ -321,7 +321,8 @@ and privacy reads "Reconnecting your account…" with nothing to press; the app
 renews it on its own.
 Quitting the app keeps the daemon copying, but other devices cannot open this
 computer's projects while the app is closed: offering the daemon to them belongs
-to the running app.
+to the running app. Quitting while an agent is working can instead continue
+that work in the cloud (see [Quitting](#quitting)).
 
 Pro → **Projects and privacy** shows privacy, the last recorded copy, and actual
 problems such as an incomplete copy or a required provider connection. Healthy
@@ -384,6 +385,12 @@ text — "In the cloud · 9m ago", "Coming home… · 9m ago" while a return ins
 to the cloud…" while this computer hands it over — read from this daemon's own
 `GET /pro/status` ownership (`workspace/placementHints.ts`); it appears only when Pro is
 configured and the project is owned elsewhere, and never in the accent colour.
+
+### Quitting
+
+Quitting the app (⌘Q, the menu, the tray, Dock › Quit, logging out), or closing its last window, while an agent is working in a project on this Mac asks first, but only when the cloud could take that work over right now: you are signed in with a plan whose cloud is set up and has time left, the project is copied to the cloud and runs on this Mac, and Chimaera has not seen that no agent is connected in the cloud. The question names the agent and the project ("Claude is still working in atlas", or "Agents are still working in 2 projects") and asks "Keep working on this Mac, or continue in the cloud?". **Keep working here** is the default and quits as before: the work keeps running on this Mac with the app closed. **Cancel** keeps the app open. **Continue in the cloud** hands just those projects to the cloud the same way sleep does, while a small window says "Sending your work to the cloud…" and lists them; the app quits when the cloud has them, or after about 25 seconds while the last steps finish on their own. If the cloud can't take over, the same window says "The cloud couldn't take over. Your work continues on this Mac." (naming the project when only some of them stayed), and **Quit** closes the app with that work still running here. Work handed over this way stays in the cloud until you open the app again, however long this Mac stays awake; from then on it comes home by the usual rules above. Unsaved edits are asked about first, in their own dialog. Closing a window that isn't the last one never asks, and neither does an app update's restart. On Linux and Windows the question says "this computer".
+
+Implementation: [`shell/quit.rs`](../../crates/chimaera-app/src/shell/quit.rs) asks and posts `POST /api/v1/pro/sleep {deadline_ms, park: true, workspace_ids}`; each `/pro/status` project row carries additive `working_agents`, `cloud_handoff` and `parked`; the app posts `/pro/wake` at launch while anything is parked ([`pro/AGENTS.md`](../../crates/chimaera-server/src/pro/AGENTS.md), "Quit handover").
 
 ### After a reinstall or reset
 

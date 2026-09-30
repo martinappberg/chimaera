@@ -12,7 +12,7 @@
     "windows": [],
     "security": {
       "csp": null,
-      "capabilities": ["wsl-setup"]
+      "capabilities": ["wsl-setup", "cloud-handoff"]
     }
   },
   "bundle": {

@@ -325,15 +325,12 @@ mod platform {
         false
     }
 }
-/// What the daemon may spend before the OS sleeps: the platform's real
-/// budget minus a margin for the answer and the OS acknowledgment, so the
-/// daemon releases its projects cleanly instead of being frozen mid-save.
+/// What the daemon may spend before the OS sleeps (or, for a quit that
+/// continues in the cloud, before the app gives up waiting): the real budget
+/// minus a margin for the answer and the OS acknowledgment, so the daemon
+/// releases its projects cleanly instead of being frozen mid-save.
 /// (Additive: an older daemon ignores the body and uses its own pacing.)
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
-    allow(dead_code)
-)]
-fn sleep_body(budget: std::time::Duration) -> serde_json::Value {
+pub(super) fn sleep_body(budget: std::time::Duration) -> serde_json::Value {
     let margin = std::time::Duration::from_secs(2).min(budget / 4);
     serde_json::json!({ "deadline_ms": budget.saturating_sub(margin).as_millis() as u64 })
 }

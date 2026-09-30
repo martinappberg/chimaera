@@ -61,6 +61,11 @@ pub(crate) struct ProState {
     /// out of time, or the flush failed): no renewal or resume happens inside
     /// the sleep window; the next wake returns them to this computer locally.
     release_pending: Mutex<std::collections::HashSet<String>>,
+    /// Projects handed to the cloud when the app quit (`/pro/sleep` with
+    /// `park`): this computer neither takes them back nor renews them until
+    /// the app returns (`/pro/wake`) or the account signs out. Persisted, so
+    /// a daemon restart keeps them away too.
+    parked: Mutex<std::collections::HashSet<String>>,
     /// The last bytes written, so an unchanged tick costs no disk sync.
     persistence: AsyncMutex<Option<Vec<u8>>>,
     configuration: Arc<AsyncMutex<()>>,
@@ -186,6 +191,10 @@ struct DiskState {
     /// still says it after a restart (the kept copies are still on disk).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     kept_both: HashMap<String, KeptRecord>,
+    /// Projects handed to the cloud on quit (see `ProState::parked`); sorted
+    /// so an unchanged set writes the same bytes.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    parked: std::collections::BTreeSet<String>,
 }
 /// A return's kept-both report as persisted: the count, and the kept copies'
 /// project-relative paths (fewer than `files` when bounded, see
@@ -301,12 +310,31 @@ impl ProState {
             .filter(|id| valid_id(id))
             .take(128)
             .collect();
+        // A project handed to the cloud on quit stays away across a restart:
+        // its finished transfer keeps its fence until the app returns. A
+        // park whose flush never finished (the daemon died mid-flush) is not
+        // a handover and is dropped, so that project is ordinary local work.
+        let parked: std::collections::HashSet<String> = disk
+            .parked
+            .into_iter()
+            .filter(|id| {
+                valid_id(id)
+                    && matches!(
+                        disk.ownership.get(id),
+                        Some(Ownership::Transferring { .. } | Ownership::Remote { .. })
+                    )
+            })
+            .take(128)
+            .collect();
         let ownership: HashMap<_, _> = disk
             .ownership
             .into_iter()
             .take(128)
             .map(|(id, owner)| {
                 let owner = match owner {
+                    Ownership::Transferring { epoch } if parked.contains(&id) => {
+                        Ownership::Transferring { epoch }
+                    }
                     Ownership::Local { epoch } | Ownership::Transferring { epoch } => {
                         Ownership::AwaitingVerification { epoch }
                     }
@@ -373,6 +401,7 @@ impl ProState {
             sleep_generation: AtomicU64::new(0),
             sleeping: Mutex::new(Default::default()),
             release_pending: Mutex::new(Default::default()),
+            parked: Mutex::new(parked),
             persistence: AsyncMutex::new(None),
             configuration: Arc::new(AsyncMutex::new(())),
             caches: Mutex::new(HashMap::new()),
@@ -704,6 +733,44 @@ pub(crate) fn owned_epoch(state: &crate::AppState, workspace: &str) -> Option<u6
         _ => None,
     }
 }
+/// Handed to the cloud when the app quit, and the app has not come back yet.
+fn parked(state: &crate::AppState, workspace: &str) -> bool {
+    crate::lock(&state.pro.parked).contains(workspace)
+}
+/// Marks a quit handover as it starts, unless the app came back meanwhile
+/// (`generation` is the handover's sleep generation). Checked and inserted
+/// under the lock `wake_parked` advances the generation under, so a wake can
+/// never be followed by a stale park. The caller persists.
+fn park(state: &crate::AppState, workspace: &str, generation: u64) -> bool {
+    let mut parked = crate::lock(&state.pro.parked);
+    if state
+        .pro
+        .sleep_generation
+        .load(std::sync::atomic::Ordering::Acquire)
+        != generation
+    {
+        return false;
+    }
+    if parked.len() < 128 || parked.contains(workspace) {
+        parked.insert(workspace.to_owned());
+    }
+    true
+}
+/// A quit handover that did not complete: its work stays on this computer.
+fn unpark(state: &crate::AppState, workspace: &str) {
+    crate::lock(&state.pro.parked).remove(workspace);
+}
+/// The app is back (or this computer woke): any flush still running for the
+/// sleep or quit that ended is no longer allowed to release, and nothing
+/// stays parked. The caller persists.
+fn wake_parked(state: &crate::AppState) {
+    let mut parked = crate::lock(&state.pro.parked);
+    state
+        .pro
+        .sleep_generation
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    parked.clear();
+}
 fn valid_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -726,6 +793,7 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
     let projects_root = crate::lock(&state.pro.projects_root).clone();
     let adoptions = crate::lock(&state.pro.adoptions).clone();
     let legacy_pending = crate::lock(&state.pro.legacy_pending).clone();
+    let parked = crate::lock(&state.pro.parked).iter().cloned().collect();
     let (provider_blocks, kept_both) = {
         let statuses = crate::lock(&state.pro.status);
         let blocks = statuses
@@ -746,6 +814,7 @@ async fn persist(state: &crate::AppState) -> anyhow::Result<()> {
         worker: state.pro.worker.load(std::sync::atomic::Ordering::Acquire),
         ownership,
         preferences,
+        parked,
     })?;
     anyhow::ensure!(bytes.len() <= 1024 * 1024, "mirror settings exceed limit");
     // State first, then the enrollment latch: a crash between them leaves a

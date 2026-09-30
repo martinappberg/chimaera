@@ -30,6 +30,7 @@ mod power;
 #[cfg(target_os = "macos")]
 mod print_frame;
 mod pro;
+mod quit;
 mod restore;
 mod tunnel;
 mod unsaved;
@@ -38,7 +39,8 @@ pub use restore::open_ui_window;
 
 /// Permissions exposed to a daemon-served workbench window. These grants are
 /// installed at runtime for one volatile window label and one exact loopback
-/// origin; the only static capability is the shell-local WSL wizard.
+/// origin; the only static capabilities are the shell-local WSL wizard and
+/// the quit handover window (`quit`, which may only close itself).
 const DAEMON_UI_CORE_PERMISSIONS: &[&str] = &[
     "core:default",
     "core:window:allow-close",
@@ -144,6 +146,9 @@ pub struct Shell {
     /// Each window's unsaved-file count and the close/quit prompts it is
     /// answering (see `unsaved`).
     unsaved: Mutex<unsaved::Guard>,
+    /// Whether a quit is asking (or handing work to the cloud) because an
+    /// agent is working on this computer (see `quit`).
+    quit_gate: Mutex<quit::Gate>,
     /// Live cross-window drags: source label → the sibling its pointer
     /// currently hovers (None over desktop). Entries live for one drag;
     /// `done_drags` is what fences late per-frame updates, so the entry
@@ -290,6 +295,12 @@ impl WindowScope {
 
     pub(crate) fn allows_askpass(&self, prompt_alias: Option<&str>) -> bool {
         askpass_scope_matches(&self.askpass_scope, prompt_alias)
+    }
+
+    /// Closing this window when it is the last one opens local Home rather
+    /// than ending the app: a workspace, remote or torn-off window.
+    pub(crate) fn reopens_home(&self) -> bool {
+        self.alias.is_some() || self.ws.is_some() || self.detached
     }
 
     /// Stable host identity for shell-owned per-host caches. Compute windows
@@ -547,6 +558,15 @@ pub(crate) fn request_quit(app: &AppHandle) {
 /// flag is what tells "the user quit" from "the user closed the last window").
 pub(crate) fn finish_quit(app: &AppHandle) {
     if let Some(shell) = app.try_state::<Shell>() {
+        if shell.quitting.load(Ordering::Relaxed) {
+            return;
+        }
+        // Past the unsaved-edits guard: an agent working on this computer
+        // may continue in the cloud instead (`quit`). A held quit comes
+        // back here once the question is settled.
+        if quit::hold_quit(app) {
+            return;
+        }
         // Idempotent: do the exit once however many paths arrive here.
         if shell.quitting.swap(true, Ordering::Relaxed) {
             return;
@@ -554,6 +574,16 @@ pub(crate) fn finish_quit(app: &AppHandle) {
         lock(&shell.registry).save_if_dirty();
     }
     app.exit(0);
+}
+
+/// Whether closing `label` ends the app: it is the only window left, and not
+/// one whose last close opens Home instead (`last_close_needs_home`).
+fn closing_ends_app(app: &AppHandle, shell: &Shell, label: &str) -> bool {
+    !shell.quitting.load(Ordering::Relaxed)
+        && app.webview_windows().keys().all(|other| other == label)
+        && !lock(&shell.windows)
+            .get(label)
+            .is_some_and(WindowScope::reopens_home)
 }
 
 /// Activate the app the way a macOS app conventionally answers a Dock click
@@ -938,6 +968,7 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             quitting: AtomicBool::new(false),
             last_close_needs_home: AtomicBool::new(false),
             unsaved: Mutex::new(unsaved::Guard::default()),
+            quit_gate: Mutex::new(quit::Gate::default()),
             drags: Mutex::new(HashMap::new()),
             done_drags: Mutex::new(HashMap::new()),
             transfers: Mutex::new(HashMap::new()),
@@ -955,6 +986,8 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
         // and a window's first scope report may already owe it a focus.
         notices::start(handle);
         pro::start(handle.clone());
+        // Work handed to the cloud on the last quit may come home again.
+        quit::welcome_back(handle);
     }
     // Reopen last session's windows. Restore itself registers a home surface
     // before launching any remote ssh that may need askpass, and also covers
@@ -1088,7 +1121,19 @@ pub fn run() {
                 // goes (Save all / Don't save / Cancel); one with nothing
                 // unsaved closes as it always has.
                 tauri::WindowEvent::CloseRequested { api, .. } => {
-                    if unsaved::hold_window_close(window.app_handle(), window.label()) {
+                    let app = window.app_handle();
+                    if window.label() == quit::HANDOFF_WINDOW {
+                        // Its Quit button or title bar: quit now; the daemon
+                        // finishes (or already ended) the handover itself.
+                        api.prevent_close();
+                        quit::handoff_window_closing(app);
+                    } else if unsaved::hold_window_close(app, window.label()) {
+                        api.prevent_close();
+                    } else if closing_ends_app(app, &shell, window.label())
+                        && quit::hold_last_close(app, window.label())
+                    {
+                        // Unsaved edits were settled first; this asks whether
+                        // working agents continue in the cloud.
                         api.prevent_close();
                     }
                 }
@@ -1131,9 +1176,7 @@ pub fn run() {
                         // the actual destroyed scope, after any unsaved prompt,
                         // and let ExitRequested decide whether it was the last.
                         shell.last_close_needs_home.store(
-                            scope.as_ref().is_some_and(|scope| {
-                                scope.alias.is_some() || scope.ws.is_some() || scope.detached
-                            }),
+                            scope.as_ref().is_some_and(WindowScope::reopens_home),
                             Ordering::Relaxed,
                         );
                         // The tray lists open windows; drop the closed one, and

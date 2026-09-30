@@ -8,7 +8,7 @@ revocable delegation over the authenticated local API.
 | --- | --- |
 | `mod.rs` | Bounded, credential-free persistent state, ownership/import fences and deferred-command policy. |
 | `authority.rs` / `authority_tests.rs` | Immutable workspace-bound worker acceptance, credential-free persisted latch, renewal/route/root guards and synthetic side-effect regressions. |
-| `routes.rs` | Authenticated configure/status/privacy/profile/power/hydration HTTP handlers. |
+| `routes.rs` | Authenticated configure/status/privacy/profile/power/hydration HTTP handlers. `/pro/status` rows carry additive `parked`, `working_agents` and `cloud_handoff` (see the quit handover below). |
 | `projects.rs` | Passive bounded cloud-project discovery and explicit per-device local adoption; native-picked folder validation, saved directory identity, retry and legacy-import fences. |
 | `projects/tests.rs` | Synthetic loopback HTTP plus real Git transfer, passive-read, conflict, retry, restart and two-device destination checks. |
 | `execution.rs` / `execution/` | Negotiated execution leases, independent stop watchdog, durable launch/crash evidence, immutable receipts and stopped same-installation recovery. |
@@ -16,7 +16,7 @@ revocable delegation over the authenticated local API.
 | `engine.rs` | Lease renewal (own account-request budget; installs and agent stops run as their own tasks), mirror coordinator, staged hydration (files are installed in place, not transactionally), deadline-bound sleep flush, three-way return and lazy return. |
 | `detached.rs` | Owned transfer tasks keyed by (kind, project, epoch): a caller that disconnects never cancels a flush or hydration; repeats join; a completed release is remembered ten minutes. |
 | `drain.rs` | `POST/DELETE /pro/drain`: refuse new transfer work and wait for jobs, transfer tasks, project caches and Git helpers before a cloud machine suspends. |
-| `continuity_tests.rs` | Loopback account fixture (records requests, scripted grants, delays; Git endpoints refuse connections) for policy, abandoned flush, sleep deadline, own-epoch reacquire, lapsed cloud lease and drain tests. |
+| `continuity_tests.rs` | Loopback account fixture (records requests, scripted grants, delays; Git endpoints refuse connections) for policy, abandoned flush, sleep deadline, quit handover (parked, failed park, status fields), own-epoch reacquire, lapsed cloud lease and drain tests. |
 | `snapshot_diagnostics.rs` | Fixed snapshot failure categories; no response bodies, paths, identifiers or error text enter diagnostic logs. |
 | `handback.rs` | Bounded automatic return coordination across worker wake and ownership changes; lost release replies are resolved by authority reads without repeating ambiguous requests. |
 | `release.rs` | Bounded clean-release retry for the account publication fence; changed ownership, account or lease never retries. A legacy release the account refuses as 409 `continuity_upgrade_required` (a bare body, no `baton`) ends at once as `UpgradeRequired`: `engine` latches the project (`execution::require_v2`) so the next reconcile uses the v2 path, logs one line, and reconciles with the unrefined configuration; the same refusal to a v2 request is a plain failure. Its mirror-row code is `checkpoint_pending` (it retries by itself). |
@@ -334,6 +334,34 @@ returned session still deferred on a device (`interrupted_return`) waits like
 a restart-deferred one instead of answering "moved" forever. A device's own
 unfinished return retries after 15 s, doubling to two minutes. Failures and
 refusals carry stable codes (`routes::error_code`; mirror row `error_code`).
+
+**Quit handover (`park`).** The native app asks before quitting when a
+`/pro/status` row has both `working_agents` (agent kinds running work now,
+`engine::working_agents`: a chat with a turn in flight, queued input or
+background work, never one waiting on a permission; a terminal agent not
+`tui_at_pause`) and `cloud_handoff` (a configured personal computer with a live
+delegation, cloud hours left and no drain; the project flushable, i.e. owned
+here, in scope and not kept on this computer; a valid lease; not parked). On
+**Continue in the cloud** it posts `/pro/sleep {deadline_ms, park: true,
+workspace_ids}`: the same flush, with three differences. Only the listed
+projects move (≤128 valid ids, all of them regardless of the time left; a
+listed one that is not flushable is reported in `failed` as `unavailable`).
+The computer stays awake, so a flush that cannot hand over skips the
+sleep-only `release_pending` branch and recovers at once (AwaitingVerification,
+then renew and resume here). And each flushed project is **parked**
+(`ProState.parked`, persisted as a sorted `parked` list in `state.json`) from
+the moment its flush starts until the flush fails (`unpark`), the app returns
+(`/pro/wake` clears every park; the app posts it at launch when a row says
+`parked`) or the account signs out. While parked, on a device the lease loop
+neither renews nor acquires the project (`reconcile_generation`; a flush still
+`Transferring` keeps renewing its own lease until it releases) and
+`lazy_handback` skips it, however long this computer has been awake on power
+and even when the cloud's lease lapsed or it released the project. `park`
+checks the flush's `sleep_generation` and inserts under the same lock
+`wake_parked` advances it under, so a wake is never followed by a stale park.
+At load a parked project keeps its `Transferring` fence (not
+AwaitingVerification); a parked entry whose ownership is neither
+`Transferring` nor `Remote` (the daemon died mid-flush) is dropped.
 
 Structured pause checks accept authoritative completed-turn/idle agent state even when a provider emits no textual idle status, but reject queued input, active turns, and background work (explicit permission/action waits remain safe pause points). Terminal agents (`agent_state::tui_at_pause`): Claude hook states decide (idle, finished, needs permission, errored and rate limited are pauses; running is not); a Codex TUI, which has no hook state, is at a pause once its authenticated `agent-turn-complete` notify arrived with no output after it, or once its terminal has been quiet for 10 s with the agent itself in the foreground.
 

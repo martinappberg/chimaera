@@ -321,6 +321,28 @@ impl Pro {
         let client = lock(&self.client);
         client.clone().map(|client| (client, self.generation()))
     }
+
+    /// Whether this build has an account endpoint at all.
+    pub(super) fn has_endpoint(&self) -> bool {
+        self.endpoint.is_some()
+    }
+
+    /// Whether the cloud could continue this account's work, from what the
+    /// app already knows (no request is made): signed in, a plan whose
+    /// cloud is set up, cloud hours left, and no remembered answer that no
+    /// agent is connected there. The daemon decides the rest per project
+    /// (`cloud_handoff` on `/pro/status`).
+    pub(super) fn cloud_may_continue(&self) -> bool {
+        if self.client_now().is_none() {
+            return false;
+        }
+        let Some(account) = lock(&self.account).clone() else {
+            return false;
+        };
+        setup_available(&account)
+            && !account.hours_exhausted
+            && self.agents.get(&account.account_id) != Some(false)
+    }
 }
 
 /// Account startup always ends with `ready`, including when a newer sign-in

@@ -1101,7 +1101,9 @@ async fn an_unsaveable_conversation_never_fails_the_project_copy() {
             name: None,
             cols: 80,
             rows: 24,
-            command: Some(vec!["/bin/sleep".into(), "30".into()]),
+            // Outlives the snapshot even when it first waits out the bounded
+            // 30 s wait for a (process-wide) Git helper slot; killed below.
+            command: Some(vec!["/bin/sleep".into(), "300".into()]),
             id: None,
             env: Vec::new(),
             env_remove: Vec::new(),
@@ -1906,4 +1908,253 @@ async fn the_opened_flag_clears_when_this_computer_holds_the_project_or_signs_ou
     crate::pro::disconnect(axum::extract::State(state.clone())).await;
     assert!(!crate::pro::opened_here(state, &id));
     reopened.finish();
+}
+
+fn renewals(account: &FakeAccount, workspace: &str) -> usize {
+    account
+        .calls("POST", &format!("/v2/baton/{workspace}/renew"))
+        .len()
+        + account
+            .calls("POST", &format!("/v2/baton/{workspace}/acquire"))
+            .len()
+}
+
+/// Work handed to the cloud when the app quit stays there until the app comes
+/// back: the lease loop neither renews nor takes it, the return path leaves it
+/// alone even when the cloud's lease lapsed and this computer has long been
+/// awake on power, and a daemon restart keeps all of that. `/pro/wake` (the
+/// app's next launch) ends it, and the ordinary return rules apply again.
+#[tokio::test]
+async fn a_project_handed_to_the_cloud_on_quit_stays_there_until_the_app_returns() {
+    let root = temp("parked");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let mut config = device(&account.endpoint);
+    config.keeper_url = account.endpoint.clone();
+    let workspace = project(&state, &root, &config, 4);
+    let id = workspace.id.clone();
+    *lock(&state.pro.runtime) = Some(config.clone());
+    state.pro.configured.store(true, Ordering::Release);
+    let generation = || state.pro.sleep_generation.load(Ordering::Acquire);
+    // The handover is starting (parked before its agents stop): the lease
+    // loop does not renew the project from under it.
+    *lock(&account.baton) = owned(&id, "d-home", 4, "lease-fixture", 1);
+    assert!(crate::pro::park(&state, &id, generation()));
+    reconcile(&state, &config, &id).await.unwrap();
+    assert_eq!(renewals(&account, &id), 0);
+    // A park whose flush never finished (the daemon died mid-flush) is no
+    // handover: a restart drops it and the project is ordinary local work.
+    crate::pro::persist(&state).await.unwrap();
+    let restarted = crate::pro::ProState::new(state.pro.root.clone());
+    assert!(lock(&restarted.parked).is_empty());
+    drop(restarted);
+    // Released: the cloud has not picked it up yet. Nothing takes it back.
+    lock(&state.pro.ownership).insert(id.clone(), Ownership::Transferring { epoch: 4 });
+    let mut released = owned(&id, "d-home", 4, "lease-fixture", 1);
+    released["holder_id"] = serde_json::Value::Null;
+    released["expires_at"] = serde_json::Value::Null;
+    *lock(&account.baton) = released;
+    reconcile(&state, &config, &id).await.unwrap();
+    assert_eq!(renewals(&account, &id), 0);
+    crate::pro::persist(&state).await.unwrap();
+    let restarted = crate::pro::ProState::new(state.pro.root.clone());
+    assert!(
+        lock(&restarted.parked).contains(&id),
+        "a restart keeps it parked"
+    );
+    assert!(
+        matches!(
+            lock(&restarted.ownership).get(&id),
+            Some(Ownership::Transferring { epoch: 4 })
+        ),
+        "and away from this computer"
+    );
+    drop(restarted);
+    // The cloud took it, then its lease lapsed; this computer has been awake
+    // on power for a long time. Ordinarily the project would come home now.
+    lock(&state.pro.ownership).insert(
+        id.clone(),
+        Ownership::Remote {
+            epoch: 5,
+            holder: "worker-a".into(),
+        },
+    );
+    let mut cloud = owned(&id, "worker-a", 5, "lease-cloud", 3);
+    cloud["checkpoint"] = checkpoint(5);
+    cloud["server_now"] = json!("2026-09-28T00:05:00Z");
+    *lock(&account.baton) = cloud;
+    state.pro.power_suitable.store(true, Ordering::Release);
+    state.pro.awake_since.store(0, Ordering::Release);
+    lazy_handback(&state, &config).await.unwrap();
+    reconcile(&state, &config, &id).await.unwrap();
+    assert!(account.calls("POST", "/v2/mirror/credentials").is_empty());
+    assert_eq!(renewals(&account, &id), 0);
+    let row = status(&state).await["workspaces"][0].clone();
+    assert_eq!(
+        (row["parked"].clone(), row["cloud_handoff"].clone()),
+        (json!(true), json!(false))
+    );
+    // The app is back.
+    assert_eq!(
+        post(&state, "/api/v1/pro/wake", "").await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(lock(&state.pro.parked).is_empty());
+    assert_eq!(status(&state).await["workspaces"][0]["parked"], false);
+    let restarted = crate::pro::ProState::new(state.pro.root.clone());
+    assert!(lock(&restarted.parked).is_empty(), "the wake is saved too");
+    drop(restarted);
+    lazy_handback(&state, &config).await.unwrap();
+    assert!(
+        !account.calls("POST", "/v2/mirror/credentials").is_empty(),
+        "the lapsed cloud lease brings the project home again"
+    );
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A quit handover moves only the projects the app named. One that cannot be
+/// handed over is reported and keeps its work here at once: the computer stays
+/// awake, so unlike sleep nothing waits for its lease to lapse or for a wake.
+#[tokio::test]
+async fn a_quit_handover_that_fails_leaves_the_work_here_and_unparked() {
+    let root = temp("park-fails");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let config = device(&account.endpoint);
+    let workspace = project(&state, &root, &config, 4);
+    let id = workspace.id.clone();
+    // Another project owned here that the app did not name.
+    let other_root = root.join("other");
+    std::fs::create_dir_all(&other_root).unwrap();
+    let other = lock(&state.workspaces).add(other_root).unwrap();
+    let grant: Baton =
+        serde_json::from_value(owned(&other.id, "d-home", 2, "lease-other", 1)).unwrap();
+    execution::accept(&state, &config, &grant, 0, execution::RequestStart::now()).unwrap();
+    lock(&state.pro.ownership).insert(other.id.clone(), Ownership::Local { epoch: 2 });
+    *lock(&account.baton) = owned(&id, "d-home", 4, "lease-fixture", 1);
+    *lock(&state.pro.runtime) = Some(config.clone());
+    // The account refuses the project's continuation policy, so the handover
+    // fails before any publication (and takes no Git helper slot for it).
+    account.script(
+        "PUT",
+        &format!("/v1/baton/{id}/policy"),
+        500,
+        json!({"error": "unavailable"}),
+    );
+    let body = json!({"deadline_ms": 20000, "park": true, "workspace_ids": [id, "w-unknown"]});
+    let (status, reply) = post(&state, "/api/v1/pro/sleep", &body.to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reply["handoff"], false);
+    assert!(
+        reply["failed"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"workspace_id": "w-unknown", "error": "unavailable"})),
+        "{reply}"
+    );
+    // (Git helper slots are process-wide: under a parallel run the flush may
+    // outlive the reply.)
+    tokio::time::timeout(StdDuration::from_secs(120), async {
+        while !lock(&state.pro.sleeping).is_empty() || crate::pro::parked(&state, &id) {
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the flush ends and the project is not parked");
+    assert!(!lock(&state.pro.release_pending).contains(&id));
+    assert!(!matches!(
+        lock(&state.pro.ownership).get(&id),
+        Some(Ownership::Transferring { .. })
+    ));
+    assert!(crate::pro::may_write(&state, &id));
+    assert!(
+        renewals(&account, &id) > 0,
+        "the project renews here at once instead of waiting for its lease to lapse"
+    );
+    // The project the app did not name was left alone.
+    assert!(account
+        .calls("PUT", &format!("/v1/baton/{}/policy", other.id))
+        .is_empty());
+    assert!(matches!(
+        lock(&state.pro.ownership).get(&other.id),
+        Some(Ownership::Local { epoch: 2 })
+    ));
+    // A malformed list is refused before anything moves.
+    let (status, _) = post(
+        &state,
+        "/api/v1/pro/sleep",
+        r#"{"park":true,"workspace_ids":["../escape"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// The quit question reads each project's row: which agents are running work
+/// there right now, and whether the cloud could take the project now.
+#[cfg(unix)]
+#[tokio::test]
+async fn project_status_names_working_agents_and_whether_the_cloud_could_take_over() {
+    let root = temp("quit-status");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let mut config = device(&account.endpoint);
+    let workspace = project(&state, &root, &config, 4);
+    let row = |reply: serde_json::Value| {
+        reply["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["workspace_id"] == workspace.id)
+            .cloned()
+            .unwrap()
+    };
+    // Not set up for Pro: the cloud cannot take anything.
+    assert_eq!(row(status(&state).await)["cloud_handoff"], false);
+    *lock(&state.pro.runtime) = Some(config.clone());
+    state.pro.configured.store(true, Ordering::Release);
+    let idle = row(status(&state).await);
+    assert_eq!(
+        (
+            idle["cloud_handoff"].clone(),
+            idle["working_agents"].clone(),
+            idle["parked"].clone()
+        ),
+        (json!(true), json!([]), json!(false))
+    );
+    let (chat, _, _) = mid_turn_chat(&state, &root, &workspace).await;
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        while row(status(&state).await)["working_agents"] != json!(["claude"]) {
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a mid-turn chat is working");
+    // Kept on this computer, out of cloud hours, or already handed over.
+    lock(&state.pro.preferences)
+        .entry(workspace.id.clone())
+        .or_default()
+        .never_mirror = true;
+    assert_eq!(row(status(&state).await)["cloud_handoff"], false);
+    lock(&state.pro.preferences)
+        .get_mut(&workspace.id)
+        .unwrap()
+        .never_mirror = false;
+    config.hours_exhausted = true;
+    *lock(&state.pro.runtime) = Some(config.clone());
+    assert_eq!(row(status(&state).await)["cloud_handoff"], false);
+    config.hours_exhausted = false;
+    *lock(&state.pro.runtime) = Some(config);
+    assert_eq!(row(status(&state).await)["cloud_handoff"], true);
+    let generation = state.pro.sleep_generation.load(Ordering::Acquire);
+    assert!(crate::pro::park(&state, &workspace.id, generation));
+    assert_eq!(row(status(&state).await)["cloud_handoff"], false);
+    // A park that lost to a wake is refused.
+    assert!(!crate::pro::park(&state, &workspace.id, generation + 1));
+    state.chat.kill(&chat);
+    drop(account);
+    drop(state);
+    let _ = std::fs::remove_dir_all(root);
 }
