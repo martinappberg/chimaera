@@ -11,9 +11,9 @@
   import ConfirmDialog from "../shared/ConfirmDialog.svelte";
   import { asyncDisposer } from "../shared/asyncDisposer";
   import { pageVisible } from "../shared/visibility";
-  import { paid, readIntent, friendlyError, recoverableAccountRestore, alreadySubscribed, connectionWarningCopy, returningLine, signInNoteCopy, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
+  import { paid, readIntent, friendlyError, recoverableAccountRestore, alreadySubscribed, connectionWarningCopy, keeperRestartLine, returningLine, signInNoteCopy, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
   import { accountErrorBar, accountPanel, completesReview, isConfirmedFree, nearLimit, offersCheck, reviewKey } from "../pro/account";
-  import { accountFailure, connectionWarningCode, grantedPlan, paymentDue, planEnded, returningUntil, signInNote } from "../pro/status";
+  import { accountFailure, connectionWarningCode, grantedPlan, keeperRestartAt, paymentDue, planEnded, returningUntil, signInNote } from "../pro/status";
   import {
     onProChanged, proStatus, proSignIn, proCancelSignIn, proSignOut, proSignOutEverywhere,
     proHosts, proSetHostKept, proDevices, proRevokeDevice, proBillingCheckout, proBillingPortal, proCancelBilling, proRefreshAccount, proMirrorStatus,
@@ -66,6 +66,13 @@
   const ended = $derived(planEnded(status));
   /** One quiet line while an ended plan's cloud work can still be brought home. */
   const returning = $derived(returningLine(returningUntil(status)));
+  /** A restart of the always-on cloud connection the account has planned. */
+  const restartAt = $derived(keeperRestartAt(status));
+  const restartPlanned = $derived(restartAt !== null);
+  /** Its one quiet line, beside the connected machines. It names the cluster
+   * when exactly one login is kept; recomputed on every account read (at
+   * least every 30 seconds while shown), so a passed time reads "shortly". */
+  const restartLine = $derived(keeperRestartLine(restartAt, hosts.filter(host => host.kind === "ssh" && host.kept).map(host => host.alias)));
   const confirmedFree = $derived(isConfirmedFree(status));
   const panel = $derived(accountPanel(status, checking ? "check" : refreshing ? "background" : "none"));
   const failure = $derived(accountFailure(status));
@@ -151,9 +158,12 @@
     else untrack(() => { accountFresh = false; refreshing = false; generation += 1; });
   });
   $effect(() => {
-    if (!visible || !$pageVisible || !status?.signed_in || status.initializing || !subscribed || !connectionsOpen) return;
+    // A planned restart reads the kept logins too, to name the cluster; a
+    // failed read then stays quiet (the connection may be restarting).
+    const open = connectionsOpen;
+    if (!visible || !$pageVisible || !status?.signed_in || status.initializing || !subscribed || !(open || restartPlanned)) return;
     let stopped = false;
-    void proHosts().then(value => { if (!stopped) hosts = value.filter(host => host.kind !== "worker"); }).catch(() => { if (!stopped) error = "Connected machines couldn't refresh. Please try again."; });
+    void proHosts().then(value => { if (!stopped) hosts = value.filter(host => host.kind !== "worker"); }).catch(() => { if (!stopped && open) error = "Connected machines couldn't refresh. Please try again."; });
     return () => { stopped = true; };
   });
   $effect(() => {
@@ -441,6 +451,7 @@
         <AccountUsage usage={status.usage} limits={status.limits} />
       </section>
       <details class="section" ontoggle={(event) => (connectionsOpen = event.currentTarget.open)}><summary>Connected machines</summary>{#if connectionsOpen}<div class="section-body"><p class="muted small">Add remote machines on Home. Choose which cluster logins stay connected here.</p>{#if hosts.length === 0}<p class="muted">No machines to show yet.</p>{/if}{#each hosts as host (host.alias)}<div class="row"><div><span>{host.alias}</span><span class="muted small">{host.status === "prompting" ? "Waiting for authentication" : host.status === "connecting" ? "Connecting…" : host.status === "connected" ? "Connected" : "Offline"}</span></div>{#if host.kind === "ssh"}<label class="keep"><input type="checkbox" checked={host.kept} disabled={busy !== null} onchange={(event) => setKept(host, event.currentTarget)} />Keep connected</label>{/if}</div>{/each}</div>{/if}</details>
+      {#if restartLine !== null}<p class="muted small restart-note" role="status">{restartLine}</p>{/if}
       <details class="section" ontoggle={(event) => (mirrorsOpen = event.currentTarget.open)}><summary>Projects and privacy</summary>{#if mirrorsOpen}<MirrorSettings visible={visible && mirrorsOpen} />{/if}</details>
     {:else if panel === "payment"}
       {@render paymentNotice(true)}
@@ -496,6 +507,7 @@
   .email { overflow-wrap: anywhere; }
   .identity .small, .row .small { display: block; margin-top: 4px; }
   .connection-warning, .returning { margin: -13px 0 25px; }
+  .restart-note { margin: -6px 0 16px; }
   .panel { margin: 20px 0; padding: 24px; border: 1px solid var(--edge); border-radius: 10px; }
   .section-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 18px; }
   .plan-heading p { margin-bottom: 0; }

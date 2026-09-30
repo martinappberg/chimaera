@@ -363,6 +363,14 @@ async fn run_flight(
     // `connect` re-emits when it starts).
     emit_progress(app, alias, "probing");
     if let Some((client, host, generation)) = super::pro::connection(&state, alias).await? {
+        if !super::tunnel::app_host(&host.kind) {
+            // The account's cloud is never connected as a host, so no window
+            // (a restored one from an older build, say) shows its own page
+            // and no update is ever offered for it. Checked before any
+            // reconnect, so nothing wakes it.
+            forget_cloud_windows(&state, alias);
+            return Err(CLOUD_IS_NOT_A_HOST.into());
+        }
         let ssh = host.kind == chimaera_link::HostKind::Ssh;
         match run_link_flight(app, client, host, generation, update_daemon).await {
             Ok(reply) => return Ok(reply),
@@ -465,6 +473,31 @@ async fn run_flight(
     // a window's reconnect — restores them, not just the next app start.
     reopen_windows(app, alias, port, &token);
     Ok(host_state)
+}
+
+/// The answer to a connect aimed at the account's cloud.
+const CLOUD_IS_NOT_A_HOST: &str =
+    "Your cloud doesn't open as a window here. Chimaera keeps it up to date for you.";
+
+/// Drop saved windows on the account's cloud (an older build could open one):
+/// they would only ever show the cloud's own page, which the app never opens.
+fn forget_cloud_windows(state: &Shell, alias: &str) {
+    let mut registry = lock(&state.registry);
+    let saved: Vec<String> = registry
+        .list()
+        .into_iter()
+        .filter(|record| record.alias.as_deref() == Some(alias))
+        .map(|record| record.id)
+        .collect();
+    if !saved.is_empty() {
+        tracing::info!(
+            "not restoring {} saved window(s) on {alias}: the app never opens the cloud's own page",
+            saved.len()
+        );
+    }
+    for id in saved {
+        registry.remove(&id);
+    }
 }
 
 /// Why a keeper-routed connect failed. Only `Transport` (the account or

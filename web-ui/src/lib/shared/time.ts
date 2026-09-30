@@ -22,7 +22,7 @@ const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
 
 /** Local calendar-day ordinal without DST-length assumptions. */
-function localDay(date: Date): number {
+export function localDay(date: Date): number {
   return Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / DAY_MS;
 }
 

@@ -25,6 +25,7 @@
   import { workspacePlugins } from "../plugins/store";
   import NotificationStatus from "./NotificationStatus.svelte";
   import UpdatesStatus from "./UpdatesStatus.svelte";
+  import { updateState } from "../workspace/update.svelte";
   import ActivitySettings from "./ActivitySettings.svelte";
   import { settingsJump } from "./jump";
   import { tick, untrack } from "svelte";
@@ -376,12 +377,15 @@
           {:else if group.category === "Updates"}
             <!-- The status block answers "is there an update?" for the app,
                  the daemon and the agents (it renders its own <h2> with a
-                 "check now"); the auto-check switch is the generic row. -->
+                 "check now"); the auto-check switch is the generic row. The
+                 account's cloud has no switch: its updates are the service's. -->
             <section data-section={group.category}>
               <UpdatesStatus onJump={jumpTo} visible={tabVisible} />
-              {#each group.defs as def (def.id)}
-                <SettingRow {def} />
-              {/each}
+              {#if updateState.daemon?.managed !== true}
+                {#each group.defs as def (def.id)}
+                  <SettingRow {def} />
+                {/each}
+              {/if}
             </section>
           {:else if group.category === "Keyboard"}
             <!-- Generic rows, then the reference chords that belong to them. -->

@@ -48,6 +48,15 @@ export function returningUntil(status: Pick<ProStatus, "signed_in" | "returning_
   return typeof until === "string" && Number.isFinite(Date.parse(until)) ? until : null;
 }
 
+/** The RFC 3339 time the account's always-on cloud connection restarts to
+ * update (in the past: shortly), or null when none is planned, the account
+ * reports a value that is not a time, or nobody is signed in
+ * (`presentation.ts` `keeperRestartLine`). */
+export function keeperRestartAt(status: Pick<ProStatus, "signed_in" | "keeper_restart_at"> | null | undefined): string | null {
+  const at = status?.signed_in === true ? status.keeper_restart_at : null;
+  return typeof at === "string" && Number.isFinite(Date.parse(at)) ? at : null;
+}
+
 /** The plan has ended and its cloud work is being brought home. */
 export function planEnded(status: Pick<ProStatus, "signed_in" | "returning_until"> | null | undefined): boolean {
   return returningUntil(status) !== null;

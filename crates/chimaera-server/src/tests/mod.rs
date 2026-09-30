@@ -39,6 +39,7 @@ mod sessions;
 mod settings;
 mod shell;
 mod support;
+mod update;
 mod upload;
 mod validate;
 mod view_state;

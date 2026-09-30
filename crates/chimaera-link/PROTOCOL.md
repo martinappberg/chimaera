@@ -169,6 +169,13 @@ Optional additive fields, omitted by older services:
   routes answer 403 `{"error":"return_window_ended"}`. Presentation only: a value
   that is not an RFC 3339 timestamp reads as absent, never failing the account
   read.
+- `keeper_restart_at` (RFC 3339 string or null): the account's always-on keeper
+  connection will restart to update. A future time is when; a time in the past
+  means shortly, as soon as no Git transfer runs. The restart drops the SSH
+  logins the keeper holds, so a kept host asks for its sign-in again on next
+  use. Null (or absent) when no restart is planned; clients stop showing it
+  when it returns to null. Presentation only, read like `returning_until`: a
+  value that is not an RFC 3339 timestamp reads as absent.
 - `plans`: the account's current offers,
   `[{plan:"pro"|"max",interval:"month"|"year",amount_cents,currency}]` with the
   amount in minor units and `currency` an ISO 4217 code. Clients never hardcode

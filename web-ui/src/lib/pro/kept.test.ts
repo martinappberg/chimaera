@@ -1,5 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { backNote, isKeptCopy, keptCopyHint, keptErrorLine, keptNoticeWorkspace, keptOriginal, sizeLabel } from "./kept";
+import {
+  backNote,
+  deletedNote,
+  isKeptCopy,
+  keptCopyHint,
+  keptErrorLine,
+  keptNoticeWorkspace,
+  keptOriginal,
+  sizeLabel,
+  useCloudForAllBody,
+  useCloudHint,
+} from "./kept";
 
 describe("kept copies", () => {
   it("recognises the daemon's names and nothing else", () => {
@@ -43,6 +54,20 @@ describe("words", () => {
     expect(backNote(1, "your computer")).toBe(
       "Back on your computer. The cloud and your computer both changed 1 file while apart.",
     );
+  });
+
+  it("says a discarded copy moves to the Trash, and only says deleted when it is", () => {
+    expect(useCloudHint(false, true, "this Mac")).toBe("The cloud's version stays; this Mac's copy moves to the Trash");
+    expect(useCloudHint(true, true, "this Mac")).toBe("The cloud deleted this file; this Mac's copy moves to the Trash");
+    expect(useCloudHint(false, false, "this computer")).toBe("The cloud's version stays; this computer's copy is deleted");
+    expect(useCloudForAllBody(3, true, "this Mac")).toBe(
+      "This Mac's versions of 3 files will be moved to the Trash. The cloud's versions stay.",
+    );
+    expect(useCloudForAllBody(1, false, "this Mac")).toBe(
+      "This Mac's versions of 1 file will be deleted: this folder's drive has no Trash. The cloud's versions stay.",
+    );
+    expect(deletedNote(1, "this Mac")).toBe("The Trash couldn't take this Mac's copy, so it was deleted.");
+    expect(deletedNote(2, "this Mac")).toBe("The Trash couldn't take 2 of this Mac's copies, so they were deleted.");
   });
 
   it("never shows a raw code", () => {

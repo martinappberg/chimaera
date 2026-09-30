@@ -79,6 +79,12 @@ app-build` (never the root `cargo`).
   hidden it restores ONLY the most recently used one (the rest stay in the Dock); with no window (only
   during startup) it opens Home. A repeated launch focuses the most recent on-screen window the same way. Minimized
   windows are never mass-restored.
+- **Never the cloud's own page.** With Chimaera Pro, where work runs is never a user choice, so no
+  window ever shows the account's cloud as a host (its Home, its workspaces): every window opens through
+  `open_shell_window`, which refuses the cloud's alias, and a connect to the cloud is refused before
+  anything reaches it (`shell/connect.rs` `run_flight`, `shell/tunnel.rs` `app_host`). A window on it
+  saved by an older build is not restored; launch logs it and drops the record. Cloud projects open in
+  local windows after their folder is adopted ([pro.md](pro.md#cloud-readiness)).
 
 ## Home launcher
 
@@ -178,8 +184,13 @@ app-build` (never the root `cargo`).
 - **An explicit check always answers** (`checkForUpdates(true)`: the menu item, the home screen's version
   stamp): "Checking for updates…", then the offer (snooze/skip don't hide what you asked for), "You're up
   to date" (fades after ~6s unless hovered), "Development build", or "Couldn't check for updates" with the
-  reason and "try again". The deciding source is what can update this window: the app's signed channel in
+  reason and "try again". A browser view of the account's cloud answers at once, without asking, with
+  "Updates for your cloud are managed for you." (it fades too; its daemon reports `managed`). The deciding source is what can update this window: the app's signed channel in
   the native shell, the daemon's release check in a browser.
+- **Never for the cloud.** The service updates the cloud's daemon; the app never offers to. Build skew is
+  window-scoped and no window shows the cloud, the shell never flags the cloud outdated
+  (`shell/tunnel.rs` `offers_daemon_update`; SSH hosts and other computers keep the note and the toast),
+  and a connect or update aimed at it is refused.
 
 ## Windows: the WSL2 engine (beta)
 

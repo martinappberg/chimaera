@@ -56,6 +56,35 @@ export function backNote(total: number, here = hereName()): string {
   return `Back on ${here}. The cloud and ${here} both changed ${files(total)} while apart.`;
 }
 
+/** "Use the cloud's" hover hint for one file: where this computer's copy
+ *  goes (the Trash, or deleted when the folder's drive has none). */
+export function useCloudHint(deletedInCloud: boolean, trash: boolean, here = hereName()): string {
+  if (deletedInCloud) {
+    return trash
+      ? `The cloud deleted this file; ${here}'s copy moves to the Trash`
+      : `The cloud deleted this file; ${here}'s copy is deleted too`;
+  }
+  return trash
+    ? `The cloud's version stays; ${here}'s copy moves to the Trash`
+    : `The cloud's version stays; ${here}'s copy is deleted`;
+}
+
+/** The "Use the cloud's for all" confirmation's text. */
+export function useCloudForAllBody(count: number, trash: boolean, here = hereName()): string {
+  const Here = here.charAt(0).toUpperCase() + here.slice(1);
+  return trash
+    ? `${Here}'s versions of ${files(count)} will be moved to the Trash. The cloud's versions stay.`
+    : `${Here}'s versions of ${files(count)} will be deleted: this folder's drive has no Trash. The cloud's versions stay.`;
+}
+
+/** After a choice the review said would use the Trash: copies no Trash
+ *  could take, so they were deleted. */
+export function deletedNote(count: number, here = hereName()): string {
+  return count === 1
+    ? `The Trash couldn't take ${here}'s copy, so it was deleted.`
+    : `The Trash couldn't take ${count} of ${here}'s copies, so they were deleted.`;
+}
+
 /** The file tree badge's hover hint beside a kept copy. */
 export function keptCopyHint(name: string, here = hereName()): string {
   const original = keptOriginal(name) ?? "the file";
@@ -93,8 +122,14 @@ export interface KeptReview {
   branches: string[];
   /** Whether the project is this computer's to change right now. */
   here: boolean;
+  /** Whether a copy discarded here ("Use the cloud's") moves to the Trash;
+   *  false: this folder's drive has no Trash, so it is deleted. */
+  trash?: boolean;
   /** After `resolve_all`: pairs that could not take the choice. */
   failed?: { mine_path: string; error_code: string }[];
+  /** After a choice: kept copies it moved to the Trash, and ones it
+   *  deleted because no Trash could take them. */
+  discarded?: { trash: number; deleted: number };
 }
 
 /** One version for the side-by-side view (`null`: not there). */

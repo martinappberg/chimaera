@@ -17,6 +17,7 @@ mod repository;
 mod routes;
 mod shadow_cache;
 mod transport;
+mod trash;
 pub(crate) use drain::{cancel as cancel_drain, start as drain};
 pub(crate) use kept::{
     file as kept_file, list as kept_list, resolve as kept_resolve, resolve_all as kept_resolve_all,
@@ -109,6 +110,14 @@ pub(crate) struct ProState {
     delegation_refused: AtomicBool,
     /// Acting on another computer brings the work there (`moves`).
     moves: moves::Moves,
+    /// Projects whose folder a snapshot last found not to be a Git
+    /// repository (`repository::describe`): the log says so once, not on
+    /// every pass. Hot state, bounded by enrolled projects.
+    plain_folders: Mutex<std::collections::HashSet<String>>,
+    /// The home Trash a discarded kept copy goes to (`trash::home`). Tests
+    /// never reach the real one: they point it at a fixture, or leave it
+    /// unset (no Trash, so a discarded copy is deleted).
+    trash: Option<PathBuf>,
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -454,6 +463,8 @@ impl ProState {
             renew_now: tokio::sync::Notify::new(),
             delegation_refused: AtomicBool::new(false),
             moves: Default::default(),
+            plain_folders: Mutex::new(Default::default()),
+            trash: if cfg!(test) { None } else { trash::home() },
         }
     }
 }
@@ -1095,6 +1106,12 @@ pub(crate) fn configured(state: &crate::AppState) -> bool {
         .pro
         .configured
         .load(std::sync::atomic::Ordering::Acquire)
+}
+/// This daemon runs as the account's cloud (configured as the worker now or
+/// before, or started as one): the service updates it, so it never checks
+/// for, or offers, its own releases (`update.rs`).
+pub(crate) fn updates_managed(state: &crate::AppState) -> bool {
+    execution::worker(state)
 }
 pub(crate) fn is_worker(state: &crate::AppState) -> bool {
     crate::lock(&state.pro.runtime)

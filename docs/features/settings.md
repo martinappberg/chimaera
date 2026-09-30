@@ -71,6 +71,8 @@ See [Pro connections](pro.md) for the connection and token lifecycle.
   summary line, "Agents ↓" jumps there). Each says up to date / \<new\> available / couldn't check (with
   the reason) / not checked yet, plus when it last checked and the cadence; "check now" asks every source
   at once. Agents read "up to date" only when every installed agent's version and latest are both known.
+  On the account's cloud (a daemon reporting `managed`) the daemon line reads "Updates for your cloud are
+  managed for you." and neither "check now" nor the `update.autoCheck` switch shows.
 
 ## Activity
 

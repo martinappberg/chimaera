@@ -9,7 +9,9 @@
 
   An explicit check answers here too: "checking…", then an offer, "you're
   up to date" (which fades on its own), or "couldn't check" with the reason
-  and a retry — never silence, which is what made the old flow unclear.
+  and a retry — never silence, which is what made the old flow unclear. On
+  the account's cloud the answer is one neutral line (its updates are the
+  service's) with nothing to do but close.
 
   Capability note: this UI is embedded in — and served by — the daemon it
   talks to, so a toast can never over-promise resurrection: if the daemon
@@ -21,6 +23,7 @@
   import {
     checkForUpdates,
     dismissAnswer,
+    MANAGED_UPDATES,
     snoozeUpdate,
     skipUpdateVersion,
   } from "./update.svelte";
@@ -40,11 +43,12 @@
     notice.kind === "checking" ||
       notice.kind === "current" ||
       notice.kind === "dev" ||
+      notice.kind === "managed" ||
       notice.kind === "failed",
   );
 
   $effect(() => {
-    if ((notice.kind !== "current" && notice.kind !== "dev") || hovered) return;
+    if ((notice.kind !== "current" && notice.kind !== "dev" && notice.kind !== "managed") || hovered) return;
     const timer = setTimeout(dismissAnswer, ANSWER_MS);
     return () => clearTimeout(timer);
   });
@@ -64,6 +68,8 @@
         return notice.pending ? "No update for the app yet" : "You're up to date";
       case "dev":
         return "Development build";
+      case "managed":
+        return MANAGED_UPDATES;
       case "failed":
         return "Couldn't check for updates";
     }
@@ -87,6 +93,8 @@
           : `chimaera ${notice.version} is the newest release.`;
       case "dev":
         return "Release updates don't apply to a development build.";
+      case "managed":
+        return null;
       case "failed":
         return notice.error;
     }
@@ -161,7 +169,7 @@
     <span class="dot" aria-hidden="true"></span>
     <span class="title">{title}</span>
   </div>
-  <p class="body">{body}</p>
+  {#if body !== null}<p class="body">{body}</p>{/if}
   {#if error !== null}
     <p class="error">{error}</p>
   {/if}
@@ -238,7 +246,8 @@
   }
 
   .update-toast[data-kind="current"] .dot,
-  .update-toast[data-kind="dev"] .dot {
+  .update-toast[data-kind="dev"] .dot,
+  .update-toast[data-kind="managed"] .dot {
     background: var(--muted);
   }
 

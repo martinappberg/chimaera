@@ -885,6 +885,11 @@ export interface ProStatus {
    * work can still be brought home; null or absent otherwise (older shells
    * omit it). An ended plan grants nothing (`pro/status.ts` `grantedPlan`). */
   returning_until?: string | null;
+  /** Optional: the RFC 3339 time the always-on cloud connection restarts to
+   * update (a past time: shortly, once no Git transfer runs). The restart drops
+   * the cluster logins it holds. Null or absent when none is planned (older
+   * shells omit it); `pro/status.ts` `keeperRestartAt` reads it. */
+  keeper_restart_at?: string | null;
   /** Optional: the account's current prices. Absent or null means the page
    * names the plans only; amounts are never built into the app. */
   plans?: ProPlanPrice[] | null;
@@ -903,6 +908,14 @@ export interface CloudProvisioningStatus {
    * remembered by the app and never probed, so a sleeping cloud is not woken
    * to answer it. Absent or null when the app has not seen a catalog yet. */
   agents_connected?: boolean | null;
+  /** Whether this account's cloud has been ready before, remembered by the
+   * app: a later `preparing` (a service update, say) is not first-time setup.
+   * Older shells omit it (`presentation.ts` `cloudReadyOnce`). */
+  cloud_ready_once?: boolean;
+  /** The provider rows of the last catalog read, remembered by the app and
+   * shown at once until a live read answers (`providers.ts`
+   * `rememberedRows`). Absent when none are remembered. */
+  remembered_providers?: RememberedProvider[];
   state: "no_plan" | "unavailable" | "preparing" | "ready" | "sleeping" | "limited" | "error";
   reason: "provisioning_disabled" | "beta_invite_required" | "hours_exhausted" | "storage_exhausted" | "spend_limit_reached" | "provisioning_failed" | null;
 }
@@ -1051,6 +1064,9 @@ export interface CloudProviderStatus {
   /** Older daemons omit this capability; never infer it from sign-in support. */
   disconnect_supported?: boolean;
 }
+/** A provider row as the last catalog read showed it (the app's or this
+ * browser's memory): the catalog's own fields that rendering needs. */
+export type RememberedProvider = Pick<CloudProviderStatus, "id" | "label" | "category" | "state"> & Partial<Pick<CloudProviderStatus, "methods" | "disconnect_supported">>;
 export interface CloudProviderConnection {
   id: string;
   provider_id: string;
@@ -1059,7 +1075,10 @@ export interface CloudProviderConnection {
   expires_at: number;
   action: { type: "device_code"; verification_url: string; user_code: string }
     | { type: "browser"; url: string; input?: "authorization_code" }
-    | { type: "terminal"; workspace_id: string; session_id: string } | null;
+    /** A terminal on the cloud: its own agent setup while `preparing`, or an
+     * older cloud's GitHub sign-in while `waiting`. Never opened from here
+     * (`pro/providers.ts` `olderCloudSignIn`). */
+    | { type: "terminal" } | null;
   error_code: string | null;
 }
 export interface CloudBlockedProvider {
@@ -1086,7 +1105,7 @@ export type CloudSetupRequest = { operation: "info" | "start" | "providers" }
   | { operation: "provider_connect"; provider_id: string }
   | { operation: "provider_disconnect"; provider_id: string; acknowledge_cloud_work: true }
   | { operation: "provider_submit"; connection_id: string; code: string }
-  | { operation: "provider_connection" | "provider_cancel" | "open_provider_browser" | "open_provider_terminal"; connection_id: string }
+  | { operation: "provider_connection" | "provider_cancel" | "open_provider_browser"; connection_id: string }
   | { operation: "resume_handoff"; workspace_id: string; expected_epoch: number }
   | { operation: "project"; url: string; name?: string };
 export async function proCloudRequest(request: CloudSetupRequest): Promise<CloudSetupInfo> {

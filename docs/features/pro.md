@@ -126,6 +126,17 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    With an active plan, toggle **Keep connected** for a saved SSH host. A password
    or Duo challenge uses the usual
    host-scoped prompt, with “Asked by your Pro connection” underneath its title.
+   When the account plans a restart of the always-on cloud connection to update
+   it (optional `ProStatus.keeper_restart_at`), one quiet line under **Connected
+   machines** says so: **Your cloud connection restarts** tonight at 02:00 (the
+   time in the person's own format: today, tonight, tomorrow, a weekday within
+   the week, else a date) **to update. You’ll be asked to sign in to your cluster
+   again when you next use it.**, naming the cluster instead ("sign in to
+   Sherlock again") when exactly one login is kept. A time that has passed reads
+   **restarts shortly**: the account restarts it as soon as no Git transfer runs.
+   The restart drops the kept cluster logins, hence the sign-in. The line goes
+   away when the account stops announcing the restart. No dialog, no warning
+   colour.
 4. Open that host from Home. Its **via Pro** label identifies the connection;
    workspaces still open through a local loopback port with the existing daemon UI.
 5. **Sign out** removes this app's credentials, removes the local daemon's Pro
@@ -179,11 +190,27 @@ preparation continues without a setup button; visible checks run
 sequentially every five seconds, slowing to thirty seconds after five minutes.
 Hidden views stop checking. Healthy phases do not ask the user to refresh.
 
+Only an account's very first setup reads as setup: **Getting things ready**,
+“Setting up your cloud. This usually takes a couple of minutes.” Once the
+account's cloud has been ready (the app remembers it per account as
+`cloud_ready_once`; the account listing a cloud daemon counts too, so a new
+computer knows), a later `preparing`, such as a service update, reads exactly
+like ready and idle: **Available when you need it** with the agents line. The
+user never has to think about a machine: no sentence in Settings → Chimaera Pro
+calls the cloud a machine or says it sleeps or wakes. Words about waking belong
+only to the user's own action: a pressed button (“Connecting Claude Code…”) and
+the chat and terminal lines for a sleeping project (“Asleep in the cloud. Send a
+message to wake it.”). `pro/vocabulary.test.ts` scans the Pro and cloud settings
+copy for it.
+
 A disabled service says cloud work isn't available yet and that work on this
 computer continues; an uninvited preview account says access is by invitation.
 Neither shows an activity animation or claims files are synchronizing. A failed
 read or unavailable connection says so and keeps checking on its own; there is no
-manual check. Project status
+manual check. One failed account status read in a row (the account service being
+updated, say) is not reported: the page keeps the last confirmed state and its
+calm copy and checks again within five seconds; only a second failed read in a
+row shows “Cloud availability couldn’t refresh”. Project status
 appears only when mirror metadata exists: completed copies, handoff in progress,
 restoration, or setup that needs attention. Saved-copy counts describe completed
 copies, never active synchronization or a promise that every file is current.
@@ -207,7 +234,7 @@ connection panel. Its official CLI completes authentication; no temporary projec
 or terminal window opens. The code is used once and never saved by Chimaera; it
 must be pasted whole (Claude shows `code#state`), and half of one keeps the
 sign-in waiting with its own error (`authorization_code_incomplete`).
-Connecting GitHub (it lets the cloud machine pull and push the user's
+Connecting GitHub (it lets the user's cloud pull and push their
 repositories) works like Codex, with no terminal: the panel shows GitHub's
 one-time code with **Copy code** and **Open sign-in page** (GitHub's device page,
 `https://github.com/login/device`), the user enters the code there and approves
@@ -219,8 +246,17 @@ for github.com (`gh auth setup-git`) and confirms with a fresh `gh auth status`.
 Each ending reads in plain words: no code shown (`sign_in_unavailable`), a code
 declined or left to expire (`sign_in_failed`), Git not set up (`git_setup_failed`,
 where **Try again** repeats only that step), or the request's own time limit. On
-success the panel says GitHub is connected and the cloud machine can now pull and
-push the user's repositories.
+success the panel says GitHub is connected and the user's cloud can now pull and
+push their repositories.
+A cloud the service has not updated yet still answers GitHub's **Connect** with a
+login terminal on the cloud. Chimaera never opens it, in the app or in a browser:
+that attempt ends quietly and the GitHub row says “Your cloud is being updated.
+GitHub sign-in is available again in a few minutes.” with **Try again** in place of
+**Connect**. Try again only looks (one passive catalog read, never waking the
+cloud); **Connect** comes back once the cloud offers the one-time code, whether
+Try again or the section's own catalog check sees it first. A catalog read that
+finds such a cloud offering only its terminal sign-in reads the same way before
+anything is pressed (`pro/providers.ts` `olderCloudSignIn`, `awaitingCloudUpdate`).
 A new attempt brings its guide into view; background status updates never scroll
 or reload the page. Installation remains automatic and separate from sign-in.
 Users can cancel or retry an expired request in place. Sign-in is confirmed by the provider CLI on the cloud
@@ -254,27 +290,44 @@ again; the UI cannot release the setup fence or infer a new move. A canceled
 connection leaves those conversations paused. A successful continuation returns to the
 originating project only if that context is still current.
 
-Status reads never wake a sleeping worker. The app remembers, per account,
-whether an agent was connected at the last catalog read (`pro-agents.json`;
-`pro_cloud_status` adds it as `agents_connected`), so the page can answer while
-the cloud sleeps: the check mark beside “Available when you need it” appears
-only when an agent is on record; none connected reads as the next step,
-“Connect an agent to start cloud work”; unknown claims nothing. A passive read
-that finds a cloud the account called ready unreachable is re-checked with the
-account first (it usually just went to sleep) and is reported as unavailable
-only on a second read in a row. A cloud machine that answers that it is asleep
-or still starting (503 `worker_asleep`/`worker_unavailable`, or a reply marked
-sleeping; both clients carry it as the fixed code `cloud_asleep`) is a state,
-not an error: it is never counted as unreachable, and the connections section
-says “Your cloud machine is waking up. Connections show in a moment.” while a
-request that wakes it is in flight or found it still starting (for at most two
-minutes, on the fast check cadence), or “Your cloud machine is asleep.
-Connecting an agent wakes it.” when nothing is waking it. Real failures keep
-their error copy. Opening the optional **Agent connections**
-disclosure loads those connections and acquires access automatically. There is no
+Status reads never wake a sleeping worker. The app remembers, per account, what
+its last catalog read showed (`pro-agents.json`, written only on change):
+whether an agent was connected, the provider rows themselves, and whether the
+cloud has ever been ready. `pro_cloud_status` carries them additively as
+`agents_connected`, `remembered_providers` and `cloud_ready_once`. A browser view
+of the cloud's own page keeps the rows in its local storage per cloud address
+(`pro/catalogMemory.ts`, never credentials) and forgets them all on sign-out.
+The page answers from that memory while the cloud sleeps: the check mark beside
+“Available when you need it” appears only when an agent is on record; none
+connected reads “Connect an agent below to start cloud work”; unknown claims
+nothing. **Agent connections** shows whenever the account has a cloud, with the
+remembered rows at once (Claude Code connected, Codex not connected, GitHub not
+connected), and a live read replaces them silently. While a live read is pending
+or finds the cloud asleep or starting, the rows simply stay; one muted
+“Checking…” beside the section title is the most that shows, and only after five
+seconds without a live answer. With nothing remembered yet (a new computer, say)
+the rows are neutral placeholders until the look answers; if it finds the cloud
+idle, the section names the catalog's providers (Claude Code, Codex, GitHub)
+without claiming any state, each with its **Connect**, under “Connect an agent to
+use it in the cloud. Agents you connected before stay connected.” A passive read that finds a cloud the account called ready
+unreachable is re-checked with the account first (it usually just went idle)
+and is reported as unavailable only on a second read in a row. A cloud that
+answers that it is asleep or still starting (503 `worker_asleep`/
+`worker_unavailable`, or a reply marked sleeping; both clients carry it as the
+fixed code `cloud_asleep`) is a state: never an error, never counted as
+unreachable, and never words on a passive path. Real failures keep their error
+copy. Opening **Agent connections** is looking, not acting: it never wakes the
+cloud. It makes one passive catalog read (`pro/cloudTransport.ts`
+`peekCatalog`); a cloud that happens to be awake refreshes the rows silently,
+and an idle one changes nothing. Only **Connect**, **Disconnect** and the
+sign-in steps carry wake intent. Pressing **Connect** says “Connecting Claude
+Code…” (or “Opening GitHub’s sign-in…”) on its button while the cloud comes up
+behind it, asking again for at most two minutes before the usual failure copy. Connect
+works from remembered rows; **Disconnect** waits for a live read. There is no
 separate cloud-start action. Connecting a provider, or opening a repository on
 the cloud machine's own page, also acquires access as part of that user request. Catalog checks are
-single-flight and visibility-gated. Active sign-in checks run sequentially every
+single-flight and visibility-gated; they poll only while the cloud answers, and
+opening the section adds one look. Active sign-in checks run sequentially every
 two seconds, stop while hidden, and end at the attempt's finite deadline. Pending
 connection operations keep the worker active only until they finish or expire.
 
@@ -292,9 +345,18 @@ connect/disconnect routes, connection read/cancel/input routes, and `/api/v1/pro
 Agent sign-in only runs through those provider connection jobs (the older
 login-terminal route `/api/v1/pro/cloud/onboard` is gone).
 The native `pro_cloud_request` command keeps account and daemon credentials out
-of the UI and opens only a server-owned connection's validated browser URL or
-terminal (a terminal only for an older cloud machine's GitHub sign-in, which the
-panel calls a sign-in window). Browser clients use the same routes through the host-pinned gateway.
+of the UI and opens only a server-owned connection's validated browser URL, in
+the user's own browser. It has no terminal operation: an older cloud's terminal
+sign-in is never opened, and the panel says the cloud is being updated instead
+(above). Browser clients use the same routes through the host-pinned gateway.
+The app never opens the cloud's own page: nothing connects to the cloud as a
+host (`shell/connect.rs`), no window is created on it (`shell/restore.rs`), a
+window on it saved by an older build is dropped at launch instead of restored,
+and it never reads as outdated or gets an update offer, since the service
+updates its daemon (`shell/tunnel.rs` `offers_daemon_update`). That daemon
+never checks for its own releases either: every view of it says “Updates for
+your cloud are managed for you.”, with nothing to check or install
+([update awareness](lifecycle-and-persistence.md#update-awareness-daemon-side)).
 A shared provider catalog bounds external authentication origins in both clients.
 
 ## Where it lives
@@ -329,7 +391,9 @@ code), `connection_warning` (informational fixed code: `connection_preparing`,
 `connection_retrying`, `account_unreachable`; work continues and Chimaera
 retries), `payment_due` (the account reports a payment problem),
 `returning_until` (an RFC 3339 time, or null: an ended plan's cloud work can be
-brought home until then) and `plans` (the
+brought home until then), `keeper_restart_at` (an RFC 3339 time, or null: the
+always-on cloud connection restarts to update then, or shortly when the time has
+passed) and `plans` (the
 offers with amounts and each plan's optional whole-number `cloud_time_multiple`
 and `storage_multiple` relative to Pro, when the service supplies them: the
 signed-in account's own list, else the public catalog from `GET /v1/plans`;
@@ -386,7 +450,10 @@ or one waiting for an agent connection asks for attention.
 
 Repository history and working files are separate Git mirrors. Snapshot commits
 use an independent index under the daemon's data directory; they never make WIP
-commits on the user's branches. `.gitignore` and `.chimaeraignore` restrict the
+commits on the user's branches. A project folder does not have to be a Git
+repository: a plain folder is copied as its working files alone, which the
+daemon's log notes once (at info level, not as a problem); if the folder later
+becomes a repository, its history travels from the next snapshot on. `.gitignore` and `.chimaeraignore` restrict the
 working snapshot. Credential filenames, private keys, agent login stores and
 secret configuration fields are excluded. Git configuration carries the
 user's name, email and simple Git aliases with known flags. Free-form or shell
@@ -421,7 +488,7 @@ configured and the project is owned elsewhere, and never in the accent colour.
 
 When the work comes home and the cloud and this Mac both changed the same file while apart, both versions are kept: the file holds the cloud's version and this Mac's version sits right beside it as `<name>.mine-<yyyymmdd-hhmm>`. Nobody has to go looking for those names. The chat marks where the work came back with one quiet line, "Back on this Mac. The cloud and this Mac both changed 3 files while apart.", and a **Review** button; the same review opens from the "Kept both versions" line in Settings → Chimaera Pro (its **Review** link), from the "Kept both versions" notification, and from a kept copy's right-click menu in the file tree, where every such copy carries a small "from this Mac" badge that explains the name on hover. (Off a Mac the words say "this computer", and a browser view of the project says "your computer".)
 
-The review is a workbench tab, "Both versions": the files on the left, and for the selected one this Mac's version and the cloud's side by side with the differences highlighted. Each file offers **Use this Mac's** (it replaces the file and the copy beside it goes away), **Use the cloud's** (the copy beside it goes away), and **Keep both** (nothing moves; the file just stops asking); the header offers **Use the cloud's for all** and **Use this Mac's for all**, each confirmed first. A picture or other non-text file, or one larger than 512 KB, shows both sizes and the same choices. A file the cloud deleted says so: this Mac's version brings it back, the cloud's leaves it deleted. Branches the cloud kept beside yours (`<branch>@cloud-<commit>`) are listed under "Branches from the cloud" for merging, with no actions. A return names at most 32 kept copies; when it kept more, the review says that some aren't listed and that they keep their `.mine-` names in the folder. Choices apply only while the project is on this Mac. Once nothing is left to choose, the chat line and the Settings line go away. Implementation: [`pro/kept.rs`](../../crates/chimaera-server/src/pro/kept.rs) (routes in [`pro/AGENTS.md`](../../crates/chimaera-server/src/pro/AGENTS.md), "Reviewing both versions") and [`web-ui/src/lib/pro/KeptReviewView.svelte`](../../web-ui/src/lib/pro/KeptReviewView.svelte).
+The review is a workbench tab, "Both versions": the files on the left, and for the selected one this Mac's version and the cloud's side by side with the differences highlighted. Each file offers **Use this Mac's** (it replaces the file and the copy beside it goes away), **Use the cloud's** (the copy beside it moves to the Trash, so it can still be taken back), and **Keep both** (nothing moves; the file just stops asking); the header offers **Use the cloud's for all** and **Use this Mac's for all**, each confirmed first ("This Mac's versions of 3 files will be moved to the Trash. The cloud's versions stay."). The copy goes to the Trash on its own drive: the Mac's Trash (`~/.Trash`) for a folder on the Mac itself, the drive's own Trash for a folder on an external drive that has one, and on Linux the desktop's trash (`~/.local/share/Trash`, restorable from the file manager). A folder on a drive with no Trash (a network share, say) says so before you choose, and there the copy is deleted instead; if a Trash refuses a copy the review promised it would take, the review says it was deleted. Moving to the Trash never replaces anything already there: a second copy of the same name becomes "<name> 2". A picture or other non-text file, or one larger than 512 KB, shows both sizes and the same choices. A file the cloud deleted says so: this Mac's version brings it back, the cloud's leaves it deleted. Branches the cloud kept beside yours (`<branch>@cloud-<commit>`) are listed under "Branches from the cloud" for merging, with no actions. A return names at most 32 kept copies; when it kept more, the review says that some aren't listed and that they keep their `.mine-` names in the folder. Choices apply only while the project is on this Mac. Once nothing is left to choose, the chat line and the Settings line go away. Implementation: [`pro/kept.rs`](../../crates/chimaera-server/src/pro/kept.rs) (routes in [`pro/AGENTS.md`](../../crates/chimaera-server/src/pro/AGENTS.md), "Reviewing both versions") and [`web-ui/src/lib/pro/KeptReviewView.svelte`](../../web-ui/src/lib/pro/KeptReviewView.svelte).
 
 ### Quitting
 

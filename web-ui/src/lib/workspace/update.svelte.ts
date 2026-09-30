@@ -17,6 +17,10 @@
  *
  * Snooze/skip live in localStorage: windows on the same daemon share an
  * origin, so dismissing once quiets every window there.
+ *
+ * The account's cloud never checks: the service updates its daemon, which
+ * says `managed`. Every view of it then shows `MANAGED_UPDATES` and offers
+ * no check and no update.
  */
 
 import { api } from "../net/api";
@@ -29,7 +33,10 @@ export interface UpdateStatus {
   /** A dev build: release checks don't apply (it is never "outdated"). */
   dev: boolean;
   /** One word for "is there an update?", decided by the daemon. */
-  state: "unchecked" | "current" | "available" | "failed";
+  state: "unchecked" | "current" | "available" | "failed" | "managed";
+  /** This daemon is the account's cloud: the service updates it, so it
+   * never checks and nothing is offered. Older daemons omit it. */
+  managed: boolean;
   available: boolean;
   latest: { version: string; url: string; published_at?: string | null } | null;
   /** Last attempt / last success, unix seconds. */
@@ -58,6 +65,8 @@ export type UpdateAnswer =
    *  the app's signed channel doesn't offer yet (so "newest" would be false). */
   | { kind: "current"; version: string; pending?: string | null }
   | { kind: "dev" }
+  /** The account's cloud: updates are the service's, nothing to check. */
+  | { kind: "managed" }
   | { kind: "failed"; error: string };
 
 export type UpdateNotice = UpdateOffer | UpdateAnswer;
@@ -67,7 +76,10 @@ const SNOOZE_KEY = "chimaera.update.snooze";
 /** "Later" quiets the toast for ~20h — under a day, so it returns tomorrow. */
 const SNOOZE_MS = 20 * 60 * 60 * 1000;
 
-const STATES = new Set(["unchecked", "current", "available", "failed"]);
+const STATES = new Set(["unchecked", "current", "available", "failed", "managed"]);
+
+/** The one line every view of the account's cloud shows for its updates. */
+export const MANAGED_UPDATES = "Updates for your cloud are managed for you.";
 
 /** Raw signals; each arrives from its own listener. */
 export const updateState = $state({
@@ -118,14 +130,16 @@ export function parseUpdateStatus(raw: unknown): UpdateStatus | null {
           published_at: str(latestRaw.published_at),
         }
       : null;
-  const state = typeof r.state === "string" && STATES.has(r.state) ? r.state : null;
+  const managed = r.managed === true || r.state === "managed";
+  const state = managed ? "managed" : typeof r.state === "string" && STATES.has(r.state) ? r.state : null;
   return {
     current: str(r.current) ?? "",
     build: str(r.build),
     dev: r.dev === true,
     state: (state ?? (r.available ? "available" : latest !== null ? "current" : "unchecked")) as UpdateStatus["state"],
-    available: r.available,
-    latest,
+    managed,
+    available: managed ? false : r.available,
+    latest: managed ? null : latest,
     checked_at: num(r.checked_at),
     succeeded_at: num(r.succeeded_at),
     error: str(r.error),
@@ -167,6 +181,14 @@ let inFlight: Promise<void> | null = null;
  * calls share one round.
  */
 export function checkForUpdates(announce: boolean): Promise<void> {
+  // The account's cloud never checks; asking it answers at once.
+  if (!isNativeShell() && updateState.daemon?.managed === true) {
+    if (announce) {
+      updateState.askError = null;
+      updateState.asked = "answered";
+    }
+    return inFlight ?? Promise.resolve();
+  }
   if (announce) {
     updateState.asked = "checking";
     updateState.askError = null;
@@ -315,6 +337,7 @@ function currentAnswer(): UpdateAnswer {
   if (updateState.askError !== null) return { kind: "failed", error: updateState.askError };
   const daemon = updateState.daemon;
   if (daemon === null) return { kind: "failed", error: "the daemon did not answer" };
+  if (daemon.managed) return { kind: "managed" };
   if (daemon.dev) return { kind: "dev" };
   if (daemon.state === "failed" || daemon.state === "unchecked") {
     return { kind: "failed", error: daemon.error ?? "the check did not finish" };

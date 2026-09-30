@@ -136,8 +136,16 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   overrides; users can disable with `update.autoCheck` (an explicit `?refresh=true` still runs — the
   setting governs phoning home on its own). Test knobs: `CHIMAERA_RELEASES_API`,
   `CHIMAERA_UPDATE_CURRENT` (also reported as `current`, so a dev build exercises the whole UI).
+- **The account's cloud never checks.** The service updates the cloud's daemon, so a daemon running as
+  the account's cloud (`pro::updates_managed`: started as one, or configured as the Pro worker now or
+  before) makes no release request, periodic or asked for, and reports `state: "managed"` with
+  `managed: true`, no `latest`, nothing available and no check times. Becoming the cloud moves the epoch,
+  so attached windows hear it at once. Every view of that daemon shows the one neutral line
+  "Updates for your cloud are managed for you." with no check and no update action (Settings → Updates
+  drops "check now" and the auto-check switch; the toast answers an explicit check with that line; the
+  version stamp's hover says it). Its plugins' release checks are unchanged.
 - **A failed check is reported as one.** The status carries one `state` word
-  (`unchecked | current | available | failed`), `checked_at` (last attempt) vs `succeeded_at`
+  (`unchecked | current | available | failed | managed`), `checked_at` (last attempt) vs `succeeded_at`
   (last answer), the failure in plain words (`error`: curl's own diagnosis minus its prefix; a
   GitHub 403/429 is named as the rate limit a shared login-node address hits), `dev`, and
   `interval_secs`. A known newer release outranks a later failed re-check — the release didn't stop
