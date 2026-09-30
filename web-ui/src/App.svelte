@@ -401,6 +401,7 @@
   import { archiveRecents, nudgeHistory, unarchiveRecents } from "./lib/workspace/history";
   import { sameFile, setSameFileOpener } from "./lib/workspace/sameFile.svelte";
   import { requestSettingsSection } from "./lib/settings/jump";
+  import { setAgentNames } from "./lib/chat/toolLabels";
   import QuickOpen from "./lib/workspace/QuickOpen.svelte";
   import FileTree from "./lib/workspace/FileTree.svelte";
   import SplitTree from "./lib/layout/SplitNode.svelte";
@@ -428,6 +429,12 @@
   let lastRecentsEpoch: number | null = null;
   let workspaces = $state<Workspace[]>([]);
   let sessions = $state<Session[]>([]);
+  // Agent-communication tool rows carry the session id an agent passed;
+  // they say the agent's name (read when a row renders — no subscription).
+  setAgentNames((id) => {
+    const s = sessions.find((x) => x.id === id);
+    return s ? displayName(s) : null;
+  });
   // Two live sessions writing one file: the chat line's and the dashboard
   // card's quiet notice (never the rail) reads this roster.
   $effect(() => {

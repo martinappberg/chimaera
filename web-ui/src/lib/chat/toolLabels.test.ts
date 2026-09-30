@@ -3,6 +3,7 @@ import {
   commsCall,
   commsTitle,
   readableToolTitle,
+  setAgentNames,
   toolGroupTitle,
   toolRunHealth,
   type HealthTool,
@@ -130,6 +131,17 @@ describe("toolRunHealth", () => {
 });
 
 describe("agent-communication tools", () => {
+  it("names a session id by the agent's name when the app knows it", () => {
+    setAgentNames((id) => (id === "s-10197809" ? "analyst" : null));
+    try {
+      expect(commsTitle(commsCall("chimaera.message_agent → s-10197809")!)).toBe("Message to analyst");
+      expect(commsTitle(commsCall("read_agent (chimaera) → s-deadbeef")!)).toBe("Read s-deadbeef's work");
+      expect(commsTitle(commsCall("message_agent (chimaera) → everyone")!)).toBe("Message to everyone");
+    } finally {
+      setAgentNames(() => null);
+    }
+  });
+
   it("recognizes every driver's MCP naming", () => {
     // claude titles `tool (server)`; codex `server.tool` (an item) or
     // `server · tool` (an approval); the raw CLI name too.

@@ -457,6 +457,10 @@ async fn a_reply_the_asker_wanted_wakes_it_without_asking() {
     assert!(text.contains("started a turn"), "{text}");
     let content = journal_has(&state, &c, "batch_id").await;
     assert!(content.contains(&format!("re #{asked}")), "{content}");
+    assert!(
+        content.contains("it answers a question you asked"),
+        "{content}"
+    );
     assert!(comms(&state, &ws).await["wake_requests"]
         .as_array()
         .unwrap()

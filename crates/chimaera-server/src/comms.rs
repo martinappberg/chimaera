@@ -866,8 +866,8 @@ enum Plan {
     Carrier,
     /// `SendIfRunning` into the running turn (codex chat).
     Steer,
-    /// Start a turn now (policy + caps allowed it).
-    Wake,
+    /// Start a turn now (policy + caps allowed it); the words say why.
+    Wake(&'static str),
     /// The Mastermind's direction as an ordinary send (queued if busy).
     Direct,
     /// Ask the user (Needs you).
@@ -896,7 +896,7 @@ fn decide_idle(
             return Plan::Inbox("the Mastermind reads it when the user hands it over");
         }
         return match st.claim_wake(sender, ws, None) {
-            Ok(()) => Plan::Wake,
+            Ok(()) => Plan::Wake("the user lets the Mastermind act on its own"),
             Err(_) => Plan::Inbox("the Mastermind was woken recently"),
         };
     }
@@ -904,7 +904,8 @@ fn decide_idle(
         return Plan::Request("ask");
     }
     match st.claim_wake(sender, ws, thread) {
-        Ok(()) => Plan::Wake,
+        Ok(()) if reply_wake => Plan::Wake("it answers a question you asked"),
+        Ok(()) => Plan::Wake("the user lets agents in this workspace wake each other"),
         Err(true) => Plan::Request("hop_limit"),
         Err(false) => Plan::Inbox("it was woken recently"),
     }
@@ -1069,7 +1070,7 @@ pub(crate) async fn message_agent(state: &Arc<AppState>, from_sid: &str, args: &
             Plan::Carrier if targets[0].busy => "next_step",
             Plan::Steer => "next_step",
             Plan::Direct if targets[0].busy => "next_step",
-            Plan::Wake | Plan::Direct => "woke",
+            Plan::Wake(_) | Plan::Direct => "woke",
             Plan::Request(_) => "asked",
             Plan::Carrier | Plan::Inbox(_) => "inbox",
         }
@@ -1194,13 +1195,12 @@ async fn execute(
                 }
             }
         }
-        Plan::Wake => {
-            let why = "[chimaera delivered this while you were idle: the user lets agents in this \
-                       workspace wake each other]";
+        Plan::Wake(reason) => {
+            let why = format!("[chimaera delivered this while you were idle: {reason}]");
             match deliver_all(
                 state,
                 target,
-                Some(why),
+                Some(&why),
                 chimaera_agent::model::ORIGIN_AGENT,
             )
             .await
@@ -1487,17 +1487,12 @@ async fn idle_check(state: &Arc<AppState>, sid: &str) {
         )
     };
     match plan {
-        Plan::Wake => {
-            let why = if reply.is_some() {
-                "[chimaera delivered these when your turn ended: a reply you asked for is among them]"
-            } else {
-                "[chimaera delivered these when your turn ended: the user lets agents in this \
-                 workspace wake each other]"
-            };
+        Plan::Wake(reason) => {
+            let why = format!("[chimaera delivered these when your turn ended: {reason}]");
             match deliver_all(
                 state,
                 &reader,
-                Some(why),
+                Some(&why),
                 chimaera_agent::model::ORIGIN_AGENT,
             )
             .await
@@ -2347,11 +2342,14 @@ mod tests {
         );
         assert_eq!(
             plan(&mut st, &to, WakePolicy::Ask, true),
-            Plan::Wake,
+            Plan::Wake("it answers a question you asked"),
             "a reply it asked for"
         );
         let mut other = CommsState::default();
-        assert_eq!(plan(&mut other, &to, WakePolicy::Auto, false), Plan::Wake);
+        assert!(matches!(
+            plan(&mut other, &to, WakePolicy::Auto, false),
+            Plan::Wake(_)
+        ));
         let mut mm = to.clone();
         mm.mastermind = true;
         assert!(

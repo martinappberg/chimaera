@@ -117,9 +117,20 @@ export function commsCall(title: string, input?: Record<string, unknown> | null)
   return null;
 }
 
-/** A recipient as a sentence says it: the two reserved addresses in words. */
+/** Names the app knows for session ids (set once from the live roster):
+ *  an agent passes an id to message or read another, and the card should say
+ *  the name the user sees. Ids it doesn't know stay ids. */
+let agentName: (id: string) => string | null = () => null;
+export function setAgentNames(resolve: (id: string) => string | null): void {
+  agentName = resolve;
+}
+
+/** A recipient as a sentence says it: the two reserved addresses in words,
+ *  a session id by its name. */
 function targetLabel(target: string): string {
   if (target === "mastermind") return "the Mastermind";
+  if (target === "everyone") return "everyone";
+  if (/^s-[0-9a-f]{6,}$/.test(target)) return agentName(target) ?? target;
   return target;
 }
 
