@@ -184,7 +184,8 @@ app-build` (never the root `cargo`).
 - **An explicit check always answers** (`checkForUpdates(true)`: the menu item, the home screen's version
   stamp): "Checking for updates…", then the offer (snooze/skip don't hide what you asked for), "You're up
   to date" (fades after ~6s unless hovered), "Development build", or "Couldn't check for updates" with the
-  reason and "try again". The deciding source is what can update this window: the app's signed channel in
+  reason and "try again". A browser view of the account's cloud answers at once, without asking, with
+  "Updates for your cloud are managed for you." (it fades too; its daemon reports `managed`). The deciding source is what can update this window: the app's signed channel in
   the native shell, the daemon's release check in a browser.
 - **Never for the cloud.** The service updates the cloud's daemon; the app never offers to. Build skew is
   window-scoped and no window shows the cloud, the shell never flags the cloud outdated

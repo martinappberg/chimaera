@@ -56,7 +56,7 @@
   import { pageVisible } from "../shared/visibility";
   import { fetchOwnershipHints } from "./placementHints";
   import { relativeAge } from "./launcher";
-  import { checkForUpdates, updateState } from "./update.svelte";
+  import { checkForUpdates, MANAGED_UPDATES, updateState } from "./update.svelte";
 
   interface Props {
     workspaces: Workspace[];
@@ -262,6 +262,8 @@
         : `daemon v${health?.version ?? "?"}`;
     const d = updateState.daemon;
     if (d === null) return `${v}. Click to check for updates.`;
+    // The account's cloud: nothing to check (a click shows the same line).
+    if (d.managed) return `${v}. ${MANAGED_UPDATES}`;
     if (d.dev) return `${v}: release updates don't apply. Click to check anyway.`;
     const checked = d.checked_at === null ? null : relativeAge(d.checked_at, stampNow);
     const when = checked === null ? "" : checked === "now" ? " (checked just now)" : ` (checked ${checked} ago)`;
@@ -274,6 +276,8 @@
         return `${v}: not checked for updates yet. Click to check.`;
       case "current":
         return `${v}: up to date${when}. Click to check again.`;
+      case "managed":
+        return `${v}. ${MANAGED_UPDATES}`;
     }
   });
 

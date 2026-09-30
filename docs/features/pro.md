@@ -353,7 +353,10 @@ The app never opens the cloud's own page: nothing connects to the cloud as a
 host (`shell/connect.rs`), no window is created on it (`shell/restore.rs`), a
 window on it saved by an older build is dropped at launch instead of restored,
 and it never reads as outdated or gets an update offer, since the service
-updates its daemon (`shell/tunnel.rs` `offers_daemon_update`).
+updates its daemon (`shell/tunnel.rs` `offers_daemon_update`). That daemon
+never checks for its own releases either: every view of it says “Updates for
+your cloud are managed for you.”, with nothing to check or install
+([update awareness](lifecycle-and-persistence.md#update-awareness-daemon-side)).
 A shared provider catalog bounds external authentication origins in both clients.
 
 ## Where it lives
