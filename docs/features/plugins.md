@@ -22,7 +22,7 @@ rollback, remove), `releases.rs` (the release checker), `capabilities.rs` (what 
 do: `[access]`, the atoms, the digest, the tier, the Can list), `trust.rs` (standing, trust
 records, admission, the admin policy, holds), `revoke.rs` (the kill switch), `activity.rs` (the
 activity log), `retired.rs` (plugins whose job moved into Chimaera,
-[below](#agent-notes)) — plus `agent_probe.rs` and `notes.rs`;
+[below](#agent-notes)) — plus `agent_probe.rs` and `comms.rs` (the post window plugins' Timeline appends share);
 the interface `crates/chimaera-plugin-api` (the WIT world and its Rust bindings,
 [map](../../crates/chimaera-plugin-api/AGENTS.md)); the first-party plugins in their own
 repositories, [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium), [chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex) and [chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst), whose releases
@@ -244,7 +244,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     refused), reads ≤ 8 MiB and listings ≤ 4,096 entries, off the reactor behind the filesystem
     semaphore; `state` — 64 KiB per (plugin, workspace), in memory (a restart clears it);
     `sessions`; `timeline-append` of `note` entries only (≤ 2 KiB, from a session's call, under
-    the per-session posts-per-minute window `tell_mastermind` shares) and `timeline-recent`;
+    the per-session posts-per-minute window agent messages share; a plugin's note is shown on the Timeline, never delivered into an agent) and `timeline-recent`;
     `emit` (one JSON object ≤ 16 KiB); `now-ms`; `log` (≤ 64 lines a call). The host serves the
     workspace and session of the call in flight, never the context a guest passes back.
   - **What a plugin hands back is capped too** — a tool result at 256 KiB, the instruction

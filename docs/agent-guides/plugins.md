@@ -321,7 +321,7 @@ return the host's reason as a `String`). The limits are in
 | `host::list(&cx, path, cap)` | a directory's entries (`name`, `is_dir`, `is_symlink`) | the same path rules; at most `cap`, clamped to 4,096 |
 | `host::state_get` / `state_put(&cx, key, &value)` | small per-(plugin, workspace) state; `null` removes a key | 64 KiB per plugin per workspace, keys and values; in memory, so a daemon restart clears it; kept across a switch off and on and across versions |
 | `host::sessions(&cx)` | the workspace's sessions: `id`, `kind`, `name`, `chat`, `alive`, `mastermind` | at most 256 |
-| `host::timeline_append(&cx, &entry)` | appends a Timeline entry; returns its seq | only from a session's call; `{"kind":"note","to":…,"text":…}` and no other kind or field; text ≤ 2 KiB; `to` a session in this workspace, `"mastermind"` or null; 10 posts per session per minute (the window `tell_mastermind` shares) |
+| `host::timeline_append(&cx, &entry)` | appends a Timeline entry; returns its seq | only from a session's call; `{"kind":"note","to":…,"text":…}` and no other kind or field; text ≤ 2 KiB; `to` a session in this workspace, `"mastermind"` or null; 10 posts per session per minute (the window agent messages share); shown on the Timeline, never delivered into an agent |
 | `host::timeline_recent(&cx, &kinds, limit)` | the newest entries of `kinds`, newest first | looks through the newest 200 entries; at most 16 kinds |
 | `host::emit(&cx, &event)` | a `{"type":"plugin","plugin":…,"workspace":…, …event}` frame on `/ws/events` | one JSON object ≤ 16 KiB; the host's keys win; a ring of 64 (no UI reads these yet) |
 | `host::now_ms()` | wall-clock ms since the epoch | |

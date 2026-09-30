@@ -1,7 +1,8 @@
 # Agent communication — design & plan
 
-Status: **planned** (2026-09-29, every decision settled 2026-09-30), nothing
-built. It
+Status: **built** (2026-09-30, branch `claude/agent-communication-redesign-224c66`),
+verified live against claude 2.1.284 and codex 0.157.1 — see "As built" below and
+[features/agent-communication.md](features/agent-communication.md). It
 replaces the *Agent notes* workbench plugin with a built-in feature, **on by
 default and switchable off**: every agent in a workspace can see which other
 agents are running and what they're doing, and send them messages that
@@ -12,6 +13,28 @@ original notes design
 ([timeline-knowledge-plugins-plan.md](timeline-knowledge-plugins-plan.md) §7),
 and mid-turn reading of queued messages (PR #217, PROTOCOL.md Pass 38).
 The maintainer's decisions are collected in §11.
+
+## As built — where it differs from the design below
+
+- **Tool names.** The design's `list_agents` / `send_message` lost a live name
+  match to Claude Code's own `ListAgents` / `SendMessage` (machine-wide peer
+  sessions): asked to "use list_agents", haiku tool-searched those and listed
+  the user's other Claude sessions. They are **`workspace_agents`** and
+  **`message_agent`** (the Mastermind's old verb, now everyone's, its meaning
+  set by the sender's role), and the instructions say the harness's own agent
+  tools never reach this workspace's agents. The text below uses the built
+  names; where it says `message_agent` "goes away" it means the Mastermind-only
+  tool of that name.
+- **Claude chat is reached through hooks, not sends** (§4 as designed), and
+  codex's `send_if_running` is a new chat command (`AgentCommand::SendIfRunning`,
+  caller-keyed so a no-echo `Dropped` settles its budget reservation).
+- **A wake says why** — "a reply you asked for", "the wake policy", or "the
+  Mastermind acts on its own" — and a conversation's first wake counts toward
+  its hop limit.
+- **Tool cards name the recipient**: both drivers append ` → <to>` to a comms
+  call's title, and the UI shows the agent's name for a session id.
+- **The Agent notes plugin is retired, not just unlisted**: `plugins/retired.rs`
+  keeps an installed copy inert with Remove, and every install path refuses it.
 
 ## 1. Why this stops being a plugin
 
@@ -102,7 +125,7 @@ is what its messages mean and what else it can do:
   chat target whatever the peer wake policy says, and is gated by its
   ask-first/auto mode exactly as `message_agent` is today (ask-first: not
   pre-allowed, so each send raises its native permission prompt).
-  `message_agent` goes away; one send verb for everyone.
+  One send verb for everyone: `message_agent`.
 - `read_session` becomes everyone's `read_agent`. `workspace_status` stays
   the Mastermind's whole-workspace view (git, terminals, jobs), its
   per-agent rows built by the same code as `workspace_agents`.
@@ -300,8 +323,9 @@ The plugin platform itself stays (Mycelium, LaTeX, Typst).
   server section of `features/linked-terminals.md`,
   `features/timeline-and-knowledge.md`, `features/dashboard.md`, the server
   and plugins `AGENTS.md` maps; a new `features/agent-communication.md`.
-- `notes.rs` becomes `comms.rs`; `tell_mastermind` and `message_agent` go
-  away in the same change, `read_session` is renamed `read_agent` (the
+- `notes.rs` becomes `comms.rs`; `tell_mastermind` goes away and the
+  Mastermind-only `message_agent` becomes everyone's in the same change,
+  `read_session` is renamed `read_agent` (the
   `agent_view` fixtures are re-blessed on purpose, with an on and an off
   baseline). The Mastermind's role prompt and skill text move to the new
   tool names.
@@ -359,8 +383,8 @@ Settled by the maintainer, 2026-09-30:
 - **The Mastermind is part of it** — the coordinator role inside agent
   communication, sharing its tools (§2, §3). Off turns it off too.
 - Following from that: **one send tool** (`message_agent`) whose meaning
-  depends on the sender's role, replacing `message_agent` and
-  `tell_mastermind`.
+  depends on the sender's role, replacing the Mastermind-only `message_agent`
+  and `tell_mastermind`.
 
 - **Wakes**: mail by default, phone by policy, and the policy defaults to
   **Ask me** (§5).
@@ -382,7 +406,7 @@ existing wire shape.
 `message_agent {to, text, reply_to?, expect_reply?}`, `read_messages {all?}`.
 The Mastermind adds `workspace_status`, `list_changed_files`,
 `read_timeline`, `spawn_agent`, `spawn_terminal`, `interrupt_agent`.
-`tell_mastermind`, `message_agent` and `read_session` are gone. Pre-allowed
+`tell_mastermind` and `read_session` are gone; `message_agent` is everyone's. Pre-allowed
 for workers: the four; an ask-first Mastermind: everything read-only
 (`workspace_agents`, `read_agent`, `read_messages`, `workspace_status`,
 `list_changed_files`, `read_timeline`, `list_terminals`, `read_terminal`)

@@ -851,12 +851,39 @@ environment"); for remote shells the journal enables **setup replay** — it kno
 `module load`, `conda activate`, `cd` sequence, so cloning becomes replaying the reviewed
 setup into a new session. Distinctive, deferred.
 
+### Agent communication: agents that see and reach each other
+
+*Added 2026-09-30. Plan: [agent-communication-plan.md](../agent-communication-plan.md); what
+users see: [features/agent-communication.md](../features/agent-communication.md).*
+
+The same per-session MCP server gives every agent in a workspace four tools — who is here,
+read one's work, message one, read your inbox — and the Mastermind is the coordinator role
+inside it, not a separate system. It is core, not a plugin, because everything that makes a
+message *arrive* is daemon privilege a sandboxed plugin must never have: the live roster, a
+hook's `additionalContext`, a chat send or steer, a billed wake. One switch
+(`agents.communication.enabled`, default on) turns all of it off, the Mastermind included.
+
+- **Record first, then the cheapest carrier that starts no turn.** A message is a Timeline
+  `note` with a `delivery` field (its seq is its id); then claude hears it on its next hook
+  (both surfaces ride the same `--settings` hooks, and PostToolUse context reaches the model
+  in chat mode — PROTOCOL.md Pass 39), codex chat by `send_if_running` (a steer that never
+  re-drives), a codex terminal by pulling its inbox. Claude has no race-free "join the turn or
+  nothing" — its CLI runs a missed queued message as the next turn — which is why claude gets
+  hooks, not sends.
+- **Waking is a policy, not a side effect.** Starting a billed turn in an idle agent follows
+  the user's `agents.communication.wakes` (never · ask · auto), capped per sender, per
+  workspace and per conversation; a reply the reader asked for wakes it without asking.
+- **Talking isn't commanding.** A peer's message is framed as information and quoted; only
+  the Mastermind's carries direction. Nothing ever types into a terminal agent.
+- **Read state is durable** (`comms.json` per workspace, atomic rewrite, claims taken under
+  one lock) so parallel hooks and restarts never deliver twice or lose one.
+
 ### Workbench plugins: WASM on a small host
 
 *Added 2026-09-26. Plan: [plugin-system-plan.md](../plugin-system-plan.md); what users see:
 [features/plugins.md](../features/plugins.md); authoring: [plugins.md](plugins.md).*
 
-Opt-in capabilities beyond the core (Mycelium's Knowledge reader, Agent notes) are **workbench
+Opt-in capabilities beyond the core (Mycelium's Knowledge reader, LaTeX, Typst) are **workbench
 plugins**, and none of their behaviour is daemon code. (The host is planned to grow into a
 platform where plugins draw screens in Chimaera's format, run declared programs and install
 side programs, with LaTeX and Typst as its first plugins:

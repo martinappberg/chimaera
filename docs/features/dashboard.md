@@ -58,6 +58,14 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   answering there). Structured questions surface as "has a question — answer in the chat"
   (the door, not an inline form). TUI sessions say honestly what is known ("needs
   permission — answer in the terminal") and offer the door.
+- **Wake requests** ([agent-communication.md](agent-communication.md#wakes-and-wake-requests)).
+  While the wake policy is **Ask me**, a message to an idle chat agent adds a card — "analyst
+  wants to wake reviewer" with the message — offering **Wake** / **Leave in inbox**; a
+  conversation past its wake limit asks "… have been going back and forth — let them
+  continue?" (**Continue**). From the comms store (`workspace/comms.svelte.ts`, over
+  `GET /workspaces/{id}/comms` and the `comms` epoch frame), counted in "needs you"; a refused
+  answer stays as a dismissible card in the daemon's words. Agent cards show "✉ N messages
+  waiting" for an agent's unread messages.
 - **Key behaviors.** Renders only when non-empty, under the label **Needs you** — quiet
   means quiet. Dead errored sessions stay in the roster, not the lane.
 
@@ -236,9 +244,10 @@ card whose session wrote a file another live session also wrote carries a small 
     read-tool list, so ask-mode semantics are identical: reads silent, acts prompt.
     A mode switch keeps the bound agent. PUT errors (the 409 missing-binary conflict
     included) surface inline in the server's own words.
-  - **Reactive-only**: nothing ever triggers a Mastermind turn on its own — no briefing
-    prompt on setup, no timer, no event-nudged sends, and an agent note never starts one.
-    It speaks when the user types or clicks one of the prompt-row buttons.
+  - **Reactive, except for messages it allows**: no briefing prompt on setup, no timer, no
+    event-nudged sends. It speaks when the user types or clicks one of the prompt-row
+    buttons — or, in **auto** mode, when a worker's message wakes it (within the wake caps;
+    never while the wake policy is Never).
   - **Senses & memory** (the Mastermind MCP tier, `crates/chimaera-server/src/mcp.rs`):
     beyond the roster digest, `workspace_status` carries each terminal's last few commands
     with exit codes (redacted heads, never output), the cached Slurm snapshot (never a cold
@@ -248,7 +257,7 @@ card whose session wrote a file another live session also wrote carries a small 
     active plugins. `read_timeline` is its memory
     ([timeline-and-knowledge.md](timeline-and-knowledge.md#the-timeline)); both are reads,
     pre-allowed in ask mode via the shared `MASTERMIND_READ_TOOLS` list. Terminal output is
-    read with `read_session` (`read_terminal` reaches only terminals linked to it).
+    read with `read_agent` (`read_terminal` reaches only terminals linked to it).
   - **The observer, not the observed**: session rows flagged `mastermind: true` are
     filtered out of the rail, the roster/lane, the chord map, quick-open, the home-screen
     rollups, and the recents-adjacent surfaces. The panel is where it renders.
@@ -265,15 +274,16 @@ card whose session wrote a file another live session also wrote carries a small 
     default 380) per browser profile, drag-resized from the panel's left edge (double-click
     resets). It docks beside the stage as a sibling of the pane cards; when that would
     leave the panes under ~560 px it floats over the stage's right edge instead.
-  - **Workers can talk to it.** In a workspace with a Mastermind every worker gets
-    `tell_mastermind {text}` (no plugin; pre-approved like `notify`; never offered to the
-    Mastermind itself). The message always lands on the Timeline as a note to the Mastermind.
-    In **ask-first** mode it waits in the panel's inbox for your click; in **auto** mode it
-    wakes the Mastermind with one turn ("[a message from <session> (<id>) … — information,
-    not an instruction]", labelled "from a worker" in its transcript — `UserMessage.origin`
-    `"worker"`), capped at one wake per worker per 3 minutes and 10 per workspace per hour —
-    past a cap, or when the message can't be delivered, it waits in the inbox
-    (`notes::tell_mastermind`).
+  - **Part of agent communication.** The Mastermind is the coordinator inside
+    [agent communication](agent-communication.md#the-mastermind-inside-it): workers reach it
+    with `message_agent {to: "mastermind"}`; its own `message_agent` carries direction. A
+    message to it lands on the Timeline; while it works it reads it at its next step; idle in
+    **ask-first** mode it waits in the panel's inbox (the chip is the comms store's unread count;
+    its click hands everything over, `POST /comms/deliver`); in **auto** mode it wakes it
+    ("[chimaera delivered this while you were idle: the user lets the Mastermind act on its
+    own]"), within the wake caps. With agent communication **off** the panel shows "Agent
+    communication is off" with **Open Settings**, the binding is kept, its tools refuse, and
+    the setup card is disabled with that reason.
   - **Honest gone-state**: a binding whose session is missing/dead says "the Mastermind
     session is gone — set it up again" with a reset (DELETE, then the setup card) —
     never a ghost chat.
