@@ -1895,6 +1895,135 @@ async fn driver_stack_end_to_end_against_real_codex() {
     manager.kill("s-codex");
 }
 
+/// `SendIfRunning` against real codex (the daemon's agent messages): idle,
+/// it settles `Dropped` and opens no turn; mid-turn it is steered, echoed
+/// queued under the caller's key, and read (`Sent`) at the agent's next step.
+#[tokio::test]
+#[ignore = "live: spawns real codex via the driver, needs auth, bills one small command turn"]
+async fn driver_codex_send_if_running_joins_the_turn_or_drops() {
+    use chimaera_agent::codex::CodexAdapter;
+    use std::sync::Arc;
+
+    let dir = tmpdir();
+    let manager = Arc::new(ChatManager::new(
+        dir.path().join("chat"),
+        Box::new(|_, _| {}),
+        Box::new(|id, exit| tracing::info!(%id, ?exit, "driver exit")),
+    ));
+    let spec = SpawnSpec::new(
+        "s-codex-sir",
+        vec!["codex".into(), "app-server".into()],
+        dir.path().to_path_buf(),
+    );
+    manager.spawn(&CodexAdapter, spec).expect("spawn driver");
+    let att = manager.attach("s-codex-sir", 0).expect("attach");
+    let mut rx = att.live;
+    let agent_send = |id: &str, text: &str| AgentCommand::SendIfRunning {
+        id: id.into(),
+        blocks: vec![ContentBlock::Text { text: text.into() }],
+    };
+
+    // Idle: dropped at once, no turn.
+    manager
+        .command("s-codex-sir", agent_send("k-idle", "nobody is listening"))
+        .await
+        .expect("send_if_running idle");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let entry = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("timed out waiting for the idle drop")
+            .expect("broadcast closed");
+        match &entry.ev {
+            AgentEvent::TurnStarted { .. } => panic!("an idle send_if_running opened a turn"),
+            AgentEvent::UserMessageUpdate { id, state } if id == "k-idle" => {
+                assert_eq!(*state, UserMessageState::Dropped);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // Mid-turn: steered and read at the next step.
+    manager
+        .command(
+            "s-codex-sir",
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "Run this shell command once: sleep 8 && echo done . Then reply with \
+                           the secret word another message gave you, or 'none'."
+                        .into(),
+                }],
+            },
+        )
+        .await
+        .expect("send");
+    let mut steered = false;
+    let mut echoed = false;
+    let mut read = false;
+    let mut prose = String::new();
+    let deadline = tokio::time::Instant::now() + TURN;
+    loop {
+        let entry = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("timed out waiting for the steered turn")
+            .expect("broadcast closed");
+        match &entry.ev {
+            AgentEvent::ToolCall { .. } if !steered => {
+                steered = true;
+                manager
+                    .command(
+                        "s-codex-sir",
+                        agent_send("k-run", "the secret word is PLUM"),
+                    )
+                    .await
+                    .expect("send_if_running mid-turn");
+            }
+            AgentEvent::PermissionRequest {
+                request_id,
+                options,
+                ..
+            } => {
+                let option = options.first().expect("an option").id.clone();
+                manager
+                    .command(
+                        "s-codex-sir",
+                        AgentCommand::Permission {
+                            request_id: request_id.clone(),
+                            option_id: option,
+                            destination: None,
+                            feedback: None,
+                        },
+                    )
+                    .await
+                    .expect("allow");
+            }
+            AgentEvent::UserMessage { id, queued, .. } if id.as_deref() == Some("k-run") => {
+                assert!(*queued, "echoed as waiting for the next step");
+                echoed = true;
+            }
+            AgentEvent::UserMessageUpdate { id, state } if id == "k-run" => {
+                assert_eq!(*state, UserMessageState::Sent, "read, not dropped");
+                read = true;
+            }
+            AgentEvent::MessageChunk { text, .. } => prose.push_str(text),
+            AgentEvent::TurnCompleted { .. } => break,
+            AgentEvent::TurnAborted { reason, .. } => panic!("turn aborted: {reason}"),
+            _ => {}
+        }
+    }
+    assert!(
+        steered && echoed && read,
+        "steered={steered} echoed={echoed} read={read}"
+    );
+    eprintln!("codex answered: {prose}");
+    assert!(
+        prose.contains("PLUM"),
+        "the steered message reached the model: {prose}"
+    );
+    manager.kill("s-codex-sir");
+}
+
 /// Ultracode at spawn (a resurrected session had it on): the handshake
 /// applies it and the read-back says so, WITHOUT counting as the user's pick
 /// (it must not become a remembered preference). Bills nothing — no turn.
