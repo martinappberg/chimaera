@@ -41,6 +41,7 @@
   import { clampRegion, cropSize, screenToPage, type Point, type Region } from "./imageRegion";
   import { activeSelection, clearSelection, setSelection, type FileSelection } from "../shared/reference";
   import { xywhFragment } from "../shared/locator";
+  import { finishPdfRender, pdfRaster } from "../shared/pdfCanvas";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
 
   pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -141,6 +142,7 @@
    *  Keep handles so closing a tab cannot leave raster/text work burning the
    *  UI thread after its pane is gone. */
   const renderTasks = new Map<number, ReturnType<PDFPageProxy["render"]>>();
+  const cropTasks = new Set<ReturnType<PDFPageProxy["render"]>>();
   const textLayers = new Map<number, InstanceType<typeof pdfjs.TextLayer>>();
   const textReaders = new Set<PdfTextReader>();
   /** Completed text layers reserve from one viewer-wide DOM budget. */
@@ -161,8 +163,6 @@
   /** Pages inside the observer margin; never evict a canvas the user is at. */
   const nearbyPages = new Set<number>();
   const dpr = typeof window !== "undefined" ? Math.min(window.devicePixelRatio || 1, 2) : 1;
-  /** Bound decoded raster memory while retaining a generous high-DPI page. */
-  const MAX_CANVAS_PIXELS = 12_000_000;
   /** Canvases outside the viewport margin are an LRU, not a document-long leak. */
   const MAX_RENDERED_PAGES = 8;
   /** pdf.js creates roughly one selectable DOM run per item. Scientific plots
@@ -364,11 +364,13 @@
       if (findTimer !== null) clearTimeout(findTimer);
       findTimer = null;
       for (const renderTask of renderTasks.values()) renderTask.cancel();
+      for (const renderTask of cropTasks) renderTask.cancel();
       for (const textLayer of textLayers.values()) textLayer.cancel();
       for (const reader of textReaders) {
         void reader.cancel(new Error("PDF view closed")).catch(() => {});
       }
       renderTasks.clear();
+      cropTasks.clear();
       textLayers.clear();
       textReaders.clear();
       textItemCounts.clear();
@@ -494,37 +496,32 @@
     if (renderingPages.has(n) || renderedScale.get(n) === s) return;
     renderingPages.add(n);
     let page: PDFPageProxy | null = null;
+    let canvas: HTMLCanvasElement | null = null;
     let renderedAtScale = false;
     try {
       page = await d.getPage(n);
       if (disposed || !slot.isConnected) return;
       const cssViewport = page.getViewport({ scale: s });
-      const desired = page.getViewport({ scale: s * dpr });
-      const desiredPixels = desired.width * desired.height;
-      if (!Number.isFinite(desiredPixels) || desiredPixels <= 0) {
-        throw new Error("invalid PDF page dimensions");
-      }
-      const rasterFactor = Math.min(1, Math.sqrt(MAX_CANVAS_PIXELS / desiredPixels));
-      const viewport = page.getViewport({ scale: s * dpr * rasterFactor });
-      let canvas = rendered.get(n) ?? null;
-      if (canvas === null) {
-        canvas = document.createElement("canvas");
-        canvas.className = "pdf-canvas";
-        slot.querySelector(".pdf-canvas")?.remove();
-        slot.insertBefore(canvas, slot.firstChild);
-        rendered.set(n, canvas);
-      }
-      const ctx = canvas.getContext("2d");
-      if (ctx === null) return;
-      canvas.width = Math.max(1, Math.floor(viewport.width));
-      canvas.height = Math.max(1, Math.floor(viewport.height));
+      const base = page.getViewport({ scale: 1 });
+      const raster = pdfRaster(base.width, base.height, s * dpr);
+      const viewport = page.getViewport({ scale: raster.scale });
+      // A failed pdf.js initialization can leave its canvas reserved. Each
+      // attempt owns a fresh canvas and replaces the visible page on success.
+      canvas = document.createElement("canvas");
+      canvas.className = "pdf-canvas";
+      canvas.width = raster.width;
+      canvas.height = raster.height;
       canvas.style.width = `${cssViewport.width}px`;
       canvas.style.height = `${cssViewport.height}px`;
-      const renderTask = page.render({ canvas, canvasContext: ctx, viewport });
+      const renderTask = page.render({ canvas, viewport });
       renderTasks.set(n, renderTask);
-      await renderTask.promise;
+      await finishPdfRender(renderTask);
       if (renderTasks.get(n) === renderTask) renderTasks.delete(n);
       if (disposed || !slot.isConnected) return;
+      const previous = rendered.get(n);
+      previous?.remove();
+      if (previous !== undefined) previous.width = previous.height = 0;
+      slot.insertBefore(canvas, slot.firstChild);
       renderedScale.set(n, s);
       renderedAtScale = true;
       rememberRendered(n, canvas);
@@ -535,6 +532,7 @@
       // a page failed to render; leave its placeholder in place
     } finally {
       renderTasks.delete(n);
+      if (canvas !== null && rendered.get(n) !== canvas) canvas.width = canvas.height = 0;
       page?.cleanup();
       renderingPages.delete(n);
       // A zoom/fit change may land while this page is rasterizing. Never
@@ -555,6 +553,7 @@
       if (rendered.size <= MAX_RENDERED_PAGES) break;
       if (old === n || nearbyPages.has(old) || renderingPages.has(old)) continue;
       oldCanvas.remove();
+      oldCanvas.width = oldCanvas.height = 0;
       const oldSlot = scroller?.querySelector<HTMLElement>(`[data-page="${old}"]`);
       oldSlot?.querySelector(".textLayer")?.remove();
       oldSlot?.querySelector(".annotationLayer")?.remove();
@@ -1375,28 +1374,35 @@
     const d = doc;
     if (d === null) return null;
     let page: PDFPageProxy | null = null;
+    let canvas: HTMLCanvasElement | null = null;
+    let renderTask: ReturnType<PDFPageProxy["render"]> | null = null;
     try {
       page = await d.getPage(p.page);
       if (disposed) return null;
       const size = cropSize(p, CROP_FACTOR, CROP_CAP);
+      const raster = pdfRaster(p.w, p.h, size.scale);
       // The offsets move the box's corner to the canvas origin; the canvas
       // clips the rest of the page away.
       const viewport = page.getViewport({
-        scale: size.scale,
-        offsetX: -p.x * size.scale,
-        offsetY: -p.y * size.scale,
+        scale: raster.scale,
+        offsetX: -p.x * raster.scale,
+        offsetY: -p.y * raster.scale,
       });
-      const canvas = document.createElement("canvas");
-      canvas.width = size.w;
-      canvas.height = size.h;
-      const ctx = canvas.getContext("2d");
-      if (ctx === null) return null;
-      await page.render({ canvas, canvasContext: ctx, viewport }).promise;
-      return await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+      canvas = document.createElement("canvas");
+      canvas.width = raster.width;
+      canvas.height = raster.height;
+      renderTask = page.render({ canvas, viewport });
+      cropTasks.add(renderTask);
+      await finishPdfRender(renderTask);
+      if (disposed) return null;
+      const drawn = canvas;
+      return await new Promise<Blob | null>((resolve) => drawn.toBlob(resolve, "image/png"));
     } catch {
       // No pixels: the locator alone still goes.
       return null;
     } finally {
+      if (renderTask !== null) cropTasks.delete(renderTask);
+      if (canvas !== null) canvas.width = canvas.height = 0;
       page?.cleanup();
     }
   }

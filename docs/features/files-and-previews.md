@@ -884,7 +884,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   `![caption](path#fragment)`, with Obsidian's size hint (`![caption|400](plot.png)`).
 - **Bodies by kind.** Image (a `#xywh=x,y,w,h` region — pixels or `percent:` — drawn cropped);
   PDF page (`#page=N`, one pdf.js page at the card's width, legacy build, ranged reads, a
-  `#page=N&xywh=` region in PDF points); code lines (`#L10-L30`, highlighted like notebook cells,
+  `#page=N&xywh=` region in PDF points, rasterized only inside the selected region);
+  code lines (`#L10-L30`, highlighted like notebook cells,
   line numbers; a whole file shows its first lines); a table slice (`#row=a-b`, `#col=`, `#cell=`,
   RFC 7111 — row 1 is the header line when the file has one, while the card's row numbers and its
   header's words count data rows as the full grid does, so `#row=2-6` shows rows 1–5;
@@ -900,6 +901,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   the opening, clipped with a fade and **more**); a plain file or folder card for everything else.
   Missing files show a dashed card that says so (and looks again when it comes back on screen);
   failed loads say why, with **try again** — never a blank box.
+- **PDF rendering.** Cards, panes and region snapshots share nonzero raster dimensions capped at
+  12 million pixels and 8192 pixels per edge (`shared/pdfCanvas.ts`). Each draw owns a fresh canvas,
+  and failed draws are cancelled before their handles are discarded: a graphics-initialization
+  failure must not poison later redraws with pdf.js's "same canvas" error. Only a completed draw
+  replaces the visible page; superseded card draws are discarded.
 - **Remote budget.** `POST /api/v1/fs/resolve_targets {base, bases?, workspace_id?, targets}`
   answers every target of a document in one round trip: canonical path, kind, size, version (the
   `X-Mtime` token), `mtime_ms`, mime, image `width`/`height` read from ≤64 KB of header bytes (never
