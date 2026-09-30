@@ -1611,21 +1611,6 @@ pub(super) fn open_notification_settings() {
     crate::notify::open_settings();
 }
 
-/// The UI's caffeinate toggle. The real work — and the same `caffeinate-changed`
-/// broadcast the tray's "Keep Awake" item drives — lives in `apply_caffeinate`
-/// so both surfaces share one guard and stay in sync.
-#[tauri::command]
-pub(super) fn set_caffeinate(app: AppHandle, on: bool) -> Result<bool, String> {
-    super::apply_caffeinate(&app, on)
-}
-
-/// Whether the caffeinate assertion is currently held. Each window reads this on
-/// mount to render its toggle; live changes ride the `caffeinate-changed` event.
-#[tauri::command]
-pub(super) fn caffeinate_state(state: State<'_, Shell>) -> bool {
-    lock(&state.caffeinate).is_some()
-}
-
 /// This app binary's build id, for daemon-skew detection in the UI (the
 /// daemon's own build rides GET /api/v1/health).
 #[tauri::command]

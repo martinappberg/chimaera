@@ -301,13 +301,11 @@
   import {
     appUpdateStatus,
     askpassActive,
-    caffeinateState,
     closeThisWindow,
     connectComputeSession,
     connectHost,
     isNativeShell,
     onAppUpdate,
-    onCaffeinateChanged,
     onHostStatus,
     onLocalDaemonUpdated,
     onFocusSession,
@@ -319,7 +317,6 @@
     reportUnsaved,
     reportWindowScope,
     reportWindowView,
-    setCaffeinate,
     setNativeWindowTitle,
     shellBuild,
     takePendingFocus,
@@ -423,29 +420,9 @@
   }
   /** This app binary's build id (native only); vs health.build = skew. */
   let appBuild = $state<string | null>(null);
-  /** Caffeinate (native, LOCAL macOS window only): whole-machine keep-awake.
-   *  Shown only on a local native window — a remote window's work runs on the
-   *  remote host, so caffeinating this laptop would be pointless — and only on
-   *  macOS, where the clamshell/lid-close keep-awake it exists for applies. */
-  let caffeinated = $state(false);
-  const canCaffeinate = isNativeShell() && isMac && getHostLabel() === "local";
   /** macOS workbench windows put the native controls over the webview instead
    *  of spending a separate row on the repeated window title. */
   const nativeTitlebarOverlay = isNativeShell() && isMac;
-  async function toggleCaffeinate(): Promise<void> {
-    try {
-      caffeinated = await setCaffeinate(!caffeinated);
-    } catch (e) {
-      // The power assertion can fail to acquire; don't leave the button lying
-      // about the state — resync from the real one, and surface the reason.
-      console.error("caffeinate toggle failed", e);
-      try {
-        caffeinated = await caffeinateState();
-      } catch {
-        /* best-effort resync */
-      }
-    }
-  }
   /** Last recents epoch seen on /ws/events (invalidate-and-pull). */
   let lastRecentsEpoch: number | null = null;
   let workspaces = $state<Workspace[]>([]);
@@ -1777,7 +1754,6 @@
     let unlistenDaemonMoved: (() => void) | null = null;
     let unlistenHostStatus: (() => void) | null = null;
     let unlistenAppUpdate: (() => void) | null = null;
-    let unlistenCaffeinate: (() => void) | null = null;
     let unlistenFocusSession: (() => void) | null = null;
     if (isNativeShell()) {
       // A notification was clicked for a session this window should show.
@@ -1794,19 +1770,6 @@
       );
       // Build-skew + app-update signals for the update toast.
       void shellBuild().then((b) => (appBuild = b));
-      // Caffeinate state: attach the cross-window broadcast FIRST, then read
-      // the current value — so an event fired during startup isn't missed, and
-      // the initial read can't clobber a fresher value the listener applied.
-      if (canCaffeinate) {
-        const listening = onCaffeinateChanged((on) => (caffeinated = on));
-        unlistenCaffeinate = asyncDisposer(listening);
-        void listening.then(
-          () => {
-            void caffeinateState().then((on) => (caffeinated = on));
-          },
-          () => {},
-        );
-      }
       // The broadcast carries only the version; the shell's cache holds the
       // whole outcome (when it checked), which Settings → Updates shows. A
       // window opened after a broadcast reads the same cache at mount.
@@ -1900,7 +1863,6 @@
       unlistenDaemonMoved?.();
       unlistenHostStatus?.();
       unlistenAppUpdate?.();
-      unlistenCaffeinate?.();
       unlistenFocusSession?.();
       document.removeEventListener("copy", onCopy);
       window.removeEventListener("dragenter", onWindowDragEnter);
@@ -5668,7 +5630,7 @@
       {/if}
       <div class="daemon" bind:this={daemonEl}>
         <!-- Two groups so the bar can WRAP: identity (dot, host, link RTT)
-             and tools (git, slurm, caffeinate, settings). When both don't
+             and tools (git, slurm, settings). When both don't
              fit one row the tools drop to a second, instead of the host name
              being squeezed to nothing behind a branch and a queue count. -->
         <span class="daemon-id">
@@ -5856,40 +5818,6 @@
             </svg>
             {#if queued > 0}<span class="dc-count">{queued}</span>{/if}
           </span>
-        {/if}
-        {#if canCaffeinate}
-          <button
-            class="daemon-settings caffeinate"
-            class:on={caffeinated}
-            title={caffeinated
-              ? "caffeinate on — this Mac won’t sleep (lid-closed needs AC power)"
-              : "caffeinate — keep this Mac awake"}
-            aria-label="caffeinate"
-            aria-pressed={caffeinated}
-            onclick={() => void toggleCaffeinate()}
-          >
-            <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
-              <path
-                d="M3 6.2h7.5v3.3a2.6 2.6 0 0 1-2.6 2.6H5.6A2.6 2.6 0 0 1 3 9.5V6.2z"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.3"
-              />
-              <path
-                d="M10.5 7.1h1.3a1.6 1.6 0 0 1 0 3.2h-1.3"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.3"
-              />
-              <path
-                d="M4.9 2.5c0 .8-.7.8-.7 1.6M7 2.5c0 .8-.7.8-.7 1.6M9.1 2.5c0 .8-.7.8-.7 1.6"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.1"
-                stroke-linecap="round"
-              />
-            </svg>
-          </button>
         {/if}
         {#if activeWsId !== null}
           <button
@@ -7443,9 +7371,8 @@
      10ch floor. The budget is what bounds the bar's wrap decision: flex
      lines break on content width, so an uncapped branch would put the tools
      on a second row for every long branch name. It does not prevent the
-     wrap — beside the caffeinate toggle AND the gear (the native macOS app)
-     a long, dirty branch still takes the second row at the default rail
-     width; that row is the point, the host stays readable. */
+     wrap — a long, dirty branch still takes the second row at the default
+     rail width; that row is the point, the host stays readable. */
   .dg-branch {
     font-family: var(--mono);
     overflow: hidden;
@@ -7512,18 +7439,6 @@
   .daemon-settings:hover {
     background: var(--row-hover);
     color: var(--fg);
-  }
-
-  /* When both the caffeinate toggle and the gear show, only the first claims
-     the auto-margin; the gear sits just after it instead of splitting the gap. */
-  .caffeinate + .daemon-settings {
-    margin-left: 4px;
-  }
-
-  /* Armed = accented, so the "keeping this Mac awake" state reads at a glance. */
-  .caffeinate.on,
-  .caffeinate.on:hover {
-    color: var(--accent);
   }
 
   .stage {
