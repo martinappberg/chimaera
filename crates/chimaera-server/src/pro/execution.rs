@@ -337,6 +337,7 @@ pub(super) fn accept(
         "project recovery is pending"
     );
     if config.execution.is_none() {
+        lock(&state.pro.opened_here).remove(&baton.workspace_id);
         return Ok(());
     }
     ensure!(
@@ -438,6 +439,8 @@ pub(super) fn accept(
         },
     );
     drop(proofs);
+    // This device holds the project now: nothing is left to pull home.
+    lock(&state.pro.opened_here).remove(&baton.workspace_id);
     state.pro.execution.changed.notify_waiters();
     Ok(())
 }
@@ -553,6 +556,12 @@ pub(super) fn preferred_here(state: &AppState, config: &Configure, workspace: &s
             .and_then(|e| e.installation_id.as_ref())
             .is_some_and(|id| Some(id) == policy.preferred_installation_id.as_ref()),
     }
+}
+/// The user opened this project here and it is not held here yet
+/// (`super::note_opened`): it may come home to this computer even when the
+/// account's preferred installation is another one.
+pub(super) fn opened_here(state: &AppState, workspace: &str) -> bool {
+    lock(&state.pro.opened_here).contains(workspace)
 }
 pub(super) fn checkpoint_mode(state: &AppState, workspace: &str) -> bool {
     lock(&state.pro.preferences)

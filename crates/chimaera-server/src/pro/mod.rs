@@ -69,6 +69,12 @@ pub(crate) struct ProState {
     /// Projects whose checkpoint install is scheduled or running: fenced from
     /// the moment it is scheduled, before its own Hydrating fence exists.
     installing: Mutex<std::collections::HashSet<String>>,
+    /// Projects the user opened on this computer that are not held here yet
+    /// (`note_opened`): the project comes home to the computer it was last
+    /// opened on, whether or not the account calls this installation the
+    /// preferred one. Cleared when this device acquires or holds the project
+    /// (`execution::accept`) and on sign-out.
+    opened_here: Mutex<std::collections::HashSet<String>>,
     /// Projects the account answered for since this daemon started; the
     /// unverified-resume fallback leaves those to the verified path.
     answered: Mutex<std::collections::HashSet<String>>,
@@ -372,6 +378,7 @@ impl ProState {
             caches: Mutex::new(HashMap::new()),
             boot_deferred: Mutex::new(Default::default()),
             installing: Mutex::new(Default::default()),
+            opened_here: Mutex::new(Default::default()),
             answered: Mutex::new(Default::default()),
             returned: Mutex::new(Default::default()),
             operations: Default::default(),
@@ -386,6 +393,29 @@ impl ProState {
             delegation_refused: AtomicBool::new(false),
         }
     }
+}
+
+/// The user opened this project on this computer (registering its folder from
+/// its identity marker, or opening a registered workspace) and this computer
+/// does not hold it: from now on the project may come home here (`lazy_handback`)
+/// even when the account's preferred installation is another one — the
+/// latest computer that had the project is the one it returns to. Bounded;
+/// inert without Pro.
+pub(crate) fn note_opened(state: &crate::AppState, workspace: &str) {
+    if matches!(
+        crate::lock(&state.pro.ownership).get(workspace),
+        Some(Ownership::Local { .. })
+    ) {
+        return;
+    }
+    let mut opened = crate::lock(&state.pro.opened_here);
+    if opened.len() < 128 || opened.contains(workspace) {
+        opened.insert(workspace.to_owned());
+    }
+}
+#[cfg(test)]
+pub(crate) fn opened_here(state: &crate::AppState, workspace: &str) -> bool {
+    crate::lock(&state.pro.opened_here).contains(workspace)
 }
 
 /// Only a verified ownership transition or an explicit clean handoff fences a

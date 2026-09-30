@@ -190,6 +190,24 @@ remain pinned to their saved folder. Old `import_roots` entries migrate only to
 pending-ID fences, never to permission to import. A partially registered legacy
 project needs explicit selection of its original folder before recovery.
 
+**Who a project returns to.** `lazy_handback` returns a project to this computer when
+this installation is the policy's preferred one (`execution::preferred_here`; the
+account sets `preferred_installation_id` to the latest device that acquired, and
+never refuses an acquire for not being preferred, only `held`) OR when the user
+opened the project here and it is not held here yet (`execution::opened_here`, the
+in-memory `ProState.opened_here` set). `pro::note_opened` inserts: `POST
+/workspaces` for a project that already existed (a registered root, the id a
+folder's marker names, a moved folder; never a freshly minted id or a local
+duplicate) and `POST /workspaces/{id}/open` while ownership is not `Local`.
+`execution::accept` success (both protocol versions) and sign-out remove it. So the
+project comes back to the latest computer that had it, and opening it on another
+of the user's computers takes it over once the first is idle. A live device
+holder keeps the existing `Remote` handling ("on your other computer"): the flag
+stays set, and the moment that lease lapses (or the holder releases) the next pass
+pulls it. The settle rule for moving live cloud work is unchanged, and the pull is
+the ordinary hydrate: kept-both, and with no shadow every differing local file is
+kept as `.mine-…` while local-only files stay.
+
 Normal lazy return only handles registered projects without a pending adoption.
 Moving live cloud work waits for the settle gate (awake on power for five
 minutes) in both protocol versions. Work the cloud is not running returns at

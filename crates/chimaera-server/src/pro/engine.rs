@@ -1948,7 +1948,12 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
         {
             continue;
         }
-        if !execution::preferred_here(state, config, &workspace)
+        // The account's preferred installation is the latest computer that
+        // had the project; one the user opened it on since may pull it home
+        // too, once nothing live holds it (the settle rule below still
+        // decides moving live cloud work).
+        if !(execution::preferred_here(state, config, &workspace)
+            || execution::opened_here(state, &workspace))
             || lock(&state.pro.preferences)
                 .get(&workspace)
                 .is_some_and(|p| p.never_mirror)

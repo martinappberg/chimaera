@@ -76,6 +76,10 @@ pub(crate) struct Registered {
     pub(crate) workspace: Workspace,
     /// The folder does not yet say this id: write its marker, off the lock.
     pub(crate) write_marker: bool,
+    /// The folder is a project that already existed (an entry of this
+    /// registry, the id its marker names, or a moved entry), not a freshly
+    /// minted id: opening it is the user picking that project up here.
+    pub(crate) known: bool,
 }
 
 /// In-memory workspace list backed by a JSON file (save-on-change).
@@ -225,6 +229,7 @@ impl WorkspaceStore {
             return Ok(Registered {
                 workspace,
                 write_marker,
+                known: true,
             });
         }
         let Some(marker) = folder.marker else {
@@ -232,12 +237,14 @@ impl WorkspaceStore {
             return Ok(Registered {
                 workspace: self.push_new(id, root)?,
                 write_marker: true,
+                known: false,
             });
         };
         let Some(holder) = self.items.iter().position(|w| w.id == marker.id) else {
             return Ok(Registered {
                 workspace: self.push_new(marker.id.clone(), root)?,
                 write_marker: false,
+                known: true,
             });
         };
         if folder.gone_root != Some(self.items[holder].root.as_path()) {
@@ -245,6 +252,7 @@ impl WorkspaceStore {
             return Ok(Registered {
                 workspace: self.push_new(id, root)?,
                 write_marker: true,
+                known: false,
             });
         }
         let entry = &mut self.items[holder];
@@ -259,6 +267,7 @@ impl WorkspaceStore {
         Ok(Registered {
             workspace,
             write_marker: true,
+            known: true,
         })
     }
 
@@ -693,6 +702,10 @@ mod tests {
         let root = test_dir("id-none-root");
         let registered = register(&mut store, &root, None, None);
         assert!(registered.write_marker);
+        assert!(
+            !registered.known,
+            "a freshly minted id is not an existing project"
+        );
         assert!(registered.workspace.id.starts_with("w-"));
         assert_eq!(registered.workspace.id.len(), 10);
         assert_eq!(store.get(&registered.workspace.id).unwrap().root, root);
@@ -708,6 +721,7 @@ mod tests {
         let matching = marker(&first.id);
         let again = register(&mut store, &root, Some(&matching), None);
         assert_eq!(again.workspace.id, first.id);
+        assert!(again.known);
         assert!(!again.write_marker, "the folder already says so");
         let missing = register(&mut store, &root, None, None);
         assert_eq!(missing.workspace.id, first.id);
@@ -734,6 +748,7 @@ mod tests {
         let mut second_daemon = daemon("id-reuse-2");
         let reopened = register(&mut second_daemon, &root, Some(&carried), None);
         assert_eq!(reopened.workspace.id, original.id);
+        assert!(reopened.known, "the folder names an existing project");
         assert!(!reopened.write_marker, "nothing to rewrite");
         assert_eq!(reopened.workspace.name, workspace_name(&root));
         assert!(reopened.workspace.last_opened_at > 0);
@@ -754,6 +769,7 @@ mod tests {
         // The original is still on disk, so the caller found nothing gone.
         let copy = register(&mut store, &copy_root, Some(&carried), None);
         assert_ne!(copy.workspace.id, original.id);
+        assert!(!copy.known, "a duplicate is a new project");
         assert!(copy.write_marker, "the copy is told its own id");
         assert_eq!(store.get(&original.id).unwrap().root, original_root);
         assert_eq!(store.list().len(), 2);
@@ -771,6 +787,7 @@ mod tests {
         let carried = marker(&original.id);
         let moved = register(&mut store, &new_root, Some(&carried), Some(&old_root));
         assert_eq!(moved.workspace.id, original.id);
+        assert!(moved.known);
         assert!(moved.write_marker);
         assert_eq!(moved.workspace.root, new_root);
         assert_eq!(moved.workspace.plugins_on, ["p"], "the entry itself moved");

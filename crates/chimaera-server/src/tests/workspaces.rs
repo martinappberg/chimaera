@@ -251,6 +251,19 @@ mod folder_identity {
         let second = register(&second_state, &root).await;
         assert_eq!(second["id"], first["id"]);
         assert_eq!(second["root"], first["root"]);
+        // The user opened an existing project here: it may come home to this
+        // computer (a fresh registration is not that).
+        let first_state = test_state();
+        let fresh = folder("ident-fresh");
+        let fresh_ws = register(&first_state, &fresh).await;
+        assert!(!crate::pro::opened_here(
+            &first_state,
+            fresh_ws["id"].as_str().unwrap()
+        ));
+        assert!(crate::pro::opened_here(
+            &second_state,
+            second["id"].as_str().unwrap()
+        ));
         // Reopening is idempotent and lists one project.
         assert_eq!(register(&second_state, &root).await["id"], first["id"]);
         let (_, list) = request(&second_state, Method::GET, "/api/v1/workspaces", None).await;
@@ -276,6 +289,10 @@ mod folder_identity {
         .unwrap();
         let copy = register(&state, &duplicate).await;
         assert_ne!(copy["id"], first["id"]);
+        assert!(!crate::pro::opened_here(
+            &state,
+            copy["id"].as_str().unwrap()
+        ));
         assert_eq!(
             identity::read(&duplicate).unwrap().id,
             copy["id"].as_str().unwrap(),
@@ -292,6 +309,7 @@ mod folder_identity {
         std::fs::rename(&original, &moved).unwrap();
         let after = register(&state, &moved).await;
         assert_eq!(after["id"], first["id"], "Pro state survives a move");
+        assert!(crate::pro::opened_here(&state, &first_id));
         assert_eq!(after["root"], moved.to_string_lossy().as_ref());
         assert_eq!(after["name"], "thesis-renamed");
         let (_, list) = request(&state, Method::GET, "/api/v1/workspaces", None).await;

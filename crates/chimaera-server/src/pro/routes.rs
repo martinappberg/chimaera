@@ -318,6 +318,7 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     // stay fenced. Sessions a transfer stopped continue here.
     let device = !execution::worker(&state);
     lock(&state.pro.release_pending).clear();
+    lock(&state.pro.opened_here).clear();
     let mut dropped = Vec::new();
     let mut returned: Vec<String> = {
         let mut ownership = lock(&state.pro.ownership);

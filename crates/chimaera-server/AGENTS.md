@@ -245,7 +245,11 @@ the lifecycle, keep them consistent:
   `bundle.rs` session import) write theirs right after it, and `POST
   /workspaces/{id}/open` backfills a missing one (fire-and-forget). A `.git`
   directory hosts the marker so it is never committed and a plain `git clone` is
-  a separate project; the marker is never mirrored to the cloud.
+  a separate project; the marker is never mirrored to the cloud. Opening a
+  folder that names a project that already exists (`Registered.known`) also
+  flags it "opened here" (`pro::note_opened`) so the cloud project can come
+  home to this computer ([`pro/AGENTS.md`](src/pro/AGENTS.md), "Who a project
+  returns to").
 
 - **Agent-plugin installs keep their result visible.** `plugins/install-agent.sh`
   receives metadata and the executable path as positional arguments; never

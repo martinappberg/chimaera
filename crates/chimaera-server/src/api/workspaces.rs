@@ -100,6 +100,11 @@ pub(crate) async fn create_workspace(
     match registered {
         Ok(registered) => {
             let workspace = registered.workspace;
+            if registered.known {
+                // The user opened this project here: it may come home to
+                // this computer (`pro::note_opened`).
+                crate::pro::note_opened(&state, &workspace.id);
+            }
             if registered.write_marker {
                 let (root, id) = (workspace.root.clone(), workspace.id.clone());
                 // Best effort, off the reactor and off the store's lock.
@@ -131,6 +136,7 @@ pub(crate) async fn open_workspace(
     match crate::lock(&state.workspaces).touch(&id) {
         Some(workspace) => {
             if !workspace.cloud_internal {
+                crate::pro::note_opened(&state, &workspace.id);
                 let (root, id) = (workspace.root.clone(), workspace.id.clone());
                 tokio::task::spawn_blocking(move || {
                     crate::workspaces::identity::backfill(&root, &id)
