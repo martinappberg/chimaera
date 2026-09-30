@@ -439,6 +439,13 @@ async fn reconcile_generation(
     if transferring && !owned {
         return Ok(None);
     }
+    // Handed to the cloud when the app quit: until the app returns
+    // (`/pro/wake`) this computer neither takes the project back nor renews
+    // it. A handover still in flight (Transferring) keeps renewing its own
+    // lease until it releases.
+    if config.role == Role::Device && !transferring && super::parked(state, workspace) {
+        return Ok(None);
+    }
 
     // A cloud machine resuming from suspension renews its own recorded epoch
     // even though the lease reads expired: the account kept it as a paused
@@ -779,6 +786,10 @@ fn sessions(state: &AppState, workspace: &str) -> Vec<String> {
 pub(super) struct Sleep {
     pub generation: u64,
     pub deadline: tokio::time::Instant,
+    /// The app is quitting, not the computer sleeping: a flush that cannot
+    /// hand over recovers at once and its work continues here, instead of
+    /// waiting for a wake with its lease left to lapse.
+    pub park: bool,
 }
 impl Sleep {
     pub fn woke(&self, state: &AppState) -> bool {
@@ -1073,7 +1084,7 @@ async fn snapshot_inner_scoped(
         }
         return result;
     }
-    if clean && sleep.is_some() && !config.recovery {
+    if clean && sleep.is_some_and(|sleep| !sleep.park) && !config.recovery {
         // Inside the sleep window a flush never renews or resumes (that would
         // restart agents seconds before sleep and keep the lease from lapsing):
         // published but unreleased, the cloud continues once the lease lapses;
@@ -1090,6 +1101,11 @@ async fn snapshot_inner_scoped(
         return result;
     }
     if result.is_err() && clean && !config.recovery {
+        // A quit handover that failed is not parked: the renewal below must
+        // be allowed to keep the work here.
+        if sleep.is_some_and(|sleep| sleep.park) {
+            super::unpark(state, &workspace.id);
+        }
         // A failed flush must not strand a stopped laptop agent, but a changed
         // account must never recover using the previous account's credentials.
         let recover = {
@@ -1877,6 +1893,62 @@ pub(super) fn at_pause(state: &AppState, workspace: &str) -> bool {
         }
     })
 }
+/// A chat running work right now: a turn in flight, input queued for the
+/// next one, or background work still going. A turn parked on a permission
+/// or a question waits on the user, which is not work.
+fn chat_working(
+    chat: &chimaera_agent::ChatInfo,
+    carry: Option<&chimaera_agent::Carryover>,
+    queued_input: bool,
+) -> bool {
+    chat.alive
+        && !chat.pending_permission
+        && (queued_input
+            || chat.background_running > 0
+            || carry.is_some_and(|carry| carry.turn_in_flight || !carry.background.is_empty()))
+}
+
+/// The agents (`claude`, `codex`, ...) running work in this project right
+/// now, each named once: what the native app's quit question names. The
+/// inverse of `at_pause` per session, except that a session nothing is known
+/// about is not counted as working.
+pub(super) fn working_agents(state: &AppState, workspace: &str) -> Vec<String> {
+    let mut kinds: Vec<String> = Vec::new();
+    for id in sessions(state, workspace) {
+        let (working, kind) = if let Some(chat) = state.chat.get(&id) {
+            let activity = state.chat.input_activity(&id);
+            let working = chat_working(
+                &chat,
+                activity.as_ref().map(|(carry, _)| carry),
+                activity.as_ref().is_some_and(|(_, pending)| *pending),
+            );
+            let kind = lock(&state.agents)
+                .get(&id)
+                .map_or(chat.agent, |record| record.kind.as_str().to_owned());
+            (working, kind)
+        } else {
+            // Cloned first: the terminal registry has its own locks.
+            let record = lock(&state.agents).get(&id).cloned();
+            let (Some(record), Some(info)) = (record, state.sessions.get(&id)) else {
+                continue;
+            };
+            let working = info.alive
+                && !crate::agent_state::tui_at_pause(
+                    &record,
+                    info.alive,
+                    info.last_output_at,
+                    info.pid,
+                    state.sessions.foreground_pid(&id),
+                    crate::session_view::now_ms(),
+                );
+            (working, record.kind.as_str().to_owned())
+        };
+        if working && !kind.is_empty() && kind.len() <= 32 && !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    kinds
+}
 /// A device waits this long between automatic attempts to finish one return.
 const RETURN_BACKOFF_MAX: u64 = 1800;
 
@@ -1951,6 +2023,11 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
             || super::projects::adoption_pending(state, &workspace)
             || !super::projects::account_matches(state, &workspace)
         {
+            continue;
+        }
+        // Handed to the cloud when the app quit: it stays there, live or
+        // released, until the app returns (`/pro/wake`).
+        if super::parked(state, &workspace) {
             continue;
         }
         // The account's preferred installation is the latest computer that

@@ -1,8 +1,10 @@
 //! Whether an agent was connected in the cloud at the last provider catalog
-//! read, so the Pro page can say so while the cloud is asleep. Only catalog
-//! reads the page already makes update it: nothing wakes the cloud to find
-//! out. Kept per account in a small file so an app restart does not forget
-//! it. A presentation hint only, never permission to move or resume work.
+//! read, and which ones, so the Pro page can say so while the cloud is asleep
+//! and quitting offers "Continue in the cloud" only for agents that could
+//! continue there. Only catalog reads the page already makes update it:
+//! nothing wakes the cloud to find out. Kept per account in a small file so an
+//! app restart does not forget it. A hint only, never permission to move or
+//! resume work: only the user's own choice moves anything.
 use serde::{Deserialize, Serialize};
 use std::{
     io::Read,
@@ -14,6 +16,10 @@ use std::{
 struct Fact {
     account: String,
     connected: bool,
+    /// The agent providers (`claude`, `codex`) signed in at that read. A
+    /// file written before this field existed names none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    signed_in: Vec<String>,
 }
 
 #[derive(Default)]
@@ -29,20 +35,33 @@ fn path() -> PathBuf {
 impl Agents {
     /// The last fact for this account; `None` when unknown.
     pub(in crate::shell) fn get(&self, account: &str) -> Option<bool> {
+        self.fact(account).map(|fact| fact.connected)
+    }
+
+    /// The agent providers signed in at the last catalog read for this
+    /// account; none when unknown.
+    pub(in crate::shell) fn signed_in(&self, account: &str) -> Vec<String> {
+        self.fact(account)
+            .map(|fact| fact.signed_in)
+            .unwrap_or_default()
+    }
+
+    fn fact(&self, account: &str) -> Option<Fact> {
         let mut memory = super::lock(&self.memory);
         memory
             .get_or_insert_with(|| read(&path()))
             .as_ref()
             .filter(|fact| fact.account == account)
-            .map(|fact| fact.connected)
+            .cloned()
     }
 
-    /// Records what the latest catalog said. `None` (not confirmed either
-    /// way) forgets the old fact rather than keeping a stale one.
-    pub(in crate::shell) fn record(&self, account: &str, connected: Option<bool>) {
-        let next = connected.map(|connected| Fact {
+    /// Records what the latest catalog said. Not confirmed either way
+    /// forgets the old fact rather than keeping a stale one.
+    pub(in crate::shell) fn record(&self, account: &str, catalog: &serde_json::Value) {
+        let next = from_catalog(catalog).map(|connected| Fact {
             account: account.to_owned(),
             connected,
+            signed_in: signed_in_agents(catalog),
         });
         {
             let mut memory = super::lock(&self.memory);
@@ -77,6 +96,24 @@ pub(in crate::shell) fn from_catalog(value: &serde_json::Value) -> Option<bool> 
         .iter()
         .all(|state| matches!(*state, "missing" | "needs_sign_in" | "unavailable"))
         .then_some(false)
+}
+
+/// The agent providers a catalog shows signed in (bounded, each named once).
+fn signed_in_agents(value: &serde_json::Value) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for provider in value["providers"].as_array().into_iter().flatten() {
+        let id = provider["id"].as_str().unwrap_or_default();
+        if provider["category"] == "agent"
+            && provider["state"] == "signed_in"
+            && !id.is_empty()
+            && id.len() <= 32
+            && !ids.iter().any(|known| known == id)
+            && ids.len() < 16
+        {
+            ids.push(id.to_owned());
+        }
+    }
+    ids
 }
 
 fn read(path: &Path) -> Option<Fact> {
@@ -140,6 +177,18 @@ mod tests {
     }
 
     #[test]
+    fn remembers_which_agent_providers_are_signed_in() {
+        let catalog = json!({"available": true, "providers": [
+            {"id": "claude", "category": "agent", "state": "signed_in"},
+            {"id": "codex", "category": "agent", "state": "needs_sign_in"},
+            {"id": "github", "category": "repository", "state": "signed_in"},
+            {"id": "claude", "category": "agent", "state": "signed_in"},
+        ]});
+        assert_eq!(signed_in_agents(&catalog), vec!["claude".to_string()]);
+        assert!(signed_in_agents(&json!({"available": true})).is_empty());
+    }
+
+    #[test]
     fn a_fact_belongs_to_one_account_and_survives_a_reread() {
         let dir = std::env::temp_dir().join(format!(
             "chimaera-agents-{}",
@@ -150,9 +199,13 @@ mod tests {
         let fact = Fact {
             account: "a".into(),
             connected: true,
+            signed_in: vec!["claude".into()],
         };
         write(&file, Some(&fact)).unwrap();
         assert_eq!(read(&file), Some(fact));
+        // A file from before providers were remembered names none.
+        std::fs::write(&file, br#"{"account":"a","connected":true}"#).unwrap();
+        assert_eq!(read(&file).map(|fact| fact.signed_in), Some(Vec::new()));
         write(&file, None).unwrap();
         assert_eq!(read(&file), None);
         write(&file, None).unwrap();
