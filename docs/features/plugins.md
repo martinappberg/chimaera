@@ -1,16 +1,16 @@
-# Plugins, skills & agent notes
+# Plugins & skills
 
 One **Extensions** tab, in three segments — **Plugins** · **Skills** · **Browse** — for two kinds
 of add-on, different in who runs them: **workbench plugins** run in Chimaera (each a WebAssembly
 component the daemon runs in a sandbox, installed per host, opt-in per workspace, saying in words
 what it adds) and **agent plugins** run inside claude / codex (read from the agents themselves,
 installed only through their own plugin managers). Beside them: the **Skills** segment (every
-skill each agent can use here), in-app **codex hook trust**, and **Agent notes** — agents
-talking, itself a workbench plugin. **Browse** (searching the marketplaces the agents already
-have) renders disabled, "later". Design: the WASM host, versions and updates in
-[docs/plugin-system-plan.md](../plugin-system-plan.md); trust — what a plugin can do and who
-approved it — in [docs/plugin-platform-plan.md](../plugin-platform-plan.md) §1–§2 (its phase
-P6, [below](#trust-what-a-plugin-can-do-and-who-approved-it)); the seam, the tab and notes in
+skill each agent can use here) and in-app **codex hook trust**. Agents talking to each other is
+built in now, no plugin: Agent communication (Settings → Agents). **Browse** (searching the
+marketplaces the agents already have) renders disabled, "later". Design: the WASM host, versions
+and updates in [docs/plugin-system-plan.md](../plugin-system-plan.md); trust — what a plugin can
+do and who approved it — in [docs/plugin-platform-plan.md](../plugin-platform-plan.md) §1–§2
+(its phase P6, [below](#trust-what-a-plugin-can-do-and-who-approved-it)); the seam and the tab in
 [docs/timeline-knowledge-plugins-plan.md](../timeline-knowledge-plugins-plan.md) §6–§7. Writing a
 plugin: [docs/agent-guides/plugins.md](../agent-guides/plugins.md).
 
@@ -21,10 +21,11 @@ MCP tools through the runtime), `installed.rs` (the installed directory; install
 rollback, remove), `releases.rs` (the release checker), `capabilities.rs` (what a manifest can
 do: `[access]`, the atoms, the digest, the tier, the Can list), `trust.rs` (standing, trust
 records, admission, the admin policy, holds), `revoke.rs` (the kill switch), `activity.rs` (the
-activity log) — plus `agent_probe.rs` and `notes.rs`;
+activity log), `retired.rs` (plugins whose job moved into Chimaera,
+[below](#agent-notes)) — plus `agent_probe.rs` and `comms.rs` (the post window plugins' Timeline appends share);
 the interface `crates/chimaera-plugin-api` (the WIT world and its Rust bindings,
 [map](../../crates/chimaera-plugin-api/AGENTS.md)); the first-party plugins in their own
-repositories, [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes), [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium), [chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex) and [chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst), whose releases
+repositories, [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium), [chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex) and [chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst), whose releases
 `plugins/plugins.lock` pins — the lock is all the daemon carries of them
 ([map](../../plugins/AGENTS.md)); the CLI `crates/chimaera/src/plugin.rs`; UI
 `web-ui/src/lib/plugins/` ([map](../../web-ui/src/lib/plugins/AGENTS.md)) — the `plugins`
@@ -51,11 +52,12 @@ installation or hook trust and on reconnect; it carries no plugin payload.
 ## Workbench plugins
 
 - **What & when.** Opt-in capabilities that change what the UI or the agents get, off by
-  default. Two are first-party, both WASM plugins in their own repositories at the releases
+  default. The first-party ones are WASM plugins in their own repositories at the releases
   `plugins/plugins.lock` pins: **Mycelium** (fills Knowledge and "Where things stand"; adds
-  `knowledge_search` · `knowledge_get` for every agent here) and **Agent notes** (below). The
-  daemon carries neither: each is listed as *available* until the user installs it on this
-  host ([below](#versions-installs--updates)).
+  `knowledge_search` · `knowledge_get` for every agent here), and **LaTeX** and **Typst**
+  ([below](#programs-and-tools-the-privileged-tier)). The daemon carries none of them: each is
+  listed as *available* until the user installs it on this host
+  ([below](#versions-installs--updates)).
 - **How it's used.** Open Extensions from the rail's **Extensions** row or quick-open
   ("Extensions"; "plugins" and "skills" find it too). Its header stays put across segments —
   "Extensions" and a chip naming the host ("Plugins are installed per host") on the left, the
@@ -102,7 +104,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     removed. Manifests over 64 KiB are refused before activation.
   - **Active = installed AND switched on here AND the footprint is present AND the plugin
     passes its gates** (`detect.any`, workspace-relative; no path component may be a symlink;
-    empty = always present, as for Agent notes). An available plugin is never active: switching
+    empty = always present, as for LaTeX). An available plugin is never active: switching
     it on answers 409 "<name> isn't installed — install it first". The switch persists in
     `workspaces.json` by plugin id — durable or refused, since a forgotten toggle would silently
     change what agents see (written off the workspaces lock, taken back if the write fails) —
@@ -242,7 +244,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     refused), reads ≤ 8 MiB and listings ≤ 4,096 entries, off the reactor behind the filesystem
     semaphore; `state` — 64 KiB per (plugin, workspace), in memory (a restart clears it);
     `sessions`; `timeline-append` of `note` entries only (≤ 2 KiB, from a session's call, under
-    the per-session posts-per-minute window `tell_mastermind` shares) and `timeline-recent`;
+    the per-session posts-per-minute window agent messages share; a plugin's note is shown on the Timeline, never delivered into an agent) and `timeline-recent`;
     `emit` (one JSON object ≤ 16 KiB); `now-ms`; `log` (≤ 64 lines a call). The host serves the
     workspace and session of the call in flight, never the context a guest passes back.
   - **What a plugin hands back is capped too** — a tool result at 256 KiB, the instruction
@@ -255,7 +257,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   - **Events reach only the plugins that declare them** (`provides.events`): a hook never
     instantiates a plugin that ignores hooks.
   - **Measured** (2026-09-26, macOS arm64): the release binary 26.8 → 38.4 MB (Cranelift); a
-    release-grade compile of Agent notes (135 KB) 55–82 ms and of Mycelium (305 KB) about
+    release-grade compile of a 135 KB plugin 55–82 ms and of Mycelium (305 KB) about
     200 ms, once per daemon lifetime; release daemon RSS 5.8 MB idle, 10.2 MB with a workspace
     and a session, 28.8 MB after the first plugin call (compile + instantiate, 70 ms end to end)
     and 28.9 MB after 50 more; a warm tool call through the MCP endpoint 1–2 ms (P1's
@@ -299,11 +301,12 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   for updates** (afterwards a muted "No newer version · checked just now" line, which ages —
   "checked 2 hours ago"), **Use previous version (0.1.1)**, **Open on GitHub** (the repository
   it installs from) and **Remove…** (a dialog naming the versions it deletes). Each change
-  reports one outcome line, never a checksum ("installed Agent notes 0.1.2", "updated to
+  reports one outcome line, never a checksum ("installed Mycelium 0.2.1", "updated to
   0.1.2", "back to 0.1.1 — Use previous returns to 0.1.2"). A plugin this daemon can't run
   shows why in a callout ("needs chimaera ≥ x (this is y)", "needs a newer chimaera: …",
   "needs a newer plugin: …", "The downloaded files don't match what the release published —
-  reinstall it", with **Reinstall** for that one) and stays off, its switch disabled; a plugin
+  reinstall it", with **Reinstall** for that one; a retired plugin's "Built into Chimaera now:
+  …", [below](#agent-notes)) and stays off, its switch disabled; a plugin
   that failed five times in a minute here adds "Switching it off and on starts it again."
   Under the cards, the small **Install from a repository** form (label, an `owner/repo` field,
   **Preview** and **Install**, both enabled once something is typed, and "The latest release of a
@@ -318,7 +321,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   gives way to the new card; like any plugin, it runs only where it is switched on. On the
   daemon's host: `chimaera plugin list` · `add <id>` · `add <owner/repo> [--version x]` ·
   `add --path <dir>` · `update <id>` · `remove <id>` — the same routes, one line per change
-  ("installed agent-notes 0.1.2") and a leading ✓ in the list for Chimaera's own plugins
+  ("installed mycelium 0.2.1") and a leading ✓ in the list for Chimaera's own plugins
   ([cli.md](cli.md)).
 - **Where it lives.** `plugins/mod.rs` (the lock — `Locked`, `parse_lock`, `lock_entries` —,
   `resolve`, `gate`, `Catalog`, `listing`, `manifest_json` / `available_json`),
@@ -476,12 +479,11 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   user to trust exactly that list first. An update that asks for more waits for the user, and
   the version that runs keeps running meanwhile. Chimaera can block a bad build everywhere
   (the kill switch), and a host's admin can allow only verified plugins. Shipped as the
-  platform plan's phase P6; nothing changed for Agent notes or Mycelium (both verified, both
-  asking for nothing new).
+  platform plan's phase P6; nothing changed for Mycelium (verified, asking for nothing new).
 - **How it's used.**
   - **The Can list** is a row of every card's facts ("Can"), in plain words: "Reads files in this
     workspace" · "Reads the Timeline and posts notes to it" · "Sees this workspace's sessions" ·
-    "Gives agents 2 tools: post_note · read_notes" · "Fills the Knowledge view" · "Offers an
+    "Gives agents 2 tools: knowledge_search · knowledge_get" · "Fills the Knowledge view" · "Offers an
     agent-side plugin for claude: …" · "Has a setup prompt it sends to an agent you choose". A
     plugin that runs programs ([below](#programs-and-tools-the-privileged-tier)) carries a "runs
     programs" tag and its program lines in the warning tone.
@@ -520,7 +522,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   `ActivityDialog.svelte`, `store.ts` (`TrustNeeded`, `trustChange`), `installCopy.ts`
   (`holdWords`, `trustWords`, `activityWords`); tests `tests/plugin_trust.rs`.
 - **Key behaviors.**
-  - **Capabilities are atoms** (`["access","files","read"]`, `["agent-tool","post_note"]`, …);
+  - **Capabilities are atoms** (`["access","files","read"]`, `["agent-tool","knowledge_search"]`, …);
     the **digest** is the SHA-256 of the sorted atoms under `chimaera-caps/1`, so a kind added
     later changes no digest of a plugin that doesn't use it. "Asks for more" is set difference;
     "covered" is subset. A 0.1 manifest without `[access]` is read as exactly what 0.1 allowed
@@ -570,8 +572,8 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   opens in the LaTeX plugin's view, **Text** always one click away), items in a file's bar
   ("Export PDF"), published data core draws (problems in a file, a build's result), its own
   settings in Settings → Plugins, a folder for what it makes, and state that survives a
-  restart. Shipped as the platform plan's phase P7; 0.1 plugins (Agent notes, Mycelium) run
-  unchanged beside it.
+  restart. Shipped as the platform plan's phase P7; 0.1 plugins (Mycelium) run unchanged
+  beside it.
 - **How to use.** Switch the plugin on in a workspace. Its card gains **Open <view>** for each
   tab it offers, its card sections, and **Settings**. A file it claims opens in its view; the
   bar above has **Text** (and, when two plugins claim it, each one — the choice is remembered
@@ -729,45 +731,23 @@ installation or hook trust and on reconnect; it carries no plugin payload.
 
 ## Agent notes
 
-- **What & when.** Agents leave short notes for each other and for the Mastermind, on the
-  Timeline — heads-ups, questions, "I'm changing the loader API". (Reaching the Mastermind
-  needs no plugin: every worker in a workspace with one has `tell_mastermind` —
-  [dashboard.md](dashboard.md#the-mastermind-panel).) **Mail, not phone:** posting
-  never starts a turn anywhere, so no ping-pong loops, no surprise bills, no chain a poisoned
-  note could set off. Talking isn't commanding: every reader gets notes framed as information.
-- **How it's used.** Switch "Agent notes" on for the workspace (it has no footprint, so on =
-  active). Tools: `post_note {text, to?}` — `to` a session id in this workspace, `"mastermind"`,
-  or omitted for everyone — and `read_notes {all?}` — unread notes for you (and for everyone),
-  oldest first, quoted, advancing your read cursor. A note reaches its recipient when it
-  (a) reads; (b) is a claude session — a one-line "N unread notes … read_notes shows them" hint
-  rides the `SessionStart` / `UserPromptSubmit` hook responses claude already fires; (c) the
-  user clicks "deliver to <name>" on the Timeline row of a note addressed to one session — a
-  real, attributed, quoted message they chose to send; (d) is the Mastermind — a "N new messages
-  from agents" chip in the Mastermind panel, where one click is one turn that quotes up to 20 of
-  them into the prompt ([dashboard.md](dashboard.md#the-mastermind-panel)).
-- **Coverage.** claude chat / TUI — read, post, hinted, addressable; codex chat — read, post,
-  pull-only; codex TUI — read, post, pull-only (it gets the MCP server because this plugin has
-  tools); shells — none. Any session in the workspace can be a `to`; **deliver** needs a
-  running chat session (a terminal agent gets 409 — "open it and paste"; chimaera never types
-  into a TUI).
-- **Where it lives.** The WASM plugin in its own repository, [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes) — `src/lib.rs` (the exports:
-  `post_note`, `read_notes`, the hook line, read cursors in host state), `src/notes.rs` (the
-  addressing rule, unread, the texts agents read; unit-tested natively), `plugin.toml`
-  (declares the `hook` and `session-ended` events). What stays in core, `notes.rs`: `deliver`,
-  `tell_mastermind`, `take_post_slot` (the posts-per-minute window the host's Timeline appends
-  share), `append_note`, `age`; the hint reaches claude through `plugins::runtime::hook` from
-  `agents.rs::ingest`. UI `TimelineRow.svelte` / `TimelineView.svelte` (deliver) and
-  `MastermindDock.svelte` (the inbox chip). Tests: `crates/chimaera-server/src/tests/plugins.rs`
-  pins the tool definitions and the texts byte for byte; the instruction paragraph is the
-  plugin's own wording (0.1.2 rewrote it), so the test checks it names `post_note` and
-  `read_notes`.
-- **Key behaviors.** ≤10 posts per session per minute and ≤2 KiB a note (the host's caps, not
-  the plugin's); notes never cross workspaces; a note for everyone has no single recipient to
-  deliver to. Read cursors (host state, per workspace) and rate windows live in daemon memory
-  (a restart resets them, so old notes can read as unread again); switching the plugin off and
-  on keeps the cursors, and a session that ends drops its own. `read_notes` looks through the
-  newest 200 Timeline entries and returns ≤30. The dock's inbox keeps its own per-browser
-  cursor (localStorage).
+- **What & when.** Agent notes was a first-party workbench plugin (`agent-notes`) for agents
+  leaving each other notes. Its job is built into Chimaera now: Agent communication (Settings →
+  Agents). It left `plugins/plugins.lock`, so nothing offers it, and its id is on the daemon's
+  retired list.
+- **How it's used.** Nothing to do but remove it. A copy an older daemon installed stays on its
+  card with the reason as its fault — "Built into Chimaera now: Agent communication (Settings →
+  Agents). Remove this copy." — and the card's **Remove**; it never runs (no tools, no hook, no
+  update offer, no trust question) and its switch refuses on. Every way in answers 409 in the
+  same words: Install by id (`chimaera plugin add agent-notes`), by its repository (before
+  anything is fetched), a release or local build whose manifest says `agent-notes` (Preview
+  shows the reason as the fault), and Update, Use previous and Check of a kept copy. Its switch
+  is dropped from every workspace's `plugins_on` when the daemon loads `workspaces.json`
+  (written once). Old notes stay on the Timeline.
+- **Where it lives.** `plugins/retired.rs` (`RETIRED`: id, repository, the reason), read by
+  `plugins::resolve` (the fault), `put_workspace_plugin`, `installed.rs` (every install route,
+  update, rollback), `releases::check`, `preview::describe` and `WorkspaceStore::load`. Tests:
+  `tests/plugin_retired.rs`, `workspaces::tests`.
 
 ---
 

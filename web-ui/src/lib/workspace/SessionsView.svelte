@@ -236,7 +236,11 @@
     spawn_terminal: "opened the terminal",
     message_agent: "messaged",
     interrupt_agent: "stopped the turn of",
-    deliver_note: "delivered a note to",
+    deliver_note: "delivered a message to",
+    // Agent communication: a wake (a peer's message, or your Wake), and your
+    // hand-over of an inbox.
+    wake_agent: "woke",
+    deliver_messages: "handed waiting messages to",
     wake_mastermind: "woke",
   };
 

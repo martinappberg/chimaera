@@ -59,7 +59,11 @@ async fn mcp_handshake_auth_and_tool_listing() {
             "read_terminal",
             "document_guide",
             "check_document",
-            "notify"
+            "notify",
+            "workspace_agents",
+            "read_agent",
+            "message_agent",
+            "read_messages",
         ]
     );
 

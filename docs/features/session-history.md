@@ -17,7 +17,7 @@ and the rail's Recents in `web-ui/src/App.svelte`. Wire (all bearer-authed):
 `GET /api/v1/workspaces/{id}/history`, `GET /api/v1/sessions/{id}/edits`,
 `GET /api/v1/workspaces/{id}/same-file`, `GET /api/v1/activity`, `GET /api/v1/activity/csv`,
 `POST /api/v1/recents/archive`, `POST /api/v1/recents/unarchive`, `GET /api/v1/recents/archived`,
-an additive `key` on each `GET /api/v1/recents` row; the Mastermind-tier MCP tool `read_session`
+an additive `key` on each `GET /api/v1/recents` row; the MCP tool `read_agent`
 reads an ended session's record; the same-file line rides the claude hook answer
 (`POST /api/v1/agent-events/{id}`).
 
@@ -48,8 +48,8 @@ reads an ended session's record; the same-file line rides the claude hook answer
   records' ~30 s checkpoint, before the ledger resurrects them). A resurrected session continues
   under a new record with `started_by: "restart"`.
 - **The audit trail.** The Mastermind's acts (`spawn_agent`, `spawn_terminal`, `message_agent`,
-  `interrupt_agent`) and note deliveries (the user's `deliver`, a worker's auto-mode wake) append
-  `act` lines — `{ts, by, act, target?, detail≤200}` — to the same file.
+  `interrupt_agent`), agent wakes (`wake_agent`) and the user's hand-overs (`deliver_note`,
+  `deliver_messages`) append `act` lines — `{ts, by, act, target?, detail≤200}` — to the same file.
 - **Git.** `git` stays null until Part 1's per-session anchors are wired: `history::git_field` is
   the one seam (`{start, current, commits[]}`, read from memory at close).
 - **Bounds.** A record is about 1 KiB (lines over 8 KiB are refused). Past 4 MiB the file compacts

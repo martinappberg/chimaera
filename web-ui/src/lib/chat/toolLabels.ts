@@ -63,6 +63,152 @@ const KINDS: { kind: string; done: Phrase; live: Phrase }[] = [
 
 const KNOWN = new Set(KINDS.map((k) => k.kind).filter((k) => k !== "other"));
 
+// --- agent communication (the chimaera MCP server) ---------------------------
+
+/** The agent-communication tools every agent has (plan §3), in the order a
+ *  group title says them. */
+const COMMS_VERBS = ["message_agent", "read_agent", "read_messages", "workspace_agents"] as const;
+export type CommsVerb = (typeof COMMS_VERBS)[number];
+
+export interface CommsCall {
+  verb: CommsVerb;
+  /** Who: `message_agent`'s `to`, `read_agent`'s `agent`; null = not known. */
+  target: string | null;
+}
+
+/** How the drivers title an MCP call — claude `message_agent (chimaera)`,
+ *  codex `chimaera.message_agent` (an item) or `chimaera · message_agent` (an
+ *  approval) — plus the raw `mcp__chimaera__message_agent` name. */
+const COMMS_TITLE = [
+  /^mcp__chimaera__([a-z_]+)(.*)$/,
+  /^([a-z_]+) \(chimaera\)(.*)$/,
+  /^chimaera(?:\.| · )([a-z_]+)(.*)$/,
+];
+/** An argument the title carries after the name: `→ loader refactor` (the
+ *  claude teammate-message shape, a `: text` after it dropped) or `: s-1a2b`. */
+const COMMS_TARGET = /^\s*(?:(?:→|->)\s*(.+?)(?::\s.*)?|:\s*(.+))$/;
+
+function isCommsVerb(v: string): v is CommsVerb {
+  return (COMMS_VERBS as readonly string[]).includes(v);
+}
+
+function cleanTarget(raw: string | undefined | null): string | null {
+  const t = (raw ?? "").trim().replace(/^["'“]|["'”]$/g, "").trim();
+  return t === "" ? null : t;
+}
+
+/** The agent-communication call a tool row is, from its title (and its
+ *  input when the caller has it); null for every other tool. */
+export function commsCall(title: string, input?: Record<string, unknown> | null): CommsCall | null {
+  for (const re of COMMS_TITLE) {
+    const m = re.exec(title.trim());
+    if (m === null || !isCommsVerb(m[1])) continue;
+    const verb = m[1];
+    const arg = verb === "message_agent" ? input?.to : verb === "read_agent" ? input?.agent : undefined;
+    const fromTitle = COMMS_TARGET.exec(m[2] ?? "");
+    const target =
+      typeof arg === "string"
+        ? cleanTarget(arg)
+        : verb === "message_agent" || verb === "read_agent"
+          ? cleanTarget(fromTitle?.[1] ?? fromTitle?.[2])
+          : null;
+    return { verb, target };
+  }
+  return null;
+}
+
+/** Names the app knows for session ids (set once from the live roster):
+ *  an agent passes an id to message or read another, and the card should say
+ *  the name the user sees. Ids it doesn't know stay ids. */
+let agentName: (id: string) => string | null = () => null;
+export function setAgentNames(resolve: (id: string) => string | null): void {
+  agentName = resolve;
+}
+
+/** A recipient as a sentence says it: the two reserved addresses in words,
+ *  a session id by its name. */
+function targetLabel(target: string): string {
+  if (target === "mastermind") return "the Mastermind";
+  if (target === "everyone") return "everyone";
+  if (/^s-[0-9a-f]{6,}$/.test(target)) return agentName(target) ?? target;
+  return target;
+}
+
+/** A comms call's card title: "Message to loader refactor", "Checked
+ *  messages", "Listed agents", "Read loader refactor's work" — or, when the
+ *  title named no one, "Sent a message", "Read another agent's work". */
+export function commsTitle(call: CommsCall): string {
+  switch (call.verb) {
+    case "message_agent":
+      // The drivers' MCP titles carry no arguments today; the recipient
+      // shows once one does (`message_agent (chimaera) → fix CI`).
+      return call.target !== null ? `Message to ${targetLabel(call.target)}` : "Sent a message";
+    case "read_messages":
+      return "Checked messages";
+    case "workspace_agents":
+      return "Listed agents";
+    case "read_agent":
+      return call.target !== null ? `Read ${targetLabel(call.target)}'s work` : "Read another agent's work";
+  }
+}
+
+/** A tool row's title as the card shows it: agent-communication calls in
+ *  words, every other tool as the driver titled it. */
+export function readableToolTitle(t: { tool: string; title: string }): string {
+  if (t.tool !== "other") return t.title;
+  const call = commsCall(t.title);
+  return call === null ? t.title : commsTitle(call);
+}
+
+interface CommsPhrase extends Phrase {
+  /** A lone call whose target is known names it. */
+  named?: (target: string) => string;
+}
+
+const COMMS_PHRASES: Record<CommsVerb, { done: CommsPhrase; live: CommsPhrase }> = {
+  message_agent: {
+    done: { one: "sent a message", many: (n) => `sent ${n} messages`, named: (t) => `messaged ${t}` },
+    live: { one: "sending a message", many: (n) => `sending ${n} messages`, named: (t) => `messaging ${t}` },
+  },
+  read_agent: {
+    done: { one: "read an agent's work", many: (n) => `read ${n} agents' work`, named: (t) => `read ${t}'s work` },
+    live: {
+      one: "reading an agent's work",
+      many: (n) => `reading ${n} agents' work`,
+      named: (t) => `reading ${t}'s work`,
+    },
+  },
+  read_messages: {
+    done: { one: "checked messages", many: (n) => `checked messages ${n} times` },
+    live: { one: "checking messages", many: () => "checking messages" },
+  },
+  workspace_agents: {
+    done: { one: "listed agents", many: (n) => `listed agents ${n} times` },
+    live: { one: "listing agents", many: () => "listing agents" },
+  },
+};
+
+/** The comms calls among `tools`, as phrases (all of one tense). */
+function commsPhrases(tools: LabelledTool[], live: boolean): string[] {
+  const calls = tools.flatMap((t) => {
+    const c = t.tool === "other" && t.title !== undefined ? commsCall(t.title) : null;
+    return c === null ? [] : [c];
+  });
+  const out: string[] = [];
+  for (const verb of COMMS_VERBS) {
+    const of = calls.filter((c) => c.verb === verb);
+    if (of.length === 0) continue;
+    const p = COMMS_PHRASES[verb][live ? "live" : "done"];
+    const target = of.length === 1 ? of[0].target : null;
+    out.push(target !== null && p.named !== undefined ? p.named(targetLabel(target)) : of.length === 1 ? p.one : p.many(of.length));
+  }
+  return out;
+}
+
+function isCommsTool(t: LabelledTool): boolean {
+  return t.tool === "other" && t.title !== undefined && commsCall(t.title) !== null;
+}
+
 /** Still running — said in the present tense, and a live dot on its line. */
 export function isLive(t: { status: string }): boolean {
   return t.status === "pending" || t.status === "in_progress";
@@ -85,10 +231,13 @@ export function countPhrase(tools: LabelledTool[]): string {
   const parts: string[] = [];
   for (const live of [false, true]) {
     for (const k of KINDS) {
+      // Agent-communication calls say what they did, ahead of the
+      // catch-all "used a tool".
+      if (k.kind === "other") parts.push(...commsPhrases(tools.filter((t) => isLive(t) === live), live));
       const of = tools.filter(
         (t) =>
           isLive(t) === live &&
-          (k.kind === "other" ? !KNOWN.has(t.tool) : t.tool === k.kind),
+          (k.kind === "other" ? !KNOWN.has(t.tool) && !isCommsTool(t) : t.tool === k.kind),
       );
       const n = count(of);
       if (n === 0) continue;

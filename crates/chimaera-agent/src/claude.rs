@@ -3417,6 +3417,16 @@ impl ClaudeMapper {
         match cmd {
             AgentCommand::Send { blocks } => self.send_blocks(blocks, false, &mut step),
             AgentCommand::SendAfterTurn { blocks } => self.send_blocks(blocks, true, &mut step),
+            // The CLI runs a queued message that misses its turn as the next
+            // turn, and a `cancel_async_message` can lose that race — so no
+            // "join the running turn or nothing" is possible here. Settle it
+            // unsent at once; the daemon reaches Claude through its hooks.
+            AgentCommand::SendIfRunning { id, .. } => {
+                step.events.push(AgentEvent::UserMessageUpdate {
+                    id,
+                    state: UserMessageState::Dropped,
+                });
+            }
             AgentCommand::Permission {
                 request_id,
                 option_id,
@@ -4845,7 +4855,13 @@ pub(crate) fn tool_title(name: &str, input: &Value) -> String {
             (Some(cron), None) => Some(format!("CronCreate: {cron}")),
             _ => None,
         },
-        _ => mcp_tool_label(name),
+        _ => mcp_tool_label(name).map(|label| {
+            let (server, tool) = name
+                .strip_prefix("mcp__")
+                .and_then(|rest| rest.split_once("__"))
+                .unwrap_or_default();
+            label + &crate::model::comms_title_suffix(server, tool, input)
+        }),
     };
     if let Some(title) = owned {
         return title;
@@ -6211,6 +6227,28 @@ pub(crate) mod tests {
     /// resolves it `Cancelled` — no `cancel_async_message` round-trip (the CLI
     /// never received it) — and the turn-end flush then delivers only the
     /// SURVIVING held message, never the cancelled one.
+    /// Claude has no race-free "join the running turn or nothing": the
+    /// daemon's agent message settles unsent at once, and nothing reaches
+    /// the CLI.
+    #[test]
+    fn send_if_running_settles_dropped_without_writing() {
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::SendIfRunning {
+            id: "agent-1".into(),
+            blocks: vec![ContentBlock::Text {
+                text: "heads-up".into(),
+            }],
+        });
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::UserMessageUpdate {
+                id: "agent-1".into(),
+                state: UserMessageState::Dropped,
+            }]
+        );
+        assert!(step.outbound.is_empty(), "{:?}", step.outbound);
+    }
+
     #[test]
     fn cancel_queued_removes_a_held_send() {
         let mut m = mapper();
@@ -9051,6 +9089,17 @@ pub(crate) mod tests {
                 &json!({ "delaySeconds": 1200, "reason": "watching CI" })
             ),
             "ScheduleWakeup: in 20m 00s · watching CI"
+        );
+        assert_eq!(
+            tool_title(
+                "mcp__chimaera__message_agent",
+                &json!({ "to": "everyone", "text": "heads-up" })
+            ),
+            "message_agent (chimaera) → everyone"
+        );
+        assert_eq!(
+            tool_title("mcp__chimaera__read_messages", &json!({})),
+            "read_messages (chimaera)"
         );
         assert_eq!(
             tool_title(

@@ -120,6 +120,40 @@ async fn events_until(
     panic!("events never matched: {last:?}");
 }
 
+/// `hook` and `session-ended` reach a plugin that declared them: a claude
+/// hook's answer carries the plugin's line, and a session's end is told to
+/// it. (The retired Agent notes plugin used to prove this.)
+#[tokio::test]
+async fn hook_and_session_ended_reach_a_plugin_that_declared_them() {
+    let (state, ws) = platform_workspace("platform-hooks").await;
+    let sid = inject_silent_agent(&state, "kh");
+    lock(&state.session_workspaces).insert(sid.clone(), ws.clone());
+    let (status, answer) = request(
+        &state,
+        Method::POST,
+        &format!("/api/v1/agent-events/{sid}?key=kh"),
+        Some(json!({"hook_event_name": "UserPromptSubmit", "prompt": "go"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let context = answer["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        context.contains("test-platform heard UserPromptSubmit"),
+        "{answer}"
+    );
+    events_until(&state, &ws, |e| {
+        e.iter().any(|x| x == "hook UserPromptSubmit")
+    })
+    .await;
+
+    crate::plugins::runtime::session_ended(&state, &sid);
+    let ended = format!("ended {sid}");
+    events_until(&state, &ws, |e| e.contains(&ended)).await;
+    state.sessions.kill(&sid).ok();
+}
+
 #[tokio::test]
 async fn a_0_2_plugin_draws_every_node_and_acts() {
     let (state, ws) = platform_workspace("platform-draw").await;

@@ -557,6 +557,7 @@ pub(crate) async fn remove_worktree(
         state.git.forget_workspace(&id);
         crate::lock(&state.quickopen).forget_workspace(&id);
         state.timeline.remove_workspace(&id);
+        state.comms.forget_workspace(&id);
         crate::lock(&state.plugin_detect).forget_workspace(&id);
         state.plugin_runtime.forget_workspace(&id);
         crate::lock(&state.plugin_state).forget_workspace(&id);

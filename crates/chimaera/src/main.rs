@@ -103,7 +103,7 @@ enum PluginCmd {
     /// pins), any plugin from its GitHub release, or a local build with
     /// --path (checksum-verified whenever there is a SHA256SUMS).
     Add {
-        /// A Chimaera plugin's id (`agent-notes`), or a repository:
+        /// A Chimaera plugin's id (`mycelium`), or a repository:
         /// owner/repo or its https://github.com/owner/repo URL.
         #[arg(required_unless_present = "path", conflicts_with = "path")]
         plugin: Option<String>,
@@ -441,7 +441,7 @@ mod tests {
         }
         for args in [
             &["chimaera", "plugin", "list"][..],
-            &["chimaera", "plugin", "add", "agent-notes"],
+            &["chimaera", "plugin", "add", "mycelium"],
             &["chimaera", "plugin", "update", "latex"],
             &["chimaera", "plugin", "update", "latex", "--trust"],
             &["chimaera", "plugin", "add", "acme/x", "--trust"],

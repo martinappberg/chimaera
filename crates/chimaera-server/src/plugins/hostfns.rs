@@ -15,7 +15,9 @@
 //! - State: 64 KiB per (plugin, workspace), in memory (`PluginStates`).
 //! - Timeline: `note` entries only, from a session's call, ≤ `TEXT_MAX`,
 //!   addressed within the workspace, under the per-session posts-per-minute
-//!   window `tell_mastermind` shares (`notes::take_post_slot`).
+//!   window agent messages share (`comms::take_post_slot`). A plugin's note
+//!   carries no `delivery`: it is shown on the Timeline, never delivered
+//!   into an agent (only agent communication does that).
 //! - `emit`: one JSON object ≤ 16 KiB per frame, a bounded ring, sent only
 //!   to windows showing the plugin's workspace.
 //! - `[access]` (`capabilities::Access`): files, the Timeline and sessions
@@ -514,8 +516,8 @@ impl host::Host for HostState {
             },
             Some(_) => return Err("`to` is a session id, \"mastermind\", or null".into()),
         };
-        crate::notes::take_post_slot(&app, &sid)?;
-        let posted = crate::notes::append_note(&app, &self.workspace, &sid, to, text, false).await;
+        crate::comms::take_post_slot(&app, &sid)?;
+        let posted = crate::comms::append_plugin_note(&app, &self.workspace, &sid, to, text).await;
         Ok(posted.seq)
     }
 

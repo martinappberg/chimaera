@@ -42,8 +42,20 @@ pub const UNHANDLED_REQUEST_NAME_MAX: usize = 80;
 /// session when a restart cut its work off (see `ChatManager::command_as`).
 pub const ORIGIN_RESTART: &str = "restart";
 /// `UserMessage.origin` for a worker's `tell_mastermind` message the daemon
-/// delivers to an auto-mode Mastermind (a wake the user didn't type).
+/// delivered to an auto-mode Mastermind — journals written before agent
+/// communication replaced it; nothing sends it any more.
 pub const ORIGIN_WORKER: &str = "worker";
+/// `UserMessage.origin` for messages from other agents the daemon delivered
+/// as a send (a Codex steer, a wake, the user's hand-over of an inbox): the
+/// text is the header-framed messages, never the user's own words.
+pub const ORIGIN_AGENT: &str = "agent";
+/// `UserMessage.origin` for the workspace Mastermind's message to an agent:
+/// direction the user sanctioned by appointing it, not the user's words.
+pub const ORIGIN_MASTERMIND: &str = "mastermind";
+/// Caps on an [`AgentEvent::AgentMessage`]: the Timeline's own text cap, and
+/// a one-line name.
+pub const AGENT_MESSAGE_TEXT_MAX: usize = 2 * 1024;
+pub const AGENT_MESSAGE_NAME_MAX: usize = 200;
 /// One-line cap for a `ToolSummary` label (live ones are ~30 chars).
 pub const TOOL_SUMMARY_MAX: usize = 200;
 /// Tool ids one `ToolSummary` may name (a batch is a single model reply).
@@ -590,6 +602,56 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+    /// A message from another agent in the workspace that reached this
+    /// session as context rather than as a send (claude: a hook's
+    /// `additionalContext` at its next step), so no `UserMessage` records it.
+    /// Journal-only: the DAEMON appends it (`ChatManager::annotate`); no
+    /// driver emits it. `message` is its Timeline seq — the id replies name.
+    /// Build with [`AgentEvent::agent_message`] (caps). APPENDED last:
+    /// additive.
+    AgentMessage {
+        message: u64,
+        from_sid: String,
+        from_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_agent: Option<String>,
+        text: String,
+        /// Sent to everyone in the workspace, not to this session alone.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        broadcast: bool,
+        /// From the workspace Mastermind: direction, not a peer's note.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        mastermind: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<u64>,
+    },
+}
+
+impl AgentEvent {
+    /// An [`AgentEvent::AgentMessage`] with its strings capped at
+    /// construction (the journal, ring and clients never see more).
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_message(
+        message: u64,
+        from_sid: &str,
+        from_name: &str,
+        from_agent: Option<&str>,
+        text: &str,
+        broadcast: bool,
+        mastermind: bool,
+        reply_to: Option<u64>,
+    ) -> Self {
+        AgentEvent::AgentMessage {
+            message,
+            from_sid: truncate_label(from_sid, AGENT_MESSAGE_NAME_MAX),
+            from_name: truncate_label(from_name, AGENT_MESSAGE_NAME_MAX),
+            from_agent: from_agent.map(|a| truncate_label(a, AGENT_MESSAGE_NAME_MAX)),
+            text: truncate_label(text, AGENT_MESSAGE_TEXT_MAX),
+            broadcast,
+            mastermind,
+            reply_to,
+        }
+    }
 }
 
 /// The live bridge carried on `Init` (see `AgentEvent::Init.remote_control`).
@@ -859,6 +921,20 @@ pub enum AgentCommand {
     SendNow {
         id: String,
     },
+    /// Join the RUNNING turn at the agent's next step, or not at all: never
+    /// opens a turn, and a message that misses its turn is never re-driven
+    /// into the next one. `id` is the caller-minted delivery key (a uuid):
+    /// its `UserMessage` echo (queued) and the `UserMessageUpdate` that
+    /// settles it — `Sent` when read, `Dropped` when it missed or no turn
+    /// was running — carry it. Codex steers; Claude answers `Dropped` at
+    /// once (its queue runs a missed message as the next turn, so the daemon
+    /// reaches a Claude session through hooks instead). The daemon's agent
+    /// messages use it — a message must not start a turn the user's wake
+    /// policy didn't allow. APPENDED last: additive.
+    SendIfRunning {
+        id: String,
+        blocks: Vec<ContentBlock>,
+    },
 }
 
 /// A client command exceeded one of the daemon's bounded-ingress budgets.
@@ -899,8 +975,13 @@ impl AgentCommand {
     /// own earlier byte ceiling; this remains authoritative for programmatic
     /// callers such as the workspace Mastermind MCP.
     pub fn validate_ingress(&self) -> Result<(), CommandValidationError> {
+        if let Self::SendIfRunning { id, .. } = self {
+            check_command_len("send id", id.len(), COMMAND_ID_MAX)?;
+        }
         match self {
-            Self::Send { blocks } | Self::SendAfterTurn { blocks } => {
+            Self::Send { blocks }
+            | Self::SendAfterTurn { blocks }
+            | Self::SendIfRunning { blocks, .. } => {
                 check_command_len("send blocks", blocks.len(), COMMAND_BLOCKS_MAX)?;
                 let mut images = 0usize;
                 let mut skills = 0usize;
@@ -1033,7 +1114,18 @@ impl AgentCommand {
     /// The content of a send, whichever way it is delivered.
     pub fn send_blocks(&self) -> Option<&Vec<ContentBlock>> {
         match self {
-            Self::Send { blocks } | Self::SendAfterTurn { blocks } => Some(blocks),
+            Self::Send { blocks }
+            | Self::SendAfterTurn { blocks }
+            | Self::SendIfRunning { blocks, .. } => Some(blocks),
+            _ => None,
+        }
+    }
+
+    /// The caller-minted delivery key of a send that carries one
+    /// ([`Self::SendIfRunning`]); other sends get theirs from the driver.
+    pub fn send_id(&self) -> Option<&str> {
+        match self {
+            Self::SendIfRunning { id, .. } => Some(id),
             _ => None,
         }
     }
@@ -1041,7 +1133,9 @@ impl AgentCommand {
     /// [`Self::send_blocks`], mutably (the daemon saves image copies into it).
     pub fn send_blocks_mut(&mut self) -> Option<&mut Vec<ContentBlock>> {
         match self {
-            Self::Send { blocks } | Self::SendAfterTurn { blocks } => Some(blocks),
+            Self::Send { blocks }
+            | Self::SendAfterTurn { blocks }
+            | Self::SendIfRunning { blocks, .. } => Some(blocks),
             _ => None,
         }
     }
@@ -1429,6 +1523,28 @@ pub fn fmt_elapsed_secs(s: u64) -> String {
         format!("{}m {:02}s", s / 60, s % 60)
     } else {
         format!("{s}s")
+    }
+}
+
+/// What a call to chimaera's agent-communication tools is about, for its
+/// card title: ` → <to>` for `message_agent`, ` → <agent>` for `read_agent`
+/// (one line, capped). Empty for every other tool — both drivers append it
+/// to their own MCP title, so the transcript says who a message went to.
+pub fn comms_title_suffix(server: &str, tool: &str, input: &serde_json::Value) -> String {
+    if server != "chimaera" {
+        return String::new();
+    }
+    let target = match tool {
+        "message_agent" => input.get("to"),
+        "read_agent" => input.get("agent").or_else(|| input.get("session")),
+        _ => None,
+    };
+    match target.and_then(|t| t.as_str()) {
+        Some(t) if !t.trim().is_empty() => {
+            let line = t.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!(" → {}", truncate_label(&line, 80))
+        }
+        _ => String::new(),
     }
 }
 

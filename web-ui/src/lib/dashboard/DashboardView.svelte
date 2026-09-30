@@ -18,6 +18,7 @@
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import AgentCard from "./AgentCard.svelte";
   import AttentionCard from "./AttentionCard.svelte";
+  import WakeRequestCard from "./WakeRequestCard.svelte";
   import { mastermindPanel, setMastermindPanelOpen } from "./mastermindPanelState.svelte";
   import NowLine from "./NowLine.svelte";
   import SinceYouLeft from "./SinceYouLeft.svelte";
@@ -48,6 +49,7 @@
   import { lastSeen, markSeen, timelineStore, type SeenMark } from "../workspace/timeline.svelte";
   import { knowledge, knowledgeAvailable } from "../workspace/knowledge";
   import { knowledgePlugin, knowledgeProviderActive } from "../plugins/store";
+  import { commsStore } from "../workspace/comms.svelte";
 
   interface Props {
     dash: DashCtx;
@@ -75,6 +77,17 @@
 
   /** Live asks, ranked into the lane; dead sessions keep to the roster. */
   const lane = $derived(agents.filter((s) => s.alive && needsAttention(s)));
+  /** Messages waiting on the user to let them wake an idle agent (the "Ask
+   *  me" wake policy) — the lane's second kind of card. */
+  const wakeRequests = $derived(commsStore.wsId === wsId ? commsStore.wakeRequests : []);
+  /** Answers the daemon refused, kept until dismissed. */
+  const wakeFailures = $derived(commsStore.wsId === wsId ? commsStore.wakeFailures : []);
+  const needsCount = $derived(lane.length + wakeRequests.length);
+  /** A wake card's vendor marks come from the roster (null = not known). */
+  const agentOf = (sid: string): string | null => {
+    const s = sessions.get(sid);
+    return s !== undefined && s.kind === "agent" ? agentKind(s) : null;
+  };
   const roster = $derived(
     agents
       .filter((s) => !(s.alive && needsAttention(s)))
@@ -390,9 +403,9 @@
         {/if}
         <span class="sentence">
           {#if working > 0}<b class="w">{working} working</b>{/if}
-          {#if lane.length > 0}<b class="a">{lane.length} needs you</b>{/if}
+          {#if needsCount > 0 || wakeFailures.length > 0}<b class="a">{needsCount} needs you</b>{/if}
           {#if finished > 0}<b class="d">{finished} finished</b>{/if}
-          {#if working === 0 && lane.length === 0 && finished === 0}
+          {#if working === 0 && needsCount === 0 && finished === 0}
             <b class="d">all quiet</b>
           {/if}
         </span>
@@ -430,8 +443,10 @@
           </div>
         {/if}
 
-        {#if lane.length > 0}
-          <!-- Needs you: the attention lane, unchanged. Quiet means quiet. -->
+        {#if needsCount > 0}
+          <!-- Needs you: the attention lane, then any wake requests (an
+               agent's message waiting on your OK to start a turn). Quiet
+               means quiet. -->
           <section class="needs" aria-labelledby="needs-title">
             <div id="needs-title" class="lbl">Needs you</div>
             <div class="lane">
@@ -448,6 +463,18 @@
                       : undefined}
                   />
                 </div>
+              {/each}
+              {#each wakeRequests as r (r.id)}
+                <WakeRequestCard request={r} {names} {agentOf} onOpenSession={dash.onOpenSession} />
+              {/each}
+              {#each wakeFailures as f (`failed:${f.request.id}`)}
+                <WakeRequestCard
+                  request={f.request}
+                  failure={f.message}
+                  {names}
+                  {agentOf}
+                  onOpenSession={dash.onOpenSession}
+                />
               {/each}
             </div>
           </section>

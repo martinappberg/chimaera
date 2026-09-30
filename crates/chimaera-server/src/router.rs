@@ -57,10 +57,22 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             "/activity/csv",
             get(crate::history::routes::get_activity_csv),
         )
-        // Agent notes: the USER sends a note to its addressee (their click).
+        // Agent communication (`comms`): the USER sends one Timeline
+        // message to its addressee, hands a session its whole inbox, or
+        // answers a wake request (their clicks); the unread counts and the
+        // requests for a workspace.
         .route(
             "/workspaces/{id}/timeline/{seq}/deliver",
-            post(crate::notes::deliver),
+            post(crate::comms::deliver),
+        )
+        .route("/workspaces/{id}/comms", get(crate::comms::get_comms))
+        .route(
+            "/workspaces/{id}/comms/deliver",
+            post(crate::comms::post_deliver),
+        )
+        .route(
+            "/workspaces/{id}/comms/wakes/{wid}",
+            post(crate::comms::post_wake),
         )
         // Workbench plugins: the catalog, per-workspace status, and the
         // per-workspace switch (`Workspace.plugins_on`; off by default).

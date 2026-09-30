@@ -290,6 +290,8 @@ pub(crate) fn no_source(m: &Manifest) -> Refusal {
 /// exists, and remember the answer. `Ok(None)`: nothing newer that this
 /// daemon can run.
 pub(crate) async fn check(state: &Arc<AppState>, id: &str) -> Result<Option<Offer>, Refusal> {
+    // Nothing to offer, so nothing asked (the daily check skips it too).
+    super::retired::refuse(id)?;
     let Some(m) = super::manifest(state, id) else {
         return Err(super::not_installed(id));
     };

@@ -108,9 +108,10 @@ pub(crate) struct SwitchUndo {
 
 impl WorkspaceStore {
     /// Load the store from `path`. A missing or corrupt file yields an empty
-    /// store (with a warning for the corrupt case).
+    /// store (with a warning for the corrupt case). A retired plugin's
+    /// switch is dropped everywhere, and the list saved once if any was on.
     pub(crate) fn load(path: PathBuf) -> Self {
-        let items = match std::fs::read_to_string(&path) {
+        let mut items: Vec<Workspace> = match std::fs::read_to_string(&path) {
             Ok(contents) => match serde_json::from_str(&contents) {
                 Ok(items) => items,
                 Err(err) => {
@@ -124,12 +125,26 @@ impl WorkspaceStore {
                 Vec::new()
             }
         };
-        WorkspaceStore {
+        let mut dropped = false;
+        for w in &mut items {
+            let before = w.plugins_on.len();
+            w.plugins_on
+                .retain(|p| crate::plugins::retired::of(p).is_none());
+            dropped |= w.plugins_on.len() != before;
+        }
+        let mut store = WorkspaceStore {
             path,
             items,
             generation: 0,
             written: Arc::new(Mutex::new(0)),
+        };
+        if dropped {
+            // Kept in memory either way: the next save carries it.
+            if let Err(err) = store.save() {
+                tracing::warn!(%err, "failed to persist dropping retired plugins' switches");
+            }
         }
+        store
     }
 
     pub(crate) fn list(&self) -> Vec<Workspace> {
@@ -458,6 +473,33 @@ mod tests {
         let reloaded = WorkspaceStore::load(path.clone());
         assert_eq!(reloaded.get(&ws.id).unwrap().plugins_on, ["a", "b"]);
         std::fs::remove_file(path).ok();
+    }
+
+    /// A retired plugin's switch (Agent notes, built in now) goes from every
+    /// workspace at load, written once; a list without one isn't rewritten.
+    #[test]
+    fn load_drops_retired_plugins_switches_and_saves_once() {
+        let dir = test_dir("retired-switches");
+        let path = dir.join("workspaces.json");
+        let record = |id: &str, on: &[&str]| serde_json::json!({"id": id, "root": dir.join(id), "name": id, "plugins_on": on});
+        let list = serde_json::json!([
+            record("w-a", &["agent-notes", "mycelium"]),
+            record("w-b", &["agent-notes"]),
+            record("w-c", &["latex"]),
+        ]);
+        std::fs::write(&path, serde_json::to_vec_pretty(&list).unwrap()).unwrap();
+        let store = WorkspaceStore::load(path.clone());
+        let on = |store: &WorkspaceStore, id: &str| store.get(id).unwrap().plugins_on;
+        assert_eq!(on(&store, "w-a"), ["mycelium"]);
+        assert!(on(&store, "w-b").is_empty());
+        assert_eq!(on(&store, "w-c"), ["latex"]);
+        assert_eq!(store.generation, 1, "saved once");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("agent-notes"), "{raw}");
+        let reloaded = WorkspaceStore::load(path.clone());
+        assert_eq!(on(&reloaded, "w-a"), ["mycelium"]);
+        assert_eq!(reloaded.generation, 0, "nothing to drop: not rewritten");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A switch whose write failed is taken back — unless the list changed

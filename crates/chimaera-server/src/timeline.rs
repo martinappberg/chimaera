@@ -173,10 +173,33 @@ pub(crate) struct Note {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) to: Option<String>,
     pub(crate) text: String,
-    /// A message to the Mastermind that already woke it (auto mode) — not
+    /// The message started a turn in its reader (`delivery` "woke") — not
     /// in its inbox any more. Additive; absent = false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) woke: bool,
+    /// Agent communication (`comms`): the sender's agent CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) from_agent: Option<String>,
+    /// The addressee's display name when it was sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) to_name: Option<String>,
+    /// The message (its seq) this one answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reply_to: Option<u64>,
+    /// The conversation's first message (seq); absent on a first message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) thread: Option<u64>,
+    /// The sender asked for a reply.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) expect_reply: bool,
+    /// Sent by the workspace Mastermind: direction, not a peer's note.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) mastermind: bool,
+    /// How it reached its reader when sent: "next_step" | "inbox" | "woke"
+    /// | "asked". Set on every agent message and on nothing else — a
+    /// plugin's own Timeline note has none and is never delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) delivery: Option<String>,
 }
 
 impl Entry {
@@ -587,12 +610,16 @@ pub(crate) fn cap(text: &str, max: usize) -> String {
     format!("{}…", text[..end].trim_end())
 }
 
-/// The prefix `mcp::message_agent` puts on a Mastermind relay. Kept in sync
-/// by a test in `mcp` (the relay must stay recognizable here).
+/// The attribution line the Mastermind's relays carried before agent
+/// communication (still in older journals and transcripts).
 pub(crate) const MASTERMIND_RELAY_PREFIX: &str = "[via the workspace Mastermind";
+/// How agent communication frames a message from the Mastermind (`comms`).
+const MASTERMIND_MESSAGE_PREFIX: &str = "[message #";
 
 /// Split a prompt into (title, via): a Mastermind relay loses its
-/// attribution line and is marked `via: "mastermind"`.
+/// attribution line and is marked `via: "mastermind"`; a turn started by
+/// other agents' messages is `via: "agent"`, titled by the first message's
+/// body. Bracketed framing lines (`[…]`) and quote marks never title a turn.
 pub(crate) fn prompt_title(prompt: &str) -> (String, Option<String>) {
     let trimmed = prompt.trim();
     if let Some(rest) = trimmed.strip_prefix(MASTERMIND_RELAY_PREFIX) {
@@ -600,6 +627,36 @@ pub(crate) fn prompt_title(prompt: &str) -> (String, Option<String>) {
         return (
             cap(&one_line(body), TITLE_MAX),
             Some("mastermind".to_string()),
+        );
+    }
+    let first = trimmed.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let framed = first.starts_with(MASTERMIND_MESSAGE_PREFIX)
+        || (first.starts_with('[')
+            && trimmed
+                .lines()
+                .any(|l| l.starts_with(MASTERMIND_MESSAGE_PREFIX)));
+    if framed {
+        let from_mastermind = trimmed
+            .lines()
+            .find(|l| l.starts_with(MASTERMIND_MESSAGE_PREFIX))
+            .is_some_and(|h| h.contains(" from the workspace Mastermind "));
+        let body: Vec<&str> = trimmed
+            .lines()
+            .skip_while(|l| !l.starts_with(MASTERMIND_MESSAGE_PREFIX))
+            .skip(1)
+            .take_while(|l| !l.starts_with(MASTERMIND_MESSAGE_PREFIX))
+            .map(|l| l.strip_prefix("> ").unwrap_or(l))
+            .collect();
+        return (
+            cap(&one_line(&body.join(" ")), TITLE_MAX),
+            Some(
+                if from_mastermind {
+                    "mastermind"
+                } else {
+                    "agent"
+                }
+                .to_string(),
+            ),
         );
     }
     (cap(&one_line(trimmed), TITLE_MAX), None)

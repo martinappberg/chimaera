@@ -81,6 +81,17 @@ export function blockWeight(
         1.5 +
         (block.attachmentPaths.length > 0 ? 5.5 : 0)
       );
+    case "agent_message":
+      // A card per message: its sender line, then the body at card width;
+      // the raw text in one plain card when no header parsed.
+      if (block.messages.length === 0) return textLines(block.text, charsPerLine * 0.8) + 1.5;
+      return (
+        (block.caption !== null ? 1 : 0) +
+        block.messages.reduce(
+          (sum, m) => sum + textLines(renderedMarkdown(m.body), charsPerLine * 0.8) + 2.5,
+          0,
+        )
+      );
     case "tool":
       return (settled ? isActivity(previous) : previous?.kind === "tool") ? 0 : 1;
     case "thought":

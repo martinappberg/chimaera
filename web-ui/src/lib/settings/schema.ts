@@ -85,6 +85,8 @@ export type SettingsMap = {
   "appearance.interfaceFontSize": number;
   "appearance.interfaceFontFamily": string;
   "agents.defaultView": "chat" | "terminal";
+  "agents.communication.enabled": boolean;
+  "agents.communication.wakes": "never" | "ask" | "auto";
   "dashboard.landing": "auto" | "never";
   "dashboard.cardDensity": "auto" | "comfortable" | "compact";
   "dashboard.roster": "line" | "cards";
@@ -233,6 +235,32 @@ const DEFS = {
       { value: "terminal", label: "Terminal (TUI)" },
     ],
     scope: "client",
+  },
+  // Agent communication (docs/agent-communication-plan.md §7): one global
+  // switch, on by default; the daemon reads both from its cached map.
+  "agents.communication.enabled": {
+    title: "Agents can see and message each other",
+    category: "Agents",
+    description:
+      "Every agent in a workspace can see which others are running and what they're working on, and send them messages that arrive — read at the agent's next step, or kept in its inbox. It adds four tools and a short paragraph to every agent's context. Off also turns the Mastermind off.",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
+    note: "New sessions get the tools; running ones stop at once and keep them listed until they restart.",
+  },
+  "agents.communication.wakes": {
+    title: "Agents may wake each other",
+    category: "Agents",
+    description:
+      "Whether a message may start a turn in an idle agent — a turn billed to your account. Never keeps messages in the agent's inbox until it looks or you hand them over. Ask me asks you in Needs you on the dashboard; a reply to a question an agent asked wakes it without asking. Within limits wakes it on its own, within caps per sender, per hour and per conversation. Terminal agents are never woken.",
+    type: "enum",
+    default: "ask",
+    options: [
+      { value: "never", label: "Never" },
+      { value: "ask", label: "Ask me" },
+      { value: "auto", label: "Within limits" },
+    ],
+    scope: "daemon",
   },
 
   // --- Dashboard ---------------------------------------------------------------

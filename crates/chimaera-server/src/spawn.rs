@@ -186,9 +186,9 @@ pub(crate) async fn spawn_session(
             } else {
                 None
             };
-            // Codex TUIs reach the chimaera endpoint only while a plugin with
-            // tools is active here or a Mastermind is appointed (opt-ins the
-            // user made — `spawn_allow`); with neither, the argv and env stay
+            // Codex TUIs reach the chimaera endpoint while agent
+            // communication is on (default) or a plugin with tools is active
+            // here (`spawn_allow`); with neither, the argv and env stay
             // exactly what they were.
             let codex_plugin_tools = if agent_kind == AgentKind::Codex {
                 crate::plugins::spawn_allow(state, &workspace.id).await

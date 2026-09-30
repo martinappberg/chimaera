@@ -6,14 +6,14 @@ import { capabilityLines, manifestFields, newer, parseLock, parseSums, pullReque
 
 const LOCK = `# comment
 [[plugin]]
-id = "agent-notes"
-name = "Agent notes"
-summary = "Agents leave short notes."
+id = "latex"
+name = "LaTeX"
+summary = "Build .tex to PDF."
 version = "0.1.3"
-repo = "martinappberg/chimaera-plugin-agent-notes"
+repo = "martinappberg/chimaera-plugin-latex"
 sha256_wasm = "${"a".repeat(64)}"
 sha256_toml = "${"b".repeat(64)}"
-tier = "sandboxed"
+tier = "privileged"
 caps = "${"1".repeat(64)}"
 
 [[plugin]]
@@ -45,9 +45,9 @@ test("a bump rewrites only that entry's values, comments and layout kept", () =>
     summary: "Project memory — findings, decisions, learnings.",
   });
   assert.equal(next.split("\n").length, LOCK.split("\n").length);
-  const [notes, bumped] = parseLock(next);
-  assert.equal(notes.version, "0.1.3");
-  assert.equal(notes.sha256_wasm, "a".repeat(64));
+  const [latex, bumped] = parseLock(next);
+  assert.equal(latex.version, "0.1.3");
+  assert.equal(latex.sha256_wasm, "a".repeat(64));
   assert.equal(bumped.version, "0.1.3");
   assert.equal(bumped.sha256_wasm, "e".repeat(64));
   assert.match(next, /learnings\."   # the card's line/);
@@ -116,9 +116,9 @@ test("the pull request is a fix: (a patch release ships the new lock)", () => {
   const one = pullRequest([bump("mycelium", "Mycelium", "0.1.3")]);
   assert.equal(one.title, "fix: update Mycelium to 0.1.3");
   assert.equal(one.branch, "plugin-lock/mycelium-0.1.3");
-  const two = pullRequest([bump("agent-notes", "Agent notes", "0.1.4"), bump("mycelium", "Mycelium", "0.1.3")]);
-  assert.equal(two.title, "fix: update first-party plugins (Agent notes 0.1.4, Mycelium 0.1.3)");
-  assert.equal(two.branch, "plugin-lock/agent-notes-0.1.4+mycelium-0.1.3");
+  const two = pullRequest([bump("latex", "LaTeX", "0.1.4"), bump("mycelium", "Mycelium", "0.1.3")]);
+  assert.equal(two.title, "fix: update first-party plugins (LaTeX 0.1.4, Mycelium 0.1.3)");
+  assert.equal(two.branch, "plugin-lock/latex-0.1.4+mycelium-0.1.3");
   assert.match(two.body, /\| Mycelium \(`mycelium`\) \| 0\.1\.0 \| 0\.1\.3 \|/);
   assert.equal(two.automerge, true);
   assert.match(two.body, /Auto-merge \(squash\) is on/);

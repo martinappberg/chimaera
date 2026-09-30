@@ -25,17 +25,10 @@
 # follow the same rules; keep every value a one-line "string". To run a
 # local build of a plugin against the daemon: `chimaera plugin add --path
 # <dir>` (see plugins/AGENTS.md).
-
-[[plugin]]
-id = "agent-notes"
-name = "Agent notes"
-summary = "Agents leave short notes for each other and for the Mastermind."
-version = "0.1.4"
-repo = "martinappberg/chimaera-plugin-agent-notes"
-sha256_wasm = "0fc717d85b8f1f34072fdc8c9fc83216aa5ab5865ddc5b50588668fd75eba44c"
-sha256_toml = "d703772594a667a13525cb0230664b7f0fae9d1fc2f305012ec595c710972601"
-tier = "sandboxed"
-caps = "3cd49d8c51a08c4f20524e55ae610473c56978917dd3ff6bee0d5738a57ec456"
+#
+# A plugin whose job moved into chimaera itself leaves this list for the
+# daemon's RETIRED list (crates/chimaera-server/src/plugins/retired.rs):
+# an installed copy is listed, off, with Remove, and no install takes it.
 
 [[plugin]]
 id = "mycelium"

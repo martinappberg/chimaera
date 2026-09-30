@@ -571,6 +571,8 @@ async fn install(
         .map_err(|_| Refusal::invalid("the release's plugin.toml is not UTF-8"))?;
     let m =
         super::parse_manifest(text).map_err(|e| Refusal::invalid(format!("the release's {e}")))?;
+    // Whoever released it: its component is never fetched.
+    super::retired::refuse(&m.id)?;
     let id = m.id.clone();
     if !m
         .release
@@ -770,6 +772,7 @@ async fn install_path(
         let text = std::str::from_utf8(&toml)
             .map_err(|_| Refusal::invalid("its plugin.toml is not UTF-8"))?;
         let m = super::parse_manifest(text).map_err(|e| Refusal::invalid(format!("its {e}")))?;
+        super::retired::refuse(&m.id)?;
         if let Some(why) = super::gate(&m, &daemon) {
             return Err(Refusal::invalid(format!(
                 "{} {} can't be installed: {why}",
@@ -955,6 +958,9 @@ pub(crate) async fn install_route(
             let version = body.version;
             detached(async move {
                 let github = normalize_github(&github);
+                if let Some(r) = super::retired::by_repo(github) {
+                    return Err(r.refusal());
+                }
                 let version = version.as_deref().map(|v| v.trim().trim_start_matches('v'));
                 let pinned = super::lock_entries()
                     .iter()
@@ -982,6 +988,9 @@ pub(crate) async fn pinned_install_route(
     State(state): State<Arc<AppState>>,
     AxPath(pid): AxPath<String>,
 ) -> Response {
+    if let Err(refusal) = super::retired::refuse(&pid) {
+        return refusal.into_response();
+    }
     let Some(l) = super::lock_entry(&pid) else {
         return Refusal::not_found(format!(
             "{pid:?} is not a plugin chimaera pins — install it from its repository"
@@ -1005,6 +1014,9 @@ pub(crate) async fn update_route(
         Ok(t) => t.trust,
         Err(r) => return r.into_response(),
     };
+    if let Err(refusal) = super::retired::refuse(&pid) {
+        return refusal.into_response();
+    }
     let Some(m) = super::manifest(&state, &pid) else {
         return super::not_installed(&pid).into_response();
     };
@@ -1067,6 +1079,7 @@ async fn rollback(
     pid: &str,
     token: Option<&str>,
 ) -> Result<(String, String), Refusal> {
+    super::retired::refuse(pid)?;
     let _change = state.plugin_releases.changing.lock().await;
     let Some(copy) = state.plugin_catalog.installed_copy(pid) else {
         return Err(super::not_installed(pid));
@@ -1382,10 +1395,10 @@ mod tests {
 
     #[test]
     fn first_party_requires_the_lock_bytes_or_the_recorded_release_source() {
-        let l = crate::plugins::lock_entry("agent-notes").unwrap();
+        let l = crate::plugins::lock_entry("mycelium").unwrap();
         let text = |version: &str, github: &str| {
             format!(
-                "id = \"agent-notes\"\nname = \"Agent notes\"\nversion = \"{version}\"\n\
+                "id = \"mycelium\"\nname = \"Mycelium\"\nversion = \"{version}\"\n\
                  summary = \"x\"\napi = \"0.1\"\n[release]\ngithub = \"{github}\"\n"
             )
         };
@@ -1407,8 +1420,8 @@ mod tests {
         let o = checked(&newer, Some(&newer), Some(&l.repo));
         assert!(o.first_party && o.verified, "{o:?}");
         // The same id from another repository never is.
-        let other = text("9.0.0", "acme/agent-notes");
-        let o = checked(&other, Some(&other), Some("acme/agent-notes"));
+        let other = text("9.0.0", "acme/mycelium");
+        let o = checked(&other, Some(&other), Some("acme/mycelium"));
         assert!(!o.first_party && o.verified, "{o:?}");
         // At the pinned version, bytes that aren't the lock's are not the
         // pinned release: unverified, no fault (a local build of it).
