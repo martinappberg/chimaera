@@ -2,8 +2,11 @@
 
 Opening a project on another device is a view onto its current owner. It never
 acquires ownership, wakes a worker, releases the home computer, or repeats an
-input that may already have been accepted. Ordinary SSH and non-Pro local windows
-keep their existing routes.
+input that may already have been accepted. Acting on it can move the work:
+input on another of the user's computers brings the project there, and a
+phone's input while the cloud sleeps may bring it to an online computer
+([HANDOFF](HANDOFF.md#acting-brings-the-work-to-you)). Ordinary SSH and non-Pro
+local windows keep their existing routes.
 
 ## Passive placement
 
@@ -137,8 +140,27 @@ cannot be delivered is answered, never dropped: each chat command gets
 composer); typing gets `read_only` with `reason:"reconnecting"`. Every chat
 refusal carries the additive `command` it answers (`send`, `interrupt`,
 `permission`…), and a client restores a draft only for `command:"send"`.
-Nothing is resent automatically. Every `read_only` refusal (`reason`:
-`watching`, `elsewhere`, `busy`, `waking`, `reconnecting`) and every HTTP
+Nothing is resent automatically.
+
+When the route is a `device-` route (another of the user's computers owns the
+project) and this computer can take it, the first real input instead brings
+the work here: the relay holds it (the same budget), says
+`{"type":"bringing","to":"here"}`, stops forwarding input to the owner and
+hides the owner's `moved`/`paused` frames and its closing socket for this move.
+Once this computer holds the project and its session resumed, the held input
+is delivered once to the local session and the socket closes quietly (the
+viewer reconnects to the session here and its replay carries the message).
+When the other computer keeps the work, each held chat command is refused
+with `command_failed`, `reason:"still_working"` and the plain line "Your other
+computer is still working on this. Try again when it pauses." (typing: one
+`read_only` with the same reason); input beyond what is held while the work
+is coming is refused with `reason:"bringing"`. A browser view gets the same
+`bringing` frame with `to:"computer"` from the account's gateway when its
+action on a sleeping cloud machine is sent to one of the user's computers
+instead; the gateway holds the socket authentication and first input and
+delivers them once to that computer's session, or to the woken cloud machine
+(`waking`) when no computer took the work. Every `read_only` refusal (`reason`:
+`watching`, `elsewhere`, `busy`, `waking`, `bringing`, `still_working`, `reconnecting`) and every HTTP
 `409 {"error":"workspace_owned_elsewhere"}` also carry the additive
 `owner: "cloud" | "computer"`: where the project's work runs now, so a client
 can say "running in the cloud" / "running on your computer" without guessing.
@@ -149,7 +171,8 @@ names its route's owner (a `worker-` route is the cloud).
 
 A session with no process where a viewer asks is not an exit, and its owning
 daemon says why (additively; older clients ignore both and reconnect):
-`{"type":"moved","to":"cloud"|"computer"}` only for a real transfer — while the
+`{"type":"moved","to":"cloud"|"computer"}` (with the additive `other:true` when
+the work went to another of the user's computers, not the cloud) only for a real transfer — while the
 source exports it, or once this machine may no longer run its project (`to` is
 where the session is going; a computer receiving its work back says
 `"computer"`) — and otherwise

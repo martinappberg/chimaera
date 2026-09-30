@@ -15,7 +15,8 @@ revocable delegation over the authenticated local API.
 | `execution/mutation.rs` | Bounded file/lifecycle/command commit reservations; account/epoch admission uses short in-memory locks, while clean stop and replacement wait for actual work even if its HTTP caller disappears. Reserved launches fail promptly if configuration is draining them, rather than waiting on themselves. |
 | `engine.rs` | Lease renewal (own account-request budget; installs and agent stops run as their own tasks), mirror coordinator, staged hydration (files are installed in place, not transactionally), deadline-bound sleep flush, three-way return and lazy return. |
 | `detached.rs` | Owned transfer tasks keyed by (kind, project, epoch): a caller that disconnects never cancels a flush or hydration; repeats join; a completed release is remembered ten minutes. |
-| `drain.rs` | `POST/DELETE /pro/drain`: refuse new transfer work and wait for jobs, transfer tasks, project caches and Git helpers before a cloud machine suspends. |
+| `drain.rs` | `POST/DELETE /pro/drain`: refuse new transfer work and wait for jobs, transfer tasks, project caches and Git helpers before a cloud machine suspends; on a cloud machine it first publishes each project it holds (the copy a computer takes when a phone acts while it sleeps). |
+| `moves.rs` | Acting brings the work to you: the asking side (`bring_here`, `answer`: request, wait for the release, take the epoch like a return, bounded five minutes / ninety seconds for a phone's request), the holder's side (`consider` on each renewal: `decide` last actor wins by the account's clock, else `hand_over` at the next pause through `routes::hand_to_computer`), `acted_here` (this computer's own input), `other_computer` (where a moved session says it went) and the passive read's `watch_query`. |
 | `continuity_tests.rs` | Loopback account fixture (records requests, scripted grants, delays; Git endpoints refuse connections) for policy, abandoned flush, sleep deadline, quit handover (parked, failed park, status fields), own-epoch reacquire, lapsed cloud lease and drain tests. |
 | `snapshot_diagnostics.rs` | Fixed snapshot failure categories; no response bodies, paths, identifiers or error text enter diagnostic logs. |
 | `handback.rs` | Bounded automatic return coordination across worker wake and ownership changes; lost release replies are resolved by authority reads without repeating ambiguous requests. |
@@ -208,6 +209,33 @@ stays set, and the moment that lease lapses (or the holder releases) the next pa
 pulls it. The settle rule for moving live cloud work is unchanged, and the pull is
 the ordinary hydrate: kept-both, and with no shadow every differing local file is
 kept as `.mine-…` while local-only files stay.
+
+**Acting brings the work to you** (`moves.rs`; contract in
+[HANDOFF](../../../chimaera-link/HANDOFF.md#acting-brings-the-work-to-you)).
+Opening a project on another computer views it; the first chat command or
+typing there (the viewer relay, `session_proxy::relay`, on a `device-` route)
+asks the account to move it (`POST /v2/baton/{w}/move`), holds that input,
+says `{"type":"bringing","to":"here"}`, and once this computer took the epoch
+(`hydrate`, as a return; the account reserves the next acquisition for it)
+delivers the input to the resumed session (`ws::deliver_held`) and closes the
+socket quietly. The holder sees `move_to` in its renewal answer
+(`engine::reconcile_generation` → `moves::consider`, only while `Local`):
+its own user's last unscoped input (`ws.rs` → `acted_here`) after the request
+claims (posts `move` naming itself); otherwise `hand_over` waits for
+`engine::at_pause` (plain shells never count) and runs the same owned clean
+flush as `/pro/handoff`; a failed flush recovers here and claims. Its views
+then say `moved` with `other:true` (`ws::classify_pause`, `owner_kind`). A
+holder whose release nobody took (the request withdrawn or lapsed:
+`moves::abandoned`) takes its own released epoch back in the lease loop. A
+phone's request (`move_reason:"phone"`) is answered the same way by the
+computer the account named, from `reconcile` (`moves::answer`), without the
+settle gate; the lazy return pass leaves a project being brought here alone
+(`moves::pulling`). The passive read adds `?ready=1&power=…` when this
+computer could take the project (`moves::watch_query`). A conversation that
+arrived and was not used yet still moves on: a chat resumed without a fork
+reports its native id only with its first turn, so the ledger keeps the id it
+was resumed from until then (`ledger::snapshot`); without it the handover
+could not export it (and a restart would have lost its history).
 
 Normal lazy return only handles registered projects without a pending adoption.
 Moving live cloud work waits for the settle gate (awake on power for five

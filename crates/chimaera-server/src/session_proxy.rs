@@ -1479,8 +1479,14 @@ const READY_SCAN_BYTES: usize = 64 * 1024;
 /// command, a permission answer) is held and carries wake intent. Held input
 /// is delivered exactly once after the owner's `ready`, or answered with a
 /// visible refusal when it cannot be delivered; nothing is resent.
+///
+/// When the owner is another of the user's computers, that first input
+/// instead brings the work here (`pro::bring_here`): it is held while the
+/// other computer finishes its step and hands the project over, then
+/// delivered once to the session running on this computer, or refused when
+/// the other computer kept it.
 pub(crate) async fn socket(
-    state: &AppState,
+    state: &Arc<AppState>,
     id: &str,
     kind: &str,
     options: &SocketOptions,
@@ -1512,7 +1518,7 @@ pub(crate) async fn socket(
 
 /// One viewer socket's fixed route to one session on its current owner.
 struct Link<'a> {
-    state: &'a AppState,
+    state: &'a Arc<AppState>,
     route: Route,
     workspace: String,
     session: String,
@@ -1610,6 +1616,64 @@ impl Link<'_> {
             }
         }
         (text.to_owned(), false)
+    }
+    /// Whether acting here brings the work here: the owner is another of the
+    /// user's computers (a `device-` route) and this viewer may type.
+    fn movable(&self) -> bool {
+        !self.read_only && self.route.host_id.starts_with("device-")
+    }
+    /// The additive status while the work comes here, once per request.
+    async fn bringing(&self, downstream: &mut axum::extract::ws::WebSocket) -> Result<()> {
+        bounded_send(
+            downstream,
+            Down::Text(json!({"type":"bringing","to":"here"}).to_string().into()),
+        )
+        .await
+    }
+    /// Input that arrived while the work is coming here and did not fit what
+    /// is already held: not sent, and said so.
+    async fn refuse_bringing(
+        &self,
+        downstream: &mut axum::extract::ws::WebSocket,
+        refused: &Down,
+    ) -> Result<()> {
+        let frame = if self.chat {
+            tagged(
+                json!({"type":"error","code":"command_failed","reason":"bringing",
+                    "message":"Still bringing the work here. That was not sent; send it again in a moment."}),
+                refused,
+            )
+        } else {
+            json!({"type":"error","code":"read_only","reason":"bringing","owner":self.owner(),
+                "message":"Bringing the work here… That input was not sent."})
+        };
+        bounded_send(downstream, Down::Text(frame.to_string().into())).await
+    }
+    /// The other computer kept the work (its user acted, or it did not reach
+    /// a pause in time): the held input comes back (a message returns to the
+    /// composer) with one plain line.
+    async fn refuse_kept<'f>(
+        &self,
+        downstream: &mut axum::extract::ws::WebSocket,
+        refused: impl IntoIterator<Item = &'f Down>,
+    ) -> Result<()> {
+        const KEPT: &str =
+            "Your other computer is still working on this. Try again when it pauses.";
+        let mut refused = refused.into_iter().peekable();
+        if self.chat {
+            for frame in refused {
+                let answer = tagged(
+                    json!({"type":"error","code":"command_failed","reason":"still_working","message":KEPT}),
+                    frame,
+                );
+                bounded_send(downstream, Down::Text(answer.to_string().into())).await?;
+            }
+        } else if refused.peek().is_some() {
+            let frame = json!({"type":"error","code":"read_only","reason":"still_working",
+                "owner":self.owner(),"message":KEPT});
+            bounded_send(downstream, Down::Text(frame.to_string().into())).await?;
+        }
+        Ok(())
     }
     /// Where this socket's owner is: a cloud machine (`worker-` route) or a
     /// computer — the additive `owner` of this relay's `read_only` refusals.
@@ -1754,6 +1818,33 @@ async fn next_up(
     }
 }
 
+/// Whether an owner's text frame says its session left that machine
+/// (`moved`/`paused`): while the work is coming here those are about this
+/// very move and the viewer is not told them.
+fn departure(text: &str) -> bool {
+    text.len() <= READY_SCAN_BYTES
+        && serde_json::from_str::<Value>(text)
+            .is_ok_and(|value| matches!(value["type"].as_str(), Some("moved" | "paused")))
+}
+/// The request to bring the work here settled (or its sender went away).
+async fn settled(
+    pull: &mut Option<tokio::sync::watch::Receiver<crate::pro::MoveOutcome>>,
+) -> crate::pro::MoveOutcome {
+    let Some(receiver) = pull.as_mut() else {
+        return std::future::pending().await;
+    };
+    loop {
+        let closed = receiver.changed().await.is_err();
+        let outcome = *receiver.borrow();
+        if outcome != crate::pro::MoveOutcome::Waiting {
+            return outcome;
+        }
+        if closed {
+            return crate::pro::MoveOutcome::Refused;
+        }
+    }
+}
+
 async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::ws::WebSocket) {
     let mut held = Held {
         chat: link.chat,
@@ -1761,6 +1852,9 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
         bytes: 0,
         budget: &HELD_BUDGET,
     };
+    // Acting here is bringing the work here: held input waits for that, not
+    // for the current owner.
+    let mut pull: Option<tokio::sync::watch::Receiver<crate::pro::MoveOutcome>> = None;
     let mut upstream: Option<Box<Upstream>> = None;
     let mut ready = false;
     // The last connection status told to the viewer, sent once per change.
@@ -1794,7 +1888,7 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                         }
                         attempt = Some(Box::pin(link.connect(true, Reach::Sleeping)));
                     }
-                    Ok(Opened::Sleeping) if !held.frames.is_empty() => {
+                    Ok(Opened::Sleeping) if !held.frames.is_empty() && pull.is_none() => {
                         wake = true;
                         attempt = Some(Box::pin(link.open(true)));
                     }
@@ -1807,8 +1901,9 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                         retry_armed = true;
                     }
                     Err(_) => {
-                        // A failed wake attempt answers what it was carrying.
-                        let refused = held.take();
+                        // A failed wake attempt answers what it was carrying
+                        // (input held for the move here waits for that).
+                        let refused = if pull.is_none() { held.take() } else { Default::default() };
                         if link.refuse(downstream, &refused).await.is_err() { return; }
                         wake = false;
                         waking = false;
@@ -1826,7 +1921,36 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                 retry_armed = false;
                 attempt = Some(Box::pin(link.open(wake)));
             }
+            outcome = settled(&mut pull) => {
+                pull = None;
+                if outcome == crate::pro::MoveOutcome::Here {
+                    // The project runs here now: deliver what the user sent,
+                    // once, to the session on this computer, then close so
+                    // the viewer reconnects to it (it replays the message).
+                    for frame in held.take() {
+                        let answer = if link.chat { Some(frame.clone()) } else { None };
+                        if crate::ws::deliver_held(link.state, &link.session, link.chat, frame).await.is_err() {
+                            match answer {
+                                Some(frame) => { let _ = link.refuse(downstream, [&frame]).await; }
+                                None => { let _ = link.refuse(downstream, [&Down::Binary(Default::default())]).await; }
+                            }
+                        }
+                    }
+                    return;
+                }
+                let refused = held.take();
+                if link.refuse_kept(downstream, &refused).await.is_err() { return; }
+                if upstream.is_none() && attempt.is_none() {
+                    retry_armed = false;
+                    attempt = Some(Box::pin(link.open(false)));
+                }
+            }
             _ = ownership.tick() => {
+                // The owner handing the project over (or this computer taking
+                // it) is the move this socket asked for: wait for its outcome.
+                if pull.is_some() {
+                    continue;
+                }
                 if let Some(moved) = link.ended() {
                     let refused = held.take();
                     let _ = link.refuse(downstream, &refused).await;
@@ -1838,14 +1962,18 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
             }
             next = next_up(&mut upstream) => match next {
                 Some(Ok(Up::Text(text))) => {
+                    if pull.is_some() && departure(&text) {
+                        continue;
+                    }
                     let (frame, is_ready) = link.downstream_text(&text);
                     if bounded_send(downstream, Down::Text(frame.into())).await.is_err() { return; }
                     if is_ready && !ready {
                         ready = true;
                         told = None;
                         waking = false;
-                        // Deliver what the viewer typed while connecting, once, in order.
-                        if let Some(socket) = upstream.as_mut() {
+                        // Deliver what the viewer typed while connecting, once,
+                        // in order (input held for a move here waits for it).
+                        if let (Some(socket), None) = (upstream.as_mut(), pull.as_ref()) {
                             for frame in held.take() {
                                 let Some(frame) = upward(frame) else { continue };
                                 if bounded_send(socket.as_mut(), frame).await.is_err() { return; }
@@ -1862,6 +1990,13 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                     }
                 }
                 Some(Ok(Up::Close(_))) | None | Some(Err(_)) => {
+                    // Handing the project here ends the owner's session there:
+                    // keep waiting for the move this socket asked for.
+                    if pull.is_some() {
+                        upstream = None;
+                        ready = false;
+                        continue;
+                    }
                     // The owner ended this connection (exit, restart, owner
                     // change). The viewer reconnects and is routed afresh.
                     let refused = held.take();
@@ -1875,6 +2010,20 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                     // A terminal's text frames are grid control (resize, park);
                     // everything a chat sends is the user acting.
                     let input = link.chat || matches!(frame, Down::Binary(_));
+                    // Acting on a project another of the user's computers runs
+                    // brings the work here; looking never does.
+                    if input && pull.is_none() && link.movable() {
+                        if let Some(receiver) = crate::pro::bring_here(link.state, &link.workspace) {
+                            pull = Some(receiver);
+                            if link.bringing(downstream).await.is_err() { return; }
+                        }
+                    }
+                    if input && pull.is_some() {
+                        if let Err(refused) = held.push(frame) {
+                            if link.refuse_bringing(downstream, &refused).await.is_err() { return; }
+                        }
+                        continue;
+                    }
                     match upstream.as_mut() {
                         Some(socket) if ready => {
                             if let Some(moved) = link.ended() {

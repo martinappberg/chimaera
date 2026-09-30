@@ -44,6 +44,10 @@ impl Outcome {
     fn succeeded(&self) -> bool {
         self.status.is_success()
     }
+    /// The operation completed (a handover released its project).
+    pub fn ok(&self) -> bool {
+        self.succeeded()
+    }
 }
 impl IntoResponse for Outcome {
     fn into_response(self) -> Response {

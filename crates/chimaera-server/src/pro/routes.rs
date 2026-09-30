@@ -319,6 +319,7 @@ pub(crate) async fn disconnect(State(state): State<Arc<AppState>>) -> Response {
     let device = !execution::worker(&state);
     lock(&state.pro.release_pending).clear();
     lock(&state.pro.opened_here).clear();
+    super::moves::forget(&state);
     // No account is left to keep a quit handover in the cloud.
     lock(&state.pro.parked).clear();
     let mut dropped = Vec::new();
@@ -1022,6 +1023,39 @@ pub(crate) async fn handoff(
     )
     .await
     .into_response()
+}
+/// Hands a project this computer runs to another of the user's computers,
+/// whose user acted on it (`moves`): the same owned clean flush as
+/// `/pro/handoff` (stop at the pause, publish, release), keyed the same way,
+/// so a repeated attempt joins it. `true` once released; a failed flush has
+/// already recovered here and the work stays.
+pub(super) async fn hand_to_computer(
+    state: &Arc<AppState>,
+    config: &Configure,
+    workspace: &str,
+    epoch: u64,
+) -> bool {
+    let owner = state.clone();
+    let config = config.clone();
+    let key = workspace.to_owned();
+    detached::run(
+        state,
+        ("handoff", true),
+        workspace,
+        epoch,
+        || handoff_refusal(state, workspace, epoch),
+        move || async move {
+            let Some(_guard) = super::drain::reserve(&owner).await else {
+                return super::drain::refusal();
+            };
+            if let Some(refusal) = handoff_refusal(&owner, &key, epoch) {
+                return refusal;
+            }
+            result(engine::snapshot(&owner, &config, &key, true).await)
+        },
+    )
+    .await
+    .ok()
 }
 fn handoff_refusal(state: &AppState, workspace: &str, epoch: u64) -> Option<detached::Outcome> {
     if super::drain::draining(state) {

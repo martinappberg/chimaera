@@ -491,6 +491,33 @@ no timer until you send or type (which wakes it) or the project answers again
 browser view of a sleeping project still opens: the account reports it as
 `suspended`, which is routed like any owner and never woken by reading.
 
+**Acting brings the work to you; looking doesn't.** When another of your
+computers is running a project and you send a chat message or type into a
+terminal of it on this computer, the work comes here. The message or the
+typing waits on this computer ("sending…", and the chat or terminal says
+"Bringing the work here…"); the other computer finishes what it is doing (a
+chat finishes its turn, a terminal agent reaches its next pause; plain
+terminals never hold it up), saves the project as it does before sleep and
+lets go, and this computer takes it the way work comes home and delivers
+what you sent, once, in the same conversation. The other computer's own
+window then says "Continuing on your other computer…". If the other computer
+has not let go within five minutes, what you sent comes back (a message
+returns to the composer) with "Your other computer is still working on this.
+Try again when it pauses." Whoever acts last wins: if someone types or sends
+on the other computer after you asked, the work stays there. Looking never
+moves anything: opening the project, scrolling, reading files and watching a
+terminal leave the work where it runs, and saving a file still saves it on
+the computer running the project, as before. From a phone the same holds, with one addition:
+when the cloud is asleep with the project and one of your computers is
+online with the app open (preferably the one the project last ran on, and
+one on power), a message or typing from the phone brings the work to that
+computer instead of waking the cloud, and the phone says "Bringing the work
+to your computer…". Only if no computer takes it within about twenty seconds
+is the cloud woken as before. For this, the cloud saves each project it holds
+as it goes to sleep. Implementation: [`pro/moves.rs`](../../crates/chimaera-server/src/pro/moves.rs)
+and the viewer relay in [`session_proxy.rs`](../../crates/chimaera-server/src/session_proxy.rs)
+(the contract is in [HANDOFF](../../crates/chimaera-link/HANDOFF.md#acting-brings-the-work-to-you)).
+
 **Moving between devices is not an exit.** When a conversation moves between
 this computer and the cloud, every open view is told it *moved*: the chat stays
 mounted with its transcript and scroll position, says "Continuing in the cloud…"
@@ -644,7 +671,8 @@ cloud copies once the account confirms them again.
 ## Project views follow the current owner
 
 Opening the same project on a phone, browser or another computer does not move
-execution away from its online preferred computer. Logical browser routes and
+execution away from its online preferred computer; acting on it from another
+computer does (see "Acting brings the work to you" above). Logical browser routes and
 native project views resolve the
 current owner passively, carry its exact workspace/epoch and preserve the same
 session identity. Files, previews and watches follow that owner while native file
@@ -686,6 +714,15 @@ This records the intended experience. Recovery depends on durable checkpoints;
 it cannot promise recovery of unsaved state or exact replay of external actions.
 Existing ownership and publication fences must remain intact. Routing/failover
 coverage and selected-project secret isolation are separate implementation gates.
+
+### Acting brings the work to you
+_Captured 2026-09-30 from the maintainer's decision, relayed with the task that implemented it._
+
+- **The rule:** "acting brings the work to you; looking doesn't". Sending a
+  message or typing on another of your computers moves the work there;
+  opening, reading and watching never do.
+- **Phone:** "if you are on your phone, and the laptop is connected, it should
+  still run on the computer and not the cloud (to minimize cloud usage)".
 
 ### Cloud connections — scope and experience
 _Captured 2026-09-28 from the maintainer's instructions in this conversation._

@@ -43,7 +43,9 @@ const WAKING = " · waking";
  *  owner is asleep (`worker_asleep`) or waking (`waking`), and whether the
  *  view already says "Reconnecting…" itself. */
 export interface OwnerNote {
-  owner?: "asleep" | "waking" | null;
+  /** What the view's socket heard; only `asleep` and `waking` change the
+   *  label (work being brought here says so in the view itself). */
+  owner?: "asleep" | "waking" | "bringing" | "bringing-computer" | null;
   /** The view's own status line already says it is reconnecting: the label
    *  must not say it a second time. */
   reconnectingShown?: boolean;
@@ -69,14 +71,24 @@ export function placementLabel(placement: unknown, available: boolean | undefine
  * exit: `moved` continues on another machine; `paused` resumes on its own.
  */
 export type SessionPause =
-  | { type: "moved"; to: "cloud" | "computer" }
+  | { type: "moved"; to: MovedTo }
   | { type: "paused"; reason: string; provider: string | null };
+
+/** Where a conversation continues after a move: the cloud, the user's
+ *  computer, or ("other") another of the user's computers — acting there
+ *  brought the work there. On the wire the last is `to:"computer"` with the
+ *  additive `other:true`. */
+export type MovedTo = "cloud" | "computer" | "other";
+export function movedTo(frame: { to?: unknown; other?: unknown }): MovedTo {
+  if (frame.to !== "computer") return "cloud";
+  return frame.other === true ? "other" : "computer";
+}
 
 /** Parse a `moved`/`paused` frame or a row's `pause` field; null otherwise. */
 export function parsePause(value: unknown): SessionPause | null {
   if (typeof value !== "object" || value === null) return null;
   const frame = value as Record<string, unknown>;
-  if (frame.type === "moved") return { type: "moved", to: frame.to === "computer" ? "computer" : "cloud" };
+  if (frame.type === "moved") return { type: "moved", to: movedTo(frame) };
   if (frame.type === "paused" && typeof frame.reason === "string") {
     return { type: "paused", reason: frame.reason, provider: typeof frame.provider === "string" ? frame.provider : null };
   }
@@ -95,6 +107,7 @@ export function sessionPause(row: unknown): SessionPause | null {
 export function pauseLabel(pause: SessionPause | null, { signedOut = false }: { signedOut?: boolean } = {}): { status: string; detail: string | null } {
   if (pause === null) return { status: "Opening…", detail: null };
   if (pause.type === "moved") {
+    if (pause.to === "other") return { status: "Continuing on your other computer…", detail: null };
     if (pause.to === "computer") return { status: "Continuing on your computer…", detail: null };
     return signedOut
       ? { status: "This conversation is in the cloud. Sign in to Chimaera Pro to bring it back.", detail: null }

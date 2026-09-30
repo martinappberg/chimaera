@@ -82,6 +82,10 @@ describe("paused sessions", () => {
   it("reads the moved and paused frames and the row field alike", () => {
     expect(parsePause({ type: "moved", to: "computer" })).toEqual({ type: "moved", to: "computer" });
     expect(parsePause({ type: "moved" })).toEqual({ type: "moved", to: "cloud" });
+    // Acting on another computer brought the work there: older clients read
+    // `to:"computer"`, this one says which computer.
+    expect(parsePause({ type: "moved", to: "computer", other: true })).toEqual({ type: "moved", to: "other" });
+    expect(pauseLabel({ type: "moved", to: "other" }).status).toBe("Continuing on your other computer…");
     expect(parsePause({ type: "paused", reason: "restarting" })).toEqual({ type: "paused", reason: "restarting", provider: null });
     expect(sessionPause({ id: "s", pause: { type: "paused", reason: "needs_provider", provider: "codex" } }))
       .toEqual({ type: "paused", reason: "needs_provider", provider: "codex" });
@@ -91,7 +95,7 @@ describe("paused sessions", () => {
   it("gives every reason its own status and only a sign-in something to do", () => {
     const reasons = ["restarting", "needs_provider", "importing", "stays_on_computer"].map((reason) =>
       pauseLabel({ type: "paused", reason, provider: "claude" }));
-    const moves = (["cloud", "computer"] as const).map((to) => pauseLabel({ type: "moved", to }));
+    const moves = (["cloud", "computer", "other"] as const).map((to) => pauseLabel({ type: "moved", to }));
     const statuses = [...reasons, ...moves].map((label) => label.status);
     expect(new Set(statuses).size).toBe(statuses.length);
     expect(reasons[1].detail).not.toBeNull();

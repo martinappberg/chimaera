@@ -8,6 +8,7 @@ mod engine;
 mod execution;
 mod kept;
 mod mirror;
+mod moves;
 mod policy;
 mod projects;
 mod protocol;
@@ -20,6 +21,7 @@ pub(crate) use drain::{cancel as cancel_drain, start as drain};
 pub(crate) use kept::{
     file as kept_file, list as kept_list, resolve as kept_resolve, resolve_all as kept_resolve_all,
 };
+pub(crate) use moves::{acted_here, bring_here, other_computer, Outcome as MoveOutcome};
 pub(crate) use policy::CloudProfile;
 pub(crate) use provider_gate::{
     blocking_provider, cloud_provider_blocks, workspace_provider_blocks,
@@ -105,6 +107,8 @@ pub(crate) struct ProState {
     /// The account refused this daemon's delegation (401/403 on renewal):
     /// `/pro/status` reports it so the native app mints a new one.
     delegation_refused: AtomicBool,
+    /// Acting on another computer brings the work there (`moves`).
+    moves: moves::Moves,
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -449,6 +453,7 @@ impl ProState {
             power_suitable: AtomicBool::new(false),
             renew_now: tokio::sync::Notify::new(),
             delegation_refused: AtomicBool::new(false),
+            moves: Default::default(),
         }
     }
 }
@@ -625,13 +630,16 @@ pub(crate) fn interrupted_return(
 /// Where a project's work runs now, in a client's words: `"cloud"` (a cloud
 /// machine) or `"computer"` (the user's own computer). The additive `owner`
 /// of the `read_only` and `workspace_owned_elsewhere` refusals, so a client
-/// can say "running in the cloud" instead of guessing. A cloud machine's only
-/// other owner is the user's computer and a computer's is the cloud (a second
-/// computer has no viewer yet) — the rule `ws::classify_pause` also applies;
-/// a project arriving here, or verifying after a restart, runs here.
+/// can say "running in the cloud" instead of guessing. A cloud machine's
+/// other owner is the user's computer; a computer's is the cloud unless the
+/// work left for another of the user's computers (`moves::other_computer`) —
+/// the rule `ws::classify_pause` also applies; a project arriving here, or
+/// verifying after a restart, runs here.
 pub(crate) fn owner_kind(state: &crate::AppState, workspace: &str) -> &'static str {
     let (here, away) = if execution::worker(state) {
         ("cloud", "computer")
+    } else if moves::other_computer(state, workspace) {
+        ("computer", "computer")
     } else {
         ("computer", "cloud")
     };

@@ -1,5 +1,5 @@
 import { daemonSocketUrl, isBrowserGateway } from "../net/base";
-import { ownerSuspended, parsePause, sendSocketAuth, type SessionPause } from "../net/placement";
+import { movedTo, ownerSuspended, parsePause, sendSocketAuth, type MovedTo, type SessionPause } from "../net/placement";
 import { getToken } from "../net/api";
 import { ownerAwake, parkUntilAwake, Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 import { CooperativeQueue } from "./cooperativeQueue";
@@ -47,15 +47,19 @@ export interface ChatSocketHandlers {
    *  socket stays up and keeps reconnecting — surface it, don't die.
    *  `command` names the refused command (`send`, `interrupt`…) when the
    *  daemon tagged it (additive); null from older daemons. */
-  onCommandFailed(message: string, command: string | null): void;
+  onCommandFailed(message: string, command: string | null, reason?: string | null): void;
   /** The conversation's project is paused; the next send picks it back up. */
   onAsleep?(): void;
   /** A send picked the paused project back up: it is waking and the send is
    *  delivered once it answers. */
   onWaking?(): void;
+  /** Acting here brings the work to this computer (`here`), or a phone's send
+   *  brings it to the user's computer (`computer`): the send that asked waits
+   *  for it rather than for the current owner. */
+  onBringing?(to: "here" | "computer"): void;
   /** The conversation is continuing on another machine: stay mounted and
    *  keep reconnecting; it did not exit. */
-  onMoved?(to: "cloud" | "computer"): void;
+  onMoved?(to: MovedTo): void;
   /** The conversation has no process here yet and resumes on its own
    *  (after an update, once its agent is signed in on the cloud machine,
    *  while its transfer opens it): stay mounted, keep reconnecting. */
@@ -77,10 +81,11 @@ type ChatDelivery =
   | { kind: "degraded" }
   | { kind: "exited"; status: number | null }
   | { kind: "error"; message: string }
-  | { kind: "command_failed"; message: string; command: string | null }
+  | { kind: "command_failed"; message: string; command: string | null; reason: string | null }
   | { kind: "asleep" }
   | { kind: "waking" }
-  | { kind: "moved"; to: "cloud" | "computer" }
+  | { kind: "bringing"; to: "here" | "computer" }
+  | { kind: "moved"; to: MovedTo }
   | { kind: "paused"; pause: SessionPause }
   | { kind: "disconnected" };
 
@@ -139,13 +144,16 @@ export class ChatSocket {
           this.handlers.onError(delivery.message);
           break;
         case "command_failed":
-          this.handlers.onCommandFailed(delivery.message, delivery.command);
+          this.handlers.onCommandFailed(delivery.message, delivery.command, delivery.reason);
           break;
         case "asleep":
           this.handlers.onAsleep?.();
           break;
         case "waking":
           this.handlers.onWaking?.();
+          break;
+        case "bringing":
+          this.handlers.onBringing?.(delivery.to);
           break;
         case "moved":
           this.handlers.onMoved?.(delivery.to);
@@ -236,11 +244,15 @@ export class ChatSocket {
           // Sends stop here, before that close lands.
           this.authenticatedSocket = null;
           this.asleep = false;
-          this.deliveries.push({ kind: "moved", to: msg.to === "computer" ? "computer" : "cloud" });
+          this.deliveries.push({ kind: "moved", to: movedTo(msg) });
           break;
         case "waking":
           this.asleep = false;
           this.deliveries.push({ kind: "waking" });
+          break;
+        case "bringing":
+          this.asleep = false;
+          this.deliveries.push({ kind: "bringing", to: msg.to === "computer" ? "computer" : "here" });
           break;
         case "paused": {
           // Not an exit either: the daemon closes this socket next and the
@@ -278,6 +290,7 @@ export class ChatSocket {
               kind: "command_failed",
               message: (msg.message as string) ?? "command failed",
               command: typeof msg.command === "string" ? msg.command : null,
+              reason: typeof msg.reason === "string" ? msg.reason : null,
             });
             break;
           }

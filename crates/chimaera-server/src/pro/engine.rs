@@ -307,9 +307,15 @@ async fn reconcile_generation(
     if lock(&state.pro.release_pending).contains(workspace) {
         return Ok(None);
     }
-    let baton: Baton = account(config, &execution::path(config, workspace, ""), "GET", None)
-        .await?
-        .json()?;
+    // The passive read also tells the account whether this computer could
+    // take the project now (`moves::watch_query`), so a phone's action on a
+    // sleeping cloud can be sent here instead of waking it.
+    let path = format!(
+        "{}{}",
+        execution::path(config, workspace, ""),
+        super::moves::watch_query(state, config, workspace)
+    );
+    let baton: Baton = account(config, &path, "GET", None).await?.json()?;
     ensure!(baton.workspace_id == workspace, "baton workspace mismatch");
     ensure!(
         generation == state.pro.generation.load(Ordering::Acquire),
@@ -333,6 +339,15 @@ async fn reconcile_generation(
         execution::effective(state, config, workspace)?
     };
     let holder = &config.delegation.device_id;
+    // The account asks this computer to take the project (the user acted on
+    // it here, or a phone acted while the cloud slept): take it now, without
+    // the settle wait a return has (`moves`).
+    if config.role == Role::Device
+        && baton.move_to.as_deref() == Some(holder.as_str())
+        && baton.holder_id.as_deref() != Some(holder.as_str())
+    {
+        super::moves::answer(state, config, workspace, &baton);
+    }
     let previous = lock(&state.pro.ownership).get(workspace).cloned();
     if baton.mirror_disabled {
         if config.role == Role::Worker {
@@ -419,6 +434,18 @@ async fn reconcile_generation(
         }
         return Ok(None);
     }
+    // Released for another computer that never took it (its request was
+    // withdrawn or lapsed): the work is still here, so take the released
+    // epoch back below (no install, no fork) and resume what stopped.
+    let previous = if config.role == Role::Device
+        && super::moves::abandoned(state, &baton, previous.as_ref())
+    {
+        let back = Ownership::AwaitingVerification { epoch: baton.epoch };
+        lock(&state.pro.ownership).insert(workspace.into(), back.clone());
+        Some(back)
+    } else {
+        previous
+    };
     // A remote release means its saved work must be hydrated first. The lease
     // loop must not race hand-back and resume this machine's older journal.
     if config.role == Role::Device
@@ -638,6 +665,11 @@ async fn reconcile_generation(
         && execution::resume_allowed(state, workspace)
     {
         crate::ledger::resume_deferred_workspace(state, workspace).await?;
+    }
+    // Another computer asked for this project (its user acted there): yield
+    // at the next pause, unless this computer's user acted after it asked.
+    if config.role == Role::Device && matches!(previous, Some(Ownership::Local { .. })) {
+        super::moves::consider(state, config, workspace, &grant);
     }
     Ok(Some(grant.epoch))
 }
@@ -2026,8 +2058,9 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
             continue;
         }
         // Handed to the cloud when the app quit: it stays there, live or
-        // released, until the app returns (`/pro/wake`).
-        if super::parked(state, &workspace) {
+        // released, until the app returns (`/pro/wake`). A project being
+        // brought here because the user acted on it is that request's.
+        if super::parked(state, &workspace) || super::moves::pulling(state, &workspace) {
             continue;
         }
         // The account's preferred installation is the latest computer that

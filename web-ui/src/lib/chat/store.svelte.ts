@@ -8,7 +8,7 @@
 import { isImagePath } from "../previews/files";
 import { artifactMentions, isArtifactPath, proseCovered, proseEmbedTargets } from "./artifacts";
 import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
-import type { SessionPause } from "../net/placement";
+import type { MovedTo, SessionPause } from "../net/placement";
 import type { ImageAttachment } from "./images";
 
 /** Names a reply may use that still cover their files (a reply listing
@@ -555,7 +555,7 @@ export class ChatStore {
   /** The conversation is continuing on another machine (a transfer between
    *  this computer and the cloud). The transcript stays; the next `ready`
    *  from wherever it runs now clears this. */
-  moving = $state<"cloud" | "computer" | null>(null);
+  moving = $state<MovedTo | null>(null);
   /** The conversation has no process yet and resumes on its own (after an
    *  update, once its agent is signed in on the cloud machine, while it
    *  opens); the next `ready` clears this. */
@@ -569,6 +569,13 @@ export class ChatStore {
   /** A send picked a paused project back up and it is waking; cleared by the
    *  next `ready`, a disconnect or a move. */
   waking = $state(false);
+  /** Acting on this conversation is bringing its work here (`here`: this
+   *  computer takes it from the other one) or to the user's computer
+   *  (`computer`: a phone's send while the cloud sleeps). The send waits for
+   *  it. It outlives the socket that closes once the work arrived (the
+   *  reconnect's `ready` ends it), a refusal from the other computer ends it,
+   *  and so do a wake or a move. */
+  bringing = $state<"here" | "computer" | null>(null);
   /** A send accepted while the conversation is not live (paused, waking,
    *  reconnecting): shown at once as a pending bubble so it is never typed
    *  twice. Its echo, a refusal (which hands the text back), a move or an
@@ -753,6 +760,7 @@ export class ChatStore {
     this.connected = true;
     this.asleep = false;
     this.waking = false;
+    this.bringing = null;
     this.moving = null;
     this.pausedFor = null;
     // This handshake succeeded, which is the one fact a socket-level fatal
@@ -798,15 +806,28 @@ export class ChatStore {
   onWaking(): void {
     this.asleep = false;
     this.waking = true;
+    this.bringing = null;
+  }
+
+  /** Acting here is bringing the work to this computer (or, from a phone, to
+   *  the user's computer). The send that asked is held until it arrives: show
+   *  it pending rather than as delivered. */
+  onBringing(to: "here" | "computer"): void {
+    this.asleep = false;
+    this.bringing = to;
+    if (this.sending === null && this.unconfirmedSend !== null) {
+      this.sending = { text: this.unconfirmedSend.text, images: this.unconfirmedSend.images.length };
+    }
   }
 
   /** The conversation moved to another machine; it did not exit. */
-  onMoved(to: "cloud" | "computer"): void {
+  onMoved(to: MovedTo): void {
     this.connected = false;
     this.moving = to;
     this.pausedFor = null;
     this.asleep = false;
     this.waking = false;
+    this.bringing = null;
     this.sending = null;
     // Whatever could not be delivered was already refused (and handed back)
     // before the move; what was delivered echoes where it runs now.
@@ -830,15 +851,17 @@ export class ChatStore {
   noteSent(text: string, images: ImageAttachment[] = []): void {
     this.unconfirmedSend = { text, images };
     // Sending is what picks a paused project back up: stop inviting it.
-    const live = this.connected && !this.waking;
+    const live = this.connected && !this.waking && this.bringing === null;
     this.asleep = false;
     if (!live) this.sending = { text, images: images.length };
   }
 
   /** One command was refused before reaching the agent. Say so, and give an
    *  unconfirmed send's text back to the composer instead of losing it. */
-  onCommandFailed(message: string, command: string | null = null): void {
+  onCommandFailed(message: string, command: string | null = null, reason: string | null = null): void {
     this.notice(message, "error");
+    // The other computer kept the work: nothing is on its way here any more.
+    if (reason === "still_working") this.bringing = null;
     // Only a refused SEND hands text back: a refused interrupt, permission
     // answer or anything else says so without resurrecting a message that
     // may already have been delivered (a re-send would be a second turn).
