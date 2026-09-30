@@ -22,7 +22,7 @@ use block2::{Block, RcBlock};
 use objc2::encode::Encode;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};
-use objc2::{class, msg_send, sel};
+use objc2::{class, msg_send, sel, Message};
 use tauri::WebviewWindow;
 
 #[repr(C)]
@@ -31,11 +31,26 @@ struct CGSize {
     height: f64,
 }
 
+/// `- (void)_webView:printFrame:pdfFirstPageSize:completionHandler:`
+type PrintFrameImp = extern "C-unwind" fn(
+    &AnyObject,
+    Sel,
+    *mut AnyObject,
+    *mut AnyObject,
+    CGSize,
+    *mut Block<dyn Fn()>,
+);
+/// `- (void)chimaeraPrintOperationDidRun:success:contextInfo:`
+type DidRunImp = extern "C-unwind" fn(&AnyObject, Sel, *mut AnyObject, Bool, *mut c_void);
+
 /// What the did-run callback needs, carried through `contextInfo`.
 struct Pending {
     completion: RcBlock<dyn Fn()>,
-    // The operation stays alive until its panel is done.
+    // Both stay alive until the panel is done. NSPrintOperation doesn't
+    // retain its delegate, and wry's is freed with the webview — a window
+    // closed under an open sheet must not leave did-run a dangling target.
     _operation: Retained<AnyObject>,
+    _delegate: Retained<AnyObject>,
 }
 
 /// Answer frame print requests in `window`'s webview.
@@ -73,15 +88,6 @@ unsafe fn install_on(webview: *mut AnyObject) {
 }
 
 fn add_methods(class: &AnyClass) -> bool {
-    let print_frame: extern "C-unwind" fn(
-        &AnyObject,
-        Sel,
-        *mut AnyObject,
-        *mut AnyObject,
-        CGSize,
-        *mut Block<dyn Fn()>,
-    ) = print_frame;
-    let did_run: extern "C-unwind" fn(&AnyObject, Sel, *mut AnyObject, Bool, *mut c_void) = did_run;
     // SAFETY: each function has its method's C ABI — (id self, SEL _cmd,
     // WKWebView *, _WKFrameHandle *, CGSize, void (^)(void)) -> void and
     // (id self, SEL _cmd, NSPrintOperation *, BOOL, void *) -> void — and the
@@ -89,21 +95,8 @@ fn add_methods(class: &AnyClass) -> bool {
     // rather than replace a method the class already defines.
     let (print_imp, did_run_imp) = unsafe {
         (
-            std::mem::transmute::<
-                extern "C-unwind" fn(
-                    &AnyObject,
-                    Sel,
-                    *mut AnyObject,
-                    *mut AnyObject,
-                    CGSize,
-                    *mut Block<dyn Fn()>,
-                ),
-                Imp,
-            >(print_frame),
-            std::mem::transmute::<
-                extern "C-unwind" fn(&AnyObject, Sel, *mut AnyObject, Bool, *mut c_void),
-                Imp,
-            >(did_run),
+            std::mem::transmute::<PrintFrameImp, Imp>(print_frame),
+            std::mem::transmute::<DidRunImp, Imp>(did_run),
         )
     };
     let class = (class as *const AnyClass).cast_mut();
@@ -197,6 +190,7 @@ unsafe fn start(
     let pending = Box::into_raw(Box::new(Pending {
         completion: completion.copy(),
         _operation: operation.clone(),
+        _delegate: delegate.retain(),
     }));
     let _: () = msg_send![
         &operation,

@@ -163,10 +163,11 @@ div.marpit>svg>foreignObject>section{break-before:auto;page-break-before:auto}`;
   const k = fitWidth === undefined ? 1 : Math.min(1, fitWidth / w);
   const slide = `display:block;width:${w}px;height:${h}px;break-after:page;page-break-after:always`;
   if (k === 1) return `${base}\ndiv.marpit>svg[data-marpit-svg]{${slide}}`;
-  // The negative right/bottom margins shrink the slide's layout box to its
-  // scaled size (a transform alone leaves it at full size, and the engine
-  // would lay the page out that wide); the left margin centres it.
+  // A transformed box adds only its scaled bounds to the page's overflow, so
+  // the page is laid out no wider than the scaled slide. The negative bottom
+  // margin pulls the box's height in to match (a right margin would be
+  // ignored: the fixed width over-constrains it); the left margin centres it.
   const fw = Math.round(w * k);
   const fh = Math.round(h * k);
-  return `${base}\ndiv.marpit>svg[data-marpit-svg]{${slide};transform:scale(${k});transform-origin:0 0;margin:0 ${fw - w}px ${fh - h}px max(0px,calc((100% - ${fw}px) / 2))}`;
+  return `${base}\ndiv.marpit>svg[data-marpit-svg]{${slide};transform:scale(${k});transform-origin:0 0;margin:0 0 ${fh - h}px max(0px,calc((100% - ${fw}px) / 2))}`;
 }

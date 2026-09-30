@@ -101,8 +101,8 @@ describe("rendered deck helpers", () => {
   it("scales printed slides by transform where the paper ignores @page size", () => {
     const print = slideDocument("", html, { w: 1280, h: 720 }, "print", 0, PRINT_FIT_WIDTH);
     expect(print).toContain(`transform:scale(${PRINT_FIT_WIDTH / 1280})`);
-    // The layout box shrinks to the scaled size: 1280 → 900 wide, 720 → 506 tall.
-    expect(print).toContain("margin:0 -380px -214px max(0px,calc((100% - 900px) / 2))");
+    // Height pulled in to the scaled 506px (720 − 214), centred at 900px wide.
+    expect(print).toContain("margin:0 0 -214px max(0px,calc((100% - 900px) / 2))");
     // A slide already narrower than the fit width prints at its own size.
     expect(slideDocument("", html, { w: 800, h: 600 }, "print", 0, PRINT_FIT_WIDTH)).not.toContain("transform:");
   });
