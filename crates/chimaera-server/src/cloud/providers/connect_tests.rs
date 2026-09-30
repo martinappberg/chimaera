@@ -1,4 +1,4 @@
-use super::super::tests::{executable, fixture, preset};
+use super::super::tests::{executable, fixture, preset, preset_github};
 use super::*;
 use crate::agents::AgentKind;
 
@@ -488,5 +488,209 @@ async fn an_uncertain_cleanup_releases_the_provider_once_the_old_group_is_gone()
         .unwrap()
         .unwrap();
     assert!(attempt.finished());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A fake GitHub CLI: signed out until its login writes `$HOME/signed-in`.
+/// Every call is recorded in `$HOME/calls`; `help` is its `auth login --help`
+/// and `login` the body run for the exact login command it expects.
+fn fake_github(root: &std::path::Path, help: &str, login: &str, args: &str) -> std::path::PathBuf {
+    let cli = root.join("gh-fixture");
+    executable(
+        &cli,
+        &format!(
+            r##"#!/bin/sh
+printf '%s\n' "$*" >> "$HOME/calls"
+case "$*" in
+'auth status --active --hostname github.com --json hosts')
+  if [ -f "$HOME/signed-in" ]; then printf '%s' '{{"hosts":{{"github.com":[{{"active":true,"state":"success","login":"private-fixture"}}]}}}}'
+  else printf '%s' '{{"hosts":{{}}}}'; fi;;
+'auth login --help') printf '%s\n' '{help}';;
+'{args}')
+  [ "$GH_PROMPT_DISABLED" = 1 ] || exit 94
+{login};;
+'auth setup-git --hostname github.com') printf x >> "$HOME/git-setup";;
+*) exit 95;;
+esac
+"##
+        ),
+    );
+    cli
+}
+const GITHUB_LOGIN: &str = "auth login --hostname github.com --git-protocol https --web";
+const GITHUB_CODE: &str = r##"  printf '%s\n' 'profile noise'
+  printf '! First copy your one-time code: ABCD-1234\n' >&2
+  printf 'Open this URL to continue in your web browser: https://github.com/login/device\n' >&2"##;
+
+fn attempt(state: &AppState, id: &str) -> Arc<Attempt> {
+    crate::lock(&state.cloud_providers.connections)
+        .get(id)
+        .unwrap()
+        .clone()
+}
+
+#[tokio::test]
+async fn github_signs_in_with_a_one_time_code_and_sets_up_git_without_a_terminal() {
+    let (root, state) = fixture("github-connect");
+    let home = super::super::home(&state);
+    let cli = fake_github(
+        &root,
+        "  --skip-ssh-key   Skip generate/upload SSH key prompt",
+        &format!(
+            "{GITHUB_CODE}\n  while [ ! -f \"$HOME/approved\" ]; do sleep 0.1; done\n  : > \"$HOME/signed-in\"\n  printf '%s\\n' 'Logged in as private-fixture' >&2"
+        ),
+        &format!("{GITHUB_LOGIN} --skip-ssh-key"),
+    );
+    preset_github(&state, cli);
+    let def = super::super::definition("github").unwrap();
+    let first = start(state.clone(), def).unwrap();
+    let current = waiting(&state, &first.id).await;
+    match current.action {
+        Some(Action::DeviceCode {
+            verification_url,
+            user_code,
+        }) => {
+            assert_eq!(verification_url, "https://github.com/login/device");
+            assert_eq!(user_code, "ABCD-1234");
+        }
+        other => panic!("expected a one-time code, got {other:?}"),
+    }
+    assert_eq!(start(state.clone(), def).unwrap().id, first.id);
+    assert!(state.sessions.list().is_empty());
+    assert!(crate::lock(&state.workspaces).list().is_empty());
+    std::fs::write(home.join("approved"), b"").unwrap();
+    let done = finished(&state, &first.id).await;
+    assert_eq!(done.phase, Phase::Connected);
+    assert!(done.action.is_none() && done.error_code.is_none());
+    assert!(!serde_json::to_string(&done)
+        .unwrap()
+        .contains("private-fixture"));
+    assert_eq!(std::fs::read(home.join("git-setup")).unwrap(), b"x");
+    // Connecting an already signed-in CLI still makes it Git's helper.
+    let again = start(state.clone(), def).unwrap();
+    assert_ne!(again.id, first.id);
+    assert_eq!(finished(&state, &again.id).await.phase, Phase::Connected);
+    assert_eq!(std::fs::read(home.join("git-setup")).unwrap(), b"xx");
+    assert!(state.sessions.list().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_declined_or_expired_github_code_is_a_plain_failure() {
+    let (root, state) = fixture("github-declined");
+    let home = super::super::home(&state);
+    let cli = fake_github(
+        &root,
+        "",
+        &format!(
+            "{GITHUB_CODE}\n  while [ ! -f \"$HOME/declined\" ]; do sleep 0.1; done\n  printf '%s\\n' 'SECRET raw failure' >&2\n  exit 1"
+        ),
+        GITHUB_LOGIN,
+    );
+    preset_github(&state, cli);
+    let c = start(state.clone(), super::super::definition("github").unwrap()).unwrap();
+    waiting(&state, &c.id).await;
+    std::fs::write(home.join("declined"), b"").unwrap();
+    let done = finished(&state, &c.id).await;
+    assert_eq!(done.phase, Phase::Failed);
+    assert_eq!(done.error_code.as_deref(), Some("sign_in_failed"));
+    assert!(done.action.is_none());
+    assert!(!serde_json::to_string(&done).unwrap().contains("SECRET"));
+    assert!(!home.join("git-setup").exists());
+    // Without the flag in its help, the CLI is not handed one.
+    let calls = std::fs::read_to_string(home.join("calls")).unwrap();
+    assert!(calls.lines().any(|line| line == GITHUB_LOGIN));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_github_cli_that_shows_no_code_fails_closed_without_a_terminal() {
+    for (label, body, code) in [
+        // Exits without a code (an environment token, an old CLI, no network).
+        (
+            "github-exits",
+            "  printf '%s\\n' 'SECRET raw failure' >&2\n  exit 1",
+            "sign_in_unavailable",
+        ),
+        // Never prints one.
+        (
+            "github-stalls",
+            "  printf '%s\\n' 'Welcome ABCD-1234'\n  exec sleep 300",
+            "sign_in_unavailable",
+        ),
+        // Reports success without signing in: the status check decides.
+        ("github-code-exits", GITHUB_CODE, "sign_in_not_confirmed"),
+    ] {
+        let (root, state) = fixture(label);
+        let cli = fake_github(&root, "", body, GITHUB_LOGIN);
+        preset_github(&state, cli);
+        let c = start(state.clone(), super::super::definition("github").unwrap()).unwrap();
+        let done = finished(&state, &c.id).await;
+        assert_eq!(done.phase, Phase::Failed, "{label}");
+        assert_eq!(done.error_code.as_deref(), Some(code), "{label}");
+        assert!(done.action.is_none());
+        assert!(!serde_json::to_string(&done).unwrap().contains("SECRET"));
+        let process = *crate::lock(&attempt(&state, &c.id).process);
+        assert!(!process.is_some_and(process::group_alive), "{label}");
+        assert!(state.sessions.list().is_empty());
+        assert!(crate::lock(&state.workspaces).list().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn canceling_github_sign_in_stops_its_cli_and_keeps_the_writer_until_cleanup() {
+    let (root, state) = fixture("github-cancel");
+    let cli = fake_github(
+        &root,
+        "",
+        &format!("{GITHUB_CODE}\n  exec sleep 300"),
+        GITHUB_LOGIN,
+    );
+    preset_github(&state, cli);
+    let def = super::super::definition("github").unwrap();
+    let c = start(state.clone(), def).unwrap();
+    waiting(&state, &c.id).await;
+    let attempt = attempt(&state, &c.id);
+    let process = *crate::lock(&attempt.process);
+    assert!(process.is_some_and(process::group_alive));
+    attempt.cancel();
+    assert!(attempt.snapshot().action.is_none());
+    assert_eq!(start(state.clone(), def).unwrap().id, c.id);
+    attempt.wait_finished().await;
+    assert!(attempt.finished());
+    assert_eq!(attempt.snapshot().phase, Phase::Canceled);
+    assert!(!process.is_some_and(process::group_alive));
+    assert!(!super::super::home(&state).join("git-setup").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_github_cli_waiting_for_enter_is_answered_and_its_page_is_githubs_own() {
+    let (root, state) = fixture("github-enter");
+    let home = super::super::home(&state);
+    let cli = fake_github(
+        &root,
+        "",
+        r##"  printf '! First copy your one-time code: WXYZ-9876\n' >&2
+  printf 'Press Enter to open github.com in your browser... ' >&2
+  IFS= read -r line
+  : > "$HOME/entered"
+  exec sleep 300"##,
+        GITHUB_LOGIN,
+    );
+    preset_github(&state, cli);
+    let c = start(state.clone(), super::super::definition("github").unwrap()).unwrap();
+    let current = waiting(&state, &c.id).await;
+    assert!(matches!(
+        current.action,
+        Some(Action::DeviceCode { ref verification_url, ref user_code })
+            if verification_url == "https://github.com/login/device" && user_code == "WXYZ-9876"
+    ));
+    assert!(home.join("entered").exists());
+    let attempt = attempt(&state, &c.id);
+    attempt.cancel();
+    attempt.wait_finished().await;
+    assert_eq!(attempt.snapshot().phase, Phase::Canceled);
     std::fs::remove_dir_all(root).unwrap();
 }

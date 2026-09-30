@@ -120,16 +120,21 @@ export function connectionError(code: string | null, operation: "connect" | "dis
     case "provider_busy": return "This service has another connection request in progress. Check its status before trying again.";
     case "invalid_status": return "The service couldn't confirm its connection status. Check again before starting sign-in.";
     case "expired": case "connection_expired": return "This sign-in request expired. Start again for a fresh request.";
-    case "canceled": case "connection_canceled": return "Sign-in was canceled. Your existing provider connections haven't changed.";
-    case "device_login_unavailable": return "Device sign-in couldn't start. Check your connection and that your provider account allows device sign-in, then try again.";
-    case "installation_failed": case "install_failed": return "Sign-in couldn't be prepared for this agent. Try again in a moment.";
-    case "installation_unavailable": return "Sign-in isn't available for this agent right now. Try again later.";
-    case "probe_timeout": return "The agent took too long to confirm sign-in. Check the connection again in a moment.";
-    case "sign_in_not_confirmed": return "The provider hasn't confirmed sign-in yet. Open its sign-in flow again to finish.";
+    case "canceled": case "connection_canceled": return "Sign-in was canceled. Your existing connections haven't changed.";
+    case "device_login_unavailable": return "Sign-in with a one-time code couldn't start. Check that your account allows it, then try again.";
+    // The cloud machine's sign-in never showed a one-time code.
+    case "sign_in_unavailable": return "Sign-in couldn't start on your cloud machine. Try again in a moment.";
+    case "sign_in_failed": return "Sign-in didn't finish. If the code expired or access wasn't approved, start again for a fresh code.";
+    // Signed in, but Git there can't use the account yet; Try again repeats only that step.
+    case "git_setup_failed": return "You're signed in, but Git on your cloud machine couldn't be set up to use this account. Try again.";
+    case "installation_failed": case "install_failed": return "Sign-in couldn't be prepared on your cloud machine. Try again in a moment.";
+    case "installation_unavailable": return "Sign-in isn't available for this connection right now. Try again later.";
+    case "probe_timeout": return "Confirming sign-in took too long. Check the connection again in a moment.";
+    case "sign_in_not_confirmed": return "Sign-in wasn't confirmed. Start again to finish.";
     // Claude's page shows `code#state`; half of it keeps the sign-in waiting.
     case "authorization_code_incomplete": return "Paste the whole code, including the part after #.";
-    case "browser_login_unavailable": return "Guided sign-in isn't available for this agent right now. Try again later.";
-    case "unsupported": case "unsupported_auth": return "This provider doesn't support guided sign-in for cloud work yet.";
-    default: return "The provider couldn't complete sign-in. You can try again without changing your local account.";
+    case "browser_login_unavailable": return "Guided sign-in isn't available for this service right now. Try again later.";
+    case "unsupported": case "unsupported_auth": return "Guided sign-in isn't available for this service yet.";
+    default: return "Sign-in couldn't finish in the cloud. You can try again; sign-in on your computer hasn't changed.";
   }
 }

@@ -18,6 +18,8 @@ use tokio::sync::{mpsc, watch};
 
 #[path = "claude.rs"]
 mod claude;
+#[path = "github.rs"]
+mod github;
 
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 pub(crate) fn active() -> usize {
@@ -428,71 +430,6 @@ async fn install(
         .map_err(|_| "installation_failed")?;
     Ok(())
 }
-async fn terminal(
-    state: &Arc<AppState>,
-    def: &ProviderDefinition,
-    bin: &FsPath,
-    attempt: &Attempt,
-) -> Result<(), &'static str> {
-    let ws = workspace(state).await?;
-    let args: Vec<String> = if def.id == "claude" {
-        vec![
-            bin.to_string_lossy().into_owned(),
-            "auth".into(),
-            "login".into(),
-            "--claudeai".into(),
-        ]
-    } else {
-        // Fixed GitHub-only command. A successful login installs Git's credential
-        // helper; no token is ever requested or printed by Chimaera.
-        vec!["/bin/sh".into(),"-c".into(),format!("{} auth login --hostname github.com --git-protocol https --web && {} auth setup-git",super::super::quote(&bin.to_string_lossy()),super::super::quote(&bin.to_string_lossy()))]
-    };
-    let id = crate::agents::fresh_session_id();
-    let env = crate::api::session_env(state, &id, "dark", None);
-    let env_remove = crate::api::spawn_env_remove(&env);
-    let opts = chimaera_pty::SpawnOpts {
-        cwd: ws.root,
-        name: Some(format!(
-            "Connect {}",
-            chimaera_core::cloud_providers::provider_definition(def.id)
-                .map_or(def.id, |p| p.label.as_str())
-        )),
-        cols: 90,
-        rows: 26,
-        command: Some(crate::launcher::wrap_login_shell(
-            &crate::launcher::login_shell(),
-            args,
-        )),
-        id: Some(id.clone()),
-        env,
-        env_remove,
-        scrollback: crate::lock(&state.settings).scrollback_lines(),
-    };
-    state
-        .sessions
-        .spawn(opts)
-        .map_err(|_| "terminal_unavailable")?;
-    crate::lock(&state.session_workspaces).insert(id.clone(), ws.id.clone());
-    crate::activity::record(state, &id);
-    state.changes.notify_waiters();
-    *crate::lock(&attempt.session) = Some(id.clone());
-    let _session = SessionGuard {
-        state: state.clone(),
-        id: id.clone(),
-    };
-    attempt.update(
-        Phase::Waiting,
-        Some(Action::Terminal {
-            workspace_id: ws.id,
-            session_id: id.clone(),
-        }),
-        None,
-    );
-    while state.sessions.get(&id).is_some_and(|s| s.alive) {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    Ok(())
-}
 fn device_action(value: &Value) -> Result<(String, Action), &'static str> {
     if value["type"] != "chatgptDeviceCode" {
         return Err("unsupported_login");
@@ -577,18 +514,23 @@ async fn run(
         .first()
         .is_some_and(|s| s.state == ProviderState::SignedIn)
     {
+        // Connecting GitHub means Git can use it too; a retry after a failed
+        // Git setup lands here with the CLI already signed in.
+        if def.id == "github" {
+            let bin = super::binary(state, def, false).await?;
+            github::setup_git(state, &bin, attempt).await?;
+        }
         return Ok(());
     }
     if matches!(super::binary(state, def, false).await, Err("not_installed")) {
         install(state, def, attempt).await?;
     }
     let bin = super::binary(state, def, false).await?;
-    if def.id == "claude" {
-        claude::login(state, &bin, attempt).await?;
-    } else if def.id == "codex" {
-        codex(state, &bin, attempt).await?;
-    } else {
-        terminal(state, def, &bin, attempt).await?;
+    match def.id {
+        "claude" => claude::login(state, &bin, attempt).await?,
+        "codex" => codex(state, &bin, attempt).await?,
+        "github" => github::login(state, &bin, attempt).await?,
+        _ => return Err("unsupported_provider"),
     }
     attempt.update(Phase::Verifying, None, None);
     let status = readiness(state, &ids, true).await;

@@ -189,7 +189,8 @@ work** presents the provider choice inline. One agent is enough to start; others
 are optional. Connected users see a quiet **Agent connections** disclosure. A
 required project connection, active sign-in, or connection error stays visible.
 Collapsing management keeps the existing status poll and sign-in state intact.
-The provider list comes from a shared catalog, initially Claude Code and Codex.
+The provider list comes from a shared catalog: Claude Code and Codex, plus GitHub
+under the optional **Repository connections**.
 Installation alone never shows a provider as connected. An unavailable or timed-out
 authentication check remains unknown.
 
@@ -200,6 +201,20 @@ connection panel. Its official CLI completes authentication; no temporary projec
 or terminal window opens. The code is used once and never saved by Chimaera; it
 must be pasted whole (Claude shows `code#state`), and half of one keeps the
 sign-in waiting with its own error (`authorization_code_incomplete`).
+Connecting GitHub (it lets the cloud machine pull and push the user's
+repositories) works like Codex, with no terminal: the panel shows GitHub's
+one-time code with **Copy code** and **Open sign-in page** (GitHub's device page,
+`https://github.com/login/device`), the user enters the code there and approves
+access, and the panel confirms the connection by itself. Behind it the cloud
+machine runs the official GitHub CLI's web sign-in with piped I/O (never a
+terminal or a browser there), reads only its code and page from complete output
+lines, waits while the CLI polls GitHub, then makes the CLI Git's credential helper
+for github.com (`gh auth setup-git`) and confirms with a fresh `gh auth status`.
+Each ending reads in plain words: no code shown (`sign_in_unavailable`), a code
+declined or left to expire (`sign_in_failed`), Git not set up (`git_setup_failed`,
+where **Try again** repeats only that step), or the request's own time limit. On
+success the panel says GitHub is connected and the cloud machine can now pull and
+push the user's repositories.
 A new attempt brings its guide into view; background status updates never scroll
 or reload the page. Installation remains automatic and separate from sign-in.
 Users can cancel or retry an expired request in place. Sign-in is confirmed by the provider CLI on the cloud
@@ -241,7 +256,15 @@ only when an agent is on record; none connected reads as the next step,
 “Connect an agent to start cloud work”; unknown claims nothing. A passive read
 that finds a cloud the account called ready unreachable is re-checked with the
 account first (it usually just went to sleep) and is reported as unavailable
-only on a second read in a row. Opening the optional **Agent connections**
+only on a second read in a row. A cloud machine that answers that it is asleep
+or still starting (503 `worker_asleep`/`worker_unavailable`, or a reply marked
+sleeping; both clients carry it as the fixed code `cloud_asleep`) is a state,
+not an error: it is never counted as unreachable, and the connections section
+says “Your cloud machine is waking up. Connections show in a moment.” while a
+request that wakes it is in flight or found it still starting (for at most two
+minutes, on the fast check cadence), or “Your cloud machine is asleep.
+Connecting an agent wakes it.” when nothing is waking it. Real failures keep
+their error copy. Opening the optional **Agent connections**
 disclosure loads those connections and acquires access automatically. There is no
 separate cloud-start action. Connecting a provider, or opening a repository on
 the cloud machine's own page, also acquires access as part of that user request. Catalog checks are
@@ -264,7 +287,8 @@ Agent sign-in only runs through those provider connection jobs (the older
 login-terminal route `/api/v1/pro/cloud/onboard` is gone).
 The native `pro_cloud_request` command keeps account and daemon credentials out
 of the UI and opens only a server-owned connection's validated browser URL or
-terminal. Browser clients use the same routes through the host-pinned gateway.
+terminal (a terminal only for an older cloud machine's GitHub sign-in, which the
+panel calls a sign-in window). Browser clients use the same routes through the host-pinned gateway.
 A shared provider catalog bounds external authentication origins in both clients.
 
 ## Where it lives

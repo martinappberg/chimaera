@@ -2780,3 +2780,24 @@ The maintainer noticed that Claude Code reads queued messages inside a running t
 - **Live, isolated daemon:**
   - claude (Haiku): two messages read after `sleep 15` inside the turn; Send now stopped a 40 s command and the message ran next; ⌥↩ LIME ran after the turn; ✕ withdrew PLUM, which never reached the agent; reload replayed identically.
   - codex (gpt-6-astra): two steers read after a 30 s command, same turn; ⌥↩ LIME opened the next turn; Send now re-drove the dropped steer as the next turn ("FINISHED PAPAYA").
+
+## Pass 43 (2026-09-29 — GitHub CLI, from its source; no live cloud probe): GitHub device-code sign-in. ADOPTED.
+
+This is daemon onboarding (`cloud/providers/github.rs`), separate from the model
+drivers, and replaces Pass 39's GitHub login terminal. With stdin and stdout not a
+TTY (and `GH_PROMPT_DISABLED=1`), `gh auth login --hostname github.com
+--git-protocol https --web` is non-interactive: `internal/authflow/flow.go` writes
+`! First copy your one-time code: XXXX-XXXX` and then `Open this URL to continue
+in your web browser: https://github.com/login/device` to stderr, never waits for
+Enter and never opens a browser, then polls GitHub until the code is approved,
+denied or expired and exits accordingly. Its interactive form instead prints
+`Press Enter to open github.com in your browser... ` and opens the page itself;
+the adapter answers that once and falls back to GitHub's own device page. A
+non-interactive login skips gh's Git credential prompt, so `gh auth setup-git
+--hostname github.com` follows (the old terminal command chained it too).
+`--skip-ssh-key` only affects SSH setup; it is passed when `gh auth login --help`
+lists it. The strings were read from gh's source at trunk (gh 2.92.0 is the
+local release); no live device-code request was made from a cloud machine, so the
+first real connection is the live gate. Hermetic fakes cover the code/page
+parsing, Enter prompt, declined, silent and stalled CLIs, cancellation and the
+Git setup.

@@ -9,9 +9,10 @@ Worker-only readiness and explicitly requested provider authentication. Parent:
 | `mod.rs` | Catalog adapters, allowlisted status parsing, bounded single-flight cache, authenticated HTTP handlers the handoff `readiness` helper, and catalog-only passive prompt observations (expired/absent status is unknown). |
 | `process.rs` | Capped CLI output and Codex auth-only JSON-RPC; owned process-group cleanup. No raw output enters HTTP errors or logs. |
 | `claude.rs` | Official Claude CLI headless browser/code adapter; bounded URL extraction and one-time stdin reply, without a workspace or PTY. |
-| `connect.rs` | Short-lived connection/disconnection jobs, one writer per provider, curated runtime installation, exact login terminals, Codex device codes, cancellation and cleanup acknowledgement. |
+| `github.rs` | Official GitHub CLI device-code adapter (`gh auth login --web`, piped, non-interactive): bounded parsing of its one-time code and GitHub's device page from stdout+stderr, then `gh auth setup-git`; no workspace, PTY or browser on the machine. |
+| `connect.rs` | Short-lived connection/disconnection jobs, one writer per provider, curated runtime installation (its visible install terminal), Codex and GitHub device codes, cancellation and cleanup acknowledgement. |
 | `disconnect.rs` | Official CLI logout adapters and fresh negative verification; personal-cloud scope, no credential-file reads or claims of vendor-wide revocation. |
-| `tests.rs`, `connect_tests.rs` | Status isolation, cache/freshness, real child/PTY cleanup, cancellation/retry races and device completion verification. |
+| `tests.rs`, `connect_tests.rs` | Status isolation, cache/freshness, real child/PTY cleanup, cancellation/retry races and device completion verification. GitHub's CLI is found on the login shell's PATH, so tests register a fake per fixture home (`preset_github`). |
 
 ## Contract
 
@@ -43,7 +44,8 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
   to its account generation through the request.
 - An action is `{type:"browser",url,input:"authorization_code"}`,
   `{type:"device_code",verification_url,user_code}` or
-  `{type:"terminal",workspace_id,session_id}`. Openers validate the shared
+  `{type:"terminal",workspace_id,session_id}` (now only an agent install while
+  `preparing`; an older server's GitHub login sent it while `waiting`). Openers validate the shared
   provider origin policy and resolve the action afresh; client-supplied URLs or
   commands are never executed. Timestamps are Unix seconds.
 - Nonworkers return `available:false` with empty lists and `connection:null`.
@@ -59,8 +61,19 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
 - Codex uses only auth app-server requests: initialize, account/read with
   `refreshToken:false`, and explicit account/login/start with
   `type:"chatgptDeviceCode"`. Claude uses `auth status --json` and explicit
-  `auth login --claudeai` with piped I/O, its own browser URL and code prompt; GitHub is optional and uses `gh auth status` JSON plus
-  its official login/setup-git terminal. Unknown protocols fail closed.
+  `auth login --claudeai` with piped I/O, its own browser URL and code prompt. GitHub is optional and uses `gh auth status` JSON,
+  explicit `gh auth login --hostname github.com --git-protocol https --web` (plus `--skip-ssh-key` when its
+  `--help` lists it) with piped I/O and `GH_PROMPT_DISABLED`/`BROWSER=true`, and then `gh auth setup-git
+  --hostname github.com` so Git uses the account. Unknown protocols fail closed.
+- GitHub sign-in publishes a `device_code` action only from complete output lines: an
+  `XXXX-XXXX` code on the line naming the one-time code, and a page on the catalog's
+  `https://github.com` origin under `/login/device` (GitHub's own device page when the
+  CLI printed none within two seconds of the code, as after an Enter prompt, which is
+  answered once). No code within 30 seconds, or a CLI that exits first, fails with
+  `sign_in_unavailable` (never a terminal); a CLI that exits non-zero after the code
+  (declined or expired) fails with `sign_in_failed`; a failed Git setup with
+  `git_setup_failed`. Connecting an already signed-in CLI runs only the Git setup, so
+  **Try again** repeats that step. Success still needs a fresh `auth status` probe.
 - `readiness` is shared by onboarding and handoff. Only `signed_in` with a
   confirmed installed runtime may satisfy a required session provider. An
   unsupported future provider remains blocked until it has an adapter.
@@ -76,7 +89,7 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
   action immediately but retains that reservation until owned process-group/PTY
   exit is observed. The cancel endpoint waits up to four seconds; uncertain
   cleanup fails closed with `cleanup_failed` and keeps the provider reserved only
-  until the old login terminal and process group are gone (re-checked every 5 s,
+  until the old install terminal and process group are gone (re-checked every 5 s,
   at most ten minutes; `release_when_gone`), then releases it. Retained finished attempts are
   capped at 24 and expire on the next explicit connection request.
 - Cancellation stops the CLI process and device polling. It does not revoke a
@@ -98,7 +111,7 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
   `https://claude.com/cai/oauth/authorize` URL and prompt before exposing the
   browser action. Unrecognized CLI output fails closed. A code is passed once
   to the owned CLI; success still requires a fresh status probe.
-- Install/login terminals live only in `~/projects/.chimaera-setup`, the existing
+- Install terminals live only in `~/projects/.chimaera-setup`, the existing
   excluded setup workspace. Its purpose is recorded as `cloud_internal`, and normal
   workspace lists omit it; old worker-reserved paths migrate to that marker. Cancel kills only the job's own session. Install uses
   the runtime subsystem's curated official downloads and existing reservation;
@@ -114,7 +127,7 @@ support:
 
 1. Add the stable ID, label, `agent` or `repository` category, and exact verified
    HTTPS authentication origins to the [shared catalog](../../../../chimaera-core/src/cloud-providers.json).
-   Keep terminal-only providers' origins empty. Add the server adapter to
+   Every published browser/device page needs its origin here. Add the server adapter to
    `PROVIDERS` in `mod.rs`; the HTTP catalog lists implemented adapters, not every
    JSON entry. Keep catalog/adapter consistency tests passing.
 2. For an agent, extend [AgentKind](../../agent_state.rs),

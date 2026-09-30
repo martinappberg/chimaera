@@ -45,7 +45,7 @@ pub(crate) const PROVIDERS: &[ProviderDefinition] = &[
     },
     ProviderDefinition {
         id: "github",
-        methods: &["terminal"],
+        methods: &["device_code"],
         kind: None,
     },
 ];
@@ -133,6 +133,12 @@ pub(super) async fn binary(
             .await
             .path
             .map_err(|_| "not_installed");
+    }
+    // GitHub's CLI is found on the login shell's PATH, which a test cannot
+    // point at a fake; tests register one per fixture home instead.
+    #[cfg(test)]
+    if let Some(bin) = tests::github_cli(state) {
+        return Ok(bin);
     }
     let mut cmd = process::command(
         std::path::Path::new("/bin/sh"),

@@ -92,3 +92,21 @@ it("carries only the bounded incomplete-code refusal back from a code submission
     await expect(cloudRequest(request)).rejects.toThrow("This cloud operation couldn't finish. Please try again.");
   }
 });
+
+it("tells a sleeping or starting cloud machine apart from a failed request", async () => {
+  for (const response of [
+    () => Response.json({ error: "worker_asleep" }, { status: 503 }),
+    () => Response.json({ error: "worker_unavailable" }, { status: 503 }),
+    () => Response.json({ available: true }, { headers: { "X-Chimaera-Worker-State": "sleeping" } }),
+    () => new Response("", { status: 503, headers: { "X-Chimaera-Worker-State": "sleeping" } }),
+  ]) {
+    mocks.api.mockResolvedValueOnce(response());
+    await expect(cloudRequest({ operation: "providers" })).rejects.toThrow("cloud_asleep");
+  }
+  for (const [body, status] of [[{ error: "worker_asleep" }, 500], [{ error: "SECRET raw stderr" }, 503]] as const) {
+    mocks.api.mockResolvedValueOnce(Response.json(body, { status }));
+    await expect(cloudRequest({ operation: "providers" })).rejects.toThrow("This cloud operation couldn't finish. Please try again.");
+  }
+  mocks.api.mockResolvedValueOnce(new Response("<html>bad gateway</html>", { status: 503 }));
+  await expect(cloudRequest({ operation: "info" })).rejects.toThrow("This cloud operation couldn't finish. Please try again.");
+});

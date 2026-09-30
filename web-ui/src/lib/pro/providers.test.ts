@@ -19,6 +19,8 @@ describe("provider readiness", () => {
     expect(providerLoginUrl("claude", "https://claude.com/cai/oauth/authorize?state=fixture")).toBe("https://claude.com/cai/oauth/authorize?state=fixture");
     expect(providerLoginUrl("claude", "https://claude.com.evil.test/cai/oauth/authorize")).toBeNull();
     expect(providerLoginUrl("future-provider", "https://auth.openai.com")).toBeNull();
+    expect(providerLoginUrl("github", "https://github.com/login/device")).toBe("https://github.com/login/device");
+    for (const url of ["https://github.com.evil.test/login/device", "https://gist.github.com/login/device", "https://auth.openai.com/codex/device"]) expect(providerLoginUrl("github", url)).toBeNull();
   });
 });
 
@@ -66,6 +68,16 @@ describe("cloud disconnection", () => {
     expect(connectionError("authorization_code_incomplete")).not.toBe(connectionError("unknown_code"));
     expect(connectionError("authorization_code_incomplete")).not.toBe(connectionError("sign_in_not_confirmed"));
     expect(connectionError("device_auth_disabled")).toBe(connectionError("unknown_code"));
+  });
+  it("names each way a one-time-code sign-in can end apart from the generic line, in plain words", () => {
+    const generic = connectionError("unknown_code");
+    const codes = ["sign_in_unavailable", "sign_in_failed", "git_setup_failed", "sign_in_not_confirmed", "expired", "canceled"];
+    for (const code of codes) expect(connectionError(code)).not.toBe(generic);
+    expect(new Set(codes.map(code => connectionError(code))).size).toBe(codes.length);
+    for (const code of [...codes, "provider_busy", "device_login_unavailable", "installation_failed", "installation_unavailable", "probe_timeout", "browser_login_unavailable", "unsupported", "SECRET raw stderr"]) {
+      expect(connectionError(code)).not.toMatch(/provider|worker|keeper|terminal/i);
+      expect(connectionError(code)).not.toContain("SECRET");
+    }
   });
   it("does not keep old success claims after an external connection change or a failed refresh", () => {
     expect(connectionSuccessCurrent(attempt("disconnected", "disconnect"), [row("codex", "needs_sign_in")], true)).toBe(true);

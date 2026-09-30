@@ -21,7 +21,7 @@ pub(crate) fn enabled() -> bool {
     std::env::var("CHIMAERA_WORKER").as_deref() == Ok("1")
 }
 pub(crate) fn is_onboarding_workspace(workspace: &crate::workspaces::Workspace) -> bool {
-    // Provider login terminals belong to worker setup, never to a project
+    // Agent install terminals belong to worker setup, never to a project
     // that should be mirrored or offered for a local copy.
     workspace.cloud_internal
         || enabled()
@@ -38,9 +38,6 @@ fn unavailable() -> Response {
 }
 fn error(message: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({"error":message}))).into_response()
-}
-fn quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 pub(crate) async fn info(State(state): State<Arc<AppState>>) -> Response {
     if !enabled() {
