@@ -55,17 +55,17 @@ fn main() {
 }
 
 /// The files git rewrites when HEAD comes to name another commit, or `None`
-/// when none reliably is: reflogs off while the branch ref is packed, the
-/// reftable backend, or a git too old for `--git-path`.
+/// when none reliably is (the reftable backend, a git too old for
+/// `--git-path`).
 ///
 /// Each name resolves through `--git-path`, which knows where this checkout
-/// keeps it — `HEAD` and `logs/HEAD` in a linked worktree's own git dir,
-/// branch refs, their reflogs and `packed-refs` in the common dir — and only
-/// files that exist are returned: cargo counts a missing watched path as
-/// changed, which would rebuild this crate and every dependent on every run.
+/// keeps it — `HEAD` in a linked worktree's own git dir; branch refs, their
+/// reflogs and `packed-refs` in the common dir — and only files that exist
+/// are returned: cargo counts a missing watched path as changed, which would
+/// rebuild this crate and every dependent on every run.
 fn head_files() -> Option<Vec<PathBuf>> {
     let branch = git(&["symbolic-ref", "-q", "HEAD"]);
-    let mut names = vec!["HEAD".to_owned(), "logs/HEAD".to_owned()];
+    let mut names = vec!["HEAD".to_owned()];
     if let Some(branch) = &branch {
         names.extend([
             branch.clone(),
@@ -84,31 +84,43 @@ fn head_files() -> Option<Vec<PathBuf>> {
     if paths.len() != names.len() {
         return None;
     }
-    let (head, head_log) = (&paths[0], &paths[1]);
-
-    // HEAD is rewritten by a branch switch. Detached, it holds the commit id
-    // itself, so it moves with every commit too — unless it is the reftable
-    // backend's `ref:` placeholder, which never changes.
-    let mut files = vec![head.clone()];
-    let mut follows_commits =
-        branch.is_none() && !fs::read_to_string(head).ok()?.starts_with("ref:");
-    // A reflog gains a line with every commit, reset or checkout, and
-    // outlives `git pack-refs`.
-    let mut logs = vec![head_log];
-    if let [loose, branch_log, packed] = &paths[2..] {
-        logs.push(branch_log);
-        if loose.exists() {
-            files.push(loose.clone());
-            follows_commits = true;
-        } else if packed.exists() {
-            // A packed ref's id lives here, though a commit writes a loose
-            // ref instead, which only the reflogs announce.
-            files.push(packed.clone());
-        }
+    let head = paths[0].clone();
+    let [loose, log, packed] = &paths[1..] else {
+        // Detached, HEAD holds the commit id itself — unless it is the
+        // reftable backend's `ref:` placeholder, which never changes.
+        let holds_id = !fs::read_to_string(&head).ok()?.starts_with("ref:");
+        return holds_id.then(|| vec![head]);
+    };
+    // On a branch, HEAD changes with a branch switch, and the branch's own
+    // files with every commit to it, whichever worktree makes it (this
+    // worktree's `logs/HEAD` misses one made elsewhere).
+    let mut files = vec![head];
+    if loose.exists() {
+        files.push(loose.clone());
+        return Some(files);
     }
-    for log in logs.into_iter().filter(|l| l.exists()) {
-        files.push(log.clone());
-        follows_commits = true;
+    // Packed: the id lives in `packed-refs` until git writes a loose ref on
+    // the next commit, and a path that doesn't exist yet can't be watched.
+    if packed.exists() {
+        files.push(packed.clone());
     }
-    follows_commits.then_some(files)
+    // The branch's reflog gains a line with that commit. Without one (a
+    // worktree made without reflogs, packed by `git gc` before its first
+    // commit), watch the nearest directory on the loose ref's path, which
+    // creating the ref bumps: sibling branches' commits rebuild too, still
+    // far fewer than every build. Stay below `refs/`; the reftable backend's
+    // `refs/heads` is a placeholder file that never changes.
+    let tracker = if log.exists() {
+        log.clone()
+    } else {
+        loose
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| !dir.ends_with("refs"))
+            .find(|dir| dir.exists())
+            .filter(|dir| dir.is_dir())?
+            .to_owned()
+    };
+    files.push(tracker);
+    Some(files)
 }
