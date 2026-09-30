@@ -5463,11 +5463,12 @@
                     : `show all ${visibleRecents.length} recent conversations`}
                   onclick={toggleRecents}
                 >
-                  {recentsExpanded ? "show less" : `all ${visibleRecents.length}`}
+                  {recentsExpanded ? "less" : "more"}
                 </button>
               {/if}
-              <!-- Every past session, beyond these: revealed while the
-                   pointer is over Recents (always on touch), and in ⌘P. -->
+              <!-- Every past session, beyond these: in ⌘P too. Both header
+                   actions reveal while the pointer is over Recents (always on
+                   touch). -->
               <button
                 class="recents-history"
                 title="All sessions — every past session in this workspace"
@@ -7014,8 +7015,9 @@
     opacity: 0.8;
   }
 
-  /* The "all N" / "show less" toggle lives in the section header: quiet
-     lowercase text (the header's uppercase tracking is for the label only). */
+  /* The "more" / "less" toggle lives in the section header: quiet lowercase
+     text (the header's uppercase tracking is for the label only), revealed
+     with the history mark below. */
   .recents-more {
     appearance: none;
     border: none;
@@ -7031,7 +7033,9 @@
     font-variant-numeric: tabular-nums;
     color: var(--muted);
     cursor: pointer;
+    opacity: 0;
     transition:
+      opacity 0.12s ease,
       color 0.12s ease,
       background-color 0.12s ease;
   }
@@ -7084,27 +7088,23 @@
       opacity 0.12s ease,
       color 0.12s ease;
   }
-  .recents:hover .recents-history,
-  .recents-history:focus-visible {
+  .recents:hover :is(.recents-more, .recents-history),
+  :is(.recents-more, .recents-history):focus-visible {
     opacity: 0.9;
   }
-  .recents-history:hover {
+  :is(.recents-more, .recents-history):hover {
     opacity: 1;
     color: var(--fg);
     background: var(--row-hover);
   }
-  .recents-history:focus-visible {
+  :is(.recents-more, .recents-history):focus-visible {
     outline: 1px solid var(--focus-ring);
   }
   @media (hover: none) {
+    .recents-more,
     .recents-history {
       opacity: 0.9;
     }
-  }
-
-  .recents-more:hover {
-    color: var(--fg);
-    background: var(--row-hover);
   }
 
   /* --- FILES section --- */
