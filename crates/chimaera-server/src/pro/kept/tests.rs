@@ -1,8 +1,9 @@
 //! The kept-version review over the real router (bearer auth included):
-//! listing, both texts, each choice, `resolve_all`, and the path fences —
+//! listing, both texts, each choice, `resolve_all`, where a discarded copy
+//! goes (a fixture home Trash, never the real one), and the path fences —
 //! only recorded siblings, only inside the project, never through a link.
 use super::*;
-use crate::pro::Ownership;
+use crate::pro::{trash::in_trash, Ownership};
 use axum::{body::Body, http::Method, http::Request};
 use http_body_util::BodyExt;
 use std::sync::atomic::Ordering;
@@ -15,22 +16,34 @@ struct Fixture {
     state: Arc<AppState>,
     project: PathBuf,
     workspace: String,
+    /// The fixture's home Trash (under `root`); `None`: this computer has
+    /// no Trash, so a discarded copy is deleted.
+    trash: Option<PathBuf>,
 }
 impl Fixture {
     fn new() -> Self {
+        Self::build(true)
+    }
+    fn without_trash() -> Self {
+        Self::build(false)
+    }
+    fn build(with_trash: bool) -> Self {
         let root =
             std::env::temp_dir().join(format!("chimaera-kept-{}", chimaera_core::generate_token()));
         std::fs::create_dir_all(root.join("project")).unwrap();
         std::fs::create_dir_all(root.join("outside")).unwrap();
         let root = root.canonicalize().unwrap();
-        let state = Arc::new(AppState::new(
+        let mut state = AppState::new(
             "fixture-token".into(),
             "fixture".into(),
             4242,
             0,
             root.clone(),
             root.join("config"),
-        ));
+        );
+        let trash = with_trash.then(|| crate::pro::trash::fixture_home_trash(&root));
+        state.pro.trash = trash.clone();
+        let state = Arc::new(state);
         state.stopping.store(true, Ordering::Release);
         let project = root.join("project");
         let workspace = crate::lock(&state.workspaces)
@@ -42,7 +55,12 @@ impl Fixture {
             state,
             project,
             workspace,
+            trash,
         }
+    }
+    /// A discarded copy's text in the fixture's Trash.
+    fn trashed(&self, name: &str) -> Option<String> {
+        std::fs::read_to_string(in_trash(self.trash.as_ref()?, name)).ok()
     }
     fn write(&self, relative: &str, body: &str) {
         let path = self.project.join(relative);
@@ -140,6 +158,7 @@ async fn each_choice_settles_its_pair_and_the_report_ends_with_the_last() {
     assert_eq!(listing["total"], 3);
     assert_eq!(listing["unlisted"], 0);
     assert_eq!(listing["here"], true);
+    assert_eq!(listing["trash"], true);
     assert_eq!(listing["branches"], json!([]));
     assert!(listing["returned_at"].as_u64().is_some_and(|at| at > 0));
     let pairs = listing["pairs"].as_array().unwrap();
@@ -184,12 +203,20 @@ async fn each_choice_settles_its_pair_and_the_report_ends_with_the_last() {
     assert_eq!(after["files"], 2);
     assert_eq!(after["total"], 3, "the return's own count never drops");
     assert_eq!(after["failed"], json!([]));
+    assert_eq!(after["discarded"], json!({"trash": 0, "deleted": 0}));
 
-    // The cloud's version stays; this computer's copy is removed.
+    // The cloud's version stays; this computer's copy leaves the project
+    // for the Trash, under its own name.
     let (status, after) = fx.resolve(&kept("data/table.csv"), "use_cloud").await;
     assert_eq!(status, StatusCode::OK, "{after}");
     assert_eq!(fx.read("data/table.csv").as_deref(), Some("a,b\n1,2\n"));
     assert_eq!(fx.read(&kept("data/table.csv")), None);
+    assert!(!fx.project.join(kept("data/table.csv")).exists());
+    assert_eq!(
+        fx.trashed(&kept("table.csv")).as_deref(),
+        Some("a,b\n1,3\n")
+    );
+    assert_eq!(after["discarded"], json!({"trash": 1, "deleted": 0}));
     assert_eq!(mine_paths(&after), vec![kept("plan.txt")]);
 
     // Keep both: nothing moves, and the last pair ends the report.
@@ -391,12 +418,83 @@ async fn resolve_all_settles_every_pair_and_the_unnamed_rest() {
     mode(0o755);
     assert_eq!(status, StatusCode::OK, "{after}");
     assert_eq!(fx.read(&kept("fine.txt")), None);
+    assert_eq!(fx.trashed(&kept("fine.txt")).as_deref(), Some("mine"));
+    assert_eq!(after["discarded"], json!({"trash": 1, "deleted": 0}));
+    assert_eq!(fx.read(&kept("locked/stuck.txt")).as_deref(), Some("mine"));
     assert_eq!(
         after["failed"],
         json!([{"mine_path": kept("locked/stuck.txt"), "error_code": "failed"}])
     );
     assert_eq!(mine_paths(&after), vec![kept("locked/stuck.txt")]);
     assert_eq!(fx.open(), Some(1));
+}
+
+#[tokio::test]
+async fn use_the_clouds_for_all_sends_every_copy_to_the_trash() {
+    let fx = Fixture::new();
+    for name in ["one.txt", "two.txt", "deep/three.txt"] {
+        fx.write(name, "cloud");
+        fx.write(&kept(name), &format!("mine {name}"));
+    }
+    // Something already in the Trash under a copy's name stays as it was.
+    let taken = in_trash(fx.trash.as_ref().unwrap(), &kept("one.txt"));
+    std::fs::create_dir_all(taken.parent().unwrap()).unwrap();
+    std::fs::write(&taken, "an older copy").unwrap();
+    fx.keep(
+        3,
+        &[&kept("one.txt"), &kept("two.txt"), &kept("deep/three.txt")],
+    );
+    let (status, after) = fx
+        .call(
+            Method::POST,
+            "kept/resolve_all",
+            Some(json!({"choice": "use_cloud"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(after["discarded"], json!({"trash": 3, "deleted": 0}));
+    assert_eq!(after["files"], 0);
+    for name in ["one.txt", "two.txt", "deep/three.txt"] {
+        assert_eq!(fx.read(name).as_deref(), Some("cloud"));
+        assert_eq!(fx.read(&kept(name)), None, "{name}");
+    }
+    assert_eq!(
+        fx.trashed(&kept("one.txt")).as_deref(),
+        Some("an older copy")
+    );
+    assert_eq!(
+        fx.trashed(&format!("{} 2", kept("one.txt"))).as_deref(),
+        Some("mine one.txt")
+    );
+    assert_eq!(
+        fx.trashed(&kept("two.txt")).as_deref(),
+        Some("mine two.txt")
+    );
+    assert_eq!(
+        fx.trashed(&kept("three.txt")).as_deref(),
+        Some("mine deep/three.txt")
+    );
+}
+
+#[tokio::test]
+async fn without_a_trash_the_clouds_version_deletes_the_copy_and_says_so() {
+    let fx = Fixture::without_trash();
+    fx.write("a.txt", "cloud");
+    fx.write(&kept("a.txt"), "mine");
+    fx.write("b.txt", "cloud");
+    fx.write(&kept("b.txt"), "mine");
+    fx.keep(2, &[&kept("a.txt"), &kept("b.txt")]);
+    assert_eq!(fx.list().await["trash"], false);
+    let (status, after) = fx.resolve(&kept("a.txt"), "use_cloud").await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(fx.read(&kept("a.txt")), None);
+    assert_eq!(fx.read("a.txt").as_deref(), Some("cloud"));
+    assert_eq!(after["discarded"], json!({"trash": 0, "deleted": 1}));
+    assert_eq!(after["trash"], false);
+    // Keeping both discards nothing.
+    let (_, after) = fx.resolve(&kept("b.txt"), "keep_both").await;
+    assert_eq!(after["discarded"], json!({"trash": 0, "deleted": 0}));
+    assert_eq!(fx.read(&kept("b.txt")).as_deref(), Some("mine"));
 }
 
 #[tokio::test]

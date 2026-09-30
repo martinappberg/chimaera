@@ -29,6 +29,7 @@ revocable delegation over the authenticated local API.
 | `repository.rs` | Portable remote/tracking allowlist; bounded ref import, compare-and-swap adoption and index/ref-lock cancellation cleanup. |
 | `canonical.rs` | Keeps the user's own version of a conflicting file right beside it (`<name>.mine-<yyyymmdd-hhmm>`) when a return installs the incoming one; bounded per return, never overwrites an earlier copy, never mirrored. `original_name` maps a copy back to the file it sits beside. |
 | `kept.rs` / `kept/tests.rs` | The review of what a return kept in both versions: list the recorded pairs (and the cloud's `@cloud` branches, read live), both texts for the side-by-side view, and settling a pair (`use_mine` / `use_cloud` / `keep_both`, one or all) — only recorded siblings, only inside the project, every name opened `O_NOFOLLOW` beneath the folder's descriptor. Tests drive the real router. |
+| `trash.rs` | Where a discarded kept copy goes: renamed (through its folder's descriptor, never replacing a name) into the home Trash (`~/.Trash`; the freedesktop.org home trash on Linux, with its `.trashinfo`), else its drive's existing Trash (`.Trashes/<uid>`; `.Trash/<uid>`, `.Trash-<uid>`), else deleted. `ProState::trash` holds the home Trash; tests point it at a fixture (never the real one). |
 | `config.rs` | Portable agent configuration export/import, scoped environment-omission diagnostics and destination connection identity preservation. |
 
 One recorded holder and epoch controls shared writes. **Laptop first (D1):** a
@@ -321,14 +322,19 @@ copies the return did not name (it names up to 32), `total` the return's own
 count (choices never lower it), `branches` the project's
 `<branch>@cloud-<12 hex>` refs read live (Git runs only for a project with an
 open report or recorded `git_branches`; one merged and deleted drops off),
-`here` whether a choice can be made now (`may_write`).
+`here` whether a choice can be made now (`may_write`), `trash` whether a
+copy discarded here goes to a Trash (`trash::available`; false: its drive has
+none, so it would be deleted).
 `GET …/kept/file?mine_path=` returns both versions of one recorded pair
 (`mine`, `cloud`: `{size, changed_at, text, binary?, too_large?}`, text up to
 512 KiB of UTF-8, `cloud` null when deleted).
 `POST …/kept/resolve {mine_path, choice}` settles one recorded pair:
 `use_mine` renames the sibling over the file (a deleted file comes back),
-`use_cloud` removes the sibling, `keep_both` moves nothing; the answer is the
-updated listing. `POST …/kept/resolve_all {choice}` applies one choice to every
+`use_cloud` moves the sibling to the Trash (`trash::discard`: a rename
+through the pair's directory descriptor, so the path fences are unchanged;
+deleted only where no Trash on its drive takes it), `keep_both` moves
+nothing; the answer is the updated listing plus `discarded` (`{trash,
+deleted}`: the copies this choice moved to a Trash, and deleted). `POST …/kept/resolve_all {choice}` applies one choice to every
 recorded pair; pairs that cannot take it stay and are named in `failed`
 (`{mine_path, error_code}`), and when none failed the report ends, unnamed
 copies included (they keep their `.mine-…` names). Refusals are

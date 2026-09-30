@@ -46,19 +46,23 @@ pub(super) fn original_name(name: &str) -> Option<&str> {
     (!original.is_empty()).then_some(original)
 }
 
-/// The local minute, for a name people read.
-fn stamp() -> String {
+/// The local time now; `None` when the C library cannot say.
+pub(super) fn local_now() -> Option<nix::libc::tm> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs()) as nix::libc::time_t;
     let mut tm = std::mem::MaybeUninit::<nix::libc::tm>::zeroed();
     // SAFETY: `localtime_r` writes into the provided buffer and is thread safe.
     let converted = unsafe { !nix::libc::localtime_r(&now, tm.as_mut_ptr()).is_null() };
-    if !converted {
-        return "00000000-0000".into();
-    }
     // SAFETY: filled by the successful call above.
-    let tm = unsafe { tm.assume_init() };
+    converted.then(|| unsafe { tm.assume_init() })
+}
+
+/// The local minute, for a name people read.
+fn stamp() -> String {
+    let Some(tm) = local_now() else {
+        return "00000000-0000".into();
+    };
     format!(
         "{:04}{:02}{:02}-{:02}{:02}",
         tm.tm_year + 1900,
