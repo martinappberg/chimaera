@@ -4,7 +4,9 @@
 //! before build ids, every build called itself 0.0.1 and a 21-hour-old
 //! daemon was indistinguishable from a fresh one (field find on a cluster).
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::{env, fs};
 
 fn git(args: &[&str]) -> Option<String> {
     let out = Command::new("git").args(args).output().ok()?;
@@ -29,13 +31,84 @@ fn main() {
         secs
     );
 
-    // Re-embed when the checked-out commit moves: HEAD for branch switches,
-    // the branch ref file for new commits. Dirty-flag freshness is
+    // Re-embed when the checked-out commit moves. Dirty-flag freshness is
     // commit-granularity by nature — plain edits touch nothing under .git.
-    if let Some(git_dir) = git(&["rev-parse", "--absolute-git-dir"]) {
-        println!("cargo:rerun-if-changed={git_dir}/HEAD");
-        if let Some(head_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
-            println!("cargo:rerun-if-changed={git_dir}/{head_ref}");
+    // Outside a git checkout (a source tarball) there is no commit to follow.
+    if git(&["rev-parse", "--git-dir"]).is_none() {
+        return;
+    }
+    match head_files() {
+        Some(files) => {
+            for file in files {
+                println!("cargo:rerun-if-changed={}", file.display());
+            }
+        }
+        // No file reliably moves with the commit. Cargo counts a missing
+        // watched path as changed, so watching one that never exists
+        // re-derives the id on every build: slow, but never stale.
+        None => {
+            let out_dir = env::var("OUT_DIR").expect("cargo sets OUT_DIR");
+            let never = Path::new(&out_dir).join("never-exists");
+            println!("cargo:rerun-if-changed={}", never.display());
         }
     }
+}
+
+/// The files git rewrites when HEAD comes to name another commit, or `None`
+/// when none reliably is: reflogs off while the branch ref is packed, the
+/// reftable backend, or a git too old for `--git-path`.
+///
+/// Each name resolves through `--git-path`, which knows where this checkout
+/// keeps it — `HEAD` and `logs/HEAD` in a linked worktree's own git dir,
+/// branch refs, their reflogs and `packed-refs` in the common dir — and only
+/// files that exist are returned: cargo counts a missing watched path as
+/// changed, which would rebuild this crate and every dependent on every run.
+fn head_files() -> Option<Vec<PathBuf>> {
+    let branch = git(&["symbolic-ref", "-q", "HEAD"]);
+    let mut names = vec!["HEAD".to_owned(), "logs/HEAD".to_owned()];
+    if let Some(branch) = &branch {
+        names.extend([
+            branch.clone(),
+            format!("logs/{branch}"),
+            "packed-refs".to_owned(),
+        ]);
+    }
+    let mut args = vec!["rev-parse"];
+    for name in &names {
+        args.extend(["--git-path", name.as_str()]);
+    }
+    // Relative results are relative to our working directory, the package root.
+    let cwd = env::current_dir().ok()?;
+    let paths: Vec<PathBuf> = git(&args)?.lines().map(|l| cwd.join(l)).collect();
+    // Any other count means this git didn't understand `--git-path`.
+    if paths.len() != names.len() {
+        return None;
+    }
+    let (head, head_log) = (&paths[0], &paths[1]);
+
+    // HEAD is rewritten by a branch switch. Detached, it holds the commit id
+    // itself, so it moves with every commit too — unless it is the reftable
+    // backend's `ref:` placeholder, which never changes.
+    let mut files = vec![head.clone()];
+    let mut follows_commits =
+        branch.is_none() && !fs::read_to_string(head).ok()?.starts_with("ref:");
+    // A reflog gains a line with every commit, reset or checkout, and
+    // outlives `git pack-refs`.
+    let mut logs = vec![head_log];
+    if let [loose, branch_log, packed] = &paths[2..] {
+        logs.push(branch_log);
+        if loose.exists() {
+            files.push(loose.clone());
+            follows_commits = true;
+        } else if packed.exists() {
+            // A packed ref's id lives here, though a commit writes a loose
+            // ref instead, which only the reflogs announce.
+            files.push(packed.clone());
+        }
+    }
+    for log in logs.into_iter().filter(|l| l.exists()) {
+        files.push(log.clone());
+        follows_commits = true;
+    }
+    follows_commits.then_some(files)
 }
