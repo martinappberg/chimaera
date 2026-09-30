@@ -5,7 +5,7 @@
   import { cloudAction, cloudRequest, peekCatalog } from "./cloudTransport";
   import { rememberCatalog } from "./catalogMemory";
   import { CHECKING_AFTER_MS, CLOUD_ASLEEP, cloudAsleep, friendlyError } from "./presentation";
-  import { agentsConnected, awaitingCloudUpdate, canDisconnect, cloudUpdateLine, connectingLabel, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, nextReadyHandoff, olderCloudSignIn, panelRows, pendingConnection, providerLabel, providerLoginUrl, providersReady, providerStateLabel, recoverDisconnect, sameConnection, stillAwaitingUpdate } from "./providers";
+  import { agentsConnected, awaitingCloudUpdate, canDisconnect, cloudUpdateLine, connectingLabel, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, installingAgent, nextReadyHandoff, olderCloudSignIn, panelRows, pendingConnection, providerLabel, providerLoginUrl, providersReady, providerStateLabel, recoverDisconnect, sameConnection, stillAwaitingUpdate } from "./providers";
 
   let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady, onReadiness, onAgents, compact = false, live = true, remembered = null }: {
     visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void; onReadiness?: (ready: boolean | null) => void;
@@ -404,7 +404,7 @@
       {:else if ended(connection.phase)}
         <p class="error small" role="status">{connectionError(connection.phase === "failed" ? connection.error_code : connection.phase)}</p>
       {:else if connection.phase === "preparing"}
-        <p class="muted small" role="status">Preparing sign-in…</p>
+        <p class="muted small" role="status">{installingAgent(connection) ? `Installing ${label} in your cloud. This takes a moment the first time…` : "Preparing sign-in…"}</p>
       {:else if connection.phase === "verifying"}
         <p class="muted small" role="status">Confirming…</p>
       {:else if action?.type === "device_code"}

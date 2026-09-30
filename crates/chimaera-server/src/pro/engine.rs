@@ -1115,11 +1115,17 @@ async fn snapshot_inner_scoped(
         }
         return result;
     }
-    if clean && sleep.is_some_and(|sleep| !sleep.park) && !config.recovery {
+    if clean && !config.recovery && sleep.is_some_and(|sleep| !sleep.park || published) {
         // Inside the sleep window a flush never renews or resumes (that would
         // restart agents seconds before sleep and keep the lease from lapsing):
         // published but unreleased, the cloud continues once the lease lapses;
         // failed, the project waits. Either way the next wake returns it here.
+        // A quit handover whose copy is published is the same once the account
+        // cannot confirm the release in time: the user chose the cloud, so the
+        // project stays parked, its lease lapses, and the cloud continues from
+        // this acknowledged copy within a couple of minutes, as after a lost
+        // connection, instead of the work quietly staying on a computer whose
+        // app is gone.
         if result.is_err()
             && matches!(lock(&state.pro.ownership).get(&workspace.id), Some(Ownership::Transferring { epoch: current }) if *current == epoch)
         {
@@ -1132,8 +1138,9 @@ async fn snapshot_inner_scoped(
         return result;
     }
     if result.is_err() && clean && !config.recovery {
-        // A quit handover that failed is not parked: the renewal below must
-        // be allowed to keep the work here.
+        // A quit handover whose copy never published is not parked: the
+        // renewal below must be allowed to keep the work here, and the app
+        // says so.
         if sleep.is_some_and(|sleep| sleep.park) {
             super::unpark(state, &workspace.id);
         }

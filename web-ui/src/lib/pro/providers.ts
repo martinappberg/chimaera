@@ -168,6 +168,14 @@ export function olderCloudSignIn(connection: CloudProviderConnection | null | un
   return connection?.phase === "waiting" && connection.action?.type === OLDER_CLOUD_METHOD;
 }
 
+/** The cloud is installing the agent before its sign-in (a first Connect on
+ * a cloud without it): the daemon runs that install in a session of its own
+ * while the attempt is still `preparing`. The row says so, since it is the
+ * one wait that takes a while. */
+export function installingAgent(connection: CloudProviderConnection | null | undefined): boolean {
+  return connection?.phase === "preparing" && connection.action?.type === OLDER_CLOUD_METHOD;
+}
+
 /** The providers still waiting for the cloud's update after a Connect found
  * an older cloud: each stays until fresh catalog rows offer it a guided
  * sign-in (the one-time code), and only then does Connect come back. */

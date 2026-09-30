@@ -412,11 +412,15 @@ here, in scope and not kept on this computer; a valid lease; not parked). On
 workspace_ids}`: the same flush, with three differences. Only the listed
 projects move (≤128 valid ids, all of them regardless of the time left; a
 listed one that is not flushable is reported in `failed` as `unavailable`).
-The computer stays awake, so a flush that cannot hand over skips the
-sleep-only `release_pending` branch and recovers at once (AwaitingVerification,
-then renew and resume here). And each flushed project is **parked**
+The computer stays awake, but the user chose the cloud: a flush whose copy is
+published and whose release the account could not confirm in time takes the
+same `release_pending` branch as sleep (it answers handed over, stays parked,
+and the cloud continues from that copy once the lease lapses, as after a lost
+connection); only a flush whose copy never published recovers at once
+(`unpark`, AwaitingVerification, then renew and resume here), and the app says
+so. And each flushed project is **parked**
 (`ProState.parked`, persisted as a sorted `parked` list in `state.json`) from
-the moment its flush starts until the flush fails (`unpark`), the app returns
+the moment its flush starts until such a flush fails (`unpark`), the app returns
 (`/pro/wake` clears every park; the app posts it at launch when a row says
 `parked`) or the account signs out. While parked, on a device the lease loop
 neither renews nor acquires the project (`reconcile_generation`; a flush still
