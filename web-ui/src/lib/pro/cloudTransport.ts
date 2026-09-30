@@ -51,15 +51,11 @@ export async function cloudRequest(request: CloudSetupRequest, signal?: AbortSig
     case "provider_submit": path = `/pro/cloud/connections/${encodeURIComponent(request.connection_id)}/input`; method = "POST"; body = { code: request.code }; break;
     case "provider_cancel": path = `/pro/cloud/connections/${encodeURIComponent(request.connection_id)}/cancel`; method = "POST"; body = {}; break;
     case "resume_handoff": path = "/pro/hydrate"; method = "POST"; body = { workspace_id: request.workspace_id, expected_epoch: request.expected_epoch, requires_fork: false }; break;
-    case "open_provider_terminal": {
-      const result = await cloudRequest({ operation: "provider_connection", connection_id: request.connection_id }, signal);
-      const action = result.connection?.action;
-      if (action?.type !== "terminal") throw new Error("The sign-in terminal is no longer available.");
-      window.dispatchEvent(new CustomEvent("chimaera:provider-terminal", { detail: { workspaceId: action.workspace_id, sessionId: action.session_id } }));
-      return result;
-    }
     case "open_provider_browser": throw new Error("Use the provider's secure sign-in link.");
     case "project": path = "/pro/cloud/project"; method = "POST"; body = request; break;
+    // Anything else (an older page's request to open a window on the cloud,
+    // say) never reaches it: the cloud's own page never opens from here.
+    default: throw new Error("This cloud operation isn't available.");
   }
   const headers: Record<string, string> = {};
   if (method !== "GET" || request.operation === "start") headers["X-Chimaera-Wake"] = "interaction";

@@ -281,6 +281,14 @@ impl Pro {
         lock(&self.device_aliases).contains(alias)
     }
 
+    /// Whether `alias` is the account's cloud as the keeper lists it. The app
+    /// never opens a window on it (`tunnel::app_host`).
+    pub fn is_cloud(&self, alias: &str) -> bool {
+        lock(&self.hosts)
+            .values()
+            .any(|host| host.alias == alias && !super::tunnel::app_host(&host.kind))
+    }
+
     fn remember_device(&self, host: &Host) {
         if host.kind != HostKind::Ssh {
             let mut devices = lock(&self.device_aliases);

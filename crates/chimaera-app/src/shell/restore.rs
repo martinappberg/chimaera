@@ -272,6 +272,20 @@ fn open_shell_window(
     record: &WindowRecord,
     window_scope: WindowScope,
 ) -> tauri::Result<()> {
+    // Every window opens here. None shows the account's cloud's own page:
+    // where work runs is never the user's choice, and the cloud is not a
+    // machine to manage. Connects to it are refused too (`connect.rs`).
+    if let Some(alias) = record.alias.as_deref() {
+        if app
+            .try_state::<Shell>()
+            .is_some_and(|shell| shell.pro.is_cloud(alias))
+        {
+            tracing::info!(
+                "not opening a window on {alias}: the app never opens the cloud's own page"
+            );
+            return Err(anyhow::anyhow!("the cloud's own page never opens in the app").into());
+        }
+    }
     let url: tauri::Url = url.parse().expect("daemon url is always valid");
     let port = url
         .port()

@@ -5,7 +5,7 @@
   import { cloudAction, cloudRequest, peekCatalog } from "./cloudTransport";
   import { rememberCatalog } from "./catalogMemory";
   import { CHECKING_AFTER_MS, cloudAsleep } from "./presentation";
-  import { agentsConnected, canDisconnect, canStartConnection, connectingLabel, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, nextReadyHandoff, panelRows, pendingConnection, providerLabel, providerLoginUrl, providersReady, providerStateLabel, recoverDisconnect, sameConnection } from "./providers";
+  import { agentsConnected, awaitingCloudUpdate, canDisconnect, canStartConnection, cloudUpdateLine, connectingLabel, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, nextReadyHandoff, olderCloudSignIn, panelRows, pendingConnection, providerLabel, providerLoginUrl, providersReady, providerStateLabel, recoverDisconnect, sameConnection, stillAwaitingUpdate } from "./providers";
 
   let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady, onReadiness, onAgents, compact = false, live = true, remembered = null }: {
     visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void; onReadiness?: (ready: boolean | null) => void;
@@ -49,6 +49,13 @@
   let copied = $state(false);
   let authorizationCode = $state("");
   let expanded = $state(false);
+  /** Providers whose Connect an older cloud answered with a sign-in the app
+   * never opens: their rows wait for the cloud's update until a fresh
+   * catalog offers the one-time code (`stillAwaitingUpdate`). */
+  let pressedUpdate = $state<string[]>([]);
+  /** Repository connections stay open or closed across the sign-in guide,
+   * which replaces the rows while it shows. */
+  let repositoriesOpen = $state(false);
   let pollingPaused = $state(false);
   let attemptedHandoffs = $state<string[]>([]);
   let resumeFailures = $state<Record<string, string>>({});
@@ -91,11 +98,14 @@
   const canStart = $derived(busy === null && !catalogDisconnectBusy && !pendingConnection(connection) && (catalogFresh || fromMemory || asleep));
   const canManage = $derived(busy === null && !catalogDisconnectBusy && canStartConnection(connection, catalogFresh));
   const confirmedSuccess = $derived(connectionSuccessCurrent(connection, providers, catalogFresh));
-  const detailsNeeded = $derived(required.length > 0 || handoffs.length > 0 || connection !== null || operationError !== null || known && (!shownReady || error !== null));
+  const detailsNeeded = $derived(required.length > 0 || handoffs.length > 0 || connection !== null || pressedUpdate.length > 0 || operationError !== null || known && (!shownReady || error !== null));
   const showDetails = $derived(!compact || expanded || detailsNeeded);
   /** A live answer still out: the first read of a cloud that answers, or a
    * look while it is idle. An idle answer ends it; a press speaks for itself. */
   const awaiting = $derived(visible && busy === null && error === null && !asleep && !liveAnswered && (live || catalogFlight));
+  /** Rows waiting for the cloud's update instead of offering Connect: a
+   * Connect found an older cloud, or a read offers only its older sign-in. */
+  const updating = $derived(new Set([...pressedUpdate, ...providers.filter(awaitingCloudUpdate).map(p => p.id)]));
   const connectionId = $derived(connection?.id ?? null);
   const connectionExpires = $derived(connection?.expires_at ?? null);
   const connectingName = $derived(rows.find(p => p.id === (requestingDisconnect ? busy : connection?.provider_id))?.label ?? "your agent");
@@ -161,6 +171,8 @@
       loaded = true;
       asleep = false;
       if (current) { liveAnswered = true; rememberCatalog(providers); }
+      // Connect comes back only once the cloud offers the one-time code.
+      if (current && pressedUpdate.length) pressedUpdate = stillAwaitingUpdate(pressedUpdate, providers);
       error = current ? null : "We couldn't check your agent sign-ins yet. We'll try again shortly.";
     } catch (cause) {
       if (alive && !signal?.aborted && visibility === visibilityGeneration) {
@@ -185,6 +197,7 @@
       if (!alive || signal?.aborted || operation !== mutation || connection?.id !== id) return;
       if (!sameConnection(connection, result.connection)) throw new Error("invalid connection");
       if (!result.connection) return;
+      if (olderCloudSignIn(result.connection)) { awaitUpdate(result.connection); return; }
       connection = result.connection;
       connectionNotice = null;
       if (!pendingConnection(connection)) { current = false; void load(); }
@@ -233,6 +246,7 @@
         : { operation: "provider_connect", provider_id: providerId }, () => alive && request === mutation);
       if (!alive || request !== mutation || result === null) return;
       if (!result.connection || result.connection.provider_id !== providerId || (result.connection.operation ?? "connect") !== operation) throw new Error("invalid connection");
+      if (olderCloudSignIn(result.connection)) { awaitUpdate(result.connection); return; }
       connection = result.connection;
       pollingPaused = false;
       if (!pendingConnection(connection)) { current = false; await load(); }
@@ -250,6 +264,16 @@
         current = false; void load();
       }
     } finally { if (alive && request === mutation) { busy = null; requestingDisconnect = false; } }
+  }
+  /** An older cloud answered Connect with a sign-in the app never opens (the
+   * cloud's own page never shows here). That attempt ends quietly, and the
+   * row says the cloud is being updated, with Try again. */
+  function awaitUpdate(attempt: CloudProviderConnection): void {
+    if (!pressedUpdate.includes(attempt.provider_id)) pressedUpdate = [...pressedUpdate, attempt.provider_id];
+    if (rows.some(p => p.id === attempt.provider_id && p.category === "repository")) repositoriesOpen = true;
+    connection = null;
+    connectionNotice = null;
+    void cloudRequest({ operation: "provider_cancel", connection_id: attempt.id }).catch(() => { /* It expires on its own. */ });
   }
   async function requestDisconnect(provider: CloudProviderStatus, trigger?: HTMLElement): Promise<void> {
     if (!canManage || !canDisconnect(provider)) return;
@@ -277,12 +301,12 @@
     } catch { if (alive && request === mutation) connectionNotice = "Cancellation couldn't be confirmed. Check sign-in status before starting again."; }
     finally { if (alive && request === mutation) busy = null; }
   }
-  async function openSignIn(terminal = false): Promise<void> {
+  async function openSignIn(): Promise<void> {
     if (!connection || disconnecting || busy !== null) return;
     const request = ++mutation;
     busy = "open"; connectionNotice = null;
-    try { await cloudRequest({ operation: terminal ? "open_provider_terminal" : "open_provider_browser", connection_id: connection.id }); }
-    catch { if (alive && request === mutation) connectionNotice = terminal ? "The sign-in window couldn't open. Try again shortly." : "Your browser couldn't open. Try again shortly."; }
+    try { await cloudRequest({ operation: "open_provider_browser", connection_id: connection.id }); }
+    catch { if (alive && request === mutation) connectionNotice = "Your browser couldn't open. Try again shortly."; }
     finally { if (alive && request === mutation) busy = null; }
   }
   async function submitCode(): Promise<void> {
@@ -353,11 +377,13 @@
   {#if known && current && agents.length === 0}<p class="muted">No cloud agent connections are available yet.</p>{/if}
   {#if !waiting && !requestingDisconnect}<div class="provider-cards">
     {#each agents as provider (provider.id)}
+      {@const waitsForUpdate = provider.state !== "signed_in" && updating.has(provider.id)}
       <article class="provider-card" class:connected={settled && provider.state === "signed_in"}>
         <div class="provider-title"><h3>{provider.label}</h3>{#if required.includes(provider.id)}<span class="required">Needed for this project</span>{/if}</div>
         {#if !unchecked}<p class="state" class:positive={settled && provider.state === "signed_in"}>{!settled && provider.state === "signed_in" ? "Previously connected · checking status" : providerStateLabel(provider)}</p>{/if}
-        <p class="provider-note">{unchecked ? "Connect the account you already use for this agent." : provider.state === "signed_in" ? "Signed in for cloud work." : provider.state === "unknown" ? "Check the connection, or sign in again if needed." : provider.state === "unavailable" ? "This connection isn't available for cloud work yet." : "Connect the account you already use for this agent."}</p>
-        <div class="provider-actions">{#if provider.state !== "signed_in"}<button class="button" disabled={!canStart || !unchecked && provider.methods.length === 0 || provider.state === "unavailable"} onclick={() => void connect(provider.id)}>{busy === provider.id ? connectingLabel(provider) : `Connect ${provider.label}`}</button>{/if}{#if canDisconnect(provider)}<button class="text-button" disabled={!canManage} onclick={(event) => void requestDisconnect(provider, event.currentTarget)}>Disconnect {provider.label}</button>{:else if provider.state === "signed_in"}<span class="connected-label">{settled ? "Connected" : "Check connection to confirm"}</span>{/if}</div>
+        <p class="provider-note" role={waitsForUpdate ? "status" : undefined}>{waitsForUpdate ? cloudUpdateLine(provider.label) : unchecked ? "Connect the account you already use for this agent." : provider.state === "signed_in" ? "Signed in for cloud work." : provider.state === "unknown" ? "Check the connection, or sign in again if needed." : provider.state === "unavailable" ? "This connection isn't available for cloud work yet." : "Connect the account you already use for this agent."}</p>
+        <!-- Try again only looks (a passive catalog read, never a wake). -->
+        <div class="provider-actions">{#if waitsForUpdate}<button class="button secondary" disabled={catalogFlight} onclick={() => void load()}>{catalogFlight ? "Checking…" : "Try again"}</button>{:else if provider.state !== "signed_in"}<button class="button" disabled={!canStart || !unchecked && provider.methods.length === 0 || provider.state === "unavailable"} onclick={() => void connect(provider.id)}>{busy === provider.id ? connectingLabel(provider) : `Connect ${provider.label}`}</button>{/if}{#if canDisconnect(provider)}<button class="text-button" disabled={!canManage} onclick={(event) => void requestDisconnect(provider, event.currentTarget)}>Disconnect {provider.label}</button>{:else if provider.state === "signed_in"}<span class="connected-label">{settled ? "Connected" : "Check connection to confirm"}</span>{/if}</div>
       </article>
     {/each}
   </div>
@@ -407,9 +433,6 @@
             <p class="muted small">The code goes directly to {connectingName}'s sign-in. It isn't saved in Chimaera.</p>
           </form>
         {/if}
-      {:else if action?.type === "terminal"}
-        <!-- Only an older cloud still asks for this (its GitHub sign-in); current ones show a code above. -->
-        <p class="muted">{connectingName} finishes sign-in in a separate window. Open the sign-in window, then come back here. We'll confirm the connection for you.</p><button class="button" disabled={busy !== null} onclick={() => void openSignIn(true)}>Open sign-in window</button>
       {:else}<p class="muted">Preparing sign-in in your cloud. This may take a moment.</p>{/if}
       {#if waiting}<div class="connection-actions">{#if pollingPaused || connectionNotice}<button class="text-button" disabled={connectionFlight || busy !== null} onclick={() => void checkConnection()}>Check sign-in status</button>{/if}<button class="text-button" disabled={busy !== null} onclick={() => void cancel()}>{busy === "cancel" ? "Canceling…" : "Cancel sign-in"}</button></div>{/if}
       {#if pollingPaused && waiting}<p class="muted small" role="status">Automatic checks have paused after this request's time limit. Check its status or cancel before trying again.</p>{/if}
@@ -422,7 +445,7 @@
   {#each handoffs as handoff (handoff.workspace_id)}
     <div class="handoff"><div><h3>{handoff.name}</h3><p class="muted small" role="status">{resumeFailures[handoffKey(handoff)] ?? (current && providersReady(providers, handoff.blocked_providers.map(p => p.id)) ? "Continuing your project…" : "Waiting for an agent connection for cloud work.")}</p></div>{#if resumeFailures[handoffKey(handoff)]}<button class="button" disabled={busy !== null || !nextReadyHandoff(providers, [handoff], [], current)} onclick={() => void resume(handoff, handoff.workspace_id === workspaceId)}>Try again</button>{:else if !current || !providersReady(providers, handoff.blocked_providers.map(p => p.id))}<button class="button secondary" onclick={() => (focusedHandoff = handoff)}>Connect required agents</button>{/if}</div>
   {/each}
-  {#if !waiting && !requestingDisconnect && repositories.length && required.length === 0}<details class="optional"><summary>Repository connections <span>Optional</span></summary><p class="muted small">Lets your cloud pull and push your repositories, including private ones.</p>{#each repositories as provider (provider.id)}<div class="repository"><div><h3>{provider.label}</h3>{#if !unchecked}<p class="muted small">{providerStateLabel(provider)}</p>{/if}<p class="muted small repository-use">{settled && provider.state === "signed_in" ? "Your cloud can pull and push your repositories." : `Connect to pull and push your ${provider.label} repositories from your cloud.`}</p></div><div class="provider-actions">{#if provider.state !== "signed_in"}<button class="button secondary" disabled={!canStart || !unchecked && provider.methods.length === 0 || provider.state === "unavailable"} onclick={() => void connect(provider.id)}>{busy === provider.id ? connectingLabel(provider) : `Connect ${provider.label}`}</button>{/if}{#if canDisconnect(provider)}<button class="text-button" disabled={!canManage} onclick={(event) => void requestDisconnect(provider, event.currentTarget)}>Disconnect {provider.label}</button>{/if}</div></div>{/each}</details>{/if}
+  {#if !waiting && !requestingDisconnect && repositories.length && required.length === 0}<details class="optional" bind:open={repositoriesOpen}><summary>Repository connections <span>Optional</span></summary><p class="muted small">Lets your cloud pull and push your repositories, including private ones.</p>{#each repositories as provider (provider.id)}{@const waitsForUpdate = provider.state !== "signed_in" && updating.has(provider.id)}<div class="repository"><div><h3>{provider.label}</h3>{#if !unchecked}<p class="muted small">{providerStateLabel(provider)}</p>{/if}<p class="muted small repository-use" role={waitsForUpdate ? "status" : undefined}>{waitsForUpdate ? cloudUpdateLine(provider.label) : settled && provider.state === "signed_in" ? "Your cloud can pull and push your repositories." : `Connect to pull and push your ${provider.label} repositories from your cloud.`}</p></div><div class="provider-actions">{#if waitsForUpdate}<button class="button secondary" disabled={catalogFlight} onclick={() => void load()}>{catalogFlight ? "Checking…" : "Try again"}</button>{:else if provider.state !== "signed_in"}<button class="button secondary" disabled={!canStart || !unchecked && provider.methods.length === 0 || provider.state === "unavailable"} onclick={() => void connect(provider.id)}>{busy === provider.id ? connectingLabel(provider) : `Connect ${provider.label}`}</button>{/if}{#if canDisconnect(provider)}<button class="text-button" disabled={!canManage} onclick={(event) => void requestDisconnect(provider, event.currentTarget)}>Disconnect {provider.label}</button>{/if}</div></div>{/each}</details>{/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if operationError}<p class="error" role="alert">{operationError}</p>{/if}
   {/if}
