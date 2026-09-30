@@ -25,6 +25,8 @@ mod commands;
 mod connect;
 mod drag;
 pub(crate) mod notices;
+#[cfg(target_os = "macos")]
+mod print_frame;
 mod restore;
 mod unsaved;
 

@@ -338,13 +338,21 @@ fn open_shell_window(
         // execute a native command.
         lock(&shell.windows).insert(label.clone(), window_scope);
     }
-    if let Err(error) = builder.build() {
-        if let Some(shell) = app.try_state::<Shell>() {
-            lock(&shell.allowed_daemon_ports).remove(&label);
-            lock(&shell.windows).remove(&label);
+    let window = match builder.build() {
+        Ok(window) => window,
+        Err(error) => {
+            if let Some(shell) = app.try_state::<Shell>() {
+                lock(&shell.allowed_daemon_ports).remove(&label);
+                lock(&shell.windows).remove(&label);
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
+    // The slides' and documents' print buttons call `print()` in a frame.
+    #[cfg(target_os = "macos")]
+    super::print_frame::install(&window);
+    #[cfg(not(target_os = "macos"))]
+    let _ = window;
     // Persist the new window so the next launch reopens it. Startup manages
     // Shell before opening any window, so every daemon window registered
     // above has an authoritative scope before its first native command.

@@ -539,7 +539,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
     after a heading or inside a figure, fence, alert, diagram, table row or list item, table
     headers repeated, long code lines wrapped, colors kept (a done task's box, an alert's
     tint). In the native app (WKWebView) the dialog is the system print panel; PDF is under
-    its PDF menu.
+    its PDF menu. WKWebView drops a frame's `print()` unless its host answers it, so the macOS
+    app does (`crates/chimaera-app/src/shell/print_frame.rs`) — the slides view prints the same way.
   - **Export bundle (.zip)** — the document as saved (unsaved edits aren't in it; the note
     says so) plus every local file it links or embeds — links, images, reference
     definitions, wikilinks, raw HTML `src`/`href` (`doc/publish.ts` `docTargets`) — resolved
@@ -739,7 +740,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   foreignObject scaling bug). Arrows / PageUp / PageDown / Space / Home / End page the deck, a
   thumbnail strip jumps, **present** goes full screen (or covers the window where a webview
   refuses), **print** opens the browser's dialog with one slide per page (save as PDF there),
-  `#slide=N` reveals a slide, and a disk change re-renders in place keeping the slide. Decks
+  `#slide=N` reveals a slide, and a disk change re-renders in place keeping the slide. Print
+  overrides Marp's own print rules (their 100vw × 100vh slides collapse in WebKit's hidden print
+  frame and the PDF comes out blank); where the engine ignores `@page` size (WebKit: Safari and
+  the macOS app print on the panel's paper) each slide is scaled by transform to 900px so a whole
+  slide fits any common paper, Chromium keeps one page per slide at the slide's own size. Decks
   over 2 MB of source are refused. The bundle stubs MathJax and the uncommon highlight.js
   grammars (see `vite.config.ts`), so the chunk is ~730 KB (226 KB gzipped), loaded only by
   a deck.
