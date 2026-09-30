@@ -1413,6 +1413,11 @@ async fn hydrate_scoped(
     );
     current()?;
     execution::accept(state, config, &grant, generation, request_start)?;
+    // A project taken here (a return, an adoption, a reopened folder) is this
+    // device's from now on: bind it to the account at once, as reconcile does
+    // after its own acquire, so the cloud-project listing can match the folder
+    // immediately instead of after the next renewal.
+    super::projects::bind_workspace_account(state, config, workspace)?;
     install_epoch.store(grant.epoch, Ordering::Release);
     if config.role == Role::Device {
         let mut returned = lock(&state.pro.returned);
