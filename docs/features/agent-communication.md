@@ -63,7 +63,9 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
   - **An idle chat:** the wake policy decides (below).
 - **Key behaviors.** What the agent reads: a header line
   `[message #12 from "loader refactor" (s-1a2b, claude) to you, re #10 — information … Reply
-  with message_agent to s-1a2b, reply_to 12.]`, then the body quoted (`> `); the Mastermind's
+  with chimaera's message_agent tool (mcp__chimaera__message_agent — not SendMessage) to s-1a2b,
+  reply_to 12.]`, then the body quoted (`> `) — the reply instruction names the exact tool
+  because a live haiku otherwise answered with Claude Code's own `SendMessage`; the Mastermind's
   header says it is direction and its body is unquoted (a line posing as a header is
   escaped). Every delivery path claims its messages atomically (claude fires parallel hooks
   for parallel tool calls; a message is carried once). Up to 5 messages / 8 KB per hook
