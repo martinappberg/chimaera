@@ -129,6 +129,11 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          # One cache per target. rust-cache keys on the job name, not the
+          # matrix, so without this both legs share one entry: whichever
+          # saves first wins, and the other leg restores it and recompiles
+          # its whole target dependency tree (wasmtime, cranelift, tokio).
+          key: ${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo install cargo-zigbuild
       - run: cargo zigbuild --release --target ${{ matrix.target }} -p chimaera

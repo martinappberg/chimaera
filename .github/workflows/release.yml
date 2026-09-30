@@ -139,9 +139,9 @@ jobs:
           cache-dependency-path: |
             crates/chimaera-app/package-lock.json
             web-ui/package-lock.json
-      - run: |
-          npm ci
-          npm run build
+      - run: npm ci
+        working-directory: web-ui
+      - run: npm run build
         working-directory: web-ui
       - run: rustup show
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
