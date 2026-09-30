@@ -165,6 +165,16 @@ in one run of about 22 minutes with production timings:
    edited on both sides.
 9. The private project never reaches the account; signing out leaves the local
    chat and shell running.
+10. A second daemon reopening the same folder gets the same project and takes
+    it (with it the home).
+11. Acting brings the work to you: a message sent on another computer while
+    the first is mid-turn is held there, the first finishes its turn and hands
+    over, and the message runs once on the other computer (same conversation,
+    no fork); typing into that computer's terminal from the first brings the
+    work back the same way.
+12. The cloud asleep with the project and a computer online on power: a phone
+    read wakes nothing, and a phone send brings the work to the computer,
+    which answers it, while the cloud machine stays asleep.
 
 Its last run on this branch is recorded in the PR. Passing it is the bar for
 "the flow works"; unit and integration tests alone are not.
@@ -207,6 +217,13 @@ Known intermittent tests under a loaded full run (they pass alone):
 
 - A failed return cannot yet restore the pre-install state (needs a staged
   install); it retries with a short backoff instead.
+- Acting brings the work to you (`pro/moves.rs`): a plain terminal is never
+  stopped by a handover, so after a move between two computers the old one
+  keeps its shell running while the new one opens a fresh one under the same
+  session id. In a browser view the send that
+  starts a move is not queued (the composer keeps it, as for a wake); a
+  second send while "Bringing the work to your computer…" is held and
+  delivered once.
 - Codex rollout lookups use the daemon's `CODEX_HOME`, not the login shell's.
 - A routed project's conversations notify on the viewing computer only while a
   window has that project open (the relay rides a window's events feed); its

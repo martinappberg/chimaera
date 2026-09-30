@@ -569,3 +569,55 @@ async fn racing_resumes_start_a_deferred_session_once() {
         .stopping
         .store(true, std::sync::atomic::Ordering::Release);
 }
+
+/// A conversation resumed here that has not run a turn yet (claude reports
+/// its native id only with its first turn) keeps the id it was resumed from
+/// in the ledger, so it can move on to another machine (the export finds its
+/// transcript) and survive a restart with its history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resumed_chat_keeps_its_conversation_before_its_first_turn() {
+    let state = test_state();
+    let root = std::fs::canonicalize(test_dir("ledger-resumed-tip-root")).unwrap();
+    let workspace = lock(&state.workspaces).add(root.clone()).unwrap();
+    preset_agent(
+        &state,
+        agents::AgentKind::Claude,
+        Ok(write_fake_claude("ledger-resumed-tip-fake")),
+        Some("9.9.9-fake"),
+    );
+    let native = "3f1c2b8e-0000-4000-8000-000000000001";
+    let store = state
+        .claude_projects_dir
+        .join(crate::launcher::encode_cwd(&root));
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join(format!("{native}.jsonl")),
+        format!("{{\"type\":\"user\",\"sessionId\":\"{native}\",\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n"),
+    )
+    .unwrap();
+    let mut entry = returned_chat("s-tip", &workspace.id, &root);
+    entry.agent.as_mut().unwrap().resume = Some(native.to_string());
+    ledger::defer(&state, entry).unwrap();
+    ledger::resume_deferred_workspace(&state, &workspace.id)
+        .await
+        .unwrap();
+    wait_resumed(&state, "s-tip").await;
+    assert!(
+        state
+            .chat
+            .get("s-tip")
+            .is_some_and(|chat| chat.native_session_id.is_none()),
+        "no turn ran, so the agent has not reported its id"
+    );
+    let (entries, _) = ledger::snapshot(&state);
+    let agent = entries
+        .iter()
+        .find(|entry| entry.id == "s-tip")
+        .and_then(|entry| entry.agent.clone())
+        .expect("the resumed chat is in the ledger");
+    assert_eq!(agent.resume.as_deref(), Some(native));
+    state.chat.kill("s-tip");
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
+}

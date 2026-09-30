@@ -278,7 +278,9 @@ async fn chat_command(
 }
 
 /// Why a session with no process here is not an exit. `Moved`: it continues on
-/// another machine (`to` is where it is going, in the viewer's words).
+/// another machine (`to` is where it is going, in the viewer's words;
+/// `"other"` is another of the user's computers, sent as `to:"computer"` with
+/// the additive `other:true`).
 /// `Paused`: it stays here and resumes on its own — after this daemon restarts
 /// (`restarting`), once its agent is signed in on this cloud machine
 /// (`needs_provider`), while its transfer finishes opening it (`importing`), or
@@ -297,6 +299,7 @@ pub(crate) enum Pause {
 impl Pause {
     pub(crate) fn frame(&self) -> serde_json::Value {
         match self {
+            Pause::Moved("other") => json!({"type":"moved","to":"computer","other":true}),
             Pause::Moved(to) => json!({"type":"moved","to":to}),
             Pause::Paused { reason, provider } => {
                 let mut frame = json!({"type":"paused","reason":reason});
@@ -314,6 +317,9 @@ impl Pause {
 struct PauseFacts {
     /// This daemon is a cloud machine (its sessions move to "your computer").
     worker: bool,
+    /// The project's work left this computer for another of the user's
+    /// computers (acting there brought it there), not for the cloud.
+    other: bool,
     /// A transfer holds this session's lifecycle right now: the source is
     /// exporting it, or the destination is opening it.
     transfer: bool,
@@ -353,7 +359,13 @@ struct EntryFacts {
 /// [`ProState`](crate::pro) exposing the ownership phase would settle both
 /// without that inference.
 fn classify_pause(facts: &PauseFacts, ran_here: impl FnOnce() -> bool) -> Option<Pause> {
-    let away = if facts.worker { "computer" } else { "cloud" };
+    let away = if facts.worker {
+        "computer"
+    } else if facts.other {
+        "other"
+    } else {
+        "cloud"
+    };
     let Some(entry) = &facts.entry else {
         // Opening a transfer before its entry is recorded: say so rather than
         // "unknown session", which a client gives up on after a few retries.
@@ -449,6 +461,10 @@ pub(crate) fn pause_for(
 ) -> Option<Pause> {
     let facts = PauseFacts {
         worker: crate::pro::is_worker(state),
+        other: crate::lock(&state.session_workspaces)
+            .get(id)
+            .or(entry.map(|entry| &entry.workspace_id))
+            .is_some_and(|workspace| crate::pro::other_computer(state, workspace)),
         transfer: crate::lock(&state.chat_switching)
             .get(id)
             .map(String::as_str)
@@ -465,6 +481,78 @@ pub(crate) fn pause_for(
 
 fn pause_frame(state: &AppState, id: &str) -> Option<serde_json::Value> {
     pause_state(state, id).map(|pause| pause.frame())
+}
+
+/// This computer's own user acted in session `id` (a chat command or typing
+/// on this daemon's unscoped socket): see `pro::acted_here`.
+fn acted_here(state: &AppState, id: &str) {
+    let workspace = crate::lock(&state.session_workspaces).get(id).cloned();
+    if let Some(workspace) = workspace {
+        crate::pro::acted_here(state, &workspace);
+    }
+}
+
+/// Delivers, once, input a viewer relay held while it brought the work to this
+/// computer (`session_proxy`): the chat commands and typing the user sent
+/// before the session ran here. Each goes through the same checks as input on
+/// this daemon's own socket. `Err` when the session cannot take it (nothing
+/// was delivered for that frame).
+pub(crate) async fn deliver_held(
+    state: &Arc<AppState>,
+    id: &str,
+    chat: bool,
+    frame: axum::extract::ws::Message,
+) -> anyhow::Result<()> {
+    // The resumed session may need a moment to come up after its project
+    // arrived; the relay is still holding the input meanwhile.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !(if chat {
+        state.chat.get(id).is_some_and(|chat| chat.alive)
+    } else {
+        state.sessions.get(id).is_some_and(|session| session.alive)
+    }) {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the session did not start here"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::ensure!(session_writable(state, id), "the project is not here");
+    match (chat, frame) {
+        (true, Message::Text(text)) => {
+            let mut command = serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text)?;
+            command.validate_ingress()?;
+            let saved = crate::upload::save_send_images(state, id, &mut command).await;
+            let interaction = crate::activity::is_interaction(&command);
+            if let Err(error) = chat_command(state, id, command, None).await {
+                crate::upload::discard_saved_images(saved);
+                return Err(error);
+            }
+            if interaction {
+                crate::activity::record(state, id);
+                acted_here(state, id);
+            }
+            Ok(())
+        }
+        (false, Message::Binary(bytes)) => {
+            let attachment = state.sessions.attach_quiet(id)?;
+            for chunk in bytes.chunks(TERMINAL_INPUT_CHUNK) {
+                terminal_input(
+                    state,
+                    id,
+                    &attachment.input,
+                    Bytes::copy_from_slice(chunk),
+                    None,
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!("terminal input failed: {error}"))?;
+            }
+            crate::activity::record(state, id);
+            acted_here(state, id);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The `type` of a chat command frame (`send`, `interrupt`, `permission`…),
@@ -500,8 +588,14 @@ fn refusal(state: &AppState, id: &str, watching: bool) -> serde_json::Value {
         json!({"type":"error","code":"read_only","reason":"watching","owner":owner,
                "message":"You're watching. Take control to type."})
     } else {
+        let workspace = crate::lock(&state.session_workspaces)
+            .get(id)
+            .cloned()
+            .unwrap_or_default();
         let place = if owner == "cloud" {
             "in the cloud"
+        } else if crate::pro::other_computer(state, &workspace) {
+            "on your other computer"
         } else {
             "on your computer"
         };
@@ -911,7 +1005,13 @@ async fn handle(
                             let _ = send_ordered_json(&mut socket, &mut batch, &gone).await;
                             return;
                         }
-                        if !interacted { crate::activity::record(&state, &id); interacted = true; }
+                        if !interacted {
+                            crate::activity::record(&state, &id);
+                            // This computer's own user typed (not a forwarded
+                            // viewer): the last actor keeps the work here.
+                            if scope.is_none() { acted_here(&state, &id); }
+                            interacted = true;
+                        }
                     }
                 }
                 Some(Ok(Message::Text(text))) => {
@@ -1360,6 +1460,9 @@ async fn handle_chat(
                                 .await;
                             } else if interaction {
                                 crate::activity::record(&state, &id);
+                                if scope.is_none() {
+                                    acted_here(&state, &id);
+                                }
                             }
                         }
                         Err(err) => {
@@ -2327,6 +2430,40 @@ mod tests {
             reason,
             provider: None,
         })
+    }
+
+    #[test]
+    fn work_that_left_for_another_computer_says_so() {
+        // Acting on another of the user's computers brought the work there:
+        // this computer's own views say it continues on the other computer
+        // (older clients read `to:"computer"`), never "in the cloud".
+        let left = |transfer, writable| PauseFacts {
+            other: true,
+            transfer,
+            entry: Some(EntryFacts {
+                writable,
+                provider: Some("claude".into()),
+                ..EntryFacts::default()
+            }),
+            ..PauseFacts::default()
+        };
+        for (transfer, writable) in [(true, true), (false, false)] {
+            let pause = classify_pause(&left(transfer, writable), || true);
+            assert_eq!(pause, Some(Pause::Moved("other")));
+            assert_eq!(
+                pause.unwrap().frame(),
+                json!({"type":"moved","to":"computer","other":true})
+            );
+        }
+        // A cloud machine's other owner is always the user's computer.
+        let worker = PauseFacts {
+            worker: true,
+            ..left(true, true)
+        };
+        assert_eq!(
+            classify_pause(&worker, || true),
+            Some(Pause::Moved("computer"))
+        );
     }
 
     #[test]

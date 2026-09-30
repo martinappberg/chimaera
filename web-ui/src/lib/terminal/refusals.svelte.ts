@@ -28,6 +28,11 @@ export function refusalText(reason: string | null, message: string | null, where
       return "Your project is reconnecting. That input was not sent.";
     case "waking":
       return "Waking the cloud machine… That input was not sent.";
+    // The daemon's own plain words name where the work is going.
+    case "bringing":
+      return message ?? "Bringing the work here… That input was not sent.";
+    case "still_working":
+      return "Your other computer is still working on this. Try again when it pauses.";
     case "elsewhere":
       return runningElsewhere(where);
     default:
@@ -39,6 +44,8 @@ export function refusalText(reason: string | null, message: string | null, where
  *  typing, so it says what comes first. */
 export function statusText(status: TerminalStatus, watching = false): string {
   if (status === "waking") return "Waking the cloud machine…";
+  if (status === "bringing") return "Bringing the work here…";
+  if (status === "bringing-computer") return "Bringing the work to your computer…";
   return watching ? "Asleep in the cloud. Take control, then press a key to wake it." : "Asleep in the cloud. Press a key to wake it.";
 }
 

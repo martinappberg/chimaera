@@ -461,6 +461,17 @@ device host; run it with a dedicated test device.
 [Handoff extension v1](HANDOFF.md) defines the workspace baton and scoped mirror
 credentials. It leaves the Link transport protocol number unchanged.
 
+### Acting brings the work to you
+
+Additive (2026-09-30): `POST|DELETE /v2/baton/{workspace}/move`, the
+`move_to`/`move_requested_at`/`move_reason` fields of ownership answers, the
+passive read's `ready`/`power` query, the `{"type":"bringing","to":"here"|"computer"}`
+socket frame, the `bringing`/`still_working` refusal reasons and the `other`
+flag of `moved`. Clients that ignore them keep today's behavior (the work
+stays where it runs and a send wakes a sleeping cloud machine). The contract is
+in [HANDOFF](HANDOFF.md#acting-brings-the-work-to-you) and
+[VIEWING](VIEWING.md#forwarded-requests).
+
 ### Sleeping worker HTTP transport
 
 A worker's TCP WebSocket carries HTTP/1 with complete framing, keep-alive and

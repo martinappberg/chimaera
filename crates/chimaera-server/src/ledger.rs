@@ -362,6 +362,28 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
         .filter(|c| c.alive)
         .filter_map(|c| Some((c.id.clone(), state.chat.carryover(&c.id)?)))
         .collect();
+    // A chat resumed without a fork reports its native id only once its first
+    // turn runs (`system/init`); until then the conversation's tip is still
+    // the one it was resumed from. Without it, a conversation that arrived
+    // (or restarted) and was not used yet could neither move on to another
+    // machine nor survive another restart with its history. Read before the
+    // state locks below, like `carries`.
+    let resumed: HashMap<String, String> = {
+        let recipes = crate::lock(&state.chat_recipes);
+        chats
+            .iter()
+            .filter(|c| c.native_session_id.is_none())
+            .filter_map(|c| {
+                let recipe = recipes.get(&c.id)?;
+                (recipe.fork_at.is_none()
+                    && !recipe.fork_head
+                    && recipe.rollback_turns.is_none()
+                    && recipe.revert_before_turn.is_none())
+                .then(|| Some((c.id.clone(), recipe.resume.clone()?)))
+                .flatten()
+            })
+            .collect()
+    };
     // Live ids across BOTH surfaces: the theme map is pruned to these, and a
     // session id belongs to at most one surface at a time.
     let live_ids: std::collections::HashSet<String> = infos
@@ -437,6 +459,10 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
             let title = record
                 .map(|r| r.display_name(None))
                 .unwrap_or_else(|| kind.as_str().to_string());
+            let resume = c
+                .native_session_id
+                .clone()
+                .or_else(|| resumed.get(&c.id).cloned());
             Some(LedgerEntry {
                 suspended: false,
                 handoff: None,
@@ -450,12 +476,11 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
                 created_at: c.created_at_ms / 1000,
                 agent: Some(LedgerAgent {
                     kind,
-                    resume: c.native_session_id.clone(),
-                    transcript: record.and_then(|r| r.transcript_path.clone()),
-                    native_cwd: c
-                        .native_session_id
+                    native_cwd: resume
                         .as_deref()
                         .and_then(|id| record.and_then(|r| r.native_cwd_for(id))),
+                    resume,
+                    transcript: record.and_then(|r| r.transcript_path.clone()),
                     title,
                     ui: SessionUi::Chat,
                     model: c.model.clone(),

@@ -118,9 +118,45 @@ it("a refused command keeps the socket and reports the refusal", async () => {
   Socket.all[0].frame({ type: "error", code: "command_failed", message: "not sent", command: "send" });
   Socket.all[0].frame({ type: "error", code: "command_failed", message: "old daemon" });
   await drain();
-  expect(h.onCommandFailed).toHaveBeenCalledWith("not sent", "send");
-  expect(h.onCommandFailed).toHaveBeenCalledWith("old daemon", null);
+  expect(h.onCommandFailed).toHaveBeenCalledWith("not sent", "send", null);
+  expect(h.onCommandFailed).toHaveBeenCalledWith("old daemon", null, null);
   expect(socket.healthy).toBe(true);
+  socket.close();
+});
+
+it("acting brings the work here: the socket says so and a kept refusal names why", async () => {
+  const h = handlers();
+  h.onBringing = vi.fn();
+  const socket = new ChatSocket("s-chat", h);
+  Socket.all[0].onopen?.();
+  Socket.all[0].frame({ type: "bringing", to: "here" });
+  Socket.all[0].frame({ type: "bringing", to: "computer" });
+  Socket.all[0].frame({
+    type: "error",
+    code: "command_failed",
+    reason: "still_working",
+    message: "Your other computer is still working on this. Try again when it pauses.",
+    command: "send",
+  });
+  await drain();
+  expect(h.onBringing).toHaveBeenNthCalledWith(1, "here");
+  expect(h.onBringing).toHaveBeenNthCalledWith(2, "computer");
+  expect(h.onCommandFailed).toHaveBeenCalledWith(
+    "Your other computer is still working on this. Try again when it pauses.",
+    "send",
+    "still_working",
+  );
+  expect(socket.healthy).toBe(true);
+  socket.close();
+});
+
+it("work that went to another of the user's computers says so", async () => {
+  const h = handlers();
+  const socket = new ChatSocket("s-chat", h);
+  Socket.all[0].onopen?.();
+  Socket.all[0].frame({ type: "moved", to: "computer", other: true });
+  await drain();
+  expect(h.onMoved).toHaveBeenCalledWith("other");
   socket.close();
 });
 

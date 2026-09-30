@@ -320,7 +320,16 @@ send with its pictures (`noteSent`) until its user echo and hands it back
 (`restoredDraft` → `insertIntoComposer` + `attachImageToComposer`) only for
 `command:"send"` — never for a refused interrupt/permission answer, which could
 resurrect a delivered message. A send accepted while not live shows at once as
-`store.sending` ("sending…") until its echo. In a browser view, `send()` into a
+`store.sending` ("sending…") until its echo. Acting on a conversation another
+of the user's computers runs brings its work here: the daemon holds the send
+and says `{"type":"bringing","to":"here"}` (a browser view's gateway says
+`to:"computer"` when a phone's send on a sleeping cloud goes to a computer) →
+`store.bringing` ("Bringing the work here…" / "Bringing the work to your
+computer…", the send shown pending); it ends with the next `ready`, a wake, a
+move, or a `command_failed` with `reason:"still_working"` (the other computer
+kept it; the send comes back to the composer). A move to another computer is
+`moved` with `other:true` → `store.moving = "other"` ("Continuing on your
+other computer…"). In a browser view, `send()` into a
 dropped socket reconnects once with `?wake=interaction` and returns false (the
 composer keeps the draft). Socket states that are not errors: `worker_asleep` →
 `store.asleep` ("Asleep in the cloud. Send a message to wake it.", and the

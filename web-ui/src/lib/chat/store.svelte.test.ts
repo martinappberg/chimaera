@@ -2061,6 +2061,35 @@ describe("ChatStore unsent text", () => {
     expect(store.asleep).toBe(false);
   });
 
+  it("bringing the work here holds the send as pending until it arrives or is kept", () => {
+    const store = new ChatStore();
+    store.onReady({ id: "s", agent: "claude", cwd: "/p", created_at_ms: 0, alive: true, exit_status: null, native_session_id: null, model: null, current_mode: null } as never, 0, 0);
+    store.noteSent("carry on here");
+    // Live when sent, so no pending bubble yet; the relay then says it holds it.
+    expect(store.sending).toBeNull();
+    store.onBringing("here");
+    expect(store.bringing).toBe("here");
+    expect(store.sending?.text).toBe("carry on here");
+    // A send while the work is coming is pending too.
+    store.noteSent("and this");
+    expect(store.sending?.text).toBe("and this");
+    // The other computer kept the work: the send comes back, nothing is coming.
+    store.onCommandFailed("Your other computer is still working on this. Try again when it pauses.", "send", "still_working");
+    expect(store.bringing).toBeNull();
+    expect(store.takeRestoredDraft()?.text).toBe("and this");
+    // It survives the socket that closes once the work arrived; the next ready ends it.
+    store.onBringing("computer");
+    store.onDisconnected();
+    expect(store.bringing).toBe("computer");
+    store.onReady({ id: "s", agent: "claude", cwd: "/p", created_at_ms: 0, alive: true, exit_status: null, native_session_id: null, model: null, current_mode: null } as never, 0, 0);
+    expect(store.bringing).toBeNull();
+    // A wake (the phone's computer did not take it) ends it too.
+    store.onBringing("computer");
+    store.onWaking();
+    expect(store.bringing).toBeNull();
+    expect(store.waking).toBe(true);
+  });
+
   it("says so, instead of loading forever, when the owner sleeps before the first replay", () => {
     const store = new ChatStore();
     // A fresh store is loading its transcript; nothing has said the owner sleeps.

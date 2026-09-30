@@ -342,7 +342,10 @@ suspension. It takes the job reservation, stops new periodic passes, refuses new
 handoff/hydrate/sleep/privacy work with 409 `{error:"draining"}`, and answers 200
 `{token}` once every transfer task, sleep flush, project cache (including a Git
 finalizer outliving its caller) and Git helper slot is free and state is synced
-to disk. Past the deadline (default 60 s, at most 600 s) it releases itself and
+to disk. On a cloud machine it first publishes each project it holds under a
+live lease (at most thirty seconds, ten short of the deadline): the copy a
+computer may take the work from while the machine sleeps ([acting brings the
+work to you](#acting-brings-the-work-to-you)). Past the deadline (default 60 s, at most 600 s) it releases itself and
 answers 409 `{error:"transfer_busy"}`. `DELETE /api/v1/pro/drain` cancels; a drain
 also lapses 15 wall-clock minutes after it began (a machine resumed without a
 cancel). The token is at most 24 characters with no control characters. Drain
@@ -482,6 +485,76 @@ at a safe pause and releases, and the computer then hydrates. A `held` refusal
 is never treated as final, and the computer never fetches or acquires from
 under a suspended owner.
 
+### Acting brings the work to you
+
+Opening a project elsewhere only views its owner; acting on it moves the work.
+Both halves are additive.
+
+**Between computers.** A computer whose user sends a chat message or types
+into a terminal of a project another signed-in computer holds asks for it:
+`POST /v2/baton/{workspace}/move` with `{holder_id, epoch}` (its own holder,
+the epoch it saw; a device credential or its daemon's delegation; a cloud
+machine's credential is 403). While the other computer holds a live lease the
+account records the request and answers 200 with the ownership read; while
+nobody runs the project (released, or a computer's lapsed lease) the same
+request reserves the next acquisition. A cloud machine, awake or asleep, is
+never asked this way (409 `held`), and an epoch the caller did not see is
+409 `stale_epoch`. The holder asking for its own project is its user acting
+there: the last actor wins (by the account's clock) and any request for the
+project ends. `DELETE /v2/baton/{workspace}/move` withdraws the caller's own
+request (204).
+
+While a request is fresh (six minutes for a computer's, two for a phone's)
+every ownership answer (GET, acquire, renew, release, move) carries the
+additive `move_to` (the holder the work goes to), `move_requested_at` (the
+account's clock) and `move_reason` (`computer` or `phone`); a stale request
+reads as none. Only `move_to` may acquire the project while it is fresh
+(anyone else, including a cloud machine the release would otherwise wake, is
+409 `held`); the worker's discovery does not offer it and a release for it
+wakes nothing. The acquisition ends the request.
+
+The holder's daemon reads `move_to` from its renewal answer. Unless its own
+user acted after the request (its local input time, placed on the account's
+clock through `server_now − move_requested_at`, in which case it posts `move`
+naming itself), it finishes its current step (a chat's turn, a terminal
+agent's next pause; plain shells never wait), publishes and releases exactly
+like the clean handoff (`/pro/handoff`'s owned flush), and its own views say
+the session `moved` with `to:"computer"` and the additive `other:true`. A
+handover that fails recovers here and posts `move` naming itself, so the
+asker hears at once. The asking daemon holds the input that asked (the
+viewer relay's held-input budget), tells the viewer `{"type":"bringing","to":"here"}`,
+takes the released epoch like a return (the reservation keeps anyone else
+out; no fork), resumes the sessions and delivers the held input once. After
+five minutes without a release it withdraws the request and refuses the held
+input (`reason:"still_working"`); a holder that released for a request that
+was then withdrawn takes its own epoch back (no install, no fork).
+
+**From a phone.** A computer's daemon adds `?ready=1&power=ac|battery` to its
+passive ownership read when it could take the project now (a negotiated
+personal computer, the project registered there, not handed to the cloud on
+quit, allowed to leave its computer). While a cloud machine holds the project
+the account remembers that computer for a few seconds. When a phone sends or
+types with wake intent into a project whose owner is a sleeping cloud machine
+(`suspended`), the account's browser gateway asks one such computer to take
+the work home instead: it must be reachable over the keeper (its app online),
+seen in the last fifteen seconds, and the machine must have gone to sleep
+cleanly — its latest checkpoint is its own, of its current epoch, with
+continuation `idle`, acknowledged no earlier than two minutes before the
+suspension, with no wake requested since. The project's home comes first,
+then a computer on power, then any. The request (`move_reason:"phone"`) lets
+that computer acquire from the sleeping owner cleanly (`requires_fork:false`,
+no wake; the machine finds its epoch gone when it next resumes and fences).
+The computer takes it without its settle wait. The gateway tells the phone
+`{"type":"bringing","to":"computer"}`, holds its socket authentication and
+first input, and delivers them once to the computer when its session
+answers; if the computer has not acquired within about twenty seconds the
+request is withdrawn and the machine is woken as before
+(`{"type":"waking"}`), with the held input delivered to it instead.
+
+A cloud machine's drain (`POST /api/v1/pro/drain`) therefore publishes each
+project it holds before it answers, within the drain's deadline; a failure
+only means the machine is woken for the work instead.
+
 ### v2 refusals
 
 v2 acquire/renew/release and the related routes answer with these stable codes
@@ -491,7 +564,7 @@ permanent refusals:
 | Code | Meaning | Client behaviour |
 | --- | --- | --- |
 | `stale_epoch` | Epoch mismatch or not the current holder (carries `baton`) | Re-read and decide; never force |
-| `held` | Another live holder owns the project (carries `baton`) | View it; no takeover |
+| `held` | Another live holder owns the project, or a fresh request to move it reserves it for another computer (carries `baton`) | View it; no takeover |
 | `takeover_grace` | Expired holder still inside the 30 s grace (carries `baton`) | Retry after the grace |
 | `unsafe_takeover` | Expired holder but the project is not in `checkpoint_fork_v1` (carries `baton`) | No automatic takeover |
 | `mirror_commit_in_progress` | A verified push is publishing refs (≤10 s) | Retry with jitter |

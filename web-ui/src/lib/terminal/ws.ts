@@ -58,7 +58,11 @@ export interface SessionSocketHandlers {
   onDrop?(): void;
 }
 
-export type TerminalStatus = "asleep" | "waking";
+/** `bringing`: typing here is bringing the work to this computer from the
+ *  other one; `bringing-computer`: a phone's typing is bringing it to the
+ *  user's computer instead of waking the cloud machine. The typing that asked
+ *  is held until it arrives. */
+export type TerminalStatus = "asleep" | "waking" | "bringing" | "bringing-computer";
 
 interface ServerTextFrame {
   type: string;
@@ -69,6 +73,7 @@ interface ServerTextFrame {
   message?: string;
   code?: string;
   reason?: string;
+  to?: string;
 }
 
 /**
@@ -292,6 +297,12 @@ export class SessionSocket {
         this.asleep = false;
         this.handlers.onStatus?.("waking");
         break;
+      case "bringing":
+        // The typing that asked is held until the work arrives; the socket
+        // then closes and the reconnect finds the terminal where it runs.
+        this.asleep = false;
+        this.handlers.onStatus?.(msg.to === "computer" ? "bringing-computer" : "bringing");
+        break;
       case "moved":
       case "paused":
         // Continuing on another machine, or resuming here on its own: not an
@@ -304,6 +315,8 @@ export class SessionSocket {
         break;
       case "error":
         if (msg.code === "read_only") {
+          // The other computer kept the work: nothing is coming any more.
+          if (msg.reason === "still_working") this.handlers.onStatus?.(null);
           if (this.handlers.onRefused !== undefined) {
             this.handlers.onRefused(msg.reason ?? null, msg.message ?? null);
           } else {

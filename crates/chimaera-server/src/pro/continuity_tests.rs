@@ -2158,3 +2158,89 @@ async fn project_status_names_working_agents_and_whether_the_cloud_could_take_ov
     drop(state);
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// Acting brings the work to you: a renewal whose answer names another of the
+/// user's computers (its user acted there) makes this computer hand the
+/// project over at its next pause, unless this computer's own user acted
+/// after that request. The last actor wins, by the account's clock.
+#[tokio::test]
+async fn another_computers_request_yields_at_a_pause_unless_this_user_acted_after_it() {
+    let root = temp("moves");
+    let state = state(&root);
+    let account = FakeAccount::start(json!({})).await;
+    let config = device(&account.endpoint);
+    let workspace = project(&state, &root, &config, 4);
+    *lock(&state.pro.runtime) = Some(config.clone());
+    let path = format!("/v2/baton/{}/move", workspace.id);
+    account.script("POST", &path, 200, json!({}));
+    *lock(&account.baton) = owned(&workspace.id, "d-home", 4, "lease-fixture", 1);
+    // Asked ten seconds ago by the account's clock (each renewal is a newer
+    // lease sequence).
+    let asked = |sequence: u64| {
+        let mut asked = owned(&workspace.id, "d-home", 4, "lease-fixture", sequence);
+        asked["server_now"] = json!("2026-09-28T00:00:10Z");
+        asked["expires_at"] = json!("2026-09-28T00:01:40Z");
+        asked["move_to"] = json!("d-other");
+        asked["move_requested_at"] = json!("2026-09-28T00:00:00Z");
+        asked["move_reason"] = json!("computer");
+        asked
+    };
+    *lock(&account.grant) = Some((200, asked(2)));
+    // This computer's user acts now, after the request: the work stays here
+    // and the request is cancelled (a move request naming this computer).
+    crate::pro::acted_here(&state, &workspace.id);
+    reconcile(&state, &config, &workspace.id).await.unwrap();
+    tokio::time::timeout(StdDuration::from_secs(10), async {
+        while account.calls("POST", &path).is_empty() {
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the request was cancelled");
+    assert_eq!(
+        account.calls("POST", &path),
+        vec![json!({"holder_id":"d-home","epoch":4})]
+    );
+    assert!(account.calls("POST", "/v2/mirror/credentials").is_empty());
+    assert!(matches!(
+        lock(&state.pro.ownership).get(&workspace.id),
+        Some(Ownership::Local { epoch: 4 })
+    ));
+    assert!(!super::super::moves::other_computer(&state, &workspace.id));
+    // The user acted before the request (or not at all): at the next pause
+    // (nothing runs here) the project is handed over like a clean handoff.
+    // The fake account has no Git service, so the publication fails: the
+    // work stays here and the other computer hears so at once.
+    super::super::moves::forget(&state);
+    lock(&account.requests).clear();
+    *lock(&account.grant) = Some((200, asked(3)));
+    reconcile(&state, &config, &workspace.id).await.unwrap();
+    tokio::time::timeout(StdDuration::from_secs(60), async {
+        while account.calls("POST", &path).is_empty() {
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the failed handover told the other computer");
+    assert!(
+        account
+            .calls("POST", "/v2/mirror/credentials")
+            .iter()
+            .any(|body| body["epoch"] == 4),
+        "the handover published under this computer's lease first"
+    );
+    assert!(!super::super::moves::other_computer(&state, &workspace.id));
+    // The next renewal (the request cancelled) confirms the work is here.
+    let mut kept = owned(&workspace.id, "d-home", 4, "lease-fixture", 9);
+    kept["server_now"] = json!("2026-09-28T00:00:20Z");
+    kept["expires_at"] = json!("2026-09-28T00:01:50Z");
+    *lock(&account.grant) = Some((200, kept));
+    reconcile(&state, &config, &workspace.id).await.unwrap();
+    assert!(matches!(
+        lock(&state.pro.ownership).get(&workspace.id),
+        Some(Ownership::Local { epoch: 4 })
+    ));
+    drop(account);
+    drop(state);
+    let _ = std::fs::remove_dir_all(root);
+}
