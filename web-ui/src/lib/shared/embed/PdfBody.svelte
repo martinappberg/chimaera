@@ -61,8 +61,10 @@
    *  only worth a new URL, page, region, or a much wider card. */
   let asked: { url: string; page: number; width: number; region: string } | null = null;
   const regionKey = $derived(region === undefined ? "" : JSON.stringify(region));
+  let painted = $state<{ url: string; page: number; region: string } | null>(null);
+  const current = $derived(painted?.url === url && painted?.page === page && painted?.region === regionKey);
 
-  async function draw(u: string, p: number, width: number, area: Region | undefined): Promise<void> {
+  async function draw(u: string, p: number, width: number, area: Region | undefined, key: string): Promise<void> {
     const mine = ++gen;
     stopRendering();
     error = null;
@@ -111,6 +113,7 @@
       canvas.width = raster.width;
       canvas.height = raster.height;
       ctx.drawImage(scratch, 0, 0);
+      painted = { url: u, page: p, region: key };
     } catch (e) {
       if (mine !== gen) return;
       asked = null;
@@ -130,7 +133,7 @@
     if (!active || u === null || w <= 0) return;
     if (asked !== null && asked.url === u && asked.page === p && asked.region === r && w <= asked.width * 1.33) return;
     asked = { url: u, page: p, width: w, region: r };
-    void draw(u, p, w, region);
+    void draw(u, p, w, region, r);
   });
 
   $effect(() => () => {
@@ -151,15 +154,15 @@
   >
     <canvas
       bind:this={canvas}
-      class:hidden={error !== null || pageSize === null}
+      class:hidden={error !== null || !current}
     ></canvas>
     {#if error !== null}
       <span class="note">{error}</span>
-    {:else if pageSize === null}
+    {:else if !current}
       <span class="note">{active ? "loading page…" : ""}</span>
     {/if}
   </button>
-  {#if total > 1}
+  {#if current && total > 1}
     <span class="pages">{shown} / {total}</span>
   {/if}
 </div>

@@ -905,7 +905,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   12 million pixels and 8192 pixels per edge (`shared/pdfCanvas.ts`). Each draw owns a fresh canvas,
   and failed draws are cancelled before their handles are discarded: a graphics-initialization
   failure must not poison later redraws with pdf.js's "same canvas" error. Only a completed draw
-  replaces the visible page; superseded card draws are discarded.
+  replaces the visible page; superseded card draws are discarded. A changed card target shows a
+  loading state until its own pixels are ready. Zoom and fit-width changes also retry nearby
+  pages whose first draw failed, and a completed canvas adopts the current display size even if
+  zoom changed while it was rendering.
 - **Remote budget.** `POST /api/v1/fs/resolve_targets {base, bases?, workspace_id?, targets}`
   answers every target of a document in one round trip: canonical path, kind, size, version (the
   `X-Mtime` token), `mtime_ms`, mime, image `width`/`height` read from ≤64 KB of header bytes (never

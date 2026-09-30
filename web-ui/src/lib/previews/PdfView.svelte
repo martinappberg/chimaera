@@ -482,7 +482,9 @@
     reRenderTimer = setTimeout(() => {
       reRenderTimer = null;
       if (disposed) return;
-      for (const [n] of rendered) {
+      // A failed first draw has no published canvas yet, but must still
+      // retry when the user changes zoom or the pane's fit width.
+      for (const n of new Set([...rendered.keys(), ...nearbyPages])) {
         const slot = scroller?.querySelector<HTMLElement>(`[data-page="${n}"]`);
         if (slot !== null && slot !== undefined) void renderPage(n, slot);
       }
@@ -497,11 +499,9 @@
     renderingPages.add(n);
     let page: PDFPageProxy | null = null;
     let canvas: HTMLCanvasElement | null = null;
-    let renderedAtScale = false;
     try {
       page = await d.getPage(n);
       if (disposed || !slot.isConnected) return;
-      const cssViewport = page.getViewport({ scale: s });
       const base = page.getViewport({ scale: 1 });
       const raster = pdfRaster(base.width, base.height, s * dpr);
       const viewport = page.getViewport({ scale: raster.scale });
@@ -511,19 +511,21 @@
       canvas.className = "pdf-canvas";
       canvas.width = raster.width;
       canvas.height = raster.height;
-      canvas.style.width = `${cssViewport.width}px`;
-      canvas.style.height = `${cssViewport.height}px`;
       const renderTask = page.render({ canvas, viewport });
       renderTasks.set(n, renderTask);
       await finishPdfRender(renderTask);
       if (renderTasks.get(n) === renderTask) renderTasks.delete(n);
       if (disposed || !slot.isConnected) return;
+      // Zoom may have changed while this detached canvas was drawing.
+      // Match the current slot immediately; the catch-up below sharpens it.
+      const cssViewport = page.getViewport({ scale: scaleOf(zoom) });
+      canvas.style.width = `${cssViewport.width}px`;
+      canvas.style.height = `${cssViewport.height}px`;
       const previous = rendered.get(n);
       previous?.remove();
       if (previous !== undefined) previous.width = previous.height = 0;
       slot.insertBefore(canvas, slot.firstChild);
       renderedScale.set(n, s);
-      renderedAtScale = true;
       rememberRendered(n, canvas);
       // Selectable text layer, positioned by --total-scale-factor.
       await renderTextLayer(page, slot, s);
@@ -535,10 +537,10 @@
       if (canvas !== null && rendered.get(n) !== canvas) canvas.width = canvas.height = 0;
       page?.cleanup();
       renderingPages.delete(n);
-      // A zoom/fit change may land while this page is rasterizing. Never
-      // render into the same canvas concurrently; finish once, then catch up.
+      // A zoom/fit change may land while this page is rasterizing, even
+      // when that draw fails. Finish once, then honor the newer scale.
       const currentScale = scaleOf(zoom);
-      if (!disposed && renderedAtScale && currentScale !== s && slot.isConnected) {
+      if (!disposed && currentScale !== s && slot.isConnected) {
         void renderPage(n, slot);
       }
     }
