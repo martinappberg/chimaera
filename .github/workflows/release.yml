@@ -121,13 +121,28 @@ jobs:
     runs-on: macos-latest
     permissions:
       contents: write
+    env:
+      # This job runs `tauri build` twice (the plugin smoke's, then
+      # tauri-action's), and the second must be a cargo no-op that only
+      # re-bundles, not a second whole fat-LTO link. Two things recompile it:
+      # a different --config, which reaches the app crate as TAURI_CONFIG, so
+      # both builds get this one; and beforeBuildCommand, which rewrites the
+      # web-ui/dist chimaera-server embeds, so this config skips it and the
+      # web-ui is built once, below.
+      APP_BUILD_CONFIG: '{"build":{"beforeBuildCommand":""}}'
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
           cache: npm
-          cache-dependency-path: crates/chimaera-app/package-lock.json
+          cache-dependency-path: |
+            crates/chimaera-app/package-lock.json
+            web-ui/package-lock.json
+      - run: npm ci
+        working-directory: web-ui
+      - run: npm run build
+        working-directory: web-ui
       - run: rustup show
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -150,9 +165,14 @@ jobs:
       # Test plugin execution under the actual macOS signing policy BEFORE
       # tauri-action publishes anything. Its build reuses this compiled binary
       # and adds the DMG/updater artifacts with the same entitlement config.
+      # The signing key is here because the updater artifacts stay on: turning
+      # them off would change the config, and so recompile the app (above).
       - name: Build signed macOS app for plugin smoke
-        run: npx tauri build --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        run: npx tauri build --bundles app --config "$APP_BUILD_CONFIG"
         working-directory: crates/chimaera-app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       - name: Exercise plugins before publishing
         run: |
           bash scripts/build-plugins.sh
@@ -164,6 +184,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: crates/chimaera-app
+          args: --config '${{ env.APP_BUILD_CONFIG }}'
           tagName: v${{ needs.version.outputs.version }}
           releaseName: "chimaera v${{ needs.version.outputs.version }}"
           releaseDraft: false

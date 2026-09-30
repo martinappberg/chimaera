@@ -107,11 +107,27 @@ export function slideCount(html: string): number {
 }
 
 /**
+ * The width (px) a slide is printed at where the print engine ignores
+ * `@page` size (WebKit: Safari and the macOS app print on the panel's
+ * paper). WebKit lays a printed page out 1.25–2× its printable width and
+ * clips anything wider, so 900px keeps a whole slide on every common paper,
+ * portrait or landscape, with or without margins.
+ */
+export const PRINT_FIT_WIDTH = 900;
+
+/** Whether this engine prints on the panel's paper whatever `@page` asks
+ *  (WebKit), rather than on a page the slide's own size (Chromium). */
+export function printIgnoresPageSize(userAgent: string): boolean {
+  return /AppleWebKit/.test(userAgent) && !/Chrom(e|ium)\/|Edg\//.test(userAgent);
+}
+
+/**
  * The document one iframe draws: every slide at its native size, stacked
  * (`column`, the stage — the parent moves and scales the frame to show one)
  * or in a row with gaps (`row`, the thumbnail strip), or one per printed
- * page (`print`). Nothing in it runs: the frame is sandboxed without
- * scripts, and Marp rendered with `html: false` and no script.
+ * page (`print`; with `fitWidth`, each slide scaled to that width). Nothing
+ * in it runs: the frame is sandboxed without scripts, and Marp rendered
+ * with `html: false` and no script.
  */
 export function slideDocument(
   css: string,
@@ -119,15 +135,39 @@ export function slideDocument(
   size: { w: number; h: number },
   layout: "column" | "row" | "print",
   gap = 0,
+  fitWidth?: number,
 ): string {
   const { w, h } = size;
   const frame =
     layout === "print"
-      ? `@page{size:${w}px ${h}px;margin:0}html,body{margin:0;padding:0;background:#fff}
-svg[data-marpit-svg]{display:block;width:${w}px;height:${h}px;break-after:page;page-break-after:always}`
+      ? printFrameCss(w, h, fitWidth)
       : `html,body{margin:0;padding:0;overflow:hidden;background:transparent}
 .marpit{display:flex;flex-direction:${layout === "row" ? "row" : "column"};gap:${gap}px;width:max-content}
 svg[data-marpit-svg]{display:block;flex:none;width:${w}px;height:${h}px}`;
   // `html` is Marp's own output (raw HTML disabled); `css` is its theme CSS.
   return `<!doctype html><html><head><meta charset="utf-8"><style>${css}</style><style>${frame}</style></head><body>${html}</body></html>`;
+}
+
+/**
+ * One slide per printed page. These rules come after Marp's theme CSS and
+ * reuse its selectors, so they win over its own `@media print` block, which
+ * breaks WebKit: it sizes each slide 100vw × 100vh (resolved against the
+ * hidden 0×0 print frame, so every slide collapses and the PDF is blank)
+ * and forces a page break inside each slide's SVG. Scaling uses a CSS
+ * transform, never the SVG's own width: WebKit does not scale the HTML in
+ * an SVG `foreignObject` by its `viewBox`.
+ */
+function printFrameCss(w: number, h: number, fitWidth?: number): string {
+  const base = `@page{size:${w}px ${h}px;margin:0}html,body{margin:0;padding:0;background:#fff;break-inside:auto;page-break-inside:auto}
+div.marpit>svg>foreignObject>section{break-before:auto;page-break-before:auto}`;
+  const k = fitWidth === undefined ? 1 : Math.min(1, fitWidth / w);
+  const slide = `display:block;width:${w}px;height:${h}px;break-after:page;page-break-after:always`;
+  if (k === 1) return `${base}\ndiv.marpit>svg[data-marpit-svg]{${slide}}`;
+  // A transformed box adds only its scaled bounds to the page's overflow, so
+  // the page is laid out no wider than the scaled slide. The negative bottom
+  // margin pulls the box's height in to match (a right margin would be
+  // ignored: the fixed width over-constrains it); the left margin centres it.
+  const fw = Math.round(w * k);
+  const fh = Math.round(h * k);
+  return `${base}\ndiv.marpit>svg[data-marpit-svg]{${slide};transform:scale(${k});transform-origin:0 0;margin:0 0 ${fh - h}px max(0px,calc((100% - ${fw}px) / 2))}`;
 }

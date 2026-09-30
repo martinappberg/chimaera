@@ -16,7 +16,15 @@
   import { untrack, type Snippet } from "svelte";
   import { fsFile, humanSize, rawTicketUrl, resolveDocPath, safeDecodeUri } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
-  import { relativeImages, rewriteImages, slideCount, slideDocument, slideSize } from "./marp";
+  import {
+    PRINT_FIT_WIDTH,
+    printIgnoresPageSize,
+    relativeImages,
+    rewriteImages,
+    slideCount,
+    slideDocument,
+    slideSize,
+  } from "./marp";
   import { revealRequest, takeReveal } from "../shared/reveal";
   import Spinner from "./Spinner.svelte";
   import ReferenceButton from "../shared/ReferenceButton.svelte";
@@ -294,7 +302,8 @@
     frame.setAttribute("aria-hidden", "true");
     frame.tabIndex = -1;
     frame.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;opacity:0";
-    frame.srcdoc = slideDocument(d.css, d.html, d.size, "print");
+    const fit = printIgnoresPageSize(navigator.userAgent) ? PRINT_FIT_WIDTH : undefined;
+    frame.srcdoc = slideDocument(d.css, d.html, d.size, "print", 0, fit);
     const done = () => {
       frame.remove();
       printing = false;
