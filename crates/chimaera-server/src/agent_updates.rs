@@ -56,7 +56,13 @@ pub(crate) async fn run_checker(state: Arc<AppState>) {
 /// Probe every agent's latest release concurrently and store what landed.
 /// A failed probe keeps the previous entry (stale beats absent); any change
 /// wakes `/ws/events` subscribers so open surfaces can refetch.
+///
+/// The account's cloud never asks: its agents come with its image and are
+/// updated with it, so there is nothing a release would be offered for.
 pub(crate) async fn check_all(state: &Arc<AppState>) {
+    if crate::pro::updates_managed(state) {
+        return;
+    }
     let results = futures::future::join_all(
         AgentKind::ALL
             .into_iter()

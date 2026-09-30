@@ -143,7 +143,9 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   so attached windows hear it at once. Every view of that daemon shows the one neutral line
   "Updates for your cloud are managed for you." with no check and no update action (Settings → Updates
   drops "check now" and the auto-check switch; the toast answers an explicit check with that line; the
-  version stamp's hover says it). Its plugins' release checks are unchanged.
+  version stamp's hover says it). Its agents' release checks stop too (`agent_updates`; no release
+  fields on its `GET /agents` rows), since they come with the cloud's image and are updated with it.
+  Its plugins' release checks are unchanged.
 - **A failed check is reported as one.** The status carries one `state` word
   (`unchecked | current | available | failed | managed`), `checked_at` (last attempt) vs `succeeded_at`
   (last answer), the failure in plain words (`error`: curl's own diagnosis minus its prefix; a

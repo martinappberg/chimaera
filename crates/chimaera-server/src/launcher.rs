@@ -460,7 +460,13 @@ pub(crate) async fn list_agents(
     } else {
         detect_all.await
     };
-    let latest_by_kind = crate::agent_updates::snapshot(&state);
+    // The account's cloud never learns of agent releases: its agents come
+    // with its image and are updated with it (`pro::updates_managed`).
+    let latest_by_kind = if crate::pro::updates_managed(&state) {
+        std::collections::HashMap::new()
+    } else {
+        crate::agent_updates::snapshot(&state)
+    };
 
     let rows = detections
         .into_iter()

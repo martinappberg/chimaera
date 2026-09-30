@@ -1819,3 +1819,39 @@ async fn real_claude_agent_session() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
+
+/// The account's cloud never offers agent updates: its agents come with its
+/// image and are updated with it, so a known-newer release stays off its rows
+/// and `?check=true` probes nothing.
+#[tokio::test]
+async fn the_cloud_never_offers_agent_updates() {
+    let state = test_state();
+    crate::pro::worker_execution_fixture(&state);
+    preset_agent(
+        &state,
+        agents::AgentKind::Claude,
+        Ok(PathBuf::from("/bin/echo")),
+        Some("2.1.196 (Claude Code)"),
+    );
+    for kind in [
+        agents::AgentKind::Codex,
+        agents::AgentKind::Gemini,
+        agents::AgentKind::Antigravity,
+    ] {
+        preset_agent(&state, kind, Err("not found (test)".to_string()), None);
+    }
+    lock(&state.agent_updates).insert(
+        agents::AgentKind::Claude,
+        agent_updates::AgentLatest {
+            version: "2.1.207".to_string(),
+            checked_at: 1_000,
+        },
+    );
+    let (status, list) = request(&state, Method::GET, "/api/v1/agents?check=true", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let claude = &list.as_array().unwrap()[0];
+    assert_eq!(claude["installed"], true);
+    assert_eq!(claude["version"], "2.1.196 (Claude Code)");
+    assert!(!claude.as_object().unwrap().contains_key("latest_version"));
+    assert!(!claude.as_object().unwrap().contains_key("update_available"));
+}

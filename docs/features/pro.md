@@ -364,6 +364,10 @@ updates its daemon (`shell/tunnel.rs` `offers_daemon_update`). That daemon
 never checks for its own releases either: every view of it says “Updates for
 your cloud are managed for you.”, with nothing to check or install
 ([update awareness](lifecycle-and-persistence.md#update-awareness-daemon-side)).
+Its agents are the cloud's too: they come with its image and are updated with
+it, so the cloud never checks their releases or offers an agent update
+(`launcher.rs`, `agent_updates.rs`), and Claude Code's own updater is off there
+(`spawn.rs`).
 A shared provider catalog bounds external authentication origins in both clients.
 
 ## Where it lives

@@ -266,6 +266,13 @@ pub(crate) async fn spawn_session(
                 opts.env
                     .push((crate::launcher::CODEX_MCP_KEY_ENV.to_string(), key.clone()));
             }
+            if agent_kind == AgentKind::Claude && crate::pro::updates_managed(state) {
+                // The cloud's agents come with its image and are updated with
+                // it: claude's own updater could only fail there (the image
+                // prefix is not the daemon user's to write) and say so mid-turn.
+                opts.env
+                    .push(("DISABLE_AUTOUPDATER".to_string(), "1".to_string()));
+            }
             let transferred = crate::lock(&state.deferred_sessions).get(&id).cloned();
             if let Some(entry) = transferred.filter(|entry| entry.workspace_id == workspace.id) {
                 // A positional prompt starts a billed turn: only a terminal
