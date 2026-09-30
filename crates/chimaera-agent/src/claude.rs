@@ -4855,7 +4855,13 @@ pub(crate) fn tool_title(name: &str, input: &Value) -> String {
             (Some(cron), None) => Some(format!("CronCreate: {cron}")),
             _ => None,
         },
-        _ => mcp_tool_label(name),
+        _ => mcp_tool_label(name).map(|label| {
+            let (server, tool) = name
+                .strip_prefix("mcp__")
+                .and_then(|rest| rest.split_once("__"))
+                .unwrap_or_default();
+            label + &crate::model::comms_title_suffix(server, tool, input)
+        }),
     };
     if let Some(title) = owned {
         return title;
@@ -9083,6 +9089,17 @@ pub(crate) mod tests {
                 &json!({ "delaySeconds": 1200, "reason": "watching CI" })
             ),
             "ScheduleWakeup: in 20m 00s · watching CI"
+        );
+        assert_eq!(
+            tool_title(
+                "mcp__chimaera__send_message",
+                &json!({ "to": "everyone", "text": "heads-up" })
+            ),
+            "send_message (chimaera) → everyone"
+        );
+        assert_eq!(
+            tool_title("mcp__chimaera__read_messages", &json!({})),
+            "read_messages (chimaera)"
         );
         assert_eq!(
             tool_title(

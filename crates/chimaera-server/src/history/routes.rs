@@ -448,7 +448,7 @@ fn count(v: Option<u64>) -> String {
     v.map_or("—".to_string(), |c| c.to_string())
 }
 
-/// The Mastermind's `read_session` for a session that has ended: its record
+/// `read_agent` for a session that has ended: its record
 /// as plain text, data-framed. `None` when the workspace has no record of it.
 pub(crate) async fn ended_session_text(
     state: &Arc<AppState>,

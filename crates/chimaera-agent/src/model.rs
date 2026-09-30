@@ -1526,6 +1526,28 @@ pub fn fmt_elapsed_secs(s: u64) -> String {
     }
 }
 
+/// What a call to chimaera's agent-communication tools is about, for its
+/// card title: ` → <to>` for `send_message`, ` → <agent>` for `read_agent`
+/// (one line, capped). Empty for every other tool — both drivers append it
+/// to their own MCP title, so the transcript says who a message went to.
+pub fn comms_title_suffix(server: &str, tool: &str, input: &serde_json::Value) -> String {
+    if server != "chimaera" {
+        return String::new();
+    }
+    let target = match tool {
+        "send_message" => input.get("to"),
+        "read_agent" => input.get("agent").or_else(|| input.get("session")),
+        _ => None,
+    };
+    match target.and_then(|t| t.as_str()) {
+        Some(t) if !t.trim().is_empty() => {
+            let line = t.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!(" → {}", truncate_label(&line, 80))
+        }
+        _ => String::new(),
+    }
+}
+
 pub fn truncate_label(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();

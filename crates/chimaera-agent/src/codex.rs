@@ -2473,10 +2473,11 @@ impl CodexMapper {
                 }
             }
             Some("mcpToolCall") => {
+                let server = item["server"].as_str().unwrap_or("mcp");
+                let tool = item["tool"].as_str().unwrap_or("tool");
                 let title = format!(
-                    "{}.{}",
-                    item["server"].as_str().unwrap_or("mcp"),
-                    item["tool"].as_str().unwrap_or("tool"),
+                    "{server}.{tool}{}",
+                    crate::model::comms_title_suffix(server, tool, &item["arguments"])
                 );
                 if !completed {
                     if let Some(flushed) = self.coalescer.flush() {
@@ -7465,6 +7466,48 @@ mod tests {
         });
         assert_eq!(step.outbound.len(), 1, "accept sends only the decision");
         assert_eq!(step.events.len(), 1, "no user echo on accept");
+    }
+
+    /// An agent-communication call's card says who it went to (the item's
+    /// `arguments`, codex 0.157.1 ThreadItem); other MCP calls keep the bare
+    /// `server.tool`.
+    #[test]
+    fn a_chimaera_message_call_names_its_recipient() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let title_of = |m: &mut CodexMapper, id: &str, tool: &str, args: Value| {
+            let step = m.on_frame(&json!({
+                "method": "item/started",
+                "params": { "item": {
+                    "id": id, "type": "mcpToolCall", "server": "chimaera",
+                    "tool": tool, "status": "inProgress", "arguments": args,
+                }},
+            }));
+            step.events
+                .iter()
+                .find_map(|e| match e {
+                    AgentEvent::ToolCall { title, .. } => Some(title.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            title_of(
+                &mut m,
+                "m1",
+                "send_message",
+                json!({"to": "s-1a2b", "text": "hi"})
+            ),
+            "chimaera.send_message → s-1a2b"
+        );
+        assert_eq!(
+            title_of(&mut m, "m2", "read_agent", json!({"agent": "mastermind"})),
+            "chimaera.read_agent → mastermind"
+        );
+        assert_eq!(
+            title_of(&mut m, "m3", "notify", json!({"message": "done"})),
+            "chimaera.notify"
+        );
     }
 
     #[test]

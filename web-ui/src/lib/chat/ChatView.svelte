@@ -2650,7 +2650,7 @@
               {:else if block.origin === "restart"}
                 <span class="origin auto" title="chimaera sent this itself: the daemon restarted while this chat had work running, so it asked the resumed agent to pick that work back up (setting: Pick Up Interrupted Work After a Restart)">sent by chimaera after a restart</span>
               {:else if block.origin === "worker"}
-                <span class="origin auto" title="a worker in this workspace sent this with tell_mastermind; chimaera delivered it because the Mastermind acts on its own (auto)">from a worker</span>
+                <span class="origin auto" title="a worker in this workspace sent this to the Mastermind (before agent communication); chimaera delivered it because the Mastermind acts on its own (auto)">from a worker</span>
               {/if}
               {#if unsavedImages(block) !== ""}
                 <span class="attach">{unsavedImages(block)}</span>

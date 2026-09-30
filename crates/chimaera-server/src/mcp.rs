@@ -56,10 +56,10 @@ const STATUS_SESSIONS_CAP: usize = 64;
 const STATUS_FILES_RECENT: usize = 3;
 /// Finished commands echoed per terminal in a `workspace_status` digest.
 const STATUS_COMMANDS: usize = 3;
-/// `read_session` lines/items: default and hard cap.
+/// `read_agent` lines/items: default and hard cap.
 const READ_SESSION_DEFAULT: usize = 60;
 const READ_SESSION_MAX: usize = 200;
-/// Bytes cap on a rendered `read_session` answer (tail wins).
+/// Bytes cap on a rendered `read_agent` answer (tail wins).
 const READ_SESSION_BYTES: usize = 24 * 1024;
 
 /// Ceiling on LIVE sessions in a workspace before the Mastermind's spawn
@@ -1465,7 +1465,7 @@ async fn spawn_agent(
         Ok(slot) => slot,
         Err(at) => return spawn_ceiling_error(at),
     };
-    // The worker stays in THIS workspace (so message_agent reaches it) and
+    // The worker stays in THIS workspace (so send_message reaches it) and
     // runs in the branch's worktree.
     let place = match branch {
         None => None,
@@ -1518,7 +1518,7 @@ async fn spawn_agent(
             );
             tool_text(format!(
                 "spawned {} chat session {} [{}] {where_} — send it work \
-                 with message_agent",
+                 with send_message",
                 kind.as_str(),
                 row["display_name"],
                 row["id"].as_str().unwrap_or("?"),
@@ -1589,7 +1589,8 @@ async fn spawn_terminal(
 }
 
 /// interrupt_agent (act) — the user's Stop button on a chat session's running
-/// turn (never kills the session). Same TUI wall as message_agent.
+/// turn (never kills the session). Nothing types into a TUI (the exec-409
+/// wall).
 async fn interrupt_agent(
     state: &Arc<AppState>,
     agent_id: &str,

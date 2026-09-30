@@ -17,7 +17,7 @@
 //! wake policy (`agents.communication.wakes`) says, inside the caps below;
 //! a reply to a question the reader asked (`expect_reply`) wakes it without
 //! asking the user. The Mastermind's own messages carry direction and wake
-//! a chat worker the way `message_agent` did (gated by its own ask/auto
+//! a chat worker the way its old `message_agent` did (gated by its own ask/auto
 //! mode, not by the policy). Nothing ever types into a terminal agent.
 //!
 //! Talking isn't commanding: a peer's message reaches its reader framed as
