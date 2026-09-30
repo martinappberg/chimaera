@@ -27,7 +27,8 @@ revocable delegation over the authenticated local API.
 | `mirror.rs` | Separate shadow and repository Git directories, incremental transfer and conservative hand-back. |
 | `shadow_cache.rs` | Validated reconstruction of an objectively damaged outgoing shadow, retaining its complete prior store in a bounded no-overwrite quarantine. |
 | `repository.rs` | Portable remote/tracking allowlist; bounded ref import, compare-and-swap adoption and index/ref-lock cancellation cleanup. |
-| `canonical.rs` | Keeps the user's own version of a conflicting file right beside it (`<name>.mine-<yyyymmdd-hhmm>`) when a return installs the incoming one; bounded per return, never overwrites an earlier copy, never mirrored. |
+| `canonical.rs` | Keeps the user's own version of a conflicting file right beside it (`<name>.mine-<yyyymmdd-hhmm>`) when a return installs the incoming one; bounded per return, never overwrites an earlier copy, never mirrored. `original_name` maps a copy back to the file it sits beside. |
+| `kept.rs` / `kept/tests.rs` | The review of what a return kept in both versions: list the recorded pairs (and the cloud's `@cloud` branches, read live), both texts for the side-by-side view, and settling a pair (`use_mine` / `use_cloud` / `keep_both`, one or all) — only recorded siblings, only inside the project, every name opened `O_NOFOLLOW` beneath the folder's descriptor. Tests drive the real router. |
 | `config.rs` | Portable agent configuration export/import, scoped environment-omission diagnostics and destination connection identity preservation. |
 
 One recorded holder and epoch controls shared writes. **Laptop first (D1):** a
@@ -303,11 +304,42 @@ incoming version takes the path and the user's own version is kept right beside
 it as `<name>.mine-<yyyymmdd-hhmm>` (a name the mirror never publishes), counted
 in the mirror row's additive `kept_both`, with `kept_paths` naming those copies.
 `report_return` records it (persisted in `state.json`'s `kept_both`, a 64 KiB
-share: counts always, names while they fit) and raises one `kept_both` notice
-per return that kept anything (`notices::push_kept_both`). The return's kept
-`@cloud` branches reach that notice only once `engine::hydrate_scoped` passes
-`repository::receive`'s result to `report_return` (today it calls
-`return_report`, files only).
+share: counts always, names while they fit, plus when the return happened and
+how many files it kept then) and raises one `kept_both` notice per return that
+kept anything (`notices::push_kept_both`, which names the return's kept
+`@cloud` branches too: `engine::hydrate_scoped` passes `repository::receive`'s
+result).
+
+**Reviewing both versions** (`kept.rs`, all authenticated, none reachable
+through a browser view's workspace scope):
+`GET /pro/projects/{workspace}/kept` answers `{workspace_id, files, total,
+returned_at, unlisted, pairs, branches, here}`: `pairs` are the recorded kept
+copies still waiting (`{path, mine_path, size, mine_size, changed_at,
+mine_changed_at}`, paths project-relative, `path` the cloud's version with
+`size`/`changed_at` null when the cloud deleted the file), `unlisted` the kept
+copies the return did not name (it names up to 32), `total` the return's own
+count (choices never lower it), `branches` the project's
+`<branch>@cloud-<12 hex>` refs read live (Git runs only for a project with an
+open report or recorded `git_branches`; one merged and deleted drops off),
+`here` whether a choice can be made now (`may_write`).
+`GET …/kept/file?mine_path=` returns both versions of one recorded pair
+(`mine`, `cloud`: `{size, changed_at, text, binary?, too_large?}`, text up to
+512 KiB of UTF-8, `cloud` null when deleted).
+`POST …/kept/resolve {mine_path, choice}` settles one recorded pair:
+`use_mine` renames the sibling over the file (a deleted file comes back),
+`use_cloud` removes the sibling, `keep_both` moves nothing; the answer is the
+updated listing. `POST …/kept/resolve_all {choice}` applies one choice to every
+recorded pair; pairs that cannot take it stay and are named in `failed`
+(`{mine_path, error_code}`), and when none failed the report ends, unnamed
+copies included (they keep their `.mine-…` names). Refusals are
+`{error, error_code}`: `unknown_project`, `not_kept` (not a recorded sibling),
+`unsafe_path` (a link, a non-plain file, a path out of the project or into
+`.git`), `gone` (`use_mine` with the copy no longer there), `not_here`
+(another owner, arriving, or leaving), `busy` (the project's cache lock held
+past ten seconds), `folder_unavailable`, `failed`. Choices hold the project's
+cache lock (serialized with mirror passes), update `kept_both`/`kept_paths`,
+persist, and mark git status dirty; a listing settles recorded copies that are
+gone or no longer plain files. The report ends when nothing waits.
 A baseline file absent from the incoming snapshot is deleted only when the
 manifest's additive `left_out` inventory (≤4096 paths the sender omitted by
 policy, size, symlink, credential content or `.chimaeraignore`) is present and

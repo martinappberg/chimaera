@@ -1031,7 +1031,7 @@ async fn snapshot_inner_scoped(
             // The last return's report stays until the next return replaces it.
             let mut statuses = lock(&state.pro.status);
             let previous = statuses.remove(&workspace.id).unwrap_or_default();
-            statuses.insert(workspace.id.clone(), WorkspaceStatus {report,last_mirrored_at:Some(super::now()),storage_limit_bytes:budget,error:None,error_code:None,kept_both:previous.kept_both,kept_paths:previous.kept_paths,blocked_providers:Vec::new()});
+            statuses.insert(workspace.id.clone(), WorkspaceStatus {report,last_mirrored_at:Some(super::now()),storage_limit_bytes:budget,error:None,error_code:None,kept_both:previous.kept_both,kept_paths:previous.kept_paths,kept_at:previous.kept_at,kept_total:previous.kept_total,blocked_providers:Vec::new()});
         }
         *phase = "persist_snapshot";
         super::persist(state).await?;

@@ -83,8 +83,9 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
     copies ("Your versions are saved beside them (notes.md.mine-20260929-1412, …)"), and an
     additive `kept: {files, paths, branches}` (up to 32 project-relative copy paths; branches
     kept as `<branch>@cloud-<commit>`). Not a session's: `session_id` is a per-project key
-    (`kept-both-<workspace_id>`), so a click raises the project's window, and a newer return
-    replaces the project's older alert. Gated by `notifications.needsYou`; never blocking,
+    (`kept-both-<workspace_id>`), so a click raises the project's window and opens its review of
+    both versions ([pro.md](pro.md#when-both-sides-changed-a-file)); a window showing that
+    review counts as looking at the notice. A newer return replaces the project's older alert. Gated by `notifications.needsYou`; never blocking,
     never counted.
 
 ## Agent-sent notifications (`notify` tool)

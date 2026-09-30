@@ -233,6 +233,73 @@ async fn install_config(
     }
     Ok(())
 }
+/// Whether `branch` is one `receive` kept for the other machine's diverged
+/// work: `<branch>@cloud-<12 hex>`.
+pub(super) fn cloud_branch_name(branch: &str) -> bool {
+    branch.rsplit_once("@cloud-").is_some_and(|(base, commit)| {
+        !base.is_empty()
+            && commit.len() == 12
+            && commit
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// The `<branch>@cloud-<commit>` branches in the project's repository, read
+/// live from its refs, so one the user merged and deleted drops off. Only a
+/// folder with its own `.git`; any failure reads as none. The child runs
+/// outside the transfer slots (a long mirror fetch never delays a listing),
+/// on a short deadline, with bounded output.
+pub(super) async fn cloud_branches(root: &Path) -> Vec<String> {
+    use tokio::io::AsyncReadExt;
+    const OUTPUT_MAX: u64 = 256 * 1024;
+    if tokio::fs::symlink_metadata(root.join(".git"))
+        .await
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Ok(mut command) = transport::git(root, None).await else {
+        return Vec::new();
+    };
+    command
+        .args(["for-each-ref", "--format=%(refname)", "refs/heads/"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let Ok(mut child) = command.spawn() else {
+        return Vec::new();
+    };
+    let Some(stdout) = child.stdout.take() else {
+        return Vec::new();
+    };
+    let mut bytes = Vec::new();
+    let read = async {
+        stdout.take(OUTPUT_MAX).read_to_end(&mut bytes).await?;
+        child.wait().await
+    };
+    // A listing cut at the cap (Git then stops on a closed pipe) still names
+    // whole refs up to its last line; only that line may be partial.
+    let capped = match tokio::time::timeout(Duration::from_secs(5), read).await {
+        Ok(Ok(status)) => !status.success() && bytes.len() as u64 >= OUTPUT_MAX,
+        _ => return Vec::new(),
+    };
+    if capped {
+        let whole = bytes
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(0, |at| at + 1);
+        bytes.truncate(whole);
+    }
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(|line| line.strip_prefix("refs/heads/"))
+        .filter(|branch| cloud_branch_name(branch))
+        .take(32)
+        .map(str::to_owned)
+        .collect()
+}
 /// Fetch into a private temporary namespace, then publish each destination ref
 /// independently. Linked worktree branches are never advanced behind their backs.
 pub(super) async fn receive(

@@ -16,6 +16,7 @@ export type PaneViewKind =
   | "plugins"
   | "plugin"
   | "sessions"
+  | "kept"
   | "browser"
   | "settings"
   | "pro";
@@ -46,6 +47,7 @@ const loaders: Record<PaneViewKind, () => Promise<PaneViewModule>> = {
   plugins: () => import("../plugins/PluginsView.svelte"),
   plugin: () => import("../plugins/ui/PluginTab.svelte"),
   sessions: () => import("../workspace/SessionsView.svelte"),
+  kept: () => import("../pro/KeptReviewView.svelte"),
   browser: () => import("../browser/BrowserView.svelte"),
   pro: () => import("../pro/ProView.svelte"),
   settings: () => import("../settings/SettingsView.svelte"),
@@ -68,6 +70,7 @@ const viewChunkPrefixes: Record<PaneViewKind, string> = {
   plugins: "PluginsView-",
   plugin: "PluginTab-",
   sessions: "SessionsView-",
+  kept: "KeptReviewView-",
   browser: "BrowserView-",
   settings: "SettingsView-",
   pro: "ProView-",

@@ -136,6 +136,13 @@ export interface PluginViewTab {
   view: string;
 }
 /**
+ * Both versions a Chimaera Pro return kept, for choosing between them
+ * (`pro/KeptReviewView.svelte`) — the workspace's own, a singleton view.
+ */
+export interface KeptTab {
+  surface: "kept";
+}
+/**
  * A review of the files ONE session changed — a session-scoped changes list
  * built on the same git status/diff APIs as the source-control panel. Keyed by
  * session so re-opening focuses the existing tab; it reads the session's live
@@ -177,6 +184,7 @@ export type Tab =
   | PluginsTab
   | PluginViewTab
   | SessionsTab
+  | KeptTab
   | BrowserTab;
 
 /** Identity key for the no-duplicates invariant (one tab per surface). */
@@ -206,6 +214,7 @@ export function tabKey(t: Tab): string {
   // `x:` (extension) — a plugin's view, its own namespace.
   if (t.surface === "plugin") return `x:${t.plugin}/${t.view}`;
   if (t.surface === "sessions") return "v:sessions";
+  if (t.surface === "kept") return "v:kept";
   if (t.surface === "changes") return `changes:${t.sessionId}`;
   // `w:` (web) — its own namespace beside the Finder's `d:` and diff's `g:`.
   if (t.surface === "browser") return `w:${t.id}`;
@@ -344,6 +353,14 @@ export function visibleSessionIds(l: Layout): string[] {
     if (t !== undefined && t.surface === "terminal") out.push(t.sessionId);
   }
   return out;
+}
+
+/** Whether the review of both versions is on screen (a shown pane's active
+ *  tab), the way `visibleSessionIds` reads sessions. */
+export function keptReviewShown(l: Layout): boolean {
+  const zoomed = l.zoomedPaneId !== null ? findPane(l.root, l.zoomedPaneId) : null;
+  const shown = zoomed !== null ? [zoomed] : panes(l.root);
+  return shown.some((p) => p.tabs[p.active]?.surface === "kept");
 }
 
 /** Every file path shown anywhere in the tree. */
@@ -701,6 +718,11 @@ export function openPluginViewTab(l: Layout, plugin: string, view: string): Layo
 /** Open (or focus) All sessions. */
 export function openSessionsList(l: Layout): Layout {
   return openTab(l, { surface: "sessions" });
+}
+
+/** Open (or focus) the review of both versions a return kept. */
+export function openKeptReview(l: Layout): Layout {
+  return openTab(l, { surface: "kept" });
 }
 
 /** Open (or focus) the session-scoped changes review. */
@@ -1483,6 +1505,7 @@ function serNode(node: LayoutNode): SNode {
         if (t.surface === "pro") return { v: "pro" };
         if (t.surface === "plugin") return { pg: t.plugin, pgv: t.view };
         if (t.surface === "sessions") return { v: "sessions" };
+        if (t.surface === "kept") return { v: "kept" };
         if (t.surface === "changes") return { cs: t.sessionId };
         if (t.surface === "browser") return { w: t.host, wo: t.port, wi: t.id, wp: t.path };
         return { v: "settings" };
@@ -1579,6 +1602,8 @@ function deserNode(
         tab = { surface: "plugin", plugin: t.pg, view: t.pgv };
       } else if (t.v === "sessions") {
         tab = { surface: "sessions" };
+      } else if (t.v === "kept") {
+        tab = { surface: "kept" };
       } else if (typeof t.cs === "string" && t.cs.length > 0) {
         tab = { surface: "changes", sessionId: t.cs };
       } else if (

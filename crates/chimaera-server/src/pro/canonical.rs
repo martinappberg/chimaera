@@ -34,6 +34,18 @@ pub(super) fn kept_copy_name(name: &str) -> bool {
                 .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
 }
 
+/// The name of the file a kept copy was saved beside (`notes.md` for
+/// `notes.md.mine-20260929-1412`), or `None` when `name` is not a kept copy.
+/// A copy whose name was shortened to fit (see [`KeptCopies::keep`]) names a
+/// shortened file too; the review finds no such file and says so.
+pub(super) fn original_name(name: &str) -> Option<&str> {
+    if !kept_copy_name(name) {
+        return None;
+    }
+    let original = &name[..name.rfind(MARKER)?];
+    (!original.is_empty()).then_some(original)
+}
+
 /// The local minute, for a name people read.
 fn stamp() -> String {
     let now = std::time::SystemTime::now()

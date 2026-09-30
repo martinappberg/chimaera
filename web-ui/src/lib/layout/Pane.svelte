@@ -548,6 +548,20 @@
     {:else}
       <Spinner />
     {/if}
+  {:else if tab.surface === "kept"}
+    {@const KeptReviewView = views.kept}
+    {#if KeptReviewView !== undefined}
+      <KeptReviewView
+        {wsId}
+        {wsRoot}
+        visible={active}
+        onOpenFile={(p: string) => ctrl.openFileFrom(node.id, p, false)}
+      />
+    {:else if viewErrors.kept}
+      {@render loadFailure("kept", "the review of both versions")}
+    {:else}
+      <Spinner />
+    {/if}
   {:else if tab.surface === "browser"}
     {@const BrowserView = views.browser}
     {#if BrowserView !== undefined}
