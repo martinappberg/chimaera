@@ -432,6 +432,9 @@ A client deadline starts before the mutating request and uses server-relative
 lease duration (at most 90 seconds), minus a 15-second stop margin. Passive GET,
 replayed lease sequences, stale generations, clock discontinuity and restart
 cannot extend that deadline. Viewer location never selects the preferred home.
+The preferred installation is simply the latest device that acquired the project;
+an acquire is never refused for not being the preferred installation, only for
+`held` (another live holder).
 Clean transfer selects exactly the receipt's working-tree/config/handoff Git
 object IDs. Unknown continuation evidence is uncertain, never a blind replay of
 external actions. In checkpoint_fork_v1, after the recorded lease expiry plus
@@ -495,7 +498,7 @@ permanent refusals:
 | `checkpoint_required` | No acknowledged checkpoint for this epoch (also on a clean release that has not published) | Publish first, then retry |
 | `clean_release_required` | The caller still owns a legacy (pre-v2) grant, or a rebind while the old holder still owns work | Release cleanly first |
 | `installation_required` | A device acquiring without a bound installation | Bind the installation |
-| `not_preferred_home` | A device that is not the project's preferred installation | Leave it to its home/cloud |
+| `not_preferred_home` | Retired: the account no longer refuses an acquire for not being the preferred installation (that is the latest device that acquired). An older service may still answer it | Leave it to its home/cloud (older services only) |
 | `capability_not_supported` | The request's capability differs from the project's mode | Use the recorded mode |
 | `continuity_upgrade_required` | A legacy (v1) route on a v2-enrolled project, or v2 renew/release without a record | Use v2. A legacy release answered this way carries only `{"error":"continuity_upgrade_required"}` (no `baton`); the daemon recognises it before any conflict parse (`release.rs` `UpgradeRequired`), logs one line, latches the project as enrolled (`execution::require_v2`, in memory) so the next reconcile reads it over v2 and restores its policy, and never retries in the same call. The same refusal to a v2 request is a plain failure: no latch, no retry |
 | `recovery_in_progress` | An installation recovery owns the project | Wait for it |

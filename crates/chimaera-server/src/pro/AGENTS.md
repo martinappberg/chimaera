@@ -23,7 +23,7 @@ revocable delegation over the authenticated local API.
 | `provider_gate.rs` / `provider_tests.rs` | Per-agent cloud readiness, bounded blocked-provider status, and staged retry/cancellation tests with a synthetic CLI and real PTY. |
 | `protocol.rs` | Additive account contract subset and strict worker host-to-holder identity translation; intentionally no link/TLS dependency in the daemon. |
 | `transport.rs` | Bounded external curl/git children; cached mirror-only Git compatibility selection; credentials only in memory, never argv or Git config. The account's 403 `{"error":"return_window_ended"}` (a plan that ended and whose time to bring cloud work home has passed) becomes an error of its own in `engine::account`, so its mirror-row and open `error_code` read `return_window_ended`; any other 403 stays a plain response. |
-| `policy.rs` | Mirrored-path policy, credential filtering, size budgets and cloud-profile classification. |
+| `policy.rs` | Mirrored-path policy (credentials, `.git`, staging names, kept copies and a folder's `.chimaera-workspace` identity marker at any depth are never mirrored), credential filtering, size budgets and cloud-profile classification. |
 | `mirror.rs` | Separate shadow and repository Git directories, incremental transfer and conservative hand-back. |
 | `shadow_cache.rs` | Validated reconstruction of an objectively damaged outgoing shadow, retaining its complete prior store in a bounded no-overwrite quarantine. |
 | `repository.rs` | Portable remote/tracking allowlist; bounded ref import, compare-and-swap adoption and index/ref-lock cancellation cleanup. |
@@ -189,6 +189,24 @@ pair runtime and generation under the configuration lock. Unstarted failed choic
 remain pinned to their saved folder. Old `import_roots` entries migrate only to
 pending-ID fences, never to permission to import. A partially registered legacy
 project needs explicit selection of its original folder before recovery.
+
+**Who a project returns to.** `lazy_handback` returns a project to this computer when
+this installation is the policy's preferred one (`execution::preferred_here`; the
+account sets `preferred_installation_id` to the latest device that acquired, and
+never refuses an acquire for not being preferred, only `held`) OR when the user
+opened the project here and it is not held here yet (`execution::opened_here`, the
+in-memory `ProState.opened_here` set). `pro::note_opened` inserts: `POST
+/workspaces` for a project that already existed (a registered root, the id a
+folder's marker names, a moved folder; never a freshly minted id or a local
+duplicate) and `POST /workspaces/{id}/open` while ownership is not `Local`.
+`execution::accept` success (both protocol versions) and sign-out remove it. So the
+project comes back to the latest computer that had it, and opening it on another
+of the user's computers takes it over once the first is idle. A live device
+holder keeps the existing `Remote` handling ("on your other computer"): the flag
+stays set, and the moment that lease lapses (or the holder releases) the next pass
+pulls it. The settle rule for moving live cloud work is unchanged, and the pull is
+the ordinary hydrate: kept-both, and with no shadow every differing local file is
+kept as `.mine-…` while local-only files stay.
 
 Normal lazy return only handles registered projects without a pending adoption.
 Moving live cloud work waits for the settle gate (awake on power for five

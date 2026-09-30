@@ -1607,8 +1607,15 @@ async fn hydrate_scoped(
             cloud_internal: false,
         };
         let owner = state.clone();
-        tokio::task::spawn_blocking(move || lock(&owner.workspaces).import_exact(new_workspace))
-            .await??;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let (root, id) = (new_workspace.root.clone(), new_workspace.id.clone());
+            lock(&owner.workspaces).import_exact(new_workspace)?;
+            // The folder carries the id it was registered under, so a
+            // reinstall finds the same project again.
+            crate::workspaces::identity::write(&root, &id);
+            Ok(())
+        })
+        .await??;
         lock(&state.pro.preferences)
             .entry(workspace.into())
             .or_default()
@@ -1941,7 +1948,12 @@ pub(super) async fn lazy_handback(state: &Arc<AppState>, config: &Configure) -> 
         {
             continue;
         }
-        if !execution::preferred_here(state, config, &workspace)
+        // The account's preferred installation is the latest computer that
+        // had the project; one the user opened it on since may pull it home
+        // too, once nothing live holds it (the settle rule below still
+        // decides moving live cloud work).
+        if !(execution::preferred_here(state, config, &workspace)
+            || execution::opened_here(state, &workspace))
             || lock(&state.pro.preferences)
                 .get(&workspace)
                 .is_some_and(|p| p.never_mirror)

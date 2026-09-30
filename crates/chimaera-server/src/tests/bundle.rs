@@ -83,6 +83,9 @@ async fn bundle_preserves_shell_identity_and_defers_moved_terminal() {
         source.sessions.get(id).unwrap().alive,
         "plain terminal stays on laptop"
     );
+    // The registering daemon recorded the id in the folder; a folder that
+    // lost it gets it back when a session import registers the workspace.
+    std::fs::remove_file(root.join(".chimaera-workspace")).unwrap();
     let imported = bundle::import(
         target.clone(),
         &path,
@@ -98,6 +101,10 @@ async fn bundle_preserves_shell_identity_and_defers_moved_terminal() {
     .unwrap();
     assert_eq!(imported.id, id);
     assert_eq!(imported.workspace_id, workspace_id);
+    assert_eq!(
+        crate::workspaces::identity::read(&root).unwrap().id,
+        workspace_id
+    );
     assert!(imported.paused);
     assert!(target.sessions.get(id).is_none());
     let suspended = ledger::snapshot(&target).0;

@@ -259,6 +259,13 @@ async fn passive_discovery_then_explicit_real_git_adoption_preserves_roots_and_r
         "cloud source\n"
     );
     assert_eq!(git(&chosen, &["rev-parse", "HEAD"]), head);
+    // The folder carries its workspace id (inside `.git`, never committed),
+    // so a reinstall reopens this same project.
+    assert_eq!(
+        crate::workspaces::identity::read(&chosen).unwrap().id,
+        "w-cloud"
+    );
+    assert!(chosen.join(".git/chimaera-workspace").is_file());
     assert_eq!(fixture.handoffs.load(Ordering::Relaxed), 1);
     std::fs::write(chosen.join("project.txt"), "new local work\n").unwrap();
     let repeated = open(

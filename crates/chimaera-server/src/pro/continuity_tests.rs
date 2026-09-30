@@ -1676,3 +1676,234 @@ fn the_settle_gate_is_fixed_in_release_builds() {
     assert_eq!(super::settle_override(true, Some("9000")), 300);
     assert_eq!(super::settle_override(true, Some("soon")), 300);
 }
+
+/// A folder whose identity marker names `id`, registered through the route as
+/// the user opening it: on a computer whose installation is not the policy's
+/// preferred one, with the account's project held (or not) elsewhere.
+struct Reopened {
+    root: PathBuf,
+    state: Arc<AppState>,
+    account: FakeAccount,
+    config: Configure,
+    workspace: String,
+}
+impl Reopened {
+    /// `holder`/`expires_at` describe who holds the project on the account
+    /// (`server_now` is 2026-09-28T00:00:00Z); its policy prefers `i-other`,
+    /// not this computer's `i-home`.
+    async fn new(label: &str, holder: Option<&str>, expires_at: &str, register: bool) -> Self {
+        let root = temp(label);
+        let state = state(&root);
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        // The id a previous install of this computer (or another computer)
+        // recorded in the folder.
+        let workspace = "w-cloudcopy".to_owned();
+        std::fs::write(
+            project.join(".chimaera-workspace"),
+            json!({"id": workspace, "written_at": 1}).to_string(),
+        )
+        .unwrap();
+        let mut baton = owned(&workspace, holder.unwrap_or("d-other"), 5, "lease-other", 3);
+        baton["continuity"]["preferred_installation_id"] = "i-other".into();
+        baton["expires_at"] = expires_at.into();
+        baton["checkpoint"] = checkpoint(5);
+        if holder.is_none() {
+            baton["holder_id"] = serde_json::Value::Null;
+            baton["expires_at"] = serde_json::Value::Null;
+            baton["execution_lease"] = serde_json::Value::Null;
+        }
+        let account = FakeAccount::start(baton).await;
+        let mut config = device(&account.endpoint);
+        config.keeper_url = account.endpoint.clone();
+        *lock(&state.pro.runtime) = Some(config.clone());
+        if register {
+            let (status, opened) = post(
+                &state,
+                "/api/v1/workspaces",
+                &json!({"root": project}).to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{opened}");
+            assert_eq!(opened["id"], workspace, "the folder's id is reused");
+        } else {
+            // Registered without the folder's identity (a fresh id): not an
+            // open of the cloud project at all.
+            lock(&state.workspaces).add(project).unwrap();
+        }
+        Self {
+            root,
+            state,
+            account,
+            config,
+            workspace,
+        }
+    }
+    /// What the lease loop does for this project each tick.
+    async fn observe(&self) {
+        if lock(&self.state.workspaces).get(&self.workspace).is_some() {
+            reconcile(&self.state, &self.config, &self.workspace)
+                .await
+                .ok();
+        }
+    }
+    fn credentials(&self) -> usize {
+        self.account.calls("POST", "/v2/mirror/credentials").len()
+    }
+    fn finish(self) {
+        drop(self.state);
+        std::fs::remove_dir_all(self.root).ok();
+    }
+}
+
+/// The account's preferred installation is simply the latest computer that
+/// had the project: the computer the user opened it on pulls it home too
+/// (kept-both, no shadow), once nothing live holds it. A project that was not
+/// opened here (no folder identity) is not pulled.
+#[tokio::test]
+async fn a_project_opened_here_comes_home_even_when_another_installation_is_preferred() {
+    // Registered without the folder's identity: not opened, not pulled.
+    let unopened =
+        Reopened::new("opened-not", Some("d-other"), "2026-09-27T23:59:00Z", false).await;
+    assert!(unopened
+        .account
+        .calls("GET", "/v2/baton/w-cloudcopy")
+        .is_empty());
+    lock(&unopened.state.pro.ownership).insert(
+        "w-cloudcopy".into(),
+        Ownership::Remote {
+            epoch: 5,
+            holder: "d-other".into(),
+        },
+    );
+    lazy_handback(&unopened.state, &unopened.config)
+        .await
+        .unwrap();
+    assert_eq!(
+        unopened.credentials(),
+        0,
+        "another installation is preferred"
+    );
+    unopened.finish();
+
+    // Opened here, the other computer's lease lapsed: pulled home, once.
+    let lapsed = Reopened::new(
+        "opened-lapsed",
+        Some("d-other"),
+        "2026-09-27T23:59:00Z",
+        true,
+    )
+    .await;
+    assert!(crate::pro::opened_here(&lapsed.state, &lapsed.workspace));
+    lapsed.observe().await;
+    assert!(matches!(
+        lock(&lapsed.state.pro.ownership).get(&lapsed.workspace),
+        Some(Ownership::Remote { epoch: 5, .. })
+    ));
+    lazy_handback(&lapsed.state, &lapsed.config).await.unwrap();
+    assert_eq!(lapsed.credentials(), 1, "the return started");
+    lazy_handback(&lapsed.state, &lapsed.config).await.unwrap();
+    assert_eq!(
+        lapsed.credentials(),
+        1,
+        "a failed return backs off, never repeats"
+    );
+    assert!(
+        crate::pro::opened_here(&lapsed.state, &lapsed.workspace),
+        "still not held here: the next free moment pulls it"
+    );
+    lapsed.finish();
+
+    // Opened here, the account released the project: pulled home at once.
+    let released = Reopened::new("opened-released", None, "", true).await;
+    lock(&released.state.pro.ownership).insert(
+        released.workspace.clone(),
+        Ownership::Remote {
+            epoch: 5,
+            holder: "worker-a".into(),
+        },
+    );
+    lazy_handback(&released.state, &released.config)
+        .await
+        .unwrap();
+    assert_eq!(released.credentials(), 1);
+    released.finish();
+}
+
+/// Another device's live lease always wins ("on your other computer"); the
+/// flag stays set, and the moment that lease lapses the project is pulled.
+#[tokio::test]
+async fn a_project_opened_here_waits_for_the_other_computers_live_lease() {
+    let held = Reopened::new("opened-live", Some("d-other"), "2026-09-28T00:01:30Z", true).await;
+    held.state.pro.power_suitable.store(true, Ordering::Release);
+    held.state.pro.awake_since.store(0, Ordering::Release);
+    held.account.script("GET", "/v1/hosts", 200, json!([]));
+    for _ in 0..3 {
+        held.observe().await;
+        lazy_handback(&held.state, &held.config).await.unwrap();
+    }
+    assert_eq!(held.credentials(), 0, "a live device holds it");
+    assert!(held
+        .account
+        .calls("POST", "/v2/baton/w-cloudcopy/acquire")
+        .is_empty());
+    assert!(matches!(
+        lock(&held.state.pro.ownership).get(&held.workspace),
+        Some(Ownership::Remote { .. })
+    ));
+    assert!(crate::pro::opened_here(&held.state, &held.workspace));
+
+    // That computer went idle: its lease is past its expiry.
+    lock(&held.account.baton)["server_now"] = json!("2026-09-28T00:05:00Z");
+    held.observe().await;
+    lazy_handback(&held.state, &held.config).await.unwrap();
+    assert_eq!(held.credentials(), 1, "pulled once the lease lapsed");
+    held.finish();
+}
+
+/// The flag is "opened here and not held here yet": holding the project (or
+/// signing out) clears it, and opening a project already held here never sets it.
+#[tokio::test]
+async fn the_opened_flag_clears_when_this_computer_holds_the_project_or_signs_out() {
+    let reopened = Reopened::new(
+        "opened-clears",
+        Some("d-other"),
+        "2026-09-27T23:59:00Z",
+        true,
+    )
+    .await;
+    let (state, id) = (&reopened.state, reopened.workspace.clone());
+    assert!(crate::pro::opened_here(state, &id));
+    // This device acquires it: the flag goes.
+    let mut grant = owned(&id, "d-home", 6, "lease-home", 1);
+    grant["checkpoint"] = checkpoint(6);
+    let grant: Baton = serde_json::from_value(grant).unwrap();
+    execution::accept(
+        state,
+        &reopened.config,
+        &grant,
+        0,
+        execution::RequestStart::now(),
+    )
+    .unwrap();
+    assert!(!crate::pro::opened_here(state, &id));
+    // Held here: opening it again sets nothing.
+    lock(&state.pro.ownership).insert(id.clone(), Ownership::Local { epoch: 6 });
+    let (status, _) = post(state, &format!("/api/v1/workspaces/{id}/open"), "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!crate::pro::opened_here(state, &id));
+    // Not held (the cloud has it): opening it sets it, and signing out clears it.
+    lock(&state.pro.ownership).insert(
+        id.clone(),
+        Ownership::Remote {
+            epoch: 7,
+            holder: "worker-a".into(),
+        },
+    );
+    let (status, _) = post(state, &format!("/api/v1/workspaces/{id}/open"), "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(crate::pro::opened_here(state, &id));
+    crate::pro::disconnect(axum::extract::State(state.clone())).await;
+    assert!(!crate::pro::opened_here(state, &id));
+    reopened.finish();
+}

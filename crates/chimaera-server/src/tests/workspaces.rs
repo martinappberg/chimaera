@@ -195,3 +195,211 @@ async fn internal_setup_is_persisted_and_hidden_without_hiding_similarly_named_u
     assert_eq!(rows.as_array().unwrap().len(), 1);
     assert_eq!(rows[0]["id"], normal.id);
 }
+
+/// A folder registered through the route records its workspace id, and the
+/// id follows the folder: a new daemon (a reinstall, a state reset, a second
+/// computer) reopens the same project; a local duplicate is its own; a moved
+/// folder keeps its workspace.
+mod folder_identity {
+    use super::*;
+    use crate::workspaces::identity;
+    use std::path::Path;
+
+    fn folder(label: &str) -> PathBuf {
+        std::fs::canonicalize(test_dir(label)).unwrap()
+    }
+
+    async fn register(state: &Arc<AppState>, root: &Path) -> serde_json::Value {
+        let (status, ws) = request(
+            state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ws}");
+        ws
+    }
+
+    #[tokio::test]
+    async fn registering_writes_the_marker_in_git_or_a_dotfile() {
+        let state = test_state();
+        let plain = folder("ident-plain");
+        let ws = register(&state, &plain).await;
+        let id = ws["id"].as_str().unwrap();
+        assert_eq!(identity::read(&plain).unwrap().id, id);
+        assert!(plain.join(".chimaera-workspace").is_file());
+
+        let repo = folder("ident-repo");
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        let ws = register(&state, &repo).await;
+        assert_eq!(
+            identity::read(&repo).unwrap().id,
+            ws["id"].as_str().unwrap()
+        );
+        assert!(repo.join(".git/chimaera-workspace").is_file());
+        assert!(!repo.join(".chimaera-workspace").exists());
+    }
+
+    #[tokio::test]
+    async fn a_new_daemon_reopens_the_same_folder_as_the_same_project() {
+        let root = folder("ident-reinstall");
+        let first = register(&test_state(), &root).await;
+        // A different daemon with an empty registry: a reinstall, a state
+        // reset, or the same folder on another computer.
+        let second_state = test_state();
+        let second = register(&second_state, &root).await;
+        assert_eq!(second["id"], first["id"]);
+        assert_eq!(second["root"], first["root"]);
+        // The user opened an existing project here: it may come home to this
+        // computer (a fresh registration is not that).
+        let first_state = test_state();
+        let fresh = folder("ident-fresh");
+        let fresh_ws = register(&first_state, &fresh).await;
+        assert!(!crate::pro::opened_here(
+            &first_state,
+            fresh_ws["id"].as_str().unwrap()
+        ));
+        assert!(crate::pro::opened_here(
+            &second_state,
+            second["id"].as_str().unwrap()
+        ));
+        // Reopening is idempotent and lists one project.
+        assert_eq!(register(&second_state, &root).await["id"], first["id"]);
+        let (_, list) = request(&second_state, Method::GET, "/api/v1/workspaces", None).await;
+        assert_eq!(list.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_local_duplicate_is_its_own_project_and_a_move_keeps_the_project() {
+        let state = test_state();
+        let parent = folder("ident-dup");
+        let original = parent.join("thesis");
+        std::fs::create_dir(&original).unwrap();
+        let first = register(&state, &original).await;
+        let first_id = first["id"].as_str().unwrap().to_owned();
+
+        // A copy of the folder (the marker comes along), the original still there.
+        let duplicate = parent.join("thesis-copy");
+        std::fs::create_dir(&duplicate).unwrap();
+        std::fs::copy(
+            original.join(".chimaera-workspace"),
+            duplicate.join(".chimaera-workspace"),
+        )
+        .unwrap();
+        let copy = register(&state, &duplicate).await;
+        assert_ne!(copy["id"], first["id"]);
+        assert!(!crate::pro::opened_here(
+            &state,
+            copy["id"].as_str().unwrap()
+        ));
+        assert_eq!(
+            identity::read(&duplicate).unwrap().id,
+            copy["id"].as_str().unwrap(),
+            "the duplicate is told its own id"
+        );
+        assert_eq!(
+            identity::read(&original).unwrap().id,
+            first_id,
+            "the original is untouched"
+        );
+
+        // Move the original: its old path is gone.
+        let moved = parent.join("thesis-renamed");
+        std::fs::rename(&original, &moved).unwrap();
+        let after = register(&state, &moved).await;
+        assert_eq!(after["id"], first["id"], "Pro state survives a move");
+        assert!(crate::pro::opened_here(&state, &first_id));
+        assert_eq!(after["root"], moved.to_string_lossy().as_ref());
+        assert_eq!(after["name"], "thesis-renamed");
+        let (_, list) = request(&state, Method::GET, "/api/v1/workspaces", None).await;
+        let list = list.as_array().unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list
+            .iter()
+            .all(|w| w["root"] != original.to_string_lossy().as_ref()));
+        assert_eq!(identity::read(&moved).unwrap().id, first_id);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_marker_is_no_marker_and_a_wrong_one_is_repaired() {
+        let state = test_state();
+        let root = folder("ident-broken");
+        std::fs::write(root.join(".chimaera-workspace"), "x".repeat(10_000)).unwrap();
+        let ws = register(&state, &root).await;
+        assert_eq!(
+            identity::read(&root).unwrap().id,
+            ws["id"].as_str().unwrap()
+        );
+
+        // A registered root whose marker names another id is repaired.
+        std::fs::write(
+            root.join(".chimaera-workspace"),
+            r#"{"id":"w-someoneelse","written_at":1}"#,
+        )
+        .unwrap();
+        let again = register(&state, &root).await;
+        assert_eq!(again["id"], ws["id"]);
+        assert_eq!(
+            identity::read(&root).unwrap().id,
+            ws["id"].as_str().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_folder_that_cannot_be_written_still_registers() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = test_state();
+        let root = folder("ident-readonly");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let ws = register(&state, &root).await;
+        let refused = std::fs::write(root.join("probe"), b"x").is_err();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ws["id"].as_str().unwrap().starts_with("w-"));
+        if refused {
+            assert!(identity::read(&root).is_none(), "no marker, no failure");
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_a_workspace_backfills_a_missing_marker_only() {
+        let state = test_state();
+        let root = folder("ident-backfill");
+        let ws = register(&state, &root).await;
+        let id = ws["id"].as_str().unwrap();
+        std::fs::remove_file(root.join(".chimaera-workspace")).unwrap();
+        let (status, _) = request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/workspaces/{id}/open"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // Best effort and off the request: wait for it briefly.
+        for _ in 0..100 {
+            if identity::read(&root).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(identity::read(&root).unwrap().id, id);
+
+        // An existing marker is never rewritten by an open.
+        std::fs::write(
+            root.join(".chimaera-workspace"),
+            r#"{"id":"w-keepthisid","written_at":1}"#,
+        )
+        .unwrap();
+        request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/workspaces/{id}/open"),
+            None,
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(identity::read(&root).unwrap().id, "w-keepthisid");
+    }
+}
