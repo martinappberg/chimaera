@@ -1646,7 +1646,7 @@ pub(crate) fn same_file_lines(state: &AppState, sid: &str) -> Vec<String> {
             .map(|n| one_line(&n))
             .unwrap_or_else(|| osid.clone());
         let name = cap(&name, 80);
-        let ago = crate::notes::age(now.saturating_sub(*at));
+        let ago = crate::comms::age(now.saturating_sub(*at));
         lines.push(format!(
             "chimaera: session '{name}' ({osid}), also running in this workspace, edited {} {ago} ago.",
             rel(path, root.as_deref())

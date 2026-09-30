@@ -445,5 +445,6 @@ straight away (the daemon reaches Claude through hooks instead).
   leaves them in its inbox. 404 unknown, 409 not a live chat.
 - `POST /api/v1/workspaces/{id}/comms/deliver` `{session}` → the user's
   hand-over of every unread message (the Mastermind panel's inbox).
-- `/ws/events` frame `{"type":"comms","workspace":"<ws>","epoch":n}` when
-  unread counts or wake requests change.
+- `/ws/events` frame `{"type":"comms","epochs":{"<ws>":n,…}}` (the
+  timeline frame's shape) when any workspace's unread counts or wake
+  requests change; a client refetches its own workspace's route.

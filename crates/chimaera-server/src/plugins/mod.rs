@@ -1077,8 +1077,9 @@ pub(crate) async fn active_for_session(state: &AppState, sid: &str) -> Vec<Arc<M
 }
 
 /// MCP tools to pre-allow for a session spawned in `ws`: those of every
-/// plugin active there, plus `tell_mastermind` when the workspace has a
-/// Mastermind (empty — and so no settings change at all — when neither).
+/// plugin active there, plus agent communication's while it is on (empty —
+/// and so no settings change at all, nor a codex terminal's MCP injection —
+/// when neither).
 pub(crate) async fn spawn_allow(state: &AppState, ws: &str) -> Vec<String> {
     // A build the host refused or faulted here offers nothing, so nothing of
     // it is pre-allowed.
@@ -1088,14 +1089,12 @@ pub(crate) async fn spawn_allow(state: &AppState, ws: &str) -> Vec<String> {
         .filter(|m| state.plugin_runtime.fault(m, ws).is_none())
         .flat_map(|m| m.provides.mcp_tools.iter().cloned())
         .collect();
-    // A workspace with a Mastermind: its workers may message it without a
-    // prompt (the Mastermind's own spawn carrying the entry is inert — the
-    // tool is never offered to it).
-    if crate::lock(&state.workspaces)
-        .get(ws)
-        .is_some_and(|w| w.mastermind.is_some())
-    {
-        tools.push("tell_mastermind".to_string());
+    // Agent communication while it is on: every agent here may see and
+    // message the others without a prompt (the switch is the standing
+    // permission; an ask-first Mastermind's sends are filtered back out by
+    // its gate).
+    if crate::comms::enabled(state) {
+        tools.extend(crate::comms::TOOLS.iter().map(|t| t.to_string()));
     }
     tools
 }
@@ -1977,7 +1976,8 @@ mod tests {
             "notify",
             "run_in_terminal",
             "spawn_agent",
-            "tell_mastermind",
+            "send_message",
+            "list_agents",
             "*",
             "echo(*)",
             "",

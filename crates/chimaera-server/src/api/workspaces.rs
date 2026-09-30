@@ -109,6 +109,15 @@ pub(crate) async fn put_mastermind(
     Json(body): Json<PutMastermind>,
 ) -> Response {
     let err = |code: StatusCode, msg: String| (code, Json(json!({"error": msg}))).into_response();
+    // The Mastermind is agent communication's coordinator: with it off,
+    // there is nothing for one to see or reach.
+    if !crate::comms::enabled(&state) {
+        return err(
+            StatusCode::CONFLICT,
+            "agent communication is off (Settings → Agents) — the Mastermind is part of it"
+                .to_string(),
+        );
+    }
     let Some(_guard) = MastermindSwitchGuard::acquire(&state, &id) else {
         return err(
             StatusCode::CONFLICT,
@@ -399,6 +408,7 @@ pub(crate) async fn delete_workspace(
             // Its Timeline too (memory now, the directory behind any queued
             // appends).
             state.timeline.remove_workspace(&id);
+            state.comms.forget_workspace(&id);
             state.history.remove_workspace(&id);
             if crate::lock(&state.recents_archive).forget_workspace(&id) {
                 crate::recents_archive::persist(&state).await;

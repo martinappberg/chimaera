@@ -2,9 +2,11 @@
 //! §10), pinned. Everything a WORKER agent is handed — the MCP tool list,
 //! the initialize instructions (plain and supervised), the generated claude
 //! `--settings`, the codex chat argv — is compared byte-for-byte against
-//! fixtures captured BEFORE the Timeline/Knowledge/Plugins work touched
-//! `mcp.rs`. Only a workspace with a plugin switched on may differ, and only
-//! by exactly what that plugin's card says it adds.
+//! fixtures. Agent communication (on by default) adds exactly its four
+//! tools and paragraph; switched off, the view is byte-for-byte the one
+//! captured before it existed (`*_off`). Only a workspace with a plugin
+//! switched on may differ further, and only by exactly what that plugin's
+//! card says it adds.
 //!
 //! Re-bless deliberately (a real, reviewed change to the worker view):
 //! `CHIMAERA_BLESS_AGENT_VIEW=1 cargo test -p chimaera-server agent_view`.
@@ -46,6 +48,22 @@ fn pretty(v: &serde_json::Value) -> String {
     serde_json::to_string_pretty(v).unwrap() + "\n"
 }
 
+/// The instructions name the session; the fixture names it `<SID>`.
+fn instructions_of(init: &serde_json::Value, sid: &str) -> String {
+    init["instructions"].as_str().unwrap().replace(sid, "<SID>")
+}
+
+async fn set_comms(state: &Arc<AppState>, on: bool) {
+    let (status, body) = request(
+        state,
+        Method::PUT,
+        "/api/v1/settings",
+        Some(serde_json::json!({"agents.communication.enabled": on})),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+}
+
 #[tokio::test]
 async fn worker_mcp_view_is_unchanged() {
     let state = test_state();
@@ -58,12 +76,10 @@ async fn worker_mcp_view_is_unchanged() {
         &pretty(&rpc(&state, &worker, "wk", "tools/list").await),
     );
     let init = rpc(&state, &worker, "wk", "initialize").await;
-    check(
-        "worker_instructions.txt",
-        init["instructions"].as_str().unwrap(),
-    );
+    check("worker_instructions.txt", &instructions_of(&init, &worker));
 
-    // Supervised: the same worker once its workspace has a Mastermind.
+    // Supervised: the same worker once its workspace has a Mastermind —
+    // the same tools, one more clause in the paragraph.
     let mm = inject_agent(&state, "mmk");
     lock(&state.session_workspaces).insert(mm.clone(), ws.clone());
     lock(&state.workspaces)
@@ -77,13 +93,13 @@ async fn worker_mcp_view_is_unchanged() {
         )
         .unwrap();
     check(
-        "supervised_tools.json",
+        "worker_tools.json",
         &pretty(&rpc(&state, &worker, "wk", "tools/list").await),
     );
     let init = rpc(&state, &worker, "wk", "initialize").await;
     check(
         "supervised_instructions.txt",
-        init["instructions"].as_str().unwrap(),
+        &instructions_of(&init, &worker),
     );
 
     // A plugin installed and switched on WITHOUT its footprint present
@@ -93,7 +109,25 @@ async fn worker_mcp_view_is_unchanged() {
         .set_plugin_on(&ws, "mycelium", true)
         .unwrap();
     check(
-        "supervised_tools.json",
+        "worker_tools.json",
+        &pretty(&rpc(&state, &worker, "wk", "tools/list").await),
+    );
+
+    // Agent communication off: exactly the view from before it existed,
+    // Mastermind or not.
+    set_comms(&state, false).await;
+    check(
+        "worker_tools_off.json",
+        &pretty(&rpc(&state, &worker, "wk", "tools/list").await),
+    );
+    let init = rpc(&state, &worker, "wk", "initialize").await;
+    check(
+        "worker_instructions_off.txt",
+        &instructions_of(&init, &worker),
+    );
+    lock(&state.workspaces).set_mastermind(&ws, None).unwrap();
+    check(
+        "worker_tools_off.json",
         &pretty(&rpc(&state, &worker, "wk", "tools/list").await),
     );
 

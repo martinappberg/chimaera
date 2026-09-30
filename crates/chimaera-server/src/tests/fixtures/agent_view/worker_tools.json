@@ -110,6 +110,85 @@
         "type": "object"
       },
       "name": "notify"
+    },
+    {
+      "description": "Who is working in this workspace: every agent session (claude, codex; chat or terminal) with its id, what it is doing right now, its branch and recent files, whether it is the Mastermind, and how a message reaches it. Check it before starting work that could overlap someone else's.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "include_exited": {
+            "description": "Also list agents that have exited",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "list_agents"
+    },
+    {
+      "description": "Read what another agent in this workspace has been doing: a chat session's recent conversation (messages, tool titles), a terminal agent's screen, or an ended session's record. Costs them nothing — try it before asking. Read-only.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "description": "The agent's id (from list_agents)",
+            "type": "string"
+          },
+          "lines": {
+            "description": "Transcript items / screen lines (default 60, cap 200)",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "agent"
+        ],
+        "type": "object"
+      },
+      "name": "read_agent"
+    },
+    {
+      "description": "Send another agent in this workspace a short message: a finding it needs, a blocker, a heads-up (\"I'm changing the loader API\"), or a question (set expect_reply to get the answer back as a message). It reaches a working agent at its next step; an idle one per the user's settings. Not for progress chatter or long content (write a file and send its path).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "expect_reply": {
+            "description": "You want an answer: their reply comes back to you (and may wake you)",
+            "type": "boolean"
+          },
+          "reply_to": {
+            "description": "The message number (#N) this answers",
+            "type": "integer"
+          },
+          "text": {
+            "description": "The message (under 2 KB)",
+            "type": "string"
+          },
+          "to": {
+            "description": "An agent's id (from list_agents), \"mastermind\", or \"everyone\"",
+            "type": "string"
+          }
+        },
+        "required": [
+          "to",
+          "text"
+        ],
+        "type": "object"
+      },
+      "name": "send_message"
+    },
+    {
+      "description": "Messages other agents sent you (and everyone) that you haven't seen — they usually reach you on their own; call this when told some are waiting.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "all": {
+            "description": "Show the recent ones you already saw too",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "read_messages"
     }
   ]
 }

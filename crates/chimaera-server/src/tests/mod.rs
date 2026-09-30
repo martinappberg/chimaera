@@ -2,6 +2,7 @@ mod agent_probe;
 mod agent_view;
 mod agents;
 mod chat;
+mod comms;
 mod doc_check;
 mod download;
 mod drafts;

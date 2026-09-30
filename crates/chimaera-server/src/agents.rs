@@ -197,11 +197,19 @@ pub(crate) fn write_settings(
         Some(crate::workspaces::MastermindMode::Auto) => allow = vec!["mcp__chimaera".into()],
         None => {}
     }
-    // Tools of workbench plugins active in the session's workspace at spawn
-    // (the user switched them on; each card says it adds them). Auto already
-    // allows the whole server; none active adds nothing.
+    // The workspace's extras at spawn (`plugins::spawn_allow`): tools of
+    // workbench plugins active there (the user switched them on; each card
+    // says it adds them) and agent communication's while it is on. Auto
+    // already allows the whole server; an ask-first Mastermind's sends keep
+    // their prompt.
     if mastermind != Some(crate::workspaces::MastermindMode::Auto) {
-        allow.extend(plugin_tools.iter().map(|t| format!("mcp__chimaera__{t}")));
+        let ask = mastermind == Some(crate::workspaces::MastermindMode::Ask);
+        allow.extend(
+            plugin_tools
+                .iter()
+                .filter(|t| !(ask && *t == crate::comms::SEND_TOOL))
+                .map(|t| format!("mcp__chimaera__{t}")),
+        );
     }
     settings["permissions"] = json!({ "allow": allow });
     if let Some(passthrough) = statusline_passthrough(user_statusline) {
@@ -714,12 +722,17 @@ pub(crate) async fn ingest(
         }
     }
 
-    // Active plugins (Agent notes' "N unread notes"): each may add one line
-    // on a carrier that already fires — never a new turn. Nothing switched
-    // on returns before any work.
+    // Active plugins: each may add one line on a carrier that already
+    // fires — never a new turn. Nothing switched on returns before any work.
     if matches!(event, "SessionStart" | "UserPromptSubmit") {
         context.extend(crate::plugins::runtime::hook(&state, &id, event).await);
     }
+
+    // Messages from other agents ride the same carriers: at the agent's
+    // next step (PostToolUse — live-verified to reach claude in chat mode
+    // too, PROTOCOL.md Pass 39), with the user's prompt, or at start. Never
+    // a new turn; nothing waiting adds nothing.
+    context.extend(crate::comms::hook_context(&state, &id, event).await);
 
     // Two live sessions here wrote the same file: this one hears about the
     // other, once per file per pair (claude reads PostToolUse and
@@ -731,7 +744,7 @@ pub(crate) async fn ingest(
 
     // `context` is only ever non-empty for SessionStart, UserPromptSubmit or
     // PostToolUse — all carry `additionalContext` — so `event` is always the
-    // right hookEventName here.
+    // right hookEventName here (`comms::hook_context` answers no other).
     if !context.is_empty() {
         return Json(json!({
             "hookSpecificOutput": {
@@ -792,7 +805,7 @@ pub(crate) fn spawn_agent_watch(
                 // retires first — so the surface here is always the terminal.
                 // A hook turn still open at death never gets its Stop.
                 crate::lock(&state.tui_episodes).forget(&session_id);
-                crate::lock(&state.notes).forget_session(&session_id);
+                state.comms.forget_session(&session_id);
                 crate::plugins::runtime::session_ended(&state, &session_id);
                 crate::recents::retire(
                     &state,
@@ -1074,12 +1087,39 @@ mod tests {
                 "mcp__chimaera__document_guide",
                 "mcp__chimaera__check_document",
                 "mcp__chimaera__workspace_status",
-                "mcp__chimaera__read_session",
                 "mcp__chimaera__list_changed_files",
                 "mcp__chimaera__read_timeline",
                 "mcp__chimaera__list_terminals",
                 "mcp__chimaera__read_terminal",
+                "mcp__chimaera__list_agents",
+                "mcp__chimaera__read_agent",
+                "mcp__chimaera__read_messages",
             ])
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(statusline_script_path(&sid)).ok();
+
+        // The workspace's extras ride along — but an ask-first
+        // Mastermind's sends keep their prompt.
+        let sid = fresh_session_id();
+        let extras: Vec<String> = crate::comms::TOOLS.iter().map(|t| t.to_string()).collect();
+        let path = write_settings(
+            &sid,
+            &key,
+            43999,
+            None,
+            None,
+            Some(MastermindMode::Ask),
+            &extras,
+        )
+        .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let allow = value["permissions"]["allow"].as_array().unwrap();
+        assert!(allow.contains(&json!("mcp__chimaera__list_agents")));
+        assert!(
+            !allow.contains(&json!("mcp__chimaera__send_message")),
+            "{allow:?}"
         );
         // The hooks still ride along untouched.
         assert_eq!(

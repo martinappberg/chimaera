@@ -1,7 +1,8 @@
-//! The workspace Mastermind (v1): the PUT/DELETE binding routes, the wire
-//! flag, and the MCP tier ("read for all, act for one" — v1 scopes both new
-//! tiers to the one bound Mastermind). Route-level where a spawn is needed,
-//! the scripted `write_fake_claude` stands in for the real CLI.
+//! The workspace Mastermind: the PUT/DELETE binding routes, the wire flag,
+//! and its MCP tier — agent communication's coordinator (every agent sees
+//! and messages the others; the Mastermind alone spawns, interrupts and
+//! directs). Route-level where a spawn is needed, the scripted
+//! `write_fake_claude` stands in for the real CLI.
 
 use super::support::*;
 use crate::*;
@@ -15,6 +16,29 @@ const BASE_TOOLS: [&str; 6] = [
     "check_document",
     "notify",
 ];
+
+/// Agent communication's tools (every agent, while it is on).
+const COMMS_TOOLS: [&str; 4] = ["list_agents", "read_agent", "send_message", "read_messages"];
+
+fn worker_tools() -> Vec<&'static str> {
+    BASE_TOOLS
+        .iter()
+        .chain(COMMS_TOOLS.iter())
+        .copied()
+        .collect()
+}
+
+/// Switch agent communication (and with it the Mastermind) on or off.
+async fn set_comms(state: &Arc<AppState>, on: bool) {
+    let (status, body) = request(
+        state,
+        Method::PUT,
+        "/api/v1/settings",
+        Some(serde_json::json!({"agents.communication.enabled": on})),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+}
 
 /// PUT the mastermind and return (status, body).
 async fn put_mastermind(
@@ -280,7 +304,8 @@ async fn tool_names(state: &Arc<AppState>, sid: &str, key: &str) -> Vec<String> 
 
 /// The tier in both directions: the Mastermind sees (and can call) the
 /// workspace tools; a sibling worker neither sees them nor gets past the
-/// call gate; both keep the base linked-terminal tools.
+/// call gate; both keep the base tools and agent communication's. With
+/// agent communication off the Mastermind is off too.
 #[tokio::test]
 async fn mcp_tier_gates_on_the_binding() {
     let state = test_state();
@@ -295,22 +320,30 @@ async fn mcp_tier_gates_on_the_binding() {
         "list_terminals",
         "run_in_terminal",
         "read_terminal",
+        "list_agents",
+        "read_agent",
+        "send_message",
+        "read_messages",
         "workspace_status",
-        "read_session",
         "list_changed_files",
+        "read_timeline",
         "spawn_agent",
         "spawn_terminal",
-        "message_agent",
         "interrupt_agent",
     ] {
-        assert!(mm_tools.contains(&tool.to_string()), "{mm_tools:?}");
+        assert!(mm_tools.contains(&tool.to_string()), "{tool}: {mm_tools:?}");
     }
-    let worker_tools = tool_names(&state, &worker, "wk").await;
-    let mut expected = BASE_TOOLS.to_vec();
-    expected.push("tell_mastermind");
+    for gone in ["message_agent", "read_session", "tell_mastermind"] {
+        assert!(
+            !mm_tools.contains(&gone.to_string()),
+            "{gone}: {mm_tools:?}"
+        );
+    }
+    let listed = tool_names(&state, &worker, "wk").await;
     assert_eq!(
-        worker_tools, expected,
-        "workers get the base tier plus tell_mastermind — never the Mastermind tier"
+        listed,
+        worker_tools(),
+        "workers get the base tier plus agent communication — never the Mastermind tier"
     );
 
     // The call gate matches the listing: a worker naming a mastermind tool
@@ -355,25 +388,63 @@ async fn mcp_tier_gates_on_the_binding() {
     assert!(ids.contains(&worker.as_str()), "{digest}");
     assert!(!ids.contains(&mastermind.as_str()), "{digest}");
 
+    // Agent communication off: the Mastermind's tier and every comms tool
+    // go at once — listed nowhere, refused by name — and the binding stays.
+    set_comms(&state, false).await;
+    assert_eq!(tool_names(&state, &mastermind, "mmk").await, BASE_TOOLS);
+    assert_eq!(tool_names(&state, &worker, "wk").await, BASE_TOOLS);
+    let (is_error, text) = mcp_tool_call(
+        &state,
+        &mastermind,
+        "mmk",
+        "workspace_status",
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(is_error && text.contains("Settings → Agents"), "{text}");
+    let (is_error, text) = mcp_tool_call(
+        &state,
+        &worker,
+        "wk",
+        "send_message",
+        serde_json::json!({"to": mastermind, "text": "hi"}),
+    )
+    .await;
+    assert!(is_error && text.contains("off"), "{text}");
+    assert!(lock(&state.workspaces)
+        .get(&ws)
+        .and_then(|w| w.mastermind)
+        .is_some());
+    // And no Mastermind can be appointed while it's off.
+    let (status, body) = put_mastermind(
+        &state,
+        &ws,
+        serde_json::json!({"agent": "claude", "mode": "ask"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    set_comms(&state, true).await;
+    assert_eq!(tool_names(&state, &mastermind, "mmk").await, mm_tools);
+
     // Unbind (fire the Mastermind): the tier drops on the very next call.
     lock(&state.workspaces).set_mastermind(&ws, None).unwrap();
     let fired = tool_names(&state, &mastermind, "mmk").await;
-    assert_eq!(fired, BASE_TOOLS);
+    assert_eq!(fired, worker_tools());
 
     state.sessions.kill(&mastermind).ok();
     state.sessions.kill(&worker).ok();
 }
 
-/// read_session reads any same-workspace session's screen (agent TUIs
-/// included — read-only is safe), and the workspace scope walls off
-/// everything else.
+/// read_agent reads any same-workspace session's screen (agent TUIs
+/// included — read-only is safe) for EVERY agent, and the workspace scope
+/// walls off everything else.
 #[tokio::test]
-async fn read_session_scopes_to_the_workspace() {
+async fn read_agent_scopes_to_the_workspace() {
     let state = test_state();
     let ws = make_workspace(&state, "mm-read").await;
     let other_ws = make_workspace(&state, "mm-read-other").await;
-    let mastermind = inject_agent(&state, "mmk");
-    bind_as_mastermind(&state, &ws, &mastermind);
+    let worker = inject_agent(&state, "wk");
+    lock(&state.session_workspaces).insert(worker.clone(), ws.clone());
 
     let shell = spawn_integrated_bash(&state, "mm-read-shell").await;
     lock(&state.session_workspaces).insert(shell.clone(), ws.clone());
@@ -381,41 +452,48 @@ async fn read_session_scopes_to_the_workspace() {
     lock(&state.session_workspaces).insert(outsider.clone(), other_ws.clone());
 
     // Type something recognizable, then read the screen.
-    let _ =
-        crate::exec::run_exec(&state, &shell, "echo mm-sees-this".to_string(), None, None).await;
+    let _ = crate::exec::run_exec(
+        &state,
+        &shell,
+        "echo worker-sees-this".to_string(),
+        None,
+        None,
+    )
+    .await;
     let (is_error, text) = mcp_tool_call(
         &state,
-        &mastermind,
-        "mmk",
-        "read_session",
-        serde_json::json!({"session": shell}),
+        &worker,
+        "wk",
+        "read_agent",
+        serde_json::json!({"agent": shell}),
     )
     .await;
     assert!(!is_error, "{text}");
-    assert!(text.contains("mm-sees-this"), "{text}");
+    assert!(text.contains("worker-sees-this"), "{text}");
 
     // Cross-workspace target: refused with guidance.
     let (is_error, text) = mcp_tool_call(
         &state,
-        &mastermind,
-        "mmk",
-        "read_session",
-        serde_json::json!({"session": outsider}),
+        &worker,
+        "wk",
+        "read_agent",
+        serde_json::json!({"agent": outsider}),
     )
     .await;
     assert!(is_error, "{text}");
-    assert!(text.contains("workspace_status"), "{text}");
+    assert!(text.contains("list_agents"), "{text}");
 
-    state.sessions.kill(&mastermind).ok();
+    state.sessions.kill(&worker).ok();
     state.sessions.kill(&shell).ok();
     state.sessions.kill(&outsider).ok();
 }
 
-/// message_agent delivers through the chat command path — the journal gets
-/// the same UserMessage stamp a /ws/chat Send produces, prefixed with the
-/// Mastermind attribution — and the TUI wall holds (propose-only).
+/// The Mastermind's send_message carries direction: to a chat worker it is
+/// an ordinary send, tagged `origin: "mastermind"` under the Mastermind
+/// header; a terminal agent gets it on its next hook, never typed in; and
+/// interrupt_agent still stops at the TUI wall.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn message_agent_stamps_journal_and_walls_tuis() {
+async fn mastermind_messages_carry_direction_and_never_type_into_tuis() {
     let state = test_state();
     let ws = make_workspace(&state, "mm-msg").await;
     let mastermind = inject_agent(&state, "mmk");
@@ -442,22 +520,22 @@ async fn message_agent_stamps_journal_and_walls_tuis() {
         &state,
         &mastermind,
         "mmk",
-        "message_agent",
-        serde_json::json!({"session": worker_id, "text": "status check: report progress"}),
+        "send_message",
+        serde_json::json!({"to": worker_id, "text": "status check: report progress"}),
     )
     .await;
     assert!(!is_error, "{text}");
     assert!(text.contains("delivered"), "{text}");
 
-    // The journal shows it as a normal user turn WITH the attribution line —
-    // exactly what every attached UI replays.
+    // The journal shows a user message tagged as the Mastermind's, under
+    // its header — exactly what every attached UI replays.
     let journal = state.chat.journal_dir().join(format!("{worker_id}.jsonl"));
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let content = std::fs::read_to_string(&journal).unwrap_or_default();
-        if content.contains("[via the workspace Mastermind")
+        if content.contains("from the workspace Mastermind")
             && content.contains("status check: report progress")
-            && content.contains("user_message")
+            && content.contains("\"origin\":\"mastermind\"")
         {
             break;
         }
@@ -468,21 +546,35 @@ async fn message_agent_stamps_journal_and_walls_tuis() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    // A TUI agent target is propose-only (the exec-409 wall).
-    let tui = inject_agent(&state, "tk");
+    // A claude terminal target hears it on its next hook — nothing typed.
+    let tui = inject_silent_agent(&state, "tk");
     lock(&state.session_workspaces).insert(tui.clone(), ws.clone());
     let (is_error, text) = mcp_tool_call(
         &state,
         &mastermind,
         "mmk",
-        "message_agent",
-        serde_json::json!({"session": tui, "text": "do the thing"}),
+        "send_message",
+        serde_json::json!({"to": tui, "text": "do the thing"}),
     )
     .await;
-    assert!(is_error, "{text}");
-    assert!(text.contains("never types into a TUI"), "{text}");
+    assert!(!is_error, "{text}");
+    let (status, answer) = request(
+        &state,
+        Method::POST,
+        &format!("/api/v1/agent-events/{tui}?key=tk"),
+        Some(serde_json::json!({"hook_event_name": "PostToolUse", "tool_name": "Bash"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let context = answer["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        context.contains("from the workspace Mastermind") && context.contains("do the thing"),
+        "{answer}"
+    );
 
-    // interrupt_agent hits the same wall for TUIs.
+    // interrupt_agent hits the TUI wall.
     let (is_error, text) = mcp_tool_call(
         &state,
         &mastermind,
@@ -498,8 +590,8 @@ async fn message_agent_stamps_journal_and_walls_tuis() {
         &state,
         &mastermind,
         "mmk",
-        "message_agent",
-        serde_json::json!({"session": mastermind, "text": "hi me"}),
+        "send_message",
+        serde_json::json!({"to": mastermind, "text": "hi me"}),
     )
     .await;
     assert!(is_error, "{text}");
@@ -657,43 +749,37 @@ async fn mastermind_changes_are_serialized_per_workspace() {
     wait_session_gone(&state, &mm).await;
 }
 
-/// Workers reach the Mastermind with no plugin switched on: tell_mastermind
-/// is offered exactly to the supervised view, records a note to the
-/// Mastermind, and — in ask-first mode — waits in its inbox (no wake).
+/// Workers reach the Mastermind with `send_message` to "mastermind": no
+/// Mastermind, an honest refusal; an ask-first Mastermind keeps it in its
+/// inbox (never a wake) and its next hook carries it.
 #[tokio::test]
-async fn workers_tell_the_mastermind_and_ask_mode_keeps_it_in_the_inbox() {
+async fn workers_message_the_mastermind_and_ask_mode_keeps_it_in_the_inbox() {
     let state = test_state();
     let ws = make_workspace(&state, "tell-mm").await;
-    let mm = inject_agent(&state, "kmm");
+    let mm = inject_silent_agent(&state, "kmm");
     let worker = inject_agent(&state, "kw");
     lock(&state.session_workspaces).insert(worker.clone(), ws.clone());
-
-    let has = |names: Vec<String>| names.iter().any(|n| n == "tell_mastermind");
-    assert!(
-        !has(tool_names(&state, &worker, "kw").await),
-        "no Mastermind, nothing to tell"
-    );
-
-    bind_as_mastermind(&state, &ws, &mm);
-    assert!(has(tool_names(&state, &worker, "kw").await));
-    assert!(
-        !has(tool_names(&state, &mm, "kmm").await),
-        "never offered to the Mastermind itself"
-    );
 
     let (is_err, text) = mcp_tool_call(
         &state,
         &worker,
         "kw",
-        "tell_mastermind",
-        serde_json::json!({"text": "the loader API changed under qc/"}),
+        "send_message",
+        serde_json::json!({"to": "mastermind", "text": "hello?"}),
+    )
+    .await;
+    assert!(is_err && text.contains("no Mastermind"), "{text}");
+
+    bind_as_mastermind(&state, &ws, &mm);
+    let (is_err, text) = mcp_tool_call(
+        &state,
+        &worker,
+        "kw",
+        "send_message",
+        serde_json::json!({"to": "mastermind", "text": "the loader API changed under qc/"}),
     )
     .await;
     assert!(!is_err, "{text}");
-    assert!(
-        text.contains("inbox"),
-        "ask-first waits for the user: {text}"
-    );
     let (_, page) = request(
         &state,
         Method::GET,
@@ -705,53 +791,34 @@ async fn workers_tell_the_mastermind_and_ask_mode_keeps_it_in_the_inbox() {
     assert_eq!(note["to"], "mastermind");
     assert_eq!(note["from_sid"], worker.as_str());
     assert!(note.get("woke").is_none(), "not woken in ask mode: {note}");
-
-    // Auto mode, but the Mastermind has no live chat to wake: the message
-    // still lands in the inbox, and no wake is claimed or reported.
-    lock(&state.workspaces)
-        .set_mastermind(
-            &ws,
-            Some(workspaces::MastermindCfg {
-                session_id: mm.clone(),
-                mode: workspaces::MastermindMode::Auto,
-                agent: "claude".to_string(),
-            }),
-        )
-        .unwrap();
-    let (is_err, text) = mcp_tool_call(
-        &state,
-        &worker,
-        "kw",
-        "tell_mastermind",
-        serde_json::json!({"text": "qc/ is green again"}),
-    )
-    .await;
-    assert!(!is_err, "{text}");
     assert!(
-        text.contains("hands it over"),
-        "no live Mastermind chat: inbox, never a wake: {text}"
+        note["delivery"] == "inbox" || note["delivery"] == "next_step",
+        "{note}"
     );
-    let (_, page) = request(
+    let (_, comms) = request(
         &state,
         Method::GET,
-        &format!("/api/v1/workspaces/{ws}/timeline"),
+        &format!("/api/v1/workspaces/{ws}/comms"),
         None,
     )
     .await;
-    let note = &page["entries"][0]["note"];
-    assert_eq!(note["text"], "qc/ is green again");
-    assert!(note.get("woke").is_none(), "{note}");
+    assert_eq!(comms["unread"][&mm], 1, "{comms}");
 
-    // Named but never offered: the call gate refuses the Mastermind itself.
-    let (_, out) = mcp_post(
+    // The Mastermind's next hook carries it.
+    let (_, answer) = request(
         &state,
-        &mm,
-        "kmm",
-        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": {"name": "tell_mastermind", "arguments": {"text": "hi"}}}),
+        Method::POST,
+        &format!("/api/v1/agent-events/{mm}?key=kmm"),
+        Some(serde_json::json!({"hook_event_name": "UserPromptSubmit", "prompt": "brief me"})),
     )
     .await;
-    assert!(out["error"]["message"].as_str().is_some(), "{out}");
+    let context = answer["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        context.contains("to the Mastermind") && context.contains("the loader API changed"),
+        "{answer}"
+    );
 
     for sid in [mm, worker] {
         state.sessions.kill(&sid).ok();
