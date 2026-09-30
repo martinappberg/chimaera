@@ -1,6 +1,7 @@
 # Agent communication — design & plan
 
-Status: **proposal** (2026-09-29, revised 2026-09-30), nothing built. It
+Status: **planned** (2026-09-29, every decision settled 2026-09-30), nothing
+built. It
 replaces the *Agent notes* workbench plugin with a built-in feature, **on by
 default and switchable off**: every agent in a workspace can see which other
 agents are running and what they're doing, and send them messages that
@@ -10,7 +11,7 @@ inside agent communication, not a separate system. It builds on the Mastermind
 original notes design
 ([timeline-knowledge-plugins-plan.md](timeline-knowledge-plugins-plan.md) §7),
 and mid-turn reading of queued messages (PR #217, PROTOCOL.md Pass 38).
-Items marked **[decide]** are the maintainer's call; §11 collects them.
+The maintainer's decisions are collected in §11.
 
 ## 1. Why this stops being a plugin
 
@@ -70,8 +71,9 @@ Changes:
 
 - **Mail, not phone → mail by default, phone by policy.** A message reaches
   a *working* agent at its next step (no new turn, no extra bill). Starting a
-  turn in an *idle* agent — a wake — becomes a per-workspace policy the user
-  sets, instead of never (§5). **[decide]** This reopens a locked decision.
+  turn in an *idle* agent — a wake — becomes a policy the user sets,
+  instead of never (§5). This deliberately reopens the locked "mail, not
+  phone" decision (maintainer, 2026-09-30).
 - **Seeing each other is for everyone.** `list_agents` and `read_agent`
   (today's Mastermind-only observe tools, trimmed) go to every agent — the
   "observe-for-all" phase the dashboard plan deferred as v0.3.
@@ -171,7 +173,8 @@ A wake is a real user-role message into an idle **chat** session, tagged
 with a new `agent` origin so its transcript shows who sent it (the `worker`
 origin's chip, generalized). It bills the user, so it's policy-gated:
 
-- **Wake policy**, the second row of the setting (§7) **[decide default]**:
+- **Wake policy**, the second row of the setting (§7); the default is
+  **Ask me**:
   - *Never* — mail only. The user wakes an agent with **Deliver** on the
     message (the existing route, generalized).
   - *Ask me* — a wake request lands in the dashboard's Needs-you queue:
@@ -180,8 +183,11 @@ origin's chip, generalized). It bills the user, so it's policy-gated:
   - *Within limits* — wakes happen on their own, inside the caps below.
 - **Reply wakes.** `send_message {expect_reply:true}` opens a thread. A
   reply to it (`reply_to`) wakes the asker if it has gone idle, because it
-  asked; still inside the caps. This is what makes a question-and-answer
-  between two agents work without a blocking call.
+  asked; still inside the caps. Under *Ask me* a reply wake needs no
+  approval (the asker asked for it; the caps and hop limit bound it), under
+  *Never* it waits in the inbox like everything else. This is what makes a
+  question-and-answer between two agents work without a blocking call or a
+  click per answer.
 - **Caps** (today's Mastermind wake caps, generalized): one wake per sender
   per 3 min, 10 wakes per workspace per hour, and a new **thread hop limit**
   — a thread can cause at most 4 wakes. Past a cap the message still lands
@@ -257,9 +263,9 @@ is not a setting.
   restart or resume.
 - Messages already on the Timeline stay.
 
-**[decide]** A per-workspace "off here" override (on the Workspace record,
-like `plugins_on`) — useful if one project should keep its agents
-isolated. Recommended: global only in v1, add the override if asked for.
+No per-workspace override in v1: the switch is global. A per-workspace
+"off here" (on the Workspace record, like `plugins_on`) comes later if
+someone needs one project's agents kept isolated.
 
 "Agent messages" is already taken by `notifications.agentMessages` (the
 `notify` tool's desktop alerts), so the setting says "Agent communication"
@@ -344,7 +350,7 @@ flag).
 
 ## 11. Decisions
 
-Settled (2026-09-30, maintainer):
+Settled by the maintainer, 2026-09-30:
 
 - **Built in, not a plugin.** The Agent notes plugin is deleted; agent
   communication is a setting.
@@ -356,12 +362,8 @@ Settled (2026-09-30, maintainer):
   depends on the sender's role, replacing `message_agent` and
   `tell_mastermind`.
 
-Open:
-
-1. **Wakes** — is "mail by default, phone by policy" right, and which
-   default: *Never*, *Ask me* (recommended), or *Within limits*?
-2. **Per-workspace override** of the global switch (§7) — recommended
-   later, only if asked for.
-3. **Peers reading each other** (`read_agent`) — recommended yes, workspace
-   only.
-4. **Cross-workspace** — recommended not in v1.
+- **Wakes**: mail by default, phone by policy, and the policy defaults to
+  **Ask me** (§5).
+- **No per-workspace override** in v1; the switch is global (§7).
+- **Peers read each other** with `read_agent`, within the workspace.
+- **No cross-workspace** visibility in v1 (P3 at the earliest).
