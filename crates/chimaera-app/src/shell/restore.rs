@@ -11,7 +11,9 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use super::connect::{do_connect, HostStatus};
-use super::{authorize_daemon_origin, daemon_navigation_allowed, lock, Shell, WindowScope};
+use super::{
+    authorize_daemon_origin, daemon_navigation_allowed, is_srcdoc_frame, lock, Shell, WindowScope,
+};
 use crate::windows::WindowRecord;
 
 static WINDOW_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -282,7 +284,8 @@ fn open_shell_window(
     let page_load_label = label.clone();
     let mut builder = WebviewWindowBuilder::new(app, label.clone(), WebviewUrl::External(url))
         .on_navigation(move |url| {
-            daemon_navigation_allowed(&navigation_app, &navigation_label, url)
+            is_srcdoc_frame(url)
+                || daemon_navigation_allowed(&navigation_app, &navigation_label, url)
         })
         .on_page_load(move |_window, payload| {
             if !matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
@@ -335,13 +338,21 @@ fn open_shell_window(
         // execute a native command.
         lock(&shell.windows).insert(label.clone(), window_scope);
     }
-    if let Err(error) = builder.build() {
-        if let Some(shell) = app.try_state::<Shell>() {
-            lock(&shell.allowed_daemon_ports).remove(&label);
-            lock(&shell.windows).remove(&label);
+    let window = match builder.build() {
+        Ok(window) => window,
+        Err(error) => {
+            if let Some(shell) = app.try_state::<Shell>() {
+                lock(&shell.allowed_daemon_ports).remove(&label);
+                lock(&shell.windows).remove(&label);
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
+    // The slides' and documents' print buttons call `print()` in a frame.
+    #[cfg(target_os = "macos")]
+    super::print_frame::install(&window);
+    #[cfg(not(target_os = "macos"))]
+    let _ = window;
     // Persist the new window so the next launch reopens it. Startup manages
     // Shell before opening any window, so every daemon window registered
     // above has an authoritative scope before its first native command.

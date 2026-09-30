@@ -25,6 +25,8 @@ mod commands;
 mod connect;
 mod drag;
 pub(crate) mod notices;
+#[cfg(target_os = "macos")]
+mod print_frame;
 mod restore;
 mod unsaved;
 
@@ -467,6 +469,16 @@ fn daemon_origin_matches(port: Option<u16>, url: &tauri::Url) -> bool {
         && url.username().is_empty()
         && url.password().is_none()
         && url.port() == port
+}
+
+/// An iframe's inline document (`<iframe srcdoc>`: the slides view, slide
+/// embeds, the live HTML preview, notebook HTML output). WebKit asks the
+/// navigation policy for subframes too and the guard sees only the URL, so
+/// without this every srcdoc frame is cancelled and draws blank. `about:srcdoc`
+/// can only ever name an iframe's own document, never a top-level page, so
+/// admitting it still keeps the main frame on the daemon origin.
+pub(super) fn is_srcdoc_frame(url: &tauri::Url) -> bool {
+    url.scheme() == "about" && url.path() == "srcdoc"
 }
 
 /// The open windows for the tray's window list: `(window label, display
@@ -1294,7 +1306,22 @@ pub fn run() {
 mod origin_tests {
     use std::collections::HashMap;
 
-    use super::{daemon_origin_matches, legacy_host_detail_label, WindowScope};
+    use super::{daemon_origin_matches, is_srcdoc_frame, legacy_host_detail_label, WindowScope};
+
+    #[test]
+    fn srcdoc_frames_pass_and_nothing_else_under_about() {
+        for allowed in ["about:srcdoc", "about:srcdoc#slide"] {
+            assert!(is_srcdoc_frame(&allowed.parse().unwrap()), "{allowed}");
+        }
+        for rejected in [
+            "about:blank",
+            "about:srcdocx",
+            "http://127.0.0.1:43123/srcdoc",
+            "data:text/html,srcdoc",
+        ] {
+            assert!(!is_srcdoc_frame(&rejected.parse().unwrap()), "{rejected}");
+        }
+    }
 
     #[test]
     fn daemon_origin_requires_exact_scheme_host_and_port() {

@@ -3,6 +3,8 @@ import {
   frontmatterOf,
   isMarpFrontmatter,
   isMarpSource,
+  PRINT_FIT_WIDTH,
+  printIgnoresPageSize,
   relativeImages,
   rewriteImages,
   slideCount,
@@ -81,5 +83,41 @@ describe("rendered deck helpers", () => {
     expect(doc).not.toMatch(/<script/i);
     const print = slideDocument("", html, { w: 960, h: 720 }, "print");
     expect(print).toContain("@page{size:960px 720px");
+  });
+
+  it("overrides Marp's own print rules, which blank the PDF in WebKit", () => {
+    const marpPrint =
+      "@media print{html, body{break-inside:avoid-page}div.marpit > svg > foreignObject > section{break-before:page}" +
+      "div.marpit > svg[data-marpit-svg]{display:block;height:100vh;width:100vw}}";
+    const print = slideDocument(marpPrint, html, { w: 960, h: 720 }, "print");
+    const after = print.slice(print.indexOf(marpPrint) + marpPrint.length);
+    // Same selectors, later in the document: ours win the cascade.
+    expect(after).toContain("div.marpit>svg[data-marpit-svg]{display:block;width:960px;height:720px;");
+    expect(after).toContain("div.marpit>svg>foreignObject>section{break-before:auto;");
+    expect(after).toMatch(/html,body\{[^}]*break-inside:auto/);
+    expect(after).not.toContain("transform:");
+  });
+
+  it("scales printed slides by transform where the paper ignores @page size", () => {
+    const print = slideDocument("", html, { w: 1280, h: 720 }, "print", 0, PRINT_FIT_WIDTH);
+    expect(print).toContain(`transform:scale(${PRINT_FIT_WIDTH / 1280})`);
+    // Height pulled in to the scaled 506px (720 − 214), centred at 900px wide.
+    expect(print).toContain("margin:0 0 -214px max(0px,calc((100% - 900px) / 2))");
+    // A slide already narrower than the fit width prints at its own size.
+    expect(slideDocument("", html, { w: 800, h: 600 }, "print", 0, PRINT_FIT_WIDTH)).not.toContain("transform:");
+  });
+
+  it("knows which engines print on the panel's paper", () => {
+    const safari =
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
+    const wkwebview = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)";
+    const chrome =
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
+    const edge = `${chrome} Edg/153.0.0.0`;
+    expect(printIgnoresPageSize(safari)).toBe(true);
+    expect(printIgnoresPageSize(wkwebview)).toBe(true);
+    expect(printIgnoresPageSize(chrome)).toBe(false);
+    expect(printIgnoresPageSize(edge)).toBe(false);
+    expect(printIgnoresPageSize("Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0")).toBe(false);
   });
 });
