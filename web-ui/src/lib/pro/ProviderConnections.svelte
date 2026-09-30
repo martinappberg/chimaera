@@ -2,26 +2,22 @@
   import { onDestroy, tick, untrack } from "svelte";
   import { pageVisible } from "../shared/visibility";
   import { isNativeShell, writeClipboard, type CloudProviderConnection, type CloudProviderStatus, type CloudSetupInfo } from "../net/native";
-  import { cloudAction, cloudRequest } from "./cloudTransport";
+  import { cloudAction, cloudRequest, peekCatalog } from "./cloudTransport";
   import { rememberCatalog } from "./catalogMemory";
   import { CHECKING_AFTER_MS, cloudAsleep } from "./presentation";
   import { agentsConnected, canDisconnect, canStartConnection, connectingLabel, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, nextReadyHandoff, panelRows, pendingConnection, providerLabel, providerLoginUrl, providersReady, providerStateLabel, recoverDisconnect, sameConnection } from "./providers";
 
-  let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady, onReadiness, onAgents, compact = false, live = true, remembered = null, pending = false, onOpen }: {
+  let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady, onReadiness, onAgents, compact = false, live = true, remembered = null }: {
     visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void; onReadiness?: (ready: boolean | null) => void;
     /** Whether any agent is connected by a fresh catalog; null when unknown. */
     onAgents?: (connected: boolean | null) => void; compact?: boolean;
     /** The cloud answers now: the catalog is polled only then. Otherwise the
-     * rows stay as remembered, or as the last read showed them. */
+     * rows stay as remembered, or as the last read showed them, and showing
+     * the section only looks (`peekCatalog`): it never wakes the cloud. */
     live?: boolean;
     /** The last catalog read's rows (the app's memory, or this browser's),
      * shown at once until a live read answers. */
     remembered?: CloudProviderStatus[] | null;
-    /** Access the user asked for (opening this section) is still coming. */
-    pending?: boolean;
-    /** The user opened the section, or arrived needing a connection, while
-     * the cloud is idle: the owner asks for access. Never on a passive path. */
-    onOpen?: () => void;
   } = $props();
   type Handoff = NonNullable<CloudSetupInfo["handoffs"]>[number];
   let providers = $state<CloudProviderStatus[]>([]);
@@ -46,8 +42,8 @@
   let asleep = $state(false);
   /** A live catalog read has answered: its rows replace the remembered ones. */
   let liveAnswered = $state(false);
-  /** Access was asked for once for this section (`request`). */
-  let requested = $state(false);
+  /** This showing of the section has looked once (`peekCatalog`). */
+  let peeked = $state(false);
   /** A live answer is late enough for the muted "Checking…". */
   let slow = $state(false);
   let copied = $state(false);
@@ -71,6 +67,8 @@
   /** Remembered rows until a live read answers; see `panelRows`. */
   const panel = $derived(panelRows({ providers, remembered, liveAnswered, loaded, current, asleep }));
   const fromMemory = $derived(panel.fromMemory);
+  /** Rows named from the shared catalog only: no state is claimed. */
+  const unchecked = $derived(panel.unchecked);
   const rows = $derived(panel.rows);
   const known = $derived(panel.known);
   const settled = $derived(panel.settled);
@@ -84,8 +82,8 @@
   /** What the words say: the rows as shown. */
   const shownReady = $derived(settled && providersReady(rows, required));
   const uncertain = $derived(!known || !settled || !shownReady && agents.some(p => p.state === "unknown"));
-  const heading = $derived(uncertain ? !known ? "Agent connections" : error ? "Agent connections need attention" : "Agent connections aren't confirmed yet" : shownReady ? required.length ? "The required agents are connected" : "Ready for cloud work" : required.length ? `Connect your agents${projectName ? ` for ${projectName}` : " to continue"}` : "Connect an agent to start cloud work");
-  const introduction = $derived(uncertain ? !known ? "" : "Chimaera is checking which agents are connected for cloud work." : shownReady ? required.length ? selectedHandoff && !resumeFailures[handoffKey(selectedHandoff)] ? "The agents this project needs are connected. Chimaera will continue it automatically." : "The agents this project needs are connected." : "Your connected agents are ready for cloud work. You can add another whenever you need it." : required.length ? "Connect the agents this project uses so it can continue automatically." : "Choose the agent you want to use. Connect one to get started; you can add others later.");
+  const heading = $derived(unchecked ? required.length ? `Connect your agents${projectName ? ` for ${projectName}` : " to continue"}` : "Agent connections" : uncertain ? !known ? "Agent connections" : error ? "Agent connections need attention" : "Agent connections aren't confirmed yet" : shownReady ? required.length ? "The required agents are connected" : "Ready for cloud work" : required.length ? `Connect your agents${projectName ? ` for ${projectName}` : " to continue"}` : "Connect an agent to start cloud work");
+  const introduction = $derived(unchecked ? required.length ? "Connect the agents this project uses so it can continue automatically." : "Connect an agent to use it in the cloud. Agents you connected before stay connected." : uncertain ? !known ? "" : "Chimaera is checking which agents are connected for cloud work." : shownReady ? required.length ? selectedHandoff && !resumeFailures[handoffKey(selectedHandoff)] ? "The agents this project needs are connected. Chimaera will continue it automatically." : "The agents this project needs are connected." : "Your connected agents are ready for cloud work. You can add another whenever you need it." : required.length ? "Connect the agents this project uses so it can continue automatically." : "Choose the agent you want to use. Connect one to get started; you can add others later.");
   const waiting = $derived(pendingConnection(connection));
   const disconnecting = $derived(disconnectConnection(connection));
   /** Connect works from remembered or idle rows too: the press itself wakes
@@ -95,11 +93,9 @@
   const confirmedSuccess = $derived(connectionSuccessCurrent(connection, providers, catalogFresh));
   const detailsNeeded = $derived(required.length > 0 || handoffs.length > 0 || connection !== null || operationError !== null || known && (!shownReady || error !== null));
   const showDetails = $derived(!compact || expanded || detailsNeeded);
-  /** Nothing to show yet, and the access the user asked for did not come. */
-  const stalled = $derived(!known && requested && !pending && !live);
-  /** A live answer the user is waiting on: opening woke the cloud, or it
-   * answers now and its first read is still out. A press speaks for itself. */
-  const awaiting = $derived(visible && busy === null && (pending || live && !liveAnswered && !asleep && error === null));
+  /** A live answer still out: the first read of a cloud that answers, or a
+   * look while it is idle. An idle answer ends it; a press speaks for itself. */
+  const awaiting = $derived(visible && busy === null && error === null && !asleep && !liveAnswered && (live || catalogFlight));
   const connectionId = $derived(connection?.id ?? null);
   const connectionExpires = $derived(connection?.expires_at ?? null);
   const connectingName = $derived(rows.find(p => p.id === (requestingDisconnect ? busy : connection?.provider_id))?.label ?? "your agent");
@@ -119,18 +115,16 @@
     const timer = setTimeout(() => (slow = true), CHECKING_AFTER_MS);
     return () => clearTimeout(timer);
   });
-  /** Arriving needing a connection (a project's context) with nothing to show
-   * is a request too: ask once, so the rows can load. */
+  /** Showing the section while the cloud is idle looks once, passively: a
+   * cloud that happens to be awake refreshes the rows silently; an idle one
+   * changes nothing. Only Connect, Disconnect and sign-in steps wake it. */
   $effect(() => {
-    if (visible && showDetails && !known && !live && !pending && !requested) untrack(() => request());
+    if (visible && $pageVisible && showDetails && !live && !peeked) untrack(() => { peeked = true; void load(); });
   });
-  function request(): void {
-    requested = true;
-    onOpen?.();
-  }
   function toggle(): void {
     expanded = !expanded;
-    if (expanded && !live) request();
+    // Each opening looks again.
+    if (!expanded) peeked = false;
   }
 
   $effect(() => {
@@ -146,9 +140,11 @@
     const operation = mutation;
     const visibility = visibilityGeneration;
     try {
-      const result = await cloudRequest({ operation: "providers" }, signal);
+      const result = await peekCatalog(signal);
       if (!alive || signal?.aborted || visibility !== visibilityGeneration) return;
       if (operation !== mutation) { catalogAgain = true; return; }
+      // A look while the cloud is idle that finds no catalog changes nothing.
+      if (!live && (result.available !== true || result.providers === undefined)) { current = false; asleep = true; error = null; return; }
       providers = result.providers ?? [];
       handoffs = result.handoffs ?? [];
       current = result.available === true && result.providers !== undefined;
@@ -169,9 +165,9 @@
     } catch (cause) {
       if (alive && !signal?.aborted && visibility === visibilityGeneration) {
         if (operation !== mutation) catalogAgain = true;
-        // Asleep or still starting is a state: the rows stay as they were
-        // (or the neutral loading state), no words, and checks continue.
-        else if (cloudAsleep(cause)) { current = false; asleep = true; error = null; }
+        // Asleep or still starting is a state, and a look while the cloud is
+        // idle is never an alarm: the rows stay as they were, with no words.
+        else if (cloudAsleep(cause) || !live) { current = false; asleep = true; error = null; }
         else { loaded = true; current = false; asleep = false; error = "We couldn't check your agent sign-ins. We'll try again shortly."; }
       }
     } finally {
@@ -349,20 +345,19 @@
   {#if requestingDisconnect || waiting || introduction}<p class="intro">{requestingDisconnect || waiting && disconnecting ? "Chimaera is signing this service out in the cloud." : waiting ? connection?.phase === "preparing" ? "Sign-in will appear here when it's ready." : connection?.phase === "verifying" ? `Chimaera is confirming your sign-in with ${connectingName}.` : "Finish sign-in below. Chimaera will confirm the connection automatically." : introduction}</p>{/if}
   <p class="privacy">Use your own accounts and subscriptions. Connected services are available across your cloud projects. Signing in or disconnecting here doesn't change sign-in on your computer.</p>
   {#if !known && !waiting && !requestingDisconnect}
-    <!-- Nothing remembered yet (a new account): placeholders, no words, until the rows load. -->
-    {#if stalled}<p class="muted" role="status">Your agent connections couldn’t load yet.</p><button class="text-button" onclick={request}>Try again</button>
-    {:else}<div class="provider-cards" aria-busy="true" aria-label="Agent connections">
+    <!-- Nothing remembered and no answer yet: placeholders, no words. -->
+    <div class="provider-cards" aria-busy="true" aria-label="Agent connections">
       {#each [0, 1] as slot (slot)}<div class="provider-card placeholder" aria-hidden="true"><span class="bar wide"></span><span class="bar"></span><span class="bar short"></span><span class="bar action"></span></div>{/each}
-    </div>{/if}
+    </div>
   {/if}
   {#if known && current && agents.length === 0}<p class="muted">No cloud agent connections are available yet.</p>{/if}
   {#if !waiting && !requestingDisconnect}<div class="provider-cards">
     {#each agents as provider (provider.id)}
       <article class="provider-card" class:connected={settled && provider.state === "signed_in"}>
         <div class="provider-title"><h3>{provider.label}</h3>{#if required.includes(provider.id)}<span class="required">Needed for this project</span>{/if}</div>
-        <p class="state" class:positive={settled && provider.state === "signed_in"}>{!settled && provider.state === "signed_in" ? "Previously connected · checking status" : providerStateLabel(provider)}</p>
-        <p class="provider-note">{provider.state === "signed_in" ? "Signed in for cloud work." : provider.state === "unknown" ? "Check the connection, or sign in again if needed." : provider.state === "unavailable" ? "This connection isn't available for cloud work yet." : "Connect the account you already use for this agent."}</p>
-        <div class="provider-actions">{#if provider.state !== "signed_in"}<button class="button" disabled={!canStart || provider.methods.length === 0 || provider.state === "unavailable"} onclick={() => void connect(provider.id)}>{busy === provider.id ? connectingLabel(provider) : `Connect ${provider.label}`}</button>{/if}{#if canDisconnect(provider)}<button class="text-button" disabled={!canManage} onclick={(event) => void requestDisconnect(provider, event.currentTarget)}>Disconnect {provider.label}</button>{:else if provider.state === "signed_in"}<span class="connected-label">{settled ? "Connected" : "Check connection to confirm"}</span>{/if}</div>
+        {#if !unchecked}<p class="state" class:positive={settled && provider.state === "signed_in"}>{!settled && provider.state === "signed_in" ? "Previously connected · checking status" : providerStateLabel(provider)}</p>{/if}
+        <p class="provider-note">{unchecked ? "Connect the account you already use for this agent." : provider.state === "signed_in" ? "Signed in for cloud work." : provider.state === "unknown" ? "Check the connection, or sign in again if needed." : provider.state === "unavailable" ? "This connection isn't available for cloud work yet." : "Connect the account you already use for this agent."}</p>
+        <div class="provider-actions">{#if provider.state !== "signed_in"}<button class="button" disabled={!canStart || !unchecked && provider.methods.length === 0 || provider.state === "unavailable"} onclick={() => void connect(provider.id)}>{busy === provider.id ? connectingLabel(provider) : `Connect ${provider.label}`}</button>{/if}{#if canDisconnect(provider)}<button class="text-button" disabled={!canManage} onclick={(event) => void requestDisconnect(provider, event.currentTarget)}>Disconnect {provider.label}</button>{:else if provider.state === "signed_in"}<span class="connected-label">{settled ? "Connected" : "Check connection to confirm"}</span>{/if}</div>
       </article>
     {/each}
   </div>
@@ -427,7 +422,7 @@
   {#each handoffs as handoff (handoff.workspace_id)}
     <div class="handoff"><div><h3>{handoff.name}</h3><p class="muted small" role="status">{resumeFailures[handoffKey(handoff)] ?? (current && providersReady(providers, handoff.blocked_providers.map(p => p.id)) ? "Continuing your project…" : "Waiting for an agent connection for cloud work.")}</p></div>{#if resumeFailures[handoffKey(handoff)]}<button class="button" disabled={busy !== null || !nextReadyHandoff(providers, [handoff], [], current)} onclick={() => void resume(handoff, handoff.workspace_id === workspaceId)}>Try again</button>{:else if !current || !providersReady(providers, handoff.blocked_providers.map(p => p.id))}<button class="button secondary" onclick={() => (focusedHandoff = handoff)}>Connect required agents</button>{/if}</div>
   {/each}
-  {#if !waiting && !requestingDisconnect && repositories.length && required.length === 0}<details class="optional"><summary>Repository connections <span>Optional</span></summary><p class="muted small">Lets your cloud pull and push your repositories, including private ones.</p>{#each repositories as provider (provider.id)}<div class="repository"><div><h3>{provider.label}</h3><p class="muted small">{providerStateLabel(provider)}</p><p class="muted small repository-use">{settled && provider.state === "signed_in" ? "Your cloud can pull and push your repositories." : `Connect to pull and push your ${provider.label} repositories from your cloud.`}</p></div><div class="provider-actions">{#if provider.state !== "signed_in"}<button class="button secondary" disabled={!canStart || provider.methods.length === 0 || provider.state === "unavailable"} onclick={() => void connect(provider.id)}>{busy === provider.id ? connectingLabel(provider) : `Connect ${provider.label}`}</button>{/if}{#if canDisconnect(provider)}<button class="text-button" disabled={!canManage} onclick={(event) => void requestDisconnect(provider, event.currentTarget)}>Disconnect {provider.label}</button>{/if}</div></div>{/each}</details>{/if}
+  {#if !waiting && !requestingDisconnect && repositories.length && required.length === 0}<details class="optional"><summary>Repository connections <span>Optional</span></summary><p class="muted small">Lets your cloud pull and push your repositories, including private ones.</p>{#each repositories as provider (provider.id)}<div class="repository"><div><h3>{provider.label}</h3>{#if !unchecked}<p class="muted small">{providerStateLabel(provider)}</p>{/if}<p class="muted small repository-use">{settled && provider.state === "signed_in" ? "Your cloud can pull and push your repositories." : `Connect to pull and push your ${provider.label} repositories from your cloud.`}</p></div><div class="provider-actions">{#if provider.state !== "signed_in"}<button class="button secondary" disabled={!canStart || !unchecked && provider.methods.length === 0 || provider.state === "unavailable"} onclick={() => void connect(provider.id)}>{busy === provider.id ? connectingLabel(provider) : `Connect ${provider.label}`}</button>{/if}{#if canDisconnect(provider)}<button class="text-button" disabled={!canManage} onclick={(event) => void requestDisconnect(provider, event.currentTarget)}>Disconnect {provider.label}</button>{/if}</div></div>{/each}</details>{/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if operationError}<p class="error" role="alert">{operationError}</p>{/if}
   {/if}

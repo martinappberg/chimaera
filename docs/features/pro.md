@@ -196,7 +196,10 @@ A disabled service says cloud work isn't available yet and that work on this
 computer continues; an uninvited preview account says access is by invitation.
 Neither shows an activity animation or claims files are synchronizing. A failed
 read or unavailable connection says so and keeps checking on its own; there is no
-manual check. Project status
+manual check. One failed account status read in a row (the account service being
+updated, say) is not reported: the page keeps the last confirmed state and its
+calm copy and checks again within five seconds; only a second failed read in a
+row shows “Cloud availability couldn’t refresh”. Project status
 appears only when mirror metadata exists: completed copies, handoff in progress,
 restoration, or setup that needs attention. Saved-copy counts describe completed
 copies, never active synchronization or a promise that every file is current.
@@ -282,26 +285,29 @@ remembered rows at once (Claude Code connected, Codex not connected, GitHub not
 connected), and a live read replaces them silently. While a live read is pending
 or finds the cloud asleep or starting, the rows simply stay; one muted
 “Checking…” beside the section title is the most that shows, and only after five
-seconds without a live answer. With nothing remembered yet (a new account) the
-rows are neutral placeholders until they load; if the access the user asked for
-does not come, one quiet line says “Your agent connections couldn’t load yet.”
-with **Try again**. A passive read that finds a cloud the account called ready
+seconds without a live answer. With nothing remembered yet (a new computer, say)
+the rows are neutral placeholders until the look answers; if it finds the cloud
+idle, the section names the catalog's providers (Claude Code, Codex, GitHub)
+without claiming any state, each with its **Connect**, under “Connect an agent to
+use it in the cloud. Agents you connected before stay connected.” A passive read that finds a cloud the account called ready
 unreachable is re-checked with the account first (it usually just went idle)
 and is reported as unavailable only on a second read in a row. A cloud that
 answers that it is asleep or still starting (503 `worker_asleep`/
 `worker_unavailable`, or a reply marked sleeping; both clients carry it as the
 fixed code `cloud_asleep`) is a state: never an error, never counted as
 unreachable, and never words on a passive path. Real failures keep their error
-copy. Opening **Agent connections** while the cloud is idle requests access (so
-does arriving from a project that needs a connection when nothing is
-remembered); checks then run on the fast cadence for at most two minutes.
-Pressing **Connect** requests access too: the button says “Connecting Claude
-Code…” (or “Opening GitHub’s sign-in…”) while the cloud comes up behind it,
-asking again for at most two minutes before the usual failure copy. Connect
+copy. Opening **Agent connections** is looking, not acting: it never wakes the
+cloud. It makes one passive catalog read (`pro/cloudTransport.ts`
+`peekCatalog`); a cloud that happens to be awake refreshes the rows silently,
+and an idle one changes nothing. Only **Connect**, **Disconnect** and the
+sign-in steps carry wake intent. Pressing **Connect** says “Connecting Claude
+Code…” (or “Opening GitHub’s sign-in…”) on its button while the cloud comes up
+behind it, asking again for at most two minutes before the usual failure copy. Connect
 works from remembered rows; **Disconnect** waits for a live read. There is no
 separate cloud-start action. Connecting a provider, or opening a repository on
 the cloud machine's own page, also acquires access as part of that user request. Catalog checks are
-single-flight, visibility-gated and run only while the cloud answers. Active sign-in checks run sequentially every
+single-flight and visibility-gated; they poll only while the cloud answers, and
+opening the section adds one look. Active sign-in checks run sequentially every
 two seconds, stop while hidden, and end at the attempt's finite deadline. Pending
 connection operations keep the worker active only until they finish or expire.
 

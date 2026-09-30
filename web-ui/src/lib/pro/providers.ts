@@ -108,18 +108,31 @@ export function rememberedRows(value: unknown): CloudProviderStatus[] | null {
   return rows.length ? rows : null;
 }
 
+/** The shared catalog's providers by name only (`unchecked`), for a panel
+ * with nothing read or remembered whose look found the cloud idle: Connect,
+ * which wakes it, stays one press away, and no row claims a state. */
+export function catalogRows(): CloudProviderStatus[] {
+  return catalog.providers
+    .filter(provider => provider.category === "agent" || provider.category === "repository")
+    .map(provider => ({ id: provider.id, label: provider.label, category: provider.category as CloudProviderStatus["category"], installed: null, state: "unknown", reason: null, checked_at: null, methods: [] }));
+}
+
 /** Which rows the connections panel shows, and how they read. Before any
  * live read answers, the remembered rows show at once (`fromMemory`); after
  * one, its rows stay, including while the cloud is idle again (`asleep`).
- * `settled` rows read as they are, with no "checking" words: a fresh read,
- * the remembered rows, or the last read while idle. `known` false is the
- * neutral loading state: nothing read and nothing remembered. */
-export function panelRows(state: { providers: CloudProviderStatus[]; remembered: CloudProviderStatus[] | null; liveAnswered: boolean; loaded: boolean; current: boolean; asleep: boolean }): { rows: CloudProviderStatus[]; fromMemory: boolean; known: boolean; settled: boolean } {
+ * With nothing read or remembered, a look that found the cloud idle shows
+ * the catalog's names (`unchecked`, `catalogRows`). `settled` rows read as
+ * they are, with no "checking" words: a fresh read, the remembered rows, or
+ * the last read while idle. `known` false is the neutral loading state:
+ * nothing read, nothing remembered, no answer yet. */
+export function panelRows(state: { providers: CloudProviderStatus[]; remembered: CloudProviderStatus[] | null; liveAnswered: boolean; loaded: boolean; current: boolean; asleep: boolean }): { rows: CloudProviderStatus[]; fromMemory: boolean; unchecked: boolean; known: boolean; settled: boolean } {
   const fromMemory = !state.liveAnswered && (state.remembered?.length ?? 0) > 0;
+  const unchecked = !state.loaded && !fromMemory && state.asleep;
   return {
-    rows: fromMemory && state.remembered ? state.remembered : state.providers,
+    rows: fromMemory && state.remembered ? state.remembered : unchecked ? catalogRows() : state.providers,
     fromMemory,
-    known: state.loaded || fromMemory,
+    unchecked,
+    known: state.loaded || fromMemory || unchecked,
     settled: state.current || fromMemory || state.asleep,
   };
 }

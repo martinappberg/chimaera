@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { MirrorStatus, MirrorWorkspace } from "../net/native";
-import { paid, readIntent, cloudAsleep, CLOUD_ASLEEP, cloudCopy, cloudReadyOnce, cloudPollDelay, cloudProjectStatus, connectionWarningCopy, copyIssue, friendlyError, projectCopiesSetupLine, projectCopyError, projectPlace, returningLine, RETURN_WINDOW_ENDED_COPY, signInNoteCopy, alreadySubscribed, recoverableAccountRestore } from "./presentation";
+import { paid, readIntent, cloudAsleep, CLOUD_ASLEEP, afterFailedRead, MISSES_REPORTED, cloudCopy, cloudReadyOnce, cloudPollDelay, cloudProjectStatus, connectionWarningCopy, copyIssue, friendlyError, projectCopiesSetupLine, projectCopyError, projectPlace, returningLine, RETURN_WINDOW_ENDED_COPY, signInNoteCopy, alreadySubscribed, recoverableAccountRestore } from "./presentation";
 
 // Copy is free to change; these tests pin which states read alike or apart,
 // what takes precedence, and that nothing from a raw error reaches the page.
@@ -272,6 +272,26 @@ describe("an ended plan's return window", () => {
     expect(friendlyError("return_window_ended", "fallback")).toBe(RETURN_WINDOW_ENDED_COPY);
     expect(friendlyError(new Error("return_window_ended and more"), "fallback")).toBe("fallback");
     expect(RETURN_WINDOW_ENDED_COPY).not.toMatch(/return_window_ended|epoch|window/i);
+  });
+});
+
+describe("a failed account read", () => {
+  it("keeps the last confirmed state and its calm copy after one miss, and reports only a second in a row", () => {
+    const ready = { state: "ready", reason: null, agents_connected: true, cloud_ready_once: true } as const;
+    const first = afterFailedRead(ready, 0);
+    expect(first).toEqual({ status: ready, misses: 1, report: false });
+    expect(cloudCopy(first.status!.state, null, undefined, true, true)).toEqual(cloudCopy("ready", null, undefined, true, true));
+    // A later `preparing` (the service being updated) keeps its calm copy too.
+    const updating = { state: "preparing", reason: null, cloud_ready_once: true } as const;
+    expect(afterFailedRead(updating, 0).status).toBe(updating);
+    const second = afterFailedRead(first.status, first.misses);
+    expect(second.report).toBe(true);
+    expect(second.misses).toBe(MISSES_REPORTED);
+    expect(second.status?.state).toBe("error");
+    expect(cloudCopy(second.status!.state, null).title).not.toBe(cloudCopy("ready", null).title);
+    // Nothing confirmed yet: the first miss still waits for a second.
+    expect(afterFailedRead(null, 0)).toEqual({ status: null, misses: 1, report: false });
+    expect(afterFailedRead(null, 1).report).toBe(true);
   });
 });
 

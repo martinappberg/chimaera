@@ -10,6 +10,13 @@ export async function isCloudMachine(signal?: AbortSignal): Promise<boolean> {
   return (await cloudRequest({ operation: "info" }, signal)).available === true;
 }
 
+/** Opening Agent connections only looks: one passive catalog read (a GET
+ * without wake intent; natively the `providers` operation, which never wakes
+ * the cloud). An idle cloud answers `cloud_asleep` and nothing changes. */
+export function peekCatalog(signal?: AbortSignal): Promise<CloudSetupInfo> {
+  return cloudRequest({ operation: "providers" }, signal);
+}
+
 /** An action the user took (Connect, Disconnect): the press itself wakes the
  * cloud. While the cloud answers that it is still coming up (`cloud_asleep`)
  * the same request is sent again after a short pause, starting no new attempt

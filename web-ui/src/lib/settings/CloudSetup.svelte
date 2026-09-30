@@ -8,7 +8,7 @@
   import { agentsConnected, rememberedRows } from "../pro/providers";
   import { BILLING_PATH } from "../pro/accountHome";
   import { pageVisible } from "../shared/visibility";
-  import { WAKE_BOUND_MS, cloudAsleep, cloudCopy, cloudPollDelay, cloudProjectStatus, cloudReadyOnce, friendlyError } from "../pro/presentation";
+  import { MISSES_REPORTED, afterFailedRead, cloudAsleep, cloudCopy, cloudPollDelay, cloudProjectStatus, cloudReadyOnce, friendlyError } from "../pro/presentation";
   import { isNativeShell, proCloudStatus, proMirrorStatus, writeClipboard, type MirrorStatus, type CloudSetupInfo, type CloudSetupRequest, type CloudProvisioningStatus } from "../net/native";
 
   let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady }: { visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void } = $props();
@@ -24,20 +24,18 @@
   let actionGeneration = 0;
   let connectionChecked = $state(false);
   let providersMounted = $state(false);
-  let connectionsRequested = $state(false);
   let projects = $state<MirrorStatus | null>(null);
   let refreshFlight: Promise<void> | null = null;
   /** Passive reads in a row that found the cloud unreachable although the
    * account said it was ready. One is usually the cloud going idle in
    * between, which is not an outage; only a second in a row is reported. */
   let unreachable = $state(0);
+  /** Account status reads in a row that failed (`afterFailedRead`): one is
+   * a service update or a blip and keeps the last confirmed state; only a
+   * second in a row is reported. */
+  let misses = 0;
   /** From the connection panel's own fresh catalog while it shows. */
   let liveAgents = $state<boolean | null>(null);
-  /** When access the user asked for (opening Agent connections) found the
-   * cloud still asleep or starting (`cloud_asleep`): the section keeps its
-   * rows, with no words, while the checks below pick up the live list, on the
-   * fast cadence and for at most `WAKE_BOUND_MS`. */
-  let wakingSince = $state<number | null>(null);
   /** A browser view's last read found the cloud asleep: a state, not an
    * outage. */
   let browserAsleep = $state(false);
@@ -50,7 +48,7 @@
   const remembered = $derived(browser ? browserRemembered : rememberedRows(status?.remembered_providers));
   const agents = $derived(liveAgents ?? (browser ? browserRemembered === null ? null : agentsConnected(browserRemembered) : status?.agents_connected ?? null));
   const connected = $derived(info?.available === true && (browser || status?.state === "ready"));
-  const outage = $derived(status?.state === "ready" && !connected && unreachable >= 2);
+  const outage = $derived(status?.state === "ready" && !connected && unreachable >= MISSES_REPORTED);
   /** Only a cloud never seen ready reads as setup; a later `preparing` (a
    * service update, say) is the same calm availability as ready and idle. */
   const readyOnce = $derived(seenReady || cloudReadyOnce(status));
@@ -60,10 +58,10 @@
   const copy = $derived(outage
     ? { title: "Cloud access is temporarily unavailable", detail: "We couldn’t reach your projects and agent connections. We’ll keep checking. You can keep working here." }
     : cloudCopy(status?.state ?? "error", status?.reason ?? null, status?.phase, agents, readyOnce));
-  $effect(() => { if (connected) { connectionsRequested = false; wakingSince = null; } });
   /** Agent connections show whenever there is a cloud: the last known rows at
-   * once, live ones when the cloud answers. */
-  const showConnections = $derived(browser ? connected || browserAsleep || connectionsRequested : hasCloud && !outage);
+   * once, live ones when the cloud answers. Showing or opening the section
+   * only looks; it never wakes the cloud. */
+  const showConnections = $derived(browser ? connected || browserAsleep : hasCloud && !outage);
   $effect(() => { if (showConnections) providersMounted = true; });
   /** Checks run on the fast cadence while a cloud is set up or confirmed after a read. */
   const settling = $derived(!browser && (status?.state === "preparing" || status?.state === "ready" && !connected && !connectionChecked));
@@ -71,10 +69,6 @@
   const available = $derived((browser ? connected || browserAsleep : hasCloud && !outage) && agents === true);
   const projectStatus = $derived(cloudProjectStatus(projects, workspaceId, browser ? "cloud" : "computer"));
   const needsCheck = $derived(browser ? connectionChecked && !connected && !browserAsleep : status?.state === "error" || status?.state === "unavailable" || outage);
-  /** Access the user asked for is still coming: a request in flight, or one
-   * that found the cloud still starting, within the bound. */
-  const wakeNoted = $derived(wakingSince !== null);
-  const pending = $derived(wakeNoted || busy === "connections");
 
   async function readProjects(signal?: AbortSignal): Promise<MirrorStatus | null> {
     try {
@@ -98,12 +92,14 @@
         if (browser) {
           const result = await cloudRequest({ operation: "info" }, signal).catch((reason: unknown) => { if (cloudAsleep(reason)) return null; throw reason; });
           if (!alive || signal?.aborted || current !== generation) return;
+          misses = 0;
           browserAsleep = result === null;
           info = result; connectionChecked = true;
           reachable = result?.available === true;
         } else {
           const result: CloudProvisioningStatus = await proCloudStatus();
           if (!alive || signal?.aborted || current !== generation) return;
+          misses = 0;
           // Passive status and metadata reads never wake a suspended machine.
           if (result.state === "ready") {
             const read = await cloudRequest({ operation: "info" }, signal).catch((reason: unknown) => cloudAsleep(reason) ? "asleep" as const : null);
@@ -128,11 +124,16 @@
         const nextProjects = !browser || reachable ? await readProjects(signal) : null;
         if (alive && !signal?.aborted && current === generation) {
           projects = nextProjects; error = null;
-          if (wakingSince !== null && Date.now() - wakingSince > WAKE_BOUND_MS) wakingSince = null;
         }
       } catch {
         if (alive && !signal?.aborted && current === generation) {
-          status = { state: "error", reason: null }; info = null; projects = null; connectionChecked = true;
+          // One failed read in a row (the account service being updated,
+          // say) keeps the last confirmed state and its calm copy; the page
+          // checks again soon, and only a second miss in a row is reported.
+          const next = afterFailedRead(status, misses);
+          misses = next.misses;
+          if (!next.report) return;
+          status = next.status; info = null; projects = null; connectionChecked = true;
           error = "Cloud availability couldn’t refresh. Your local work is still available.";
         }
       }
@@ -143,8 +144,6 @@
   }
   $effect(() => {
     if (!visible || !$pageVisible) return;
-    // A noted wake restarts the checks on the fast cadence (and its end on the usual one).
-    void wakeNoted;
     const controller = new AbortController();
     const started = Date.now();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -153,7 +152,8 @@
       if (controller.signal.aborted) return;
       // Read after the response, outside reactive tracking: status replacement
       // must not restart an immediate polling loop. Slow after five minutes.
-      timer = setTimeout(() => void poll(), cloudPollDelay(settling || pending, Date.now() - started));
+      // After a miss, the next check comes soon so a second one is reported promptly.
+      timer = setTimeout(() => void poll(), cloudPollDelay(settling || misses > 0, Date.now() - started));
     };
     untrack(() => void poll());
     return () => { generation += 1; controller.abort(); clearTimeout(timer); };
@@ -163,11 +163,9 @@
     if (busy !== null) return;
     const action = ++actionGeneration;
     busy = label; error = null;
-    if (request.operation === "start") { connectionsRequested = true; generation += 1; }
     try {
       const result = await cloudRequest(request);
       if (!alive || action !== actionGeneration) return;
-      if (request.operation === "start") generation += 1;
       if (result.available !== undefined) info = result;
       // Only the cloud machine's own page opens a repository there; it is
       // navigation to the new project, never a way to move work.
@@ -183,24 +181,11 @@
       }
       if (!alive || action !== actionGeneration) return;
       if (request.operation === "project") repository = "";
-      if (request.operation === "start") await refresh(undefined, true);
     } catch (reason) {
       if (!alive || action !== actionGeneration) return;
-      if (request.operation === "start") {
-        // Still asleep or starting: keep the rows and keep checking, quietly.
-        if (cloudAsleep(reason)) wakingSince = Date.now();
-        // Otherwise the section settles: its last known rows stay, and with
-        // none it offers Try again itself. Opening a list is not worth an alarm.
-        return;
-      }
       error = friendlyError(reason, "This repository couldn’t open in the cloud. Check the URL and your Git access, then try again.");
     }
     finally { if (alive && action === actionGeneration) busy = null; }
-  }
-  /** The user opened Agent connections (or arrived needing one) while the
-   * cloud is idle: that is the request for access. Passive paths never wake it. */
-  function openConnections(): void {
-    if (!connected) void act("connections", { operation: "start" });
   }
   async function copyKey(): Promise<void> {
     if (!info?.ssh_public_key) return;
@@ -220,7 +205,7 @@
   {#if providersMounted}
     <!-- Stays mounted across readiness changes so a sign-in in progress is never reset. -->
     <div class="provider-section" hidden={!showConnections}>
-      <ProviderConnections visible={visible && showConnections} live={connected} {remembered} {pending} onOpen={openConnections} {requiredProviders} {contextLabel} {workspaceId} {onReady} onAgents={(value) => (liveAgents = value)} compact />
+      <ProviderConnections visible={visible && showConnections} live={connected} {remembered} {requiredProviders} {contextLabel} {workspaceId} {onReady} onAgents={(value) => (liveAgents = value)} compact />
     </div>
   {/if}
   {#if connected && (browser || info?.ssh_public_key)}

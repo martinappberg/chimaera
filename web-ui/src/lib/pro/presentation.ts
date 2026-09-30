@@ -78,9 +78,9 @@ export const CLOUD_ASLEEP = "cloud_asleep";
 export function cloudAsleep(reason: unknown): boolean {
   return (reason instanceof Error ? reason.message : String(reason)) === CLOUD_ASLEEP;
 }
-/** How long an action the user took (opening Agent connections, pressing
- * Connect) keeps waiting for the cloud to come up behind it before the
- * section settles or the action reports its usual failure. */
+/** How long an action the user took (pressing Connect or Disconnect) keeps
+ * asking while the cloud comes up behind it before the action reports its
+ * usual failure. */
 export const WAKE_BOUND_MS = 120_000;
 /** A live answer this late may show one muted "Checking…" beside the
  * section title; sooner, the remembered rows simply stay. */
@@ -197,6 +197,20 @@ export function connectionWarningCopy(code: string | null): string {
     // connection_preparing, and any code a newer app sends.
     default: return "Connecting to the cloud… Work on this computer continues as usual.";
   }
+}
+
+/** Reads in a row that must fail before the page reports a problem: one
+ * miss is usually the cloud going idle in between, or the account service
+ * being updated, never an outage. */
+export const MISSES_REPORTED = 2;
+
+/** After an account status read that failed: the first in a row keeps the
+ * last confirmed status (the calm copy stays, nothing is reported, the page
+ * checks again soon); the next one in a row is reported as a failed read. A
+ * successful read starts the count again at zero. */
+export function afterFailedRead(status: CloudProvisioningStatus | null, missesBefore: number): { status: CloudProvisioningStatus | null; misses: number; report: boolean } {
+  const misses = missesBefore + 1;
+  return misses < MISSES_REPORTED ? { status, misses, report: false } : { status: { state: "error", reason: null }, misses, report: true };
 }
 
 /** Faster startup checks are finite, sequential in CloudSetup, and never wake compute. */

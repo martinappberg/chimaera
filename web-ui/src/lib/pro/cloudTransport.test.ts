@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cloudAction, cloudRequest } from "./cloudTransport";
+import { cloudAction, cloudRequest, peekCatalog } from "./cloudTransport";
 import { WAKE_BOUND_MS } from "./presentation";
 const mocks = vi.hoisted(() => ({ api: vi.fn(), native: vi.fn(() => false), invoke: vi.fn() }));
 vi.mock("../net/api", () => ({ api: mocks.api }));
@@ -149,5 +149,28 @@ describe("an action the user took while the cloud comes up", () => {
     await vi.advanceTimersByTimeAsync(10_000);
     await expect(result).resolves.toBeNull();
     expect(mocks.api).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("opening Agent connections", () => {
+  // Showing or opening the section only looks; only Connect, Disconnect and
+  // sign-in steps carry wake intent.
+  const sources = import.meta.glob<string>(["/src/lib/settings/CloudSetup.svelte", "/src/lib/pro/ProviderConnections.svelte"], { query: "?raw", import: "default", eager: true });
+  it("looks with one passive catalog read, in the browser and natively", async () => {
+    await peekCatalog();
+    expect(mocks.api.mock.calls.map(([path, options]) => [path, options.method, options.headers])).toEqual([["/pro/cloud/providers", "GET", {}]]);
+    mocks.native.mockReturnValue(true);
+    mocks.invoke.mockResolvedValue({ available: true, providers: [] });
+    await peekCatalog();
+    expect(mocks.invoke).toHaveBeenCalledWith({ operation: "providers" });
+  });
+  it("never sends the waking start from the connections section", () => {
+    expect(Object.keys(sources)).toHaveLength(2);
+    for (const [file, source] of Object.entries(sources)) {
+      expect({ file, start: /operation:\s*"start"/.test(source) }).toEqual({ file, start: false });
+    }
+    // The panel's catalog reads all go through the passive look.
+    expect(sources["/src/lib/pro/ProviderConnections.svelte"]).not.toMatch(/operation:\s*"providers"/);
+    expect(sources["/src/lib/pro/ProviderConnections.svelte"]).toMatch(/peekCatalog\(/);
   });
 });
