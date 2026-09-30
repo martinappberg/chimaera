@@ -148,10 +148,58 @@ async fn optional(root: &Path, args: &[&str]) -> Result<Option<String>> {
         .success
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string()))
 }
-pub(super) async fn capture(root: &Path) -> Result<Option<Snapshot>> {
-    if optional(root, &["rev-parse", "--git-dir"]).await?.is_none() {
-        return Ok(None);
+/// What a snapshot records of the project's own Git repository.
+#[derive(Default)]
+pub(super) struct Described {
+    /// The checked-out branch (`refs/heads/…`); none on a detached HEAD.
+    pub branch: Option<String>,
+    /// A safe `origin` URL (`mirror::repository_origin`).
+    pub origin: Option<String>,
+    /// HEAD and the portable configuration; none for a plain folder.
+    pub snapshot: Option<Snapshot>,
+}
+
+/// The repository step of a snapshot. A plain folder (not a Git repository)
+/// is an ordinary project whose working files alone are copied: the log says
+/// so once, at info level, when a snapshot first finds it so (and again only
+/// if it has been a repository in between), never as a failure. An actual
+/// repository's failures still warn and fail the snapshot.
+pub(super) async fn describe(
+    pro: &super::ProState,
+    workspace: &str,
+    root: &Path,
+) -> Result<Described> {
+    let repository = optional(root, &["rev-parse", "--git-dir"]).await?.is_some();
+    let first_seen = {
+        let mut plain = crate::lock(&pro.plain_folders);
+        if repository {
+            plain.remove(workspace);
+            false
+        } else {
+            plain.insert(workspace.to_owned())
+        }
+    };
+    if !repository {
+        if first_seen {
+            tracing::info!("no git repository; only the working files are copied");
+        }
+        return Ok(Described::default());
     }
+    // `symbolic-ref -q` exits 1 without a word on a detached HEAD: no
+    // branch, not a failure.
+    let branch = optional(root, &["symbolic-ref", "-q", "HEAD"])
+        .await
+        .ok()
+        .flatten()
+        .filter(|branch| !branch.is_empty());
+    Ok(Described {
+        branch,
+        origin: mirror::repository_origin(root).await,
+        snapshot: Some(capture(root).await?),
+    })
+}
+
+async fn capture(root: &Path) -> Result<Snapshot> {
     let head = optional(root, &["rev-parse", "--verify", "HEAD"]).await?;
     let bytes = transport::git_output(
         transport::git(root, None).await?,
@@ -180,7 +228,7 @@ pub(super) async fn capture(root: &Path) -> Result<Option<Snapshot>> {
             config.push(entry);
         }
     }
-    Ok(Some(Snapshot { head, config }))
+    Ok(Snapshot { head, config })
 }
 pub(super) async fn keep_source_head(root: &Path, cache: &Path) -> Result<()> {
     if optional(root, &["rev-parse", "--verify", "HEAD"])
@@ -1010,6 +1058,132 @@ mod tests {
             .trim()
             .to_string()
     }
+    /// Every event on this thread (the test's current-thread runtime): its
+    /// level and message.
+    struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+    impl tracing::Subscriber for Recorder {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A project folder that is not a Git repository is ordinary: the parts
+    /// of a mirror pass that read the folder (the inventory, the repository
+    /// step, the history mirror's check) never warn about it, pass after
+    /// pass; the log says once that only its working files are copied, and
+    /// again only after it has been a repository in between.
+    #[tokio::test]
+    async fn a_plain_folder_is_said_once_and_never_warned_about() {
+        const SAID: &str = "no git repository; only the working files are copied";
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-plain-folder-{}",
+            chimaera_core::generate_token()
+        ));
+        let project = root.join("project");
+        let shadow = root.join("shadow");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("notes.txt"), "plain").unwrap();
+        mirror::initialize(&shadow).await.unwrap();
+        let pro = super::super::ProState::new(root.join("pro"));
+        let credentials = MirrorCredentials {
+            workspace_id: "w-plain".into(),
+            repository_url: "https://mirror.invalid/repository.git".into(),
+            working_tree_url: "https://mirror.invalid/working-tree.git".into(),
+            username: "fixture".into(),
+            password: "fixture".into(),
+            read_only: false,
+            storage_limit_bytes: 1 << 20,
+            max_file_bytes: 1 << 20,
+        };
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let guard = tracing::subscriber::set_default(Recorder(events.clone()));
+        let pass = || async {
+            let (paths, _) = mirror::inventory(&project, &shadow).await.unwrap();
+            assert_eq!(paths, vec![std::path::PathBuf::from("notes.txt")]);
+            let described = describe(&pro, "w-plain", &project).await.unwrap();
+            assert!(described.branch.is_none());
+            assert!(described.origin.is_none());
+            assert!(described.snapshot.is_none());
+            mirror::mirror_repository(&project, &root.join("repository.git"), &credentials)
+                .await
+                .unwrap();
+        };
+        let count = |level: tracing::Level, text: Option<&str>| {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(at, message)| *at == level && text.is_none_or(|text| message == text))
+                .count()
+        };
+        pass().await;
+        pass().await;
+        assert_eq!(
+            count(tracing::Level::WARN, None),
+            0,
+            "{:?}",
+            events.lock().unwrap()
+        );
+        assert_eq!(count(tracing::Level::INFO, Some(SAID)), 1);
+
+        // It becomes a repository (on a detached HEAD, which has no branch):
+        // described, and still quiet.
+        git(&project, &["init", "-q", "-b", "main"]).await;
+        git(&project, &["add", "notes.txt"]).await;
+        git(&project, &["commit", "-q", "-m", "notes"]).await;
+        git(&project, &["checkout", "-q", "--detach"]).await;
+        let described = describe(&pro, "w-plain", &project).await.unwrap();
+        assert!(described
+            .snapshot
+            .is_some_and(|snapshot| snapshot.head.is_some()));
+        assert_eq!(described.branch, None);
+        git(&project, &["checkout", "-q", "main"]).await;
+        let described = describe(&pro, "w-plain", &project).await.unwrap();
+        assert_eq!(described.branch.as_deref(), Some("refs/heads/main"));
+        assert_eq!(count(tracing::Level::INFO, Some(SAID)), 1);
+
+        // And a plain folder again: said once more, then quiet.
+        std::fs::remove_dir_all(project.join(".git")).unwrap();
+        pass().await;
+        pass().await;
+        drop(guard);
+        assert_eq!(
+            count(tracing::Level::WARN, None),
+            0,
+            "{:?}",
+            events.lock().unwrap()
+        );
+        assert_eq!(count(tracing::Level::INFO, Some(SAID)), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn portable_config_rejects_credentials_helpers_and_executable_overrides() {
         for (key, value) in [
@@ -1290,7 +1464,7 @@ mod tests {
             &["config", "credential.helper", "MUST_NOT_TRANSFER"],
         )
         .await;
-        let snapshot = capture(&laptop).await.unwrap().unwrap();
+        let snapshot = capture(&laptop).await.unwrap();
         assert!(snapshot
             .config
             .iter()

@@ -25,9 +25,12 @@
     hereTitle,
     KeptError,
     keptErrorLine,
+    deletedNote,
     resolveAllKept,
     resolveKept,
     sizeLabel,
+    useCloudForAllBody,
+    useCloudHint,
     type KeptChoice,
     type KeptFile,
     type KeptPair,
@@ -52,10 +55,14 @@
   );
   const pairs = $derived(review?.pairs ?? []);
   const canChoose = $derived(review?.here === true);
+  /** A discarded copy goes to the Trash here (else it is deleted). */
+  const toTrash = $derived(review?.trash === true);
 
   let selected = $state<string | null>(null);
   let busy = $state<string | null>(null);
   let actionError = $state<string | null>(null);
+  /** Copies a choice deleted after all, though the review said Trash. */
+  let actionNote = $state<string | null>(null);
   let confirmAll = $state<KeptChoice | null>(null);
   let loadError = $state<string | null>(null);
 
@@ -138,15 +145,25 @@
     return rest[Math.min(Math.max(at, 0), rest.length - 1)].mine_path;
   }
 
+  /** Say so when copies were deleted where the review promised the Trash
+   *  (its drive's Trash refused them). */
+  function noteDeleted(answer: KeptReview, promised: boolean): void {
+    const deleted = answer.discarded?.deleted ?? 0;
+    actionNote = promised && deleted > 0 ? deletedNote(deleted, here) : null;
+  }
+
   async function choose(pair: KeptPair, choice: KeptChoice): Promise<void> {
     if (wsId === null || busy !== null) return;
     busy = pair.mine_path;
     actionError = null;
+    actionNote = null;
+    const promised = toTrash;
     const next = nextAfter(pair.mine_path);
     try {
       const answer = await resolveKept(wsId, pair.mine_path, choice);
       selected = next;
       keptReviews.set(wsId, answer);
+      noteDeleted(answer, promised);
     } catch (error) {
       actionError = error instanceof KeptError ? error.message : keptErrorLine("failed");
       void keptReviews.refresh(wsId);
@@ -160,9 +177,12 @@
     confirmAll = null;
     busy = "all";
     actionError = null;
+    actionNote = null;
+    const promised = toTrash;
     try {
       const answer = await resolveAllKept(wsId, choice);
       keptReviews.set(wsId, answer);
+      noteDeleted(answer, promised);
       const failed = answer.failed?.length ?? 0;
       if (failed > 0) {
         const code = answer.failed?.[0]?.error_code ?? "failed";
@@ -196,9 +216,9 @@
     return confirmAll === "use_cloud"
       ? {
           title: "Use the cloud's version for all?",
-          body: `${Here}'s versions of ${files} will be removed. The cloud's versions stay.`,
+          body: useCloudForAllBody(n, toTrash, here),
           label: "Use the cloud's",
-          danger: true,
+          danger: !toTrash,
         }
       : {
           title: `Use ${here}'s version for all?`,
@@ -228,6 +248,9 @@
         </svg>
         <p class="empty-title">Nothing left to review</p>
         <p class="empty-body">You chose for every file both sides changed.</p>
+        {#if actionNote !== null}
+          <p class="empty-body" role="status">{actionNote}</p>
+        {/if}
         {#if review.branches.length > 0}
           {@render branchList(review.branches)}
         {/if}
@@ -260,6 +283,9 @@
     {/if}
     {#if actionError !== null}
       <p class="banner error" role="alert">{actionError}</p>
+    {/if}
+    {#if actionNote !== null}
+      <p class="banner" role="status">{actionNote}</p>
     {/if}
     <div class="body">
       <nav class="side" aria-label="Files changed on both sides">
@@ -325,9 +351,7 @@
               <button
                 class="btn primary"
                 disabled={busy !== null || !canChoose}
-                title={current.size === null
-                  ? `The cloud deleted this file; ${here}'s copy goes away too`
-                  : `The cloud's version stays; ${here}'s copy goes away`}
+                title={useCloudHint(current.size === null, toTrash, here)}
                 onclick={() => void choose(current, "use_cloud")}>Use the cloud's</button
               >
               <button

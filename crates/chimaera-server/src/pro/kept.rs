@@ -7,18 +7,22 @@
 //!
 //! - `use_mine`: this computer's version replaces the file (the sibling is
 //!   renamed over it; a file the cloud deleted comes back);
-//! - `use_cloud`: the cloud's version stays and the sibling is removed (a
-//!   file the cloud deleted stays deleted);
+//! - `use_cloud`: the cloud's version stays and the sibling moves to the
+//!   Trash (`trash`), or is deleted where its drive has no Trash (a file the
+//!   cloud deleted stays deleted);
 //! - `keep_both`: nothing moves; the pair only stops waiting for a choice.
 //!
 //! Only siblings the return recorded are ever touched, only inside the
 //! project folder, and never through a symlink: every component is opened
-//! `O_NOFOLLOW` beneath the folder's descriptor, and the rename or removal
-//! runs against the pair's own directory descriptor. A recorded sibling that
-//! is gone (renamed or deleted by hand) or no longer a plain file counts as
-//! settled. Choices update `kept_both`/`kept_paths` and persist with the rest
+//! `O_NOFOLLOW` beneath the folder's descriptor, and the rename (to the file,
+//! or out to the Trash) or removal runs against the pair's own directory
+//! descriptor. A recorded sibling that is gone (renamed or deleted by hand)
+//! or no longer a plain file counts as settled. Choices update `kept_both`/`kept_paths` and persist with the rest
 //! of the Pro state, so the project's row and the chat stop asking.
-use super::{canonical, policy};
+use super::{
+    canonical, policy,
+    trash::{self, Discarded},
+};
 use crate::AppState;
 use axum::{
     extract::{Path as UrlPath, Query, State},
@@ -27,7 +31,7 @@ use axum::{
     Json,
 };
 use rustix::{
-    fs::{AtFlags, Mode, OFlags},
+    fs::{Mode, OFlags},
     io::Errno,
 };
 use serde::{Deserialize, Serialize};
@@ -288,20 +292,27 @@ fn inspect(root: &Path, mine_path: &Path) -> Result<Option<Pair>, Refusal> {
     }))
 }
 
-/// Apply one choice to one recorded pair. A kept copy already gone settles
-/// the pair for every choice but `use_mine`, which has nothing to bring back.
-fn apply(root: &Path, mine_path: &Path, choice: Choice) -> Result<(), Refusal> {
+/// Apply one choice to one recorded pair; for `use_cloud`, where the kept
+/// copy went. A kept copy already gone settles the pair for every choice but
+/// `use_mine`, which has nothing to bring back. `home` is the home Trash
+/// (`ProState::trash`).
+fn apply(
+    root: &Path,
+    mine_path: &Path,
+    choice: Choice,
+    home: Option<&Path>,
+) -> Result<Option<Discarded>, Refusal> {
     let (parent, mine, original) = split(mine_path)?;
     let Some(dir) = open_dir(root, &parent)? else {
         return match choice {
             Choice::UseMine => Err(Refusal::Gone),
-            _ => Ok(()),
+            _ => Ok(None),
         };
     };
     match entry(&dir, &mine)? {
         Entry::File(..) => {}
         Entry::Missing if choice == Choice::UseMine => return Err(Refusal::Gone),
-        Entry::Missing => return Ok(()),
+        Entry::Missing => return Ok(None),
         Entry::Other => return Err(Refusal::Unsafe),
     }
     match (entry(&dir, &original)?, choice) {
@@ -312,15 +323,18 @@ fn apply(root: &Path, mine_path: &Path, choice: Choice) -> Result<(), Refusal> {
         _ => {}
     }
     match choice {
-        Choice::KeepBoth => Ok(()),
+        Choice::KeepBoth => Ok(None),
         Choice::UseCloud => {
-            rustix::fs::unlinkat(&dir, mine.as_str(), AtFlags::empty()).map_err(failed)
+            let origin = root.join(&parent).join(&mine);
+            trash::discard(&dir, &mine, &origin, root, home)
+                .map(Some)
+                .map_err(failed)
         }
         // A rename follows neither name, and replaces the cloud's version in
         // one step (never a moment without a file at its path).
-        Choice::UseMine => {
-            rustix::fs::renameat(&dir, mine.as_str(), &dir, original.as_str()).map_err(failed)
-        }
+        Choice::UseMine => rustix::fs::renameat(&dir, mine.as_str(), &dir, original.as_str())
+            .map(|()| None)
+            .map_err(failed),
     }
 }
 
@@ -390,12 +404,15 @@ fn settle(state: &AppState, workspace: &str, settled: &[PathBuf], everything: bo
 }
 
 /// The review's answer: the pairs still waiting, how many kept copies the
-/// return did not name, the cloud's branches, and whether a choice can be
-/// made here now (`here`: the project is this computer's to change).
+/// return did not name, the cloud's branches, whether a choice can be made
+/// here now (`here`: the project is this computer's to change), and whether
+/// a copy discarded here goes to the Trash (`trash`; otherwise it is
+/// deleted).
 async fn listing(state: &Arc<AppState>, workspace: &str) -> Result<Value, Refusal> {
     let Report { root, recorded } = report(state, workspace)?;
     let scan_root = root.clone();
-    let (pairs, settled) = tokio::task::spawn_blocking(move || {
+    let home = state.pro.trash.clone();
+    let (pairs, settled, to_trash) = tokio::task::spawn_blocking(move || {
         let mut pairs = Vec::new();
         let mut settled = Vec::new();
         for path in recorded {
@@ -404,7 +421,8 @@ async fn listing(state: &Arc<AppState>, workspace: &str) -> Result<Value, Refusa
                 None => settled.push(path),
             }
         }
-        Ok::<_, Refusal>((pairs, settled))
+        let to_trash = trash::available(&scan_root, home.as_deref());
+        Ok::<_, Refusal>((pairs, settled, to_trash))
     })
     .await
     .map_err(failed)??;
@@ -448,6 +466,7 @@ async fn listing(state: &Arc<AppState>, workspace: &str) -> Result<Value, Refusa
         "pairs": pairs,
         "branches": branches,
         "here": super::may_write(state, workspace),
+        "trash": to_trash,
     }))
 }
 
@@ -501,18 +520,36 @@ pub(crate) async fn file(
     }
 }
 
-/// What a choice did: the pairs it settled, and the ones it could not
-/// (`resolve_all` only; `{mine_path, error_code}`).
-type Outcome = (Vec<PathBuf>, Vec<Value>);
+/// What a choice did: the pairs it settled, the ones it could not
+/// (`resolve_all` only; `{mine_path, error_code}`), and where the kept copies
+/// it discarded went.
+#[derive(Default)]
+struct Outcome {
+    settled: Vec<PathBuf>,
+    failures: Vec<Value>,
+    trashed: usize,
+    deleted: usize,
+}
+impl Outcome {
+    fn discarded(&mut self, went: Option<Discarded>) {
+        match went {
+            Some(Discarded::Trash) => self.trashed += 1,
+            Some(Discarded::Deleted) => self.deleted += 1,
+            None => {}
+        }
+    }
+}
 
 /// Run a choice serialized with mirror passes and other choices on the
 /// project, and only while the project is this computer's to change; answer
-/// with the updated review.
+/// with the updated review, plus `failed` and `discarded` (`{trash,
+/// deleted}`: how many kept copies went to the Trash, and how many were
+/// deleted because no Trash could take them).
 async fn choose(
     state: &Arc<AppState>,
     workspace: &str,
     everything: bool,
-    work: impl FnOnce(&Path, Vec<PathBuf>) -> Result<Outcome, Refusal> + Send + 'static,
+    work: impl FnOnce(&Path, Vec<PathBuf>, Option<&Path>) -> Result<Outcome, Refusal> + Send + 'static,
 ) -> Result<Value, Refusal> {
     report(state, workspace)?;
     if !super::may_write(state, workspace) {
@@ -529,7 +566,13 @@ async fn choose(
         return Err(Refusal::NotHere);
     }
     let folder = root.clone();
-    let (settled, failures) = tokio::task::spawn_blocking(move || work(&folder, recorded))
+    let home = state.pro.trash.clone();
+    let Outcome {
+        settled,
+        failures,
+        trashed,
+        deleted,
+    } = tokio::task::spawn_blocking(move || work(&folder, recorded, home.as_deref()))
         .await
         .map_err(failed)??;
     settle(
@@ -548,6 +591,7 @@ async fn choose(
     }
     let mut value = listing(state, workspace).await?;
     value["failed"] = Value::Array(failures);
+    value["discarded"] = json!({"trash": trashed, "deleted": deleted});
     Ok(value)
 }
 
@@ -560,12 +604,14 @@ pub(crate) async fn resolve(
 ) -> Response {
     let mine_path = PathBuf::from(&request.mine_path);
     let choice = request.choice;
-    let result = choose(&state, &workspace, false, move |root, recorded| {
+    let result = choose(&state, &workspace, false, move |root, recorded, home| {
         if !recorded.contains(&mine_path) {
             return Err(Refusal::NotKept);
         }
-        apply(root, &mine_path, choice)?;
-        Ok((vec![mine_path], Vec::new()))
+        let mut outcome = Outcome::default();
+        outcome.discarded(apply(root, &mine_path, choice, home)?);
+        outcome.settled.push(mine_path);
+        Ok(outcome)
     })
     .await;
     match result {
@@ -584,19 +630,21 @@ pub(crate) async fn resolve_all(
     Json(request): Json<ResolveAll>,
 ) -> Response {
     let choice = request.choice;
-    let result = choose(&state, &workspace, true, move |root, recorded| {
-        let mut settled = Vec::new();
-        let mut failures = Vec::new();
+    let result = choose(&state, &workspace, true, move |root, recorded, home| {
+        let mut outcome = Outcome::default();
         for path in recorded {
-            match apply(root, &path, choice) {
-                Ok(()) => settled.push(path),
-                Err(refusal) => failures.push(json!({
+            match apply(root, &path, choice, home) {
+                Ok(went) => {
+                    outcome.discarded(went);
+                    outcome.settled.push(path);
+                }
+                Err(refusal) => outcome.failures.push(json!({
                     "mine_path": shown(&path),
                     "error_code": refusal.parts().1,
                 })),
             }
         }
-        Ok((settled, failures))
+        Ok(outcome)
     })
     .await;
     match result {

@@ -16,6 +16,7 @@ mod repository;
 mod routes;
 mod shadow_cache;
 mod transport;
+mod trash;
 pub(crate) use drain::{cancel as cancel_drain, start as drain};
 pub(crate) use kept::{
     file as kept_file, list as kept_list, resolve as kept_resolve, resolve_all as kept_resolve_all,
@@ -105,6 +106,14 @@ pub(crate) struct ProState {
     /// The account refused this daemon's delegation (401/403 on renewal):
     /// `/pro/status` reports it so the native app mints a new one.
     delegation_refused: AtomicBool,
+    /// Projects whose folder a snapshot last found not to be a Git
+    /// repository (`repository::describe`): the log says so once, not on
+    /// every pass. Hot state, bounded by enrolled projects.
+    plain_folders: Mutex<std::collections::HashSet<String>>,
+    /// The home Trash a discarded kept copy goes to (`trash::home`). Tests
+    /// never reach the real one: they point it at a fixture, or leave it
+    /// unset (no Trash, so a discarded copy is deleted).
+    trash: Option<PathBuf>,
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -449,6 +458,8 @@ impl ProState {
             power_suitable: AtomicBool::new(false),
             renew_now: tokio::sync::Notify::new(),
             delegation_refused: AtomicBool::new(false),
+            plain_folders: Mutex::new(Default::default()),
+            trash: if cfg!(test) { None } else { trash::home() },
         }
     }
 }
