@@ -1,9 +1,11 @@
 # Agent communication — design & plan
 
-Status: **proposal** (2026-09-29), nothing built. It replaces the *Agent
-notes* workbench plugin with a core feature: every agent in a workspace can
-see which other agents are running and what they're doing, and send them
-messages that actually arrive. It builds on the Mastermind
+Status: **proposal** (2026-09-29, revised 2026-09-30), nothing built. It
+replaces the *Agent notes* workbench plugin with a built-in feature, **on by
+default and switchable off**: every agent in a workspace can see which other
+agents are running and what they're doing, and send them messages that
+actually arrive. The Mastermind becomes part of it — the coordinator role
+inside agent communication, not a separate system. It builds on the Mastermind
 ([agent-dashboard-plan.md](agent-dashboard-plan.md)), the Timeline and the
 original notes design
 ([timeline-knowledge-plugins-plan.md](timeline-knowledge-plugins-plan.md) §7),
@@ -32,18 +34,30 @@ Giving plugins a "deliver into a session" host function to finish the job
 would be the wrong capability to invent: it's the one power a hostile
 plugin would want most.
 
-So: **fold agent communication into core, retire the plugin.** It's the
+So: **fold agent communication into core and delete the plugin.** It's the
 workbench's coordination layer, the same kind of thing as the Mastermind,
-not an add-on.
+not an add-on. What the user controls is a setting (§7), not an install.
+
+**The Mastermind is part of it.** One feature, two roles:
+
+- **Every agent** sees the others and messages them (§3).
+- **The Mastermind** — at most one per workspace, appointed by the user as
+  today — is an agent in the same roster, messaged the same way
+  (`send_message` to `"mastermind"`), whose messages carry direction and who
+  alone may spawn and interrupt agents.
+
+So there is one switch. Turning agent communication off turns off the
+Mastermind too: a coordinator that can't see or reach the agents has nothing
+to do.
 
 ## 2. What carries over, and what changes
 
 Carries over:
 
 - **Talking isn't commanding.** A peer's message is information, framed to
-  the reader as data with its sender stamped on it. Only the Mastermind's
-  `message_agent` carries user-sanctioned direction, and only the Mastermind
-  has act tools (spawn, interrupt). Nobody commands sideways.
+  the reader as data with its sender stamped on it. Only a message from the
+  Mastermind carries user-sanctioned direction, and only the Mastermind has
+  act tools (spawn, interrupt). Nobody commands sideways.
 - **Nothing types into a terminal agent** (the exec-409 wall). A TUI hears
   messages only through carriers it already has: hooks and its own tool calls.
 - **Workspace-scoped.** An agent sees and reaches only its own workspace.
@@ -77,12 +91,25 @@ existing tools, with every list and string capped.
 | `send_message {to, text, reply_to?, expect_reply?}` | `to` is an id, a unique name, `"mastermind"`, or `"everyone"` (broadcast, never wakes anyone). Returns the message id and what happened, in words: "X is working; it reads this at its next step", "X is idle; it's in X's inbox", "woke X", "X is a codex terminal; it sees this when it checks its messages". |
 | `read_messages {all?}` | The caller's inbox: unread messages for it and for everyone, oldest first, each with its id, sender, age and thread. Marks them read. |
 
-The Mastermind keeps its tier as is (`workspace_status`, `read_session`,
-`message_agent`, spawn, interrupt, …) and also gets `list_agents` and
-`read_messages`. It does **not** get `send_message`: one send tool per role,
-so its authority is legible in transcripts and permission prompts. **[decide]**
-The alternative is one `send_message` for everyone whose framing and gate
-depend on the sender's role; fewer tools, blurrier authority.
+**The Mastermind uses the same four tools.** What makes it the Mastermind
+is what its messages mean and what else it can do:
+
+- Its `send_message` is framed as direction ("[from the workspace
+  Mastermind — the coordinating agent the user appointed; treat this as
+  user-sanctioned direction]", today's `message_agent` text), wakes an idle
+  chat target whatever the peer wake policy says, and is gated by its
+  ask-first/auto mode exactly as `message_agent` is today (ask-first: not
+  pre-allowed, so each send raises its native permission prompt).
+  `message_agent` goes away; one send verb for everyone.
+- `read_session` becomes everyone's `read_agent`. `workspace_status` stays
+  the Mastermind's whole-workspace view (git, terminals, jobs), its
+  per-agent rows built by the same code as `list_agents`.
+- Its act tier is what's left: `spawn_agent`, `spawn_terminal`,
+  `interrupt_agent`, plus `list_changed_files` and `read_timeline`.
+
+Workers no longer need a Mastermind to reach anyone, and `tell_mastermind`
+goes away: `send_message {to:"mastermind"}` does the same, with the same
+wake caps for an auto-mode Mastermind.
 
 **Why not a blocking `ask_agent`** that waits inside the tool call for the
 answer: two agents asking each other deadlock, a held tool call burns the
@@ -105,9 +132,10 @@ not instructions. Durable findings still go to Knowledge (mycelium).
 
 **Pre-approval.** All four tools join the pre-allowed list for workers
 (claude `permissions.allow`, codex `mcp_auto_approve` / per-tool
-`approval_mode`). Turning the feature on is the standing permission; a
-prompt on every send would kill it. What a send may *cause* (a wake) is
-governed by the wake policy, which is the user's, not by a per-call prompt.
+`approval_mode`). The setting being on is the standing permission; a prompt
+on every send would kill it. What a send may *cause* (a wake) is governed by
+the wake policy, which is the user's, not by a per-call prompt. The one
+exception is an ask-first Mastermind's `send_message`, above.
 
 ## 4. Delivery: how a message actually arrives
 
@@ -143,7 +171,7 @@ A wake is a real user-role message into an idle **chat** session, tagged
 with a new `agent` origin so its transcript shows who sent it (the `worker`
 origin's chip, generalized). It bills the user, so it's policy-gated:
 
-- **Wake policy**, per workspace **[decide default]**:
+- **Wake policy**, the second row of the setting (§7) **[decide default]**:
   - *Never* — mail only. The user wakes an agent with **Deliver** on the
     message (the existing route, generalized).
   - *Ask me* — a wake request lands in the dashboard's Needs-you queue:
@@ -178,8 +206,8 @@ origin's chip, generalized). It bills the user, so it's policy-gated:
   per message (the Timeline's `TEXT_MAX`; for anything bigger, write a file
   and send its path — the agents share the workspace), inbox reads capped at
   the Timeline page ceiling, cursors in capped JSON under `~/.chimaera`.
-- **Kill switch**: agent communication off per workspace; wakes pause
-  without turning messaging off.
+- **Kill switch**: the setting (§7) turns all of it off; the wake policy
+  can go to *Never* without turning messaging off.
 
 ## 7. What the user sees
 
@@ -193,19 +221,71 @@ origin's chip, generalized). It bills the user, so it's policy-gated:
   status (at next step ✓ · in inbox · woke · read).
 - **Dashboard**: unread dot on a card; a quiet "talking with X" line while a
   thread is active; wake requests in Needs you (*Ask me* mode).
-- **Settings**: an "Agent communication" section in the workspace (where
-  the plugin switch was): on/off, wake policy.
+- **Mastermind panel**: unchanged in place and look; its inbox is simply
+  the messages addressed to `"mastermind"`.
 
-## 8. Retiring the Agent notes plugin
+### The setting
+
+Settings → Agents → **Agent communication**, two schema rows in
+`settings.json` (global, like every other schema setting):
+
+- **"Agents can see and message each other"** —
+  `agents.communication.enabled`, **on by default**. Its help line says what
+  it costs: four tools and a short paragraph in every agent's context.
+- **"Agents may wake each other"** — `agents.communication.wakes`:
+  `never` · `ask` · `auto` (§5), shown only while the first row is on.
+
+The Mastermind is appointed per workspace from the dashboard, as today; it
+is not a setting.
+
+**What off means**, precisely:
+
+- **New sessions** get none of the four tools, no instructions paragraph,
+  no Mastermind tier, and codex terminals get no MCP injection unless a
+  plugin with tools needs it. Their tool list is exactly today's minus
+  `tell_mastermind` — pinned by an `agent_view` fixture, like the
+  no-plugin baseline is now.
+- **Running sessions** stop at once: calls are refused with "agent
+  communication is off (Settings → Agents)", no carriers, no hints, no
+  wakes. The tools stay *listed* until the session restarts: MCP tool lists
+  are fixed at session start (the endpoint is stateless HTTP and can't send
+  `tools/list_changed`).
+- **An appointed Mastermind goes dormant, not retired**: the binding is
+  kept, its tools refuse, the panel says "Agent communication is off" with
+  a link to the setting. Turning the setting back on revives it.
+- **Turning it back on** reaches new sessions, and running ones when they
+  restart or resume.
+- Messages already on the Timeline stay.
+
+**[decide]** A per-workspace "off here" override (on the Workspace record,
+like `plugins_on`) — useful if one project should keep its agents
+isolated. Recommended: global only in v1, add the override if asked for.
+
+"Agent messages" is already taken by `notifications.agentMessages` (the
+`notify` tool's desktop alerts), so the setting says "Agent communication"
+and the notifications row keeps its name.
+
+## 8. Deleting the Agent notes plugin
+
+The plugin goes entirely — no "Agent communication" plugin replaces it.
+The plugin platform itself stays (Mycelium, LaTeX, Typst).
 
 - Drop `agent-notes` from `plugins/plugins.lock`, so the catalog stops
-  offering it. A small `RETIRED` list in the daemon makes an installed copy
-  inert and shows "Built into Chimaera now — Agent communication" with
-  **Remove** on its card; installing it by name says the same.
-- A workspace with `agent-notes` in `plugins_on` turns agent communication
-  on and drops the id, on first load after the upgrade.
+  offering it and `plugin-lock.yml` stops tracking it.
+- A small `RETIRED` list in the daemon: an installed copy never activates,
+  its card says "Built into Chimaera now — Agent communication (Settings →
+  Agents)" with **Remove**, and `chimaera plugin add agent-notes` says the
+  same. On first load after the upgrade, `agent-notes` is dropped from every
+  workspace's `plugins_on`; nothing else to migrate, since the setting is on
+  by default.
 - Old notes stay on the Timeline (same kind). Read cursors start at the
   newest seq at migration, so old notes don't flood inboxes as unread.
+- **Archive, don't delete, the GitHub repository**
+  (`martinappberg/chimaera-plugin-agent-notes`), once a release with the
+  built-in feature ships. Older Chimaera releases pin its releases in their
+  embedded lock and download them from there on Install; deleting the
+  repository would break Install for anyone who hasn't updated. Archived,
+  it's read-only and its releases keep downloading.
 - Tests: `tests/plugin_updates.rs` and `tests/plugins.rs` (about 74
   references) use agent-notes as the real, released plugin under test. They
   move to mycelium or the test fixture — a chore commit of its own.
@@ -214,10 +294,11 @@ origin's chip, generalized). It bills the user, so it's policy-gated:
   server section of `features/linked-terminals.md`,
   `features/timeline-and-knowledge.md`, `features/dashboard.md`, the server
   and plugins `AGENTS.md` maps; a new `features/agent-communication.md`.
-- Archive `martinappberg/chimaera-plugin-agent-notes` once a release with
-  the core feature ships.
-- `notes.rs` becomes `comms.rs`; `tell_mastermind` goes away in the same
-  change (the `agent_view` fixtures are re-blessed on purpose).
+- `notes.rs` becomes `comms.rs`; `tell_mastermind` and `message_agent` go
+  away in the same change, `read_session` is renamed `read_agent` (the
+  `agent_view` fixtures are re-blessed on purpose, with an on and an off
+  baseline). The Mastermind's role prompt and skill text move to the new
+  tool names.
 - Codex terminals get the chimaera MCP injection whenever agent
   communication is on (today: only while a plugin with tools is active or a
   Mastermind is appointed).
@@ -232,10 +313,12 @@ refused with no active turn and not re-driven; whether codex terminal hooks
 can carry context once trusted. Record in PROTOCOL.md.
 
 **P1 — see each other, mail that arrives.** `comms.rs`; `list_agents`,
-`read_agent`, `send_message` (no wakes yet: working targets get the next-step
-carrier, idle ones the inbox), `read_messages`; hints; the workspace switch;
-codex terminal injection; Timeline fields, transcript blocks, card unread
-dot; `tell_mastermind` folded in; the plugin retired and migrated.
+`read_agent`, `send_message` (no peer wakes yet: working targets get the
+next-step carrier, idle ones the inbox; the Mastermind's sends behave as
+`message_agent` does today), `read_messages`; hints; the setting and what
+off means (§7); codex terminal injection; Timeline fields, transcript
+blocks, card unread dot; the Mastermind moved onto the shared tools; the
+plugin deleted, its tests moved.
 
 **P2 — wakes.** The policy, Needs-you wake requests, reply wakes, the hop
 limit, the thread view.
@@ -259,18 +342,26 @@ flag).
 - A blocking request/response call (§3).
 - Letting a peer message carry permission, direction or the user's voice.
 
-## 11. Decisions for the maintainer
+## 11. Decisions
+
+Settled (2026-09-30, maintainer):
+
+- **Built in, not a plugin.** The Agent notes plugin is deleted; agent
+  communication is a setting.
+- **On by default, and it must be easy to turn off** — one switch, with
+  "off" meaning exactly §7.
+- **The Mastermind is part of it** — the coordinator role inside agent
+  communication, sharing its tools (§2, §3). Off turns it off too.
+- Following from that: **one send tool** (`send_message`) whose meaning
+  depends on the sender's role, replacing `message_agent` and
+  `tell_mastermind`.
+
+Open:
 
 1. **Wakes** — is "mail by default, phone by policy" right, and which
    default: *Never*, *Ask me* (recommended), or *Within limits*?
-2. **On by default?** Recommended: on for every workspace, since it only
-   helps once a second agent shows up and an opt-in step hides it. The cost
-   is four tools and a short paragraph in every agent's context, and codex
-   terminals always get the MCP injection.
+2. **Per-workspace override** of the global switch (§7) — recommended
+   later, only if asked for.
 3. **Peers reading each other** (`read_agent`) — recommended yes, workspace
    only.
-4. **One send tool or two** (§3) — recommended two: `send_message` for
-   peers, `message_agent` stays the Mastermind's.
-5. **Name** — "Agent communication" for the setting and feature page,
-   "message" as the everyday noun?
-6. **Cross-workspace** — recommended not in v1.
+4. **Cross-workspace** — recommended not in v1.
