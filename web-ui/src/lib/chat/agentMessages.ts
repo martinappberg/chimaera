@@ -120,8 +120,9 @@ export function parseAgentText(text: string): ParsedAgentText {
   let body: string[] = [];
   const close = () => {
     if (current === null) return;
-    // The daemon escapes a Mastermind body line that would pose as a header.
-    const unescaped = body.map((l) => (l.startsWith("\\[message #") ? l.slice(1) : l));
+    // The daemon escapes a Mastermind body line that would pose as a header
+    // (one more `\` before any the author wrote); strip that one.
+    const unescaped = body.map((l) => (/^\\+\[message #/.test(l) ? l.slice(1) : l));
     const kept = trimBlankLines(current.mastermind ? unescaped : unquote(body));
     messages.push({ ...current, body: kept.join("\n") });
   };

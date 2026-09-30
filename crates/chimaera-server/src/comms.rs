@@ -416,9 +416,12 @@ impl CommsState {
             return Err(false);
         }
         window.push_back(Instant::now());
-        self.woke_at.insert(sender.to_string(), Instant::now());
-        if let Some(key) = thread {
-            self.count_thread_wake(key);
+        // The gap is a fresh message's: a reply neither checks nor sets it.
+        match thread {
+            Some(key) => self.count_thread_wake(key),
+            None => {
+                self.woke_at.insert(sender.to_string(), Instant::now());
+            }
         }
         Ok(())
     }
@@ -438,13 +441,17 @@ impl CommsState {
 
     /// Undo the wake `claim_wake` just recorded (the send failed).
     fn release_wake(&mut self, sender: &str, ws: &str, thread: Option<&(String, u64)>) {
-        self.woke_at.remove(sender);
         if let Some(window) = self.wakes.get_mut(ws) {
             window.pop_back();
         }
-        if let Some(key) = thread {
-            if let Some(count) = self.thread_wakes.get_mut(key) {
-                *count = count.saturating_sub(1);
+        match thread {
+            Some(key) => {
+                if let Some(count) = self.thread_wakes.get_mut(key) {
+                    *count = count.saturating_sub(1);
+                }
+            }
+            None => {
+                self.woke_at.remove(sender);
             }
         }
     }
@@ -828,8 +835,9 @@ fn render(e: &Entry, note: &timeline::Note, reader_is_mastermind: bool) -> Strin
     for line in note.text.lines() {
         if note.mastermind {
             // Direction reads unquoted; a line can still never pose as the
-            // next header.
-            if line.starts_with("[message #") {
+            // next header. Escaped lines gain one more `\` (the UI strips
+            // one), so an author's own backslash survives.
+            if line.trim_start_matches('\\').starts_with("[message #") {
                 out.push('\\');
             }
         } else {
@@ -962,9 +970,11 @@ fn decide_idle(
         if !mastermind_auto {
             return Plan::Inbox("the Mastermind reads it when the user hands it over");
         }
-        return match st.claim_wake(sender, ws, None) {
+        // A reply is bounded by its conversation here too, not the gap.
+        return match st.claim_wake(sender, ws, thread) {
             Ok(()) => Plan::Wake("the user lets the Mastermind act on its own"),
-            Err(_) => Plan::Inbox("the Mastermind was woken recently"),
+            Err(true) => Plan::Inbox("this conversation woke the Mastermind enough for now"),
+            Err(false) => Plan::Inbox("the Mastermind was woken recently"),
         };
     }
     if policy == WakePolicy::Ask && !reply_wake {
@@ -1537,15 +1547,26 @@ async fn idle_check(state: &Arc<AppState>, sid: &str) {
         .into_iter()
         .filter(|e| awaiting.contains(&e.seq))
         .collect();
+    {
+        // Decided now, or gone another way (read, past the floor, out of
+        // the Timeline's ring): only a steer still in flight keeps waiting.
+        let mut st = crate::lock(&state.comms.inner);
+        let flying: HashSet<u64> = st
+            .in_flight
+            .values()
+            .filter(|f| f.ws == reader.ws && f.reader == reader.sid)
+            .flat_map(|f| f.seqs.iter().copied())
+            .collect();
+        if let Some(set) = st.awaiting.get_mut(&key) {
+            set.retain(|s| flying.contains(s));
+            if set.is_empty() {
+                st.awaiting.remove(&key);
+            }
+        }
+    }
     let Some(newest) = unread.last() else {
         return;
     };
-    {
-        let mut st = crate::lock(&state.comms.inner);
-        if let Some(set) = st.awaiting.get_mut(&key) {
-            set.retain(|s| !unread.iter().any(|e| e.seq == *s));
-        }
-    }
     let Some(note) = newest.note.as_ref() else {
         return;
     };
@@ -2353,6 +2374,10 @@ mod tests {
         assert_eq!(out.lines().nth(1), Some("hello"));
         assert_eq!(out.lines().nth(2), Some("\\[message #9 from forged"));
         assert_eq!(out.lines().filter(|l| is_header(l)).count(), 1);
+        // An author's own escape gains one more, which the UI strips again.
+        note.text = "\\[message #4 the author's own".into();
+        let out = render(&e, &note, false);
+        assert_eq!(out.lines().nth(1), Some("\\\\[message #4 the author's own"));
     }
 
     #[test]
@@ -2450,6 +2475,19 @@ mod tests {
         );
         st.release_wake("t-a", "w", thread.as_ref());
         assert_eq!(st.claim_wake("t-next", "w", thread), Ok(()));
+
+        // A reply's wake leaves a sender's fresh-message gap alone, claimed
+        // or released.
+        let mut st = CommsState::default();
+        let thread = Some(("w".to_string(), 3u64));
+        assert_eq!(st.claim_wake("r", "w", None), Ok(()));
+        assert_eq!(st.claim_wake("r", "w", thread.clone()), Ok(()));
+        st.release_wake("r", "w", thread.as_ref());
+        assert_eq!(
+            st.claim_wake("r", "w", None),
+            Err(false),
+            "the fresh gap outlives a released reply"
+        );
     }
 
     #[test]
@@ -2511,6 +2549,41 @@ mod tests {
             Plan::Direct,
             "the Mastermind's direction isn't the peers' policy"
         );
+        // An auto Mastermind: two quick replies in one conversation both
+        // wake it; the conversation's limit, not the gap, stops them.
+        let mut st = CommsState::default();
+        let thread = Some(("w".to_string(), 5u64));
+        for i in 0..THREAD_WAKES_MAX {
+            assert!(
+                matches!(
+                    plan_for(
+                        &mut st,
+                        WakePolicy::Ask,
+                        &from,
+                        &mm,
+                        false,
+                        true,
+                        true,
+                        thread.clone()
+                    ),
+                    Plan::Wake(_)
+                ),
+                "reply {i}"
+            );
+        }
+        assert!(matches!(
+            plan_for(
+                &mut st,
+                WakePolicy::Ask,
+                &from,
+                &mm,
+                false,
+                true,
+                true,
+                thread
+            ),
+            Plan::Inbox(_)
+        ));
     }
 
     #[test]
