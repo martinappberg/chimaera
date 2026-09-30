@@ -218,6 +218,9 @@ Known intermittent tests under a loaded full run (they pass alone):
   gives it no home, so it never returns automatically after its first cloud stint.
 - The account browser's `HEAD` plan check and the settings gateway view are not
   exercised by the loopback harness (they need the private browser gateway).
+- The web's Home (the account's own `/`, [pro feature](../features/pro.md#on-the-web))
+  opens a project view, but a project view has no way back to it other than the
+  browser's Back button.
 - Live acceptance on staging (real sleep, real vendors, two devices) follows a
   coordinated private deploy: the branch fails closed against a service without
   the negotiated protocol, so nothing here can be tested against an older

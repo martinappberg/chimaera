@@ -1,7 +1,7 @@
 import { derived, readable } from "svelte/store";
 import { getHostLabel } from "./api";
 import { asyncDisposer } from "../shared/asyncDisposer";
-import { isBrowserGateway, workbenchPath } from "./base";
+import { isAccountHome, isBrowserGateway, workbenchPath } from "./base";
 import { isNativeShell, onProChanged, proStatus, type ProStatus } from "./native";
 import { accountFailure, grantedPlan, paymentDue } from "../pro/status";
 
@@ -58,7 +58,8 @@ const account = readable<AccountState>({ plan: "loading", offered: null, signedO
   set("loading");
   if (typeof document === "undefined") return;
   const native = isNativeShell();
-  const gateway = !native && isBrowserGateway();
+  // The account's own Home (`/`) answers the same HEAD as a project view's index.
+  const gateway = !native && (isBrowserGateway() || isAccountHome());
   if (!native && !gateway) { offered = false; set("unavailable"); return; }
   // A native window showing another host's daemon (an SSH remote, another
   // computer, the cloud) has no account bridge: its `pro_*` calls are refused.

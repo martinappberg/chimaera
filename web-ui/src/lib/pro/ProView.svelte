@@ -8,6 +8,7 @@
   import { isBrowserGateway } from "../net/base";
   import { cloudRequest } from "./cloudTransport";
   import { cloudAsleep } from "./presentation";
+  import { BILLING_PATH } from "./accountHome";
   import { cloudOnboarding } from "./onboarding.svelte";
   let { visible = true, requiredProviders, contextLabel, workspaceId, onReady }: {
     visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void;
@@ -57,13 +58,13 @@
       <div class="brand"><BrandMark size={44} /><span>chimaera <span class="product">Pro</span></span></div>
       {#if worker}
         <CloudSetup {visible} requiredProviders={required} contextLabel={project} workspaceId={workspace} onReady={done} />
-        {#if isBrowserGateway()}<a class="account-link" href="/account">Manage account and billing</a>{/if}
+        {#if isBrowserGateway()}<a class="account-link" href={BILLING_PATH}>Manage account and billing</a>{/if}
       {:else if worker === null}
         <h1>Connect your cloud agents</h1>
         {#if error}<p role="status">We couldn’t load your agent connections. Try again in a moment.</p><div class="actions"><button disabled={checking} onclick={() => void check(true)}>Try again</button></div>{:else}<p role="status">Loading your agent connections…</p>{/if}
       {:else}
         <h1>Your work, here and away.</h1>
-        {#if isBrowserGateway()}<p>Your plan, billing and connected devices live in your account.</p><a class="button" href="/account">Open your account</a>{:else}<p>Open Chimaera Pro from the desktop app to manage your account.</p>{/if}
+        {#if isBrowserGateway()}<p>Your plan, billing and connected devices live in your account.</p><a class="button" href={BILLING_PATH}>Open your account</a>{:else}<p>Open Chimaera Pro from the desktop app to manage your account.</p>{/if}
       {/if}
     </div>
   {/if}

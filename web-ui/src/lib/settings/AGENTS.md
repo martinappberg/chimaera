@@ -39,9 +39,15 @@ opens it, without adding a full-width sidebar row for any plan.
 It renders `ProSettings.svelte`, which invokes the native `pro_*` commands.
 The generic Settings form no longer embeds account/billing/onboarding controls.
 An account browser on a cloud worker opens the same provider flow; other hosts
-link to `/account`. Ordinary browser daemons have no Pro entry. An account browser
+link to the account's billing page (`/account/billing`). Ordinary browser daemons
+have no Pro entry. An account browser
 shows a Cloud category only on the cloud machine's own page (a passive
 `isCloudMachine` read); it remains host-pinned and cookie-authenticated.
+On the web's Home (the account's own page, `net/base.ts` `isAccountHome`; see
+[pro](../pro/AGENTS.md) `AccountHome.svelte`) there is no daemon: `SettingsView`
+with `account` shows only Chimaera Pro, rendered in place by
+`pro/BrowserAccount.svelte` (plan, usage, the billing link and Sign out), with no
+search, JSON tab or daemon settings.
 Credentials stay in the app's keychain, never in the schema or this UI.
 Account devices group only verified installation bindings; unbound older sessions
 are collapsed under Other sign-ins, retaining individual removal controls.
