@@ -497,12 +497,14 @@ the epoch it saw; a device credential or its daemon's delegation; a cloud
 machine's credential is 403). While the other computer holds a live lease the
 account records the request and answers 200 with the ownership read; while
 nobody runs the project (released, or a computer's lapsed lease) the same
-request reserves the next acquisition. A cloud machine, awake or asleep, is
-never asked this way (409 `held`), and an epoch the caller did not see is
-409 `stale_epoch`. The holder asking for its own project is its user acting
-there: the last actor wins (by the account's clock) and any request for the
-project ends. `DELETE /v2/baton/{workspace}/move` withdraws the caller's own
-request (204).
+request reserves the next acquisition. A project a cloud machine holds is
+never asked for this way, whatever the machine's state (awake, asleep, or
+stopped with its lease lapsed): 409 `held`. An epoch the caller did not see
+is 409 `stale_epoch`. The holder asking for its own project is its user
+acting there: the last actor wins (by the account's clock) and any request
+for the project ends. `DELETE /v2/baton/{workspace}/move` withdraws the
+caller's own request (204; the same call from any other computer changes
+nothing).
 
 While a request is fresh (six minutes for a computer's, two for a phone's)
 every ownership answer (GET, acquire, renew, release, move) carries the
@@ -511,7 +513,10 @@ account's clock) and `move_reason` (`computer` or `phone`); a stale request
 reads as none. Only `move_to` may acquire the project while it is fresh
 (anyone else, including a cloud machine the release would otherwise wake, is
 409 `held`); the worker's discovery does not offer it and a release for it
-wakes nothing. The acquisition ends the request.
+wakes nothing. The acquisition ends the request. A request that expires
+unanswered ends as if it had never been made: a release made for it is then
+an ordinary release, so the worker's discovery offers the project again and
+the automatic cloud wake after a device release may take it.
 
 The holder's daemon reads `move_to` from its renewal answer. Unless its own
 user acted after the request (its local input time, placed on the account's
@@ -549,7 +554,10 @@ The computer takes it without its settle wait. The gateway tells the phone
 first input, and delivers them once to the computer when its session
 answers; if the computer has not acquired within about twenty seconds the
 request is withdrawn and the machine is woken as before
-(`{"type":"waking"}`), with the held input delivered to it instead.
+(`{"type":"waking"}`), with the held input delivered to it instead. Held
+input the owner's session does not take is refused to the phone
+(`command_failed` or `read_only` with reason `reconnecting`, so a chat send
+returns to the composer), never dropped.
 
 A cloud machine's drain (`POST /api/v1/pro/drain`) therefore publishes each
 project it holds before it answers, within the drain's deadline; a failure
