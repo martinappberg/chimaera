@@ -27,7 +27,9 @@
     isCutPending,
     pasteInto,
   } from "./fileClipboard.svelte";
-  import { isOwnerAsleep, isRemoteHost, projectStateNote } from "../net/api";
+  import { getActiveWorkspaceId, isOwnerAsleep, isRemoteHost, projectStateNote } from "../net/api";
+  import { hereName, isKeptCopy, keptCopyHint } from "../pro/kept";
+  import { requestKeptReview } from "../pro/keptReviews.svelte";
   import { refetchWhenOwnerAwake } from "../net/reconnect";
   import { stemLength, validateEntryName } from "../shared/fsNames";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
@@ -35,6 +37,8 @@
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import Spinner from "../previews/Spinner.svelte";
+  /** Who a kept copy's version belongs to, in the tree's badge. */
+  const keptHere = hereName();
 
   /** Local-daemon windows hide Download (the file already lives here). */
   const remote = isRemoteHost();
@@ -893,6 +897,18 @@
         ? [{ label: "Download", onSelect: () => void fsDownload(entry.path) } as ContextMenuEntry]
         : []),
       { label: "Copy Path", onSelect: () => void copyPath(entry.path) },
+      // This computer's version kept beside the cloud's (a Pro return).
+      ...(entry.kind === "file" && isKeptCopy(entry.name) && getActiveWorkspaceId() !== null
+        ? [
+            {
+              label: "Review both versions",
+              onSelect: () => {
+                const id = getActiveWorkspaceId();
+                if (id !== null) requestKeptReview(id);
+              },
+            } as ContextMenuEntry,
+          ]
+        : []),
       // Only inside a repository: git is ambient, never an offer.
       ...(entry.kind === "file" && repoForPath($gitRepos, entry.path) !== null
         ? [{ label: "File history", onSelect: () => openFileHistory(entry.path) } as ContextMenuEntry]
@@ -1232,6 +1248,11 @@
           class:symlink={entry.symlink}
           class:broken={entry.broken}
           style:color={entry.broken ? undefined : gDeco ? gDeco.color : undefined}>{entry.name}</span>
+        {#if entry.kind === "file" && !entry.symlink && isKeptCopy(entry.name)}
+          <!-- A Pro return's kept copy: the odd name explained where it
+               appears (right-click offers the review). -->
+          <span class="kept-mark" title={keptCopyHint(entry.name, keptHere)}>from {keptHere}</span>
+        {/if}
         {#if entry.kind === "dir" && $gitIndex.repoRoots.has(entry.path)}
           <!-- A repository of its own: a quiet mark (its changes are its own,
                in its own section of the Source Control panel). -->
@@ -1804,6 +1825,18 @@
     font-weight: 600;
     font-variant-numeric: tabular-nums;
     line-height: 1;
+  }
+  /* A Pro return's kept copy: a small pill right after the name. */
+  .kept-mark {
+    flex: none;
+    margin-left: 0.4rem;
+    padding: 0 5px;
+    border: 1px solid var(--edge);
+    border-radius: 999px;
+    font-size: 10px;
+    line-height: 14px;
+    color: var(--muted);
+    white-space: nowrap;
   }
   .repo-mark {
     flex: none;

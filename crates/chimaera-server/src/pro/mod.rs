@@ -6,6 +6,7 @@ mod detached;
 mod drain;
 mod engine;
 mod execution;
+mod kept;
 mod mirror;
 mod policy;
 mod projects;
@@ -16,6 +17,9 @@ mod routes;
 mod shadow_cache;
 mod transport;
 pub(crate) use drain::{cancel as cancel_drain, start as drain};
+pub(crate) use kept::{
+    file as kept_file, list as kept_list, resolve as kept_resolve, resolve_all as kept_resolve_all,
+};
 pub(crate) use policy::CloudProfile;
 pub(crate) use provider_gate::{
     blocking_provider, cloud_provider_blocks, workspace_provider_blocks,
@@ -155,12 +159,19 @@ struct WorkspaceStatus {
     /// Additive: a stable code for `error` (see `routes::error_code`).
     #[serde(skip_serializing_if = "Option::is_none")]
     error_code: Option<&'static str>,
-    /// Additive: files the last return kept in both versions, and up to 32
-    /// of their project-relative paths.
+    /// Additive: files the last return kept in both versions that still
+    /// wait for a choice (`kept.rs` settles them one by one), and up to 32 of
+    /// their project-relative paths.
     #[serde(skip_serializing_if = "Option::is_none")]
     kept_both: Option<usize>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     kept_paths: Vec<PathBuf>,
+    /// Additive: when that return happened (Unix ms) and how many files it
+    /// kept in both versions then, which choices never lower.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kept_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kept_total: Option<usize>,
     #[serde(skip)]
     blocked_providers: Vec<provider_gate::BlockedProvider>,
 }
@@ -195,6 +206,13 @@ struct KeptRecord {
     files: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     paths: Vec<PathBuf>,
+    /// When the return happened (Unix ms); 0 in a report saved before it was
+    /// recorded.
+    #[serde(default)]
+    at: u64,
+    /// How many files that return kept (`files` counts those still open).
+    #[serde(default)]
+    total: usize,
 }
 /// Kept-both reports share `state.json`'s 1 MiB cap with ownership state, so
 /// they get a small fixed share of it: a report that would push past it keeps
@@ -207,15 +225,16 @@ const KEPT_PATH_PERSIST_MAX: usize = 1024;
 fn persisted_kept(statuses: &HashMap<String, WorkspaceStatus>) -> HashMap<String, KeptRecord> {
     let mut reports: Vec<_> = statuses
         .iter()
-        .filter_map(|(id, status)| Some((id, status.kept_both?, &status.kept_paths)))
+        .filter_map(|(id, status)| Some((id, status.kept_both?, status)))
         .collect();
     reports.sort_by(|a, b| a.0.cmp(b.0));
     let mut budget = KEPT_PERSIST_BYTES;
     reports
         .into_iter()
         .take(128)
-        .map(|(id, files, paths)| {
-            let paths = paths
+        .map(|(id, files, status)| {
+            let paths = status
+                .kept_paths
                 .iter()
                 .filter(|path| path.as_os_str().len() <= KEPT_PATH_PERSIST_MAX)
                 .take_while(|path| {
@@ -228,7 +247,15 @@ fn persisted_kept(statuses: &HashMap<String, WorkspaceStatus>) -> HashMap<String
                 })
                 .cloned()
                 .collect();
-            (id.clone(), KeptRecord { files, paths })
+            (
+                id.clone(),
+                KeptRecord {
+                    files,
+                    paths,
+                    at: status.kept_at.unwrap_or(0),
+                    total: status.kept_total.unwrap_or(files).max(files),
+                },
+            )
         })
         .collect()
 }
@@ -343,6 +370,8 @@ impl ProState {
             let entry = status.entry(id).or_default();
             entry.kept_both = Some(kept.files);
             entry.kept_paths = kept.paths.into_iter().take(32).collect();
+            entry.kept_at = (kept.at > 0).then_some(kept.at);
+            entry.kept_total = Some(kept.total.max(kept.files));
         }
         let authority = authority::Authority::load(&root);
         let execution = execution::State::restore(
@@ -910,6 +939,8 @@ fn report_return(
         let status = statuses.entry(workspace.into()).or_default();
         status.kept_both = (files > 0).then_some(files);
         status.kept_paths = paths.clone();
+        status.kept_at = (files > 0).then(crate::session_view::now_ms);
+        status.kept_total = (files > 0).then_some(files);
     }
     if crate::notices::push_kept_both(state, workspace, files, &paths, cloud_branches).is_none() {
         state.changes.notify_waiters();

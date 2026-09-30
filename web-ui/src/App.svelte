@@ -1,5 +1,7 @@
 <script lang="ts">
   import { cloudOnboarding } from "./lib/pro/onboarding.svelte";
+  import { keptReviews } from "./lib/pro/keptReviews.svelte";
+  import { KEPT_NOTICE_PREFIX, keptNoticeWorkspace } from "./lib/pro/kept";
   import { onMount, tick, untrack } from "svelte";
   import ProNavigation from "./lib/pro/ProNavigation.svelte";
   import { paidPlan, proOffered } from "./lib/net/plan";
@@ -171,6 +173,8 @@
     openPlugins,
     openPluginViewTab,
     openSessionsList,
+    openKeptReview,
+    keptReviewShown,
     openGit,
     openSession,
     openSettings,
@@ -1151,7 +1155,14 @@
 
   /** Sessions on screen in this window (each pane's active tab). */
   const visibleSessions = $derived(
-    activeWsId !== null && layoutReady ? visibleSessionIds(layout) : [],
+    activeWsId !== null && layoutReady
+      ? [
+          ...visibleSessionIds(layout),
+          // The review of both versions stands in for the `kept_both`
+          // notice's per-project key: looking at it clears that alert.
+          ...(keptReviewShown(layout) ? [`${KEPT_NOTICE_PREFIX}${activeWsId}`] : []),
+        ]
+      : [],
   );
   // Tell the notifier what this window shows, so it never alerts about a
   // session the user is looking at — and clears alerts for ones they now
@@ -1739,6 +1750,11 @@
       // The browser's notification source. The native app ignores these: its
       // shell consumes the same feed per daemon and posts OS notifications.
       onNotices: (list) => {
+        // A return that kept both versions: the chat's line and an open
+        // review read the project's answer again (native or browser).
+        for (const n of list) {
+          if (n.kind === "kept_both" && n.workspace_id !== null) void keptReviews.refresh(n.workspace_id);
+        }
         if (isNativeShell()) return;
         deliverBrowserNotices(list, {
           visible: untrack(() => visibleSessions),
@@ -1880,6 +1896,10 @@
     const onCopy = () => rememberCopy();
     // Which-key discovery: holding the app modifier fades in the ⌘1–9 badges.
     const stopChordHints = initChordHints();
+    const keptReviewRequested = (event: Event) => {
+      const id = (event as CustomEvent).detail;
+      if (typeof id === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(id)) void openKeptReviewFor(id);
+    };
     const connectProviders = (event: Event) => {
       if (cloudOnboarding.set((event as CustomEvent).detail)) openProSurface();
     };
@@ -1903,6 +1923,7 @@
     window.addEventListener("keydown", onKeydown, true);
     window.addEventListener("pagehide", onPagehide);
     window.addEventListener("chimaera:open-pro", openProSurface);
+    window.addEventListener("chimaera:kept-review", keptReviewRequested);
     document.addEventListener("copy", onCopy);
     return () => {
       window.removeEventListener("chimaera:providers-ready", providersReady);
@@ -1911,6 +1932,7 @@
       window.removeEventListener("keydown", onKeydown, true);
       window.removeEventListener("pagehide", onPagehide);
       window.removeEventListener("chimaera:open-pro", openProSurface);
+      window.removeEventListener("chimaera:kept-review", keptReviewRequested);
       stopProReturn();
       unlistenMenu?.();
       unlistenDaemonMoved?.();
@@ -3469,6 +3491,12 @@
    * waits for the roster, then for the layout, like a worktree reveal.
    */
   function focusFromNotification(sessionId: string): void {
+    // A project notice (`kept_both`): its key names the project, not a session.
+    const keptWorkspace = keptNoticeWorkspace(sessionId);
+    if (keptWorkspace !== null) {
+      void openKeptReviewFor(keptWorkspace);
+      return;
+    }
     const s = sessionsById.get(sessionId);
     if (s === undefined) {
       if (!gotSessions) pendingNoticeFocus = sessionId;
@@ -3558,6 +3586,43 @@
     layout = openDashboard(layout);
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
+
+  /**
+   * Open (or focus) the review of both versions a Pro return kept for
+   * `workspaceId` — from the chat's line, Settings, the file tree, or the
+   * `kept_both` notice. Another project's review switches this window to
+   * that project first (the notification-reveal path), then opens once its
+   * layout has booted.
+   */
+  let pendingKeptReview = $state<string | null>(null);
+  async function openKeptReviewFor(workspaceId: string): Promise<void> {
+    if (workspaceId !== activeWsId) {
+      let target = workspaces.find((w) => w.id === workspaceId);
+      if (target === undefined) {
+        const list = await listWorkspaces().catch(() => null);
+        if (list !== null) {
+          workspaces = list;
+          target = list.find((w) => w.id === workspaceId);
+        }
+      }
+      if (target === undefined) return;
+      pendingKeptReview = workspaceId;
+      void activateWorkspace(target);
+      return;
+    }
+    if (!layoutReady) {
+      pendingKeptReview = workspaceId;
+      return;
+    }
+    layout = openKeptReview(layout);
+    void keptReviews.refresh(workspaceId);
+  }
+  $effect(() => {
+    const id = pendingKeptReview;
+    if (id === null || !layoutReady || activeWsId !== id) return;
+    pendingKeptReview = null;
+    untrack(() => void openKeptReviewFor(id));
+  });
 
   /** Open/focus All sessions (the Recents header, the dashboard's usage
    *  line, quick-open). */

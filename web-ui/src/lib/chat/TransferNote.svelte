@@ -2,6 +2,7 @@
   import { formatFullTimestamp, formatMessageTimestamp } from "../shared/time";
   import { isBrowserGateway } from "../net/base";
   import { transferNote, type TransferOrigin } from "./transfer";
+  import { backNote } from "../pro/kept";
 
   interface Props {
     origin: TransferOrigin;
@@ -13,11 +14,16 @@
     nowMs: number;
     sourceIndex: number;
     sourceUid: number;
+    /** The work came home with files both sides changed that still wait for
+     *  a choice (`home` only): the line says so and offers the review. */
+    kept?: { total: number; onReview(): void } | null;
   }
 
-  let { origin, text, sentAtMs, nowMs, sourceIndex, sourceUid }: Props = $props();
+  let { origin, text, sentAtMs, nowMs, sourceIndex, sourceUid, kept = null }: Props = $props();
 
-  const note = $derived(transferNote(origin, text, isBrowserGateway()));
+  const note = $derived(
+    kept !== null && origin === "home" ? backNote(kept.total) : transferNote(origin, text, isBrowserGateway()),
+  );
   const timeLabel = $derived(formatMessageTimestamp(sentAtMs, nowMs));
   let open = $state(false);
 </script>
@@ -31,6 +37,10 @@
       >{note}{#if timeLabel !== ""}<span class="sep" aria-hidden="true">{" · "}</span><time
           datetime={new Date(sentAtMs).toISOString()}
           title={formatFullTimestamp(sentAtMs)}>{timeLabel}</time
+        >{/if}{#if kept !== null && origin === "home"}<button
+          type="button"
+          class="review"
+          onclick={kept.onReview}>Review</button
         >{/if}</span
     >
   </p>
@@ -69,6 +79,26 @@
   }
   time {
     font-variant-numeric: tabular-nums;
+  }
+  /* The same action KeptNote offers. */
+  .review {
+    appearance: none;
+    margin-left: 8px;
+    padding: 1px 8px;
+    border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--edge));
+    border-radius: 999px;
+    background: transparent;
+    color: var(--fg);
+    font: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .review:hover {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  .review:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
   }
   details {
     width: 100%;

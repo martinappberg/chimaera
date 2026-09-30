@@ -5,6 +5,7 @@
   import { copyIssue, projectCopiesSetupLine, projectCopyError, projectPlace } from "../pro/presentation";
   import { computerSteps, proposedSetup, settleProposal, type ProposalDecision } from "../pro/profile";
   import { proMirrorStatus, proSetNeverMirror, type MirrorStatus, type MirrorWorkspace } from "../net/native";
+  import { requestKeptReview } from "../pro/keptReviews.svelte";
   let { visible = true, recoveryOnly = false }: { visible?: boolean; recoveryOnly?: boolean } = $props();
   let status = $state<MirrorStatus | null>(null);
   let error = $state<string | null>(null);
@@ -126,7 +127,7 @@
         {/if}
         {#if workspace.mirror}
           {#if workspace.mirror.last_mirrored_at}<p class="hint">Last copied {new Date(workspace.mirror.last_mirrored_at * 1000).toLocaleString()}</p>{/if}
-          {#if workspace.mirror.kept_both}<p class="hint kept" role="status">{keptBoth(workspace.mirror)}</p>{/if}
+          {#if workspace.mirror.kept_both}<div class="kept-row"><p class="hint kept" role="status">{keptBoth(workspace.mirror)}</p><button class="link" onclick={() => requestKeptReview(workspace.workspace_id)}>Review</button></div>{/if}
           {#if workspace.mirror.too_large}<p class="hint" role="status">Some files are too large for the cloud copy. They stay on this computer.</p>{/if}
           {#if workspace.mirror.error && workspace.mirror.error !== "cloud_provider_not_ready"}<p class={copyIssue(workspace.mirror) === "problem" ? "error" : "hint"} role="status">{projectCopyError(workspace.mirror.error, workspace.mirror.error_code)}</p>{/if}
         {/if}
@@ -138,7 +139,12 @@
   .mirrors { border-top: 1px solid var(--edge); padding: 18px 14px 0; margin-top: 18px; }
   h3 { font-size: var(--text-sm); margin: 0 0 8px; }
   .hint { color: var(--muted); font-size: var(--text-xs); line-height: 1.55; }
-  .kept { overflow-wrap: anywhere; }
+  .kept { overflow-wrap: anywhere; margin: 0; }
+  .kept-row { display: flex; align-items: baseline; gap: 10px; }
+  .kept-row .kept { flex: 1; min-width: 0; }
+  .link { flex: none; border: none; background: none; padding: 0; color: var(--accent); font: inherit; font-size: var(--text-xs); cursor: pointer; }
+  .link:hover { text-decoration: underline; }
+  .link:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; border-radius: 3px; }
   details { border: 1px solid var(--edge); border-radius: 8px; margin: 10px 0; }
   summary { cursor: pointer; padding: 12px; }
   summary:focus-visible, .btn:focus-visible, input:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }

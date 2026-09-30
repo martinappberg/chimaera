@@ -22,6 +22,8 @@ import {
   openPlugins,
   openPluginViewTab,
   openSessionsList,
+  openKeptReview,
+  keptReviewShown,
   openSettings,
   openPro,
   openChanges,
@@ -83,6 +85,7 @@ describe("tabKey", () => {
     expect(tabKey({ surface: "knowledge" })).toBe("v:knowledge");
     expect(tabKey({ surface: "plugins" })).toBe("v:plugins");
     expect(tabKey({ surface: "sessions" })).toBe("v:sessions");
+    expect(tabKey({ surface: "kept" })).toBe("v:kept");
     // diff uses `g:` (NOT `d:`) so it can't alias a Finder in the dedupe set.
     expect(tabKey({ surface: "diff", path: "/a", mode: "head" } as unknown as Tab)).toBe(
       "g:head:/a",
@@ -187,6 +190,24 @@ describe("opening surfaces", () => {
       { surface: "sessions" },
       { surface: "settings" },
     ]);
+  });
+});
+
+describe("the review of both versions", () => {
+  it("is one tab per window that round-trips and reports whether it is on screen", () => {
+    let l = openSession(defaultLayout(), "agent");
+    expect(keptReviewShown(l)).toBe(false);
+    l = openKeptReview(l);
+    l = openKeptReview(l);
+    expect(tabCount(l)).toBe(2);
+    expect(keptReviewShown(l)).toBe(true);
+    const restored = deserializeLayout(serializeLayout(l));
+    expect(restored).not.toBeNull();
+    expect(panes(restored!.root)[0].tabs).toEqual([
+      { surface: "terminal", sessionId: "agent" },
+      { surface: "kept" },
+    ]);
+    expect(keptReviewShown(openSession(l, "agent"))).toBe(false);
   });
 });
 

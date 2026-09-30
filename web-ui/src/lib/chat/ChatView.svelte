@@ -64,7 +64,9 @@
   import ForkDialog from "./ForkDialog.svelte";
   import AgentMessageMeta from "./AgentMessageMeta.svelte";
   import TransferNote from "./TransferNote.svelte";
+  import KeptNote from "./KeptNote.svelte";
   import { isTransferOrigin } from "./transfer";
+  import { keptReviews, requestKeptReview, waitingReview } from "../pro/keptReviews.svelte";
   import Composer from "./Composer.svelte";
   import SameFileNotice from "../workspace/SameFileNotice.svelte";
   import { sameFile } from "../workspace/sameFile.svelte";
@@ -2390,6 +2392,45 @@
     return folded;
   });
 
+  // --- a Pro return that kept both versions ----------------------------------
+  // When this chat's project came back to this computer with files both sides
+  // changed while apart, one line marks where (`KeptNote`, or the `home`
+  // pick-up's own line when there is one) and offers the review. Placed by
+  // time: before the first row sent after the return; after the last row
+  // when nothing followed yet. A chat that began after the return, or whose
+  // return point is outside the mounted window, shows nothing.
+  const keptWorkspace = $derived(session.workspace_id ?? null);
+  $effect(() => {
+    const id = keptWorkspace;
+    if (id === null || !visible) return;
+    untrack(() => keptReviews.ensure(id));
+  });
+  const keptWaiting = $derived.by(() => {
+    const review = keptWorkspace === null ? undefined : keptReviews.byWorkspace[keptWorkspace];
+    return waitingReview(review) ? review : null;
+  });
+  type KeptAnchor = { key: string; merge: boolean } | "end";
+  const keptAnchor = $derived.by((): KeptAnchor | null => {
+    const at = keptWaiting?.returned_at ?? null;
+    if (at === null) return null;
+    let before = false;
+    for (const item of renderItems) {
+      if (item.t !== "single") continue;
+      const block = item.block;
+      if (block.kind !== "user" && block.kind !== "message") continue;
+      if (block.sentAtMs < at) {
+        before = true;
+        continue;
+      }
+      if (!before) return null;
+      return { key: item.key, merge: block.kind === "user" && block.origin === "home" };
+    }
+    return before && atLiveEdge ? "end" : null;
+  });
+  function reviewKept(): void {
+    if (keptWorkspace !== null) requestKeptReview(keptWorkspace);
+  }
+
   /** A finished turn's duration, kept out of the page (the live elapsed on
    *  the status line is the number that matters while it runs) and offered
    *  on the closing message's timestamp tooltip instead. Keyed by uid. */
@@ -2669,6 +2710,9 @@
       {/if}
     {/snippet}
     {#each renderItems as item (item.key)}
+      {#if keptWaiting !== null && keptAnchor !== null && keptAnchor !== "end" && keptAnchor.key === item.key && !keptAnchor.merge}
+        <KeptNote total={keptWaiting.total} onReview={reviewKept} />
+      {/if}
       {#if item.t === "fold"}
         <ActivityFold
           tools={item.tools}
@@ -2694,6 +2738,9 @@
           nowMs={messageTimeNowMs}
           sourceIndex={item.index}
           sourceUid={item.block.uid}
+          kept={keptWaiting !== null && keptAnchor !== null && keptAnchor !== "end" && keptAnchor.key === item.key && keptAnchor.merge
+            ? { total: keptWaiting.total, onReview: reviewKept }
+            : null}
         />
       {:else if item.block.kind === "user"}
         {@const block = item.block}
@@ -2862,6 +2909,9 @@
         </div>
       {/if}
     {/each}
+    {#if keptWaiting !== null && keptAnchor === "end"}
+      <KeptNote total={keptWaiting.total} onReview={reviewKept} />
+    {/if}
 
     {#if !atLiveEdge}
       {#if canAutoLoadHistory}
