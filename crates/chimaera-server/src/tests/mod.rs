@@ -25,6 +25,7 @@ mod notices;
 mod plugin_host;
 mod plugin_jobs;
 mod plugin_platform;
+mod plugin_retired;
 mod plugin_trust;
 mod plugin_updates;
 mod plugins;

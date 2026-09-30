@@ -184,11 +184,6 @@ pub(super) fn local_build(src: &std::path::Path, toml: &str, wasm: &[u8], sums: 
     }
 }
 
-/// The first-party release the lock pins for Agent notes.
-pub(super) fn agent_notes_release() -> (&'static crate::plugins::Locked, String, Vec<u8>, String) {
-    locked_release("agent-notes")
-}
-
 /// A first-party release the lock pins, as the build script laid it out:
 /// its lock entry, manifest, component and SHA256SUMS.
 pub(super) fn locked_release(
@@ -382,18 +377,18 @@ async fn install_writes_the_version_dir_and_current_and_lists_it_installed() {
         assert!(entry.get(absent).is_none(), "{absent}: {entry}");
     }
     // The first-party plugins, nothing installed for them: available.
-    let notes = listed(&state, "agent-notes").await;
-    assert_eq!(notes["source"], "available");
-    assert_eq!(notes["installed"], false);
-    assert_eq!(notes["first_party"], true);
+    let myc = listed(&state, "mycelium").await;
+    assert_eq!(myc["source"], "available");
+    assert_eq!(myc["installed"], false);
+    assert_eq!(myc["first_party"], true);
     assert_eq!(
-        notes["pinned_version"],
-        crate::plugins::lock_entry("agent-notes")
+        myc["pinned_version"],
+        crate::plugins::lock_entry("mycelium")
             .unwrap()
             .version
             .as_str()
     );
-    assert!(notes.get("path").is_none() && notes.get("sha256_wasm").is_none());
+    assert!(myc.get("path").is_none() && myc.get("sha256_wasm").is_none());
 
     let (status, body) = install(&state, "acme/up-install", Some("0.1.0")).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -549,12 +544,12 @@ async fn a_newer_compatible_release_is_offered_and_an_older_or_incompatible_one_
 async fn a_first_party_plugin_installs_the_pinned_release_checked_twice() {
     let fake = FakeReleases::start().await;
     let state = state_for(&fake);
-    let (l, toml, wasm, sums) = agent_notes_release();
+    let (l, toml, wasm, sums) = locked_release("mycelium");
     fake.publish_with_sums(&l.repo, &l.version, &toml, &wasm, &sums);
-    let before = listed(&state, "agent-notes").await;
+    let before = listed(&state, "mycelium").await;
     assert_eq!(before["source"], "available");
 
-    let (status, body) = post(&state, "/api/v1/plugins/agent-notes/install").await;
+    let (status, body) = post(&state, "/api/v1/plugins/mycelium/install").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["version"], l.version.as_str());
     assert_eq!(body["previous"], Value::Null);
@@ -568,25 +563,29 @@ async fn a_first_party_plugin_installs_the_pinned_release_checked_twice() {
     assert_eq!(e["pinned_version"], l.version.as_str());
     assert_eq!(e["repo"], l.repo.as_str());
     assert!(e.get("local_path").is_none());
-    let vdir = plugin_dir(&state, "agent-notes").join(&l.version);
+    let vdir = plugin_dir(&state, "mycelium").join(&l.version);
     assert_eq!(std::fs::read(vdir.join("plugin.wasm")).unwrap(), wasm);
     assert_eq!(
         std::fs::read_to_string(vdir.join("SHA256SUMS")).unwrap(),
         sums
     );
-    no_temp_left(&state, "agent-notes");
-    let (status, body) = post(&state, "/api/v1/plugins/agent-notes/install").await;
+    no_temp_left(&state, "mycelium");
+    let (status, body) = post(&state, "/api/v1/plugins/mycelium/install").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body["error"]
         .as_str()
         .unwrap()
         .contains("already installed"));
 
-    // An ordinary plugin now: switched on, its tools are offered.
-    let (_ws, sid) = workspace_with(&state, "fp-install", "kfp1", &["agent-notes"]).await;
+    // An ordinary plugin now: switched on where its footprint is, its
+    // tools are offered.
+    let (ws, sid) = workspace_with(&state, "fp-install", "kfp1", &["mycelium"]).await;
+    let root = lock(&state.workspaces).get(&ws).unwrap().root;
+    std::fs::write(root.join("MYCELIUM.md"), "# protocol").unwrap();
+    crate::plugins::refresh_detect(&state, &ws).await;
     assert!(tool_names(&state, &sid, "kfp1")
         .await
-        .contains(&"post_note".to_string()));
+        .contains(&"knowledge_search".to_string()));
 
     // A newer release from the same repository: offered and installed like
     // any update, and still first-party and verified past the pin.
@@ -596,11 +595,11 @@ async fn a_first_party_plugin_installs_the_pinned_release_checked_twice() {
         1,
     );
     fake.publish(&l.repo, "9.0.0", &newer, &wasm);
-    let (_, body) = post(&state, "/api/v1/plugins/agent-notes/check").await;
+    let (_, body) = post(&state, "/api/v1/plugins/mycelium/check").await;
     assert_eq!(body["update"]["version"], "9.0.0", "{body}");
-    let (status, body) = post(&state, "/api/v1/plugins/agent-notes/update").await;
+    let (status, body) = post(&state, "/api/v1/plugins/mycelium/update").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let e = listed(&state, "agent-notes").await;
+    let e = listed(&state, "mycelium").await;
     assert_eq!(e["version"], "9.0.0");
     assert_eq!(e["first_party"], true);
     assert_eq!(e["verified"], true);
@@ -612,10 +611,10 @@ async fn a_first_party_plugin_installs_the_pinned_release_checked_twice() {
     assert_eq!(e["previous"], l.version.as_str());
 
     // Removed: available again.
-    let (status, body) = request(&state, Method::DELETE, "/api/v1/plugins/agent-notes", None).await;
+    let (status, body) = request(&state, Method::DELETE, "/api/v1/plugins/mycelium", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["plugin"]["source"], "available");
-    assert!(!plugin_dir(&state, "agent-notes").exists());
+    assert!(!plugin_dir(&state, "mycelium").exists());
 
     // Installing by its repository is the pinned release too, whatever the
     // latest is.
@@ -635,11 +634,11 @@ async fn a_first_party_plugin_installs_the_pinned_release_checked_twice() {
 async fn a_release_that_is_not_what_the_lock_pins_is_refused() {
     let fake = FakeReleases::start().await;
     let state = state_for(&fake);
-    let (l, toml, _wasm, sums) = agent_notes_release();
+    let (l, toml, _wasm, sums) = locked_release("mycelium");
 
     // The release lists other bytes than the lock: nothing is downloaded.
     fake.publish(&l.repo, &l.version, &toml, &v1_wasm());
-    let (status, body) = post(&state, "/api/v1/plugins/agent-notes/install").await;
+    let (status, body) = post(&state, "/api/v1/plugins/mycelium/install").await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     let error = body["error"].as_str().unwrap();
     assert!(
@@ -653,15 +652,15 @@ async fn a_release_that_is_not_what_the_lock_pins_is_refused() {
 
     // It lists the lock's sha256s, but serves another component.
     fake.publish_with_sums(&l.repo, &l.version, &toml, &v1_wasm(), &sums);
-    let (status, body) = post(&state, "/api/v1/plugins/agent-notes/install").await;
+    let (status, body) = post(&state, "/api/v1/plugins/mycelium/install").await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert!(body["error"]
         .as_str()
         .unwrap()
         .contains("don't match what the release published"));
-    assert!(!plugin_dir(&state, "agent-notes").join(&l.version).exists());
-    no_temp_left(&state, "agent-notes");
-    assert_eq!(listed(&state, "agent-notes").await["source"], "available");
+    assert!(!plugin_dir(&state, "mycelium").join(&l.version).exists());
+    no_temp_left(&state, "mycelium");
+    assert_eq!(listed(&state, "mycelium").await["source"], "available");
 
     // Only a plugin the lock names installs by id.
     let (status, body) = post(&state, "/api/v1/plugins/test-fixture/install").await;
@@ -847,7 +846,7 @@ async fn use_previous_swaps_back_and_is_reversible() {
         .await
         .contains(&"version".to_string()));
 
-    let (status, _) = post(&state, "/api/v1/plugins/agent-notes/rollback").await;
+    let (status, _) = post(&state, "/api/v1/plugins/mycelium/rollback").await;
     assert_eq!(status, StatusCode::CONFLICT);
     let (status, _) = post(&state, "/api/v1/plugins/nothing-here/rollback").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -897,12 +896,9 @@ async fn remove_deletes_the_plugins_directory() {
 
     let (status, _) = request(&state, Method::DELETE, "/api/v1/plugins/up-rm", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, body) = request(&state, Method::DELETE, "/api/v1/plugins/agent-notes", None).await;
+    let (status, body) = request(&state, Method::DELETE, "/api/v1/plugins/mycelium", None).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(
-        body["error"],
-        "Agent notes isn't installed — install it first"
-    );
+    assert_eq!(body["error"], "Mycelium isn't installed — install it first");
     state.sessions.kill(&sid).ok();
 }
 
@@ -912,20 +908,20 @@ async fn a_first_party_id_from_another_repository_is_not_first_party() {
     let state = state_for(&fake);
     // `manifest` releases it from `acme/<id>`, not the lock's repository.
     fake.publish(
-        "acme/agent-notes",
+        "acme/mycelium",
         "9.0.0",
-        &manifest(false, "agent-notes", "9.0.0", ""),
+        &manifest(false, "mycelium", "9.0.0", ""),
         &v1_wasm(),
     );
-    let (status, body) = install(&state, "acme/agent-notes", None).await;
+    let (status, body) = install(&state, "acme/mycelium", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let e = listed(&state, "agent-notes").await;
+    let e = listed(&state, "mycelium").await;
     assert_eq!(e["source"], "installed");
     assert_eq!(e["version"], "9.0.0");
     assert_eq!(e["first_party"], false, "{e}");
     assert_eq!(e["verified"], true, "it is what its own release lists");
     assert!(e.get("pinned_version").is_none());
-    assert_eq!(e["repo"], "acme/agent-notes");
+    assert_eq!(e["repo"], "acme/mycelium");
 }
 
 #[tokio::test]
@@ -1115,7 +1111,7 @@ async fn a_local_build_installs_from_a_directory_and_replaces_itself() {
 
     // A local build of a first-party plugin at the pinned version, with
     // other bytes than the lock's: installed, no maintainer badge, not verified.
-    let (l, toml, _, _) = agent_notes_release();
+    let (l, toml, _, _) = locked_release("mycelium");
     let fp = test_dir("fp-local");
     local_build(&fp, &toml, &v1_wasm(), Some(&sums_of(&v1_wasm(), &toml)));
     std::fs::write(fp.join("source-github"), &l.repo).unwrap();
@@ -1245,32 +1241,22 @@ async fn events_reach_only_the_plugins_that_declared_them() {
         &v1_wasm(),
     );
     assert_eq!(install(&state, gh, None).await.0, StatusCode::OK);
-    install_first_party(&state, "agent-notes").await;
-    let (ws, a) = workspace_with(&state, "up-events", "ke1", &["agent-notes", "up-events"]).await;
-    let b = inject_agent(&state, "ke2");
-    lock(&state.session_workspaces).insert(b.clone(), ws.clone());
+    let (ws, a) = workspace_with(&state, "up-events", "ke1", &["up-events"]).await;
 
-    let (is_err, text) = mcp_tool_call(
-        &state,
-        &a,
-        "ke1",
-        "post_note",
-        json!({"text": "hi", "to": b}),
-    )
-    .await;
-    assert!(!is_err, "{text}");
     let (status, out) = request(
         &state,
         Method::POST,
-        &format!("/api/v1/agent-events/{b}?key=ke2"),
+        &format!("/api/v1/agent-events/{a}?key=ke1"),
         Some(json!({"hook_event_name": "SessionStart"})),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        out["hookSpecificOutput"]["additionalContext"],
-        "1 unread note from other sessions in this workspace — read_notes shows it.",
-        "agent notes declared `hook` and still answers it"
+        out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or(""),
+        "",
+        "nothing that heard the hook, nothing added to it: {out}"
     );
     assert_eq!(
         state.plugin_runtime.live_instances("up-events"),
@@ -1281,9 +1267,7 @@ async fn events_reach_only_the_plugins_that_declared_them() {
         .await
         .iter()
         .any(|m| m.id == "up-events"));
-    for sid in [a, b] {
-        state.sessions.kill(&sid).ok();
-    }
+    state.sessions.kill(&a).ok();
 }
 
 async fn details(state: &Arc<AppState>, id: &str) -> (StatusCode, Value) {
@@ -1379,22 +1363,22 @@ async fn details_describe_an_available_plugin_from_its_pinned_release_once() {
 async fn details_refuse_a_plugin_toml_that_is_not_the_one_the_lock_pins() {
     let fake = FakeReleases::start().await;
     let state = state_for(&fake);
-    let (l, toml, wasm, sums) = agent_notes_release();
+    let (l, toml, wasm, sums) = locked_release("mycelium");
     let changed = toml.replacen(
         "summary = \"",
         "summary = \"Not what the maintainers approved. ",
         1,
     );
     fake.publish_with_sums(&l.repo, &l.version, &changed, &wasm, &sums);
-    let (status, body) = details(&state, "agent-notes").await;
+    let (status, body) = details(&state, "mycelium").await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(
         body["error"],
-        "Agent notes's description on GitHub isn't the one chimaera approved"
+        "Mycelium's description on GitHub isn't the one chimaera approved"
     );
     // Never cached: the approved file answers the next ask.
     fake.publish_with_sums(&l.repo, &l.version, &toml, &wasm, &sums);
-    let (status, body) = details(&state, "agent-notes").await;
+    let (status, body) = details(&state, "mycelium").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["summary"], l.summary.as_str());
 }
@@ -1467,16 +1451,16 @@ async fn a_preview_describes_a_repository_without_installing_it() {
 
     // The lock's repository: first-party, and the release Install installs
     // from it — the pinned one.
-    let (l, toml, wasm, sums) = agent_notes_release();
+    let (l, toml, wasm, sums) = locked_release("mycelium");
     fake.publish_with_sums(&l.repo, &l.version, &toml, &wasm, &sums);
     let (status, p) = preview(&state, &l.repo.to_uppercase()).await;
     assert_eq!(status, StatusCode::OK, "{p}");
-    assert_eq!(p["id"], "agent-notes");
+    assert_eq!(p["id"], "mycelium");
     assert_eq!(p["first_party"], true);
     assert_eq!(p["version"], l.version.as_str());
     assert_eq!(p["pinned_version"], l.version.as_str());
     assert_eq!(p["repo"], l.repo.as_str());
-    assert_eq!(listed(&state, "agent-notes").await["source"], "available");
+    assert_eq!(listed(&state, "mycelium").await["source"], "available");
 
     for bad in ["", "   ", "../etc", "a/b/c"] {
         let (status, body) = preview(&state, bad).await;
@@ -1513,12 +1497,12 @@ async fn an_unreachable_release_source_answers_502_in_plain_words() {
 async fn review_release_cannot_claim_another_repository() {
     let fake = FakeReleases::start().await;
     let state = state_for(&fake);
-    let l = crate::plugins::lock_entry("agent-notes").unwrap();
-    let toml = manifest(false, "agent-notes", "9.0.0", "").replace("acme/agent-notes", &l.repo);
+    let l = crate::plugins::lock_entry("mycelium").unwrap();
+    let toml = manifest(false, "mycelium", "9.0.0", "").replace("acme/mycelium", &l.repo);
     fake.publish("unrelated/plugin", "9.0.0", &toml, &v1_wasm());
     let (status, body) = install(&state, "unrelated/plugin", None).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(listed(&state, "agent-notes").await["source"], "available");
+    assert_eq!(listed(&state, "mycelium").await["source"], "available");
 }
 
 #[tokio::test]

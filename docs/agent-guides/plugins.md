@@ -11,7 +11,7 @@ versions and updates) and
 (the seam and the card). What users see: [features/plugins.md](../features/plugins.md).
 The maps: the API crate [chimaera-plugin-api](../../crates/chimaera-plugin-api/AGENTS.md),
 the lock and the test fixture [plugins/](../../plugins/AGENTS.md). The first-party
-plugins, each its own repository and the worked examples here: [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes) and
+plugins, each its own repository and a real example beside the illustration here:
 [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium) (API 0.1, sandboxed), and
 [chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex) and
 [chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst) (API 0.2, privileged: file
@@ -38,7 +38,7 @@ views, programs, a downloaded tool, long agent tools).
   imports without breaking a 0.1 plugin.
 - **No host call in a native test.** Built natively (tests, clippy), every
   host import is a wit-bindgen stub that aborts the whole test binary. Keep
-  pure logic in functions that take data (Agent notes' `src/notes.rs`) or
+  pure logic in functions that take data (the example's `src/pad.rs`) or
   behind a trait the test implements (Mycelium's `src/fs.rs`); the
   integration runs in the daemon's tests.
 - **JSON for open-ended payloads.** Tool arguments and results, Timeline
@@ -113,10 +113,10 @@ github = "owner/repo"
 ```
 
 (Real manifests: the `plugin.toml` at the root of each first-party
-repository; both name their own repository in `[release]`, which is where
+repository; each names its own repository in `[release]`, which is where
 chimaera installs them from. The host records that source; a manifest alone cannot
 grant a copy the maintainer badge.
-`[requires] chimaera` above is an illustration; neither carries it.
+`[requires] chimaera` above is an illustration; none carries it.
 Mycelium v0.1.1 moves its agent plugin from `requires` to `recommends`: the
 Knowledge reader works with no agent plugin at all; v0.1.2 adds its
 `description` and `[recommends] summary`, the shape above.)
@@ -176,19 +176,24 @@ per id and digest, so the rebuild loop asks nothing.
 
 ## The crate
 
+The example throughout is an illustration, a small **Scratchpad** plugin:
+one agent tool that adds a line to a per-workspace list, and a hint on the
+hook the agent already fires. The first-party repositories are the real
+thing.
+
 ```
-chimaera-plugin-agent-notes/      its own repository
+chimaera-plugin-scratchpad/       its own repository
   Cargo.toml          [lib] crate-type = ["cdylib"]; depends on chimaera-plugin-api
   plugin.toml         the manifest
   rust-toolchain.toml the pinned toolchain, with the wasm32-wasip2 target
-  src/lib.rs          impl Plugin for AgentNotes { … } + chimaera_plugin_api::export!(AgentNotes)
-  src/notes.rs        the pure logic (addressing, unread, the texts), unit-tested natively
+  src/lib.rs          impl Plugin for Scratchpad { … } + chimaera_plugin_api::export!(Scratchpad)
+  src/pad.rs          the pure logic (the line's checks, the kept length, the texts), unit-tested natively
   .github/workflows/  ci.yml (fmt, clippy, tests, the wasm build) · release.yml (the three assets)
 ```
 
 ```toml
 [package]
-name = "chimaera-plugin-agent-notes"
+name = "chimaera-plugin-scratchpad"
 version = "0.1.0"               # plugin.toml's `version` must equal this (and the tag)
 
 [lib]
@@ -213,30 +218,28 @@ is reproducible.
 unit struct, override only what the plugin offers (`tools`, `instructions`,
 `call_tool`, `knowledge`, `query`, `on_event`; each has a default), and wire
 it with `export!` once at the crate root. JSON arrives parsed
-(`serde_json::Value`), and `serde_json` is re-exported. From
-Agent notes' `src/lib.rs`, trimmed to one tool:
+(`serde_json::Value`), and `serde_json` is re-exported. The example's
+`src/lib.rs`:
 
 ```rust
 use chimaera_plugin_api::serde_json::{json, Value};
 use chimaera_plugin_api::{host, Context, Event, Plugin, ToolDef, ToolResult};
 
-mod notes;
+mod pad;
 
-struct AgentNotes;
+struct Scratchpad;
 
-impl Plugin for AgentNotes {
+impl Plugin for Scratchpad {
     fn tools() -> Vec<ToolDef> {
         vec![ToolDef::new(
-            "post_note",
-            "Leave a short note on the workspace Timeline. `to` is a \
-             session id, \"mastermind\", or omitted for everyone. Never \
-             starts anyone's turn.",
+            "pad_add",
+            "Add a line to this workspace's scratchpad, for you and the other \
+             agents here to read later.",
             json!({
                 "type": "object",
                 "required": ["text"],
                 "properties": {
-                    "text": {"type": "string", "description": "The note (under 2 KB)"},
-                    "to": {"type": "string", "description": "Session id or \"mastermind\""},
+                    "text": {"type": "string", "description": "The line (under 500 characters)"},
                 },
                 "additionalProperties": false,
             }),
@@ -249,62 +252,52 @@ impl Plugin for AgentNotes {
 
     fn call_tool(cx: Context, name: &str, args: Value) -> ToolResult {
         match name {
-            "post_note" => post(&cx, &args),
+            "pad_add" => add(&cx, &args),
             other => ToolResult::error(format!("unknown plugin tool {other}")),
         }
     }
 
     fn on_event(cx: Context, event: Event) -> Option<String> {
         match event {
-            // Mail waits to be read: a one-line hint on a carrier that
-            // already fires, never a new turn.
-            Event::Hook(hook)
-                if matches!(hook.name.as_str(), "SessionStart" | "UserPromptSubmit") =>
-            {
-                let cursor = cursors(&cx).get(&hook.session).and_then(Value::as_u64);
-                let recent = recent_notes(&cx).ok()?;
-                let (unread, _) =
-                    notes::unread(recent, &hook.session, cx.mastermind, cursor.unwrap_or(0));
-                notes::hint(unread.len())
-            }
+            // A one-line hint on a carrier that already fires, never a new
+            // turn (the manifest declares `events = ["hook"]`).
+            Event::Hook(hook) if hook.name == "SessionStart" => pad::hint(lines(&cx).len()),
             _ => None,
         }
     }
 }
 
-chimaera_plugin_api::export!(AgentNotes);
+chimaera_plugin_api::export!(Scratchpad);
 
-/// post_note {text, to?}
-fn post(cx: &Context, args: &Value) -> ToolResult {
-    if cx.session.is_none() {
-        return ToolResult::error("post_note needs a calling session");
-    }
-    let body = match notes::message_text(args) {
-        Ok(body) => body,
+/// pad_add {text}
+fn add(cx: &Context, args: &Value) -> ToolResult {
+    let line = match pad::line_text(args) {
+        Ok(line) => line,
         Err(err) => return ToolResult::error(err),
     };
-    let to = match notes::target(args) {
-        None => None,
-        Some("mastermind") => Some("mastermind".to_string()),
-        Some(target) => {
-            // Notes never cross workspaces.
-            if !host::sessions(cx).iter().any(|s| s.id == target) {
-                return ToolResult::error(notes::not_in_workspace(target));
-            }
-            Some(target.to_string())
-        }
-    };
-    match host::timeline_append(cx, &json!({"kind": "note", "to": to, "text": body})) {
-        Ok(seq) => ToolResult::text(notes::posted(seq, to.as_deref())),
+    let mut all = lines(cx);
+    all.push(json!({"text": line, "at": host::now_ms(), "by": cx.session}));
+    pad::keep_newest(&mut all);
+    match host::state_put(cx, "lines", &Value::Array(all)) {
+        Ok(()) => ToolResult::text(pad::added(&line)),
         Err(err) => ToolResult::error(err),
+    }
+}
+
+/// The kept lines; none yet is an empty list.
+fn lines(cx: &Context) -> Vec<Value> {
+    match host::state_get(cx, "lines") {
+        Ok(Some(Value::Array(all))) => all,
+        _ => Vec::new(),
     }
 }
 ```
 
-`INSTRUCTIONS`, `cursors` and `recent_notes` are in the same file (the
-paragraph, a `host::state_get` of the read cursors, a `host::timeline_recent`
-of `note` entries). Note what the plugin does not do: rate-cap posts, cap the
-text server-side or fill in who posted. The host does.
+`INSTRUCTIONS` is in the same file (the paragraph an agent gets at
+`initialize`). Note what the plugin does not do: cap its state or the hint
+line, or fill in which workspace a line belongs to. The host does (state is
+per plugin and workspace, 64 KiB; a hook line ≤ 1 KiB); `keep_newest` is the
+plugin's own choice of how much to keep.
 
 The other exports: `knowledge(cx, known)` returns `Ok(None)` when `known` (the
 stamp the host holds) is still current, else `Snapshot::new(&stamp, &data)`
@@ -380,10 +373,10 @@ component, renamed) and `plugin.toml` in a directory and install it from there
 on the daemon's host:
 
 ```sh
-mkdir -p /tmp/agent-notes-dev
-cp target/wasm32-wasip2/release/chimaera_plugin_agent_notes.wasm /tmp/agent-notes-dev/plugin.wasm
-cp plugin.toml /tmp/agent-notes-dev/plugin.toml
-chimaera plugin add --path /tmp/agent-notes-dev   # or POST /api/v1/plugins/install {"path": "/tmp/agent-notes-dev"}
+mkdir -p /tmp/scratchpad-dev
+cp target/wasm32-wasip2/release/chimaera_plugin_scratchpad.wasm /tmp/scratchpad-dev/plugin.wasm
+cp plugin.toml /tmp/scratchpad-dev/plugin.toml
+chimaera plugin add --path /tmp/scratchpad-dev   # or POST /api/v1/plugins/install {"path": "/tmp/scratchpad-dev"}
 ```
 
 The daemon copies both files (and a `SHA256SUMS`, when the directory has one:
@@ -419,11 +412,14 @@ The integration runs in the daemon's tests:
   manifest/tools mismatch refusal, emit frames. It runs against
   `plugins/test-fixture` (one tool per host limit), which the script builds
   into `plugins/dist-test/`; only the daemon's test builds embed it.
-- `tests/plugins.rs` (Agent notes: tools only where on, posts and reads stay
-  in their workspace, the hook hint, the texts byte for byte),
+- `tests/plugins.rs` (Mycelium as the installed plugin: available until
+  installed, tools offered and call-gated only where it is on and its
+  footprint is present),
   `tests/knowledge.rs` (Mycelium: the route JSON and tool texts against
   fixtures), `tests/plugin_updates.rs` (the three install kinds, update,
   rollback, remove and the checker, against a fake releases server),
+  `tests/plugin_retired.rs` (a plugin built into Chimaera now: listed with
+  why, never run, never installed again),
   `tests/agent_view.rs` (the plugin-free view, unchanged).
 
 ## What the card says about a plugin
@@ -456,8 +452,8 @@ What the card shows is the daemon's, never the plugin's own claim:
 ## Shipping it
 
 **First-party** plugins live in their own repositories and are named, with
-one pinned release each, in `plugins/plugins.lock`. The two that exist are the
-worked example: [chimaera-plugin-agent-notes](https://github.com/martinappberg/chimaera-plugin-agent-notes) and [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium). Each is the crate and its `plugin.toml` (naming
+one pinned release each, in `plugins/plugins.lock`. They are the worked
+examples: [chimaera-plugin-mycelium](https://github.com/martinappberg/chimaera-plugin-mycelium), [chimaera-plugin-latex](https://github.com/martinappberg/chimaera-plugin-latex) and [chimaera-plugin-typst](https://github.com/martinappberg/chimaera-plugin-typst). Each is the crate and its `plugin.toml` (naming
 the repository as `[release] github`), a CI workflow (fmt, clippy, tests, the
 wasm build) and a release workflow that, on a `v<version>` tag whose version
 equals `Cargo.toml`'s and `plugin.toml`'s, builds `plugin.wasm` and publishes
@@ -529,8 +525,8 @@ host:
   install a first-party release whose manifest isn't the lock's version.
 - **Tolerate old state.** Host state and the per-workspace switch follow the
   plugin id, not the version: a new version reads what an older one stored
-  (Agent notes' read cursors are the example). A plugin that wants a clean
-  slate writes a new key.
+  (the example's `lines` key). A plugin that wants a clean slate writes a new
+  key.
 - **The gates decide who gets it.** `api` must be a WIT version the daemon
   serves (0.1 today), and `requires.chimaera` (optional) must match the
   daemon. A release that fails either is never offered, and an installed copy

@@ -27,9 +27,9 @@ const SHA = "0123456789abcdef".repeat(4);
 function available(over: Partial<WorkspacePlugin> = {}): WorkspacePlugin {
   return {
     platform: EMPTY_PLATFORM,
-    id: "agent-notes",
-    name: "Agent notes",
-    summary: "Notes your agents keep for you.",
+    id: "latex",
+    name: "LaTeX",
+    summary: "Build .tex to PDF beside the source.",
     description: null,
     homepage: null,
     adds: { ui: [], agents: [] },
@@ -50,7 +50,7 @@ function available(over: Partial<WorkspacePlugin> = {}): WorkspacePlugin {
     first_party: true,
     verified: false,
     sha256_wasm: null,
-    repo: "martinappberg/chimaera-agent-notes",
+    repo: "martinappberg/chimaera-plugin-latex",
     pinned_version: "0.1.0",
     local_path: null,
     path: null,
@@ -71,17 +71,17 @@ describe("installCopy", () => {
   it("the Install tooltip names the repository and says it does nothing until switched on", () => {
     expect(pinnedVersion(available())).toBe("0.1.0");
     expect(installTitle(available())).toBe(
-      "Downloads it from github.com/martinappberg/chimaera-agent-notes into this host's ~/.chimaera/plugins. It does nothing until you switch it on in a workspace.",
+      "Downloads it from github.com/martinappberg/chimaera-plugin-latex into this host's ~/.chimaera/plugins. It does nothing until you switch it on in a workspace.",
     );
     expect(installTitle(available({ repo: null }))).toContain("from its release into");
   });
 
   it("the install outcome names the plugin and its version, never a checksum", () => {
     const o = installedOutcome(
-      { id: "agent-notes", version: "0.1.0", sha256: { "plugin.wasm": SHA }, plugin: { name: "Agent notes" } },
-      "agent-notes",
+      { id: "latex", version: "0.1.0", sha256: { "plugin.wasm": SHA }, plugin: { name: "LaTeX" } },
+      "latex",
     );
-    expect(o).toEqual({ text: "installed Agent notes 0.1.0" });
+    expect(o).toEqual({ text: "installed LaTeX 0.1.0" });
   });
 
   it("falls back to the given name, and an update says only the version", () => {
@@ -150,7 +150,7 @@ describe("the card's words", () => {
 
   it("the tile's letters", () => {
     expect(tileLetters("Mycelium")).toBe("my");
-    expect(tileLetters("Agent notes")).toBe("an");
+    expect(tileLetters("Knowledge base")).toBe("kb");
     expect(tileLetters("Test fixture")).toBe("tf");
     expect(tileLetters("LaTeX")).toBe("la");
     expect(tileLetters("x-ray")).toBe("xr");

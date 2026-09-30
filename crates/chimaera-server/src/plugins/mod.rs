@@ -22,8 +22,9 @@
 //! lists it with a fault and it never loads. Gates run before anything
 //! loads: a manifest's `api` must be a WIT version this host serves and its
 //! `requires.chimaera` must match this daemon — a plugin that fails one
-//! stays listed, off, with the reason. The catalog reloads after every
-//! install, update, rollback and remove.
+//! stays listed, off, with the reason — as does a copy of a plugin whose
+//! job moved into chimaera (`retired`), which nothing installs again. The
+//! catalog reloads after every install, update, rollback and remove.
 //!
 //! State is minimal by design: a plugin is switched on per workspace
 //! (`Workspace.plugins_on` — the Plugins page is per workspace, so is its
@@ -62,6 +63,7 @@ pub(crate) mod pdata;
 pub(crate) mod platform;
 pub(crate) mod preview;
 pub(crate) mod releases;
+pub(crate) mod retired;
 pub(crate) mod revoke;
 pub(crate) mod runtime;
 pub(crate) mod screens;
@@ -676,7 +678,8 @@ pub(crate) fn hostfns_relative(path: &str) -> Result<PathBuf, String> {
 /// paragraphs reach an agent in): every installed copy, and (test builds)
 /// the catalog extras no installed copy shadows. Then the gates, on each —
 /// after the fault reading the copy already found (its files not matching
-/// its `SHA256SUMS`), which wins.
+/// its `SHA256SUMS`), which wins. A retired plugin's reason wins over both:
+/// whatever else is wrong with the copy, the answer is to remove it.
 pub(crate) fn resolve(
     extras: &[Arc<Manifest>],
     installed: &[installed::InstalledCopy],
@@ -698,7 +701,11 @@ pub(crate) fn resolve(
         )
         .map(|mut m| {
             m.origin.release = m.release.as_ref().map(|r| r.github.clone());
-            m.origin.fault = m.origin.fault.take().or_else(|| gate(&m, daemon));
+            let fault = match retired::of(&m.id) {
+                Some(r) => Some(r.reason.to_string()),
+                None => m.origin.fault.take().or_else(|| gate(&m, daemon)),
+            };
+            m.origin.fault = fault;
             Arc::new(m)
         })
         .collect();
@@ -1338,6 +1345,10 @@ pub(crate) async fn put_workspace_plugin(
     match manifest(&state, &pid) {
         Some(m) if body.on => {
             if let Some(fault) = &m.origin.fault {
+                // A retired plugin's fault is the whole answer already.
+                if let Some(r) = retired::of(&m.id) {
+                    return r.refusal().into_response();
+                }
                 return (
                     StatusCode::CONFLICT,
                     Json(json!({"error": format!("{} can't run on this daemon: {fault}", m.name)})),
@@ -1767,7 +1778,7 @@ mod tests {
             ids.windows(2).all(|p| p[0] < p[1]),
             "sorted, each once: {ids:?}"
         );
-        assert!(lock_entry("agent-notes").is_some() && lock_entry("mycelium").is_some());
+        assert!(lock_entry("mycelium").is_some());
         assert!(
             lock_entry("test-fixture").is_none(),
             "the fixture is never first-party"
@@ -2055,7 +2066,7 @@ mod tests {
 
     #[test]
     fn ids_and_github_slugs_are_path_safe() {
-        assert!(valid_id("agent-notes") && valid_id("latex2"));
+        assert!(valid_id("mycelium") && valid_id("latex2"));
         for bad in [
             "", "-x", "X", "a/b", "a.b", "..", "install", "preview", "a b",
         ] {
@@ -2184,10 +2195,7 @@ mod tests {
         let catalog = &catalog;
         let none = detect_blocking(&root, catalog);
         assert!(!none.contains("mycelium"));
-        assert!(
-            none.contains("agent-notes"),
-            "no footprint = always present"
-        );
+        assert!(none.contains("latex"), "no footprint = always present");
         let elsewhere = root.join("elsewhere");
         std::fs::create_dir_all(elsewhere.join("findings")).unwrap();
         #[cfg(unix)]

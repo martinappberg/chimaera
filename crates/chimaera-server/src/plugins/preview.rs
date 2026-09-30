@@ -19,10 +19,11 @@
 //! Both answer the installed entry's shape (`manifest_fields`) with
 //! `source: "available"`, `installed: false`, `requires` / `recommends`,
 //! `release_url` and — when the releases API gives the component's size —
-//! `download: {wasm_bytes}`; a gate this daemon would refuse at install is
-//! the entry's `fault`. Every fetch rides `releases`' fence (10 s, 1 MiB,
-//! the manifest capped again at `TOML_MAX`); nothing here runs at boot or in
-//! the checker's loop, and a failure is never cached.
+//! `download: {wasm_bytes}`; a gate this daemon would refuse at install (or
+//! a retired id, `retired`) is the entry's `fault`. Every fetch rides
+//! `releases`' fence (10 s, 1 MiB, the manifest capped again at
+//! `TOML_MAX`); nothing here runs at boot or in the checker's loop, and a
+//! failure is never cached.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -98,7 +99,11 @@ fn describe(
     if let Some(bytes) = release.wasm_size {
         v["download"] = json!({"wasm_bytes": bytes});
     }
-    if let Some(why) = super::gate(m, &state.plugin_catalog.daemon_version()) {
+    let why = match super::retired::of(&m.id) {
+        Some(r) => Some(r.reason.to_string()),
+        None => super::gate(m, &state.plugin_catalog.daemon_version()),
+    };
+    if let Some(why) = why {
         v["fault"] = json!(why);
     }
     v

@@ -669,14 +669,14 @@ async fn a_privileged_first_party_release_past_the_pin_asks() {
 
 #[tokio::test]
 async fn a_first_party_plugin_is_verified_and_asks_nothing() {
-    let (l, toml, wasm, sums) = agent_notes_release();
+    let (l, toml, wasm, sums) = locked_release("mycelium");
     let fake = FakeReleases::start().await;
     let state = state_for(&fake);
     fake.publish_with_sums(&l.repo, &l.version, &toml, &wasm, &sums);
     let (status, body) = request(
         &state,
         Method::POST,
-        "/api/v1/plugins/agent-notes/install",
+        "/api/v1/plugins/mycelium/install",
         None,
     )
     .await;
@@ -686,7 +686,9 @@ async fn a_first_party_plugin_is_verified_and_asks_nothing() {
     assert_eq!(p["first_party"], true);
     assert_eq!(p["tier"], "sandboxed");
     assert_eq!(p["caps"], l.caps.as_str());
-    assert!(texts(&p["can"]).iter().any(|t| t.contains("post_note")));
+    assert!(texts(&p["can"])
+        .iter()
+        .any(|t| t.contains("knowledge_search")));
     assert!(
         trust::records_for_tests(&state).is_empty(),
         "the lock covers it: no record"
