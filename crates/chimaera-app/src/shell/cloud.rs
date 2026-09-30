@@ -121,10 +121,11 @@ async fn worker(
     wake: bool,
 ) -> Result<Option<Host>, String> {
     if wake {
-        client
-            .wake_worker()
-            .await
-            .map_err(|_| "The cloud is unavailable right now. Try again shortly.")?;
+        // The status alone reaches the log: the page shows a fixed sentence.
+        client.wake_worker().await.map_err(|error| {
+            tracing::warn!(%error, "cloud wake request refused");
+            "The cloud is unavailable right now. Try again shortly."
+        })?;
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(if wake { 90 } else { 5 });
     let mut pause = Duration::from_millis(500);
@@ -179,6 +180,11 @@ async fn worker(
         }
         if tokio::time::Instant::now() >= deadline {
             // Still waking: a state the page shows quietly, not a failure.
+            tracing::info!(
+                live_check_failed,
+                listed = hosts.is_ok(),
+                "cloud wake wait ran out; the page keeps it as still connecting"
+            );
             return Err(CLOUD_ASLEEP.into());
         }
         tokio::time::sleep(pause).await;
@@ -349,7 +355,10 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
     };
     let tunnel = LinkTunnel::bind(client, host.id.clone())
         .await
-        .map_err(|_| SETUP_FAILED)?;
+        .map_err(|error| {
+            tracing::warn!(%error, "cloud request could not open its tunnel");
+            SETUP_FAILED
+        })?;
     let url = format!("http://127.0.0.1:{}/api/v1/pro/{route}", tunnel.local_port);
     let token = host
         .daemon
@@ -375,8 +384,16 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
                 .header("Authorization", &format!("Bearer {token}"))
                 .call()
         }
-        .map_err(|_| SETUP_FAILED)?;
+        .map_err(|error| {
+            // A transport failure only; the daemon's answer, when there is
+            // one, is read below and never logged.
+            tracing::warn!(%route, %error, "cloud request failed in transit");
+            SETUP_FAILED
+        })?;
         let status = response.status();
+        if !status.is_success() {
+            tracing::info!(%route, status = status.as_u16(), "cloud request refused");
+        }
         let sleeping = response
             .headers()
             .get("x-chimaera-worker-state")

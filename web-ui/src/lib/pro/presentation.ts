@@ -120,6 +120,10 @@ export const WAKE_BOUND_MS = 120_000;
 /** A live answer this late may show one muted "Checking…" beside the
  * section title; sooner, the remembered rows simply stay. */
 export const CHECKING_AFTER_MS = 5000;
+/** How long a connection warning must last before the Pro page shows it:
+ * the app reconnects to the cloud by itself within seconds after a launch
+ * or a look away, and that blink is not worth a line. */
+export const WARNING_AFTER_MS = 15_000;
 export function friendlyError(reason: unknown, fallback: string): string {
   const text = reason instanceof Error ? reason.message : String(reason);
   if (text === "return_window_ended") return RETURN_WINDOW_ENDED_COPY;

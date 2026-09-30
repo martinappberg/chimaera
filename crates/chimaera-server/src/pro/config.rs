@@ -530,19 +530,22 @@ fn merge_mcp_connections(existing: &mut serde_json::Value, incoming: serde_json:
     }
 }
 
+/// The block a Git config's portable preferences live in on the machine
+/// that received them. `git_identity` never reads from inside it.
+const GIT_PREFERENCES_START: &str = "# chimaera portable Git preferences begin";
+const GIT_PREFERENCES_END: &str = "# chimaera portable Git preferences end";
+
 fn merge_git_preferences(existing: &[u8], incoming: &[u8]) -> Result<Vec<u8>> {
-    const START: &str = "# chimaera portable Git preferences begin";
-    const END: &str = "# chimaera portable Git preferences end";
     let text = std::str::from_utf8(existing)?;
     let mut output = String::new();
     let mut managed = false;
     for line in text.lines() {
-        if line == START {
+        if line == GIT_PREFERENCES_START {
             ensure!(!managed, "nested portable Git preferences");
             managed = true;
             continue;
         }
-        if line == END {
+        if line == GIT_PREFERENCES_END {
             ensure!(managed, "unmatched portable Git preferences");
             managed = false;
             continue;
@@ -553,10 +556,10 @@ fn merge_git_preferences(existing: &[u8], incoming: &[u8]) -> Result<Vec<u8>> {
         }
     }
     ensure!(!managed, "unterminated portable Git preferences");
-    output.push_str(START);
+    output.push_str(GIT_PREFERENCES_START);
     output.push('\n');
     output.push_str(std::str::from_utf8(incoming)?);
-    output.push_str(END);
+    output.push_str(GIT_PREFERENCES_END);
     output.push('\n');
     ensure!(
         output.len() as u64 <= policy::MAX_CONFIG_FILE,
@@ -565,13 +568,31 @@ fn merge_git_preferences(existing: &[u8], incoming: &[u8]) -> Result<Vec<u8>> {
     Ok(output.into_bytes())
 }
 
+/// The author identity and simple aliases a Git config carries, once each. A
+/// file that already holds a managed block (a cloud copy, or a computer that
+/// received one) contributes nothing from inside it, so the identity never
+/// grows by one copy per round trip between a computer and the cloud; a key
+/// named twice keeps its last value, as Git reads it.
 fn git_identity(bytes: &[u8]) -> Vec<u8> {
     let text = String::from_utf8_lossy(bytes);
     let mut section = "";
-    let mut identity = String::new();
-    let mut aliases = String::new();
+    let mut name: Option<String> = None;
+    let mut email: Option<String> = None;
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    let mut managed = false;
     for line in text.lines() {
         let line = line.trim();
+        if line == GIT_PREFERENCES_START {
+            managed = true;
+            continue;
+        }
+        if line == GIT_PREFERENCES_END {
+            managed = false;
+            continue;
+        }
+        if managed {
+            continue;
+        }
         if line.starts_with('[') {
             section = if line.eq_ignore_ascii_case("[user]") {
                 "user"
@@ -593,7 +614,11 @@ fn git_identity(bytes: &[u8]) -> Vec<u8> {
                 continue;
             }
             if section == "user" && matches!(key.as_str(), "name" | "email") {
-                identity.push_str(&format!("\t{key} = {value}\n"));
+                if key == "name" {
+                    name = Some(value.to_owned());
+                } else {
+                    email = Some(value.to_owned());
+                }
             } else if section == "alias"
                 && key.len() <= 64
                 && key
@@ -656,11 +681,25 @@ fn git_identity(bytes: &[u8]) -> Vec<u8> {
                             | "cherry-pick"
                     )
                 {
-                    aliases.push_str(&format!("\t{key} = {value}\n"));
+                    match aliases.iter_mut().find(|(known, _)| *known == key) {
+                        Some(alias) => alias.1 = value.to_owned(),
+                        None => aliases.push((key, value.to_owned())),
+                    }
                 }
             }
         }
     }
+    let mut identity = String::new();
+    if let Some(name) = name {
+        identity.push_str(&format!("\tname = {name}\n"));
+    }
+    if let Some(email) = email {
+        identity.push_str(&format!("\temail = {email}\n"));
+    }
+    let aliases: String = aliases
+        .iter()
+        .map(|(key, value)| format!("\t{key} = {value}\n"))
+        .collect();
     format!(
         "{}{}",
         if identity.is_empty() {
@@ -704,6 +743,26 @@ mod tests {
         assert!(String::from_utf8(merged)
             .unwrap()
             .contains("helper = host-login-helper"));
+    }
+    #[test]
+    fn git_identity_never_grows_by_its_own_managed_block() {
+        // A computer's config after it received the cloud's preferences: its
+        // own [user] plus the managed block, whose copies must not count.
+        let received = b"[user]\n\tname = Dev\n\temail = dev@example.invalid\n# chimaera portable Git preferences begin\n[user]\n\tname = Dev\n\temail = dev@example.invalid\n\tname = Dev\n\temail = dev@example.invalid\n# chimaera portable Git preferences end\n[user]\n\temail = later@example.invalid\n";
+        let identity = String::from_utf8(git_identity(received)).unwrap();
+        assert_eq!(identity.matches("name = ").count(), 1);
+        assert_eq!(identity.matches("email = ").count(), 1);
+        // A key named twice keeps its last value, as Git reads it.
+        assert!(identity.contains("email = later@example.invalid"));
+        // Round trips settle: merging what a machine sends back changes nothing.
+        let merged = merge_git_preferences(received, identity.as_bytes()).unwrap();
+        let again = git_identity(&merged);
+        assert_eq!(again, identity.as_bytes());
+        assert_eq!(
+            merge_git_preferences(&merged, &again).unwrap(),
+            merged,
+            "a second round trip is a fixed point"
+        );
     }
     #[test]
     fn mcp_overlay_never_retargets_destination_credentials() {

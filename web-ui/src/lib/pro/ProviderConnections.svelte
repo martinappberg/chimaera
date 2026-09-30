@@ -4,8 +4,8 @@
   import { isNativeShell, writeClipboard, type CloudProviderConnection, type CloudProviderStatus, type CloudSetupInfo } from "../net/native";
   import { cloudAction, cloudRequest, peekCatalog } from "./cloudTransport";
   import { rememberCatalog } from "./catalogMemory";
-  import { CHECKING_AFTER_MS, cloudAsleep } from "./presentation";
-  import { agentsConnected, awaitingCloudUpdate, canDisconnect, canStartConnection, cloudUpdateLine, connectingLabel, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, nextReadyHandoff, olderCloudSignIn, panelRows, pendingConnection, providerLabel, providerLoginUrl, providersReady, providerStateLabel, recoverDisconnect, sameConnection, stillAwaitingUpdate } from "./providers";
+  import { CHECKING_AFTER_MS, CLOUD_ASLEEP, cloudAsleep, friendlyError } from "./presentation";
+  import { agentsConnected, awaitingCloudUpdate, canDisconnect, cloudUpdateLine, connectingLabel, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, nextReadyHandoff, olderCloudSignIn, panelRows, pendingConnection, providerLabel, providerLoginUrl, providersReady, providerStateLabel, recoverDisconnect, sameConnection, stillAwaitingUpdate } from "./providers";
 
   let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady, onReadiness, onAgents, compact = false, live = true, remembered = null }: {
     visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void; onReadiness?: (ready: boolean | null) => void;
@@ -93,10 +93,11 @@
   const introduction = $derived(unchecked ? required.length ? "Connect the agents this project uses so it can continue automatically." : "Connect an agent to use it in the cloud. Agents you connected before stay connected." : uncertain ? !known ? "" : "Chimaera is checking which agents are connected for cloud work." : shownReady ? required.length ? selectedHandoff && !resumeFailures[handoffKey(selectedHandoff)] ? "The agents this project needs are connected. Chimaera will continue it automatically." : "The agents this project needs are connected." : "Your connected agents are ready for cloud work. You can add another whenever you need it." : required.length ? "Connect the agents this project uses so it can continue automatically." : "Choose the agent you want to use. Connect one to get started; you can add others later.");
   const waiting = $derived(pendingConnection(connection));
   const disconnecting = $derived(disconnectConnection(connection));
-  /** Connect works from remembered or idle rows too: the press itself wakes
-   * the cloud, which checks the request. Disconnecting needs a fresh read. */
+  /** Connect and Disconnect both work from remembered or idle rows: the
+   * press itself brings the cloud up, which then checks the request. Nothing
+   * on this page is greyed out only because the cloud is idle. */
   const canStart = $derived(busy === null && !catalogDisconnectBusy && !pendingConnection(connection) && (catalogFresh || fromMemory || asleep));
-  const canManage = $derived(busy === null && !catalogDisconnectBusy && canStartConnection(connection, catalogFresh));
+  const canManage = $derived(canStart);
   const confirmedSuccess = $derived(connectionSuccessCurrent(connection, providers, catalogFresh));
   const detailsNeeded = $derived(required.length > 0 || handoffs.length > 0 || connection !== null || pressedUpdate.length > 0 || operationError !== null || known && (!shownReady || error !== null));
   const showDetails = $derived(!compact || expanded || detailsNeeded);
@@ -125,6 +126,16 @@
   /** Whether a sign-in or sign-out ended short: its reason shows in the row. */
   function ended(phase: string): boolean {
     return ["failed", "expired", "canceled"].includes(phase);
+  }
+  /** What a press that never reached the cloud says: the cloud still coming
+   * up past the wake bound, the app's own sentence when it gave one (the
+   * cloud unavailable, the account changed), else the generic line. A bare
+   * code is never shown. */
+  function pressFailure(cause: unknown, operation: "connect" | "disconnect"): string {
+    if (cloudAsleep(cause)) return friendlyError(CLOUD_ASLEEP, "");
+    const message = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "";
+    if (/^[A-Z][^_{}<>]{15,160}[.!]$/.test(message)) return message;
+    return operation === "disconnect" ? "Disconnection couldn't be confirmed. Check the connection before trying again." : "Sign-in couldn't start in the cloud. Try again in a moment.";
   }
   const loginUrl = $derived(connection && action && (action.type === "device_code" || action.type === "browser")
     ? providerLoginUrl(connection.provider_id, action.type === "device_code" ? action.verification_url : action.url) : null);
@@ -275,7 +286,7 @@
       if (alive && request === mutation) {
         operationError = cause === "provider_busy" || cause instanceof Error && cause.message === "provider_busy"
           ? connectionError("provider_busy", operation)
-          : operation === "disconnect" ? "Disconnection couldn't be confirmed. Check the connection before trying again." : "Sign-in couldn't start in the cloud. Try again in a moment.";
+          : pressFailure(cause, operation);
         failedDisconnectProvider = operation === "disconnect" ? providerId : null;
         current = false; void load();
       }
@@ -462,7 +473,9 @@
     </section>
   {/if}
 
-  {#if ready && onReady && !selectedHandoff && !disconnectCandidate && !waiting}<div class="ready"><p>{required.length ? "The required agents are connected." : "Your first agent is connected. You're ready for cloud work."}</p><button class="button" disabled={busy !== null} onclick={() => onReady?.()}>{required.length ? "Back to project" : "Back to projects"}</button></div>{/if}
+  <!-- Only a project waiting on its agents gets a way back from here; the
+       plain page has its own navigation, and a row already says Connected. -->
+  {#if ready && onReady && required.length > 0 && !selectedHandoff && !disconnectCandidate && !waiting}<div class="ready"><p>{required.length ? "The required agents are connected." : "Your first agent is connected. You're ready for cloud work."}</p><button class="button" disabled={busy !== null} onclick={() => onReady?.()}>{required.length ? "Back to project" : "Back to projects"}</button></div>{/if}
   {#each handoffs as handoff (handoff.workspace_id)}
     <div class="handoff"><div><h3>{handoff.name}</h3><p class="muted small" role="status">{resumeFailures[handoffKey(handoff)] ?? (current && providersReady(providers, handoff.blocked_providers.map(p => p.id)) ? "Continuing your project…" : "Waiting for an agent connection for cloud work.")}</p></div>{#if resumeFailures[handoffKey(handoff)]}<button class="button" disabled={busy !== null || !nextReadyHandoff(providers, [handoff], [], current)} onclick={() => void resume(handoff, handoff.workspace_id === workspaceId)}>Try again</button>{:else if !current || !providersReady(providers, handoff.blocked_providers.map(p => p.id))}<button class="button secondary" onclick={() => (focusedHandoff = handoff)}>Connect required agents</button>{/if}</div>
   {/each}

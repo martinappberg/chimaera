@@ -11,7 +11,7 @@
   import ConfirmDialog from "../shared/ConfirmDialog.svelte";
   import { asyncDisposer } from "../shared/asyncDisposer";
   import { pageVisible } from "../shared/visibility";
-  import { paid, readIntent, friendlyError, recoverableAccountRestore, alreadySubscribed, connectionWarningCopy, keeperRestartLine, returningLine, signInNoteCopy, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
+  import { paid, readIntent, friendlyError, recoverableAccountRestore, alreadySubscribed, connectionWarningCopy, keeperRestartLine, returningLine, signInNoteCopy, WARNING_AFTER_MS, type PaidPlan, type BillingInterval, type PurchaseIntent } from "../pro/presentation";
   import { accountErrorBar, accountPanel, completesReview, isConfirmedFree, nearLimit, offersCheck, reviewKey } from "../pro/account";
   import { accountFailure, connectionWarningCode, grantedPlan, keeperRestartAt, paymentDue, planEnded, returningUntil, signInNote } from "../pro/status";
   import {
@@ -78,6 +78,16 @@
   const failure = $derived(accountFailure(status));
   const paymentNeeded = $derived(paymentDue(status));
   const warning = $derived(status?.signed_in === true ? connectionWarningCode(status) : null);
+  /** A connection warning shows only once it has lasted (`WARNING_AFTER_MS`):
+   * after a launch or a look away the app reconnects to the cloud by itself
+   * within seconds, and a line that blinks in for that reads as trouble. */
+  let warningShown = $state<string | null>(null);
+  $effect(() => {
+    const code = warning;
+    if (code === null) { warningShown = null; return; }
+    const timer = setTimeout(() => (warningShown = code), WARNING_AFTER_MS);
+    return () => clearTimeout(timer);
+  });
   const signInPhase = $derived(status?.sign_in?.phase ?? null);
   const billing = $derived(status?.billing ?? null);
   const billingActive = $derived(billingPending(billing));
@@ -391,7 +401,7 @@
         <PlanBadge plan={subscribed && paid(status.plan) ? status.plan : null} {ended} />
       </div>
       {#if returning !== null}<p class="muted small returning" role="status">{returning}</p>{/if}
-      {#if warning !== null}<p class="muted small connection-warning" role="status">{connectionWarningCopy(warning)}</p>{/if}
+      {#if warningShown !== null}<p class="muted small connection-warning" role="status">{connectionWarningCopy(warningShown)}</p>{/if}
     {/if}
 
     {#if signInPhase === "waiting"}
