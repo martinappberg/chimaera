@@ -59,9 +59,28 @@ export function returningLine(until: string | null, now = Date.now(), locale?: s
   if (ends <= now) return RETURN_WINDOW_ENDED_COPY;
   return `Your plan has ended. Bring your work home from the cloud by ${formatFullTimestamp(ends, locale)}.`;
 }
+/** The fixed code the native shell and the browser transport give a cloud
+ * request answered by a cloud machine that is asleep or still starting (503
+ * `worker_asleep`/`worker_unavailable`, or a reply marked sleeping). That is a
+ * state, never an error: it reads as one of `sleepingConnectionsLine`'s quiet
+ * lines and the page keeps checking on its usual cadence. */
+export const CLOUD_ASLEEP = "cloud_asleep";
+export function cloudAsleep(reason: unknown): boolean {
+  return (reason instanceof Error ? reason.message : String(reason)) === CLOUD_ASLEEP;
+}
+/** The quiet line for agent connections while the cloud machine sleeps:
+ * waking while a request that wakes it is in flight (or it reports it is
+ * starting), asleep when nothing is waking it. */
+export function sleepingConnectionsLine(waking: boolean): string {
+  return waking
+    ? "Your cloud machine is waking up. Connections show in a moment."
+    : "Your cloud machine is asleep. Connecting an agent wakes it.";
+}
 export function friendlyError(reason: unknown, fallback: string): string {
   const text = reason instanceof Error ? reason.message : String(reason);
   if (text === "return_window_ended") return RETURN_WINDOW_ENDED_COPY;
+  // A request that wakes the machine found it still starting.
+  if (text === CLOUD_ASLEEP) return "Your cloud machine is waking up. Try again in a moment.";
   if (text === "service_unsupported") return "Cloud work is off for now because this version of Chimaera and your account don’t match. Installing an update, if one is offered, turns it back on; otherwise it resumes on its own. Work on this computer isn’t affected.";
   // Sign-out finished here; the app removes the saved sign-in by itself.
   if (text === "sign_out_pending") return "You’re signed out on this computer. The saved sign-in is cleared automatically next time you’re online.";

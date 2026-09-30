@@ -3,12 +3,15 @@
   import { pageVisible } from "../shared/visibility";
   import { isNativeShell, writeClipboard, type CloudProviderConnection, type CloudProviderStatus, type CloudSetupInfo } from "../net/native";
   import { cloudRequest } from "./cloudTransport";
+  import { cloudAsleep, sleepingConnectionsLine } from "./presentation";
   import { canDisconnect, canStartConnection, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, nextReadyHandoff, pendingConnection, providerLabel, providerLoginUrl, providersReady, providerStateLabel, recoverDisconnect, sameConnection } from "./providers";
 
-  let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady, onReadiness, onAgents, compact = false }: {
+  let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady, onReadiness, onAgents, compact = false, waking = false }: {
     visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void; onReadiness?: (ready: boolean | null) => void;
     /** Whether any agent is connected by a fresh catalog; null when unknown. */
     onAgents?: (connected: boolean | null) => void; compact?: boolean;
+    /** Something outside this panel is waking the cloud machine (a start in flight). */
+    waking?: boolean;
   } = $props();
   type Handoff = NonNullable<CloudSetupInfo["handoffs"]>[number];
   let providers = $state<CloudProviderStatus[]>([]);
@@ -27,6 +30,11 @@
   let operationError = $state<string | null>(null);
   let failedDisconnectProvider: string | null = null;
   let connectionNotice = $state<string | null>(null);
+  /** The last catalog read found the cloud machine asleep or still starting
+   * (`cloud_asleep`): a quiet line, never the error, while polling continues. */
+  let asleep = $state(false);
+  /** A connection request of ours found it still starting (it woke it). */
+  let wakeRequested = $state(false);
   let copied = $state(false);
   let authorizationCode = $state("");
   let expanded = $state(false);
@@ -52,8 +60,9 @@
   const catalogFresh = $derived(current && catalogMutation === mutation && catalogVisibility === visibilityGeneration);
   const ready = $derived(catalogFresh && providersReady(providers, required));
   const uncertain = $derived(!loaded || !current || !ready && agents.some(p => p.state === "unknown"));
-  const heading = $derived(uncertain ? !loaded ? "Checking your agent connections…" : error ? "Agent connections need attention" : "Agent connections aren't confirmed yet" : ready ? required.length ? "The required agents are connected" : "Ready for cloud work" : required.length ? `Connect your agents${projectName ? ` for ${projectName}` : " to continue"}` : "Connect an agent to start cloud work");
-  const introduction = $derived(uncertain ? "Chimaera is checking which agents are connected for cloud work." : ready ? required.length ? selectedHandoff && !resumeFailures[handoffKey(selectedHandoff)] ? "The agents this project needs are connected. Chimaera will continue it automatically." : "The agents this project needs are connected." : "Your connected agents are ready for cloud work. You can add another whenever you need it." : required.length ? "Connect the agents this project uses so it can continue automatically." : "Choose the agent you want to use. Connect one to get started; you can add others later.");
+  const sleepLine = $derived(sleepingConnectionsLine(waking || wakeRequested || busy !== null));
+  const heading = $derived(uncertain ? !loaded ? "Checking your agent connections…" : error ? "Agent connections need attention" : asleep ? "Agent connections" : "Agent connections aren't confirmed yet" : ready ? required.length ? "The required agents are connected" : "Ready for cloud work" : required.length ? `Connect your agents${projectName ? ` for ${projectName}` : " to continue"}` : "Connect an agent to start cloud work");
+  const introduction = $derived(uncertain ? asleep && loaded && !error ? sleepLine : "Chimaera is checking which agents are connected for cloud work." : ready ? required.length ? selectedHandoff && !resumeFailures[handoffKey(selectedHandoff)] ? "The agents this project needs are connected. Chimaera will continue it automatically." : "The agents this project needs are connected." : "Your connected agents are ready for cloud work. You can add another whenever you need it." : required.length ? "Connect the agents this project uses so it can continue automatically." : "Choose the agent you want to use. Connect one to get started; you can add others later.");
   const waiting = $derived(pendingConnection(connection));
   const disconnecting = $derived(disconnectConnection(connection));
   const canStart = $derived(busy === null && !catalogDisconnectBusy && canStartConnection(connection, catalogFresh));
@@ -105,11 +114,14 @@
       catalogMutation = operation;
       catalogVisibility = visibility;
       loaded = true;
+      asleep = false; wakeRequested = false;
       error = current ? null : "We couldn't check your agent sign-ins yet. We'll try again shortly.";
-    } catch {
+    } catch (cause) {
       if (alive && !signal?.aborted && visibility === visibilityGeneration) {
         if (operation !== mutation) catalogAgain = true;
-        else { loaded = true; current = false; error = "We couldn't check your agent sign-ins. We'll try again shortly."; }
+        // Asleep or still starting is a state: say so quietly and keep checking.
+        else if (cloudAsleep(cause)) { loaded = true; current = false; asleep = true; error = null; }
+        else { loaded = true; current = false; asleep = false; error = "We couldn't check your agent sign-ins. We'll try again shortly."; }
       }
     } finally {
       catalogFlight = false;
@@ -180,7 +192,10 @@
         connectionElement?.focus({ preventScroll: true });
       }
     } catch (cause) {
-      if (alive && request === mutation) {
+      // The request woke the machine, which is still starting: the waking
+      // line replaces an error, and the catalog check picks up from there.
+      if (alive && request === mutation && cloudAsleep(cause)) { wakeRequested = true; asleep = true; error = null; current = false; void load(); }
+      else if (alive && request === mutation) {
         operationError = cause === "provider_busy" || cause instanceof Error && cause.message === "provider_busy"
           ? connectionError("provider_busy", operation)
           : operation === "disconnect" ? "Disconnection couldn't be confirmed. Check the connection before trying again." : "Sign-in couldn't start in the cloud. Try again in a moment.";
@@ -282,7 +297,7 @@
   <p class="intro">{requestingDisconnect || waiting && disconnecting ? "Chimaera is signing this service out in the cloud." : waiting ? connection?.phase === "preparing" ? "Sign-in will appear here when it's ready." : connection?.phase === "verifying" ? `Chimaera is confirming your sign-in with ${connectingLabel}.` : "Finish sign-in below. Chimaera will confirm the connection automatically." : introduction}</p>
   <p class="privacy">Use your own accounts and subscriptions. Connected services are available across your cloud projects. Signing in or disconnecting here doesn't change sign-in on your computer.</p>
   {#if !loaded}<p class="muted" role="status">Checking your cloud connections…</p>{/if}
-  {#if loaded && agents.length === 0}<p class="muted">No cloud agent connections are available yet.</p>{/if}
+  {#if loaded && !asleep && agents.length === 0}<p class="muted">No cloud agent connections are available yet.</p>{/if}
   {#if !waiting && !requestingDisconnect}<div class="provider-cards">
     {#each agents as provider (provider.id)}
       <article class="provider-card" class:connected={current && provider.state === "signed_in"}>

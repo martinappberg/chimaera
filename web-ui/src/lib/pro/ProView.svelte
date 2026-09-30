@@ -7,6 +7,7 @@
   import { isNativeShell } from "../net/native";
   import { isBrowserGateway } from "../net/base";
   import { cloudRequest } from "./cloudTransport";
+  import { cloudAsleep } from "./presentation";
   import { cloudOnboarding } from "./onboarding.svelte";
   let { visible = true, requiredProviders, contextLabel, workspaceId, onReady }: {
     visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void;
@@ -26,7 +27,12 @@
     try {
       const info = await cloudRequest({ operation: wake ? "start" : "info" }, signal);
       if (!signal?.aborted && current === revision) { worker = info.available === true; error = false; }
-    } catch { if (!signal?.aborted && current === revision) error = true; }
+    } catch (reason) {
+      if (signal?.aborted || current !== revision) return;
+      // Only a cloud machine's transport answers "asleep": show its page,
+      // which says so quietly, rather than a failure.
+      if (cloudAsleep(reason)) { worker = true; error = false; } else error = true;
+    }
     finally { if (current === revision) checking = false; }
   }
   $effect(() => {

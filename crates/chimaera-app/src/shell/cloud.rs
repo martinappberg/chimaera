@@ -145,7 +145,8 @@ async fn worker(
             return Ok(None);
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err("Cloud machine is still starting. Try again shortly.".into());
+            // Still waking: a state the page shows quietly, not a failure.
+            return Err(CLOUD_ASLEEP.into());
         }
         tokio::time::sleep(pause).await;
         pause = (pause * 2).min(Duration::from_secs(5));
@@ -346,6 +347,10 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
         }
         .map_err(|_| SETUP_FAILED)?;
         let status = response.status();
+        let sleeping = response
+            .headers()
+            .get("x-chimaera-worker-state")
+            .is_some_and(|state| state == "sleeping");
         let mut bytes = Vec::new();
         response
             .body_mut()
@@ -355,6 +360,9 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
             .map_err(|_| SETUP_FAILED)?;
         if bytes.len() > 64 * 1024 {
             return Err("Cloud setup response exceeds limit".into());
+        }
+        if asleep_answer(status.as_u16(), sleeping, &bytes) {
+            return Err(CLOUD_ASLEEP.into());
         }
         let value = response_value(status.as_u16(), &bytes)?;
         if !status.is_success() {
@@ -437,6 +445,23 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
 }
 
 const SETUP_FAILED: &str = "Couldn't complete cloud setup. Try again shortly.";
+/// The fixed code for a cloud machine that is asleep or still starting. The
+/// page maps it to a quiet line ("waking up" / "asleep"), never an error.
+const CLOUD_ASLEEP: &str = "cloud_asleep";
+
+/// A sleeping or starting cloud machine answers through its transport: 503
+/// `worker_asleep` / `worker_unavailable`, or an answer marked
+/// `X-Chimaera-Worker-State: sleeping` (a cache reply, never live setup data).
+fn asleep_answer(status: u16, sleeping: bool, body: &[u8]) -> bool {
+    sleeping
+        || status == 503
+            && serde_json::from_slice::<Value>(body).is_ok_and(|value| {
+                matches!(
+                    value["error"].as_str(),
+                    Some("worker_asleep" | "worker_unavailable")
+                )
+            })
+}
 
 fn response_value(status: u16, bytes: &[u8]) -> Result<Value, String> {
     if status == 204 && bytes.is_empty() {
@@ -551,6 +576,27 @@ mod tests {
         assert_eq!(response_value(204, &[]).unwrap(), json!({}));
         assert!(response_value(200, &[]).is_err());
         assert!(response_value(503, &[]).is_err());
+    }
+
+    #[test]
+    fn a_sleeping_or_starting_cloud_machine_is_told_apart_from_a_failure() {
+        for body in [
+            r#"{"error":"worker_asleep"}"#,
+            r#"{"error":"worker_unavailable"}"#,
+        ] {
+            assert!(asleep_answer(503, false, body.as_bytes()));
+            assert!(!asleep_answer(500, false, body.as_bytes()));
+        }
+        assert!(asleep_answer(503, true, b""));
+        assert!(asleep_answer(200, true, br#"{"available":true}"#));
+        for body in [
+            &br#"{"error":"provider_busy"}"#[..],
+            b"<html>bad gateway</html>",
+            b"",
+        ] {
+            assert!(!asleep_answer(503, false, body));
+        }
+        assert!(!asleep_answer(409, false, br#"{"error":"provider_busy"}"#));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { MirrorStatus, MirrorWorkspace } from "../net/native";
-import { paid, readIntent, cloudCopy, cloudPollDelay, cloudProjectStatus, connectionWarningCopy, copyIssue, friendlyError, projectCopiesSetupLine, projectCopyError, projectPlace, returningLine, RETURN_WINDOW_ENDED_COPY, signInNoteCopy, alreadySubscribed, recoverableAccountRestore } from "./presentation";
+import { paid, readIntent, cloudAsleep, CLOUD_ASLEEP, sleepingConnectionsLine, cloudCopy, cloudPollDelay, cloudProjectStatus, connectionWarningCopy, copyIssue, friendlyError, projectCopiesSetupLine, projectCopyError, projectPlace, returningLine, RETURN_WINDOW_ENDED_COPY, signInNoteCopy, alreadySubscribed, recoverableAccountRestore } from "./presentation";
 
 // Copy is free to change; these tests pin which states read alike or apart,
 // what takes precedence, and that nothing from a raw error reaches the page.
@@ -252,5 +252,26 @@ describe("an ended plan's return window", () => {
     expect(friendlyError("return_window_ended", "fallback")).toBe(RETURN_WINDOW_ENDED_COPY);
     expect(friendlyError(new Error("return_window_ended and more"), "fallback")).toBe("fallback");
     expect(RETURN_WINDOW_ENDED_COPY).not.toMatch(/return_window_ended|epoch|window/i);
+  });
+});
+
+describe("a sleeping or waking cloud machine", () => {
+  it("recognizes only the fixed code, from the native shell (a string) or the browser transport (an Error)", () => {
+    expect(cloudAsleep(CLOUD_ASLEEP)).toBe(true);
+    expect(cloudAsleep(new Error(CLOUD_ASLEEP))).toBe(true);
+    for (const other of ["worker_asleep", "Couldn't complete cloud setup. Try again shortly.", new Error("provider_busy"), null, undefined]) expect(cloudAsleep(other)).toBe(false);
+  });
+  it("reads as a quiet state that tells waking from asleep, never as the failure copy", () => {
+    const failure = "Your agent connections couldn’t load. Try again in a moment.";
+    const waking = sleepingConnectionsLine(true);
+    const asleep = sleepingConnectionsLine(false);
+    expect(waking).not.toBe(asleep);
+    for (const line of [waking, asleep]) {
+      expect(line).not.toBe(failure);
+      expect(line).not.toMatch(/couldn|error|failed|worker|keeper/i);
+    }
+    expect(friendlyError(CLOUD_ASLEEP, failure)).not.toBe(failure);
+    expect(friendlyError(new Error(CLOUD_ASLEEP), failure)).toBe(friendlyError(CLOUD_ASLEEP, failure));
+    expect(friendlyError("something else", failure)).toBe(failure);
   });
 });

@@ -256,7 +256,15 @@ only when an agent is on record; none connected reads as the next step,
 “Connect an agent to start cloud work”; unknown claims nothing. A passive read
 that finds a cloud the account called ready unreachable is re-checked with the
 account first (it usually just went to sleep) and is reported as unavailable
-only on a second read in a row. Opening the optional **Agent connections**
+only on a second read in a row. A cloud machine that answers that it is asleep
+or still starting (503 `worker_asleep`/`worker_unavailable`, or a reply marked
+sleeping; both clients carry it as the fixed code `cloud_asleep`) is a state,
+not an error: it is never counted as unreachable, and the connections section
+says “Your cloud machine is waking up. Connections show in a moment.” while a
+request that wakes it is in flight or found it still starting (for at most two
+minutes, on the fast check cadence), or “Your cloud machine is asleep.
+Connecting an agent wakes it.” when nothing is waking it. Real failures keep
+their error copy. Opening the optional **Agent connections**
 disclosure loads those connections and acquires access automatically. There is no
 separate cloud-start action. Connecting a provider, or opening a repository on
 the cloud machine's own page, also acquires access as part of that user request. Catalog checks are
