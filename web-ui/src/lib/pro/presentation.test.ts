@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { MirrorStatus, MirrorWorkspace } from "../net/native";
-import { paid, readIntent, cloudAsleep, CLOUD_ASLEEP, afterFailedRead, MISSES_REPORTED, cloudCopy, cloudReadyOnce, cloudPollDelay, cloudProjectStatus, connectionWarningCopy, copyIssue, friendlyError, projectCopiesSetupLine, projectCopyError, projectPlace, returningLine, RETURN_WINDOW_ENDED_COPY, signInNoteCopy, alreadySubscribed, recoverableAccountRestore } from "./presentation";
+import { paid, readIntent, cloudAsleep, CLOUD_ASLEEP, afterFailedRead, MISSES_REPORTED, cloudCopy, cloudReadyOnce, cloudPollDelay, cloudProjectStatus, connectionWarningCopy, copyIssue, friendlyError, keeperRestartLine, projectCopiesSetupLine, projectCopyError, projectPlace, restartWhen, returningLine, RETURN_WINDOW_ENDED_COPY, signInNoteCopy, alreadySubscribed, recoverableAccountRestore } from "./presentation";
 
 // Copy is free to change; these tests pin which states read alike or apart,
 // what takes precedence, and that nothing from a raw error reaches the page.
@@ -249,6 +249,54 @@ describe("saved account recovery", () => {
     expect(recoverableAccountRestore("account_restore_locked")).toBe(true);
     expect(recoverableAccountRestore("account_restore_unavailable")).toBe(true);
     for (const value of [null, "sign in required", "authorization revoked", "some upstream error"]) expect(recoverableAccountRestore(value)).toBe(false);
+  });
+});
+
+describe("a planned restart of the cloud connection", () => {
+  // Local wall-clock times (months from 0), so the words hold in any time zone.
+  const at = (month: number, day: number, hour: number, minute = 0) => new Date(2026, month, day, hour, minute).getTime();
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const afternoon = at(8, 30, 14); // Wednesday 30 September, 14:00
+  const tonight = at(9, 1, 2); // Thursday 1 October, 02:00
+  it("says when a future restart happens, in the person's own time format, and what it asks of them", () => {
+    expect(keeperRestartLine(iso(tonight), [], afternoon, "en-GB")).toBe(
+      "Your cloud connection restarts tonight at 02:00 to update. You’ll be asked to sign in to your cluster again when you next use it.",
+    );
+    expect(keeperRestartLine(iso(tonight), [], afternoon, "en-US")).toContain("restarts tonight at 2:00");
+  });
+  it("says shortly once the time has come (it waits for Git transfers to finish)", () => {
+    const line = "Your cloud connection restarts shortly to update. You’ll be asked to sign in to your cluster again when you next use it.";
+    expect(keeperRestartLine(iso(afternoon), [], afternoon, "en-GB")).toBe(line);
+    expect(keeperRestartLine(iso(afternoon - 60_000), [], afternoon, "en-GB")).toBe(line);
+    expect(keeperRestartLine("2020-01-01T00:00:00Z", [], afternoon)).toBe(line);
+  });
+  it("names the cluster only when exactly one login is kept", () => {
+    expect(keeperRestartLine(iso(tonight), ["Sherlock"], afternoon, "en-GB")).toBe(
+      "Your cloud connection restarts tonight at 02:00 to update. You’ll be asked to sign in to Sherlock again when you next use it.",
+    );
+    expect(keeperRestartLine(iso(afternoon - 1), ["Sherlock"], afternoon)).toBe(
+      "Your cloud connection restarts shortly to update. You’ll be asked to sign in to Sherlock again when you next use it.",
+    );
+    for (const hosts of [[], ["Sherlock", "Oak"], ["a", "b", "c"]]) {
+      expect(keeperRestartLine(iso(tonight), hosts, afternoon, "en-GB")).toContain("sign in to your cluster again");
+    }
+  });
+  it("shows nothing without a planned time", () => {
+    expect(keeperRestartLine(null, ["Sherlock"], afternoon)).toBeNull();
+    expect(keeperRestartLine("tonight", ["Sherlock"], afternoon)).toBeNull();
+  });
+  it("words the time relative to now", () => {
+    const words = (when: number, now = afternoon) => restartWhen(when, now, "en-GB");
+    expect(words(at(8, 30, 22, 30))).toBe("tonight at 22:30");
+    expect(words(at(8, 30, 16))).toBe("today at 16:00");
+    expect(words(tonight)).toBe("tonight at 02:00");
+    // In the small hours, the same night.
+    expect(words(at(8, 30, 3), at(8, 30, 1))).toBe("tonight at 03:00");
+    expect(words(at(9, 1, 3), at(8, 30, 1))).toBe("tomorrow at 03:00");
+    expect(words(at(9, 1, 9))).toBe("tomorrow at 09:00");
+    expect(words(at(9, 2, 2))).toBe("on Friday at 02:00");
+    expect(words(at(9, 9, 2))).toBe("on 9 October at 02:00");
+    expect(words(new Date(2027, 10, 4, 2).getTime())).toBe("on 4 November 2027 at 02:00");
   });
 });
 

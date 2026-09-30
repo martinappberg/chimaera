@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { accountFailure, connectionWarningCode, grantedPlan, planEnded, rechecksItself, returningUntil, signInNote } from "./status";
+import { accountFailure, connectionWarningCode, grantedPlan, keeperRestartAt, planEnded, rechecksItself, returningUntil, signInNote } from "./status";
 
 const connectionWarning = (status: Parameters<typeof connectionWarningCode>[0]) => connectionWarningCode(status) !== null;
 
@@ -68,5 +68,23 @@ describe("an ended plan inside its return window", () => {
     }
     expect(grantedPlan({ signed_in: true, plan: null })).toBeNull();
     expect(grantedPlan(null)).toBeUndefined();
+  });
+});
+
+describe("a planned restart of the cloud connection", () => {
+  it("reads the account's time, future or past, only while signed in", () => {
+    for (const at of ["2026-10-01T02:00:00Z", "2020-01-01T00:00:00+02:00"]) {
+      expect(keeperRestartAt({ signed_in: true, keeper_restart_at: at })).toBe(at);
+      expect(keeperRestartAt({ signed_in: false, keeper_restart_at: at })).toBeNull();
+    }
+  });
+  it("is absent when the account omits it, sends null, or sends something that is not a time", () => {
+    expect(keeperRestartAt({ signed_in: true })).toBeNull();
+    expect(keeperRestartAt({ signed_in: true, keeper_restart_at: null })).toBeNull();
+    for (const bad of ["tonight", "", "soon-ish", 1_790_000_000, true, { at: "2026-10-01T02:00:00Z" }]) {
+      expect(keeperRestartAt({ signed_in: true, keeper_restart_at: bad as unknown as string })).toBeNull();
+    }
+    expect(keeperRestartAt(null)).toBeNull();
+    expect(keeperRestartAt(undefined)).toBeNull();
   });
 });

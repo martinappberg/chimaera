@@ -562,6 +562,7 @@ mod tests {
             subscription_status: None,
             plans: None,
             returning_until: None,
+            keeper_restart_at: None,
         };
         assert!(!confirms("own", Some(&Plan::Pro), &account));
         account.plan = Plan::Pro;

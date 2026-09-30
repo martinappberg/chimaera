@@ -99,6 +99,10 @@ pub struct Status {
     /// Additive: the plan has ended and this RFC 3339 time is how long its
     /// cloud work can still be brought home; null otherwise.
     returning_until: Option<String>,
+    /// Additive: the RFC 3339 time the always-on cloud connection restarts to
+    /// update (a past time: shortly, once no Git transfer runs), dropping the
+    /// cluster logins it holds; null when none is planned.
+    keeper_restart_at: Option<String>,
     /// Additive: the offers to display, passed through when the service
     /// supplies them; clients never hardcode prices. A signed-in account's own
     /// list wins; otherwise the service's public catalog (`GET /v1/plans`),
@@ -229,6 +233,9 @@ impl Pro {
             returning_until: account
                 .as_ref()
                 .and_then(|account| account.returning_until.clone()),
+            keeper_restart_at: account
+                .as_ref()
+                .and_then(|account| account.keeper_restart_at.clone()),
             plans: account
                 .as_ref()
                 .and_then(|account| account.plans.clone())
@@ -1539,6 +1546,7 @@ mod tests {
         let wire = serde_json::to_value(pro.status_snapshot()).unwrap();
         assert!(wire["connection_warning"].is_null() && wire["plans"].is_null());
         assert!(wire["returning_until"].is_null());
+        assert!(wire["keeper_restart_at"].is_null());
         assert_eq!(wire["payment_due"], false);
         assert_eq!(wire["plan"], "pro");
         let mut newer = fixture_account();
@@ -1554,6 +1562,16 @@ mod tests {
         let wire = serde_json::to_value(pro.status_snapshot()).unwrap();
         assert_eq!(wire["returning_until"], "2026-11-03T09:30:00Z");
         assert_eq!(wire["plan"], "none");
+        // A planned restart of the cloud connection rides through as given,
+        // and clears when the account stops announcing it.
+        let mut restarting = fixture_account();
+        restarting.keeper_restart_at = Some("2026-10-01T02:00:00Z".into());
+        *lock(&pro.account) = Some(restarting);
+        let wire = serde_json::to_value(pro.status_snapshot()).unwrap();
+        assert_eq!(wire["keeper_restart_at"], "2026-10-01T02:00:00Z");
+        *lock(&pro.account) = Some(fixture_account());
+        let wire = serde_json::to_value(pro.status_snapshot()).unwrap();
+        assert!(wire["keeper_restart_at"].is_null());
     }
 
     fn offer(

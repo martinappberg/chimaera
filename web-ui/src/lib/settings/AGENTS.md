@@ -67,7 +67,8 @@ error. An overdue payment (`payment_due`) shows Payment needs attention with
 Manage billing and never plans or checkout. An ended plan inside its return
 window (`returning_until`) reads as no plan: the badge says **Plan ended**, plans
 are offered, and one quiet line says when its cloud work can still be brought
-home. The page renders from the last
+home. A planned restart of the always-on cloud connection (`keeper_restart_at`)
+is one quiet line under Connected machines, until the account clears it. The page renders from the last
 confirmed status (`pro/account.ts` `accountPanel`) while background reads run, so
 nothing unmounts on `pro-changed` or focus; an account needing attention keeps
 that panel too, and only Check again shows checking (the error bar hides

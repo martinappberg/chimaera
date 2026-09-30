@@ -133,8 +133,8 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   a fixed code (`account_restore_*`, `account_credentials_unsaved`,
   `service_unsupported`); additive `connection_warning` is an informational
   code (`connection_preparing`, `connection_retrying`, `account_unreachable`)
-  cleared by a live keeper host event; additive `payment_due` and `plans` come
-  from the account's optional `/v1/me` fields (`plans` falls back to the public
+  cleared by a live keeper host event; additive `payment_due`, `returning_until`,
+  `keeper_restart_at` and `plans` come from the account's optional `/v1/me` fields (`plans` falls back to the public
   catalog in `shell/pro/catalog.rs` until an account answer carries its own). `plan` is only `none`, `pro`,
   `max` or null: a plan this client cannot name (`Plan::Unknown`) reports null,
   the neutral state, and checkout accepts only Pro or Max. IPC errors are fixed sentences.

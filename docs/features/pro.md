@@ -126,6 +126,17 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    With an active plan, toggle **Keep connected** for a saved SSH host. A password
    or Duo challenge uses the usual
    host-scoped prompt, with “Asked by your Pro connection” underneath its title.
+   When the account plans a restart of the always-on cloud connection to update
+   it (optional `ProStatus.keeper_restart_at`), one quiet line under **Connected
+   machines** says so: **Your cloud connection restarts** tonight at 02:00 (the
+   time in the person's own format: today, tonight, tomorrow, a weekday within
+   the week, else a date) **to update. You’ll be asked to sign in to your cluster
+   again when you next use it.**, naming the cluster instead ("sign in to
+   Sherlock again") when exactly one login is kept. A time that has passed reads
+   **restarts shortly**: the account restarts it as soon as no Git transfer runs.
+   The restart drops the kept cluster logins, hence the sign-in. The line goes
+   away when the account stops announcing the restart. No dialog, no warning
+   colour.
 4. Open that host from Home. Its **via Pro** label identifies the connection;
    workspaces still open through a local loopback port with the existing daemon UI.
 5. **Sign out** removes this app's credentials, removes the local daemon's Pro
@@ -377,7 +388,9 @@ code), `connection_warning` (informational fixed code: `connection_preparing`,
 `connection_retrying`, `account_unreachable`; work continues and Chimaera
 retries), `payment_due` (the account reports a payment problem),
 `returning_until` (an RFC 3339 time, or null: an ended plan's cloud work can be
-brought home until then) and `plans` (the
+brought home until then), `keeper_restart_at` (an RFC 3339 time, or null: the
+always-on cloud connection restarts to update then, or shortly when the time has
+passed) and `plans` (the
 offers with amounts and each plan's optional whole-number `cloud_time_multiple`
 and `storage_multiple` relative to Pro, when the service supplies them: the
 signed-in account's own list, else the public catalog from `GET /v1/plans`;
