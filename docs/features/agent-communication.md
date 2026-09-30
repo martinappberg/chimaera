@@ -41,11 +41,8 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
   avoid Claude Code's own `ListAgents` / `SendMessage` (machine-wide, other Claude sessions):
   asked to "use list_agents", a live haiku loaded those instead, so the instructions also say
   the harness's own agent tools never reach this workspace's agents. Those tools stay the
-  agent's — never denied; when one is used anyway, the hook after it adds this workspace's
-  side (`comms::native_tool_note`): after `ListAgents` the roster, after a `SendMessage` aimed
-  at a workspace agent (by id or name — it fails natively) "send it with chimaera's
-  message_agent tool", after one that went through to a same-named Claude session a note
-  that the workspace didn't see it. Nothing is added to a send to anyone else. Workspace-scoped:
+  agent's — never denied, never intercepted; a mix-up fails harmlessly (no Claude session has
+  a workspace agent's id), and only haiku ever made one live. Workspace-scoped:
   another workspace's agents are neither listed nor reachable. A message is ≤ 2 KB (bigger:
   write a file and send its path); 10 posts per session per minute (shared with plugins'
   Timeline appends).
@@ -136,12 +133,12 @@ woke it; the switch off in Settings refused a running agent's `message_agent` at
 emptied its tool list to the base six, and the Mastermind panel showed its off banner.
 Later the same day: asked in plain words, a sonnet chat and an opus chat each put a question
 to the codex chat through `workspace_agents` / `read_agent` / `message_agent` and were woken
-by its answers; a haiku pushed to Claude Code's own `ListAgents` answered with the workspace's
-agents from the hook note, and pushed to `SendMessage` "reviewer" switched to `message_agent`
-after the native send failed; two haiku chats in a counting relay under **Within limits**
+by its answers; two haiku chats in a counting relay under **Within limits**
 woke each other four times (a reply within the 3 minutes included), the fifth asked the user,
 **Continue** gave four more; a codex **terminal** read its inbox with `read_messages` when
-prompted and answered with `message_agent`, pre-approved, which woke the asker.
+prompted and answered with `message_agent`, pre-approved, which woke the asker; a codex chat,
+asked in plain words, started a conversation itself (`workspace_agents` → `read_agent` →
+`message_agent`) and read the haiku's answer, steered into its still-running turn.
 
 ---
 

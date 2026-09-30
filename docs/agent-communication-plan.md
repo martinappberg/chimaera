@@ -22,11 +22,9 @@ The maintainer's decisions are collected in §11.
   the user's other Claude sessions. They are **`workspace_agents`** and
   **`message_agent`** (the Mastermind's old verb, now everyone's, its meaning
   set by the sender's role), and the instructions say the harness's own agent
-  tools never reach this workspace's agents. Claude Code's own tools are never
-  denied (the maintainer's call); when an agent uses one anyway, the hook after
-  it answers with this workspace's roster (`ListAgents`) or the tool that
-  reaches a workspace agent (`SendMessage` aimed at one) —
-  `comms::native_tool_note`. The text below uses the built
+  tools never reach this workspace's agents. Claude Code's own tools are
+  neither denied (the maintainer's call) nor intercepted: the prompt carries
+  it, and a mix-up only fails (live, only haiku ever made one). The text below uses the built
   names; where it says `message_agent` "goes away" it means the Mastermind-only
   tool of that name.
 - **Claude chat is reached through hooks, not sends** (§4 as designed), and
