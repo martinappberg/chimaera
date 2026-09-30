@@ -14,13 +14,13 @@
 //! fires for the human's own composer input).
 //!
 //! While agent communication is on (`comms`, Settings → Agents, default on)
-//! every agent also gets its four tools — `list_agents`, `read_agent`,
-//! `send_message`, `read_messages` — and a paragraph naming its own session.
+//! every agent also gets its four tools — `workspace_agents`, `read_agent`,
+//! `message_agent`, `read_messages` — and a paragraph naming its own session.
 //! On top sits the **Mastermind tier**, agent communication's coordinator:
 //! the workspace's one bound Mastermind session (`workspaces::MastermindCfg`)
 //! additionally gets `workspace_status`, `list_changed_files`,
 //! `read_timeline`, `spawn_agent`, `spawn_terminal` and `interrupt_agent`,
-//! and its `send_message` carries direction. The tier is decided by WHO YOU
+//! and its `message_agent` carries direction. The tier is decided by WHO YOU
 //! ARE — computed per call from the binding and the setting, never granted —
 //! and every act call leaves a tracing audit line. `interrupt_agent` reaches
 //! chat sessions only: nothing ever types into a TUI (the exec-409 wall).
@@ -87,7 +87,7 @@ pub(crate) const MASTERMIND_READ_TOOLS: [&str; 8] = [
     "read_timeline",
     "list_terminals",
     "read_terminal",
-    "list_agents",
+    "workspace_agents",
     "read_agent",
     "read_messages",
 ];
@@ -158,7 +158,7 @@ turns, failed commands, ended jobs, knowledge changes, messages — read it for 
 any \"what happened / brief me\" question), list_changed_files (who touched \
 what), spawn_agent / spawn_terminal (new workers at the workspace root), \
 interrupt_agent (chat sessions only). read_agent reads any session's screen \
-or transcript tail. Your send_message carries direction: the user's \
+or transcript tail. Your message_agent carries direction: the user's \
 appointment sanctions it, so a worker treats it as the user's direction — \
 a working chat reads it at its next step, an idle one starts a turn with \
 it; a terminal agent gets it at its next step or prompt, never typed in. \
@@ -379,7 +379,7 @@ fn mastermind_tool_defs() -> Vec<Value> {
             "description": "Spawn a new worker agent chat session at the workspace root \
                             (or, with `branch`, in that branch's own worktree). \
                             State WHY you are spawning it, then send it work with \
-                            send_message. Workers bill as the user's own account.",
+                            message_agent. Workers bill as the user's own account.",
             "inputSchema": {
                 "type": "object",
                 "required": ["agent"],
@@ -695,11 +695,11 @@ async fn tools_call(
         "document_guide" => Ok(tool_text(crate::agent_docs::GUIDE.to_string())),
         "check_document" => Ok(check_document(state, agent_id, &args).await),
         "notify" => Ok(notify(state, agent_id, &args)),
-        "list_agents" | "read_agent" | "send_message" | "read_messages" if !comms_on => {
+        "workspace_agents" | "read_agent" | "message_agent" | "read_messages" if !comms_on => {
             Ok(tool_error(crate::comms::OFF.to_string()))
         }
-        "list_agents" => Ok(crate::comms::list_agents(state, agent_id, &args).await),
-        "send_message" => Ok(crate::comms::send_message(state, agent_id, &args).await),
+        "workspace_agents" => Ok(crate::comms::workspace_agents(state, agent_id, &args).await),
+        "message_agent" => Ok(crate::comms::message_agent(state, agent_id, &args).await),
         "read_messages" => Ok(crate::comms::read_messages(state, agent_id, &args).await),
         "read_agent" => {
             let Some(workspace) = workspace_of(state, agent_id) else {
@@ -751,7 +751,7 @@ fn resolve_workspace_session(
         .is_some_and(|ws| ws == &workspace.id);
     if !in_workspace {
         return Err(format!(
-            "no session {sid} in this workspace — list_agents shows who is here"
+            "no session {sid} in this workspace — workspace_agents shows who is here"
         ));
     }
     Ok(sid.to_string())
@@ -1465,7 +1465,7 @@ async fn spawn_agent(
         Ok(slot) => slot,
         Err(at) => return spawn_ceiling_error(at),
     };
-    // The worker stays in THIS workspace (so send_message reaches it) and
+    // The worker stays in THIS workspace (so message_agent reaches it) and
     // runs in the branch's worktree.
     let place = match branch {
         None => None,
@@ -1518,7 +1518,7 @@ async fn spawn_agent(
             );
             tool_text(format!(
                 "spawned {} chat session {} [{}] {where_} — send it work \
-                 with send_message",
+                 with message_agent",
                 kind.as_str(),
                 row["display_name"],
                 row["id"].as_str().unwrap_or("?"),

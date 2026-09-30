@@ -9092,10 +9092,10 @@ pub(crate) mod tests {
         );
         assert_eq!(
             tool_title(
-                "mcp__chimaera__send_message",
+                "mcp__chimaera__message_agent",
                 &json!({ "to": "everyone", "text": "heads-up" })
             ),
-            "send_message (chimaera) → everyone"
+            "message_agent (chimaera) → everyone"
         );
         assert_eq!(
             tool_title("mcp__chimaera__read_messages", &json!({})),

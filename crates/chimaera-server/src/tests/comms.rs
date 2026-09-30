@@ -73,7 +73,7 @@ async fn send(
     key: &str,
     args: serde_json::Value,
 ) -> (bool, String) {
-    mcp_tool_call(state, from, key, "send_message", args).await
+    mcp_tool_call(state, from, key, "message_agent", args).await
 }
 
 async fn comms(state: &Arc<AppState>, ws: &str) -> serde_json::Value {
@@ -224,10 +224,10 @@ fn walk_for(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// list_agents names everyone else with an id and how a message reaches
+/// workspace_agents names everyone else with an id and how a message reaches
 /// them; addressing mistakes come back as words the model can act on.
 #[tokio::test]
-async fn list_agents_and_addressing() {
+async fn workspace_agents_and_addressing() {
     let state = test_state();
     let ws = make_workspace(&state, "comms-list").await;
     let other_ws = make_workspace(&state, "comms-list-other").await;
@@ -236,7 +236,7 @@ async fn list_agents_and_addressing() {
     let outsider = tui(&state, &other_ws, "ko");
 
     let (is_err, text) =
-        mcp_tool_call(&state, &a, "ka", "list_agents", serde_json::json!({})).await;
+        mcp_tool_call(&state, &a, "ka", "workspace_agents", serde_json::json!({})).await;
     assert!(!is_err, "{text}");
     assert!(text.starts_with(&format!("You are {a}")), "{text}");
     assert!(text.contains(&format!("- {b} ")), "{text}");
@@ -249,7 +249,7 @@ async fn list_agents_and_addressing() {
     for (args, needle) in [
         (
             serde_json::json!({"to": outsider, "text": "hi"}),
-            "list_agents",
+            "workspace_agents",
         ),
         (
             serde_json::json!({"to": a, "text": "hi"}),

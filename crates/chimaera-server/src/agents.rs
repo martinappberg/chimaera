@@ -1091,7 +1091,7 @@ mod tests {
                 "mcp__chimaera__read_timeline",
                 "mcp__chimaera__list_terminals",
                 "mcp__chimaera__read_terminal",
-                "mcp__chimaera__list_agents",
+                "mcp__chimaera__workspace_agents",
                 "mcp__chimaera__read_agent",
                 "mcp__chimaera__read_messages",
             ])
@@ -1116,9 +1116,9 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let allow = value["permissions"]["allow"].as_array().unwrap();
-        assert!(allow.contains(&json!("mcp__chimaera__list_agents")));
+        assert!(allow.contains(&json!("mcp__chimaera__workspace_agents")));
         assert!(
-            !allow.contains(&json!("mcp__chimaera__send_message")),
+            !allow.contains(&json!("mcp__chimaera__message_agent")),
             "{allow:?}"
         );
         // The hooks still ride along untouched.

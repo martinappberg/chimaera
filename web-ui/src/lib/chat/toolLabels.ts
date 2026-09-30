@@ -67,18 +67,18 @@ const KNOWN = new Set(KINDS.map((k) => k.kind).filter((k) => k !== "other"));
 
 /** The agent-communication tools every agent has (plan §3), in the order a
  *  group title says them. */
-const COMMS_VERBS = ["send_message", "read_agent", "read_messages", "list_agents"] as const;
+const COMMS_VERBS = ["message_agent", "read_agent", "read_messages", "workspace_agents"] as const;
 export type CommsVerb = (typeof COMMS_VERBS)[number];
 
 export interface CommsCall {
   verb: CommsVerb;
-  /** Who: `send_message`'s `to`, `read_agent`'s `agent`; null = not known. */
+  /** Who: `message_agent`'s `to`, `read_agent`'s `agent`; null = not known. */
   target: string | null;
 }
 
-/** How the drivers title an MCP call — claude `send_message (chimaera)`,
- *  codex `chimaera.send_message` (an item) or `chimaera · send_message` (an
- *  approval) — plus the raw `mcp__chimaera__send_message` name. */
+/** How the drivers title an MCP call — claude `message_agent (chimaera)`,
+ *  codex `chimaera.message_agent` (an item) or `chimaera · message_agent` (an
+ *  approval) — plus the raw `mcp__chimaera__message_agent` name. */
 const COMMS_TITLE = [
   /^mcp__chimaera__([a-z_]+)(.*)$/,
   /^([a-z_]+) \(chimaera\)(.*)$/,
@@ -104,12 +104,12 @@ export function commsCall(title: string, input?: Record<string, unknown> | null)
     const m = re.exec(title.trim());
     if (m === null || !isCommsVerb(m[1])) continue;
     const verb = m[1];
-    const arg = verb === "send_message" ? input?.to : verb === "read_agent" ? input?.agent : undefined;
+    const arg = verb === "message_agent" ? input?.to : verb === "read_agent" ? input?.agent : undefined;
     const fromTitle = COMMS_TARGET.exec(m[2] ?? "");
     const target =
       typeof arg === "string"
         ? cleanTarget(arg)
-        : verb === "send_message" || verb === "read_agent"
+        : verb === "message_agent" || verb === "read_agent"
           ? cleanTarget(fromTitle?.[1] ?? fromTitle?.[2])
           : null;
     return { verb, target };
@@ -128,13 +128,13 @@ function targetLabel(target: string): string {
  *  title named no one, "Sent a message", "Read another agent's work". */
 export function commsTitle(call: CommsCall): string {
   switch (call.verb) {
-    case "send_message":
+    case "message_agent":
       // The drivers' MCP titles carry no arguments today; the recipient
-      // shows once one does (`send_message (chimaera) → fix CI`).
+      // shows once one does (`message_agent (chimaera) → fix CI`).
       return call.target !== null ? `Message to ${targetLabel(call.target)}` : "Sent a message";
     case "read_messages":
       return "Checked messages";
-    case "list_agents":
+    case "workspace_agents":
       return "Listed agents";
     case "read_agent":
       return call.target !== null ? `Read ${targetLabel(call.target)}'s work` : "Read another agent's work";
@@ -155,7 +155,7 @@ interface CommsPhrase extends Phrase {
 }
 
 const COMMS_PHRASES: Record<CommsVerb, { done: CommsPhrase; live: CommsPhrase }> = {
-  send_message: {
+  message_agent: {
     done: { one: "sent a message", many: (n) => `sent ${n} messages`, named: (t) => `messaged ${t}` },
     live: { one: "sending a message", many: (n) => `sending ${n} messages`, named: (t) => `messaging ${t}` },
   },
@@ -171,7 +171,7 @@ const COMMS_PHRASES: Record<CommsVerb, { done: CommsPhrase; live: CommsPhrase }>
     done: { one: "checked messages", many: (n) => `checked messages ${n} times` },
     live: { one: "checking messages", many: () => "checking messages" },
   },
-  list_agents: {
+  workspace_agents: {
     done: { one: "listed agents", many: (n) => `listed agents ${n} times` },
     live: { one: "listing agents", many: () => "listing agents" },
   },

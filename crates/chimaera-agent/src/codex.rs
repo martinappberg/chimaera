@@ -7495,10 +7495,10 @@ mod tests {
             title_of(
                 &mut m,
                 "m1",
-                "send_message",
+                "message_agent",
                 json!({"to": "s-1a2b", "text": "hi"})
             ),
-            "chimaera.send_message → s-1a2b"
+            "chimaera.message_agent → s-1a2b"
         );
         assert_eq!(
             title_of(&mut m, "m2", "read_agent", json!({"agent": "mastermind"})),

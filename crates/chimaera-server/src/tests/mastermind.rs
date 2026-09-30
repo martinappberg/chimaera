@@ -18,7 +18,12 @@ const BASE_TOOLS: [&str; 6] = [
 ];
 
 /// Agent communication's tools (every agent, while it is on).
-const COMMS_TOOLS: [&str; 4] = ["list_agents", "read_agent", "send_message", "read_messages"];
+const COMMS_TOOLS: [&str; 4] = [
+    "workspace_agents",
+    "read_agent",
+    "message_agent",
+    "read_messages",
+];
 
 fn worker_tools() -> Vec<&'static str> {
     BASE_TOOLS
@@ -320,9 +325,9 @@ async fn mcp_tier_gates_on_the_binding() {
         "list_terminals",
         "run_in_terminal",
         "read_terminal",
-        "list_agents",
+        "workspace_agents",
         "read_agent",
-        "send_message",
+        "message_agent",
         "read_messages",
         "workspace_status",
         "list_changed_files",
@@ -333,7 +338,12 @@ async fn mcp_tier_gates_on_the_binding() {
     ] {
         assert!(mm_tools.contains(&tool.to_string()), "{tool}: {mm_tools:?}");
     }
-    for gone in ["message_agent", "read_session", "tell_mastermind"] {
+    for gone in [
+        "send_message",
+        "list_agents",
+        "read_session",
+        "tell_mastermind",
+    ] {
         assert!(
             !mm_tools.contains(&gone.to_string()),
             "{gone}: {mm_tools:?}"
@@ -406,7 +416,7 @@ async fn mcp_tier_gates_on_the_binding() {
         &state,
         &worker,
         "wk",
-        "send_message",
+        "message_agent",
         serde_json::json!({"to": mastermind, "text": "hi"}),
     )
     .await;
@@ -481,14 +491,14 @@ async fn read_agent_scopes_to_the_workspace() {
     )
     .await;
     assert!(is_error, "{text}");
-    assert!(text.contains("list_agents"), "{text}");
+    assert!(text.contains("workspace_agents"), "{text}");
 
     state.sessions.kill(&worker).ok();
     state.sessions.kill(&shell).ok();
     state.sessions.kill(&outsider).ok();
 }
 
-/// The Mastermind's send_message carries direction: to a chat worker it is
+/// The Mastermind's message_agent carries direction: to a chat worker it is
 /// an ordinary send, tagged `origin: "mastermind"` under the Mastermind
 /// header; a terminal agent gets it on its next hook, never typed in; and
 /// interrupt_agent still stops at the TUI wall.
@@ -520,7 +530,7 @@ async fn mastermind_messages_carry_direction_and_never_type_into_tuis() {
         &state,
         &mastermind,
         "mmk",
-        "send_message",
+        "message_agent",
         serde_json::json!({"to": worker_id, "text": "status check: report progress"}),
     )
     .await;
@@ -553,7 +563,7 @@ async fn mastermind_messages_carry_direction_and_never_type_into_tuis() {
         &state,
         &mastermind,
         "mmk",
-        "send_message",
+        "message_agent",
         serde_json::json!({"to": tui, "text": "do the thing"}),
     )
     .await;
@@ -590,7 +600,7 @@ async fn mastermind_messages_carry_direction_and_never_type_into_tuis() {
         &state,
         &mastermind,
         "mmk",
-        "send_message",
+        "message_agent",
         serde_json::json!({"to": mastermind, "text": "hi me"}),
     )
     .await;
@@ -749,7 +759,7 @@ async fn mastermind_changes_are_serialized_per_workspace() {
     wait_session_gone(&state, &mm).await;
 }
 
-/// Workers reach the Mastermind with `send_message` to "mastermind": no
+/// Workers reach the Mastermind with `message_agent` to "mastermind": no
 /// Mastermind, an honest refusal; an ask-first Mastermind keeps it in its
 /// inbox (never a wake) and its next hook carries it.
 #[tokio::test]
@@ -764,7 +774,7 @@ async fn workers_message_the_mastermind_and_ask_mode_keeps_it_in_the_inbox() {
         &state,
         &worker,
         "kw",
-        "send_message",
+        "message_agent",
         serde_json::json!({"to": "mastermind", "text": "hello?"}),
     )
     .await;
@@ -775,7 +785,7 @@ async fn workers_message_the_mastermind_and_ask_mode_keeps_it_in_the_inbox() {
         &state,
         &worker,
         "kw",
-        "send_message",
+        "message_agent",
         serde_json::json!({"to": "mastermind", "text": "the loader API changed under qc/"}),
     )
     .await;

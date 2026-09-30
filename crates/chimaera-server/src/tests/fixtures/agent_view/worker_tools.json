@@ -112,7 +112,7 @@
       "name": "notify"
     },
     {
-      "description": "Who is working in this workspace: every agent session (claude, codex; chat or terminal) with its id, what it is doing right now, its branch and recent files, whether it is the Mastermind, and how a message reaches it. Check it before starting work that could overlap someone else's.",
+      "description": "Who is working in this chimaera workspace: every agent session (claude, codex; chat or terminal) with its id, what it is doing right now, its branch and recent files, whether it is the Mastermind, and how a message reaches it. Not your harness's own peers or subagents. Check it before starting work that could overlap someone else's.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -123,7 +123,7 @@
         },
         "type": "object"
       },
-      "name": "list_agents"
+      "name": "workspace_agents"
     },
     {
       "description": "Read what another agent in this workspace has been doing: a chat session's recent conversation (messages, tool titles), a terminal agent's screen, or an ended session's record. Costs them nothing — try it before asking. Read-only.",
@@ -131,7 +131,7 @@
         "additionalProperties": false,
         "properties": {
           "agent": {
-            "description": "The agent's id (from list_agents)",
+            "description": "The agent's id (from workspace_agents)",
             "type": "string"
           },
           "lines": {
@@ -164,7 +164,7 @@
             "type": "string"
           },
           "to": {
-            "description": "An agent's id (from list_agents), \"mastermind\", or \"everyone\"",
+            "description": "An agent's id (from workspace_agents), \"mastermind\", or \"everyone\"",
             "type": "string"
           }
         },
@@ -174,7 +174,7 @@
         ],
         "type": "object"
       },
-      "name": "send_message"
+      "name": "message_agent"
     },
     {
       "description": "Messages other agents sent you (and everyone) that you haven't seen — they usually reach you on their own; call this when told some are waiting.",
