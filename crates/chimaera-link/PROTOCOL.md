@@ -534,6 +534,41 @@ resource may use a same-origin Referer that names that ID; ambiguous cookie-only
 routing is forbidden. Upstream cookies never become account/keeper credentials.
 Browsers that block third-party cookies can open the preview in a separate tab.
 
+### Account home in a browser
+
+A signed-in account browser's `GET /` (and `HEAD /`) serves the same public UI
+index as a project view, changed only by one first element in `<head>`:
+`<meta name="chimaera-surface" content="account-home">`. The UI then shows the
+account's Home and Settings rather than a workbench, since no daemon stands
+behind that page. The index carries the same `X-Chimaera-Plan` header and
+`Cache-Control: no-store`; its bundle is served under `/assets/` and
+`/favicon.svg` exactly as under `/app/{host_id}/`. Without a live browser
+session, `/` is the sign-in page.
+
+Three routes serve that page. Each requires the browser session; none wakes a
+keeper or a worker, and none accepts a host, a destination or a credential:
+
+| Method and path | Request | Response |
+| --- | --- | --- |
+| `GET /home/account` | — | `{email,plan,limits,usage,hours_exhausted,payment_due,returning_until}`: the `/v1/me` fields of those names; no identifiers, keeper address or prices |
+| `GET /home/projects` | — | `{projects:[{workspace_id,name,href,available}],pending}` |
+| `POST /home/sign-out` | — (the account Origin and `X-Chimaera-Browser: 1`) | `204`; revokes this browser's own device and clears its cookie |
+
+`projects` lists the account's enrolled projects, whose `href` is
+`/workspace/{workspace_id}/`, then any other project registered on a cloud
+machine (never one the machine marks `cloud_internal`), whose `href` is
+`/app/{host_id}/#ws={workspace_id}`. `name` is the owning daemon's registered
+name, or null when it could not be read in time; `available` is then false and
+the project still opens. An account without a plan that includes the cloud has
+an empty list. `pending` means part of the list could not be read just now (a
+keeper or machine that did not answer); clients ask again later. Clients follow
+only those two `href` forms and ignore unknown fields.
+
+The account's plan, billing, usage and devices page is `/account/billing`. The
+former landing page `/account` redirects to `/`, or to `/account/billing` with
+its query when it carries a known billing parameter. A browser sign-in lands
+on `/`.
+
 ### Device display and installation binding
 
 `GET /v1/devices` may include `installation_id` for an account-verified native

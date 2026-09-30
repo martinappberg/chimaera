@@ -14,6 +14,7 @@
   import EnvironmentSettings from "./EnvironmentSettings.svelte";
   import DocumentsSettings from "./DocumentsSettings.svelte";
   import CloudSetup from "./CloudSetup.svelte";
+  import BrowserAccount from "../pro/BrowserAccount.svelte";
   import { isBrowserGateway } from "../net/base";
   import { isNativeShell } from "../net/native";
   import BrandMark from "../shared/BrandMark.svelte";
@@ -30,8 +31,11 @@
   import { APP_MENU, PINNED } from "../shared/keys";
   import { activeModLabel } from "../shared/keybindings";
 
-  /** The tab is showing (kept-alive tabs stay mounted while hidden). */
-  let { visible: tabVisible = true }: { visible?: boolean } = $props();
+  /** The tab is showing (kept-alive tabs stay mounted while hidden).
+   *  `account`: the web's Home, the account's own page. It has no daemon, so
+   *  Settings is only Chimaera Pro, whose plan, usage and sign-out show in
+   *  place (`pro/BrowserAccount.svelte`). */
+  let { visible: tabVisible = true, account = false }: { visible?: boolean; account?: boolean } = $props();
 
   /**
    * Nav sections: the schema categories, plus the bespoke Environment section
@@ -40,6 +44,7 @@
    * after that.
    */
   const sections = (() => {
+    if (account) return ["Chimaera Pro"];
     const out = [...CATEGORIES];
     const at = out.indexOf("Agents");
     out.splice(at >= 0 ? at + 1 : out.length, 0, "Environment", "Documents");
@@ -139,7 +144,7 @@
       }
       if (cat === "Chimaera Pro") {
         // A build without an account endpoint never shows an account group.
-        if (proVisible && (isBrowserGateway() || $proOffered === true)) out.push({ category: cat, defs: [] });
+        if (account || (proVisible && (isBrowserGateway() || $proOffered === true))) out.push({ category: cat, defs: [] });
         continue;
       }
       if (cat === "Cloud") {
@@ -234,6 +239,7 @@
   <header class="top">
     <div class="title-row">
       <h1 class="title">Settings</h1>
+      {#if !account}
       <div class="tabs" role="tablist" aria-label="settings mode">
         <button class="mode" class:on={tab === "ui"} role="tab" aria-selected={tab === "ui"} onclick={() => (tab = "ui")}>
           UI
@@ -248,7 +254,11 @@
           JSON
         </button>
       </div>
+      {/if}
     </div>
+    {#if account}
+      <p class="subtitle">Your Chimaera account. Each project's own settings open with the project.</p>
+    {:else}
     <p class="subtitle">
       Ground truth: <code>~/.config/chimaera/settings.json</code> on the daemon host — hand-edits
       and other windows sync here live.
@@ -259,7 +269,8 @@
         <span class="loading">loading…</span>
       {/if}
     </p>
-    {#if tab === "ui"}
+    {/if}
+    {#if tab === "ui" && !account}
       <input
         class="search"
         type="text"
@@ -294,6 +305,9 @@
           {#if group.category === "Chimaera Pro"}
             <section data-section={group.category}>
               <h2 class="cat">Chimaera Pro</h2>
+              {#if account}
+                <BrowserAccount visible={tabVisible} />
+              {:else}
               <button class="pro-entry" aria-label={proAction === "Get Pro" ? "Get Chimaera Pro" : `View Chimaera ${$accountPlan === "max" ? "Max" : "Pro"} account`}
                 onclick={() => window.dispatchEvent(new Event("chimaera:open-pro"))}>
                 <BrandMark size={30} />
@@ -311,6 +325,7 @@
                 </span>
                 <span class="pro-open" aria-hidden="true">{proAction} <span>→</span></span>
               </button>
+              {/if}
             </section>
           {:else if group.category === "Agents"}
             <!-- Bespoke panel: fuses live daemon detection with the

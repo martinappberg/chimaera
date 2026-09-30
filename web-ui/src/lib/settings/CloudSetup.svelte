@@ -4,6 +4,7 @@
   import { gatewayWorkspace, workbenchPath } from "../net/base";
   import ProviderConnections from "../pro/ProviderConnections.svelte";
   import { cloudRequest } from "../pro/cloudTransport";
+  import { BILLING_PATH } from "../pro/accountHome";
   import { pageVisible } from "../shared/visibility";
   import { cloudCopy, cloudPollDelay, cloudProjectStatus, friendlyError } from "../pro/presentation";
   import { isNativeShell, proCloudStatus, proMirrorStatus, writeClipboard, type MirrorStatus, type CloudSetupInfo, type CloudSetupRequest, type CloudProvisioningStatus } from "../net/native";
@@ -155,7 +156,7 @@
   <div class="machine" class:attention={needsCheck}>
     <div class="heading"><div><span class="eyebrow">Cloud</span><h2>{browser ? connected ? "Available when you need it" : connectionChecked ? "Cloud access is temporarily unavailable" : "Checking availability…" : status ? copy.title : "Checking availability…"}</h2></div><span class="status-mark" class:connected={available} class:preparing aria-hidden="true">{#if available}<svg viewBox="0 0 24 24"><path d="m6 12 4 4 8-8" /></svg>{:else}<svg viewBox="0 0 24 24"><path d="M7 17a4 4 0 0 1-1-7.9 6 6 0 0 1 11.4-1.5A4.7 4.7 0 0 1 18 17H7Z" /></svg>{/if}</span></div>
     <p class="hint" role="status">{browser ? connected ? agents ? "Agents connected here can keep working while your computer sleeps." : "Agents you connect here can keep working while your computer sleeps." : connectionChecked ? "We couldn’t reach your projects and agent connections. We’ll keep checking." : "Checking access to your projects and agent connections." : status ? copy.detail : "Your projects and conversations come with you."}</p>
-    {#if needsCheck && browser}<div class="recovery"><a class="account-link" href="/account">Open your account →</a></div>{/if}
+    {#if needsCheck && browser}<div class="recovery"><a class="account-link" href={BILLING_PATH}>Open your account →</a></div>{/if}
   </div>
   {#if projectStatus}
     <div class="project-status" class:attention={projectStatus.state === "attention"} role="status"><span class="project-dot" class:active={projectStatus.state === "active"} aria-hidden="true"></span><div><h3>{projectStatus.title}</h3><p class="hint">{projectStatus.detail}</p></div></div>

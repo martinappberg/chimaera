@@ -7,6 +7,7 @@ const bridge = vi.hoisted(() => ({
   proStatus: vi.fn(),
 }));
 const gateway = vi.hoisted(() => ({
+  isAccountHome: vi.fn(() => false),
   isBrowserGateway: vi.fn(),
   workbenchPath: vi.fn(() => "/app/fixture-host/"),
 }));
@@ -237,6 +238,21 @@ describe("shared paid plan", () => {
     visibility("visible");
     await flush();
     expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
+  it("reads the account's own Home the way it reads a project view", async () => {
+    bridge.isNativeShell.mockReturnValue(false);
+    gateway.isAccountHome.mockReturnValueOnce(true);
+    gateway.workbenchPath.mockReturnValue("/");
+    const offered: Array<boolean | null> = [];
+    subscriptions.push(proOffered.subscribe((value) => offered.push(value)));
+    const values = subscribe();
+    await flush();
+    expect(offered.at(-1)).toBe(true);
+    expect(values.at(-1)).toBe("pro");
+    expect(fetcher).toHaveBeenCalledWith("/", expect.objectContaining({ method: "HEAD", credentials: "same-origin" }));
+    expect(bridge.proStatus).not.toHaveBeenCalled();
+    gateway.workbenchPath.mockReturnValue("/app/fixture-host/");
   });
 
   it("times out gateway requests, rejects late responses, and treats unknown headers as unpaid", async () => {

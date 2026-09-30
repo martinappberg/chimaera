@@ -12,6 +12,7 @@ import "@fontsource/jetbrains-mono/latin-ext-600.css";
 import "./app.css";
 import App from "./App.svelte";
 import { installReloadHook } from "./lib/layout/windowReload";
+import { isAccountHome } from "./lib/net/base";
 
 // Before mount: the native Reload Window must still reach a window whose App
 // fails to boot.
@@ -24,6 +25,11 @@ if (!target) {
   throw new Error("missing #app mount point");
 }
 
-const app = mount(App, { target });
+// The web's Home (the account's own signed-in page) has no daemon behind it,
+// so it mounts its own Home and Settings instead of the workbench, which
+// would start asking one for workspaces and sessions. Loaded only there.
+const app = isAccountHome()
+  ? import("./lib/pro/AccountHome.svelte").then(({ default: AccountHome }) => mount(AccountHome, { target }))
+  : mount(App, { target });
 
 export default app;
