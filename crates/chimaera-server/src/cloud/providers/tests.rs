@@ -23,6 +23,16 @@ pub(super) fn executable(path: &Path, source: &str) {
     std::fs::write(path, source).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
+/// Fake GitHub CLIs by fixture home (each fixture has its own), since the
+/// real one is found on the login shell's PATH.
+static GITHUB_CLI: std::sync::LazyLock<Mutex<HashMap<PathBuf, PathBuf>>> =
+    std::sync::LazyLock::new(Default::default);
+pub(super) fn github_cli(state: &AppState) -> Option<PathBuf> {
+    crate::lock(&GITHUB_CLI).get(&home(state)).cloned()
+}
+pub(super) fn preset_github(state: &AppState, path: PathBuf) {
+    crate::lock(&GITHUB_CLI).insert(home(state), path);
+}
 pub(super) fn preset(state: &AppState, kind: AgentKind, path: PathBuf) {
     crate::lock(&state.agent_bins).insert(
         kind,

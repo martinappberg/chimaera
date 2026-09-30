@@ -572,6 +572,17 @@ mod tests {
         connection["action"]["verification_url"] = json!("https://auth.openai.com/device");
         connection["provider_id"] = json!("future-provider");
         assert!(connection_browser_url(&connection).is_err());
+        // GitHub's one-time code opens only GitHub's own page.
+        let mut github = json!({"provider_id":"github","action":{"type":"device_code","verification_url":"https://github.com/login/device"}});
+        assert!(connection_browser_url(&github).is_ok());
+        for invalid in [
+            "https://github.com.evil.test/login/device",
+            "https://auth.openai.com/codex/device",
+            "https://user@github.com/login/device",
+        ] {
+            github["action"]["verification_url"] = json!(invalid);
+            assert!(connection_browser_url(&github).is_err());
+        }
     }
 
     #[test]

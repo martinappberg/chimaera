@@ -189,7 +189,8 @@ work** presents the provider choice inline. One agent is enough to start; others
 are optional. Connected users see a quiet **Agent connections** disclosure. A
 required project connection, active sign-in, or connection error stays visible.
 Collapsing management keeps the existing status poll and sign-in state intact.
-The provider list comes from a shared catalog, initially Claude Code and Codex.
+The provider list comes from a shared catalog: Claude Code and Codex, plus GitHub
+under the optional **Repository connections**.
 Installation alone never shows a provider as connected. An unavailable or timed-out
 authentication check remains unknown.
 
@@ -200,6 +201,20 @@ connection panel. Its official CLI completes authentication; no temporary projec
 or terminal window opens. The code is used once and never saved by Chimaera; it
 must be pasted whole (Claude shows `code#state`), and half of one keeps the
 sign-in waiting with its own error (`authorization_code_incomplete`).
+Connecting GitHub (it lets the cloud machine pull and push the user's
+repositories) works like Codex, with no terminal: the panel shows GitHub's
+one-time code with **Copy code** and **Open sign-in page** (GitHub's device page,
+`https://github.com/login/device`), the user enters the code there and approves
+access, and the panel confirms the connection by itself. Behind it the cloud
+machine runs the official GitHub CLI's web sign-in with piped I/O (never a
+terminal or a browser there), reads only its code and page from complete output
+lines, waits while the CLI polls GitHub, then makes the CLI Git's credential helper
+for github.com (`gh auth setup-git`) and confirms with a fresh `gh auth status`.
+Each ending reads in plain words: no code shown (`sign_in_unavailable`), a code
+declined or left to expire (`sign_in_failed`), Git not set up (`git_setup_failed`,
+where **Try again** repeats only that step), or the request's own time limit. On
+success the panel says GitHub is connected and the cloud machine can now pull and
+push the user's repositories.
 A new attempt brings its guide into view; background status updates never scroll
 or reload the page. Installation remains automatic and separate from sign-in.
 Users can cancel or retry an expired request in place. Sign-in is confirmed by the provider CLI on the cloud
@@ -264,7 +279,8 @@ Agent sign-in only runs through those provider connection jobs (the older
 login-terminal route `/api/v1/pro/cloud/onboard` is gone).
 The native `pro_cloud_request` command keeps account and daemon credentials out
 of the UI and opens only a server-owned connection's validated browser URL or
-terminal. Browser clients use the same routes through the host-pinned gateway.
+terminal (a terminal only for an older cloud machine's GitHub sign-in, which the
+panel calls a sign-in window). Browser clients use the same routes through the host-pinned gateway.
 A shared provider catalog bounds external authentication origins in both clients.
 
 ## Where it lives
