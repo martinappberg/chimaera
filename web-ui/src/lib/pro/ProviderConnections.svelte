@@ -109,9 +109,23 @@
   const connectionId = $derived(connection?.id ?? null);
   const connectionExpires = $derived(connection?.expires_at ?? null);
   const connectingName = $derived(rows.find(p => p.id === (requestingDisconnect ? busy : connection?.provider_id))?.label ?? "your agent");
-  /** A repository connection (GitHub) is for Git in the cloud, not for an agent. */
-  const connectingRepository = $derived(rows.find(p => p.id === connection?.provider_id)?.category === "repository");
   const action = $derived(connection?.action ?? null);
+  /** Whether this row's own sign-in or sign-out is under way: its guide
+   * shows in the row and the row's buttons step aside. */
+  function inProgress(provider: Pick<CloudProviderStatus, "id">): boolean {
+    return pendingConnection(connection) && connection?.provider_id === provider.id || requestingDisconnect && busy === provider.id;
+  }
+  /** The row's button: what it does while pressed, Try again once its last
+   * sign-in ended short, Connect otherwise. */
+  function connectLabel(provider: CloudProviderStatus): string {
+    if (busy === provider.id) return connectingLabel(provider);
+    if (connection?.provider_id === provider.id && ["failed", "expired", "canceled"].includes(connection.phase)) return "Try again";
+    return `Connect ${provider.label}`;
+  }
+  /** Whether a sign-in or sign-out ended short: its reason shows in the row. */
+  function ended(phase: string): boolean {
+    return ["failed", "expired", "canceled"].includes(phase);
+  }
   const loginUrl = $derived(connection && action && (action.type === "device_code" || action.type === "browser")
     ? providerLoginUrl(connection.provider_id, action.type === "device_code" ? action.verification_url : action.url) : null);
 
@@ -238,6 +252,8 @@
     if (operation === "disconnect" && !providers.some(p => p.id === providerId && canDisconnect(p))) return;
     const request = ++mutation;
     busy = providerId; requestingDisconnect = operation === "disconnect"; error = null; operationError = null; failedDisconnectProvider = null; copied = false; authorizationCode = ""; connectionNotice = null; disconnectCandidate = null;
+    // A repository's sign-in shows in its row, inside the optional list.
+    if (rows.some(p => p.id === providerId && p.category === "repository")) repositoriesOpen = true;
     try {
       // The press wakes the cloud; while it comes up, the button keeps
       // saying what it does (bounded, then the usual failure below).
@@ -359,14 +375,61 @@
   }
 </script>
 
+<!-- A sign-in lives inside its own row (agent card or repository line): the
+     code and one button, a short waiting line and Cancel. Nothing else on the
+     page moves while it runs, and the row itself reports how it ended. -->
+{#snippet inline(provider: CloudProviderStatus)}
+  {#if connection && connection.provider_id === provider.id && (connection.phase !== "connected" && connection.phase !== "disconnected" || confirmedSuccess)}
+    {@const label = provider.label}
+    <div class="guide" tabindex="-1" bind:this={connectionElement} aria-label={disconnecting || connection.phase === "disconnected" ? `Disconnect ${label}` : `Connect ${label}`}>
+      {#if connection.phase === "disconnected"}
+        <p class="connection-success" role="status">Signed out in the cloud. Sign-in on your computer hasn't changed.</p>
+      {:else if disconnecting}
+        {#if waiting}<p class="muted small" role="status">{connection.phase === "verifying" ? "Confirming the sign-out…" : "Signing out in the cloud…"}</p>
+        {:else}<p class="error small" role="status">{connectionError(connection.phase === "failed" ? connection.error_code : connection.phase, "disconnect")}</p>{/if}
+        {#if !waiting || pollingPaused || connectionNotice}<p class="muted small"><button class="text-button" disabled={connectionFlight || catalogFlight || busy !== null} onclick={() => waiting ? void checkConnection() : void load()}>{waiting ? "Check sign-out status" : "Check connection"}</button>{#if !waiting && canManage && canDisconnect(provider)} · <button class="text-button" onclick={(event) => void requestDisconnect(provider, event.currentTarget)}>Try disconnecting again</button>{/if}</p>{/if}
+      {:else if connection.phase === "connected"}
+        <p class="connection-success" role="status">{provider.category === "repository" ? "Connected. Your cloud can now pull and push your repositories." : "Connected for cloud work."}</p>
+      {:else if ended(connection.phase)}
+        <p class="error small" role="status">{connectionError(connection.phase === "failed" ? connection.error_code : connection.phase)}</p>
+      {:else if connection.phase === "preparing"}
+        <p class="muted small" role="status">Preparing sign-in…</p>
+      {:else if connection.phase === "verifying"}
+        <p class="muted small" role="status">Confirming…</p>
+      {:else if action?.type === "device_code"}
+        <div class="code-row"><code aria-label="One-time sign-in code">{action.user_code}</code><button class="button secondary" onclick={() => void copyCode()}>{copied ? "Copied" : "Copy"}</button>{#if native}<button class="button" disabled={busy !== null} onclick={() => void openSignIn()}>Open {label}</button>{:else if loginUrl}<a class="button" href={loginUrl} target="_blank" rel="noopener noreferrer">Open {label}</a>{:else}<span class="error small">This sign-in link couldn't be verified.</span>{/if}</div>
+        <p class="muted small" role="status">Enter the code on {label}'s sign-in page and approve. Waiting for you… <button class="text-button" disabled={busy !== null} onclick={() => void cancel()}>{busy === "cancel" ? "Canceling…" : "Cancel"}</button></p>
+      {:else if action?.type === "browser"}
+        <div class="code-row">{#if native}<button class="button" disabled={busy !== null} onclick={() => void openSignIn()}>Open {label} sign-in</button>{:else if loginUrl}<a class="button" href={loginUrl} target="_blank" rel="noopener noreferrer">Open {label} sign-in</a>{:else}<span class="error small">This sign-in link couldn't be verified.</span>{/if}</div>
+        {#if action.input === "authorization_code"}
+          <form class="authorization" onsubmit={(event) => { event.preventDefault(); void submitCode(); }}>
+            <!-- Visible so a paste can be checked; still cleared on submit, cancel, hide and teardown. -->
+            <div class="authorization-row"><input id={`provider-code-${connection.id}`} aria-label={`Code from ${label}`} type="text" bind:value={authorizationCode} autocomplete="off" autocapitalize="off" spellcheck={false} maxlength="4096" placeholder={`Paste the code ${label} shows`} disabled={busy !== null} /><button class="button" type="submit" disabled={busy !== null || !authorizationCode.trim()}>{busy === "submit" ? "Confirming…" : "Connect"}</button></div>
+          </form>
+          <p class="muted small" role="status">Sign in there, then paste the whole code it shows. <button class="text-button" disabled={busy !== null} onclick={() => void cancel()}>{busy === "cancel" ? "Canceling…" : "Cancel"}</button></p>
+        {:else}
+          <p class="muted small" role="status">Sign in there. Waiting for you… <button class="text-button" disabled={busy !== null} onclick={() => void cancel()}>{busy === "cancel" ? "Canceling…" : "Cancel"}</button></p>
+        {/if}
+      {:else}
+        <p class="muted small" role="status">Preparing sign-in…</p>
+      {/if}
+      {#if waiting && !disconnecting && (pollingPaused || connectionNotice)}<p class="muted small"><button class="text-button" disabled={connectionFlight || busy !== null} onclick={() => void checkConnection()}>Check sign-in status</button></p>{/if}
+      {#if pollingPaused && waiting}<p class="muted small" role="status">{disconnecting ? "This is taking longer than expected. Check its status before trying again." : "Automatic checks paused at this request's time limit. Check its status or cancel, then start again."}</p>{/if}
+      {#if connectionNotice}<p class="error small" role="status">{connectionNotice}</p>{/if}
+    </div>
+  {/if}
+{/snippet}
+
 <section class="providers" class:compact aria-label="Cloud agent connections">
   {#if compact && !detailsNeeded}
     <button class="management" aria-expanded={showDetails} onclick={toggle}><span><span class="title-row"><strong>Agent connections</strong>{#if slow}<span class="checking">Checking…</span>{/if}</span>{#if known}<span class="management-state">{shownReady ? "Ready for cloud work" : "Checking connection status…"}</span>{/if}</span><span class="chevron" class:expanded aria-hidden="true">›</span></button>
   {/if}
   {#if showDetails}
   <!-- With nothing to show yet, the management row above is the title. -->
-  {#if known || waiting || requestingDisconnect || !(compact && !detailsNeeded)}<div class="heading"><div><span class="eyebrow">{waiting && connectingRepository ? "Repository connection" : "Cloud agents"}</span><h2>{requestingDisconnect ? `Disconnecting ${connectingName}…` : waiting ? disconnecting ? `Disconnecting ${connectingName}…` : connection?.phase === "preparing" ? `Preparing ${connectingName} sign-in…` : connection?.phase === "verifying" ? `Connecting ${connectingName}…` : `Connect ${connectingName}` : heading}</h2></div>{#if slow && !(compact && !detailsNeeded)}<span class="checking" role="status">Checking…</span>{/if}</div>{/if}
-  {#if requestingDisconnect || waiting || introduction}<p class="intro">{requestingDisconnect || waiting && disconnecting ? "Chimaera is signing this service out in the cloud." : waiting ? connection?.phase === "preparing" ? "Sign-in will appear here when it's ready." : connection?.phase === "verifying" ? `Chimaera is confirming your sign-in with ${connectingName}.` : "Finish sign-in below. Chimaera will confirm the connection automatically." : introduction}</p>{/if}
+  <!-- A sign-in or sign-out in progress changes nothing up here: it shows
+       inside its own row, so the heading and the other rows stay put. -->
+  {#if known || waiting || requestingDisconnect || !(compact && !detailsNeeded)}<div class="heading"><div><span class="eyebrow">Cloud agents</span><h2>{heading}</h2></div>{#if slow && !(compact && !detailsNeeded)}<span class="checking" role="status">Checking…</span>{/if}</div>{/if}
+  {#if introduction}<p class="intro">{introduction}</p>{/if}
   <p class="privacy">Use your own accounts and subscriptions. Connected services are available across your cloud projects. Signing in or disconnecting here doesn't change sign-in on your computer.</p>
   {#if !known && !waiting && !requestingDisconnect}
     <!-- Nothing remembered and no answer yet: placeholders, no words. -->
@@ -375,7 +438,7 @@
     </div>
   {/if}
   {#if known && current && agents.length === 0}<p class="muted">No cloud agent connections are available yet.</p>{/if}
-  {#if !waiting && !requestingDisconnect}<div class="provider-cards">
+  <div class="provider-cards">
     {#each agents as provider (provider.id)}
       {@const waitsForUpdate = provider.state !== "signed_in" && updating.has(provider.id)}
       <article class="provider-card" class:connected={settled && provider.state === "signed_in"}>
@@ -383,13 +446,12 @@
         {#if !unchecked}<p class="state" class:positive={settled && provider.state === "signed_in"}>{!settled && provider.state === "signed_in" ? "Previously connected · checking status" : providerStateLabel(provider)}</p>{/if}
         <p class="provider-note" role={waitsForUpdate ? "status" : undefined}>{waitsForUpdate ? cloudUpdateLine(provider.label) : unchecked ? "Connect the account you already use for this agent." : provider.state === "signed_in" ? "Signed in for cloud work." : provider.state === "unknown" ? "Check the connection, or sign in again if needed." : provider.state === "unavailable" ? "This connection isn't available for cloud work yet." : "Connect the account you already use for this agent."}</p>
         <!-- Try again only looks (a passive catalog read, never a wake). -->
-        <div class="provider-actions">{#if waitsForUpdate}<button class="button secondary" disabled={catalogFlight} onclick={() => void load()}>{catalogFlight ? "Checking…" : "Try again"}</button>{:else if provider.state !== "signed_in"}<button class="button" disabled={!canStart || !unchecked && provider.methods.length === 0 || provider.state === "unavailable"} onclick={() => void connect(provider.id)}>{busy === provider.id ? connectingLabel(provider) : `Connect ${provider.label}`}</button>{/if}{#if canDisconnect(provider)}<button class="text-button" disabled={!canManage} onclick={(event) => void requestDisconnect(provider, event.currentTarget)}>Disconnect {provider.label}</button>{:else if provider.state === "signed_in"}<span class="connected-label">{settled ? "Connected" : "Check connection to confirm"}</span>{/if}</div>
+        <div class="provider-actions">{#if waitsForUpdate}<button class="button secondary" disabled={catalogFlight} onclick={() => void load()}>{catalogFlight ? "Checking…" : "Try again"}</button>{:else if provider.state !== "signed_in" && !inProgress(provider)}<button class="button" disabled={!canStart || !unchecked && provider.methods.length === 0 || provider.state === "unavailable"} onclick={() => void connect(provider.id)}>{connectLabel(provider)}</button>{/if}{#if canDisconnect(provider) && !inProgress(provider)}<button class="text-button" disabled={!canManage} onclick={(event) => void requestDisconnect(provider, event.currentTarget)}>Disconnect {provider.label}</button>{:else if provider.state === "signed_in" && !inProgress(provider)}<span class="connected-label">{settled ? "Connected" : "Check connection to confirm"}</span>{/if}</div>
+        {@render inline(provider)}
       </article>
     {/each}
   </div>
   {#each [...new Set(required.filter(id => !agents.some(p => p.id === id)))] as id (id)}<p class="error">{providerLabel(id)} isn't available in the cloud yet. This project waits on your computer.</p>{/each}
-
-  {/if}
 
   {#if disconnectCandidate}
     <section class="connection confirmation" aria-label={`Disconnect ${disconnectCandidate.label}`} tabindex="-1" bind:this={confirmationElement}>
@@ -400,61 +462,26 @@
     </section>
   {/if}
 
-  {#if connection}
-    {#if connection.phase === "disconnected"}{#if confirmedSuccess}<p class="connection-success" role="status">{connectingName} is signed out in the cloud. Sign-in on your computer hasn't changed.</p>{/if}
-    {:else if disconnecting}
-    <section class="connection" aria-label={`Disconnect ${connectingName}`} tabindex="-1" bind:this={connectionElement}>
-      {#if !waiting}<h3>{connectingName} disconnection needs attention</h3>{/if}
-      <p class="muted" role="status">{waiting ? connection.phase === "verifying" ? "Confirming that this service is signed out in the cloud." : "Signing this service out in the cloud. Sign-in on your computer stays as it is." : connectionError(connection.phase === "failed" ? connection.error_code : connection.phase, "disconnect")}</p>
-      {#if !waiting || pollingPaused || connectionNotice}<div class="connection-actions"><button class="text-button" disabled={connectionFlight || catalogFlight || busy !== null} onclick={() => waiting ? void checkConnection() : void load()}>{waiting ? "Check disconnection status" : "Check connection"}</button>{#if !waiting && canManage}{@const provider = providers.find(p => p.id === connection?.provider_id)}{#if provider && canDisconnect(provider)}<button class="text-button" onclick={(event) => void requestDisconnect(provider, event.currentTarget)}>Try disconnecting again</button>{/if}{/if}</div>{/if}
-      {#if pollingPaused && waiting}<p class="muted small" role="status">This is taking longer than expected. Check the request's status before trying again.</p>{/if}
-      {#if connectionNotice}<p class="error" role="status">{connectionNotice}</p>{/if}
-    </section>
-    {:else if connection.phase === "connected"}{#if confirmedSuccess}<p class="connection-success" role="status">{connectingRepository ? `${connectingName} is connected. Your cloud can now pull and push your repositories.` : `${connectingName} is connected for cloud work.`}</p>{/if}{:else}
-    <section class="connection" aria-label={`Connect ${connectingName}`} tabindex="-1" bind:this={connectionElement}>
-      <div class="heading">{#if !waiting}<h3>{connection.phase === "failed" ? `${connectingName} sign-in needs attention` : connection.phase === "expired" ? `${connectingName} sign-in expired` : connection.phase === "canceled" ? `${connectingName} sign-in canceled` : `Connect ${connectingName}`}</h3>{/if}{#if waiting}<span class="phase" role="status">{connection.phase === "preparing" ? "Preparing sign-in…" : connection.phase === "verifying" ? "Confirming connection…" : "Waiting for sign-in"}</span>{/if}</div>
-      {#if ["failed", "expired", "canceled"].includes(connection.phase)}<p class="muted">{connectionError(connection.phase === "failed" ? connection.error_code : connection.phase)}</p><button class="button" disabled={!canStart} onclick={() => void connect(connection!.provider_id)}>Try again</button>
-      {:else if connection.phase === "preparing"}<p class="muted" role="status">Preparing {connectingName} for sign-in. This happens automatically and may take a moment.</p>
-      {:else if connection.phase === "verifying"}<p class="muted" role="status">Confirming your connection with {connectingName}…</p>
-      {:else if action?.type === "device_code"}
-        {#if connectingRepository}<p class="muted">This lets your cloud pull and push your {connectingName} repositories.</p>{/if}
-        <ol class="instructions"><li>Copy this one-time code.</li></ol><div class="code-row"><code aria-label="One-time sign-in code">{action.user_code}</code><button class="button secondary" onclick={() => void copyCode()}>{copied ? "Copied" : "Copy code"}</button></div>
-        <ol class="instructions" start="2"><li>Open {connectingName}'s sign-in page, enter the code and approve access.</li></ol>
-        {#if native}<button class="button" disabled={busy !== null} onclick={() => void openSignIn()}>Open sign-in page</button>{:else if loginUrl}<a class="button" href={loginUrl} target="_blank" rel="noopener noreferrer">Open sign-in page</a>{:else}<p class="error">This sign-in link couldn't be verified.</p>{/if}
-        <p class="muted small">Leave this view open while you finish. We'll confirm the connection here.</p>
-      {:else if action?.type === "browser"}
-        <p class="muted">Sign in to {connectingName} in your browser.{#if action.input === "authorization_code"} It then shows a code — copy it and paste it here.{/if}</p>
-        {#if native}<button class="button" disabled={busy !== null} onclick={() => void openSignIn()}>Continue in browser</button>{:else if loginUrl}<a class="button" href={loginUrl} target="_blank" rel="noopener noreferrer">Continue in browser</a>{:else}<p class="error">This sign-in link couldn't be verified.</p>{/if}
-        {#if action.input === "authorization_code"}
-          <form class="authorization" onsubmit={(event) => { event.preventDefault(); void submitCode(); }}>
-            <label for={`provider-code-${connection.id}`}>Code from {connectingName}</label>
-            <!-- Visible so a paste can be checked; still cleared on submit, cancel, hide and teardown. -->
-            <div class="authorization-row"><input id={`provider-code-${connection.id}`} type="text" bind:value={authorizationCode} autocomplete="off" autocapitalize="off" spellcheck={false} maxlength="4096" placeholder="Paste the code here" disabled={busy !== null} /><button class="button" type="submit" disabled={busy !== null || !authorizationCode.trim()}>{busy === "submit" ? "Confirming…" : "Connect"}</button></div>
-            <p class="muted small">The code goes directly to {connectingName}'s sign-in. It isn't saved in Chimaera.</p>
-          </form>
-        {/if}
-      {:else}<p class="muted">Preparing sign-in in your cloud. This may take a moment.</p>{/if}
-      {#if waiting}<div class="connection-actions">{#if pollingPaused || connectionNotice}<button class="text-button" disabled={connectionFlight || busy !== null} onclick={() => void checkConnection()}>Check sign-in status</button>{/if}<button class="text-button" disabled={busy !== null} onclick={() => void cancel()}>{busy === "cancel" ? "Canceling…" : "Cancel sign-in"}</button></div>{/if}
-      {#if pollingPaused && waiting}<p class="muted small" role="status">Automatic checks have paused after this request's time limit. Check its status or cancel before trying again.</p>{/if}
-      {#if connectionNotice}<p class="error" role="status">{connectionNotice}</p>{/if}
-    </section>
-    {/if}
-  {/if}
-
   {#if ready && onReady && !selectedHandoff && !disconnectCandidate && !waiting}<div class="ready"><p>{required.length ? "The required agents are connected." : "Your first agent is connected. You're ready for cloud work."}</p><button class="button" disabled={busy !== null} onclick={() => onReady?.()}>{required.length ? "Back to project" : "Back to projects"}</button></div>{/if}
   {#each handoffs as handoff (handoff.workspace_id)}
     <div class="handoff"><div><h3>{handoff.name}</h3><p class="muted small" role="status">{resumeFailures[handoffKey(handoff)] ?? (current && providersReady(providers, handoff.blocked_providers.map(p => p.id)) ? "Continuing your project…" : "Waiting for an agent connection for cloud work.")}</p></div>{#if resumeFailures[handoffKey(handoff)]}<button class="button" disabled={busy !== null || !nextReadyHandoff(providers, [handoff], [], current)} onclick={() => void resume(handoff, handoff.workspace_id === workspaceId)}>Try again</button>{:else if !current || !providersReady(providers, handoff.blocked_providers.map(p => p.id))}<button class="button secondary" onclick={() => (focusedHandoff = handoff)}>Connect required agents</button>{/if}</div>
   {/each}
-  {#if !waiting && !requestingDisconnect && repositories.length && required.length === 0}<details class="optional" bind:open={repositoriesOpen}><summary>Repository connections <span>Optional</span></summary><p class="muted small">Lets your cloud pull and push your repositories, including private ones.</p>{#each repositories as provider (provider.id)}{@const waitsForUpdate = provider.state !== "signed_in" && updating.has(provider.id)}<div class="repository"><div><h3>{provider.label}</h3>{#if !unchecked}<p class="muted small">{providerStateLabel(provider)}</p>{/if}<p class="muted small repository-use" role={waitsForUpdate ? "status" : undefined}>{waitsForUpdate ? cloudUpdateLine(provider.label) : settled && provider.state === "signed_in" ? "Your cloud can pull and push your repositories." : `Connect to pull and push your ${provider.label} repositories from your cloud.`}</p></div><div class="provider-actions">{#if waitsForUpdate}<button class="button secondary" disabled={catalogFlight} onclick={() => void load()}>{catalogFlight ? "Checking…" : "Try again"}</button>{:else if provider.state !== "signed_in"}<button class="button secondary" disabled={!canStart || !unchecked && provider.methods.length === 0 || provider.state === "unavailable"} onclick={() => void connect(provider.id)}>{busy === provider.id ? connectingLabel(provider) : `Connect ${provider.label}`}</button>{/if}{#if canDisconnect(provider)}<button class="text-button" disabled={!canManage} onclick={(event) => void requestDisconnect(provider, event.currentTarget)}>Disconnect {provider.label}</button>{/if}</div></div>{/each}</details>{/if}
+  {#if repositories.length && required.length === 0}<details class="optional" bind:open={repositoriesOpen}><summary>Repository connections <span>Optional</span></summary><p class="muted small">Lets your cloud pull and push your repositories, including private ones.</p>{#each repositories as provider (provider.id)}{@const waitsForUpdate = provider.state !== "signed_in" && updating.has(provider.id)}<div class="repository"><div><h3>{provider.label}</h3>{#if !unchecked}<p class="muted small">{providerStateLabel(provider)}</p>{/if}<p class="muted small repository-use" role={waitsForUpdate ? "status" : undefined}>{waitsForUpdate ? cloudUpdateLine(provider.label) : settled && provider.state === "signed_in" ? "Your cloud can pull and push your repositories." : `Connect to pull and push your ${provider.label} repositories from your cloud.`}</p></div><div class="provider-actions">{#if waitsForUpdate}<button class="button secondary" disabled={catalogFlight} onclick={() => void load()}>{catalogFlight ? "Checking…" : "Try again"}</button>{:else if provider.state !== "signed_in" && !inProgress(provider)}<button class="button secondary" disabled={!canStart || !unchecked && provider.methods.length === 0 || provider.state === "unavailable"} onclick={() => void connect(provider.id)}>{connectLabel(provider)}</button>{/if}{#if canDisconnect(provider) && !inProgress(provider)}<button class="text-button" disabled={!canManage} onclick={(event) => void requestDisconnect(provider, event.currentTarget)}>Disconnect {provider.label}</button>{/if}</div></div>{@render inline(provider)}{/each}</details>{/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if operationError}<p class="error" role="alert">{operationError}</p>{/if}
   {/if}
 </section>
 
 <style>
-  .connection-success { margin: 18px 0 0; color: var(--accent); font-size: var(--text-sm); }
-  .authorization { margin-top: 24px; }
-  .authorization label { display: block; margin-bottom: 9px; font-size: var(--text-sm); font-weight: 550; }
+  .connection-success { margin: 0; color: var(--accent); font-size: var(--text-sm); line-height: 1.6; }
+  /* The in-row guide: a rule above it inside a card, none under a repository line. */
+  .guide { display: grid; gap: 10px; width: 100%; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--edge); }
+  .guide:focus { outline: none; }
+  .guide p { margin: 0; }
+  .guide .error { margin: 0; }
+  .repository + .guide { margin-top: 0; padding: 0 0 14px; border-top: 0; }
+  .guide .text-button { padding: 0; }
+  .authorization { margin: 0; }
   .authorization-row { display: flex; gap: 10px; flex-wrap: wrap; }
   .authorization input { flex: 1 1 200px; min-width: 0; padding: 10px 12px; border: 1px solid var(--edge); border-radius: 7px; color: var(--fg); background: var(--bg); font: inherit; }
   .authorization input:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
@@ -502,13 +529,10 @@
   .connection:focus { outline: none; }
   .confirmation:focus { outline: 2px solid var(--focus-ring); outline-offset: 3px; }
   .confirmation-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 12px; margin-top: 20px; }
-  .phase { color: var(--muted); font-size: var(--text-xs); }
   .muted { color: var(--muted); font-size: var(--text-sm); line-height: 1.7; }
   .small { font-size: var(--text-xs); }
-  .instructions { margin: 20px 0 12px; padding-left: 18px; color: var(--fg); font-size: var(--text-sm); line-height: 1.65; }
-  .code-row { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; }
-  code { font-family: var(--mono); font-size: 25px; letter-spacing: .1em; overflow-wrap: anywhere; user-select: text; }
-  .connection-actions { display: flex; flex-wrap: wrap; gap: 20px; margin-top: 22px; padding-top: 17px; border-top: 1px solid var(--edge); }
+  .code-row { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+  code { font-family: var(--mono); font-size: 22px; letter-spacing: .1em; overflow-wrap: anywhere; user-select: text; }
   .ready, .handoff { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 15px; margin-top: 20px; padding: 18px 0; border-top: 1px solid var(--edge); }
   .ready p { margin: 0; font-size: var(--text-sm); line-height: 1.7; }
   .handoff > div { flex: 1; min-width: 200px; }

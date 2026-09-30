@@ -234,11 +234,18 @@ connection panel. Its official CLI completes authentication; no temporary projec
 or terminal window opens. The code is used once and never saved by Chimaera; it
 must be pasted whole (Claude shows `code#state`), and half of one keeps the
 sign-in waiting with its own error (`authorization_code_incomplete`).
+Every sign-in shows inside its own row (the agent's card, or GitHub's line under
+**Repository connections**), never in place of the other rows, so nothing else on
+the page moves while it runs: the one-time code with **Copy** and one **Open
+GitHub** (or **Open Codex**) button, a short "Waiting for you…" line and a small
+**Cancel**; Claude's row shows **Open Claude Code sign-in** and the paste field.
+The row itself then reports how it ended (connected, or the reason in plain words
+with **Try again** as its button).
 Connecting GitHub (it lets the user's cloud pull and push their
-repositories) works like Codex, with no terminal: the panel shows GitHub's
-one-time code with **Copy code** and **Open sign-in page** (GitHub's device page,
-`https://github.com/login/device`), the user enters the code there and approves
-access, and the panel confirms the connection by itself. Behind it the cloud
+repositories) works like Codex, with no terminal: the row shows GitHub's
+one-time code, **Open GitHub** opens GitHub's device page
+(`https://github.com/login/device`), the user enters the code there and approves
+access, and the row confirms the connection by itself. Behind it the cloud
 machine runs the official GitHub CLI's web sign-in with piped I/O (never a
 terminal or a browser there), reads only its code and page from complete output
 lines, waits while the CLI polls GitHub, then makes the CLI Git's credential helper

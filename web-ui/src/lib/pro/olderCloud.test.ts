@@ -28,7 +28,8 @@ describe("an older cloud's sign-in", () => {
   it("says the cloud is being updated in the row, with a Try again that only looks", () => {
     // Agent cards and repository rows alike.
     expect(panel.match(/cloudUpdateLine\(provider\.label\)/g)).toHaveLength(2);
-    const tryAgain = /\{#if waitsForUpdate\}<button class="button secondary" disabled=\{catalogFlight\} onclick=\{\(\) => void load\(\)\}>\{catalogFlight \? "Checking…" : "Try again"\}<\/button>\{:else if provider\.state !== "signed_in"\}/g;
+    // The row's own Connect steps aside only while its sign-in runs in the row.
+    const tryAgain = /\{#if waitsForUpdate\}<button class="button secondary" disabled=\{catalogFlight\} onclick=\{\(\) => void load\(\)\}>\{catalogFlight \? "Checking…" : "Try again"\}<\/button>\{:else if provider\.state !== "signed_in" && !inProgress\(provider\)\}/g;
     expect(panel.match(tryAgain)).toHaveLength(2);
     // `load` is the passive catalog read: it never wakes the cloud.
     expect(panel).toMatch(/async function load\(signal\?: AbortSignal\): Promise<void> \{[\s\S]*?const result = await peekCatalog\(signal\);/);
