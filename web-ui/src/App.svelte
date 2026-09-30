@@ -5458,16 +5458,18 @@
                      rows may sit under the fold, the header never does. -->
                 <button
                   class="recents-more"
+                  aria-expanded={recentsExpanded}
                   title={recentsExpanded
                     ? "show only what fits"
                     : `show all ${visibleRecents.length} recent conversations`}
                   onclick={toggleRecents}
                 >
-                  {recentsExpanded ? "show less" : `all ${visibleRecents.length}`}
+                  {recentsExpanded ? "less" : "more"}
                 </button>
               {/if}
-              <!-- Every past session, beyond these: revealed while the
-                   pointer is over Recents (always on touch), and in ⌘P. -->
+              <!-- Every past session, beyond these: in ⌘P too. Both header
+                   actions reveal while the pointer is over Recents (always on
+                   touch). -->
               <button
                 class="recents-history"
                 title="All sessions — every past session in this workspace"
@@ -7014,26 +7016,15 @@
     opacity: 0.8;
   }
 
-  /* The "all N" / "show less" toggle lives in the section header: quiet
-     lowercase text (the header's uppercase tracking is for the label only). */
+  /* The "more" / "less" toggle lives in the section header: quiet lowercase
+     text (the header's uppercase tracking is for the label only). */
   .recents-more {
-    appearance: none;
-    border: none;
-    background: none;
-    margin: -2px -4px -2px 0;
     padding: 1px 4px;
-    border-radius: 4px;
     font: inherit;
     font-size: var(--text-xs);
     font-weight: 500;
     letter-spacing: 0;
     text-transform: none;
-    font-variant-numeric: tabular-nums;
-    color: var(--muted);
-    cursor: pointer;
-    transition:
-      color 0.12s ease,
-      background-color 0.12s ease;
   }
 
   .recents-note {
@@ -7065,46 +7056,48 @@
     align-items: center;
     gap: 4px;
   }
-  /* All sessions: a quiet history mark, shown while the pointer is over
-     Recents or a key focuses it, and always where there is no hover. */
+  /* All sessions: a quiet history mark. */
   .recents-history {
-    appearance: none;
-    border: none;
-    background: none;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    margin: -2px -4px -2px 0;
     padding: 2px 4px;
+  }
+  /* Both header actions show while the pointer is over Recents or a key
+     focuses them, and always where there is no hover. */
+  :is(.recents-more, .recents-history) {
+    appearance: none;
+    border: none;
+    background: none;
+    margin: -2px -4px -2px 0;
     border-radius: 4px;
     color: var(--muted);
     cursor: pointer;
     opacity: 0;
     transition:
       opacity 0.12s ease,
-      color 0.12s ease;
+      color 0.12s ease,
+      background-color 0.12s ease;
   }
-  .recents:hover .recents-history,
-  .recents-history:focus-visible {
+  .recents:hover :is(.recents-more, .recents-history),
+  :is(.recents-more, .recents-history):focus-visible {
     opacity: 0.9;
   }
-  .recents-history:hover {
+  /* Scoped under .recents so it outranks the reveal rule above (the
+     pointer is over both), letting the hovered action reach full opacity. */
+  .recents :is(.recents-more, .recents-history):hover {
     opacity: 1;
     color: var(--fg);
     background: var(--row-hover);
   }
-  .recents-history:focus-visible {
+  :is(.recents-more, .recents-history):focus-visible {
     outline: 1px solid var(--focus-ring);
   }
   @media (hover: none) {
+    .recents-more,
     .recents-history {
       opacity: 0.9;
     }
-  }
-
-  .recents-more:hover {
-    color: var(--fg);
-    background: var(--row-hover);
   }
 
   /* --- FILES section --- */
