@@ -3,6 +3,7 @@
   import { contextMenu } from "../shared/contextMenu.svelte";
   import { menuPoint, resolveAndOpen, type OpenPathFn, type PathResolver } from "./paths";
   import type { ChatBlock, ToolContent } from "./store.svelte";
+  import { readableToolTitle } from "./toolLabels";
 
   interface Props {
     block: Extract<ChatBlock, { kind: "tool" }>;
@@ -46,6 +47,9 @@
     other: "·",
   };
   const glyph = $derived(GLYPHS[block.tool] ?? "·");
+  /** Agent-communication calls read as what they did ("Message to …");
+   *  the driver's own title stays on hover. */
+  const shownTitle = $derived(readableToolTitle(block));
   const hasBody = $derived(
     block.content !== null &&
       !(block.content.kind === "output" && (block.content.text ?? "").trim() === ""),
@@ -169,7 +173,11 @@
       title={statusTitle}
     >
       <span class="glyph">{glyph}</span>
-      <span class="title" class:with-live={liveLine !== null}>{block.title}</span>
+      <span
+        class="title"
+        class:with-live={liveLine !== null}
+        title={shownTitle !== block.title ? block.title : undefined}>{shownTitle}</span
+      >
       {#if liveLine !== null}
         <span class="live">{liveLine}</span>
       {/if}

@@ -37,6 +37,8 @@
   import ToolGroup from "./ToolGroup.svelte";
   import type { TurnTail } from "./toolLabels";
   import FinishedRow from "./FinishedRow.svelte";
+  import AgentMessageCards from "./AgentMessageCards.svelte";
+  import { isAgentOrigin, parseAgentText } from "./agentMessages";
   import ActivityFold from "./ActivityFold.svelte";
   import { foldSpans } from "./activityFold";
   import { backgroundKind } from "./backgroundKinds";
@@ -2245,7 +2247,13 @@
     let turnTools: Extract<ChatBlock, { kind: "tool" }>[] = [];
     renderBlocks.forEach((block, i) => {
       const originalIndex = renderStart + i;
-      if (block.kind === "user" || block.kind === "wake" || block.kind === "turn_end") turnTools = [];
+      if (
+        block.kind === "user" ||
+        block.kind === "wake" ||
+        block.kind === "turn_end" ||
+        (block.kind === "agent_message" && block.via === "send")
+      )
+        turnTools = [];
       // Every user block in `blocks` is delivered — queued/undelivered sends
       // live in the pending transcript tail (`store.pendingSends`), never
       // here — so they all render inline in transcript order.
@@ -2650,6 +2658,22 @@
             </span>
           {/if}
         </div>
+      {:else if item.block.kind === "agent_message"}
+        <!-- Other agents' messages: a card each, sender and vendor named;
+             never a fork or rewind point. -->
+        <AgentMessageCards
+          messages={item.block.messages}
+          caption={item.block.caption}
+          text={item.block.text}
+          mastermind={item.block.mastermind}
+          {visible}
+          onOpenPath={openProsePath}
+          resolvePaths={prosePaths}
+          embeds={proseEmbeds}
+          {hoverTargets}
+          sourceIndex={item.index}
+          sourceUid={item.block.uid}
+        />
       {:else if item.block.kind === "message"}
         <div
           class="msg agent"
@@ -2852,6 +2876,25 @@
       >
         {#each pinnedSends as send (send.id)}
           {@const pictureOnly = send.text.length === 0 && send.attachmentPaths.length > 0}
+          {#if isAgentOrigin(send.origin)}
+            <!-- Another agent's message steered in (Codex): it waits for the
+                 agent's next step like a queued send; one that misses its
+                 turn stays in the agent's inbox. -->
+            {@const parsed = parseAgentText(send.text)}
+            <AgentMessageCards
+              messages={parsed.messages}
+              caption={parsed.caption}
+              text={send.text}
+              mastermind={send.origin === "mastermind"}
+              state={send.state}
+              onDismiss={() => cancelQueued(send.id)}
+              {visible}
+              onOpenPath={openProsePath}
+              resolvePaths={prosePaths}
+              embeds={proseEmbeds}
+              {hoverTargets}
+            />
+          {:else}
           <div class="msg user pending-msg" class:dropped={send.state === "dropped"}>
             {#if send.attachmentPaths.length > 0 && !pictureOnly}
               {@render sentImages(send.attachmentPaths)}
@@ -2902,6 +2945,7 @@
               <span class="attach">{unsavedImages(send)}</span>
             {/if}
           </div>
+          {/if}
         {/each}
       </div>
     {/if}

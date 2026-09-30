@@ -11,8 +11,10 @@ import {
   formatDuration,
   groupEvidence,
   groupTimeline,
+  FILTER_LABELS,
+  deliveryLabel,
   isBadNews,
-  mastermindInbox,
+  messageRecipient,
   sinceYouLeft,
 } from "./timelineModel";
 
@@ -221,22 +223,42 @@ describe("filters + days", () => {
   });
 });
 
-describe("mastermindInbox", () => {
-  it("counts unread notes addressed to the Mastermind only", () => {
+describe("messages", () => {
+  const note = (over: Partial<NonNullable<TimelineEntry["note"]>> = {}) => ({
+    from_sid: "s1",
+    from_name: "claude-1",
+    text: "hi",
+    ...over,
+  });
+  const live = new Map([["s2", "fix CI (renamed)"]]);
+  const nameOf = (sid: string) => live.get(sid);
+
+  it("names the recipient: its name then, the live name, the id, or the reserved words", () => {
+    expect(messageRecipient(note({ to: "s2", to_name: "fix CI" }), nameOf)).toBe("fix CI");
+    expect(messageRecipient(note({ to: "s2" }), nameOf)).toBe("fix CI (renamed)");
+    expect(messageRecipient(note({ to: "s-gone" }), nameOf)).toBe("s-gone");
+    expect(messageRecipient(note({ to: "mastermind", to_name: "Mastermind" }), nameOf)).toBe("the Mastermind");
+    expect(messageRecipient(note(), nameOf)).toBe("everyone");
+    expect(messageRecipient(note({ to: "everyone" }), nameOf)).toBe("everyone");
+  });
+
+  it("says how each message was delivered, old notes included", () => {
+    expect(deliveryLabel(note({ delivery: "next_step" }))).toBe("read at its next step");
+    expect(deliveryLabel(note({ delivery: "inbox" }))).toBe("in its inbox");
+    expect(deliveryLabel(note({ delivery: "woke", woke: true }))).toBe("woke it");
+    expect(deliveryLabel(note({ delivery: "asked" }))).toBe("asked you");
+    // Written before delivery was recorded: only a wake was known.
+    expect(deliveryLabel(note({ woke: true }))).toBe("woke it");
+    expect(deliveryLabel(note())).toBeNull();
+    expect(deliveryLabel(note({ delivery: "teleported" }))).toBeNull();
+  });
+
+  it("files them under Messages, keeping the filter's id", () => {
     seq = 0;
-    const toMm: TimelineEntry = {
-      seq: ++seq,
-      ts: T0,
-      kind: "note",
-      note: { from_sid: "s1", from_name: "claude-1", to: "mastermind", text: "hi" },
-    };
-    const toOther: TimelineEntry = {
-      seq: ++seq,
-      ts: T0,
-      kind: "note",
-      note: { from_sid: "s1", from_name: "claude-1", to: "s2", text: "hi" },
-    };
-    const later: TimelineEntry = { ...toMm, seq: ++seq };
-    expect(mastermindInbox([later, toOther, toMm], toMm.seq).map((e) => e.seq)).toEqual([later.seq]);
+    const msg: TimelineEntry = { seq: ++seq, ts: T0, kind: "note", note: note({ to: "s2" }) };
+    const groups = groupTimeline([ep("s1", 0), msg]);
+    expect(filtersPresent(groups)).toEqual(["all", "agents", "notes"]);
+    expect(FILTER_LABELS.notes).toBe("Messages");
+    expect(filterGroups(groups, "notes").map((g) => g.kind)).toEqual(["note"]);
   });
 });

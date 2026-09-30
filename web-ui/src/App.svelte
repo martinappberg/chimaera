@@ -234,6 +234,7 @@
   import { computeStatus, initCompute, queuedJobCount } from "./lib/workspace/compute";
   import { surfacesOf } from "./lib/layout/surfaces";
   import { activateTimelineWorkspace, onTimelineNudge } from "./lib/workspace/timeline.svelte";
+  import { activateCommsWorkspace, onCommsNudge, onCommsReconnect } from "./lib/workspace/comms.svelte";
   import {
     activateKnowledgeWorkspace,
     focusKnowledgeEntry,
@@ -1057,6 +1058,7 @@
     // The Timeline / Knowledge / plugin-status stores follow the same
     // activate-on-switch, nudge-to-refetch discipline (one small GET each).
     void activateTimelineWorkspace(wsId);
+    activateCommsWorkspace(wsId);
     void activateKnowledgeWorkspace(wsId);
     void activatePluginsWorkspace(wsId);
     eventsSocket?.watch(wsId);
@@ -1697,6 +1699,7 @@
       onSettings: applyRemoteSettings,
       onGit: onGitNudge,
       onTimeline: onTimelineNudge,
+      onComms: onCommsNudge,
       onAgentPlugins: onAgentPluginsChanged,
       onUpdate: (status) => (updateState.daemon = status),
       onRecents: (epoch) => {
@@ -1726,6 +1729,9 @@
         // latch the old link's floor (the badge goes blank until the next
         // health sample, which the recovery kick fetches promptly).
         if (up && !eventsUp) resetLinkRtt();
+        // No comms frame is sent on connect: refetch what changed while the
+        // socket was down (or a restarted daemon renumbered).
+        if (up && !eventsUp) onCommsReconnect();
         eventsUp = up;
         // A save that died with the link retries once it is back.
         noteDaemonLink(up);
@@ -3445,6 +3451,13 @@
   function openActivitySurface(): void {
     openSettingsSurface();
     requestSettingsSection("Activity");
+  }
+
+  /** Open Settings scrolled to one setting's row (the Mastermind panel's
+   *  "agent communication is off" state). */
+  function openSettingsAt(settingId: string): void {
+    openSettingsSurface();
+    requestSettingsSection(settingId);
   }
 
   /** Open/focus the workspace Timeline (dashboard link, quick-open). */
@@ -5925,6 +5938,7 @@
         visible
         context={mmContext}
         hostWidth={bodyWidth}
+        onOpenSettings={openSettingsAt}
       />
     {/if}
   </div>

@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { toolGroupTitle, toolRunHealth, type HealthTool, type LabelledTool } from "./toolLabels";
+import {
+  commsCall,
+  commsTitle,
+  readableToolTitle,
+  toolGroupTitle,
+  toolRunHealth,
+  type HealthTool,
+  type LabelledTool,
+} from "./toolLabels";
 
 function tool(kind: string, over: Partial<LabelledTool> = {}): LabelledTool {
   return { tool: kind, status: "completed", locations: [], summary: null, ...over };
@@ -118,5 +126,73 @@ describe("toolRunHealth", () => {
     expect(toolRunHealth([failedEdit], { tools: [failedEdit, other], from: 1 })).toBe("failed");
     // Calls before `from` belong to the run (or precede it) and don't count.
     expect(toolRunHealth([failedEdit], { tools: [retry, failedEdit], from: 2 })).toBe("failed");
+  });
+});
+
+describe("agent-communication tools", () => {
+  it("recognizes every driver's MCP naming", () => {
+    // claude titles `tool (server)`; codex `server.tool` (an item) or
+    // `server · tool` (an approval); the raw CLI name too.
+    for (const title of [
+      "send_message (chimaera)",
+      "chimaera.send_message",
+      "chimaera · send_message",
+      "mcp__chimaera__send_message",
+    ]) {
+      expect(commsCall(title)).toEqual({ verb: "send_message", target: null });
+    }
+    expect(commsCall("read_messages (chimaera)")).toEqual({ verb: "read_messages", target: null });
+    expect(commsCall("chimaera.list_agents")).toEqual({ verb: "list_agents", target: null });
+  });
+
+  it("leaves other servers and other chimaera tools alone", () => {
+    expect(commsCall("search_memory (goldfish)")).toBeNull();
+    expect(commsCall("goldfish.send_message")).toBeNull();
+    expect(commsCall("workspace_status (chimaera)")).toBeNull();
+    expect(commsCall("SendMessage → teammate: hi")).toBeNull();
+  });
+
+  it("takes the target from the input, else from the title", () => {
+    expect(commsCall("mcp__chimaera__send_message", { to: "loader refactor", text: "x" })).toEqual({
+      verb: "send_message",
+      target: "loader refactor",
+    });
+    expect(commsCall("mcp__chimaera__read_agent", { agent: "s-1a2b" })?.target).toBe("s-1a2b");
+    expect(commsCall("send_message (chimaera) → fix CI: the loader changed")?.target).toBe("fix CI");
+    expect(commsCall("chimaera.read_agent: s-9f")?.target).toBe("s-9f");
+  });
+
+  it("titles each call in words", () => {
+    expect(commsTitle({ verb: "send_message", target: "loader refactor" })).toBe("Message to loader refactor");
+    expect(commsTitle({ verb: "send_message", target: "mastermind" })).toBe("Message to the Mastermind");
+    expect(commsTitle({ verb: "send_message", target: "everyone" })).toBe("Message to everyone");
+    expect(commsTitle({ verb: "send_message", target: null })).toBe("Sent a message");
+    expect(commsTitle({ verb: "read_messages", target: null })).toBe("Checked messages");
+    expect(commsTitle({ verb: "list_agents", target: null })).toBe("Listed agents");
+    expect(commsTitle({ verb: "read_agent", target: "fix CI" })).toBe("Read fix CI's work");
+    expect(readableToolTitle({ tool: "other", title: "chimaera.list_agents" })).toBe("Listed agents");
+    // Only MCP-kind rows are renamed; everything else keeps the driver's title.
+    expect(readableToolTitle({ tool: "execute", title: "chimaera.list_agents" })).toBe("chimaera.list_agents");
+    expect(readableToolTitle({ tool: "other", title: "search_memory (goldfish)" })).toBe(
+      "search_memory (goldfish)",
+    );
+  });
+
+  it("says what a group did instead of 'used a tool'", () => {
+    expect(toolGroupTitle([tool("other", { title: "list_agents (chimaera)" })])).toBe("Listed agents");
+    expect(
+      toolGroupTitle([
+        tool("other", { title: "read_agent (chimaera) → fix CI" }),
+        tool("other", { title: "send_message (chimaera) → fix CI" }),
+        tool("other", { title: "search_memory (goldfish)" }),
+      ]),
+    ).toBe("Messaged fix CI, read fix CI's work, used a tool");
+    expect(
+      toolGroupTitle([
+        tool("other", { title: "chimaera.send_message" }),
+        tool("other", { title: "chimaera.send_message" }),
+        tool("other", { title: "chimaera.read_messages", status: "in_progress" }),
+      ]),
+    ).toBe("Sent 2 messages, checking messages");
   });
 });

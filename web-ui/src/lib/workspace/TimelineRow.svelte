@@ -17,13 +17,16 @@
   import {
     commandHead,
     commandLabel,
+    deliveryLabel,
     formatClock,
     formatDuration,
     groupDurationMs,
     groupEvidence,
     jobFailed,
+    messageRecipient,
     type TimelineGroup,
   } from "./timelineModel";
+  import { unreadFor } from "./comms.svelte";
   import { relPath } from "../dashboard/dash";
   import { resolveReference } from "../shared/references";
   import { knowledgeLookup } from "../knowledge/store";
@@ -41,7 +44,8 @@
     onOpenFile: (absPath: string) => void;
     /** Knowledge rows link into the Knowledge view. */
     onOpenKnowledge?: () => void;
-    /** Agent notes: hand the note to its addressee as a real message. */
+    /** A message still in its recipient's inbox: hand the inbox over as a
+     *  real message (the user's click starts that turn). */
     onDeliver?: (entry: TimelineEntry) => void;
     /** The row's own delivery state text (the caller owns the request). */
     deliverState?: string | null;
@@ -133,7 +137,9 @@
       case "session":
         return { mark: "✕", tone: "err", title: "the session ended unexpectedly" };
       case "note":
-        return { mark: "✉", tone: "muted", title: "a note" };
+        return first.note?.mastermind === true
+          ? { mark: "✉", tone: "accent", title: "a message from the Mastermind" }
+          : { mark: "✉", tone: "muted", title: "a message" };
       default:
         return { mark: "·", tone: "muted", title: first.kind };
     }
@@ -146,12 +152,23 @@
     return clock;
   });
 
-  /** Where a note is addressed: a session name, the Mastermind, or everyone. */
-  const noteTo = $derived.by(() => {
-    const to = first.note?.to;
-    if (to === undefined) return "everyone";
-    if (to === "mastermind") return "Mastermind";
-    return names.get(to) ?? sessions.get(to)?.name ?? to;
+  /** Where a message is addressed: a session's name, the Mastermind, or
+   *  everyone. */
+  const noteTo = $derived(
+    first.note !== undefined
+      ? messageRecipient(first.note, (id) => names.get(id) ?? sessions.get(id)?.name)
+      : "everyone",
+  );
+  /** A message its recipient may not have read yet — it wasn't carried
+   *  into a turn and the recipient still has mail waiting — so the user can
+   *  hand it over. The Mastermind's inbox is handed over in its panel;
+   *  a broadcast has no single recipient. */
+  const deliverable = $derived.by(() => {
+    const n = first.note;
+    if (n === undefined || onDeliver === undefined) return false;
+    if (n.to === undefined || n.to === "everyone" || n.to === "mastermind") return false;
+    if (n.delivery === "next_step" || n.delivery === "woke") return false;
+    return unreadFor(n.to) > 0;
   });
 
   const jobVerb = $derived.by(() => {
@@ -235,6 +252,9 @@
     {:else if first.kind === "note"}
       {@const n = first.note}
       <span class="name">{n?.from_name ?? name}</span>
+      {#if n?.mastermind === true}
+        <span class="mm" title="direction from the workspace Mastermind">Mastermind</span>
+      {/if}
       <span class="to">→ {noteTo}</span>
       <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
       <span class="title">{@html inlineMarkdown(n?.text ?? "")}</span>
@@ -319,23 +339,35 @@
       </div>
       <span></span>
     {/if}
-  {:else if first.kind === "note" && onDeliver !== undefined && first.note?.to !== undefined && first.note.to !== "mastermind"}
+  {:else if first.kind === "note" && first.note}
+    <!-- The message's id (what "re #N" points at), what it answers, how it
+         arrived, and — while it waits in a session's inbox — the hand-over. -->
+    {@const n = first.note}
+    {@const chip = deliveryLabel(n)}
     <span></span>
-    <div class="result quiet">
+    <div class="result quiet msgmeta">
+      <span class="mono" title="the message's id — replies name it">#{first.seq}</span>
+      {#if n.reply_to !== undefined}
+        <span class="dot-sep">·</span><span>re #{n.reply_to}</span>
+      {/if}
+      {#if n.expect_reply === true}
+        <span class="dot-sep">·</span><span>asks for a reply</span>
+      {/if}
+      {#if chip !== null}
+        <span class="dchip {n.delivery ?? (n.woke === true ? 'woke' : '')}">{chip}</span>
+      {/if}
       {#if deliverState !== null}
-        {deliverState}
-      {:else}
-        <button class="inline-link" onclick={() => onDeliver(first)} title="send this note to {noteTo} as a real message — your click starts that turn"
+        <span class="dot-sep">·</span><span>{deliverState}</span>
+      {:else if deliverable && onDeliver !== undefined}
+        <span class="dot-sep">·</span>
+        <button
+          class="inline-link"
+          onclick={() => onDeliver(first)}
+          title="send {noteTo} this message now as a real one — your click starts that turn"
           >deliver to {noteTo}</button
         >
       {/if}
     </div>
-    <span></span>
-  {:else if first.kind === "note" && first.note?.to === "mastermind" && first.note.woke === true}
-    <!-- Only the settled fact: an inbox hand-over happens in the panel, so a
-         "still in the inbox" line here would go stale. -->
-    <span></span>
-    <div class="result quiet">the Mastermind read it right away</div>
     <span></span>
   {/if}
 </div>
@@ -537,6 +569,46 @@
   }
   .pill .mono {
     font-size: var(--text-xs);
+  }
+  /* A message from the Mastermind: the same row, its name tagged. */
+  .mm {
+    font-size: var(--text-xs);
+    color: var(--accent);
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--edge));
+    border-radius: 999px;
+    padding: 0 6px;
+    margin-right: 6px;
+    white-space: nowrap;
+  }
+  .msgmeta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    column-gap: 0;
+    row-gap: 2px;
+  }
+  .msgmeta .dot-sep {
+    margin: 0 5px;
+  }
+  /* How it arrived: a quiet word, toned only where it matters — a wake
+     billed a turn, an ask is waiting on you. */
+  .dchip {
+    margin-left: 8px;
+    font-size: var(--text-xs);
+    line-height: 1.5;
+    color: var(--muted);
+    background: color-mix(in srgb, var(--fg) 6%, transparent);
+    border-radius: 999px;
+    padding: 0 7px;
+    white-space: nowrap;
+  }
+  .dchip.woke {
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 11%, transparent);
+  }
+  .dchip.asked {
+    color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 12%, transparent);
   }
   .via {
     font-size: var(--text-xs);

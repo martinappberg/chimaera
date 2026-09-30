@@ -7,6 +7,7 @@
 
 import { isImagePath } from "../previews/files";
 import { artifactMentions, isArtifactPath, proseCovered, proseEmbedTargets } from "./artifacts";
+import { agentMessageFromEvent, isAgentOrigin, parseAgentText, type AgentMessage } from "./agentMessages";
 import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
 
 /** Names a reply may use that still cover their files (a reply listing
@@ -101,6 +102,7 @@ const TRANSCRIPT_EVENTS = new Set([
   "init",
   "user_message",
   "user_message_update",
+  "agent_message",
   // "checkpoint" is deliberately absent: it touches the version conditionally
   // (only when it mutates a rendered block — see its reducer case), because a
   // checkpoint landing on a still-queued send changes nothing the reader sees
@@ -229,6 +231,11 @@ export interface PendingSend {
    *  being read at the agent's next step (the wire's `after_turn`, absent =
    *  false). Fixed at the echo — Send now reads it early, never re-labels it. */
   afterTurn: boolean;
+  /** The echo's origin: "agent"/"mastermind" is other agents' messages the
+   *  daemon steered in (a Codex steer waiting for the next step) — it
+   *  promotes to an `agent_message` block, and a drop means it stayed in the
+   *  reader's inbox. Null = this workbench's user typed it. */
+  origin: string | null;
 }
 
 /** Identity every transcript block carries alongside its variant body. */
@@ -287,6 +294,32 @@ export type ChatBlock = BlockIdentity &
       /** Codex thread/fork can use turnId only after this is the completed
        *  turn's final assistant block. */
       nativeTurnComplete: boolean;
+    }
+  | {
+      /** Messages from other agents in the workspace (agent communication).
+       *  Two carriers, one card: a Claude chat's hook delivery (the journal's
+       *  `agent_message` — context at the agent's next step, no user
+       *  message), and a real send (`user_message` with origin "agent" /
+       *  "mastermind": a Codex steer, a wake, the user's hand-over) whose
+       *  text holds one or more header-framed messages (`agentMessages.ts`).
+       *  Never a rewind or fork point: the reader didn't write it. */
+      kind: "agent_message";
+      via: "hook" | "send";
+      /** In order; empty when no header parsed — the card shows `text`. */
+      messages: AgentMessage[];
+      /** The send's leading "why" line (brackets removed), if any. */
+      caption: string | null;
+      /** The delivered text as written. */
+      text: string;
+      /** Sent under the Mastermind's origin (the plain card's style when no
+       *  header parsed; parsed cards carry their own flag). */
+      mastermind: boolean;
+      /** The send's delivery key (its checkpoint lands here, unused); null
+       *  for a hook delivery. */
+      id: string | null;
+      /** Read inside a running turn (a hook, or a steer taken at a step) —
+       *  it joined that turn instead of opening one. */
+      midTurn?: true;
     }
   | { kind: "thought"; text: string; turnId: string }
   | {
@@ -891,7 +924,12 @@ export class ChatStore {
             checkpoint: null,
             state: "queued",
             afterTurn: ev.after_turn === true,
+            origin,
           });
+        } else if (isAgentOrigin(origin)) {
+          // Other agents' messages, delivered as a send (a wake, the user's
+          // hand-over): a card per message, not the user's bubble.
+          this.pushAgentSend(text, id, false, origin === "mastermind");
         } else {
           // A fresh (turn-opening) send, or a permission-feedback echo — it was
           // received, so it goes straight into history.
@@ -1002,13 +1040,17 @@ export class ChatStore {
           // only inspects the tail, so a following agent chunk starts a fresh
           // block: the agent's message is never split.
           this.pendingSends.splice(pIdx, 1);
+          if (isAgentOrigin(pending.origin)) {
+            this.pushAgentSend(pending.text, pending.id, this.running, pending.origin === "mastermind");
+            break;
+          }
           this.blocks.push(
             this.stamp({
               kind: "user",
               text: pending.text,
               attachments: pending.attachments,
               attachmentPaths: pending.attachmentPaths,
-              origin: null,
+              origin: pending.origin,
               checkpoint: pending.checkpoint,
               id: pending.id,
               forkSeq: entry.seq,
@@ -1025,6 +1067,26 @@ export class ChatStore {
           // delivered" so the text can be copied and re-sent.
           pending.state = "dropped";
         }
+        break;
+      }
+      case "agent_message": {
+        // A hook carried another agent's message into this Claude chat at
+        // its next step (daemon-journaled; the model saw it as context, so
+        // no user message exists). It lands where it was read.
+        const message = agentMessageFromEvent(ev);
+        if (message === null) break;
+        this.blocks.push(
+          this.stamp({
+            kind: "agent_message",
+            via: "hook",
+            messages: [message],
+            caption: null,
+            text: message.body,
+            mastermind: message.mastermind,
+            id: null,
+            ...(this.running ? { midTurn: true as const } : {}),
+          }),
+        );
         break;
       }
       case "prompt_suggestion":
@@ -1055,11 +1117,15 @@ export class ChatStore {
             this.touchTranscript();
             break;
           }
+          // Another agent's message offers no rewind; its anchor must not
+          // fall through to an earlier user message below.
+          if (block.kind === "agent_message") break;
         }
         // Fallback for pre-id journals (the user echo carried no id to match):
         // stamp the last delivered user block, the message this followed.
         for (let i = this.blocks.length - 1; i >= 0; i--) {
           const block = this.blocks[i];
+          if (block.kind === "agent_message" && block.via === "send") break;
           if (block.kind === "user") {
             block.checkpoint = cp;
             block.forkSeq = entry.seq;
@@ -1711,6 +1777,26 @@ export class ChatStore {
     }
   }
 
+  /** Other agents' messages delivered as a send: one block, a card per
+   *  header-framed message (the raw text when none parsed). Registered by
+   *  its delivery key so a checkpoint for it never lands elsewhere. */
+  private pushAgentSend(text: string, id: string | null, midTurn: boolean, mastermind: boolean): void {
+    const { caption, messages } = parseAgentText(text);
+    this.blocks.push(
+      this.stamp({
+        kind: "agent_message",
+        via: "send",
+        messages,
+        caption,
+        text,
+        mastermind,
+        id,
+        ...(midTurn ? { midTurn: true as const } : {}),
+      }),
+    );
+    if (id !== null) this.userIndex.set(id, this.blocks.length - 1);
+  }
+
   /** A turn that opens with no user message since the previous turn ended
    *  was started by the agent itself. Say so — unless a finished row since
    *  that turn end already shows the cause (a background task reported). A
@@ -1720,7 +1806,8 @@ export class ChatStore {
     let sawTurnEnd = false;
     for (let i = this.blocks.length - 1; i >= 0; i--) {
       const kind = this.blocks[i].kind;
-      if (kind === "user") return;
+      // A message since the last turn end is the visible cause.
+      if (kind === "user" || kind === "agent_message") return;
       if (kind === "finished" || kind === "wake") return;
       if (kind === "turn_end") {
         sawTurnEnd = true;
@@ -1919,7 +2006,11 @@ export class ChatStore {
       // Every user block here is delivered (queued sends live in pendingSends),
       // so a user block is this turn's opening boundary — stop the scan —
       // unless the agent read it mid-turn: the turn it joined began earlier.
-      if ((b.kind === "user" && b.midTurn !== true) || b.kind === "turn_end") break;
+      if (
+        ((b.kind === "user" || b.kind === "agent_message") && b.midTurn !== true) ||
+        b.kind === "turn_end"
+      )
+        break;
       if (b.kind === "message") {
         prose.push(b.text);
         continue;
@@ -1971,7 +2062,7 @@ export class ChatStore {
     this.questionIndex.clear();
     this.blocks.forEach((b, i) => {
       if (b.kind === "tool") this.toolIndex.set(b.id, i);
-      if (b.kind === "user" && b.id !== null) this.userIndex.set(b.id, i);
+      if ((b.kind === "user" || b.kind === "agent_message") && b.id !== null) this.userIndex.set(b.id, i);
       if (b.kind === "question") this.questionIndex.set(b.id, i);
     });
   }

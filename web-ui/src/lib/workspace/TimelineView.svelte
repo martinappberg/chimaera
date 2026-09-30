@@ -8,7 +8,6 @@
   import { onMount } from "svelte";
   import type { DashCtx } from "../dashboard/dash";
   import type { LayoutCtrl } from "../layout/dnd";
-  import { ApiError } from "../net/api";
   import { pageVisible } from "../shared/visibility";
   import type { Session } from "./sessions";
   import {
@@ -79,8 +78,10 @@
     if (timelineStore.head === 0) refreshTimeline();
   });
 
-  /** Per-note delivery state (seq → text), replaced never mutated. */
+  /** Per-message hand-over state (seq → text), replaced never mutated. */
   let deliverStates = $state(new Map<number, string>());
+  /** Hand the recipient this message as a real one, then open it to watch
+   *  the turn. */
   async function deliver(entry: TimelineEntry): Promise<void> {
     if (wsId === null) return;
     deliverStates = new Map(deliverStates).set(entry.seq, "delivering…");
@@ -89,12 +90,8 @@
       deliverStates = new Map(deliverStates).set(entry.seq, "delivered");
       dash.onOpenSession(res.session_id);
     } catch (e) {
-      const msg =
-        e instanceof ApiError && e.status === 404
-          ? "this daemon can't deliver notes yet"
-          : e instanceof Error
-            ? e.message
-            : String(e);
+      // The daemon's own words (a terminal recipient, a gone session).
+      const msg = e instanceof Error ? e.message : String(e);
       deliverStates = new Map(deliverStates).set(entry.seq, `not delivered — ${msg}`);
     }
   }
@@ -126,7 +123,7 @@
       <p class="empty err">{timelineStore.error}</p>
     {:else if timelineStore.entries.length === 0}
       <p class="empty">
-        {#if timelineStore.loading}loading…{:else}Nothing recorded yet. Finished agent turns, long or failed commands, ended jobs and recorded findings will land here.{/if}
+        {#if timelineStore.loading}loading…{:else}Nothing recorded yet. Finished agent turns, messages between agents, long or failed commands, ended jobs and recorded findings will land here.{/if}
       </p>
     {:else if shown.length === 0}
       <p class="empty">Nothing matches that filter.</p>

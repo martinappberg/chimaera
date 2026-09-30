@@ -28,6 +28,7 @@
     type Session,
   } from "../workspace/sessions";
   import { isUnread } from "../workspace/unread.svelte";
+  import { unreadFor } from "../workspace/comms.svelte";
   import SameFileNotice from "../workspace/SameFileNotice.svelte";
   import { inlineMarkdown } from "../shared/inlineMarkdown";
   import type { BackgroundTask, ChatBlock, ChatStore } from "../chat/store.svelte";
@@ -67,6 +68,8 @@
   }: Props = $props();
 
   const prov = $derived(provenanceOf(session));
+  /** Messages from other agents waiting in this one's inbox. */
+  const waiting = $derived(unreadFor(session.id));
   const touched = $derived(session.files_touched ?? []);
 
   /** One honest line about what the session is doing right now. */
@@ -384,6 +387,15 @@
   {/if}
 
   <div class="meta">
+    {#if waiting > 0}
+      <!-- Mail, not a signal: quiet, beside the facts, never on the name. -->
+      <span
+        class="inbox"
+        title="{waiting} message{waiting === 1 ? '' : 's'} from other agents waiting in its inbox — it reads them when it next checks"
+        ><span aria-hidden="true">✉</span>
+        {compact ? waiting : `${waiting} message${waiting === 1 ? "" : "s"} waiting`}</span
+      >
+    {/if}
     {#if ctxPct !== null}
       <span class="ctxwrap" title={ctxTitle}>
         <span class="ctxlabel">ctx</span>
@@ -832,6 +844,18 @@
   .evidence:hover {
     color: var(--fg);
     border-bottom-color: var(--fg);
+  }
+  .inbox {
+    flex: none;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+    font-family: var(--ui-font);
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .inbox > span {
+    color: color-mix(in srgb, var(--accent) 70%, var(--muted));
   }
   .age {
     margin-left: auto;
