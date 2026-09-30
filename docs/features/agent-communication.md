@@ -40,7 +40,12 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
   standing permission; an ask-first Mastermind's `message_agent` keeps its prompt. The names
   avoid Claude Code's own `ListAgents` / `SendMessage` (machine-wide, other Claude sessions):
   asked to "use list_agents", a live haiku loaded those instead, so the instructions also say
-  the harness's own agent tools never reach this workspace's agents. Workspace-scoped:
+  the harness's own agent tools never reach this workspace's agents. Those tools stay the
+  agent's — never denied; when one is used anyway, the hook after it adds this workspace's
+  side (`comms::native_tool_note`): after `ListAgents` the roster, after a `SendMessage` aimed
+  at a workspace agent (by id or name — it fails natively) "send it with chimaera's
+  message_agent tool", after one that went through to a same-named Claude session a note
+  that the workspace didn't see it. Nothing is added to a send to anyone else. Workspace-scoped:
   another workspace's agents are neither listed nor reachable. A message is ≤ 2 KB (bigger:
   write a file and send its path); 10 posts per session per minute (shared with plugins'
   Timeline appends).
@@ -87,8 +92,9 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
   meets the same policy then. The user can also hand an agent its inbox
   (`POST /comms/deliver`, the Mastermind panel's inbox chip) or one Timeline message
   (`POST /timeline/{seq}/deliver`).
-- **Key behaviors.** Caps: one wake per sender per 3 minutes, 10 per workspace per hour, 4 per
-  conversation (a reply chain) — past the conversation's limit the user is asked "X and Y have
+- **Key behaviors.** Caps: a fresh message wakes at most once per sender per 3 minutes, 10
+  wakes per workspace per hour, 4 per conversation (a reply chain; a reply isn't held to the
+  3 minutes — a quick second question's answer would otherwise sit unread) — past the conversation's limit the user is asked "X and Y have
   been going back and forth — let them continue?" (Continue resets it). A wake starts with a
   line saying why ("[chimaera delivered this while you were idle: it answers a question you
   asked]"). Terminal agents are never woken, whatever the policy. Wake requests are one per
@@ -128,6 +134,14 @@ card) in the same turn; one sent while codex ran a 60 s command was steered (que
 `sent`) and answered in that turn; an auto-mode claude Mastermind directed codex, whose report
 woke it; the switch off in Settings refused a running agent's `message_agent` at once and
 emptied its tool list to the base six, and the Mastermind panel showed its off banner.
+Later the same day: asked in plain words, a sonnet chat and an opus chat each put a question
+to the codex chat through `workspace_agents` / `read_agent` / `message_agent` and were woken
+by its answers; a haiku pushed to Claude Code's own `ListAgents` answered with the workspace's
+agents from the hook note, and pushed to `SendMessage` "reviewer" switched to `message_agent`
+after the native send failed; two haiku chats in a counting relay under **Within limits**
+woke each other four times (a reply within the 3 minutes included), the fifth asked the user,
+**Continue** gave four more; a codex **terminal** read its inbox with `read_messages` when
+prompted and answered with `message_agent`, pre-approved, which woke the asker.
 
 ---
 
@@ -153,4 +167,7 @@ _Captured 2026-09-29/30 from the maintainer, in the design conversation that pro
   works now.
 - **Deliberately open / where it may go:** a per-workspace "off here" override (later, if
   someone needs it); visibility across workspaces (not in v1).
-- **Do not change (or: open to change):** pending — not asked beyond the calls above.
+- **Do not change (or: open to change):** an agent keeps every tool its harness gave it —
+  Chimaera never denies or hides Claude Code's own `ListAgents` / `SendMessage` in the agents
+  it spawns, even to stop them being mistaken for the workspace's tools: "no we can absolutely
+  not do that" (2026-09-30). Beyond that, pending — not asked.

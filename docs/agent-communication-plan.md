@@ -22,7 +22,11 @@ The maintainer's decisions are collected in §11.
   the user's other Claude sessions. They are **`workspace_agents`** and
   **`message_agent`** (the Mastermind's old verb, now everyone's, its meaning
   set by the sender's role), and the instructions say the harness's own agent
-  tools never reach this workspace's agents. The text below uses the built
+  tools never reach this workspace's agents. Claude Code's own tools are never
+  denied (the maintainer's call); when an agent uses one anyway, the hook after
+  it answers with this workspace's roster (`ListAgents`) or the tool that
+  reaches a workspace agent (`SendMessage` aimed at one) —
+  `comms::native_tool_note`. The text below uses the built
   names; where it says `message_agent` "goes away" it means the Mastermind-only
   tool of that name.
 - **Claude chat is reached through hooks, not sends** (§4 as designed), and
@@ -213,7 +217,10 @@ origin's chip, generalized). It bills the user, so it's policy-gated:
   click per answer.
 - **Caps** (today's Mastermind wake caps, generalized): one wake per sender
   per 3 min, 10 wakes per workspace per hour, and a new **thread hop limit**
-  — a thread can cause at most 4 wakes. Past a cap the message still lands
+  — a thread can cause at most 4 wakes. *As built:* the per-sender gap bounds
+  fresh messages only; a reply is bounded by its thread (a second question
+  within 3 min otherwise left its answer unread beside an asker waiting for
+  it). Past a cap the message still lands
   in the inbox, the sender is told so, and a hop-limit hit tells the user
   "X and Y have been going back and forth — let them continue?"
 - Broadcasts (`"everyone"`) never wake anyone.

@@ -871,8 +871,9 @@ hook's `additionalContext`, a chat send or steer, a billed wake. One switch
   nothing" — its CLI runs a missed queued message as the next turn — which is why claude gets
   hooks, not sends.
 - **Waking is a policy, not a side effect.** Starting a billed turn in an idle agent follows
-  the user's `agents.communication.wakes` (never · ask · auto), capped per sender, per
-  workspace and per conversation; a reply the reader asked for wakes it without asking.
+  the user's `agents.communication.wakes` (never · ask · auto), capped per sender (fresh
+  messages), per workspace and per conversation; a reply the reader asked for wakes it
+  without asking.
 - **Talking isn't commanding.** A peer's message is framed as information and quoted; only
   the Mastermind's carries direction. Nothing ever types into a terminal agent.
 - **Read state is durable** (`comms.json` per workspace, atomic rewrite, claims taken under

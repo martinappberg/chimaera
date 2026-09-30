@@ -733,6 +733,11 @@ pub(crate) async fn ingest(
     // too, PROTOCOL.md Pass 39), with the user's prompt, or at start. Never
     // a new turn; nothing waiting adds nothing.
     context.extend(crate::comms::hook_context(&state, &id, event).await);
+    // Claude Code's own ListAgents / SendMessage stay the agent's; the step
+    // after one says where this workspace's agents are.
+    if event == "PostToolUse" {
+        context.extend(crate::comms::native_tool_note(&state, &id, &payload));
+    }
 
     // Two live sessions here wrote the same file: this one hears about the
     // other, once per file per pair (claude reads PostToolUse and
