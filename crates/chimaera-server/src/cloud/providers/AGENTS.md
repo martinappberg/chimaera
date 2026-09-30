@@ -45,7 +45,9 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
 - An action is `{type:"browser",url,input:"authorization_code"}`,
   `{type:"device_code",verification_url,user_code}` or
   `{type:"terminal",workspace_id,session_id}` (now only an agent install while
-  `preparing`; an older server's GitHub login sent it while `waiting`). Openers validate the shared
+  `preparing`; an older server's GitHub login sent it while `waiting`). No client
+  opens a terminal action (the native app and the browser panel read only its
+  type), so it is removable once no older cloud remains. Openers validate the shared
   provider origin policy and resolve the action afresh; client-supplied URLs or
   commands are never executed. Timestamps are Unix seconds.
 - Nonworkers return `available:false` with empty lists and `connection:null`.

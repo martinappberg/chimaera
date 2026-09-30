@@ -144,6 +144,42 @@ export function agentsConnected(rows: CloudProviderStatus[]): boolean | null {
   return agents.some(row => row.state === "signed_in") ? true : agents.some(row => row.state === "unknown") ? null : false;
 }
 
+/** The sign-in methods this panel guides: a one-time code (Codex, GitHub)
+ * and a browser code (Claude Code). */
+const GUIDED_METHODS: readonly string[] = ["device_code", "browser_code"];
+/** An older cloud's sign-in: a login terminal on the cloud, which the app
+ * never opens. Its daemon is updated by the service, never by the user. */
+const OLDER_CLOUD_METHOD = "terminal";
+
+/** Whether a catalog row offers a sign-in this panel guides. */
+export function signInGuided(provider: Pick<CloudProviderStatus, "methods">): boolean {
+  return (provider.methods ?? []).some(method => GUIDED_METHODS.includes(method));
+}
+
+/** A catalog row from an older cloud, whose only sign-in for it is a login
+ * terminal: the row waits for the cloud's update instead of offering Connect. */
+export function awaitingCloudUpdate(provider: Pick<CloudProviderStatus, "methods">): boolean {
+  return !signInGuided(provider) && (provider.methods ?? []).includes(OLDER_CLOUD_METHOD);
+}
+
+/** A Connect an older cloud answered with its login terminal (the sign-in
+ * step, `waiting`). Setting up an agent (`preparing`) is not a sign-in. */
+export function olderCloudSignIn(connection: CloudProviderConnection | null | undefined): boolean {
+  return connection?.phase === "waiting" && connection.action?.type === OLDER_CLOUD_METHOD;
+}
+
+/** The providers still waiting for the cloud's update after a Connect found
+ * an older cloud: each stays until fresh catalog rows offer it a guided
+ * sign-in (the one-time code), and only then does Connect come back. */
+export function stillAwaitingUpdate(waiting: string[], fresh: CloudProviderStatus[]): string[] {
+  return waiting.filter(id => !fresh.some(provider => provider.id === id && signInGuided(provider)));
+}
+
+/** A row's line while its sign-in waits for the cloud's update. */
+export function cloudUpdateLine(label: string): string {
+  return `Your cloud is being updated. ${label} sign-in is available again in a few minutes.`;
+}
+
 /** What a Connect button says while its press is in flight, including while
  * the cloud comes up behind it: the action, never how the cloud gets there. */
 export function connectingLabel(provider: Pick<CloudProviderStatus, "label" | "category">): string {

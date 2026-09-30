@@ -73,6 +73,11 @@ fn set_up<'a>(
     ) || hosts.any(|host| host.kind == HostKind::Worker && host.daemon.is_some())
 }
 
+/// What the page may ask of the account's cloud. There is no terminal
+/// operation: an older cloud still answers GitHub's connect with a login
+/// terminal, which the app never opens (it never shows the cloud's own page);
+/// the panel says the cloud is being updated instead, so an
+/// `open_provider_terminal` request fails to parse.
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum Request {
@@ -97,9 +102,6 @@ pub enum Request {
         code: String,
     },
     OpenProviderBrowser {
-        connection_id: String,
-    },
-    OpenProviderTerminal {
         connection_id: String,
     },
     ResumeHandoff {
@@ -208,7 +210,7 @@ where
 }
 
 // Cached metadata survives VM suspension; require an authenticated live
-// response before opening a login terminal against a possibly stale bearer.
+// response before sending a woken request against a possibly stale bearer.
 async fn live_worker(client: &Client, host: &Host) -> bool {
     let Some(daemon) = &host.daemon else {
         return false;
@@ -261,7 +263,6 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
             | Request::Project { .. }
             | Request::ProviderConnect { .. }
             | Request::ProviderDisconnect { .. }
-            | Request::OpenProviderTerminal { .. }
             | Request::ResumeHandoff { .. }
     );
     let account_mutation = matches!(
@@ -270,7 +271,6 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
     );
     let open_browser = matches!(request, Request::OpenProviderBrowser { .. });
     let catalog = matches!(request, Request::Providers);
-    let open_terminal = matches!(request, Request::OpenProviderTerminal { .. });
     let timeout = match &request {
         Request::ResumeHandoff { .. } => 1200,
         Request::Project { .. } => 310,
@@ -311,7 +311,6 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
         }
         Request::ProviderConnection { connection_id }
         | Request::OpenProviderBrowser { connection_id }
-        | Request::OpenProviderTerminal { connection_id }
             if valid_id(&connection_id) =>
         {
             (format!("cloud/connections/{connection_id}"), None)
@@ -426,47 +425,18 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
             state.pro.agents.record(&account, &value);
         }
     }
-    if open_browser || open_terminal {
-        let connection = active_connection(&value)?;
-        if open_terminal {
-            let action = &connection["action"];
-            if action["type"] != "terminal" {
-                return Err("This connection doesn't need a terminal.".into());
-            }
-            let workspace = action["workspace_id"]
-                .as_str()
-                .filter(|id| valid_id(id))
-                .ok_or("The connection workspace is unavailable.")?
-                .to_owned();
-            let session = action["session_id"]
-                .as_str()
-                .filter(|id| valid_id(id))
-                .ok_or("The connection session is unavailable.")?
-                .to_owned();
-            let _operation = state.pro.operation.lock().await;
-            if state.pro.generation() != generation {
-                return Err("Your account changed. Start the connection again.".into());
-            }
-            // Resolving the alias may reconnect saved windows. Bind that side
-            // effect to the same account as the server-owned login session.
-            tokio::time::timeout(
-                Duration::from_secs(20),
-                super::connect::do_connect(&app, host.alias.clone(), false),
-            )
-            .await
-            .map_err(|_| "The cloud connection timed out. Try again.")??;
-            super::notices::open_session(&app, host.alias.clone(), workspace, session).await?;
-        } else {
-            let url = connection_browser_url(connection)?;
-            let _operation = state.pro.operation.lock().await;
-            if state.pro.generation() != generation {
-                return Err("Your account changed. Start the connection again.".into());
-            }
-            tokio::task::spawn_blocking(move || open::that(url.as_str()))
-                .await
-                .map_err(|_| "Couldn't open your browser. Try again.")?
-                .map_err(|_| "Couldn't open your browser. Try again.")?;
+    if open_browser {
+        // Only a provider's validated sign-in page, in the user's own
+        // browser. Nothing here ever opens a window on the cloud.
+        let url = connection_browser_url(active_connection(&value)?)?;
+        let _operation = state.pro.operation.lock().await;
+        if state.pro.generation() != generation {
+            return Err("Your account changed. Start the connection again.".into());
         }
+        tokio::task::spawn_blocking(move || open::that(url.as_str()))
+            .await
+            .map_err(|_| "Couldn't open your browser. Try again.")?
+            .map_err(|_| "Couldn't open your browser. Try again.")?;
     }
     value["host_alias"] = Value::String(host.alias);
     Ok(value)
@@ -680,6 +650,27 @@ mod tests {
             github["action"]["verification_url"] = json!(invalid);
             assert!(connection_browser_url(&github).is_err());
         }
+    }
+
+    #[test]
+    fn an_older_clouds_terminal_sign_in_is_never_opened() {
+        // The page has no terminal operation to ask for; the request is
+        // refused before anything reaches the cloud.
+        assert!(serde_json::from_value::<Request>(
+            json!({"operation":"open_provider_terminal","connection_id":"attempt-1"})
+        )
+        .is_err());
+        assert!(matches!(
+            serde_json::from_value::<Request>(
+                json!({"operation":"open_provider_browser","connection_id":"attempt-1"})
+            ),
+            Ok(Request::OpenProviderBrowser { .. })
+        ));
+        // Nor does the browser step open anything for an older cloud's
+        // GitHub sign-in, which answers with a login terminal.
+        let older = json!({"provider_id":"github","phase":"waiting","expires_at":u64::MAX,
+            "action":{"type":"terminal","workspace_id":"setup","session_id":"login"}});
+        assert!(connection_browser_url(&older).is_err());
     }
 
     #[test]

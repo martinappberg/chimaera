@@ -237,6 +237,15 @@ declined or left to expire (`sign_in_failed`), Git not set up (`git_setup_failed
 where **Try again** repeats only that step), or the request's own time limit. On
 success the panel says GitHub is connected and the user's cloud can now pull and
 push their repositories.
+A cloud the service has not updated yet still answers GitHub's **Connect** with a
+login terminal on the cloud. Chimaera never opens it, in the app or in a browser:
+that attempt ends quietly and the GitHub row says “Your cloud is being updated.
+GitHub sign-in is available again in a few minutes.” with **Try again** in place of
+**Connect**. Try again only looks (one passive catalog read, never waking the
+cloud); **Connect** comes back once the cloud offers the one-time code, whether
+Try again or the section's own catalog check sees it first. A catalog read that
+finds such a cloud offering only its terminal sign-in reads the same way before
+anything is pressed (`pro/providers.ts` `olderCloudSignIn`, `awaitingCloudUpdate`).
 A new attempt brings its guide into view; background status updates never scroll
 or reload the page. Installation remains automatic and separate from sign-in.
 Users can cancel or retry an expired request in place. Sign-in is confirmed by the provider CLI on the cloud
@@ -325,9 +334,15 @@ connect/disconnect routes, connection read/cancel/input routes, and `/api/v1/pro
 Agent sign-in only runs through those provider connection jobs (the older
 login-terminal route `/api/v1/pro/cloud/onboard` is gone).
 The native `pro_cloud_request` command keeps account and daemon credentials out
-of the UI and opens only a server-owned connection's validated browser URL or
-terminal (a terminal only for an older cloud machine's GitHub sign-in, which the
-panel calls a sign-in window). Browser clients use the same routes through the host-pinned gateway.
+of the UI and opens only a server-owned connection's validated browser URL, in
+the user's own browser. It has no terminal operation: an older cloud's terminal
+sign-in is never opened, and the panel says the cloud is being updated instead
+(above). Browser clients use the same routes through the host-pinned gateway.
+The app never opens the cloud's own page: nothing connects to the cloud as a
+host (`shell/connect.rs`), no window is created on it (`shell/restore.rs`), a
+window on it saved by an older build is dropped at launch instead of restored,
+and it never reads as outdated or gets an update offer, since the service
+updates its daemon (`shell/tunnel.rs` `offers_daemon_update`).
 A shared provider catalog bounds external authentication origins in both clients.
 
 ## Where it lives

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentsConnected, catalogRows, canDisconnect, canStartConnection, connectingLabel, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, nextReadyHandoff, panelRows, pausedConnect, pendingConnection, providerLabel, providerLoginUrl, providersReady, recoverDisconnect, rememberedRows, sameConnection, type ProviderHandoff } from "./providers";
+import { agentsConnected, awaitingCloudUpdate, catalogRows, canDisconnect, canStartConnection, cloudUpdateLine, connectingLabel, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, nextReadyHandoff, olderCloudSignIn, panelRows, pausedConnect, pendingConnection, providerLabel, providerLoginUrl, providersReady, recoverDisconnect, rememberedRows, sameConnection, signInGuided, stillAwaitingUpdate, type ProviderHandoff } from "./providers";
 import type { CloudProviderConnection, CloudProviderStatus } from "../net/native";
 const row = (id: string, state: CloudProviderStatus["state"], category: CloudProviderStatus["category"] = "agent"): CloudProviderStatus => ({ id, label: id, state, category, installed: true, reason: null, checked_at: 1, methods: ["device_code"] });
 describe("provider readiness", () => {
@@ -210,5 +210,36 @@ describe("the last known connections", () => {
     expect(repository).toContain("GitHub");
     expect(agent).not.toBe(connectingLabel({ label: "Claude Code", category: "repository" }));
     for (const line of [agent, repository]) expect(line).not.toMatch(/machine|wak|asleep|start/i);
+  });
+});
+
+describe("an older cloud", () => {
+  const attempt = (phase: CloudProviderConnection["phase"], action: CloudProviderConnection["action"]): CloudProviderConnection => ({ id: "attempt", provider_id: "github", phase, expires_at: 1, action, error_code: null });
+  it("recognizes only its sign-in step, never the cloud setting up an agent", () => {
+    expect(olderCloudSignIn(attempt("waiting", { type: "terminal" }))).toBe(true);
+    expect(olderCloudSignIn(attempt("preparing", { type: "terminal" }))).toBe(false);
+    expect(olderCloudSignIn(attempt("waiting", { type: "device_code", verification_url: "https://github.com/login/device", user_code: "ABCD-1234" }))).toBe(false);
+    expect(olderCloudSignIn(attempt("waiting", null))).toBe(false);
+    expect(olderCloudSignIn(null)).toBe(false);
+  });
+  it("reads a catalog row offering only the older sign-in as waiting for the update", () => {
+    const github = (methods: string[]): CloudProviderStatus => ({ ...row("github", "needs_sign_in", "repository"), methods });
+    expect(awaitingCloudUpdate(github(["terminal"]))).toBe(true);
+    expect(awaitingCloudUpdate(github(["device_code"]))).toBe(false);
+    expect(awaitingCloudUpdate(github(["terminal", "device_code"]))).toBe(false);
+    expect(awaitingCloudUpdate(github([]))).toBe(false);
+    expect(signInGuided(github(["device_code"]))).toBe(true);
+    expect(signInGuided({ ...row("claude", "needs_sign_in"), methods: ["browser_code"] })).toBe(true);
+    expect(signInGuided(github(["terminal"]))).toBe(false);
+  });
+  it("brings Connect back only once a fresh catalog offers the one-time code", () => {
+    const github = (methods: string[]): CloudProviderStatus => ({ ...row("github", "needs_sign_in", "repository"), methods });
+    expect(stillAwaitingUpdate(["github"], [github(["terminal"])])).toEqual(["github"]);
+    expect(stillAwaitingUpdate(["github"], [])).toEqual(["github"]);
+    expect(stillAwaitingUpdate(["github"], [github(["device_code"])])).toEqual([]);
+    expect(stillAwaitingUpdate(["github", "codex"], [github(["device_code"])])).toEqual(["codex"]);
+  });
+  it("says so in the row, in plain words", () => {
+    expect(cloudUpdateLine("GitHub")).toBe("Your cloud is being updated. GitHub sign-in is available again in a few minutes.");
   });
 });

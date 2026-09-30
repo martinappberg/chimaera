@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cloudAction, cloudRequest, peekCatalog } from "./cloudTransport";
 import { WAKE_BOUND_MS } from "./presentation";
+import type { CloudSetupRequest } from "../net/native";
 const mocks = vi.hoisted(() => ({ api: vi.fn(), native: vi.fn(() => false), invoke: vi.fn() }));
 vi.mock("../net/api", () => ({ api: mocks.api }));
 vi.mock("../net/native", () => ({ isNativeShell: mocks.native, proCloudRequest: mocks.invoke }));
@@ -54,15 +55,13 @@ describe("cloud provider request intent", () => {
     mocks.api.mockResolvedValue(new Response(null, { status: 204 }));
     await expect(cloudRequest({ operation: "resume_handoff", workspace_id: "ws-1", expected_epoch: 7 })).resolves.toEqual({});
   });
-  it("opens the server-owned terminal through routing, without a URL token or hash rewrite", async () => {
+  it("never opens a window on the cloud: an older page's terminal request reaches nothing", async () => {
     const dispatchEvent = vi.fn();
     vi.stubGlobal("window", { dispatchEvent });
-    mocks.api.mockResolvedValue(Response.json({ available: true, connection: { action: { type: "terminal", workspace_id: "setup", session_id: "login" } } }));
-    await cloudRequest({ operation: "open_provider_terminal", connection_id: "a" });
-    const event = dispatchEvent.mock.calls[0][0];
-    expect(event.type).toBe("chimaera:provider-terminal");
-    expect(event.detail).toEqual({ workspaceId: "setup", sessionId: "login" });
-    expect(mocks.api.mock.calls[0][1].headers).toEqual({});
+    const older = { operation: "open_provider_terminal", connection_id: "a" } as unknown as CloudSetupRequest;
+    await expect(cloudRequest(older)).rejects.toThrow("This cloud operation isn't available.");
+    expect(mocks.api).not.toHaveBeenCalled();
+    expect(dispatchEvent).not.toHaveBeenCalled();
   });
   it("passes native browser-open only the connection id", async () => {
     mocks.native.mockReturnValue(true);

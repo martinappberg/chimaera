@@ -1070,7 +1070,10 @@ export interface CloudProviderConnection {
   expires_at: number;
   action: { type: "device_code"; verification_url: string; user_code: string }
     | { type: "browser"; url: string; input?: "authorization_code" }
-    | { type: "terminal"; workspace_id: string; session_id: string } | null;
+    /** A terminal on the cloud: its own agent setup while `preparing`, or an
+     * older cloud's GitHub sign-in while `waiting`. Never opened from here
+     * (`pro/providers.ts` `olderCloudSignIn`). */
+    | { type: "terminal" } | null;
   error_code: string | null;
 }
 export interface CloudBlockedProvider {
@@ -1097,7 +1100,7 @@ export type CloudSetupRequest = { operation: "info" | "start" | "providers" }
   | { operation: "provider_connect"; provider_id: string }
   | { operation: "provider_disconnect"; provider_id: string; acknowledge_cloud_work: true }
   | { operation: "provider_submit"; connection_id: string; code: string }
-  | { operation: "provider_connection" | "provider_cancel" | "open_provider_browser" | "open_provider_terminal"; connection_id: string }
+  | { operation: "provider_connection" | "provider_cancel" | "open_provider_browser"; connection_id: string }
   | { operation: "resume_handoff"; workspace_id: string; expected_epoch: number }
   | { operation: "project"; url: string; name?: string };
 export async function proCloudRequest(request: CloudSetupRequest): Promise<CloudSetupInfo> {
