@@ -25,7 +25,7 @@ on:
       - ".github/workflows/app.yml"
   workflow_dispatch:
 
-# macOS runners are the scarcest resource here (5 concurrent, 5 min a build):
+# macOS runners are the scarcest resource here (5 concurrent, ~10 min a build):
 # never leave an obsolete bundle building after a new commit supersedes it.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
