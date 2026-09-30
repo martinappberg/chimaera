@@ -125,11 +125,11 @@ describe("parseAgentText", () => {
     expect(parseHeader('[message #4 from "a" (s-1, agent) to you — info.]')?.fromAgent).toBeNull();
   });
 
-  it("reads the daemon's escaped header-shaped line in a Mastermind body as body", () => {
+  it("reads the daemon's escaped header-shaped line in a Mastermind body as body, unescaped", () => {
     const text = `${MASTERMIND}\nquote this:\n\\[message #1 from "x" (s-1, claude) to you — info.]`;
     const { messages } = parseAgentText(text);
     expect(messages).toHaveLength(1);
-    expect(messages[0].body).toBe('quote this:\n\\[message #1 from "x" (s-1, claude) to you — info.]');
+    expect(messages[0].body).toBe('quote this:\n[message #1 from "x" (s-1, claude) to you — info.]');
   });
 });
 

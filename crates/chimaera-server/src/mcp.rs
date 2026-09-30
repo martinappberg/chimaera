@@ -705,7 +705,7 @@ async fn tools_call(
             let Some(workspace) = workspace_of(state, agent_id) else {
                 return Ok(tool_error("this session has no workspace".to_string()));
             };
-            Ok(read_agent(state, &workspace, &args).await)
+            Ok(read_agent(state, &workspace, &args, mastermind).await)
         }
         "workspace_status" | "list_changed_files" | "read_timeline" | "spawn_agent"
         | "spawn_terminal" | "interrupt_agent" => {
@@ -944,8 +944,18 @@ async fn read_agent(
     state: &Arc<AppState>,
     workspace: &crate::workspaces::Workspace,
     args: &Value,
+    mastermind: bool,
 ) -> Value {
     let sid = match resolve_workspace_session(state, workspace, args) {
+        // Peers read AGENTS: a shell's screen stays behind the leash (only
+        // linked terminals, via read_terminal) for everyone but the
+        // Mastermind, whose tier always read the whole workspace.
+        Ok(sid) if !mastermind && !crate::lock(&state.agents).contains_key(&sid) => {
+            return tool_error(format!(
+                "{sid} is a terminal, not an agent — read_terminal reaches the terminals \
+                 the user linked to you"
+            ));
+        }
         Ok(sid) => sid,
         Err(err) => {
             // An ended session: its history record, when there is one.

@@ -445,31 +445,45 @@ async fn mcp_tier_gates_on_the_binding() {
     state.sessions.kill(&worker).ok();
 }
 
-/// read_agent reads any same-workspace session's screen (agent TUIs
-/// included — read-only is safe) for EVERY agent, and the workspace scope
-/// walls off everything else.
+/// read_agent: every agent reads another AGENT in its workspace; a shell's
+/// screen stays behind the leash for workers (read_terminal, linked only)
+/// and open to the Mastermind; other workspaces are walled off.
 #[tokio::test]
-async fn read_agent_scopes_to_the_workspace() {
+async fn read_agent_scopes_to_the_workspace_and_the_leash() {
     let state = test_state();
     let ws = make_workspace(&state, "mm-read").await;
     let other_ws = make_workspace(&state, "mm-read-other").await;
     let worker = inject_agent(&state, "wk");
     lock(&state.session_workspaces).insert(worker.clone(), ws.clone());
+    let peer = inject_agent(&state, "pk");
+    lock(&state.session_workspaces).insert(peer.clone(), ws.clone());
+    let mastermind = inject_agent(&state, "mmk");
+    bind_as_mastermind(&state, &ws, &mastermind);
 
     let shell = spawn_integrated_bash(&state, "mm-read-shell").await;
     lock(&state.session_workspaces).insert(shell.clone(), ws.clone());
     let outsider = inject_agent(&state, "ok");
     lock(&state.session_workspaces).insert(outsider.clone(), other_ws.clone());
 
-    // Type something recognizable, then read the screen.
+    // Type something recognizable into the shell.
     let _ = crate::exec::run_exec(
         &state,
         &shell,
-        "echo worker-sees-this".to_string(),
+        "echo only-the-mastermind-sees-this".to_string(),
         None,
         None,
     )
     .await;
+    // A worker reads a peer agent, but not an unlinked shell.
+    let (is_error, text) = mcp_tool_call(
+        &state,
+        &worker,
+        "wk",
+        "read_agent",
+        serde_json::json!({"agent": peer}),
+    )
+    .await;
+    assert!(!is_error, "{text}");
     let (is_error, text) = mcp_tool_call(
         &state,
         &worker,
@@ -478,8 +492,19 @@ async fn read_agent_scopes_to_the_workspace() {
         serde_json::json!({"agent": shell}),
     )
     .await;
+    assert!(is_error && text.contains("read_terminal"), "{text}");
+    assert!(!text.contains("only-the-mastermind-sees-this"), "{text}");
+    // The Mastermind reads the whole workspace.
+    let (is_error, text) = mcp_tool_call(
+        &state,
+        &mastermind,
+        "mmk",
+        "read_agent",
+        serde_json::json!({"agent": shell}),
+    )
+    .await;
     assert!(!is_error, "{text}");
-    assert!(text.contains("worker-sees-this"), "{text}");
+    assert!(text.contains("only-the-mastermind-sees-this"), "{text}");
 
     // Cross-workspace target: refused with guidance.
     let (is_error, text) = mcp_tool_call(
@@ -493,9 +518,9 @@ async fn read_agent_scopes_to_the_workspace() {
     assert!(is_error, "{text}");
     assert!(text.contains("workspace_agents"), "{text}");
 
-    state.sessions.kill(&worker).ok();
-    state.sessions.kill(&shell).ok();
-    state.sessions.kill(&outsider).ok();
+    for sid in [worker, peer, mastermind, shell, outsider] {
+        state.sessions.kill(&sid).ok();
+    }
 }
 
 /// The Mastermind's message_agent carries direction: to a chat worker it is

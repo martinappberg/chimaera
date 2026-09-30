@@ -90,8 +90,12 @@ const IN_FLIGHT_MAX: usize = 256;
 const OUTPUT_QUIET_MS: u64 = 2_000;
 /// Names in a header: one line, bounded.
 const NAME_MAX: usize = 80;
-/// `read_messages {all}` shows at most this many.
-const ALL_MESSAGES_MAX: usize = 20;
+/// `read_messages` shows at most this many (and bytes); the rest wait for
+/// the next call.
+const READ_MESSAGES_MAX: usize = 20;
+const READ_BYTES_MAX: usize = 16 * 1024;
+/// Messages per reader waiting to meet the wake policy at its turn end.
+const AWAITING_MAX: usize = 64;
 
 /// What may start a turn in an idle agent (`agents.communication.wakes`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,6 +207,15 @@ struct CommsState {
     epochs: HashMap<String, u64>,
     /// Workspaces whose read state changed since it was last written.
     dirty: HashSet<String>,
+    /// Per (workspace, reader): messages sent while the reader was working
+    /// that must meet the wake policy if its turn ends before it reads them
+    /// — once. Nothing else does: a broadcast never wakes anyone, and a
+    /// message the policy already decided (the user's "Leave in inbox")
+    /// isn't re-asked at every later turn end.
+    awaiting: HashMap<(String, String), BTreeSet<u64>>,
+    /// Per workspace: the newest message seq seen — a reader whose floor is
+    /// past it has nothing to read, without scanning the Timeline.
+    last_message: HashMap<String, u64>,
 }
 
 /// Agent communication's daemon-wide half (on `AppState.comms`).
@@ -241,6 +254,7 @@ impl Comms {
         st.posts.remove(sid);
         st.woke_at.remove(sid);
         st.in_flight.retain(|_, f| f.reader != sid);
+        st.awaiting.retain(|(_, reader), _| reader != sid);
         let mut touched = Vec::new();
         for (ws, list) in st.requests.iter_mut() {
             let before = list.len();
@@ -262,6 +276,8 @@ impl Comms {
         st.wakes.remove(ws);
         st.epochs.remove(ws);
         st.dirty.remove(ws);
+        st.awaiting.retain(|(w, _), _| w != ws);
+        st.last_message.remove(ws);
         st.in_flight.retain(|_, f| f.ws != ws);
         st.thread_wakes.retain(|(w, _), _| w != ws);
         st.thread_order.retain(|(w, _)| w != ws);
@@ -328,10 +344,20 @@ fn persist(state: &Arc<AppState>, ws: &str) {
             crate::persist::atomic_write_json(&path, body)
         })
         .await;
-        match wrote {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => tracing::warn!(%err, workspace = %ws, "agent read state not saved"),
-            Err(err) => tracing::warn!(%err, workspace = %ws, "agent read state write failed"),
+        let failed = match wrote {
+            Ok(Ok(())) => false,
+            Ok(Err(err)) => {
+                tracing::warn!(%err, workspace = %ws, "agent read state not saved");
+                true
+            }
+            Err(err) => {
+                tracing::warn!(%err, workspace = %ws, "agent read state write failed");
+                true
+            }
+        };
+        // Still unsaved: the next write (any later change) carries it.
+        if failed {
+            crate::lock(&state.comms.inner).dirty.insert(ws);
         }
     });
 }
@@ -480,8 +506,35 @@ impl CommsState {
         if let Some(list) = self.requests.get_mut(ws) {
             list.retain(|r| r.to_sid != reader || !seqs.contains(&r.message));
         }
+        if let Some(set) = self.awaiting.get_mut(&(ws.to_string(), reader.to_string())) {
+            set.retain(|s| !seqs.contains(s));
+        }
         self.dirty.insert(ws.to_string());
         bump(self, ws);
+    }
+
+    /// A message reached a working chat's carrier: if its turn ends before
+    /// it reads it, it meets the wake policy then (`idle_check`).
+    fn await_turn_end(&mut self, ws: &str, reader: &str, seq: u64) {
+        let set = self
+            .awaiting
+            .entry((ws.to_string(), reader.to_string()))
+            .or_default();
+        set.insert(seq);
+        while set.len() > AWAITING_MAX {
+            set.pop_first();
+        }
+    }
+
+    /// Nothing newer than the reader's floor: no message to read.
+    fn nothing_new(&self, ws: &str, reader: &str) -> bool {
+        let Some(last) = self.last_message.get(ws) else {
+            return false;
+        };
+        self.inboxes
+            .get(ws)
+            .and_then(|inbox| inbox.readers.get(reader))
+            .is_some_and(|rs| rs.floor >= *last)
     }
 
     /// Ask the user about a wake: one request per reader (a newer message
@@ -642,6 +695,11 @@ async fn messages(state: &Arc<AppState>, ws: &str) -> Vec<Arc<Entry>> {
         .filter(|e| is_message(e))
         .collect();
     out.reverse();
+    if let Some(newest) = out.last() {
+        let mut st = crate::lock(&state.comms.inner);
+        let last = st.last_message.entry(ws.to_string()).or_insert(0);
+        *last = (*last).max(newest.seq);
+    }
     out
 }
 
@@ -663,6 +721,9 @@ async fn take_unread(
     pick: impl FnOnce(&[Arc<Entry>]) -> usize,
 ) -> Vec<Arc<Entry>> {
     ensure_loaded(state, &reader.ws).await;
+    if crate::lock(&state.comms.inner).nothing_new(&reader.ws, &reader.sid) {
+        return Vec::new();
+    }
     let msgs = messages(state, &reader.ws).await;
     let mut st = crate::lock(&state.comms.inner);
     let unread = st.unread(reader, &msgs);
@@ -1103,6 +1164,20 @@ pub(crate) async fn message_agent(state: &Arc<AppState>, from_sid: &str, args: &
     let posted = state.timeline.append(&from.ws, entry).await;
     tracing::info!(workspace = %from.ws, from = %from.sid, message = posted.seq,
         to = %to, delivery, "agent message");
+    {
+        let mut st = crate::lock(&state.comms.inner);
+        let last = st.last_message.entry(from.ws.clone()).or_insert(0);
+        *last = (*last).max(posted.seq);
+        if !broadcast {
+            for (target, plan) in targets.iter().zip(&plans) {
+                let next_step = matches!(plan, Plan::Steer)
+                    || matches!(plan, Plan::Carrier if target.busy && target.chat);
+                if next_step {
+                    st.await_turn_end(&target.ws, &target.sid, posted.seq);
+                }
+            }
+        }
+    }
     let mut outcome = String::new();
     for (target, plan) in targets.iter().zip(plans) {
         let said = execute(state, &from, target, plan, &posted, thread_key.clone()).await;
@@ -1437,10 +1512,31 @@ async fn idle_check(state: &Arc<AppState>, sid: &str) {
     if !reader.chat || !reader.alive || reader.busy {
         return;
     }
-    let unread = unread_now(state, &reader).await;
+    let key = (reader.ws.clone(), reader.sid.clone());
+    let awaiting = crate::lock(&state.comms.inner)
+        .awaiting
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+    if awaiting.is_empty() {
+        return;
+    }
+    // Only what reached a carrier while it worked and was never read meets
+    // the policy here, once; a steer still in flight waits for its fate.
+    let unread: Vec<Arc<Entry>> = unread_now(state, &reader)
+        .await
+        .into_iter()
+        .filter(|e| awaiting.contains(&e.seq))
+        .collect();
     let Some(newest) = unread.last() else {
         return;
     };
+    {
+        let mut st = crate::lock(&state.comms.inner);
+        if let Some(set) = st.awaiting.get_mut(&key) {
+            set.retain(|s| !unread.iter().any(|e| e.seq == *s));
+        }
+    }
     let Some(note) = newest.note.as_ref() else {
         return;
     };
@@ -1807,43 +1903,67 @@ pub(crate) async fn read_messages(state: &Arc<AppState>, sid: &str, args: &Value
     };
     let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
     let unread = unread_now(state, &me).await;
-    if all {
+    // Bounded like every tool answer: the oldest first, up to the caps; only
+    // what is shown is settled.
+    let fit = |list: &[Arc<Entry>]| {
+        let mut bytes = 0usize;
+        list.iter()
+            .take(READ_MESSAGES_MAX)
+            .take_while(|e| {
+                bytes += e.note.as_ref().map_or(0, |n| n.text.len()) + 300;
+                bytes <= READ_BYTES_MAX
+            })
+            .count()
+            .max(1)
+            .min(list.len())
+    };
+    let (shown, lead): (Vec<Arc<Entry>>, &str) = if all {
         let msgs = messages(state, &me.ws).await;
         let mine: Vec<Arc<Entry>> = msgs
             .iter()
             .filter(|e| e.note.as_ref().is_some_and(|n| addressed_to(n, e.ts, &me)))
-            .rev()
-            .take(ALL_MESSAGES_MAX)
             .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
             .collect();
         if mine.is_empty() {
             return text("No messages for you in this workspace's recent history.".into());
         }
-        let seqs: Vec<u64> = unread.iter().map(|e| e.seq).collect();
+        // The newest that fit, in order.
+        let newest: Vec<Arc<Entry>> = mine.iter().rev().cloned().collect();
+        let n = fit(&newest);
+        let mut shown: Vec<Arc<Entry>> = newest.into_iter().take(n).collect();
+        shown.reverse();
+        (
+            shown,
+            "Recent messages to you (and to everyone), oldest first:",
+        )
+    } else {
+        if unread.is_empty() {
+            return text("No messages waiting for you.".into());
+        }
+        let n = fit(&unread);
+        (
+            unread[..n].to_vec(),
+            "Messages waiting for you, oldest first:",
+        )
+    };
+    let seqs: Vec<u64> = shown
+        .iter()
+        .filter(|e| unread.iter().any(|u| u.seq == e.seq))
+        .map(|e| e.seq)
+        .collect();
+    if !seqs.is_empty() {
         crate::lock(&state.comms.inner).settle(&me.ws, &me.sid, &seqs);
         persist(state, &me.ws);
         state.changes.notify_waiters();
-        return text(render_batch(
-            Some("Recent messages to you (and to everyone), oldest first:"),
-            &mine,
-            &me,
+    }
+    let mut out = render_batch(Some(lead), &shown, &me);
+    let left = unread.len().saturating_sub(seqs.len());
+    if left > 0 {
+        out.push_str(&format!(
+            "({left} more unread — call read_messages again.)\n"
         ));
     }
-    if unread.is_empty() {
-        return text("No messages waiting for you.".into());
-    }
-    let seqs: Vec<u64> = unread.iter().map(|e| e.seq).collect();
-    crate::lock(&state.comms.inner).settle(&me.ws, &me.sid, &seqs);
-    persist(state, &me.ws);
-    state.changes.notify_waiters();
-    text(render_batch(
-        Some("Messages waiting for you, oldest first:"),
-        &unread,
-        &me,
-    ))
+    text(out)
 }
 
 // ---- Routes -----------------------------------------------------------------
@@ -2087,6 +2207,9 @@ pub(crate) async fn deliver(
                 Some(&note.text),
             );
             if note.delivery.is_some() {
+                // Loaded first: a settle into a never-loaded workspace would
+                // start its read state empty and overwrite the saved one.
+                ensure_loaded(&state, &id).await;
                 crate::lock(&state.comms.inner).settle(&id, &target, &[seq]);
                 persist(&state, &id);
                 state.changes.notify_waiters();

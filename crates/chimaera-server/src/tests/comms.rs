@@ -563,3 +563,126 @@ async fn switched_off_nothing_moves() {
         state.sessions.kill(&sid).ok();
     }
 }
+
+/// Only a message that reached a working chat and went unread meets the
+/// wake policy at its turn end — once. A broadcast never wakes it, and a
+/// message the user left in the inbox isn't asked about again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_end_decides_only_what_missed_the_turn_and_only_once() {
+    let state = test_state();
+    set_comms(&state, true, "auto").await;
+    let ws = make_workspace(&state, "comms-turn-end").await;
+    let a = tui(&state, &ws, "ka");
+    let (c, _) = chat(&state, &ws, "comms-turn-end-fake").await;
+    let turn_end = |state: &Arc<AppState>| {
+        lock(&state.agents).get_mut(&c).unwrap().state = agent_state::AgentState::Finished;
+        crate::comms::on_chat_event(
+            state,
+            &c,
+            &chimaera_agent::model::AgentEvent::TurnCompleted {
+                turn_id: "t".into(),
+                usage: Default::default(),
+            },
+        );
+    };
+
+    // A broadcast while C works, still unread at its turn end: no wake.
+    lock(&state.agents).get_mut(&c).unwrap().state = agent_state::AgentState::Running;
+    let (is_err, _) = send(
+        &state,
+        &a,
+        "ka",
+        serde_json::json!({"to": "everyone", "text": "broadcast-only"}),
+    )
+    .await;
+    assert!(!is_err);
+    turn_end(&state);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !journal(&state, &c).contains("broadcast-only"),
+        "a broadcast woke it"
+    );
+
+    // Ask: a direct message while it works → at the turn end, one request;
+    // the user leaves it in the inbox; the next turn end asks nothing.
+    set_comms(&state, true, "ask").await;
+    lock(&state.agents).get_mut(&c).unwrap().state = agent_state::AgentState::Running;
+    let (_, text) = send(
+        &state,
+        &a,
+        "ka",
+        serde_json::json!({"to": c, "text": "left-in-inbox"}),
+    )
+    .await;
+    assert!(text.contains("next step"), "{text}");
+    turn_end(&state);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let wid = loop {
+        let body = comms(&state, &ws).await;
+        if let Some(r) = body["wake_requests"].as_array().unwrap().first() {
+            break r["id"].as_str().unwrap().to_string();
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no request: {body}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let (status, _) = request(
+        &state,
+        Method::POST,
+        &format!("/api/v1/workspaces/{ws}/comms/wakes/{wid}"),
+        Some(serde_json::json!({"wake": false})),
+    )
+    .await;
+    assert!(status.is_success());
+    lock(&state.agents).get_mut(&c).unwrap().state = agent_state::AgentState::Running;
+    turn_end(&state);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let body = comms(&state, &ws).await;
+    assert!(
+        body["wake_requests"].as_array().unwrap().is_empty(),
+        "asked again: {body}"
+    );
+    assert_eq!(
+        body["unread"][&c], 2,
+        "both still wait in its inbox: {body}"
+    );
+    assert!(!journal(&state, &c).contains("left-in-inbox"));
+
+    state.chat.kill(&c);
+    state.sessions.kill(&a).ok();
+}
+
+/// read_messages is bounded: 20 at most per call, oldest first, and only
+/// what it shows is marked read.
+#[tokio::test]
+async fn read_messages_is_bounded_and_settles_only_what_it_shows() {
+    let state = test_state();
+    let ws = make_workspace(&state, "comms-read-cap").await;
+    let b = tui(&state, &ws, "kb");
+    // 25 senders (the post window is per sender, 10 a minute).
+    let mut senders = Vec::new();
+    for i in 0..25 {
+        let key = format!("ks{i}");
+        let sid = tui(&state, &ws, &key);
+        let (is_err, text) = send(
+            &state,
+            &sid,
+            &key,
+            serde_json::json!({"to": b, "text": format!("note number {i}")}),
+        )
+        .await;
+        assert!(!is_err, "{text}");
+        senders.push(sid);
+    }
+    let (_, first) = mcp_tool_call(&state, &b, "kb", "read_messages", serde_json::json!({})).await;
+    assert!(first.contains("note number 0\n"), "oldest first: {first}");
+    assert!(!first.contains("note number 24"), "{first}");
+    assert!(first.contains("5 more unread"), "{first}");
+    let (_, second) = mcp_tool_call(&state, &b, "kb", "read_messages", serde_json::json!({})).await;
+    assert!(second.contains("note number 24"), "{second}");
+    assert!(!second.contains("note number 0\n"), "{second}");
+    let (_, third) = mcp_tool_call(&state, &b, "kb", "read_messages", serde_json::json!({})).await;
+    assert!(third.contains("No messages waiting"), "{third}");
+    for sid in senders.into_iter().chain([b]) {
+        state.sessions.kill(&sid).ok();
+    }
+}

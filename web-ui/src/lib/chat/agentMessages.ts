@@ -120,7 +120,9 @@ export function parseAgentText(text: string): ParsedAgentText {
   let body: string[] = [];
   const close = () => {
     if (current === null) return;
-    const kept = trimBlankLines(current.mastermind ? body : unquote(body));
+    // The daemon escapes a Mastermind body line that would pose as a header.
+    const unescaped = body.map((l) => (l.startsWith("\\[message #") ? l.slice(1) : l));
+    const kept = trimBlankLines(current.mastermind ? unescaped : unquote(body));
     messages.push({ ...current, body: kept.join("\n") });
   };
   for (const line of lines) {
