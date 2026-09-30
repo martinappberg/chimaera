@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use self::tunnel::Tunnel;
 use tauri::ipc::CapabilityBuilder;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 use crate::daemon::LocalDaemon;
 use crate::windows::{WindowRecord, WindowRegistry};
@@ -142,10 +142,6 @@ pub struct Shell {
     /// Each window's unsaved-file count and the close/quit prompts it is
     /// answering (see `unsaved`).
     unsaved: Mutex<unsaved::Guard>,
-    /// The held power assertion for the "caffeinate" toggle — Some = armed
-    /// (this machine won't idle/display/system-sleep). Dropped to disarm; the
-    /// guard drops on quit, so the assertion never outlives the app.
-    caffeinate: Mutex<Option<keepawake::KeepAwake>>,
     /// Live cross-window drags: source label → the sibling its pointer
     /// currently hovers (None over desktop). Entries live for one drag;
     /// `done_drags` is what fences late per-frame updates, so the entry
@@ -842,50 +838,6 @@ pub(crate) fn focused_daemon_open(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether the "caffeinate" power assertion is currently held. Reads the
-/// managed `Shell` off the app handle so the tray (a sibling module that can't
-/// see `Shell`'s private field) can reflect the state; false before startup.
-pub(crate) fn caffeinate_armed(app: &AppHandle) -> bool {
-    app.try_state::<Shell>()
-        .map(|s| lock(&s.caffeinate).is_some())
-        .unwrap_or(false)
-}
-
-/// Arm/disarm the caffeinate assertion for THIS machine, the shared core behind
-/// both the UI command (`commands::set_caffeinate`) and the tray's "Keep Awake"
-/// item. While armed the app host won't idle-, display-, or system-sleep —
-/// including lid-closed on macOS, though only on AC power (Apple blocks
-/// clamshell-awake on battery; no app can override that). Idempotent: re-arming
-/// keeps the single held guard, disarming drops it. The resulting state
-/// broadcasts on `caffeinate-changed` so every window's toggle AND the tray
-/// (icon + menu check) stay in sync regardless of which surface flipped it.
-pub(crate) fn apply_caffeinate(app: &AppHandle, on: bool) -> Result<bool, String> {
-    let shell = app
-        .try_state::<Shell>()
-        .ok_or_else(|| "the app is not ready yet".to_string())?;
-    let mut guard = lock(&shell.caffeinate);
-    if on {
-        if guard.is_none() {
-            let awake = keepawake::Builder::default()
-                .display(true)
-                .idle(true)
-                .sleep(true)
-                .app_name("Chimaera")
-                .app_reverse_domain("com.chimaera.app")
-                .reason("Caffeinate")
-                .create()
-                .map_err(|e| format!("{e:#}"))?;
-            *guard = Some(awake);
-        }
-    } else {
-        *guard = None; // dropping the guard releases the assertion
-    }
-    let armed = guard.is_some();
-    drop(guard);
-    let _ = app.emit("caffeinate-changed", armed);
-    Ok(armed)
-}
-
 /// Startup completion is a real three-state gate, NOT `try_state::<Shell>()`:
 /// the wizard's finishing command must be excluded while another invocation
 /// is mid-flight (provisioning runs minutes, and a webview reload re-enables
@@ -974,7 +926,6 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             quitting: AtomicBool::new(false),
             last_close_needs_home: AtomicBool::new(false),
             unsaved: Mutex::new(unsaved::Guard::default()),
-            caffeinate: Mutex::new(None),
             drags: Mutex::new(HashMap::new()),
             done_drags: Mutex::new(HashMap::new()),
             transfers: Mutex::new(HashMap::new()),
@@ -1098,8 +1049,6 @@ pub fn run() {
             commands::shell_build,
             commands::write_clipboard,
             commands::open_external,
-            commands::set_caffeinate,
-            commands::caffeinate_state,
             commands::answer_askpass,
             commands::list_askpass,
             commands::cache_appearance,
