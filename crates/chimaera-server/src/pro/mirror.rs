@@ -188,46 +188,37 @@ pub(super) async fn inventory(root: &Path, shadow: &Path) -> Result<(Vec<PathBuf
     let repo = transport::run(command, vec![], std::time::Duration::from_secs(5), 256)
         .await?
         .success;
-    let mut command = transport::git(root, None).await?;
-    if !repo {
-        command.env("GIT_DIR", shadow).env("GIT_WORK_TREE", root);
-    }
-    let bytes = transport::git_output(
-        command,
-        &[
+    let list = |ignore_file: bool| async move {
+        let mut command = transport::git(root, None).await?;
+        if !repo {
+            command.env("GIT_DIR", shadow).env("GIT_WORK_TREE", root);
+        }
+        let mut args = vec![
             "ls-files",
             "-z",
             "--cached",
             "--others",
             "--exclude-standard",
-            "--exclude-from=.chimaeraignore",
-        ],
-        vec![],
-    )
-    .await;
-    // --exclude-from refuses a missing file, so add it only when present.
-    let bytes = match bytes {
-        Ok(bytes) => bytes,
-        Err(error) if !tokio::fs::try_exists(root.join(".chimaeraignore")).await? => {
-            let mut command = transport::git(root, None).await?;
-            if !repo {
-                command.env("GIT_DIR", shadow).env("GIT_WORK_TREE", root);
-            }
-            transport::git_output(
-                command,
-                &[
-                    "ls-files",
-                    "-z",
-                    "--cached",
-                    "--others",
-                    "--exclude-standard",
-                ],
-                vec![],
-            )
-            .await
-            .map_err(|_| error)?
+        ];
+        if ignore_file {
+            args.push("--exclude-from=.chimaeraignore");
         }
-        Err(error) => return Err(error),
+        transport::git_output(command, &args, vec![]).await
+    };
+    // `--exclude-from` refuses a missing file (a failed helper, and a
+    // warning, on every pass), so it is passed only when the file is there;
+    // one removed in between is listed again without it.
+    let ignore_file = root.join(".chimaeraignore");
+    let bytes = if tokio::fs::try_exists(&ignore_file).await? {
+        match list(true).await {
+            Ok(bytes) => bytes,
+            Err(error) if !tokio::fs::try_exists(&ignore_file).await? => {
+                list(false).await.map_err(|_| error)?
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        list(false).await?
     };
     let paths: BTreeSet<PathBuf> = bytes
         .split(|b| *b == 0)

@@ -386,7 +386,10 @@ or one waiting for an agent connection asks for attention.
 
 Repository history and working files are separate Git mirrors. Snapshot commits
 use an independent index under the daemon's data directory; they never make WIP
-commits on the user's branches. `.gitignore` and `.chimaeraignore` restrict the
+commits on the user's branches. A project folder does not have to be a Git
+repository: a plain folder is copied as its working files alone, which the
+daemon's log notes once (at info level, not as a problem); if the folder later
+becomes a repository, its history travels from the next snapshot on. `.gitignore` and `.chimaeraignore` restrict the
 working snapshot. Credential filenames, private keys, agent login stores and
 secret configuration fields are excluded. Git configuration carries the
 user's name, email and simple Git aliases with known flags. Free-form or shell

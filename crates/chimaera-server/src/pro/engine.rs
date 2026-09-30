@@ -1013,9 +1013,8 @@ async fn snapshot_inner_scoped(
             publish_policy(config, &workspace.id, epoch, has_agents).await?;
         }
         *phase = "capture_repository";
-        let branch=transport::git_output(transport::git(&workspace.root,None).await?,&["symbolic-ref","-q","HEAD"],vec![]).await.ok().and_then(|bytes|String::from_utf8(bytes).ok()).map(|text|text.trim().to_string());
-        let repository_origin=mirror::repository_origin(&workspace.root).await;
-        let repository=super::repository::capture(&workspace.root).await?;
+        let super::repository::Described { branch, origin: repository_origin, snapshot: repository } =
+            super::repository::describe(&state.pro, &workspace.id, &workspace.root).await?;
         let manifest = Manifest {version:1,branch,repository_origin,repository,workspace_id:workspace.id.clone(),root:workspace.root.clone(),name:workspace.name.clone(),epoch,clean,continuation,profile:profile.clone(),sessions:archives,left_out:report.left_out.clone()};
         tokio::fs::write(handoff.join("manifest.json"), serde_json::to_vec(&manifest)?).await?;
         *phase = "mirror_repository";
