@@ -206,8 +206,18 @@ fn render(
 ) -> String {
     // Only catalog labels and closed states enter generated guidance. Provider
     // errors, identifiers, endpoints, hardware details and credentials do not.
+    // A provider the cloud has not looked at since it started is left out: an
+    // "unknown" row reads as a missing sign-in to the agent (and to the person
+    // reading the brief), which it is not.
+    use crate::cloud::providers::ProviderState;
     let providers: Vec<_> = providers
         .iter()
+        .filter(|status| {
+            matches!(
+                status.state,
+                ProviderState::SignedIn | ProviderState::NeedsSignIn | ProviderState::Missing
+            )
+        })
         .take(16)
         .filter_map(|status| {
             let catalog = chimaera_core::cloud_providers::provider_definition(&status.id)?;
@@ -262,6 +272,38 @@ mod tests {
             .unwrap()
             .contains("does not prove a dependency is missing"));
         assert!(tools[1].get("annotations").is_none());
+    }
+    #[test]
+    fn the_brief_names_only_providers_the_cloud_has_looked_at() {
+        use crate::cloud::providers::{ProviderState, ProviderStatus};
+        let row = |id: &str, state: ProviderState| ProviderStatus {
+            id: id.into(),
+            label: id.into(),
+            category: "agent".into(),
+            installed: Some(true),
+            state,
+            reason: None,
+            checked_at: None,
+            methods: Vec::new(),
+            disconnect_supported: false,
+        };
+        let cloud = render(
+            true,
+            &CloudProfile::default(),
+            Some("/project"),
+            Some(false),
+            &[
+                row("claude", ProviderState::SignedIn),
+                row("codex", ProviderState::Unknown),
+                row("github", ProviderState::NeedsSignIn),
+            ],
+        );
+        assert!(cloud.contains("{\"provider\":\"Claude Code\",\"status\":\"signed_in\"}"));
+        assert!(cloud.contains("{\"provider\":\"GitHub\",\"status\":\"needs_sign_in\"}"));
+        assert!(
+            !cloud.contains("Codex"),
+            "an unlooked-at provider says nothing"
+        );
     }
     #[test]
     fn capability_guidance_is_current_actionable_and_does_not_report_infrastructure() {

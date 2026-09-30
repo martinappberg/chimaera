@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { SeqEvent } from "./chatWs";
 import { ChatStore } from "./store.svelte";
 import journal from "./transferJournal.fixture.json";
-import { isTransferOrigin, pickupNote, RESTART_NOTE, transferNote } from "./transfer";
+import { isTransferOrigin, pickupNote, RESTART_NOTE, toldInWords, transferNote } from "./transfer";
 
 // Stand-ins shaped like the daemon's `transfer_context` wording.
 const MOVED = "Chimaera moved this conversation to the cloud. You now run in the cloud.";
@@ -76,5 +76,16 @@ describe("pickupNote (a surface that holds only the prompt's text)", () => {
     ]) {
       expect(pickupNote(typed)).toBeNull();
     }
+  });
+});
+
+describe("what the agent was told, for a person", () => {
+  it("keeps the sentences and drops the machine blocks", () => {
+    const told = "Chimaera moved this conversation to the cloud. Re-check tools and paths.\n\nWhere this work runs now: in the cloud.\n<work-capabilities>\n{\"execution_location\":\"cloud\",\"provider_observations\":[]}\n</work-capabilities>\n\nKeep working toward the user's goal.\n<cloud-profile-data>\n{\"setup_command\":null}\n</cloud-profile-data>";
+    const words = toldInWords(told);
+    expect(words).toBe("Chimaera moved this conversation to the cloud. Re-check tools and paths.\n\nWhere this work runs now: in the cloud.\n\nKeep working toward the user's goal.");
+    expect(words).not.toMatch(/[{}<>]/);
+    // Text without such blocks is untouched.
+    expect(toldInWords("Back on your computer.")).toBe("Back on your computer.");
   });
 });

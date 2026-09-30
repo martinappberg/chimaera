@@ -38,6 +38,17 @@ export function transferNote(origin: TransferOrigin, text: string, viewer = fals
  *  short line stands in for the message. */
 export const RESTART_NOTE = "Picked up after a restart";
 
+/** The daemon's pick-up carries, besides its sentences, blocks the agent
+ *  reads as data (`<work-capabilities>…</work-capabilities>` and
+ *  `<cloud-profile-data>…</cloud-profile-data>`: JSON about the platform and
+ *  the saved profile). A person opening "Show what the agent was told" gets
+ *  the sentences only; the blocks are the machine's, not words. */
+const MACHINE_BLOCKS = /\n?<(work-capabilities|cloud-profile-data)>[\s\S]*?<\/\1>\n?/g;
+
+export function toldInWords(text: string): string {
+  return text.replace(MACHINE_BLOCKS, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 /** The opening words of the daemon's own pick-up messages (`chimaera-server`
  *  `transfer_context`, `restart_message`). They are the daemon's, never
  *  typed by a person, so they recognise a pick-up where its origin tag is

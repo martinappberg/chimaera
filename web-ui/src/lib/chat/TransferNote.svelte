@@ -1,7 +1,7 @@
 <script lang="ts">
   import { formatFullTimestamp, formatMessageTimestamp } from "../shared/time";
   import { isBrowserGateway } from "../net/base";
-  import { transferNote, type TransferOrigin } from "./transfer";
+  import { toldInWords, transferNote, type TransferOrigin } from "./transfer";
   import { backNote } from "../pro/kept";
 
   interface Props {
@@ -46,7 +46,7 @@
   </p>
   <details bind:open>
     <summary>{open ? "Hide what the agent was told" : "Show what the agent was told"}</summary>
-    <p class="told">{text}</p>
+    <p class="told">{toldInWords(text)}</p>
   </details>
 </div>
 
