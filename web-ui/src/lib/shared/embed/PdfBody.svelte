@@ -10,6 +10,7 @@
   import { cropLayout } from "./embed";
   import type { Region } from "./fragment";
   import type { OpenedPdf } from "./pdfEmbed";
+  import { finishPdfRender, pdfRaster } from "../pdfCanvas";
 
   interface Props {
     url: string | null;
@@ -40,7 +41,7 @@
     return pageSize;
   });
   const maxH = $derived(compact ? TILE_H : MAX_H);
-  const frameMax = $derived(Math.round((maxH * frame.w) / frame.h));
+  const frameMax = $derived(Math.max(1, Math.round((maxH * frame.w) / frame.h)));
 
   /** The open document, kept per URL so a sharper redraw reuses it (a new
    *  file version is a new URL, and reopens). */
@@ -48,7 +49,8 @@
   let gen = 0;
   /** The render in flight: pdf.js refuses a second render() on a canvas
    *  still in use, so a newer draw (another page, a sharper width) cancels
-   *  it first — cancelling frees the canvas at once. */
+   *  it first. Each draw owns a scratch canvas; only a completed, current
+   *  draw is copied to the visible canvas. */
   let rendering: { cancel(): void } | null = null;
 
   function stopRendering(): void {
@@ -56,13 +58,17 @@
     rendering = null;
   }
   /** What the last draw was asked for (not what finished): a redraw is
-   *  only worth a new URL, a new page, or a much wider card. */
-  let asked: { url: string; page: number; width: number } | null = null;
+   *  only worth a new URL, page, region, or a much wider card. */
+  let asked: { url: string; page: number; width: number; region: string } | null = null;
+  const regionKey = $derived(region === undefined ? "" : JSON.stringify(region));
+  let painted = $state<{ url: string; page: number; region: string } | null>(null);
+  const current = $derived(painted?.url === url && painted?.page === page && painted?.region === regionKey);
 
-  async function draw(u: string, p: number, width: number): Promise<void> {
+  async function draw(u: string, p: number, width: number, area: Region | undefined, key: string): Promise<void> {
     const mine = ++gen;
     stopRendering();
     error = null;
+    let scratch: HTMLCanvasElement | null = null;
     try {
       if (opened?.url !== u) {
         const { openPdf } = await import("./pdfEmbed");
@@ -79,29 +85,41 @@
       if (mine !== gen) return;
       const base = pg.getViewport({ scale: 1 });
       pageSize = { w: base.width, h: base.height };
-      const target = canvas;
-      if (target === null) return;
-      // Render the whole page at the resolution the frame needs: for a
-      // crop, the full page is drawn larger and positioned inside it.
-      const zoom = crop !== null ? crop.width / 100 : 1;
+      const clipped = area === undefined ? null : cropLayout(pageSize, area);
+      const w = clipped === null ? base.width : (base.width * 100) / clipped.width;
+      const h = clipped === null ? base.height : (base.height * 100) / clipped.height;
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
-      const scale = Math.max(0.1, (width * zoom * dpr) / base.width);
-      const vp = pg.getViewport({ scale });
-      target.width = Math.floor(vp.width);
-      target.height = Math.floor(vp.height);
-      const ctx = target.getContext("2d");
-      if (ctx === null) return;
-      const task = pg.render({ canvas: target, canvasContext: ctx, viewport: vp });
+      const raster = pdfRaster(w, h, (width * dpr) / w);
+      // Clip in the raster itself: magnifying a tiny region must not
+      // allocate a giant canvas for the entire page outside that region.
+      const vp = pg.getViewport({
+        scale: raster.scale,
+        offsetX: clipped === null ? 0 : (clipped.left / 100) * w * raster.scale,
+        offsetY: clipped === null ? 0 : (clipped.top / 100) * h * raster.scale,
+      });
+      scratch = document.createElement("canvas");
+      scratch.width = raster.width;
+      scratch.height = raster.height;
+      const task = pg.render({ canvas: scratch, viewport: vp });
       rendering = task;
       try {
-        await task.promise;
+        await finishPdfRender(task);
       } finally {
         if (rendering === task) rendering = null;
       }
+      if (mine !== gen || canvas === null) return;
+      const ctx = canvas.getContext("2d");
+      if (ctx === null) throw new Error("couldn't create a PDF canvas");
+      canvas.width = raster.width;
+      canvas.height = raster.height;
+      ctx.drawImage(scratch, 0, 0);
+      painted = { url: u, page: p, region: key };
     } catch (e) {
       if (mine !== gen) return;
       asked = null;
       error = e instanceof Error && e.message !== "" ? e.message : "couldn't draw this page";
+    } finally {
+      if (scratch !== null) scratch.width = scratch.height = 0;
     }
   }
 
@@ -110,11 +128,12 @@
   $effect(() => {
     const u = url;
     const p = page;
+    const r = regionKey;
     const w = Math.min(boxW, frameMax);
     if (!active || u === null || w <= 0) return;
-    if (asked !== null && asked.url === u && asked.page === p && w <= asked.width * 1.33) return;
-    asked = { url: u, page: p, width: w };
-    void draw(u, p, w);
+    if (asked !== null && asked.url === u && asked.page === p && asked.region === r && w <= asked.width * 1.33) return;
+    asked = { url: u, page: p, width: w, region: r };
+    void draw(u, p, w, region, r);
   });
 
   $effect(() => () => {
@@ -135,20 +154,15 @@
   >
     <canvas
       bind:this={canvas}
-      class:cropped={crop !== null}
-      class:hidden={error !== null || pageSize === null}
-      style:width={crop !== null ? `${crop.width}%` : null}
-      style:height={crop !== null ? `${crop.height}%` : null}
-      style:left={crop !== null ? `${crop.left}%` : null}
-      style:top={crop !== null ? `${crop.top}%` : null}
+      class:hidden={error !== null || !current}
     ></canvas>
     {#if error !== null}
       <span class="note">{error}</span>
-    {:else if pageSize === null}
+    {:else if !current}
       <span class="note">{active ? "loading page…" : ""}</span>
     {/if}
   </button>
-  {#if total > 1}
+  {#if current && total > 1}
     <span class="pages">{shown} / {total}</span>
   {/if}
 </div>
@@ -185,9 +199,6 @@
     display: block;
     width: 100%;
     height: 100%;
-  }
-  canvas.cropped {
-    position: absolute;
   }
   canvas.hidden {
     visibility: hidden;
