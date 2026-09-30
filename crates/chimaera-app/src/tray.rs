@@ -39,7 +39,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
     #[cfg(target_os = "macos")]
     {
         builder = builder
-            .icon(tauri::include_image!("icons/tray-idle.png"))
+            .icon(tauri::include_image!("icons/tray.png"))
             .icon_as_template(true);
     }
     #[cfg(not(target_os = "macos"))]
