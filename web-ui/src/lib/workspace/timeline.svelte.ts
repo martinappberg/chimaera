@@ -59,14 +59,34 @@ export interface TimelineKnowledge {
   claim: string;
 }
 
+/** How a message reached its recipient (agent communication §4/§5). */
+export type NoteDelivery = "next_step" | "inbox" | "woke" | "asked";
+
+/** An agent's message (the wire keeps the kind `note`; the UI says
+ *  "message"). Every field past `text` is additive — absent on notes written
+ *  before agent communication, which keep their old meaning. */
 export interface TimelineNote {
   from_sid: string;
   from_name: string;
   /** A session id, "mastermind", or absent (everyone). */
   to?: string;
   text: string;
-  /** A message to the Mastermind that already woke it (auto mode). */
+  /** It started a turn in its recipient (kept alongside `delivery: "woke"`). */
   woke?: boolean;
+  /** The sender's vendor ("claude" | "codex"). */
+  from_agent?: string;
+  /** The recipient's name when it was sent. */
+  to_name?: string;
+  /** The message (seq) this one answers. */
+  reply_to?: number;
+  /** The thread's root seq (absent on a root). */
+  thread?: number;
+  /** The sender asked for an answer. */
+  expect_reply?: boolean;
+  /** Sent by the workspace Mastermind: direction, not a peer's note. */
+  mastermind?: boolean;
+  /** Verbatim from the wire; an unknown word shows no chip. */
+  delivery?: NoteDelivery | string;
 }
 
 /** One wire entry (crates/chimaera-server/src/timeline.rs `Entry`); only the
@@ -150,8 +170,9 @@ export async function fetchTimeline(
   };
 }
 
-/** Agent notes: deliver a note to its addressee as a real, attributed message
- *  (the user's click starts that turn — never the post itself). */
+/** Hand one message to its recipient as a real, attributed message (the
+ *  user's click starts that turn — never the post itself). The comms
+ *  `deliver` route hands over a whole inbox; this is the one message. */
 export async function deliverNote(
   workspaceId: string,
   seq: number,
@@ -368,7 +389,6 @@ export async function loadOlderTimeline(): Promise<void> {
 // ---- per-viewer "last seen" ------------------------------------------------------
 
 const SEEN_PREFIX = "chimaera.timeline.seen.";
-const MM_INBOX_PREFIX = "chimaera.mastermind.inbox.";
 
 export interface SeenMark {
   /** The highest seq this viewer had looked at. */
@@ -412,14 +432,3 @@ export function markSeen(wsId: string, seq: number): void {
   writeMark(SEEN_PREFIX + wsId, { seq, ts: Date.now() });
 }
 
-/** The Mastermind inbox cursor: notes addressed to "mastermind" past this
- *  seq are unread (the dock's chip). Separate from the dashboard mark — the
- *  user reading the dashboard has not handed anything to the Mastermind. */
-export function inboxSeen(wsId: string): number {
-  const mark = readMark(MM_INBOX_PREFIX + wsId);
-  return mark === null || mark.seq > timelineStore.head ? 0 : mark.seq;
-}
-
-export function markInboxSeen(wsId: string, seq: number): void {
-  writeMark(MM_INBOX_PREFIX + wsId, { seq, ts: Date.now() });
-}

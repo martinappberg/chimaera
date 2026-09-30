@@ -503,8 +503,11 @@ async fn knowledge_of(state: &Arc<AppState>, ws: &str) -> serde_json::Value {
 /// Claude waits on a hook's answer (10 s): the Knowledge work a turn start
 /// or end sets off must not stand in front of it, however slow the
 /// provider. The turn still lands on the Timeline once the provider gives
-/// up — unattributed.
-#[tokio::test]
+/// up — unattributed. Multi-threaded like the daemon: a hook that yields
+/// once (agent communication's first read-state load) must not hand a
+/// single test thread to the provider's 1.5 s of plugin work; one that
+/// WAITED on it would still take that long and fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_claude_hook_answers_before_a_slow_knowledge_provider() {
     let state = test_state();
     let (ws, sid) = provider_workspace(&state, "knowledge-slow-hook", "kh").await;

@@ -7,7 +7,6 @@
   import { gatewayWorkspace, isBrowserGateway } from "../net/base";
   import { projectWhere, projectWhereLabel } from "../net/placement";
   import ComputeLaunchDialog from "./ComputeLaunchDialog.svelte";
-  import CloudProjects from "../pro/CloudProjects.svelte";
   import { keyHint } from "../shared/keybindings";
   import { isBusy, needsApproval, type Session, type Workspace } from "./sessions";
   import {
@@ -1218,7 +1217,12 @@
 
 
     {#if native && ownAlias === null && $paidPlan !== null}
-      <CloudProjects onOpen={onOpen} knownIds={workspaces.map(workspace => workspace.id)} />
+      <!-- The cloud projects list (and the Pro presentation copy behind it)
+           loads only for a paid plan: it stays out of the always-loaded
+           entry, whose budget the shell is close to. -->
+      {#await import("../pro/CloudProjects.svelte") then { default: CloudProjects }}
+        <CloudProjects onOpen={onOpen} knownIds={workspaces.map(workspace => workspace.id)} />
+      {/await}
     {/if}
 
     {#if ownAlias === null}

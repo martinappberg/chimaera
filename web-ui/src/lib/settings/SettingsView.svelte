@@ -166,11 +166,20 @@
     return out;
   });
 
+  /** Scroll to a section, or to one setting's row when given its id
+   *  ("agents.communication.enabled" — the Mastermind panel's off state),
+   *  highlighting the section that holds it. */
   function jumpTo(section: string): void {
-    activeSection = section;
-    const el = listEl?.querySelector<HTMLElement>(`[data-section="${section}"]`);
+    const el =
+      listEl?.querySelector<HTMLElement>(`[data-section="${CSS.escape(section)}"]`) ??
+      (listEl !== null ? document.getElementById(`setting-${section}`) : null);
+    activeSection = el?.closest<HTMLElement>("[data-section]")?.dataset.section ?? section;
     el?.scrollIntoView({ block: "start", behavior: "instant" as ScrollBehavior });
   }
+
+  /** The Agents section's own schema rows: agent communication, a titled
+   *  block under the bespoke binaries panel. */
+  const isCommsDef = (d: SettingDef) => d.id.startsWith("agents.communication.");
 
   // A section asked for from elsewhere (Quick Open "Usage", the dashboard's
   // cost line): clear any search that hides it, then scroll there once shown.
@@ -331,9 +340,25 @@
           {:else if group.category === "Agents"}
             <!-- Bespoke panel: fuses live daemon detection with the
                  agents.<id>.path settings and an uninstall action. It renders
-                 its own <h2>, so the generic rows are skipped here. -->
+                 its own <h2>, so its generic rows are skipped here. Agent
+                 communication's two rows follow as ordinary schema rows. -->
+            {@const comms = group.defs.filter(isCommsDef)}
             <section data-section={group.category}>
-              <AgentsSettings />
+              {#if q === "" || group.defs.some((d) => !isCommsDef(d))}
+                <AgentsSettings />
+              {:else}
+                <h2 class="cat">{group.category}</h2>
+              {/if}
+              {#if comms.length > 0}
+                <h3 class="subcat">Agent communication</h3>
+                <p class="subnote">
+                  Agents in a workspace see each other and send messages that arrive. The
+                  Mastermind is part of it.
+                </p>
+                {#each comms as def (def.id)}
+                  <SettingRow {def} />
+                {/each}
+              {/if}
             </section>
           {:else if group.category === "Environment"}
             <!-- Bespoke panel: edits the daemon's prelude map over
@@ -652,6 +677,22 @@
     .pro-entry { grid-template-columns: 30px minmax(0, 1fr); }
     .pro-open { grid-column: 2; }
   }
+  /* A titled block inside a section (Agents → Agent communication). */
+  .subcat {
+    margin: 18px 0 2px;
+    padding: 0 14px;
+    font-size: var(--text-sm);
+    font-weight: 600;
+    color: var(--fg);
+  }
+  .subnote {
+    margin: 0 0 4px;
+    padding: 0 14px;
+    font-size: var(--text-sm);
+    line-height: 1.45;
+    color: var(--muted);
+    max-width: 60ch;
+  }
 
   .empty {
     padding: 40px 14px;
@@ -799,7 +840,9 @@
       padding: 0 6px;
     }
 
-    .kbd-note {
+    .kbd-note,
+    .subcat,
+    .subnote {
       padding: 0 6px;
     }
 

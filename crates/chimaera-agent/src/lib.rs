@@ -76,7 +76,7 @@ impl fmt::Display for CommandQueueFull {
 
 impl std::error::Error for CommandQueueFull {}
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct SendReservation {
     token: u64,
     bytes: usize,
@@ -84,6 +84,11 @@ struct SendReservation {
     /// stamped onto the driver's echo — the one event this reservation pairs
     /// with, so neither driver has to carry the tag.
     origin: Option<&'static str>,
+    /// The caller-minted delivery key (`SendIfRunning`). Such a send may be
+    /// settled with no echo at all (`Dropped`: no turn to join), so it pairs
+    /// by key, never by FIFO position — a later send's echo must not take
+    /// its reservation, nor its origin.
+    send_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -105,6 +110,7 @@ impl CommandBudget {
         &mut self,
         bytes: usize,
         origin: Option<&'static str>,
+        send_id: Option<String>,
     ) -> Result<u64, CommandQueueFull> {
         if self.sends >= RETAINED_SENDS_MAX
             || bytes > RETAINED_SEND_BYTES_MAX.saturating_sub(self.bytes)
@@ -120,8 +126,20 @@ impl CommandBudget {
             token,
             bytes,
             origin,
+            send_id,
         });
         Ok(token)
+    }
+
+    /// The reservation an echo with delivery key `id` pairs with: the keyed
+    /// one when the caller minted that key, else the oldest unkeyed one.
+    fn take_for_echo(&mut self, id: &str) -> Option<SendReservation> {
+        let pos = self
+            .unassigned
+            .iter()
+            .position(|r| r.send_id.as_deref() == Some(id))
+            .or_else(|| self.unassigned.iter().position(|r| r.send_id.is_none()))?;
+        self.unassigned.remove(pos)
     }
 
     fn release(&mut self, reservation: SendReservation) {
@@ -151,7 +169,7 @@ impl CommandBudget {
                 origin,
                 ..
             } => {
-                let Some(reservation) = self.unassigned.pop_front() else {
+                let Some(reservation) = self.take_for_echo(id) else {
                     return;
                 };
                 if origin.is_none() {
@@ -175,6 +193,15 @@ impl CommandBudget {
                         self.awaiting_turn = true;
                     }
                     self.release(reservation);
+                } else if let Some(pos) = self
+                    .unassigned
+                    .iter()
+                    .position(|r| r.send_id.as_deref() == Some(id.as_str()))
+                {
+                    // A keyed send settled without ever being echoed.
+                    if let Some(reservation) = self.unassigned.remove(pos) {
+                        self.release(reservation);
+                    }
                 }
             }
             AgentEvent::TurnStarted { .. }
@@ -459,6 +486,11 @@ fn fold_session_metadata(info: &mut ChatInfo, ev: &AgentEvent) {
 }
 
 struct ChatSession {
+    /// The pump's own event queue, weakly: the daemon's `annotate` rides it
+    /// so its events take a seq in order with the driver's, while the
+    /// channel still closes (ending the pump) when the driver drops its
+    /// sender.
+    annotate_tx: mpsc::WeakSender<AgentEvent>,
     info: Mutex<ChatInfo>,
     background_work: Mutex<BackgroundWork>,
     carryover: Mutex<Carryover>,
@@ -640,6 +672,7 @@ impl ChatManager {
         };
         let process_control = Arc::new(ndjson::ProcessControl::default());
         let session = Arc::new(ChatSession {
+            annotate_tx: ev_tx.downgrade(),
             info: Mutex::new(info.clone()),
             background_work: Mutex::new(BackgroundWork::default()),
             carryover: Mutex::new(Carryover::default()),
@@ -977,7 +1010,7 @@ impl ChatManager {
                 .command_budget
                 .lock()
                 .expect("command budget lock")
-                .reserve(bytes, origin)?;
+                .reserve(bytes, origin, cmd.send_id().map(str::to_owned))?;
             Some(EnqueueReservation {
                 budget: &session.command_budget,
                 token: Some(token),
@@ -1012,6 +1045,18 @@ impl ChatManager {
             session,
             restore: true,
         })
+    }
+
+    /// Journal + broadcast an event the DAEMON authored (never a driver's:
+    /// an [`AgentEvent::AgentMessage`] a hook delivered). It rides the
+    /// pump's own queue, so it takes its seq in order with the driver's
+    /// events. Never waits: a dead session or a full queue is an error the
+    /// caller reports.
+    pub fn annotate(&self, id: &str, ev: AgentEvent) -> Result<()> {
+        let session = self.get_session(id)?;
+        let tx = session.annotate_tx.upgrade().context("driver gone")?;
+        tx.try_send(ev)
+            .map_err(|err| anyhow::anyhow!("event queue unavailable: {err}"))
     }
 
     /// Ask the driver to shut the child down (polite, then SIGKILL after the
@@ -1195,7 +1240,7 @@ mod tests {
     fn submitted_input_evidence_survives_queue_release_and_exit() {
         let mut budget = CommandBudget::default();
         assert!(!budget.submitted_input);
-        let token = budget.reserve(1, None).unwrap();
+        let token = budget.reserve(1, None, None).unwrap();
         budget.release_unassigned(token);
         assert_eq!(budget.sends, 0);
         assert!(budget.submitted_input);
@@ -1206,7 +1251,7 @@ mod tests {
     #[test]
     fn delivered_input_stays_busy_before_turn_started_without_holding_quota() {
         let mut budget = CommandBudget::default();
-        budget.reserve(1, None).unwrap();
+        budget.reserve(1, None, None).unwrap();
         budget.observe(&mut AgentEvent::UserMessage {
             text: "work".into(),
             attachments: 0,
@@ -1222,7 +1267,7 @@ mod tests {
             turn_id: "t".into(),
         });
         assert!(!budget.awaiting_turn); // carryover is now active under the same lock.
-        budget.reserve(1, None).unwrap();
+        budget.reserve(1, None, None).unwrap();
         budget.observe(&mut AgentEvent::UserMessage {
             text: "queued".into(),
             attachments: 0,
@@ -1332,8 +1377,10 @@ mod tests {
     #[test]
     fn command_budget_bounds_bytes_and_releases_on_delivery() {
         let mut budget = CommandBudget::default();
-        let first = budget.reserve(RETAINED_SEND_BYTES_MAX - 1, None).unwrap();
-        assert_eq!(budget.reserve(2, None), Err(CommandQueueFull));
+        let first = budget
+            .reserve(RETAINED_SEND_BYTES_MAX - 1, None, None)
+            .unwrap();
+        assert_eq!(budget.reserve(2, None, None), Err(CommandQueueFull));
         budget.observe(&mut AgentEvent::UserMessage {
             text: "queued".to_string(),
             attachments: 0,
@@ -1360,9 +1407,9 @@ mod tests {
     fn command_budget_bounds_tiny_send_count_and_clears_on_exit() {
         let mut budget = CommandBudget::default();
         for _ in 0..RETAINED_SENDS_MAX {
-            budget.reserve(0, None).unwrap();
+            budget.reserve(0, None, None).unwrap();
         }
-        assert_eq!(budget.reserve(0, None), Err(CommandQueueFull));
+        assert_eq!(budget.reserve(0, None, None), Err(CommandQueueFull));
         budget.observe(&mut AgentEvent::Exited { status: None });
         assert_eq!(budget.bytes, 0);
         assert_eq!(budget.sends, 0);
@@ -1372,7 +1419,7 @@ mod tests {
     #[test]
     fn idless_feedback_does_not_consume_a_send_reservation() {
         let mut budget = CommandBudget::default();
-        budget.reserve(1024, None).unwrap();
+        budget.reserve(1024, None, None).unwrap();
         budget.observe(&mut AgentEvent::UserMessage {
             text: "try a dry run first".to_string(),
             attachments: 0,
@@ -1401,7 +1448,7 @@ mod tests {
     #[test]
     fn enqueue_reservation_drop_releases_quota_unless_disarmed() {
         let budget = Mutex::new(CommandBudget::default());
-        let token = budget.lock().unwrap().reserve(1024, None).unwrap();
+        let token = budget.lock().unwrap().reserve(1024, None, None).unwrap();
         {
             let _guard = EnqueueReservation {
                 budget: &budget,
@@ -1410,7 +1457,7 @@ mod tests {
         }
         assert_eq!(budget.lock().unwrap().bytes, 0);
 
-        let token = budget.lock().unwrap().reserve(2048, None).unwrap();
+        let token = budget.lock().unwrap().reserve(2048, None, None).unwrap();
         {
             let mut guard = EnqueueReservation {
                 budget: &budget,
@@ -1421,11 +1468,47 @@ mod tests {
         assert_eq!(budget.lock().unwrap().bytes, 2048);
     }
 
+    /// A keyed send (`SendIfRunning`) pairs by its key: settled with no echo
+    /// it gives its reservation back, and a later send's echo never takes
+    /// its slot or its origin.
+    #[test]
+    fn keyed_sends_pair_by_key_never_by_position() {
+        let mut budget = CommandBudget::default();
+        budget
+            .reserve(64, Some(model::ORIGIN_AGENT), Some("k1".into()))
+            .unwrap();
+        budget.reserve(32, None, None).unwrap();
+        let mut plain = AgentEvent::UserMessage {
+            text: "mine".to_string(),
+            attachments: 0,
+            attachment_paths: Vec::new(),
+            id: Some("m1".to_string()),
+            queued: false,
+            after_turn: false,
+            origin: None,
+        };
+        budget.observe(&mut plain);
+        assert!(
+            matches!(&plain, AgentEvent::UserMessage { origin: None, .. }),
+            "{plain:?}"
+        );
+        assert_eq!(budget.sends, 1, "only the keyed send is still held");
+        let mut dropped = AgentEvent::UserMessageUpdate {
+            id: "k1".to_string(),
+            state: model::UserMessageState::Dropped,
+        };
+        budget.observe(&mut dropped);
+        assert_eq!((budget.sends, budget.bytes), (0, 0));
+        assert!(budget.unassigned.is_empty());
+    }
+
     #[test]
     fn daemon_origin_rides_the_echo_its_reservation_pairs_with() {
         let mut budget = CommandBudget::default();
-        budget.reserve(64, Some(model::ORIGIN_RESTART)).unwrap();
-        budget.reserve(64, None).unwrap();
+        budget
+            .reserve(64, Some(model::ORIGIN_RESTART), None)
+            .unwrap();
+        budget.reserve(64, None, None).unwrap();
         // Id-less feedback consumes nothing, so it cannot steal the tag.
         let mut feedback = AgentEvent::UserMessage {
             text: "feedback".to_string(),

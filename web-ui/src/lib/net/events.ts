@@ -44,6 +44,13 @@ export interface EventsSocketHandlers {
    */
   onTimeline?(epochs: Record<string, number>): void;
   /**
+   * Per-workspace agent-communication epoch map (the timeline frame's shape):
+   * fired whenever a workspace's unread counts or wake requests changed. The
+   * caller refetches `GET /workspaces/{id}/comms` for its active workspace
+   * iff that workspace's epoch moved.
+   */
+  onComms?(epochs: Record<string, number>): void;
+  /**
    * The daemon's release knowledge (same shape as GET /api/v1/update),
    * pushed after auth and whenever it changes.
    */
@@ -270,6 +277,13 @@ export class EventsSocket {
       ) {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.handlers.onTimeline?.(msg.epochs);
+      } else if (
+        msg.type === "comms" &&
+        typeof msg.epochs === "object" &&
+        msg.epochs !== null
+      ) {
+        this.backoffMs = INITIAL_BACKOFF_MS;
+        this.handlers.onComms?.(msg.epochs);
       } else if (msg.type === "update" && typeof msg.available === "boolean") {
         this.backoffMs = INITIAL_BACKOFF_MS;
         const status = parseUpdateStatus(msg);

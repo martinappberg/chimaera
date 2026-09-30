@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::{
-    agent_probe, agent_updates, agents, chat, compute, environment, episodes, fs, git, knowledge,
-    launcher, ledger, notes, plugins, proxy, quickopen, recents, settings, timeline, update,
+    agent_probe, agent_updates, agents, chat, comms, compute, environment, episodes, fs, git,
+    knowledge, launcher, ledger, plugins, proxy, quickopen, recents, settings, timeline, update,
     view_state, workspaces,
 };
 
@@ -250,10 +250,11 @@ pub(crate) struct AppState {
     /// Init), for the Skills view's "built into the agent" group. Bounded by
     /// live sessions; dropped on exit.
     pub(crate) chat_catalogs: Mutex<HashMap<String, Vec<(String, String)>>>,
-    /// Notes in core: per-session post rate windows (shared by
-    /// `tell_mastermind` and plugins' Timeline appends) and the Mastermind
-    /// wake caps (in memory; notes themselves live on the Timeline).
-    pub(crate) notes: Mutex<notes::NotesState>,
+    /// Agent communication (see `comms`): post rate windows (shared with
+    /// plugins' Timeline appends), wake caps and requests, steers in flight
+    /// (memory), and each workspace's read state (`comms.json`). Messages
+    /// themselves live on the Timeline.
+    pub(crate) comms: comms::Comms,
     /// Knowledge-provider cache, the Timeline's diff baseline, and who
     /// recorded what (see `knowledge`). Hot state; rebuilt from the files.
     pub(crate) knowledge: Mutex<knowledge::KnowledgeState>,
@@ -362,7 +363,7 @@ impl AppState {
             timeline_jobs_started: std::sync::atomic::AtomicBool::new(false),
             probes: agent_probe::ProbeState::default(),
             chat_catalogs: Mutex::new(HashMap::new()),
-            notes: Mutex::new(notes::NotesState::default()),
+            comms: comms::Comms::new(data_dir.join("workspace")),
             knowledge: Mutex::new(knowledge::KnowledgeState::default()),
         }
     }

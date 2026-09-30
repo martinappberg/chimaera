@@ -42,12 +42,18 @@ fn curl_quoted(s: &str) -> String {
 async fn call(method: &str, path: &str, body: Option<&Value>) -> anyhow::Result<Value> {
     let (code, value) = request(method, path, body).await?;
     if !(200..300).contains(&code) {
-        match value.get("error").and_then(Value::as_str) {
-            Some(error) => bail!("{error}"),
-            None => bail!("the daemon answered {code}"),
-        }
+        return Err(refused(code, &value));
     }
     Ok(value)
+}
+
+/// A refusal in the daemon's own words (its `{error}`), whatever the status:
+/// they say what to do instead (a plugin now built in says where it went).
+fn refused(code: u16, value: &Value) -> anyhow::Error {
+    match value.get("error").and_then(Value::as_str) {
+        Some(error) => anyhow::anyhow!("{error}"),
+        None => anyhow::anyhow!("the daemon answered {code}"),
+    }
 }
 
 /// `call`, answering the daemon's status and body whatever they are.
@@ -184,10 +190,7 @@ async fn with_trust(
         return call(method, path, Some(&body)).await;
     }
     if !(200..300).contains(&code) {
-        match value.get("error").and_then(Value::as_str) {
-            Some(error) => bail!("{error}"),
-            None => bail!("the daemon answered {code}"),
-        }
+        return Err(refused(code, &value));
     }
     Ok(value)
 }
@@ -294,8 +297,8 @@ pub async fn list() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What an install or update printed: one line, "installed agent-notes
-/// 0.1.2" (a local build says so; an update names the version it replaced,
+/// What an install or update printed: one line, "installed mycelium
+/// 0.2.1" (a local build says so; an update names the version it replaced,
 /// which the daemon keeps for Use previous).
 fn installed_line(verb: &str, body: &Value) -> String {
     let local = if body["plugin"]
@@ -498,7 +501,7 @@ mod tests {
 
     #[test]
     fn ids_are_the_only_url_segments() {
-        assert_eq!(id_segment("agent-notes").unwrap(), "agent-notes");
+        assert_eq!(id_segment("mycelium").unwrap(), "mycelium");
         for bad in ["", "Agent", "a/b", "x?y", "a b", "../x"] {
             assert!(id_segment(bad).is_err(), "{bad}");
         }
@@ -506,13 +509,13 @@ mod tests {
 
     #[test]
     fn the_list_line_says_what_the_card_says() {
-        let first_party = json!({"id": "agent-notes", "version": "0.1.2", "source": "installed",
+        let first_party = json!({"id": "latex", "version": "0.1.2", "source": "installed",
             "first_party": true, "verified": true, "pinned_version": "0.1.2"});
         assert_eq!(mark(&first_party), "✓");
         assert_eq!(list_line(&first_party), "installed");
         assert_eq!(
             list_line(
-                &json!({"id": "agent-notes", "version": "0.1.3", "source": "installed",
+                &json!({"id": "latex", "version": "0.1.3", "source": "installed",
                 "first_party": true, "verified": true, "pinned_version": "0.1.2",
                 "previous": "0.1.2"})
             ),
@@ -545,18 +548,18 @@ mod tests {
 
     #[test]
     fn an_install_is_one_line_without_hashes() {
-        let body = json!({"id": "agent-notes", "version": "0.1.2", "previous": null,
+        let body = json!({"id": "mycelium", "version": "0.1.2", "previous": null,
             "sha256": {"plugin.wasm": "a".repeat(64), "plugin.toml": "b".repeat(64)},
-            "plugin": {"id": "agent-notes", "first_party": true}});
+            "plugin": {"id": "mycelium", "first_party": true}});
         assert_eq!(
             installed_line("installed", &body),
-            "installed agent-notes 0.1.2"
+            "installed mycelium 0.1.2"
         );
-        let body = json!({"id": "agent-notes", "version": "0.1.3", "previous": "0.1.2",
-            "plugin": {"id": "agent-notes"}});
+        let body = json!({"id": "mycelium", "version": "0.1.3", "previous": "0.1.2",
+            "plugin": {"id": "mycelium"}});
         assert_eq!(
             installed_line("updated", &body),
-            "updated agent-notes 0.1.3 (was 0.1.2)"
+            "updated mycelium 0.1.3 (was 0.1.2)"
         );
         let body = json!({"id": "dev", "version": "0.2.0", "previous": "0.1.0",
             "plugin": {"local_path": "/home/me/dev"}});
@@ -566,13 +569,28 @@ mod tests {
         );
     }
 
+    /// `chimaera plugin add agent-notes` (built into Chimaera now) prints the
+    /// daemon's refusal as it words it; a bare status only without one.
+    #[test]
+    fn a_refusal_is_the_daemons_own_words() {
+        let retired = json!({"error": "Built into Chimaera now: Agent communication (Settings → Agents). Remove this copy."});
+        assert_eq!(
+            refused(409, &retired).to_string(),
+            "Built into Chimaera now: Agent communication (Settings → Agents). Remove this copy."
+        );
+        assert_eq!(
+            refused(502, &Value::Null).to_string(),
+            "the daemon answered 502"
+        );
+    }
+
     #[test]
     fn remove_says_how_a_chimaera_plugin_comes_back() {
-        let body = json!({"id": "agent-notes", "removed": true,
+        let body = json!({"id": "mycelium", "removed": true,
             "plugin": {"source": "available"}});
         assert_eq!(
-            removed_line("agent-notes", &body),
-            "removed agent-notes — `chimaera plugin add agent-notes` installs it again"
+            removed_line("mycelium", &body),
+            "removed mycelium — `chimaera plugin add mycelium` installs it again"
         );
         let body = json!({"id": "x", "removed": true, "plugin": null});
         assert_eq!(removed_line("x", &body), "removed x");

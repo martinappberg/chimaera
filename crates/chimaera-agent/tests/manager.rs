@@ -434,6 +434,49 @@ async fn spawn_neutralizes_stale_background_set_in_reused_journal() {
     );
 }
 
+/// A daemon-authored event (`annotate`) takes its seq on the pump like any
+/// driver event: journaled, broadcast, and replayed on reconnect. A dead
+/// session refuses it.
+#[tokio::test]
+async fn annotate_journals_a_daemon_event_in_seq_order() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-annotate", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-annotate", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+    if !seen.iter().any(|e| matches!(e.ev, AgentEvent::Init { .. })) {
+        wait_for(&mut rx, &mut seen, "Init", |ev| {
+            matches!(ev, AgentEvent::Init { .. })
+        })
+        .await;
+    }
+    let message = AgentEvent::agent_message(
+        12,
+        "s-other",
+        "loader refactor",
+        Some("codex"),
+        "the loader returns Result now",
+        false,
+        false,
+        None,
+    );
+    fx.manager
+        .annotate("s-annotate", message.clone())
+        .expect("annotate a live session");
+    let entry = wait_for(&mut rx, &mut seen, "the annotation", |ev| {
+        matches!(ev, AgentEvent::AgentMessage { .. })
+    })
+    .await;
+    assert_eq!(entry.ev, message);
+    let head = seen.iter().map(|e| e.seq).max().unwrap();
+    assert_eq!(entry.seq, head, "it took the next seq");
+    let replay = fx.manager.attach("s-annotate", 0).expect("replay").replay;
+    assert!(replay.iter().any(|e| e.ev == message));
+    assert!(fx.manager.annotate("s-missing", message).is_err());
+}
+
 /// Background work is CROSS-TURN: a task started mid-turn is still in the live
 /// set after the turn ends, and a second turn adds to it rather than replacing
 /// it. That outliving is what every "still working off-screen" cue is gated on

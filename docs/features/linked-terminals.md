@@ -35,10 +35,12 @@ leash-drawing in `web-ui/src/App.svelte`; the drag band that arms a link is in
 
 - **What & when.** How a linked agent actually reaches its terminals: the daemon exposes a built-in
   MCP server per agent session. Every agent on it gets the three terminal tools below; the same
-  server also carries the Mastermind tier and workbench-plugin tools (see "Beyond the leash").
+  server also carries agent communication, the Mastermind tier and workbench-plugin tools (see
+  "Beyond the leash").
 - **How it's used.** Wired into claude via the generated `--mcp-config`, and into codex via
   `-c mcp_servers.chimaera.*` overrides (key in the env, never argv — every codex chat; a codex
-  TUI only while a workbench plugin with tools is active in its workspace), pointing at
+  TUI while agent communication is on or a workbench plugin with tools is active in its
+  workspace), pointing at
   `POST /api/v1/mcp/{agent_id}?key={secret}` (JSON-RPC over MCP streamable-HTTP, stateless). Tools:
   `list_terminals` (the agent's granted terminals), `run_in_terminal` (type a command, await the
   outcome — the same [exec engine](terminals.md#the-exec-engine-and-command-journal)), `read_terminal`
@@ -57,15 +59,17 @@ leash-drawing in `web-ui/src/App.svelte`; the drag band that arms a link is in
   hook (TUI) or the protocol input (chat) **is** the consent. MCP is stateless streamable-HTTP
   (plain JSON, no SSE). Dead-session edges are pruned at read time so the `/ws/events` snapshot dedup
   doesn't flap.
-- **Beyond the leash.** `tools/list` and the call gate are computed per call. The workspace
-  **Mastermind** additionally gets its tier — reads `workspace_status` / `read_timeline` /
-  `read_session` / `list_changed_files`, acts `spawn_agent` / `spawn_terminal` /
-  `message_agent` / `interrupt_agent` ([dashboard.md](dashboard.md#the-mastermind-panel)) — by
-  who it is, not by a grant. A **worker in a workspace with a Mastermind** also gets
-  `tell_mastermind` (the supervised view). **Workbench plugins** add tools only where they're active —
-  `knowledge_search` / `knowledge_get` (mycelium), `post_note` / `read_notes` (Agent notes) —
-  each with an instruction paragraph at `initialize` ([plugins.md](plugins.md#workbench-plugins)).
-  A plugin-free worker's view (tools, instructions, generated settings, codex argv) is pinned
+- **Beyond the leash.** `tools/list` and the call gate are computed per call. While **agent
+  communication** is on (default), every agent also gets `workspace_agents` / `read_agent` /
+  `message_agent` / `read_messages` and a paragraph naming its session
+  ([agent-communication.md](agent-communication.md)). The workspace **Mastermind** additionally
+  gets its tier — reads `workspace_status` / `read_timeline` / `list_changed_files`, acts
+  `spawn_agent` / `spawn_terminal` / `interrupt_agent`, and its `message_agent` carries direction
+  ([dashboard.md](dashboard.md#the-mastermind-panel)) — by who it is, not by a grant; off, there
+  is no tier. **Workbench plugins** add tools only where they're active — `knowledge_search` /
+  `knowledge_get` (mycelium) — each with an instruction paragraph at `initialize`
+  ([plugins.md](plugins.md#workbench-plugins)). A plugin-free worker's view (tools,
+  instructions, generated settings, codex argv), with agent communication on and off, is pinned
   byte-for-byte by `crates/chimaera-server/src/tests/agent_view.rs`.
 
 ---

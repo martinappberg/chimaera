@@ -3,7 +3,7 @@
 //! docs/plugin-platform-plan.md §1 ("Capabilities").
 //!
 //! - **Atoms.** Each capability is one atom, a short JSON array such as
-//!   `["access","files","read"]` or `["agent-tool","post_note"]`. A plugin's
+//!   `["access","files","read"]` or `["agent-tool","knowledge_search"]`. A plugin's
 //!   capabilities are the set of its atoms; "asks for more" is set
 //!   difference, "covered" is subset.
 //! - **The digest** is the SHA-256 of the sorted atoms under a version line.

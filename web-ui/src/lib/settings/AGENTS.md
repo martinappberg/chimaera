@@ -107,7 +107,14 @@ shows sessions, tokens and time from the session records across every workspace
 (`GET /api/v1/activity`, CSV via `/api/v1/activity/csv`, both through
 `../workspace/history.ts`). No dollar figures (cost is only a CSV column); unknown is
 "—" with a tooltip, never zero. `jump.ts` lets another surface open Settings at a
-section (`requestSettingsSection`).
+section (`requestSettingsSection`) — or at one setting's row, given its id.
+
+**Agents holds schema rows too.** The Agents category renders the bespoke
+`AgentsSettings` panel (its `agents.<id>.path` rows are presented there, not
+generically), then **Agent communication** — `agents.communication.enabled` and
+`agents.communication.wakes` — as ordinary `SettingRow`s under their own
+subheading (`SettingsView`). The schema has no "show only when" yet, so the
+wakes row always shows.
 
 ## File map
 
@@ -126,7 +133,7 @@ section (`requestSettingsSection`).
 | `agentDocs.ts` | Wire types + `getAgentDocs`/`installAgentDocs` for `/api/v1/agent-docs`. |
 | `PluginsSettings.svelte` | Settings → Plugins: every installed plugin's declared settings (see the exception above); slotted after Extensions. |
 | `ActivitySettings.svelte` | The Activity panel (see the exception above): this week's sessions and tokens + time worked, one 14-day sessions chart, by agent and model / by workspace, Export CSV. Fetches while Settings is visible and on the history nudge. |
-| `jump.ts` | `settingsJump` / `requestSettingsSection`: open Settings scrolled to a section (Quick Open "Activity", the dashboard's activity line). |
+| `jump.ts` | `settingsJump` / `requestSettingsSection`: open Settings scrolled to a section (Quick Open "Activity", the dashboard's activity line) or to a setting's row by id (the Mastermind panel's "Agent communication is off"). |
 | `UpdatesStatus.svelte` | The Updates section's status block: app / daemon / agents, each up to date, available, or couldn't check (with why), plus "check now". A `managed` daemon (the account's cloud) reads `MANAGED_UPDATES` with no "check now" and no auto-check switch (`SettingsView` hides the row). Reads `workspace/update.svelte.ts`; the auto-check switch below it is a schema row. |
 | `NotificationStatus.svelte` | The Notifications section's status line: whether the OS (native) or browser will show alerts, with Allow / Open System Settings / Send test. The switches below it are ordinary schema rows. |
 | `SettingRow.svelte` | One schema-driven control. |

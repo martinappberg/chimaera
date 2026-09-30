@@ -46,7 +46,9 @@ and the Mastermind-tier MCP tool `read_timeline`.
     kills, and handshake failures (which degrade to a terminal) are not history.
   - `knowledge` — a finding's status moved, or a finding appeared that couldn't be
     attributed to one turn (see Knowledge below); its id opens the entry.
-  - `note` — posted by the Agent notes plugin ([plugins.md](plugins.md#agent-notes)).
+  - `note` — a message between agents ([agent-communication.md](agent-communication.md); its
+    `delivery`, `reply_to`, `to_name` and `mastermind` fields say how it went), or a note a
+    workbench plugin posted (no `delivery`; never delivered into an agent).
 - **How it's used.** The Timeline tab (quick-open "Timeline", or the dashboard's "open
   timeline →"): day groups (Today / Yesterday / dates), filter chips only for kinds that have
   entries (All · Agents · Commands · Jobs · Knowledge · Notes · Problems), "load older" paging

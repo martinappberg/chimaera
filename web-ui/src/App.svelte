@@ -246,6 +246,7 @@
   import { computeStatus, initCompute, queuedJobCount } from "./lib/workspace/compute";
   import { surfacesOf } from "./lib/layout/surfaces";
   import { activateTimelineWorkspace, onTimelineNudge } from "./lib/workspace/timeline.svelte";
+  import { activateCommsWorkspace, onCommsNudge, onCommsReconnect } from "./lib/workspace/comms.svelte";
   import {
     activateKnowledgeWorkspace,
     focusKnowledgeEntry,
@@ -414,6 +415,7 @@
   import { archiveRecents, nudgeHistory, unarchiveRecents } from "./lib/workspace/history";
   import { sameFile, setSameFileOpener } from "./lib/workspace/sameFile.svelte";
   import { requestSettingsSection } from "./lib/settings/jump";
+  import { setAgentNames } from "./lib/chat/toolLabels";
   import QuickOpen from "./lib/workspace/QuickOpen.svelte";
   import FileTree from "./lib/workspace/FileTree.svelte";
   import SplitTree from "./lib/layout/SplitNode.svelte";
@@ -441,6 +443,12 @@
   let lastRecentsEpoch: number | null = null;
   let workspaces = $state<Workspace[]>([]);
   let sessions = $state<Session[]>([]);
+  // Agent-communication tool rows carry the session id an agent passed;
+  // they say the agent's name (read when a row renders — no subscription).
+  setAgentNames((id) => {
+    const s = sessions.find((x) => x.id === id);
+    return s ? displayName(s) : null;
+  });
   // Two live sessions writing one file: the chat line's and the dashboard
   // card's quiet notice (never the rail) reads this roster.
   $effect(() => {
@@ -1082,6 +1090,7 @@
     // The Timeline / Knowledge / plugin-status stores follow the same
     // activate-on-switch, nudge-to-refetch discipline (one small GET each).
     void activateTimelineWorkspace(wsId);
+    activateCommsWorkspace(wsId);
     void activateKnowledgeWorkspace(wsId);
     void activatePluginsWorkspace(wsId);
     eventsSocket?.watch(wsId);
@@ -1733,6 +1742,7 @@
       onSettings: applyRemoteSettings,
       onGit: onGitNudge,
       onTimeline: onTimelineNudge,
+      onComms: onCommsNudge,
       onAgentPlugins: onAgentPluginsChanged,
       onUpdate: (status) => (updateState.daemon = status),
       onRecents: (epoch) => {
@@ -1767,6 +1777,9 @@
         // latch the old link's floor (the badge goes blank until the next
         // health sample, which the recovery kick fetches promptly).
         if (up && !eventsUp) resetLinkRtt();
+        // No comms frame is sent on connect: refetch what changed while the
+        // socket was down (or a restarted daemon renumbered).
+        if (up && !eventsUp) onCommsReconnect();
         eventsUp = up;
         // A save that died with the link retries once it is back.
         noteDaemonLink(up);
@@ -3625,6 +3638,13 @@
   function openActivitySurface(): void {
     openSettingsSurface();
     requestSettingsSection("Activity");
+  }
+
+  /** Open Settings scrolled to one setting's row (the Mastermind panel's
+   *  "agent communication is off" state). */
+  function openSettingsAt(settingId: string): void {
+    openSettingsSurface();
+    requestSettingsSection(settingId);
   }
 
   /** Open/focus the workspace Timeline (dashboard link, quick-open). */
@@ -5671,16 +5691,18 @@
                      rows may sit under the fold, the header never does. -->
                 <button
                   class="recents-more"
+                  aria-expanded={recentsExpanded}
                   title={recentsExpanded
                     ? "show only what fits"
                     : `show all ${visibleRecents.length} recent conversations`}
                   onclick={toggleRecents}
                 >
-                  {recentsExpanded ? "show less" : `all ${visibleRecents.length}`}
+                  {recentsExpanded ? "less" : "more"}
                 </button>
               {/if}
-              <!-- Every past session, beyond these: revealed while the
-                   pointer is over Recents (always on touch), and in ⌘P. -->
+              <!-- Every past session, beyond these: in ⌘P too. Both header
+                   actions reveal while the pointer is over Recents (always on
+                   touch). -->
               <button
                 class="recents-history"
                 title="All sessions — every past session in this workspace"
@@ -6136,6 +6158,7 @@
         visible
         context={mmContext}
         hostWidth={bodyWidth}
+        onOpenSettings={openSettingsAt}
       />
     {/if}
   </div>
@@ -7284,26 +7307,15 @@
     opacity: 0.8;
   }
 
-  /* The "all N" / "show less" toggle lives in the section header: quiet
-     lowercase text (the header's uppercase tracking is for the label only). */
+  /* The "more" / "less" toggle lives in the section header: quiet lowercase
+     text (the header's uppercase tracking is for the label only). */
   .recents-more {
-    appearance: none;
-    border: none;
-    background: none;
-    margin: -2px -4px -2px 0;
     padding: 1px 4px;
-    border-radius: 4px;
     font: inherit;
     font-size: var(--text-xs);
     font-weight: 500;
     letter-spacing: 0;
     text-transform: none;
-    font-variant-numeric: tabular-nums;
-    color: var(--muted);
-    cursor: pointer;
-    transition:
-      color 0.12s ease,
-      background-color 0.12s ease;
   }
 
   .recents-note {
@@ -7335,46 +7347,48 @@
     align-items: center;
     gap: 4px;
   }
-  /* All sessions: a quiet history mark, shown while the pointer is over
-     Recents or a key focuses it, and always where there is no hover. */
+  /* All sessions: a quiet history mark. */
   .recents-history {
-    appearance: none;
-    border: none;
-    background: none;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    margin: -2px -4px -2px 0;
     padding: 2px 4px;
+  }
+  /* Both header actions show while the pointer is over Recents or a key
+     focuses them, and always where there is no hover. */
+  :is(.recents-more, .recents-history) {
+    appearance: none;
+    border: none;
+    background: none;
+    margin: -2px -4px -2px 0;
     border-radius: 4px;
     color: var(--muted);
     cursor: pointer;
     opacity: 0;
     transition:
       opacity 0.12s ease,
-      color 0.12s ease;
+      color 0.12s ease,
+      background-color 0.12s ease;
   }
-  .recents:hover .recents-history,
-  .recents-history:focus-visible {
+  .recents:hover :is(.recents-more, .recents-history),
+  :is(.recents-more, .recents-history):focus-visible {
     opacity: 0.9;
   }
-  .recents-history:hover {
+  /* Scoped under .recents so it outranks the reveal rule above (the
+     pointer is over both), letting the hovered action reach full opacity. */
+  .recents :is(.recents-more, .recents-history):hover {
     opacity: 1;
     color: var(--fg);
     background: var(--row-hover);
   }
-  .recents-history:focus-visible {
+  :is(.recents-more, .recents-history):focus-visible {
     outline: 1px solid var(--focus-ring);
   }
   @media (hover: none) {
+    .recents-more,
     .recents-history {
       opacity: 0.9;
     }
-  }
-
-  .recents-more:hover {
-    color: var(--fg);
-    background: var(--row-hover);
   }
 
   /* --- FILES section --- */

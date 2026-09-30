@@ -1139,6 +1139,13 @@ struct CodexMapper {
     /// right after a deny-with-feedback does not start a new turn. Each entry
     /// leaves on its steer's answer; teardown clears it.
     feedback_steers: HashSet<String>,
+    /// `SendIfRunning` messages (the daemon's agent messages) steered into
+    /// the running turn and not read yet: one that misses its turn settles
+    /// `Dropped` instead of opening the next — a message must not start a
+    /// turn the user's wake policy didn't allow. Each entry leaves when read,
+    /// dropped or cancelled, or on the user's Send now (their own delivery);
+    /// teardown clears it.
+    agent_steers: HashSet<String>,
     /// Interrupt watchdog: ticks remaining before we synthesize the abort the
     /// app-server never sent. Armed on `Interrupt`, counted down in `tick`,
     /// disarmed when a turn ends (`reset_turn_state`) or a fresh turn opens.
@@ -1282,6 +1289,7 @@ impl CodexMapper {
             unread_steers: BTreeMap::new(),
             read_before_answer: HashSet::new(),
             feedback_steers: HashSet::new(),
+            agent_steers: HashSet::new(),
             interrupt_grace: None,
             idle_flush_grace: None,
             coalescer: Coalescer::new(),
@@ -2479,10 +2487,11 @@ impl CodexMapper {
                 }
             }
             Some("mcpToolCall") => {
+                let server = item["server"].as_str().unwrap_or("mcp");
+                let tool = item["tool"].as_str().unwrap_or("tool");
                 let title = format!(
-                    "{}.{}",
-                    item["server"].as_str().unwrap_or("mcp"),
-                    item["tool"].as_str().unwrap_or("tool"),
+                    "{server}.{tool}{}",
+                    crate::model::comms_title_suffix(server, tool, &item["arguments"])
                 );
                 if !completed {
                     if let Some(flushed) = self.coalescer.flush() {
@@ -3368,6 +3377,7 @@ impl CodexMapper {
             .iter()
             .find(|(_, send)| send.client_msg_id == client_id)
             .map(|(order, _)| *order);
+        self.agent_steers.remove(client_id);
         if let Some(order) = unread {
             self.unread_steers.remove(&order);
         } else if self.steer_pending_for(client_id) {
@@ -3459,11 +3469,21 @@ impl CodexMapper {
             return;
         }
         if !self.deferred_steer_redrives.is_empty() {
-            let batch = std::mem::take(&mut self.deferred_steer_redrives)
-                .into_values()
-                .collect();
-            self.redrive_batch(batch, step);
-            return;
+            let (missed, batch): (Vec<QueuedSend>, Vec<QueuedSend>) =
+                std::mem::take(&mut self.deferred_steer_redrives)
+                    .into_values()
+                    .partition(|send| self.agent_steers.contains(&send.client_msg_id));
+            for send in missed {
+                self.agent_steers.remove(&send.client_msg_id);
+                step.events.push(AgentEvent::UserMessageUpdate {
+                    id: send.client_msg_id,
+                    state: UserMessageState::Dropped,
+                });
+            }
+            if !batch.is_empty() {
+                self.redrive_batch(batch, step);
+                return;
+            }
         }
         let Some(queued) = self.queued_sends.pop_front() else {
             return;
@@ -3484,6 +3504,7 @@ impl CodexMapper {
         let mut events = Vec::new();
         self.read_before_answer.clear();
         self.feedback_steers.clear();
+        self.agent_steers.clear();
         for (_, steered) in std::mem::take(&mut self.unread_steers) {
             events.push(AgentEvent::UserMessageUpdate {
                 id: steered.client_msg_id,
@@ -4221,6 +4242,18 @@ impl CodexMapper {
     }
 
     fn send_blocks(&mut self, blocks: Vec<ContentBlock>, after_turn: bool, step: &mut DriverStep) {
+        self.send_blocks_as(blocks, after_turn, None, step);
+    }
+
+    /// [`Self::send_blocks`] with the caller's delivery key when it minted
+    /// one (`SendIfRunning`), else a fresh one.
+    fn send_blocks_as(
+        &mut self,
+        blocks: Vec<ContentBlock>,
+        after_turn: bool,
+        client_msg_id: Option<String>,
+        step: &mut DriverStep,
+    ) {
         let text = crate::model::blocks_text(&blocks);
         // Images ride the input array as data URLs (the extension's non-local
         // path form; local paths need a shared fs).
@@ -4259,7 +4292,7 @@ impl CodexMapper {
             }
         }
         let input = json!(input);
-        let client_msg_id = crate::model::fresh_uuid();
+        let client_msg_id = client_msg_id.unwrap_or_else(crate::model::fresh_uuid);
         // A send during a live/pending run steers: the agent reads it at its
         // next step (the Codex TUI's and desktop app's default), and it stays
         // pending until then. `SendAfterTurn` holds it for the NEXT turn
@@ -4303,6 +4336,19 @@ impl CodexMapper {
         match cmd {
             AgentCommand::Send { blocks } => self.send_blocks(blocks, false, &mut step),
             AgentCommand::SendAfterTurn { blocks } => self.send_blocks(blocks, true, &mut step),
+            // Steer only into a turn whose id is known; the start window and
+            // idle settle it unsent (the daemon keeps it in the inbox).
+            AgentCommand::SendIfRunning { id, blocks } => {
+                if self.turn_active && !self.turn_id.is_empty() && !self.turn_pending {
+                    self.agent_steers.insert(id.clone());
+                    self.send_blocks_as(blocks, false, Some(id), &mut step);
+                } else {
+                    step.events.push(AgentEvent::UserMessageUpdate {
+                        id,
+                        state: UserMessageState::Dropped,
+                    });
+                }
+            }
             AgentCommand::Permission {
                 request_id,
                 option_id,
@@ -4528,6 +4574,7 @@ impl CodexMapper {
                     self.queued_sends.retain(|send| send.client_msg_id != id);
                     self.deferred_steer_redrives
                         .retain(|_, send| send.client_msg_id != id);
+                    self.agent_steers.remove(&id);
                     step.events.push(AgentEvent::UserMessageUpdate {
                         id,
                         state: UserMessageState::Cancelled,
@@ -4573,6 +4620,9 @@ impl CodexMapper {
             // simply opens the next turn; in the start window it steers once
             // the turn id lands. Already read: nothing to do.
             AgentCommand::SendNow { id } => {
+                // The user's own "deliver it now": an agent message they
+                // promote is theirs to open the next turn with.
+                self.agent_steers.remove(&id);
                 let running = self.turn_active && !self.turn_id.is_empty();
                 if let Some(pos) = self
                     .queued_sends
@@ -5210,6 +5260,156 @@ mod tests {
         // The item's completion (or any repeat) resolves nothing again.
         let step = m.on_frame(&read_item(&msg_id));
         assert!(step.events.is_empty());
+    }
+
+    fn agent_send(id: &str, text: &str) -> AgentCommand {
+        AgentCommand::SendIfRunning {
+            id: id.into(),
+            blocks: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// The daemon's agent message joins the running turn under ITS key and
+    /// resolves `sent` when the agent reads it — like any steer.
+    #[test]
+    fn agent_message_steers_the_running_turn_under_its_own_key() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_command(agent_send("agent-1", "heads-up"));
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::UserMessage { id: Some(id), queued: true, .. } if id == "agent-1"
+        ));
+        assert_eq!(step.outbound[0]["method"], "turn/steer");
+        assert_eq!(step.outbound[0]["params"]["clientUserMessageId"], "agent-1");
+        let rpc = step.outbound[0]["id"].as_u64().unwrap();
+        m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+        let step = m.on_frame(&read_item("agent-1"));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::UserMessageUpdate {
+                id: "agent-1".into(),
+                state: UserMessageState::Sent,
+            }]
+        );
+        assert!(m.agent_steers.is_empty());
+    }
+
+    /// No turn to join: settled unsent at once — no echo, no turn/start.
+    #[test]
+    fn agent_message_with_no_running_turn_settles_dropped() {
+        let mut m = mapper();
+        let step = m.on_command(agent_send("agent-1", "heads-up"));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::UserMessageUpdate {
+                id: "agent-1".into(),
+                state: UserMessageState::Dropped,
+            }]
+        );
+        assert!(step.outbound.is_empty(), "{:?}", step.outbound);
+        assert!(m.agent_steers.is_empty());
+    }
+
+    /// A turn that ends before reading it drops the agent message instead of
+    /// opening the next turn with it; the user's own unread steer still
+    /// re-drives, alone.
+    #[test]
+    fn agent_message_that_misses_its_turn_is_dropped_not_redriven() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_command(agent_send("agent-1", "heads-up"));
+        let rpc = step.outbound[0]["id"].as_u64().unwrap();
+        m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "mine".into(),
+            }],
+        });
+        let AgentEvent::UserMessage { id: Some(mine), .. } = &step.events[0] else {
+            panic!("expected UserMessage, got {:?}", step.events);
+        };
+        let mine = mine.clone();
+        let rpc = step.outbound[0]["id"].as_u64().unwrap();
+        m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "completed" } },
+        }));
+        assert!(step.events.contains(&AgentEvent::UserMessageUpdate {
+            id: "agent-1".into(),
+            state: UserMessageState::Dropped,
+        }));
+        let starts: Vec<_> = step
+            .outbound
+            .iter()
+            .filter(|o| o["method"] == "turn/start")
+            .collect();
+        assert_eq!(starts.len(), 1, "{:?}", step.outbound);
+        assert_eq!(starts[0]["params"]["clientUserMessageId"], json!(mine));
+        assert_eq!(
+            starts[0]["params"]["input"],
+            json!([{ "type": "text", "text": "mine" }])
+        );
+        assert!(m.agent_steers.is_empty());
+    }
+
+    /// A refused steer (the turn ended under it) is dropped too.
+    #[test]
+    fn a_refused_agent_steer_is_dropped() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_command(agent_send("agent-1", "heads-up"));
+        let rpc = step.outbound[0]["id"].as_u64().unwrap();
+        m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "completed" } },
+        }));
+        let step = m.on_frame(&json!({
+            "id": rpc,
+            "error": { "code": -32600, "message": "no active turn to steer" },
+        }));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::UserMessageUpdate {
+                id: "agent-1".into(),
+                state: UserMessageState::Dropped,
+            }]
+        );
+        assert!(
+            !step.outbound.iter().any(|o| o["method"] == "turn/start"),
+            "{:?}",
+            step.outbound
+        );
+    }
+
+    /// The user's Send now on an agent message is their own delivery: it
+    /// opens the next turn like any message they promote.
+    #[test]
+    fn send_now_on_an_agent_message_delivers_it() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_command(agent_send("agent-1", "heads-up"));
+        let rpc = step.outbound[0]["id"].as_u64().unwrap();
+        m.on_frame(&json!({ "id": rpc, "result": { "turnId": "turn-A" } }));
+        m.on_command(AgentCommand::SendNow {
+            id: "agent-1".into(),
+        });
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "interrupted" } },
+        }));
+        let starts: Vec<_> = step
+            .outbound
+            .iter()
+            .filter(|o| o["method"] == "turn/start")
+            .collect();
+        assert_eq!(starts.len(), 1, "{:?}", step.outbound);
+        assert_eq!(starts[0]["params"]["clientUserMessageId"], "agent-1");
+        assert!(step.events.contains(&AgentEvent::UserMessageUpdate {
+            id: "agent-1".into(),
+            state: UserMessageState::Sent,
+        }));
     }
 
     /// Codex drops a steer it accepted but never read when the turn ends
@@ -7318,6 +7518,48 @@ mod tests {
         });
         assert_eq!(step.outbound.len(), 1, "accept sends only the decision");
         assert_eq!(step.events.len(), 1, "no user echo on accept");
+    }
+
+    /// An agent-communication call's card says who it went to (the item's
+    /// `arguments`, codex 0.157.1 ThreadItem); other MCP calls keep the bare
+    /// `server.tool`.
+    #[test]
+    fn a_chimaera_message_call_names_its_recipient() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let title_of = |m: &mut CodexMapper, id: &str, tool: &str, args: Value| {
+            let step = m.on_frame(&json!({
+                "method": "item/started",
+                "params": { "item": {
+                    "id": id, "type": "mcpToolCall", "server": "chimaera",
+                    "tool": tool, "status": "inProgress", "arguments": args,
+                }},
+            }));
+            step.events
+                .iter()
+                .find_map(|e| match e {
+                    AgentEvent::ToolCall { title, .. } => Some(title.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            title_of(
+                &mut m,
+                "m1",
+                "message_agent",
+                json!({"to": "s-1a2b", "text": "hi"})
+            ),
+            "chimaera.message_agent → s-1a2b"
+        );
+        assert_eq!(
+            title_of(&mut m, "m2", "read_agent", json!({"agent": "mastermind"})),
+            "chimaera.read_agent → mastermind"
+        );
+        assert_eq!(
+            title_of(&mut m, "m3", "notify", json!({"message": "done"})),
+            "chimaera.notify"
+        );
     }
 
     #[test]

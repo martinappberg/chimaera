@@ -34,9 +34,12 @@
     context: MastermindContext | null;
     /** The window body's width (rail + stage + this) — docked vs overlay. */
     hostWidth: number;
+    /** Open Settings at one setting's row (the dock's off state). */
+    onOpenSettings?: (settingId: string) => void;
   }
 
-  let { cfg, session, wsId, paneId, ctrl, refresh, visible, context, hostWidth }: Props = $props();
+  let { cfg, session, wsId, paneId, ctrl, refresh, visible, context, hostWidth, onOpenSettings }: Props =
+    $props();
 
   /** What the panes keep beside a docked panel before it floats instead. */
   const STAGE_MIN = 560;
@@ -111,6 +114,7 @@
       {refresh}
       {visible}
       {context}
+      {onOpenSettings}
       onCollapse={() => setMastermindPanelOpen(false)}
     />
   </div>

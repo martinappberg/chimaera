@@ -244,6 +244,8 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
             match signal {
                 ChatSignal::Event(id, entry) => {
                     apply_chat_event(&state, &id, &entry.ev);
+                    // AFTER the fold: a turn end reads the record idle.
+                    crate::comms::on_chat_event(&state, &id, &entry.ev);
                     crate::history::observe_chat(&state, &id, &entry.ev);
                     // @term: grants ride the protocol input in chat mode —
                     // the UserPromptSubmit hook (the TUI's autolink path)
@@ -312,7 +314,7 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
                     // Record the death BEFORE handle_chat_exit: retiring drops
                     // the workspace mapping the Timeline entry needs.
                     if !deliberate {
-                        crate::lock(&state.notes).forget_session(&id);
+                        state.comms.forget_session(&id);
                         crate::plugins::runtime::session_ended(&state, &id);
                         let now = crate::timeline::now_ms();
                         if let Some(draft) = episodes.flush(&id, now) {
@@ -559,12 +561,16 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
     // agent (a hook duplicate would be a no-op — first write wins).
     if record.first_prompt.is_none() {
         // The daemon's restart note is not the user's words and must not
-        // name the conversation (a Remote Control message is theirs).
+        // name the conversation (a Remote Control message is theirs); nor is
+        // another agent's message, while the Mastermind's direction names
+        // the work by its body (`comms::naming_text`).
         if let AgentEvent::UserMessage { text, origin, .. } = ev {
             let text = text.trim();
             if !text.is_empty() && origin.as_deref() != Some(chimaera_agent::model::ORIGIN_RESTART)
             {
-                record.first_prompt = Some(text.to_string());
+                if let Some(name) = crate::comms::naming_text(text, origin.as_deref()) {
+                    record.first_prompt = Some(name);
+                }
             }
         }
     }
@@ -3683,16 +3689,22 @@ pub(crate) async fn resurrect_chat_transfer(
 
 /// The codex driver's standing consent to chimaera MCP tool calls (see the
 /// gating note in `spawn_chat_session`): the prompt-free tools and the
-/// workspace's active plugin tools for every session, plus a Mastermind's
-/// tier.
+/// workspace's extras (`plugins::spawn_allow`: active plugin tools, agent
+/// communication's) for every session, plus a Mastermind's tier — whose
+/// ask-first sends keep their prompt.
 fn codex_mcp_auto_approve(
     mastermind: Option<crate::workspaces::MastermindMode>,
     plugin_tools: Vec<String>,
 ) -> chimaera_agent::driver::McpAutoApprove {
+    let ask = mastermind == Some(crate::workspaces::MastermindMode::Ask);
     let always = crate::mcp::ALWAYS_ALLOWED_TOOLS
         .iter()
         .map(|t| t.to_string())
-        .chain(plugin_tools);
+        .chain(
+            plugin_tools
+                .into_iter()
+                .filter(move |t| !(ask && t == crate::comms::SEND_TOOL)),
+        );
     chimaera_agent::driver::McpAutoApprove {
         server: "chimaera".to_string(),
         tools: match mastermind {

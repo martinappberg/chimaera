@@ -192,8 +192,12 @@ pub(crate) async fn spawn_session(
             } else {
                 None
             };
-            // Cloud projects also need host/profile context on the TUI surface.
-            // Otherwise preserve the existing plugin/Mastermind opt-in boundary.
+            // Codex TUIs reach the chimaera endpoint while agent
+            // communication is on (default) or a plugin with tools is active
+            // here (`spawn_allow`); with neither, the argv and env stay
+            // exactly what they were.
+            // Cloud projects also need host/profile context on the TUI surface
+            // (`pro::workspace_profile`); otherwise that opt-in boundary stands.
             let codex_plugin_tools = if agent_kind == AgentKind::Codex {
                 crate::plugins::spawn_allow(state, &workspace.id).await
             } else {

@@ -1877,6 +1877,7 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     let mut last_recents_epoch: Option<u64> = None;
     let mut last_agent_plugins_epoch: Option<u64> = None;
     let mut last_timeline: Option<String> = None;
+    let mut last_comms: Option<String> = None;
     // Notices start at the head: a (re)connecting window is told about what
     // happens from now on, never handed old alerts as new.
     let mut last_notice = state.notices.head();
@@ -1927,6 +1928,12 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         return;
     }
     if send_timeline_snapshot(&mut socket, &state, &mut last_timeline, None)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if send_comms_snapshot(&mut socket, &state, &mut last_comms)
         .await
         .is_err()
     {
@@ -2093,6 +2100,12 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         {
             return;
         }
+        if send_comms_snapshot(&mut socket, &state, &mut last_comms)
+            .await
+            .is_err()
+        {
+            return;
+        }
         if send_agent_plugins_snapshot(&mut socket, &state, &mut last_agent_plugins_epoch)
             .await
             .is_err()
@@ -2220,6 +2233,26 @@ async fn send_timeline_snapshot(
         epochs.insert(workspace.clone(), *epoch);
     }
     let frame = json!({"type": "timeline", "epochs": epochs}).to_string();
+    if last.as_deref() == Some(frame.as_str()) {
+        return Ok(());
+    }
+    socket.send(Message::Text(frame.clone().into())).await?;
+    *last = Some(frame);
+    Ok(())
+}
+
+/// Send a `{"type":"comms","epochs":{workspace_id:epoch}}` invalidate frame
+/// when any workspace's agent-communication state (unread counts, wake
+/// requests) may have changed — the timeline frame's shape and dedupe; the
+/// client pulls its own workspace's `GET /workspaces/{id}/comms`.
+async fn send_comms_snapshot(
+    socket: &mut WebSocket,
+    state: &AppState,
+    last: &mut Option<String>,
+) -> Result<(), axum::Error> {
+    let epochs: std::collections::BTreeMap<String, u64> =
+        state.comms.epochs_snapshot().into_iter().collect();
+    let frame = json!({"type": "comms", "epochs": epochs}).to_string();
     if last.as_deref() == Some(frame.as_str()) {
         return Ok(());
     }

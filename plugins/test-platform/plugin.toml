@@ -11,7 +11,7 @@ api = "0.2"
 files = "read"
 
 [provides]
-events = ["file-saved", "file-changed", "settings-changed", "switched-on", "switched-off"]
+events = ["file-saved", "file-changed", "settings-changed", "switched-on", "switched-off", "hook", "session-ended"]
 
 [adds]
 ui = ["A Platform board tab, a dashboard panel, a status chip and a card section", "Opens .fixture files in its own view"]

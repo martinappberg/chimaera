@@ -101,15 +101,14 @@ async fn tui_mcp(
     .await
     .unwrap();
     let args = std::fs::read_to_string(&capture).unwrap();
-    assert_eq!(args.contains("mcp_servers.chimaera.url="), enabled);
-    // The notify hook (pause state, restart resume) is a Pro-project feature:
-    // elsewhere a Codex TUI keeps its argv and the user's own notify.
-    assert_eq!(args.contains("notify=["), enabled);
+    // Agent communication (on by default) hands every Codex TUI the chimaera
+    // endpoint and its key; the cloud profile tools are never pre-approved.
+    assert!(args.contains("mcp_servers.chimaera.url="));
     assert!(!args.contains("update_cloud_profile"));
-    assert_eq!(
-        std::fs::read_to_string(&present).unwrap(),
-        if enabled { "yes" } else { "no" }
-    );
+    assert_eq!(std::fs::read_to_string(&present).unwrap(), "yes");
+    // The notify hook (pause state, restart resume) is a Pro-project feature:
+    // elsewhere a Codex TUI keeps the user's own notify.
+    assert_eq!(args.contains("notify=["), enabled);
     state.sessions.kill(id).unwrap();
     std::fs::remove_file(capture).unwrap();
     std::fs::remove_file(present).unwrap();

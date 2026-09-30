@@ -306,10 +306,7 @@ async fn timeline_appends_are_notes_only_rate_capped_and_readable() {
         serde_json::json!({"text": "one too many"}),
     )
     .await;
-    assert!(
-        is_err && text.contains("too many notes this minute"),
-        "{text}"
-    );
+    assert!(is_err && text.contains("this minute"), "{text}");
 
     let (is_err, text) = mcp_tool_call(
         &state,

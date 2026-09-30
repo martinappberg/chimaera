@@ -4,7 +4,7 @@
  * "bad news leads" order — design §3/§9). No DOM, no store: everything here
  * is unit-tested in timelineModel.test.ts.
  */
-import type { TimelineEntry, TimelineRecorded } from "./timeline.svelte";
+import type { TimelineEntry, TimelineNote, TimelineRecorded } from "./timeline.svelte";
 
 /** Consecutive turns of ONE session within this gap merge into one row
  *  ("+N follow-ups"); the store stays per turn. */
@@ -252,13 +252,15 @@ export function dayGroups(groups: readonly TimelineGroup[], nowMs: number, local
 
 export type TimelineFilter = "all" | "agents" | "commands" | "jobs" | "knowledge" | "notes" | "problems";
 
+/** The `notes` id predates agent communication; the label says what the
+ *  rows are now. */
 export const FILTER_LABELS: Record<TimelineFilter, string> = {
   all: "All",
   agents: "Agents",
   commands: "Commands",
   jobs: "Jobs",
   knowledge: "Knowledge",
-  notes: "Notes",
+  notes: "Messages",
   problems: "Problems",
 };
 
@@ -314,10 +316,32 @@ export function commandLabel(text: string, max = 48): string {
   return label.length > max ? `${label.slice(0, max - 1)}…` : label;
 }
 
-/** Unread notes addressed to the Mastermind past `seenSeq`. */
-export function mastermindInbox(entries: readonly TimelineEntry[], seenSeq: number): TimelineEntry[] {
-  // A message that already woke the Mastermind (auto mode) was read.
-  return entries.filter(
-    (e) => e.kind === "note" && e.note?.to === "mastermind" && e.note.woke !== true && e.seq > seenSeq,
-  );
+/** Who a message went to, in words: its recipient's name when it was sent,
+ *  else the live name (older messages carry none), else the id; the two
+ *  reserved addresses read as "the Mastermind" and "everyone". */
+export function messageRecipient(note: TimelineNote, nameOf: (sid: string) => string | undefined): string {
+  const to = note.to;
+  if (to === undefined || to === "everyone") return "everyone";
+  if (to === "mastermind") return "the Mastermind";
+  const named = note.to_name?.trim();
+  return named !== undefined && named !== "" ? named : (nameOf(to) ?? to);
+}
+
+/** The delivery chip's words, or null for none. A message written before
+ *  delivery was recorded still says it woke its recipient. */
+export function deliveryLabel(note: TimelineNote): string | null {
+  switch (note.delivery) {
+    case "next_step":
+      return "read at its next step";
+    case "inbox":
+      return "in its inbox";
+    case "woke":
+      return "woke it";
+    case "asked":
+      return "asked you";
+    case undefined:
+      return note.woke === true ? "woke it" : null;
+    default:
+      return null;
+  }
 }

@@ -174,7 +174,9 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
 - **How it's used.** Click a `recent` row to reopen it (shows agent glyph, title, relative age).
   The section fills whatever height the sessions column has left and shows **as many rows as fit**
   (measured by a `ResizeObserver`, fixed 26px rows; a floor of 3 below which the column scrolls);
-  "all N" appears only when more exist and expands into a scrollable list.
+  "more" appears only when more exist and expands into a scrollable list ("less" collapses it);
+  it and the all-sessions history mark beside it reveal while the pointer is over Recents
+  (always shown on touch).
 - **Where it lives.** `App.svelte` (`refreshRecents`/`openRecent`), `launcher.ts` (`listRecents`).
   Route `GET /api/v1/recents?workspace_id=` (server `recents.rs`); reopening rides
   `POST /sessions` with `resume` + `title_hint`. History replay: `chimaera-agent/src/transcript.rs`

@@ -318,6 +318,13 @@ impl Plugin for Fixture {
             Event::SwitchedOff => {
                 let _ = platform::state_keep(&cx, "switched", &json!("off"));
             }
+            // A hook the plugin declared: recorded, and answered with one
+            // line the hook's `additionalContext` carries.
+            Event::Hook(hook) => {
+                record(&cx, format!("hook {}", hook.name));
+                return Some(format!("test-platform heard {}", hook.name));
+            }
+            Event::SessionEnded(sid) => record(&cx, format!("ended {sid}")),
             _ => {}
         }
         None
