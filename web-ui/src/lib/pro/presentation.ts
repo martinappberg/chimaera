@@ -18,31 +18,40 @@ export function readIntent(value: string | null, now = Date.now()): PurchaseInte
 }
 /** `agents` is whether an agent was connected in the cloud at the last
  * catalog read (remembered by the app, never probed): unknown claims nothing,
- * and none connected reads as the next step, not as an error. */
-export function cloudCopy(state: string, reason: string | null, _phase?: CloudProvisioningStatus["phase"], agents: boolean | null = null): { title: string; detail: string } {
+ * and none connected reads as the next step, not as an error. `readyOnce` is
+ * whether this account's cloud has been ready before (`cloudReadyOnce`): only
+ * its very first setup reads as setup; any later `preparing` (a service
+ * update, say) is the same calm availability as ready and idle. */
+export function cloudCopy(state: string, reason: string | null, _phase?: CloudProvisioningStatus["phase"], agents: boolean | null = null, readyOnce = false): { title: string; detail: string } {
   if (reason === "provisioning_disabled") return { title: "Cloud access is temporarily unavailable", detail: "Cloud work isn’t available yet. Work on this computer continues as usual." };
   if (reason === "beta_invite_required") return { title: "Cloud access is by invitation", detail: "This preview needs an invitation before you can use cloud work." };
   if (reason === "hours_exhausted") return { title: "Cloud allowance used for this month", detail: "Work continues on your computer. Your cloud allowance resets next month." };
   if (reason === "storage_exhausted") return { title: "Cloud copying needs more room", detail: "Your local projects remain available. The latest cloud copy couldn’t fit within your allowance. Review Usage and plan details." };
   if (reason === "spend_limit_reached") return { title: "Cloud use is paused", detail: "Your account’s cloud spending limit has been reached. Your local work is unaffected." };
+  if (state === "preparing" && !readyOnce) return { title: "Getting things ready", detail: "Setting up your cloud. This usually takes a couple of minutes." };
   switch (state) {
-    // Idle compute is an implementation detail, not a different level of access.
-    case "ready": case "sleeping":
-      // Asleep, the connection panel isn't shown, so the step is named here;
-      // awake, the panel below names it and this stays about availability.
-      if (agents === false) return state === "sleeping"
-        ? { title: "Connect an agent to start cloud work", detail: "Open Agent connections below and sign in with the agent you already use." }
-        : { title: "Available when you need it", detail: "Connect an agent below to start cloud work." };
-      return { title: "Available when you need it", detail: agents
-        ? "Your connected agents can keep working while you’re away. Your projects and conversations come with you."
-        : "Agents you connect can keep working while you’re away. Your projects and conversations come with you." };
-    case "preparing": return { title: "Getting things ready", detail: "Chimaera is preparing access to your projects and agent connections. You can keep working here." };
+    // Idle compute, and a cloud being updated, are implementation details,
+    // not a different level of access. The connections section below shows
+    // the agents, so this stays about availability.
+    case "ready": case "sleeping": case "preparing":
+      return { title: "Available when you need it", detail: agents === false
+        ? "Connect an agent below to start cloud work."
+        : agents
+          ? "Your connected agents can keep working while you’re away. Your projects and conversations come with you."
+          : "Agents you connect can keep working while you’re away. Your projects and conversations come with you." };
     case "no_plan": return { title: "Cloud is included with Pro", detail: "Choose a plan when you’re ready. Local work and ordinary SSH stay available." };
     case "limited": return { title: "Cloud use is paused", detail: "Your account has reached a cloud limit. Your local work is unaffected." };
     // A state this app does not know (a newer service) is not an outage.
     case "unknown": return { title: "Checking cloud access", detail: "Your local work is available while Chimaera checks." };
     default: return { title: "Cloud is temporarily unavailable", detail: "We couldn’t check cloud access. Chimaera keeps trying; your local work is available." };
   }
+}
+/** Whether this account's cloud has been ready before, from the app's memory
+ * (`cloud_ready_once`). An older shell without it: a remembered catalog fact
+ * means a catalog was read, which needs a ready cloud. */
+export function cloudReadyOnce(status: Pick<CloudProvisioningStatus, "cloud_ready_once" | "agents_connected" | "remembered_providers"> | null): boolean {
+  if (status === null) return false;
+  return status.cloud_ready_once ?? (status.agents_connected != null || (status.remembered_providers?.length ?? 0) > 0);
 }
 /** The account's `return_window_ended` code (403 once a plan has ended and the
  * time to bring its cloud work home has passed). Quiet: a plain sentence, no
@@ -60,27 +69,27 @@ export function returningLine(until: string | null, now = Date.now(), locale?: s
   return `Your plan has ended. Bring your work home from the cloud by ${formatFullTimestamp(ends, locale)}.`;
 }
 /** The fixed code the native shell and the browser transport give a cloud
- * request answered by a cloud machine that is asleep or still starting (503
+ * request answered by a cloud that is asleep or still starting (503
  * `worker_asleep`/`worker_unavailable`, or a reply marked sleeping). That is a
- * state, never an error: it reads as one of `sleepingConnectionsLine`'s quiet
- * lines and the page keeps checking on its usual cadence. */
+ * state, never an error, and never words on a passive path: the connections
+ * section keeps its remembered rows and the page keeps checking. Only an
+ * action the user took says it is still connecting. */
 export const CLOUD_ASLEEP = "cloud_asleep";
 export function cloudAsleep(reason: unknown): boolean {
   return (reason instanceof Error ? reason.message : String(reason)) === CLOUD_ASLEEP;
 }
-/** The quiet line for agent connections while the cloud machine sleeps:
- * waking while a request that wakes it is in flight (or it reports it is
- * starting), asleep when nothing is waking it. */
-export function sleepingConnectionsLine(waking: boolean): string {
-  return waking
-    ? "Your cloud machine is waking up. Connections show in a moment."
-    : "Your cloud machine is asleep. Connecting an agent wakes it.";
-}
+/** How long an action the user took (opening Agent connections, pressing
+ * Connect) keeps waiting for the cloud to come up behind it before the
+ * section settles or the action reports its usual failure. */
+export const WAKE_BOUND_MS = 120_000;
+/** A live answer this late may show one muted "Checking…" beside the
+ * section title; sooner, the remembered rows simply stay. */
+export const CHECKING_AFTER_MS = 5000;
 export function friendlyError(reason: unknown, fallback: string): string {
   const text = reason instanceof Error ? reason.message : String(reason);
   if (text === "return_window_ended") return RETURN_WINDOW_ENDED_COPY;
-  // A request that wakes the machine found it still starting.
-  if (text === CLOUD_ASLEEP) return "Your cloud machine is waking up. Try again in a moment.";
+  // An action the user took found the cloud still coming up.
+  if (text === CLOUD_ASLEEP) return "Still connecting to your cloud. Try again in a moment.";
   if (text === "service_unsupported") return "Cloud work is off for now because this version of Chimaera and your account don’t match. Installing an update, if one is offered, turns it back on; otherwise it resumes on its own. Work on this computer isn’t affected.";
   // Sign-out finished here; the app removes the saved sign-in by itself.
   if (text === "sign_out_pending") return "You’re signed out on this computer. The saved sign-in is cleared automatically next time you’re online.";

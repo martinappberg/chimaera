@@ -1,13 +1,29 @@
 import { api } from "../net/api";
 import { isNativeShell, proCloudRequest, type CloudSetupInfo, type CloudSetupRequest } from "../net/native";
-import { CLOUD_ASLEEP } from "./presentation";
+import { CLOUD_ASLEEP, WAKE_BOUND_MS, cloudAsleep } from "./presentation";
 
 /** All passive operations stay GETs without wake intent. Provider connection is
- * the user's explicit authorization to prepare/wake the cloud machine. */
+ * the user's explicit authorization to prepare/wake the cloud. */
 /** Whether this daemon is a cloud machine: a passive read that never wakes one.
  * Any other daemon answers `available: false`. */
 export async function isCloudMachine(signal?: AbortSignal): Promise<boolean> {
   return (await cloudRequest({ operation: "info" }, signal)).available === true;
+}
+
+/** An action the user took (Connect, Disconnect): the press itself wakes the
+ * cloud. While the cloud answers that it is still coming up (`cloud_asleep`)
+ * the same request is sent again after a short pause, starting no new attempt
+ * later than `WAKE_BOUND_MS` after the press; then that answer stands and the
+ * caller shows its usual failure. Null once `wanted` says the press no longer
+ * matters (a newer action, a closed page). */
+export async function cloudAction(request: CloudSetupRequest, wanted: () => boolean = () => true, pauseMs = 3000): Promise<CloudSetupInfo | null> {
+  const started = Date.now();
+  for (;;) {
+    try { return await cloudRequest(request); }
+    catch (cause) { if (!cloudAsleep(cause) || Date.now() - started >= WAKE_BOUND_MS) throw cause; }
+    await new Promise(resolve => setTimeout(resolve, pauseMs));
+    if (!wanted()) return null;
+  }
 }
 
 export async function cloudRequest(request: CloudSetupRequest, signal?: AbortSignal): Promise<CloudSetupInfo> {

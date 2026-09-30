@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { MirrorStatus, MirrorWorkspace } from "../net/native";
-import { paid, readIntent, cloudAsleep, CLOUD_ASLEEP, sleepingConnectionsLine, cloudCopy, cloudPollDelay, cloudProjectStatus, connectionWarningCopy, copyIssue, friendlyError, projectCopiesSetupLine, projectCopyError, projectPlace, returningLine, RETURN_WINDOW_ENDED_COPY, signInNoteCopy, alreadySubscribed, recoverableAccountRestore } from "./presentation";
+import { paid, readIntent, cloudAsleep, CLOUD_ASLEEP, cloudCopy, cloudReadyOnce, cloudPollDelay, cloudProjectStatus, connectionWarningCopy, copyIssue, friendlyError, projectCopiesSetupLine, projectCopyError, projectPlace, returningLine, RETURN_WINDOW_ENDED_COPY, signInNoteCopy, alreadySubscribed, recoverableAccountRestore } from "./presentation";
 
 // Copy is free to change; these tests pin which states read alike or apart,
 // what takes precedence, and that nothing from a raw error reaches the page.
@@ -39,12 +39,32 @@ describe("honest cloud state", () => {
     const connected = cloudCopy("sleeping", null, undefined, true);
     const none = cloudCopy("sleeping", null, undefined, false);
     expect(new Set([unknown.detail, connected.detail, none.detail]).size).toBe(3);
-    expect(none.title).not.toBe(connected.title);
-    // Awake, the connection panel names the step; the heading stays about availability.
-    expect(cloudCopy("ready", null, undefined, false).title).toBe(connected.title);
-    expect(cloudCopy("ready", null, undefined, true)).toEqual(connected);
+    // The connections section always shows, so the heading stays about availability.
+    expect(new Set([unknown.title, connected.title, none.title]).size).toBe(1);
+    // Idle and awake read alike for every agent fact.
+    for (const agents of [null, true, false]) expect(cloudCopy("ready", null, undefined, agents)).toEqual(cloudCopy("sleeping", null, undefined, agents));
     // A limit still takes precedence over the agent step.
     expect(cloudCopy("sleeping", "hours_exhausted", undefined, false)).toEqual(cloudCopy("limited", "hours_exhausted"));
+  });
+  it("reads as setup only while an account's cloud has never been ready", () => {
+    const first = cloudCopy("preparing", null, "worker", null, false);
+    for (const agents of [null, true, false]) {
+      // A later `preparing` (a service update, say) is the calm available state.
+      expect(cloudCopy("preparing", null, "worker", agents, true)).toEqual(cloudCopy("ready", null, undefined, agents));
+      expect(cloudCopy("preparing", null, undefined, agents, false)).toEqual(first);
+    }
+    expect(first.title).not.toBe(cloudCopy("ready", null).title);
+    // Ready and idle never read as setup, whatever the memory says.
+    expect(cloudCopy("ready", null, undefined, null, false)).toEqual(cloudCopy("ready", null, undefined, null, true));
+    expect(cloudCopy("preparing", "hours_exhausted", undefined, null, false)).toEqual(cloudCopy("limited", "hours_exhausted"));
+  });
+  it("remembers a ready cloud from the app, or from an older app's catalog fact", () => {
+    expect(cloudReadyOnce(null)).toBe(false);
+    expect(cloudReadyOnce({ cloud_ready_once: true })).toBe(true);
+    expect(cloudReadyOnce({ cloud_ready_once: false, agents_connected: true })).toBe(false);
+    expect(cloudReadyOnce({})).toBe(false);
+    expect(cloudReadyOnce({ agents_connected: false })).toBe(true);
+    expect(cloudReadyOnce({ agents_connected: null, remembered_providers: [{ id: "claude", label: "Claude Code", category: "agent", state: "signed_in" }] })).toBe(true);
   });
   it("gives each ended sign-in its own quiet line and a signed-out sign-out its own sentence", () => {
     const notes = ["sign_in_timed_out", "sign_in_incomplete", "browser_unavailable"].map(signInNoteCopy);
@@ -255,23 +275,18 @@ describe("an ended plan's return window", () => {
   });
 });
 
-describe("a sleeping or waking cloud machine", () => {
+describe("a sleeping or starting cloud", () => {
   it("recognizes only the fixed code, from the native shell (a string) or the browser transport (an Error)", () => {
     expect(cloudAsleep(CLOUD_ASLEEP)).toBe(true);
     expect(cloudAsleep(new Error(CLOUD_ASLEEP))).toBe(true);
     for (const other of ["worker_asleep", "Couldn't complete cloud setup. Try again shortly.", new Error("provider_busy"), null, undefined]) expect(cloudAsleep(other)).toBe(false);
   });
-  it("reads as a quiet state that tells waking from asleep, never as the failure copy", () => {
-    const failure = "Your agent connections couldn’t load. Try again in a moment.";
-    const waking = sleepingConnectionsLine(true);
-    const asleep = sleepingConnectionsLine(false);
-    expect(waking).not.toBe(asleep);
-    for (const line of [waking, asleep]) {
-      expect(line).not.toBe(failure);
-      expect(line).not.toMatch(/couldn|error|failed|worker|keeper/i);
-    }
-    expect(friendlyError(CLOUD_ASLEEP, failure)).not.toBe(failure);
-    expect(friendlyError(new Error(CLOUD_ASLEEP), failure)).toBe(friendlyError(CLOUD_ASLEEP, failure));
+  it("answers an action the user took quietly, never with the failure copy or machine words", () => {
+    const failure = "This repository couldn’t open in the cloud. Check the URL and your Git access, then try again.";
+    const line = friendlyError(CLOUD_ASLEEP, failure);
+    expect(line).not.toBe(failure);
+    expect(line).not.toMatch(/machine|waking|asleep|couldn|error|failed|worker|keeper/i);
+    expect(friendlyError(new Error(CLOUD_ASLEEP), failure)).toBe(line);
     expect(friendlyError("something else", failure)).toBe(failure);
   });
 });
