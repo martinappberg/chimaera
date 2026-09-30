@@ -327,21 +327,23 @@ impl Pro {
         self.endpoint.is_some()
     }
 
-    /// Whether the cloud could continue this account's work, from what the
-    /// app already knows (no request is made): signed in, a plan whose
-    /// cloud is set up, cloud hours left, and no remembered answer that no
-    /// agent is connected there. The daemon decides the rest per project
-    /// (`cloud_handoff` on `/pro/status`).
-    pub(super) fn cloud_may_continue(&self) -> bool {
+    /// The agent providers (`claude`, `codex`) the cloud could continue this
+    /// account's work with, from what the app already knows (no request is
+    /// made): signed in, a plan whose cloud is set up, cloud hours left, and
+    /// each provider signed in there at the last catalog read. Empty when
+    /// the cloud could continue nothing. The daemon decides the rest per
+    /// project (`cloud_handoff` on `/pro/status`).
+    pub(super) fn cloud_agents(&self) -> Vec<String> {
         if self.client_now().is_none() {
-            return false;
+            return Vec::new();
         }
         let Some(account) = lock(&self.account).clone() else {
-            return false;
+            return Vec::new();
         };
-        setup_available(&account)
-            && !account.hours_exhausted
-            && self.agents.get(&account.account_id) != Some(false)
+        if !setup_available(&account) || account.hours_exhausted {
+            return Vec::new();
+        }
+        self.agents.signed_in(&account.account_id)
     }
 }
 

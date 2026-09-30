@@ -4,10 +4,12 @@
 //! **When it asks.** A quit (⌘Q, the menu or tray, Dock › Quit, logging out)
 //! or closing the last window when that ends the app, once the unsaved-edits
 //! guard has let it through (`unsaved` always runs first; the two dialogs stay
-//! separate), while the account's cloud could run the work
-//! (`Pro::cloud_may_continue`) and the daemon reports a project whose agents
-//! are running work that the cloud could take now (`working_agents` and
-//! `cloud_handoff` on `GET /pro/status`). Otherwise nothing changes: the app
+//! separate), while the account's cloud could run the work and the daemon
+//! reports a project whose agents are running work that the cloud could take
+//! now (`working_agents` and `cloud_handoff` on `GET /pro/status`), each of
+//! those agents' own provider signed in there (`Pro::cloud_agents`, from the
+//! last provider catalog read). A project whose agent is not is left out of
+//! the question; when none is left, nothing changes: the app
 //! exits and the daemon, which outlives the app by design, keeps the agents
 //! running here. Closing any other window never asks.
 //!
@@ -81,12 +83,27 @@ pub(crate) struct Working {
     pub(crate) agents: Vec<String>,
 }
 
-/// The projects the question is about, from the daemon's `/pro/status`.
-/// Nothing when the daemon is not set up for Pro.
-pub(crate) fn working_projects(status: &Value) -> Vec<Working> {
+/// The cloud provider an agent kind signs in with; `None` for one the cloud
+/// cannot run.
+fn cloud_provider(kind: &str) -> Option<&'static str> {
+    match kind {
+        "claude" => Some("claude"),
+        "codex" => Some("codex"),
+        _ => None,
+    }
+}
+
+/// The projects the question is about, from the daemon's `/pro/status`:
+/// working, takeable by the cloud, and every working agent's own provider
+/// among `connected` (the providers signed in in the cloud). Nothing when the
+/// daemon is not set up for Pro.
+pub(crate) fn working_projects(status: &Value, connected: &[String]) -> Vec<Working> {
     if status["configured"] != true {
         return Vec::new();
     }
+    let continues = |kind: &String| {
+        cloud_provider(kind).is_some_and(|provider| connected.iter().any(|id| id == provider))
+    };
     let rows = status["workspaces"]
         .as_array()
         .map(Vec::as_slice)
@@ -103,7 +120,8 @@ pub(crate) fn working_projects(status: &Value) -> Vec<Working> {
                 .take(8)
                 .map(str::to_owned)
                 .collect();
-            (!agents.is_empty()).then(|| Working {
+            // An agent the cloud has no sign-in for would only wait there.
+            (!agents.is_empty() && agents.iter().all(continues)).then(|| Working {
                 workspace_id,
                 name: project_name(row["name"].as_str()),
                 agents,
@@ -308,26 +326,30 @@ fn request(phase: &Phase) -> Request {
 struct Probe {
     port: u16,
     token: String,
+    /// The agent providers signed in in the cloud.
+    connected: Vec<String>,
 }
 
 impl Probe {
-    /// `None` when the cloud could not run anything for this account: the
-    /// quit is exactly what it always was.
+    /// `None` when the cloud could not continue any agent for this account
+    /// (the daemon is not even asked): the quit is what it always was.
     fn new(shell: &Shell) -> Option<Self> {
-        if !shell.pro.cloud_may_continue() {
+        let connected = shell.pro.cloud_agents();
+        if connected.is_empty() {
             return None;
         }
         let local = lock(&shell.local).clone();
         Some(Self {
             port: local.port,
             token: local.token,
+            connected,
         })
     }
 
     /// Blocking and bounded ([`STATUS_TIMEOUT`]); no answer asks nothing.
     fn working(&self) -> Vec<Working> {
         read_status(self.port, &self.token)
-            .map(|status| working_projects(&status))
+            .map(|status| working_projects(&status, &self.connected))
             .unwrap_or_default()
     }
 }
@@ -688,6 +710,10 @@ mod tests {
         }
     }
 
+    fn providers(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
     #[test]
     fn asks_only_about_working_projects_the_cloud_could_take() {
         let reply = status(json!([
@@ -701,7 +727,7 @@ mod tests {
             {"workspace_id": "w-e", "name": "  ", "cloud_handoff": true, "working_agents": ["codex", "claude"]},
         ]));
         assert_eq!(
-            working_projects(&reply),
+            working_projects(&reply, &providers(&["claude", "codex"])),
             vec![
                 working("w-a", "atlas", &["claude"]),
                 working("w-e", "a project", &["codex", "claude"]),
@@ -710,11 +736,45 @@ mod tests {
     }
 
     #[test]
+    fn a_project_is_offered_only_when_every_working_agent_is_signed_in_in_the_cloud() {
+        let reply = status(json!([
+            {"workspace_id": "w-a", "name": "atlas", "cloud_handoff": true, "working_agents": ["claude"]},
+            {"workspace_id": "w-b", "name": "borealis", "cloud_handoff": true, "working_agents": ["codex"]},
+            // One of its two agents could only wait in the cloud.
+            {"workspace_id": "w-c", "name": "cirrus", "cloud_handoff": true, "working_agents": ["claude", "codex"]},
+            // An agent the cloud cannot run at all.
+            {"workspace_id": "w-d", "name": "delta", "cloud_handoff": true, "working_agents": ["gemini"]},
+        ]));
+        // Only Claude is signed in there: only its project is offered.
+        assert_eq!(
+            working_projects(&reply, &providers(&["claude"])),
+            vec![working("w-a", "atlas", &["claude"])]
+        );
+        assert_eq!(
+            working_projects(&reply, &providers(&["codex", "claude"])),
+            vec![
+                working("w-a", "atlas", &["claude"]),
+                working("w-b", "borealis", &["codex"]),
+                working("w-c", "cirrus", &["claude", "codex"]),
+            ]
+        );
+        // No agent signed in there (or never seen): no question, quit as today.
+        assert!(working_projects(&reply, &[]).is_empty());
+        // A repository sign-in is not an agent.
+        assert!(working_projects(&reply, &providers(&["github"])).is_empty());
+    }
+
+    #[test]
     fn nothing_to_ask_without_pro_setup_or_an_answer() {
+        let connected = providers(&["claude"]);
         let rows = json!([{"workspace_id": "w-a", "name": "atlas", "cloud_handoff": true, "working_agents": ["claude"]}]);
-        assert!(working_projects(&json!({"configured": false, "workspaces": rows})).is_empty());
-        assert!(working_projects(&Value::Null).is_empty());
-        assert!(working_projects(&json!({"configured": true})).is_empty());
+        assert!(working_projects(
+            &json!({"configured": false, "workspaces": rows}),
+            &connected
+        )
+        .is_empty());
+        assert!(working_projects(&Value::Null, &connected).is_empty());
+        assert!(working_projects(&json!({"configured": true}), &connected).is_empty());
     }
 
     #[test]

@@ -392,10 +392,7 @@ pub async fn pro_cloud_request(app: AppHandle, request: Request) -> Result<Value
     let mut value = result?;
     if catalog {
         if let Some(account) = state.pro.account_id() {
-            state
-                .pro
-                .agents
-                .record(&account, pro::agents::from_catalog(&value));
+            state.pro.agents.record(&account, &value);
         }
     }
     if open_browser || open_terminal {
