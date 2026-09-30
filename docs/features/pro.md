@@ -179,11 +179,27 @@ preparation continues without a setup button; visible checks run
 sequentially every five seconds, slowing to thirty seconds after five minutes.
 Hidden views stop checking. Healthy phases do not ask the user to refresh.
 
+Only an account's very first setup reads as setup: **Getting things ready**,
+“Setting up your cloud. This usually takes a couple of minutes.” Once the
+account's cloud has been ready (the app remembers it per account as
+`cloud_ready_once`; the account listing a cloud daemon counts too, so a new
+computer knows), a later `preparing`, such as a service update, reads exactly
+like ready and idle: **Available when you need it** with the agents line. The
+user never has to think about a machine: no sentence in Settings → Chimaera Pro
+calls the cloud a machine or says it sleeps or wakes. Words about waking belong
+only to the user's own action: a pressed button (“Connecting Claude Code…”) and
+the chat and terminal lines for a sleeping project (“Asleep in the cloud. Send a
+message to wake it.”). `pro/vocabulary.test.ts` scans the Pro and cloud settings
+copy for it.
+
 A disabled service says cloud work isn't available yet and that work on this
 computer continues; an uninvited preview account says access is by invitation.
 Neither shows an activity animation or claims files are synchronizing. A failed
 read or unavailable connection says so and keeps checking on its own; there is no
-manual check. Project status
+manual check. One failed account status read in a row (the account service being
+updated, say) is not reported: the page keeps the last confirmed state and its
+calm copy and checks again within five seconds; only a second failed read in a
+row shows “Cloud availability couldn’t refresh”. Project status
 appears only when mirror metadata exists: completed copies, handoff in progress,
 restoration, or setup that needs attention. Saved-copy counts describe completed
 copies, never active synchronization or a promise that every file is current.
@@ -207,7 +223,7 @@ connection panel. Its official CLI completes authentication; no temporary projec
 or terminal window opens. The code is used once and never saved by Chimaera; it
 must be pasted whole (Claude shows `code#state`), and half of one keeps the
 sign-in waiting with its own error (`authorization_code_incomplete`).
-Connecting GitHub (it lets the cloud machine pull and push the user's
+Connecting GitHub (it lets the user's cloud pull and push their
 repositories) works like Codex, with no terminal: the panel shows GitHub's
 one-time code with **Copy code** and **Open sign-in page** (GitHub's device page,
 `https://github.com/login/device`), the user enters the code there and approves
@@ -219,8 +235,8 @@ for github.com (`gh auth setup-git`) and confirms with a fresh `gh auth status`.
 Each ending reads in plain words: no code shown (`sign_in_unavailable`), a code
 declined or left to expire (`sign_in_failed`), Git not set up (`git_setup_failed`,
 where **Try again** repeats only that step), or the request's own time limit. On
-success the panel says GitHub is connected and the cloud machine can now pull and
-push the user's repositories.
+success the panel says GitHub is connected and the user's cloud can now pull and
+push their repositories.
 A new attempt brings its guide into view; background status updates never scroll
 or reload the page. Installation remains automatic and separate from sign-in.
 Users can cancel or retry an expired request in place. Sign-in is confirmed by the provider CLI on the cloud
@@ -254,27 +270,44 @@ again; the UI cannot release the setup fence or infer a new move. A canceled
 connection leaves those conversations paused. A successful continuation returns to the
 originating project only if that context is still current.
 
-Status reads never wake a sleeping worker. The app remembers, per account,
-whether an agent was connected at the last catalog read (`pro-agents.json`;
-`pro_cloud_status` adds it as `agents_connected`), so the page can answer while
-the cloud sleeps: the check mark beside “Available when you need it” appears
-only when an agent is on record; none connected reads as the next step,
-“Connect an agent to start cloud work”; unknown claims nothing. A passive read
-that finds a cloud the account called ready unreachable is re-checked with the
-account first (it usually just went to sleep) and is reported as unavailable
-only on a second read in a row. A cloud machine that answers that it is asleep
-or still starting (503 `worker_asleep`/`worker_unavailable`, or a reply marked
-sleeping; both clients carry it as the fixed code `cloud_asleep`) is a state,
-not an error: it is never counted as unreachable, and the connections section
-says “Your cloud machine is waking up. Connections show in a moment.” while a
-request that wakes it is in flight or found it still starting (for at most two
-minutes, on the fast check cadence), or “Your cloud machine is asleep.
-Connecting an agent wakes it.” when nothing is waking it. Real failures keep
-their error copy. Opening the optional **Agent connections**
-disclosure loads those connections and acquires access automatically. There is no
+Status reads never wake a sleeping worker. The app remembers, per account, what
+its last catalog read showed (`pro-agents.json`, written only on change):
+whether an agent was connected, the provider rows themselves, and whether the
+cloud has ever been ready. `pro_cloud_status` carries them additively as
+`agents_connected`, `remembered_providers` and `cloud_ready_once`. A browser view
+of the cloud's own page keeps the rows in its local storage per cloud address
+(`pro/catalogMemory.ts`, never credentials) and forgets them all on sign-out.
+The page answers from that memory while the cloud sleeps: the check mark beside
+“Available when you need it” appears only when an agent is on record; none
+connected reads “Connect an agent below to start cloud work”; unknown claims
+nothing. **Agent connections** shows whenever the account has a cloud, with the
+remembered rows at once (Claude Code connected, Codex not connected, GitHub not
+connected), and a live read replaces them silently. While a live read is pending
+or finds the cloud asleep or starting, the rows simply stay; one muted
+“Checking…” beside the section title is the most that shows, and only after five
+seconds without a live answer. With nothing remembered yet (a new computer, say)
+the rows are neutral placeholders until the look answers; if it finds the cloud
+idle, the section names the catalog's providers (Claude Code, Codex, GitHub)
+without claiming any state, each with its **Connect**, under “Connect an agent to
+use it in the cloud. Agents you connected before stay connected.” A passive read that finds a cloud the account called ready
+unreachable is re-checked with the account first (it usually just went idle)
+and is reported as unavailable only on a second read in a row. A cloud that
+answers that it is asleep or still starting (503 `worker_asleep`/
+`worker_unavailable`, or a reply marked sleeping; both clients carry it as the
+fixed code `cloud_asleep`) is a state: never an error, never counted as
+unreachable, and never words on a passive path. Real failures keep their error
+copy. Opening **Agent connections** is looking, not acting: it never wakes the
+cloud. It makes one passive catalog read (`pro/cloudTransport.ts`
+`peekCatalog`); a cloud that happens to be awake refreshes the rows silently,
+and an idle one changes nothing. Only **Connect**, **Disconnect** and the
+sign-in steps carry wake intent. Pressing **Connect** says “Connecting Claude
+Code…” (or “Opening GitHub’s sign-in…”) on its button while the cloud comes up
+behind it, asking again for at most two minutes before the usual failure copy. Connect
+works from remembered rows; **Disconnect** waits for a live read. There is no
 separate cloud-start action. Connecting a provider, or opening a repository on
 the cloud machine's own page, also acquires access as part of that user request. Catalog checks are
-single-flight and visibility-gated. Active sign-in checks run sequentially every
+single-flight and visibility-gated; they poll only while the cloud answers, and
+opening the section adds one look. Active sign-in checks run sequentially every
 two seconds, stop while hidden, and end at the attempt's finite deadline. Pending
 connection operations keep the worker active only until they finish or expire.
 

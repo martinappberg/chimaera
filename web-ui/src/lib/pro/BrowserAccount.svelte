@@ -12,6 +12,7 @@
   import { pageVisible } from "../shared/visibility";
   import type { ProStatus } from "../net/native";
   import { BILLING_PATH, fetchBrowserAccount, signOutBrowser } from "./accountHome";
+  import { forgetCatalogs } from "./catalogMemory";
   import { grantedPlan, paymentDue, returningUntil } from "./status";
   import { returningLine } from "./presentation";
 
@@ -43,6 +44,8 @@
     signOutFailed = false;
     try {
       await signOutBrowser();
+      // The next account signed in here starts without this one's agent rows.
+      forgetCatalogs();
       location.assign("/");
     } catch {
       signOutFailed = true;

@@ -118,7 +118,7 @@ section (`requestSettingsSection`).
 | `AgentsSettings.svelte` | Per-agent binary/model settings (paths, managed installs). |
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
-| `CloudSetup.svelte` | Automatic cloud status, bounded visible polling (no manual check); the check mark needs an agent on record (live from the connection panel, else the app's remembered `agents_connected`), none connected reads as the next step and unknown claims nothing; a ready-but-unreachable read is re-checked with the account and reported only on a second read in a row; an asleep-or-starting answer (`cloud_asleep`) is idle, never unreachable: in a browser view it keeps "Available when you need it" with the asleep line, and a wake (opening Agent connections) that finds the machine still starting shows "waking up" in that section, with no error, on the fast check cadence for at most two minutes; historical project-copy summaries and contextual provider connections; sleeping workers wake only for explicit connection management/use. Opening a repository exists only on the cloud machine's own page, as navigation; the app has none. See [provider map](../pro/AGENTS.md). |
+| `CloudSetup.svelte` | Automatic cloud status, bounded visible polling (no manual check). Only an account's very first setup reads as setup ("Getting things ready", "Setting up your cloud. This usually takes a couple of minutes."); once the cloud has been ready (`presentation.ts` `cloudReadyOnce` from the app's `cloud_ready_once`, or seen ready this session) a later `preparing` is the same "Available when you need it" as ready and idle. The check mark needs an agent on record (live from the connection panel, else the app's remembered `agents_connected`, or in a browser view its remembered rows); none connected names the step, unknown claims nothing. A ready-but-unreachable read is re-checked with the account and reported only on a second read in a row, and a failed account status read likewise (`presentation.ts` `afterFailedRead`: one miss keeps the last confirmed state and its calm copy and re-checks on the fast cadence; the second in a row shows the existing error); an asleep-or-starting answer (`cloud_asleep`) is idle, never unreachable and never words. **Agent connections** (`ProviderConnections`, compact, mounted once and kept) shows whenever the account has a cloud, fed the remembered rows (`remembered_providers`, or `pro/catalogMemory.ts` in a browser view) and `live` only while the cloud answers. Showing or opening it never wakes the cloud (it only looks, passively); there is no `start` request here. Historical project-copy summaries. Opening a repository exists only on the cloud machine's own page, as navigation; the app has none. See [provider map](../pro/AGENTS.md). |
 | `MirrorSettings.svelte` | Native project-copy status and privacy; visibility-gated 15-second status refresh; the row is re-read after every change; a privacy change the account hasn't confirmed yet is a success that reads as quiet progress and is re-sent quietly (≤1/min, the first a minute after the click); each row names who runs the project (`presentation.ts` `projectPlace`), and setup reads as progress unless it failed or waits on an agent; the switch is **Keep this project on this computer**; copy work still under way and too-large files read as a muted hint, only real problems in the warning colour; `renewal_failed` reads "Reconnecting your account…"; kept-both rows name the user's versions saved beside each file; blocked-provider rows open the shared connection flow. An agent's proposed setup command (`pending_setup_command`) shows once per project, whole, with Confirm/Dismiss (`pro/profile.ts`); `profile.deferred` is a plain "Steps that need your computer" list with no run button. Setup commands are otherwise not edited here, and idle-session policy stays internal. |
 | `ProSettings.svelte` | Dedicated Pro overview content: account identity, plan choices, browser checkout/portal, usage, and progressive connection/privacy/security sections; **Sign in** beside **See plans** for signed-out users; a browser sign-in that ended (`status.ts` `signInNote`) keeps the plans with one quiet line; sign-out asks first (ConfirmDialog) for **Sign out everywhere** and when a project is running in the cloud, and `sign_out_pending` reads as a quiet signed-out line. |
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
@@ -148,16 +148,18 @@ section (`requestSettingsSection`).
   both hold.
 
 Idle cloud status means available on demand, not a manual Start task. Opening
-Agent connections explicitly requests access; passive polling never wakes compute.
-The page describes the requested work without narrating machine power state.
+Agent connections only looks (one passive read); only Connect, Disconnect and
+sign-in steps wake the cloud, and passive polling never does.
+The page describes the requested work without narrating machine power state,
+and no sentence calls the cloud a machine (`pro/vocabulary.test.ts`).
 Native project-copy status remains visible while compute is idle. Project privacy
 shows the last recorded copy and actual blockers; healthy file counts and storage
 quotas are not a task list. Setup commands and idle-session pins are not account
 controls; the only setup decision here is confirming or dismissing a command an
 agent proposed, and it applies only to the exact command shown. Generic missing-environment diagnostics are not shown
 as missing credentials or instructions without a verified integration requirement.
-After its first connection the provider component remains mounted while hidden
-across readiness changes, so unrelated status refreshes cannot reset sign-in.
+Once shown, the provider component remains mounted (hidden only in an outage or
+error) across readiness changes, so unrelated status refreshes cannot reset sign-in.
 Ordinary connection rows exclude managed cloud workers; they remain available
 through automatic Pro routing. Background plan checks retain the last confirmed
 badge while pending; confirmed sign-out or failed account reads clear it, and a

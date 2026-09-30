@@ -16,6 +16,15 @@ pub struct CloudStatus {
     /// is not woken to answer it. Absent when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     agents_connected: Option<bool>,
+    /// Additive: this account's cloud has been ready before, so `preparing`
+    /// now (a service update, say) is not its first setup and the page keeps
+    /// the calm available state. Remembered per account.
+    cloud_ready_once: bool,
+    /// Additive: the provider rows of the last catalog read, which the page
+    /// shows at once and replaces when a live read answers. Absent when none
+    /// are remembered.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    remembered_providers: Vec<pro::agents::Row>,
 }
 
 #[tauri::command]
@@ -32,14 +41,36 @@ pub async fn pro_cloud_status(app: AppHandle) -> Result<CloudStatus, String> {
     if state.pro.generation() != generation {
         return Err("Your account changed. Refresh your cloud status.".into());
     }
-    let agents_connected = state
+    let remembered = state
         .pro
         .account_id()
-        .and_then(|account| state.pro.agents.get(&account));
+        .map(|account| {
+            // Ready or asleep, or a registered cloud daemon (another computer
+            // may have seen it ready first), means the cloud is set up.
+            if set_up(&worker.state, super::lock(&state.pro.hosts).values()) {
+                state.pro.agents.mark_ready(&account);
+            }
+            state.pro.agents.remembered(&account)
+        })
+        .unwrap_or_default();
     Ok(CloudStatus {
         worker,
-        agents_connected,
+        agents_connected: remembered.agents_connected,
+        cloud_ready_once: remembered.ready_once,
+        remembered_providers: remembered.providers,
     })
+}
+
+/// Whether the account's cloud exists: the account says it is ready or
+/// asleep, or lists a cloud daemon for it.
+fn set_up<'a>(
+    state: &chimaera_link::WorkerState,
+    mut hosts: impl Iterator<Item = &'a Host>,
+) -> bool {
+    matches!(
+        state,
+        chimaera_link::WorkerState::Ready | chimaera_link::WorkerState::Sleeping
+    ) || hosts.any(|host| host.kind == HostKind::Worker && host.daemon.is_some())
 }
 
 #[derive(Deserialize)]
@@ -566,6 +597,29 @@ mod tests {
         assert_eq!(token(worker_rows(None, false, fresh).await), "fresh");
         let down = || async { Err(anyhow::anyhow!("account unavailable")) };
         assert!(worker_rows(None, true, down).await.is_err());
+    }
+
+    #[test]
+    fn a_cloud_is_set_up_once_ready_asleep_or_registered() {
+        use chimaera_link::WorkerState;
+        for ready in [WorkerState::Ready, WorkerState::Sleeping] {
+            assert!(set_up(&ready, [].iter()));
+        }
+        for other in [
+            WorkerState::Preparing,
+            WorkerState::NoPlan,
+            WorkerState::Unavailable,
+            WorkerState::Limited,
+            WorkerState::Error,
+            WorkerState::Unknown,
+        ] {
+            assert!(!set_up(&other, [].iter()));
+        }
+        // A service update can say `preparing` for a cloud that exists.
+        assert!(set_up(&WorkerState::Preparing, [worker("t")].iter()));
+        let mut unregistered = worker("t");
+        unregistered.daemon = None;
+        assert!(!set_up(&WorkerState::Preparing, [unregistered].iter()));
     }
 
     #[test]

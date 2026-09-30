@@ -31,7 +31,7 @@
     } catch (reason) {
       if (signal?.aborted || current !== revision) return;
       // Only a cloud machine's transport answers "asleep": show its page,
-      // which says so quietly, rather than a failure.
+      // which keeps its remembered rows quietly, rather than a failure.
       if (cloudAsleep(reason)) { worker = true; error = false; } else error = true;
     }
     finally { if (current === revision) checking = false; }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canDisconnect, canStartConnection, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, nextReadyHandoff, pausedConnect, pendingConnection, providerLabel, providerLoginUrl, providersReady, recoverDisconnect, sameConnection, type ProviderHandoff } from "./providers";
+import { agentsConnected, catalogRows, canDisconnect, canStartConnection, connectingLabel, connectionError, connectionSuccessCurrent, disconnectConnection, handoffKey, nextReadyHandoff, panelRows, pausedConnect, pendingConnection, providerLabel, providerLoginUrl, providersReady, recoverDisconnect, rememberedRows, sameConnection, type ProviderHandoff } from "./providers";
 import type { CloudProviderConnection, CloudProviderStatus } from "../net/native";
 const row = (id: string, state: CloudProviderStatus["state"], category: CloudProviderStatus["category"] = "agent"): CloudProviderStatus => ({ id, label: id, state, category, installed: true, reason: null, checked_at: 1, methods: ["device_code"] });
 describe("provider readiness", () => {
@@ -140,5 +140,75 @@ describe("paused sessions waiting for a sign-in", () => {
   });
   it("never forwards an unsafe project id", () => {
     expect(pausedConnect({ ...paused, workspace_id: "../other", blocked_provider: "claude" })).toEqual({ providerId: "claude", label: providerLabel("claude") });
+  });
+});
+
+describe("the last known connections", () => {
+  const remembered = [
+    { id: "claude", label: "Claude Code", category: "agent", state: "signed_in", methods: ["browser"], disconnect_supported: true },
+    { id: "codex", label: "Codex", category: "agent", state: "needs_sign_in", methods: ["device_code"] },
+    { id: "github", label: "GitHub", category: "repository", state: "missing", methods: ["device_code"] },
+  ];
+  it("keeps only well-formed remembered rows, each once, in the catalog's shape", () => {
+    const rows = rememberedRows([...remembered,
+      { id: "claude", label: "Again", category: "agent", state: "missing" },
+      { id: "../x", label: "Bad", category: "agent", state: "missing" },
+      { id: "future", label: "Future", category: "unknown_kind", state: "missing" },
+      { id: "newer", label: "Newer", category: "agent", state: "a_newer_state", methods: ["ok", "bad method", 3] },
+      { id: "nameless", label: "", category: "repository", state: "missing" },
+      null, "text"]);
+    expect(rows?.map(row => [row.id, row.label, row.state, row.methods])).toEqual([
+      ["claude", "Claude Code", "signed_in", ["browser"]], ["codex", "Codex", "needs_sign_in", ["device_code"]], ["github", "GitHub", "missing", ["device_code"]],
+      ["newer", "Newer", "unknown", ["ok"]], ["nameless", "nameless", "missing", []],
+    ]);
+    expect(rows?.[0]).toMatchObject({ installed: null, reason: null, checked_at: null, disconnect_supported: true });
+    expect("disconnect_supported" in rows![1]).toBe(false);
+    for (const nothing of [null, undefined, [], [null], "rows", {}]) expect(rememberedRows(nothing)).toBeNull();
+    expect(rememberedRows(Array.from({ length: 40 }, (_, index) => ({ id: `p${index}`, label: "P", category: "agent", state: "missing" })))?.length).toBe(16);
+  });
+  it("shows the remembered rows at once and settled while the live read is pending or finds the cloud asleep", () => {
+    const rows = rememberedRows(remembered)!;
+    const live = [row("claude", "signed_in"), row("codex", "signed_in")];
+    const base = { providers: [] as CloudProviderStatus[], remembered: rows, liveAnswered: false, loaded: false, current: false, asleep: false };
+    // Pending: nothing live yet.
+    expect(panelRows(base)).toEqual({ rows, fromMemory: true, unchecked: false, known: true, settled: true });
+    // The live read found the cloud asleep or starting: still the remembered rows.
+    expect(panelRows({ ...base, asleep: true })).toMatchObject({ rows, fromMemory: true, settled: true });
+    // A live answer replaces them, and they never come back.
+    expect(panelRows({ ...base, providers: live, liveAnswered: true, loaded: true, current: true })).toEqual({ rows: live, fromMemory: false, unchecked: false, known: true, settled: true });
+    expect(panelRows({ ...base, providers: live, liveAnswered: true, loaded: true, asleep: true })).toMatchObject({ rows: live, settled: true });
+    // Right after the user's own change, a live panel says it is checking.
+    expect(panelRows({ ...base, providers: live, liveAnswered: true, loaded: true }).settled).toBe(false);
+    // Nothing remembered and no answer yet: the neutral loading state.
+    expect(panelRows({ ...base, remembered: null })).toMatchObject({ rows: [], fromMemory: false, unchecked: false, known: false });
+    // A look that found the cloud idle names the catalog's providers, claiming no state.
+    expect(panelRows({ ...base, remembered: null, asleep: true })).toEqual({ rows: catalogRows(), fromMemory: false, unchecked: true, known: true, settled: true });
+    expect(panelRows({ ...base, asleep: true }).unchecked).toBe(false);
+    expect(panelRows({ ...base, remembered: null, asleep: true, providers: live, loaded: true, liveAnswered: true }).unchecked).toBe(false);
+  });
+  it("names only the shared catalog's providers when nothing is known, with Connect still possible", () => {
+    const rows = catalogRows();
+    expect(rows.map(row => [row.id, row.category])).toEqual([["claude", "agent"], ["codex", "agent"], ["github", "repository"]]);
+    for (const row of rows) {
+      expect(row.label).toBe(providerLabel(row.id));
+      expect(row).toMatchObject({ state: "unknown", installed: null, checked_at: null });
+      // Never offered for disconnection, never counted as connected.
+      expect(canDisconnect(row)).toBe(false);
+    }
+    expect(agentsConnected(rows)).toBeNull();
+    expect(providersReady(rows)).toBe(false);
+  });
+  it("tells a connected agent from none and from unknown", () => {
+    expect(agentsConnected([row("claude", "signed_in"), row("codex", "unknown")])).toBe(true);
+    expect(agentsConnected([row("claude", "needs_sign_in"), row("codex", "unknown")])).toBeNull();
+    expect(agentsConnected([row("claude", "needs_sign_in"), row("github", "signed_in", "repository")])).toBe(false);
+  });
+  it("names the action a pressed Connect is taking, never the cloud's machinery", () => {
+    const agent = connectingLabel({ label: "Claude Code", category: "agent" });
+    const repository = connectingLabel({ label: "GitHub", category: "repository" });
+    expect(agent).toContain("Claude Code");
+    expect(repository).toContain("GitHub");
+    expect(agent).not.toBe(connectingLabel({ label: "Claude Code", category: "repository" }));
+    for (const line of [agent, repository]) expect(line).not.toMatch(/machine|wak|asleep|start/i);
   });
 });

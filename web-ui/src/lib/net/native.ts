@@ -903,6 +903,14 @@ export interface CloudProvisioningStatus {
    * remembered by the app and never probed, so a sleeping cloud is not woken
    * to answer it. Absent or null when the app has not seen a catalog yet. */
   agents_connected?: boolean | null;
+  /** Whether this account's cloud has been ready before, remembered by the
+   * app: a later `preparing` (a service update, say) is not first-time setup.
+   * Older shells omit it (`presentation.ts` `cloudReadyOnce`). */
+  cloud_ready_once?: boolean;
+  /** The provider rows of the last catalog read, remembered by the app and
+   * shown at once until a live read answers (`providers.ts`
+   * `rememberedRows`). Absent when none are remembered. */
+  remembered_providers?: RememberedProvider[];
   state: "no_plan" | "unavailable" | "preparing" | "ready" | "sleeping" | "limited" | "error";
   reason: "provisioning_disabled" | "beta_invite_required" | "hours_exhausted" | "storage_exhausted" | "spend_limit_reached" | "provisioning_failed" | null;
 }
@@ -1051,6 +1059,9 @@ export interface CloudProviderStatus {
   /** Older daemons omit this capability; never infer it from sign-in support. */
   disconnect_supported?: boolean;
 }
+/** A provider row as the last catalog read showed it (the app's or this
+ * browser's memory): the catalog's own fields that rendering needs. */
+export type RememberedProvider = Pick<CloudProviderStatus, "id" | "label" | "category" | "state"> & Partial<Pick<CloudProviderStatus, "methods" | "disconnect_supported">>;
 export interface CloudProviderConnection {
   id: string;
   provider_id: string;
