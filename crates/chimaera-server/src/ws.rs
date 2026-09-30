@@ -2073,7 +2073,7 @@ async fn send_update_snapshot(
     if *last_epoch == Some(epoch) {
         return Ok(());
     }
-    let mut frame = crate::lock(&state.update).to_json();
+    let mut frame = crate::update::status_json(state);
     frame["type"] = serde_json::json!("update");
     socket.send(Message::Text(frame.to_string().into())).await?;
     *last_epoch = Some(epoch);

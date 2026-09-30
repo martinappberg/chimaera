@@ -165,10 +165,20 @@ pub struct Account {
     /// only: a value that is not a timestamp is dropped, never failing the read.
     #[serde(
         default,
-        deserialize_with = "returning_until",
+        deserialize_with = "timestamp",
         skip_serializing_if = "Option::is_none"
     )]
     pub returning_until: Option<String>,
+    /// Additive: the RFC 3339 time the account's always-on cloud connection
+    /// restarts to update (a past time: as soon as no Git transfer runs); null
+    /// or absent when none is planned. The restart drops the held cluster
+    /// logins. Presentation only, read exactly like `returning_until`.
+    #[serde(
+        default,
+        deserialize_with = "timestamp",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub keeper_restart_at: Option<String>,
 }
 impl Account {
     /// A lapsed payment reads as plan `none` on older services; this is the
@@ -263,7 +273,10 @@ where
         _ => None,
     })
 }
-fn returning_until<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+/// An optional RFC 3339 time the account adds for presentation. Anything that
+/// is not one (a date alone, a number, an object, an overlong string) reads as
+/// absent, never failing the account read.
+fn timestamp<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -480,6 +493,50 @@ mod tests {
         assert!(serde_json::to_value(account(serde_json::json!({})))
             .unwrap()
             .get("returning_until")
+            .is_none());
+    }
+    #[test]
+    fn a_planned_connection_restart_is_optional_and_never_fails_the_account_read() {
+        // An older service omits it; null means none is planned.
+        assert!(account(serde_json::json!({})).keeper_restart_at.is_none());
+        assert!(account(serde_json::json!({"keeper_restart_at":null}))
+            .keeper_restart_at
+            .is_none());
+        // A future time, and a past one (restarting as soon as no Git
+        // transfer runs), both read as given.
+        for at in ["2026-10-01T02:00:00Z", "2020-01-01T00:00:00+02:00"] {
+            let planned = account(serde_json::json!({"keeper_restart_at":at}));
+            assert_eq!(planned.keeper_restart_at.as_deref(), Some(at));
+            assert_eq!(
+                serde_json::to_value(&planned).unwrap()["keeper_restart_at"],
+                at
+            );
+        }
+        // A value this client cannot read as a time is dropped; the account
+        // still reads, with its other additive time untouched.
+        for unreadable in [
+            serde_json::json!("tonight"),
+            serde_json::json!("2026-10-01"),
+            serde_json::json!(1_790_000_000),
+            serde_json::json!(true),
+            serde_json::json!({"at":"2026-10-01T02:00:00Z"}),
+            serde_json::json!("2026-10-01T02:00:00Z".repeat(8)),
+        ] {
+            let read = account(serde_json::json!({
+                "keeper_restart_at": unreadable,
+                "returning_until": "2026-11-03T09:30:00Z",
+            }));
+            assert!(read.keeper_restart_at.is_none(), "{unreadable}");
+            assert_eq!(
+                read.returning_until.as_deref(),
+                Some("2026-11-03T09:30:00Z")
+            );
+            assert_eq!(read.email, "a@example.invalid");
+        }
+        // Absent stays absent on the wire.
+        assert!(serde_json::to_value(account(serde_json::json!({})))
+            .unwrap()
+            .get("keeper_restart_at")
             .is_none());
     }
     #[test]

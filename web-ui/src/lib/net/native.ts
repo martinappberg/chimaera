@@ -885,6 +885,11 @@ export interface ProStatus {
    * work can still be brought home; null or absent otherwise (older shells
    * omit it). An ended plan grants nothing (`pro/status.ts` `grantedPlan`). */
   returning_until?: string | null;
+  /** Optional: the RFC 3339 time the always-on cloud connection restarts to
+   * update (a past time: shortly, once no Git transfer runs). The restart drops
+   * the cluster logins it holds. Null or absent when none is planned (older
+   * shells omit it); `pro/status.ts` `keeperRestartAt` reads it. */
+  keeper_restart_at?: string | null;
   /** Optional: the account's current prices. Absent or null means the page
    * names the plans only; amounts are never built into the app. */
   plans?: ProPlanPrice[] | null;

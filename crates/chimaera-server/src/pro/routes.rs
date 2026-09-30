@@ -270,6 +270,8 @@ async fn configure_inner(
         if let Err(error) = super::persist(&state).await {
             return failure(error);
         }
+        // Its updates are the service's from now on; tell attached windows.
+        crate::update::became_managed(&state);
     }
     *lock(&state.pro.runtime) = Some(config);
     state.pro.delegation_refused.store(false, Ordering::Release);

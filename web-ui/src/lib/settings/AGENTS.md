@@ -67,7 +67,8 @@ error. An overdue payment (`payment_due`) shows Payment needs attention with
 Manage billing and never plans or checkout. An ended plan inside its return
 window (`returning_until`) reads as no plan: the badge says **Plan ended**, plans
 are offered, and one quiet line says when its cloud work can still be brought
-home. The page renders from the last
+home. A planned restart of the always-on cloud connection (`keeper_restart_at`)
+is one quiet line under Connected machines, until the account clears it. The page renders from the last
 confirmed status (`pro/account.ts` `accountPanel`) while background reads run, so
 nothing unmounts on `pro-changed` or focus; an account needing attention keeps
 that panel too, and only Check again shows checking (the error bar hides
@@ -126,7 +127,7 @@ section (`requestSettingsSection`).
 | `PluginsSettings.svelte` | Settings → Plugins: every installed plugin's declared settings (see the exception above); slotted after Extensions. |
 | `ActivitySettings.svelte` | The Activity panel (see the exception above): this week's sessions and tokens + time worked, one 14-day sessions chart, by agent and model / by workspace, Export CSV. Fetches while Settings is visible and on the history nudge. |
 | `jump.ts` | `settingsJump` / `requestSettingsSection`: open Settings scrolled to a section (Quick Open "Activity", the dashboard's activity line). |
-| `UpdatesStatus.svelte` | The Updates section's status block: app / daemon / agents, each up to date, available, or couldn't check (with why), plus "check now". Reads `workspace/update.svelte.ts`; the auto-check switch below it is a schema row. |
+| `UpdatesStatus.svelte` | The Updates section's status block: app / daemon / agents, each up to date, available, or couldn't check (with why), plus "check now". A `managed` daemon (the account's cloud) reads `MANAGED_UPDATES` with no "check now" and no auto-check switch (`SettingsView` hides the row). Reads `workspace/update.svelte.ts`; the auto-check switch below it is a schema row. |
 | `NotificationStatus.svelte` | The Notifications section's status line: whether the OS (native) or browser will show alerts, with Allow / Open System Settings / Send test. The switches below it are ordinary schema rows. |
 | `SettingRow.svelte` | One schema-driven control. |
 | `SettingsJson.svelte` | The raw-JSON editor (validates against the schema). |

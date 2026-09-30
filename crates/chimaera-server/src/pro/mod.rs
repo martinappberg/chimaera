@@ -1099,6 +1099,12 @@ pub(crate) fn configured(state: &crate::AppState) -> bool {
         .configured
         .load(std::sync::atomic::Ordering::Acquire)
 }
+/// This daemon runs as the account's cloud (configured as the worker now or
+/// before, or started as one): the service updates it, so it never checks
+/// for, or offers, its own releases (`update.rs`).
+pub(crate) fn updates_managed(state: &crate::AppState) -> bool {
+    execution::worker(state)
+}
 pub(crate) fn is_worker(state: &crate::AppState) -> bool {
     crate::lock(&state.pro.runtime)
         .as_ref()

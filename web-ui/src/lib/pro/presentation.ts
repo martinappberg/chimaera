@@ -1,5 +1,5 @@
 import type { CloudProvisioningStatus, MirrorStatus, MirrorWorkspace, ProAuthScreenHint } from "../net/native";
-import { formatFullTimestamp } from "../shared/time";
+import { formatFullTimestamp, localDay } from "../shared/time";
 
 export type PaidPlan = "pro" | "max";
 export type BillingInterval = "month" | "year";
@@ -67,6 +67,41 @@ export function returningLine(until: string | null, now = Date.now(), locale?: s
   if (!Number.isFinite(ends)) return null;
   if (ends <= now) return RETURN_WINDOW_ENDED_COPY;
   return `Your plan has ended. Bring your work home from the cloud by ${formatFullTimestamp(ends, locale)}.`;
+}
+/** When a planned restart happens, in words relative to `now` and in the
+ * user's locale: "tonight at 02:00" (this evening, or the small hours of the
+ * coming night), "today at 14:30", "tomorrow at 09:00", "on Wednesday at
+ * 02:00" within the week, else "on 12 October at 02:00". */
+export function restartWhen(at: number, now = Date.now(), locale?: string): string {
+  const when = new Date(at);
+  const today = new Date(now);
+  const days = localDay(when) - localDay(today);
+  const hour = when.getHours();
+  // The locale's own short time: "02:00" in most of the world, "2:00 AM" in the US.
+  const time = new Intl.DateTimeFormat(locale, { timeStyle: "short" }).format(when);
+  const night = hour >= 18 || hour < 6;
+  if ((days === 0 && night) || (days === 1 && hour < 6 && today.getHours() >= 6)) return `tonight at ${time}`;
+  if (days === 0) return `today at ${time}`;
+  if (days === 1) return `tomorrow at ${time}`;
+  if (days > 1 && days < 7) return `on ${new Intl.DateTimeFormat(locale, { weekday: "long" }).format(when)} at ${time}`;
+  const date = new Intl.DateTimeFormat(locale, {
+    day: "numeric",
+    month: "long",
+    ...(when.getFullYear() === today.getFullYear() ? {} : { year: "numeric" }),
+  }).format(when);
+  return `on ${date} at ${time}`;
+}
+/** The one quiet line while the account plans a restart of the always-on
+ * cloud connection (`status.ts` `keeperRestartAt`): when it happens (a past
+ * time means shortly, once no Git transfer runs) and that the cluster sign-in
+ * it holds is asked for again. `keptHosts` names the kept cluster logins; the
+ * cluster is named only when there is exactly one. Null when none is planned. */
+export function keeperRestartLine(at: string | null, keptHosts: readonly string[] = [], now = Date.now(), locale?: string): string | null {
+  const time = at === null ? Number.NaN : Date.parse(at);
+  if (!Number.isFinite(time)) return null;
+  const when = time > now ? restartWhen(time, now, locale) : "shortly";
+  const cluster = keptHosts.length === 1 ? keptHosts[0] : "your cluster";
+  return `Your cloud connection restarts ${when} to update. You’ll be asked to sign in to ${cluster} again when you next use it.`;
 }
 /** The fixed code the native shell and the browser transport give a cloud
  * request answered by a cloud that is asleep or still starting (503
