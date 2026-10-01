@@ -1,8 +1,9 @@
 # Logical project viewing
 
 Opening a project on another device is a view onto its current owner. It never
-acquires ownership, wakes a worker, releases the home computer, or repeats an
-input that may already have been accepted. Acting on it can move the work:
+acquires ownership, wakes a worker, releases the home computer, or runs an
+input twice (a client repeats only a chat send, under the id the owner accepts
+at most once). Acting on it can move the work:
 input on another of the user's computers brings the project there, and a
 phone's input while the cloud sleeps may bring it to an online computer
 ([HANDOFF](HANDOFF.md#acting-brings-the-work-to-you)). Ordinary SSH and non-Pro
@@ -119,37 +120,351 @@ does, the native proxy relaxes the probe: mutations (and explicitly wake-marked
 requests) are forwarded — the transport wakes the owner, which re-checks scope on
 every write — with a 120 s response budget; passive reads are forwarded with no
 wake marker and are answered from the transport's cache or with `worker_asleep`;
-a socket attach stays passive and does not connect. (The transport half —
-answering the probe from placement state with the scope headers — is a service
-requirement.)
+a socket attach stays passive: for a cloud machine the proxy makes one attach
+without a wake marker (next paragraph), and when the transport refuses that
+attach, or refused one in the last five minutes, it does not connect. (The transport half — answering the probe from
+placement state with the scope headers — is a service requirement.)
 
-**Reconnects, held input and moves.** Viewing is passive; doing wakes. A native
+**A sleeping cloud machine's sockets.** Additive (2026-09-30); a contract for
+a keeper that keeps a cloud machine's sockets, which a keeper need not be.
+Such a keeper is the machine's front door, so that no device has to be told
+the machine is asleep. It marks **every** WebSocket upgrade it accepts for a
+`worker-` host with the response header `X-Chimaera-Sockets: kept`, whether
+the machine is awake or asleep at that moment; a keeper that does not send it
+is the older kind (it answers a passive upgrade to a sleeping machine 503
+`worker_asleep` and closes sockets when the machine suspends), and clients
+must work with both. The header alone tells the two apart: what a probe or a
+placement read said a moment ago does not.
+
+This repository ships the daemon (send ids, `cancel_send`, the list of acting
+commands), the UI and the native proxy. The keeper and the account's browser
+gateway belong to the service; what follows is what they do, and the clients
+here work with a keeper of either kind and with a daemon that predates send
+ids.
+
+A keeping keeper accepts the upgrade of `/ws/chat/{id}`, `/ws/sessions/{id}`
+and `/ws/events` whether the machine is awake or asleep, with or without wake
+intent, and never closes such a socket because the machine suspended or
+resumed. On a suspension it closes only its own connection to the machine;
+the viewer's side stays open and quiet (pings are answered). It closes the
+viewer's side only when the viewer closes, the outer authorization ends, the
+machine was replaced (a new boot or a new daemon credential), the daemon
+closed for a reason that is not the suspension (an ownership change,
+`workspace_scope_changed` with close 1013, an exit). A cap being reached
+does not close it: the frame that does not fit is refused alone (below).
+
+The viewer's first frame is its authentication. The keeper remembers it, with
+the request it forwarded, and attaches with it again later. A chat's
+`last_seq` is raised to the highest sequence number relayed on this socket
+(`seq` of an `ev` frame and of every entry of a `batch`), so the daemon
+replays exactly the gap. A terminal's later `resize`, `park` and `unpark`
+text frames are folded into the remembered frame (its `cols`/`rows` and
+`parked`), so every attach uses the grid and park state the viewer has now.
+
+What the user does is held whenever the daemon has not answered `ready` on
+the current attach: while nothing is attached, and also after an attach until
+its `ready`. Held are a chat's acting commands (up to 4 frames and 12 MiB per
+socket), a chat's settings commands (below; they have their own bound), and a
+terminal's typing, which is its binary frames (up to 64 KiB per socket), at
+most 12 MiB across the keeper. The first held frame asks the account to wake
+a sleeping machine; the keeper then attaches with wake intent, replays the
+authentication, waits for the daemon's `ready` and delivers the held frames
+once, in order. Frames that arrive during the wake join the queue. Before it
+delivers held acting input the keeper tells the account and waits for its
+answer (at most 3 s), so a wake adds up to that to the delivery. An upgrade
+that carries the wake marker (`?wake=interaction`) wakes the machine even
+with nothing held.
+
+A chat command is one of three kinds, and the keeper and the daemon agree on
+which:
+
+- **Acting commands** are exactly the ones the daemon counts as interaction
+  (`chimaera-server` `activity::is_interaction`; the two lists change
+  together): `send`, `send_after_turn`, `permission`, `answer`, `interrupt`,
+  `compact`, `rewind` when it is not a dry run, `background_tool` and
+  `stop_task`. Held, in order, and the machine is woken for them.
+- **The seven settings commands** the user gives: `set_model`, `set_mode`,
+  `set_effort`, `set_ultracode`, `set_remote_control`, `set_mcp_enabled` and
+  `reconnect_mcp`. Held too, and the machine is woken for them, but they do
+  not count toward the four-command cap: at most 16 per socket, 16 KiB each.
+  They are coalesced as "the latest wins unless the user acted in between":
+  consecutive picks of one setting collapse to the last, while `set_model X`,
+  `send A`, `set_model Y` is delivered in exactly that order, so a model
+  picked before a message still applies to it. `set_mcp_enabled` and
+  `reconnect_mcp` coalesce per command and `server`.
+- **Everything else** is not the user acting: `set_thinking` (a chat pushes
+  it by itself), `get_usage`, `get_mcp`, `cancel_send`, `cancel_queued`,
+  `steer_queued`, `send_now`, `send_if_running`, a dry-run `rewind`, and any
+  command the keeper does not know. Never held, never a reason to wake, and
+  counted toward no cap: with nothing attached the keeper drops it, attached
+  it passes through.
+
+The last kind also covers a terminal's text frames (folded, as above, and
+passed on when attached) and everything an events socket sends (its `watch`
+registration, dropped while nothing is attached; the client sends it again
+after every attach, below).
+
+When it starts holding input from a socket, the keeper sends that socket the
+existing `{"type":"waking"}` frame, before anything else and once per wake.
+The frame drives presentation only (a client shows its unconfirmed sends as
+"sending…" from it); it does not decide what becomes of a send (next
+paragraphs).
+
+A frame that does not fit is refused alone, and what is already held stays
+held: `command_failed` tagged with its `command` and, when the command
+carried a well-formed one, its `client_id`; with `reason:"waking"` when that
+socket already holds input and `reason:"reconnecting"` when the keeper-wide
+total is used up. A setting that does not fit its bound is refused the same
+way. The keeper copies the `client_id` of any chat command into the refusal
+of that command, not only a send's.
+
+When the machine cannot be attached within 150 s, the daemon refuses the
+attach, or ownership moved while holding, every held chat command is handed
+back with the daemon's own refusals (`command_failed` tagged with its
+`command` and `client_id`, so a send returns to the composer) and held typing
+with `read_only`, `reason:"reconnecting"`, followed by one
+`remote_unavailable`. A hand-back's `remote_unavailable` never carries a
+`reason`. A refused wake is handed back the same way with its reason. The
+socket stays open and kept after a hand-back, with one exception: a project
+that moved while frames were held gets the hand-back, then
+`workspace_scope_changed` and close 1013, and that socket is not kept. Held
+input lives in memory only and is never logged. Input is delivered only to
+the project's owner at the current epoch.
+
+The keeper pings its connection to the daemon every 10 s and detaches after
+30 s of silence; the viewer's side stays open, and the next acting input is
+held and wakes the machine. After a hand-back at the 150 s bound, and after
+it drops a silent daemon connection, the keeper makes one passive attach by
+itself when it believes the machine awake. A passive attach the daemon
+refuses is answered with `remote_unavailable` (no `reason`), and the socket
+stays open and kept.
+
+When the viewer's side of a kept socket closes while frames are still held,
+the keeper discards them: nothing is ever delivered for a socket that is
+gone. A send the keeper passed on to a machine in the instant it froze is
+gone too. Neither loses a message, because the client sends an unconfirmed
+send again by its id (next).
+
+**A send is delivered at most once, by its id.** Additive (2026-10-01); this
+replaces every rule under which a client guessed what became of a send from
+its text, its position or the time.
+
+- `send` and `send_after_turn` take an optional `client_id`: 8 to 64
+  characters of `A-Z a-z 0-9 _ -`, minted by the client per send. A daemon
+  that predates it ignores the field; one that has it refuses a send whose
+  id is not well formed with `invalid_command` and never echoes such an id.
+- A daemon with send ids says `send_ids: true` in `ready`. It accepts a send
+  under one id at most once, from the moment the command is queued (before
+  the agent's driver handles it): a second send under an accepted id is
+  dropped silently, and starts no second turn. The `user_message` the send
+  produces carries the `client_id`, and so does every refusal of that command
+  (`command_failed`, `invalid_command`, `read_only`).
+- `cancel_send {client_id}` (not the user acting) withdraws an id. The
+  daemon answers `send_cancelled {client_id, cancelled}`: `true` when no send
+  under the id had been accepted, after which a send under it is refused
+  with `command_failed`; `false` when one had been, which changes nothing.
+- The daemon remembers the newest 128 ids per conversation and reads them
+  back from the conversation's journal when it opens it, so a restart, a
+  respawn or a resume still drops the repeat. An id whose send was queued
+  for a driver that ended before handling it is forgotten with that driver
+  (the client's next copy is then the only one).
+- A client keeps every send it made until the echo that carries its id.
+  Only that echo confirms it, and only a refusal that carries its id returns
+  its text to the composer; nothing else does either. At every `ready` that
+  says `send_ids`, once the replay through `head` has been applied, it sends
+  each send still without an echo again under the same id while the send is
+  younger than two minutes. That is right whatever became of the first copy:
+  lost, still queued in the daemon, or about to be delivered by a keeper that
+  held it. An older one it withdraws with `cancel_send` and returns to the
+  composer on `cancelled: true` (on `false` the echo is coming). A client
+  sends `cancel_send` only right after a `ready`: a keeper drops it while
+  nothing is attached.
+- Against a daemon without `send_ids` a client sends nothing twice and
+  decides nothing at `ready`. That daemon's echo carries no id: it confirms
+  the unconfirmed send with exactly its text, never another one. Its refusal
+  names no send and returns the one just made.
+- **Every holder treats ids as the daemon does.** A holder is anything that
+  keeps a client's frames for an owner that has not answered: this
+  computer's relay, a keeper, the account's gateway. The id of a send it
+  holds counts as accepted. So a frame whose `client_id` it already holds is
+  dropped silently, never refused and never held twice (the first copy will
+  be delivered; a refusal would return a message that then runs). A
+  `cancel_send` for an id it holds is never passed on: the holder answers
+  `send_cancelled {client_id, cancelled:false}` itself (an owner that has not
+  seen the send would call it withdrawn, and the held copy would still be
+  delivered). And frames a client sends while held frames await delivery are
+  delivered after them, in order, never ahead of them to whichever owner
+  happens to be attached.
+- A client withdraws a send at 120 s while a holder may hold one for up to
+  150 s. That is safe because of the rule above: a withdrawal cannot win
+  against a send that is held, only against one that is nowhere.
+- A client sends a given send again at most once per pause, which starts at
+  3 s and doubles to 30 s (a send can be megabytes, and a `ready` resets the
+  reconnect backoff); a copy that is not due at a `ready` goes out when it
+  is, unless its echo came first. A client's own resend or `cancel_send`
+  never redials a socket or asks for a wake.
+- The echo of a send is always journaled with its ids. A message too long
+  for one journal line (the limit is the size of the largest text a send may
+  carry, and characters that JSON escapes need several bytes each) is
+  recorded with its text cut in the middle, never replaced.
+
+What the rule does not cover, stated plainly:
+
+- A withdrawal is remembered for as long as the conversation's process
+  lives. After that process is replaced (a restart of the daemon, a resume,
+  switching the conversation to its terminal and back), a copy of the
+  withdrawn send that arrives only then is accepted and runs. Holders
+  discard what they hold when its socket closes and answer a cancel for what
+  they still hold, so no copy should outlive a withdrawal.
+- A daemon that is killed after it handed a message to the agent and before
+  it recorded the echo leaves a delivered message whose id it does not know.
+  The client's resend then runs it a second time, or, after two minutes,
+  its withdrawal is answered "withdrawn" although it ran.
+
+When the machine is awake again for any reason, the keeper attaches every
+socket it kept, on its own, with the remembered authentication. An events
+socket has no `ready`: once attached, frames pass, and the daemon's first
+frames are its full snapshots.
+
+What clients do, against either kind of keeper:
+
+- A second `ready` on one socket is a reattach. A chat keeps its transcript
+  and drops every event at or below the last `seq` it applied; pending sends
+  stay pending until their echoes, and go out again by id as at any `ready`
+  (above). A terminal treats it as a reconnect's
+  `ready`, answering its auth frame with the `park`/`unpark` it sent since
+  folded in. After a shown attach it resets and takes the snapshot that
+  follows, then sends its grid when `ready` names another one; hidden with
+  its `park` not yet sent, it sends only `park` (a hidden terminal never
+  resizes the PTY). After a parked attach no snapshot follows: a hidden
+  terminal discards its buffer and repaints when shown, and a shown one
+  whose `unpark` never went out resets, sends its grid and `unpark` (which
+  repaints).
+- A browser cannot read the upgrade's header, so the UI infers a kept socket:
+  open, authenticated and without a frame for 1.5 s is kept (no
+  "Reconnecting…", no retry timer, no reconnecting indicator). A send, a
+  decision or a keystroke on an open socket is simply sent. A kept socket
+  that later drops is dialed again before anything is concluded from the
+  placement. `worker_asleep` at any time means the socket is not kept.
+- `remote_unavailable` ends a wake that was under way and means "not live
+  until the next `ready`". With `reason:"reconnecting"` it is a relay that
+  cannot reach the owner and keeps trying: the view says "Reconnecting…"
+  until the next frame. Without it (a hand-back) the socket is still kept,
+  and quiet for 1.5 s again returns to the kept presentation.
+- Several sends can be pending at once, each shown as its own "sending…"
+  bubble until the echo that carries its id; a refusal that carries its id
+  returns exactly that send, above whatever is being written in the composer
+  (`send_after_turn` is a send). A refusal that names an id the client no
+  longer holds (a second copy of a send already confirmed or returned) is
+  ignored. A refusal that names no send, from a holder that predates ids in
+  front of a daemon that has them, returns nothing, not even when one send
+  is unconfirmed (it may answer a second copy of a send that holder still
+  delivers): the sends show as pending and the next `ready` sends or
+  withdraws each. A prompt the UI sends from outside the composer goes out
+  under its own id; refused, it is said and returns nothing.
+- Nothing in the UI waits forever on a command that is not the user acting:
+  the MCP panel keeps the inventory it has and closes after 10 s without a
+  first answer, a rewind's dry-run check closes after 30 s. The thinking
+  preference is pushed again when a new agent process starts (`init`) and
+  after a reattach (a second `ready` on the same socket: its keeper dropped
+  a push sent while nothing was attached), never on a plain reconnect: there
+  the process still has it, and pushing again would let one window's default
+  override another window's explicit choice at every blip. A toggle made
+  while the conversation is not live is pushed at the next `ready`. The
+  seven settings commands change nothing in the UI until the daemon confirms
+  them (a keeper and the native proxy both hold them, so the old value shows
+  until the owner answers; a held one the proxy gives up on is refused by
+  name); the client itself never sends one twice.
+- An events client sends its `watch` registration again whenever a `settings`
+  frame arrives on a gateway socket: the daemon sends one per attach, and a
+  registration lives on the daemon's side of one attach.
+- The native proxy reads the header on the upgrade it makes, and nothing else
+  decides. Kept: it passes every frame straight through in both directions
+  from the first moment, holds nothing and tells the viewer nothing, whatever
+  its scope probe said (a cached "awake" may be seconds stale); when such a
+  socket ends (the keeper's side closes, or the project changes owner, which
+  also says `moved`) it only closes the viewer's socket, and the viewer's
+  client sends its unconfirmed sends again at the next `ready`. Not kept: the
+  next paragraph applies unchanged. For a `worker-` owner its probe reports
+  asleep, the proxy makes one passive attach (no wake marker) to find out; a
+  refusal, or an unmarked accept that closes before `ready` or says nothing
+  for 15 s, is remembered for that host's transport for five minutes, during
+  which no further passive attach is made (viewer sockets and feed retries
+  behave as before). An accept that closes ends the viewer's socket as any
+  owner's close does (what the proxy held is refused first; the viewer
+  reconnects onto the path below and its client sends again). One that only
+  stays silent is dropped by the proxy after those 15 s, and input held for
+  it then wakes the machine as below. A viewer
+  already told `remote_unavailable` with no input held is closed when a kept
+  attach succeeds, so its reconnect attaches quietly (a setting held alone
+  does not keep it open: it is refused by name first). The proxy's events feed
+  attaches the same way, sends no registration before the owner's first frame
+  on a kept or sleeping attach, and registers again on every `settings` frame
+  of a `worker-` owner (a computer's feed is as before).
+
+**Reconnects, held input and moves.** Viewing is passive; doing wakes. This is
+what the native proxy does for an owner that is another computer, for one
+that cannot be reached, and for a cloud machine whose keeper does not mark its
+sockets kept (the paragraphs above replace it otherwise). A native
 window's chat/terminal socket to its own daemon stays open while the owner is
-unreachable or asleep (`remote_unavailable` / `worker_asleep`, both non-fatal);
-the daemon retries the owner on its own (2 s doubling to 30 s). The first real
-input — terminal bytes or any chat command — is held (≤64 KiB of typing, ≤4 chat
-commands, and ≤64 MiB across every socket of the daemon), opens the owner's
-socket with `?wake=interaction`, and is delivered exactly once, in order, right
-after the owner's `ready`. When that input finds the owner asleep the viewer
+unreachable or asleep (`remote_unavailable` with the additive
+`reason:"reconnecting"`, the relay's own lasting state / `worker_asleep`, both
+non-fatal); the daemon retries the owner on its own (2 s doubling to 30 s). The first real
+input is held (≤64 KiB of typing, ≤4 chat commands, and ≤64 MiB across every
+socket of the daemon), opens the owner's socket with `?wake=interaction`, and
+is delivered once, in order, right after the owner's `ready`. Real input is a
+terminal's typing and a chat's acting commands (the daemon's
+`activity::is_interaction` list above, and nothing else). The seven settings
+commands are held too, coalesced and bounded as a keeper's are: the latest
+pick of a setting wins unless the user acted in between (`set_mcp_enabled`
+and `reconnect_mcp` per `server`), at most 16 per socket of 16 KiB each,
+outside the four-command cap. A held setting asks for no wake and brings no
+work here, and it is delivered only in front of acting input from the same
+viewer: it rides ahead of that viewer's next held or forwarded acting
+command, so a permission mode picked before a message is in force when that
+message runs. It is never delivered by itself. A `ready` with no input from
+this viewer leaves it held, and after ten minutes it is refused with
+`command_failed` naming its command, so a window left open cannot hand a
+mode picked long ago to a turn another device starts. A setting picked while
+the owner is attached is forwarded at once and replaces an older pick of it
+still held. A setting that cannot be held is refused the same way, as is one
+held when its input comes back (a failed wake, a route change, the other
+computer keeping the work) or sent on a socket whose route just changed.
+Every other chat command (the automatic
+`set_thinking`, the reads, `cancel_send`, a command the daemon does not
+know) passes to an attached owner and is dropped otherwise. When the first
+input finds the owner asleep the viewer
 gets the additive `{"type":"waking"}` status; while the wake is pending,
 further input is refused rather than held (chat: `command_failed` with
 `reason:"waking"`; typing: `read_only` with `reason:"waking"`, at most one
-note a second), so a repeated send never becomes a second turn. Input that
+note a second). A fifth chat command while four are held is refused alone,
+the four stay held. Input that
 cannot be delivered is answered, never dropped: each chat command gets
 `command_failed` (the UI puts a refused send's text and pictures back into the
 composer); typing gets `read_only` with `reason:"reconnecting"`. Every chat
 refusal carries the additive `command` it answers (`send`, `interrupt`,
-`permission`…), and a client restores a draft only for `command:"send"`.
-Nothing is resent automatically.
+`permission`…) and the additive `client_id` that command was sent under, and
+a client restores a draft only for `command:"send"` or `"send_after_turn"`,
+and then exactly the send the id names. The relay is a holder and follows the
+holders' rule above (a second copy of a held send is dropped, a
+`cancel_send` for it is answered `cancelled:false` here). It sends nothing
+twice itself; a viewer socket that closes while this relay still holds input
+loses that input here, and the client sends it again by its id at its next
+`ready`.
 
 When the route is a `device-` route (another of the user's computers owns the
 project) and this computer can take it, the first real input instead brings
 the work here: the relay holds it (the same budget), says
-`{"type":"bringing","to":"here"}`, stops forwarding input to the owner and
+`{"type":"bringing","to":"here"}`, stops forwarding anything a chat sends to
+the owner (input and settings are held for the session here; the rest is
+dropped, a `cancel_send` included, unless it names a held send) and
 hides the owner's `moved`/`paused` frames and its closing socket for this move.
-Once this computer holds the project and its session resumed, the held input
-is delivered once to the local session and the socket closes quietly (the
-viewer reconnects to the session here and its replay carries the message).
+Once this computer holds the project and its session resumed, what was held
+is delivered once to the local session, in the order the user did it
+(settings included), and the socket closes quietly (the viewer reconnects to
+the session here and its replay carries the message). The whole batch gets
+one wait for that session to start, and once a setting could not be applied
+nothing after it is run: those frames are refused instead.
 When the other computer keeps the work, each held chat command is refused
 with `command_failed`, `reason:"still_working"` and the plain line "Your other
 computer is still working on this. Try again when it pauses." (typing: one
@@ -159,7 +474,9 @@ is coming is refused with `reason:"bringing"`. A browser view gets the same
 action on a sleeping cloud machine is sent to one of the user's computers
 instead; the gateway holds the socket authentication and first input and
 delivers them once to that computer's session, or to the woken cloud machine
-(`waking`) when no computer took the work. Every `read_only` refusal (`reason`:
+(`waking`) when no computer took the work. Like a keeper it holds only acting
+commands and the seven settings commands while the work is being brought,
+never a view's other frames. Every `read_only` refusal (`reason`:
 `watching`, `elsewhere`, `busy`, `waking`, `bringing`, `still_working`, `reconnecting`) and every HTTP
 `409 {"error":"workspace_owned_elsewhere"}` also carry the additive
 `owner: "cloud" | "computer"`: where the project's work runs now, so a client
@@ -188,8 +505,9 @@ closes; a change of only the host's transport (a tunnel rebind or a new
 credential for the same owner) closes quietly and the client reconnects to the
 same owner. A scoped viewer whose connection changed hears
 `workspace_scope_changed` first. Browser views have no local daemon to hold
-input: a send or keystroke into a dropped socket reconnects once with wake
-intent, and the action is not queued (a terminal says so over the pane).
+input: an open socket takes it (a keeper that keeps a cloud machine's sockets
+holds it), and a send or keystroke into a dropped socket reconnects once with
+wake intent, and that action is not queued (a terminal says so over the pane).
 
 **Events.** A window's own `/ws/events` loop stays authoritative. For a routed
 project it runs a bounded feed from the owner that contributes only that
@@ -214,7 +532,11 @@ reported as `((registration mod 2^20) + 1) << 32 | epoch`: above any daemon's ow
 counter and different per registration, so a local-to-routed switch (or back,
 or between owners) always refetches. A feed ends as soon as its route changes
 (a registration notifies it; a 2 s tick backs that up) and restarts with
-backoff; the window's socket never closes for an owner change.
+backoff; the window's socket never closes for an owner change. A sleeping
+cloud machine's feed stays open and quiet when its keeper keeps it, and ends
+(to be retried, 1 s doubling to 30 s, without another attach while the
+refusal is remembered) when the keeper refuses it; a sleeping computer's is
+not opened.
 `remote_unavailable` and `workspace_scope_changed` on an events socket mean
 "reconnect", not "rejected".
 

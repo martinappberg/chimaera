@@ -490,6 +490,48 @@ always suppresses wake. Background health checks and viewer attachments must
 never mark interaction. An awake daemon still requires its normal authenticated
 WebSocket first frame.
 
+### Sleeping worker sockets
+
+Additive (2026-09-30). A keeper may keep a worker's sockets. One that does
+marks every WebSocket upgrade it accepts for a worker host (101), awake or
+asleep, with the response header `X-Chimaera-Sockets: kept`; a keeper without
+it is the older kind, which answers a passive upgrade to a sleeping worker
+with the 503 above and closes sockets on a suspension. Clients handle both and
+tell them apart by that header only.
+
+A keeping keeper accepts the upgrade of `/ws/chat/{id}`, `/ws/sessions/{id}`
+and `/ws/events` whether the worker is awake or asleep, with or without the
+wake marker, and keeps the client's side open across the worker's suspend and
+resume. It remembers the client's first frame (folding a terminal's later
+`resize`, `park` and `unpark` into it), holds a chat's acting commands, its
+seven settings commands (`set_model`, `set_mode`, `set_effort`,
+`set_ultracode`, `set_remote_control`, `set_mcp_enabled`, `reconnect_mcp`;
+coalesced, the latest wins unless the user acted in between, outside the
+four-command cap) and a terminal's typing whenever the daemon has not
+answered `ready` on the current attach (nothing attached, or attached and not
+yet `ready`), wakes the worker for them, attaches, replays the first frame (a
+chat's `last_seq` raised to what it already relayed), waits for `ready` and
+delivers what it held once, in order. An upgrade that carries the wake marker
+wakes the worker even with nothing held. Every other chat command
+(`set_thinking`, the reads, `cancel_send`, queue housekeeping, anything it
+does not know) is never held and never wakes: dropped while nothing is
+attached, passed through otherwise. A frame that does not fit a cap is
+refused alone and the rest stay held. What it cannot deliver it hands back
+with the daemon's own refusal frames (each carrying the `client_id` of the
+command it refuses) followed by `remote_unavailable`, and keeps the socket
+open. When the client's side closes while frames are still held it discards
+them and never delivers them later; the client sends an unconfirmed send
+again under its id at its next `ready`, and the daemon accepts an id at most
+once. A keeper treats the id of a send it holds as accepted too: a second
+copy is dropped silently (never refused, never held twice), a `cancel_send`
+for it is answered `send_cancelled {client_id, cancelled:false}` by the
+keeper and not passed on, and what a client sends while frames are held is
+delivered after them. It adds no frame type: the one status it sends is the existing
+`{"type":"waking"}`, once per wake. The rules, the caps, the send ids and
+what clients do are in
+[VIEWING](VIEWING.md#forwarded-requests) ("A sleeping cloud machine's
+sockets"). HTTP requests are unchanged.
+
 ### Background handoff HTTP adapter
 
 `/v1/hosts/{host_id}/http/{path}` accepts a device or daemon-delegation bearer and

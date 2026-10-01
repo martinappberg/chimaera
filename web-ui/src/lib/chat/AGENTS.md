@@ -34,7 +34,7 @@ hard-resets and rebuilds.
 | File | What it owns |
 |---|---|
 | `store.svelte.ts` | `ChatStore` — the reducer + all reactive view state (`blocks`, `pending`, `pendingSends`, `questions`, model/mode, activity, exited/degraded/connected/fatalError — the last cleared by a fresh `init`, a `forked` marker, or a journal reset; a SOCKET-origin fatal (a handshake failure via `onFatalError`) also clears on the next successful `ready`, while a journal `error{fatal}` outlives reconnects until the driver is genuinely relaunched), including initial replay hydration through the ready-frame `head`. **The single source of truth for the view.** Every block carries a monotonic per-store `uid` (the transcript's keyed-render key — never an array index). `blocks` is capped at ~2000 with hysteresis: it runs one 64-block slack past the cap, then one batch splice trims back to the cap behind a single "earlier history trimmed" notice (so the O(n) index rebuild runs once per batch, not per event at cap); `trimmedCount` counts the NET front shift (dropped − the replacing notice), making a block's virtual index (`trimmedCount + i`) invariant and `virtualTotal` (`blocks.length + trimmedCount`) monotonic at cap. `structuralVersion` counts insertions/removals (net lengths are a false proxy — a retracted-then-reappended tail cancels out) and `epoch` stamps the transcript generation (a journal reset restarts the trim numbering). `activeAgents` is the reducer-maintained live-subagents set (same proxies as `blocks`, so tray rows update in place — no per-event full-blocks filter), and `tool_output_delta` accumulation is capped client-side (12 KiB head + rolling 4 KiB tail behind the server's own "[N bytes omitted]" marker; the authoritative result replaces it). Its reducer has a vitest test (`store.svelte.test.ts`) — the one place the UI is unit-tested. |
-| `chatWs.ts` / `cooperativeQueue.ts` | `ChatSocket` — connect/auth/reconnect(backoff)/gap-replay, then dispatch replay/live/control frames through one order-preserving cooperative queue so a cold history cannot starve browser input. Per-command refusals (`command_failed` / `invalid_command`) are visible but nonfatal. Shares reconnect accounting with `../terminal/ws.ts`. |
+| `chatWs.ts` / `cooperativeQueue.ts` | `ChatSocket` — connect/auth/reconnect(backoff)/gap-replay, then dispatch replay/live/control frames through one order-preserving cooperative queue so a cold history cannot starve browser input. Per-command refusals (`command_failed` / `invalid_command` / `read_only`) are visible but nonfatal and carry the refused command's `client_id`; a `ready` reports `send_ids` and whether it is a reattach (`ReadyAttach`), and `send_cancelled` answers the store's `cancel_send`. Shares reconnect accounting with `../terminal/ws.ts`. |
 | `chatPool.ts` | Session-keyed warm reducer/socket + scroll/render-window/followed-revision cursor. The agent keeps folding while a tab's bounded DOM snapshot is hidden or its view is evicted; client-pool eviction never stops the daemon-owned process. |
 | `ChatView.svelte` | The host: renders a bottom-anchored transcript window (64 blocks initially, 192 maximum) that pages automatically in both directions — scroll-driven prefetch mounts the next page about two viewports ahead in the reader's direction of travel (one page per frame), sentinels cover windows that end inside the viewport, and fallback buttons appear only without IntersectionObserver — plus a direct jump to newest. A **history spacer** ahead of the column stands in for the unmounted earlier history (sized by `heightModel.ts`, calibrated by what the pages mounted above the reader really measured) and absorbs every above-viewport height change for a scrolled-up reader (see the scroll invariant below); its twin, the **later spacer** after the column, stands in for the unmounted later rows of a history page and takes every scroll-height change a range write makes below the reader, so the scrollbar thumb moves only when the reader scrolls (zero at the live edge, forced; never below the model of the rows still unmounted, or an undershooting estimate ends the scroll range early and the last page moves the end away). A scrollbar drag deep into either mounts the page the model puts there (`pageAround`; a drag to the very end lands on the live edge). A page write never discards rows within one viewport past the prefetch reach (`keepInReach`): the cap counts blocks, and a folded tool run is one short line. Once the window holds the first row, the history spacer's leftover (blank above the first message) shrinks as fast as the reader scrolls into it (`holdTopEdge`). It hangs the header/composer/overlays/panels off itself. Non-tool rows are keyed `b-${block.uid}` and tool groups `g-${firstTool.id}` — **stable identities, never array indices**, so an at-cap trim's front-splice cannot remount the whole window (one caveat: a group whose FIRST tool is trimmed away changes key and remounts). "New rows vs in-place chunk" detection keys on the store's `structuralVersion` (never net lengths), a reducer trim shifts the view's absolute range AND its rendered slice by the trim delta (`trimShift`) so range, rows, and index labels keep agreeing — falling back to the tail when the whole window was trimmed — and cursors/ranges are discarded, never shifted, across a store `epoch` change. Re-activating a hidden tab whose window+content are unchanged since its freeze skips the range rebuild entirely (the frozen rows rebind to live proxies on the next event or bottom-reach). Visible tail rows are reducer proxies; hidden/history rows are one inert snapshot. A fresh replay stays gated until `head`, so it never paints oldest-to-newest. Still the big one — keep new chrome in child components, not inline. |
 | `transcriptWindow.ts` | Pure range math for the 64-block/192-block sliding transcript DOM window — array coordinates throughout; saved cursors alone persist in trim-stable virtual coordinates, converted back at the boundary by `restoreVirtualWindow` (the one stale-cursor policy, with a one-page floor) while `trimShift` keeps a mounted range aligned across a trim. Also the scroll policy: `prefetchPage` (direction-gated, so a short window cannot ping-pong), `keepInReach` (a page write keeps the rows near the reader — the 192-block cap alone unmounted the row being read on tool-heavy history, or pulled the discarded edge within reach so its sentinel paged it straight back, every frame), `pageAround` (a far jump's page), and the spacer's `spacerTarget` / `spacerNeedsRebalance` with the WebKit rationale. Tests cover both paging directions, stale cursor repair, both trim conversions, prefetch, and the spacer policy. |
@@ -69,7 +69,7 @@ hard-resets and rebuilds.
 | `AttachmentStrip.svelte` / `ImagePreview.svelte` | A message's images as picture tiles (one row height, width from the picture's aspect via `images.ts::tileBox`, no hover effects): `drafts` in the composer (in-memory pixels, ✕ to remove, click → `ImagePreview`, a fixed overlay like the plan card's) and `paths` on sent/queued bubbles (the daemon's saved copies from `user_message.attachment_paths`, resolved near the viewport through `resolveFile`, click → open in a pane, a gone copy a dashed tile). A picture-only message puts the strip where the bubble would be. |
 | `paths.ts` | The chat half of path links: which candidates a code span / link target offers (parsing is `../shared/fileRef.ts`, shared with the terminal), and `PathResolver` — one per ChatView, batching every renderer's candidates into `fsValidate` calls grouped by base ladder (live cwd, spawn cwd, workspace root from App's `setChatLinkContext`), caching hits/ambiguous/misses keyed by candidate + base ladder + workspace (`resolveScope`; misses expire after 15 s and at every turn end, hits after 60 s; failures are never cached). A click re-checks before opening (`resolveNow` / `reopenResolution`), so a stale hit never opens a moved or deleted file. Opening goes through `../shared/openPath.ts` (reveal at the line, Cmd/Ctrl split); ambiguous names open a context-menu pick list. Own vitest suite (`paths.test.ts`). |
 | `voice.svelte.ts` / `voiceCapture.ts` / `VoiceMeter.svelte` / `voiceLanguages.ts` | Voice dictation — the composer's mic button (on by default; `/voice on` or `off`; the same in Claude and Codex chats). `Dictation` (one per composer) is a chain of `Phrase`s — one `/ws/voice` socket each, opened with the mic (audio captured before a socket is up is queued, never dropped). `PauseDetector` (pure, tested) ends a phrase at a pause: the service revises nothing until a stream is finalized, so the recording finalizes each phrase there and speaks on into a fresh one — opened only when speech resumes, with ~300 ms of pre-roll, so a recording that ends in silence opens none — and each phrase's corrected text arrives a moment later. The host check (`hostCanDictate`) re-asks on the window's next focus/visibility whenever the answer was no. `finals` is the leading run of finished phrases, `interim` everything after (a finishing phrase keeps its guess until its correction lands); keeps the last five levels for `VoiceMeter`'s waveform (beside the stop button), and owns `error` (the composer only reads it) — including the silence message naming the device when the loudest chunk stayed near zero; a generation counter fences late events from an ended recording. `hostCanDictate` / `recheckHost` cache the daemon's `GET /api/v1/voice` per window (re-asked after a login error), gating the mic; `voiceProblem` is `/voice on`'s check (that, then one mic permission request). `voiceCapture.ts`: `listMicrophones` (names are withheld until the page has the mic once), `startCapture(onChunk, microphone)` resolving a remembered NAME to this origin's device id, and an AudioWorklet (inlined as a Blob URL) box-filtering the device rate to 16 kHz mono PCM16 in 100 ms chunks with an RMS level; the mic is released after each recording. Keys stay the composer's: the Dictate chord (`keys.dictate`, matched only while the composer has focus — App's handler has no case for it, so it falls through), and while recording Esc restores the draft and Enter stops and sends; Space is never taken over. The words stream INTO the draft (`dictationParts` / `joinParts`: the text around the caret, settled words, forming words, spaced like typing), so the box grows like typing; the textarea goes read-only with transparent text and the composer's `.ghost` mirror (exact box, font, wrapping, scroll and scrollbar-width padding) draws it with the spoken part dimmed — keep their box and font properties identical. Pure helpers (`dictationParts`, `insertDictation`, `joinSpoken`) have a vitest suite (`voice.test.ts`). |
-| `composerBus.ts` | Cross-component channel to insert text/attachments into the active composer (e.g. `@term:` grants, references, dropped-file paths, a quoted transcript passage). An insert is `inline` (joins the draft after a space) or `block` (its own paragraph, so a quote's `>` starts a line); `composer.ts::draftWithInsert` is the pure join. An insert may name the mounting view's token (`view`): one chat can be mounted twice (the Mastermind dock and a pane), and a quote belongs in the composer under its selection. Own vitest suite (`composerBus.test.ts`). |
+| `composerBus.ts` | Cross-component channel to insert text/attachments into the active composer (e.g. `@term:` grants, references, dropped-file paths, a quoted transcript passage). An insert is `inline` (joins the draft after a space) or `block` (its own paragraph, so a quote's `>` starts a line); `composer.ts::draftWithInsert` is the pure join (its `above` is for the return channel). A message that did not arrive comes back through `registerComposerReturn` / `returnableCount` / `returnToComposer`: all or nothing (its pictures must fit), above the draft, and never taking focus; keyed by the mounting view's token like inserts, so a chat mounted twice keeps a target when one view unmounts. An insert may name the mounting view's token (`view`): one chat can be mounted twice (the Mastermind dock and a pane), and a quote belongs in the composer under its selection. Own vitest suite (`composerBus.test.ts`). |
 | `composerHeight.ts` | Pure height policy for content-fit growth plus manual resize baselines; covered by `composerHeight.test.ts`. |
 | `drafts.ts` | Per-session composer draft persistence (survives the per-session ChatView remount + a page reload) — text layers into sessionStorage, images stay in-memory; both bounded. It also publishes which drafts remain memory-only so an interface-build transition cannot silently reload over them. |
 | `images.ts` | Pasted/dropped image → downscale + base64 encode into an `ImageAttachment` (the canonical home of that type, with its encoded size); size-bounded. Also the tile geometry (`tileBox`) and draft `<img>` source (`attachmentSrc`); own vitest suite. |
@@ -323,23 +323,114 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
   chrome the same way rather than inlining it into the host.
 
 Remote chats (Pro): attaching and reconnecting are passive; there is no wake
-button. In a native window the daemon holds the first command while a paused
+button. A keeper may keep a sleeping cloud machine's sockets open (it marks them
+`X-Chimaera-Sockets: kept`; VIEWING.md, "A sleeping cloud machine's sockets";
+none is deployed as this is written), and a native window's daemon then passes
+straight through to it. `ChatSocket.send` on an open socket is simply sent
+(never a wake redial). `QUIET_OPEN_MS` after authentication a socket that
+heard nothing is `store.held` (not live, so a send shows pending; not
+reconnecting, so no "Reconnecting…" row, no rail pulse and no "· reconnecting"
+in the header; before the first replay a viewed cloud conversation shows the
+wake hint, `waitsForCloud`). `{"type":"waking"}` shows unconfirmed sends as
+pending even when the socket still looked live, and a second `ready` on the
+same socket is a reattach: `onReady` resets nothing, `apply`'s seq guard drops
+what the store has, pending bubbles wait for their echoes (and go out again by
+id, below). `worker_asleep`
+ends `held`; so does `remote_unavailable`, which also ends `connected` and
+`waking`: with `reason:"reconnecting"` (a relay retrying) that lasts until the
+next frame, without it (a hand-back) the socket is still kept and `held`
+returns after the quiet window. A kept socket that drops is dialed again
+before the placement's "suspended" parks it.
+
+Sends (any keeper, relay or daemon): each composer send goes out under a
+`client_id` (`mintSendId`) and is kept in `store.unconfirmed` with its frame
+(`noteSent(id, frame, text, images)`); `store.sending` is the ones shown as
+"sending…" bubbles (several at once, also under the loading line). Only the id
+settles a send. The echo (`user_message`) that carries it confirms it. A
+refusal of a `send`/`send_after_turn` that carries it (`onCommandFailed`'s
+`clientId`) hands back exactly that text through `restoredDrafts` /
+`takeRestoredDrafts` (a queue; ChatView hands the oldest
+that fit to the composer through `composerBus`'s return channel,
+`returnableCount` + `returnToComposer`: texts above the draft in progress,
+pictures attached, no focus taken and a focused caret kept where it was; a
+send whose pictures do not fit waits in the queue, whole, until the composer
+reports room through `onReturnRoom`); a refusal naming an id the store no
+longer holds says nothing (unless it is one `noteSentOutside` recorded,
+below). At every `ready` whose daemon says
+`send_ids` (`ReadyAttach.sendIds`), once `lastSeq` reaches its `head`
+(`resendUnconfirmed`), each send still without an echo goes out again under
+the same id through the path `chatPool` bound with `bindSender`
+(`ChatSocket.sendQuietly`: never a redial, never a wake), while it is
+younger than `RESEND_FOR_MS` (two minutes): the daemon runs an id once, so
+that is right whether the first copy was lost, is queued in the daemon or is
+about to be delivered by a keeper. Copies of one send are paced (`resendDue`:
+at least `RESEND_GAP_MS` since it last went out, doubling to 30 s); one not
+due at the `ready` goes out from the store's own timer when it is, if the
+conversation is still live and its echo has not come (`onDisconnected` and
+`dispose` clear the timer). An older one is withdrawn with
+`cancel_send`; `send_cancelled` (`onSendCancelled`) with `cancelled:true`
+returns its text with the notice "not delivered", `false` leaves the bubble
+for the echo that is coming. Those two frames are the only thing this client
+ever sends by itself; there is no queue of commands. A refused `cancel_send`
+is not shown and is asked again at the next `ready`.
+
+A daemon without `send_ids` is never sent anything twice and no `ready`
+decides anything there. Its echo has no id and confirms the oldest send with
+exactly that text (a send made against such a daemon keeps that rule after the
+daemon is replaced, `UnconfirmedSend.plain`); its refusal names no send and
+returns the newest. A refusal without an id behind a daemon that has them (a
+holder in between that predates ids) returns nothing, however many sends are
+unconfirmed: it may answer a second copy of a send that holder still
+delivers. They show as pending and the next `ready` sends or withdraws each. `waking`/`bringing` only change
+presentation (`showUnconfirmed`). A send on a live connection shows no bubble
+until it has waited `SHOW_UNCONFIRMED_AFTER_MS` for its echo (ChatView's timer
+calls `showOverdue`; ids daemons only). `onDisconnected` (the pool calls it
+too when it heals a dead socket) shows what is unconfirmed as pending; an exit
+or a fall back to the terminal hands back everything; a move forgets nothing.
+The Mastermind panel's one-click prompts go out under their own id and tell
+the store (`noteSentOutside`): nothing to confirm or return, but a refusal
+that names one is still said, and is never taken for the composer's send.
+
+Commands that are not the user acting (`set_thinking`, `get_usage`, `get_mcp`,
+`cancel_send`, a dry-run `rewind`) are dropped by a keeper or relay while
+nothing is attached, so nothing may wait on one forever: `/mcp` keeps the
+inventory it has and closes after 10 s without a first answer, a rewind's dry
+run closes after 30 s (both only for a viewed conversation). `thinkingPushed`
+is cleared by a new `init` and by a second `ready` on the same socket
+(`ReadyAttach.reattach`: its keeper dropped a push made while nothing was
+attached), never by a plain reconnect, where the process still has it and a
+second window's default would override another window's choice at every blip.
+A toggle made while not `connected` is marked pending (`toggleThinking`), so
+the next `ready` pushes it.
+The seven settings commands (`set_model`, `set_mode`, `set_effort`,
+`set_ultracode`, `set_remote_control`, `set_mcp_enabled`, `reconnect_mcp`) are
+held by a keeper and by this computer's relay while the owner is not attached.
+The relay delivers one only in front of this viewer's next acting command
+(never by itself at a `ready`) and refuses it by name after ten minutes, so
+the refusal's notice shows; they have no optimistic state, so the old value
+shows until the owner confirms.
+
+The rest of this paragraph is what happens against a keeper that refuses or
+closes those sockets (today's), and for another computer as owner. In a native window the daemon holds the first command while a paused
 owner wakes (the additive `{"type":"waking"}` → `store.waking`, "Waking the
-cloud machine…"), refuses further commands until it answers, and answers
-anything it cannot deliver with `command_failed`. Every refusal carries the
-additive `command` it answers; the store keeps the composer's last accepted
-send with its pictures (`noteSent`) until its user echo and hands it back
-(`restoredDraft` → `insertIntoComposer` + `attachImageToComposer`) only for
-`command:"send"` — never for a refused interrupt/permission answer, which could
-resurrect a delivered message. A send accepted while not live shows at once as
-`store.sending` ("sending…") until its echo. Acting on a conversation another
+cloud machine…"), refuses further acting commands until it answers, and answers
+anything it cannot deliver with `command_failed`. Only acting commands (the
+daemon's `activity::is_interaction`) wake the owner or bring work here; the
+seven settings commands are held with them (above), everything else is
+dropped while the owner is away. Every refusal carries the additive `command`
+it answers and the `client_id` it was sent under; the store keeps each send
+with its pictures (`noteSent`) until its echo and hands it back
+(`restoredDrafts` → `composerBus`'s return channel) only for
+`command:"send"` / `"send_after_turn"` — never for a refused interrupt/permission
+answer, which could resurrect a delivered message. A send made while not
+live shows at once in `store.sending` ("sending…") until its echo. Acting on a conversation another
 of the user's computers runs brings its work here: the daemon holds the send
 and says `{"type":"bringing","to":"here"}` (a browser view's gateway says
 `to:"computer"` when a phone's send on a sleeping cloud goes to a computer) →
 `store.bringing` ("Bringing the work here…" / "Bringing the work to your
 computer…", the send shown pending); it ends with the next `ready`, a wake, a
 move, or a `command_failed` with `reason:"still_working"` (the other computer
-kept it; the send comes back to the composer). A move to another computer is
+kept it; the send it names comes back to the composer). A move to another computer is
 `moved` with `other:true` → `store.moving = "other"` ("Continuing on your
 other computer…"). In a browser view, `send()` into a
 dropped socket reconnects once with `?wake=interaction` and returns false (the
@@ -383,3 +474,5 @@ line itself (`TransferNote`'s `kept` prop) instead of a second divider. The line
 nothing waits for a choice.
 `store.awaitingWake` (`hydrating && asleep`) replaces the loading line with one quiet sentence while
 the owner sleeps before the first replay; a wake (`waking`) hands back to the ordinary loading line.
+ChatView's `waitsForCloud` shows the same sentence for a kept, quiet socket (`held`) of a viewed
+conversation that runs on a cloud machine (`net/placement.ts` `ownerIsCloud`), never for a local chat.

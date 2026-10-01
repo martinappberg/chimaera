@@ -125,6 +125,13 @@ describe("where a routed session runs", () => {
     expect(placementLabel(cloud, true, { owner: "asleep" })).toBe("In the cloud · asleep");
     expect(placementLabel(cloud, false, { owner: "waking" })).not.toContain("reconnecting");
   });
+  it("does not say reconnecting while the view's own socket is answered or kept open", () => {
+    // A sleeping owner fails the roster read while its socket is kept open.
+    expect(placementLabel(cloud, false, { reachable: true })).toBe("In the cloud");
+    expect(placementLabel(cloud, false, { reachable: false })).toBe("In the cloud · reconnecting");
+    // What the socket heard still wins.
+    expect(placementLabel(cloud, false, { owner: "asleep", reachable: true })).toBe("In the cloud · asleep");
+  });
   it("says reconnecting once: not in the label while the view's status line says it", () => {
     expect(placementLabel(cloud, false, { reconnectingShown: true })).toBe("In the cloud");
     expect(placementLabel("here", false, { owner: "asleep" })).toBeNull();

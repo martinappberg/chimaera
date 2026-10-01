@@ -23,6 +23,8 @@ pub(crate) use kept::{
     file as kept_file, list as kept_list, resolve as kept_resolve, resolve_all as kept_resolve_all,
 };
 pub(crate) use moves::{acted_here, bring_here, other_computer, Outcome as MoveOutcome};
+#[cfg(test)]
+pub(crate) use moves::{device_fixture, settle_fixture};
 pub(crate) use policy::CloudProfile;
 pub(crate) use provider_gate::{
     blocking_provider, cloud_provider_blocks, workspace_provider_blocks,

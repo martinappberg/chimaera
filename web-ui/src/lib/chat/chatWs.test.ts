@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { ChatSocket, type ChatSocketHandlers } from "./chatWs";
 import { readPlacement } from "../net/placement";
+import { QUIET_OPEN_MS, reconnectingSockets } from "../net/reconnect";
+import { get } from "svelte/store";
 
 class Socket {
   static OPEN = 1;
@@ -117,9 +119,12 @@ it("a refused command keeps the socket and reports the refusal", async () => {
   expect(socket.send({ type: "send", blocks: [] })).toBe(true);
   Socket.all[0].frame({ type: "error", code: "command_failed", message: "not sent", command: "send" });
   Socket.all[0].frame({ type: "error", code: "command_failed", message: "old daemon" });
+  // The refused send, named by the id it went out under.
+  Socket.all[0].frame({ type: "error", code: "read_only", message: "named", command: "send", client_id: "client-0001" });
   await drain();
-  expect(h.onCommandFailed).toHaveBeenCalledWith("not sent", "send", null);
-  expect(h.onCommandFailed).toHaveBeenCalledWith("old daemon", null, null);
+  expect(h.onCommandFailed).toHaveBeenCalledWith("not sent", "send", null, null);
+  expect(h.onCommandFailed).toHaveBeenCalledWith("old daemon", null, null, null);
+  expect(h.onCommandFailed).toHaveBeenCalledWith("named", "send", null, "client-0001");
   expect(socket.healthy).toBe(true);
   socket.close();
 });
@@ -145,6 +150,7 @@ it("acting brings the work here: the socket says so and a kept refusal names why
     "Your other computer is still working on this. Try again when it pauses.",
     "send",
     "still_working",
+    null,
   );
   expect(socket.healthy).toBe(true);
   socket.close();
@@ -170,6 +176,21 @@ it("a send into a browser view whose socket is down reconnects once with wake in
   expect(socket.send({ type: "send", blocks: [] })).toBe(false);
   expect(Socket.all).toHaveLength(2);
   expect(Socket.all[1].url).toContain("?wake=interaction");
+  expect(Socket.all.flatMap((s) => s.sent)).toHaveLength(0);
+  socket.close();
+});
+
+it("a frame the store sends by itself never redials or asks for a wake", () => {
+  vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-one/"));
+  vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => {})));
+  const socket = new ChatSocket("s-chat", handlers());
+  Socket.all[0].onopen?.();
+  // Down (not authenticated yet): the user's own send would dial with wake
+  // intent here; a resend or a withdrawal is simply not written.
+  expect(socket.sendQuietly({ type: "send", blocks: [], client_id: "client-0001" })).toBe(false);
+  expect(socket.sendQuietly({ type: "cancel_send", client_id: "client-0001" })).toBe(false);
+  expect(Socket.all).toHaveLength(1);
+  expect(Socket.all[0].url).not.toContain("wake=");
   expect(Socket.all.flatMap((s) => s.sent)).toHaveLength(0);
   socket.close();
 });
@@ -256,5 +277,198 @@ it("a project view parks when its placement says the owner sleeps, and dials onc
   await vi.advanceTimersByTimeAsync(2_001);
   expect(Socket.all).toHaveLength(2);
   expect(Socket.all[1].url).not.toContain("wake=");
+  socket.close();
+});
+
+// Against a keeper that keeps a sleeping cloud machine's sockets open (it
+// marks them `X-Chimaera-Sockets: kept`; VIEWING.md, "A sleeping cloud
+// machine's sockets"), directly or through this computer's relay.
+
+it("a socket kept open for an owner that has not answered is healthy, and a send goes out on it", async () => {
+  const h = handlers();
+  h.onHeld = vi.fn();
+  const socket = new ChatSocket("s-chat", h);
+  Socket.all[0].onopen?.();
+  await vi.advanceTimersByTimeAsync(QUIET_OPEN_MS - 1);
+  expect(h.onHeld).not.toHaveBeenCalled();
+  await vi.advanceTimersByTimeAsync(51);
+  expect(h.onHeld).toHaveBeenCalledOnce();
+  // However long it stays quiet: no retry, no parked wait, no indicator.
+  await vi.advanceTimersByTimeAsync(60 * 60_000);
+  expect(Socket.all).toHaveLength(1);
+  expect(socket.waitingForOwner).toBe(false);
+  expect(get(reconnectingSockets)).toBe(0);
+  expect(h.onDisconnected).not.toHaveBeenCalled();
+  expect(h.onAsleep).not.toHaveBeenCalled();
+  // The send is simply sent (whoever keeps the socket holds it): no redial.
+  expect(socket.send({ type: "send", blocks: [] })).toBe(true);
+  expect(socket.send({ type: "permission", request_id: "r", option_id: "allow_once" })).toBe(true);
+  expect(Socket.all).toHaveLength(1);
+  expect(Socket.all[0].sent).toHaveLength(3);
+  socket.close();
+});
+
+it("a second ready on the same socket is one more ready, in order with the gap it brings", async () => {
+  const calls: string[] = [];
+  const h = handlers();
+  h.onReady = vi.fn((_session: unknown, replayFrom: number) => void calls.push(`ready from ${replayFrom}`));
+  h.onEvent = vi.fn((entry: { seq: number }) => void calls.push(`seq ${entry.seq}`));
+  h.onWaking = vi.fn(() => void calls.push("waking"));
+  const socket = new ChatSocket("s-chat", h);
+  const ws = Socket.all[0];
+  ws.onopen?.();
+  ws.frame({ type: "ready", session: {}, replay_from: 0, head: 1 });
+  ws.frame({ type: "batch", events: [{ seq: 1, ts: 1, ev: { type: "user_message", text: "one" } }] });
+  // The machine sleeps and wakes behind the kept socket.
+  expect(socket.send({ type: "send", blocks: [] })).toBe(true);
+  ws.frame({ type: "waking" });
+  ws.frame({ type: "ready", session: {}, replay_from: 1, head: 1 });
+  ws.frame({ type: "ev", seq: 2, ts: 2, ev: { type: "user_message", text: "two" } });
+  await drain();
+  expect(calls).toEqual(["ready from 0", "seq 1", "waking", "ready from 1", "seq 2"]);
+  expect(h.onDisconnected).not.toHaveBeenCalled();
+  expect(Socket.all).toHaveLength(1);
+  socket.close();
+});
+
+it("a ready says whether the daemon takes send ids and whether it is a reattach", async () => {
+  const h = handlers();
+  const socket = new ChatSocket("s-chat", h);
+  Socket.all[0].onopen?.();
+  // A daemon that predates send ids says nothing about them.
+  Socket.all[0].frame({ type: "ready", session: {}, replay_from: 0, head: 0 });
+  // The same socket attached again by whoever keeps it, to a daemon with them.
+  Socket.all[0].frame({ type: "ready", session: {}, replay_from: 0, head: 0, send_ids: true });
+  await drain();
+  expect(h.onReady).toHaveBeenNthCalledWith(1, {}, 0, 0, { sendIds: false, reattach: false });
+  expect(h.onReady).toHaveBeenNthCalledWith(2, {}, 0, 0, { sendIds: true, reattach: true });
+  // A new socket's first `ready` is a plain reconnect again.
+  Socket.all[0].close();
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(Socket.all.length).toBeGreaterThan(1);
+  Socket.all.at(-1)?.onopen?.();
+  Socket.all.at(-1)?.frame({ type: "ready", session: {}, replay_from: 0, head: 0, send_ids: true });
+  await drain();
+  expect(h.onReady).toHaveBeenLastCalledWith({}, 0, 0, { sendIds: true, reattach: false });
+  socket.close();
+});
+
+it("the answer to cancel_send reaches the store, in order with the journal", async () => {
+  const calls: string[] = [];
+  const h = handlers();
+  h.onEvent = vi.fn((entry: { seq: number }) => void calls.push(`seq ${entry.seq}`));
+  h.onSendCancelled = vi.fn((id: string, cancelled: boolean) => void calls.push(`${id} ${cancelled}`));
+  const socket = new ChatSocket("s-chat", h);
+  const ws = Socket.all[0];
+  ws.onopen?.();
+  ws.frame({ type: "ready", session: {}, replay_from: 0, head: 0, send_ids: true });
+  ws.frame({ type: "ev", seq: 1, ts: 1, ev: { type: "user_message", text: "one", client_id: "client-0001" } });
+  ws.frame({ type: "send_cancelled", client_id: "client-0001", cancelled: false });
+  ws.frame({ type: "send_cancelled", client_id: "client-0002", cancelled: true });
+  // Not an answer this client can use.
+  ws.frame({ type: "send_cancelled", cancelled: true });
+  await drain();
+  expect(calls).toEqual(["seq 1", "client-0001 false", "client-0002 true"]);
+  expect(socket.healthy).toBe(true);
+  socket.close();
+});
+
+it("a relay that cannot reach the owner is not a kept socket, however long it stays quiet", async () => {
+  const h = handlers();
+  h.onHeld = vi.fn();
+  h.onUnreachable = vi.fn();
+  const socket = new ChatSocket("s-chat", h);
+  Socket.all[0].onopen?.();
+  // The relay's own word, said before the quiet window passed: never kept.
+  Socket.all[0].frame({ type: "error", code: "remote_unavailable", reason: "reconnecting", message: "reconnecting" });
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(h.onHeld).not.toHaveBeenCalled();
+  expect(h.onUnreachable).toHaveBeenCalledOnce();
+  socket.close();
+  // A slow answer (its probe can take seconds) lands after the socket
+  // counted as kept: it ends that, and nothing brings it back but a frame.
+  const late = new ChatSocket("s-chat", h);
+  Socket.all[1].onopen?.();
+  await vi.advanceTimersByTimeAsync(QUIET_OPEN_MS + 50);
+  expect(h.onHeld).toHaveBeenCalledOnce();
+  Socket.all[1].frame({ type: "error", code: "remote_unavailable", reason: "reconnecting", message: "reconnecting" });
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(h.onUnreachable).toHaveBeenCalledTimes(2);
+  expect(h.onHeld).toHaveBeenCalledOnce();
+  late.close();
+});
+
+it("a wake handed back on a kept socket returns to kept, not to reconnecting forever", async () => {
+  const calls: string[] = [];
+  const h = handlers();
+  h.onHeld = vi.fn(() => void calls.push("held"));
+  h.onWaking = vi.fn(() => void calls.push("waking"));
+  h.onUnreachable = vi.fn(() => void calls.push("unreachable"));
+  h.onCommandFailed = vi.fn((_message: string, command: string | null) => void calls.push(`refused ${command}`));
+  const socket = new ChatSocket("s-chat", h);
+  const ws = Socket.all[0];
+  ws.onopen?.();
+  await vi.advanceTimersByTimeAsync(QUIET_OPEN_MS + 50);
+  expect(socket.send({ type: "send", blocks: [] })).toBe(true);
+  expect(socket.send({ type: "send", blocks: [] })).toBe(true);
+  ws.frame({ type: "waking" });
+  // The wake does not arrive: both held sends come back, then the keeper's
+  // "cannot be reached" (no relay's `reason`), and the socket stays open.
+  ws.frame({ type: "error", code: "command_failed", message: "Not sent.", command: "send" });
+  ws.frame({ type: "error", code: "command_failed", message: "Not sent.", command: "send" });
+  ws.frame({ type: "error", code: "remote_unavailable", message: "Your project is reconnecting." });
+  await vi.advanceTimersByTimeAsync(QUIET_OPEN_MS + 50);
+  expect(calls).toEqual(["held", "waking", "refused send", "refused send", "unreachable", "held"]);
+  expect(Socket.all).toHaveLength(1);
+  expect(h.onDisconnected).not.toHaveBeenCalled();
+  socket.close();
+});
+
+it("a slow \"asleep\" after the socket counted as kept is the asleep state, and its close parks", async () => {
+  const h = handlers();
+  h.onHeld = vi.fn();
+  const socket = new ChatSocket("s-chat", h);
+  Socket.all[0].onopen?.();
+  await vi.advanceTimersByTimeAsync(QUIET_OPEN_MS + 50);
+  expect(h.onHeld).toHaveBeenCalledOnce();
+  Socket.all[0].frame({ type: "error", code: "worker_asleep", message: "asleep" });
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(h.onAsleep).toHaveBeenCalledOnce();
+  expect(h.onHeld).toHaveBeenCalledOnce();
+  Socket.all[0].close();
+  await drain();
+  expect(socket.waitingForOwner).toBe(true);
+  socket.close();
+});
+
+it("a kept socket that drops while the owner sleeps is dialed again, and only a refused dial parks", async () => {
+  vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-three/"));
+  const suspended = { workspace_id: "w-three", holder_id: "wk", route_host_id: "worker-wk", epoch: 3, policy_revision: 1, availability: "suspended", server_now: "2026-09-28T19:00:00Z", expires_at: "2026-09-28T18:00:00Z" };
+  vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(Response.json(suspended))));
+  vi.useRealTimers();
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+  const h = handlers();
+  h.onHeld = vi.fn();
+  const socket = new ChatSocket("s-chat", h);
+  Socket.all[0].onopen?.();
+  await readPlacement();
+  await vi.advanceTimersByTimeAsync(QUIET_OPEN_MS + 50);
+  expect(h.onHeld).toHaveBeenCalledOnce();
+  // This one was kept, so its drop is not "asleep, wait for a send": a
+  // keeper that keeps sockets takes the next dial too.
+  Socket.all[0].close();
+  await drain();
+  expect(h.onAsleep).not.toHaveBeenCalled();
+  expect(socket.waitingForOwner).toBe(false);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(Socket.all).toHaveLength(2);
+  expect(Socket.all[1].url).not.toContain("wake=");
+  // A keeper that keeps none refuses it: the old wait, with no timer.
+  Socket.all[1].close();
+  await drain();
+  expect(h.onAsleep).toHaveBeenCalledOnce();
+  expect(socket.waitingForOwner).toBe(true);
+  await vi.advanceTimersByTimeAsync(10 * 60_000);
+  expect(Socket.all).toHaveLength(2);
   socket.close();
 });

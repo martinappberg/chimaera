@@ -11,7 +11,7 @@
   import AttachmentStrip from "./AttachmentStrip.svelte";
   import ComposerMentions from "./ComposerMentions.svelte";
   import ImagePreview from "./ImagePreview.svelte";
-  import { registerComposer, registerComposerAttach } from "./composerBus";
+  import { registerComposer, registerComposerAttach, registerComposerReturn } from "./composerBus";
   import {
     attachmentSrc,
     imageToAttachment,
@@ -82,6 +82,9 @@
     onDraftState(active: boolean): void;
     /** Words dictation should favor (project and agent names). */
     voiceTerms?: string[];
+    /** The pictures attached here changed (or the composer just mounted):
+     *  a returned message that was waiting for room may fit now. */
+    onReturnRoom?: () => void;
   }
 
   let {
@@ -101,6 +104,7 @@
     onSlash,
     onDraftState,
     voiceTerms = [],
+    onReturnRoom = undefined,
   }: Props = $props();
 
   const uid = $props.id();
@@ -331,6 +335,34 @@
       },
       view,
     );
+  });
+
+  // A message that did not arrive comes back here by itself: above whatever
+  // is being written, with its pictures, and without taking focus. A composer
+  // that has focus keeps its caret where it was in the text being written
+  // (setting the value would throw it to the end).
+  $effect(() => {
+    if (sessionId === null) return;
+    return registerComposerReturn(sessionId, {
+      room: () => IMAGE_MAX_ATTACHMENTS - images.length,
+      take: (returned) => {
+        const before = draft.length;
+        const focused = el !== null && document.activeElement === el;
+        const start = el?.selectionStart ?? before;
+        const end = el?.selectionEnd ?? start;
+        if (returned.text.length > 0) draft = draftWithInsert(draft, returned.text, "above");
+        images.push(...returned.images);
+        const shift = draft.length - before;
+        caret += shift;
+        if (focused) void tick().then(() => el?.setSelectionRange(start + shift, end + shift));
+      },
+    }, view);
+  });
+  // The host keeps a returned message whose pictures do not fit until there
+  // is room: tell it whenever the number attached changes (and at mount).
+  $effect(() => {
+    void images.length;
+    untrack(() => onReturnRoom?.());
   });
 
   // Workbench attach flow (an image dropped from the OS desktop onto this

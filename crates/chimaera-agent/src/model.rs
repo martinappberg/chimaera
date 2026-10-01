@@ -267,6 +267,13 @@ pub enum AgentEvent {
         /// Mastermind. Absent = this workbench's composer. Additive.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<String>,
+        /// The id the sending client minted for the `send` this echoes (see
+        /// [`valid_client_id`]). It is how that client knows this very send
+        /// arrived, and how the manager refuses to run the same send twice.
+        /// Stamped by the manager, never by a driver. Absent on a send
+        /// without one and on every message no client sent. Additive.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
     },
     ToolCall {
         id: String,
@@ -955,6 +962,25 @@ pub enum AgentCommand {
         id: String,
         blocks: Vec<ContentBlock>,
     },
+}
+
+/// Length bounds of a client-minted send id (`client_id` on a `send` /
+/// `send_after_turn` frame).
+pub const CLIENT_ID_MIN: usize = 8;
+pub const CLIENT_ID_MAX: usize = 64;
+/// How many send ids a session remembers (the newest), in memory and when it
+/// reads them back from its journal. Far more than the sends a client can
+/// still have unconfirmed, and under 10 KiB a session at the id length cap.
+pub const CLIENT_IDS_REMEMBERED: usize = 128;
+
+/// Whether `id` is a well-formed client-minted send id: 8 to 64 characters
+/// from `[A-Za-z0-9_-]`. The bound is what keeps a session's record of ids
+/// small; the alphabet keeps an id safe to echo in any frame.
+pub fn valid_client_id(id: &str) -> bool {
+    (CLIENT_ID_MIN..=CLIENT_ID_MAX).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// A client command exceeded one of the daemon's bounded-ingress budgets.
@@ -1916,6 +1942,7 @@ mod tests {
             queued: false,
             after_turn: false,
             origin: None,
+            client_id: None,
         };
         let json = serde_json::to_value(&with).unwrap();
         assert_eq!(
@@ -2058,6 +2085,19 @@ mod tests {
             answers,
         };
         assert!(too_many_answers.validate_ingress().is_err());
+    }
+
+    #[test]
+    fn client_send_ids_are_short_and_plain() {
+        assert!(valid_client_id("abcdEFGH"));
+        assert!(valid_client_id("0f8fad5b-d9cb-469f-a165-70867728950e"));
+        assert!(valid_client_id(&"a".repeat(CLIENT_ID_MAX)));
+        assert!(valid_client_id("with_under-score"));
+        assert!(!valid_client_id("short"));
+        assert!(!valid_client_id(&"a".repeat(CLIENT_ID_MAX + 1)));
+        assert!(!valid_client_id("has space1"));
+        assert!(!valid_client_id("quote\"12345"));
+        assert!(!valid_client_id("ünïcödé-id"));
     }
 
     #[test]

@@ -1579,6 +1579,12 @@ async fn the_request_that_wakes_a_cloud_machine_is_admitted_before_its_watchdog_
     execution::thawed_fixture(&state, &workspace.id);
     assert!(crate::pro::may_execute(&state, &workspace.id));
     assert!(execution::resuming(&state, &workspace.id));
+    // Noticing the thaw wakes the lease loop then and there (the watchdog
+    // does the same on its own tick): the renewal a viewer is waiting on
+    // starts at once, not at the loop's next five-second tick.
+    tokio::time::timeout(StdDuration::from_millis(50), state.pro.renew_now.notified())
+        .await
+        .expect("the thaw woke the lease loop");
     let generation = state.pro.generation.load(Ordering::Acquire);
     assert!(
         execution::expire(&state, generation).is_empty(),

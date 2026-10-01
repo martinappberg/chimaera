@@ -2077,6 +2077,7 @@ fn render_fork_context(events: &[AgentEvent]) -> Vec<ForkContextRow> {
                 queued: true,
                 after_turn: _,
                 origin: None,
+                client_id: _,
             } => {
                 assistant_turn = None;
                 if let Some(id) = id {
@@ -4022,6 +4023,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_event(
@@ -4108,6 +4110,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_event(
@@ -4139,6 +4142,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_event(
@@ -4166,6 +4170,7 @@ mod tests {
                     queued: true,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_event(
@@ -4229,6 +4234,7 @@ mod tests {
                 queued: false,
                 after_turn: false,
                 origin: None,
+                client_id: None,
             },
             AgentEvent::MessageChunk {
                 turn_id: "t1".into(),
@@ -4281,6 +4287,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_event(
@@ -4347,6 +4354,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_event(
@@ -4387,6 +4395,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_event(
@@ -4464,6 +4473,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_event(
@@ -4529,6 +4539,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_line(
@@ -4561,6 +4572,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_line(
@@ -4648,6 +4660,7 @@ mod tests {
                     queued: false,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_line(
@@ -4673,6 +4686,7 @@ mod tests {
                     queued: true,
                     after_turn: false,
                     origin: None,
+                    client_id: None,
                 },
             ),
             seq_line(
@@ -4765,6 +4779,7 @@ mod tests {
             queued,
             after_turn: false,
             origin: None,
+            client_id: None,
         };
         let update = |id: &str| AgentEvent::UserMessageUpdate {
             id: id.into(),
@@ -4937,6 +4952,7 @@ mod tests {
                 queued: false,
                 after_turn: false,
                 origin: None,
+                client_id: None,
             },
             AgentEvent::TurnStarted {
                 turn_id: "turn-1".into(),

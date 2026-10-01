@@ -1,7 +1,7 @@
 import { ownerSuspended, sendSocketAuth } from "../net/placement";
 import { daemonSocketUrl, isBrowserGateway } from "../net/base";
 import { getToken } from "../net/api";
-import { ownerAwake, parkUntilAwake, Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
+import { ownerAwake, parkUntilAwake, QUIET_OPEN_MS, Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 
 export interface SessionSocketHandlers {
   readOnly?(): boolean;
@@ -35,6 +35,12 @@ export interface SessionSocketHandlers {
    *  project's owner is asleep and a keystroke wakes it; `waking`: the first
    *  input is waking it), or null once it is live. */
   onStatus?(status: TerminalStatus | null): void;
+  /** The connection is answered, or open and kept for an owner that has not
+   *  answered yet (by a keeper that keeps a sleeping cloud machine's sockets
+   *  and delivers typing once it wakes): `true`. It dropped, was told the
+   *  owner is asleep, or cannot reach the owner: `false`. The pane's label
+   *  says "reconnecting" only while this is false. */
+  onKept?(kept: boolean): void;
   /**
    * Whether the terminal is currently parked (hidden pooled instance). Read
    * at every (re)connect: a parked attach tells the server to withhold
@@ -97,8 +103,12 @@ export class SessionSocket {
    */
   private sawExited = false;
   private everReady = false;
-  /** The auth frame of the CURRENT connection carried `parked: true`. */
-  private sentParkedAuth = false;
+  /** Whether the owner was attached parked on this connection, as far as
+   *  this socket can know: what its auth frame said, then every `park` /
+   *  `unpark` it sent since. A keeper that keeps the socket folds exactly
+   *  those frames into the auth frame it attaches with, so this is what the
+   *  next `ready` answers; a daemon reached directly applies them itself. */
+  private wireParked = false;
   private unknownRetries = 0;
   /** A wake-carrying reconnect is in flight (at most one per drop). */
   private waking = false;
@@ -112,6 +122,11 @@ export class SessionSocket {
    *  timer runs; a keystroke (with wake intent) or a sign the owner answers
    *  again dials it. Calling it leaves the waiting set. */
   private leaveSleepWait: (() => void) | null = null;
+  /** This connection was answered (`ready`) or stayed open quietly
+   *  ({@link QUIET_OPEN_MS}): its owner's side keeps it. One that closes
+   *  before either was refused. */
+  private kept = false;
+  private quietTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly recon = new Reconnector(() => this.connect());
   private readonly encoder = new TextEncoder();
 
@@ -127,6 +142,7 @@ export class SessionSocket {
   private connect(interaction = false): void {
     if (this.closed) return;
     this.stopSleepWait();
+    this.setKept(false);
     const readOnly = this.handlers.readOnly?.() ?? false;
     const query = readOnly ? "?read_only=true" : interaction && !this.handlers.parked?.() ? "?wake=interaction" : "";
     const ws = new WebSocket(daemonSocketUrl(`/ws/sessions/${this.sessionId}${query}`));
@@ -138,12 +154,15 @@ export class SessionSocket {
       // Parked attach: the server withholds output + snapshot until unpark,
       // and must not adopt this hidden window's stale dims.
       const parked = this.handlers.parked?.() ?? false;
-      this.sentParkedAuth = parked;
+      this.wireParked = parked;
       // Carry the client grid so the server resizes BEFORE rendering the
       // snapshot; the frame then always matches what the terminal displays.
       const dims = parked || readOnly ? null : (this.handlers.dims?.() ?? null);
       sendSocketAuth(ws, { type: "auth", token: getToken() ?? "", parked, ...(dims ?? {}) },
-        () => this.ws === ws && !this.closed, () => { this.authenticatedSocket = ws; });
+        () => this.ws === ws && !this.closed, () => {
+          this.authenticatedSocket = ws;
+          this.awaitQuiet(ws);
+        });
     };
 
     ws.onmessage = (ev: MessageEvent) => {
@@ -158,9 +177,15 @@ export class SessionSocket {
       if (this.ws === ws) this.ws = null;
       this.waking = false;
       this.live = false;
+      const kept = this.kept;
+      this.setKept(false);
       // A project view's placement read may say the owner sleeps before any
-      // frame did (a gateway can close without one).
-      if (!this.asleep && !this.closed && !this.fatal && !this.exited && ownerSuspended()) this.asleep = true;
+      // frame did (a gateway can close without one). That holds for a
+      // connection the owner's side refused. One it kept (answered, or open
+      // and quiet) and then lost is dialed again first: a keeper that keeps
+      // a sleeping machine's sockets takes it, and one that does not refuses
+      // that dial, which parks it here.
+      if (!this.asleep && !kept && !this.closed && !this.fatal && !this.exited && ownerSuspended()) this.asleep = true;
       this.handlers.onStatus?.(this.asleep ? "asleep" : null);
       if (this.closed || this.fatal || this.exited) {
         this.recon.clear();
@@ -193,6 +218,33 @@ export class SessionSocket {
     this.leaveSleepWait = null;
   }
 
+  /** Authenticated: if nothing is heard for {@link QUIET_OPEN_MS} the socket
+   *  is kept open for an owner that has not answered. That is healthy: it
+   *  leaves the reconnecting indicator (keeping its backoff, which a later
+   *  drop continues). */
+  private awaitQuiet(ws: WebSocket): void {
+    this.stopQuiet();
+    this.quietTimer = setTimeout(() => {
+      this.quietTimer = null;
+      if (this.ws !== ws || this.closed) return;
+      this.recon.clear();
+      this.setKept(true);
+    }, QUIET_OPEN_MS);
+  }
+
+  private stopQuiet(): void {
+    if (this.quietTimer !== null) clearTimeout(this.quietTimer);
+    this.quietTimer = null;
+  }
+
+  /** Settles the quiet wait either way; tells the pane only on a change. */
+  private setKept(kept: boolean): void {
+    this.stopQuiet();
+    if (this.kept === kept) return;
+    this.kept = kept;
+    this.handlers.onKept?.(kept);
+  }
+
   /** Waiting for a sleeping owner (no socket, no retry timer). */
   get waitingForOwner(): boolean {
     return this.leaveSleepWait !== null;
@@ -210,9 +262,10 @@ export class SessionSocket {
   /**
    * Keystrokes into a browser view whose socket is down, or into any socket
    * waiting for a sleeping owner: reconnect now, once, carrying wake intent.
-   * The keystrokes themselves are not queued. A native window's open socket
-   * never needs this: its daemon holds early typing itself while the owner
-   * wakes.
+   * The keystrokes themselves are not queued. An open socket never needs
+   * this: whoever keeps it (a native window's daemon, or a keeper that keeps
+   * a sleeping cloud machine's sockets) holds early typing itself while the
+   * owner wakes.
    */
   private wakeOnInput(): void {
     if (!(isBrowserGateway() || this.leaveSleepWait !== null) || this.closed || this.fatal || this.exited || this.waking) return;
@@ -232,6 +285,8 @@ export class SessionSocket {
     } catch {
       return;
     }
+    // Any frame ends the quiet wait: the owner's side spoke.
+    this.stopQuiet();
     switch (msg.type) {
       case "ready": {
         this.recon.succeeded();
@@ -239,14 +294,34 @@ export class SessionSocket {
         this.waking = false;
         this.asleep = false;
         this.live = true;
+        this.setKept(true);
         // The project answers on this socket: whatever waited for it reads again.
         ownerAwake();
         this.handlers.onStatus?.(null);
-        if (this.sentParkedAuth) {
-          // No snapshot follows on a parked connection — never reset the
-          // grid for it, and skip the dims reconcile (no dims were sent).
+        // `ready` answers the frame the owner was attached with: the auth
+        // frame, with the `park`/`unpark` sent since folded in by a keeper
+        // that kept this socket across its owner's sleep (`wireParked`). The
+        // cases below settle what the terminal is now against that.
+        const parkedNow = this.handlers.parked?.() ?? false;
+        const reset = this.everReady || (this.handlers.readOnly?.() ?? false);
+        if (this.wireParked) {
+          // A parked attach: no snapshot follows and output is withheld.
           this.everReady = true;
-          this.handlers.onParkedReady?.();
+          if (parkedNow) {
+            // Never reset the grid for it, and send no dims.
+            this.handlers.onParkedReady?.();
+            break;
+          }
+          // Shown, but its `unpark` never went out on this socket. Settle
+          // the grid first, then unpark, which after a parked attach always
+          // repaints (resync + snapshot). Reset first: should a snapshot
+          // follow after all, it must not land on the old screen.
+          const shown = this.handlers.dims?.() ?? null;
+          if (reset) this.handlers.onReset(msg.cols, msg.rows);
+          if (shown !== null && (msg.cols !== shown.cols || msg.rows !== shown.rows)) {
+            this.sendResize(shown.cols, shown.rows);
+          }
+          this.sendUnpark();
           break;
         }
         // Grid truth BEFORE the reset below may resize the terminal: a fit
@@ -258,8 +333,16 @@ export class SessionSocket {
         // the server already adopted the auth-frame grid, and for a dead
         // session's last-words replay these are the death-time dims the
         // final screen must parse at — so adopt them like a resync's.
-        if (this.everReady || this.handlers.readOnly?.()) this.handlers.onReset(msg.cols, msg.rows);
+        if (reset) this.handlers.onReset(msg.cols, msg.rows);
         this.everReady = true;
+        if (parkedNow) {
+          // Parked, and its `park` never went out on this socket: the owner
+          // would stream to a hidden terminal. Stop it (the snapshot still
+          // lands) and send no grid: a hidden pooled terminal never resizes
+          // the PTY, least of all over the window that shows it.
+          this.sendPark();
+          break;
+        }
         // Reconcile grids: resizes are silently dropped while the socket is
         // down or mid-handshake (the first fit often lands during CONNECTING),
         // and ResizeObserver never re-fires for an unchanged container. The
@@ -292,9 +375,11 @@ export class SessionSocket {
         this.handlers.onExited(msg.status ?? null);
         break;
       case "waking":
-        // The typing that asked is held until the owner answers; the rest
-        // is refused (a note says so) and nothing echoes before `ready`.
+        // The typing that asked is held until the owner answers, and nothing
+        // echoes before `ready`: not live meanwhile, also on a socket that
+        // was (the machine went to sleep behind a kept connection).
         this.asleep = false;
+        this.live = false;
         this.handlers.onStatus?.("waking");
         break;
       case "bringing":
@@ -325,12 +410,29 @@ export class SessionSocket {
           break;
         }
         if (msg.code === "worker_asleep") {
-          // Not an error: the pane says so until a keystroke wakes it.
+          // Not an error: the pane says so until a keystroke wakes it. Said
+          // by a relay or gateway that keeps no socket for the owner,
+          // possibly after this one had counted as kept (a slow answer).
+          this.setKept(false);
           this.asleep = true;
           this.handlers.onStatus?.("asleep");
           break;
         }
-        if (msg.code === "remote_unavailable" || msg.code === "workspace_scope_changed") { break; }
+        if (msg.code === "remote_unavailable") {
+          // Nothing typed now is heard, and a wake that was under way did
+          // not arrive.
+          this.live = false;
+          this.handlers.onStatus?.(null);
+          this.setKept(false);
+          // A relay that cannot reach the owner says it is retrying
+          // (`reason:"reconnecting"`) and stays silent meanwhile: that lasts
+          // until its next frame. Anyone else saying it has handed back what
+          // it held and still keeps this socket: quiet from here on is kept
+          // again.
+          if (msg.reason !== "reconnecting" && this.ws !== null) this.awaitQuiet(this.ws);
+          break;
+        }
+        if (msg.code === "workspace_scope_changed") { break; }
         if (msg.code === "unknown_session") {
           // After a witnessed exit, "unknown" means even the session's
           // last words are gone (bounded server-side memory) — terminal-
@@ -367,7 +469,10 @@ export class SessionSocket {
     return this.isOpen && this.live;
   }
 
-  /** Send raw keyboard input (from term.onData) as a binary frame. */
+  /** Send raw keyboard input (from term.onData) as a binary frame. An open
+   *  socket takes it whether or not its owner has answered: whoever keeps the
+   *  connection for a sleeping owner holds the typing, wakes the owner and
+   *  delivers it once (or refuses it, which the pane says). */
   sendInput(data: string): void {
     if (this.handlers.readOnly?.()) return;
     if (this.ws?.readyState === WebSocket.OPEN && this.authenticatedSocket === this.ws) {
@@ -384,10 +489,10 @@ export class SessionSocket {
   /** One guard for every control frame: silently dropped when the socket is
    *  down — reconnect re-establishes the state these frames carry (dims via
    *  the ready reconcile, parked via the auth flag). */
-  private sendJson(msg: unknown): void {
-    if (this.ws?.readyState === WebSocket.OPEN && this.authenticatedSocket === this.ws) {
-      this.ws.send(JSON.stringify(msg));
-    }
+  private sendJson(msg: unknown): boolean {
+    if (this.ws?.readyState !== WebSocket.OPEN || this.authenticatedSocket !== this.ws) return false;
+    this.ws.send(JSON.stringify(msg));
+    return true;
   }
 
   /** Send a resize request as a text frame. */
@@ -402,13 +507,13 @@ export class SessionSocket {
    * handles that stream, so both directions degrade gracefully.
    */
   sendPark(): void {
-    this.sendJson({ type: "park" });
+    if (this.sendJson({ type: "park" })) this.wireParked = true;
   }
 
   /** Resume after park: the server catches up from its ring, or repaints
    *  (resync + snapshot) when the ring can't cover the gap. */
   sendUnpark(): void {
-    this.sendJson({ type: "unpark" });
+    if (this.sendJson({ type: "unpark" })) this.wireParked = false;
   }
 
   /**
@@ -445,6 +550,7 @@ export class SessionSocket {
   close(): void {
     this.closed = true;
     this.stopSleepWait();
+    this.setKept(false);
     this.recon.cancel();
     this.recon.clear();
     this.dropSocket();

@@ -2,7 +2,7 @@
   import { cloudOnboarding } from "./lib/pro/onboarding.svelte";
   import { keptReviews } from "./lib/pro/keptReviews.svelte";
   import { KEPT_NOTICE_PREFIX, keptNoticeWorkspace } from "./lib/pro/kept";
-  import { onMount, tick, untrack } from "svelte";
+  import { onMount, tick, untrack, type Component } from "svelte";
   import ProNavigation from "./lib/pro/ProNavigation.svelte";
   import { paidPlan, proOffered } from "./lib/net/plan";
   import { listenForProReturn } from "./lib/net/proReturn";
@@ -372,10 +372,9 @@
     saveRailChrome,
   } from "./lib/layout/railState";
   import { hintsActive, initChordHints } from "./lib/shared/chordHints.svelte";
-  import FolderPicker from "./lib/workspace/FolderPicker.svelte";
   import HomeScreen from "./lib/workspace/HomeScreen.svelte";
   import HomeNavigation from "./lib/workspace/HomeNavigation.svelte";
-  import { loadPaneView } from "./lib/layout/lazyViews";
+  import { loadDialog, loadPaneView } from "./lib/layout/lazyViews";
   import AskpassModal from "./lib/workspace/AskpassModal.svelte";
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
@@ -3050,11 +3049,35 @@
       });
   }
 
+  /** The folder picker's component, once its chunk has loaded (it is opened
+   *  on demand and stays out of the always-loaded entry). */
+  let FolderPicker = $state<Component<any> | null>(null);
+  let pickerLoadFailed = false;
+
   function openPicker(): void {
     if (pickerOpen) return;
     pickerRestoreEl = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     refreshWorkspaces();
     pickerOpen = true;
+    if (FolderPicker !== null) return;
+    // A chunk can fail while a tunnel reconnects or after a daemon handoff
+    // replaced the asset set. Never leave the picker "open" with nothing
+    // drawn: close it (focus goes back) and say so the way a view that
+    // failed to load does. Opening it again tries again.
+    void loadDialog("folderPicker").then(
+      (view) => {
+        FolderPicker = view;
+        // It loaded after an earlier failure was noted: that notice is done.
+        if (pickerLoadFailed) clearChunkFailure();
+        pickerLoadFailed = false;
+      },
+      (error: unknown) => {
+        console.error("could not load the folder picker", error);
+        pickerLoadFailed = true;
+        noteChunkFailure();
+        closePicker();
+      },
+    );
   }
 
   /** Close the picker and put focus back where it was (or on the focused
@@ -6303,7 +6326,7 @@
 {/if}
 
 
-{#if pickerOpen}
+{#if pickerOpen && FolderPicker !== null}
   <FolderPicker recents={workspaces} onOpened={activateWorkspace} onClose={closePicker} />
 {/if}
 

@@ -255,24 +255,34 @@ async fn terminal_input(
     }
 }
 
+/// `client_id`: the id the client minted for this send (already checked), so
+/// the session runs it at most once however often it arrives.
 async fn chat_command(
     state: &Arc<AppState>,
     id: &str,
     command: chimaera_agent::model::AgentCommand,
+    client_id: Option<&str>,
     scope: Option<&SocketScope>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<chimaera_agent::SendOutcome> {
     let Some(scope) = scope else {
-        return state.chat.command(id, command).await;
+        return state.chat.send_from_client(id, command, client_id).await;
     };
     let guard = scope.begin_session(state, id)?;
     let state = Arc::clone(state);
     let id = id.to_owned();
+    let client_id = client_id.map(str::to_owned);
     // Keep admitted enqueue work owned if its viewer disconnects. The bounded
     // wait is cancellable before enqueue; an accepted item belongs to the old
     // driver, which must be fenced before replacement authority can activate.
     tokio::spawn(async move {
         let _guard = guard;
-        tokio::time::timeout(Duration::from_secs(5), state.chat.command(&id, command)).await?
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            state
+                .chat
+                .send_from_client(&id, command, client_id.as_deref()),
+        )
+        .await?
     })
     .await?
 }
@@ -492,20 +502,30 @@ fn acted_here(state: &AppState, id: &str) {
     }
 }
 
+/// How long the frames a relay held get, together, for the resumed session
+/// to come up after its project arrived.
+pub(crate) const HELD_DELIVERY: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(20)
+};
+
 /// Delivers, once, input a viewer relay held while it brought the work to this
 /// computer (`session_proxy`): the chat commands and typing the user sent
 /// before the session ran here. Each goes through the same checks as input on
-/// this daemon's own socket. `Err` when the session cannot take it (nothing
-/// was delivered for that frame).
+/// this daemon's own socket. `deadline`: until when the session may still be
+/// starting; the caller sets one for the whole batch (see [`HELD_DELIVERY`]),
+/// so a session that never comes up costs one wait, not one per frame. `Err`
+/// when the session cannot take it (nothing was delivered for that frame).
 pub(crate) async fn deliver_held(
     state: &Arc<AppState>,
     id: &str,
     chat: bool,
     frame: axum::extract::ws::Message,
+    deadline: tokio::time::Instant,
 ) -> anyhow::Result<()> {
     // The resumed session may need a moment to come up after its project
     // arrived; the relay is still holding the input meanwhile.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while !(if chat {
         state.chat.get(id).is_some_and(|chat| chat.alive)
     } else {
@@ -522,11 +542,22 @@ pub(crate) async fn deliver_held(
         (true, Message::Text(text)) => {
             let mut command = serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text)?;
             command.validate_ingress()?;
+            // The send keeps its client's id here too: the viewer reconnects
+            // to this session next and may send it again before its echo.
+            let client_id = command_tag(&text).client_id;
             let saved = crate::upload::save_send_images(state, id, &mut command).await;
             let interaction = crate::activity::is_interaction(&command);
-            if let Err(error) = chat_command(state, id, command, None).await {
-                crate::upload::discard_saved_images(saved);
-                return Err(error);
+            match chat_command(state, id, command, client_id.as_deref(), None).await {
+                Ok(chimaera_agent::SendOutcome::Accepted) => {}
+                // Already accepted from the viewer's own resend.
+                Ok(chimaera_agent::SendOutcome::Duplicate) => {
+                    crate::upload::discard_saved_images(saved);
+                    return Ok(());
+                }
+                Err(error) => {
+                    crate::upload::discard_saved_images(saved);
+                    return Err(error);
+                }
             }
             if interaction {
                 crate::activity::record(state, id);
@@ -555,24 +586,144 @@ pub(crate) async fn deliver_held(
     }
 }
 
-/// The `type` of a chat command frame (`send`, `interrupt`, `permission`…),
-/// for tagging a refusal with the command it answers: a client hands text
-/// back to the composer only for a refused `send`. `None` for anything that
-/// is not a small command tag.
-pub(crate) fn command_kind(text: &str) -> Option<String> {
-    #[derive(Deserialize)]
-    struct Kind {
-        #[serde(rename = "type")]
-        kind: String,
-    }
-    let kind = serde_json::from_str::<Kind>(text).ok()?.kind;
-    (kind.len() <= 32 && kind.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')).then_some(kind)
+/// What a chat command frame says about itself, read without building the
+/// command: a refused frame may be one this daemon cannot parse, and a relay
+/// that only needs a frame's kind must not copy a send's pictures to learn it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct CommandTag {
+    /// Its `type` (`send`, `interrupt`, `permission`…); `None` for anything
+    /// that is not a small command tag.
+    pub(crate) kind: Option<String>,
+    /// The id its client minted for it (`client_id`), when well formed
+    /// (`chimaera_agent::model::valid_client_id`).
+    pub(crate) client_id: Option<String>,
+    /// It carries a `client_id` that is not well formed.
+    pub(crate) bad_client_id: bool,
+    /// A `rewind` that only asks what it would do.
+    pub(crate) dry_run: bool,
+    /// The `server` an MCP setting names, when it is short enough to be one.
+    pub(crate) server: Option<String>,
 }
 
-/// A chat refusal naming the command it answers (additive `command`).
-fn command_refusal(mut answer: serde_json::Value, text: &str) -> serde_json::Value {
-    if let Some(command) = command_kind(text) {
+/// One of a frame's tag fields, whatever JSON it turned out to be: a field
+/// of the wrong type must not make the others unreadable (a refusal still
+/// has to name the send it answers), and nothing longer than a tag can be is
+/// kept.
+enum Probe {
+    Bool(bool),
+    Text(String),
+    Other,
+}
+/// The longest text a tag field can hold (an MCP server's name).
+const TAG_TEXT_MAX: usize = chimaera_agent::model::COMMAND_MCP_SERVER_MAX;
+impl<'de> Deserialize<'de> for Probe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Any;
+        impl<'de> serde::de::Visitor<'de> for Any {
+            type Value = Probe;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Probe, E> {
+                Ok(if v.len() <= TAG_TEXT_MAX {
+                    Probe::Text(v.to_owned())
+                } else {
+                    Probe::Other
+                })
+            }
+            fn visit_bool<E>(self, v: bool) -> Result<Probe, E> {
+                Ok(Probe::Bool(v))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Probe, E> {
+                Ok(Probe::Other)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Probe, E> {
+                Ok(Probe::Other)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Probe, E> {
+                Ok(Probe::Other)
+            }
+            fn visit_unit<E>(self) -> Result<Probe, E> {
+                Ok(Probe::Other)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Probe, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(Probe::Other)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Probe, A::Error> {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(Probe::Other)
+            }
+        }
+        deserializer.deserialize_any(Any)
+    }
+}
+impl Probe {
+    fn text(self) -> Option<String> {
+        match self {
+            Probe::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn command_tag(text: &str) -> CommandTag {
+    // Every other field (a send's `blocks` above all) is skipped unread, and
+    // each of these is read by itself: one of the wrong type is only absent.
+    #[derive(Deserialize)]
+    struct Tag {
+        #[serde(rename = "type", default)]
+        kind: Option<Probe>,
+        #[serde(default)]
+        client_id: Option<Probe>,
+        #[serde(default)]
+        dry_run: Option<Probe>,
+        #[serde(default)]
+        server: Option<Probe>,
+    }
+    let Ok(tag) = serde_json::from_str::<Tag>(text) else {
+        return CommandTag::default();
+    };
+    let small =
+        |kind: &str| kind.len() <= 32 && kind.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    let sent_as = tag.client_id.is_some();
+    let client_id = tag
+        .client_id
+        .and_then(Probe::text)
+        .filter(|id| chimaera_agent::model::valid_client_id(id));
+    CommandTag {
+        bad_client_id: sent_as && client_id.is_none(),
+        client_id,
+        dry_run: matches!(tag.dry_run, Some(Probe::Bool(true))),
+        server: tag.server.and_then(Probe::text),
+        kind: tag.kind.and_then(Probe::text).filter(|kind| small(kind)),
+    }
+}
+
+/// What a frame whose `client_id` is not well formed is told. Only a client
+/// that mints its own ids wrongly ever reads it.
+const BAD_CLIENT_ID: &str = "client_id must be 8 to 64 characters of A-Z, a-z, 0-9, _ or -";
+
+/// A chat refusal naming the command it answers (additive `command`) and,
+/// for a command sent under a client's id, that id (additive `client_id`):
+/// a client hands text back to the composer only for a refused send, and
+/// with the id it hands back exactly the send that was refused.
+pub(crate) fn command_refusal(mut answer: serde_json::Value, text: &str) -> serde_json::Value {
+    let tag = command_tag(text);
+    if let Some(command) = tag.kind {
         answer["command"] = json!(command);
+    }
+    if let Some(client_id) = tag.client_id {
+        answer["client_id"] = json!(client_id);
     }
     answer
 }
@@ -1315,6 +1466,10 @@ async fn handle_chat(
         // this is stale (the journal was recreated and numbering restarted);
         // it hard-resets rather than silently dropping every replayed event.
         "head": attachment.head_seq,
+        // This daemon accepts a `send` under one `client_id` at most once and
+        // answers `cancel_send`, so a client may resend what it could not
+        // confirm. Additive: a daemon without it must never be resent to.
+        "send_ids": true,
     });
     if send_json(&mut socket, &ready).await.is_err() {
         return;
@@ -1402,10 +1557,46 @@ async fn handle_chat(
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(text))) => {
                     if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
+                    let tag = command_tag(&text);
+                    if tag.kind.as_deref() == Some("cancel_send") {
+                        // A forwarded viewer changes this session's record
+                        // under the same admission as its commands.
+                        let _admitted = match scope.as_ref().map(|s| s.begin_session(&state, &id)) {
+                            Some(Err(_)) => { scope_changed(&mut socket).await; return; }
+                            Some(Ok(guard)) => Some(guard),
+                            None => None,
+                        };
+                        let answer = cancel_send(&state, &id, &tag, options.read_only, &text).await;
+                        if send_json(&mut socket, &answer).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
                     match serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text) {
                         Ok(mut cmd) => {
+                            use chimaera_agent::model::AgentCommand;
+                            let is_send = matches!(cmd, AgentCommand::Send { .. } | AgentCommand::SendAfterTurn { .. });
+                            let client_id = tag.client_id.filter(|_| is_send);
+                            // A repeat of a send this session already accepted
+                            // is dropped before anything can refuse it: a
+                            // refusal would hand back text that is delivered.
+                            if client_id.as_deref().is_some_and(|client_id| {
+                                state.chat.client_id_state(&id, client_id)
+                                    == Some(chimaera_agent::ClientIdState::Accepted)
+                            }) {
+                                continue;
+                            }
                             if options.read_only || !session_writable(&state, &id) {
                                 let _ = send_json(&mut socket, &command_refusal(refusal(&state, &id, options.read_only), &text)).await;
+                                continue;
+                            }
+                            if is_send && tag.bad_client_id {
+                                let _ = send_json(
+                                    &mut socket,
+                                    &command_refusal(json!({"type": "error", "code": "invalid_command",
+                                            "message": BAD_CLIENT_ID}), &text),
+                                )
+                                .await;
                                 continue;
                             }
                             if let Err(err) = cmd.validate_ingress() {
@@ -1430,7 +1621,11 @@ async fn handle_chat(
                                 return;
                             }
                             let interaction = crate::activity::is_interaction(&cmd);
-                            if let Err(err) = chat_command(&state, &id, cmd, scope.as_ref()).await {
+                            let outcome = chat_command(&state, &id, cmd, client_id.as_deref(), scope.as_ref()).await;
+                            if let Ok(chimaera_agent::SendOutcome::Duplicate) = outcome {
+                                // The first copy owns its saved images.
+                                crate::upload::discard_saved_images(saved);
+                            } else if let Err(err) = outcome {
                                 // The send never happened: neither do its copies.
                                 crate::upload::discard_saved_images(saved);
                                 if err.is::<crate::pro::mutation::Changed>() {
@@ -1474,6 +1669,47 @@ async fn handle_chat(
                 Some(Ok(_)) => {}
             },
         }
+    }
+}
+
+/// Answer a `cancel_send`: one `send_cancelled` saying whether the id was
+/// withdrawn (no send under it was accepted, and none will be), or the same
+/// refusal a send would get where this socket may not act or the session
+/// does not answer in time (the client asks again at its next `ready`). It is
+/// not the user acting: nothing is recorded as interaction.
+async fn cancel_send(
+    state: &Arc<AppState>,
+    id: &str,
+    tag: &CommandTag,
+    read_only: bool,
+    text: &str,
+) -> serde_json::Value {
+    if read_only || !session_writable(state, id) {
+        return command_refusal(refusal(state, id, read_only), text);
+    }
+    let Some(client_id) = tag.client_id.as_deref() else {
+        return command_refusal(
+            json!({"type": "error", "code": "invalid_command",
+                   "message": BAD_CLIENT_ID}),
+            text,
+        );
+    };
+    // It waits its turn behind a send that is being queued, which a driver
+    // that takes nothing can stall: bounded like a forwarded viewer's send,
+    // because the caller may hold that viewer's admission while it waits.
+    let answer = tokio::time::timeout(
+        Duration::from_secs(5),
+        state.chat.cancel_send(id, client_id),
+    )
+    .await;
+    match answer {
+        Ok(Ok(cancelled)) => {
+            json!({"type": "send_cancelled", "client_id": client_id, "cancelled": cancelled})
+        }
+        _ => command_refusal(
+            json!({"type": "error", "code": "command_failed", "message": "agent unavailable"}),
+            text,
+        ),
     }
 }
 
@@ -1748,9 +1984,12 @@ enum LocalWatch {
 /// A window watching a project that currently runs on another machine gets
 /// that project's session, file, Git and Timeline frames from its owner,
 /// merged into this window's own loop; everything else (settings, recents,
-/// notices, updates, plugins) stays this daemon's. When the owner changes or
-/// sleeps the feed ends and restarts; the window's socket never closes for
-/// it. A project with no route (every free user's) stays in local mode.
+/// notices, updates, plugins) stays this daemon's. When the owner changes
+/// the feed ends and restarts, and so it does for a sleeping owner whose
+/// transport refuses the feed (one that keeps a sleeping cloud machine's
+/// sockets leaves it open and quiet instead); the window's socket never
+/// closes for it. A project with no route (every free user's) stays in local
+/// mode.
 struct ProjectView {
     /// The window's watched project and its mounted/listed paths.
     watched: Option<(String, Vec<String>, Vec<String>)>,
@@ -1837,7 +2076,7 @@ impl ProjectView {
             None => std::future::pending().await,
         }
     }
-    /// The feed ended (owner change, sleeping owner, transient failure).
+    /// The feed ended (owner change, a refused sleeping owner, transient failure).
     fn ended(&mut self) {
         self.feed = None;
         self.retry_at = Some(tokio::time::Instant::now() + self.backoff);
@@ -2440,22 +2679,84 @@ mod tests {
 
     #[test]
     fn a_refusal_names_the_command_it_answers() {
+        let kind = |text: &str| command_tag(text).kind;
         assert_eq!(
-            command_kind(r#"{"type":"send","blocks":[]}"#).as_deref(),
+            kind(r#"{"type":"send","blocks":[]}"#).as_deref(),
             Some("send")
         );
         assert_eq!(
-            command_kind(r#"{"type":"interrupt"}"#).as_deref(),
+            kind(r#"{"type":"interrupt"}"#).as_deref(),
             Some("interrupt")
         );
         for text in ["", "{}", r#"{"type":"Send"}"#, r#"{"type":7}"#, "not json"] {
-            assert_eq!(command_kind(text), None, "{text}");
+            assert_eq!(kind(text), None, "{text}");
         }
         let refused = command_refusal(
             json!({"type":"error","code":"command_failed"}),
             r#"{"type":"permission","request_id":"r","option_id":"o"}"#,
         );
         assert_eq!(refused["command"], "permission");
+        assert!(refused.get("client_id").is_none());
+    }
+
+    /// A refused send says which send it was, by the id its client minted,
+    /// so the client hands back exactly that one. An id that is not well
+    /// formed is never echoed.
+    #[test]
+    fn a_refused_send_carries_its_client_id() {
+        let refused = command_refusal(
+            json!({"type":"error","code":"command_failed"}),
+            r#"{"type":"send","blocks":[],"client_id":"client-0001"}"#,
+        );
+        assert_eq!(refused["command"], "send");
+        assert_eq!(refused["client_id"], "client-0001");
+        let after_turn = command_refusal(
+            json!({"type":"error","code":"read_only"}),
+            r#"{"type":"send_after_turn","client_id":"client-0002","blocks":[]}"#,
+        );
+        assert_eq!(after_turn["command"], "send_after_turn");
+        assert_eq!(after_turn["client_id"], "client-0002");
+
+        for bad in [
+            r#"{"type":"send","blocks":[],"client_id":"short"}"#,
+            r#"{"type":"send","blocks":[],"client_id":"has a space"}"#,
+            r#"{"type":"send","blocks":[],"client_id":12345678}"#,
+        ] {
+            let tag = command_tag(bad);
+            assert_eq!(tag.kind.as_deref(), Some("send"), "{bad}");
+            assert_eq!(tag.client_id, None, "{bad}");
+            assert!(tag.bad_client_id, "{bad}");
+            let refused = command_refusal(json!({"type":"error"}), bad);
+            assert!(refused.get("client_id").is_none(), "{bad}");
+        }
+        assert!(!command_tag(r#"{"type":"send","blocks":[]}"#).bad_client_id);
+        // A sibling field of the wrong type never hides the id (or the kind):
+        // the refusal of such a frame still names the send.
+        for odd in [
+            r#"{"type":"send","client_id":"client-0001","dry_run":"yes","blocks":[]}"#,
+            r#"{"type":"send","dry_run":{"a":[1]},"server":7,"client_id":"client-0001"}"#,
+            r#"{"server":["x"],"client_id":"client-0001","type":"send"}"#,
+        ] {
+            let tag = command_tag(odd);
+            assert_eq!(tag.kind.as_deref(), Some("send"), "{odd}");
+            assert_eq!(tag.client_id.as_deref(), Some("client-0001"), "{odd}");
+            assert!(!tag.dry_run && tag.server.is_none(), "{odd}");
+        }
+        // And a `type` that is no tag leaves the id readable.
+        let tag = command_tag(r#"{"type":7,"client_id":"client-0001"}"#);
+        assert_eq!(
+            (tag.kind, tag.client_id.as_deref()),
+            (None, Some("client-0001"))
+        );
+        let tag = command_tag(r#"{"type":"rewind","dry_run":true,"user_message_id":"u"}"#);
+        assert!(tag.dry_run);
+        let tag = command_tag(r#"{"type":"reconnect_mcp","server":"files"}"#);
+        assert_eq!(tag.server.as_deref(), Some("files"));
+        // An older daemon's parser: the additive field does not break a send.
+        assert!(serde_json::from_str::<AgentCommand>(
+            r#"{"type":"send","blocks":[],"client_id":"client-0001"}"#
+        )
+        .is_ok());
     }
 
     fn paused(reason: &'static str) -> Option<Pause> {

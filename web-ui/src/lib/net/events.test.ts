@@ -64,3 +64,63 @@ it("a rejected socket still gives up and says why", () => {
   expect(Socket.all).toHaveLength(1);
   events.close();
 });
+
+// Against a keeper that keeps a sleeping cloud machine's sockets open (it
+// marks them `X-Chimaera-Sockets: kept`; VIEWING.md, "A sleeping cloud
+// machine's sockets"), which attaches them again when it wakes.
+
+it("an open socket that says nothing is healthy: no retry and no status change, however long", () => {
+  const h = handlers();
+  const events = new EventsSocket(h);
+  Socket.all[0].onopen?.();
+  vi.advanceTimersByTime(60 * 60_000);
+  expect(Socket.all).toHaveLength(1);
+  expect(h.onStatus).not.toHaveBeenCalled();
+  // The machine wakes: its first snapshot brings the socket up...
+  Socket.all[0].frame({ type: "sessions", sessions: [] });
+  expect(h.onStatus).toHaveBeenLastCalledWith(true);
+  // ...and it sleeping again behind the open socket is not a disconnect.
+  vi.advanceTimersByTime(60 * 60_000);
+  expect(Socket.all).toHaveLength(1);
+  expect(h.onStatus).toHaveBeenCalledOnce();
+  events.close();
+});
+
+it("a gateway view registers again each time the machine attaches to the same socket", () => {
+  vi.stubGlobal("location", new URL("https://fixture.invalid/app/worker-one/"));
+  const h = { ...handlers(), onSettings: vi.fn() };
+  const events = new EventsSocket(h);
+  events.watch("w-one");
+  events.watchFs(["/project/a.md"], ["/project"]);
+  const ws = Socket.all[0];
+  ws.onopen?.();
+  const watches = (): unknown[] => ws.sent.map((raw) => JSON.parse(raw as string)).filter((frame) => frame.type === "watch");
+  const registration = { type: "watch", workspace_id: "w-one", files: ["/project/a.md"], dirs: ["/project"], git_repos: [] };
+  expect(watches()).toEqual([registration]);
+  // Attached: the snapshots, and the registration again (the first one may
+  // have been sent to a machine that was asleep).
+  ws.frame({ type: "sessions", sessions: [] });
+  ws.frame({ type: "settings", settings: {} });
+  expect(watches()).toEqual([registration, registration]);
+  // Asleep and awake again behind the same socket: fresh snapshots, and the
+  // registration the new attach does not have.
+  ws.frame({ type: "sessions", sessions: [{ id: "s-new" }] });
+  ws.frame({ type: "settings", settings: {} });
+  expect(watches()).toEqual([registration, registration, registration]);
+  expect(h.onSessions).toHaveBeenCalledTimes(2);
+  expect(h.onSettings).toHaveBeenCalledTimes(2);
+  expect(Socket.all).toHaveLength(1);
+  events.close();
+});
+
+it("a window on its own daemon never repeats its registration", () => {
+  const h = handlers();
+  const events = new EventsSocket(h);
+  events.watch("w-one");
+  const ws = Socket.all[0];
+  ws.onopen?.();
+  ws.frame({ type: "settings", settings: {} });
+  ws.frame({ type: "sessions", sessions: [] });
+  expect(ws.sent).toHaveLength(2);
+  events.close();
+});

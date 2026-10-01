@@ -1200,3 +1200,221 @@ async fn ws_events_bad_token_is_rejected() {
         other => panic!("expected error text frame, got {other:?}"),
     }
 }
+
+/// The chat socket's send ids, end to end against one daemon: `ready` says
+/// the daemon has them, a send's echo carries its client's id, the same id
+/// sent again starts nothing, `cancel_send` loses against an accepted send
+/// and wins against one that never arrived (which is then refused, named by
+/// its id), every refusal of a send carries the id, and the journal keeps it
+/// for the next attach.
+#[tokio::test]
+async fn ws_chat_sends_are_accepted_once_under_their_client_id() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    async fn next_json<S>(socket: &mut S) -> serde_json::Value
+    where
+        S: futures::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        loop {
+            if let WsMessage::Text(text) = next_ws_frame(socket).await {
+                return serde_json::from_str(&text).unwrap();
+            }
+        }
+    }
+    /// The next frame that is not journal traffic (an `ev` or a `batch`).
+    async fn next_answer<S>(socket: &mut S) -> serde_json::Value
+    where
+        S: futures::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        loop {
+            let frame = next_json(socket).await;
+            if frame["type"] != "ev" && frame["type"] != "batch" {
+                return frame;
+            }
+        }
+    }
+    /// Every `user_message` in a frame, as (text, client_id).
+    fn echoes(frame: &serde_json::Value) -> Vec<(String, Option<String>)> {
+        frame["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| &entry["ev"])
+            .chain([&frame["ev"]])
+            .filter(|ev| ev["type"] == "user_message")
+            .map(|ev| {
+                (
+                    ev["text"].as_str().unwrap_or_default().to_owned(),
+                    ev["client_id"].as_str().map(str::to_owned),
+                )
+            })
+            .collect()
+    }
+    fn send_as(text: &str, client_id: &str) -> WsMessage {
+        WsMessage::text(
+            serde_json::json!({
+                "type":"send","blocks":[{"type":"text","text":text}],"client_id":client_id
+            })
+            .to_string(),
+        )
+    }
+    fn cancel(client_id: &str) -> WsMessage {
+        WsMessage::text(serde_json::json!({"type":"cancel_send","client_id":client_id}).to_string())
+    }
+
+    let state = test_state();
+    let cwd = test_dir("ws-send-ids");
+    let capture = cwd.join("agent-stdin.txt");
+    let fake = write_fake_claude("ws-send-ids-agent");
+    let script = std::fs::read_to_string(&fake).unwrap();
+    std::fs::write(
+        &fake,
+        script.replace("cat >/dev/null", "cat > \"$CHIMAERA_TEST_CAPTURE\""),
+    )
+    .unwrap();
+    let id = "s-send-ids".to_string();
+    let mut spec = chimaera_agent::driver::SpawnSpec::new(
+        id.clone(),
+        vec![fake.to_string_lossy().into_owned()],
+        cwd.clone(),
+    );
+    spec.env.push((
+        "CHIMAERA_TEST_CAPTURE".into(),
+        capture.to_string_lossy().into_owned(),
+    ));
+    state
+        .chat
+        .spawn(&chimaera_agent::claude::ClaudeAdapter, spec)
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let connect = |query: &'static str| {
+        let id = id.clone();
+        async move {
+            let (mut socket, _) =
+                tokio_tungstenite::connect_async(format!("ws://{addr}/ws/chat/{id}{query}"))
+                    .await
+                    .unwrap();
+            socket
+                .send(WsMessage::text(
+                    serde_json::json!({"type": "auth", "token": "test-token", "last_seq": 0})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            socket
+        }
+    };
+    let user_turns = |text: &str| {
+        std::fs::read_to_string(&capture)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(r#""type":"user""#) && line.contains(text))
+            .count()
+    };
+
+    let mut socket = connect("").await;
+    let ready = next_json(&mut socket).await;
+    assert_eq!(ready["type"], "ready");
+    assert_eq!(ready["send_ids"], true, "{ready}");
+
+    // One send, sent three times under one id, then a second message: the
+    // journal holds the first once, with its id.
+    for _ in 0..3 {
+        socket.send(send_as("ONCE", "client-once-1")).await.unwrap();
+    }
+    socket.send(send_as("NEXT", "client-next-1")).await.unwrap();
+    let mut seen = Vec::new();
+    while !seen.iter().any(|(text, _)| text == "NEXT") {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "error", "{frame}");
+        seen.extend(echoes(&frame));
+    }
+    assert_eq!(
+        seen,
+        [
+            ("ONCE".to_string(), Some("client-once-1".to_string())),
+            ("NEXT".to_string(), Some("client-next-1".to_string())),
+        ]
+    );
+
+    // Too late to withdraw the accepted one; an id that never arrived is
+    // withdrawn, and a send that then arrives under it is refused by name.
+    socket.send(cancel("client-once-1")).await.unwrap();
+    assert_eq!(
+        next_answer(&mut socket).await,
+        serde_json::json!({"type":"send_cancelled","client_id":"client-once-1","cancelled":false})
+    );
+    socket.send(cancel("client-gone-1")).await.unwrap();
+    assert_eq!(
+        next_answer(&mut socket).await,
+        serde_json::json!({"type":"send_cancelled","client_id":"client-gone-1","cancelled":true})
+    );
+    socket.send(send_as("GONE", "client-gone-1")).await.unwrap();
+    let refused = next_answer(&mut socket).await;
+    assert_eq!(refused["type"], "error", "{refused}");
+    assert_eq!(refused["code"], "command_failed", "{refused}");
+    assert_eq!(refused["command"], "send", "{refused}");
+    assert_eq!(refused["client_id"], "client-gone-1", "{refused}");
+
+    // An id that is not well formed is refused and never echoed back; a
+    // `cancel_send` without a usable id likewise.
+    socket.send(send_as("BAD", "not an id")).await.unwrap();
+    let refused = next_answer(&mut socket).await;
+    assert_eq!(refused["code"], "invalid_command", "{refused}");
+    assert_eq!(refused["command"], "send", "{refused}");
+    assert!(refused.get("client_id").is_none(), "{refused}");
+    socket.send(cancel("short")).await.unwrap();
+    let refused = next_answer(&mut socket).await;
+    assert_eq!(refused["code"], "invalid_command", "{refused}");
+    assert_eq!(refused["command"], "cancel_send", "{refused}");
+
+    // A socket that may not act: its refusal names the send too, and it can
+    // withdraw nothing.
+    let mut watching = connect("?read_only=true").await;
+    assert_eq!(next_json(&mut watching).await["type"], "ready");
+    watching
+        .send(send_as("WATCHED", "client-watch-1"))
+        .await
+        .unwrap();
+    let refused = next_answer(&mut watching).await;
+    assert_eq!(refused["code"], "read_only", "{refused}");
+    assert_eq!(refused["command"], "send", "{refused}");
+    assert_eq!(refused["client_id"], "client-watch-1", "{refused}");
+    watching.send(cancel("client-watch-2")).await.unwrap();
+    let refused = next_answer(&mut watching).await;
+    assert_eq!(refused["code"], "read_only", "{refused}");
+    assert_eq!(refused["command"], "cancel_send", "{refused}");
+    assert_eq!(
+        state.chat.client_id_state(&id, "client-watch-2"),
+        None,
+        "a watching socket changes nothing"
+    );
+
+    // What the agent received (its turn never ends in this fixture, so the
+    // second message waits in the driver), and what the next attach replays.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while user_turns("ONCE") == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ONCE never delivered"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(user_turns("ONCE"), 1);
+    for never in ["GONE", "BAD", "WATCHED"] {
+        assert_eq!(user_turns(never), 0, "{never}");
+    }
+    let mut again = connect("").await;
+    assert_eq!(next_json(&mut again).await["type"], "ready");
+    let mut replayed = Vec::new();
+    while replayed.len() < 2 {
+        replayed.extend(echoes(&next_json(&mut again).await));
+    }
+    assert_eq!(replayed, seen);
+    state.chat.kill(&id);
+}

@@ -14,9 +14,9 @@
   } from "./paths";
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { attachImageToComposer, insertIntoComposer, registerFollow } from "./composerBus";
+  import { insertIntoComposer, registerFollow, returnableCount, returnToComposer } from "./composerBus";
   import { isBrowserGateway } from "../net/base";
-  import { pauseLabel, placementLabel, sessionPause } from "../net/placement";
+  import { ownerIsCloud, pauseLabel, placementLabel, projectWhere, sessionPause } from "../net/placement";
   import { accountSignedOut } from "../net/plan";
   import { pausedConnect } from "../pro/providers";
   import { canOpenOnboarding, cloudOnboarding } from "../pro/onboarding.svelte";
@@ -86,6 +86,7 @@
     PendingSend,
     PlanEntry,
   } from "./store.svelte";
+  import { mintSendId, SHOW_UNCONFIRMED_AFTER_MS } from "./store.svelte";
   import {
     advanceTailWindow,
     autoPageEarlier,
@@ -1406,7 +1407,13 @@
     for (const img of images) {
       blocks.push({ type: "image", media_type: img.media_type, data: img.data });
     }
-    return socket.send({ type: afterTurn ? "send_after_turn" : "send", blocks });
+    // The id this send goes out under: the daemon runs an id once, so the
+    // store may send the same frame again until its echo names it.
+    const id = mintSendId();
+    const frame = { type: afterTurn ? "send_after_turn" : "send", blocks, client_id: id };
+    if (!socket.send(frame)) return false;
+    store.noteSent(id, frame, text, images);
+    return true;
   }
 
   // A send made outside the composer (the Mastermind panel's one-click
@@ -1425,9 +1432,6 @@
     // when the socket isn't open so the composer keeps the draft.
     const accepted = sendMessage(text, images, afterTurn);
     if (accepted) {
-      // Kept until the agent's echo: a send the daemon could not deliver
-      // (the project was reconnecting) comes back into the composer.
-      store.noteSent(text, images);
       // Submission is stronger intent than merely clearing a draft: the user
       // expects to see the delivered/queued bubble and the reply it starts.
       atBottom = true;
@@ -1436,13 +1440,45 @@
     return accepted;
   }
 
-  // A refused send's text goes back into this chat's composer, once.
+  // A send made on a live connection shows no pending bubble, because its
+  // echo follows at once. One still unconfirmed a moment later shows after
+  // all: a machine that froze as the message arrived says nothing.
   $effect(() => {
-    if (store.restoredDraft === null) return;
-    const draft = store.takeRestoredDraft();
-    if (draft === null) return;
-    if (draft.text.length > 0) insertIntoComposer(session.id, draft.text);
-    for (const image of draft.images) attachImageToComposer(session.id, image);
+    const since = store.unshownSince;
+    if (since === null) return;
+    const timer = setTimeout(() => store.showOverdue(), Math.max(0, since + SHOW_UNCONFIRMED_AFTER_MS - Date.now()));
+    return () => clearTimeout(timer);
+  });
+
+  // An undelivered send goes back into this chat's composer, once, above
+  // whatever is being written there now (it was written first, and must not
+  // land under the caret), and without taking focus: nobody asked for it at
+  // this moment. Several can come back together (every send a wake was
+  // holding): each its own paragraph, in the order sent. A send comes back
+  // whole or not yet: while the composer has no room for its pictures it
+  // waits in the store, and `returnRoom` brings this back when it has.
+  let returnRoom = $state(0);
+  $effect(() => {
+    void returnRoom;
+    const drafts = store.restoredDrafts;
+    if (drafts.length === 0) return;
+    untrack(() => {
+      const count = returnableCount(session.id, drafts, quoteOwner);
+      if (count === 0) return;
+      const fitting = drafts.slice(0, count);
+      const returned = returnToComposer(
+        session.id,
+        {
+          text: fitting
+            .map((draft) => draft.text)
+            .filter((text) => text.length > 0)
+            .join("\n\n"),
+          images: fitting.flatMap((draft) => draft.images),
+        },
+        quoteOwner,
+      );
+      if (returned) store.takeRestoredDrafts(count);
+    });
   });
 
   /** One never-lose-a-click path for every interactive AgentCommand. A closed
@@ -1605,7 +1641,9 @@
       case "mcp":
         if (agentKind === "claude") {
           if (!sendCommand({ type: "get_mcp" }, "MCP request not sent")) return false;
-          store.mcpServers = null;
+          // The inventory already known stays up while this one is fetched:
+          // a read is not the user acting, so nobody answers it while a cloud
+          // machine sleeps (see `UNANSWERED_MS`).
           menu = "mcp";
           return true;
         }
@@ -1878,6 +1916,29 @@
       : null,
   );
 
+  /** A read is not the user acting (`get_mcp`, a rewind's dry run): a keeper
+   *  that keeps a sleeping cloud machine's socket neither holds it nor wakes
+   *  the machine for it, so no answer comes. A surface waiting on one closes
+   *  after this long instead of saying "loading…" for good; asking again
+   *  once the conversation answers works. Only a viewed conversation: a
+   *  local daemon always answers or refuses. */
+  const UNANSWERED_MS = { mcp: 10_000, rewind: 30_000 };
+  $effect(() => {
+    if (!viewed || menu !== "mcp" || store.mcpServers !== null) return;
+    const timer = setTimeout(() => {
+      if (menu === "mcp") menu = null;
+    }, UNANSWERED_MS.mcp);
+    return () => clearTimeout(timer);
+  });
+  $effect(() => {
+    const intent = rewindIntent;
+    if (!viewed || intent === null || intent.stage !== "dry" || rewindReport !== null) return;
+    const timer = setTimeout(() => {
+      if (rewindIntent === intent) rewindIntent = null;
+    }, UNANSWERED_MS.rewind);
+    return () => clearTimeout(timer);
+  });
+
   function askRewind(checkpoint: { id: string; preceding: string | null }) {
     store.rewind = null;
     if (conversationOnlyRewind) {
@@ -2009,11 +2070,13 @@
   function toggleThinking() {
     const next = !thinkingOn;
     store.setThinking(next);
-    if (!sendCommand({ type: "set_thinking", enabled: next }, "thinking change not sent")) {
-      // Keep the user's preference, but mark it unsynchronized so the existing
-      // connected-effect retries it on the next ready frame.
-      store.markThinkingPending();
-    }
+    // Keep the user's preference, but mark it unsynchronized whenever it may
+    // not have reached the driver, so the connected-effect below pushes it at
+    // the next `ready`: the socket refused the frame, or took it while the
+    // conversation is not live (whoever keeps a sleeping owner's socket drops
+    // a `set_thinking`, and a plain reconnect does not push it again).
+    const sent = sendCommand({ type: "set_thinking", enabled: next }, "thinking change not sent");
+    if (!sent || !store.connected) store.markThinkingPending();
   }
   // Push the effective preference to the live driver, once per driver process.
   // It pushes whatever the user's effective choice IS (never forces a value),
@@ -2093,11 +2156,28 @@
   /** A project viewed from another device (a routed row, or a browser view of
    *  a project). An ordinary local chat never grows connection chrome. */
   const viewed = $derived(typeof session.placement === "object" || isBrowserGateway());
+  /** Nothing to load yet and no end to a loading line: the first replay
+   *  waits on a cloud machine that sleeps. Either its relay said so
+   *  (`awaitingWake`), or the socket is kept open for it and has heard
+   *  nothing (until a send goes out, which is what wakes it); only a viewed
+   *  conversation in the cloud, never a local one whose daemon is merely
+   *  slow to answer. */
+  const waitsForCloud = $derived(
+    store.awaitingWake ||
+      (store.hydrating &&
+        store.held &&
+        !store.waking &&
+        store.sending.length === 0 &&
+        viewed &&
+        ownerIsCloud(session.placement, $projectWhere)),
+  );
   /** Name a dropped connection only after a short grace, so the first
-   *  handshake and a quick reconnect never flash a status row. */
+   *  handshake and a quick reconnect never flash a status row. A socket that
+   *  is open and kept for an owner that has not answered (`held`) is not
+   *  reconnecting. */
   let reconnectingShown = $state(false);
   $effect(() => {
-    if (!viewed || store.connected || store.exited !== null || store.degraded) {
+    if (!viewed || store.connected || store.held || store.exited !== null || store.degraded) {
       reconnectingShown = false;
       return;
     }
@@ -2106,13 +2186,15 @@
   });
   /** "In the cloud" / "On another computer" for a routed conversation. A
    *  sleeping owner fails the daemon's passive roster read like an
-   *  unreachable one, so what this socket heard (asleep, waking) wins over
-   *  the row's "reconnecting"; and the status line under the transcript says
-   *  "Reconnecting…" itself when it is showing, so the header does not. */
+   *  unreachable one, so what this socket heard (asleep, waking) or is
+   *  (answered, or kept open) wins over the row's "reconnecting"; and the
+   *  status line under the transcript says "Reconnecting…" itself when it is
+   *  showing, so the header does not. */
   const runsElsewhere = $derived(
     placementLabel(session.placement, session.placement_available, {
       owner: store.asleep ? "asleep" : store.waking && !store.connected ? "waking" : null,
       reconnectingShown: reconnectingShown && !continuing && !store.waking && !store.asleep,
+      reachable: store.connected || store.held,
     }),
   );
   const activityLabel = $derived.by(() => {
@@ -2650,9 +2732,32 @@
     <!-- One real reading column (the Claude Desktop measure): agent prose
          fills it from the left, user bubbles right-align inside it. -->
     <div class="column" bind:this={columnEl}>
-    {#if store.awaitingWake}
+    <!-- Sends made while the conversation is not live (paused, waking,
+         reconnecting): each shown at once, so nobody sends it twice. Its echo
+         replaces it; a send that was not delivered goes back to the composer. -->
+    {#snippet unconfirmedBubbles()}
+      {#if store.sending.length > 0}
+        <div class="pending" aria-live={visible ? "polite" : "off"}>
+          {#each store.sending as pending (pending.key)}
+            <div class="msg user pending-msg">
+              <div class="bubble-row">
+                <div class="bubble">
+                  <UserText text={pending.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />
+                </div>
+              </div>
+              <span class="delivery">sending…</span>
+              {#if pending.images > 0}
+                <span class="attach">{pending.images} image{pending.images > 1 ? "s" : ""}</span>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      {/if}
+    {/snippet}
+    {#if waitsForCloud}
       <!-- Asleep before the first replay: nothing to load yet, and no spinner
-           for a wait that only a send ends (the footer says the same). -->
+           for a wait that only a send ends (the footer says the same when a
+           relay said the machine is asleep). -->
       <div class="empty asleep-note" role="status">
         <span>The conversation shows once the cloud wakes. Sending a message wakes it.</span>
       </div>
@@ -2661,6 +2766,9 @@
         <SessionGlyph kind="agent" {agentKind} size={18} state="alive" />
         <span>loading recent conversation…</span>
       </div>
+      <!-- A send made before the first replay shows under the loading line
+           instead of vanishing from the composer. -->
+      {@render unconfirmedBubbles()}
     {:else}
     {#if store.blocks.length === 0 && store.exited === null}
       <div class="empty">
@@ -3103,24 +3211,7 @@
         {/each}
       </div>
     {/if}
-    <!-- A send made while the conversation is not live (paused, waking,
-         reconnecting): shown at once, so nobody sends it twice. Its echo
-         replaces it; a refusal hands the text back to the composer. -->
-    {#if store.sending !== null}
-      <div class="pending" aria-live={visible ? "polite" : "off"}>
-        <div class="msg user pending-msg">
-          <div class="bubble-row">
-            <div class="bubble">
-              <UserText text={store.sending.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />
-            </div>
-          </div>
-          <span class="delivery">sending…</span>
-          {#if store.sending.images > 0}
-            <span class="attach">{store.sending.images} image{store.sending.images > 1 ? "s" : ""}</span>
-          {/if}
-        </div>
-      </div>
-    {/if}
+    {@render unconfirmedBubbles()}
     {/if}
 
     {#if hasDeferredActivity || !atBottom}
@@ -3299,6 +3390,7 @@
     {onSubmit}
     {voiceTerms}
     onDraftState={(active) => (composerEngaged = active)}
+    onReturnRoom={() => (returnRoom += 1)}
     onInterrupt={interrupt}
     onCycleMode={cycleMode}
     {onSlash}
