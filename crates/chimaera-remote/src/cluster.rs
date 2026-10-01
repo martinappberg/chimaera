@@ -15,8 +15,8 @@
 //! Politeness is part of the contract: the queue is asked at most once a
 //! minute per host (`SQUEUE_FLOOR`), everything else is a file read.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{LazyLock, Mutex};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
@@ -1414,9 +1414,11 @@ pub fn spawn_attached(
         .iter()
         .map(|a| sh_quote(a))
         .collect();
+    // One line, so each statement needs its `;`: the PATH line ends in a
+    // newline, and a space there once made it `export PATH exec srun …`.
     let script = format!(
         "unset SLURM_JOB_ID SLURM_JOBID; {}exec srun {} /bin/bash \"{}/job.sh\"",
-        path_line(host).replace('\n', " "),
+        path_line(host).replace('\n', "; "),
         args.join(" "),
         job_dir(home, jid)
     );
@@ -1426,10 +1428,69 @@ pub fn spawn_attached(
         .arg(host)
         .arg(super::sh_wrap(&script))
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        // The pty merges srun's errors into stdout; the caller keeps the
+        // last lines to say why a job never started.
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     cmd.spawn().context("failed to start the attached job")
+}
+
+/// The last lines an attached job printed (srun's own words included — the
+/// pty merges them into stdout), kept while it runs so an early end can say
+/// why. Reads both pipes to their end (a full pipe would stall srun); `echo`
+/// also passes each line to this process's stderr (the CLI's terminal).
+pub fn attached_output(child: &mut Child, echo: bool) -> Arc<Mutex<VecDeque<String>>> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    const KEEP: usize = 8;
+    let tail = Arc::new(Mutex::new(VecDeque::with_capacity(KEEP)));
+    let pipes: [Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>; 2] = [
+        child.stdout.take().map(|p| Box::new(p) as _),
+        child.stderr.take().map(|p| Box::new(p) as _),
+    ];
+    for pipe in pipes.into_iter().flatten() {
+        let tail = tail.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(pipe).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let line = plain_line(&line);
+                if line.is_empty() || line.starts_with("Shared connection to") {
+                    continue;
+                }
+                if echo {
+                    eprintln!("{line}");
+                }
+                let mut t = tail.lock().unwrap_or_else(|p| p.into_inner());
+                if t.len() == KEEP {
+                    t.pop_front();
+                }
+                t.push_back(line.chars().take(300).collect());
+            }
+        });
+    }
+    tail
+}
+
+/// A terminal line without its colors and carriage returns.
+fn plain_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => {
+                if chars.next() == Some('[') {
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+            }
+            '\r' => {}
+            c => out.push(c),
+        }
+    }
+    out.trim().to_string()
 }
 
 /// Stop a job (`scancel`, which tells job-host first so every workspace in
@@ -2229,6 +2290,15 @@ mod tests {
             Some(1_784_118_840_000)
         );
         assert_eq!(parse_slurm_timestamp("N/A", "+0000"), None);
+    }
+
+    #[test]
+    fn attached_output_lines_lose_colors_and_carriage_returns() {
+        assert_eq!(
+            plain_line("\u{1b}[31msrun: error: Invalid partition\u{1b}[0m\r"),
+            "srun: error: Invalid partition"
+        );
+        assert_eq!(plain_line("  \r"), "");
     }
 
     #[test]

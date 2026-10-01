@@ -819,16 +819,52 @@ fn hold_attached(app: &AppHandle, alias: &str, jid: &str, mut child: tokio::proc
     }
     let app = app.clone();
     let alias = alias.to_string();
+    let jid = jid.to_string();
     tauri::async_runtime::spawn(async move {
-        tokio::select! {
-            _ = child.wait() => {}
+        let output = cluster::attached_output(&mut child, false);
+        let ended_itself = tokio::select! {
+            status = child.wait() => Some(status),
             _ = rx => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
+                None
             }
-        }
+        };
         let shell = app.state::<Shell>();
         lock(&shell.attached_jobs).remove(&key);
+        // Ended on its own before it was ever seen running: it never got a
+        // node — say why, in Slurm's words (a job that ran is the watcher's
+        // to report).
+        if let Some(status) = ended_itself {
+            let never_ran = lock(&shell.clusters)
+                .get(&alias)
+                .and_then(|c| c.last_jobs.get(&jid).copied())
+                .is_none_or(|s| s == "waiting");
+            let lines: Vec<String> = output
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .cloned()
+                .collect();
+            tracing::warn!(%alias, job = %jid, ?status, "attached job ended: {}", lines.join(" | "));
+            if never_ran {
+                let why = lines
+                    .iter()
+                    .rev()
+                    .find(|l| l.contains("error") || l.contains("srun"))
+                    .or(lines.last())
+                    .cloned()
+                    .unwrap_or_else(|| "The connection to the cluster ended.".into());
+                toast(
+                    &alias,
+                    &jid,
+                    "nostart",
+                    format!("Your job on {alias} didn't start"),
+                    "",
+                    why,
+                );
+            }
+        }
         cluster::invalidate_queue(&alias);
         let _ = app.emit("cluster-changed", json!({ "alias": alias }));
     });

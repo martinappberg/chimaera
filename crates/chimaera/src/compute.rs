@@ -373,6 +373,7 @@ async fn submit(
             cluster::remember_spec(host, home, &spec, args.save_as).await?;
             let mut child =
                 cluster::spawn_attached(host, home, &job, &spec, &job_name, facts.gpu_flag)?;
+            let _output = cluster::attached_output(&mut child, true);
             println!(
                 "job {job} starts attached to this terminal: it stops when you press Ctrl-C or \
                  this connection ends. Open workspaces in it from another terminal."
