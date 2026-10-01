@@ -85,6 +85,7 @@ mod tests {
             version: "0.0.0".into(),
             started_at: 0,
             build: None,
+            slurm_job_id: None,
         };
 
         // Another node's record whose pid happens to be a live process here
