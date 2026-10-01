@@ -1300,6 +1300,9 @@ pub fn run() {
                 // the app (the daemons keep running by design).
                 if let Some(state) = app.try_state::<Shell>() {
                     lock(&state.registry).save_if_dirty();
+                    // Login-node terminals end with the app: a quit does not
+                    // reliably deliver each window's Destroyed first.
+                    cluster::end_all_terminals(app);
                     tauri::async_runtime::block_on(async {
                         let tunnels: Vec<_> =
                             state.tunnels.lock().await.drain().map(|(_, t)| t).collect();

@@ -1213,6 +1213,25 @@ pub(crate) fn terminal_window_closed(app: &AppHandle, stable_id: &str, quitting:
     }
 }
 
+/// The app is exiting: end every open login-node terminal, inline.
+pub(crate) fn end_all_terminals(app: &AppHandle) {
+    let shell = app.state::<Shell>();
+    let sessions: Vec<String> = lock(&shell.terminal_windows)
+        .drain()
+        .map(|(_, s)| s)
+        .collect();
+    if sessions.is_empty() {
+        return;
+    }
+    let (port, token) = {
+        let local = lock(&shell.local);
+        (local.port, local.token.clone())
+    };
+    for session in sessions {
+        end_terminal_session(port, token.clone(), session);
+    }
+}
+
 /// At launch, end login-node terminal sessions a crash or force quit left
 /// without a window (their windows are never restored, so every live one is
 /// an orphan). Nothing when no terminal was ever opened here.
