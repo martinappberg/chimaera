@@ -112,3 +112,29 @@ The adapters do not translate hook formats, permission grants or login flows bet
 providers. AGY's connection CLI omits project/plugin servers; the UI describes that
 limit. Terminal MCP injection for the two new CLIs is not verified/supported;
 Chimaera communication uses Chat, without changing global native configuration.
+
+## Final review and merge gate
+
+Rebased onto `5ab16d83` (including pane Find and file browsing changes), preserving
+the new Chat Find integration alongside capability-based controls.
+
+- `just check` passed with Rust 1.96: format, workspace/plugin Clippy, workspace
+  tests (including all 806 server tests) and plugin tests. Test concurrency was
+  limited to two on this busy development machine. Earlier runs exposed two stale
+  plugin response expectations and an overly broad assertion in the new retry
+  regression; all were corrected. Timing-sensitive existing tests also passed
+  with bounded concurrency.
+- UI type checking reported zero errors/warnings; production build passed. The
+  complete rebased UI suite passed: 1,612 tests, three skipped, 112 files, using
+  two workers and a 20-second timeout. Documentation and agent-asset checks passed.
+- Restarted the isolated daemon into the final build. Native skill, plugin and
+  connection refresh endpoints all succeeded; 89 skills were reported with both
+  new agents' project/plugin fixtures present. The running versions were Claude
+  Code 2.1.287, Codex 0.159.3, Antigravity 1.2.14 and Grok Build 1.0.46.
+- Browser verification showed all four agents ready, the existing Claude terminal
+  conversation still in Terminal, and the existing Grok conversation still in
+  Chat. The final Settings screenshot was saved with the task's artifacts.
+- Self-review covered transport/capability handling, saved surfaces, copied forks,
+  installer provenance, native extension actions/trust and communication delivery.
+  The transient-version retry bug found during this review has a passing route
+  regression. No remaining blocking findings were identified before opening the PR.

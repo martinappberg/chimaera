@@ -695,7 +695,11 @@ esac
     let url = format!("/api/v1/workspaces/{ws}/skills");
     let (status, initial) = request(&state, Method::GET, &url, None).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(initial["skills"].as_array().unwrap().is_empty());
+    assert!(!initial["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|skill| skill["name"] == "retry-probe"));
     assert!(initial["errors"].to_string().contains("Try again"));
     let (status, retried) =
         request(&state, Method::GET, &format!("{url}?refresh=true"), None).await;

@@ -1,7 +1,7 @@
 # web-ui/src/lib/chat — the structured chat surface
 
 Orientation for coding agents. This directory is the **front half of chat mode**:
-the rich UI that renders the daemon's structured agent stream (Claude & Codex),
+the rich UI that renders Claude, Codex, Antigravity and Grok agent streams,
 the sibling of the xterm.js terminal surface. Parent map: repo-root
 [AGENTS.md](../../../../AGENTS.md). The back half it talks to is
 [`crates/chimaera-agent`](../../../../crates/chimaera-agent/AGENTS.md).
