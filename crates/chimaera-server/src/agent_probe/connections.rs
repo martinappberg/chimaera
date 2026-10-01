@@ -115,6 +115,63 @@ fn codex_connections(output: &str) -> Result<Vec<Connection>, &'static str> {
     Ok(rows)
 }
 
+fn agy_connections(output: &str) -> Result<Vec<Connection>, &'static str> {
+    if output.trim() == "No MCP servers configured." {
+        return Ok(vec![]);
+    }
+    if !output
+        .lines()
+        .next()
+        .is_some_and(|s| s.starts_with("NAME") && s.contains("STATUS"))
+    {
+        return Err("Antigravity couldn't report its connections.");
+    }
+    let mut rows = Vec::new();
+    for line in output.lines().skip(1).filter(|s| !s.trim().is_empty()) {
+        let fields: Vec<&str> = line.split_whitespace().take(3).collect();
+        if fields.len() != 3 || !valid_name(fields[0]) {
+            return Err("Antigravity returned an unrecognized connection.");
+        }
+        let status = match fields[2] {
+            "disabled" => "disabled",
+            "enabled" => "configured",
+            _ => "unknown",
+        };
+        rows.push(connection(fields[0], "mcp", status, false));
+        if rows.len() > MAX_ROWS {
+            return Err("Too many connections to list.");
+        }
+    }
+    Ok(rows)
+}
+
+fn grok_connections(output: &str) -> Result<Vec<Connection>, &'static str> {
+    let raw: Value =
+        serde_json::from_str(output).map_err(|_| "Grok couldn't report its connections.")?;
+    let list = raw
+        .as_array()
+        .filter(|v| v.len() <= MAX_ROWS)
+        .ok_or("Grok returned an unrecognized connection inventory.")?;
+    list.iter()
+        .map(|row| {
+            let name = row["name"]
+                .as_str()
+                .filter(|s| valid_name(s))
+                .ok_or("Grok returned an unrecognized connection.")?;
+            Ok(connection(
+                name,
+                "mcp",
+                if row["enabled"] == false {
+                    "disabled"
+                } else {
+                    "configured"
+                },
+                false,
+            ))
+        })
+        .collect()
+}
+
 fn hosted_connections(raw: &Value) -> Result<Vec<Connection>, &'static str> {
     let apps = raw["apps"]
         .as_array()
@@ -143,7 +200,7 @@ fn hosted_connections(raw: &Value) -> Result<Vec<Connection>, &'static str> {
 
 /// CLI listing can start MCP subprocesses. Its whole process group belongs to
 /// this bounded probe, including on request cancellation or a timeout.
-async fn run_cli(
+pub(super) async fn run_cli(
     bin: &Path,
     args: &[&str],
     root: &Path,
@@ -196,7 +253,7 @@ async fn probe(state: &Arc<AppState>, ws: &str, root: &Path, kind: AgentKind) ->
         };
         let generation = state.probes.generation.load(Ordering::Relaxed);
         let prelude = ProbePrelude::write(state, Some(ws)).await;
-        let args: &[&str] = if kind == AgentKind::Codex {
+        let args: &[&str] = if matches!(kind, AgentKind::Codex | AgentKind::Grok) {
             &["mcp", "list", "--json"]
         } else {
             &["mcp", "list"]
@@ -204,12 +261,12 @@ async fn probe(state: &Arc<AppState>, ws: &str, root: &Path, kind: AgentKind) ->
         let listed = run_cli(&bin, args, root, prelude.path()).await;
         let parsed = listed
             .map_err(|_| "Couldn't check connections. Try again.")
-            .and_then(|out| {
-                if kind == AgentKind::Codex {
-                    codex_connections(&out)
-                } else {
-                    claude_connections(&out)
-                }
+            .and_then(|out| match kind {
+                AgentKind::Claude => claude_connections(&out),
+                AgentKind::Codex => codex_connections(&out),
+                AgentKind::Antigravity => agy_connections(&out),
+                AgentKind::Grok => grok_connections(&out),
+                _ => Err("Connection discovery is unavailable for this agent."),
             });
         let (mut rows, mut errors) = match parsed {
             Ok(rows) => (rows, vec![]),
@@ -261,19 +318,54 @@ pub(crate) async fn list(
         return not_found();
     };
     if query.refresh {
-        state.probes.invalidate();
+        refresh_probes(&state).await;
     }
     // Each holds the shared agent-probe gate; the whole request is bounded.
-    let (claude, codex) = tokio::join!(
+    let (claude, codex, mut agy, mut grok, effective) = tokio::join!(
         probe(&state, &ws, &root, AgentKind::Claude),
-        probe(&state, &ws, &root, AgentKind::Codex)
+        probe(&state, &ws, &root, AgentKind::Codex),
+        probe(&state, &ws, &root, AgentKind::Antigravity),
+        probe(&state, &ws, &root, AgentKind::Grok),
+        super::extensions::inventory(&state, &ws, &root, AgentKind::Grok),
     );
-    Json(json!({"host":state.hostname,"agents":[claude,codex]})).into_response()
+    agy["actions"] = json!(["manage_connections"]);
+    agy["notice"] = json!("Lists connections managed by Antigravity's CLI. Project and plugin connections can also load when an agent starts. Manage sign-in in Antigravity.");
+    grok["actions"] = json!(["manage_connections"]);
+    if let Some(rows) = grok["connections"].as_array_mut() {
+        for row in effective["connections"].as_array().into_iter().flatten() {
+            if !rows.iter().any(|r| r["name"] == row["name"]) {
+                rows.push(row.clone());
+            }
+        }
+    }
+    if let Some(error) = effective["error"].as_str() {
+        if let Some(errors) = grok["errors"].as_array_mut() {
+            errors.push(json!(error));
+        }
+    }
+    Json(json!({"host":state.hostname,"agents":[claude,codex,agy,grok]})).into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_provider_connections_are_whitelisted_and_not_assumed_authenticated() {
+        let agy = agy_connections(
+            "NAME TYPE STATUS COMMAND/URL\nprivate http disabled https://secret/?token=secret\n",
+        )
+        .unwrap();
+        assert_eq!(agy[0].status, "disabled");
+        let grok = grok_connections(
+            r#"[{"name":"private","url":"https://secret","headers":{"Authorization":"secret"}}]"#,
+        )
+        .unwrap();
+        assert_eq!(grok[0].status, "configured");
+        assert!(!serde_json::to_string(&grok).unwrap().contains("secret"));
+        assert!(!serde_json::to_string(&agy).unwrap().contains("secret"));
+        assert!(agy_connections("unknown output").is_err());
+    }
 
     #[test]
     fn cli_reports_never_expose_endpoints_or_credentials() {

@@ -595,11 +595,14 @@ impl Reader {
     /// Where a message to it goes while it works / while idle, in words.
     fn reach(&self, policy: WakePolicy, mastermind_auto: bool) -> &'static str {
         match (self.chat, self.claude(), self.busy) {
-            (_, true, true) | (true, false, true) => "reads messages at its next step",
+            (_, true, true) => "reads messages at its next step",
+            (true, false, true) if self.agent == "codex" => "reads messages at its next step",
+            (true, false, true) => "messages wait until its current turn finishes",
             (false, true, false) => "sees messages with the user's next prompt there",
-            (false, false, _) => {
-                "a terminal without hooks — sees messages only when it calls read_messages"
+            (false, false, _) if self.agent == "codex" => {
+                "sees messages when it calls read_messages"
             }
+            (false, false, _) => "use Chat for Chimaera messages with this agent",
             (true, _, false) if self.mastermind => {
                 if mastermind_auto && policy != WakePolicy::Never {
                     "a message wakes it (the user lets the Mastermind act on its own)"
@@ -1012,7 +1015,8 @@ fn plan_for(
     }
     match (reader.chat, reader.claude(), reader.busy) {
         (_, true, true) => Plan::Carrier,
-        (true, false, true) => Plan::Steer,
+        (true, false, true) if reader.agent == "codex" => Plan::Steer,
+        (true, false, true) => Plan::Inbox("its current turn is still running"),
         (false, true, false) => Plan::Carrier,
         (false, false, _) => Plan::Inbox("a terminal without hooks"),
         (true, _, false) if broadcast => Plan::Inbox("broadcasts never wake anyone"),
@@ -1187,7 +1191,7 @@ pub(crate) async fn message_agent(state: &Arc<AppState>, from_sid: &str, args: &
         if !broadcast {
             for (target, plan) in targets.iter().zip(&plans) {
                 let next_step = matches!(plan, Plan::Steer)
-                    || matches!(plan, Plan::Carrier if target.busy && target.chat);
+                    || matches!(plan, Plan::Carrier | Plan::Inbox(_) if target.busy && target.chat && target.alive);
                 if next_step {
                     st.await_turn_end(&target.ws, &target.sid, posted.seq);
                 }
@@ -1209,7 +1213,7 @@ pub(crate) async fn message_agent(state: &Arc<AppState>, from_sid: &str, args: &
     let seq = posted.seq;
     let mut answer = if broadcast {
         format!(
-            "Sent (#{seq}) to everyone here ({} agents): working ones read it at their next step, the rest when they next look.",
+            "Sent (#{seq}) to everyone here ({} agents). Each can read it from its inbox; broadcasts never start an idle agent.",
             targets.len()
         )
     } else {
@@ -1540,7 +1544,7 @@ async fn idle_check(state: &Arc<AppState>, sid: &str) {
     if awaiting.is_empty() {
         return;
     }
-    // Only what reached a carrier while it worked and was never read meets
+    // Only direct messages queued while it worked and never read meet
     // the policy here, once; a steer still in flight waits for its fate.
     let unread: Vec<Arc<Entry>> = unread_now(state, &reader)
         .await
@@ -2488,6 +2492,48 @@ mod tests {
             Err(false),
             "the fresh gap outlives a released reply"
         );
+    }
+
+    #[test]
+    fn busy_acp_readers_keep_messages_until_the_turn_ends() {
+        for agent in ["agy", "grok", "extension.future"] {
+            let mut st = CommsState::default();
+            let from = reader("s-from");
+            let mut to = reader("s-to");
+            to.agent = agent.into();
+            to.busy = true;
+            assert_eq!(
+                plan_for(
+                    &mut st,
+                    WakePolicy::Auto,
+                    &from,
+                    &to,
+                    false,
+                    false,
+                    false,
+                    None
+                ),
+                Plan::Inbox("its current turn is still running")
+            );
+            assert_eq!(
+                to.reach(WakePolicy::Auto, false),
+                "messages wait until its current turn finishes"
+            );
+            to.busy = false;
+            assert!(matches!(
+                plan_for(
+                    &mut st,
+                    WakePolicy::Auto,
+                    &from,
+                    &to,
+                    false,
+                    false,
+                    false,
+                    None
+                ),
+                Plan::Wake(_)
+            ));
+        }
     }
 
     #[test]

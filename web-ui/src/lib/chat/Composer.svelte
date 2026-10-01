@@ -80,6 +80,7 @@
     onDraftState(active: boolean): void;
     /** Words dictation should favor (project and agent names). */
     voiceTerms?: string[];
+    imageInput?: boolean;
   }
 
   let {
@@ -98,6 +99,7 @@
     onSlash,
     onDraftState,
     voiceTerms = [],
+    imageInput = true,
   }: Props = $props();
 
   const uid = $props.id();
@@ -133,6 +135,10 @@
   }
 
   function addImage(image: ImageAttachment): boolean {
+    if (!imageInput) {
+      attachmentError = "this agent does not support images in chat";
+      return false;
+    }
     if (images.length >= IMAGE_MAX_ATTACHMENTS) {
       attachmentError = `maximum ${IMAGE_MAX_ATTACHMENTS} images per message`;
       return false;

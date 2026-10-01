@@ -158,6 +158,7 @@ export interface Session {
   background_running?: number | null;
   /** Whether this agent can run as a chat session (drives the toggle). */
   chat_capable?: boolean;
+  view_switchable?: boolean;
   /**
    * The repository checkout this session is in, from its current folder (a
    * shell's cwd, an agent's hook-reported cwd, else its spawn folder). Null
@@ -391,9 +392,11 @@ function turnDotTitle(s: Session): string {
       if (unintegrated(s)) {
         if (s.output_active === true) return "agent working (terminal activity)";
         if (s.output_active === false) return "quiet — no recent output";
-        return `state unknown (no ${agentKind(s)} integration yet)`;
+        return "terminal open";
       }
-      return "starting…";
+      // Claude TUIs may not emit SessionStart on resume. An absent hook
+      // cannot mean startup is still in progress indefinitely.
+      return s.ui === "chat" ? "connecting to agent…" : "terminal open";
   }
 }
 
@@ -533,6 +536,15 @@ export interface AgentSpawn {
   cwd?: string;
 }
 
+/** Saved/explicit surfaces are authoritative. Only fresh, implicit launches
+ * use the global default and readiness fallback. The server reports an
+ * unavailable saved chat rather than silently opening a different surface. */
+export function sessionSurface(spawn: AgentSpawn, defaultChat: boolean, chatCapable?: boolean): "chat" | "term" {
+  if (spawn.ui !== undefined) return spawn.ui;
+  if (spawn.resume !== undefined) return "term";
+  return defaultChat && chatCapable !== false ? "chat" : "term";
+}
+
 export async function createSession(
   workspaceId: string,
   kind: SessionKind = "shell",
@@ -569,11 +581,7 @@ export async function createSession(
     // degrades to a PTY on its own if the protocol handshake fails. An agent
     // the catalog knows is NOT chat-capable (outdated CLI) skips chat
     // entirely — it would only handshake-watchdog then degrade.
-    const wantChat =
-      spawn.ui !== undefined ? spawn.ui === "chat" : getSetting("agents.defaultView") === "chat";
-    if (["claude", "codex"].includes(spawn.agent ?? "claude") && wantChat && chatCapable !== false) {
-      extras.ui = "chat";
-    }
+    extras.ui = sessionSurface(spawn, getSetting("agents.defaultView") === "chat", chatCapable);
   }
   if (spawn.cwd !== undefined && spawn.cwd !== "") extras.cwd = spawn.cwd;
   // Every spawn (shell AND agent) carries the UI's current scheme: the

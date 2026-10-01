@@ -52,7 +52,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
 ## Connections
 
 - **What & when.** The second segment lists configured MCP servers and installed hosted
-  connectors, separately for Claude Code and Codex in the current workspace on this host.
+  connectors for Claude Code, Codex, Antigravity and Grok Build in the current workspace on this host.
   Plugins remains the default. Agent account login is outside this flow.
 - **How it's used.** Open Extensions → Connections. **Check again** refreshes the agents'
   reports. **Sign in** opens a dialog with a browser authorization link, progress,
@@ -727,7 +727,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   (skills, hooks, always-on tokens — for the first 12); codex from a short-lived
   `codex app-server` (`skills/list`, `hooks/list` for the workspace cwd — no thread, no model
   call), a codex plugin being whatever `pluginId` codex attributes skills and hooks to. The
-  **Skills** segment lists every skill once per name, grouped by origin — this project
+  **Skills** segment keeps different source files separate, including equal skill names, grouped by origin — this project
   (`<root>/.claude/skills`; codex `repo` scope) · from plugins (enabled claude plugins'
   `skills/`; codex `pluginId`) · yours (`~/.claude/skills`; codex `user`) · built into the agent
   (claude's catalog from a *live* claude chat session's handshake in this workspace — present
@@ -738,8 +738,8 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   available ✓ · off ◌ ("disabled in codex's config") · absent, with the reason in words ("codex
   is not installed here", "the plugin is not installed for claude") — and the invocation in each
   agent's own syntax (`/name` claude, `$name` codex). Codex's skill load errors are listed.
-  The controls follow Settings' recipes — the segmented All · claude · codex, a search field,
-  the counts — and a row opens in place into a small definition list: **Use it** (each
+  The controls use a compact agent selector (including All agents), a search field,
+  and a count of the matching skills — and a row opens in place into a small definition list: **Use it** (each
   agent's invocation, copyable), **File** (open SKILL.md), **Problems** (load errors).
 - **Where it lives.** `agent_probe.rs` (`claude_state`, `codex_raw` / `codex_state`,
   `CodexRpc`, `agent_plugins`, `skills`, `scan_skills`); UI `SkillsView.svelte`,
@@ -752,6 +752,48 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   stale results. Claude has no skills-list API, so its side is
   a bounded directory scan (200 skills per dir, 8 KiB of each `SKILL.md`) joined with the live
   catalog.
+
+### Antigravity and Grok Build
+
+Both are core agents in Plugins, Connections and Skills. Agent identity and action lists are
+open-ended on these reports; the UI never assumes an unknown agent is Codex. This does not
+add third-party agent registration to the current Wasm plugin API.
+
+- **Grok:** discovery uses `grok inspect --json`, including Claude-compatible add-ons that
+  `grok plugin list` and `grok mcp list` omit. Project trust remains Grok's decision. Its
+  `/plugins` and `/mcps` menus open through **Manage in Grok Build**. Installation runs the
+  native CLI in a visible terminal, asking **Install and trust?** before passing `--trust`.
+  Project/compatible plugins do not receive installation-only action buttons.
+- **Antigravity:** `agy plugin list` reports imported packages. The native zero-model-turn
+  `/skills` print command supplies loaded skills and their source/plugin identity (CLI
+  1.2.14 or newer; unknown/older versions are not prompted during discovery). A package's
+  presence alone does not prove enablement: the UI says **installed** until a loaded skill
+  confirms it. User and project copies remain separate. Install/enable/disable use native
+  CLI commands. **Command help** opens CLI help: `/plugins` is *not* a native menu in 1.2.14
+  and must never be sent as a management prompt.
+- **Connections:** Antigravity's list covers CLI-managed connections, not every project or
+  plugin server; the page says so. Grok combines its native MCP list with effective inspect
+  results. Neither adapter fabricates OAuth status or a `mcp login` flow; Grok sign-in uses
+  its native menu. Reports expose presentation fields, never endpoints, headers or secrets.
+- **Skill use:** invocation comes from the provider's report. Non-invocable skills have no
+  copy-command action; a skill's `allowed-tools` declaration is not translated into a common
+  permission grant. Hooks and trust remain provider-owned, not converted between formats.
+
+The adapters live in `agent_probe/extensions.rs`; fixed-argument user actions live in
+`agent_probe/actions.rs`. A failed skill inventory offers **Try again**, which clears
+cached inventories and rechecks any missing CLI version without changing the chosen
+installation. Native command arguments are defined in
+`launcher::extension_action`. The bearer-authenticated
+`POST /workspaces/{id}/agent-extensions/action {agent,action,target?}` opens a retained PTY,
+keeps the native command's outcome visible, and invalidates discovery on completion or exit.
+The shared gate permits one probe process at a time; parallel report requests share a
+60-second deadline including queue time. Per-command output and row caps remain in force.
+
+Workbench manifests can require or recommend an agent-side package with an additive
+`source` (local folder or repository accepted by that CLI) for `agy` or `grok`; the existing
+Claude/Codex `marketplace` contract is unchanged. The server advertises whether installation
+is supported. Unknown enablement blocks setup rather than claiming the package is ready.
+
 
 ## Codex hook trust
 

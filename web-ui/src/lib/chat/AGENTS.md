@@ -1,7 +1,7 @@
 # web-ui/src/lib/chat — the structured chat surface
 
 Orientation for coding agents. This directory is the **front half of chat mode**:
-the rich UI that renders the daemon's structured agent stream (Claude & Codex),
+the rich UI that renders Claude, Codex, Antigravity and Grok agent streams,
 the sibling of the xterm.js terminal surface. Parent map: repo-root
 [AGENTS.md](../../../../AGENTS.md). The back half it talks to is
 [`crates/chimaera-agent`](../../../../crates/chimaera-agent/AGENTS.md).
@@ -321,3 +321,11 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
 - Keep `ChatView.svelte` from growing without bound. The overlays/panels (header,
   rewind dialog, `/mcp`, usage, effort) are already their own components — add new
   chrome the same way rather than inlining it into the host.
+
+## Session capabilities
+
+`capabilities.ts` consumes the driver’s additive `capabilities` event; unknown agents have no
+implicit controls. `catalog` refreshes model/mode/command choices without replaying Init or
+resetting a turn. Header/composer controls follow those facts. `ForkDialog` includes every
+ready chat adapter; native history and a conversation copy have different transfer semantics.
+See [integration design](../../../../docs/agent-harness-design.md).

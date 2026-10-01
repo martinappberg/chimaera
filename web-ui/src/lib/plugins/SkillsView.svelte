@@ -11,7 +11,6 @@
    * its SKILL.md, and any load error. Truth comes from the agents; codex's
    * load errors are shown, not hidden.
    */
-  import Segmented from "../shared/Segmented.svelte";
   import { inlineMarkdown } from "../shared/inlineMarkdown";
   import { copyText } from "../shared/clipboard";
   import {
@@ -20,11 +19,10 @@
     invokeSyntax,
     pluginSections,
     shortName,
-    skillCounts,
     type SkillFilter,
     type SkillGroup,
   } from "./skillsModel";
-  import type { AgentId, Skill, SkillsReport } from "./store";
+  import { agentName, type AgentId, type Skill, type SkillsReport } from "./store";
 
   interface Props {
     report: SkillsReport | null;
@@ -52,28 +50,27 @@
   let builtinsAll = $state(new Set<string>());
   const BUILTIN_SHOWN = 18;
 
-  const AGENTS: AgentId[] = ["claude", "codex"];
+  const AGENTS = $derived(Object.keys(report?.agents ?? {}));
 
   const all = $derived(report?.skills ?? []);
-  const counts = $derived(skillCounts(all));
   const shown = $derived(filterSkills(all, filter, query));
   const groups = $derived(groupSkills(shown, host));
   /** claude reports its built-ins only while one of its chats runs: say so
    *  where they would be, and only then. */
   const claudeQuiet = $derived(
-    report !== null && report.agents.claude.available && !report.agents.claude.live && filter !== "codex" && query.trim() === "",
+    report !== null && report.agents.claude?.available && !report.agents.claude.live && (filter === "all" || filter === "claude") && query.trim() === "",
   );
   const hasClaudeBuiltins = $derived(groups.some((g) => g.key === "builtin-claude"));
 
   function builtinAgent(g: SkillGroup): AgentId {
-    return g.key === "builtin-codex" ? "codex" : "claude";
+    return g.key.slice("builtin-".length);
   }
 
   function abs(p: string): string {
     return p.startsWith("/") || p.startsWith("~") || wsRoot === null ? p : `${wsRoot}/${p}`;
   }
   function skillFile(s: Skill): string | null {
-    const p = s.paths.claude ?? s.paths.codex ?? null;
+    const p = Object.values(s.paths).find(Boolean) ?? null;
     if (p === null) return null;
     return p.endsWith("SKILL.md") ? p : `${p.replace(/\/$/, "")}/SKILL.md`;
   }
@@ -84,17 +81,18 @@
   }
   function errorsFor(s: Skill): string[] {
     if (report === null) return [];
-    const paths = [s.paths.claude, s.paths.codex].filter((p): p is string => !!p);
+    const paths = Object.values(s.paths).filter((p): p is string => !!p);
     return report.errors
       .filter((e) => e.path !== undefined && paths.some((p) => within(e.path!, p)))
-      .map((e) => `${e.agent}: ${e.message}`);
+      .map((e) => `${agentName(e.agent)}: ${e.message}`);
   }
   /** Load errors no listed skill claims (a SKILL.md too broken to list). */
   const strayErrors = $derived.by(() => {
     if (report === null) return [];
-    const claimed = all.flatMap((s) => [s.paths.claude, s.paths.codex].filter((p): p is string => !!p));
+    const claimed = all.flatMap((s) => Object.values(s.paths).filter((p): p is string => !!p));
     return report.errors.filter(
-      (e) => e.path === undefined || !claimed.some((p) => within(e.path!, p)),
+      (e) => (filter === "all" || e.agent === filter) &&
+        (e.path === undefined || !claimed.some((p) => within(e.path!, p))),
     );
   });
 
@@ -108,21 +106,21 @@
 </script>
 
 {#snippet row(s: Skill, name: string)}
-  {@const expanded = openName === s.name}
+  {@const expanded = openName === (s.id ?? s.name)}
   {@const errs = errorsFor(s)}
   <div class="skill" class:expanded>
-    <button class="shead" aria-expanded={expanded} onclick={() => (openName = expanded ? null : s.name)}>
+    <button class="shead" aria-expanded={expanded} onclick={() => (openName = expanded ? null : (s.id ?? s.name))}>
       <span class="sname" title={s.name}>{name}</span>
       <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
       <span class="sdesc">{@html inlineMarkdown(s.description)}</span>
       <span class="agents">
         {#if errs.length > 0}<span class="warnmark" title={errs.join("\n")}>!</span>{/if}
         {#each AGENTS as a (a)}
-          {@const st = s.agents[a]}
+          {@const st = s.agents[a] ?? {state: "absent"}}
           {#if st.state === "available"}
-            <span class="agent">{a}</span>
+            <span class="agent">{agentName(a)}</span>
           {:else if st.state === "off"}
-            <span class="agent off" title="{a}: {st.reason ?? 'present but not usable'}">{a}</span>
+            <span class="agent off" title="{a}: {st.reason ?? 'present but not usable'}">{agentName(a)}</span>
           {/if}
         {/each}
       </span>
@@ -136,15 +134,15 @@
         <dt>Use it</dt>
         <dd class="uses">
           {#each AGENTS as a (a)}
-            {@const st = s.agents[a]}
-            {#if st.state === "available"}
+            {@const st = s.agents[a] ?? {state: "absent"}}
+            {#if st.state === "available" && invokeSyntax(s, a)}
               <button class="use" title="Copy, then type it in {a}" onclick={() => copy(s, a)}>
-                <span class="uagent">{a}</span>
+                <span class="uagent">{agentName(a)}</span>
                 <span class="uinv">{invokeSyntax(s, a)}</span>
                 <span class="ucopy">{copied === `${s.name}:${a}` ? "copied" : "copy"}</span>
               </button>
-            {:else if st.state === "off"}
-              <span class="useoff"><span class="uagent">{a}</span>{st.reason ?? "present but not usable"}</span>
+            {:else if st.state === "off" || st.state === "available"}
+              <span class="useoff"><span class="uagent">{agentName(a)}</span>{st.reason ?? "present but not usable"}</span>
             {/if}
           {/each}
         </dd>
@@ -172,10 +170,14 @@
   {@const agent = builtinAgent(g)}
   {@const all = builtinsAll.has(g.key)}
   <div class="flow">
-    {#each all ? g.skills : g.skills.slice(0, BUILTIN_SHOWN) as s (s.name)}
-      <button class="bchip" title="{s.description || s.name} — click to copy" onclick={() => copy(s, agent)}>
-        {copied === `${s.name}:${agent}` ? "copied" : invokeSyntax(s, agent)}
-      </button>
+    {#each all ? g.skills : g.skills.slice(0, BUILTIN_SHOWN) as s, i (s.id ?? `${i}:${s.name}`)}
+      {#if invokeSyntax(s, agent)}
+        <button class="bchip" title="{s.description || s.name} — click to copy" onclick={() => copy(s, agent)}>
+          {copied === `${s.name}:${agent}` ? "copied" : invokeSyntax(s, agent)}
+        </button>
+      {:else}
+        <span class="bchip" title={s.agents[agent]?.reason ?? s.description}>{s.name}</span>
+      {/if}
     {/each}
     {#if g.skills.length > BUILTIN_SHOWN}
       <button
@@ -205,33 +207,30 @@
 {:else if status === "error" && report === null}
   <p class="empty"><span class="err">Couldn't ask the agents: {error}</span> <button class="link" onclick={onRefresh}>Try again</button></p>
 {:else if report === null}
-  <p class="empty">asking claude and codex…</p>
+  <p class="empty">Asking your agents…</p>
 {:else}
   <div class="bar">
-    <Segmented
-      label="Show skills for"
-      value={filter}
-      options={[
-        { value: "all", label: "All" },
-        { value: "claude", label: "claude" },
-        { value: "codex", label: "codex" },
-      ]}
-      onChange={(v) => (filter = v as SkillFilter)}
-    />
+    <label class="agent-filter">
+      <span class="sr">Show skills for</span>
+      <select aria-label="Show skills for" bind:value={filter}>
+        <option value="all">All agents</option>
+        {#each AGENTS as agent (agent)}<option value={agent}>{agentName(agent)}</option>{/each}
+      </select>
+    </label>
     <label class="search">
       <span class="sr">Search skills</span>
       <input type="search" placeholder="Search skills" bind:value={query} spellcheck="false" autocomplete="off" />
     </label>
     <span class="count">
-      {counts.total} skill{counts.total === 1 ? "" : "s"}
-      <span class="muted">· claude {counts.claude} · codex {counts.codex}</span>
+      {shown.length} skill{shown.length === 1 ? "" : "s"}
+
     </span>
   </div>
 
-  {#if !report.agents.claude.available && !report.agents.codex.available}
-    <p class="empty">Neither claude nor codex is installed on {host}, so there are no skills to list.</p>
+  {#if !Object.values(report.agents).some(a => a.available)}
+    <p class="empty">Install an agent on {host} to see its skills.</p>
   {:else if shown.length === 0}
-    <p class="empty">{query.trim() !== "" ? `No skill matches “${query.trim()}”.` : "No skills here yet."}</p>
+    <p class="empty">{query.trim() !== "" ? `No skill matches “${query.trim()}”.` : strayErrors.length > 0 ? "The skill list is incomplete." : "No skills here yet."}</p>
   {/if}
 
   {#each groups as g (g.key)}
@@ -251,22 +250,22 @@
               <span class="pname">{p.plugin}</span>
               <span class="hint"
                 >{p.skills.length} skill{p.skills.length === 1 ? "" : "s"}{p.agents.length > 0
-                  ? ` · ${p.agents.join(" and ")}`
+                  ? ` · ${p.agents.map(agentName).join(" · ")}`
                   : ""}</span
               >
             </div>
             <div class="list">
-              {#each p.skills as s (s.name)}
+              {#each p.skills as s, i (s.id ?? `${i}:${s.name}`)}
                 {@render row(s, shortName(s))}
               {/each}
             </div>
           </div>
         {/each}
-      {:else if g.key === "builtin-claude" || g.key === "builtin-codex"}
+      {:else if g.key.startsWith("builtin-")}
         {@render builtins(g)}
       {:else}
         <div class="list">
-          {#each g.skills as s (s.name)}
+          {#each g.skills as s, i (s.id ?? `${i}:${s.name}`)}
             {@render row(s, s.name)}
           {/each}
         </div>
@@ -279,9 +278,12 @@
 
   {#if strayErrors.length > 0}
     <section class="group">
-      <h3 class="ghead"><span class="lbl">Couldn't load</span><span class="hint">as the agents report it</span></h3>
+      <h3 class="ghead">
+        <span class="lbl">Couldn't load</span>
+        <button class="link" disabled={status === "loading"} onclick={onRefresh}>{status === "loading" ? "Checking…" : "Try again"}</button>
+      </h3>
       {#each strayErrors as e, i (i)}
-        <div class="errline">{e.agent}: {e.message}{#if e.path}<span class="fpath"> · {e.path}</span>{/if}</div>
+        <div class="errline">{agentName(e.agent)}: {e.message}{#if e.path}<span class="fpath"> · {e.path}</span>{/if}</div>
       {/each}
     </section>
   {/if}
@@ -296,9 +298,6 @@
   }
   .err {
     color: var(--err);
-  }
-  .muted {
-    color: var(--muted);
   }
   .sr {
     position: absolute;
@@ -351,6 +350,16 @@
     align-items: center;
     gap: 10px 14px;
     flex-wrap: wrap;
+  }
+  .agent-filter select {
+    max-width: 220px;
+    font: inherit;
+    font-size: var(--text-sm);
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--edge);
+    border-radius: 7px;
+    padding: 4px 28px 4px 10px;
   }
   .search {
     flex: 1 1 220px;
@@ -657,7 +666,17 @@
     .count {
       margin-left: 0;
     }
-    .search {
+    .agent-filter select {
+    max-width: 220px;
+    font: inherit;
+    font-size: var(--text-sm);
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--edge);
+    border-radius: 7px;
+    padding: 4px 28px 4px 10px;
+  }
+  .search {
       max-width: none;
       flex-basis: 100%;
       order: 3;

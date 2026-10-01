@@ -53,7 +53,8 @@ wakes row always shows.
 | `schema.ts` | The settings schema: keys, types, defaults, labels, groups. Ground truth. |
 | `store.svelte.ts` | The reactive settings store: load/patch/persist against `/api/v1/settings`, sparse-map semantics, the `dirtySince` echo-guard, and document-wide theme/interface/editor CSS variables. |
 | `themes.ts` | The curated light/dark theme definitions + `applyAppearance`. |
-| `AgentsSettings.svelte` | Per-agent binary/model settings (paths, managed installs). |
+| `AgentsSettings.svelte` | Agent readiness/install/update cards; Advanced paths and removal. Tracks installer exit, polls only while visible, preserves unfinished edits. |
+| `agentStatus.ts` | Honest update and installer status rules; unknown/failure never means up to date or installed. |
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
 | `DocumentsSettings.svelte` | The Documents panel: the opt-in AGENTS.md / Claude skill installs (see the exception above). |
