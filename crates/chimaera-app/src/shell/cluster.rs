@@ -1153,6 +1153,10 @@ pub(super) async fn cluster_peek(
     cluster::fetch_file(&alias, &path, &dest)
         .await
         .map_err(err)?;
+    // The daemon registers workspace roots canonically, and the page accepts
+    // `open=` only inside the root as written — both must agree.
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let dest = std::fs::canonicalize(&dest).unwrap_or(dest);
     let (port, token) = {
         let local = lock(&state.local);
         (local.port, local.token.clone())
