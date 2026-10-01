@@ -77,12 +77,16 @@
    *  is the upload-and-reference target (HTML5 dnd — no tile gesture to
    *  partition against). */
   const uploadPane = $derived(dropSpot?.kind === "upload" && dropSpot.paneId === node.id);
-  /** An OS-desktop file drag hovering a Finder pane: upload INTO the folder
+  /** An upload or in-app transfer hovering a Finder pane: land INTO the folder
    *  under the pointer. The pane only frames itself — the Finder lights the
    *  exact column or dir row `dir` names (see FinderView's dropDir). */
-  const uploadDir = $derived(dropSpot?.kind === "uploadDir" && dropSpot.paneId === node.id ? dropSpot.dir : null);
+  const folderDrop = $derived(
+    (dropSpot?.kind === "uploadDir" || (dropSpot?.kind === "fileOp" && dropSpot.blocked === null)) &&
+    dropSpot.paneId === node.id ? dropSpot : null,
+  );
+  const uploadDir = $derived(folderDrop?.dir ?? null);
   const uploadRow = $derived(
-    dropSpot?.kind === "uploadDir" && dropSpot.paneId === node.id && dropSpot.row,
+    folderDrop?.row ?? false,
   );
   /** The live session this pane shows, named as its tab is — so a drop band
    *  says WHICH session it targets ("@ reference in claude-1"), not just
@@ -409,6 +413,8 @@
         {wsRoot}
         dropDir={active ? uploadDir : null}
         dropOnRow={active && uploadRow}
+        dropAction={folderDrop?.kind === "fileOp" ? folderDrop.operation : "upload"}
+        onDragStart={ctrl.dragFileEntry}
         onOpenFile={(p: string, split: boolean) => ctrl.openFileFrom(node.id, p, split)}
         onNavigate={(p: string) => ctrl.navigateFinder(tab.id, p)}
       />
