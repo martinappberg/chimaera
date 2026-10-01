@@ -1,9 +1,9 @@
 <script lang="ts">
   /**
    * The Extensions tab (design §6; the layout surface, wire and store keep
-   * the id "plugins"): three equal segments — Plugins (chimaera's own
+   * the id "plugins"): Plugins (chimaera's own
    * plugins with Install / the switch and plain sentences, then the agent
-   * plugins each CLI reports), Skills (every skill each agent can use here),
+   * plugins each CLI reports), Connections, Skills (every skill each agent can use here),
    * Browse (later — rendered disabled, honestly). Per workspace, naming the
    * host, because plugins are installed per host. Agent state always comes
    * from the agents themselves (the daemon's probes), never re-derived here.
@@ -21,6 +21,7 @@
   import type { LayoutCtrl } from "../layout/dnd";
   import InstalledView from "./InstalledView.svelte";
   import SkillsView from "./SkillsView.svelte";
+  import ConnectionsView from "./ConnectionsView.svelte";
   import {
     agentInstallContinuation,
     agentPluginsRevision,
@@ -46,7 +47,8 @@
 
   let { dash, wsId, wsRoot, paneId, ctrl, visible = true }: Props = $props();
 
-  let view = $state<"plugins" | "skills" | "browse">("plugins");
+  let view = $state<"plugins" | "connections" | "skills" | "browse">("plugins");
+  let connectionsMounted = $state(false);
   /** Skills mounts on its first show and then stays, parked, like Plugins. */
   let skillsMounted = $state(false);
 
@@ -122,15 +124,16 @@
     <header class="head">
       <div class="titles">
         <h1>Extensions</h1>
-        <span class="chip mono" title="Plugins are installed per host">on {host}</span>
+        <span class="chip mono" title="Extensions and connections on this host">on {host}</span>
       </div>
-      <!-- Three equal segments: the wrapper sizes each to the widest. -->
+      <!-- Plugins stays first and selected by default. -->
       <div class="segs">
         <Segmented
           label="Extensions sections"
           value={view}
           options={[
             { value: "plugins", label: "Plugins" },
+            { value: "connections", label: "Connections" },
             { value: "skills", label: "Skills" },
             {
               value: "browse",
@@ -143,6 +146,7 @@
           onChange={(v) => {
             view = v as typeof view;
             if (v === "skills") skillsMounted = true;
+            if (v === "connections") connectionsMounted = true;
           }}
         />
       </div>
@@ -157,7 +161,7 @@
         </div>
       </div>
     {:else}
-      <!-- One scroller per view, both always present (Pane.svelte's layer
+      <!-- One scroller per view, all always present (Pane.svelte's layer
            idiom): a switch flips which one shows, so each keeps its scroll
            position — and Skills its filter and search — and no sibling is
            inserted beside the other's content. -->
@@ -179,6 +183,15 @@
             {wsId}
           />
         </div>
+      </div>
+      <div class="view" class:parked={view !== "connections"} inert={view !== "connections"}>
+        {#if connectionsMounted && wsId !== null}
+          <div class="inner">
+            {#key wsId}
+              <ConnectionsView {wsId} visible={visible && view === "connections"} />
+            {/key}
+          </div>
+        {/if}
       </div>
       <div class="view" class:parked={view !== "skills"} inert={view !== "skills"}>
         {#if skillsMounted}
@@ -263,7 +276,7 @@
     margin-left: auto;
   }
   /* Equal-width segments: a grid of 1fr columns sized to the widest
-     label — "Browse later", which is never the bold one, so the bar is as
+     label, so the bar is as
      wide in every view (Segmented stays the shared flex recipe elsewhere). */
   .segs :global(.seg) {
     display: grid;
@@ -272,7 +285,7 @@
   }
   /* Narrow: the title row over the bar — chosen by the tab's width alone,
      never by which view shows. 720px keeps a typical host name whole in the
-     one-row layout; below it the bar squeezes to equal thirds only when even
+     one-row layout; below it the bar squeezes to equal columns only when even
      its own width doesn't fit. */
   @container (max-width: 720px) {
     .head {
@@ -294,6 +307,16 @@
     .segs :global(.seg) {
       grid-auto-columns: minmax(0, 1fr);
     }
+  }
+
+  @container (max-width: 520px) {
+    .segs { width: 100%; }
+    .segs :global(.seg) {
+      grid-auto-flow: row;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .segs :global(.seg-btn:nth-child(3)) { border-left: 0; }
+    .segs :global(.seg-btn:nth-child(n + 3)) { border-top: 1px solid var(--edge); }
   }
 
   .body {

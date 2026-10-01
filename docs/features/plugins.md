@@ -1,6 +1,6 @@
 # Plugins & skills
 
-One **Extensions** tab, in three segments — **Plugins** · **Skills** · **Browse** — for two kinds
+One **Extensions** tab, in four segments — **Plugins** · **Connections** · **Skills** · **Browse** — for two kinds
 of add-on, different in who runs them: **workbench plugins** run in Chimaera (each a WebAssembly
 component the daemon runs in a sandbox, installed per host, opt-in per workspace, saying in words
 what it adds) and **agent plugins** run inside claude / codex (read from the agents themselves,
@@ -49,6 +49,45 @@ showing that workspace (no UI reads one yet).
 The additive `{"type":"agent_plugins","epoch":…}` frame invalidates agent reports after
 installation or hook trust and on reconnect; it carries no plugin payload.
 
+## Connections
+
+- **What & when.** The second segment lists configured MCP servers and installed hosted
+  connectors, separately for Claude Code and Codex in the current workspace on this host.
+  Plugins remains the default. Agent account login is outside this flow.
+- **How it's used.** Open Extensions → Connections. **Check again** refreshes the agents'
+  reports. **Sign in** opens a dialog with a browser authorization link, progress,
+  cancel and retry. Hosted Claude connectors offer **Set up**, with a dialog linking to
+  Claude's connector settings and a **Check connection** action after setup in the browser;
+  local MCP sign-ins accept the full callback URL from the browser when needed. The agent
+  still owns OAuth and credential storage. Hosted authorization is managed by the vendor,
+  not stored by chimaera on this host. Hosted connectors also offer **Manage** when
+  no setup is needed.
+- **Where it lives.** UI `plugins/ConnectionsView.svelte` and `plugins/connections.ts`;
+  daemon `agent_probe/connections.rs`. Bearer-authenticated routes:
+  `GET /workspaces/{id}/connections?refresh=true` and
+  `POST /workspaces/{id}/connections/login {agent,name}`; job status/cancel at
+  `GET/DELETE …/login/{attempt}`, callback input at `POST …/{attempt}/callback {url}`,
+  and hosted verification at `POST …/{attempt}/check`. Auth jobs live in
+  `agent_probe/connections/auth.rs`; the UI is `plugins/ConnectionDialog.svelte`.
+- **Key behaviors.** Claude's `mcp list` reports connection health. Codex's `mcp list --json`
+  reports configuration and credential status; **Configured** and **Signed in** do not
+  promise a live connection. Its `app/installed` snapshot reports effective availability
+  of ChatGPT apps; policy restrictions are not treated as expired authentication. Missing
+  or unsupported reports show an explicit error. No agent turn is started to list services.
+  Probes use the host + workspace Environment, share the daemon's single-flight gate,
+  cache for 60 seconds, cap output and rows, and time out. Endpoints, environment values,
+  credentials, and raw CLI errors never enter the report. Sign-in revalidates the selected
+  server and passes names as literal arguments. Its child process is cancelled on close,
+  timeout or daemon shutdown. Auth URLs exist only in memory during a bounded job; callback
+  input is never persisted or echoed in status. A fresh agent report must confirm completion before
+  the dialog says Connected. Existing sessions may need reconnection or reopening.
+  Claude's hosted "needs authentication" can also cover configuration errors or a connector
+  that hasn't been activated. The UI says **Setup needed in Claude** and opens its settings,
+  avoiding a forced OAuth flow for public connectors. Browser errors are only visible in
+  the vendor's page; the dialog explains where to review them and retains a settings action
+  after expiry or failure.
+  This first pass does not add/remove server configurations or implement a connector catalog.
+
 ## Workbench plugins
 
 - **What & when.** Opt-in capabilities that change what the UI or the agents get, off by
@@ -60,7 +99,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   ([below](#versions-installs--updates)).
 - **How it's used.** Open Extensions from the rail's **Extensions** row or quick-open
   ("Extensions"; "plugins" and "skills" find it too). Its header stays put across segments —
-  "Extensions" and a chip naming the host ("Plugins are installed per host") on the left, the
+  "Extensions" and a chip naming the host ("Extensions and connections on this host") on the left, the
   segments in the far corner (under the title when the tab is narrow) — and each segment
   scrolls on its own below it, keeping its place when you switch away and back. The **Plugins**
   segment opens with "Plugins add tools for your agents and views for you. Install one, then
@@ -757,6 +796,20 @@ installation or hook trust and on reconnect; it carries no plugin payload.
 > skill when a `feat:` ships in this area. **Never** inferred from code. Everything above
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
+
+### Connections — scope and placement
+_Captured 2026-09-30 from the maintainer's instructions in this chat._
+
+- **Problem it solves:** “We have the extensions page and I feel like those should
+  be there too so it is easy to know connectors and plugins, auth them etc.”
+- **Placement:** “connections should be second in the tab (more rarely used too)”;
+  Plugins includes Chimaera plugins and remains first.
+- **Deferred:** “I will fix the codex / claude auth flow after the PRO service is
+  done and merged.” This change covers connectors, not agent account sign-in.
+- **Sign-in UX:** after trying the first implementation, the maintainer asked, “do we
+  really want that flow to go through the terminal ?” and chose “Build the in-app MCP
+  sign-in dialog now.”
+- **How settled it is:** no additional permanence constraints captured.
 
 ### Plugins, Skills, hook trust & Agent notes — why it exists
 _Captured 2026-09-25 (from the maintainer, via capture-feature-intent)._

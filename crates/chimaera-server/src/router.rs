@@ -195,6 +195,26 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         )
         .route("/workspaces/{id}/skills", get(agent_probe::skills))
         .route(
+            "/workspaces/{id}/connections",
+            get(agent_probe::connections::list),
+        )
+        .route(
+            "/workspaces/{id}/connections/login",
+            post(agent_probe::connections::login),
+        )
+        .route(
+            "/workspaces/{id}/connections/login/{attempt}",
+            get(agent_probe::connections::status).delete(agent_probe::connections::cancel),
+        )
+        .route(
+            "/workspaces/{id}/connections/login/{attempt}/callback",
+            post(agent_probe::connections::input),
+        )
+        .route(
+            "/workspaces/{id}/connections/login/{attempt}/check",
+            post(agent_probe::connections::check),
+        )
+        .route(
             "/workspaces/{id}/knowledge",
             get(crate::knowledge::get_knowledge),
         )

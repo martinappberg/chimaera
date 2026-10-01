@@ -219,6 +219,27 @@ the lifecycle, keep them consistent:
 
 ## Invariants / gotchas
 
+- **Connector inventory stays with the agent.** `agent_probe/connections.rs`
+  serves `GET /workspaces/{id}/connections` and `POST …/connections/login`.
+  Claude's `mcp list`, Codex's `mcp list --json` and `app/installed` run under
+  the workspace Environment with the shared probe gate/cache, process-group
+  cleanup, output/row caps and a 60-second budget including queue time. Reports
+  whitelist names/statuses only; no endpoints, environment values or raw errors.
+  Connector sign-in (`connections/auth.rs`) is a bounded in-memory job, never a
+  terminal. `POST …/connections/login {agent,name}` revalidates the report and
+  starts the CLI's `mcp login --no-browser` for local MCP servers; hosted Claude
+  connectors instead open Claude's connector settings (no forced OAuth).
+  `GET/DELETE …/login/{attempt}` reads
+  or cancels it, `POST …/{attempt}/callback {url}` feeds one callback line, and
+  `POST …/{attempt}/check` checks hosted authorization. All are workspace-scoped
+  and bearer-authenticated. URLs are transient, no-store, cleared at completion;
+  raw output and callbacks never reach logs/reports. Jobs expire at ten minutes,
+  output is capped at 64 KiB, and process groups die on cancel/timeout/shutdown.
+  Hosted "needs authentication" can mean setup or configuration failure, including
+  a public connector that needs no OAuth. Only a fresh connection report proves
+  success; browser error pages cannot be observed by the daemon. Provider account
+  login remains separate.
+
 - **Agent-plugin installs keep their result visible.** `plugins/install-agent.sh`
   receives metadata and the executable path as positional arguments; never
   splice them into shell source. The 8th argument is the directory of the git
