@@ -20,7 +20,7 @@ tracing.workspace = true
 rust-embed.workspace = true
 mime_guess.workspace = true
 hostname.workspace = true
-nix.workspace = true
+nix = { workspace = true, features = ["term"] }
 rustix = { workspace = true, features = ["process"] }
 chimaera-agent.workspace = true
 chimaera-core.workspace = true

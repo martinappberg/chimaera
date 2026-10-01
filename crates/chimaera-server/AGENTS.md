@@ -253,6 +253,30 @@ the lifecycle, keep them consistent:
   flags it "opened here" (`pro::note_opened`) so the cloud project can come
   home to this computer ([`pro/AGENTS.md`](src/pro/AGENTS.md), "Who a project
   returns to").
+- **Connector inventory stays with the agent.** `agent_probe/connections.rs`
+  serves `GET /workspaces/{id}/connections` and `POST …/connections/login`.
+  Claude's `mcp list`, Codex's `mcp list --json` and `app/installed` run under
+  the workspace Environment with the shared probe gate/cache, process-group
+  cleanup, output/row caps and a 60-second budget including queue time. Reports
+  whitelist names/statuses only; no endpoints, environment values or raw errors.
+  Connector sign-in (`connections/auth.rs`) is a bounded in-memory job, never a
+  workbench terminal session. Claude requires an internal PTY for input and output even with
+  `--no-browser` (`connections/auth_pty.rs`); nonblocking I/O is cancellable, raw
+  input avoids canonical line truncation, and output is private and capped. Codex
+  accepts pipes. Neither transport creates a terminal pane or persists output.
+  `POST …/connections/login {agent,name}` revalidates the report and
+  starts the CLI's `mcp login --no-browser` for local MCP servers; hosted Claude
+  connectors instead open Claude's connector settings (no forced OAuth).
+  `GET/DELETE …/login/{attempt}` reads
+  or cancels it, `POST …/{attempt}/callback {url}` feeds one callback line, and
+  `POST …/{attempt}/check` checks hosted authorization. All are workspace-scoped
+  and bearer-authenticated. URLs are transient, no-store, cleared at completion;
+  raw output and callbacks never reach logs/reports. Jobs expire at ten minutes,
+  output is capped at 64 KiB, and process groups die on cancel/timeout/shutdown.
+  Hosted "needs authentication" can mean setup or configuration failure, including
+  a public connector that needs no OAuth. Only a fresh connection report proves
+  success; browser error pages cannot be observed by the daemon. Provider account
+  login remains separate.
 
 - **Agent-plugin installs keep their result visible.** `plugins/install-agent.sh`
   receives metadata and the executable path as positional arguments; never
