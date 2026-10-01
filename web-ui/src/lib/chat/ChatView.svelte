@@ -1996,8 +1996,7 @@
 
   /** Extended-thinking toggle (claude). ON by default — chimaera's chat is a
    *  workbench for real coding work, where the reasoning pass earns its keep;
-   *  the chip shows an explicit on/off and tints when on, so the state (and the
-   *  cost) is never hidden, and one click turns it off. The preference lives in
+   *  Chat options shows an explicit on/off beside the toggle. The preference lives in
    *  the pooled store, not here, so a tab remount keeps it. */
   const hasThinking = $derived(agentKind === "claude");
   /** Effective thinking state: the user's explicit choice, or ON by default
@@ -3234,6 +3233,7 @@
      padding rides OUTSIDE the measure so text edges line up with it. */
   .chat > :global(.composer),
   .chat > .suggestion-row,
+  .chat > .branch-line,
   /* Every pinned strip (subagents, background, plan) — they were full-bleed
      while the plan alone was inset, so the group never lined up. */
   .chat > :global(.tray) {
@@ -3677,7 +3677,7 @@
     justify-content: space-between;
     gap: 12px;
     min-width: 0;
-    padding: 4px 14px 0;
+    padding-top: 4px;
   }
   .branch-slot {
     display: inline-flex;

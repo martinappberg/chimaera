@@ -225,7 +225,6 @@
   <div class="menu-host extras">
     <button class="chip more" title="Chat options" aria-label="Chat options" aria-haspopup="menu"
       aria-expanded={menu === "options" || menu === "remote"}
-      class:on={store.ultracode || thinking || rcState === "connected"}
       onclick={() => (menu = menu === "options" ? null : "options")}>
       <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><circle cx="3" cy="8" r="1.2" /><circle cx="8" cy="8" r="1.2" /><circle cx="13" cy="8" r="1.2" /></svg>
     </button>
@@ -399,12 +398,6 @@
     background: var(--pane-control-hover);
   }
   .mode-picker .chip, .effort-picker .chip { color: var(--muted); }
-  /* Keep active session options discoverable even with the menu closed. */
-  .chip.on {
-    color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
-  }
   .caret {
     flex: none;
     display: inline-flex;
