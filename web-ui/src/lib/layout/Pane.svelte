@@ -17,6 +17,7 @@
     requestAssetReload,
   } from "./assetTransition";
   import Spinner from "../previews/Spinner.svelte";
+  import { findTargetsChanged, targetIn } from "../shared/find";
   import type { DashCtx } from "../dashboard/dash";
 
   interface Props {
@@ -62,6 +63,12 @@
 
   const focused = $derived(node.id === focusedPaneId);
   const activeTab = $derived(node.tabs[node.active] ?? null);
+  let canFind = $state(false);
+  $effect(() => {
+    void $findTargetsChanged;
+    void activeTab;
+    canFind = targetIn(contentEl?.querySelector(".layer.active") ?? null) !== null;
+  });
   /** Edge/center drop-zone preview for THIS pane, if a drag hovers it. */
   const zone = $derived(
     dropSpot?.kind === "zone" && dropSpot.paneId === node.id ? dropSpot.zone : null,
@@ -586,6 +593,10 @@
     {dropSpot}
     {ctrl}
     bind:el={tabbarEl}
+    onFind={canFind ? () => {
+      ctrl.focusPane(node.id);
+      targetIn(contentEl?.querySelector(".layer.active") ?? null)?.("open");
+    } : undefined}
   />
   <div class="content" bind:this={contentEl}>
     <!-- Retained file/workbench/chat views stay mounted with the active one

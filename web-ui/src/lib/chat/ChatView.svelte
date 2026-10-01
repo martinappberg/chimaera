@@ -31,6 +31,7 @@
   import { dismiss } from "../shared/dismiss";
   import { formatElapsedSeconds, messageTimestampRefreshIn } from "../shared/time";
   import ChatHeader from "./ChatHeader.svelte";
+  import ChatFind from "./ChatFind.svelte";
   import Markdown from "./Markdown.svelte";
   import UserText from "./UserText.svelte";
   import ThoughtRow from "./ThoughtRow.svelte";
@@ -1129,6 +1130,25 @@
       });
     }
     scheduleScrollIdle();
+  }
+
+  async function revealFindMessage(uid: number): Promise<HTMLElement | null> {
+    const index = store.blocks.findIndex((block) => block.uid === uid);
+    if (index < 0 || !visible || transcriptEl === null) return null;
+    atBottom = false;
+    pagingTranscript = true;
+    const page = pageAround(index, store.blocks.length);
+    const tail = page.end >= store.blocks.length;
+    setRange(page.start, page.end, { live: tail, tail });
+    await tick();
+    if (!visible) { pagingTranscript = false; return null; }
+    const row = columnEl?.querySelector<HTMLElement>(`[data-block-uid="${uid}"]`) ?? null;
+    if (row !== null && transcriptEl !== null) {
+      transcriptEl.scrollTop += row.getBoundingClientRect().top - transcriptEl.getBoundingClientRect().top - 24;
+      pinReadingAnchor();
+    }
+    afterPaging();
+    return row;
   }
 
   function revealEarlier() {
@@ -2497,6 +2517,9 @@
     onInterrupt={interrupt}
     onSetRemoteControl={setRemoteControl}
   />
+
+  <ChatFind target={chatEl} blocks={() => store.blocks} revision={store.transcriptVersion} {visible}
+    trimmed={store.trimmedCount > 0} reveal={revealFindMessage} />
 
   <!-- Focusable so keyboard scrolling works in WKWebView (Safari never
        auto-focuses scrollers); role="log" announces new agent output. The

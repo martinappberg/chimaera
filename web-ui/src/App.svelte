@@ -123,6 +123,7 @@
   import { provenanceFor, rememberCopy } from "./lib/shared/provenance";
   import { asyncDisposer } from "./lib/shared/asyncDisposer";
   import { modalFocus, modalOpen } from "./lib/shared/modalFocus";
+  import { findInFocusedPane, findLayer, findNavigation, targetIn } from "./lib/shared/find";
   import {
     activateTab,
     adjacentPane,
@@ -2739,6 +2740,19 @@
     }
     if (quickOpenOpen) return;
 
+    if (hit?.id === "find") {
+      if (!e.isComposing && findInFocusedPane("open")) intercept();
+      return;
+    }
+    if (hit === null) {
+      const terminal = findLayer()?.querySelector(":scope > .term-view") != null;
+      const command = findNavigation(e, terminal);
+      if (command !== null && findInFocusedPane(command)) {
+        intercept();
+        return;
+      }
+    }
+
     if (hit === null) {
       // Context bridge: reference the current selection in the target agent.
       // Spec-pinned chord — ⇧⌘R / Ctrl+Shift+R. Intercepts only while a
@@ -3466,6 +3480,14 @@
   // Knowledge is offered only while a knowledge plugin is on here (it is
   // that plugin's view; without one there is nothing to open).
   const quickOpenCommands = $derived([
+    { id: "find", label: "Find in current pane", aliases: ["search"], hint: keyHint("find"), run: () => {
+      const pane = quickOpenRestoreEl?.closest(".pane");
+      const find = targetIn(pane?.querySelector<HTMLElement>(".layer.active") ?? findLayer());
+      quickOpenRestoreEl = null;
+      void tick().then(() => {
+        if (!find?.("open")) showFlash("Find is not available in this view.");
+      });
+    } },
     { id: "timeline", label: "Timeline", hint: "what happened", run: openTimelineSurface },
     {
       id: "sessions",

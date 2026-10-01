@@ -87,6 +87,7 @@
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import Chevron from "../shared/Chevron.svelte";
   import Spinner from "./Spinner.svelte";
+  import DocumentFind from "../shared/DocumentFind.svelte";
   import DocIssues from "./DocIssues.svelte";
   import PublishButton from "./PublishButton.svelte";
   import { HoverPreviews } from "./doc/hoverController.svelte";
@@ -1553,6 +1554,7 @@
     >
   </div>
 
+  <DocumentFind target={readingEl} enabled={render} />
   <div class="md-main">
     <!-- Delegated link handling: the interactive targets are the rendered
          document's own <a> elements, which are already focusable and fire a

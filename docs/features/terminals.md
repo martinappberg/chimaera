@@ -58,6 +58,23 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
   burst absorber for a visible attachment on a slow link, whose `Lagged` costs an uncapped
   scrollback repaint down that same link).
 
+## Find in scrollback
+
+`Mod+F` or the pane's magnifier searches the terminal's retained screen and
+scrollback with literal text, optional case matching, match counts, highlights,
+and wrapping previous/next navigation. It works on shell and agent TUI sessions.
+The search panel belongs to the view and is disposed on close/tab departure;
+the pooled terminal and daemon session stay alive. Search-created selections do
+not copy to the clipboard or become agent references. A hidden window suspends
+the search addon and refreshes the query when shown again. xterm's search addon caps
+highlighted/countable matches at 1,000 (the count shows `+` at that threshold).
+A TUI's alternate screen exposes only the text it retains; this is not a search
+of the agent's full conversation history.
+
+Implementation: `Terminal.svelte`, `termPool.ts` / `termPoolRuntime.ts`, and the
+official `@xterm/addon-search`; shared routing is described in
+[workbench](workbench.md#find-in-the-current-pane). All search work is client-side.
+
 ## Warm terminal pool (client)
 
 - **What & when.** Each session keeps one long-lived xterm instance + open socket that survive
