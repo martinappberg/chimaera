@@ -93,19 +93,24 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   search retained message text, including messages outside the rendered window
   (not tool output). Markdown searches expanded document text, materializing
   windowed paragraphs while find is open. Each search shows its own scope and
-  any result limit. Unsupported surfaces retain their ordinary key handling.
+  any result limit. Shared Find controls keep the query and match navigation on one row,
+  with scope and result count below it, so narrow panes never wrap buttons into the tab row.
+  Unsupported surfaces retain their ordinary key handling.
 
 ## Splitting, tabs & drag-and-drop
 
 - **What & when.** Divide any pane row/column (recursively) to see surfaces side by side; each
   pane is a tab stack.
-- **How it's used.** Split via the pane-bar buttons, `Mod+D` (right) / `Mod2+D` (down), or drag
+  In the sidebar, an agent working in a linked worktree shows its branch on a secondary
+  line, with the full branch and path on hover. Agents in the main checkout have no branch line.
+- **How it's used.** Split via **Pane actions** (the tab bar’s ellipsis menu), `Mod+D` (right) / `Mod2+D` (down), or drag
   a tab to a pane edge. Drag the divider to reratio (double-click snaps 50/50; Escape restores).
   Open a surface → it appends a tab to the focused pane (VS Code "no duplicates": if already
   open anywhere, that tab is focused). Middle-click or `×` closes a tab (**detaches the view —
-  never kills the session**). `Mod+Alt+[`/`]` cycle tabs. Drag a tab to reorder within a bar,
+  never kills the session**). `Mod+Alt+[`/`]` cycle tabs. Tab focuses the selected tab;
+  Left/Right and Home/End activate and reveal tabs without moving focus into the document. Drag a tab to reorder within a bar,
   move to another pane, tear off into a split, or slam a **window edge** to split the whole window.
-  A **pane grip** (a small window icon) fades in at the top-left of the tab strip on hover; drag
+  A **pane grip** (six dots) sits with the actions at the right of the tab strip; drag
   it to move the **whole pane** (all its tabs) to another split — center merges, edges tear a
   split, a window edge re-roots — or drag it past the window edge to tear the whole pane out
   into its own window. It hides only while the pane is zoomed (a single-pane window's grip
@@ -126,7 +131,10 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   their hover/active visibility, with an unread dot in the same slot on inactive agent tabs. Adjacent
   tabs are separated by a hairline and the
   active tab carries a thin accent underline; a tab drag hovering near either edge of an
-  overflowed strip auto-scrolls it.
+  overflowed strip auto-scrolls it. The tab row is 28px high and starts flush with the
+  pane edge, with no reserved drag-handle gutter. Find and zoom stay directly
+  reachable, while split, text size/reset, and close-view actions share **Pane actions**.
+  In narrow panes, changed-file summaries are also available in that menu.
 - **Preview (italic) tabs.** File opens are **preview** tabs, VS Code-style: the name renders
   italic, opening another file **replaces** the one preview slot per pane (so single-clicking
   through files doesn't pile up tabs), and it **pins** (non-italic, permanent) on a
@@ -152,7 +160,7 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   (`add to this pane` over a tab strip too — the caret says where — plus `@ reference in
   ⟨session⟩`, `link to ⟨agent⟩`) — quiet for tile moves, accent for reference/link/out. One
   vocabulary, one source: `zoneWord`/`sideWord` in `dnd.ts` feed both the ghost and the pane
-  previews and match the pane-bar split buttons; `DragOptions.describe` lets App supply session
+  previews and match the pane-bar split actions; `DragOptions.describe` lets App supply session
   names and `dnd.ts` falls back to generic text, written only on a spot change. A tab-strip drop
   anchors only to the tabs in view — the scrolled-away run under the strip's controls is never
   a target — and lands after the last visible tab past them.

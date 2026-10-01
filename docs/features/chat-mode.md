@@ -154,8 +154,16 @@ verified. See [integration design](../agent-harness-design.md) for the plugin bo
 
 ## Header controls
 
-- **Model / effort / mode / thinking / ultracode pickers.** Click a header chip (or `/model`,
-  `/effort`, `/mode`) to switch. The agent's *live* catalog (claude `initialize.models` / codex
+- **Model / effort / mode / thinking / ultracode pickers.** Model, permission mode, and
+  effort are direct header selectors (also `/model`, `/effort`, `/mode`). Thinking and
+  ultracode live in **Chat options** (the ellipsis). The header is one 30px row at wide
+  widths, or two fixed rows below 480px: session/status above, selectors below. Long labels
+  truncate with their full value in the tooltip and accessible name. Usage-limit warnings
+  (80%+ or reached) and high context usage (80%+) remain visible in the header, including
+  narrow panes. Stop appears only during a turn or compaction. Pickers open at the
+  current choice; the effort selector keeps its connected faster-to-smarter scale. Arrow keys
+  and Home/End move focus, Enter selects, and Escape returns
+  focus to the trigger. The agent's *live* catalog (claude `initialize.models` / codex
   `model/list`) beats the daemon's curated list — and once any chat of that agent has handshaked,
   `GET /api/v1/agents` serves that live catalog for launch-time choices too (fallback: `fable`,
   `opus`, `sonnet`, `haiku`; `gpt-6-astra`, `gpt-5.6-sol`). Claude's bracketed ids (`opus[1m]`,
@@ -199,16 +207,16 @@ verified. See [integration design](../agent-harness-design.md) for the plugin bo
   effort and mode (the journal index carries them per native conversation, since neither agent
   rehydrates them from its history); the prefs only fill in what that chat never carried. This
   mirrors the official TUIs, which persist the same choices in their config.
-- **Remote Control (claude).** The header's **remote** chip turns on Claude Code's own Remote
+- **Remote Control (claude).** **Chat options → Remote Control** turns on Claude Code's own Remote
   Control bridge for this session — the same `remote_control` control the official VS Code and
   Desktop hosts use — so you can pick the conversation up in the Claude mobile app or at
   claude.ai/code while it keeps running on the daemon's host (an HPC login node included). The
-  chip's dot reads off / connecting (breathing) / on (accent) / failed (warn); its popover carries
+  popover's dot reads off / connecting (breathing) / on (accent) / failed (warn); it carries
   **Open on claude.ai/code**, **Copy session link**, and the on/off action, or the CLI's own
   refusal sentence (no claude.ai subscription, org policy, nested remote session). `/remote-control`
   and `/rc` toggle it (`on`/`off` pin a direction). The state is journaled (`remote_control`
   events, latest-wins), so reconnects and replays agree; the bridge is process-owned — a respawn,
-  view toggle, or exit switches it off and the chip says so. The session rail shows a small
+  view toggle, or exit switches it off and the options menu says so. The session rail shows a small
   **remote** pill while the bridge is up. A message sent from a phone shows a **via Remote
   Control** tag under its bubble (unverified end to end — see PROTOCOL.md Pass 30). The daemon
   setting **Remote Control at Start (Claude)** (`chat.remoteControlAtStart`, default off) turns it

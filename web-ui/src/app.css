@@ -648,3 +648,12 @@ body.dragging {
   outline-offset: 3px;
   border-radius: 4px;
 }
+
+/* Pane chrome uses one rhythm in both themes and at every split width. */
+:root {
+  --pane-tab-height: 28px;
+  --pane-toolbar-height: 30px;
+  --pane-control-size: 24px;
+  --pane-control-hover: color-mix(in srgb, var(--fg) 5%, transparent);
+  --pane-control-selected: color-mix(in srgb, var(--fg) 8%, transparent);
+}
