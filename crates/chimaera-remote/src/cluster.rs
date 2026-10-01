@@ -1749,6 +1749,23 @@ async fn host_request(
 }
 
 /// `GET /api/v1/job`.
+/// Where workspace `wid` listens in job `jid`, from that job's own job-host
+/// (never the shared filesystem, which can show a new manifest on the login
+/// node only a minute later). `None` until it is open.
+pub fn endpoint_from(status: &JobHostStatus, jid: &str, wid: &str) -> Option<Endpoint> {
+    let w = status
+        .workspaces
+        .iter()
+        .find(|w| w.id == wid && w.state == HostedState::Open)?;
+    Some(Endpoint {
+        job: jid.to_string(),
+        slurm_job_id: status.slurm_job_id.clone(),
+        node: status.node.clone(),
+        port: w.port?,
+        token: w.token.clone()?,
+    })
+}
+
 pub async fn host_status(local_port: u16, token: &str) -> anyhow::Result<JobHostStatus> {
     let (status, body) = host_request(local_port, token, "GET", "/api/v1/job", 8).await?;
     anyhow::ensure!(status == 200, "the job answered HTTP {status}");

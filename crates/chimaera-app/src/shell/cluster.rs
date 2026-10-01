@@ -49,6 +49,8 @@ pub(crate) struct ClusterLive {
     /// Workspaces on their way from the job in `last_ws` to another (a move,
     /// or a job continuing in a new one): their windows wait, then follow.
     moving: HashSet<String>,
+    /// When this app last opened each workspace's window (see [`OPEN_GRACE`]).
+    opened_at: HashMap<String, Instant>,
     /// One notification per (kind, job).
     notified: HashSet<String>,
     /// Slurm start estimates for waiting jobs, asked at most every 5 min.
@@ -66,6 +68,11 @@ pub(crate) struct ClusterInfo {
     pub(crate) scheduler: chimaera_core::slurm::Scheduler,
     pub(crate) login_daemon: Option<chimaera_remote::LoginDaemon>,
 }
+
+/// How long a window just opened is taken as open whatever the cluster
+/// folder says: a manifest written on the compute node can take a minute to
+/// show on the login node (the shared filesystem's attribute cache).
+const OPEN_GRACE: Duration = Duration::from_secs(120);
 
 fn home() -> RemoteHome {
     RemoteHome::current()
@@ -346,6 +353,13 @@ async fn absorb(app: &AppHandle, alias: &str, ov: &ClusterOverview) {
                     if c.notified.insert(told_moving) {
                         ended.push((key, "moving".into()));
                     }
+                }
+                None if old_running
+                    && c.opened_at
+                        .get(&wid)
+                        .is_some_and(|at| at.elapsed() < OPEN_GRACE) =>
+                {
+                    next_ws.insert(wid.clone(), old_job.clone());
                 }
                 None if old_running => {
                     let failed = ov
@@ -1058,7 +1072,14 @@ async fn host_port(app: &AppHandle, alias: &str, jid: &str) -> Result<(u16, Stri
 }
 
 /// Ask job `jid` to open workspace `wid` and wait (bounded) until it's open.
-async fn open_in_job(app: &AppHandle, alias: &str, jid: &str, wid: &str) -> Result<(), String> {
+/// Where it listens comes from job-host itself, never the shared filesystem
+/// (a new manifest can take a minute to show on the login node).
+async fn open_in_job(
+    app: &AppHandle,
+    alias: &str,
+    jid: &str,
+    wid: &str,
+) -> Result<cluster::Endpoint, String> {
     let (port, token) = host_port(app, alias, jid).await?;
     match cluster::host_open(port, &token, wid).await.map_err(err)? {
         HostOpen::Opened(_) => {}
@@ -1071,8 +1092,10 @@ async fn open_in_job(app: &AppHandle, alias: &str, jid: &str, wid: &str) -> Resu
     let started = Instant::now();
     loop {
         let status = cluster::host_status(port, &token).await.map_err(err)?;
+        if let Some(endpoint) = cluster::endpoint_from(&status, jid, wid) {
+            return Ok(endpoint);
+        }
         match status.workspaces.iter().find(|w| w.id == wid) {
-            Some(w) if w.state == HostedState::Open && w.port.is_some() => return Ok(()),
             Some(w) if w.state == HostedState::Failed => {
                 return Err(format!(
                     "It didn't start:\n{}",
@@ -1178,6 +1201,7 @@ async fn open_ws_window(
         let mut clusters = lock(&shell.clusters);
         let c = clusters.entry(alias.to_string()).or_default();
         c.last_ws.insert(wid.to_string(), endpoint.job.clone());
+        c.opened_at.insert(wid.to_string(), Instant::now());
     }
     let _ = app.emit(
         "host-status",
@@ -1230,15 +1254,7 @@ pub(super) async fn cluster_open(
         ("queued", _, _) if !view.opening => {
             return Err(format!("{} opens when its job starts", view.name));
         }
-        (_, _, Some(jid)) => {
-            open_in_job(&app, &alias, &jid, &workspace_id).await?;
-            let ov = fresh_overview(&alias).await?;
-            absorb(&app, &alias, &ov).await;
-            ov.endpoints
-                .get(&workspace_id)
-                .cloned()
-                .ok_or_else(|| format!("{} isn't open yet — try again in a moment", view.name))?
-        }
+        (_, _, Some(jid)) => open_in_job(&app, &alias, &jid, &workspace_id).await?,
         (_, _, None) => return Err(format!("{} isn't open in a job", view.name)),
     };
     let _ = app.emit("cluster-changed", json!({ "alias": alias }));
@@ -1331,13 +1347,8 @@ pub(super) async fn cluster_move(
                 .map_err(err)?;
         }
         let _ = app.emit("cluster-changed", json!({ "alias": alias }));
-        open_in_job(&app, &alias, &job_id, &workspace_id).await?;
+        let endpoint = open_in_job(&app, &alias, &job_id, &workspace_id).await?;
         let ov = fresh_overview(&alias).await?;
-        let endpoint = ov
-            .endpoints
-            .get(&workspace_id)
-            .cloned()
-            .ok_or("it moved but isn't reachable yet — open it again in a moment")?;
         Ok::<_, String>((ov, endpoint))
     }
     .await;

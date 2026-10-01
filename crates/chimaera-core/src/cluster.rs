@@ -233,6 +233,11 @@ pub struct HostedWorkspace {
     /// Agents working right now (the page's "2 chats working").
     #[serde(default)]
     pub working: u32,
+    /// Its chimaera's token, once open: job-host reads it where it was
+    /// written, so a client never waits for the shared filesystem to show
+    /// the new manifest on the login node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub detail: String,
 }

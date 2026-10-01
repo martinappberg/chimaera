@@ -356,8 +356,8 @@ async fn status(host: &Host) -> JobHostStatus {
                 id: id.clone(),
                 state: h.state,
                 port: h.port,
-                working: 0,
                 detail: h.detail.clone(),
+                ..Default::default()
             })
             .collect();
         list.sort_by(|a, b| a.id.cmp(&b.id));
@@ -365,8 +365,15 @@ async fn status(host: &Host) -> JobHostStatus {
     };
     let counts = futures::future::join_all(snapshot.iter().map(|w| async {
         match (w.state, w.port) {
-            (HostedState::Open, Some(port)) => working_agents(&host.cluster_dir, &w.id, port).await,
-            _ => 0,
+            (HostedState::Open, Some(port)) => {
+                let token = manifest_token(&host.cluster_dir, &w.id).await;
+                let working = match &token {
+                    Some(token) => working_agents(port, token).await,
+                    None => 0,
+                };
+                (working, token)
+            }
+            _ => (0, None),
         }
     }))
     .await;
@@ -377,33 +384,37 @@ async fn status(host: &Host) -> JobHostStatus {
         workspaces: snapshot
             .into_iter()
             .zip(counts)
-            .map(|(mut w, n)| {
-                w.working = n;
+            .map(|(mut w, (working, token))| {
+                w.working = working;
+                w.token = token;
                 w
             })
             .collect(),
     }
 }
 
-/// Agents working right now in one open workspace — asked of its own
-/// chimaera on this node, bounded; 0 when it doesn't answer.
-async fn working_agents(cluster_dir: &Path, wid: &str, port: u16) -> u32 {
+/// An open workspace's token, from the manifest its chimaera wrote on this
+/// node.
+async fn manifest_token(cluster_dir: &Path, wid: &str) -> Option<String> {
     let manifest = cluster_dir
         .join("w")
         .join(wid)
         .join("data")
         .join("manifest.json");
-    let Some(token) = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         read_json::<chimaera_core::Manifest>(&manifest).map(|m| m.token)
     })
     .await
     .ok()
-    .flatten() else {
-        return 0;
-    };
+    .flatten()
+}
+
+/// Agents working right now in one open workspace — asked of its own
+/// chimaera on this node, bounded; 0 when it doesn't answer.
+async fn working_agents(port: u16, token: &str) -> u32 {
     let body = tokio::time::timeout(
         Duration::from_millis(1500),
-        local_get(port, "/api/v1/sessions", &token),
+        local_get(port, "/api/v1/sessions", token),
     )
     .await
     .ok()
@@ -519,8 +530,8 @@ async fn open(host: &Arc<Host>, wid: &str) -> Result<HostedWorkspace, OpenError>
                         id: wid.to_string(),
                         state: h.state,
                         port: h.port,
-                        working: 0,
                         detail: h.detail.clone(),
+                        ..Default::default()
                     })
                 }
                 HostedState::Closing => return Err(OpenError::Closing),
@@ -725,9 +736,7 @@ async fn spawn_workspace(
     Ok(HostedWorkspace {
         id: wid.to_string(),
         state: HostedState::Starting,
-        port: None,
-        working: 0,
-        detail: String::new(),
+        ..Default::default()
     })
 }
 

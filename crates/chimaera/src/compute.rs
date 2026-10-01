@@ -113,13 +113,15 @@ async fn host_tunnel(
 }
 
 /// Ask a job to open a workspace and wait (bounded) until it's open.
+/// Ask job `jid` to open workspace `wid` and wait until it listens; where it
+/// listens comes from job-host itself.
 async fn open_in(
     host: &str,
     ov: &ClusterOverview,
     jid: &str,
     wid: &str,
     name: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<cluster::Endpoint> {
     let (tunnel, token) = host_tunnel(host, ov, jid).await?;
     let result = async {
         match cluster::host_open(tunnel.local_port, &token, wid).await? {
@@ -131,8 +133,10 @@ async fn open_in(
         let mut told = false;
         loop {
             let status = cluster::host_status(tunnel.local_port, &token).await?;
+            if let Some(endpoint) = cluster::endpoint_from(&status, jid, wid) {
+                return Ok(endpoint);
+            }
             match status.workspaces.iter().find(|w| w.id == wid) {
-                Some(w) if w.state == HostedState::Open && w.port.is_some() => return Ok(()),
                 Some(w) if w.state == HostedState::Failed => {
                     bail!("{name} didn't start:\n{}", w.detail)
                 }
@@ -409,22 +413,25 @@ async fn submit(
 pub async fn open(host: &str, which: &str, job: Option<&str>, no_open: bool) -> anyhow::Result<()> {
     let host = slurm_host(host).await?;
     let home = RemoteHome::current();
-    let mut ov = cluster::overview(&host, home).await?;
+    let ov = cluster::overview(&host, home).await?;
     let view = pick_ws(&ov, which)?.clone();
-    if view.state != "open" {
-        anyhow::ensure!(
-            view.state == "closed",
-            "{} opens when its job starts — `chimaera compute jobs {host}` to watch",
-            view.name
-        );
-        let target = running_job(&ov, job, &host)?.id.clone();
-        open_in(&host, &ov, &target, &view.id, &view.name).await?;
-        ov = cluster::overview(&host, home).await?;
-    }
-    let endpoint = ov
-        .endpoints
-        .get(&view.id)
-        .with_context(|| format!("{} isn't open yet — try again in a moment", view.name))?;
+    let opened;
+    let endpoint = match ov.endpoints.get(&view.id) {
+        Some(e) if view.state == "open" => e,
+        _ => {
+            anyhow::ensure!(
+                view.state == "closed" || view.opening,
+                "{} opens when its job starts — `chimaera compute jobs {host}` to watch",
+                view.name
+            );
+            let target = match (view.opening, &view.job) {
+                (true, Some(j)) => j.clone(),
+                _ => running_job(&ov, job, &host)?.id.clone(),
+            };
+            opened = open_in(&host, &ov, &target, &view.id, &view.name).await?;
+            &opened
+        }
+    };
     let tunnel = chimaera_remote::connect_compute_node(
         &host,
         &endpoint.node,
