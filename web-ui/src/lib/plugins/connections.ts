@@ -49,7 +49,7 @@ async function read<T>(response: Response): Promise<T> {
 }
 
 export async function fetchConnections(workspace: string, refresh: boolean): Promise<ConnectionsReport> {
-  const body = await read<ConnectionsReport>(await api(`/workspaces/${encodeURIComponent(workspace)}/connections${refresh ? "?refresh=true" : ""}`));
+  const body = await read<ConnectionsReport>(await api(`/workspaces/${encodeURIComponent(workspace)}/connections${refresh ? "?refresh=true" : ""}`, { signal: AbortSignal.timeout(65000) }));
   return {
     host: typeof body.host === "string" ? body.host : "",
     agents: (Array.isArray(body.agents) ? body.agents : []).filter(a => a.agent === "claude" || a.agent === "codex").map(a => ({

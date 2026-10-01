@@ -2682,6 +2682,14 @@ The Agent notes plugin became built-in agent communication (plan `docs/agent-com
   availability to Codex; it must not be relabeled as authentication status.
 - Both installed CLIs advertise `mcp login --no-browser <name>`; Codex 0.158.0
   was also checked. Local MCP flows accept the complete browser callback URL on stdin.
+  Real local OAuth fixture probes exposed an additional Claude requirement: **both
+  stdin and stdout must be TTYs**. Piped stdin is refused; a TTY only on stdin prints
+  the link but never offers or reads the pasted callback. An internal raw PTY on all
+  streams prints `Or paste the redirect URL here:` and consumes a URL followed by
+  CR. Its URL may use an OSC hyperlink envelope. Codex accepts ordinary pipes and LF.
+  The daemon was exercised with both installed CLIs through authorization-link
+  generation, pasted callbacks reaching a fixture token endpoint's `invalid_grant`,
+  and cancellation/retry. No real-provider credential was created.
   Claude's help explicitly includes claude.ai connectors. A live hosted bioRxiv
   attempt printed `Visit this URL to authorize:` followed by an HTTPS claude.ai
   `/api/organizations/.../mcp/start-auth/...` URL, then **exited 0 immediately**.
@@ -2695,7 +2703,7 @@ The Agent notes plugin became built-in agent communication (plan `docs/agent-com
   process exit alone to successful authentication. The daemon cannot observe browser
   error pages; the UI must keep the provider's settings available for recovery.
 - Sign-in jobs are workspace-scoped, in-memory, bounded and cancellable. The agent
-  owns OAuth and credentials. No terminal is created. Account login is separate.
+  owns OAuth and credentials. No workbench terminal session is created. Account login is separate.
 
 Verification: the isolated daemon returned 12 Claude connections and 16 Codex
 connections/apps; the UI displayed both inventories. No model turn was needed.

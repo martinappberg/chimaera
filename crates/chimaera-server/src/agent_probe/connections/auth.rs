@@ -1,5 +1,6 @@
 //! Transient connector sign-in jobs. The real CLI owns OAuth and credential
 //! storage; we retain only a bounded authorization URL and status in memory.
+use super::auth_pty::AuthPty;
 use super::*;
 use tokio::sync::{mpsc, watch};
 
@@ -254,8 +255,15 @@ fn safe_url(url: &str) -> bool {
 fn authorization_url(text: &str) -> Option<String> {
     let lower = text.to_ascii_lowercase();
     let marker = lower.find("authoriz")?;
-    text[marker..].split_whitespace().find_map(|part| {
-        let url = part.split('\x1b').next()?.trim_matches(['\'', '"']);
+    // Terminal output can wrap a URL in an OSC hyperlink. Start at the URL
+    // itself and stop at controls so its escape envelope never reaches the UI.
+    let text = &text[marker..];
+    text.match_indices("http").find_map(|(start, _)| {
+        let rest = &text[start..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c.is_control())
+            .unwrap_or(rest.len());
+        let url = rest[..end].trim_matches(['\'', '"']);
         safe_url(url).then(|| url.to_string())
     })
 }
@@ -323,37 +331,56 @@ async fn run(
             Some(&root),
             prelude.path(),
         );
-        command.stdin(Stdio::piped()).process_group(0);
+        let terminal = if attempt.kind == AgentKind::Claude {
+            Some(
+                AuthPty::prepare(&mut command)
+                    .map_err(|_| "Couldn't prepare the agent's sign-in terminal.")?,
+            )
+        } else {
+            command.stdin(Stdio::piped());
+            None
+        };
+        command.process_group(0);
         let mut child = command
             .spawn()
             .map_err(|_| "Couldn't start the agent's sign-in flow.")?;
+        drop(command);
         let group = GroupKill(child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)));
-        let mut stdin = child.stdin.take().ok_or("Couldn't open sign-in input.")?;
-        let mut stdout = child
-            .stdout
-            .take()
-            .ok_or("Couldn't read sign-in progress.")?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .ok_or("Couldn't read sign-in progress.")?;
+        let mut stdin = child.stdin.take();
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let (mut out_done, mut err_done) = (false, false);
+        let (mut out_done, mut err_done) = (false, terminal.is_some());
         let (mut out_buf, mut err_buf) = ([0u8; 2048], [0u8; 2048]);
         while !out_done || !err_done {
             tokio::select! {
-                read = stdout.read(&mut out_buf), if !out_done => {
+                read = async {
+                    match &terminal {
+                        Some(pty) => pty.read(&mut out_buf).await,
+                        None => stdout.as_mut().expect("piped stdout").read(&mut out_buf).await,
+                    }
+                }, if !out_done => {
                     let n = read.map_err(|_| "Couldn't read sign-in progress.")?;
                     out_done = n == 0; out.extend_from_slice(&out_buf[..n]);
                 }
-                read = stderr.read(&mut err_buf), if !err_done => {
+                read = async { stderr.as_mut().expect("piped stderr").read(&mut err_buf).await }, if !err_done => {
                     let n = read.map_err(|_| "Couldn't read sign-in progress.")?;
                     err_done = n == 0; err.extend_from_slice(&err_buf[..n]);
                 }
                 Some(Input::Callback(url)) = input.recv() => {
-                    stdin.write_all(url.as_bytes()).await.map_err(|_| "The sign-in flow stopped accepting input.")?;
-                    stdin.write_all(b"\n").await.map_err(|_| "The sign-in flow stopped accepting input.")?;
+                    let result = if let Some(pty) = &terminal {
+                        // Claude's terminal readline treats Return as CR.
+                        pty.write_all(format!("{url}\r").as_bytes()).await
+                    } else {
+                        let stdin = stdin.as_mut().expect("piped stdin");
+                        async {
+                            stdin.write_all(url.as_bytes()).await?;
+                            stdin.write_all(b"\n").await?;
+                            stdin.flush().await
+                        }.await
+                    };
+                    result.map_err(|_| "The sign-in flow stopped accepting input.")?;
                 }
             }
             if out.len() + err.len() > OUTPUT_LIMIT {
@@ -424,6 +451,7 @@ mod tests {
             .as_deref(),
             Some("https://example.test/oauth?state=a")
         );
+        assert_eq!(authorization_url("Visit this URL to authorize:\n \x1b]8;;https://example.test/oauth?state=a\x07https://example.test/oauth?state=a\x1b]8;;\x07\n").as_deref(), Some("https://example.test/oauth?state=a"));
         assert!(authorization_url("docs: https://example.test/help\n").is_none());
         assert!(!safe_url("javascript:alert(1)"));
         assert!(!safe_url("https://a.test/cb\nnext command"));

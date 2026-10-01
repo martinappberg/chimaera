@@ -78,7 +78,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
   cache for 60 seconds, cap output and rows, and time out. Endpoints, environment values,
   credentials, and raw CLI errors never enter the report. Sign-in revalidates the selected
   server and passes names as literal arguments. Its child process is cancelled on close,
-  timeout or daemon shutdown. Auth URLs exist only in memory during a bounded job; callback
+  timeout or daemon shutdown. Claude's terminal requirements use an internal PTY without
+  a terminal pane or saved output; Codex accepts piped input.
+  Auth URLs exist only in memory during a bounded job; callback
   input is never persisted or echoed in status. A fresh agent report must confirm completion before
   the dialog says Connected. Existing sessions may need reconnection or reopening.
   Claude's hosted "needs authentication" can also cover configuration errors or a connector

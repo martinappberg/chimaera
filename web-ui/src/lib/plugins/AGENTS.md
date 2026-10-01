@@ -50,7 +50,9 @@ QuickOpen — not in `shared/icons.ts`, which `prebuild` regenerates from Tabler
   need configuration or activation without sign-in. Browser errors stay in Claude;
   the dialog explains this and keeps a settings action after expiry/failure.
   Cancel/close destroys the job; a failed job can be retried. Polling reads only
-  an in-memory status snapshot and stops while the page/pane is hidden. No agent
+  an in-memory status snapshot and stops while the page/pane is hidden. No
+  status response from before an action may overwrite its result; in-flight reads
+  are invalidated when starting, submitting a callback, checking or closing. No agent
   account login is added here. The view is keyed by workspace, preserves rows
   while refreshing, and reports missing routes or partial probe failures. At
   widths ≤520px the four header segments form two rows in the same order.

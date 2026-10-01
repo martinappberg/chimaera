@@ -135,7 +135,7 @@ async fn auth_state(state: &Arc<AppState>, url: &str, expected: &str) -> serde_j
         }
     })
     .await
-    .expect("auth flow stalled")
+    .unwrap_or_else(|_| panic!("auth flow stalled waiting for {expected}"))
 }
 
 const AUTH_CLI: &str = r#"#!/bin/bash
@@ -153,9 +153,20 @@ elif [ "$1 $2" = 'mcp list' ]; then
 elif [ "$3" = '--help' ]; then
     printf 'Usage: mcp login --no-browser\n'
 else
+    case "$0" in
+      *claude) test -t 0 && test -t 1 && test -t 2 || exit 1; stty raw -echo;;
+      *codex) test ! -t 0 || exit 1;;
+    esac
     printf '%s\n' "$@" > "$PWD/login-args"
     printf 'Visit this URL to authorize:\n  https://example.test/oauth?state=private\n'
-    read -r callback
+    callback=''
+    case "$0" in
+      *claude)
+        while IFS= read -r -n 1 char; do
+          case "$char" in ''|$'\r') break;; *) callback+="$char";; esac
+        done;;
+      *) IFS= read -r callback;;
+    esac
     printf '%s' "$callback" > "$PWD/callback"
     if [ -f "$PWD/fail" ]; then exit 1; fi
     touch "$PWD/connected"
@@ -216,7 +227,11 @@ async fn connector_dialog_revalidates_and_completes_both_cli_callbacks() {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        let callback = "http://localhost:4321/cb?code=secret&state=private";
+        // A canonical-mode PTY would truncate a callback beyond its line limit.
+        let callback = format!(
+            "http://localhost:4321/cb?code=secret&state=private&padding={}",
+            "x".repeat(5000)
+        );
         let (status, _) = request(
             &state,
             Method::POST,
@@ -249,7 +264,7 @@ async fn hosted_connector_uses_settings_without_forcing_oauth_and_is_workspace_s
     let script = AUTH_CLI
         .replace("docs $(touch escaped)", "claude.ai Docs")
         .replace("Usage: mcp login --no-browser", "Unsupported command")
-        .replace("    read -r callback", "    exit 1\n    read -r callback");
+        .replace("    printf '%s'", "    exit 1\n    printf '%s'");
     let bin = fake_cli(&root, "claude", &script);
     preset_agent(&state, AgentKind::Claude, Ok(bin), Some("test"));
     let url = format!("/api/v1/workspaces/{ws}/connections/login");

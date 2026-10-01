@@ -226,7 +226,11 @@ the lifecycle, keep them consistent:
   cleanup, output/row caps and a 60-second budget including queue time. Reports
   whitelist names/statuses only; no endpoints, environment values or raw errors.
   Connector sign-in (`connections/auth.rs`) is a bounded in-memory job, never a
-  terminal. `POST …/connections/login {agent,name}` revalidates the report and
+  workbench terminal session. Claude requires an internal PTY for input and output even with
+  `--no-browser` (`connections/auth_pty.rs`); nonblocking I/O is cancellable, raw
+  input avoids canonical line truncation, and output is private and capped. Codex
+  accepts pipes. Neither transport creates a terminal pane or persists output.
+  `POST …/connections/login {agent,name}` revalidates the report and
   starts the CLI's `mcp login --no-browser` for local MCP servers; hosted Claude
   connectors instead open Claude's connector settings (no forced OAuth).
   `GET/DELETE …/login/{attempt}` reads

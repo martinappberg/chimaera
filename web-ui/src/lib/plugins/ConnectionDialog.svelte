@@ -17,6 +17,7 @@
   let busy = $state(false);
   let alive = true;
   let announced = false;
+  let statusSequence = 0;
   const dialogId = $props.id();
   const hosted = $derived(agent === "claude" && name.startsWith("claude.ai "));
   const attemptId = $derived(attempt?.id);
@@ -28,6 +29,7 @@
   });
 
   async function start(): Promise<void> {
+    statusSequence++;
     error = null; attempt = null; callback = ""; busy = true;
     try {
       const result = await loginConnection(wsId, agent, name);
@@ -38,12 +40,13 @@
   }
 
   async function refresh(id: string): Promise<void> {
+    const sequence = ++statusSequence;
     try {
       const result = await connectionAuthStatus(wsId, id);
-      if (!alive || attempt?.id !== id) return;
+      if (!alive || attempt?.id !== id || sequence !== statusSequence) return;
       attempt = result; error = null;
       if (result.state === "succeeded" && !announced) { announced = true; onConnected(); }
-    } catch (e) { if (alive) error = e instanceof Error ? e.message : String(e); }
+    } catch (e) { if (alive && sequence === statusSequence) error = e instanceof Error ? e.message : String(e); }
   }
 
   onMount(() => {
@@ -62,7 +65,7 @@
     let stopped = false;
     let timer: ReturnType<typeof setTimeout>;
     async function poll(): Promise<void> {
-      await refresh(id!);
+      if (!busy) await refresh(id!);
       if (!stopped) timer = setTimeout(() => void poll(), 1000);
     }
     timer = setTimeout(() => void poll(), 100);
@@ -71,9 +74,13 @@
 
   async function act(action: "check" | "callback"): Promise<void> {
     if (!attempt || busy) return;
+    // A pre-action poll must not overwrite the response after a callback or
+    // connection check. This also prevents stale errors reopening a finished job.
+    statusSequence++;
     busy = true; error = null;
     try {
       await connectionAuthAction(wsId, attempt.id, action, action === "callback" ? callback.trim() : undefined);
+      if (!alive) return;
       callback = "";
       await refresh(attempt.id);
     } catch (e) { if (alive) error = e instanceof Error ? e.message : String(e); }
@@ -82,6 +89,7 @@
 
   async function close(): Promise<void> {
     if (busy && attempt !== null) return;
+    statusSequence++;
     if (attempt && !terminal) {
       busy = true;
       try { await connectionAuthAction(wsId, attempt.id, "cancel"); }

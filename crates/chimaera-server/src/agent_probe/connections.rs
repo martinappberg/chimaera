@@ -11,6 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 mod auth;
+mod auth_pty;
 pub(crate) use auth::{cancel, check, input, login, status, AuthState};
 
 const MAX_ROWS: usize = 256;
@@ -37,8 +38,6 @@ fn connection(name: &str, kind: &str, status: &str, login: bool) -> Connection {
         login,
         source: if kind == "app" {
             "ChatGPT"
-        } else if name.starts_with("claude.ai ") {
-            "claude.ai"
         } else if name.starts_with("plugin:") {
             "Agent plugin"
         } else {
@@ -69,7 +68,11 @@ fn claude_connections(output: &str) -> Result<Vec<Connection>, &'static str> {
             "⏸ Pending approval" => "needs_approval",
             _ => "unknown",
         };
-        rows.push(connection(name, "mcp", status, status == "needs_auth"));
+        let mut row = connection(name, "mcp", status, status == "needs_auth");
+        if name.starts_with("claude.ai ") {
+            row.source = "claude.ai".into();
+        }
+        rows.push(row);
         if rows.len() > MAX_ROWS {
             return Err("Too many connections to list.");
         }
@@ -295,6 +298,10 @@ mod tests {
         assert!(rows[0].login);
         assert!(!rows[1].login);
         assert_eq!(rows[2].status, "configured");
+        let codex_named_like_claude =
+            codex_connections(r#"[{"name":"claude.ai Docs","auth_status":"not_logged_in"}]"#)
+                .unwrap();
+        assert_eq!(codex_named_like_claude[0].source, "MCP server");
     }
 
     #[test]
