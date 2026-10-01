@@ -24,7 +24,7 @@ revocable delegation over the authenticated local API.
 | `provider_gate.rs` / `provider_tests.rs` | Per-agent cloud readiness, bounded blocked-provider status, and staged retry/cancellation tests with a synthetic CLI and real PTY. |
 | `protocol.rs` | Additive account contract subset and strict worker host-to-holder identity translation; intentionally no link/TLS dependency in the daemon. |
 | `transport.rs` | Bounded external curl/git children; cached mirror-only Git compatibility selection; credentials only in memory, never argv or Git config. The account's 403 `{"error":"return_window_ended"}` (a plan that ended and whose time to bring cloud work home has passed) becomes an error of its own in `engine::account`, so its mirror-row and open `error_code` read `return_window_ended`; any other 403 stays a plain response. |
-| `policy.rs` | Mirrored-path policy (credentials, `.git`, staging names, kept copies and a folder's `.chimaera-workspace` identity marker at any depth are never mirrored), credential filtering, size budgets and cloud-profile classification. |
+| `policy.rs` | Mirrored-path policy (credentials, `.git`, staging names, kept copies and a folder's `.chimaera-workspace` identity marker at any depth are never mirrored), `REBUILT_DIRS` (dependency and cache folders that never travel as untracked content, used by the mirror inventory and the agent-config export), credential filtering, size budgets and cloud-profile classification. |
 | `mirror.rs` | Separate shadow and repository Git directories, incremental transfer and conservative hand-back. |
 | `shadow_cache.rs` | Validated reconstruction of an objectively damaged outgoing shadow, retaining its complete prior store in a bounded no-overwrite quarantine. |
 | `repository.rs` | Portable remote/tracking allowlist; bounded ref import, compare-and-swap adoption and index/ref-lock cancellation cleanup. `describe` is a snapshot's repository step: a plain folder (no repository) is ordinary, logged once at info (`ProState.plain_folders`) and never as a failed helper; a detached HEAD is no branch, not a failure. |
@@ -380,6 +380,11 @@ policy, size, symlink, credential content or `.chimaeraignore`) is present and
 does not list it. Fast-forwards set identical untracked files aside and keep
 the cloud branch separate on a differing one; only `refs/heads` get `@cloud`
 copies.
+
+The lease loop starts a copy of every eligible project every 120 s (`TIMED_COPY`), and of one project as soon as one of
+its agents finishes a turn (`TurnEnds`: fed each 5 s tick from `working_agents`, a working → not working transition marks
+the project; copied once 20 s have passed since the last copy started, `TURN_COPY_GAP`; a turn that ends while a copy runs
+is copied next; that pass skips `lazy_handback`). One copy task at a time, never while draining.
 
 The sleep flush (`/pro/sleep {deadline_ms?}`) preempts the periodic pass, flushes
 projects in parallel as owned tasks (live agents first), releases within the

@@ -465,7 +465,14 @@ commits on the user's branches. A project folder does not have to be a Git
 repository: a plain folder is copied as its working files alone, which the
 daemon's log notes once (at info level, not as a problem); if the folder later
 becomes a repository, its history travels from the next snapshot on. `.gitignore` and `.chimaeraignore` restrict the
-working snapshot. Credential filenames, private keys, agent login stores and
+working snapshot. Dependency and cache folders that are rebuilt wherever the project runs (`node_modules`, `target`, `.venv`,
+`__pycache__`, `.cache`, at any depth; `policy.rs` `REBUILT_DIRS`) never travel as untracked content either, also where no
+`.gitignore` says so, as in a plain folder; a file the project tracks in Git under one of those names still does. A single
+file over 100 MB stays on the computer it is on (Settings says "Some files are too large for the cloud copy. They stay on
+this computer."), and a project is limited to 100,000 copied paths and to the plan's storage. The copy runs for every
+project every two minutes, and for a project right after one of its agents finishes a turn (within about five seconds, at
+most every 20 seconds; `engine.rs` `TurnEnds`), so after a sudden loss of this computer the cloud continues from the end of
+the last turn rather than from up to two minutes before it. Credential filenames, private keys, agent login stores and
 secret configuration fields are excluded. Git configuration carries the
 user's name, email and simple Git aliases with known flags. Free-form or shell
 aliases, helpers, hooks, includes and signing credentials stay on their host.

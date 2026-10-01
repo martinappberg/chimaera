@@ -193,16 +193,26 @@ pub(super) async fn inventory(root: &Path, shadow: &Path) -> Result<(Vec<PathBuf
         if !repo {
             command.env("GIT_DIR", shadow).env("GIT_WORK_TREE", root);
         }
-        let mut args = vec![
+        let mut args: Vec<String> = [
             "ls-files",
             "-z",
             "--cached",
             "--others",
             "--exclude-standard",
-        ];
+        ]
+        .map(String::from)
+        .to_vec();
+        // `--exclude` only skips UNTRACKED paths: what the project tracks
+        // under one of these names still travels.
+        args.extend(
+            policy::REBUILT_DIRS
+                .iter()
+                .map(|dir| format!("--exclude={dir}/")),
+        );
         if ignore_file {
-            args.push("--exclude-from=.chimaeraignore");
+            args.push("--exclude-from=.chimaeraignore".into());
         }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
         transport::git_output(command, &args, vec![]).await
     };
     // `--exclude-from` refuses a missing file (a failed helper, and a
@@ -670,6 +680,33 @@ mod tests {
             repository_origin(&root).await.as_deref(),
             Some("https://example.test/repo")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A plain folder has no `.gitignore`: its dependency and cache folders
+    /// still stay home, at any depth, while ordinary files travel.
+    #[tokio::test]
+    async fn rebuilt_folders_never_travel_as_untracked_content() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-mirror-{}",
+            chimaera_core::generate_token()
+        ));
+        let project = root.join("project");
+        let shadow = root.join("shadow");
+        fs::create_dir_all(project.join("node_modules/dep")).unwrap();
+        fs::create_dir_all(project.join("app/target/debug")).unwrap();
+        fs::create_dir_all(project.join("app/src")).unwrap();
+        initialize(&shadow).await.unwrap();
+        fs::write(project.join("node_modules/dep/index.js"), "x").unwrap();
+        fs::write(project.join("app/target/debug/out"), "x").unwrap();
+        fs::write(project.join("app/src/main.rs"), "fn main() {}").unwrap();
+        fs::write(project.join("notes.txt"), "hello").unwrap();
+        let (paths, ignored) = inventory(&project, &shadow).await.unwrap();
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("app/src/main.rs"), PathBuf::from("notes.txt")]
+        );
+        assert!(ignored.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 

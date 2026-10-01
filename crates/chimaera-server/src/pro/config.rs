@@ -116,7 +116,7 @@ impl Export<'_> {
             }
             for entry in fs::read_dir(source)? {
                 let entry = entry?;
-                if ["node_modules", "target", ".venv", "__pycache__", ".cache"]
+                if policy::REBUILT_DIRS
                     .iter()
                     .any(|name| entry.file_name() == *name)
                 {
