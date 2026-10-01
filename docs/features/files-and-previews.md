@@ -129,8 +129,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   a rename/move **rewrites open tabs** (file/diff/finder, prefix-aware for folder renames —
   `rewriteTabPaths` in `layout/layout.ts`); a delete closes tabs under the path and retargets
   Finders to the parent (`pruneDeletedPath`). A slow (remote) listing shows a delayed spinner —
-  a per-node "listing…" row in the tree, an incoming-column spinner in the Finder. A file tab's
-  Rename is disabled while the file has unsaved edits. Escape cancels any inline input; blur
+  a per-node "listing…" row in the tree, an incoming-column spinner in the Finder. Unsaved
+  buffers follow an in-app rename or move to the new path. Escape cancels any inline input; blur
   commits a non-empty valid name. Finder descents reveal the new column with the smallest possible
   horizontal movement; refreshes preserve the user's horizontal position and re-list only affected
   visible columns, coalescing mutation and disk-watch bursts.

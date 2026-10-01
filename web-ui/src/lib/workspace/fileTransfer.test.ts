@@ -30,12 +30,19 @@ describe("file transfer destinations", () => {
     const source = { path: "/work/note.txt", kind: "file" } as const;
     expect(transferBlock(source, "/work/", "move")).toBe("Already in this folder");
     expect(transferBlock(source, "/work", "copy")).toBeNull();
-    await transferInto(source, "/work", "move");
+    for (const dest of ["/work", "/work/"]) await transferInto(source, dest, "move");
     expect(fsMoveOp).not.toHaveBeenCalled();
     expect(reportUploadError).not.toHaveBeenCalled();
     vi.mocked(fsCopyOp).mockResolvedValue("/work/note copy.txt");
     expect(await transferInto(source, "/work", "copy")).toBe("/work/note copy.txt");
     expect(fsCopyOp).toHaveBeenCalledWith(source.path, source.path, "unique");
+  });
+
+  it("moves directory paths with trailing slashes using the directory's name", async () => {
+    vi.mocked(fsMoveOp).mockResolvedValue("/dest/data");
+    expect(await transferInto({ path: "/work/data/", kind: "dir" }, "/dest/", "move"))
+      .toBe("/dest/data");
+    expect(fsMoveOp).toHaveBeenCalledWith("/work/data", "/dest/data");
   });
 
   it("uses the move API without opting into collision replacement", async () => {

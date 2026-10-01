@@ -11,9 +11,13 @@ export interface FileSource {
 
 export type FileOperation = "copy" | "move";
 
+function withoutTrailingSlash(path: string): string {
+  return path.replace(/\/+$/, "") || "/";
+}
+
 export function transferBlock(source: FileSource, destDir: string, operation: FileOperation): string | null {
-  const from = source.path.replace(/\/+$/, "") || "/";
-  const dir = destDir.replace(/\/+$/, "") || "/";
+  const from = withoutTrailingSlash(source.path);
+  const dir = withoutTrailingSlash(destDir);
   if (source.kind === "dir" && (from === "/" || dir === from || dir.startsWith(`${from}/`))) {
     return "A folder can't go inside itself";
   }
@@ -28,15 +32,17 @@ export async function transferInto(
   destDir: string,
   operation: FileOperation,
 ): Promise<string | null> {
+  const from = withoutTrailingSlash(source.path);
+  const dir = withoutTrailingSlash(destDir);
   const blocked = transferBlock(source, destDir, operation);
   if (blocked !== null) {
     // Same-parent cuts are an intentional no-op, just like a file-manager drop.
-    if (operation !== "move" || dirname(source.path) !== destDir) reportUploadError(blocked);
+    if (operation !== "move" || dirname(from) !== dir) reportUploadError(blocked);
     return null;
   }
-  const name = basename(source.path);
-  const dest = joinPath(destDir, name);
+  const name = basename(from);
+  const dest = joinPath(dir, name);
   return trackFileOp(`${operation === "move" ? "Moving" : "Copying"} ${name}…`, () =>
-    operation === "move" ? fsMoveOp(source.path, dest) : fsCopyOp(source.path, dest, "unique"),
+    operation === "move" ? fsMoveOp(from, dest) : fsCopyOp(from, dest, "unique"),
   );
 }
