@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
+  import { paneTabHasKeyboardFocus } from "./lib/shared/tabNavigation";
   import { flip } from "svelte/animate";
   import { fade } from "svelte/transition";
   import { runStallDrive, stallDriveSpec } from "./lib/perf/tabSwitchDrive";
@@ -4120,7 +4121,7 @@
     activateTab(paneId, index) {
       layout = activateTab(layout, paneId, index);
       const sid = focusedSessionOf(layout);
-      if (sid !== null) pool.focusTerminal(sid);
+      if (sid !== null && !paneTabHasKeyboardFocus()) pool.focusTerminal(sid);
     },
     closeTab(paneId, index) {
       // Detaches the view only — the session stays alive in the rail. A file

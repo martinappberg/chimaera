@@ -1,5 +1,10 @@
 import type { Action } from "svelte/action";
 
+/** Surface autofocus must not interrupt keyboard navigation in the pane tabs. */
+export function paneTabHasKeyboardFocus(): boolean {
+  return document.activeElement?.matches('[role="tab"][data-tab-index]:focus-visible') ?? false;
+}
+
 /** One tab stop per strip; arrows activate neighbours without scrolling ancestors. */
 export const tabNavigation: Action<HTMLElement> = (node) => {
   const onKey = (event: KeyboardEvent): void => {
