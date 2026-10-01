@@ -31,6 +31,11 @@ fmt:
 chat-smoke:
     cargo test -p chimaera-agent --test live -- --ignored --test-threads=1 --nocapture
 
+# CHIMAERA_TEST_AGY_ACP / CHIMAERA_TEST_GROK name official executables.
+# Uses existing logins and disposable workspaces; includes billed turns.
+chat-smoke-acp:
+    cargo test -p chimaera-agent --test acp_live -- --ignored --test-threads=1 --nocapture
+
 # Run the daemon locally (foreground)
 serve: ui
     cargo run -p chimaera -- serve

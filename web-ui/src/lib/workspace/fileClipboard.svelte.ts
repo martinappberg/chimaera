@@ -9,9 +9,7 @@
  * Runes discipline: mutate the field only through this module's functions.
  */
 
-import { basename, dirname, joinPath } from "../previews/files";
-import { reportUploadError, trackFileOp } from "../net/uploads";
-import { fsCopyOp, fsMoveOp } from "./fsEvents";
+import { transferInto } from "./fileTransfer";
 
 export interface FileClip {
   path: string;
@@ -43,12 +41,6 @@ export function clearClip(): void {
   clip = null;
 }
 
-/** True when `dest` is `src` itself or lies inside it (can't paste a dir into
- *  its own subtree). */
-function within(dest: string, src: string): boolean {
-  return dest === src || dest.startsWith(`${src}/`);
-}
-
 /**
  * Paste the clipboard entry INTO `destDir` (an absolute directory path). Copy
  * runs a server-side /fs/copy with macOS "name copy" collision handling; cut
@@ -59,17 +51,7 @@ function within(dest: string, src: string): boolean {
 export async function pasteInto(destDir: string): Promise<void> {
   const c = clip;
   if (c === null) return;
-  const dest = joinPath(destDir, basename(c.path));
-  if (c.kind === "dir" && within(destDir, c.path)) {
-    reportUploadError("can't paste a folder into itself");
-    return;
-  }
-  if (c.mode === "cut") {
-    if (dirname(c.path) === destDir) return; // moving into the same folder is a no-op
-    const moved = await trackFileOp(`Moving ${basename(c.path)}…`, () => fsMoveOp(c.path, dest));
-    if (moved !== null) clearClip();
-  } else {
-    // Copy keeps the clipboard so the same source can be pasted repeatedly.
-    await trackFileOp(`Copying ${basename(c.path)}…`, () => fsCopyOp(c.path, dest, "unique"));
-  }
+  const result = await transferInto(c, destDir, c.mode === "cut" ? "move" : "copy");
+  // A slow paste must not clear a newer copy/cut made while it was in flight.
+  if (result !== null && c.mode === "cut" && clip === c) clearClip();
 }

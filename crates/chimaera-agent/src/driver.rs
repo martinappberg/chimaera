@@ -100,8 +100,8 @@ pub struct SpawnSpec {
     pub fork_at: Option<String>,
     /// Quiet portable-fork context. Codex passes it as thread-open developer
     /// instructions; Claude receives the same text through the launcher's
-    /// `--append-system-prompt-file`. It initializes context without creating
-    /// a synthetic user turn or triggering an agent response.
+    /// `--append-system-prompt-file`. ACP holds it until the first real send.
+    /// Opening a fork never creates a synthetic turn or agent response.
     pub portable_context: Option<String>,
     /// Developer-role context added to the thread's history right after it
     /// opens — a cluster job's facts. Codex-only (`thread/inject_items`, over
@@ -109,6 +109,8 @@ pub struct SpawnSpec {
     /// It reaches resumed threads too, whose opening instructions Codex never
     /// replaces (PROTOCOL.md Pass 41).
     pub developer_note: Option<String>,
+    /// ACP MCP servers, supplied by the embedder over stdin (never argv).
+    pub mcp_servers: Vec<Value>,
     /// MCP tool calls the embedder has already consented to: the driver
     /// answers their approval prompts accept itself instead of surfacing a
     /// PermissionRequest. Codex-only today — its app-server elicits EVERY
@@ -165,6 +167,7 @@ impl SpawnSpec {
             fork_at: None,
             portable_context: None,
             developer_note: None,
+            mcp_servers: Vec::new(),
             mcp_auto_approve: None,
             remote_control: None,
             revert_before_turn: None,
@@ -209,6 +212,10 @@ pub trait AgentAdapter: Send + Sync {
 /// only turns inbound frames and client commands into outbound frames +
 /// [`AgentEvent`]s. Both drivers implement this over the same [`DriverStep`].
 pub trait Mapper: Send {
+    /// Negotiated controls, when the adapter has a capability handshake.
+    fn capabilities(&self) -> Option<crate::capabilities::ChatCapabilities> {
+        None
+    }
     /// The `Init` event emitted immediately after a successful handshake.
     fn init_event(&self) -> AgentEvent;
     /// Translate one inbound protocol frame.
@@ -435,6 +442,18 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
     };
 
     if io.events.send(mapper.init_event()).await.is_err() {
+        guard.shutdown(Duration::ZERO).await;
+        return DriverExit::Killed;
+    }
+    let capabilities = mapper
+        .capabilities()
+        .unwrap_or_else(|| crate::capabilities::ChatCapabilities::legacy(driver.kind()));
+    if io
+        .events
+        .send(AgentEvent::Capabilities { capabilities })
+        .await
+        .is_err()
+    {
         guard.shutdown(Duration::ZERO).await;
         return DriverExit::Killed;
     }

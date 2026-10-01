@@ -1321,8 +1321,8 @@ async fn details_describe_an_available_plugin_from_its_pinned_release_once() {
     assert_eq!(
         d["recommends"],
         json!([
-            {"agent": "claude", "id": "mycelium@mycelium", "marketplace": "arjunrajlaboratory/mycelium"},
-            {"agent": "codex", "id": "mycelium@mycelium", "marketplace": "arjunrajlaboratory/mycelium"},
+            {"agent": "claude", "id": "mycelium@mycelium", "marketplace": "arjunrajlaboratory/mycelium", "source": null, "installable": true},
+            {"agent": "codex", "id": "mycelium@mycelium", "marketplace": "arjunrajlaboratory/mycelium", "source": null, "installable": true},
         ])
     );
     assert_eq!(d["requires"], json!([]));

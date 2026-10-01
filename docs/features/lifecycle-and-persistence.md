@@ -60,6 +60,14 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   history oldest-first but never a live session's journal — an idle resurrected chat is routinely the
   oldest file in the dir.
 
+## Reopening keeps the conversation's view
+
+The default view applies only to new conversations. Saved chats reopen in chat, saved terminal
+conversations reopen in terminal, and legacy entries without a view default to terminal. This
+prevents upgrades or a changed launcher preference from migrating old CLI conversations into chat.
+A failed resumed handshake remains visible in chat; it never automatically reroutes the saved
+conversation. All four chat providers retain their native resume handle through the ledger.
+
 ## Restart carryover (chat sessions)
 
 - **What & when.** Resuming the conversation brings back what the agent *said*, not what its process

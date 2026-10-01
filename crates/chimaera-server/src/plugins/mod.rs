@@ -321,7 +321,7 @@ pub(crate) struct Detect {
 #[derive(Deserialize, Debug, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Requires {
-    /// agent kind ("claude" | "codex") → the agent-native plugin it needs.
+    /// Stable agent identity → the agent-native plugin it needs.
     /// A genuine hard requirement (none today; a recommendation is
     /// `recommends`).
     #[serde(default)]
@@ -382,7 +382,12 @@ pub(crate) struct AgentPluginReq {
     /// The agent's own plugin id, e.g. "mycelium@mycelium".
     pub(crate) id: String,
     /// What the agent's `marketplace add` takes (owner/repo or a URL).
+    #[serde(default)]
     pub(crate) marketplace: String,
+    /// Native install source for providers without the Claude/Codex marketplace
+    /// pipeline: a local package or a source accepted by that provider.
+    #[serde(default)]
+    pub(crate) source: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1264,6 +1269,12 @@ fn agent_plugins_json(map: &BTreeMap<String, AgentPluginReq>) -> Value {
             "agent": agent,
             "id": req.id,
             "marketplace": req.marketplace,
+            "source": req.source,
+            "installable": match crate::agents::AgentKind::parse(agent) {
+                Some(crate::agents::AgentKind::Claude | crate::agents::AgentKind::Codex) => true,
+                Some(crate::agents::AgentKind::Antigravity | crate::agents::AgentKind::Grok) => req.source.is_some(),
+                _ => false,
+            },
         }))
         .collect::<Vec<_>>())
 }
@@ -1528,6 +1539,30 @@ pub(crate) async fn install_requirement(
     let Some(kind) = crate::agents::AgentKind::parse(&body.agent) else {
         return bad_request("unknown agent");
     };
+    if matches!(
+        kind,
+        crate::agents::AgentKind::Antigravity | crate::agents::AgentKind::Grok
+    ) {
+        let Some(source) = req.source.clone() else {
+            return bad_request("This plugin needs to declare an installation source for this agent. Manage it in the agent meanwhile.");
+        };
+        return crate::agent_probe::actions::run(
+            State(state),
+            AxPath(id),
+            Json(crate::agent_probe::actions::Action {
+                agent: body.agent,
+                action: "install_plugin".into(),
+                target: Some(source),
+            }),
+        )
+        .await;
+    }
+    if !matches!(
+        kind,
+        crate::agents::AgentKind::Claude | crate::agents::AgentKind::Codex
+    ) {
+        return bad_request("Plugin installation is unavailable for this agent.");
+    }
     if !cli_safe(&req.id) || !cli_safe(&req.marketplace) {
         return bad_request("manifest requirement is not CLI-safe");
     }
@@ -1886,6 +1921,38 @@ mod tests {
                 assert!(cli_safe(&req.id) && cli_safe(&req.marketplace), "{}", l.id);
             }
         }
+    }
+
+    #[test]
+    fn native_plugin_sources_are_additive_and_unknown_agents_are_not_installable() {
+        let m = demo(
+            r#"version = "0.1.0"
+api = "0.1"
+[requires.agent_plugins.agy]
+id = "kit"
+source = "/tmp/antigravity-kit"
+[requires.agent_plugins.grok]
+id = "kit"
+source = "https://example.test/kit.git"
+[requires.agent_plugins.future]
+id = "future-kit"
+"#,
+        )
+        .unwrap();
+        let rows = agent_plugins_json(&m.requires.agent_plugins);
+        let rows = rows.as_array().unwrap();
+        assert_eq!(
+            rows.iter().find(|r| r["agent"] == "agy").unwrap()["installable"],
+            true
+        );
+        assert_eq!(
+            rows.iter().find(|r| r["agent"] == "grok").unwrap()["source"],
+            "https://example.test/kit.git"
+        );
+        assert_eq!(
+            rows.iter().find(|r| r["agent"] == "future").unwrap()["installable"],
+            false
+        );
     }
 
     #[test]

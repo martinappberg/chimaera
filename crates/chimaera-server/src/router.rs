@@ -195,6 +195,10 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         )
         .route("/workspaces/{id}/skills", get(agent_probe::skills))
         .route(
+            "/workspaces/{id}/agent-extensions/action",
+            post(agent_probe::actions::run),
+        )
+        .route(
             "/workspaces/{id}/connections",
             get(agent_probe::connections::list),
         )

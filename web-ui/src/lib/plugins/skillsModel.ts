@@ -4,9 +4,9 @@
  * the "only one agent" filter, and the search. Unit-tested in
  * skillsModel.test.ts.
  */
-import type { AgentId, Skill, SkillSource } from "./store";
+import { agentName, type AgentId, type Skill, type SkillSource } from "./store";
 
-export type SkillGroupKey = "project" | "plugin" | "user" | "builtin-claude" | "builtin-codex";
+export type SkillGroupKey = "project" | "plugin" | "user" | `builtin-${string}`;
 
 export interface SkillGroup {
   key: SkillGroupKey;
@@ -42,7 +42,7 @@ export function groupOf(source: SkillSource | string): "project" | "plugin" | "u
 }
 
 export function usable(skill: Skill, agent: AgentId): boolean {
-  return skill.agents[agent].state === "available";
+  return skill.agents[agent]?.state === "available";
 }
 
 export interface SkillCounts {
@@ -66,13 +66,12 @@ export function skillCounts(skills: readonly Skill[]): SkillCounts {
   return { total: skills.length, claude, codex, both };
 }
 
-export type SkillFilter = "all" | "claude" | "codex";
+export type SkillFilter = string;
 
 export function filterSkills(skills: readonly Skill[], filter: SkillFilter, query: string): Skill[] {
   const q = query.trim().toLowerCase();
   return skills.filter((s) => {
-    if (filter === "claude" && !usable(s, "claude")) return false;
-    if (filter === "codex" && !usable(s, "codex")) return false;
+    if (filter !== "all" && !usable(s, filter)) return false;
     if (q === "") return true;
     return (
       s.name.toLowerCase().includes(q) ||
@@ -99,17 +98,15 @@ export function groupSkills(skills: readonly Skill[], host = ""): SkillGroup[] {
       put(g, s);
       continue;
     }
-    const claude = s.agents.claude.state !== "absent";
-    const codex = s.agents.codex.state !== "absent";
-    if (claude) put("builtin-claude", s);
-    if (codex) put("builtin-codex", s);
-    if (!claude && !codex) put(s.source === "builtin" ? "builtin-claude" : "builtin-codex", s);
+    for (const [agent, state] of Object.entries(s.agents)) {
+      if (state.state !== "absent") put(`builtin-${agent}`, s);
+    }
   }
   const out: SkillGroup[] = [];
-  for (const key of GROUP_ORDER) {
+  for (const key of [...GROUP_ORDER, ...[...buckets.keys()].filter(k => !GROUP_ORDER.includes(k))]) {
     const list = buckets.get(key);
     if (list === undefined || list.length === 0) continue;
-    const base = GROUP_LABELS[key];
+    const base = GROUP_LABELS[key] ?? {label: `Built into ${agentName(key.slice(8))}`, hint: ""};
     let hint = base.hint;
     if (key === "user" && host !== "") hint = `every project on ${host} sees these`;
     if (key === "plugin") {
@@ -124,7 +121,9 @@ export function groupSkills(skills: readonly Skill[], host = ""): SkillGroup[] {
 /** The agent's own invocation syntax — canonical vocabulary, never relabeled:
  *  `/name` for claude, `$name` for codex (the daemon's `invoke` wins). */
 export function invokeSyntax(skill: Skill, agent: AgentId): string {
-  return skill.agents[agent].invoke ?? (agent === "claude" ? `/${skill.name}` : `$${skill.name}`);
+  const state = skill.agents[agent];
+  if (state?.invoke === null) return "";
+  return state?.invoke ?? (agent === "claude" ? `/${skill.name}` : agent === "codex" ? `$${skill.name}` : "");
 }
 
 /** The name as the list shows it: under its plugin's own header the plugin
@@ -163,6 +162,6 @@ export function pluginSections(skills: readonly Skill[]): PluginSection[] {
     .map(([plugin, list]) => ({
       plugin,
       skills: list,
-      agents: (["claude", "codex"] as AgentId[]).filter((a) => list.some((s) => usable(s, a))),
+      agents: [...new Set(list.flatMap(s => Object.keys(s.agents)))].filter((a) => list.some((s) => usable(s, a))),
     }));
 }

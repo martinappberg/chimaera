@@ -17,6 +17,8 @@
    * every host remounts per path.
    */
   import { onMount, untrack, type Component } from "svelte";
+  import { openSearchPanel, closeSearchPanel, searchPanelOpen, findNext, findPrevious } from "@codemirror/search";
+  import { findTarget } from "../shared/find";
   import { Compartment, EditorState, type Extension } from "@codemirror/state";
   import { EditorView, lineNumbers, highlightSpecialChars, drawSelection } from "@codemirror/view";
   import {
@@ -242,6 +244,15 @@
     if (el === null) return () => releaseBuffer(buf);
     const v = new EditorView({ state: buf.stateFor(viewExtensions()), parent: el });
     view = v;
+    const findRegistration = findTarget(el, (command) => {
+      if (view !== v) return false;
+      if (command === "open") return openSearchPanel(v);
+      if (!searchPanelOpen(v.state)) return false;
+      if (command === "close") return closeSearchPanel(v);
+      if (command === "previous") findPrevious(v); else findNext(v);
+      // A query with no matches still owns navigation; never fall through to browser Find.
+      return true;
+    });
     const onSuperseded = () => {
       superseded = true;
       view = null;
@@ -284,6 +295,7 @@
     }
 
     return () => {
+      findRegistration.destroy();
       ready = false;
       if (view === v) view = null;
       if (flashTimer !== null) clearTimeout(flashTimer);

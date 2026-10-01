@@ -2726,3 +2726,98 @@ A cluster workspace job tells its agents which job they are in, on which node, u
 Adopted: `SpawnSpec.developer_note` (the cluster context, codex chats only) rides `thread/inject_items` once the thread opens, after any rewind (a revert could otherwise drop it). Nothing of it is on argv any more, and the user's own `developer_instructions` stay untouched (the argv design replaced them, so it skipped codex whenever the user had set one). A failed inject is logged and the chat opens without it.
 
 Gate: live `driver_codex_developer_note_reaches_fresh_and_resumed_threads` through the real driver (fresh FIRSTOTTER; resumed in a new process with a new note, SECONDHERON); hermetic `developer_note_is_one_developer_message_for_inject_items`; full `just chat-smoke` 27/27.
+
+## ACP v1 — Grok Build and Google Antigravity (2026-10-01)
+
+Verified Grok Build **1.0.46 (2765805b9442)** with `grok agent --no-leader stdio`,
+and Google's **agy-acp-server 1.2.1** (`agy_acp_server.par` beside `localharness_external`).
+The standalone `agy` CLI initially probed was **1.1.1**; the live managed installer
+subsequently installed **1.2.14**. It is a different executable/version. The probed headless
+stream-json interface rejects interactive control requests; use Google's official ACP package
+for chat. The server must resolve managed symlinks before launch so sibling tools remain visible.
+
+Both speak JSON-RPC over newline-delimited stdio, negotiate `protocolVersion: 1`, advertise
+`loadSession`, `sessionCapabilities.resume`, HTTP MCP servers, and stream `session/update`.
+Grok advertises `grok.com` auth but accepts `cached_token` with `_meta.headless: true` for an
+existing login; Google's `oauth-personal` reused the existing personal login. Other Google auth
+methods are advertised but not yet selected by the built-in adapter. Auth is never copied into
+Chimaera state. MCP credentials go over stdin in HTTP server headers, never process arguments.
+
+`session/new` returns the native id and account model catalog. Grok's catalog after authentication
+included `grok-4.7`; Google's included Gemini 3.8 Flash effort-specific model ids. Do not hardcode
+these lists. `configOptions` supplies select controls by category (`model`, `mode`, `thought_level`),
+and `session/set_config_option` returns the authoritative current values. `config_option_update`
+can replace controls; absence removes an effort control. Grok advertised image input false;
+Google true. Buttons and attachment admission follow that negotiated capability.
+
+A `session/prompt` response ends the turn (`end_turn` or `cancelled`). Permission requests are
+agent-initiated JSON-RPC requests; replies preserve the original numeric/string id and choose
+only an offered `optionId`. Cancellation resolves open permission requests as cancelled before
+sending `session/cancel`. A queued prompt starts after the preceding prompt response, not after
+writing the cancel notification. `session/resume` restores provider history without replaying it;
+Chimaera's journal restores the visible transcript. `session/load` is the compatibility fallback.
+
+Neither tested initialization advertises a native fork. Conversation copies are held in the mapper
+until the first real user message and prepended to that prompt; opening a fork must not synthesize
+a turn. An undelivered copy is recovered from its journal marker after a restart/reopen. Live tests
+are explicit opt-in: `CHIMAERA_TEST_GROK` / `CHIMAERA_TEST_AGY_ACP` specify the real executables;
+`cargo test -p chimaera-agent --test acp_live -- --ignored --test-threads=1` bills tiny turns.
+
+Sources: [Google ACP distribution](https://antigravity.google/docs/ide/extensions),
+[Google headless CLI](https://www.antigravity.google/docs/cli/headless/),
+[Grok headless interfaces](https://docs.x.ai/build/cli/headless-scripting).
+
+
+The ACP fork handoff stays pending until the provider emits response content/tool activity
+or successfully completes the first prompt. The driver journals `ForkContextConsumed` at
+that point; a JSON-RPC rejection before acceptance retains the copy for retry/restart.
+ACP permission replies contain only the selected option id. In particular, Grok's TUI-derived
+reject label mentions feedback, but there is no feedback field in this protocol response.
+Chimaera labels that action “Deny” and does not display feedback or rule-destination controls.
+
+`just chat-smoke-acp` covers the common live flow for both registrations: copied-context
+recall, ordered streaming, replay, same-id resume, model readback, allow/deny, stop while
+awaiting permission, queue cancellation, and delivery after the active turn. Set
+`CHIMAERA_TEST_AGY_ACP` and `CHIMAERA_TEST_GROK` to official runtime executables; the tests
+reuse existing logins and create files only in temporary workspaces.
+
+
+## 2026-10-01: current native-driver compatibility
+
+`just chat-smoke` passed all 26 live tests with Claude Code 2.1.287 and Codex
+0.159.3 after these installed CLIs updated during the integration work. Their
+verified-version constants now name those builds. No further native wire changes
+were needed; this repeats the complete approval, queue, background task, fork,
+rollback, compaction and driver lifecycle suite, not only an echo prompt.
+
+### 2026-10-01: core-agent extension and MCP verification
+
+Antigravity CLI 1.2.14 and Grok Build 1.0.46 were exercised through the daemon's
+Chat → native ACP → Chimaera MCP path. Both listed workspace peers, sent a local
+message and read the other agent's reply. Both also held a message while busy,
+reached the Ask wake policy on turn completion, and consumed the message once
+after the user-approved wake. ACP permission requests remain native; no consent
+is inferred from a tool's display title. Cold ACP startup can exceed 20 seconds
+while starting the harness and configured MCPs, so server spawns allow 60 seconds.
+
+Native extension discovery is separate from ACP. `grok inspect --json` includes
+Claude-compatible inventory omitted by `plugin list` / `mcp list`. Skill plugin
+identity is `source.plugin_name`; bundled skills have `source.type: "bundled"`.
+`agy -p /skills --output-format json --print-timeout 15s` returns
+`command.name: "skills"`, `num_turns: 0`, `status: "SUCCESS"` and
+`command.data.skills`. Probe only known supported versions. AGY `plugin list`
+imports have no enablement state and omit project-only packages. A loaded skill
+is positive evidence for its own scope, not for another copy with the same name.
+
+In 1.2.14, AGY `/plugins` is a model prompt, not a management menu; use native
+plugin CLI commands. Grok's `/plugins` and `/mcps` open its native extensions menu.
+Grok local-source installation requires explicit `--trust`; Chimaera asks in the
+visible install terminal before setting that flag. Antigravity's
+`/chimaera-fixture:probe` and Grok's loaded `probe` skill returned the disposable
+plugin's verification word in real chats.
+
+Terminal MCP injection remains Claude/Codex-only. Grok 1.0.46 rejected the
+`--plugin-dir` option advertised by its docs; no verified session-only override
+was found for the Antigravity terminal CLI either. Chat uses ACP's `mcpServers`
+parameter without rewriting global settings. Do not infer terminal parity from
+these passing Chat tests.

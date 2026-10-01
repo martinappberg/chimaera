@@ -35,7 +35,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use crate::agents::AgentKind;
 use crate::AppState;
 
+pub(crate) mod actions;
 pub(crate) mod connections;
+mod extensions;
 
 const CACHE_TTL: Duration = Duration::from_secs(60);
 const CLI_TIMEOUT: Duration = Duration::from_secs(20);
@@ -805,6 +807,32 @@ pub(crate) struct ProbeQuery {
     refresh: bool,
 }
 
+async fn refresh_probes(state: &AppState) {
+    state.probes.invalidate();
+    // A transient version timeout must not disable inventory until a daemon
+    // restart. Explicit retries reuse the resolved binary, preserving the
+    // configured installation and avoiding expensive PATH probes for others.
+    let missing: Vec<_> = crate::lock(&state.agent_bins)
+        .iter()
+        .filter(|(_, detection)| detection.version.is_none())
+        .filter_map(|(kind, detection)| {
+            detection
+                .path
+                .as_ref()
+                .ok()
+                .map(|path| (*kind, path.clone()))
+        })
+        .collect();
+    for (kind, path) in missing {
+        let version = crate::launcher::probe_version(&path).await;
+        if let Some(current) = crate::lock(&state.agent_bins).get_mut(&kind) {
+            if current.path.as_ref().ok() == Some(&path) && current.version.is_none() {
+                current.version = version;
+            }
+        }
+    }
+}
+
 /// GET /workspaces/{id}/agent-plugins — each agent's plugins (and codex's
 /// hooks with their trust state), asked of the agents themselves.
 pub(crate) async fn agent_plugins(
@@ -817,14 +845,18 @@ pub(crate) async fn agent_plugins(
         return not_found();
     };
     if query.refresh {
-        state.probes.invalidate();
+        refresh_probes(&state).await;
     }
-    let claude = claude_state(&state).await;
-    let codex = codex_state(&state, &id, &root).await;
+    let (claude, codex, agy, grok) = tokio::join!(
+        claude_state(&state),
+        codex_state(&state, &id, &root),
+        extensions::inventory(&state, &id, &root, AgentKind::Antigravity),
+        extensions::inventory(&state, &id, &root, AgentKind::Grok),
+    );
     axum::Json(json!({
         "schema": 1,
         "host": state.hostname,
-        "agents": [claude, codex],
+        "agents": [claude, codex, agy, grok],
     }))
     .into_response()
 }
@@ -1050,10 +1082,14 @@ pub(crate) async fn skills(
         return not_found();
     };
     if query.refresh {
-        state.probes.invalidate();
+        refresh_probes(&state).await;
     }
-    let claude = claude_state(&state).await;
-    let codex = codex_raw(&state, &id, &root).await;
+    let (claude, codex, agy, grok) = tokio::join!(
+        claude_state(&state),
+        codex_raw(&state, &id, &root),
+        extensions::inventory(&state, &id, &root, AgentKind::Antigravity),
+        extensions::inventory(&state, &id, &root, AgentKind::Grok),
+    );
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let plugin_dirs: Vec<(String, PathBuf)> = claude
         .get("plugins")
@@ -1096,9 +1132,9 @@ pub(crate) async fn skills(
     .await
     .unwrap_or_default();
 
-    let mut rows: BTreeMap<String, SkillRow> = BTreeMap::new();
+    let mut rows: BTreeMap<(String, Option<PathBuf>), SkillRow> = BTreeMap::new();
     for (source, plugin, name, description, path) in scanned {
-        let row = rows.entry(name.clone()).or_default();
+        let row = rows.entry((name.clone(), Some(path.clone()))).or_default();
         row.description = description;
         row.source = source;
         row.plugin = plugin;
@@ -1114,7 +1150,7 @@ pub(crate) async fn skills(
         .into_iter()
         .filter(|(name, _)| !name.starts_with('_'))
     {
-        let row = rows.entry(name.clone()).or_default();
+        let row = rows.entry((name.clone(), None)).or_default();
         if row.claude.is_none() {
             row.claude = Some(("available".into(), None, None));
             row.source = "builtin";
@@ -1138,7 +1174,8 @@ pub(crate) async fn skills(
                 .unwrap_or(true);
             let scope = skill.get("scope").and_then(Value::as_str).unwrap_or("");
             let plugin_id = skill.get("pluginId").and_then(Value::as_str);
-            let row = rows.entry(name.to_string()).or_default();
+            let path = skill.get("path").and_then(Value::as_str).map(PathBuf::from);
+            let row = rows.entry((name.to_string(), path)).or_default();
             if row.source.is_empty() {
                 row.source = match (scope, plugin_id) {
                     (_, Some(_)) => "plugin",
@@ -1181,9 +1218,9 @@ pub(crate) async fn skills(
     }
     let claude_available = claude.get("available") == Some(&json!(true));
     let codex_available = codex.get("available") == Some(&json!(true));
-    let skills: Vec<Value> = rows
+    let mut skills: Vec<Value> = rows
         .into_iter()
-        .map(|(name, row)| {
+        .map(|((name, _), row)| {
             let side = |slot: &Option<(String, Option<String>, Option<PathBuf>)>,
                         prefix: char,
                         available: bool,
@@ -1222,12 +1259,31 @@ pub(crate) async fn skills(
             })
         })
         .collect();
+    for inventory in [&agy, &grok] {
+        extensions::append_skills(&mut skills, inventory);
+        for key in ["error", "skills_error"] {
+            if let Some(message) = inventory[key].as_str() {
+                errors.push(json!({"agent":inventory["agent"],"message":message}));
+            }
+        }
+    }
+    for skill in &mut skills {
+        use sha2::Digest;
+        // A refreshed inventory can insert/remove earlier rows. Never transfer
+        // an expanded row to another skill just because its position changed.
+        let identity = json!({"name":skill["name"],"paths":skill["paths"]}).to_string();
+        let digest = sha2::Sha256::digest(identity.as_bytes());
+        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        skill["id"] = json!(format!("skill-{hex}"));
+    }
     axum::Json(json!({
         "schema": 1,
         "host": state.hostname,
         "agents": {
             "claude": {"available": claude_available, "version": claude.get("version"), "live": live},
             "codex": {"available": codex_available, "version": codex.get("version")},
+            "agy": {"available":agy["available"],"version":agy["version"]},
+            "grok": {"available":grok["available"],"version":grok["version"]},
         },
         "skills": skills,
         "errors": errors,

@@ -27,7 +27,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   pane. Start typing (or click the magnifier) to filter the loaded tree; the **collapse folders**
   button beside it folds every open dir and returns to the top. A directory link clicked
   in a terminal/chat reveals + flashes its row. File rows drag out (drop into a pane/split, or
-  onto an agent to reference).
+  onto an agent to reference). Arrow keys move focus, expand/collapse folders, and return
+  to the parent; Home/End jump to the ends. F2 renames and Delete asks for confirmation.
 - **Finding your place in a deep tree.** **Indent guides** — one hairline per depth under each
   level's chevron; hovering a row draws its parent folder's guide strong, so "which folder am I
   in" is answered without scrolling up. **Sticky ancestors** — while scrolled inside a folder,
@@ -72,7 +73,7 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   requests share an eight-operation blocking-work ceiling, so a burst against a slow NFS/Lustre
   mount queues without consuming the daemon's async workers or an unbounded blocking-thread pool.
 
-## File management (create / rename / copy / paste / delete / download)
+## File management (create / rename / move / copy / paste / delete / download)
 
 - **What & when.** Right-click anywhere files show — tree rows, the tree background, Finder
   entries, Finder column backgrounds, file-backed pane tabs — for New File…/New Folder…,
@@ -86,7 +87,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   ⌘/Ctrl+C/X/V while a tree row or Finder is focused (scoped so terminals keep their own
   copy): paste runs a server-side copy/move (bytes never round-trip the browser), copies get a
   macOS "name copy" sibling on collision, a cut row dims until it lands (Escape clears it), and
-  a cut into the same folder is a no-op. Files can also be **dragged from the OS desktop** onto
+  a cut into the same folder is a no-op. **Drag to move** between tree folders and Finder
+  columns/rows/breadcrumbs; hold Option/Alt to copy. A file-preview tab can move its file into
+  a folder too. The target and operation are named before release; hover opens folders,
+  edges scroll, and invalid drops explain why. Files can also be **dragged from the OS desktop** onto
   a Finder column or a FILES-tree folder to upload into it (see
   [drag-drop-and-uploads.md](drag-drop-and-uploads.md)). Delete always confirms in a modal
   (permanent — no server-side trash), which names any file under the path with unsaved edits:
@@ -101,7 +105,7 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 - **Where it lives.** UI: `shared/contextMenu.svelte.ts` + `ContextMenuHost.svelte` (the one
   right-click menu), `shared/ConfirmDialog.svelte`, `shared/fsNames.ts` (name validation +
   stem preselect), `workspace/fsEvents.ts` (the mutation bus), `workspace/fileClipboard.svelte.ts`
-  (the in-app file clipboard + paste). Daemon: `fs.rs` handlers
+  (the in-app file clipboard + paste) + `workspace/fileTransfer.ts` (shared move/copy policy). Daemon: `fs.rs` handlers
   `create`/`rename`/`copy`/`move`/`delete` + `crates/chimaera-server/src/download.rs`.
 - **Routes.** `POST /api/v1/fs/create {path, kind}` (makes parents; 409 if the target exists),
   `POST /api/v1/fs/rename {from, to}` (409 on existing target; symlink-safe; case-only renames
@@ -125,11 +129,43 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   a rename/move **rewrites open tabs** (file/diff/finder, prefix-aware for folder renames —
   `rewriteTabPaths` in `layout/layout.ts`); a delete closes tabs under the path and retargets
   Finders to the parent (`pruneDeletedPath`). A slow (remote) listing shows a delayed spinner —
-  a per-node "listing…" row in the tree, an incoming-column spinner in the Finder. A file tab's
-  Rename is disabled while the file has unsaved edits. Escape cancels any inline input; blur
+  a per-node "listing…" row in the tree, an incoming-column spinner in the Finder. Unsaved
+  buffers follow an in-app rename or move to the new path. Escape cancels any inline input; blur
   commits a non-empty valid name. Finder descents reveal the new column with the smallest possible
   horizontal movement; refreshes preserve the user's horizontal position and re-list only affected
   visible columns, coalescing mutation and disk-watch bursts.
+
+## Find within a document
+
+The [pane Find command](workbench.md#find-in-the-current-pane) opens the existing
+CodeMirror search panel for code/source editors and the PDF viewer's document
+search, even when focus is in pane chrome. Rendered markdown uses
+`shared/DocumentFind.svelte` / `domFind.ts`: literal, case-optional matching across
+inline formatting, with CSS range highlights that leave renderer-owned DOM and
+reference selections intact. `readingWindow.ts` materializes parked paragraphs
+while search is open, then resumes windowing on close. Search skips collapsed
+content and is bounded to 2 million characters, 50,000 text nodes and 1,000
+matches; a limit notice means results are partial. Closing or leaving the tab
+clears highlights and observers. Opening or closing folded sections refreshes
+matches, including nested folds. PDF keeps its existing page-text search limits.
+
+## Finder navigation and controls
+
+The Finder shows the directory chain in columns. Its toolbar exposes **parent folder**, the
+full breadcrumb, **New folder**, and a **folder actions** menu with New File, New Folder,
+Paste, Copy Path, and workspace/home jumps. The breadcrumb scrolls to keep the current folder
+visible in narrow panes. The active column determines the toolbar and keyboard paste
+destination; clicking an empty column activates it. Ancestor selections use a neutral fill;
+the active selection has an accent edge and a stronger keyboard focus ring. The footer shows
+the item count and selected name, or the current drop destination with the copy modifier.
+Drag/copy guidance also appears in entry tooltips. Outside-workspace locations retain a quiet
+return link in the footer.
+
+Arrow keys select entries and traverse columns; Home/End jump to the first/last entry.
+Selection scrolls into view and is exposed through the tree's active descendant. Enter opens,
+F2 renames and Delete opens the existing delete confirmation. Inline name inputs retain their
+normal text-editing shortcuts. Broken links remain manageable but never open. A failed or
+superseded folder navigation cannot start a create operation in a different directory.
 
 ## Raw reads & lightweight editing
 

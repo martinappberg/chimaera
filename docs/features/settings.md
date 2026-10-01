@@ -62,7 +62,7 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   ("chimaera" in a browser, "local daemon" / "daemon on \<host\>" in the app) and the agent CLIs (one
   summary line, "Agents ↓" jumps there). Each says up to date / \<new\> available / couldn't check (with
   the reason) / not checked yet, plus when it last checked and the cadence; "check now" asks every source
-  at once. Agents read "up to date" only when every installed agent's version and latest are both known.
+  at once. Agents read "up to date" only when every installed agent has comparable versions and a successful latest check. Failed re-checks preserve the known release while displaying the failure; unknown versions never count as current. The Agents and Updates sections share the catalog, so installation and path changes refresh both.
 
 ## Activity
 
@@ -72,10 +72,13 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
 
 ## Agents settings & themes
 
-- **Agents panel** (`AgentsSettings.svelte`) — update/uninstall managed agent runtimes and set an
-  explicit binary path per agent; "re-check" also probes upstream for each agent's latest release,
-  a known-newer release shows an accent "update → \<new\>" button on managed rows and a quiet
-  "\<new\> available" note on your own (see [agents.md](agents.md)).
+- **Agents panel** (`AgentsSettings.svelte`) — four built-in cards show version, chat/terminal readiness,
+  and whether Chimaera manages the installation. Install, Set up chat, or Update is offered when
+  applicable; personal installations link to official update instructions. Antigravity's chat setup
+  installs Google's companion. Advanced holds custom executable paths, Reinstall and Uninstall.
+  Installation progress follows a retained daemon result from the terminal's actual exit status, with bounded polling only while
+  Settings is visible. Re-checking and saving another row preserve unfinished path edits.
+  See [agents.md](agents.md).
 - **Theme palettes** (`themes.ts`) — each theme carries its own hand-tuned 16-color terminal ANSI
   palette alongside the UI tokens; a UI theme without a terminal palette is "half a theme". UI quality
   (curated light/dark) is an acceptance criterion, per [rules/web-ui.md](../../.claude/rules/web-ui.md).

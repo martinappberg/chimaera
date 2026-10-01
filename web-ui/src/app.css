@@ -642,3 +642,9 @@ body.dragging {
   outline-offset: 1px;
   border-radius: 2px;
 }
+/* Search never rewrites message DOM or steals the reference selection. */
+.find-current-message {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
+}

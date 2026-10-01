@@ -115,14 +115,13 @@ export function createReadingWindow(root: HTMLElement): ReadingWindow {
     });
   }
 
-  // Selecting and native Find need the complete text. Materialize before
-  // Cmd/Ctrl+A/F/G's default action and keep it present for a drag selection.
+  // Selecting needs the complete text. Pane-scoped Find requests it through
+  // onFindVisibility; another pane's search must not materialize this one.
   function onKey(event: KeyboardEvent): void {
     if (layer?.inert || scroll?.classList.contains("hidden")) return;
-    if (!(event.metaKey || event.ctrlKey) || !["a", "f", "g"].includes(event.key.toLowerCase())) return;
-    if (event.key.toLowerCase() === "a" && (!(event.target instanceof Node) || !scroll?.contains(event.target))) return;
-    finding = event.key.toLowerCase() !== "a";
-    selecting = !finding;
+    if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "a") return;
+    if (!(event.target instanceof Node) || !scroll?.contains(event.target)) return;
+    selecting = true;
     restoreAll();
   }
   function onSelection(): void {
@@ -162,11 +161,17 @@ export function createReadingWindow(root: HTMLElement): ReadingWindow {
     printing = true;
     restoreAll();
   }
+  function onFindVisibility(event: Event): void {
+    finding = (event as CustomEvent<boolean>).detail;
+    if (finding) restoreAll();
+    else schedule();
+  }
   function afterPrint(): void {
     printing = false;
     schedule();
   }
   window.addEventListener("beforeprint", beforePrint);
+  scroll?.addEventListener("chimaera-find-visibility", onFindVisibility);
   window.addEventListener("afterprint", afterPrint);
   document.addEventListener("keydown", onKey, true);
   document.addEventListener("selectionchange", onSelection);
@@ -180,6 +185,7 @@ export function createReadingWindow(root: HTMLElement): ReadingWindow {
       activation.disconnect();
       observer.disconnect();
       window.removeEventListener("beforeprint", beforePrint);
+      scroll?.removeEventListener("chimaera-find-visibility", onFindVisibility);
       window.removeEventListener("afterprint", afterPrint);
       document.removeEventListener("keydown", onKey, true);
       document.removeEventListener("selectionchange", onSelection);

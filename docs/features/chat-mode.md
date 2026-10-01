@@ -2,7 +2,7 @@
 
 The rich chat surface: instead of running an agent as a raw TUI, Chimaera drives the same
 CLI over its **structured JSON protocol** (Claude Code over bidirectional `stream-json`,
-Codex over `codex app-server` JSON-RPC) and renders a first-class chat UI — streamed prose
+Codex over `codex app-server` JSON-RPC, Grok Build and Google Antigravity over ACP v1) and renders a first-class chat UI — streamed prose
 and thinking, tool cards, permission and question prompts, inline artifacts, model/effort
 controls, and lossless reconnect. The same session identity can toggle between chat and the
 TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
@@ -18,6 +18,16 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 [PROTOCOL.md](../../crates/chimaera-agent/PROTOCOL.md); rules:
 [rules/agent-protocol.md](../../.claude/rules/agent-protocol.md); working skill:
 [chat-mode](../../.claude/skills/chat-mode/SKILL.md).
+
+## Agents and available controls
+
+Claude Code, Codex, Antigravity (Gemini models), and Grok Build share the transcript,
+composer, permissions, queue and replay core. Session `capabilities` and `catalog` events
+control the available header/composer actions. ACP model choices come from the authenticated
+provider; unsupported actions are not guessed from the agent's brand. Forking works across all
+four using native history where available or a conversation copy. Same-session chat/terminal
+switching and rewind remain Claude/Codex-only until the new providers' native boundaries are
+verified. See [integration design](../agent-harness-design.md) for the plugin boundary.
 
 ## Composing & sending
 
@@ -655,9 +665,9 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   constant (the current pins live at the top of `claude.rs` / `codex.rs`). Touching a driver or
   bumping a CLI **requires `just chat-smoke`** (live, bills a few cents). The two drivers must stay
   **symmetric**.
-- **Handshake watchdog → degrade-to-PTY** (`driver.rs`, `chat.rs`): a chat session that can't prove
-  its protocol in 20s fails fast and respawns as the real TUI on the same session id (one attempt),
-  so a pane never hangs.
+- **Handshake watchdog** (`driver.rs`, `chat.rs`): a session that cannot initialize in 20s fails
+  visibly. A fresh Claude/Codex launch retains its one-time terminal fallback. A resumed chat
+  stays in chat on failure, preserving its handle and diagnostics; ACP never silently changes view.
 
 ## View switch, rewind, and branch
 
@@ -681,7 +691,9 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   uses `thread/fork` through a completed turn. Every other combination — cross-agent, a same-agent
   boundary the native API cannot represent exactly, or a source with no reusable native id — copies
   the normalized visible Chimaera prefix and installs a bounded vendor-neutral transcript as quiet
-  system/developer context. The new journal retains the full copied visible prefix; only the
+  system/developer context for Claude/Codex. ACP attaches it to the first real user prompt,
+  without an initialization turn. Copies include messages/tool results but not image bytes,
+  private reasoning or running tasks. The new journal retains the full copied visible prefix; only the
   model-facing handoff is head/tail capped. Neither path rolls files back, kills the source process,
   truncates its journal, or asks the destination agent to speak before the user sends something.
 - **Rewind + fork (claude).** Hover a user message → "↺" → a dry-run report → a dialog listing the
@@ -711,6 +723,22 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   checkpoint can authenticate the message immediately before that prompt, while Codex exposes
   completed turns. The branch action remains available at every message, but uses the portable
   handoff elsewhere.
+
+## Find in conversation messages
+
+`Mod+F` and the pane magnifier search retained user, assistant and agent-to-agent
+message text. Results are **messages**, with a source-text excerpt and a visible
+mark on the matching row; Enter / Shift+Enter wrap through up to 500 matching
+messages. Source markdown is searched, so a link target can match even when its
+label is all that is displayed. Tool output and thinking are excluded. The bar
+says when earlier history has been trimmed from the retained conversation.
+
+`ChatFind.svelte` owns the controls and highlights, `chatFind.ts` the bounded
+message lookup, and `ChatView.svelte::revealFindMessage` mounts the target's
+ordinary bounded transcript page by stable block uid. It never renders the whole
+history or changes the journal. Streaming refreshes results at a bounded cadence
+without moving the reader, and finding a reply at the live edge keeps that reply
+streaming. Closing or hiding the view clears marks and pending search work.
 
 ---
 

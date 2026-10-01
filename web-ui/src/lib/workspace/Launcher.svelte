@@ -31,7 +31,7 @@
   import {
     getAgentDefault,
     listAgents,
-    versionNumber,
+    orderAgents,
     type AgentInfo,
     type LaunchPick,
   } from "./launcher";
@@ -84,10 +84,10 @@
     // The window's last-known catalog paints the rows synchronously; only a
     // cold window (boot probe never landed) fetches before first paint.
     if (initial !== null && initial.length > 0) {
-      agents = initial;
+      agents = orderAgents(initial);
       hl = Math.max(
         0,
-        initial.findIndex((x) => x.id === def.agent),
+        agents.findIndex((x) => x.id === def.agent),
       );
     }
     const loadTimer = setTimeout(() => (showLoading = true), 150);
@@ -99,16 +99,18 @@
     void first
       .then((a) => {
         if (agents === null) {
-          agents = a;
+          agents = orderAgents(a);
           onAgents?.(a);
           hl = Math.max(
             0,
-            a.findIndex((x) => x.id === def.agent),
+            agents.findIndex((x) => x.id === def.agent),
           );
         }
         return listAgents(true).then((fresh) => {
           if (fresh.length > 0) {
-            agents = fresh;
+            const selected = agents?.[hl]?.id;
+            agents = orderAgents(fresh);
+            hl = Math.max(0, agents.findIndex((a) => a.id === selected));
             onAgents?.(fresh);
           }
         });
@@ -151,15 +153,12 @@
     return { left, top, width, maxH };
   });
 
-  /** Spawn (or install). A plain row press / Enter follows the STICKY default
-   *  (agents.defaultView); the "open" button, the terminal button, and ⌘↵ are
-   *  explicit surface picks that also become the sticky default. Agents with no
-   *  chat view always open their TUI — but that never flips the user's default.
-   *  `ui` undefined = non-explicit, follow the setting. */
-  function activate(i: number, ui?: "chat" | "term"): void {
+  /** Row/Enter must do what the visible primary action says. The separate
+   * terminal action stays explicit; the rail's main button uses the saved default. */
+  function activate(i: number, ui: "chat" | "term" = "chat"): void {
     const a = agents?.[i];
     if (a === undefined) return;
-    if (!a.installed) {
+    if (!a.installed || (a.chatSetupRequired && ui !== "term")) {
       // No curated install: nothing to run — the docs link is the
       // affordance (the POST would 400).
       if (a.managedInstall) onInstall(a);
@@ -171,9 +170,7 @@
       onPick({ agent: a.id, ui: "term", explicit: false });
       return;
     }
-    // A concrete ui is a deliberate choice → sticky; undefined follows the
-    // setting (createSession reads agents.defaultView when ui is omitted).
-    onPick({ agent: a.id, ui, explicit: ui !== undefined });
+    onPick({ agent: a.id, ui, explicit: true });
   }
 
   function move(delta: number): void {
@@ -227,6 +224,10 @@
   {:else}
     <div class="agents">
       {#each agents as a, i (a.id)}
+        {@const ready = a.installed && !a.outdated && a.chatCapable}
+        {#if i === 0 || ready !== (agents[i - 1].installed && !agents[i - 1].outdated && agents[i - 1].chatCapable)}
+          <div class="group-label">{ready ? "ready to start" : "set up an agent"}</div>
+        {/if}
         <!-- div, not button: rows contain a real link (docs) and a real
              button (update chip); interactive elements cannot nest. The
              popover root owns all keyboard handling (roving highlight). -->
@@ -261,8 +262,7 @@
             <span class="asub">
               {#if a.installed && !a.outdated}
                 <span class="aver" class:managed={a.managed} title={whereTitle(a)}>
-                  <span class="prov">{a.managed ? "chimaera" : "yours"}</span>
-                  {#if a.version !== null}<span class="num">{versionNumber(a.version)}</span>{/if}
+                  <span>{a.chatSetupRequired ? "finish chat setup" : a.id === "agy" ? "Google · Gemini models" : a.id === "grok" ? "xAI" : a.id === "claude" ? "Anthropic" : a.id === "codex" ? "OpenAI" : "ready"}</span>
                 </span>
                 {#if a.updateAvailable && a.latestVersion !== null}
                   {#if a.managed}
@@ -309,7 +309,7 @@
               {/if}
             </span>
           </span>
-          {#if !a.installed && a.managedInstall}
+          {#if (!a.installed || a.chatSetupRequired) && a.managedInstall}
             <button
               class="achip"
               tabindex="-1"
@@ -319,7 +319,7 @@
                 onInstall(a);
               }}
             >
-              install
+              {a.chatSetupRequired ? "set up chat" : "install"}
             </button>
           {:else if a.outdated}
             <button
@@ -385,7 +385,7 @@
                 activate(i, a.chatCapable ? "chat" : "term");
               }}
             >
-              open
+              {a.chatCapable ? "chat" : "terminal"}
             </button>
           {/if}
         </div>
@@ -402,6 +402,7 @@
 </div>
 
 <style>
+  .group-label { padding: 7px 9px 4px; color: var(--muted); font-size: var(--text-xs); }
   .launcher {
     position: fixed;
     z-index: 120;
@@ -551,32 +552,7 @@
     max-width: 170px;
     overflow: hidden;
     white-space: nowrap;
-    font-family: var(--mono);
-    font-variant-numeric: tabular-nums;
-  }
 
-  /* Provenance word ("chimaera" / "yours") — the at-a-glance answer to whose
-     binary a spawn runs. Muted for the user's own; accent tint when chimaera
-     installed the build itself (~/.chimaera/agents). */
-  .prov {
-    flex: none;
-  }
-
-  .aver.managed .prov {
-    color: var(--accent);
-  }
-
-  /* Version number, set off from the provenance word by a thin middot. */
-  .num {
-    flex: none;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .num::before {
-    content: "·";
-    margin-right: 5px;
-    opacity: 0.5;
   }
 
   /* Update-available: "→ <new>" appended to the version line, only when a
@@ -591,8 +567,7 @@
     padding: 0;
     flex: none;
     font: inherit;
-    font-family: var(--mono);
-    font-variant-numeric: tabular-nums;
+
     color: var(--accent);
     opacity: 0.85;
     transition: opacity 0.12s ease;

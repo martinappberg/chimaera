@@ -48,7 +48,10 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
   (`Reconnector`), server `ws.rs` (`resync`, `authenticate`), `session.rs::resize`.
 - **Key behaviors.** The snapshot must render at the grid it was captured at — resize *before*
   `term.reset()` or every soft-wrapped row re-wraps wrong. `resize` rejects 0×0, no-ops on
-  unchanged dims, and resizes the PTY first (the only fallible step). A *foreign* resize (another
+  unchanged dims, and resizes the PTY first (the only fallible step). Server-driven grid
+  adoption never echoes a resize request: crossed events from multiple clients would otherwise
+  send old dimensions back to the daemon and keep reflowing indefinitely. Real pane/font fits
+  and the reconnect size reconciliation still send requests. A *foreign* resize (another
   window on the same session) repaints after a `RESYNC_DEBOUNCE = 120ms` window; the resize
   *initiator* is skipped (its xterm already reflowed — resyncing it is the "terminal resets when
   I change font size" bug). `unknown_session` is retried a bounded number of times (mid
@@ -57,6 +60,23 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
   of ≤8 KiB, 16 MiB per session worst case — the ring only serves catch-up, but it is also the
   burst absorber for a visible attachment on a slow link, whose `Lagged` costs an uncapped
   scrollback repaint down that same link).
+
+## Find in scrollback
+
+`Mod+F` or the pane's magnifier searches the terminal's retained screen and
+scrollback with literal text, optional case matching, match counts, highlights,
+and wrapping previous/next navigation. It works on shell and agent TUI sessions.
+The search panel belongs to the view and is disposed on close/tab departure;
+the pooled terminal and daemon session stay alive. Search-created selections do
+not copy to the clipboard or become agent references. A hidden window suspends
+the search addon and refreshes the query when shown again. xterm's search addon caps
+highlighted/countable matches at 1,000 (the count shows `+` at that threshold).
+A TUI's alternate screen exposes only the text it retains; this is not a search
+of the agent's full conversation history.
+
+Implementation: `Terminal.svelte`, `termPool.ts` / `termPoolRuntime.ts`, and the
+official `@xterm/addon-search`; shared routing is described in
+[workbench](workbench.md#find-in-the-current-pane). All search work is client-side.
 
 ## Warm terminal pool (client)
 
@@ -140,12 +160,24 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
   `terminal.copyOnSelect`, selecting copies immediately. When a terminal owns a selection the pane
   bar grows a quiet "@ reference" action (`⇧⌘R` / `Ctrl+Shift+R`) that sends the selection into a
   target agent.
-- **Where it lives.** `termPool.ts` (`registerTerminalClipboard`), `web-ui/src/lib/shared/reference.ts`,
+- **Where it lives.** `termPoolRuntime.ts` (`registerTerminalClipboard`), `web-ui/src/lib/shared/reference.ts`,
   `PaneTabs.svelte`.
 - **Key behaviors.** Bare Ctrl is never intercepted — it stays SIGINT/tmux/EOF for the PTY. OSC 52
   *writes* are honored (a remote agent's only path back to the Mac clipboard), but rejected before
   decode above 1.4M base64 characters (about 1 MiB decoded); OSC 52 *reads* are silently swallowed
   so a process can't exfiltrate the clipboard over the PTY.
+
+## Command-line word navigation
+
+- **How it's used.** On macOS, Option+Left/Right moves by word in local and remote shells,
+  using the readline Meta-b/f sequences that stock Bash and zsh bind. This does not require
+  enabling “Option as Meta”; Option-letter combinations still follow that setting.
+- **Where it lives.** `web-ui/src/lib/terminal/terminalKeys.ts`, registered by
+  `termPoolRuntime.ts` alongside the terminal clipboard keys.
+- **Key behaviors.** Alternate-screen applications and application-cursor mode keep xterm's
+  original modified-arrow sequences. Ctrl, Command, Shift combinations, composition, and
+  other platforms are unchanged. The remote shell still owns its keymap; custom bindings
+  and modal editors can assign different meanings to these sequences.
 
 ## Live theming
 

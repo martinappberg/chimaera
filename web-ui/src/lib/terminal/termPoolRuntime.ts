@@ -29,6 +29,7 @@
 
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { SearchAddon } from "@xterm/addon-search";
 import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { SessionSocket } from "./ws";
@@ -41,8 +42,11 @@ import { BASE_FONT_SIZE, baseFontSize, fontFamily } from "./terminalMetrics";
 import { activeTheme, getSetting, onSettingsChange } from "../settings/store.svelte";
 import { isMac } from "../shared/keys";
 import { copyText } from "../shared/clipboard";
+import { wordNavigationInput } from "./terminalKeys";
 
 const POOL_CAP = 12;
+// Search uses xterm's selection internally; it must never trigger copy-on-select.
+const finding = new Set<string>();
 const REFIT_DEBOUNCE_MS = 80;
 /**
  * Cap on bytes buffered for a parked (hidden) terminal. Beyond this the
@@ -199,7 +203,8 @@ function isVisible(entry: PoolEntry): boolean {
  * Resize-before-reset, the grid-adoption ordering for an incoming snapshot:
  * it was rendered at (cols, rows), and replaying at any other width re-wraps
  * every soft-wrapped row at the wrong column. The onResize echo the resize
- * fires is a server-side no-op.
+ * fires is suppressed by SessionSocket: adopting server state must never
+ * turn an old snapshot size into a fresh resize request.
  */
 function applyReset(term: Terminal, cols?: number, rows?: number): void {
   if (cols !== undefined && rows !== undefined && (term.cols !== cols || term.rows !== rows)) {
@@ -328,6 +333,15 @@ function registerTerminalClipboard(term: Terminal): void {
   });
 
   term.attachCustomKeyEventHandler((e) => {
+    const wordInput = wordNavigationInput(
+      e, isMac, term.buffer.active.type, term.modes.applicationCursorKeysMode,
+    );
+    if (wordInput !== null) {
+      term.input(wordInput, true);
+      e.preventDefault();
+      e.stopPropagation();
+      return false;
+    }
     if (e.type !== "keydown" || (e.key !== "c" && e.key !== "C")) return true;
     const copyChord = isMac
       ? e.metaKey && !e.ctrlKey && !e.altKey
@@ -354,6 +368,8 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
 
   const term = new Terminal({
     ...settingsOptions(),
+    // The official search addon's match decorations use this xterm API.
+    allowProposedApi: true,
     fontSize,
     fontWeight: "400",
     fontWeightBold: "600",
@@ -503,6 +519,7 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
   });
   term.onResize(({ cols, rows }) => entry.socket.sendResize(cols, rows));
   term.onSelectionChange(() => {
+    if (finding.has(id)) return;
     const text = term.getSelection();
     handlers?.onSelection(id, text);
     if (text.length > 0 && getSetting("terminal.copyOnSelect")) {
@@ -696,6 +713,47 @@ export function focusTerminal(id: string): void {
   } else {
     pendingFocusId = id;
   }
+}
+
+/** Search is view-owned: opening installs it; closing/unmounting releases it. */
+export function beginFind(id: string, results: (index: number, count: number) => void) {
+  const entry = pool.get(id);
+  if (entry === undefined || !isVisible(entry)) return null;
+  const { term } = entry;
+  const selection = term.getSelection();
+  const addon = new SearchAddon({ highlightLimit: 1000 });
+  term.loadAddon(addon);
+  finding.add(id);
+  handlers?.onSelection(id, "");
+  let lastCase = false;
+  const subscription = addon.onDidChangeResults(({ resultIndex, resultCount }) => results(resultIndex, resultCount));
+  return {
+    selection,
+    search(query: string, caseSensitive: boolean, direction: -1 | 0 | 1): void {
+      // addon-search 0.16 stores options before comparing them: invalidate
+      // its decoration cache explicitly when the case toggle changes.
+      if (caseSensitive !== lastCase) addon.clearDecorations();
+      lastCase = caseSensitive;
+      if (query === "") { addon.clearDecorations(); term.clearSelection(); results(-1, 0); return; }
+      const theme = themeFromTokens();
+      const options = { caseSensitive, incremental: direction === 0, decorations: {
+        matchBorder: theme.yellow,
+        matchOverviewRuler: theme.yellow,
+        activeMatchBorder: theme.foreground,
+        activeMatchColorOverviewRuler: theme.foreground,
+      } };
+      if (direction === -1) addon.findPrevious(query, options);
+      else addon.findNext(query, options);
+    },
+    dispose(): void {
+      subscription.dispose();
+      addon.clearDecorations();
+      addon.dispose();
+      term.clearSelection();
+      finding.delete(id);
+      handlers?.onSelection(id, "");
+    },
+  };
 }
 
 /**

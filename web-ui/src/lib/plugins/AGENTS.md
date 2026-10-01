@@ -14,6 +14,13 @@ with four equal segments: **Plugins** · **Connections** · **Skills** · **Brow
 only through `ExtensionsGlyph.svelte` by PaneTabs, App's rail row and
 QuickOpen — not in `shared/icons.ts`, which `prebuild` regenerates from Tabler.
 
+Agent plugin/skill/connection reports accept namespaced identities and explicit supported
+actions. Never default unknown agents to Codex, synthesize `$skill` syntax for them, or show
+management actions they did not advertise. Antigravity/Grok native discovery has its own
+limits: `notice` explains partial inventories and `enabled: null` means only installed.
+`AgentExtensionControls.svelte` opens verified native actions in a retained terminal;
+Antigravity command help never sends `/plugins` as a model prompt.
+
 ## File map
 
 | File | What it owns |

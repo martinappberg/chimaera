@@ -4,6 +4,7 @@
  * split button / Cmd+Shift+E spawn instantly.
  */
 
+import { writable } from "svelte/store";
 import { api, ApiError } from "../net/api";
 
 /** One agent CLI as reported by GET /api/v1/agents. */
@@ -27,7 +28,7 @@ export interface AgentInfo {
    *  "yours" vs "chimaera" is answerable at a glance. */
   path: string | null;
   /** Whether POST /agents/{id}/install has a curated managed install.
-   *  False (gemini: node runtime, phase 2) means the POST would 400 —
+   *  False means the POST would 400 —
    *  no install chip; the docs link is the affordance. */
   managedInstall: boolean;
   /** Official docs URL — a clickable link on every launcher row. */
@@ -36,12 +37,16 @@ export interface AgentInfo {
   models: { id: string; label: string }[];
   /** Whether this agent can run as a structured chat session. */
   chatCapable: boolean;
+  chatSetupRequired?: boolean;
+  forkCapable?: boolean;
   /** The newest upstream release the daemon knows of (bare number), from
    *  its slow periodic probe or a `check=true` re-check. Null until a
    *  probe has landed. */
   latestVersion: string | null;
   /** When that probe ran, unix seconds. */
   latestCheckedAt: number | null;
+  latestError?: string | null;
+  installation?: { sessionId: string; running: boolean; exitStatus: number | null };
   /** Installed and strictly older than `latestVersion` — the update
    *  affordance: one-click for a managed binary (POST update), quiet
    *  information for the user's own. Never guessed: unparseable versions
@@ -69,7 +74,17 @@ async function json<T>(res: Response): Promise<T> {
  *  reflashed the header model chip. `refresh` bypasses it and replaces it (App
  *  re-probes after the install flow); a rejected fetch is dropped so a transient
  *  error can't poison later calls. */
+const catalog = writable<AgentInfo[]>([]);
+export const agentCatalog = { subscribe: catalog.subscribe };
+
 let agentsCache: Promise<AgentInfo[]> | null = null;
+
+/** Ready chats first; setup never looks like a launch action. Stable sorting
+ * preserves the curated/provider order within each group. */
+export function orderAgents(agents: AgentInfo[]): AgentInfo[] {
+  const rank = (a: AgentInfo) => a.installed && !a.outdated && a.chatCapable ? 0 : 1;
+  return [...agents].sort((a, b) => rank(a) - rank(b));
+}
 
 /** GET /api/v1/agents — what this host has, per known agent. `check` also
  *  probes upstream for each agent's latest release inline (Settings'
@@ -90,8 +105,8 @@ export function listAgents(refresh = false, check = false): Promise<AgentInfo[]>
  *  watcher already re-detects when an install/update session ends, and its
  *  mtime validation notices a swapped binary, so a poll never needs to force
  *  four login-shell re-resolutions per tick. Replaces the memoized catalog. */
-export function pollAgents(): Promise<AgentInfo[]> {
-  const pending = fetchAgents(false);
+export function pollAgents(signal?: AbortSignal): Promise<AgentInfo[]> {
+  const pending = fetchAgents(false, false, signal);
   agentsCache = pending;
   void pending.catch(() => {
     if (agentsCache === pending) agentsCache = null;
@@ -99,25 +114,42 @@ export function pollAgents(): Promise<AgentInfo[]> {
   return pending;
 }
 
-async function fetchAgents(refresh: boolean, check = false): Promise<AgentInfo[]> {
+async function fetchAgents(refresh: boolean, check = false, signal?: AbortSignal): Promise<AgentInfo[]> {
   const params = new URLSearchParams();
   if (refresh) params.set("refresh", "true");
   if (check) params.set("check", "true");
   // Not URLSearchParams.size: it's missing on older WebKit (Safari < 17 /
   // webkit2gtk), where `undefined > 0` would silently drop the params.
   const qs = params.toString();
-  const body = await json<unknown>(await api(`/agents${qs === "" ? "" : `?${qs}`}`));
+  const body = await json<unknown>(await api(`/agents${qs === "" ? "" : `?${qs}`}`, { signal }));
+  const rows = normalizeAgentCatalog(body);
+  catalog.set(rows);
+  return rows;
+}
+
+/** Catalog identities are data, including future namespaced extension agents.
+ * Reject malformed/duplicate rows before they reach keyed menus. */
+export function normalizeAgentCatalog(body: unknown): AgentInfo[] {
   if (!Array.isArray(body)) return [];
-  return body.flatMap((raw): AgentInfo[] => {
+  const ids = new Set<string>();
+  return body.slice(0, 64).flatMap((raw): AgentInfo[] => {
     if (typeof raw !== "object" || raw === null) return [];
     const a = raw as Record<string, unknown>;
-    if (typeof a.id !== "string") return [];
+    if (typeof a.id !== "string" || !a.id || a.id.length > 128 || ids.has(a.id)) return [];
+    ids.add(a.id);
+    const modelIds = new Set<string>();
     const install =
       typeof a.install === "object" && a.install !== null
         ? (a.install as Record<string, unknown>)
         : {};
+    const operation = typeof a.installation === "object" && a.installation !== null
+      ? a.installation as Record<string, unknown> : null;
     return [
       {
+        installation: operation && typeof operation.session_id === "string" ? {
+          sessionId: operation.session_id, running: operation.running === true,
+          exitStatus: typeof operation.exit_status === "number" ? operation.exit_status : null,
+        } : undefined,
         id: a.id,
         name: typeof a.name === "string" ? a.name : a.id,
         installed: a.installed === true,
@@ -129,15 +161,19 @@ async function fetchAgents(refresh: boolean, check = false): Promise<AgentInfo[]
         managedInstall: a.managed_install === true,
         installUrl: typeof install.url === "string" ? install.url : null,
         models: Array.isArray(a.models)
-          ? a.models.flatMap((m): { id: string; label: string }[] => {
+          ? a.models.slice(0, 64).flatMap((m): { id: string; label: string }[] => {
+              if (typeof m !== "object" || m === null) return [];
               const mm = m as Record<string, unknown>;
-              return typeof mm.id === "string" && typeof mm.label === "string"
-                ? [{ id: mm.id, label: mm.label }]
-                : [];
+              if (typeof mm.id !== "string" || !mm.id || mm.id.length > 128 || modelIds.has(mm.id) || typeof mm.label !== "string") return [];
+              modelIds.add(mm.id);
+              return [{ id: mm.id, label: mm.label.slice(0, 256) }];
             })
           : [],
         chatCapable: a.chat_capable === true,
+        chatSetupRequired: a.chat_setup_required === true,
+        forkCapable: a.fork_capable === true || (a.fork_capable === undefined && (a.id === "claude" || a.id === "codex")),
         latestVersion: typeof a.latest_version === "string" ? a.latest_version : null,
+        latestError: typeof a.latest_error === "string" ? a.latest_error : null,
         latestCheckedAt: typeof a.latest_checked_at === "number" ? a.latest_checked_at : null,
         updateAvailable: a.update_available === true,
       },
@@ -232,7 +268,7 @@ export interface RecentConvo {
   lastActive: number;
   /** The surface it last ran on ("chat"/"term"), so reopening the row lands in
    *  the same mode. Null for pre-`ui` entries and scanned transcripts → the
-   *  launcher's sticky default decides. */
+   *  conversation reopens in terminal view. */
   ui: "chat" | "term" | null;
 }
 

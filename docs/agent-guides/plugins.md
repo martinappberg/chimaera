@@ -130,7 +130,7 @@ What each part does, and what exists today:
 | `version`, `api` | which build runs, and the WIT it needs; `api` is a gate | `plugins::gate`, `resolve` |
 | `detect.any` | footprint → "active here" (no path component may be a symlink); each path relative, plain components only (no `..`, `.` or absolute path: refused at parse) | `plugins::validate`, `plugins::detect_blocking` |
 | `[access]` | what the plugin may read through the host: `files` (`read` / `none`), `timeline` (`none` / `read` / `notes` = read and post notes), `sessions` (`read` / `none`). A 0.1 manifest without it (or a key left out) keeps exactly what 0.1 allowed without saying: files, notes, sessions. The card lists it; `hostfns` refuses what it doesn't allow. Narrow it to what the plugin uses — a new version that asks for more asks the user again | `plugins::capabilities`, `hostfns` |
-| `requires.agent_plugins` | a genuine hard requirement (no plugin has one today): per-agent install state (asked of the agents), "Requires the <agent> plugin <id>" on the card for agents installed here, and an install button running the agent's own `plugin marketplace add` + `install`/`add` in a visible terminal; the attach sheet's step 1; codex hook trust | `agent_probe.rs`, `plugins::install_requirement` |
+| `requires.agent_plugins` | a genuine hard requirement (no plugin has one today): per-agent install state (asked of the agents), "Requires the <agent> plugin <id>" on the card for agents installed here, and an install button running the agent's own installer (Claude/Codex marketplace pipeline, Antigravity/Grok native source) in a visible terminal; the attach sheet's step 1; codex hook trust | `agent_probe.rs`, `plugins::install_requirement` |
 | `recommends.agent_plugins` | the same shape and the same install route, attach-sheet step and hook trust, for an agent-side plugin that makes this one more useful to the agents the user runs but is never needed: the card's **Agent-side plugin** box, one row per agent installed here ("claude · installed 0.7.2", "codex · not installed [Install]") | `agent_probe.rs`, `plugins::install_requirement` |
 | `requires.summary`, `recommends.summary` | optional: one plain sentence saying what the agent-side plugin is for; the box and the attach sheet's step 1 say it above the agents' rows (`requires_summary` / `recommends_summary` on the wire; a plain fallback when absent) | `manifest_json` |
 | `requires.chimaera` | a gate: this daemon's version must match | `plugins::gate` |
@@ -173,6 +173,27 @@ updates (the running version keeps running): so a new tool, a wider
 `[access]` or a new agent-side plugin is a question for your users, and a
 release that asks for nothing new is not. A local build (`--path`) asks once
 per id and digest, so the rebuild loop asks nothing.
+
+Antigravity and Grok agent-side packages can use `source` instead of `marketplace`:
+
+```toml
+[recommends.agent_plugins.agy]
+id = "my-agent-kit"
+source = "/absolute/path/to/antigravity-kit"
+
+[recommends.agent_plugins.grok]
+id = "my-agent-kit"
+source = "https://github.com/example/grok-kit.git"
+```
+
+`source` is passed as one argument to that agent's native `plugin install`; no shell
+expansion or trust flag comes from the manifest. Local sources must exist on the daemon
+host. Grok asks the user to trust installation in its visible terminal before executing it.
+Do not reuse a Claude/Codex marketplace automatically: publish a compatible package for each
+agent you declare. The UI does not offer installation for an unknown provider or a new
+provider without a source. Native skills, hooks, permissions and MCP configuration retain
+their own semantics. This manifest contribution installs an add-on inside an existing agent;
+it does not register a new agent harness with Chimaera.
 
 ## The crate
 

@@ -15,6 +15,8 @@ export interface AgentConnections {
   version?: string;
   connections: Connection[];
   errors: string[];
+  notice?: string;
+  actions?: string[];
 }
 
 export interface ConnectionsReport { host: string; agents: AgentConnections[] }
@@ -52,7 +54,7 @@ export async function fetchConnections(workspace: string, refresh: boolean): Pro
   const body = await read<ConnectionsReport>(await api(`/workspaces/${encodeURIComponent(workspace)}/connections${refresh ? "?refresh=true" : ""}`, { signal: AbortSignal.timeout(65000) }));
   return {
     host: typeof body.host === "string" ? body.host : "",
-    agents: (Array.isArray(body.agents) ? body.agents : []).filter(a => a.agent === "claude" || a.agent === "codex").map(a => ({
+    agents: (Array.isArray(body.agents) ? body.agents : []).filter(a => typeof a.agent === "string" && /^[a-z][a-z0-9_.:-]{0,127}$/.test(a.agent)).map(a => ({
       ...a,
       available: a.available === true,
       connections: (Array.isArray(a.connections) ? a.connections : []).filter(c => typeof c.name === "string" && (c.kind === "mcp" || c.kind === "app")),
