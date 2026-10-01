@@ -251,9 +251,10 @@ With the login-node override (§4.6), agents get the login-node version: on a
 shared login node, not in a job; light editing, inspecting and preparing jobs
 only; submit anything heavy; leave nothing running.
 
-Codex, uninformed today, gets the same text through the
-`developer_instructions` seam the Mastermind already uses (verify it doesn't
-replace a user's own setting — §13). Whether `sbatch` works from inside a job
+Codex, uninformed today, gets the same text as a developer message added
+once its chat opens (`thread/inject_items`, over stdin): never argv, which
+anyone on a shared node can read, and unlike opening instructions it also
+reaches a reopened chat, so a chat continued in a new job learns the new job. Whether `sbatch` works from inside a job
 is probed at job start and the second bullet is dropped where it doesn't.
 
 ## 8. Mechanics
@@ -421,7 +422,7 @@ adoption's 4 × 1.5 s, and the in-job snapshot's 30 s TTL.
    process of ours on the login node afterwards (`ps -u $USER`).
    Until PR 3 lands, workspaces can't be started from the app on a cluster.
 2. **Agent context on clusters** — the §7 texts, the rules-for-agents
-   setting with the generic default, codex through `developer_instructions`,
+   setting with the generic default, codex through a developer note,
    end time from `%e` once. Server-side; verify with claude chat + TUI and
    codex chat inside a real job.
 3. **Starting workspaces from the app** — `chimaera-core::slurm`,
@@ -468,8 +469,9 @@ folder inside a running job.
   else worth offering?
 - **The hook carrier's size limit** for appended rules (a published rules
   file can be ~10 KB) — measure before choosing the inline/pointer cutoff.
-- **Codex `developer_instructions`**: does `-c` replace a user's own value?
-  If so, merge or skip.
+- ~~**Codex `developer_instructions`**: does `-c` replace a user's own
+  value?~~ Moot: the note rides `thread/inject_items` beside the user's own
+  instructions (PROTOCOL.md Pass 41).
 - **The manifest lease on NFS**: which atomic primitive (O_EXCL create,
   `mkdir`, rename) holds on the filesystems clusters actually use.
 - **Partition visibility**: the exact join of associations and partition

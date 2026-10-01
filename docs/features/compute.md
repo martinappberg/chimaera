@@ -98,13 +98,14 @@ Nothing site-specific is ever coded.
   the previous jobs forward as `degraded`), and the `self` block when it runs inside a job
   (the window's countdown and allocation strip). `DELETE /api/v1/compute/self` scancels
   its own job.
-- **Agents are told where they are** (claude through the hook carrier, codex through its
-  developer instructions): inside job N on node X with these resources until an absolute
-  time; use the allocation fully; submit longer or bigger work as separate jobs with an
-  explicit `--time`, checking at most once a minute. Then the cluster's rules for agents
-  — a file on the cluster the user pointed at and/or their own text — or, without any, a
-  short generic set. A daemon on a login node (the override) tells its agents to keep to
-  light work there.
+- **Agents are told where they are** (claude through the hook carrier, codex through a
+  developer note added once its chat opens, which also reaches a reopened chat, so a chat
+  continued on a new node learns the new job): inside job N on node X with these
+  resources until an absolute time; use the allocation fully; submit longer or bigger
+  work as separate jobs with an explicit `--time`, checking at most once a minute. Then
+  the cluster's rules for agents — a file on the cluster the user pointed at and/or
+  their own text — or, without any, a short generic set. A daemon on a login node (the
+  override) tells its agents to keep to light work there.
 - **Startup commands** (cluster default, workspace, this run) reach every shell and agent
   the job daemon spawns, as the outermost prelude scope.
 - **The rail chip** stays a passive indicator: the user's queued/running job count.

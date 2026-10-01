@@ -151,7 +151,6 @@ fn worker_generated_settings_and_codex_argv_are_unchanged() {
         std::path::Path::new("/bin/codex"),
         Some("http://127.0.0.1:4242/api/v1/mcp/s-agentview"),
         None,
-        None,
     );
     check("codex_argv.json", &pretty(&serde_json::json!(argv)));
 }

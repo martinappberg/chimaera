@@ -103,6 +103,12 @@ pub struct SpawnSpec {
     /// `--append-system-prompt-file`. It initializes context without creating
     /// a synthetic user turn or triggering an agent response.
     pub portable_context: Option<String>,
+    /// Developer-role context added to the thread's history right after it
+    /// opens — a cluster job's facts. Codex-only (`thread/inject_items`, over
+    /// stdin, never argv); Claude gets the same text through its hook carrier.
+    /// It reaches resumed threads too, whose opening instructions Codex never
+    /// replaces (PROTOCOL.md Pass 41).
+    pub developer_note: Option<String>,
     /// MCP tool calls the embedder has already consented to: the driver
     /// answers their approval prompts accept itself instead of surfacing a
     /// PermissionRequest. Codex-only today — its app-server elicits EVERY
@@ -158,6 +164,7 @@ impl SpawnSpec {
             rollback_turns: None,
             fork_at: None,
             portable_context: None,
+            developer_note: None,
             mcp_auto_approve: None,
             remote_control: None,
             revert_before_turn: None,

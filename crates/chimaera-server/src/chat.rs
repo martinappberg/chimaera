@@ -3106,31 +3106,6 @@ async fn codex_initial_effort(state: &Arc<AppState>, recipe: &ChatRecipe) -> Opt
     }
 }
 
-/// The cluster context (`compute::agent_context`: inside a Slurm job, or on
-/// a login node) for a codex chat spawn, which has no hook carrier: it rides
-/// `developer_instructions` beside the host frame. That `-c` value REPLACES a
-/// `developer_instructions` from the user's own config.toml (CLI overrides
-/// outrank the file — see `runtimes::codex_user_developer_instructions_set`),
-/// so when the user set their own, codex is skipped and their text stands
-/// in our place: we'd rather not inform it than silently clobber theirs.
-/// Off-cluster this returns before any file read.
-async fn codex_cluster_context(state: &Arc<AppState>) -> Option<String> {
-    let context = state.compute.agent_context().await?;
-    let config = state.codex_config_path.clone();
-    let users_own = tokio::task::spawn_blocking(move || {
-        crate::runtimes::codex_user_developer_instructions_set(&config)
-    })
-    .await
-    .unwrap_or(true);
-    if users_own {
-        tracing::info!(
-            "codex config sets developer_instructions; the cluster context is not added to codex chats"
-        );
-        return None;
-    }
-    Some(context)
-}
-
 /// Precedence for what a chat starts with: the recipe's explicit model, then
 /// the conversation's own last settings (a reopened chat; `recovered_effort`
 /// is codex's journal-recovered effort for pre-index rows), then the agent
@@ -3157,11 +3132,11 @@ pub(crate) async fn spawn_chat_session(
     let recovered_effort = codex_initial_effort(state, &recipe).await;
     // Read before the no-await stretch below: a cluster job's startup
     // commands (the outermost prelude scope) and, for codex, the cluster
-    // context its developer instructions carry. Both are None off-cluster
-    // without any I/O.
+    // context it gets as a developer note once its thread opens (claude's
+    // rides the hook carrier). Both are None off-cluster without any I/O.
     let startup = crate::environment::job_startup().await;
     let codex_cluster_context = if recipe.kind == AgentKind::Codex {
-        codex_cluster_context(state).await
+        state.compute.agent_context().await
     } else {
         None
     };
@@ -3259,7 +3234,6 @@ pub(crate) async fn spawn_chat_session(
                     &recipe.bin,
                     mcp_url.as_deref(),
                     recipe.mastermind,
-                    codex_cluster_context.as_deref(),
                 ),
                 recipe.resume.clone(),
             )
@@ -3392,12 +3366,8 @@ pub(crate) async fn spawn_chat_session(
     // Same-agent native branch: Claude already receives this through argv;
     // Codex consumes it during the handshake as thread/fork lastTurnId.
     spec.fork_at = recipe.fork_at.clone();
-    // A codex portable branch opens with `developerInstructions` that replace
-    // the argv ones, cluster context included — so it rides along there.
-    spec.portable_context = match (recipe.portable_context.clone(), &codex_cluster_context) {
-        (Some(context), Some(cluster)) => Some(format!("{context}\n\n{cluster}")),
-        (context, _) => context,
-    };
+    spec.portable_context = recipe.portable_context.clone();
+    spec.developer_note = codex_cluster_context;
     // Resurrection carries the original creation time so age survives the
     // restart; every other path leaves it None → the spawn stamps now.
     spec.created_at_ms = recipe.created_at_ms;
