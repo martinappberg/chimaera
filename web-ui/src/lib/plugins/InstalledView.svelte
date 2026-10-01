@@ -12,10 +12,13 @@
   import { pageVisible } from "../shared/visibility";
   import { knowledge } from "../workspace/knowledge";
   import { installedOutcome, type Outcome } from "./installCopy";
+  import AgentExtensionControls from "./AgentExtensionControls.svelte";
   import PluginCard from "./PluginCard.svelte";
   import TrustDialog from "./TrustDialog.svelte";
   import type { AgentsState } from "./requirementsModel";
   import {
+    agentName,
+    agentExtensionAction,
     changeWorkbenchPlugin,
     checkedAt,
     installWorkbenchPlugin,
@@ -194,6 +197,17 @@
     return res;
   }
 
+  let actionError = $state<string | null>(null);
+  let actionBusy = $state<string | null>(null);
+  async function changeAgentPlugin(agent: string, action: string, target: string): Promise<void> {
+    if (!wsId || actionBusy) return;
+    actionBusy = `${agent}:${target}`;
+    actionError = null;
+    try { onOpenSession(await agentExtensionAction(wsId, agent, action, target)); }
+    catch (e) { actionError = e instanceof Error ? e.message : String(e); }
+    finally { actionBusy = null; }
+  }
+
   // --- agent plugins ------------------------------------------------------------
 
   /** The codex hooks of one agent plugin still waiting for the user's trust. */
@@ -226,6 +240,7 @@
   function metaLine(pl: AgentPlugin): string {
     const parts: string[] = [];
     if (pl.skills_n !== undefined && pl.skills_n > 0) parts.push(`${pl.skills_n} skill${pl.skills_n === 1 ? "" : "s"}`);
+    if (pl.has_hooks && pl.hooks_n === undefined) parts.push("hooks");
     if (pl.hooks_n !== undefined && pl.hooks_n > 0) parts.push(`${pl.hooks_n} hook${pl.hooks_n === 1 ? "" : "s"}`);
     if (pl.always_on_tokens !== undefined && pl.always_on_tokens > 0) {
       parts.push(`${fmtTokens(pl.always_on_tokens)} tokens in every session`);
@@ -365,6 +380,7 @@
 
 <section class="sec" aria-labelledby="ag-title">
   <h2 id="ag-title" class="lbl">Agent plugins</h2>
+  {#if actionError}<p class="err" role="alert">{actionError}</p>{/if}
   {#if agentState === "unavailable"}
     <p class="empty">This daemon can't ask the agents about their plugins yet — update chimaera.</p>
   {:else if agentState === "error" && agentPlugins === null}
@@ -373,24 +389,28 @@
       <button class="link" onclick={onRefresh}>Try again</button>
     </p>
   {:else if agentPlugins === null}
-    <p class="empty">asking claude and codex…</p>
+    <p class="empty">Asking your agents…</p>
   {:else}
     <div class="agents">
       {#each agentPlugins.agents as a (a.agent)}
         <div class="agroup">
           <div class="ghead">
-            <span class="gname">{a.agent}</span>
+            <span class="gname">{agentName(a.agent)}</span>
             {#if a.version}<span class="gver" title={a.version}>{agentVersion(a.version)}</span>{/if}
             {#if a.available && !a.error && a.plugins.length > 0}
               <span class="gcount">{a.plugins.length} plugin{a.plugins.length === 1 ? "" : "s"}</span>
             {/if}
           </div>
+          {#if a.available && wsId && a.actions?.includes("manage_plugins")}
+            <AgentExtensionControls agent={a.agent} {wsId} {onOpenSession} canInstall={a.actions?.includes("install_plugin") ?? false} />
+          {/if}
+          {#if a.notice}<p class="gline">{a.notice}</p>{/if}
           {#if a.error}
             <p class="gline err">{a.error}</p>
           {:else if !a.available}
-            <p class="gline">{a.agent} isn't installed on this host</p>
+            <p class="gline">{agentName(a.agent)} isn't installed on this host</p>
           {:else if a.plugins.length === 0}
-            <p class="gline">{a.agent} has no plugins</p>
+            <p class="gline">No plugins reported for {agentName(a.agent)}</p>
           {:else}
             <ul class="plist">
               <!-- The agent lists one row per installation: the same id can come
@@ -402,7 +422,7 @@
                 <li class="prow">
                   <div class="pmain">
                     <span class="pname" title={pl.id}>{pl.id.split("@")[0]}</span>
-                    <span class="pver">{[pl.version, pl.scope].filter(Boolean).join(" · ")}</span>
+                    <span class="pver">{[pl.version, pl.scope, pl.origin].filter(Boolean).join(" · ")}</span>
                   </div>
                   <div class="pmeta">
                     {#if waiting > 0}
@@ -418,7 +438,16 @@
                       {meta}
                     {/if}
                   </div>
-                  <span class="pstate" class:off={!pl.enabled}>{pl.enabled ? "enabled" : "disabled"}</span>
+                  <div class="pstate">
+                    <span class:off={pl.enabled === false}>{pl.enabled === null ? "installed" : pl.enabled ? "enabled" : "disabled"}</span>
+                    {#if pl.enabled !== true && pl.actions?.includes("enable_plugin")}
+                      <button class="opt small" disabled={actionBusy !== null} onclick={() => void changeAgentPlugin(a.agent, "enable_plugin", pl.id)}>Enable</button>
+                    {/if}
+                    {#if pl.enabled !== false && pl.actions?.includes("disable_plugin")}
+                      <button class="opt small" disabled={actionBusy !== null} onclick={() => void changeAgentPlugin(a.agent, "disable_plugin", pl.id)}>Disable</button>
+                    {/if}
+                    {#if pl.actions?.includes("update_plugin")}<button class="opt small" disabled={actionBusy !== null} onclick={() => void changeAgentPlugin(a.agent, "update_plugin", pl.id)}>Update</button>{/if}
+                  </div>
                 </li>
               {/each}
             </ul>
@@ -628,7 +657,7 @@
     font-size: var(--text-xs);
     color: var(--accent);
   }
-  .pstate.off {
+  .pstate .off {
     color: var(--muted);
   }
   .pmeta {

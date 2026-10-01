@@ -552,6 +552,8 @@ async fn the_card_carries_the_authors_description_and_agent_plugin_summary() {
             "agent": "claude",
             "id": "fixture-helper@fixture",
             "marketplace": "acme/fixture-helper",
+            "source": null,
+            "installable": true,
         }])
     );
     // The catalog route says the same.

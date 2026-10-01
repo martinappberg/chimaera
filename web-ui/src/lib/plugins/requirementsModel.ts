@@ -166,6 +166,8 @@ export function requirementsModel(input: RequirementsInput): RequirementsModel {
   function row(kind: RowKind, r: PluginRequirement): RequirementRow | null {
     const entry = here(r.agent);
     if (entry === null) return null;
+    if (entry.error) return { ...blankRow(kind, r), state: "Couldn't check this agent", tone: "warn" };
+
     const base = baseId(r.id);
     const candidateIds = new Set([
       ...[...requires, ...recommends]
@@ -190,10 +192,16 @@ export function requirementsModel(input: RequirementsInput): RequirementsModel {
     }
     if (got === undefined) {
       out.status = "missing";
-      out.offerInstall = true;
+      out.offerInstall = r.installable !== false;
       out.state = "not installed";
       out.tone = kind === "requires" ? "warn" : "neutral";
-      out.action = "install";
+      out.action = r.installable === false ? null : "install";
+      if (r.installable === false) out.state = "Set up in the agent";
+      return out;
+    }
+    if (got.enabled === null) {
+      out.state = "installed · check enablement in the agent";
+      out.status = "unknown";
       return out;
     }
     out.status = got.enabled ? "installed" : "disabled";

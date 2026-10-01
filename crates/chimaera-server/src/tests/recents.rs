@@ -51,42 +51,48 @@ async fn recents_retire_round_trips_and_persists() {
     assert_eq!(entries[0]["ui"], "chat");
 }
 
-/// Codex chat has no Claude transcript path: its resumable identity lives in
+/// Other chat providers have no Claude transcript path: its resumable identity lives in
 /// ChatInfo and must be carried across registry removal into Recents.
 #[tokio::test]
-async fn recents_retire_codex_chat_preserves_native_thread() {
-    let data_dir = test_dir("recents-codex-chat");
-    let state = test_state_with_data_dir(0, data_dir.clone());
-    let ws = make_workspace(&state, "recents-codex-chat-root").await;
-    plant_agent_record(
-        &state,
-        "s-cdx-chat",
-        &ws,
+async fn recents_retire_every_non_claude_chat_preserves_native_thread() {
+    for kind in [
         agents::AgentKind::Codex,
-        Some("continue the parser"),
-        None,
-    );
+        agents::AgentKind::Antigravity,
+        agents::AgentKind::Grok,
+    ] {
+        let data_dir = test_dir(&format!("recents-{}-chat", kind.as_str()));
+        let state = test_state_with_data_dir(0, data_dir.clone());
+        let ws = make_workspace(&state, "recents-codex-chat-root").await;
+        plant_agent_record(
+            &state,
+            "s-cdx-chat",
+            &ws,
+            kind,
+            Some("continue the parser"),
+            None,
+        );
 
-    recents::retire_with_resume(
-        &state,
-        "s-cdx-chat",
-        None,
-        None,
-        chimaera_agent::model::SessionUi::Chat,
-        Some("thread-cdx-42".to_string()),
-    );
+        recents::retire_with_resume(
+            &state,
+            "s-cdx-chat",
+            None,
+            None,
+            chimaera_agent::model::SessionUi::Chat,
+            Some("thread-cdx-42".to_string()),
+        );
 
-    let entries = recents_of(&state, &ws).await;
-    assert_eq!(entries.len(), 1, "{entries:?}");
-    assert_eq!(entries[0]["kind"], "codex");
-    assert_eq!(entries[0]["resume"], "thread-cdx-42");
-    assert_eq!(entries[0]["ui"], "chat");
+        let entries = recents_of(&state, &ws).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["kind"], kind.as_str());
+        assert_eq!(entries[0]["resume"], "thread-cdx-42");
+        assert_eq!(entries[0]["ui"], "chat");
 
-    // The native id is durable, not merely held in the live store.
-    let reloaded = test_state_with_data_dir(0, data_dir);
-    let entries = recents_of(&reloaded, &ws).await;
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0]["resume"], "thread-cdx-42");
+        // The native id is durable, not merely held in the live store.
+        let reloaded = test_state_with_data_dir(0, data_dir);
+        let entries = recents_of(&reloaded, &ws).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["resume"], "thread-cdx-42");
+    }
 }
 
 #[tokio::test]

@@ -71,7 +71,7 @@
     if (missing <= 0) return undefined;
     if (agent === "codex") return "Codex terminals don't report tokens";
     if (agent !== undefined) return `${agent} doesn't report tokens here`;
-    return `${missing} session${missing === 1 ? "" : "s"} without token counts — codex terminals don't report them`;
+    return `${missing} session${missing === 1 ? "" : "s"} without reported token counts`;
   }
 
   const dayMax = $derived(Math.max(1, ...(report?.days ?? []).map((d) => d.sessions)));

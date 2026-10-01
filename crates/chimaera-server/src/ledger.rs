@@ -643,7 +643,7 @@ fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u6
         // native id passes straight through; claude (chat or TUI) needs the
         // transcript on disk (`resolve_resume`), else the row honestly starts
         // fresh (existing UI rule).
-        resume: if is_chat && agent.kind == AgentKind::Codex {
+        resume: if is_chat && agent.kind != AgentKind::Claude {
             agent.resume.clone()
         } else {
             resolve_resume(&state.claude_projects_dir, entry)
@@ -794,6 +794,31 @@ mod tests {
             plan_restore(&agent_entry(AgentKind::Claude, Some("abc")), true, false),
             RestorePlan::Retire
         );
+    }
+
+    #[test]
+    fn every_chat_provider_keeps_its_surface_and_resume_handle_across_restart() {
+        let dir =
+            std::env::temp_dir().join(format!("chimaera-provider-ledger-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        let mut store = LedgerStore::new(path.clone());
+        let entries: Vec<_> = AgentKind::ALL
+            .into_iter()
+            .map(|kind| {
+                let mut entry = chat_entry(kind, Some("native-session"));
+                entry.id = kind.as_str().into();
+                entry
+            })
+            .collect();
+        store.write_if_changed(&entries, &HashMap::new());
+        let loaded = LedgerStore::new(path).load_boot();
+        assert_eq!(loaded.sessions, entries);
+        for entry in loaded.sessions {
+            assert_eq!(plan_restore(&entry, true, true), RestorePlan::Respawn);
+            assert_eq!(plan_restore(&entry, false, true), RestorePlan::Retire);
+            assert_eq!(entry.agent.unwrap().ui, SessionUi::Chat);
+        }
     }
 
     #[test]

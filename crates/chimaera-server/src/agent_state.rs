@@ -13,14 +13,15 @@ use std::path::PathBuf;
 ///
 /// Gemini CLI's Google sign-in was retired for individual accounts on
 /// 2026-06-18 (API-key auth still works); Google's successor is the
-/// Antigravity CLI (binary `agy`). Both stay in the catalog — the rows
-/// carry official docs links, not editorials.
+/// Antigravity CLI (binary `agy`). Gemini stays readable in old session
+/// records; new launches offer Antigravity, alongside Claude, Codex and Grok.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AgentKind {
     Claude,
     Codex,
     Gemini,
     Antigravity,
+    Grok,
 }
 
 impl AgentKind {
@@ -28,8 +29,8 @@ impl AgentKind {
     pub(crate) const ALL: [AgentKind; 4] = [
         AgentKind::Claude,
         AgentKind::Codex,
-        AgentKind::Gemini,
         AgentKind::Antigravity,
+        AgentKind::Grok,
     ];
 
     /// Stable id — also the binary name (`claude`, `codex`, `agy`, `gemini`).
@@ -39,6 +40,7 @@ impl AgentKind {
             AgentKind::Codex => "codex",
             AgentKind::Antigravity => "agy",
             AgentKind::Gemini => "gemini",
+            AgentKind::Grok => "grok",
         }
     }
 
@@ -47,12 +49,18 @@ impl AgentKind {
         match self {
             AgentKind::Claude => "Claude Code",
             AgentKind::Codex => "Codex",
-            AgentKind::Antigravity => "Antigravity CLI",
+            AgentKind::Antigravity => "Antigravity",
             AgentKind::Gemini => "Gemini CLI",
+            AgentKind::Grok => "Grok Build",
         }
     }
 
     pub(crate) fn parse(s: &str) -> Option<AgentKind> {
+        // Existing sessions/recents retain their identity after retirement
+        // from the new-agent catalog.
+        if s == "gemini" {
+            return Some(AgentKind::Gemini);
+        }
         AgentKind::ALL.into_iter().find(|k| k.as_str() == s)
     }
 
@@ -64,7 +72,23 @@ impl AgentKind {
     /// launcher computes is this AND path-ok AND !outdated — a composite the
     /// UI consumes; this is just the protocol-capability half.)
     pub(crate) fn chat_capable(self) -> bool {
-        matches!(self, AgentKind::Claude | AgentKind::Codex)
+        self.chat_adapter().is_some()
+    }
+
+    pub(crate) fn native_chat_controls(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex)
+    }
+
+    /// Explicit registration: a new identity must never fall through to the
+    /// Codex adapter. The protocol choice does not reach the picker UI.
+    pub(crate) fn chat_adapter(self) -> Option<&'static dyn chimaera_agent::driver::AgentAdapter> {
+        match self {
+            Self::Claude => Some(&chimaera_agent::claude::ClaudeAdapter),
+            Self::Codex => Some(&chimaera_agent::codex::CodexAdapter),
+            Self::Antigravity => Some(&chimaera_agent::acp::ANTIGRAVITY),
+            Self::Grok => Some(&chimaera_agent::acp::GROK),
+            Self::Gemini => None,
+        }
     }
 }
 

@@ -9,6 +9,7 @@ import { isImagePath } from "../previews/files";
 import { artifactMentions, isArtifactPath, proseCovered, proseEmbedTargets } from "./artifacts";
 import { agentMessageFromEvent, isAgentOrigin, parseAgentText, type AgentMessage } from "./agentMessages";
 import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
+import { parseCapabilities, type ChatCapabilities } from "./capabilities";
 
 /** Names a reply may use that still cover their files (a reply listing
  *  thirty outputs covers thirty); resolve candidates from shell text stay
@@ -525,6 +526,20 @@ export interface SlashCommand {
   skill_path?: string;
 }
 
+/** Provider/plugin catalogs can repeat ids. Bound and deduplicate before
+ * they reach keyed menus; Init and later catalog updates use the same parser. */
+function catalogRows(value: unknown, key: string): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  return value.slice(0, 64).filter((row): row is Record<string, unknown> => {
+    if (row === null || typeof row !== "object") return false;
+    const id = row[key];
+    if (typeof id !== "string" || id.length === 0 || id.length > 512 || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
 export class ChatStore {
   blocks = $state<ChatBlock[]>([]);
   pending = $state<PendingPermission[]>([]);
@@ -532,8 +547,10 @@ export class ChatStore {
    *  requestUserInput) — rendered as QuestionCards. */
   questions = $state<PendingQuestion[]>([]);
   plan = $state<PlanEntry[]>([]);
+  initialized = $state(false);
   model = $state<string | null>(null);
   modes = $state<ModeInfo[]>([]);
+  capabilities = $state<ChatCapabilities | null>(null);
   currentMode = $state<string | null>(null);
   slashCommands = $state<SlashCommand[]>([]);
   running = $state(false);
@@ -815,6 +832,13 @@ export class ChatStore {
     this.epoch += 1;
     this.structuralVersion += 1;
     this.lastSeq = 0;
+    this.initialized = false;
+    this.capabilities = null;
+    this.model = null;
+    this.currentMode = null;
+    this.models = [];
+    this.modes = [];
+    this.slashCommands = [];
     this.hydrating = false;
     this.replayHead = 0;
     this.exited = null;
@@ -839,13 +863,36 @@ export class ChatStore {
     this.touchTranscript();
   }
 
+  private applyCatalog(ev: AgentEvent): void {
+    const label = (value: unknown, fallback = "") => typeof value === "string" ? value.slice(0, 512) : fallback;
+    this.modes = catalogRows(ev.modes, "id").map((m) => ({ id: m.id as string, label: label(m.label, m.id as string) }));
+    this.slashCommands = catalogRows(ev.slash_commands, "name").map((c) => ({
+      name: c.name as string, description: label(c.description),
+      skill_path: typeof c.skill_path === "string" ? c.skill_path : undefined,
+    }));
+    this.models = catalogRows(ev.models, "id").map((m) => ({
+      id: m.id as string, label: label(m.label, m.id as string),
+      description: typeof m.description === "string" ? label(m.description) : null,
+      resolved: typeof m.resolved === "string" ? label(m.resolved) : null,
+      efforts: Array.isArray(m.efforts) ? [...new Set(m.efforts.filter((v): v is string => typeof v === "string" && v.length <= 128))].slice(0, 64) : [],
+      defaultEffort: typeof m.default_effort === "string" ? m.default_effort : null,
+    }));
+  }
+
   apply(entry: SeqEvent): void {
     if (entry.seq <= this.lastSeq) return;
     this.lastSeq = entry.seq;
     if (this.hydrating && this.lastSeq >= this.replayHead) this.hydrating = false;
     const ev = entry.ev;
     switch (ev.type) {
+      case "catalog":
+        this.applyCatalog(ev);
+        break;
+      case "capabilities":
+        this.capabilities = parseCapabilities(ev.capabilities);
+        break;
       case "init": {
+        this.initialized = true;
         // A fresh driver handshake: the session is live again whatever a
         // replayed exit or fatal error said (toggle round-trips, resumes, a
         // relaunch after a protocol error) — a red banner pinned above a
@@ -881,7 +928,6 @@ export class ChatStore {
         // resumed agent with no commands/models must not inherit stale rows.
         this.model = typeof ev.model === "string" ? ev.model : null;
         this.currentMode = typeof ev.current_mode === "string" ? ev.current_mode : null;
-        this.modes = Array.isArray(ev.modes) ? (ev.modes as ModeInfo[]) : [];
         // Offer flags are Init-scoped (absent = false on the wire). The bridge
         // rides Init as a SNAPSHOT: claude re-emits system/init mid-process
         // (first prompt, background settles), so a live bridge must survive a
@@ -889,19 +935,7 @@ export class ChatStore {
         this.remoteControlAvailable = ev.remote_control_available === true;
         this.remoteControlAutoEnable = ev.remote_control_auto_enable === true;
         this.remoteControl = foldRemoteControl(ev.remote_control);
-        this.slashCommands = Array.isArray(ev.slash_commands)
-          ? (ev.slash_commands as SlashCommand[])
-          : [];
-        this.models = Array.isArray(ev.models)
-          ? (ev.models as Record<string, unknown>[]).map((m) => ({
-            id: m.id as string,
-            label: (m.label as string) ?? (m.id as string),
-            description: (m.description as string) ?? null,
-            resolved: (m.resolved as string) ?? null,
-            efforts: (m.efforts as string[]) ?? [],
-            defaultEffort: (m.default_effort as string) ?? null,
-          }))
-          : [];
+        this.applyCatalog(ev);
         break;
       }
       case "user_message": {
@@ -1631,7 +1665,9 @@ export class ChatStore {
           // be a different vendor). Keep transcript blocks, but never let its
           // model catalog, limits, context meter, controls, or error state
           // masquerade as destination telemetry while the target initializes.
+          this.initialized = false;
           this.model = null;
+          this.capabilities = null;
           this.modes = [];
           this.currentMode = null;
           this.slashCommands = [];
@@ -1654,9 +1690,10 @@ export class ChatStore {
             ? "Claude Code"
             : ev.source_agent === "codex"
               ? "Codex"
-              : String(ev.source_agent ?? "agent");
+              : ev.source_agent === "agy" ? "Antigravity"
+                : ev.source_agent === "grok" ? "Grok Build" : String(ev.source_agent ?? "agent");
         this.notice(
-          `${native ? "native" : "portable"} fork from ${source} · source session unchanged`,
+          `continued from ${source}${native ? "" : " · conversation copied"}`,
           "info",
         );
         break;

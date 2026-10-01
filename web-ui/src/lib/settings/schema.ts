@@ -129,6 +129,8 @@ export type SettingsMap = {
   "agents.codex.path": string;
   "agents.gemini.path": string;
   "agents.agy.path": string;
+  "agents.agy.chatPath": string;
+  "agents.grok.path": string;
   "daemon.scrollbackLines": number;
   "daemon.restoreSessions": boolean;
   "chat.remoteControlAtStart": boolean;
@@ -242,7 +244,7 @@ const DEFS = {
     title: "Agents can see and message each other",
     category: "Agents",
     description:
-      "Every agent in a workspace can see which others are running and what they're working on, and send them messages that arrive — read at the agent's next step, or kept in its inbox. It adds four tools and a short paragraph to every agent's context. Off also turns the Mastermind off.",
+      "Agents can see who else is working in the workspace and exchange messages. Works in Chat for all four built-in agents, and in Terminal for Claude Code and Codex. Messages wait in an inbox when they cannot be delivered immediately. Off also turns the Mastermind off.",
     type: "boolean",
     default: true,
     scope: "daemon",
@@ -742,6 +744,19 @@ const DEFS = {
     note: "Resolved by the daemon; used for spawns and terminal shims.",
   },
 
+  "agents.grok.path": {
+    title: "Grok Build Binary",
+    category: "Agents",
+    description: "Optional absolute path to Grok Build. Empty finds your installed copy automatically.",
+    type: "string", default: "", placeholder: "resolve from login shell / PATH", scope: "daemon",
+  },
+  "agents.agy.chatPath": {
+    title: "Antigravity Chat Binary",
+    category: "Agents",
+    description: "Optional advanced override for Google's chat executable. Normally installed automatically with Antigravity.",
+    type: "string", default: "", placeholder: "use the installed chat runtime", scope: "daemon",
+  },
+
   // --- Daemon ----------------------------------------------------------------
   "daemon.scrollbackLines": {
     title: "Scrollback Lines (daemon)",
@@ -788,7 +803,7 @@ const DEFS = {
     title: "Voice Dictation",
     category: "Chat",
     description:
-      "A mic button in every chat composer, Claude or Codex: click it (or press the Dictate shortcut) and speak — the words fill your message as they're heard; click again to keep them, Enter to send, Esc to discard. `/voice on|off` flips this too. Your speech goes to Claude's speech-to-text service (the one Claude Code's own /voice uses) with the claude.ai login on the daemon's host, so the button only shows where that login exists; the microphone is on only while you're dictating.",
+      "A mic button in every chat composer: click it (or press the Dictate shortcut) and speak — the words fill your message as they're heard; click again to keep them, Enter to send, Esc to discard. `/voice on|off` flips this too. Your speech goes to Claude's speech-to-text service (the one Claude Code's own /voice uses) with the claude.ai login on the daemon's host, so the button only shows where that login exists; the microphone is on only while you're dictating.",
     type: "boolean",
     default: true,
     scope: "client",
@@ -820,7 +835,7 @@ const DEFS = {
     title: "Restore Sessions on Restart",
     category: "Daemon",
     description:
-      "When the daemon restarts (update, crash, machine reboot), bring sessions back where they were: shells respawn at their last directory, Claude conversations resume, other agents land in Recents. Off: nothing respawns, but agent conversations still retire into Recents.",
+      "When the daemon restarts (update, crash, machine reboot), bring sessions back in their saved view: shells restart in their last folder, supported agent conversations resume, and other agents appear in Recents. Off: nothing respawns, but agent conversations still retire into Recents.",
     type: "boolean",
     default: true,
     scope: "daemon",

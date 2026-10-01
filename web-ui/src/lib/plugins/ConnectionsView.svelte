@@ -3,12 +3,13 @@
   import { ApiError, getHostLabel } from "../net/api";
   import { pageVisible } from "../shared/visibility";
   import { openInSystemBrowser } from "../shared/urlOpen";
-  import { agentPluginsRevision, type AgentId } from "./store";
+  import { agentName, agentPluginsRevision, type AgentId } from "./store";
   import { connectionStatus, fetchConnections, managementUrl, type ConnectionsReport } from "./connections";
 
+  import AgentExtensionControls from "./AgentExtensionControls.svelte";
   import ConnectionDialog from "./ConnectionDialog.svelte";
 
-  let { wsId, visible }: { wsId: string; visible: boolean } = $props();
+  let { wsId, visible, onOpenSession }: { wsId: string; visible: boolean; onOpenSession: (id: string) => void } = $props();
   let report = $state<ConnectionsReport | null>(null);
   let loading = $state(false);
   let unavailable = $state(false);
@@ -58,11 +59,13 @@
     {#if report === null && loading}
       <p class="empty" role="status">Asking your agents about their connections…</p>
     {:else if report !== null && agents.length === 0}
-      <p class="empty">Install Claude Code or Codex on this host to see its connections.</p>
+      <p class="empty">Install an agent on this host to see its connections.</p>
     {/if}
     {#each agents as agent, agentIndex (`${agentIndex}:${agent.agent}`)}
       <section aria-label={`${agent.agent} connections`}>
-        <header><h2>{agent.agent === "claude" ? "Claude Code" : "Codex"}</h2>{#if agent.version}<span class="version">{agent.version.replace("(Claude Code)", "").replace("codex-cli", "").trim()}</span>{/if}</header>
+        <header><h2>{agentName(agent.agent)}</h2>{#if agent.version}<span class="version">{agent.version.replace("(Claude Code)", "").replace("codex-cli", "").trim()}</span>{/if}</header>
+        {#if agent.actions?.includes("manage_connections")}<AgentExtensionControls agent={agent.agent} {wsId} {onOpenSession} section="connections" />{/if}
+        {#if agent.notice}<p class="empty">{agent.notice}</p>{/if}
         {#each agent.errors as problem}<p class="error">{problem}</p>{/each}
         {#if agent.connections.length === 0 && agent.errors.length === 0}
           <p class="empty">No connections reported in this workspace.</p>

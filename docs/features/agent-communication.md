@@ -1,6 +1,6 @@
 # Agent communication
 
-Every agent in a workspace — claude and codex, chat or terminal — can see which other agents
+Claude, Codex, Antigravity and Grok chats, plus Claude/Codex terminals, can see which other agents
 are running and what they're doing, read one's recent work, and send them messages that
 actually arrive. The workspace **Mastermind** is part of it: the one coordinator the user
 appoints, whose messages carry direction. Built into Chimaera (it replaced the Agent notes
@@ -37,7 +37,7 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
   (`message_agent (chimaera) → s-…`, `chimaera.message_agent → s-…`).
 - **Key behaviors.** Pre-allowed for workers (claude `permissions.allow`, codex
   `mcp_auto_approve`, the codex-terminal `approval_mode`), because the setting is the
-  standing permission; an ask-first Mastermind's `message_agent` keeps its prompt. The names
+  standing permission. Antigravity and Grok retain native ACP approval requests; an ask-first Mastermind's `message_agent` keeps its prompt. The names
   avoid Claude Code's own `ListAgents` / `SendMessage` (machine-wide, other Claude sessions):
   asked to "use list_agents", a live haiku loaded those instead, so the instructions also say
   the harness's own agent tools never reach this workspace's agents. Those tools stay the
@@ -60,8 +60,13 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
   - **Codex chat, mid-turn:** `send_if_running` — steered into the running turn (a queued
     user message with `origin: "agent"`), read (`sent`) at its next step. One that misses its
     turn settles `dropped` and goes back to the inbox; it never opens a turn.
-  - **Codex (and other hook-less) terminals:** the inbox only — it sees messages when it calls
+  - **Antigravity and Grok chats, mid-turn:** messages stay in the inbox. Unread direct
+    messages meet the wake policy after the current turn; these agents do not support
+    Codex steering.
+  - **Codex terminals:** the inbox only — it sees messages when it calls
     `read_messages` (`workspace_agents` says so, and says how many wait).
+  - **Antigravity and Grok terminals:** automatic Chimaera MCP injection is not available
+    in the verified CLIs. Use Chat for Chimaera messages; no global configuration is changed.
   - **An idle chat:** the wake policy decides (below).
 - **Key behaviors.** What the agent reads: a header line
   `[message #12 from "loader refactor" (s-1a2b, claude) to you, re #10 — information … Reply

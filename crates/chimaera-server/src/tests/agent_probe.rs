@@ -6,6 +6,16 @@ use super::support::*;
 use crate::agents::AgentKind;
 use crate::*;
 
+fn test_state() -> Arc<AppState> {
+    let state = super::support::test_state();
+    // Inventory now asks every built-in. Never discover the developer's real
+    // CLIs for providers a test did not explicitly replace with a fixture.
+    for kind in AgentKind::ALL {
+        preset_agent(&state, kind, Err("test: unavailable".into()), None);
+    }
+    state
+}
+
 fn fake_cli(dir: &std::path::Path, name: &str, script: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let bin = dir.join(name);
@@ -570,4 +580,204 @@ done
         "host|\n",
         "claude's answer is host-wide"
     );
+}
+
+#[tokio::test]
+async fn new_agent_inventory_routes_preserve_identity_and_native_provenance() {
+    let state = test_state();
+    let ws = make_workspace(&state, "extensions-native").await;
+    let root = root_of(&state, &ws);
+    for kind in [AgentKind::Claude, AgentKind::Codex] {
+        preset_agent(&state, kind, Err("not installed".into()), None);
+    }
+    let agy = fake_cli(
+        &root,
+        "agy",
+        r##"#!/bin/bash
+case "$1 $2" in
+'-p /skills') printf '%s' '{"status":"SUCCESS","num_turns":0,"command":{"name":"skills","data":{"skills":[{"name":"native-review","path":"/fixture/skills/native-review/SKILL.md"}]}}}' ;;
+'plugin list') printf '%s' '{"imports":[{"name":"native-kit"}]}' ;;
+'mcp list') printf 'NAME TYPE STATUS COMMAND/URL\nnative-docs http disabled https://private.invalid/?token=secret\n' ;;
+*) exit 1 ;;
+esac
+"##,
+    );
+    let grok = fake_cli(
+        &root,
+        "grok",
+        r##"#!/bin/bash
+case "$1 $2" in
+'inspect --json') printf '%s' '{"projectTrusted":false,"plugins":[{"name":"compatible-kit","path":"/home/test/.claude/plugins/kit","enabled":true}],"skills":[{"name":"native-review","source":{"type":"user","path":"/different/skills/review/SKILL.md"},"userInvocable":false}],"mcpServers":[{"name":"compatible-docs","vendor":"claude","target":"https://private.invalid/?token=secret"}]}' ;;
+'mcp list') printf '[]' ;;
+*) exit 1 ;;
+esac
+"##,
+    );
+    preset_agent(&state, AgentKind::Antigravity, Ok(agy), Some("1.2.14"));
+    preset_agent(&state, AgentKind::Grok, Ok(grok), Some("1.0.46"));
+    let (status, plugins) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/workspaces/{ws}/agent-plugins"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let agents = plugins["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 4);
+    assert!(
+        agents[2]["plugins"][0]["enabled"].is_null(),
+        "installed is not proof of enabled"
+    );
+    assert_eq!(agents[3]["plugins"][0]["origin"], "Claude compatibility");
+    assert!(agents[3]["notice"].as_str().unwrap().contains("trust"));
+    let (_, skills) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/workspaces/{ws}/skills"),
+        None,
+    )
+    .await;
+    let reviews: Vec<_> = skills["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["name"] == "native-review")
+        .collect();
+    assert_eq!(
+        reviews.len(),
+        2,
+        "different definitions cannot merge by name"
+    );
+    assert!(reviews
+        .iter()
+        .any(|s| s["agents"]["grok"]["invoke"].is_null()));
+    let (_, connections) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/workspaces/{ws}/connections"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        connections["agents"][2]["connections"][0]["status"],
+        "disabled"
+    );
+    assert_eq!(
+        connections["agents"][3]["connections"][0]["source"],
+        "Claude compatibility"
+    );
+    assert!(!connections.to_string().contains("private.invalid"));
+    assert!(!connections.to_string().contains("secret"));
+}
+
+#[tokio::test]
+async fn skill_retry_recovers_a_failed_version_check_without_prompting_unknown_builds() {
+    let state = test_state();
+    let ws = make_workspace(&state, "skills-version-retry").await;
+    let root = root_of(&state, &ws);
+    for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok] {
+        preset_agent(&state, kind, Err("not installed".into()), None);
+    }
+    let agy = fake_cli(
+        &root,
+        "agy",
+        r##"#!/bin/bash
+case "$1 $2" in
+'--version ') printf '1.2.14\n' ;;
+'-p /skills') printf '%s' '{"status":"SUCCESS","num_turns":0,"command":{"name":"skills","data":{"skills":[{"name":"retry-probe","path":"/fixture/SKILL.md"}]}}}' ;;
+'plugin list') printf '%s' '{"imports":[]}' ;;
+*) exit 1 ;;
+esac
+"##,
+    );
+    preset_agent(&state, AgentKind::Antigravity, Ok(agy.clone()), None);
+    let url = format!("/api/v1/workspaces/{ws}/skills");
+    let (status, initial) = request(&state, Method::GET, &url, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(initial["skills"].as_array().unwrap().is_empty());
+    assert!(initial["errors"].to_string().contains("Try again"));
+    let (status, retried) =
+        request(&state, Method::GET, &format!("{url}?refresh=true"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        retried["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "retry-probe"),
+        "{retried}"
+    );
+    let detection = lock(&state.agent_bins)
+        .get(&AgentKind::Antigravity)
+        .unwrap()
+        .clone();
+    assert_eq!(detection.path.unwrap(), agy);
+    assert_eq!(detection.version.as_deref(), Some("1.2.14"));
+}
+
+#[tokio::test]
+async fn native_extension_action_preserves_arguments_and_invalidates_inventory() {
+    let state = test_state();
+    let ws = make_workspace(&state, "extensions-actions").await;
+    let root = root_of(&state, &ws);
+    let bin = fake_cli(
+        &root,
+        "grok",
+        "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$PWD/action-args\"\n",
+    );
+    preset_agent(&state, AgentKind::Antigravity, Ok(bin), Some("1.0.46"));
+    let route = format!("/api/v1/workspaces/{ws}/agent-extensions/action");
+    let response = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&route)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"agent":"agy","action":"install_plugin","target":"kit"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    for agent in ["extension.unknown", "gemini"] {
+        let (status, _) = request(
+            &state,
+            Method::POST,
+            &route,
+            Some(serde_json::json!({"agent":agent,"action":"install_plugin","target":"kit"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    let generation = state.probes.changed_epoch();
+    let target = "/tmp/package with spaces; literal $(touch should-not-exist)";
+    let (status, body) = request(
+        &state,
+        Method::POST,
+        &route,
+        Some(serde_json::json!({"agent":"agy","action":"install_plugin","target":target})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sid = body["session_id"].as_str().unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        if state.probes.changed_epoch() > generation {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "action did not invalidate discovery"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("action-args")).unwrap(),
+        format!("plugin\ninstall\n{target}\n")
+    );
+    assert!(!root.join("should-not-exist").exists());
+    state.sessions.kill(sid).ok();
 }

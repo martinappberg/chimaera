@@ -16,6 +16,8 @@
 //! process + protocol translation) feeding a pump that assigns sequence
 //! numbers, journals every event, and fans out to attached clients.
 
+pub mod acp;
+pub mod capabilities;
 pub mod claude;
 pub mod codex;
 pub mod driver;
@@ -862,7 +864,7 @@ impl ChatManager {
             }
         }
         if let Some(agent) = catalog_to_record {
-            if let AgentEvent::Init { models, .. } = &ev {
+            if let AgentEvent::Init { models, .. } | AgentEvent::Catalog { models, .. } = &ev {
                 self.latest_models
                     .lock()
                     .expect("latest_models lock")

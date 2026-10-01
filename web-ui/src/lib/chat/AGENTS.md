@@ -321,3 +321,11 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
 - Keep `ChatView.svelte` from growing without bound. The overlays/panels (header,
   rewind dialog, `/mcp`, usage, effort) are already their own components — add new
   chrome the same way rather than inlining it into the host.
+
+## Session capabilities
+
+`capabilities.ts` consumes the driver’s additive `capabilities` event; unknown agents have no
+implicit controls. `catalog` refreshes model/mode/command choices without replaying Init or
+resetting a turn. Header/composer controls follow those facts. `ForkDialog` includes every
+ready chat adapter; native history and a conversation copy have different transfer semantics.
+See [integration design](../../../../docs/agent-harness-design.md).

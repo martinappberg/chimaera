@@ -138,7 +138,7 @@
    *  agent supports the structured chat surface; null hides the control. */
   const viewToggle = $derived.by(() => {
     if (activeSession === null || activeSession.kind !== "agent") return null;
-    if (activeSession.chat_capable !== true) return null;
+    if (activeSession.chat_capable !== true || activeSession.view_switchable === false) return null;
     return activeSession.ui === "chat" ? ("term" as const) : ("chat" as const);
   });
 
