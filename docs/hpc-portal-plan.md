@@ -1,21 +1,18 @@
-# HPC clusters — workspaces as jobs, nothing on the login node
+# HPC clusters — Chimaera in Slurm jobs, workspaces open inside them
 
-Status: **plan** (2026-09-30, branch `claude/chimaera-compute-nodes-373200`).
-Nothing here is built yet. It replaces how Chimaera treats an HPC cluster:
-today `connect` starts a long-lived `chimaera serve` on the cluster's login
-node and that daemon launches compute-node sessions; after this plan, a
-cluster's login node only ever sees short commands and an interactive ssh
-terminal, and Chimaera runs **inside Slurm jobs**, one per workspace, started
-and stopped from the app. Regular remotes (dev servers, lab machines, cloud
-VMs) do not change at all. The maintainer's decisions are collected in §12.
+Status: **plan, revision 2** (2026-10-01, branch
+`claude/chimaera-compute-nodes-373200`, PR #236, not merged). Revision 1
+(one job per workspace) is built on that branch; this revision keeps its
+foundations and changes the model the user sees: **you start jobs, and you
+open workspaces inside them** — several jobs at once if you want, several
+workspaces per job, and a workspace can move from one job to another with
+its chats. §11 says what carries over, what changes and what goes. The
+maintainer's decisions are in §12.
 
-Builds on [features/compute.md](features/compute.md) (Slurm awareness and
-today's compute sessions), [features/remote-connect.md](features/remote-connect.md)
-(the ssh layer this reuses), [features/environment.md](features/environment.md)
-(startup commands) and the architecture guide's
-[compute-node sessions](agent-guides/architecture.md#environment-prelude--compute-node-sessions)
-design, whose "Mode 2" becomes the default and whose "Mode 1" becomes an
-explicit override.
+Regular remotes (dev servers, lab machines, cloud VMs) do not change. Builds
+on [features/compute.md](features/compute.md),
+[features/remote-connect.md](features/remote-connect.md) and
+[features/environment.md](features/environment.md).
 
 ## 1. Why
 
@@ -25,467 +22,537 @@ The common rule — written down by some centers, enforced by all — is that
 nothing server-like, unattended, or outliving your interactive session runs
 there: no listening daemons, no process that keeps another alive or restarts
 it, no continuous file sync, no tunnel or relay left running unattended.
-Such processes are killed without notice, and repeated or deliberate cases
-put the user's account at risk. Long-lived services belong in a job.
+Long-lived services belong in a job. A site's admins asked us to stop running
+Chimaera on login nodes; every Chimaera user on every cluster would get the
+same request, so the fix is the product's default.
 
-Chimaera's login-node daemon breaks every clause of that rule: it detaches,
-listens, keeps agents alive while nobody is there, and the app restarts it on
-its own (window restore, reconnect after sleep, a 401, a compute window
-healing its login tunnel). A site's admins asked us to stop. The same request
-would reach every Chimaera user on every cluster, so the fix is the product's
-default, not one user's workaround.
+What the same rules allow, and what this plan is built from: short commands
+on the login node, spaced politely; an `ssh -L` from your own machine through
+the login node to a service in your own job; and inside your own job, using
+its CPUs and memory fully — including agents working while you are away.
 
-What the same rules explicitly allow, and what this plan is built from:
+The shape users already know is Open OnDemand's RStudio or VS Code server:
+you ask for a job with some resources and time, wait for it, and work inside
+it. Chimaera on a cluster works the same way.
 
-- short commands on the login node (`sbatch`, `squeue`, `scancel`, `sinfo`,
-  reading small files), spaced politely;
-- helpers an interactive tool starts for itself and stops with it;
-- an `ssh -L` from your own machine, through the login node, to a service in
-  your own job, for as long as you use it;
-- inside your own allocation, using its CPUs and memory fully — including
-  agents working on a bounded task while you are away.
-
-## 2. Principles (review criteria for every PR here)
+## 2. Principles (review criteria for every change here)
 
 1. **Nothing of ours keeps running on a login node.** No `chimaera serve`
-   (unless the user opts in, §4.6), no detached `srun` client, no relay
-   process, no polling loop. Only short commands the app runs while it is
-   open, and the user's own interactive terminal.
-2. **Nothing site-specific.** No partition names, no site commands (helper
-   scripts some centers ship), no site paths or environment variables, no
-   hostnames, no per-site branches. Everything comes from standard Slurm, from
-   the cluster's own answers (including its refusal messages), or from the
-   user. Clusters we test on are test beds, never special cases in code.
-3. **Probe, never assume; say "not supported here" plainly.** Every
-   per-cluster fact (§5) is discovered or learned, cached, and re-learned when
-   the cluster says otherwise. Where a capability is missing (compute nodes
-   unreachable, no internet on nodes), the UI says so in one sentence.
-4. **A person starts every job.** No automatic restarts, no scheduled starts,
-   no requeue (`--no-requeue`), no job that resubmits itself. The compliant
-   form of "restart it" is a notification and one click.
-5. **Polite to the scheduler.** At least 60 s between scheduler status
-   checks, only while something is visible; prefer one combined command to
-   several; read files instead of asking the scheduler wherever a file
-   answers (§10).
-6. **Regular remotes are untouched.** Cluster mode applies only to hosts where
-   a scheduler is detected. A host without one behaves exactly as today.
+   (unless the user opts in, §4.9), no detached `srun`, no relay, no polling
+   loop. Only short commands — `squeue`, `sbatch`, `scancel`, `sinfo`, and
+   the read-only `chimaera browse` (§8.7), each of which exits at once —
+   and the user's own interactive terminal.
+2. **Nothing site-specific.** No partition names, site commands, site paths
+   or variables, hostnames, or per-site branches in code, tests or docs.
+   Everything comes from standard Slurm, the cluster's own answers (its
+   refusal messages included) or the user.
+3. **Probe, never assume; say "not supported here" plainly** in one sentence.
+4. **A person starts every job.** No automatic restarts, scheduled starts,
+   requeue (`--no-requeue`) or self-resubmission. The compliant form of
+   "restart it" is a notification and one click.
+5. **Polite to the scheduler.** At least 60 s between status checks, only
+   while something is visible or a job this app started is alive; one
+   combined command rather than several; read files where files answer.
+6. **Regular remotes are untouched.**
+7. **Plain words.** The UI says cluster, job, workspace, chats and
+   terminals (§4.10). A user who has never used Chimaera on a cluster must be
+   able to tell from the page alone what is running, where, until when, and
+   what each button will do. If a screen needs an explanation, the screen is
+   wrong.
 
 ## 3. The model
 
-- A **cluster host** is a remote where a scheduler was detected. Its login
-  node gets an interactive terminal and short commands; Chimaera never runs
-  there by default.
-- A **cluster workspace** is a folder on that cluster's shared filesystem
-  plus a remembered **setup** (partition, time, resources, startup commands).
-  It is either **running** (a job holds it), **waiting for a node** (the job
-  is queued), **starting** (the job runs, Chimaera is booting), or
-  **stopped**.
-- **One job per workspace.** A running workspace is a Slurm job whose body is
-  the startup commands followed by `chimaera serve`. Each project's resources
-  and time limit are its own; two jobs never write the same workspace's state.
-  (Opening a second folder inside a running job can come later.)
-- **"Session" keeps its meaning**: the chats and terminals inside a
-  workspace. The job is a property of the workspace ("running on node X ·
-  4 CPU · 16 GB · 5d 22h left"), never a list of "sessions".
-- **The app is the control plane.** The app (and the CLI) run the cluster
-  commands themselves over the existing ssh ControlMaster. Nothing on the
-  cluster coordinates anything between your clicks.
-- **The job is reached Slurm's ordinary way**: the job's Chimaera listens on
-  the node's network address (token-gated), and the app holds a plain
-  `ssh -L <port>:<node>:<port> <host>` through the login node for as long as
-  the job runs and the app is open (§8.5).
+| On screen | What it is | Lives |
+|---|---|---|
+| **Cluster** | a remote where Slurm was detected | Home |
+| **Job** | a Slurm job running Chimaera; workspaces open inside it | the cluster's page |
+| **Workspace** | a folder on the cluster, with its chats and terminals | inside a job, or "not open" |
+| **Chats, terminals** | the sessions inside a workspace (unchanged) | the workspace window |
+
+- A job has a setup (partition, time, CPUs, memory, GPUs, startup
+  commands), a node once it runs, and an end time. **Several jobs can run at
+  once** on one cluster — a long CPU job and a short GPU job, say.
+- A workspace is **open in at most one job at a time**. Open in a job, its
+  chats and terminals run on that job's node and share that job's
+  resources. It can **move** to another job; its chats come with it, because
+  a workspace keeps its chats in its own folder on the cluster, not in the
+  job.
+- A job can be **empty** (started, nothing opened yet) — like starting
+  RStudio before choosing a project.
+- **The app is the control plane.** It runs every cluster command itself over
+  the existing ssh connection. Nothing on the cluster coordinates anything
+  between your clicks except inside your own jobs.
 
 ## 4. What the user sees
 
 ### 4.1 Home
 
-A cluster host's row reads differently from a server's: a "Slurm cluster"
-label and a one-line state ("crc running · 5d 22h left", or "no workspace
-running"). A server row keeps "online · 127.0.0.1:port". Cluster workspaces
-also appear among the home's workspaces with a cluster mark and their state;
-opening one opens it if running, or offers to start it.
+Home lists hosts and workspaces, never files. A cluster's row:
 
-### 4.2 The cluster page
+| State | Row text |
+|---|---|
+| nothing running | `Slurm cluster · no jobs running` |
+| one job | `1 job running · ends in 5d 22h` |
+| several | `2 jobs running · next ends in 3h 40m` |
+| only waiting | `1 job waiting for a node` |
+| login-node override on | `Slurm cluster · Chimaera on the login node` (amber) |
 
-Clicking a cluster host opens its page (the remote detail page today):
+Clicking the row opens the cluster's page. A workspace from a cluster that is
+open in a running job also appears among Home's recent workspaces and opens
+directly.
 
-- **Masthead**: name, "Slurm cluster · Chimaera runs on compute nodes only",
-  the login node the app is connected to, **Terminal**, and a `…` menu.
-- **Workspaces**, each with its state dot, path, and one line of detail:
-  running → node · resources · time left · "3 chats", with **Open** and
-  **Stop**; waiting → "waiting for a node · Slurm estimates 14:20" (and
-  Slurm's reason when it isn't plain priority), with **Cancel**; stopped →
-  why it stopped (time limit, cancelled, failed, preempted, node failure) and
-  "chats saved", with **Start**.
-- **Add a workspace**: a path on the cluster, checked over ssh, plus a name.
-- One quiet line: "Your other jobs on this cluster: 2 running · 9 waiting" —
-  a count only, no controls (the compute chip's "indicator, not controller"
-  rule).
+### 4.2 The cluster's page
 
-### 4.3 Starting a workspace
+Header: the cluster's name, `Slurm cluster`, **Terminal**, a `…` menu
+(**Startup commands…**, **Rules for agents…**, **Run Chimaera on the login
+node…**) and **Start a job**.
 
-The start sheet is built only from what the cluster reports and what the user
-chose before:
+**First visit** (no workspaces, no jobs):
 
-- **Saved setups** first (the last one preselected); a first start has none
-  and says "this one will be remembered".
-- **Partition**: only partitions the user can submit to (§5), each with its
-  maximum time; the default partition marked; tags only for facts the
-  cluster reported or taught us — "can be preempted", "interactive only ·
-  stops when you disconnect".
-- **Time**: required (every job states its time limit), as d/h/m boxes,
-  checked against the partition's maximum.
-- **CPUs, memory, GPUs**: optional — blank means the cluster's defaults.
-- **Account, QOS, constraint**: shown only on clusters that use them, filled
-  from the user's associations; a field the cluster requires (learned from
-  its refusal) becomes required.
-- **Startup commands**: the cluster default, the workspace's, and lines for
-  this run only, each labelled with where it comes from (§6).
-- After **Start**: "Submitted · waiting for a node", with Slurm's start
-  estimate; the window opens by itself when Chimaera is up, and a system
-  notification says so.
+> **Work on {cluster} in Slurm jobs**
+> Chimaera runs inside jobs you start, never on the login node. Add a folder
+> to work in, then start a job to open it.
+> [**Add a workspace…**] [Start a job]
 
-### 4.4 Inside a running workspace
+**Jobs**, one card each, newest first:
 
-The existing compute window identity stays: title `{host} › {node} —
-{workspace}`, the allocation strip (node · time left · resources), the
-banner on the home page. New:
+- Title: the saved setup's name ("Long", "GPU"), else `{partition} · {time}`.
+- One status line:
+  - running: `On node-12 · 8 CPUs · 32 GB · ends in 5d 22h`
+  - starting: `Starting on node-12…`
+  - waiting: `Waiting for a node · Slurm estimates 2:20 pm`, plus Slurm's
+    reason in plain words when it isn't ordinary priority
+    (`· waiting for free GPUs`, else its own word verbatim)
+  - interactive-only partition: `· stops if this app disconnects`
+- Actions: running → **Continue in a new job…**, **Stop**; waiting →
+  **Cancel**.
+- Inside the card, the workspaces open in it: name, folder (muted), what's
+  happening (`2 chats working`, `idle`), **Open**, and a `…` menu:
+  **Move to {other job}** (one entry per other running job), **Close**,
+  **Startup commands…**.
+- A waiting job lists the workspaces that `open when it starts`.
+- Last row: **+ Open a workspace here** (a menu of the not-open workspaces
+  and **Add a workspace…**).
 
-- An hour before the end (and again at ten minutes), a non-blocking banner
-  plus a notification: "Stops in 58 min. Continue on a new node and your
-  chats move with you." **Continue on a new node** queues the next job now
-  with the same setup; when it starts, live chats move over (the restart
-  handoff), the window re-homes onto the new node, and the old job ends. If
-  the old job ends first, the window says so, keeps the chats, and shows the
-  waiting job.
-- When the job ends while the window is open: "This workspace stopped (time
-  limit). Your chats are saved." with **Start again** and **Back to
-  {host}**.
+**Not open**: every other workspace on this cluster — name, folder, `last
+open 2 days ago · chats saved`, **Open**, and `…` (**Startup commands…**,
+**Remove from this list** — "Your files and chats stay where they are").
 
-### 4.5 Terminal
+**Open** never makes the user think about jobs they don't need to:
 
-**Terminal** opens a small window, "{host} · login node", with a terminal
-running `ssh {host}` over the app's ControlMaster (no second password or 2FA
-prompt), and a quiet line: "Login node — for editing, inspecting and
-submitting jobs." It is the user's own interactive session and ends when
-closed.
+| Jobs running | Open does |
+|---|---|
+| none | opens the start sheet with this workspace ticked |
+| one | opens the workspace in that job |
+| several | a small menu: `In Long` · `In GPU` · `In a new job…` |
 
-### 4.6 The login-node override
+Below everything, **+ Add a workspace…**, then one quiet line: `Your other
+Slurm jobs: 37 running · 4 waiting` (a count, no controls).
 
-In the cluster page's `…` menu: **Run Chimaera on the login node**, off by
-default, per host. Turning it on shows one warning and needs a confirm:
-"Chimaera and its agents would keep running on a shared login node after you
-disconnect. Many clusters don't allow that. Turn this on only if your
-cluster's admins say it's fine." While on, the host row carries an amber
-"login node" label and the host behaves as a regular remote (today's flow),
-and agents there get the login-node context (§7). Without the override, a
-login-node daemon found from before gets a notice with **Shut it down**
-(SIGTERM-only, as always).
+A job that ended stays as one line until dismissed: `Long ended 2 h ago — it
+hit its time limit. Chats are saved.` with **Start again** and `×`.
+
+### 4.3 Starting a job
+
+A sheet titled `Start a job on {cluster}`, built only from what the cluster
+reports and what the user chose before:
+
+- **Saved setups** as chips, the last one selected; **New**. A first start
+  has none and says `Your choices are remembered for next time.`
+- **Partition** (only the ones the user may submit to, each with its maximum
+  time; `can be preempted` / `interactive only` tags only when the cluster
+  said so), **Time** (required), **CPUs**, **Memory**, **GPUs** (only on a
+  cluster with GPUs), **Account** / **QOS** (only where used).
+- **Open when it starts**: the not-open workspaces as checkboxes, the one
+  the user clicked already ticked.
+- **Startup commands for this job** (collapsed): `Run before every chat and
+  terminal in this job, after the cluster's and each workspace's.`
+- **Save as** (optional name) to keep the setup.
+- **Start job**. The sheet closes; the job card appears as `Waiting for a
+  node`. A refusal shows Slurm's own message and keeps the sheet open.
+
+### 4.4 Adding a workspace
+
+The only file browsing outside a workspace window. A picker titled `Choose a
+folder on {cluster}`:
+
+- Starts in the home folder; quick links to the folders that hold existing
+  workspaces. A breadcrumb, then **folders only**, each marked `git` or
+  `already added` where true.
+- A small **Go to** field for typing a path (`~` and `$VARS` expand on the
+  cluster).
+- **Add** (or **Add and open** while a job runs — it opens in that job, or
+  asks which).
+- Optional name; defaults to the folder's name.
+
+Before any job runs, each folder is listed by one `chimaera browse` call on
+the login node (§8.7); inside a job, by that job.
+
+### 4.5 Inside a workspace window
+
+- Title `{workspace} — {cluster}`; the job strip (built) reads `In job on
+  node-12 · ends in 5d 22h · 8 CPUs · 32 GB`.
+- An hour before the end and again at ten minutes, a banner: `This job ends
+  in 58 min. Continue in a new job and your chats come with you.`
+  **Continue…**
+- When the job ends: `This job ended — it hit its time limit. Your chats are
+  saved.` **Back to {cluster}** · **Close window**.
+- When the workspace moves to another job, the window follows by itself and
+  says `Moved to GPU` for a moment.
+
+### 4.6 Notifications
+
+Always sent, whatever the user is looking at; windows never open by
+themselves.
+
+| When | Title | Body | Action |
+|---|---|---|---|
+| a job starts | `Your job on {cluster} is ready` | `crc-joint-fold is ready to open.` | Open |
+| 1 h left | `Your job on {cluster} ends in 1 hour` | `Continue in a new job to keep working.` | Continue |
+| 10 min left | `… ends in 10 minutes` | same | Continue |
+| it ended | `Your job on {cluster} stopped` | `It hit its time limit. Chats are saved.` | — |
+| refused | `Slurm didn't accept your job` | Slurm's message | — |
+
+### 4.7 Moving, continuing, stopping
+
+- **Move to {job}**: no confirmation (nothing is lost). The workspace closes
+  in one job — its chats are saved — and opens in the other; its windows
+  follow. The row shows `Moving…` meanwhile.
+- **Continue in a new job…**: the start sheet, prefilled with this job's
+  setup (ask for more time or CPUs if you like), listing `Moves:
+  crc-joint-fold, sc-atlas`. **Start new job**. The old card says
+  `Continuing in a new job — waiting for a node`; when the new job starts,
+  the workspaces move and the old job stops itself. If the old job ends
+  first, its workspaces show `waiting for the new job`.
+- **Stop**: `Stop this job? crc-joint-fold and sc-atlas close. Their chats
+  are saved.` **Stop job**.
+- **Cancel** (waiting job): no confirmation.
+
+### 4.8 Terminal (built)
+
+**Terminal** opens a terminal-only window, `{cluster} · login node`, running
+`ssh {cluster}` over the app's connection. Never listed as a workspace, never
+restored; its session ends when the window closes.
+
+### 4.9 The login-node override (built)
+
+In the `…` menu, off by default, per cluster, with one warning and a
+confirm. While on, the cluster behaves as a regular remote and agents get the
+login-node context.
+
+### 4.10 Words
+
+| Say | Don't say |
+|---|---|
+| job | server, session (for a job), allocation, daemon, instance |
+| workspace | cluster workspace, project slot |
+| open in a job, move, continue in a new job | attach, migrate, handoff, lease, resubmit |
+| ends in 5d 22h | walltime, time limit remaining |
+| waiting for a node | pending, queued (in the status line) |
+| chats are saved | ledger, journal, resumed |
+
+Slurm's own words appear only where Slurm is the speaker (partition names,
+its refusal messages, the reason it gives for waiting).
 
 ## 5. What the app learns from the cluster
 
-All discovery runs as one ssh exec through the master, when the start sheet
-opens, cached for a day per host, and re-run after a refusal. Learned facts
-live in the cluster folder (§8.6) so the CLI and later windows share them.
+Discovery (built) runs as one ssh exec when the start sheet first opens,
+cached a day per cluster in the cluster folder, re-run after a refusal.
 
-| Fact | Where it comes from | Fallback |
+| Fact | Source | Fallback |
 |---|---|---|
-| Scheduler present | login-shell `PATH` walk for `sbatch`/`squeue`/`scancel`/`sinfo`/`srun` (and `qsub`/`qstat`, `bsub`/`bjobs` for PBS and LSF) | not a cluster |
-| Partitions, default, max time, node sizes | `sinfo -h -o "%P\|%a\|%l\|%c\|%m\|%G"` | — |
-| Partitions the user may use | `sacctmgr -nP show assoc user=$USER format=account,partition,qos` ⋈ `scontrol show partition` (`AllowAccounts`, `AllowGroups` vs `id -Gn`, `AllowQos`) | all partitions; a refusal removes one |
-| Accounts, default account | the associations above; `sacctmgr -nP show user $USER format=defaultaccount` | no account field |
-| Preemptible partitions | `scontrol show partition` `PreemptMode` | no tag |
-| Interactive-only partitions | the cluster's refusal of `sbatch` (its own message is shown) | — |
-| Required QOS / constraint / account | the cluster's refusal message, parsed loosely, shown verbatim | — |
-| GPU syntax | `--gpus` (Slurm ≥ 19.05), else `--gres=gpu:N` | — |
-| Start estimate | `squeue --start -j <id>` | "waiting for a node" |
-| Why a job ended | `sacct -nX -j <id> -o State,ExitCode` once | "ended" |
-| Compute nodes reach the internet | the job's egress probe (exists: `caps.json`) | agents can't run in jobs here — say so |
-| Compute nodes reachable from the login node | the connection ladder (§8.5) | "can't reach compute nodes here" |
-| Shared home between login and compute nodes | the job's manifest appears where the app looks | say so |
+| Scheduler present | login-shell `PATH` walk | not a cluster |
+| Partitions, default, max time, node sizes, GPUs | `sinfo` | — |
+| Partitions the user may use | `sacctmgr` associations ⋈ `scontrol show partition` `Allow*` | all; a refusal removes one |
+| Accounts, default account | associations | no account field |
+| Preemptible partitions | `PreemptMode` | no tag |
+| Interactive-only partitions | the cluster's refusal of `sbatch` | — |
+| Required account / QOS / constraint | the refusal message, shown verbatim | — |
+| GPU syntax | Slurm version | `--gres=gpu:N` |
+| Start estimate, why waiting | `squeue --start` / `%r` | `waiting for a node` |
+| Why a job ended | `sacct` once | `ended` |
+| Compute nodes reach the internet | the job's egress probe | say agents can't run here |
+| `sbatch` works inside a job | probed by the job at start | drop that advice for agents |
+
+The same facts feed what agents are told (§7).
 
 ## 6. Startup commands
 
-Environment preludes stay exactly as designed: opaque shell lines, never
-parsed, concatenated in scope order and run before Chimaera and in every
-shell and agent it spawns. On a cluster the scopes are **cluster default**
-(what the host default is elsewhere) ⊕ **workspace** ⊕ **this run**.
+Environment preludes stay as designed: opaque shell lines, never parsed,
+concatenated in scope order, run before every chat and terminal. On a cluster
+the scopes are:
 
-Only storage changes: there is no login-node daemon to hold them. The cluster
-default and saved setups live in the cluster's normal config dir on its
-shared home (`${XDG_CONFIG_HOME:-~/.config}/chimaera`, or the dev home), which
-every job daemon on that cluster already reads as its config dir, so the
-Environment settings panel in any running workspace edits them; the
-workspace scope lives with the workspace. The app reads and writes the same
-files over ssh for the start sheet (small JSON, atomic temp + rename, re-read
-before write).
+| Level | Stored | Edited from |
+|---|---|---|
+| **Cluster** | `env-profiles.json` host scope, in the cluster's shared config dir | cluster page `…` → **Startup commands…**, or Environment settings in any of its workspace windows |
+| **Workspace** | `env-profiles.json` workspace scope (same file) | the workspace's `…` → **Startup commands…**, or its window's Environment settings |
+| **This job** | the job's folder (§8.2) | the start sheet |
+
+Cluster and workspace are the same scopes the Environment settings already
+edit: every Chimaera on a cluster shares that cluster's config dir, so one
+file, two editors, no duplicates. The app edits the file over ssh (re-read,
+change one scope, atomic rename). Order: cluster ⊕ workspace ⊕ this job ⊕
+the per-launch line, so a workspace that needs `R/4.3` and one that needs
+`python/3.12` can share a job.
 
 ## 7. What agents are told
 
-The existing compute-node context (`compute::agent_context`, delivered once
-per session through the hook carrier) becomes, generically:
+Delivered once per chat (claude: the hook carrier; codex: a developer note
+added when its chat opens — built, PROTOCOL.md Pass 41), and refreshed when a
+chat reopens in a new job. Generic text, filled from the job and §5's facts:
 
 ```text
-You are running inside Slurm job <id> on node <node> (cluster <host>,
-partition <p>) with <cpus> CPUs, <mem> of memory and <gpus>. The job ends
-around <absolute time>; anything still running then is stopped.
+You are working inside a Slurm job on <cluster>: job <id> on node <node>,
+<cpus> CPUs, <mem> of memory<, <gpus> GPUs>. It ends at <time, date>;
+anything still running in it then is stopped. Other workspaces may be open
+in the same job and share these resources.
 
-- Commands you run execute inside this job. Use its CPUs and memory fully
-  (match thread counts to $SLURM_CPUS_PER_TASK).
-- For work that needs more time than is left, more resources, or a GPU,
-  submit a separate job with sbatch and an explicit --time. Check on it at
-  most once a minute, or chain steps with --dependency.
+Use this job for interactive work and short runs, and use its CPUs fully
+(match threads to $SLURM_CPUS_PER_TASK). For anything that needs more time
+than is left, more resources, or a GPU this job doesn't have, submit your own
+job with sbatch — it keeps running after this one ends:
+
+  sbatch --time=<always> [--partition=…] [--cpus-per-task=…] [--mem=…] [--gpus=…] job.sh
+
+Chain steps with --dependency=afterok:<id>. Check on your jobs at most once a
+minute (squeue -j <id>, sacct -j <id>), never in a tight loop; or tell the
+user the job id and stop. Write results somewhere the user can find them.
+
+What you can submit to here:
+  partition  max time   largest node            note
+  normal *   7-00:00    64 CPUs · 256 GB        default
+  gpu        2-00:00    32 CPUs · 512 GB · 4 GPUs
+  dev        2:00:00    16 CPUs · 64 GB         interactive only
+<Account: … | No --account needed.> <GPUs: --gpus=N.>
 ```
 
-followed by the cluster's **rules for agents**:
-
-- A per-cluster setting, **Rules for agents on this cluster**: a file on the
-  cluster (some centers publish one) or text the user pastes. Appended
-  verbatim when it fits the carrier's size limit; otherwise the agent is told
-  to read that file before significant work.
-- Without one, a short generic paragraph: explicit `--time` on every job, no
-  queue checks more often than once a minute, no polling loops, nothing left
-  running on login nodes, nothing that keeps itself alive.
-
-With the login-node override (§4.6), agents get the login-node version: on a
-shared login node, not in a job; light editing, inspecting and preparing jobs
-only; submit anything heavy; leave nothing running.
-
-Codex, uninformed today, gets the same text as a developer message added
-once its chat opens (`thread/inject_items`, over stdin): never argv, which
-anyone on a shared node can read, and unlike opening instructions it also
-reaches a reopened chat, so a chat continued in a new job learns the new job. Whether `sbatch` works from inside a job
-is probed at job start and the second bullet is dropped where it doesn't.
+followed by the cluster's **rules for agents** (built: a file on the cluster
+and/or the user's own text, else a short generic set). The partition table
+is capped (usable partitions first, at most 12 rows). Where `sbatch` doesn't
+work inside jobs, the second paragraph says to ask the user instead. On the
+login node (override), agents get the login-node text (built).
 
 ## 8. Mechanics
 
-### 8.1 Detection and cluster mode
+### 8.1 Detection and cluster mode (built)
 
-- The connect probe (one exec, `remote_probe`) adds the scheduler PATH walk
-  to its script; the verdict rides the probe's framed output.
-- `resolve_daemon` gains a cluster branch: on a cluster host without the
-  override it **never** calls `ensure_remote_binary` + `start_remote`, never
-  updates, and never tunnels to a login daemon. It returns "cluster" (with a
-  found login daemon reported, not used).
-- Every automatic path inherits that branch, because they all go through
-  `do_connect`: launch restore (`restore_windows`), a window's reconnect on
-  `down` or 401 (App.svelte → `connectHost`), a compute window healing its
-  login tunnel (`connect_compute_session`). Restored remote-workspace records
-  for a cluster host are dropped and the cluster page opens instead.
-- `HostEntry` gains `login_serve: bool` (`#[serde(default)]`). An older build
-  that rewrites `hosts.json` drops it, which turns the override **off** — the
-  safe direction. The scheduler verdict is not persisted: it is re-probed on
-  every connect.
-- CLI: `chimaera connect <cluster>` explains cluster mode and exits unless
-  `--login-node`; `chimaera status <cluster>` says "cluster".
+Scheduler detection rides the connect probe; on a cluster without the
+override nothing is ever started on the login node, on any automatic path.
 
-### 8.2 The control plane on the laptop
+### 8.2 The cluster folder
 
-A new `chimaera-remote` module (`cluster.rs`) owns every cluster command, each
-one bounded ssh exec through the master (`sh_wrap`, output caps, timeouts),
-shared by the app and the CLI. Pure parts — `parse_squeue`, `parse_sinfo`,
-the time parsers, the script builder, spec validation (extended with account,
-QOS, constraint, GPUs) — move from `chimaera-server` into a `slurm` module in
-`chimaera-core`, which both the server (the in-job context) and
-`chimaera-remote` depend on. The login-daemon routes `/compute/sessions` and
-the host page's hub that called them are retired (a deliberate wire removal,
-called out in that PR); `GET /compute` stays (the in-job daemon's own view).
-
-The **list** exec, the one that runs repeatedly, combines in one round trip:
-`squeue -u $USER -h -o …` (only when the per-host cache is older than 60 s),
-`date +%s` (remote clock for every age), and the cluster folder's per-
-workspace launch records and manifests (`cat`, no scheduler). The app keeps
-one cache per host shared by the home row, the cluster page and every window.
-
-### 8.3 Starting a job
-
-- `sbatch --parsable` with the script on stdin (no adoption by name: sbatch
-  returns the id), `--job-name chimaera-<ws-slug>`, `--time`, the optional
-  partition/account/QOS/constraint/CPUs/memory/GPUs, `--no-requeue`, and
-  `--output` into the workspace's folder. The launch record is written
-  atomically before submit and completed with the id after.
-- **Interactive-only partitions**: an `srun` that the app's own ssh channel
-  holds in the foreground — a helper started and stopped with the app. It
-  ends when the app disconnects (laptop sleep, quit); the UI says so up
-  front. Never `setsid`/`nohup`/backgrounded.
-- The detached-`srun` launcher (`compute_jobs.rs`) is removed.
-
-### 8.4 The job script
-
-`#!/bin/bash -l`, `umask 077`, unset inherited Chimaera prelude variables,
-the startup commands verbatim, the egress probe, then
-`exec chimaera serve --bind-routable` with:
-
-- **config** = the cluster's normal config dir (shared by all jobs on the
-  cluster: settings, the cluster-default startup commands, saved setups,
-  plugins);
-- **data** = the workspace's own folder on the shared filesystem (§8.6) —
-  manifest, ledger, chat journals, timeline, view state — which moves from
-  job to job;
-- **runtime** = job-local scratch (`$TMPDIR` when Slurm sets one, else
-  `/tmp/chimaera-$UID-$SLURM_JOB_ID`), gone with the job.
-
-This needs data/runtime overrides beside `CHIMAERA_HOME` in `chimaera-core`
-(today `CHIMAERA_HOME` moves all four dirs together).
-
-### 8.5 Reaching the job
-
-The ladder is reordered and shortened:
-
-1. **Direct** (default): the job binds the node's address (token-gated,
-   per-job token) and the app asks its ControlMaster to add
-   `-L <local>:<node>:<port>` (`ssh -O forward`). Nothing new runs on the
-   login node; its sshd does the forwarding.
-2. **Ssh into the node** (fallback, clusters that adopt ssh into a user's
-   job): the existing laptop-to-node rung.
-3. Otherwise: "can't reach compute nodes from here" — the job keeps running.
-
-The login-node relay rung (`spawn_chained_node_tunnel`, an `ssh -N -L`
-process on the login node) is retired. Every rung keeps `tunnel_proven`
-(bearer-authed 200 through our own forward). The app holds the forward while
-it runs and the job lives, re-adds it after sleep, and cancels it when the
-job ends.
-
-### 8.6 The cluster folder
-
-On the cluster's shared home, under the release home (`~/.chimaera/cluster/`;
-the dev home for dev builds, via `RemoteHome`), owner-only:
+On the cluster's shared home (`~/.chimaera/cluster/`; dev builds
+`~/.chimaera-dev/data/cluster/`), owner-only:
 
 ```
-cluster/
-  workspaces.json        id, name, path, setup id — the cluster's workspace list
-  facts.json             learned facts (§5) + when
-  workspaces/<ws>/
-    data/                the workspace's Chimaera data dir (manifest = lease)
-    launch.json          current/last job: id, setup, submitted, ended reason
-    job.sh  job.log      the script (0600) and Slurm's output, last run only
+cluster.json        workspaces [{id, name, path}], saved setups,
+                    rules for agents, learned facts (§5)
+w/<wid>/data/       a workspace's Chimaera data: chats, history, timeline,
+                    ledger. Its manifest is the lease: one job at a time.
+j/<jid>/job.json    setup, name, open-on-start list, `replaces`, Slurm id
+j/<jid>/job.sh      the script (0600); job.log Slurm's output
+j/<jid>/startup.sh  this job's startup commands
+j/<jid>/host.json   written by the job: node, port, token (0600)
 ```
 
-Saved setups and the cluster-default startup commands live in the config dir
-(§6). The **manifest is the lease**: a job's Chimaera refuses to start
-serving a workspace whose manifest names another job that is still in the
-queue (the app checks; the job waits for the handoff, §8.7).
+`jid` is our own id (`j-` + 8 hex), minted before `sbatch`; the Slurm id is
+added after. Settings and `env-profiles.json` stay in the cluster's normal
+config dir, which every Chimaera on the cluster already shares.
 
-### 8.7 Moving between jobs
+### 8.3 The job: `chimaera job-host`
 
-- **Start**: the new job's Chimaera finds the workspace's data dir, resumes
-  its chats from the ledger (claude `--resume`, codex threads) **idle** — no
-  restart pick-up message on clusters, since a job may start hours after the
-  click with nobody there.
-- **Continue on a new node**: queue the next job now; when it reports in, the
-  app asks the old daemon for its graceful stop (ledger snapshot), the old
-  daemon exits (its job ends with it), and the new one takes the lease and
-  restores. The restart-handoff code already does the hard half.
-- **Stop**: `scancel`; "Invalid job id" is success; the record is marked so
-  the stopped line says "stopped by you" rather than inventing a reason.
+The job script (`#!/bin/bash -l`, `umask 077`) runs the egress probe and
+`exec chimaera job-host --job <jid>`. job-host is the job's main process and
+the only long-lived thing per job:
 
-### 8.8 CLI
+- binds the node's address on a free port, token-gated; writes `host.json`
+  atomically; opens the job's open-on-start workspaces;
+- **`GET /status`**: the job (Slurm id, node, resources, end) and its
+  workspaces (`starting` · `open` · `closing` · `failed`, with each one's
+  port);
+- **`POST /workspaces/{wid}/open`**: starts that workspace's Chimaera inside
+  the job (below). `409` naming the holder when another live job holds the
+  workspace;
+- **`POST /workspaces/{wid}/close`**: SIGTERM to that workspace's Chimaera;
+  it saves its chats and exits;
+- if `job.json` says it `replaces` a job: once its first workspace finds the
+  lease held by that job, it `scancel`s that job once (today's self-stop,
+  moved here), and the workspaces take over as the old ones save and exit;
+- on SIGTERM (Stop, the time limit): SIGTERM to every workspace, wait for
+  them (bounded under Slurm's kill wait), exit;
+- a workspace that exits unexpectedly is reported `failed` with its last log
+  lines and never restarted on its own.
 
-`chimaera compute list|start|stop|open <host> [<workspace>]` over the same
-`cluster.rs`, no login daemon needed — the verification harness and the
-browser-only path.
+No polling; it waits on its children and its socket.
+
+### 8.4 A workspace inside a job
+
+One `chimaera serve --bind-routable` per open workspace, started by
+job-host with: data dir `w/<wid>/data`, runtime dir on node-local `/tmp`
+(per job, per workspace), the shared config dir, `CHIMAERA_HOST_PRELUDE_FILE`
+= the job's `startup.sh`, the rules and facts files. Everything below is
+built: the manifest lease (waits while another job holds it), chats resumed
+**idle** (no restart pick-up turn — a job can start hours after the click),
+agent context, the hidden-workspace and ledger rules.
+
+Memory: each open workspace is a Chimaera process (about 50–150 MB) inside
+the job's memory; the start sheet's memory hint says so.
+
+### 8.5 Reaching jobs and workspaces
+
+The app adds one `ssh -O forward` per job (to job-host) and one per open
+workspace (to its Chimaera) on its connection to the login node — the built
+direct rung, with the ssh-into-node fallback. Windows talk to their
+workspace's Chimaera exactly as today.
+
+### 8.6 Status
+
+One ssh exec per cluster serves Home, the cluster page and every window: `date
++%s`, `squeue -u $USER` (when the cache is older than 60 s) and `chimaera
+browse --state` (§8.7). Workspace activity (`2 chats working`) comes from
+job-host's `/status` through the job's forward, fetched only while the page
+is visible.
+
+### 8.7 `chimaera browse`
+
+A read-only subcommand of the binary already deployed to the cluster. It
+reads, prints JSON and exits; it never writes, locks, logs to a file or starts
+anything.
+
+- `chimaera browse --state`: `cluster.json`, each job's `job.json` and
+  `host.json` (token stripped), each workspace's manifest (which job holds
+  it). Replaces the shell parsing in today's list exec.
+- `chimaera browse --dir <path>`: one folder's subfolders (capped), each
+  marked `git` / `workspace`. `~` and `$VARS` expand from its own environment,
+  never through a shell.
+
+### 8.8 The sequences
+
+- **Start a job**: write `j/<jid>/` (job.json, job.sh, startup.sh), `sbatch
+  --parsable --no-requeue`, record the Slurm id. The card shows `Waiting for a
+  node` from then on.
+- **Ready**: the status exec sees `host.json`; the app adds the forward and
+  notifies.
+- **Open**: `POST …/open` → the workspace's manifest appears → forward →
+  window.
+- **Move A → B**: `POST A …/close`, then `POST B …/open`; B's Chimaera waits
+  for the lease; windows re-home.
+- **Continue**: start a job with `replaces: A` and A's open workspaces as
+  open-on-start; when it runs, it stops A (8.3) and takes over.
+- **Stop / Cancel**: `scancel`; "Invalid job id" is success; marked `stopped
+  by you`.
+- **Ended**: the next status exec finds the job gone; `sacct` once for why;
+  windows get the ended screen; a notification.
+
+### 8.9 CLI
+
+`chimaera compute jobs | start | stop | open <workspace> [--job <jid>] |
+move | add <path>` over the same code, plus `chimaera browse` (§8.7) — the
+verification harness and the browser-only path.
 
 ## 9. Things that stay out
 
-- **Anything automatic that starts or keeps jobs alive** (watchdogs, timers,
-  `scrontab`, `--begin`, self-resubmission, requeue). A notification plus one
-  click replaces all of them.
-- **Relays or tunnels held on a login node.** The forward lives in the
-  login node's sshd for as long as the app holds it; nothing else.
-- **Syncing a cluster folder to the laptop.** Data doesn't fit, copies drift,
-  commands run in the wrong place, and continuous sync is exactly what login
-  nodes forbid. Code moves with git; data stays where it is.
-- **Site knowledge in code** (§2.2).
+- Anything automatic that starts or keeps jobs alive; relays or tunnels on a
+  login node; syncing cluster folders to the laptop; site knowledge in code.
+- **File browsing on Home or the cluster's page.** Files live in workspace
+  windows; the folder picker (§4.4) is the only exception.
+- **Windows that open by themselves.** Notifications only.
+- **One workspace open in two jobs at once.** It moves instead.
 
 ## 10. Scheduler and filesystem budget
 
 | What | Command | When | Floor |
 |---|---|---|---|
-| Workspace states, other-jobs count | `squeue -u $USER` (+ file reads) | home row or cluster page visible | 60 s per host |
-| Start estimate | `squeue --start -j` | with the list while a job waits | 60 s |
+| Jobs, waiting reasons, other-jobs count | `squeue -u $USER` | Home row or cluster page visible, or a job this app started is alive | 60 s per cluster |
+| Folder state | `chimaera browse --state` | with the above | 60 s |
+| Start estimate | `squeue --start -j` | with the above, while waiting | 60 s |
 | End reason | `sacct -nX -j` | once per ended job | once |
-| Discovery | `sinfo`, `sacctmgr`, `scontrol show partition` | start sheet opens; after a refusal | 1 day |
-| Readiness | read the workspace manifest (no scheduler) | a start is on screen and the job runs | 15 s, ≤ 10 min |
-| In-job end time | `squeue -j $SLURM_JOB_ID -o %e` | once at boot; the countdown ticks locally | once (+ 10 min) |
+| Discovery | `sinfo`, `sacctmgr`, `scontrol` | start sheet; after a refusal | 1 day |
+| Workspace activity | job-host `/status` (no scheduler) | cluster page visible | 15 s |
+| Folder picker | `chimaera browse --dir` | per click | — |
 
-Today's floors this replaces: the host page's 30 s / 5 s polls, launch
-adoption's 4 × 1.5 s, and the in-job snapshot's 30 s TTL.
+## 11. From revision 1
 
-## 11. PRs
+**Carries over** (built and verified live on #236): detection and cluster
+mode; the login-node override; the terminal window; discovery and the start
+sheet's resource fields; `sbatch` and the interactive-only `srun`; the direct
+forward; a workspace's own data folder, the manifest lease, idle resume and
+the continuing job stopping the one it replaces; agent context and rules for
+agents; the codex developer note; notifications and the in-window banner and
+ended screen; the hidden workspace.
 
-1. **Cluster mode** — the safety fix, ships alone. Scheduler detection in the
-   probe; the cluster branch in `resolve_daemon` and every automatic path;
-   `login_serve` + the override with its warning; the found-login-daemon
-   notice with **Shut it down**; the cluster row and page shell with
-   **Terminal**; CLI refusal; docs (remote-connect, compute, architecture).
-   Verify live: connect, relaunch, sleep/wake against two clusters — no
-   process of ours on the login node afterwards (`ps -u $USER`).
-   Until PR 3 lands, workspaces can't be started from the app on a cluster.
-2. **Agent context on clusters** — the §7 texts, the rules-for-agents
-   setting with the generic default, codex through a developer note,
-   end time from `%e` once. Server-side; verify with claude chat + TUI and
-   codex chat inside a real job.
-3. **Starting workspaces from the app** — `chimaera-core::slurm`,
-   `chimaera-remote::cluster`, discovery (§5), the start sheet, saved setups,
-   `sbatch` + the interactive-only `srun`, the job script and dir overrides,
-   the direct forward, the cluster page's workspace states, notifications,
-   the other-jobs line, CLI, retiring `/compute/sessions` and the relay rung.
-4. **Workspaces across jobs** — the cluster folder, the manifest lease,
-   idle resume, **Continue on a new node**, the stopped screen and **Start
-   again**, cluster workspaces on the home, **Add a workspace**.
-5. **File peek** (optional) — a read-only browser on the cluster page: one
-   `ls` per folder click, a file copied to the laptop on open (size-capped)
-   into the normal preview.
+**Changes**: launch records move from per workspace to per job (`j/`); the
+job script execs `job-host` instead of `chimaera serve`; the cluster page and
+start sheet as in §4; status through `chimaera browse --state`; startup
+commands become the `env-profiles.json` scopes plus this job's; agent context
+gains the Slurm setup (§7); Continue and Stop act on a job.
 
-Later: an HPC workbench plugin (agents probe and record cluster facts, write
-setups and rules with the user), launchers for PBS and LSF, opening a second
-folder inside a running job.
+**Goes**: the file peek (`ClusterFiles`, `cluster_list`, `cluster_peek`, the
+peek folder); the cluster-default and workspace startup fields in
+`cluster.json`; one job per workspace.
 
-## 12. Decisions (maintainer, 2026-09-30)
+**Order of work** (all in #236): job-host, `chimaera browse` and the folder
+layout, verified from the CLI on a real cluster; the app's job commands
+(start, open, close, move, continue, stop) and status; the cluster page,
+start sheet and folder picker with §4's words; agents' Slurm setup; docs; a
+live pass on a real cluster with two jobs; the maintainer's click-through.
 
-1. No Chimaera daemon on a cluster's login node by default; a per-host
-   **Run Chimaera on the login node** override with a blunt warning.
-2. Jobs listen on the node's network address by default, token-gated, and
-   are reached with a plain `ssh -L` through the login node. **This reverses
-   the 2026-07-16 addendum** in features/compute.md ("loopback stays the
-   default; routable is per-launch opt-in"); the login-node relay is retired.
-3. **One job per workspace**; the UI is workspace-first; "session" keeps
-   meaning chats and terminals.
-4. **Nothing site-specific** — HPC/Slurm-generic only; sites are test beds.
+## 12. Decisions
+
+2026-09-30:
+
+1. No Chimaera on a cluster's login node by default; a per-cluster override
+   with a blunt warning.
+2. Jobs listen on the node's address, token-gated, reached by a plain `ssh
+   -L` through the login node (reverses the 2026-07-16 loopback addendum).
+3. ~~One job per workspace~~ — superseded by 11.
+4. Nothing site-specific.
 5. A person starts every job; nothing restarts or resubmits on its own.
-6. Startup commands stay, with the cluster default stored on the cluster.
-7. Agents are told they are inside a job, its resources and end, to submit
-   longer work as separate jobs, and the cluster's rules for agents.
-8. Presets are not invented: the start sheet shows discovered facts and the
-   user's own saved setups.
-9. No sync; an on-demand, read-only file peek is optional.
-10. The app holding the job's forward on the user's own machine for the job's
-    lifetime is fine.
+6. Startup commands stay.
+7. Agents are told they are in a job, its resources and end, to submit longer
+   work as separate jobs, and the cluster's rules for agents.
+8. The start sheet shows discovered facts and saved setups, no invented
+   presets.
+9. No sync.
+10. The app holding a job's forward for the job's lifetime is fine.
+
+2026-10-01:
+
+11. **Jobs host workspaces.** Several jobs per cluster; a workspace is open in
+    at most one job and moves between jobs with its chats; a job can be
+    empty.
+12. **No file browsing on Home or the cluster page.** The folder picker when
+    adding a workspace is the only browsing outside a workspace window; the
+    file peek is dropped.
+13. **`chimaera browse`**: read-only, exits at once, the only Chimaera
+    command run on the login node.
+14. **Notifications always; windows never open by themselves.**
+15. **Startup commands at three levels** — cluster, workspace, this job —
+    all editable from the cluster page; cluster and workspace are the
+    Environment settings' own scopes.
+16. **Agents know the cluster's Slurm setup** and how to submit and watch
+    their own jobs.
+17. **Plain words** (§4.10); the UI must explain itself.
 
 ## 13. Open questions
 
-- **Clusters whose compute nodes have no internet**: agents can't run in
-  jobs. Beyond saying so and the proxy line in startup commands, is anything
-  else worth offering?
-- **The hook carrier's size limit** for appended rules (a published rules
-  file can be ~10 KB) — measure before choosing the inline/pointer cutoff.
-- ~~**Codex `developer_instructions`**: does `-c` replace a user's own
-  value?~~ Moot: the note rides `thread/inject_items` beside the user's own
-  instructions (PROTOCOL.md Pass 41).
-- **The manifest lease on NFS**: which atomic primitive (O_EXCL create,
-  `mkdir`, rename) holds on the filesystems clusters actually use.
-- **Partition visibility**: the exact join of associations and partition
-  `Allow*` lists, checked against a cluster that enforces accounts and one
-  that doesn't.
+- **Compute nodes without internet**: agents can't run in jobs there. Beyond
+  saying so and a proxy line in startup commands, anything else?
+- **Carrier size**: the facts table plus a published rules file against the
+  hook carrier's limit — measure, then choose inline vs "read this file".
+- **Shutdown time**: several workspaces saving at once against Slurm's kill
+  wait (often 30 s) — measure with three open workspaces.
+- **Agent preferences** (last model and effort) live in each workspace's
+  data folder today; share them per cluster through the config dir?
+- **The lease on NFS**: which atomic primitive holds on the filesystems
+  clusters actually use.
 
 ## 14. Testing
 
-- **CI**: the existing `CHIMAERA_SLURM_BINDIR` stand-ins, extended with modes:
-  accounts required, batch refused on one partition, a preemptible partition,
-  `sacct` missing, compute nodes without egress, and a cluster with PBS
-  commands only.
-- **Live**: two clusters of opposite styles — one without accounts, with an
-  interactive-only partition and a preemptible one; one with enforced
-  accounts and partitions the user can't use listed by `sinfo`. Each PR
-  states what was run and observed, including a `ps -u $USER` on the login
-  node after the app quits and after a sleep.
+- **CI**: the `CHIMAERA_SLURM_BINDIR` stand-ins (accounts required, batch
+  refused, preemptible, no `sacct`, no egress); job-host with fake
+  workspace processes (open, close, 409, SIGTERM fan-out, a child that dies);
+  `chimaera browse` against fixture folders.
+- **Live**, on a real cluster: two jobs at once; open, move between them,
+  continue, stop, and a 5-minute job reaching its time limit; `ps -u $USER`
+  on the login node after each, after the app quits and after a sleep.
