@@ -1020,18 +1020,35 @@ fn local_api(
     body: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let url = format!("http://127.0.0.1:{port}{path}");
-    let request = match method {
-        "POST" => crate::http::agent().post(&url),
+    let agent = crate::http::agent();
+    let auth = format!("Bearer {token}");
+    let timeout = Some(Duration::from_secs(20));
+    let sent = match method {
+        "POST" => agent
+            .post(&url)
+            .header("Authorization", &auth)
+            .config()
+            .timeout_global(timeout)
+            .http_status_as_error(false)
+            .build()
+            .send_json(body),
+        "GET" | "DELETE" => {
+            let request = if method == "GET" {
+                agent.get(&url)
+            } else {
+                agent.delete(&url)
+            };
+            request
+                .header("Authorization", &auth)
+                .config()
+                .timeout_global(timeout)
+                .http_status_as_error(false)
+                .build()
+                .call()
+        }
         _ => return Err(format!("unsupported method {method}")),
     };
-    let mut response = request
-        .header("Authorization", &format!("Bearer {token}"))
-        .config()
-        .timeout_global(Some(Duration::from_secs(20)))
-        .http_status_as_error(false)
-        .build()
-        .send_json(body)
-        .map_err(|e| format!("the local daemon didn't answer: {e}"))?;
+    let mut response = sent.map_err(|e| format!("the local daemon didn't answer: {e}"))?;
     let status = response.status();
     let text = response
         .body_mut()
@@ -1065,9 +1082,38 @@ fn local_workspace(port: u16, token: &str, dir: &std::path::Path) -> Result<Stri
         .ok_or_else(|| "the local daemon returned no workspace id".to_string())
 }
 
-/// Open a window with an interactive `ssh <alias>` terminal on the cluster's
-/// login node — the user's own session over the app's connection, ending
-/// when its tab closes.
+/// Where the login-node terminals' hidden workspace is rooted: an empty
+/// folder of the app's own, so nothing ever scans a real one for it.
+fn terminals_dir() -> std::path::PathBuf {
+    chimaera_core::data_dir().join("cluster-terminals")
+}
+
+/// The local daemon's hidden workspace for login-node terminals (created if
+/// needed): never listed on Home or anywhere else, and its sessions never
+/// come back after a daemon restart.
+fn terminals_workspace(port: u16, token: &str) -> Result<String, String> {
+    let dir = terminals_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let v = local_api(
+        port,
+        token,
+        "POST",
+        "/api/v1/workspaces",
+        json!({ "root": dir.to_string_lossy(), "hidden": true }),
+    )?;
+    v.get("id")
+        .and_then(|i| i.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "the local daemon returned no workspace id".to_string())
+}
+
+/// Open a terminal-only window with an interactive `ssh <alias>` on the
+/// cluster's login node — the user's own session over the app's connection.
+/// The session lives in the hidden terminals workspace and only as long as
+/// its window: closing the window ends it ([`terminal_window_closed`]), the
+/// window is never restored, and one a crash left behind is ended at the
+/// next launch ([`sweep_terminals`]).
 #[tauri::command]
 pub(super) async fn cluster_open_terminal(
     app: AppHandle,
@@ -1088,34 +1134,117 @@ pub(super) async fn cluster_open_terminal(
             .collect::<Vec<_>>()
             .join(" ")
     );
-    let home_dir = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .ok_or("no home folder")?;
     let name = format!("{alias} · login node");
-    let (ws, session) = tokio::task::spawn_blocking(move || {
-        let ws = local_workspace(port, &token, &home_dir)?;
-        let v = local_api(
-            port,
-            &token,
-            "POST",
-            "/api/v1/sessions",
-            json!({ "workspace_id": ws, "kind": "shell", "name": name, "prelude": prelude }),
-        )?;
-        let session = v
-            .get("id")
-            .and_then(|i| i.as_str())
-            .map(str::to_string)
-            .ok_or("the local daemon returned no session id")?;
-        Ok::<_, String>((ws, session))
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-    super::notices::expect_focus(&app, None, ws.clone(), session);
-    let token = lock(&state.local).token.clone();
-    let record = WindowRecord::new(None, Some(ws));
-    super::open_ui_window(&app, port, &token, &record)
-        .map_err(|e| format!("could not open window: {e}"))
+    let (ws, session) = {
+        let (token, name) = (token.clone(), name.clone());
+        tokio::task::spawn_blocking(move || {
+            let ws = terminals_workspace(port, &token)?;
+            let v = local_api(
+                port,
+                &token,
+                "POST",
+                "/api/v1/sessions",
+                json!({ "workspace_id": ws, "kind": "shell", "name": name, "prelude": prelude }),
+            )?;
+            let session = v
+                .get("id")
+                .and_then(|i| i.as_str())
+                .map(str::to_string)
+                .ok_or("the local daemon returned no session id")?;
+            Ok::<_, String>((ws, session))
+        })
+        .await
+        .map_err(|e| e.to_string())??
+    };
+    let mut record = WindowRecord::new(None, Some(ws.clone()));
+    record.width = Some(900.0);
+    record.height = Some(580.0);
+    let appearance = lock(&state.appearance).get(None);
+    let url = super::restore::daemon_window_url(
+        port,
+        &token,
+        &record.id,
+        None,
+        None,
+        super::restore::WindowUrlKind::Workbench,
+        appearance.as_ref(),
+    )
+    .map_err(|e| e.to_string())?;
+    let url = format!("{url}&term={}", urlencoding::encode(&session));
+    // Detached: never the target of an "open this workspace" raise, and no
+    // Home duty. The tray names it before the page could.
+    let mut scope = super::WindowScope::new_detached(None, Some(ws), record.id.clone());
+    scope.label = name.clone();
+    lock(&state.terminal_windows).insert(record.id.clone(), session.clone());
+    if let Err(e) = super::restore::open_shell_window(&app, &url, &name, &record, scope) {
+        lock(&state.terminal_windows).remove(&record.id);
+        end_terminal_session(port, token, session);
+        return Err(format!("could not open window: {e}"));
+    }
+    // Never restored: its session ends with the window.
+    lock(&state.registry).remove(&record.id);
+    Ok(())
+}
+
+/// End one login-node terminal session (its ssh) on the local daemon.
+fn end_terminal_session(port: u16, token: String, session: String) {
+    let path = format!("/api/v1/sessions/{}", urlencoding::encode(&session));
+    if let Err(e) = local_api(port, &token, "DELETE", &path, json!(null)) {
+        tracing::warn!("could not end login-node terminal {session}: {e}");
+    }
+}
+
+/// A window closed: if it was a login-node terminal, end its session — it
+/// exists only for that window. Inline while the app quits (a spawned thread
+/// would die with the process), on a thread otherwise.
+pub(crate) fn terminal_window_closed(app: &AppHandle, stable_id: &str, quitting: bool) {
+    let shell = app.state::<Shell>();
+    let Some(session) = lock(&shell.terminal_windows).remove(stable_id) else {
+        return;
+    };
+    let (port, token) = {
+        let local = lock(&shell.local);
+        (local.port, local.token.clone())
+    };
+    if quitting {
+        end_terminal_session(port, token, session);
+    } else {
+        std::thread::spawn(move || end_terminal_session(port, token, session));
+    }
+}
+
+/// At launch, end login-node terminal sessions a crash or force quit left
+/// without a window (their windows are never restored, so every live one is
+/// an orphan). Nothing when no terminal was ever opened here.
+pub(crate) fn sweep_terminals(port: u16, token: String) {
+    if !terminals_dir().is_dir() {
+        return;
+    }
+    let ws = match terminals_workspace(port, &token) {
+        Ok(ws) => ws,
+        Err(e) => {
+            tracing::warn!("login-node terminal sweep skipped: {e}");
+            return;
+        }
+    };
+    let sessions = match local_api(port, &token, "GET", "/api/v1/sessions", json!(null)) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("login-node terminal sweep skipped: {e}");
+            return;
+        }
+    };
+    for s in sessions.as_array().into_iter().flatten() {
+        if s.get("workspace_id").and_then(|w| w.as_str()) != Some(ws.as_str())
+            || s.get("alive").and_then(|a| a.as_bool()) != Some(true)
+        {
+            continue;
+        }
+        if let Some(id) = s.get("id").and_then(|i| i.as_str()) {
+            tracing::info!("ending login-node terminal {id} left without a window");
+            end_terminal_session(port, token.clone(), id.to_string());
+        }
+    }
 }
 
 #[tauri::command]

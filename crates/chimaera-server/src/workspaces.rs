@@ -53,6 +53,11 @@ pub(crate) struct Workspace {
     /// switch is per workspace. Additive wire field: absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) plugins_on: Vec<String>,
+    /// An internal workspace the native app keeps for its own windows (a
+    /// cluster's login-node terminal): never listed (`GET /workspaces`), and
+    /// its sessions never enter the ledger. Absent for every user workspace.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) hidden: bool,
 }
 
 /// In-memory workspace list backed by a JSON file (save-on-change).
@@ -151,6 +156,34 @@ impl WorkspaceStore {
         self.items.clone()
     }
 
+    /// The workspaces a user sees: every one but the app's hidden ones.
+    pub(crate) fn listed(&self) -> Vec<Workspace> {
+        self.items.iter().filter(|w| !w.hidden).cloned().collect()
+    }
+
+    /// Ids of the hidden workspaces (their sessions stay out of the ledger).
+    pub(crate) fn hidden_ids(&self) -> std::collections::HashSet<String> {
+        self.items
+            .iter()
+            .filter(|w| w.hidden)
+            .map(|w| w.id.clone())
+            .collect()
+    }
+
+    /// Register `root` (canonical) as a hidden workspace, idempotent per
+    /// root like [`Self::add`]; an existing record for it becomes hidden.
+    pub(crate) fn add_hidden(&mut self, root: PathBuf) -> anyhow::Result<Workspace> {
+        let mut workspace = self.add(root)?;
+        if !workspace.hidden {
+            workspace.hidden = true;
+            if let Some(existing) = self.items.iter_mut().find(|w| w.id == workspace.id) {
+                existing.hidden = true;
+            }
+            self.save()?;
+        }
+        Ok(workspace)
+    }
+
     pub(crate) fn get(&self, id: &str) -> Option<Workspace> {
         self.items.iter().find(|w| w.id == id).cloned()
     }
@@ -173,6 +206,7 @@ impl WorkspaceStore {
             last_opened_at: unix_now(),
             mastermind: None,
             plugins_on: Vec::new(),
+            hidden: false,
         };
         self.items.push(workspace.clone());
         self.save()?;
@@ -204,6 +238,7 @@ impl WorkspaceStore {
                 last_opened_at: unix_now(),
                 mastermind: None,
                 plugins_on: Vec::new(),
+                hidden: false,
             },
         );
         self.save()?;

@@ -16,6 +16,8 @@ const NODE_KEY = "chimaera.node";
 /** The cluster workspace a job window serves (`cws=`), for stop/continue. */
 const CWS_KEY = "chimaera.cws";
 const DETACHED_KEY = "chimaera.dt";
+/** A terminal-only window's session (`term=`): the page shows just it. */
+const TERM_KEY = "chimaera.term";
 
 /**
  * Read the access token, workspace id, host label, and window id from the
@@ -40,6 +42,7 @@ function initFromHash(): string | null {
   const jobFromHash = params.get("job");
   const nodeFromHash = params.get("node");
   const cwsFromHash = params.get("cws");
+  const termFromHash = params.get("term");
   // A file the shell asks this window to show once (a cluster file peek).
   // Held in memory only, never sessionStorage: a reload must not reopen it.
   const openFromHash = params.get("open");
@@ -103,6 +106,9 @@ function initFromHash(): string | null {
   if (cwsFromHash !== null && /^[A-Za-z0-9_-]{1,64}$/.test(cwsFromHash)) {
     sessionStorage.setItem(CWS_KEY, cwsFromHash);
   }
+  if (termFromHash !== null && /^[A-Za-z0-9_-]{1,64}$/.test(termFromHash)) {
+    sessionStorage.setItem(TERM_KEY, termFromHash);
+  }
   if (
     tokenFromHash !== null ||
     wsFromHash !== null ||
@@ -112,6 +118,7 @@ function initFromHash(): string | null {
     jobFromHash !== null ||
     nodeFromHash !== null ||
     cwsFromHash !== null ||
+    termFromHash !== null ||
     openFromHash !== null
   ) {
     history.replaceState(null, "", location.pathname + location.search);
@@ -123,6 +130,15 @@ function initFromHash(): string | null {
  *  bootstrap can assign it). */
 let pendingOpen: string | null = null;
 let token = initFromHash();
+
+/**
+ * The session a terminal-only window shows (the `term=` hash param — a
+ * cluster's login-node terminal), or null for every other window. Kept in
+ * sessionStorage so a reload stays a terminal window.
+ */
+export function terminalWindowSession(): string | null {
+  return sessionStorage.getItem(TERM_KEY);
+}
 
 /**
  * The absolute path the shell asked this window to open (the `open=` hash

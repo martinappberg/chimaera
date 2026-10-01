@@ -45,8 +45,10 @@ side (its own allocation, agent context, startup commands, the lease) in
   the cluster's workspaces, each **running** (node · resources · time left), **starting**,
   **waiting for a node** (Slurm's start estimate and its reason when not plain priority),
   or **stopped** (why: time limit, cancelled, failed, preempted, its node failed, out of
-  memory — asked of `sacct` once and kept); a Terminal button (a local window running
-  `ssh <host>` over the app's ControlMaster); add / remove a workspace; a read-only file
+  memory — asked of `sacct` once and kept); a Terminal button (a terminal-only window,
+  "<host> · login node", running `ssh <host>` over the app's ControlMaster — no workbench
+  around it, never listed as a workspace, never restored, and its session ends when the
+  window closes); add / remove a workspace; a read-only file
   peek; startup commands and rules for agents; and one quiet count of the user's other
   jobs.
 - **One job per workspace.** A workspace is either running or not; the job is a detail

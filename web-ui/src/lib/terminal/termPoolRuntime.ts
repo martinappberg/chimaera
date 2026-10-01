@@ -391,18 +391,20 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
     fontOverride,
     // Clickable paths work in EVERY session — agents and shells alike. So do
     // proxyable URLs (the browser pane's front door); both providers share
-    // one dispose.
-    disposeLinks: composeDispose(
-      registerPathLinks(term, id, {
-        context: (sid) =>
-          handlers?.linkContext(sid) ?? { cwd: null, root: null, workspaceId: null },
-        open: (sid, path, kind, opts) => handlers?.onOpenPath(sid, path, kind, opts),
-      }),
-      registerUrlLinks(term, id, {
-        open: (sid, target, newSplit) => handlers?.onOpenUrl(sid, target, newSplit),
-        menu: (event, url) => handlers?.onUrlMenu(event, url),
-      }),
-    ),
+    // one dispose. A plain-text pool (the login-node terminal) has neither.
+    disposeLinks: handlers?.plainText
+      ? () => {}
+      : composeDispose(
+          registerPathLinks(term, id, {
+            context: (sid) =>
+              handlers?.linkContext(sid) ?? { cwd: null, root: null, workspaceId: null },
+            open: (sid, path, kind, opts) => handlers?.onOpenPath(sid, path, kind, opts),
+          }),
+          registerUrlLinks(term, id, {
+            open: (sid, target, newSplit) => handlers?.onOpenUrl(sid, target, newSplit),
+            menu: (event, url) => handlers?.onUrlMenu(event, url),
+          }),
+        ),
     buf: new ParkedBuffer(PARKED_BUFFER_MAX_BYTES),
     // Ghosting a keystroke the closed socket silently dropped would show
     // input that was never delivered — the socket gate is non-negotiable.

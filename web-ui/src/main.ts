@@ -12,6 +12,8 @@ import "@fontsource/jetbrains-mono/latin-ext-600.css";
 import "./app.css";
 import App from "./App.svelte";
 import { installReloadHook } from "./lib/layout/windowReload";
+import { terminalWindowSession } from "./lib/net/api";
+import TerminalWindow from "./lib/terminal/TerminalWindow.svelte";
 
 // Before mount: the native Reload Window must still reach a window whose App
 // fails to boot.
@@ -24,6 +26,12 @@ if (!target) {
   throw new Error("missing #app mount point");
 }
 
-const app = mount(App, { target });
+// A terminal-only window (a cluster's login-node terminal) is just that
+// terminal: none of the workbench around it.
+const termSession = terminalWindowSession();
+const app =
+  termSession !== null
+    ? mount(TerminalWindow, { target, props: { sessionId: termSession } })
+    : mount(App, { target });
 
 export default app;

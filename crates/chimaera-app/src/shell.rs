@@ -95,6 +95,10 @@ pub struct Shell {
     /// Attached jobs (partitions that take only interactive jobs), held in the
     /// foreground by this app: sending on the channel ends one.
     attached_jobs: Mutex<HashMap<(String, String), tokio::sync::oneshot::Sender<()>>>,
+    /// Open login-node terminal windows: stable window id → their session on
+    /// the local daemon, ended when the window goes (`cluster::
+    /// terminal_window_closed`).
+    terminal_windows: Mutex<HashMap<String, String>>,
     /// Composite keys mid-connect: one tunnel build per job at a time (a
     /// click storm must not race N tunnel builds — seen on first live use).
     compute_connecting: Mutex<std::collections::HashSet<String>>,
@@ -906,6 +910,7 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             compute_tunnels: tokio::sync::Mutex::new(HashMap::new()),
             clusters: Mutex::new(HashMap::new()),
             attached_jobs: Mutex::new(HashMap::new()),
+            terminal_windows: Mutex::new(HashMap::new()),
             compute_connecting: Mutex::new(std::collections::HashSet::new()),
             connecting: Mutex::new(HashMap::new()),
             windows: Mutex::new(HashMap::new()),
@@ -1085,6 +1090,15 @@ pub fn run() {
                     lock(&shell.focus_order).retain(|l| l != window.label());
                     notices::window_gone(window.app_handle(), window.label());
                     let scope = lock(&shell.windows).remove(window.label());
+                    // A login-node terminal's session lives only as long as
+                    // its window — quit included (it is never restored).
+                    if let Some(scope) = &scope {
+                        cluster::terminal_window_closed(
+                            window.app_handle(),
+                            &scope.stable_id,
+                            shell.quitting.load(Ordering::Relaxed),
+                        );
+                    }
                     // After the scope and focus entries are gone: a quit this
                     // window was holding moves on to the next one.
                     unsaved::window_destroyed(window.app_handle(), window.label());
@@ -1214,6 +1228,12 @@ pub fn run() {
             // still be claimed so a stale wizard invocation later reads
             // "done" instead of racing a second startup.
             let _ = claim_startup();
+            // A login-node terminal a crash left without a window ends here
+            // (off the startup path: two loopback calls at most).
+            {
+                let (port, token) = (local.port, local.token.clone());
+                std::thread::spawn(move || cluster::sweep_terminals(port, token));
+            }
             let finished = finish_startup(&handle, local);
             release_startup(finished.is_ok());
             finished?;

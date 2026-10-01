@@ -489,20 +489,6 @@ pub(crate) fn window_focused(app: &AppHandle, label: &str) {
     mark_seen(app, &alias, &visible);
 }
 
-/// The next window that reports `(alias, ws)` should focus `session` — what a
-/// notification click does, for a window the shell opens for a new session
-/// (a cluster's login-node terminal).
-pub(crate) fn expect_focus(app: &AppHandle, alias: Key, ws: String, session: String) {
-    if let Some(hub) = hub(app) {
-        lock(&hub.inner).pending_focus.push(PendingFocus {
-            alias,
-            ws,
-            session,
-            at: Instant::now(),
-        });
-    }
-}
-
 /// A window just reported its scope: if a notification click opened it for
 /// a session, focus that session now that the page is listening.
 pub(crate) fn window_scoped(app: &AppHandle, label: &str, alias: &Key, ws: &Option<String>) {

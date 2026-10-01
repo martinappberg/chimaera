@@ -11,14 +11,17 @@ use serde_json::json;
 use crate::workspaces::Workspace;
 use crate::AppState;
 
-/// GET /api/v1/workspaces
+/// GET /api/v1/workspaces — every workspace but the app's hidden ones.
 pub(crate) async fn list_workspaces(State(state): State<Arc<AppState>>) -> Json<Vec<Workspace>> {
-    Json(crate::lock(&state.workspaces).list())
+    Json(crate::lock(&state.workspaces).listed())
 }
 
 #[derive(Deserialize)]
 pub(crate) struct CreateWorkspace {
     root: String,
+    /// The native app's own internal workspace (`Workspace::hidden`).
+    #[serde(default)]
+    hidden: bool,
 }
 
 /// POST /api/v1/workspaces — register a directory, idempotent per canonical root.
@@ -53,7 +56,15 @@ pub(crate) async fn create_workspace(
                 .into_response();
         }
     };
-    match crate::lock(&state.workspaces).add(root) {
+    let added = {
+        let mut store = crate::lock(&state.workspaces);
+        if body.hidden {
+            store.add_hidden(root)
+        } else {
+            store.add(root)
+        }
+    };
+    match added {
         Ok(workspace) => Json(workspace).into_response(),
         Err(err) => {
             tracing::error!(%err, "failed to persist workspace");
