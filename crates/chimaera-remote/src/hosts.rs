@@ -68,6 +68,17 @@ pub struct HostEntry {
     pub added_at: u64,
     #[serde(default)]
     pub last_connected_at: Option<u64>,
+    /// The user allowed a chimaera daemon on this cluster's login node (the
+    /// warned per-host override). Off unless set: an older build that
+    /// rewrites this file drops the field, which turns the override off —
+    /// the safe direction.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub login_serve: bool,
+    /// The scheduler the last connect found on the host — a display hint for
+    /// the home screen before the next connect re-probes. Never trusted for
+    /// behavior: every connect probes afresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<chimaera_core::slurm::Scheduler>,
 }
 
 /// In-memory host list backed by a JSON file (save-on-change).
@@ -164,6 +175,8 @@ impl HostsStore {
             binary,
             added_at: unix_now(),
             last_connected_at: None,
+            login_serve: false,
+            scheduler: None,
         };
         self.items.push(entry.clone());
         self.save()?;
@@ -195,6 +208,8 @@ impl HostsStore {
                     binary: None,
                     added_at: unix_now(),
                     last_connected_at: Some(unix_now()),
+                    login_serve: false,
+                    scheduler: None,
                 };
                 self.items.push(entry.clone());
                 entry
@@ -202,6 +217,44 @@ impl HostsStore {
         };
         self.save()?;
         Ok(entry)
+    }
+
+    /// Set the warned login-node override for `alias` (adding the host if
+    /// unknown) and return the updated entry.
+    pub fn set_login_serve(&mut self, alias: &str, on: bool) -> anyhow::Result<HostEntry> {
+        let alias = &normalize_alias(alias)?;
+        if !self.items.iter().any(|h| h.alias == *alias) {
+            self.add(alias, None)?;
+        }
+        let entry = self
+            .items
+            .iter_mut()
+            .find(|h| h.alias == *alias)
+            .expect("just added");
+        entry.login_serve = on;
+        let entry = entry.clone();
+        self.save()?;
+        Ok(entry)
+    }
+
+    /// Remember which scheduler the last connect found (a display hint).
+    /// Saves only when it changed.
+    pub fn record_scheduler(
+        &mut self,
+        alias: &str,
+        scheduler: chimaera_core::slurm::Scheduler,
+    ) -> anyhow::Result<Option<HostEntry>> {
+        let Some(entry) = self.items.iter_mut().find(|h| h.alias == alias) else {
+            return Ok(None);
+        };
+        let seen = scheduler.is_cluster().then_some(scheduler);
+        if entry.scheduler != seen {
+            entry.scheduler = seen;
+            let entry = entry.clone();
+            self.save()?;
+            return Ok(Some(entry));
+        }
+        Ok(Some(entry.clone()))
     }
 
     /// Atomically persist the list (tmp file + rename). The tmp name is
@@ -310,6 +363,32 @@ mod tests {
         let (mut store, dir) = tmp_store("record");
         store.record_connected("fresh").unwrap();
         assert_eq!(store.get("fresh").unwrap().alias, "fresh");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The login-node override is off unless set, survives a reload, and an
+    /// entry without the field (an older build's rewrite) reads as off.
+    #[test]
+    fn login_serve_is_opt_in_and_persists() {
+        let (mut store, dir) = tmp_store("login-serve");
+        let entry = store.add("cluster", None).unwrap();
+        assert!(!entry.login_serve);
+        assert!(store.set_login_serve("cluster", true).unwrap().login_serve);
+        store
+            .record_scheduler("cluster", chimaera_core::slurm::Scheduler::Slurm)
+            .unwrap();
+        let reloaded = HostsStore::load(dir.join("hosts.json"));
+        let e = reloaded.get("cluster").unwrap();
+        assert!(e.login_serve);
+        assert_eq!(e.scheduler, Some(chimaera_core::slurm::Scheduler::Slurm));
+        let older = serde_json::json!([{"alias": "cluster", "added_at": 1}]);
+        std::fs::write(dir.join("hosts.json"), older.to_string()).unwrap();
+        assert!(
+            !HostsStore::load(dir.join("hosts.json"))
+                .get("cluster")
+                .unwrap()
+                .login_serve
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
