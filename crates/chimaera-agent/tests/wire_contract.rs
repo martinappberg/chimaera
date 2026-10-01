@@ -107,6 +107,7 @@ fn user_message_delivery_fields_are_additive() {
             queued: false,
             after_turn: false,
             origin: None,
+            client_id: None,
         })
         .unwrap(),
         json!({ "type": "user_message", "text": "hi" })
@@ -120,6 +121,7 @@ fn user_message_delivery_fields_are_additive() {
             queued: true,
             after_turn: false,
             origin: None,
+            client_id: None,
         })
         .unwrap(),
         json!({ "type": "user_message", "text": "hi", "id": "u1", "queued": true })
@@ -134,10 +136,26 @@ fn user_message_delivery_fields_are_additive() {
             queued: true,
             after_turn: true,
             origin: None,
+            client_id: None,
         })
         .unwrap(),
         json!({ "type": "user_message", "text": "hi", "id": "u1", "queued": true,
                 "after_turn": true })
+    );
+    // A client's send id rides the echo of the send it names, and only then.
+    assert_eq!(
+        serde_json::to_value(AgentEvent::UserMessage {
+            text: "hi".into(),
+            attachments: 0,
+            attachment_paths: Vec::new(),
+            id: Some("u1".into()),
+            queued: false,
+            after_turn: false,
+            origin: None,
+            client_id: Some("c-12345678".into()),
+        })
+        .unwrap(),
+        json!({ "type": "user_message", "text": "hi", "id": "u1", "client_id": "c-12345678" })
     );
     // An old journal line (no id/queued) still parses.
     let old: AgentEvent =
@@ -152,6 +170,7 @@ fn user_message_delivery_fields_are_additive() {
             queued: false,
             after_turn: false,
             origin: None,
+            client_id: None,
         }
     );
     assert_eq!(
@@ -622,6 +641,7 @@ fn remote_control_wire_shapes_are_additive() {
             queued: false,
             after_turn: false,
             origin: Some("remote".into()),
+            client_id: None,
         })
         .unwrap(),
         json!({ "type": "user_message", "text": "from my phone", "origin": "remote" })

@@ -255,24 +255,34 @@ async fn terminal_input(
     }
 }
 
+/// `client_id`: the id the client minted for this send (already checked), so
+/// the session runs it at most once however often it arrives.
 async fn chat_command(
     state: &Arc<AppState>,
     id: &str,
     command: chimaera_agent::model::AgentCommand,
+    client_id: Option<&str>,
     scope: Option<&SocketScope>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<chimaera_agent::SendOutcome> {
     let Some(scope) = scope else {
-        return state.chat.command(id, command).await;
+        return state.chat.send_from_client(id, command, client_id).await;
     };
     let guard = scope.begin_session(state, id)?;
     let state = Arc::clone(state);
     let id = id.to_owned();
+    let client_id = client_id.map(str::to_owned);
     // Keep admitted enqueue work owned if its viewer disconnects. The bounded
     // wait is cancellable before enqueue; an accepted item belongs to the old
     // driver, which must be fenced before replacement authority can activate.
     tokio::spawn(async move {
         let _guard = guard;
-        tokio::time::timeout(Duration::from_secs(5), state.chat.command(&id, command)).await?
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            state
+                .chat
+                .send_from_client(&id, command, client_id.as_deref()),
+        )
+        .await?
     })
     .await?
 }
@@ -522,11 +532,22 @@ pub(crate) async fn deliver_held(
         (true, Message::Text(text)) => {
             let mut command = serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text)?;
             command.validate_ingress()?;
+            // The send keeps its client's id here too: the viewer reconnects
+            // to this session next and may send it again before its echo.
+            let client_id = command_tag(&text).client_id;
             let saved = crate::upload::save_send_images(state, id, &mut command).await;
             let interaction = crate::activity::is_interaction(&command);
-            if let Err(error) = chat_command(state, id, command, None).await {
-                crate::upload::discard_saved_images(saved);
-                return Err(error);
+            match chat_command(state, id, command, client_id.as_deref(), None).await {
+                Ok(chimaera_agent::SendOutcome::Accepted) => {}
+                // Already accepted from the viewer's own resend.
+                Ok(chimaera_agent::SendOutcome::Duplicate) => {
+                    crate::upload::discard_saved_images(saved);
+                    return Ok(());
+                }
+                Err(error) => {
+                    crate::upload::discard_saved_images(saved);
+                    return Err(error);
+                }
             }
             if interaction {
                 crate::activity::record(state, id);
@@ -555,24 +576,60 @@ pub(crate) async fn deliver_held(
     }
 }
 
-/// The `type` of a chat command frame (`send`, `interrupt`, `permission`…),
-/// for tagging a refusal with the command it answers: a client hands text
-/// back to the composer only for a refused `send`. `None` for anything that
-/// is not a small command tag.
-pub(crate) fn command_kind(text: &str) -> Option<String> {
-    #[derive(Deserialize)]
-    struct Kind {
-        #[serde(rename = "type")]
-        kind: String,
-    }
-    let kind = serde_json::from_str::<Kind>(text).ok()?.kind;
-    (kind.len() <= 32 && kind.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')).then_some(kind)
+/// What a chat command frame says about itself, read without parsing the
+/// command (a refused frame may be one this daemon cannot parse).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct CommandTag {
+    /// Its `type` (`send`, `interrupt`, `permission`…); `None` for anything
+    /// that is not a small command tag.
+    pub(crate) kind: Option<String>,
+    /// The id its client minted for it (`client_id`), when well formed
+    /// (`chimaera_agent::model::valid_client_id`).
+    pub(crate) client_id: Option<String>,
+    /// It carries a `client_id` that is not well formed.
+    pub(crate) bad_client_id: bool,
 }
 
-/// A chat refusal naming the command it answers (additive `command`).
-fn command_refusal(mut answer: serde_json::Value, text: &str) -> serde_json::Value {
-    if let Some(command) = command_kind(text) {
+pub(crate) fn command_tag(text: &str) -> CommandTag {
+    #[derive(Deserialize)]
+    struct Tag {
+        #[serde(rename = "type")]
+        kind: String,
+        #[serde(default)]
+        client_id: Option<serde_json::Value>,
+    }
+    let Ok(tag) = serde_json::from_str::<Tag>(text) else {
+        return CommandTag::default();
+    };
+    let client_id = tag.client_id.as_ref().and_then(|id| {
+        id.as_str()
+            .filter(|id| chimaera_agent::model::valid_client_id(id))
+            .map(str::to_owned)
+    });
+    CommandTag {
+        bad_client_id: tag.client_id.is_some() && client_id.is_none(),
+        client_id,
+        kind: Some(tag.kind).filter(|kind| {
+            kind.len() <= 32 && kind.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+        }),
+    }
+}
+
+/// What a frame whose `client_id` is not well formed is told. Only a client
+/// that mints its own ids wrongly ever reads it.
+const BAD_CLIENT_ID: &str = "client_id must be 8 to 64 characters of A-Z, a-z, 0-9, _ or -";
+
+/// A chat refusal naming the command it answers (additive `command`) and,
+/// for a command sent under a client's id, that id (additive `client_id`):
+/// a client hands text back to the composer only for a refused send, and
+/// with the id it hands back exactly the send that was refused.
+pub(crate) fn command_refusal(mut answer: serde_json::Value, text: &str) -> serde_json::Value {
+    let tag = command_tag(text);
+    if let Some(command) = tag.kind {
         answer["command"] = json!(command);
+    }
+    if let Some(client_id) = tag.client_id {
+        answer["client_id"] = json!(client_id);
     }
     answer
 }
@@ -1315,6 +1372,10 @@ async fn handle_chat(
         // this is stale (the journal was recreated and numbering restarted);
         // it hard-resets rather than silently dropping every replayed event.
         "head": attachment.head_seq,
+        // This daemon accepts a `send` under one `client_id` at most once and
+        // answers `cancel_send`, so a client may resend what it could not
+        // confirm. Additive: a daemon without it must never be resent to.
+        "send_ids": true,
     });
     if send_json(&mut socket, &ready).await.is_err() {
         return;
@@ -1402,10 +1463,46 @@ async fn handle_chat(
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(text))) => {
                     if scope.as_ref().is_some_and(|s| s.session(&state, &id).is_err()) { scope_changed(&mut socket).await; return; }
+                    let tag = command_tag(&text);
+                    if tag.kind.as_deref() == Some("cancel_send") {
+                        // A forwarded viewer changes this session's record
+                        // under the same admission as its commands.
+                        let _admitted = match scope.as_ref().map(|s| s.begin_session(&state, &id)) {
+                            Some(Err(_)) => { scope_changed(&mut socket).await; return; }
+                            Some(Ok(guard)) => Some(guard),
+                            None => None,
+                        };
+                        let answer = cancel_send(&state, &id, &tag, options.read_only, &text).await;
+                        if send_json(&mut socket, &answer).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
                     match serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text) {
                         Ok(mut cmd) => {
+                            use chimaera_agent::model::AgentCommand;
+                            let is_send = matches!(cmd, AgentCommand::Send { .. } | AgentCommand::SendAfterTurn { .. });
+                            let client_id = tag.client_id.filter(|_| is_send);
+                            // A repeat of a send this session already accepted
+                            // is dropped before anything can refuse it: a
+                            // refusal would hand back text that is delivered.
+                            if client_id.as_deref().is_some_and(|client_id| {
+                                state.chat.client_id_state(&id, client_id)
+                                    == Some(chimaera_agent::ClientIdState::Accepted)
+                            }) {
+                                continue;
+                            }
                             if options.read_only || !session_writable(&state, &id) {
                                 let _ = send_json(&mut socket, &command_refusal(refusal(&state, &id, options.read_only), &text)).await;
+                                continue;
+                            }
+                            if is_send && tag.bad_client_id {
+                                let _ = send_json(
+                                    &mut socket,
+                                    &command_refusal(json!({"type": "error", "code": "invalid_command",
+                                            "message": BAD_CLIENT_ID}), &text),
+                                )
+                                .await;
                                 continue;
                             }
                             if let Err(err) = cmd.validate_ingress() {
@@ -1430,7 +1527,11 @@ async fn handle_chat(
                                 return;
                             }
                             let interaction = crate::activity::is_interaction(&cmd);
-                            if let Err(err) = chat_command(&state, &id, cmd, scope.as_ref()).await {
+                            let outcome = chat_command(&state, &id, cmd, client_id.as_deref(), scope.as_ref()).await;
+                            if let Ok(chimaera_agent::SendOutcome::Duplicate) = outcome {
+                                // The first copy owns its saved images.
+                                crate::upload::discard_saved_images(saved);
+                            } else if let Err(err) = outcome {
                                 // The send never happened: neither do its copies.
                                 crate::upload::discard_saved_images(saved);
                                 if err.is::<crate::pro::mutation::Changed>() {
@@ -1474,6 +1575,38 @@ async fn handle_chat(
                 Some(Ok(_)) => {}
             },
         }
+    }
+}
+
+/// Answer a `cancel_send`: one `send_cancelled` saying whether the id was
+/// withdrawn (no send under it was accepted, and none will be), or the same
+/// refusal a send would get where this socket may not act. It is not the user
+/// acting: nothing is recorded as interaction.
+async fn cancel_send(
+    state: &Arc<AppState>,
+    id: &str,
+    tag: &CommandTag,
+    read_only: bool,
+    text: &str,
+) -> serde_json::Value {
+    if read_only || !session_writable(state, id) {
+        return command_refusal(refusal(state, id, read_only), text);
+    }
+    let Some(client_id) = tag.client_id.as_deref() else {
+        return command_refusal(
+            json!({"type": "error", "code": "invalid_command",
+                   "message": BAD_CLIENT_ID}),
+            text,
+        );
+    };
+    match state.chat.cancel_send(id, client_id).await {
+        Ok(cancelled) => {
+            json!({"type": "send_cancelled", "client_id": client_id, "cancelled": cancelled})
+        }
+        Err(_) => command_refusal(
+            json!({"type": "error", "code": "command_failed", "message": "agent unavailable"}),
+            text,
+        ),
     }
 }
 
@@ -2443,22 +2576,62 @@ mod tests {
 
     #[test]
     fn a_refusal_names_the_command_it_answers() {
+        let kind = |text: &str| command_tag(text).kind;
         assert_eq!(
-            command_kind(r#"{"type":"send","blocks":[]}"#).as_deref(),
+            kind(r#"{"type":"send","blocks":[]}"#).as_deref(),
             Some("send")
         );
         assert_eq!(
-            command_kind(r#"{"type":"interrupt"}"#).as_deref(),
+            kind(r#"{"type":"interrupt"}"#).as_deref(),
             Some("interrupt")
         );
         for text in ["", "{}", r#"{"type":"Send"}"#, r#"{"type":7}"#, "not json"] {
-            assert_eq!(command_kind(text), None, "{text}");
+            assert_eq!(kind(text), None, "{text}");
         }
         let refused = command_refusal(
             json!({"type":"error","code":"command_failed"}),
             r#"{"type":"permission","request_id":"r","option_id":"o"}"#,
         );
         assert_eq!(refused["command"], "permission");
+        assert!(refused.get("client_id").is_none());
+    }
+
+    /// A refused send says which send it was, by the id its client minted,
+    /// so the client hands back exactly that one. An id that is not well
+    /// formed is never echoed.
+    #[test]
+    fn a_refused_send_carries_its_client_id() {
+        let refused = command_refusal(
+            json!({"type":"error","code":"command_failed"}),
+            r#"{"type":"send","blocks":[],"client_id":"client-0001"}"#,
+        );
+        assert_eq!(refused["command"], "send");
+        assert_eq!(refused["client_id"], "client-0001");
+        let after_turn = command_refusal(
+            json!({"type":"error","code":"read_only"}),
+            r#"{"type":"send_after_turn","client_id":"client-0002","blocks":[]}"#,
+        );
+        assert_eq!(after_turn["command"], "send_after_turn");
+        assert_eq!(after_turn["client_id"], "client-0002");
+
+        for bad in [
+            r#"{"type":"send","blocks":[],"client_id":"short"}"#,
+            r#"{"type":"send","blocks":[],"client_id":"has a space"}"#,
+            r#"{"type":"send","blocks":[],"client_id":12345678}"#,
+        ] {
+            let tag = command_tag(bad);
+            assert_eq!(tag.kind.as_deref(), Some("send"), "{bad}");
+            assert_eq!(tag.client_id, None, "{bad}");
+            assert!(tag.bad_client_id, "{bad}");
+            let refused = command_refusal(json!({"type":"error"}), bad);
+            assert!(refused.get("client_id").is_none(), "{bad}");
+        }
+        assert!(!command_tag(r#"{"type":"send","blocks":[]}"#).bad_client_id);
+        // An older daemon's parser: the additive field does not break a send.
+        assert!(serde_json::from_str::<AgentCommand>(
+            r#"{"type":"send","blocks":[],"client_id":"client-0001"}"#
+        )
+        .is_ok());
     }
 
     fn paused(reason: &'static str) -> Option<Pause> {

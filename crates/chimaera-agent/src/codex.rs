@@ -4306,6 +4306,7 @@ impl CodexMapper {
             queued,
             after_turn: queued && after_turn,
             origin: None,
+            client_id: None,
         });
         if queued && !after_turn && !self.turn_pending {
             self.emit_steer(input, client_msg_id, step);
@@ -4406,6 +4407,7 @@ impl CodexMapper {
                             queued: false,
                             after_turn: false,
                             origin: None,
+                            client_id: None,
                         });
                         self.dispatch_input(json!([{ "type": "text", "text": fb }]), &mut step);
                     }
@@ -6525,6 +6527,7 @@ mod tests {
                 queued,
                 after_turn: _,
                 origin: _,
+                client_id: _,
             } => {
                 assert_eq!(text, "see");
                 assert_eq!(*attachments, 1);

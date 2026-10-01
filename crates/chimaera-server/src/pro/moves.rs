@@ -187,6 +187,33 @@ pub(crate) fn bring_here(
     start(state, config, workspace, true, BOUND)
 }
 
+/// A signed-in personal computer on the negotiated protocol whose account is
+/// at `endpoint`: one that may take a project another computer runs, for
+/// fixtures that exercise what asks it to ([`bring_here`]).
+#[cfg(test)]
+pub(crate) fn device_fixture(state: &AppState, endpoint: &str) {
+    let config = serde_json::from_value(json!({
+        "account_id": "a-fixture",
+        "role": "device",
+        "endpoint": endpoint,
+        "keeper_url": "",
+        "hours_exhausted": false,
+        "execution": {
+            "version": 1,
+            "installation_id": "i-home",
+            "capability": execution::wire::ExecutionCapability::checkpoint_fork(),
+        },
+        "delegation": {
+            "access_token": "synthetic",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "scope": ["baton", "mirror"],
+            "device_id": "d-home",
+        },
+    }))
+    .expect("device configuration fixture");
+    *lock(&state.pro.runtime) = Some(config);
+}
+
 /// The account asked this computer to take `workspace` (a phone acted while
 /// the cloud slept, or this computer's own earlier request outlived the
 /// daemon that made it): take it at once, unless a request is under way.

@@ -76,6 +76,70 @@ impl fmt::Display for CommandQueueFull {
 
 impl std::error::Error for CommandQueueFull {}
 
+/// What became of a client's send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// Queued for the driver. Its echo will carry the client's id.
+    Accepted,
+    /// The session already accepted a send under this id: nothing was queued
+    /// and no second turn runs. The first one's echo exists or will.
+    Duplicate,
+}
+
+/// A send was refused because its client withdrew that id (`cancel_send`)
+/// before any send under it was accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SendCancelled;
+
+impl fmt::Display for SendCancelled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the send was cancelled before it arrived")
+    }
+}
+
+impl std::error::Error for SendCancelled {}
+
+/// What a session knows about a client-minted send id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientIdState {
+    /// A send under it was accepted: queued for the driver, or echoed into
+    /// the journal.
+    Accepted,
+    /// Its client withdrew it before any send under it was accepted.
+    Cancelled,
+}
+
+/// The newest send ids a session has settled: echoed into its journal, or
+/// cancelled. Bounded to [`model::CLIENT_IDS_REMEMBERED`]. An id that was
+/// accepted but not echoed yet is not here: it lives on its reservation, so
+/// it is forgotten with a driver that ends before handling the send, and the
+/// client's resend can then reach the next process.
+#[derive(Default)]
+struct ClientIds {
+    newest_last: VecDeque<(String, ClientIdState)>,
+}
+
+impl ClientIds {
+    fn get(&self, id: &str) -> Option<ClientIdState> {
+        self.newest_last
+            .iter()
+            .rev()
+            .find(|(known, _)| known == id)
+            .map(|(_, state)| *state)
+    }
+
+    fn remember(&mut self, id: String, state: ClientIdState) {
+        if let Some(known) = self.newest_last.iter_mut().find(|(known, _)| *known == id) {
+            known.1 = state;
+            return;
+        }
+        if self.newest_last.len() == model::CLIENT_IDS_REMEMBERED {
+            self.newest_last.pop_front();
+        }
+        self.newest_last.push_back((id, state));
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SendReservation {
     token: u64,
@@ -89,6 +153,10 @@ struct SendReservation {
     /// by key, never by FIFO position — a later send's echo must not take
     /// its reservation, nor its origin.
     send_id: Option<String>,
+    /// The id the sending client minted (`client_id` on its frame), stamped
+    /// onto the echo. While this reservation waits for that echo, the id
+    /// counts as accepted.
+    client_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -103,6 +171,9 @@ struct CommandBudget {
     unassigned: VecDeque<SendReservation>,
     /// Driver-held sends, keyed by the delivery id resolved in the journal.
     queued: HashMap<String, SendReservation>,
+    /// Outlives [`Self::clear`]: a dead driver forgets what it had not
+    /// handled, never what the journal holds or what a client withdrew.
+    client_ids: ClientIds,
 }
 
 impl CommandBudget {
@@ -111,6 +182,7 @@ impl CommandBudget {
         bytes: usize,
         origin: Option<&'static str>,
         send_id: Option<String>,
+        client_id: Option<String>,
     ) -> Result<u64, CommandQueueFull> {
         if self.sends >= RETAINED_SENDS_MAX
             || bytes > RETAINED_SEND_BYTES_MAX.saturating_sub(self.bytes)
@@ -127,8 +199,37 @@ impl CommandBudget {
             bytes,
             origin,
             send_id,
+            client_id,
         });
         Ok(token)
+    }
+
+    /// What this session knows about a client's send id: accepted while a
+    /// reservation carries it (queued, not echoed yet) or once its echo was
+    /// journaled, cancelled once its client withdrew it.
+    fn client_id_state(&self, id: &str) -> Option<ClientIdState> {
+        if self
+            .unassigned
+            .iter()
+            .any(|r| r.client_id.as_deref() == Some(id))
+        {
+            return Some(ClientIdState::Accepted);
+        }
+        self.client_ids.get(id)
+    }
+
+    /// Withdraw `id` unless a send under it was already accepted. True when
+    /// no send under it will ever run here.
+    fn cancel_client_id(&mut self, id: &str) -> bool {
+        match self.client_id_state(id) {
+            Some(ClientIdState::Accepted) => false,
+            Some(ClientIdState::Cancelled) => true,
+            None => {
+                self.client_ids
+                    .remember(id.to_owned(), ClientIdState::Cancelled);
+                true
+            }
+        }
     }
 
     /// The reservation an echo with delivery key `id` pairs with: the keyed
@@ -167,13 +268,22 @@ impl CommandBudget {
                 id: Some(id),
                 queued,
                 origin,
+                client_id,
                 ..
             } => {
-                let Some(reservation) = self.take_for_echo(id) else {
+                let Some(mut reservation) = self.take_for_echo(id) else {
                     return;
                 };
                 if origin.is_none() {
                     *origin = reservation.origin.map(str::to_string);
+                }
+                // The echo is the journal's proof of this send: from here the
+                // id is remembered there and in the record, not on the
+                // reservation.
+                if let Some(sent_as) = reservation.client_id.take() {
+                    self.client_ids
+                        .remember(sent_as.clone(), ClientIdState::Accepted);
+                    *client_id = Some(sent_as);
                 }
                 if *queued {
                     if let Some(previous) = self.queued.remove(id) {
@@ -631,6 +741,14 @@ impl ChatManager {
         }
 
         let journal = Arc::new(Journal::open(&self.journal_dir, &id)?);
+        // A new process of this session still refuses the sends its journal
+        // already holds (a daemon restart, a respawn, a resume).
+        let mut command_budget = CommandBudget::default();
+        for client_id in journal.client_ids_at_open() {
+            command_budget
+                .client_ids
+                .remember(client_id.clone(), ClientIdState::Accepted);
+        }
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_QUEUE);
         let (ev_tx, mut ev_rx) = mpsc::channel::<AgentEvent>(EVENT_QUEUE);
         let (events_tx, _) = broadcast::channel(BROADCAST_QUEUE);
@@ -682,7 +800,7 @@ impl ChatManager {
             kill_tx,
             process_control: process_control.clone(),
             command_order: tokio::sync::Mutex::new(()),
-            command_budget: Mutex::new(CommandBudget::default()),
+            command_budget: Mutex::new(command_budget),
         });
 
         let handle = adapter
@@ -994,9 +1112,85 @@ impl ChatManager {
         cmd: AgentCommand,
         origin: Option<&'static str>,
     ) -> Result<()> {
+        self.enqueue(id, cmd, origin, None).await.map(|_| ())
+    }
+
+    /// [`Self::command`] for a `send` / `send_after_turn` a client made under
+    /// an id it minted ([`model::valid_client_id`]; the caller checks it).
+    /// The session accepts an id at most once: a second send under it is
+    /// [`SendOutcome::Duplicate`] and queues nothing, so a client may resend
+    /// what it could not confirm; one under an id its client cancelled fails
+    /// with [`SendCancelled`]. The id is accepted from the moment the send is
+    /// queued, before the driver handles it, and rides the echo. Ignored for
+    /// commands that are not such a send.
+    pub async fn send_from_client(
+        &self,
+        id: &str,
+        cmd: AgentCommand,
+        client_id: Option<&str>,
+    ) -> Result<SendOutcome> {
+        self.enqueue(id, cmd, None, client_id).await
+    }
+
+    /// What session `id` knows about a client's send id; `None` when it knows
+    /// nothing (or there is no such session).
+    pub fn client_id_state(&self, id: &str, client_id: &str) -> Option<ClientIdState> {
+        self.get_session(id)
+            .ok()?
+            .command_budget
+            .lock()
+            .expect("command budget lock")
+            .client_id_state(client_id)
+    }
+
+    /// Withdraw a client's send id (`cancel_send`): true when no send under
+    /// it was accepted, and none will be from now on; false when one already
+    /// was (its echo exists or will), which changes nothing. Serialized with
+    /// sends, so it never interleaves with one being accepted.
+    pub async fn cancel_send(&self, id: &str, client_id: &str) -> Result<bool> {
+        let session = self.get_session(id)?;
+        let _order = session.command_order.lock().await;
+        let cancelled = session
+            .command_budget
+            .lock()
+            .expect("command budget lock")
+            .cancel_client_id(client_id);
+        Ok(cancelled)
+    }
+
+    async fn enqueue(
+        &self,
+        id: &str,
+        cmd: AgentCommand,
+        origin: Option<&'static str>,
+        client_id: Option<&str>,
+    ) -> Result<SendOutcome> {
         cmd.validate_ingress().context("invalid agent command")?;
         let session = self.get_session(id)?;
         let _order = session.command_order.lock().await;
+        // Only a plain send carries a client's id (a `SendIfRunning` has its
+        // caller's own key).
+        let client_id = client_id.filter(|_| {
+            matches!(
+                cmd,
+                AgentCommand::Send { .. } | AgentCommand::SendAfterTurn { .. }
+            )
+        });
+        // Before any refusal: a repeat of an accepted send must be dropped,
+        // never answered as "not sent" (its text would come back to a
+        // composer while the first copy is delivered).
+        if let Some(client_id) = client_id {
+            match session
+                .command_budget
+                .lock()
+                .expect("command budget lock")
+                .client_id_state(client_id)
+            {
+                Some(ClientIdState::Accepted) => return Ok(SendOutcome::Duplicate),
+                Some(ClientIdState::Cancelled) => return Err(SendCancelled.into()),
+                None => {}
+            }
+        }
         anyhow::ensure!(
             !session
                 .command_budget
@@ -1010,7 +1204,12 @@ impl ChatManager {
                 .command_budget
                 .lock()
                 .expect("command budget lock")
-                .reserve(bytes, origin, cmd.send_id().map(str::to_owned))?;
+                .reserve(
+                    bytes,
+                    origin,
+                    cmd.send_id().map(str::to_owned),
+                    client_id.map(str::to_owned),
+                )?;
             Some(EnqueueReservation {
                 budget: &session.command_budget,
                 token: Some(token),
@@ -1024,7 +1223,7 @@ impl ChatManager {
             // the pump observes delivery/update/exit.
             reservation.disarm();
         }
-        Ok(())
+        Ok(SendOutcome::Accepted)
     }
 
     /// Serialize a lifecycle proof with all accepted commands. A caller must
@@ -1240,7 +1439,7 @@ mod tests {
     fn submitted_input_evidence_survives_queue_release_and_exit() {
         let mut budget = CommandBudget::default();
         assert!(!budget.submitted_input);
-        let token = budget.reserve(1, None, None).unwrap();
+        let token = budget.reserve(1, None, None, None).unwrap();
         budget.release_unassigned(token);
         assert_eq!(budget.sends, 0);
         assert!(budget.submitted_input);
@@ -1251,7 +1450,7 @@ mod tests {
     #[test]
     fn delivered_input_stays_busy_before_turn_started_without_holding_quota() {
         let mut budget = CommandBudget::default();
-        budget.reserve(1, None, None).unwrap();
+        budget.reserve(1, None, None, None).unwrap();
         budget.observe(&mut AgentEvent::UserMessage {
             text: "work".into(),
             attachments: 0,
@@ -1260,6 +1459,7 @@ mod tests {
             queued: false,
             after_turn: false,
             origin: None,
+            client_id: None,
         });
         assert_eq!(budget.sends, 0);
         assert!(budget.awaiting_turn);
@@ -1267,7 +1467,7 @@ mod tests {
             turn_id: "t".into(),
         });
         assert!(!budget.awaiting_turn); // carryover is now active under the same lock.
-        budget.reserve(1, None, None).unwrap();
+        budget.reserve(1, None, None, None).unwrap();
         budget.observe(&mut AgentEvent::UserMessage {
             text: "queued".into(),
             attachments: 0,
@@ -1276,6 +1476,7 @@ mod tests {
             queued: true,
             after_turn: false,
             origin: None,
+            client_id: None,
         });
         budget.observe(&mut AgentEvent::TurnCompleted {
             turn_id: "t".into(),
@@ -1378,9 +1579,9 @@ mod tests {
     fn command_budget_bounds_bytes_and_releases_on_delivery() {
         let mut budget = CommandBudget::default();
         let first = budget
-            .reserve(RETAINED_SEND_BYTES_MAX - 1, None, None)
+            .reserve(RETAINED_SEND_BYTES_MAX - 1, None, None, None)
             .unwrap();
-        assert_eq!(budget.reserve(2, None, None), Err(CommandQueueFull));
+        assert_eq!(budget.reserve(2, None, None, None), Err(CommandQueueFull));
         budget.observe(&mut AgentEvent::UserMessage {
             text: "queued".to_string(),
             attachments: 0,
@@ -1389,6 +1590,7 @@ mod tests {
             queued: true,
             after_turn: false,
             origin: None,
+            client_id: None,
         });
         assert_eq!(budget.bytes, RETAINED_SEND_BYTES_MAX - 1);
         budget.observe(&mut AgentEvent::UserMessageUpdate {
@@ -1407,9 +1609,9 @@ mod tests {
     fn command_budget_bounds_tiny_send_count_and_clears_on_exit() {
         let mut budget = CommandBudget::default();
         for _ in 0..RETAINED_SENDS_MAX {
-            budget.reserve(0, None, None).unwrap();
+            budget.reserve(0, None, None, None).unwrap();
         }
-        assert_eq!(budget.reserve(0, None, None), Err(CommandQueueFull));
+        assert_eq!(budget.reserve(0, None, None, None), Err(CommandQueueFull));
         budget.observe(&mut AgentEvent::Exited { status: None });
         assert_eq!(budget.bytes, 0);
         assert_eq!(budget.sends, 0);
@@ -1419,7 +1621,7 @@ mod tests {
     #[test]
     fn idless_feedback_does_not_consume_a_send_reservation() {
         let mut budget = CommandBudget::default();
-        budget.reserve(1024, None, None).unwrap();
+        budget.reserve(1024, None, None, None).unwrap();
         budget.observe(&mut AgentEvent::UserMessage {
             text: "try a dry run first".to_string(),
             attachments: 0,
@@ -1428,6 +1630,7 @@ mod tests {
             queued: false,
             after_turn: false,
             origin: None,
+            client_id: None,
         });
         assert_eq!(budget.bytes, 1024);
         assert_eq!(budget.unassigned.len(), 1);
@@ -1440,6 +1643,7 @@ mod tests {
             queued: true,
             after_turn: false,
             origin: None,
+            client_id: None,
         });
         assert!(budget.unassigned.is_empty());
         assert!(budget.queued.contains_key("q1"));
@@ -1448,7 +1652,11 @@ mod tests {
     #[test]
     fn enqueue_reservation_drop_releases_quota_unless_disarmed() {
         let budget = Mutex::new(CommandBudget::default());
-        let token = budget.lock().unwrap().reserve(1024, None, None).unwrap();
+        let token = budget
+            .lock()
+            .unwrap()
+            .reserve(1024, None, None, None)
+            .unwrap();
         {
             let _guard = EnqueueReservation {
                 budget: &budget,
@@ -1457,7 +1665,11 @@ mod tests {
         }
         assert_eq!(budget.lock().unwrap().bytes, 0);
 
-        let token = budget.lock().unwrap().reserve(2048, None, None).unwrap();
+        let token = budget
+            .lock()
+            .unwrap()
+            .reserve(2048, None, None, None)
+            .unwrap();
         {
             let mut guard = EnqueueReservation {
                 budget: &budget,
@@ -1468,6 +1680,126 @@ mod tests {
         assert_eq!(budget.lock().unwrap().bytes, 2048);
     }
 
+    fn echo(id: &str) -> AgentEvent {
+        AgentEvent::UserMessage {
+            text: "hi".to_string(),
+            attachments: 0,
+            attachment_paths: Vec::new(),
+            id: Some(id.to_string()),
+            queued: false,
+            after_turn: false,
+            origin: None,
+            client_id: None,
+        }
+    }
+
+    /// A client's send id is accepted from the moment its send is reserved
+    /// (queued for a driver that may still be in its handshake), rides the
+    /// echo, and stays known after the driver ends.
+    #[test]
+    fn a_client_send_id_is_accepted_when_queued_and_rides_its_echo() {
+        let mut budget = CommandBudget::default();
+        assert_eq!(budget.client_id_state("client-0001"), None);
+        budget
+            .reserve(8, None, None, Some("client-0001".into()))
+            .unwrap();
+        assert_eq!(
+            budget.client_id_state("client-0001"),
+            Some(ClientIdState::Accepted)
+        );
+        // A send without an id ahead of it in the queue takes the older echo.
+        budget.reserve(8, None, None, None).unwrap();
+        let mut first = echo("u1");
+        budget.observe(&mut first);
+        assert!(
+            matches!(&first, AgentEvent::UserMessage { client_id: Some(id), .. } if id == "client-0001"),
+            "{first:?}"
+        );
+        let mut second = echo("u2");
+        budget.observe(&mut second);
+        assert!(
+            matches!(
+                &second,
+                AgentEvent::UserMessage {
+                    client_id: None,
+                    ..
+                }
+            ),
+            "{second:?}"
+        );
+        budget.observe(&mut AgentEvent::Exited { status: None });
+        assert_eq!(
+            budget.client_id_state("client-0001"),
+            Some(ClientIdState::Accepted)
+        );
+    }
+
+    /// A driver that ends before handling a queued send takes that send with
+    /// it, so its id must be free again: the client's resend is the only copy.
+    #[test]
+    fn a_send_id_is_forgotten_with_a_driver_that_never_handled_it() {
+        let mut budget = CommandBudget::default();
+        budget
+            .reserve(8, None, None, Some("client-lost".into()))
+            .unwrap();
+        budget.observe(&mut AgentEvent::Exited { status: None });
+        assert_eq!(budget.client_id_state("client-lost"), None);
+
+        // So is one whose enqueue failed.
+        let token = budget
+            .reserve(8, None, None, Some("client-refused".into()))
+            .unwrap();
+        budget.release_unassigned(token);
+        assert_eq!(budget.client_id_state("client-refused"), None);
+    }
+
+    #[test]
+    fn cancelling_a_send_id_only_works_before_it_is_accepted() {
+        let mut budget = CommandBudget::default();
+        assert!(budget.cancel_client_id("client-early"));
+        assert_eq!(
+            budget.client_id_state("client-early"),
+            Some(ClientIdState::Cancelled)
+        );
+        // Asked again (its answer was lost): the same answer.
+        assert!(budget.cancel_client_id("client-early"));
+
+        budget
+            .reserve(8, None, None, Some("client-queued".into()))
+            .unwrap();
+        assert!(!budget.cancel_client_id("client-queued"));
+        budget.observe(&mut echo("u1"));
+        assert!(!budget.cancel_client_id("client-queued"));
+        assert_eq!(
+            budget.client_id_state("client-queued"),
+            Some(ClientIdState::Accepted)
+        );
+        // A dead driver keeps what was cancelled and what was echoed.
+        budget.clear();
+        assert_eq!(
+            budget.client_id_state("client-early"),
+            Some(ClientIdState::Cancelled)
+        );
+        assert_eq!(
+            budget.client_id_state("client-queued"),
+            Some(ClientIdState::Accepted)
+        );
+    }
+
+    #[test]
+    fn the_send_id_record_keeps_only_the_newest_ids() {
+        let mut ids = ClientIds::default();
+        for n in 0..model::CLIENT_IDS_REMEMBERED + 5 {
+            ids.remember(format!("client-{n:04}"), ClientIdState::Accepted);
+        }
+        assert_eq!(ids.newest_last.len(), model::CLIENT_IDS_REMEMBERED);
+        assert_eq!(ids.get("client-0004"), None);
+        assert_eq!(ids.get("client-0005"), Some(ClientIdState::Accepted));
+        // Remembering a known id again never grows the record.
+        ids.remember("client-0005".into(), ClientIdState::Accepted);
+        assert_eq!(ids.newest_last.len(), model::CLIENT_IDS_REMEMBERED);
+    }
+
     /// A keyed send (`SendIfRunning`) pairs by its key: settled with no echo
     /// it gives its reservation back, and a later send's echo never takes
     /// its slot or its origin.
@@ -1475,9 +1807,9 @@ mod tests {
     fn keyed_sends_pair_by_key_never_by_position() {
         let mut budget = CommandBudget::default();
         budget
-            .reserve(64, Some(model::ORIGIN_AGENT), Some("k1".into()))
+            .reserve(64, Some(model::ORIGIN_AGENT), Some("k1".into()), None)
             .unwrap();
-        budget.reserve(32, None, None).unwrap();
+        budget.reserve(32, None, None, None).unwrap();
         let mut plain = AgentEvent::UserMessage {
             text: "mine".to_string(),
             attachments: 0,
@@ -1486,6 +1818,7 @@ mod tests {
             queued: false,
             after_turn: false,
             origin: None,
+            client_id: None,
         };
         budget.observe(&mut plain);
         assert!(
@@ -1506,9 +1839,9 @@ mod tests {
     fn daemon_origin_rides_the_echo_its_reservation_pairs_with() {
         let mut budget = CommandBudget::default();
         budget
-            .reserve(64, Some(model::ORIGIN_RESTART), None)
+            .reserve(64, Some(model::ORIGIN_RESTART), None, None)
             .unwrap();
-        budget.reserve(64, None, None).unwrap();
+        budget.reserve(64, None, None, None).unwrap();
         // Id-less feedback consumes nothing, so it cannot steal the tag.
         let mut feedback = AgentEvent::UserMessage {
             text: "feedback".to_string(),
@@ -1518,6 +1851,7 @@ mod tests {
             queued: false,
             after_turn: false,
             origin: None,
+            client_id: None,
         };
         budget.observe(&mut feedback);
         let origin_of = |ev: &AgentEvent| match ev {
@@ -1533,6 +1867,7 @@ mod tests {
             queued: false,
             after_turn: false,
             origin: None,
+            client_id: None,
         };
         let mut first = echo("m1");
         budget.observe(&mut first);
@@ -1642,6 +1977,7 @@ mod tests {
             queued: false,
             after_turn: false,
             origin: Some(model::ORIGIN_RESTART.into()),
+            client_id: None,
         });
         assert!(carry.pickup_at_ms > 0, "the pick-up is stamped");
 
@@ -1662,6 +1998,7 @@ mod tests {
             queued: false,
             after_turn: false,
             origin: Some(origin.into()),
+            client_id: None,
         };
         for origin in [
             model::ORIGIN_RESTART,

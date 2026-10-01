@@ -16,7 +16,10 @@ use chimaera_agent::model::{
     AgentCommand, AgentEvent, BackgroundTask, ContentBlock, RemoteControlState, ToolContent,
     ToolStatus, UserMessageState,
 };
-use chimaera_agent::{ChatManager, CommandQueueFull, EventHook, ExitHook, RETAINED_SENDS_MAX};
+use chimaera_agent::{
+    ChatManager, ClientIdState, CommandQueueFull, EventHook, ExitHook, SendCancelled, SendOutcome,
+    RETAINED_SENDS_MAX,
+};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_fake-claude");
 /// Ceiling per wait. Every wait here is condition-driven, so this only bounds
@@ -2732,4 +2735,243 @@ async fn managed_fence_does_not_claim_containment_of_setsid_descendants() {
     })
     .await
     .unwrap();
+}
+
+fn text_send(text: &str) -> AgentCommand {
+    AgentCommand::Send {
+        blocks: vec![ContentBlock::Text { text: text.into() }],
+    }
+}
+
+/// How many messages the journal holds under a client's send id.
+fn echoes_of(replay: &[Arc<SeqEvent>], client_id: &str) -> usize {
+    replay
+        .iter()
+        .filter(|e| {
+            matches!(&e.ev, AgentEvent::UserMessage { client_id: Some(id), .. } if id == client_id)
+        })
+        .count()
+}
+
+/// A send that arrives while the driver is still in its handshake is accepted
+/// at once (queued, with nothing in the journal yet). The client cannot see
+/// it there and sends it again under the same id: that copy must be dropped,
+/// or the agent would run the message twice.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_send_queued_during_the_handshake_is_accepted_once() {
+    let fx = fixture();
+    // The agent answers its handshake a moment late.
+    let launch = SpawnSpec::new(
+        "s-handshake",
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "sleep 1; exec \"$0\" normal".into(),
+            FAKE.to_string(),
+        ],
+        fx.cwd.clone(),
+    );
+    fx.manager.spawn(&ClaudeAdapter, launch).expect("spawn");
+    let att = fx.manager.attach("s-handshake", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+    assert!(
+        !seen.iter().any(|e| matches!(e.ev, AgentEvent::Init { .. })),
+        "the handshake must still be running"
+    );
+
+    let outcome = fx
+        .manager
+        .send_from_client("s-handshake", text_send("once"), Some("client-handshake"))
+        .await
+        .expect("send");
+    assert_eq!(outcome, SendOutcome::Accepted);
+    assert_eq!(
+        fx.manager
+            .client_id_state("s-handshake", "client-handshake"),
+        Some(ClientIdState::Accepted)
+    );
+    // The client's resend, and a late cancel: neither changes anything.
+    let again = fx
+        .manager
+        .send_from_client("s-handshake", text_send("once"), Some("client-handshake"))
+        .await
+        .expect("resend");
+    assert_eq!(again, SendOutcome::Duplicate);
+    assert!(!fx
+        .manager
+        .cancel_send("s-handshake", "client-handshake")
+        .await
+        .unwrap());
+
+    let echo = wait_for(&mut rx, &mut seen, "the echo", |ev| {
+        matches!(ev, AgentEvent::UserMessage { .. })
+    })
+    .await;
+    assert!(
+        matches!(&echo.ev, AgentEvent::UserMessage { text, client_id: Some(id), .. }
+            if text == "once" && id == "client-handshake"),
+        "{:?}",
+        echo.ev
+    );
+    wait_for(&mut rx, &mut seen, "PermissionRequest", |ev| {
+        matches!(ev, AgentEvent::PermissionRequest { .. })
+    })
+    .await;
+    // One more resend after the echo, then the journal: one message, one turn.
+    let late = fx
+        .manager
+        .send_from_client("s-handshake", text_send("once"), Some("client-handshake"))
+        .await
+        .expect("late resend");
+    assert_eq!(late, SendOutcome::Duplicate);
+    let replay = fx.manager.attach("s-handshake", 0).expect("attach").replay;
+    assert_eq!(echoes_of(&replay, "client-handshake"), 1);
+    assert_eq!(
+        replay
+            .iter()
+            .filter(|e| matches!(e.ev, AgentEvent::UserMessage { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        replay
+            .iter()
+            .filter(|e| matches!(e.ev, AgentEvent::TurnStarted { .. }))
+            .count(),
+        1
+    );
+    assert!(fx.manager.kill("s-handshake"));
+}
+
+/// The record of accepted ids is read back from the journal, so a daemon
+/// that restarted (a new manager over the same journal) still drops a resend
+/// of a message its previous life delivered.
+#[tokio::test]
+async fn a_send_id_in_the_journal_is_still_refused_after_a_restart() {
+    let mut fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-restart", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-restart", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+    let outcome = fx
+        .manager
+        .send_from_client("s-restart", text_send("before"), Some("client-before"))
+        .await
+        .expect("send");
+    assert_eq!(outcome, SendOutcome::Accepted);
+    wait_for(&mut rx, &mut seen, "the echo", |ev| {
+        matches!(ev, AgentEvent::UserMessage { client_id: Some(id), .. } if id == "client-before")
+    })
+    .await;
+    assert!(fx.manager.kill("s-restart"));
+    tokio::time::timeout(WAIT, fx.exits.recv())
+        .await
+        .expect("exit hook fired")
+        .expect("channel open");
+
+    let restarted = Arc::new(ChatManager::new(
+        fx.manager.journal_dir().clone(),
+        Box::new(|_, _| {}),
+        Box::new(|_, _| {}),
+    ));
+    restarted
+        .spawn(&ClaudeAdapter, spec("s-restart", &fx.cwd, "normal"))
+        .expect("spawn again");
+    assert_eq!(
+        restarted.client_id_state("s-restart", "client-before"),
+        Some(ClientIdState::Accepted)
+    );
+    let again = restarted
+        .send_from_client("s-restart", text_send("before"), Some("client-before"))
+        .await
+        .expect("resend");
+    assert_eq!(again, SendOutcome::Duplicate);
+    // A different id is a different message.
+    let other = restarted
+        .send_from_client("s-restart", text_send("after"), Some("client-after1"))
+        .await
+        .expect("send");
+    assert_eq!(other, SendOutcome::Accepted);
+    // The reopened journal's history is on disk: read it off the runtime.
+    let attach = |manager: Arc<ChatManager>| async move {
+        tokio::task::spawn_blocking(move || manager.attach("s-restart", 0).expect("attach"))
+            .await
+            .expect("attach task")
+    };
+    let att = attach(Arc::clone(&restarted)).await;
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+    if echoes_of(&seen, "client-after1") == 0 {
+        wait_for(&mut rx, &mut seen, "the second echo", |ev| {
+            matches!(ev, AgentEvent::UserMessage { client_id: Some(id), .. } if id == "client-after1")
+        })
+        .await;
+    }
+    let replay = attach(Arc::clone(&restarted)).await.replay;
+    assert_eq!(echoes_of(&replay, "client-before"), 1);
+    assert_eq!(echoes_of(&replay, "client-after1"), 1);
+    assert!(restarted.kill("s-restart"));
+}
+
+/// `cancel_send` wins only against a send that was never accepted: from then
+/// on that id is refused. Against an accepted one it loses and changes
+/// nothing.
+#[tokio::test]
+async fn cancel_send_wins_before_acceptance_and_loses_after() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-cancel", &fx.cwd, "normal"))
+        .expect("spawn");
+
+    assert!(fx
+        .manager
+        .cancel_send("s-cancel", "client-withdrawn")
+        .await
+        .unwrap());
+    let refused = fx
+        .manager
+        .send_from_client("s-cancel", text_send("late"), Some("client-withdrawn"))
+        .await
+        .expect_err("a cancelled id is refused");
+    assert!(
+        refused.downcast_ref::<SendCancelled>().is_some(),
+        "{refused}"
+    );
+
+    let att = fx.manager.attach("s-cancel", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+    let outcome = fx
+        .manager
+        .send_from_client("s-cancel", text_send("kept"), Some("client-accepted"))
+        .await
+        .expect("send");
+    assert_eq!(outcome, SendOutcome::Accepted);
+    assert!(!fx
+        .manager
+        .cancel_send("s-cancel", "client-accepted")
+        .await
+        .unwrap());
+    wait_for(&mut rx, &mut seen, "the echo", |ev| {
+        matches!(ev, AgentEvent::UserMessage { client_id: Some(id), .. } if id == "client-accepted")
+    })
+    .await;
+    assert!(!fx
+        .manager
+        .cancel_send("s-cancel", "client-accepted")
+        .await
+        .unwrap());
+    let replay = fx.manager.attach("s-cancel", 0).expect("attach").replay;
+    assert_eq!(echoes_of(&replay, "client-withdrawn"), 0);
+    assert!(
+        !replay
+            .iter()
+            .any(|e| matches!(&e.ev, AgentEvent::UserMessage { text, .. } if text == "late")),
+        "a cancelled send never reaches the agent"
+    );
+    assert!(fx.manager.kill("s-cancel"));
 }

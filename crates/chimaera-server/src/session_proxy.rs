@@ -1504,6 +1504,16 @@ const RETRY_MIN: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(30);
 /// Frames larger than this are replay batches, never a `ready` frame.
 const READY_SCAN_BYTES: usize = 64 * 1024;
+/// How long an awake owner gets to accept a socket.
+const AWAKE_CONNECT: Duration = Duration::from_secs(15);
+/// How long an [`Opened::Doubtful`] socket gets to say `ready`, the same
+/// wait: it was accepted for an owner reported asleep, so silence past this
+/// means nothing is behind it.
+const DOUBTFUL_READY: Duration = if cfg!(test) {
+    Duration::from_millis(600)
+} else {
+    AWAKE_CONNECT
+};
 
 /// Caller has consumed and authenticated the local first frame. Remote tokens
 /// replace only that frame's token; application messages remain byte-for-byte.
@@ -1582,8 +1592,10 @@ enum Opened {
     Held(Box<Upstream>),
     /// Accepted without wake intent although the probe said the owner is
     /// asleep, by a transport that did not mark it kept: the machine woke in
-    /// between, or the transport takes sockets it then drops. Treated as
-    /// [`Opened::Live`]; one that closes before `ready` counts as a refusal.
+    /// between, or the transport takes sockets it then drops or never
+    /// attaches. Treated as [`Opened::Live`]; one that closes before `ready`,
+    /// or says nothing for [`DOUBTFUL_READY`], counts as a refusal (input it
+    /// was holding then wakes the owner, as for one reported asleep).
     Doubtful(Box<Upstream>),
     /// The owner is asleep and this attempt carried no interaction.
     Sleeping,
@@ -1659,7 +1671,7 @@ impl Link<'_> {
             .max_message_size(Some(10 * 1024 * 1024))
             .max_frame_size(Some(10 * 1024 * 1024));
         let deadline = match reach {
-            Reach::Awake => Duration::from_secs(15),
+            Reach::Awake => AWAKE_CONNECT,
             Reach::Sleeping => WAKE_DEADLINE,
         };
         let (mut upstream, upgrade) = tokio::time::timeout(
@@ -1889,19 +1901,36 @@ fn waking_status() -> Value {
 }
 /// A terminal says "waking" at most this often while typing is refused.
 const WAKING_NOTE_EVERY: Duration = Duration::from_secs(1);
+/// Whether a viewer's frame is the user acting: a terminal's typing (its
+/// binary frames; text frames are grid control), or one of a chat's acting
+/// commands, which are exactly the daemon's own list
+/// ([`crate::activity::is_interaction`]). Only acting input is held, wakes a
+/// sleeping owner or brings the work to this computer. Everything else a chat
+/// sends (settings such as the automatic `set_thinking`, reads, `cancel_send`,
+/// a command this daemon does not know) passes to an attached owner and is
+/// dropped otherwise.
+fn acting(chat: bool, frame: &Down) -> bool {
+    match frame {
+        Down::Binary(_) => !chat,
+        Down::Text(text) if chat => {
+            serde_json::from_str::<chimaera_agent::model::AgentCommand>(text)
+                .is_ok_and(|command| crate::activity::is_interaction(&command))
+        }
+        _ => false,
+    }
+}
 /// The existing per-command refusal: the socket stays up, the client keeps
 /// the unsent text.
 fn not_sent() -> Value {
     json!({"type":"error","code":"command_failed","message":"Not sent. Your project is reconnecting."})
 }
-/// A chat refusal naming the command it answers.
-fn tagged(mut answer: Value, refused: &Down) -> Value {
-    if let Down::Text(text) = refused {
-        if let Some(command) = crate::ws::command_kind(text) {
-            answer["command"] = json!(command);
-        }
+/// A chat refusal naming the command it answers and, for a send made under
+/// a client's id, that id: the client hands back exactly the refused send.
+fn tagged(answer: Value, refused: &Down) -> Value {
+    match refused {
+        Down::Text(text) => crate::ws::command_refusal(answer, text),
+        _ => answer,
     }
-    answer
 }
 fn upward(frame: Down) -> Option<Up> {
     match frame {
@@ -1965,8 +1994,11 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
     // The transport keeps this upstream ([`Opened::Held`]) and holds input
     // itself, so everything passes through, before `ready` too.
     let mut through = false;
-    // See [`Opened::Doubtful`].
+    // See [`Opened::Doubtful`]: such a socket has until `doubt` to say
+    // `ready`.
     let mut doubtful = false;
+    let doubt = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(doubt);
     // The last connection status told to the viewer, sent once per change.
     let mut told: Option<&'static str> = None;
     let mut attempt: Option<futures::future::BoxFuture<'_, Result<Opened>>> =
@@ -1988,6 +2020,9 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                 match result {
                     Ok(opened @ (Opened::Live(_) | Opened::Doubtful(_))) => {
                         doubtful = matches!(opened, Opened::Doubtful(_));
+                        if doubtful {
+                            doubt.as_mut().reset(tokio::time::Instant::now() + DOUBTFUL_READY);
+                        }
                         let (Opened::Live(socket) | Opened::Doubtful(socket)) = opened else { continue };
                         upstream = Some(socket);
                         ready = false;
@@ -2060,6 +2095,27 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
             _ = &mut retry, if retry_armed => {
                 retry_armed = false;
                 attempt = Some(Box::pin(link.open(wake, passive)));
+            }
+            // Accepted for an owner reported asleep and silent since: nothing
+            // is behind this socket. That is a refusal, as if it had closed:
+            // what was held for it wakes the owner, and with nothing held the
+            // viewer hears the owner is asleep.
+            _ = &mut doubt, if doubtful && !ready && upstream.is_some() => {
+                link.state.session_proxy.note_passive_refused(&link.route);
+                upstream = None;
+                doubtful = false;
+                passive = false;
+                if !held.frames.is_empty() && pull.is_none() {
+                    wake = true;
+                    attempt = Some(Box::pin(link.open(true, false)));
+                } else {
+                    if told != Some("worker_asleep") {
+                        told = Some("worker_asleep");
+                        if bounded_send(downstream, Down::Text(asleep().to_string().into())).await.is_err() { return; }
+                    }
+                    retry.as_mut().reset(tokio::time::Instant::now() + RETRY_MAX);
+                    retry_armed = true;
+                }
             }
             outcome = settled(&mut pull) => {
                 pull = None;
@@ -2157,9 +2213,7 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
             },
             next = downstream.recv() => match next {
                 Some(Ok(frame @ (Down::Text(_) | Down::Binary(_)))) => {
-                    // A terminal's text frames are grid control (resize, park);
-                    // everything a chat sends is the user acting.
-                    let input = link.chat || matches!(frame, Down::Binary(_));
+                    let input = acting(link.chat, &frame);
                     // Acting on a project another of the user's computers runs
                     // brings the work here; looking never does.
                     if input && pull.is_none() && link.movable() {
@@ -2212,6 +2266,9 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                         }
                         // Grid control before the owner answers: the auth frame
                         // already carries the grid; the ready reconcile fixes drift.
+                        // A chat command that is not the user acting is dropped
+                        // too: nothing confirms it in the viewer until the owner
+                        // does, and holding it would let it wake a machine.
                         _ => {}
                     }
                 }
@@ -2688,6 +2745,61 @@ mod tests {
             mapped.uri().to_string(),
             "/fs/check_document?path=%2Fproject%2Fdoc.md"
         );
+    }
+
+    /// What the relay holds, wakes a machine for and brings work here for is
+    /// the daemon's own list of acting commands and a terminal's typing,
+    /// nothing else: not the thinking preference a chat pushes by itself, a
+    /// read, a settings change, `cancel_send`, or a command it cannot parse.
+    #[test]
+    fn only_acting_input_is_held_or_wakes_or_brings_work_here() {
+        let chat = |frame: Value| acting(true, &Down::Text(frame.to_string().into()));
+        for frame in [
+            json!({"type":"send","blocks":[]}),
+            json!({"type":"send","blocks":[],"client_id":"client-0001"}),
+            json!({"type":"send_after_turn","blocks":[]}),
+            json!({"type":"permission","request_id":"r","option_id":"allow"}),
+            json!({"type":"answer","request_id":"r","answers":{}}),
+            json!({"type":"interrupt"}),
+            json!({"type":"compact"}),
+            json!({"type":"rewind","user_message_id":"u"}),
+            json!({"type":"background_tool","tool_call_id":"t"}),
+            json!({"type":"stop_task","task_id":"t"}),
+        ] {
+            assert!(chat(frame.clone()), "{frame}");
+        }
+        for frame in [
+            json!({"type":"set_thinking","enabled":true}),
+            json!({"type":"get_usage"}),
+            json!({"type":"get_mcp"}),
+            json!({"type":"cancel_send","client_id":"client-0001"}),
+            json!({"type":"set_model","model_id":"m"}),
+            json!({"type":"set_mode","mode_id":"m"}),
+            json!({"type":"set_effort","effort_id":"e"}),
+            json!({"type":"set_ultracode","enabled":true}),
+            json!({"type":"set_remote_control","enabled":true}),
+            json!({"type":"set_mcp_enabled","server":"s","enabled":true}),
+            json!({"type":"reconnect_mcp","server":"s"}),
+            json!({"type":"rewind","user_message_id":"u","dry_run":true}),
+            json!({"type":"cancel_queued","id":"q"}),
+            json!({"type":"from_the_future"}),
+            json!({"blocks":[]}),
+        ] {
+            assert!(!chat(frame.clone()), "{frame}");
+        }
+        assert!(!acting(true, &Down::Text("not json".into())));
+        // A chat sends no binary frames; a terminal's are its typing, and
+        // its text frames are grid control.
+        assert!(!acting(true, &Down::Binary(Default::default())));
+        assert!(acting(false, &Down::Binary(Default::default())));
+        assert!(!acting(
+            false,
+            &Down::Text(
+                json!({"type":"resize","cols":80,"rows":24})
+                    .to_string()
+                    .into()
+            )
+        ));
     }
 
     #[test]

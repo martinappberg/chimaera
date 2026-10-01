@@ -898,6 +898,7 @@ mod tests {
             queued,
             after_turn: false,
             origin: None,
+            client_id: None,
         }
     }
     fn started() -> AgentEvent {

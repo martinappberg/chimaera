@@ -104,6 +104,9 @@ pub struct Journal {
     /// disk already refused).
     written_seq: Arc<AtomicU64>,
     caps: JournalCaps,
+    /// See [`Journal::client_ids_at_open`]. Read in the same pass that finds
+    /// the last seq, so it costs no second read of the file.
+    client_ids: Vec<String>,
 }
 
 impl Journal {
@@ -124,6 +127,7 @@ impl Journal {
         // next write starts on a clean boundary.
         let mut last_seq = 0u64;
         let mut size = 0u64;
+        let mut client_ids = VecDeque::new();
         if let Ok(bytes) = fs::read(&path) {
             size = bytes.len() as u64;
             let mut line_start = 0usize;
@@ -133,6 +137,16 @@ impl Journal {
                     if let Ok(entry) = serde_json::from_slice::<SeqEvent>(&bytes[line_start..i]) {
                         last_seq = last_seq.max(entry.seq);
                         good_end = (i + 1) as u64;
+                        if let AgentEvent::UserMessage {
+                            client_id: Some(id),
+                            ..
+                        } = entry.ev
+                        {
+                            if client_ids.len() == crate::model::CLIENT_IDS_REMEMBERED {
+                                client_ids.pop_front();
+                            }
+                            client_ids.push_back(id);
+                        }
                     }
                     line_start = i + 1;
                 }
@@ -182,7 +196,15 @@ impl Journal {
             writer: Some(handle),
             written_seq,
             caps,
+            client_ids: client_ids.into(),
         })
+    }
+
+    /// The send ids of the newest messages this journal held when it was
+    /// opened, oldest first (at most [`crate::model::CLIENT_IDS_REMEMBERED`]):
+    /// what a new process of the session must still refuse to run again.
+    pub fn client_ids_at_open(&self) -> &[String] {
+        &self.client_ids
     }
 
     /// Assign the next seq, journal the event, and return it for broadcast.
@@ -1007,6 +1029,45 @@ mod tests {
         }
     }
 
+    /// A reopened journal hands back the send ids of its newest messages, so
+    /// the session's next process refuses to run those sends again.
+    #[tokio::test]
+    async fn reopen_reads_back_the_newest_send_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let sent = |n: usize, client_id: Option<String>| AgentEvent::UserMessage {
+            text: format!("message {n}"),
+            attachments: 0,
+            attachment_paths: Vec::new(),
+            id: Some(format!("u{n}")),
+            queued: false,
+            after_turn: false,
+            origin: None,
+            client_id,
+        };
+        {
+            let journal = Journal::open(dir.path(), "s").unwrap();
+            assert!(journal.client_ids_at_open().is_empty());
+            journal.append(sent(0, None)).await;
+            for n in 1..=crate::model::CLIENT_IDS_REMEMBERED + 2 {
+                journal
+                    .append(sent(n, Some(format!("client-{n:04}"))))
+                    .await;
+            }
+            journal.sync_async().await;
+        }
+        let journal = Journal::open(dir.path(), "s").unwrap();
+        let ids = journal.client_ids_at_open();
+        assert_eq!(ids.len(), crate::model::CLIENT_IDS_REMEMBERED);
+        assert_eq!(ids.first().map(String::as_str), Some("client-0003"));
+        assert_eq!(
+            ids.last().cloned(),
+            Some(format!(
+                "client-{:04}",
+                crate::model::CLIENT_IDS_REMEMBERED + 2
+            ))
+        );
+    }
+
     #[tokio::test]
     async fn reopen_resumes_seq_numbering() {
         let dir = tempfile::tempdir().unwrap();
@@ -1131,6 +1192,7 @@ mod tests {
                 queued: false,
                 after_turn: false,
                 origin: None,
+                client_id: None,
             },
             AgentEvent::TurnStarted {
                 turn_id: "t1".into(),
