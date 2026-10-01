@@ -51,8 +51,8 @@ function wired() {
   };
   /** Everything waiting to go back into the composer, oldest first. */
   const returned = (): string[] => {
-    const texts: string[] = [];
-    for (let draft = store.takeRestoredDraft(); draft !== null; draft = store.takeRestoredDraft()) texts.push(draft.text);
+    const texts = store.restoredDrafts.map((draft) => draft.text);
+    store.takeRestoredDrafts(texts.length);
     return texts;
   };
   return { store, wire, send, returned };
@@ -1954,13 +1954,14 @@ describe("ChatStore unsent text", () => {
     const id = send("please run the tests", [picture]);
     store.onCommandFailed("refused", "send", null, id);
     expect(store.blocks.at(-1)?.kind).toBe("notice");
-    expect(store.takeRestoredDraft()).toEqual({ text: "please run the tests", images: [picture] });
-    expect(store.takeRestoredDraft()).toBeNull();
+    expect(store.restoredDrafts).toEqual([{ text: "please run the tests", images: [picture] }]);
+    store.takeRestoredDrafts(1);
+    expect(store.restoredDrafts).toEqual([]);
     // The same refusal again (a second copy of the send was refused too):
     // nothing is left to hand back, and nothing more is said.
     const notices = store.blocks.filter((b) => b.kind === "notice").length;
     store.onCommandFailed("refused", "send", null, id);
-    expect(store.restoredDraft).toBeNull();
+    expect(store.restoredDrafts).toEqual([]);
     expect(store.blocks.filter((b) => b.kind === "notice")).toHaveLength(notices);
   });
 
@@ -1969,7 +1970,7 @@ describe("ChatStore unsent text", () => {
     const id = send("already delivered, echo on its way");
     for (const command of ["interrupt", "permission", "answer", null]) {
       store.onCommandFailed("refused", command);
-      expect(store.restoredDraft).toBeNull();
+      expect(store.restoredDrafts).toEqual([]);
     }
     expect(store.blocks.filter((b) => b.kind === "notice")).toHaveLength(4);
     // Not even one that carries the send's id: a relay copies the id of any
@@ -1977,7 +1978,7 @@ describe("ChatStore unsent text", () => {
     // the id of the send it asks about. Refusing the question says nothing
     // about the send, and is not shown (the user did not ask it).
     store.onCommandFailed("This project is running in the cloud right now. That was not sent.", "cancel_send", "elsewhere", id);
-    expect(store.restoredDraft).toBeNull();
+    expect(store.restoredDrafts).toEqual([]);
     expect(store.blocks.filter((b) => b.kind === "notice")).toHaveLength(4);
   });
 
@@ -2725,7 +2726,7 @@ describe("ChatStore sends, by id: never delivered and returned, never neither", 
         w.store.onWaking();
         const fifth = w.say("five", "lost");
         w.store.onCommandFailed("Still waking the cloud machine. That was not sent; send it again in a moment.", "send", "waking", fifth);
-        expect(w.store.restoredDraft?.text).toBe("five");
+        expect(w.store.restoredDrafts.map((draft) => draft.text)).toEqual(["five"]);
         expect(w.store.sending.map((pending) => pending.text)).toEqual(["one", "two", "three", "four"]);
         w.attach();
       },
@@ -2840,19 +2841,24 @@ describe("ChatStore sends, by id: never delivered and returned, never neither", 
       returned: [],
     },
     {
-      name: "a refusal that names no send returns the only send there is",
+      name: "a refusal that names no send returns nothing, even with one send unconfirmed",
       run(w) {
         w.attach();
-        w.say("the wake failed", "lost");
-        // An older keeper refusing a failed wake names nothing. With one
-        // send unconfirmed it can only be that one: "not sent" must not sit
-        // beside a bubble that never ends.
-        w.store.onCommandFailed("Not sent. Your project is reconnecting.", "send");
-        expect(w.store.sending).toEqual([]);
+        // The holder in between predates ids and holds this send. The client
+        // sends it again at a `ready`; that copy does not fit and is refused
+        // without a name. The refusal answers the copy, not the send, which
+        // the holder still delivers: returning it would return a message
+        // that runs.
+        w.say("held by an older keeper", "held");
+        w.store.onWaking();
+        w.store.onCommandFailed("Still waking the cloud machine. That was not sent; send it again in a moment.", "send", "waking");
+        expect(w.store.restoredDrafts).toEqual([]);
+        expect(w.store.sending.map((pending) => pending.text)).toEqual(["held by an older keeper"]);
         expect(w.store.blocks.at(-1)?.kind).toBe("notice");
+        w.attach();
       },
-      delivered: [],
-      returned: ["the wake failed"],
+      delivered: ["held by an older keeper"],
+      returned: [],
     },
     {
       name: "an exit returns what the agent never got, and a late refusal returns nothing more",
@@ -3270,6 +3276,28 @@ describe("ChatStore's own frames", () => {
     }
   });
 
+  it("a refused prompt sent from outside the composer is said, and returns nothing", () => {
+    const { store, send, returned } = wired();
+    store.onReady(SESSION, 0, 0, IDS);
+    // A one-click prompt: sent under its own id, told to the store, not kept.
+    store.noteSentOutside("client-prompt-1");
+    const mine = send("the composer's own");
+    const notices = (): number => store.blocks.filter((b) => b.kind === "notice").length;
+    const before = notices();
+    store.onCommandFailed("This project is running in the cloud right now. That was not sent.", "send", "elsewhere", "client-prompt-1");
+    expect(notices()).toBe(before + 1);
+    expect(returned()).toEqual([]);
+    expect(store.sending).toEqual([]);
+    // Said once: a second refusal of it, or one under an id nobody sent, is
+    // a stray copy and stays silent.
+    store.onCommandFailed("again", "send", "elsewhere", "client-prompt-1");
+    store.onCommandFailed("stray", "send", null, "client-nobody");
+    expect(notices()).toBe(before + 1);
+    // The composer's send is untouched by all of it.
+    store.apply(echo(1, "the composer's own", mine));
+    expect(returned()).toEqual([]);
+  });
+
   it("returned sends wait in order until the composer takes them", () => {
     const picture = { media_type: "image/png", data: "AA==", label: "shot" };
     const { store, send } = wired();
@@ -3285,7 +3313,7 @@ describe("ChatStore's own frames", () => {
     store.takeRestoredDrafts(1);
     expect(store.restoredDrafts.map((draft) => [draft.text, draft.images.length])).toEqual([["two", 2]]);
     store.takeRestoredDrafts(1);
-    expect(store.restoredDraft).toBeNull();
+    expect(store.restoredDrafts).toEqual([]);
   });
 });
 

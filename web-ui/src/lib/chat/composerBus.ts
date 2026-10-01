@@ -159,22 +159,42 @@ interface ReturnTarget {
   take(sends: ReturnedSends): void;
 }
 
-const returnRegistry = new Map<string, ReturnTarget>();
+/** Every mounted composer of a session, newest last: a chat can be mounted
+ *  twice (the Mastermind dock and a pane), and one of them unmounting must
+ *  leave the other as the place its messages return to. */
+const returnRegistry = new Map<string, ReturnTarget[]>();
+/** The same targets by the view that mounted them (ChatView's token). */
+const returnByView = new WeakMap<object, ReturnTarget>();
 
-/** Register a mounted composer as where its session's undelivered messages
- *  return to. Returns the unregister. */
-export function registerComposerReturn(sessionId: string, target: ReturnTarget): () => void {
-  returnRegistry.set(sessionId, target);
+/** Register a mounted composer (and, when given, the view it belongs to) as
+ *  where its session's undelivered messages return to. Returns the
+ *  unregister. */
+export function registerComposerReturn(sessionId: string, target: ReturnTarget, view?: object): () => void {
+  returnRegistry.set(sessionId, [...(returnRegistry.get(sessionId) ?? []), target]);
+  if (view !== undefined) returnByView.set(view, target);
   return () => {
-    if (returnRegistry.get(sessionId) === target) returnRegistry.delete(sessionId);
+    const rest = (returnRegistry.get(sessionId) ?? []).filter((mounted) => mounted !== target);
+    if (rest.length > 0) returnRegistry.set(sessionId, rest);
+    else returnRegistry.delete(sessionId);
+    if (view !== undefined && returnByView.get(view) === target) returnByView.delete(view);
   };
 }
 
-/** How many of `drafts` (oldest first) fit the session's composer now: the
- *  longest run from the front whose pictures it has room for. 0 while no
- *  composer is mounted. */
-export function returnableCount(sessionId: string, drafts: readonly { images: readonly unknown[] }[]): number {
-  const target = returnRegistry.get(sessionId);
+/** The composer a view's returned messages go to: its own when it is
+ *  mounted, else the session's newest. */
+function returnTarget(sessionId: string, view?: object): ReturnTarget | undefined {
+  return (view !== undefined ? returnByView.get(view) : undefined) ?? returnRegistry.get(sessionId)?.at(-1);
+}
+
+/** How many of `drafts` (oldest first) fit the composer now: the longest run
+ *  from the front whose pictures it has room for. 0 while no composer is
+ *  mounted. */
+export function returnableCount(
+  sessionId: string,
+  drafts: readonly { images: readonly unknown[] }[],
+  view?: object,
+): number {
+  const target = returnTarget(sessionId, view);
   if (target === undefined) return 0;
   let room = target.room();
   let count = 0;
@@ -186,10 +206,10 @@ export function returnableCount(sessionId: string, drafts: readonly { images: re
   return count;
 }
 
-/** Give messages back to the session's composer. False (and nothing taken)
- *  when none is mounted or their pictures do not fit. */
-export function returnToComposer(sessionId: string, sends: ReturnedSends): boolean {
-  const target = returnRegistry.get(sessionId);
+/** Give messages back to the composer. False (and nothing taken) when none
+ *  is mounted or their pictures do not fit. */
+export function returnToComposer(sessionId: string, sends: ReturnedSends, view?: object): boolean {
+  const target = returnTarget(sessionId, view);
   if (target === undefined || sends.images.length > target.room()) return false;
   target.take(sends);
   return true;

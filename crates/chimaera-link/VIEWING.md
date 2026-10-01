@@ -150,8 +150,8 @@ the viewer's side stays open and quiet (pings are answered). It closes the
 viewer's side only when the viewer closes, the outer authorization ends, the
 machine was replaced (a new boot or a new daemon credential), the daemon
 closed for a reason that is not the suspension (an ownership change,
-`workspace_scope_changed` with close 1013, an exit), or a cap below is
-exceeded.
+`workspace_scope_changed` with close 1013, an exit). A cap being reached
+does not close it: the frame that does not fit is refused alone (below).
 
 The viewer's first frame is its authentication. The keeper remembers it, with
 the request it forwarded, and attaches with it again later. A chat's
@@ -356,10 +356,12 @@ What clients do, against either kind of keeper:
   returns exactly that send, above whatever is being written in the composer
   (`send_after_turn` is a send). A refusal that names an id the client no
   longer holds (a second copy of a send already confirmed or returned) is
-  ignored. A refusal that names no send, from a relay that predates ids in
-  front of a daemon that has them, returns nothing: the sends show as
-  pending and the next `ready` sends or withdraws each; when exactly one
-  send is unconfirmed it can only be that one, and it is returned.
+  ignored. A refusal that names no send, from a holder that predates ids in
+  front of a daemon that has them, returns nothing, not even when one send
+  is unconfirmed (it may answer a second copy of a send that holder still
+  delivers): the sends show as pending and the next `ready` sends or
+  withdraws each. A prompt the UI sends from outside the composer goes out
+  under its own id; refused, it is said and returns nothing.
 - Nothing in the UI waits forever on a command that is not the user acting:
   the MCP panel keeps the inventory it has and closes after 10 s without a
   first answer, a rewind's dry-run check closes after 30 s. The thinking
@@ -371,7 +373,8 @@ What clients do, against either kind of keeper:
   while the conversation is not live is pushed at the next `ready`. The
   seven settings commands change nothing in the UI until the daemon confirms
   them (a keeper and the native proxy both hold them, so the old value shows
-  until the owner answers); they are not sent again.
+  until the owner answers; a held one the proxy gives up on is refused by
+  name); the client itself never sends one twice.
 - An events client sends its `watch` registration again whenever a `settings`
   frame arrives on a gateway socket: the daemon sends one per attach, and a
   registration lives on the daemon's side of one attach.
@@ -392,8 +395,9 @@ What clients do, against either kind of keeper:
   reconnects onto the path below and its client sends again). One that only
   stays silent is dropped by the proxy after those 15 s, and input held for
   it then wakes the machine as below. A viewer
-  already told `remote_unavailable` with nothing held is closed when a kept
-  attach succeeds, so its reconnect attaches quietly. The proxy's events feed
+  already told `remote_unavailable` with no input held is closed when a kept
+  attach succeeds, so its reconnect attaches quietly (a setting held alone
+  does not keep it open: it is refused by name first). The proxy's events feed
   attaches the same way, sends no registration before the owner's first frame
   on a kept or sleeping attach, and registers again on every `settings` frame
   of a `worker-` owner (a computer's feed is as before).
@@ -411,14 +415,22 @@ socket of the daemon), opens the owner's socket with `?wake=interaction`, and
 is delivered once, in order, right after the owner's `ready`. Real input is a
 terminal's typing and a chat's acting commands (the daemon's
 `activity::is_interaction` list above, and nothing else). The seven settings
-commands are held too, as a keeper holds them: in order with the input, the
-latest pick of a setting winning unless the user acted in between
-(`set_mcp_enabled` and `reconnect_mcp` per `server`), at most 16 per socket
-of 16 KiB each, outside the four-command cap. A held setting asks for no
-wake and brings no work here: it waits for the owner and is delivered with
-what the user does next, so a permission mode picked before a message is in
-force when that message runs. A setting that cannot be held is refused with
-`command_failed` naming the command. Every other chat command (the automatic
+commands are held too, coalesced and bounded as a keeper's are: the latest
+pick of a setting wins unless the user acted in between (`set_mcp_enabled`
+and `reconnect_mcp` per `server`), at most 16 per socket of 16 KiB each,
+outside the four-command cap. A held setting asks for no wake and brings no
+work here, and it is delivered only in front of acting input from the same
+viewer: it rides ahead of that viewer's next held or forwarded acting
+command, so a permission mode picked before a message is in force when that
+message runs. It is never delivered by itself. A `ready` with no input from
+this viewer leaves it held, and after ten minutes it is refused with
+`command_failed` naming its command, so a window left open cannot hand a
+mode picked long ago to a turn another device starts. A setting picked while
+the owner is attached is forwarded at once and replaces an older pick of it
+still held. A setting that cannot be held is refused the same way, as is one
+held when its input comes back (a failed wake, a route change, the other
+computer keeping the work) or sent on a socket whose route just changed.
+Every other chat command (the automatic
 `set_thinking`, the reads, `cancel_send`, a command the daemon does not
 know) passes to an attached owner and is dropped otherwise. When the first
 input finds the owner asleep the viewer
@@ -447,9 +459,12 @@ the work here: the relay holds it (the same budget), says
 the owner (input and settings are held for the session here; the rest is
 dropped, a `cancel_send` included, unless it names a held send) and
 hides the owner's `moved`/`paused` frames and its closing socket for this move.
-Once this computer holds the project and its session resumed, the held input
-is delivered once to the local session and the socket closes quietly (the
-viewer reconnects to the session here and its replay carries the message).
+Once this computer holds the project and its session resumed, what was held
+is delivered once to the local session, in the order the user did it
+(settings included), and the socket closes quietly (the viewer reconnects to
+the session here and its replay carries the message). The whole batch gets
+one wait for that session to start, and once a setting could not be applied
+nothing after it is run: those frames are refused instead.
 When the other computer keeps the work, each held chat command is refused
 with `command_failed`, `reason:"still_working"` and the plain line "Your other
 computer is still working on this. Try again when it pauses." (typing: one

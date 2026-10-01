@@ -556,10 +556,13 @@ chat commands, within one daemon-wide budget) and delivers it once after the
 owner answers. Only what you do counts as input: the thinking preference a
 chat sends by itself and usage and MCP reads never wake a machine or move
 work. A setting you change while the owner is away (the model, the
-permission mode, the effort) does not wake it either, but it is kept and
-applied before whatever you send next, so a stricter mode picked before a
-message is in force when that message runs; until then the old value keeps
-showing. The message shows at once as a "sending…" bubble and
+permission mode, the effort) does not wake it either. It is kept and applied
+in front of whatever you send next from that window, so a stricter mode
+picked before a message is in force when that message runs; until then the
+old value keeps showing. It is never applied by itself: if you send nothing
+within ten minutes it is dropped with a short note, so a window left open
+cannot change the mode of work someone starts later from another device.
+The message shows at once as a "sending…" bubble and
 the chat says "Waking the cloud machine…"; a terminal says the same over the
 pane and echoes nothing until the owner answers. While it wakes, a second
 message or more typing is not held: it is refused with a short note (the

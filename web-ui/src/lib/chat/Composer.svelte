@@ -356,7 +356,7 @@
         caret += shift;
         if (focused) void tick().then(() => el?.setSelectionRange(start + shift, end + shift));
       },
-    });
+    }, view);
   });
   // The host keeps a returned message whose pictures do not fit until there
   // is room: tell it whenever the number attached changes (and at mount).

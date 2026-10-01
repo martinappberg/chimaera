@@ -661,12 +661,8 @@ export class ChatStore {
   pausedFor = $state<SessionPause | null>(null);
   /** Sends that never reached the agent (refused, or withdrawn), oldest
    *  first, waiting to go back into the composer
-   *  ({@link takeRestoredDraft}). Raw: pictures are large. */
+   *  ({@link takeRestoredDrafts}). Raw: pictures are large. */
   private restored = $state.raw<RestoredDraft[]>([]);
-  /** The oldest send waiting to go back into the composer, or null. */
-  get restoredDraft(): RestoredDraft | null {
-    return this.restored[0] ?? null;
-  }
   /** Every send waiting to go back into the composer, oldest first. They
    *  wait here until the composer has room for their pictures
    *  ({@link takeRestoredDrafts}). */
@@ -696,6 +692,13 @@ export class ChatStore {
   private sender: ((frame: Record<string, unknown>) => boolean) | null = null;
   bindSender(send: (frame: Record<string, unknown>) => boolean): void {
     this.sender = send;
+  }
+  /** Ids of sends that went out on this chat's socket from outside the
+   *  composer (a one-click prompt): nothing to confirm, send again or return,
+   *  but a refusal that names one is still said. The newest few only. */
+  private outside: string[] = [];
+  noteSentOutside(id: string): void {
+    this.outside = [...this.outside.slice(-15), id];
   }
   /** Fires when the next unconfirmed send is due to go out again. */
   private resendTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1189,9 +1192,17 @@ export class ChatStore {
     // may already have been delivered (a re-send would be a second turn).
     const send = command === "send" || command === "send_after_turn";
     const at = send && clientId !== null ? this.unconfirmed.findIndex((unconfirmed) => unconfirmed.id === clientId) : -1;
-    // It answers a second copy of a send that was confirmed or returned
-    // already: there is nothing to say and nothing to return.
-    if (send && clientId !== null && at < 0) return;
+    if (send && clientId !== null && at < 0) {
+      // A prompt sent from outside the composer was refused: say so (there
+      // is no text to return). Anything else under an id this store does not
+      // hold answers a second copy of a send that was confirmed or returned
+      // already: nothing to say, nothing to return.
+      if (this.outside.includes(clientId)) {
+        this.outside = this.outside.filter((id) => id !== clientId);
+        this.notice(message, "error");
+      }
+      return;
+    }
     this.notice(message, "error");
     // The other computer kept the work: nothing is on its way here any more.
     if (reason === "still_working") this.bringing = null;
@@ -1202,22 +1213,13 @@ export class ChatStore {
     }
     // A refusal that names no send. A daemon without send ids never resends,
     // so the send just made comes back, as it always did there. Behind a
-    // daemon with send ids it comes from an older keeper or relay in
-    // between. With one send unconfirmed it can only be that one, and it
-    // comes back (the words "not sent" beside a bubble that never ends would
-    // be worse). With several it may answer any of them: none is returned on
-    // a guess, they show as pending and the next `ready` sends or withdraws
-    // each by its id.
-    if (this.sendIds !== true || this.unconfirmed.length === 1) this.handBackAt(this.unconfirmed.length - 1);
-    else this.showUnconfirmed();
-  }
-
-  /** Hand one undelivered send (the oldest waiting) to exactly one composer;
-   *  call until null. */
-  takeRestoredDraft(): RestoredDraft | null {
-    const draft = this.restored[0] ?? null;
-    if (draft !== null) this.restored = this.restored.slice(1);
-    return draft;
+    // daemon with send ids it comes from a holder in between that predates
+    // them, and may answer anything: a second copy of a send that holder
+    // still holds and will deliver, above all. Nothing is returned on a
+    // guess, not even when one send is unconfirmed. They show as pending
+    // and the next `ready` sends or withdraws each by its id.
+    if (this.sendIds === true) this.showUnconfirmed();
+    else this.handBackAt(this.unconfirmed.length - 1);
   }
 
   /** Nothing more will be delivered here: what is still unconfirmed goes

@@ -79,4 +79,26 @@ describe("composerBus", () => {
     off();
     expect(returnableCount("s-return", drafts)).toBe(0);
   });
+
+  it("a chat mounted twice keeps a return target when one view unmounts", () => {
+    const target = (taken: ReturnedSends[]) => ({ room: () => 4, take: (sends: ReturnedSends) => void taken.push(sends) });
+    const pane: ReturnedSends[] = [];
+    const dock: ReturnedSends[] = [];
+    const paneView = {};
+    const dockView = {};
+    const offPane = registerComposerReturn("s-two", target(pane), paneView);
+    const offDock = registerComposerReturn("s-two", target(dock), dockView);
+    // Each view's returned message goes to its own composer.
+    expect(returnToComposer("s-two", { text: "to the pane", images: [] }, paneView)).toBe(true);
+    expect(returnToComposer("s-two", { text: "to the dock", images: [] }, dockView)).toBe(true);
+    expect([pane.map((s) => s.text), dock.map((s) => s.text)]).toEqual([["to the pane"], ["to the dock"]]);
+    // The dock (mounted last) goes away: the pane is still a target, for its
+    // own view and for the session.
+    offDock();
+    expect(returnableCount("s-two", [{ images: [] }], paneView)).toBe(1);
+    expect(returnToComposer("s-two", { text: "still here", images: [] })).toBe(true);
+    expect(pane.map((s) => s.text)).toEqual(["to the pane", "still here"]);
+    offPane();
+    expect(returnToComposer("s-two", { text: "nobody", images: [] }, paneView)).toBe(false);
+  });
 });

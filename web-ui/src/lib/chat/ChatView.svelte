@@ -1463,16 +1463,20 @@
     const drafts = store.restoredDrafts;
     if (drafts.length === 0) return;
     untrack(() => {
-      const count = returnableCount(session.id, drafts);
+      const count = returnableCount(session.id, drafts, quoteOwner);
       if (count === 0) return;
       const fitting = drafts.slice(0, count);
-      const returned = returnToComposer(session.id, {
-        text: fitting
-          .map((draft) => draft.text)
-          .filter((text) => text.length > 0)
-          .join("\n\n"),
-        images: fitting.flatMap((draft) => draft.images),
-      });
+      const returned = returnToComposer(
+        session.id,
+        {
+          text: fitting
+            .map((draft) => draft.text)
+            .filter((text) => text.length > 0)
+            .join("\n\n"),
+          images: fitting.flatMap((draft) => draft.images),
+        },
+        quoteOwner,
+      );
       if (returned) store.takeRestoredDrafts(count);
     });
   });

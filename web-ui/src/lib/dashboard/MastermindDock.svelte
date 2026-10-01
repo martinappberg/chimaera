@@ -213,9 +213,12 @@
    *  (no client-side queue; reconnect replays the daemon's gap, not ours). */
   function sendPrompt(text: string): boolean {
     if (mm === null) return false;
-    // Under its own id, like any send: a refusal then names this prompt, and
-    // can never be taken for the composer's message.
-    const sent = mm.socket.send({ type: "send", blocks: [{ type: "text", text }], client_id: mintSendId() });
+    // Under its own id, like any send: a refusal then names this prompt and
+    // can never be taken for the composer's message, and the store, told the
+    // id, still says the refusal.
+    const id = mintSendId();
+    const sent = mm.socket.send({ type: "send", blocks: [{ type: "text", text }], client_id: id });
+    if (sent) mm.store.noteSentOutside(id);
     if (!sent) mm.store.notice("not connected — not sent, try again", "error");
     // The user's click is a send: show the question and follow the reply.
     else if (mmId !== null) followToBottom(mmId);
