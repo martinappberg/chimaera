@@ -3168,3 +3168,47 @@ async fn a_setting_picked_while_the_owner_sleeps_is_held_and_applies_to_the_next
     assert!(line("picked-model") < line("UNDER_THE_NEW_MODE"));
     assert!(!stdin.contains("get_usage"), "{stdin}");
 }
+
+/// Typing held while the work comes here waits for the session here. A
+/// terminal's grid control still passes to the computer it is leaving (the
+/// pane keeps its size), but must not take the held typing with it.
+#[tokio::test]
+async fn grid_control_during_a_move_never_delivers_the_held_typing() {
+    let fixture = routed_remote("held-typing", true, "device-other", false).await;
+    pro::device_fixture(&fixture.local, &silent_account().await);
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{}/ws/sessions/{}",
+        fixture.local_addr, fixture.id
+    ))
+    .await
+    .unwrap();
+    socket
+        .send(command(
+            serde_json::json!({"type":"auth","token":"test-token","cols":80,"rows":24}),
+        ))
+        .await
+        .unwrap();
+    loop {
+        if next_json(&mut socket).await["type"] == "ready" {
+            break;
+        }
+    }
+    socket
+        .send(Message::Binary(b"HELD_TYPING\r".to_vec().into()))
+        .await
+        .unwrap();
+    loop {
+        if next_json(&mut socket).await["type"] == "bringing" {
+            break;
+        }
+    }
+    socket
+        .send(command(
+            serde_json::json!({"type":"resize","cols":100,"rows":30}),
+        ))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let typed = std::fs::read_to_string(&fixture.capture).unwrap_or_default();
+    assert!(!typed.contains("HELD_TYPING"), "{typed}");
+}

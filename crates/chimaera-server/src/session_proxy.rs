@@ -2405,11 +2405,16 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                                 }
                                 return;
                             }
-                            // Anything still held goes first: what the viewer
-                            // sends now is delivered after it, in order.
-                            for earlier in held.take() {
-                                let Some(earlier) = upward(earlier) else { continue };
-                                if bounded_send(socket.as_mut(), earlier).await.is_err() { return; }
+                            // Anything still held for this owner goes first:
+                            // what the viewer sends now is delivered after it,
+                            // in order. (What is held for a move here is not
+                            // for this owner: a terminal's grid control still
+                            // passes while its typing waits.)
+                            if pull.is_none() {
+                                for earlier in held.take() {
+                                    let Some(earlier) = upward(earlier) else { continue };
+                                    if bounded_send(socket.as_mut(), earlier).await.is_err() { return; }
+                                }
                             }
                             let Some(frame) = upward(frame) else { continue };
                             if bounded_send(socket.as_mut(), frame).await.is_err() { return; }
