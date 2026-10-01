@@ -25,8 +25,8 @@
   );
   const tip = $derived(
     git.worktree === git.repo
-      ? git.repo
-      : `${git.worktree} — a worktree of ${git.repo}`,
+      ? `${label} — ${git.repo}`
+      : `${label} — ${git.worktree} — a worktree of ${git.repo}`,
   );
 </script>
 

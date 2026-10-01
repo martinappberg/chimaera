@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { toolbarPopover } from "../shared/toolbarPopover";
   /**
    * The markdown toolbar's "N issues" chip: the daemon's portable-dialect
    * check (`GET /fs/check_document`, the same checker agents call as the MCP
@@ -183,7 +184,7 @@
       {flagged.length === 1 ? "issue" : "issues"}
     </button>
     {#if open}
-      <div class="pop" role="dialog" aria-label="document issues">
+      <div class="pop" use:toolbarPopover={{ onClose: () => (open = false) }} role="dialog" aria-label="document issues">
         <div class="pop-head">
           <span class="pop-title">{summary}</span>
           <span class="pop-sub">portable markdown check</span>
@@ -231,7 +232,7 @@
     position: relative;
     display: inline-flex;
     align-items: center;
-    margin-left: auto;
+    flex: none;
   }
 
   .chip {
@@ -244,15 +245,15 @@
     font-size: var(--text-xs);
     letter-spacing: 0.02em;
     line-height: 1;
+    white-space: nowrap;
+    height: 24px;
     color: color-mix(in srgb, var(--tint) 70%, var(--fg));
-    background: color-mix(in srgb, var(--tint) 9%, transparent);
-    border: 1px solid color-mix(in srgb, var(--tint) 35%, var(--edge));
-    border-radius: 999px;
+    background: transparent;
+    border: none;
+    border-radius: 5px;
     padding: 3px 8px 3px 7px;
     cursor: pointer;
-    transition:
-      background-color 0.12s ease,
-      border-color 0.12s ease;
+    transition: background-color 0.12s ease;
   }
 
   .chip.err {
@@ -261,8 +262,7 @@
 
   .chip:hover,
   .chip[aria-expanded="true"] {
-    background: color-mix(in srgb, var(--tint) 16%, transparent);
-    border-color: color-mix(in srgb, var(--tint) 55%, var(--edge));
+    background: var(--pane-control-hover);
   }
 
   .chip:focus-visible {
@@ -278,11 +278,12 @@
   }
 
   .pop {
+    white-space: normal;
     position: absolute;
     top: calc(100% + 6px);
     right: 0;
     z-index: 30;
-    width: min(440px, calc(100vw - 32px));
+    width: min(440px, calc(100vw - 16px));
     max-height: min(60vh, 420px);
     display: flex;
     flex-direction: column;
@@ -297,7 +298,8 @@
     flex: none;
     display: flex;
     align-items: baseline;
-    gap: 8px;
+    flex-wrap: wrap;
+    gap: 4px 8px;
     padding: 8px 12px 7px;
     border-bottom: 1px solid var(--edge);
   }
@@ -351,8 +353,9 @@
   .row:hover,
   .row:focus-visible {
     background: var(--row-hover);
-    outline: none;
   }
+
+  .row:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
 
   .ln {
     font-family: var(--mono);

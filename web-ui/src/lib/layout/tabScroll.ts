@@ -9,18 +9,18 @@ export function tabInView(scroll: number, view: number, tab: TabBounds): boolean
   return tab.left >= scroll - 2 && tab.left + tab.width <= scroll + view + 2;
 }
 
-/** Fade padding yields to the tab itself in narrow panes. Clamp both edges
- * together: alternating left/right corrections can hide the close button. */
+/** Reveal a clipped tab from its leading edge, rather than leaving an empty
+ * tail of the preceding tab before it. Already visible tabs stay put; a tab
+ * wider than the strip gives its close button priority. */
 export function revealTabScrollLeft(
   scroll: number,
   view: number,
   content: number,
   tab: TabBounds,
 ): number {
-  const padding = Math.min(TAB_FADE_PX, Math.max(0, (view - tab.width) / 2));
-  const min = tab.left + tab.width - view + padding;
-  const max = Math.max(min, tab.left - padding);
-  return Math.max(0, Math.min(Math.max(0, content - view), Math.max(min, Math.min(max, scroll))));
+  const next = tab.width > view ? tab.left + tab.width - view
+    : tabInView(scroll, view, tab) ? scroll : tab.left;
+  return Math.max(0, Math.min(Math.max(0, content - view), next));
 }
 
 /** A fully revealed tab may fill the strip. Its controls take precedence

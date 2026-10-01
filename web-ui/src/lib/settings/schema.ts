@@ -548,7 +548,7 @@ const DEFS = {
     title: "Markdown Preview Font Size",
     category: "Editor",
     description:
-      "Body size in pixels for rendered Markdown previews. Defaults to the same size as Chat; per-pane A−/A+ controls can still override it.",
+      "Body size in pixels for rendered Markdown previews. Defaults to the same size as Chat; Pane actions → Smaller / Larger text can still override it.",
     type: "number",
     default: 13.5,
     min: 10,
@@ -760,7 +760,7 @@ const DEFS = {
     title: "Remote Control at Start (Claude)",
     category: "Chat",
     description:
-      "Turn on Claude Code's Remote Control for every new Claude chat session as soon as it starts, so you can pick it up from the Claude mobile app or claude.ai/code. Off: use the header's remote chip (or /remote-control) per session. Registers the session with claude.ai; only offered where your account and organization allow it.",
+      "Turn on Claude Code's Remote Control for every new Claude chat session as soon as it starts, so you can pick it up from the Claude mobile app or claude.ai/code. Off: use Chat options → Remote Control (or /remote-control) per session. Registers the session with claude.ai; only offered where your account and organization allow it.",
     type: "boolean",
     default: false,
     scope: "daemon",

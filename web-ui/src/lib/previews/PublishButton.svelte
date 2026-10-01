@@ -89,27 +89,38 @@
   aria-busy={busy !== null}
   disabled={text === null || busy !== null}
   title={text === null ? "available once the document has loaded (files under 1 MB)" : "export as HTML, print to PDF, or bundle with its files"}
-  onclick={open}>{busy !== null ? BUSY[busy] : "publish"}</button
+  aria-label={busy !== null ? BUSY[busy] : "Publish document"}
+  onclick={open}>
+  <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M8 10V2m-3 3 3-3 3 3M3 9v4h10V9" /></svg>
+  <span class="pub-label">{busy !== null ? BUSY[busy] : "Publish"}</span></button
 >
 
 <style>
   .pub {
     appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    flex: none;
+    height: var(--pane-control-size);
+    white-space: nowrap;
     border: none;
     background: none;
     font: inherit;
     font-size: var(--text-xs);
-    letter-spacing: 0.04em;
+    letter-spacing: 0;
     color: var(--muted);
     cursor: pointer;
-    padding: 2px 8px;
-    border-radius: 4px;
+    padding: 0 8px;
+    border-radius: 5px;
     transition:
       background-color 0.12s ease,
       color 0.12s ease;
   }
 
   .pub:hover:not(:disabled) {
+    background: var(--pane-control-hover);
     color: var(--fg);
   }
 
@@ -153,5 +164,9 @@
       opacity: 0;
       transform: translateY(-2px);
     }
+  }
+  @container pane-chrome (max-width: 620px) {
+    .pub-label { display: none; }
+    .pub { width: var(--pane-control-size); padding: 0; }
   }
 </style>

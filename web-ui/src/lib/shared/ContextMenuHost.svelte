@@ -140,6 +140,9 @@
       e.preventDefault();
       const entry = contextMenu.items[activeIndex];
       if (entry !== undefined && entry !== "separator") select(entry);
+    } else if (e.key === "Tab") {
+      contextMenu.close();
+      refocus();
     }
     // Escape is handled by the dismiss action (which also refocuses).
   }
@@ -149,6 +152,7 @@
   <div
     class="ctx overlay-surface"
     role="menu"
+    aria-activedescendant={activeIndex >= 0 ? `context-menu-row-${activeIndex}` : undefined}
     tabindex="-1"
     bind:this={menuEl}
     style:left={`${left}px`}
@@ -171,7 +175,10 @@
           class="overlay-row ctx-row"
           class:danger={entry.danger}
           class:active={i === activeIndex}
-          role="menuitem"
+          role={entry.checked === undefined ? "menuitem" : "menuitemcheckbox"}
+          aria-checked={entry.checked}
+          tabindex="-1"
+          id={`context-menu-row-${i}`}
           data-row={i}
           disabled={entry.disabled}
           title={entry.disabled === true ? entry.hint : undefined}
@@ -193,6 +200,7 @@
     outline: none;
     /* A long pick list (every tab of a crowded pane) scrolls inside the
        viewport instead of running off its bottom edge. */
+    max-width: calc(100vw - 16px);
     max-height: calc(100vh - 8px);
     overflow-y: auto;
     scrollbar-width: thin;
@@ -200,7 +208,8 @@
 
   .ctx-row {
     display: block;
-    white-space: nowrap;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   /* The pick-list gutter: a fixed slot so a check never shifts the label. */

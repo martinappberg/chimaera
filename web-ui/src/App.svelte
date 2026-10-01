@@ -5283,12 +5283,6 @@
                 >
                   <span class="name">
                     {displayNames.get(s.id) ?? displayName(s)}
-                    {#if s.kind === "agent" && s.git && s.git.worktree !== s.git.repo}
-                      <!-- Only an agent working in a separate worktree gets a
-                           mark: its branch, quiet, after the name (the name
-                           keeps the width). The main checkout shows nothing. -->
-                      <span class="wt-mark"><BranchChip git={s.git} /></span>
-                    {/if}
                     {#if s.kind === "agent" && s.remote_control_url}
                       <!-- Remote Control is on: this session is reachable from
                            the Claude app / claude.ai/code. Quiet accent pill;
@@ -5296,6 +5290,11 @@
                       <span class="remote-badge" title="Remote Control on — pick this session up in the Claude app or at claude.ai/code">remote</span>
                     {/if}
                   </span>
+                  {#if s.kind === "agent" && s.git && s.git.worktree !== s.git.repo}
+                    <!-- Give worktree context its own line so a long branch
+                         never truncates the agent's identity. -->
+                    <span class="wt-mark"><BranchChip git={s.git} /></span>
+                  {/if}
                   <!-- Second line only when it adds something over the name.
                        Shells never do: the name already resolves to the title
                        (program-set) or the cwd (the shell's "user@host:dir"
@@ -6687,9 +6686,11 @@
     font-family: var(--mono);
     font-size: var(--text-sm);
   }
-  /* An agent in a separate worktree: its branch after the name, quiet. */
+  /* Worktree context stays secondary and gets its own truncation budget. */
   .wt-mark {
-    margin-left: 0.4rem;
+    display: flex;
+    min-width: 0;
+    margin-top: 2px;
     opacity: 0.85;
   }
 

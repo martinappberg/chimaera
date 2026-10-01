@@ -189,7 +189,7 @@
   // position instead of snapping to the bottom.
   // svelte-ignore state_referenced_locally
   let atBottom = $state(chatScroll(session.id).atBottom);
-  let menu = $state<"model" | "mode" | "effort" | "mcp" | "remote" | null>(null);
+  let menu = $state<"model" | "mode" | "effort" | "mcp" | "remote" | "options" | null>(null);
 
   // --- bounded transcript DOM ------------------------------------------------
   // The reducer/socket always fold the complete bounded journal so background

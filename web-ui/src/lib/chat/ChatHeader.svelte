@@ -5,6 +5,7 @@
    * rate limit, context). It renders and toggles the shared `menu` state but
    * the picks themselves are the host's callbacks (they ride socket.send).
    */
+  import { toolbarPopover } from "../shared/toolbarPopover";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import EffortPopover from "./EffortPopover.svelte";
   import { copyText } from "../shared/clipboard";
@@ -24,7 +25,7 @@
     agentName: string;
     /** The one-of-N open overlay; two-way so the host can open /mcp and the
      *  outside-dismiss action can close everything. */
-    menu: "model" | "mode" | "effort" | "mcp" | "remote" | null;
+    menu: "model" | "mode" | "effort" | "mcp" | "remote" | "options" | null;
     modelChoices: ModelChoice[];
     modelLabel: string | null;
     modeLabel: string | null;
@@ -70,22 +71,13 @@
     onSetRemoteControl,
   }: Props = $props();
 
-  // Remote Control: the chip shows where the bridge stands; the popover
+  // Remote Control: Chat options shows where the bridge stands; the popover
   // carries the one action plus the session link. Offered for claude when
   // the CLI says so; a codex row appears only once its daemon reports a
   // live state (its bridge is not switchable from here).
   const rc = $derived(store.remoteControl);
   const rcShown = $derived(store.remoteControlAvailable || rc !== null);
   const rcState = $derived<"off" | "connecting" | "connected" | "error">(rc?.state ?? "off");
-  const rcLabel = $derived(
-    rcState === "connected"
-      ? "remote on"
-      : rcState === "connecting"
-        ? "remote…"
-        : rcState === "error"
-          ? "remote ✕"
-          : "remote off",
-  );
   const rcTitle = $derived(
     rcState === "connected"
       ? `Remote Control on${rc?.name ? ` — ${rc.name}` : ""}: pick this session up in the Claude app or at claude.ai/code`
@@ -136,16 +128,18 @@
   </span>
 {/snippet}
 
+<div class="chat-header">
 <header class="strip">
   <span class="agent-id" title="{agentName} chat session">
     <SessionGlyph kind="agent" {agentKind} size={11} />
     <span class="agent-name">{agentName}</span>
   </span>
 
-  <div class="menu-host">
+  <div class="menu-host primary-picker model-picker">
     <button
       class="chip pick"
-      title={modelLabel === null ? "resolving model…" : "model — click to switch"}
+      title={modelLabel === null ? "Resolving model…" : `Model: ${modelLabel}`}
+      aria-label={`Model: ${modelLabel ?? "loading"}`}
       aria-haspopup="menu"
       aria-expanded={menu === "model"}
       onclick={() => (menu = menu === "model" ? null : "model")}
@@ -156,12 +150,12 @@
       {#if modelLabel === null}
         <span class="model-skel" aria-label="loading model"></span>
       {:else}
-        {modelLabel}
+        <span class="pick-label">{modelLabel}</span>
       {/if}
       {@render caret()}
     </button>
     {#if menu === "model"}
-      <div class="overlay-surface menu" role="menu" aria-label="model">
+      <div class="overlay-surface menu" use:toolbarPopover={{ onClose: () => (menu = null) }} role="menu" aria-label="model">
         {#if modelChoices.length === 0}
           <span class="menu-empty">no known models</span>
         {/if}
@@ -169,7 +163,8 @@
           <button
             class="overlay-row menu-row"
             class:current={m.id === store.model || m.resolved === store.model}
-            role="menuitem"
+            role="menuitemradio"
+            aria-checked={m.id === store.model || m.resolved === store.model}
             title={typeof m.description === "string" ? m.description : undefined}
             onclick={() => onPickModel(m.id)}
           >
@@ -180,24 +175,26 @@
     {/if}
   </div>
   {#if store.modes.length > 0}
-    <div class="menu-host">
+    <div class="menu-host primary-picker mode-picker">
       <button
         class="chip pick"
-        title="permission mode — click to switch"
+        title={`Permission mode: ${modeLabel ?? "mode"}`}
+        aria-label={`Permission mode: ${modeLabel ?? "mode"}`}
         aria-haspopup="menu"
         aria-expanded={menu === "mode"}
         onclick={() => (menu = menu === "mode" ? null : "mode")}
       >
-        {modeLabel ?? "mode"}
+        <span class="pick-label">{modeLabel ?? "mode"}</span>
         {@render caret()}
       </button>
       {#if menu === "mode"}
-        <div class="overlay-surface menu" role="menu" aria-label="permission mode">
+        <div class="overlay-surface menu" use:toolbarPopover={{ onClose: () => (menu = null) }} role="menu" aria-label="permission mode">
           {#each store.modes as m (m.id)}
             <button
               class="overlay-row menu-row"
               class:current={m.id === store.currentMode}
-              role="menuitem"
+              role="menuitemradio"
+              aria-checked={m.id === store.currentMode}
               onclick={() => onPickMode(m.id)}
             >
               {m.label}
@@ -208,62 +205,60 @@
     </div>
   {/if}
   {#if hasEffort}
-    <div class="menu-host">
+    <div class="menu-host primary-picker effort-picker">
       <button
         class="chip pick"
         title={effortHint}
+        aria-label={`Reasoning effort: ${effortShown ?? "default"}`}
         aria-haspopup="menu"
         aria-expanded={menu === "effort"}
         onclick={() => (menu = menu === "effort" ? null : "effort")}
       >
-        {effortShown ?? "effort"}
+        <span class="pick-label">{effortShown ?? "effort"}</span>
         {@render caret()}
       </button>
       {#if menu === "effort"}
-        <EffortPopover choices={effortChoices} shown={effortShown} onPick={onPickEffort} />
+        <EffortPopover choices={effortChoices} shown={effortShown} onPick={onPickEffort} onClose={() => (menu = null)} />
       {/if}
     </div>
   {/if}
-  {#if hasUltracode}
-    <button
-      class="chip pick"
-      class:on={store.ultracode}
-      title="ultracode — xhigh effort + standing workflow orchestration, this session only"
-      aria-pressed={store.ultracode}
-      onclick={onToggleUltracode}
-    >
-      ultracode{store.ultracode ? " on" : " off"}
+  <div class="menu-host extras">
+    <button class="chip more" title="Chat options" aria-label="Chat options" aria-haspopup="menu"
+      aria-expanded={menu === "options" || menu === "remote"}
+      class:on={store.ultracode || thinking || rcState === "connected"}
+      onclick={() => (menu = menu === "options" ? null : "options")}>
+      <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><circle cx="3" cy="8" r="1.2" /><circle cx="8" cy="8" r="1.2" /><circle cx="13" cy="8" r="1.2" /></svg>
     </button>
-  {/if}
-  {#if hasThinking}
-    <button
-      class="chip pick"
-      class:on={thinking === true}
-      title="extended thinking — applies from your next message"
-      aria-pressed={thinking === true}
-      onclick={onToggleThinking}
-    >
-      thinking{thinking ? " on" : " off"}
-    </button>
-  {/if}
-  {#if rcShown}
-    <div class="menu-host">
-      <button
-        class="chip pick rc"
-        class:on={rcState === "connected"}
-        class:busy={rcState === "connecting"}
-        class:err={rcState === "error"}
-        title={rcTitle}
-        aria-haspopup="menu"
-        aria-expanded={menu === "remote"}
-        onclick={() => (menu = menu === "remote" ? null : "remote")}
-      >
-        <span class="rc-dot" aria-hidden="true"></span>
-        {rcLabel}
-        {@render caret()}
-      </button>
+    {#if menu === "options"}
+      <div class="overlay-surface menu options-menu" role="menu" aria-label="Chat options" use:toolbarPopover={{ onClose: () => (menu = null) }}>
+        <div class="options-heading">{agentName} · session options</div>
+        {#if hasUltracode}
+          <button class="overlay-row menu-row" role="menuitemcheckbox" aria-checked={store.ultracode}
+            title="xhigh effort + standing workflow orchestration, this session only" onclick={onToggleUltracode}>
+            ultracode <span>{store.ultracode ? "on" : "off"}</span>
+          </button>
+        {/if}
+        {#if hasThinking}
+          <button class="overlay-row menu-row" role="menuitemcheckbox" aria-checked={thinking}
+            title="Extended thinking — applies from your next message" onclick={onToggleThinking}>
+            thinking <span>{thinking ? "on" : "off"}</span>
+          </button>
+        {/if}
+        {#if rcShown}
+          <button class="overlay-row menu-row" role="menuitem" title={rcTitle} onclick={() => (menu = "remote")}>
+            Remote Control <span>{rcState}</span>
+          </button>
+        {/if}
+        <div class="options-heading">
+          {store.contextPct === null ? "Context usage not yet available" : `${Math.round(store.contextPct)}% of context used`}
+          {#if store.rateLimit !== null && (store.rateLimit.limitReached || store.rateLimit.utilization >= 80)}
+            <br />{store.rateLimit.label ?? "Usage limit"}: {store.rateLimit.limitReached ? "reached" : `${Math.floor(store.rateLimit.utilization)}%`}
+          {/if}
+        </div>
+      </div>
+    {/if}
       {#if menu === "remote"}
-        <div class="overlay-surface menu rc-menu" role="menu" aria-label="remote control">
+        <div class="overlay-surface menu rc-menu" use:toolbarPopover={{ onClose: () => (menu = null) }} role="menu" aria-label="remote control">
           <div class="rc-head">
             <span class="rc-dot big" class:on={rcState === "connected"} class:busy={rcState === "connecting"} class:err={rcState === "error"} aria-hidden="true"></span>
             <span class="rc-title">Remote Control</span>
@@ -312,22 +307,21 @@
           {/if}
         </div>
       {/if}
-    </div>
-  {/if}
+  </div>
   <span class="spacer"></span>
+  <div class="session-status">
   {#if store.running || store.compacting}
-    <button class="stop" onclick={onInterrupt} title="interrupt the agent (Esc)">stop</button>
+    <button class="stop" onclick={onInterrupt} aria-label="Stop" title="interrupt the agent (Esc)"><span class="stop-mark" aria-hidden="true"></span><span class="stop-label">Stop</span></button>
   {/if}
   {#if store.rateLimit !== null && (store.rateLimit.limitReached || store.rateLimit.utilization >= 80)}
     <span
       class="ratelimit"
       class:hit={store.rateLimit.limitReached}
-      title={store.rateLimit.resetsAt !== null
-        ? `resets ${new Date(Number(store.rateLimit.resetsAt) * 1000).toLocaleString()}`
-        : "account rate limit"}
+      title={`${store.rateLimit.label ?? "Usage limit"}: ${store.rateLimit.limitReached ? "reached" : `${Math.floor(store.rateLimit.utilization)}%`}${store.rateLimit.resetsAt !== null ? ` · resets ${new Date(Number(store.rateLimit.resetsAt) * 1000).toLocaleString()}` : ""}`}
     >
-      {store.rateLimit.label ?? "usage limit"}
-      {store.rateLimit.limitReached ? "reached" : `${Math.floor(store.rateLimit.utilization)}%`}
+      <span class="rate-label">{store.rateLimit.label ?? "Usage limit"}</span>
+      <span class="rate-label-short">{(store.rateLimit.label ?? "Usage").replace(/\s+limit$/i, "")}</span>
+      <span>{store.rateLimit.limitReached ? "reached" : `${Math.floor(store.rateLimit.utilization)}%`}</span>
     </span>
   {/if}
   {#if store.contextPct !== null}
@@ -341,16 +335,22 @@
       {Math.round(store.contextPct)}% ctx
     </span>
   {/if}
+  </div>
 </header>
+</div>
 
 <style>
+  .chat-header { container: pane-chrome / inline-size; flex: none; min-width: 0; }
   .strip {
     display: flex;
     align-items: center;
-    flex-wrap: wrap; /* narrow panes get a clean second chip row, not clipping */
-    gap: 4px 6px;
-    padding: 4px 10px;
+    min-width: 0;
+    height: var(--pane-toolbar-height);
+    gap: 5px;
+    padding: 0 8px;
+    white-space: nowrap;
     border-bottom: 1px solid var(--edge);
+    background: color-mix(in srgb, var(--bg) 65%, var(--term-bg));
     font-size: var(--text-xs);
     color: var(--muted);
     flex: none;
@@ -373,13 +373,13 @@
     white-space: nowrap;
   }
   .chip {
-    border: 1px solid var(--edge);
-    border-radius: 999px;
-    padding: 0 8px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 0 6px;
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    height: calc(var(--text-xs) + 6px);
+    height: var(--pane-control-size);
     /* Fixed-height pill: the label must clip, never wrap out of it. */
     white-space: nowrap;
     min-width: 0;
@@ -387,39 +387,30 @@
   }
   .chip.pick {
     background: none;
-    color: var(--muted);
+    color: var(--fg);
     font: inherit;
-    font-family: var(--mono);
     cursor: pointer;
     transition:
       color 0.12s ease,
-      border-color 0.12s ease;
+      background-color 0.12s ease;
   }
-  .chip.pick:hover {
+  .chip.pick:hover, .chip.pick[aria-expanded="true"], .more:hover {
     color: var(--fg);
-    border-color: color-mix(in srgb, var(--accent) 40%, var(--edge));
+    background: var(--pane-control-hover);
   }
-  /* Shared "toggle is on" treatment for the ultracode + thinking chips: an
-     accent tint so an active toggle reads at a glance, not just from its label. */
+  .mode-picker .chip, .effort-picker .chip { color: var(--muted); }
+  /* Keep active session options discoverable even with the menu closed. */
   .chip.on {
     color: var(--accent);
     border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
     background: color-mix(in srgb, var(--accent) 10%, transparent);
   }
   .caret {
+    flex: none;
     display: inline-flex;
-    opacity: 0.7;
+    opacity: 0.5;
   }
-  /* Remote Control chip: the same pill as its siblings, plus a state dot —
-     muted when off, breathing while connecting, accent when live, warn on a
-     refusal. The dot carries the state at a glance; the label spells it. */
-  .chip.rc {
-    gap: 5px;
-  }
-  .chip.rc.err {
-    color: var(--warn);
-    border-color: color-mix(in srgb, var(--warn) 50%, var(--edge));
-  }
+  /* Remote Control keeps its state dot inside its details popover. */
   .rc-dot {
     width: 6px;
     height: 6px;
@@ -432,28 +423,23 @@
     width: 8px;
     height: 8px;
   }
-  .chip.rc.on .rc-dot,
   .rc-dot.on {
     background: var(--accent);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
   }
-  .chip.rc.busy .rc-dot,
   .rc-dot.busy {
     background: var(--accent);
     animation: pulse 1.4s ease-in-out infinite; /* shared keyframe in app.css */
   }
-  .chip.rc.err .rc-dot,
   .rc-dot.err {
     background: var(--warn);
   }
   /* Infinite "presence" animations pause while the app is hidden (the
      html.app-hidden contract; see app.css). */
-  :global(html.app-hidden) .chip.rc.busy .rc-dot,
   :global(html.app-hidden) .rc-dot.busy {
     animation-play-state: paused;
   }
   @media (prefers-reduced-motion: reduce) {
-    .chip.rc.busy .rc-dot,
     .rc-dot.busy {
       animation: none;
       opacity: 0.8;
@@ -544,6 +530,7 @@
   /* .overlay-surface / .overlay-row live in app.css; .menu / .menu-row add the
      dropdown anchor and the menu-item specifics. */
   .menu {
+    white-space: normal;
     top: 100%;
     left: 0;
     margin-top: 4px;
@@ -562,23 +549,61 @@
     color: var(--muted);
     font-size: var(--text-sm);
   }
-  .spacer {
-    flex: 1;
+  .spacer { flex: 1; }
+  .session-status { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .rate-label-short { display: none; }
+  .primary-picker { flex: 0 1 auto; min-width: 0; }
+  .primary-picker .chip { max-width: 100%; }
+  .pick-label { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .more { width: var(--pane-control-size); justify-content: center; padding: 0; background: none; color: var(--muted); cursor: pointer; }
+  .extras { flex: none; }
+  .options-menu { min-width: 240px; }
+  .options-menu .menu-row { display: flex; gap: 16px; justify-content: space-between; }
+  .options-menu .menu-row span { color: var(--muted); }
+  .options-heading { padding: 8px 12px; font-size: var(--text-xs); color: var(--muted); white-space: normal; }
+  .chip:focus-visible, .stop:focus-visible, .menu-row:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+  .stop, .ctx, .ratelimit { flex: none; white-space: nowrap; }
+  .stop { height: var(--pane-control-size); }
+  @container pane-chrome (max-width: 620px) {
+    .agent-name, .ctx { display: none; }
+    .ctx.full { display: inline; }
+    .agent-id { border: 0; margin: 0; padding: 0; }
+    .strip .ratelimit { min-width: 0; flex-shrink: 1; padding: 0 6px; }
+    .rate-label { display: none; }
+    .rate-label-short { display: inline; min-width: 0; max-width: 52px; overflow: hidden; text-overflow: ellipsis; }
+    .stop { width: var(--pane-control-size); padding: 0; }
+    .stop-label { display: none; }
+  }
+  /* Small chat panes have two deliberate rows: session/status, then selectors.
+     Their height stays fixed as a turn starts, stops, or reports a limit. */
+  @container pane-chrome (max-width: 480px) {
+    .strip { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 76px 24px; grid-template-rows: 24px 24px; gap: 4px 5px; height: calc(var(--pane-toolbar-height) * 2); padding: 4px 8px; }
+    .agent-id { grid-row: 1; grid-column: 1; min-width: 0; }
+    .agent-name { display: inline; overflow: hidden; text-overflow: ellipsis; }
+    .model-picker { grid-row: 2; grid-column: 1; }
+    .mode-picker { grid-row: 2; grid-column: 2; }
+    .effort-picker { grid-row: 2; grid-column: 3; }
+    .extras { grid-row: 2; grid-column: 4; }
+    .primary-picker .chip { width: 100%; justify-content: space-between; }
+    .session-status { grid-row: 1; grid-column: 2 / 5; justify-self: end; max-width: 100%; }
+    .spacer { display: none; }
   }
   .stop {
     font: inherit;
     font-size: var(--text-xs);
-    border: 1px solid color-mix(in srgb, var(--err) 50%, var(--edge));
-    color: var(--err);
-    background: none;
-    border-radius: 5px;
-    padding: 0 10px;
+    border: 1px solid var(--edge);
+    color: var(--fg);
+    background: var(--term-bg);
+    border-radius: 6px;
+    padding: 0 9px;
     line-height: 1.35;
     cursor: pointer;
     transition: background-color 0.12s ease;
   }
+  .stop { display: inline-flex; align-items: center; justify-content: center; gap: 5px; }
+  .stop-mark { width: 6px; height: 6px; border-radius: 1px; background: currentColor; }
   .stop:hover {
-    background: color-mix(in srgb, var(--err) 10%, transparent);
+    background: var(--row-hover);
   }
   .ctx {
     font-variant-numeric: tabular-nums;
@@ -588,6 +613,7 @@
     color: var(--warn);
   }
   .ratelimit {
+    gap: 4px;
     font-variant-numeric: tabular-nums;
     color: var(--warn);
     border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--edge));

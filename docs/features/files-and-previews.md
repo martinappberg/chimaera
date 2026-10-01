@@ -258,6 +258,11 @@ superseded folder navigation cannot start a create operation in a different dire
 ## Rendered previews
 
 - **Markdown.** `MarkdownView.svelte`, with Obsidian-style modes **live | reading | source**.
+  The 30px toolbar groups regular-weight mode labels with a flat selected fill,
+  switching to a compact mode menu
+  below 420px. Issue counts never shrink; Publish and Outline use named icon buttons
+  below 620px. The editing hint appears only when it fits, with the full gesture described
+  by the Live control. Error/status notes stay on one line with their full text on hover.
   A file opens in the mode it was last shown in — remembered per file in this browser's
   `localStorage` (the 300 most recently opened; `mdDoc.ts` `createModeMemory`, every access
   guarded, so a private window just forgets) — else in the **Markdown Default Mode** setting
