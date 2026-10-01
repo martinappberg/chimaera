@@ -80,10 +80,11 @@ pub(crate) fn record(state: &crate::AppState, id: &str) {
 /// and brings work to this computer for (`session_proxy`), and nothing else
 /// is; and a keeper that keeps a sleeping cloud machine's sockets holds and
 /// wakes for the same list (VIEWING.md, "A sleeping cloud machine's sockets"
-/// mirrors it; change both together). A keeper also holds the seven settings
-/// commands the user gives; the relay here drops them while the owner is not
-/// attached. The automatic `SetThinking`, the reads, `cancel_send` (not an
-/// `AgentCommand`) and queue housekeeping neither wake nor are held anywhere.
+/// mirrors it; change both together). The seven settings commands the user
+/// gives are held by both as well, without waking or moving anything
+/// ([`chat_frame`]). The automatic `SetThinking`, the reads, `cancel_send`
+/// (not an `AgentCommand`) and queue housekeeping neither wake nor are held
+/// anywhere.
 /// `SendAfterTurn` is a send: idle it opens a turn like any other.
 pub(crate) fn is_interaction(command: &chimaera_agent::model::AgentCommand) -> bool {
     use chimaera_agent::model::AgentCommand;

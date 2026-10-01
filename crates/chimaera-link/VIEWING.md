@@ -283,6 +283,43 @@ its text, its position or the time.
   decides nothing at `ready`. That daemon's echo carries no id: it confirms
   the unconfirmed send with exactly its text, never another one. Its refusal
   names no send and returns the one just made.
+- **Every holder treats ids as the daemon does.** A holder is anything that
+  keeps a client's frames for an owner that has not answered: this
+  computer's relay, a keeper, the account's gateway. The id of a send it
+  holds counts as accepted. So a frame whose `client_id` it already holds is
+  dropped silently, never refused and never held twice (the first copy will
+  be delivered; a refusal would return a message that then runs). A
+  `cancel_send` for an id it holds is never passed on: the holder answers
+  `send_cancelled {client_id, cancelled:false}` itself (an owner that has not
+  seen the send would call it withdrawn, and the held copy would still be
+  delivered). And frames a client sends while held frames await delivery are
+  delivered after them, in order, never ahead of them to whichever owner
+  happens to be attached.
+- A client withdraws a send at 120 s while a holder may hold one for up to
+  150 s. That is safe because of the rule above: a withdrawal cannot win
+  against a send that is held, only against one that is nowhere.
+- A client sends a given send again at most once per pause, which starts at
+  3 s and doubles to 30 s (a send can be megabytes, and a `ready` resets the
+  reconnect backoff); a copy that is not due at a `ready` goes out when it
+  is, unless its echo came first. A client's own resend or `cancel_send`
+  never redials a socket or asks for a wake.
+- The echo of a send is always journaled with its ids. A message too long
+  for one journal line (the limit is the size of the largest text a send may
+  carry, and characters that JSON escapes need several bytes each) is
+  recorded with its text cut in the middle, never replaced.
+
+What the rule does not cover, stated plainly:
+
+- A withdrawal is remembered for as long as the conversation's process
+  lives. After that process is replaced (a restart of the daemon, a resume,
+  switching the conversation to its terminal and back), a copy of the
+  withdrawn send that arrives only then is accepted and runs. Holders
+  discard what they hold when its socket closes and answer a cancel for what
+  they still hold, so no copy should outlive a withdrawal.
+- A daemon that is killed after it handed a message to the agent and before
+  it recorded the echo leaves a delivered message whose id it does not know.
+  The client's resend then runs it a second time, or, after two minutes,
+  its withdrawal is answered "withdrawn" although it ran.
 
 When the machine is awake again for any reason, the keeper attaches every
 socket it kept, on its own, with the remembered authentication. An events
@@ -321,7 +358,8 @@ What clients do, against either kind of keeper:
   longer holds (a second copy of a send already confirmed or returned) is
   ignored. A refusal that names no send, from a relay that predates ids in
   front of a daemon that has them, returns nothing: the sends show as
-  pending and the next `ready` sends or withdraws each.
+  pending and the next `ready` sends or withdraws each; when exactly one
+  send is unconfirmed it can only be that one, and it is returned.
 - Nothing in the UI waits forever on a command that is not the user acting:
   the MCP panel keeps the inventory it has and closes after 10 s without a
   first answer, a rewind's dry-run check closes after 30 s. The thinking
@@ -329,11 +367,11 @@ What clients do, against either kind of keeper:
   after a reattach (a second `ready` on the same socket: its keeper dropped
   a push sent while nothing was attached), never on a plain reconnect: there
   the process still has it, and pushing again would let one window's default
-  override another window's explicit choice at every blip. The seven
-  settings commands change nothing in the UI until the daemon confirms them
-  (a keeper holds them, above; the native proxy drops them while the owner
-  is not attached, below, and the old value keeps showing); they are not
-  sent again.
+  override another window's explicit choice at every blip. A toggle made
+  while the conversation is not live is pushed at the next `ready`. The
+  seven settings commands change nothing in the UI until the daemon confirms
+  them (a keeper and the native proxy both hold them, so the old value shows
+  until the owner answers); they are not sent again.
 - An events client sends its `watch` registration again whenever a `settings`
   frame arrives on a gateway socket: the daemon sends one per attach, and a
   registration lives on the daemon's side of one attach.
@@ -349,8 +387,11 @@ What clients do, against either kind of keeper:
   refusal, or an unmarked accept that closes before `ready` or says nothing
   for 15 s, is remembered for that host's transport for five minutes, during
   which no further passive attach is made (viewer sockets and feed retries
-  behave as before), and input the proxy was holding for that attach then
-  wakes the machine as below. A viewer
+  behave as before). An accept that closes ends the viewer's socket as any
+  owner's close does (what the proxy held is refused first; the viewer
+  reconnects onto the path below and its client sends again). One that only
+  stays silent is dropped by the proxy after those 15 s, and input held for
+  it then wakes the machine as below. A viewer
   already told `remote_unavailable` with nothing held is closed when a kept
   attach succeeds, so its reconnect attaches quietly. The proxy's events feed
   attaches the same way, sends no registration before the owner's first frame
@@ -369,11 +410,18 @@ input is held (≤64 KiB of typing, ≤4 chat commands, and ≤64 MiB across eve
 socket of the daemon), opens the owner's socket with `?wake=interaction`, and
 is delivered once, in order, right after the owner's `ready`. Real input is a
 terminal's typing and a chat's acting commands (the daemon's
-`activity::is_interaction` list above, and nothing else): every other chat
-command, the seven settings commands, the automatic `set_thinking`, the reads
-and `cancel_send` included, passes to an attached owner and is dropped
-otherwise, so none of them ever wakes a machine or brings work to this
-computer. When that input finds the owner asleep the viewer
+`activity::is_interaction` list above, and nothing else). The seven settings
+commands are held too, as a keeper holds them: in order with the input, the
+latest pick of a setting winning unless the user acted in between
+(`set_mcp_enabled` and `reconnect_mcp` per `server`), at most 16 per socket
+of 16 KiB each, outside the four-command cap. A held setting asks for no
+wake and brings no work here: it waits for the owner and is delivered with
+what the user does next, so a permission mode picked before a message is in
+force when that message runs. A setting that cannot be held is refused with
+`command_failed` naming the command. Every other chat command (the automatic
+`set_thinking`, the reads, `cancel_send`, a command the daemon does not
+know) passes to an attached owner and is dropped otherwise. When the first
+input finds the owner asleep the viewer
 gets the additive `{"type":"waking"}` status; while the wake is pending,
 further input is refused rather than held (chat: `command_failed` with
 `reason:"waking"`; typing: `read_only` with `reason:"waking"`, at most one
@@ -385,14 +433,19 @@ composer); typing gets `read_only` with `reason:"reconnecting"`. Every chat
 refusal carries the additive `command` it answers (`send`, `interrupt`,
 `permission`…) and the additive `client_id` that command was sent under, and
 a client restores a draft only for `command:"send"` or `"send_after_turn"`,
-and then exactly the send the id names. The relay itself sends nothing twice;
-a viewer socket that closes while this relay still holds input loses that
-input here, and the client sends it again by its id at its next `ready`.
+and then exactly the send the id names. The relay is a holder and follows the
+holders' rule above (a second copy of a held send is dropped, a
+`cancel_send` for it is answered `cancelled:false` here). It sends nothing
+twice itself; a viewer socket that closes while this relay still holds input
+loses that input here, and the client sends it again by its id at its next
+`ready`.
 
 When the route is a `device-` route (another of the user's computers owns the
 project) and this computer can take it, the first real input instead brings
 the work here: the relay holds it (the same budget), says
-`{"type":"bringing","to":"here"}`, stops forwarding input to the owner and
+`{"type":"bringing","to":"here"}`, stops forwarding anything a chat sends to
+the owner (input and settings are held for the session here; the rest is
+dropped, a `cancel_send` included, unless it names a held send) and
 hides the owner's `moved`/`paused` frames and its closing socket for this move.
 Once this computer holds the project and its session resumed, the held input
 is delivered once to the local session and the socket closes quietly (the

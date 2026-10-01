@@ -564,7 +564,8 @@ request is withdrawn and the machine is woken as before
 the work is being brought the gateway holds only a chat's acting commands,
 its seven settings commands and a terminal's typing, as a keeper does
 ([VIEWING](VIEWING.md#forwarded-requests)); a view's other frames are not
-held. Held input the owner's session does not take is refused to the phone
+held. It is a holder like any other: a second copy of a send it holds is
+dropped, and a `cancel_send` for one is answered `cancelled:false` there. Held input the owner's session does not take is refused to the phone
 (`command_failed` or `read_only` with reason `reconnecting`; a refused chat
 command carries the `client_id` it was sent under, so exactly that send
 returns to the composer), never dropped.

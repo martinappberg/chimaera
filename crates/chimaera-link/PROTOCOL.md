@@ -522,7 +522,11 @@ command it refuses) followed by `remote_unavailable`, and keeps the socket
 open. When the client's side closes while frames are still held it discards
 them and never delivers them later; the client sends an unconfirmed send
 again under its id at its next `ready`, and the daemon accepts an id at most
-once. It adds no frame type: the one status it sends is the existing
+once. A keeper treats the id of a send it holds as accepted too: a second
+copy is dropped silently (never refused, never held twice), a `cancel_send`
+for it is answered `send_cancelled {client_id, cancelled:false}` by the
+keeper and not passed on, and what a client sends while frames are held is
+delivered after them. It adds no frame type: the one status it sends is the existing
 `{"type":"waking"}`, once per wake. The rules, the caps, the send ids and
 what clients do are in
 [VIEWING](VIEWING.md#forwarded-requests) ("A sleeping cloud machine's

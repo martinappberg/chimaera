@@ -69,7 +69,7 @@ hard-resets and rebuilds.
 | `AttachmentStrip.svelte` / `ImagePreview.svelte` | A message's images as picture tiles (one row height, width from the picture's aspect via `images.ts::tileBox`, no hover effects): `drafts` in the composer (in-memory pixels, ✕ to remove, click → `ImagePreview`, a fixed overlay like the plan card's) and `paths` on sent/queued bubbles (the daemon's saved copies from `user_message.attachment_paths`, resolved near the viewport through `resolveFile`, click → open in a pane, a gone copy a dashed tile). A picture-only message puts the strip where the bubble would be. |
 | `paths.ts` | The chat half of path links: which candidates a code span / link target offers (parsing is `../shared/fileRef.ts`, shared with the terminal), and `PathResolver` — one per ChatView, batching every renderer's candidates into `fsValidate` calls grouped by base ladder (live cwd, spawn cwd, workspace root from App's `setChatLinkContext`), caching hits/ambiguous/misses keyed by candidate + base ladder + workspace (`resolveScope`; misses expire after 15 s and at every turn end, hits after 60 s; failures are never cached). A click re-checks before opening (`resolveNow` / `reopenResolution`), so a stale hit never opens a moved or deleted file. Opening goes through `../shared/openPath.ts` (reveal at the line, Cmd/Ctrl split); ambiguous names open a context-menu pick list. Own vitest suite (`paths.test.ts`). |
 | `voice.svelte.ts` / `voiceCapture.ts` / `VoiceMeter.svelte` / `voiceLanguages.ts` | Voice dictation — the composer's mic button (on by default; `/voice on` or `off`; the same in Claude and Codex chats). `Dictation` (one per composer) is a chain of `Phrase`s — one `/ws/voice` socket each, opened with the mic (audio captured before a socket is up is queued, never dropped). `PauseDetector` (pure, tested) ends a phrase at a pause: the service revises nothing until a stream is finalized, so the recording finalizes each phrase there and speaks on into a fresh one — opened only when speech resumes, with ~300 ms of pre-roll, so a recording that ends in silence opens none — and each phrase's corrected text arrives a moment later. The host check (`hostCanDictate`) re-asks on the window's next focus/visibility whenever the answer was no. `finals` is the leading run of finished phrases, `interim` everything after (a finishing phrase keeps its guess until its correction lands); keeps the last five levels for `VoiceMeter`'s waveform (beside the stop button), and owns `error` (the composer only reads it) — including the silence message naming the device when the loudest chunk stayed near zero; a generation counter fences late events from an ended recording. `hostCanDictate` / `recheckHost` cache the daemon's `GET /api/v1/voice` per window (re-asked after a login error), gating the mic; `voiceProblem` is `/voice on`'s check (that, then one mic permission request). `voiceCapture.ts`: `listMicrophones` (names are withheld until the page has the mic once), `startCapture(onChunk, microphone)` resolving a remembered NAME to this origin's device id, and an AudioWorklet (inlined as a Blob URL) box-filtering the device rate to 16 kHz mono PCM16 in 100 ms chunks with an RMS level; the mic is released after each recording. Keys stay the composer's: the Dictate chord (`keys.dictate`, matched only while the composer has focus — App's handler has no case for it, so it falls through), and while recording Esc restores the draft and Enter stops and sends; Space is never taken over. The words stream INTO the draft (`dictationParts` / `joinParts`: the text around the caret, settled words, forming words, spaced like typing), so the box grows like typing; the textarea goes read-only with transparent text and the composer's `.ghost` mirror (exact box, font, wrapping, scroll and scrollbar-width padding) draws it with the spoken part dimmed — keep their box and font properties identical. Pure helpers (`dictationParts`, `insertDictation`, `joinSpoken`) have a vitest suite (`voice.test.ts`). |
-| `composerBus.ts` | Cross-component channel to insert text/attachments into the active composer (e.g. `@term:` grants, references, dropped-file paths, a quoted transcript passage). An insert is `inline` (joins the draft after a space), `block` (its own paragraph, so a quote's `>` starts a line) or `above` (its own paragraph ahead of the draft: a message that did not arrive, coming back); `composer.ts::draftWithInsert` is the pure join. An insert may name the mounting view's token (`view`): one chat can be mounted twice (the Mastermind dock and a pane), and a quote belongs in the composer under its selection. Own vitest suite (`composerBus.test.ts`). |
+| `composerBus.ts` | Cross-component channel to insert text/attachments into the active composer (e.g. `@term:` grants, references, dropped-file paths, a quoted transcript passage). An insert is `inline` (joins the draft after a space) or `block` (its own paragraph, so a quote's `>` starts a line); `composer.ts::draftWithInsert` is the pure join (its `above` is for the return channel). A message that did not arrive comes back through `registerComposerReturn` / `returnableCount` / `returnToComposer`: all or nothing (its pictures must fit), above the draft, and never taking focus. An insert may name the mounting view's token (`view`): one chat can be mounted twice (the Mastermind dock and a pane), and a quote belongs in the composer under its selection. Own vitest suite (`composerBus.test.ts`). |
 | `composerHeight.ts` | Pure height policy for content-fit growth plus manual resize baselines; covered by `composerHeight.test.ts`. |
 | `drafts.ts` | Per-session composer draft persistence (survives the per-session ChatView remount + a page reload) — text layers into sessionStorage, images stay in-memory; both bounded. It also publishes which drafts remain memory-only so an interface-build transition cannot silently reload over them. |
 | `images.ts` | Pasted/dropped image → downscale + base64 encode into an `ImageAttachment` (the canonical home of that type, with its encoded size); size-bounded. Also the tile geometry (`tileBox`) and draft `<img>` source (`attachmentSrc`); own vitest suite. |
@@ -349,15 +349,24 @@ Sends (any keeper, relay or daemon): each composer send goes out under a
 settles a send. The echo (`user_message`) that carries it confirms it. A
 refusal of a `send`/`send_after_turn` that carries it (`onCommandFailed`'s
 `clientId`) hands back exactly that text through `restoredDraft` /
-`takeRestoredDraft` (a queue; ChatView drains it and inserts the texts above
-the draft in progress, `insertIntoComposer(…, "above")`); a refusal naming an
-id the store no longer holds says nothing. At every `ready` whose daemon says
+`restoredDrafts` / `takeRestoredDrafts` (a queue; ChatView hands the oldest
+that fit to the composer through `composerBus`'s return channel,
+`returnableCount` + `returnToComposer`: texts above the draft in progress,
+pictures attached, no focus taken and a focused caret kept where it was; a
+send whose pictures do not fit waits in the queue, whole, until the composer
+reports room through `onReturnRoom`); a refusal naming an id the store no
+longer holds says nothing. At every `ready` whose daemon says
 `send_ids` (`ReadyAttach.sendIds`), once `lastSeq` reaches its `head`
 (`resendUnconfirmed`), each send still without an echo goes out again under
-the same id through the socket `chatPool` bound with `bindSender`, while it is
+the same id through the path `chatPool` bound with `bindSender`
+(`ChatSocket.sendQuietly`: never a redial, never a wake), while it is
 younger than `RESEND_FOR_MS` (two minutes): the daemon runs an id once, so
 that is right whether the first copy was lost, is queued in the daemon or is
-about to be delivered by a keeper. An older one is withdrawn with
+about to be delivered by a keeper. Copies of one send are paced (`resendDue`:
+at least `RESEND_GAP_MS` since it last went out, doubling to 30 s); one not
+due at the `ready` goes out from the store's own timer when it is, if the
+conversation is still live and its echo has not come (`onDisconnected` and
+`dispose` clear the timer). An older one is withdrawn with
 `cancel_send`; `send_cancelled` (`onSendCancelled`) with `cancelled:true`
 returns its text with the notice "not delivered", `false` leaves the bubble
 for the echo that is coming. Those two frames are the only thing this client
@@ -369,14 +378,17 @@ decides anything there. Its echo has no id and confirms the oldest send with
 exactly that text (a send made against such a daemon keeps that rule after the
 daemon is replaced, `UnconfirmedSend.plain`); its refusal names no send and
 returns the newest. A refusal without an id behind a daemon that has them (an
-older relay in between) returns nothing: the sends show as pending and the
-next `ready` sends or withdraws each. `waking`/`bringing` only change
+older relay in between) returns the send when exactly one is unconfirmed;
+with several it returns nothing, they show as pending and the next `ready`
+sends or withdraws each. `waking`/`bringing` only change
 presentation (`showUnconfirmed`). A send on a live connection shows no bubble
 until it has waited `SHOW_UNCONFIRMED_AFTER_MS` for its echo (ChatView's timer
 calls `showOverdue`; ids daemons only). `onDisconnected` (the pool calls it
 too when it heals a dead socket) shows what is unconfirmed as pending; an exit
 or a fall back to the terminal hands back everything; a move forgets nothing.
-The Mastermind panel's one-click prompts carry no id and are not tracked.
+The Mastermind panel's one-click prompts go out under their own id (so a
+refusal names them and is never taken for the composer's send) and are not
+tracked.
 
 Commands that are not the user acting (`set_thinking`, `get_usage`, `get_mcp`,
 `cancel_send`, a dry-run `rewind`) are dropped by a keeper or relay while
@@ -387,11 +399,13 @@ is cleared by a new `init` and by a second `ready` on the same socket
 (`ReadyAttach.reattach`: its keeper dropped a push made while nothing was
 attached), never by a plain reconnect, where the process still has it and a
 second window's default would override another window's choice at every blip.
+A toggle made while not `connected` is marked pending (`toggleThinking`), so
+the next `ready` pushes it.
 The seven settings commands (`set_model`, `set_mode`, `set_effort`,
 `set_ultracode`, `set_remote_control`, `set_mcp_enabled`, `reconnect_mcp`) are
-held by a keeper and dropped by this computer's relay while the owner is not
-attached; they have no optimistic state, so a dropped one leaves the old value
-showing.
+held by a keeper and by this computer's relay while the owner is not attached
+(no wake; delivered in order with the next send); they have no optimistic
+state, so the old value shows until the owner confirms.
 
 The rest of this paragraph is what happens against a keeper that refuses or
 closes those sockets (today's), and for another computer as owner. In a native window the daemon holds the first command while a paused

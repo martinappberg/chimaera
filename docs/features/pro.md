@@ -554,9 +554,12 @@ computer, the daemon keeps the chat/terminal connection open while the owner is
 paused or reconnecting, holds that first input (a little typing, up to four
 chat commands, within one daemon-wide budget) and delivers it once after the
 owner answers. Only what you do counts as input: the thinking preference a
-chat sends by itself, usage and MCP reads and settings changes never wake a
-machine or move work, and a setting changed while the owner is away keeps
-showing its old value. The message shows at once as a "sending…" bubble and
+chat sends by itself and usage and MCP reads never wake a machine or move
+work. A setting you change while the owner is away (the model, the
+permission mode, the effort) does not wake it either, but it is kept and
+applied before whatever you send next, so a stricter mode picked before a
+message is in force when that message runs; until then the old value keeps
+showing. The message shows at once as a "sending…" bubble and
 the chat says "Waking the cloud machine…"; a terminal says the same over the
 pane and echoes nothing until the owner answers. While it wakes, a second
 message or more typing is not held: it is refused with a short note (the
@@ -617,11 +620,18 @@ arrives a moment later from whoever was holding it, the second is dropped,
 and if it had not, this one is delivered. A message that has waited more than
 two minutes is not sent again; the app withdraws it instead, and it returns
 to the composer with the note "not delivered" unless it had arrived after
-all, in which case it shows in the transcript. What this does not cover: a
+all, in which case it shows in the transcript. A message that comes back
+with pictures comes back whole: if the composer has no room for them yet, it
+waits until it does. What this does not cover: a
 machine that runs an older version of Chimaera has no ids, so nothing is sent
 to it twice and a message whose connection ended before it confirmed stays
-"sending…" there; and a message sent to a machine in the instant it fell
-asleep waits, shown as "sending…", until something wakes that machine.
+"sending…" there; a message sent to a machine in the instant it fell
+asleep waits, shown as "sending…", until something wakes that machine; a
+withdrawn message is only remembered as withdrawn until the conversation's
+agent is restarted (an update, a resume, switching to its terminal and
+back), so a copy that turned up after that would run; and if the machine's
+Chimaera is killed in the instant between handing a message to the agent and
+recording it, the copy the app sends next runs it a second time.
 Typing that is refused is said in a small note over the terminal; typing that
 was still on its way when a connection ended is not replayed.
 
