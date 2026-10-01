@@ -1,7 +1,9 @@
 /**
  * Pure helpers for the cluster surfaces (the host row, the cluster page, the
- * start sheet, the job window's notices): workspace state → words, the start
- * sheet's form → a Slurm launch spec, and time formatting.
+ * start sheet, the folder picker, the workspace window's notices): job and
+ * workspace state → plain words, the start sheet's form → a Slurm launch
+ * spec, and time formatting. The words follow docs/hpc-portal-plan.md §4:
+ * cluster, job, workspace, chats — never server, session, allocation.
  *
  * Generic Slurm only — nothing here knows a site, a partition name, or a
  * site command. Slurm's own words (a pending reason, a refusal message) are
@@ -12,6 +14,7 @@
 import type {
   ClusterConfig,
   ClusterFacts,
+  ClusterJob,
   ClusterOverview,
   ClusterWorkspaceView,
   LaunchSpec,
@@ -157,112 +160,157 @@ export function memWords(mem: string | undefined | null): string {
   return `${m[1]} ${unit}B`;
 }
 
-/** "4 CPU · 16 GB · 1 GPU" — whatever the job carries. */
-export function resourceWords(w: Pick<ClusterWorkspaceView, "cpus" | "mem" | "gpus">): string {
+/** "8 CPUs · 32 GB · 1 GPU" — whatever the job carries. */
+export function jobResources(j: Pick<ClusterJob, "cpus" | "mem" | "gpus">): string {
   const parts: string[] = [];
-  if (w.cpus !== undefined && w.cpus.trim() !== "") parts.push(`${w.cpus.trim()} CPU`);
-  const mem = memWords(w.mem);
+  const cpus = j.cpus?.trim() ?? "";
+  if (cpus !== "") parts.push(cpus === "1" ? "1 CPU" : `${cpus} CPUs`);
+  const mem = memWords(j.mem);
   if (mem !== "") parts.push(mem);
-  if (w.gpus !== undefined && w.gpus > 0) parts.push(w.gpus === 1 ? "1 GPU" : `${w.gpus} GPUs`);
+  if (j.gpus !== undefined && j.gpus > 0) parts.push(j.gpus === 1 ? "1 GPU" : `${j.gpus} GPUs`);
   return parts.join(" · ");
 }
 
-// --- workspace state → words --------------------------------------------------
+// --- jobs → words ----------------------------------------------------------------
+
+/** The first word of a Slurm state (`CANCELLED by 1234`, `CANCELLED+`). */
+function stateWord(state: string | null | undefined): string {
+  return (state ?? "").trim().toUpperCase().split(/[\s+]/)[0] ?? "";
+}
 
 /**
- * Why a workspace's last job ended, in words. `stoppedByUser` wins: the app
- * recorded the stop, so it never guesses a reason over a known one. Slurm's
- * state may carry a suffix (`CANCELLED by 1234`, `CANCELLED+`); the shell
- * reports "stopped" for a stop made from the app.
+ * How a job ended, as the end of a sentence: "it hit its time limit". The
+ * shell reports "stopped" for a stop made from the app and "closed" when a
+ * window's workspace was closed (its job still runs).
  */
 export function endedWords(ended: string | undefined | null, stoppedByUser: boolean): string {
-  if (stoppedByUser) return "stopped by you";
-  const state = (ended ?? "").trim().toUpperCase().split(/[\s+]/)[0] ?? "";
-  switch (state) {
+  if (stoppedByUser) return "you stopped it";
+  switch (stateWord(ended)) {
     case "STOPPED":
-      return "stopped by you";
+      return "you stopped it";
     case "TIMEOUT":
-      return "hit its time limit";
+      return "it hit its time limit";
     case "CANCELLED":
-      return "cancelled";
+      return "it was cancelled";
     case "FAILED":
-      return "failed";
+      return "it failed";
     case "PREEMPTED":
-      return "preempted";
+      return "it was preempted";
     case "NODE_FAIL":
       return "its node failed";
     case "OUT_OF_MEMORY":
-      return "ran out of memory";
-    default:
-      return "ended";
-  }
-}
-
-/** The state dot's class, in the home screen's dot language. */
-export function stateDot(state: ClusterWorkspaceView["state"]): "alive" | "booting" | "queued" | "" {
-  switch (state) {
-    case "running":
-      return "alive";
-    case "starting":
-      return "booting";
-    case "waiting":
-      return "queued";
+      return "it ran out of memory";
+    case "COMPLETED":
+      return "it finished";
     default:
       return "";
   }
 }
 
-/** The one line of detail under a workspace on the cluster page. */
-export function workspaceDetail(
-  w: ClusterWorkspaceView,
-  nowMs: number,
-  locale?: string,
-): string {
-  switch (w.state) {
+/**
+ * Why a job waits, in plain words — `null` for ordinary priority (not worth
+ * saying). Reasons without a plain reading stay Slurm's own word: there,
+ * Slurm is the speaker.
+ */
+export function reasonWords(reason: string | null | undefined): string | null {
+  const r = (reason ?? "").trim();
+  if (r === "" || r === "Priority" || r === "None") return null;
+  if (r === "Resources") return "waiting for the nodes it needs to free up";
+  if (r === "Dependency") return "waiting for another job to finish";
+  if (r === "BeginTime") return "set to start later";
+  if (r === "PartitionDown" || r === "PartitionInactive") return "its partition is down";
+  if (r.startsWith("ReqNodeNotAvail")) return "a node it needs isn't available";
+  if (r === "JobHeldUser" || r === "JobHeldAdmin") return "on hold";
+  if (r === "Reservation") return "waiting for a reservation";
+  if (/Limit/.test(r)) return `you're at a limit on this cluster (${r})`;
+  return `Slurm says: ${r}`;
+}
+
+/** "ends in 5d 22h", or "time's up". */
+export function endsInWords(endsAtMs: number, nowMs: number): string {
+  const secs = Math.floor((endsAtMs - nowMs) / 1000);
+  if (secs <= 0) return "time's up";
+  return `ends in ${shortDuration(secs)}`;
+}
+
+/** A job card's one status line (plan §4.2). */
+export function jobStatusLine(j: ClusterJob, nowMs: number, locale?: string): string {
+  let line: string;
+  switch (j.state) {
     case "running": {
-      const parts: string[] = [w.node ? `running on ${w.node}` : "running"];
-      const res = resourceWords(w);
+      const parts: string[] = [j.node ? `On ${j.node}` : "Running"];
+      const res = jobResources(j);
       if (res !== "") parts.push(res);
-      if (w.ends_at_ms !== undefined) parts.push(timeLeftWords(w.ends_at_ms, nowMs));
-      return parts.join(" · ");
+      if (j.ends_at_ms !== undefined) parts.push(endsInWords(j.ends_at_ms, nowMs));
+      line = parts.join(" · ");
+      break;
     }
     case "starting":
-      return w.node ? `starting chimaera on ${w.node}…` : "starting chimaera…";
+      line = j.node ? `Starting on ${j.node}…` : "Starting…";
+      break;
     case "waiting": {
-      let line = "waiting for a node";
-      if (w.start_estimate_ms !== undefined && w.start_estimate_ms !== null) {
-        line += ` · Slurm estimates ${clockWords(w.start_estimate_ms, nowMs, locale)}`;
+      line = "Waiting for a node";
+      if (j.start_estimate_ms !== undefined && j.start_estimate_ms !== null) {
+        line += ` · Slurm estimates ${clockWords(j.start_estimate_ms, nowMs, locale)}`;
       }
-      if (w.reason !== undefined && w.reason.trim() !== "") {
-        line += ` · Slurm's reason: ${w.reason.trim()}`;
-      }
-      return line;
+      const why = reasonWords(j.reason);
+      if (why !== null) line += ` · ${why}`;
+      break;
     }
-    case "stopped": {
-      if (w.fresh) return "not started yet";
-      let line = endedWords(w.ended, w.stopped_by_user);
-      if (w.ended_at_ms !== undefined) line += ` ${agoWords(w.ended_at_ms, nowMs, locale)}`;
-      return `${line} · chats saved`;
-    }
+    case "ended":
+      return endedLine(j, nowMs, locale);
+  }
+  if (j.attached) line += " · stops if this app disconnects";
+  return line;
+}
+
+/** "Long ended 2 h ago — it hit its time limit. Chats are saved." */
+export function endedLine(j: ClusterJob, nowMs: number, locale?: string): string {
+  const when = j.ended_at_ms !== undefined ? ` ${agoWords(j.ended_at_ms, nowMs, locale)}` : "";
+  const why = endedWords(j.ended, j.stopped_by_user);
+  return `${j.name} ended${when}${why === "" ? "" : ` — ${why}`}. Chats are saved.`;
+}
+
+/** What a workspace row says about itself (plan §4.2). */
+export function workspaceActivity(w: ClusterWorkspaceView, nowMs: number, locale?: string): string {
+  switch (w.state) {
+    case "open":
+      if (w.failed !== undefined) return "stopped unexpectedly";
+      if (w.closing) return "closing — saving its chats…";
+      if (w.working === undefined) return "";
+      if (w.working === 0) return "idle";
+      return w.working === 1 ? "1 chat working" : `${w.working} chats working`;
+    case "queued":
+      return w.opening ? "opening…" : "opens when it starts";
+    case "closed":
+      return w.last_open_ms !== undefined
+        ? `last open ${agoWords(w.last_open_ms, nowMs, locale)} · chats saved`
+        : "not opened yet";
   }
 }
 
-/** Quiet extra lines a workspace may carry (each one fact, no actions). */
-export function workspaceNotes(w: ClusterWorkspaceView): { text: string; warn: boolean }[] {
-  const notes: { text: string; warn: boolean }[] = [];
-  if (w.state === "running" && w.egress === false) {
-    notes.push({ text: "agents can't reach the internet from this node", warn: true });
-  }
-  if (w.attached && w.state !== "stopped") {
-    notes.push({ text: "stops when you disconnect", warn: false });
-  }
-  return notes;
+/** Where Open sends a workspace that isn't open (plan §4.2's table). */
+export type OpenPlan =
+  | { kind: "sheet" }
+  | { kind: "job"; job: ClusterJob }
+  | { kind: "choose"; jobs: ClusterJob[] };
+
+export function openPlan(jobs: readonly ClusterJob[]): OpenPlan {
+  const running = jobs.filter((j) => j.state === "running");
+  if (running.length === 0) return { kind: "sheet" };
+  if (running.length === 1) return { kind: "job", job: running[0] };
+  return { kind: "choose", jobs: running };
 }
 
-/** "Your other jobs on this cluster: 2 running · 9 waiting" (count only). */
+/** Jobs shown as cards: everything not ended, newest first. */
+export function liveJobs(jobs: readonly ClusterJob[]): ClusterJob[] {
+  return jobs.filter((j) => j.state !== "ended").sort((a, b) => b.submitted_ms - a.submitted_ms);
+}
+
+/** "Your other Slurm jobs: 37 running · 4 waiting" (count only); "" when none. */
 export function otherJobsWords(other: ClusterOverview["other_jobs"]): string {
-  if (other.running === 0 && other.waiting === 0) return "Your other jobs on this cluster: none";
-  return `Your other jobs on this cluster: ${other.running} running · ${other.waiting} waiting`;
+  if (other.running === 0 && other.waiting === 0) return "";
+  return `Your other Slurm jobs: ${other.running} running · ${other.waiting} waiting`;
 }
 
 // --- the start sheet ------------------------------------------------------------
@@ -453,16 +501,7 @@ export function partitionTags(
   return tags;
 }
 
-// --- the file peek ---------------------------------------------------------------
-
-/** Folders first, then names (case-insensitive, numbers in order). */
-export function sortEntries<T extends { name: string; dir: boolean }>(entries: readonly T[]): T[] {
-  return [...entries].sort(
-    (a, b) =>
-      Number(b.dir) - Number(a.dir) ||
-      a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }),
-  );
-}
+// --- the folder picker -------------------------------------------------------------
 
 /** `dir` + `name` with one slash between ("/" stays the root). */
 export function childPath(dir: string, name: string): string {
@@ -479,18 +518,34 @@ export function parentPath(path: string): string | null {
 
 // --- the job window -------------------------------------------------------------
 
-/** Below this the job window offers to continue on a new node. */
+/** Below this the workspace window offers to continue in a new job. */
 export const CONTINUE_OFFER_SECS = HOUR;
 /** Below this a dismissed offer comes back once. */
 export const CONTINUE_LAST_CALL_SECS = 10 * MINUTE;
 
-/** "Stops in 58 min." for the continue banner. */
+/** "This job ends in 58 min." for the window's banner. */
 export function stopsInWords(remainingSecs: number): string {
-  if (remainingSecs < MINUTE) return "Stops in under a minute.";
-  return `Stops in ${shortDuration(remainingSecs)}.`;
+  if (remainingSecs < MINUTE) return "This job ends in under a minute.";
+  return `This job ends in ${shortDuration(remainingSecs)}.`;
 }
 
-/** The ended overlay's reason in words; the shell's reason is Slurm's state or "stopped". */
-export function endedReasonWords(reason: string | null | undefined): string {
-  return endedWords(reason, false);
+/**
+ * The window's ended screen, from the shell's reason: Slurm's state,
+ * "stopped" (stopped from the app), "closed" (this workspace was closed; its
+ * job still runs), "workspace-failed" (its chimaera stopped on its own) or
+ * "moving" (it is on its way to another job; the window follows).
+ */
+export function endedScreenWords(reason: string | null | undefined): string {
+  switch (stateWord(reason)) {
+    case "CLOSED":
+      return "This workspace was closed. Its chats are saved.";
+    case "WORKSPACE-FAILED":
+      return "This workspace stopped unexpectedly. Its chats are saved — open it again from the cluster page.";
+    case "MOVING":
+      return "Moving to the new job — this window reopens there when it's ready. Your chats come with you.";
+  }
+  const why = endedWords(reason, false);
+  return why === ""
+    ? "This job ended. Your chats are saved."
+    : `This job ended — ${why}. Your chats are saved.`;
 }

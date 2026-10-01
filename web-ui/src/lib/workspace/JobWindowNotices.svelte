@@ -1,17 +1,18 @@
 <script lang="ts">
   /**
-   * What a job window (a cluster workspace served from inside its Slurm job)
-   * says about the job's end:
+   * What a cluster workspace's window (served from inside a Slurm job) says
+   * about the job's end (docs/hpc-portal-plan.md §4.5):
    * - under an hour left (and once more under ten minutes): a non-blocking
-   *   banner offering to continue on a new node — the next job queues now
-   *   with the same setup, and when it starts the chats move over and this
-   *   window re-homes onto it (the shell drives the handoff);
-   * - once the shell reports the job ended (`host-status` "ended" on this
-   *   window's job key): a calm overlay — the work is gone, the chats aren't.
-   * A person starts every job (docs/hpc-portal-plan.md §2.4): nothing here
-   * queues anything without a click.
+   *   banner offering to continue in a new job — it queues now with the same
+   *   setup, and when it starts this job's workspaces move over and this
+   *   window follows (the shell opens it there);
+   * - once the shell reports the job ended, or this workspace was closed
+   *   (`host-status` "ended" on this window's key): a calm overlay — the work
+   *   is gone, the chats aren't.
+   * A person starts every job (plan §2.4): nothing here queues anything
+   * without a click.
    */
-  import { clusterContinue, closeThisWindow, isNativeShell, openWindow } from "../net/native";
+  import { clusterContinueJob, closeThisWindow, isNativeShell, openWindow } from "../net/native";
   import { pageVisible } from "../shared/visibility";
   import { modalFocus } from "../shared/modalFocus";
   import { focusOnMount } from "../shared/focusOnMount";
@@ -19,7 +20,7 @@
   import {
     CONTINUE_LAST_CALL_SECS,
     CONTINUE_OFFER_SECS,
-    endedReasonWords,
+    endedScreenWords,
     stopsInWords,
   } from "./cluster";
 
@@ -87,7 +88,7 @@
     phase = "asking";
     continueError = null;
     try {
-      const result = await clusterContinue(alias, cws);
+      const result = await clusterContinueJob(alias, { workspaceId: cws });
       if (result.kind === "refused") {
         continueError = result.message;
         phase = "offer";
@@ -106,6 +107,9 @@
     if (phase === "waiting") waitingHidden = true;
     else dismissed = tier;
   }
+
+  /** On its way to another job: the shell reopens this window there. */
+  const moving = $derived(ended !== null && ended.reason === "moving");
 
   let leaving = $state(false);
   let leaveError = $state<string | null>(null);
@@ -132,20 +136,23 @@
       class="ended-panel"
       role="alertdialog"
       aria-modal="true"
-      aria-label="This workspace stopped"
+      aria-label={endedScreenWords(ended.reason)}
       tabindex="-1"
       use:modalFocus
     >
       <p class="ended-copy">
-        This workspace stopped ({endedReasonWords(ended.reason)}). Your chats are saved.
+        {#if moving}<span class="spinner" aria-hidden="true"></span>{/if}
+        {endedScreenWords(ended.reason)}
       </p>
       {#if leaveError !== null}<p class="ended-err">{leaveError}</p>{/if}
       <div class="ended-acts">
         {#if isNativeShell()}
           <button class="quiet" onclick={closeThisWindow}>Close window</button>
-          <button class="primary" disabled={leaving} use:focusOnMount onclick={() => void backToHost()}
-            >Back to {alias}</button
-          >
+          {#if !moving}
+            <button class="primary" disabled={leaving} use:focusOnMount onclick={() => void backToHost()}
+              >Back to {alias}</button
+            >
+          {/if}
         {/if}
       </div>
     </div>
@@ -154,15 +161,15 @@
   <div class="job-banner" class:stacked role="status" aria-live="polite">
     {#if phase === "waiting"}
       <span class="spinner" aria-hidden="true"></span>
-      <span class="copy">New job waiting for a node — your work stays here until it starts.</span>
+      <span class="copy">New job waiting for a node — you keep working here until it starts.</span>
     {:else}
       <span class="copy">
         <strong>{stopsInWords(remaining ?? 0)}</strong>
-        Continue on a new node and your chats move with you.
+        Continue in a new job and your chats come with you.
         {#if continueError !== null}<span class="err">{continueError}</span>{/if}
       </span>
       <button class="primary" disabled={phase === "asking"} onclick={() => void continueOnNewNode()}
-        >{phase === "asking" ? "Queuing…" : "Continue on a new node"}</button
+        >{phase === "asking" ? "Queuing…" : "Continue in a new job"}</button
       >
     {/if}
     <button class="dismiss" aria-label="Dismiss" title="Dismiss" onclick={dismiss}>×</button>
@@ -312,6 +319,12 @@
     font-size: var(--text-md);
     line-height: 1.5;
     color: var(--fg);
+  }
+
+  .ended-copy .spinner {
+    display: inline-block;
+    vertical-align: -1px;
+    margin-right: 8px;
   }
 
   .ended-err {

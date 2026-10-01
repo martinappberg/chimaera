@@ -422,14 +422,16 @@ impl ComputeService {
         // the bake simply retries on a later call rather than caching an
         // absence forever.
         let alloc = self.snapshot(false).await.self_alloc?;
-        let rules = tokio::task::spawn_blocking(AgentRules::from_env)
-            .await
-            .unwrap_or_default();
+        let (rules, facts) =
+            tokio::task::spawn_blocking(|| (AgentRules::from_env(), read_cluster_facts()))
+                .await
+                .unwrap_or_default();
         let text = job_context_text(
             &alloc,
             env_nonempty("SLURM_CLUSTER_NAME").as_deref(),
             SystemTime::now(),
             &rules,
+            facts.as_ref(),
         );
         let mut inner = self.inner.lock().await;
         // get_or_insert: a concurrent first bake wins and both callers hand
@@ -710,6 +712,88 @@ Rules for agents on shared clusters: every job you submit states an explicit \
 nothing running on login nodes. Never start anything that keeps itself alive or \
 resubmits itself.";
 
+/// The cluster's Slurm setup as the app discovered it, from the job's
+/// `CHIMAERA_CLUSTER_FACTS_FILE`. Blocking (a shared filesystem): run off
+/// the reactor.
+fn read_cluster_facts() -> Option<chimaera_core::cluster::ClusterFacts> {
+    let path = env_nonempty(chimaera_core::cluster::ENV_CLUSTER_FACTS_FILE)?;
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(256 * 1024).read_to_end(&mut bytes).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// What agents may submit to: one line per partition that is up (at most
+/// 12), its time limit and largest node, then accounts and the GPU flag.
+fn facts_text(f: &chimaera_core::cluster::ClusterFacts) -> Option<String> {
+    const ROWS: usize = 12;
+    let up: Vec<&slurm::PartitionChoice> = f.partitions.iter().filter(|p| p.up).collect();
+    if up.is_empty() {
+        return None;
+    }
+    let mut t = String::from(
+        "What you can submit to on this cluster (partition — time limit — largest node):",
+    );
+    for p in up.iter().take(ROWS) {
+        let time = if p.max_time.eq_ignore_ascii_case("UNLIMITED") || p.max_time.is_empty() {
+            "no limit".to_string()
+        } else {
+            p.max_time.clone()
+        };
+        let mut node: Vec<String> = Vec::new();
+        let cpus = p.cpus_per_node.trim_end_matches('+');
+        if !cpus.is_empty() {
+            node.push(format!("{cpus} CPUs"));
+        }
+        if let Some(mem) = mem_words(&p.mem_per_node) {
+            node.push(mem);
+        }
+        if p.gpus {
+            node.push("GPUs".to_string());
+        }
+        let mut line = format!(
+            "\n- {}{} — {time}",
+            p.name,
+            if p.default { " (default)" } else { "" }
+        );
+        if !node.is_empty() {
+            line.push_str(&format!(" — {}", node.join(", ")));
+        }
+        if p.preemptible {
+            line.push_str(" — can be preempted");
+        }
+        t.push_str(&line);
+    }
+    if up.len() > ROWS {
+        t.push_str(&format!(
+            "\n- and {} more (sinfo lists them)",
+            up.len() - ROWS
+        ));
+    }
+    match (&f.default_account, f.accounts.as_slice()) {
+        (_, []) => t.push_str("\nNo --account is needed here."),
+        (Some(d), accounts) => t.push_str(&format!(
+            "\nAccounts: {} (default {d}); pass --account=… for another.",
+            accounts.join(", ")
+        )),
+        (None, accounts) => t.push_str(&format!(
+            "\nPass --account= one of: {}.",
+            accounts.join(", ")
+        )),
+    }
+    Some(t)
+}
+
+/// sinfo's `%m` (megabytes, maybe `+`-suffixed) in plain words.
+fn mem_words(raw: &str) -> Option<String> {
+    let mb: u64 = raw.trim_end_matches('+').parse().ok()?;
+    Some(if mb >= 1000 {
+        format!("{} GB", (mb + 500) / 1000)
+    } else {
+        format!("{mb} MB")
+    })
+}
+
 /// One rules-for-agents source, as read at bake time.
 #[derive(Clone, Debug, PartialEq)]
 enum RulesText {
@@ -775,6 +859,7 @@ fn job_context_text(
     cluster: Option<&str>,
     now: SystemTime,
     rules: &AgentRules,
+    facts: Option<&chimaera_core::cluster::ClusterFacts>,
 ) -> String {
     let mut place = format!("Slurm job {}", alloc.job_id);
     if !alloc.node.is_empty() {
@@ -813,15 +898,37 @@ fn job_context_text(
         Some(end) => format!("around {end}"),
         None => "at its time limit".to_string(),
     };
+    // A chimaera job (its job-host passes the cluster's facts) may host
+    // several workspaces; a daemon started by hand in an allocation is alone.
+    let shared = if facts.is_some() {
+        " Other workspaces may be open in this job and share its resources."
+    } else {
+        ""
+    };
+    let gpu_arg = match facts {
+        Some(f) if f.partitions.iter().any(|p| p.gpus) => match f.gpu_flag {
+            slurm::GpuFlag::Gpus => " [--gpus=N]",
+            slurm::GpuFlag::Gres => " [--gres=gpu:N]",
+        },
+        _ => "",
+    };
     let mut text = format!(
         "You are running inside {place}{resources}. The job ends {ends}; anything \
-         still running then is stopped.\n\n\
+         still running then is stopped.{shared}\n\n\
          - Commands you run execute inside this job. Use its CPUs and memory fully \
          (match thread counts to $SLURM_CPUS_PER_TASK).\n\
-         - For work that needs more time than is left, more resources, or a GPU, \
-         submit a separate job with sbatch and an explicit --time. Check on it at \
-         most once a minute, or chain steps with --dependency."
+         - For work that needs more time than is left, more resources, or a GPU \
+         this job doesn't have, submit your own job with sbatch and an explicit \
+         --time; it keeps running after this one ends: `sbatch --time=… \
+         [--partition=…] [--cpus-per-task=…] [--mem=…]{gpu_arg} job.sh`. Chain steps \
+         with --dependency=afterok:<id>. Check on your jobs at most once a minute \
+         (squeue -j <id>, sacct -j <id>), never in a loop, or tell the user the job \
+         id and stop."
     );
+    if let Some(table) = facts.and_then(facts_text) {
+        text.push_str("\n\n");
+        text.push_str(&table);
+    }
     let mut any_rules = false;
     if let Some(source) = &rules.source {
         any_rules = true;
@@ -1032,7 +1139,7 @@ mod tests {
     fn job_context_bakes_facts_absolute_end_and_generic_rules() {
         // Bake at 2026-07-15 12:34 UTC; 3:59:00 left → ends 16:33 UTC.
         let now = UNIX_EPOCH + Duration::from_secs(1_784_118_840);
-        let text = job_context_text(&alloc(), Some("c1"), now, &AgentRules::default());
+        let text = job_context_text(&alloc(), Some("c1"), now, &AgentRules::default(), None);
         assert!(
             text.starts_with(
                 "You are running inside Slurm job 4242 on node n042 (cluster c1, \
@@ -1065,7 +1172,7 @@ mod tests {
             mem: String::new(),
             gres: String::new(),
         };
-        let text = job_context_text(&sparse, None, now, &AgentRules::default());
+        let text = job_context_text(&sparse, None, now, &AgentRules::default(), None);
         assert!(
             text.starts_with("You are running inside Slurm job 7 with 2 CPUs."),
             "{text}"
@@ -1082,7 +1189,7 @@ mod tests {
             source: Some(RulesText::Inline("No jobs over a day.".into())),
             user: Some(RulesText::Inline("Use the scratch space.".into())),
         };
-        let text = job_context_text(&alloc(), None, now, &rules);
+        let text = job_context_text(&alloc(), None, now, &rules, None);
         assert!(
             text.contains("This cluster's rules for agents:\nNo jobs over a day.\n\nThe user's rules for agents on this cluster:\nUse the scratch space."),
             "{text}"
@@ -1093,7 +1200,7 @@ mod tests {
             source: Some(RulesText::TooLong(PathBuf::from("/shared/rules.md"))),
             user: None,
         };
-        let text = job_context_text(&alloc(), None, now, &long);
+        let text = job_context_text(&alloc(), None, now, &long, None);
         assert!(
             text.ends_with(
                 "This cluster's rules for agents are in /shared/rules.md. Read that file \
@@ -1102,6 +1209,62 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains(GENERIC_RULES), "{text}");
+    }
+
+    #[test]
+    fn a_chimaera_job_tells_agents_what_they_can_submit_to() {
+        use chimaera_core::cluster::ClusterFacts;
+        let now = UNIX_EPOCH + Duration::from_secs(1_784_118_840);
+        let part = |name: &str, default: bool, time: &str, gpus: bool, preempt: bool| {
+            slurm::PartitionChoice {
+                name: name.into(),
+                default,
+                max_time: time.into(),
+                max_time_secs: None,
+                cpus_per_node: "64+".into(),
+                mem_per_node: "256000".into(),
+                gpus,
+                preemptible: preempt,
+                up: true,
+                accounts: Vec::new(),
+            }
+        };
+        let facts = ClusterFacts {
+            partitions: vec![
+                part("normal", true, "7-00:00:00", false, false),
+                part("gpu", false, "2-00:00:00", true, true),
+                slurm::PartitionChoice {
+                    up: false,
+                    ..part("down", false, "1:00:00", false, false)
+                },
+            ],
+            accounts: vec!["lab".into(), "other".into()],
+            default_account: Some("lab".into()),
+            ..Default::default()
+        };
+        let text = job_context_text(&alloc(), None, now, &AgentRules::default(), Some(&facts));
+        assert!(
+            text.contains("still running then is stopped. Other workspaces may be open in this job and share its resources."),
+            "{text}"
+        );
+        assert!(text.contains("[--mem=…] [--gpus=N] job.sh"), "{text}");
+        assert!(
+            text.contains("- normal (default) — 7-00:00:00 — 64 CPUs, 256 GB\n- gpu — 2-00:00:00 — 64 CPUs, 256 GB, GPUs — can be preempted"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("- down"),
+            "a partition that is down isn't offered: {text}"
+        );
+        assert!(
+            text.contains("Accounts: lab, other (default lab)"),
+            "{text}"
+        );
+        assert!(text.ends_with(GENERIC_RULES), "{text}");
+
+        let alone = job_context_text(&alloc(), None, now, &AgentRules::default(), None);
+        assert!(!alone.contains("Other workspaces"), "{alone}");
+        assert!(!alone.contains("--gpus=N"), "{alone}");
     }
 
     #[test]

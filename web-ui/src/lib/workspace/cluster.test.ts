@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type {
   ClusterConfig,
   ClusterFacts,
+  ClusterJob,
   ClusterOverview,
   ClusterWorkspaceView,
   PartitionChoice,
@@ -15,27 +16,31 @@ import {
   clockWords,
   composeWalltime,
   defaultForm,
+  endedLine,
+  endedScreenWords,
   endedWords,
   formFromSpec,
   hostSummary,
   isInteractiveOnly,
+  jobResources,
+  jobStatusLine,
   limitWords,
+  liveJobs,
   memWords,
   nodeSizeWords,
+  openPlan,
   otherJobsWords,
   parentPath,
   parseSlurmTime,
   partitionTags,
+  reasonWords,
   refusalField,
-  resourceWords,
   shortDuration,
-  sortEntries,
   splitWalltime,
   stopsInWords,
   timeLeftWords,
   walltimeSecs,
-  workspaceDetail,
-  workspaceNotes,
+  workspaceActivity,
   type StartForm,
 } from "./cluster";
 
@@ -49,11 +54,22 @@ function ws(over: Partial<ClusterWorkspaceView> = {}): ClusterWorkspaceView {
     id: "w-0000aaaa",
     name: "proj",
     path: "/scratch/u/proj",
-    state: "stopped",
+    state: "closed",
+    ...over,
+  };
+}
+
+function job(over: Partial<ClusterJob> = {}): ClusterJob {
+  return {
+    id: "j-0000aaaa",
+    name: "Long",
+    state: "running",
     attached: false,
     stopped_by_user: false,
-    fresh: false,
+    open: [],
+    spec: { time: "7-00:00:00" },
     startup: "",
+    submitted_ms: NOW - HOUR,
     ...over,
   };
 }
@@ -87,9 +103,8 @@ function facts(over: Partial<ClusterFacts> = {}): ClusterFacts {
 
 function config(over: Partial<ClusterConfig> = {}): ClusterConfig {
   return {
-    version: 1,
+    version: 2,
     workspaces: [],
-    startup: "",
     setups: [],
     agent_rules: { text: "" },
     learned: {},
@@ -97,16 +112,18 @@ function config(over: Partial<ClusterConfig> = {}): ClusterConfig {
   };
 }
 
-function overview(workspaces: ClusterWorkspaceView[]): ClusterOverview {
+function overview(jobs: ClusterJob[], workspaces: ClusterWorkspaceView[] = []): ClusterOverview {
   return {
     scheduler: "slurm",
     login_node: "login1",
     now_ms: NOW,
+    jobs,
     workspaces,
     other_jobs: { running: 0, waiting: 0 },
     degraded: false,
     queue_at_ms: NOW,
     config: config(),
+    startup: { cluster: "", workspaces: {} },
   };
 }
 
@@ -167,8 +184,8 @@ describe("durations", () => {
   });
 
   it("words the continue banner", () => {
-    expect(stopsInWords(58 * 60)).toBe("Stops in 58 min.");
-    expect(stopsInWords(20)).toBe("Stops in under a minute.");
+    expect(stopsInWords(58 * 60)).toBe("This job ends in 58 min.");
+    expect(stopsInWords(20)).toBe("This job ends in under a minute.");
   });
 });
 
@@ -219,90 +236,139 @@ describe("resources", () => {
   });
 
   it("joins what the job carries", () => {
-    expect(resourceWords({ cpus: "4", mem: "16G", gpus: 1 })).toBe("4 CPU · 16 GB · 1 GPU");
-    expect(resourceWords({ cpus: "8", gpus: 2 })).toBe("8 CPU · 2 GPUs");
-    expect(resourceWords({})).toBe("");
+    expect(jobResources({ cpus: "8", mem: "32G", gpus: 1 })).toBe("8 CPUs · 32 GB · 1 GPU");
+    expect(jobResources({ cpus: "1", gpus: 2 })).toBe("1 CPU · 2 GPUs");
+    expect(jobResources({})).toBe("");
   });
 });
 
-describe("workspace state in words", () => {
+describe("jobs in words", () => {
   it("names why a job ended", () => {
-    expect(endedWords("TIMEOUT", false)).toBe("hit its time limit");
-    expect(endedWords("CANCELLED by 1234", false)).toBe("cancelled");
-    expect(endedWords("CANCELLED+", true)).toBe("stopped by you");
-    expect(endedWords(undefined, true)).toBe("stopped by you");
-    expect(endedWords("stopped", false)).toBe("stopped by you");
-    expect(endedWords("FAILED", false)).toBe("failed");
-    expect(endedWords("PREEMPTED", false)).toBe("preempted");
+    expect(endedWords("TIMEOUT", false)).toBe("it hit its time limit");
+    expect(endedWords("CANCELLED by 1234", false)).toBe("it was cancelled");
+    expect(endedWords("CANCELLED+", true)).toBe("you stopped it");
+    expect(endedWords("stopped", false)).toBe("you stopped it");
     expect(endedWords("NODE_FAIL", false)).toBe("its node failed");
-    expect(endedWords("OUT_OF_MEMORY", false)).toBe("ran out of memory");
-    expect(endedWords("ENDED", false)).toBe("ended");
-    expect(endedWords("COMPLETED", false)).toBe("ended");
-    expect(endedWords(undefined, false)).toBe("ended");
+    expect(endedWords("OUT_OF_MEMORY", false)).toBe("it ran out of memory");
+    expect(endedWords("ENDED", false)).toBe("");
+    expect(endedWords(undefined, false)).toBe("");
   });
 
-  it("details a running workspace", () => {
-    const w = ws({
-      state: "running",
+  it("says why a job waits only when it isn't plain priority", () => {
+    expect(reasonWords("Priority")).toBeNull();
+    expect(reasonWords("None")).toBeNull();
+    expect(reasonWords(undefined)).toBeNull();
+    expect(reasonWords("Resources")).toBe("waiting for the nodes it needs to free up");
+    expect(reasonWords("QOSMaxJobsPerUserLimit")).toBe(
+      "you're at a limit on this cluster (QOSMaxJobsPerUserLimit)",
+    );
+    expect(reasonWords("ReqNodeNotAvail, Reserved for maintenance")).toBe(
+      "a node it needs isn't available",
+    );
+    expect(reasonWords("SomethingNew")).toBe("Slurm says: SomethingNew");
+  });
+
+  it("gives each job card one status line", () => {
+    const running = job({
       node: "n042",
-      cpus: "4",
-      mem: "16G",
+      cpus: "8",
+      mem: "32G",
       ends_at_ms: NOW + 5 * DAY + 22 * HOUR + 10 * MIN,
     });
-    expect(workspaceDetail(w, NOW)).toBe("running on n042 · 4 CPU · 16 GB · 5d 22h left");
-  });
-
-  it("details starting and waiting workspaces", () => {
-    expect(workspaceDetail(ws({ state: "starting", node: "n7" }), NOW)).toBe("starting chimaera on n7…");
-    expect(workspaceDetail(ws({ state: "waiting" }), NOW)).toBe("waiting for a node");
+    expect(jobStatusLine(running, NOW)).toBe("On n042 · 8 CPUs · 32 GB · ends in 5d 22h");
+    expect(jobStatusLine(job({ state: "starting", node: "n7" }), NOW)).toBe("Starting on n7…");
+    expect(jobStatusLine(job({ state: "waiting" }), NOW)).toBe("Waiting for a node");
     const est = new Date(2026, 8, 30, 14, 20).getTime();
     expect(
-      workspaceDetail(ws({ state: "waiting", start_estimate_ms: est, reason: "QOSMaxJobsPerUserLimit" }), NOW, "en-GB"),
-    ).toBe("waiting for a node · Slurm estimates 14:20 · Slurm's reason: QOSMaxJobsPerUserLimit");
-  });
-
-  it("details a stopped workspace", () => {
-    expect(workspaceDetail(ws({ fresh: true }), NOW)).toBe("not started yet");
-    expect(workspaceDetail(ws({ ended: "TIMEOUT", ended_at_ms: NOW - 3 * HOUR }), NOW)).toBe(
-      "hit its time limit 3 h ago · chats saved",
-    );
-    expect(workspaceDetail(ws({ ended: "CANCELLED", stopped_by_user: true }), NOW)).toBe(
-      "stopped by you · chats saved",
+      jobStatusLine(job({ state: "waiting", start_estimate_ms: est, reason: "Resources" }), NOW, "en-GB"),
+    ).toBe("Waiting for a node · Slurm estimates 14:20 · waiting for the nodes it needs to free up");
+    expect(jobStatusLine(job({ state: "waiting", attached: true }), NOW)).toBe(
+      "Waiting for a node · stops if this app disconnects",
     );
   });
 
-  it("adds the egress and attached notes only where they apply", () => {
-    expect(workspaceNotes(ws({ state: "running", egress: false, attached: true }))).toEqual([
-      { text: "agents can't reach the internet from this node", warn: true },
-      { text: "stops when you disconnect", warn: false },
-    ]);
-    expect(workspaceNotes(ws({ state: "running", egress: true }))).toEqual([]);
-    expect(workspaceNotes(ws({ state: "stopped", attached: true, egress: false }))).toEqual([]);
+  it("words an ended job as one line", () => {
+    expect(endedLine(job({ state: "ended", ended: "TIMEOUT", ended_at_ms: NOW - 2 * HOUR }), NOW)).toBe(
+      "Long ended 2 h ago — it hit its time limit. Chats are saved.",
+    );
+    expect(endedLine(job({ state: "ended", stopped_by_user: true }), NOW)).toBe(
+      "Long ended — you stopped it. Chats are saved.",
+    );
+    expect(endedLine(job({ state: "ended" }), NOW)).toBe("Long ended. Chats are saved.");
+  });
+
+  it("words the window's ended screen", () => {
+    expect(endedScreenWords("TIMEOUT")).toBe(
+      "This job ended — it hit its time limit. Your chats are saved.",
+    );
+    expect(endedScreenWords("closed")).toBe("This workspace was closed. Its chats are saved.");
+    expect(endedScreenWords("moving")).toBe(
+      "Moving to the new job — this window reopens there when it's ready. Your chats come with you.",
+    );
+    expect(endedScreenWords("workspace-failed")).toBe(
+      "This workspace stopped unexpectedly. Its chats are saved — open it again from the cluster page.",
+    );
+    expect(endedScreenWords(null)).toBe("This job ended. Your chats are saved.");
+  });
+
+  it("says what a workspace is doing", () => {
+    expect(workspaceActivity(ws({ state: "open", working: 2 }), NOW)).toBe("2 chats working");
+    expect(workspaceActivity(ws({ state: "open", working: 1 }), NOW)).toBe("1 chat working");
+    expect(workspaceActivity(ws({ state: "open", working: 0 }), NOW)).toBe("idle");
+    expect(workspaceActivity(ws({ state: "open" }), NOW)).toBe("");
+    expect(workspaceActivity(ws({ state: "open", failed: "boom" }), NOW)).toBe("stopped unexpectedly");
+    expect(workspaceActivity(ws({ state: "queued" }), NOW)).toBe("opens when it starts");
+    expect(workspaceActivity(ws({ state: "queued", opening: true }), NOW)).toBe("opening…");
+    expect(workspaceActivity(ws({ state: "open", working: 1, closing: true }), NOW)).toBe(
+      "closing — saving its chats…",
+    );
+    expect(workspaceActivity(ws({ last_open_ms: NOW - 2 * DAY }), NOW)).toBe(
+      "last open 2 days ago · chats saved",
+    );
+    expect(workspaceActivity(ws(), NOW)).toBe("not opened yet");
+  });
+
+  it("decides what Open does from the running jobs", () => {
+    expect(openPlan([])).toEqual({ kind: "sheet" });
+    expect(openPlan([job({ state: "waiting" })])).toEqual({ kind: "sheet" });
+    const one = job({ id: "j-0000bbbb" });
+    expect(openPlan([one, job({ state: "waiting" })])).toEqual({ kind: "job", job: one });
+    const two = job({ id: "j-0000cccc", name: "GPU" });
+    expect(openPlan([one, two])).toEqual({ kind: "choose", jobs: [one, two] });
+  });
+
+  it("shows live jobs newest first", () => {
+    const old = job({ id: "j-1", submitted_ms: 1 });
+    const fresh = job({ id: "j-2", submitted_ms: 2, state: "waiting" });
+    const gone = job({ id: "j-3", state: "ended" });
+    expect(liveJobs([old, gone, fresh]).map((j) => j.id)).toEqual(["j-2", "j-1"]);
   });
 
   it("summarizes a cluster for its host row", () => {
-    expect(hostSummary(overview([]), NOW)).toBe("no workspaces yet");
+    expect(hostSummary(overview([]), NOW)).toBe("no jobs running");
+    expect(hostSummary(overview([job({ state: "ended" })]), NOW)).toBe("no jobs running");
     expect(
-      hostSummary(overview([ws({ name: "crc", state: "running", ends_at_ms: NOW + 5 * DAY + 22 * HOUR + 5 * MIN })]), NOW),
-    ).toBe("crc running · 5d 22h left");
-    expect(hostSummary(overview([ws({ name: "a" }), ws({ name: "b", id: "w-2" })]), NOW)).toBe(
-      "2 workspaces · none running",
-    );
-    expect(hostSummary(overview([ws({ name: "a" })]), NOW)).toBe("1 workspace · not running");
-    expect(hostSummary(overview([ws({ name: "a", state: "waiting" })]), NOW)).toBe("a waiting for a node");
+      hostSummary(overview([job({ ends_at_ms: NOW + 5 * DAY + 22 * HOUR + 5 * MIN })]), NOW),
+    ).toBe("1 job running · ends in 5d 22h");
     expect(
       hostSummary(
-        overview([ws({ name: "a", state: "running" }), ws({ id: "w-2", name: "b", state: "waiting" })]),
+        overview([
+          job({ ends_at_ms: NOW + 5 * DAY }),
+          job({ id: "j-2", ends_at_ms: NOW + 3 * HOUR + 40 * MIN }),
+        ]),
         NOW,
       ),
-    ).toBe("1 running · 1 waiting");
+    ).toBe("2 jobs running · next ends in 3h 40m");
+    expect(hostSummary(overview([job({ state: "waiting" })]), NOW)).toBe("1 job waiting for a node");
+    expect(hostSummary(overview([job(), job({ id: "j-2", state: "waiting" })]), NOW)).toBe(
+      "1 job running · 1 waiting",
+    );
+    expect(hostSummary(overview([job({ state: "starting" })]), NOW)).toBe("1 job starting");
   });
 
-  it("counts the user's other jobs", () => {
-    expect(otherJobsWords({ running: 2, waiting: 9 })).toBe(
-      "Your other jobs on this cluster: 2 running · 9 waiting",
-    );
-    expect(otherJobsWords({ running: 0, waiting: 0 })).toBe("Your other jobs on this cluster: none");
+  it("counts the user's other Slurm jobs", () => {
+    expect(otherJobsWords({ running: 2, waiting: 9 })).toBe("Your other Slurm jobs: 2 running · 9 waiting");
+    expect(otherJobsWords({ running: 0, waiting: 0 })).toBe("");
   });
 });
 
@@ -415,17 +481,7 @@ describe("the start sheet", () => {
   });
 });
 
-describe("the file peek", () => {
-  it("lists folders first, then names in natural order", () => {
-    const sorted = sortEntries([
-      { name: "b.txt", dir: false },
-      { name: "run10", dir: true },
-      { name: "A.txt", dir: false },
-      { name: "run2", dir: true },
-    ]);
-    expect(sorted.map((e) => e.name)).toEqual(["run2", "run10", "A.txt", "b.txt"]);
-  });
-
+describe("the folder picker", () => {
   it("walks paths", () => {
     expect(childPath("/scratch/u", "data")).toBe("/scratch/u/data");
     expect(childPath("/scratch/u/", "data")).toBe("/scratch/u/data");

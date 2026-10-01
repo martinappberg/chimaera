@@ -41,27 +41,30 @@ export function timeLeftWords(endsAtMs: number, nowMs: number): string {
 }
 
 /**
- * The host row's one-line summary: "crc running · 5d 22h left",
- * "2 running · 1 waiting", "2 workspaces · none running", "no workspaces yet".
+ * The host row's one line (plan §4.1): "no jobs running", "1 job running ·
+ * ends in 5d 22h", "2 jobs running · next ends in 3h 40m", "1 job waiting
+ * for a node", "1 job running · 1 waiting".
  */
 export function hostSummary(ov: ClusterOverview, nowMs: number): string {
-  const ws = ov.workspaces;
-  if (ws.length === 0) return "no workspaces yet";
-  const running = ws.filter((w) => w.state === "running" || w.state === "starting");
-  const waiting = ws.filter((w) => w.state === "waiting");
-  if (running.length === 1 && waiting.length === 0) {
-    const w = running[0];
-    if (w.state === "starting") return `${w.name} starting`;
-    return w.ends_at_ms !== undefined
-      ? `${w.name} running · ${timeLeftWords(w.ends_at_ms, nowMs)}`
-      : `${w.name} running`;
-  }
-  if (running.length === 0 && waiting.length === 1) return `${waiting[0].name} waiting for a node`;
-  if (running.length > 0 || waiting.length > 0) {
-    const parts: string[] = [];
-    if (running.length > 0) parts.push(`${running.length} running`);
-    if (waiting.length > 0) parts.push(`${waiting.length} waiting`);
-    return parts.join(" · ");
-  }
-  return ws.length === 1 ? "1 workspace · not running" : `${ws.length} workspaces · none running`;
+  const live = ov.jobs.filter((j) => j.state !== "ended");
+  const running = live.filter((j) => j.state === "running" || j.state === "starting");
+  const waiting = live.filter((j) => j.state === "waiting");
+  const jobs = (n: number) => (n === 1 ? "1 job" : `${n} jobs`);
+  if (live.length === 0) return "no jobs running";
+  if (running.length === 0) return `${jobs(waiting.length)} waiting for a node`;
+  if (waiting.length > 0) return `${jobs(running.length)} running · ${waiting.length} waiting`;
+  if (running.length === 1 && running[0].state === "starting") return "1 job starting";
+  const ends = running
+    .map((j) => j.ends_at_ms)
+    .filter((e): e is number => e !== undefined)
+    .sort((a, b) => a - b);
+  if (ends.length === 0) return `${jobs(running.length)} running`;
+  const secs = Math.floor((ends[0] - nowMs) / 1000);
+  const when = secs <= 0 ? "time's up" : `${running.length > 1 ? "next ends" : "ends"} in ${shortDuration(secs)}`;
+  return `${jobs(running.length)} running · ${when}`;
+}
+
+/** Whether any job on the cluster is running (the row's dot). */
+export function anyJobRunning(ov: ClusterOverview): boolean {
+  return ov.jobs.some((j) => j.state === "running");
 }

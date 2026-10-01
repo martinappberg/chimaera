@@ -472,7 +472,10 @@
    *  listens ONLY on its composite key — matching the bare login alias made
    *  every login-tunnel blip re-home job windows onto the login daemon
    *  (found live: "opening the session just opens the login host"). */
-  const statusAlias = jobCtx !== null ? `${hostAlias}#job${jobCtx.jobId}` : hostAlias;
+  const statusAlias =
+    jobCtx !== null
+      ? `${hostAlias}#job${jobCtx.jobId}${jobCtx.cws !== null ? `~${jobCtx.cws}` : ""}`
+      : hostAlias;
   /** Only the native shell can re-run ssh; a browser tunnel is the CLI's job. */
   const canReconnect = isRemoteWindow && isNativeShell();
   /** Native events are not replayed. A stale-token page must not invoke

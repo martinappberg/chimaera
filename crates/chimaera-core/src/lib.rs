@@ -266,7 +266,7 @@ pub fn generate_token() -> String {
 /// shared login nodes, where the usual `write` then `chmod(0600)` sequence has
 /// a real read window between the two syscalls. A random `create_new` sibling
 /// also keeps concurrent writers from truncating each other's temporary file.
-fn atomic_write_private(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+pub fn atomic_write_private(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy())
@@ -292,7 +292,7 @@ fn atomic_write_private(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
 }
 
 /// On-disk record of a running chimaera daemon.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
     pub hostname: String,
     pub port: u16,

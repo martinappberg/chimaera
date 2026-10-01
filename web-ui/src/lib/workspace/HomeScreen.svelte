@@ -31,7 +31,7 @@
   import { computeStatus } from "./compute";
   import ComputeBanner from "./ComputeBanner.svelte";
   import { clusterNow, clusterOverviews } from "./clusterStore.svelte";
-  import { hostSummary, schedulerLabel } from "./clusterRow";
+  import { anyJobRunning, hostSummary, schedulerLabel } from "./clusterRow";
   import { pageVisible } from "../shared/visibility";
   import { getJobContext, isHomeHub, type Health } from "../net/api";
   import { asyncDisposer } from "../shared/asyncDisposer";
@@ -171,13 +171,10 @@
     return hostSummary(entry.overview, clusterNow(entry));
   }
 
-  /** Whether any of a cluster's workspaces is running (the row's dot). */
+  /** Whether any of a cluster's jobs is running (the row's dot). */
   function clusterRunning(alias: string): boolean {
-    return (
-      clusterOverviews
-        .entry(alias)
-        ?.overview?.workspaces.some((w) => w.state === "running" || w.state === "starting") ?? false
-    );
+    const ov = clusterOverviews.entry(alias)?.overview;
+    return ov !== null && ov !== undefined && anyJobRunning(ov);
   }
 
   /** This home screen sits on a compute-node daemon (a workspace's job):
@@ -593,7 +590,7 @@
   <div class="rowwrap" role="presentation">
     <button
       class="row sub jobs"
-      title="{alias}'s workspaces, each run as its own Slurm job"
+      title="Start Slurm jobs on {alias} and open workspaces inside them"
       onclick={() => showCluster(alias)}
     >
       <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
@@ -602,7 +599,7 @@
         <rect x="2" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
         <rect x="9" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
       </svg>
-      <span class="name">Workspaces as jobs</span>
+      <span class="name">Jobs</span>
     </button>
   </div>
 {/snippet}
@@ -930,7 +927,7 @@
                   <div class="rowwrap" role="presentation" class:connected={running}>
                     <button
                       class="row"
-                      title="{h.alias}'s workspaces"
+                      title="{h.alias}'s jobs and workspaces"
                       disabled={h.status === "connecting"}
                       onclick={() => void connect(h.alias)}
                     >
@@ -939,13 +936,13 @@
                         title={h.status === "connecting"
                           ? "connecting…"
                           : running
-                            ? "a workspace is running"
-                            : "no workspace running"}
+                            ? "a job is running"
+                            : "no job running"}
                       ></span>
                       <span class="name">{h.alias}</span>
                       <span
                         class="pill-sched"
-                        title="{h.alias}'s login node reaches a batch scheduler: workspaces run as jobs on compute nodes, never on the login node"
+                        title="{h.alias} has a batch scheduler: Chimaera runs inside jobs you start there, never on the login node"
                         >{schedulerLabel(h.cluster?.scheduler)}</span
                       >
                       {#if localState?.dev_build}
@@ -1099,8 +1096,8 @@
                     </div>
                   {:else if cluster}
                     <!-- The login-node override is on, so the row connects to
-                         the login daemon as before; the workspaces-as-jobs
-                         page stays one click away. -->
+                         the login daemon as before; the cluster page (jobs)
+                         stays one click away. -->
                     <div class="remote-ws">{@render jobsRow(h.alias)}</div>
                   {/if}
                 {/if}

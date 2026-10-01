@@ -361,9 +361,11 @@ config dir, which every Chimaera on the cluster already shares.
 
 ### 8.3 The job: `chimaera job-host`
 
-The job script (`#!/bin/bash -l`, `umask 077`) runs the egress probe and
-`exec chimaera job-host --job <jid>`. job-host is the job's main process and
-the only long-lived thing per job:
+job-host runs on the job's compute node, inside the job — never on the login
+node. Nothing of it exists while the job waits in the queue. The job script
+(`#!/bin/bash -l`, `umask 077`) runs the egress probe and `exec chimaera
+job-host --job <jid>`, so job-host is the job's main process, lives exactly as
+long as the job, and is the only long-lived thing per job:
 
 - binds the node's address on a free port, token-gated; writes `host.json`
   atomically; opens the job's open-on-start workspaces;

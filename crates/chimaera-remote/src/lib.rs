@@ -637,7 +637,7 @@ impl RemoteHome {
         format!("{}/bin", self.dir())
     }
 
-    fn bin_path(self) -> String {
+    pub(crate) fn bin_path(self) -> String {
         format!("{}/chimaera", self.bin_dir())
     }
 

@@ -19,6 +19,7 @@ mod fs;
 mod fs_watch;
 mod git;
 mod history;
+mod job_host;
 mod knowledge;
 mod launcher;
 mod ledger;
@@ -61,6 +62,7 @@ pub struct ServerConfig {
     pub routable_bind: bool,
 }
 
+pub use job_host::run as run_job_host;
 pub use lifecycle::run;
 /// `chimaera plugin caps <plugin.toml>`: a manifest's tier, capability
 /// digest and Can list, as the lock and the card record them.

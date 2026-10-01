@@ -1,20 +1,22 @@
 <script lang="ts">
   /**
-   * Start a cluster workspace as a Slurm job. Built only from what the
-   * cluster reports (`clusterFacts`: partitions, limits, accounts) and what
-   * the user chose before (saved setups, the workspace's last run) — no
-   * invented presets, no site knowledge. Validation is inline and blocks the
-   * call; the scheduler's own refusal comes back verbatim under the title,
-   * with the one follow-up it allows (start attached, or fill the field it
-   * named).
+   * Start a job on a cluster (workspaces open inside it), or continue a
+   * running job in a new one. Built only from what the cluster reports
+   * (`clusterFacts`: partitions, limits, accounts) and what the user chose
+   * before (saved setups, the last job's setup) — no invented presets, no
+   * site knowledge. Validation is inline and blocks the call; the
+   * scheduler's own refusal comes back verbatim under the title, with the
+   * one follow-up it allows (start attached, or fill the field it named).
    */
   import { onMount, tick } from "svelte";
   import {
+    clusterContinueJob,
     clusterFacts,
     clusterSetStartup,
-    clusterStart,
+    clusterStartJob,
     type ClusterConfig,
     type ClusterFacts,
+    type ClusterJob,
     type ClusterWorkspaceView,
     type LaunchSpec,
     type StartResult,
@@ -37,16 +39,50 @@
 
   interface Props {
     alias: string;
-    workspace: ClusterWorkspaceView;
     /** The cluster's config as the overview last read it. */
     config: ClusterConfig;
+    /** The cluster-level startup commands (the Environment settings' own). */
+    clusterStartup: string;
+    /** Every workspace on the cluster (the closed ones can open in the job). */
+    workspaces: ClusterWorkspaceView[];
+    /** Workspaces ticked to open when it starts. */
+    preselect?: string[];
+    /** Continue this running job in a new one (its setup, its workspaces). */
+    continueJob?: ClusterJob | null;
+    /** Start from this setup ("Start again" on an ended job). */
+    initialSpec?: LaunchSpec | null;
     /** The job was submitted (or started attached) — the page closes this
      *  sheet and refreshes. */
     onStarted: (result: Exclude<StartResult, { kind: "refused" }>) => void;
     onClose: () => void;
   }
 
-  let { alias, workspace, config, onStarted, onClose }: Props = $props();
+  let {
+    alias,
+    config,
+    clusterStartup,
+    workspaces,
+    preselect = [],
+    continueJob = null,
+    initialSpec = null,
+    onStarted,
+    onClose,
+  }: Props = $props();
+
+  /** Closed workspaces: the ones that can open in a new job. */
+  const closed = $derived(workspaces.filter((w) => w.state === "closed"));
+  /** What a continue moves over. */
+  const moving = $derived(
+    continueJob === null
+      ? []
+      : workspaces.filter((w) => w.job === continueJob.id && w.state === "open"),
+  );
+  // svelte-ignore state_referenced_locally
+  let openIds = $state<string[]>([...preselect]);
+
+  function toggleOpen(id: string): void {
+    openIds = openIds.includes(id) ? openIds.filter((x) => x !== id) : [...openIds, id];
+  }
 
   let facts = $state<ClusterFacts | null>(null);
   let factsError = $state<string | null>(null);
@@ -63,17 +99,14 @@
   let missingPartition = $state<string | null>(null);
 
   // svelte-ignore state_referenced_locally
-  let startupCluster = $state(config.startup);
+  let startupCluster = $state(clusterStartup);
   // svelte-ignore state_referenced_locally
-  let startupWs = $state(workspace.startup);
-  let startupRun = $state("");
-  /** What the cluster/workspace scopes hold on the cluster now (moves after a save). */
+  let startupRun = $state(continueJob?.startup ?? "");
+  /** What the cluster scope holds on the cluster now (moves after a save). */
   // svelte-ignore state_referenced_locally
-  let savedCluster = $state(config.startup);
+  let savedCluster = $state(clusterStartup);
   // svelte-ignore state_referenced_locally
-  let savedWs = $state(workspace.startup);
-  // svelte-ignore state_referenced_locally
-  let startupOpen = $state(config.startup.trim() !== "" || workspace.startup.trim() !== "");
+  let startupOpen = $state(clusterStartup.trim() !== "" || (continueJob?.startup ?? "").trim() !== "");
 
   let moreOpen = $state(false);
   let saveAs = $state("");
@@ -98,7 +131,7 @@
   });
   const requires = $derived(effectiveConfig.learned.requires ?? []);
 
-  const lastSpec = $derived<LaunchSpec | null>(workspace.last_spec ?? config.last_spec ?? null);
+  const lastSpec = $derived<LaunchSpec | null>(config.last_spec ?? null);
   const selected = $derived(facts?.partitions.find((p) => p.name === form.partition) ?? null);
   const accounts = $derived(accountChoices(facts, selected));
   // One account and nothing requiring it: there is no choice to make, and
@@ -126,11 +159,9 @@
     const count = (s: string) => s.split("\n").filter((l) => l.trim() !== "").length;
     const parts: string[] = [];
     const c = count(startupCluster);
-    const w = count(startupWs);
     const r = count(startupRun);
-    if (c > 0) parts.push(`${c} for every workspace`);
-    if (w > 0) parts.push(`${w} for this one`);
-    if (r > 0) parts.push(`${r} for this run`);
+    if (c > 0) parts.push(`${c} for every job on ${alias}`);
+    if (r > 0) parts.push(`${r} for this job`);
     return parts.length === 0 ? "none" : parts.join(" · ");
   });
 
@@ -157,7 +188,9 @@
 
   onMount(() => {
     void loadFacts().then(() => {
-      if (workspace.last_spec) applySpec(workspace.last_spec, "last");
+      if (continueJob !== null) applySpec(continueJob.spec, "job");
+      else if (initialSpec !== null) applySpec(initialSpec, "again");
+      else if (config.last_spec) applySpec(config.last_spec, "last");
       else {
         form = defaultForm(facts);
         reconcileAccount();
@@ -230,15 +263,11 @@
     fieldEl(f)?.focus();
   }
 
-  /** Save edited cluster/workspace startup commands before the job reads them. */
+  /** Save edited cluster-level startup commands before the job reads them. */
   async function saveStartup(): Promise<void> {
     if (startupCluster !== savedCluster) {
       await clusterSetStartup(alias, null, startupCluster);
       savedCluster = startupCluster;
-    }
-    if (startupWs !== savedWs) {
-      await clusterSetStartup(alias, workspace.id, startupWs);
-      savedWs = startupWs;
     }
   }
 
@@ -265,14 +294,18 @@
     const name = saveAs.trim();
     let result: StartResult;
     try {
-      result = await clusterStart(
-        alias,
-        workspace.id,
-        built.spec,
-        startupRun,
-        name === "" ? null : name,
-        forceAttached || attachedRun,
-      );
+      result =
+        continueJob !== null
+          ? await clusterContinueJob(alias, { jobId: continueJob.id }, built.spec, startupRun)
+          : await clusterStartJob(
+              alias,
+              built.spec,
+              openIds.filter((id) => closed.some((w) => w.id === id)),
+              startupRun,
+              null,
+              name === "" ? null : name,
+              forceAttached || attachedRun,
+            );
     } catch (e) {
       startError = e instanceof Error ? e.message : String(e);
       busy = false;
@@ -315,7 +348,7 @@
     class="panel"
     role="dialog"
     aria-modal="true"
-    aria-label={`Start ${workspace.name}`}
+    aria-label={continueJob !== null ? `Continue ${continueJob.name} in a new job` : `Start a job on ${alias}`}
     tabindex="-1"
     use:modalFocus
   >
@@ -328,17 +361,29 @@
     >
       <div class="head">
         <div class="title-line">
-          <span class="title">Start {workspace.name}</span>
-          <span class="host">as a Slurm job on {alias}</span>
+          {#if continueJob !== null}
+            <span class="title">Continue {continueJob.name} in a new job</span>
+          {:else}
+            <span class="title">Start a job on {alias}</span>
+          {/if}
         </div>
-        <span class="path" title={workspace.path}>{workspace.path}</span>
+        {#if continueJob !== null}
+          <span class="sub">
+            {moving.length === 0
+              ? "Nothing is open in it."
+              : `Moves: ${moving.map((w) => w.name).join(", ")}.`}
+            When the new job starts, {moving.length === 0 ? "it" : "they"} move over and {continueJob.name} stops.
+          </span>
+        {:else}
+          <span class="sub">Workspaces open inside it. Slurm queues it; you'll get a notification when it's ready.</span>
+        {/if}
         {#if refusal !== null}
           <div class="refusal" role="alert">
             <span class="refusal-lead">Slurm didn't take it:</span>
             <span class="refusal-text">{refusal.message}</span>
             {#if refusal.refusal === "batch_not_allowed"}
               <button type="button" class="refusal-act" disabled={busy} onclick={() => void start(true)}
-                >Start it attached instead — it stops when you disconnect</button
+                >Start it attached instead — it stops if this app disconnects</button
               >
             {/if}
           </div>
@@ -355,11 +400,19 @@
           <!-- Saved setups: the user's own, never invented presets. -->
           <div class="block">
             <span class="lab">Setup</span>
-            {#if lastSpec === null && config.setups.length === 0}
-              <span class="hint">First start here — this one will be remembered.</span>
+            {#if continueJob === null && lastSpec === null && config.setups.length === 0}
+              <span class="hint">Your choices are remembered for next time.</span>
             {:else}
               <div class="chips">
-                {#if lastSpec !== null}
+                {#if continueJob !== null}
+                  <button
+                    type="button"
+                    class="chip"
+                    class:on={activeChip === "job"}
+                    onclick={() => continueJob !== null && applySpec(continueJob.spec, "job")}
+                    >{continueJob.name}'s</button
+                  >
+                {:else if lastSpec !== null}
                   <button
                     type="button"
                     class="chip"
@@ -485,6 +538,7 @@
 
           <div class="block">
             <span class="lab">Resources <span class="aside">· blank uses the cluster's default</span></span>
+            <span class="hint">Each workspace you open in the job uses about 100 MB of its memory.</span>
             <div class="triple">
               <label class="field">
                 <span class="sublab">CPUs</span>
@@ -636,9 +690,11 @@
               {#if !startupOpen}<span class="aside">· {startupSummary}</span>{/if}
             </button>
             {#if startupOpen}
-              <span class="hint">Run before every shell and agent in the job.</span>
+              <span class="hint"
+                >Run before every chat and terminal: {alias}'s first, then each workspace's own, then this job's.</span
+              >
               <label class="field">
-                <span class="sublab">Every workspace on {alias}</span>
+                <span class="sublab">Every job on {alias}</span>
                 <textarea
                   class="in mono startup"
                   bind:value={startupCluster}
@@ -648,17 +704,7 @@
                 ></textarea>
               </label>
               <label class="field">
-                <span class="sublab">This workspace</span>
-                <textarea
-                  class="in mono startup"
-                  bind:value={startupWs}
-                  rows="2"
-                  spellcheck="false"
-                  placeholder={"conda activate …"}
-                ></textarea>
-              </label>
-              <label class="field">
-                <span class="sublab">This run only</span>
+                <span class="sublab">This job</span>
                 <textarea
                   class="in mono startup"
                   bind:value={startupRun}
@@ -670,26 +716,55 @@
             {/if}
           </div>
 
+          {#if continueJob === null}
+            <div class="block">
+              <span class="lab">Open when it starts</span>
+              {#if closed.length === 0}
+                <span class="hint">
+                  {workspaces.length === 0
+                    ? "No workspaces yet — add one, then open it in this job."
+                    : "Every workspace is already open in a job."}
+                </span>
+              {:else}
+                <div class="opens">
+                  {#each closed as w (w.id)}
+                    <label class="open-row">
+                      <input
+                        type="checkbox"
+                        checked={openIds.includes(w.id)}
+                        onchange={() => toggleOpen(w.id)}
+                      />
+                      <span class="open-name">{w.name}</span>
+                      <span class="open-path" title={w.path}>{w.path}</span>
+                    </label>
+                  {/each}
+                </div>
+              {/if}
+            </div>
+          {/if}
+
+          {#if continueJob === null}
           <label class="block">
             <span class="lab">Save as a setup <span class="aside">· optional</span></span>
             <input
               class="in"
               bind:value={saveAs}
-              placeholder="a name, to start it this way again"
+              placeholder="a name, to start a job this way again"
               spellcheck="false"
               autocomplete="off"
             />
           </label>
+          {/if}
         {/if}
       </div>
 
       <div class="acts">
         {#if attachedRun}
-          <span class="acts-note">Interactive only — stops when you disconnect</span>
+          <span class="acts-note">Interactive only — stops if this app disconnects</span>
         {/if}
         <button type="button" class="quiet" disabled={busy} onclick={onClose}>Cancel</button>
         <button type="submit" class="cta" disabled={busy || (factsLoading && facts === null)}>
-          {busy ? "Starting…" : "Start"}
+          {busy ? "Starting…" : continueJob !== null ? "Start new job" : "Start job"}
         </button>
       </div>
     </form>
@@ -768,13 +843,60 @@
     white-space: nowrap;
   }
 
-  .path {
-    font-family: var(--mono);
-    font-size: var(--text-xs);
+  .sub {
+    font-size: var(--text-sm);
     color: var(--muted);
+    line-height: 1.45;
+  }
+
+  /* Open when it starts: one quiet checkbox row per closed workspace. */
+  .opens {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    max-height: 168px;
+    overflow-y: auto;
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    padding: 3px;
+  }
+
+  .open-row {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    min-width: 0;
+    padding: 5px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .open-row:hover {
+    background: var(--row-hover);
+  }
+
+  .open-row input {
+    flex: none;
+    margin: 0;
+    accent-color: var(--accent);
+  }
+
+  .open-name {
+    flex: none;
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    color: var(--fg);
+  }
+
+  .open-path {
+    flex: 1;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--muted);
   }
 
   /* The scheduler's own words, verbatim, in the danger wash. */

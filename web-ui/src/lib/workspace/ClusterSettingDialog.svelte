@@ -1,9 +1,10 @@
 <script lang="ts">
   /**
-   * The cluster page's two per-cluster settings, each a small dialog:
-   * - "startup": the cluster-default startup commands (every workspace job
-   *   on this cluster runs them first; stored on the cluster).
-   * - "rules": what agents in this cluster's workspaces are told about the
+   * The cluster page's settings, each a small dialog:
+   * - "startup": startup commands for the whole cluster, or — with
+   *   `workspace` — for one workspace. Both are the Environment settings'
+   *   own scopes, in the cluster's config folder: one file, two editors.
+   * - "rules": what agents in this cluster's jobs are told about the
    *   cluster's rules — a file on the cluster and/or pasted text.
    */
   import { clusterSetAgentRules, clusterSetStartup, type AgentRules } from "../net/native";
@@ -13,8 +14,10 @@
   interface Props {
     alias: string;
     mode: "startup" | "rules";
-    /** Current cluster-default startup commands ("startup" mode). */
+    /** Current startup commands ("startup" mode). */
     startup?: string;
+    /** Edit this workspace's startup commands instead of the cluster's. */
+    workspace?: { id: string; name: string } | null;
     /** Current rules ("rules" mode). */
     rules?: AgentRules;
     /** Saved — the page refetches. */
@@ -22,7 +25,15 @@
     onClose: () => void;
   }
 
-  let { alias, mode, startup = "", rules = { text: "" }, onSaved, onClose }: Props = $props();
+  let {
+    alias,
+    mode,
+    startup = "",
+    workspace = null,
+    rules = { text: "" },
+    onSaved,
+    onClose,
+  }: Props = $props();
 
   // The dialog mounts fresh per open: the props' values are the baseline.
   // svelte-ignore state_referenced_locally
@@ -40,7 +51,7 @@
     busy = true;
     try {
       if (mode === "startup") {
-        await clusterSetStartup(alias, null, text);
+        await clusterSetStartup(alias, workspace?.id ?? null, text);
       } else {
         const f = file.trim();
         if (f !== "" && !f.startsWith("/")) {
@@ -73,7 +84,11 @@
     class="panel"
     role="dialog"
     aria-modal="true"
-    aria-label={mode === "startup" ? `Startup commands on ${alias}` : `Rules for agents on ${alias}`}
+    aria-label={mode === "rules"
+      ? `Rules for agents on ${alias}`
+      : workspace !== null
+        ? `Startup commands for ${workspace.name}`
+        : `Startup commands on ${alias}`}
     tabindex="-1"
     use:modalFocus
   >
@@ -86,12 +101,17 @@
     >
       <div class="title">
         {mode === "startup" ? "Startup commands" : "Rules for agents"}
-        <span class="host">on {alias}</span>
+        <span class="host">{workspace !== null ? `for ${workspace.name}` : `on ${alias}`}</span>
       </div>
       {#if mode === "startup"}
         <p class="lede">
-          Every workspace job on {alias} runs these first, before every shell and agent in it —
-          then the workspace's own, then a run's.
+          {#if workspace !== null}
+            Run before every chat and terminal in {workspace.name}, whichever job it's open in —
+            after {alias}'s own and before a job's. New chats and terminals pick them up.
+          {:else}
+            Run before every chat and terminal on {alias}, in every job — then each workspace's
+            own, then a job's. New chats and terminals pick them up.
+          {/if}
         </p>
         <textarea
           class="in mono"
@@ -103,7 +123,7 @@
         ></textarea>
       {:else}
         <p class="lede">
-          Agents in this cluster's workspaces are told these rules. Without any, they get a short
+          Agents in this cluster's jobs are told these rules. Without any, they get a short
           generic set: explicit time limits, polite queue checks, nothing left running on login
           nodes.
         </p>
