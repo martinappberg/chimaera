@@ -251,7 +251,8 @@ its text, its position or the time.
 
 - `send` and `send_after_turn` take an optional `client_id`: 8 to 64
   characters of `A-Z a-z 0-9 _ -`, minted by the client per send. A daemon
-  that predates it ignores the field.
+  that predates it ignores the field; one that has it refuses a send whose
+  id is not well formed with `invalid_command` and never echoes such an id.
 - A daemon with send ids says `send_ids: true` in `ready`. It accepts a send
   under one id at most once, from the moment the command is queued (before
   the agent's driver handles it): a second send under an accepted id is
