@@ -7,6 +7,13 @@ use std::path::{Component, Path};
 pub(super) const MAX_FILE_BYTES: u64 = 100_000_000;
 pub(super) const MAX_PATHS: usize = 100_000;
 pub(super) const MAX_CONFIG_FILE: u64 = 8 * 1024 * 1024;
+/// Dependency and cache folders a project rebuilds wherever it runs. As
+/// untracked content they never travel, also where no `.gitignore` says so (a
+/// plain folder has none): copying them would spend the storage allowance and
+/// the path cap on bytes the other side recreates. A file the project TRACKS
+/// in Git under one of these names still travels.
+pub(super) const REBUILT_DIRS: [&str; 5] =
+    ["node_modules", "target", ".venv", "__pycache__", ".cache"];
 
 pub(super) fn allowed_path(path: &Path) -> bool {
     if path.is_absolute() {

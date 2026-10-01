@@ -8,6 +8,7 @@ use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::{atomic::Ordering, Arc},
     time::Duration,
@@ -130,12 +131,70 @@ async fn credentials(
     );
     Ok(credentials)
 }
+/// Every project is copied this often whatever its agents do: the backstop
+/// for work no agent did (the user's own edits, a plain shell).
+const TIMED_COPY: u64 = 120;
+/// A copy this soon after the last one started would mostly republish it; a
+/// run of short turns is copied at most this often.
+const TURN_COPY_GAP: u64 = 20;
+
+/// Which projects had an agent finish a step since their last copy. A
+/// finished turn is the moment its work is whole, so that project is copied
+/// then instead of at the next timer pass: after a sudden loss of this
+/// computer the cloud continues from the end of the last turn, not from up to
+/// two minutes before it. Fed by the lease loop each tick; holds only ids the
+/// loop iterates.
+#[derive(Default)]
+struct TurnEnds {
+    working: BTreeSet<String>,
+    ended: BTreeSet<String>,
+}
+
+impl TurnEnds {
+    fn observe(&mut self, workspace: &str, working: bool) {
+        if working {
+            self.working.insert(workspace.to_owned());
+        } else if self.working.remove(workspace) {
+            self.ended.insert(workspace.to_owned());
+        }
+    }
+
+    /// Projects the loop no longer iterates are forgotten.
+    fn keep(&mut self, seen: &BTreeSet<String>) {
+        self.working.retain(|id| seen.contains(id));
+        self.ended.retain(|id| seen.contains(id));
+    }
+
+    /// Whether a copy should start, given the seconds since the last one
+    /// started: `Some(None)` is every project (the timer), `Some(Some(ids))`
+    /// the projects whose turn ended, `None` not yet.
+    fn due(&self, since_last: u64) -> Option<Option<BTreeSet<String>>> {
+        if since_last >= TIMED_COPY {
+            Some(None)
+        } else if !self.ended.is_empty() && since_last >= TURN_COPY_GAP {
+            Some(Some(self.ended.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// A copy started for these projects (every project when `None`). A turn
+    /// that ends while it runs is seen by a later tick and copied next.
+    fn copied(&mut self, only: &Option<BTreeSet<String>>) {
+        match only {
+            None => self.ended.clear(),
+            Some(ids) => self.ended.retain(|id| !ids.contains(id)),
+        }
+    }
+}
+
 pub(super) fn start(state: Arc<AppState>) {
     let generation = state.pro.generation.load(Ordering::Acquire);
     let task_state = state.clone();
     let task = tokio::spawn(async move {
         let state = task_state;
         let mut last_mirror = 0;
+        let mut turns = TurnEnds::default();
         let mut renewed = super::now();
         let mut next_renewal = 0;
         let mut unauthorized = false;
@@ -163,6 +222,7 @@ pub(super) fn start(state: Arc<AppState>) {
             // Previous-life processes that have exited release their fence.
             execution::reprobe(&state);
             let workspaces = lock(&state.workspaces).list();
+            let mut seen = BTreeSet::new();
             for workspace in workspaces
                 .into_iter()
                 .filter(|workspace| eligible(&state, workspace))
@@ -184,24 +244,40 @@ pub(super) fn start(state: Arc<AppState>) {
                         .any(|cause| cause.to_string() == transport::UNAUTHORIZED);
                     record_error(&state, &workspace.id, &error);
                 }
+                turns.observe(
+                    &workspace.id,
+                    super::owned_epoch(&state, &workspace.id).is_some()
+                        && !working_agents(&state, &workspace.id).is_empty(),
+                );
+                seen.insert(workspace.id);
             }
-            if super::now().saturating_sub(last_mirror) >= 120
-                && !super::drain::draining(&state)
-                && lock(&state.pro.mirror_task)
-                    .as_ref()
-                    .is_none_or(|task| task.is_finished())
-            {
+            turns.keep(&seen);
+            let copy = turns.due(super::now().saturating_sub(last_mirror));
+            if let Some(only) = copy.filter(|_| {
+                !super::drain::draining(&state)
+                    && lock(&state.pro.mirror_task)
+                        .as_ref()
+                        .is_none_or(|task| task.is_finished())
+            }) {
+                turns.copied(&only);
                 let owner = state.clone();
                 let config = config.clone();
                 let task = tokio::spawn(async move {
                     let _guard = owner.pro.jobs.lock().await;
-                    if let Err(error) = lazy_handback(&owner, &config).await {
-                        tracing::warn!(phase="locate_return", error=%error, "Could not locate returning projects");
+                    // Locating returning projects stays on the timer: a copy
+                    // after a turn publishes that project and nothing else.
+                    if only.is_none() {
+                        if let Err(error) = lazy_handback(&owner, &config).await {
+                            tracing::warn!(phase="locate_return", error=%error, "Could not locate returning projects");
+                        }
                     }
                     let workspaces = lock(&owner.workspaces).list();
                     for workspace in workspaces
                         .into_iter()
                         .filter(|workspace| eligible(&owner, workspace))
+                        .filter(|workspace| {
+                            only.as_ref().is_none_or(|ids| ids.contains(&workspace.id))
+                        })
                         .take(128)
                     {
                         if generation != owner.pro.generation.load(Ordering::Acquire) {
@@ -2507,6 +2583,41 @@ pub(super) fn eligible(state: &AppState, workspace: &crate::workspaces::Workspac
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_finished_turn_is_copied_soon_and_the_timer_stays_the_backstop() {
+        let mut turns = TurnEnds::default();
+        let ids = |list: &[&str]| {
+            list.iter()
+                .map(|id| id.to_string())
+                .collect::<BTreeSet<_>>()
+        };
+        // Nothing ended: only the timer copies.
+        turns.observe("a", true);
+        turns.observe("b", false);
+        assert_eq!(turns.due(TURN_COPY_GAP), None);
+        assert_eq!(turns.due(TIMED_COPY), Some(None));
+        // The agent in `a` finishes: that project is due once the gap passed,
+        // and only that project.
+        turns.observe("a", false);
+        assert_eq!(turns.due(TURN_COPY_GAP - 1), None);
+        assert_eq!(turns.due(TURN_COPY_GAP), Some(Some(ids(&["a"]))));
+        // A copy that started is not repeated; a turn that ends while it runs
+        // is copied next.
+        turns.observe("b", true);
+        turns.copied(&Some(ids(&["a"])));
+        assert_eq!(turns.due(TURN_COPY_GAP), None);
+        turns.observe("b", false);
+        assert_eq!(turns.due(TURN_COPY_GAP), Some(Some(ids(&["b"]))));
+        // The timer pass covers everything pending.
+        turns.copied(&None);
+        assert_eq!(turns.due(TURN_COPY_GAP), None);
+        // A project the loop no longer iterates is forgotten.
+        turns.observe("c", true);
+        turns.observe("c", false);
+        turns.keep(&ids(&["a", "b"]));
+        assert_eq!(turns.due(TURN_COPY_GAP), None);
+    }
     #[tokio::test]
     async fn setup_failure_fences_agents_until_success_and_laptop_steps_never_autoplay() {
         let root = std::env::temp_dir().join(format!(
