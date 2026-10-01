@@ -1700,11 +1700,12 @@ fn set_scheduler(host: &str, info: Option<SchedulerInfo>) {
 /// never `command -v`: clusters wrap these tools in profile shell functions
 /// (`command -v squeue` then names the function, not a file), and the walk
 /// reads the same under every shell. The PATH comes from the user's login
-/// shell when it takes `-lc` (tcsh refuses it), else from `sh -l` (the
-/// system profile, where clusters put their scheduler), else this shell's.
+/// shell when it answers `-lc` (tcsh refuses it; a profile that `exec`s
+/// another shell swallows it), else from `sh -l` (the system profile, where
+/// clusters put their scheduler), else this shell's.
 fn sh_scheduler() -> String {
     format!(
-        r#"P=$( {{ "${{SHELL:-/bin/sh}}" -lc 'printf "\n%s%s\n" __chimaera_path__ "$PATH"' </dev/null 2>/dev/null || sh -lc 'printf "\n%s%s\n" __chimaera_path__ "$PATH"' </dev/null 2>/dev/null; }} | sed -n 's/^__chimaera_path__//p' | tail -n 1); [ -n "$P" ] || P=$PATH; has() {{ _o=$IFS; IFS=:; set -f; for _d in $P; do if [ -n "$_d" ] && [ -f "$_d/$1" ] && [ -x "$_d/$1" ]; then IFS=$_o; set +f; printf %s "$_d"; return 0; fi; done; IFS=$_o; set +f; return 1; }}; s=none; b=; if b=$(has sbatch) && has squeue >/dev/null && has scancel >/dev/null && has sinfo >/dev/null; then s=slurm; elif b=$(has qsub) && has qstat >/dev/null; then s=pbs; elif b=$(has bsub) && has bjobs >/dev/null; then s=lsf; else b=; fi; printf '\n%s %s %s\n' '{SCHED_MARK}' "$s" "$b";"#
+        r#"P=$("${{SHELL:-/bin/sh}}" -lc 'printf "\n%s%s\n" __chimaera_path__ "$PATH"' </dev/null 2>/dev/null | sed -n 's/^__chimaera_path__//p' | tail -n 1); [ -n "$P" ] || P=$(sh -lc 'printf "\n%s%s\n" __chimaera_path__ "$PATH"' </dev/null 2>/dev/null | sed -n 's/^__chimaera_path__//p' | tail -n 1); [ -n "$P" ] || P=$PATH; has() {{ _o=$IFS; IFS=:; set -f; for _d in $P; do if [ -n "$_d" ] && [ -f "$_d/$1" ] && [ -x "$_d/$1" ]; then IFS=$_o; set +f; printf %s "$_d"; return 0; fi; done; IFS=$_o; set +f; return 1; }}; s=none; b=; if b=$(has sbatch) && has squeue >/dev/null && has scancel >/dev/null && has sinfo >/dev/null; then s=slurm; elif b=$(has qsub) && has qstat >/dev/null; then s=pbs; elif b=$(has bsub) && has bjobs >/dev/null; then s=lsf; else b=; fi; printf '\n%s %s %s\n' '{SCHED_MARK}' "$s" "$b";"#
     )
 }
 

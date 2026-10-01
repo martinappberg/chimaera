@@ -198,7 +198,15 @@ async fn absorb(app: &AppHandle, alias: &str, ov: &ClusterOverview) {
                             &w.id,
                             "1h",
                             &job,
-                            format!("{} stops in about an hour", w.name),
+                            format!(
+                                "{} stops in {}",
+                                w.name,
+                                if left >= 50 * 60_000 {
+                                    "about an hour".to_string()
+                                } else {
+                                    format!("{} minutes", left / 60_000)
+                                }
+                            ),
                             "Continue on a new node from its window to keep working.".into(),
                         );
                     }
@@ -1137,6 +1145,9 @@ pub(super) async fn cluster_peek(
         .chars()
         .map(|c| if c == '/' || c == '\0' { '_' } else { c })
         .collect::<String>();
+    if name == "." || name == ".." {
+        return Err(format!("{path} isn't a file"));
+    }
     let safe_alias: String = alias
         .chars()
         .map(|c| {

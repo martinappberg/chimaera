@@ -18,9 +18,13 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     let own_job = std::env::var("SLURM_JOB_ID")
         .ok()
         .filter(|j| !j.trim().is_empty());
+    // Only a cluster workspace job holds a lease: a daemon someone starts by
+    // hand inside an allocation keeps today's single-daemon check below.
+    let workspace_job = std::env::var_os(chimaera_core::cluster::ENV_CLUSTER_WORKSPACE)
+        .is_some_and(|v| !v.is_empty());
     let previous_job = match own_job.as_deref() {
-        Some(own) => wait_for_previous_job(own).await,
-        None => None,
+        Some(own) if workspace_job => wait_for_previous_job(own).await,
+        _ => None,
     };
 
     // One daemon per state dir: the manifest is the registry, and a second
@@ -286,14 +290,69 @@ async fn wait_for_previous_job(own: &str) -> Option<String> {
     let path = chimaera_core::Manifest::path();
     // Only resolved once another job is found holding the lease: the common
     // boot (no manifest, or our own) runs no login shell for it.
-    let squeue = || async {
+    let tools = || async {
         let bindir = std::env::var_os("CHIMAERA_SLURM_BINDIR").map(PathBuf::from);
         match crate::compute::detect_tools(bindir.as_deref()).await {
-            Some(crate::compute::Detection::Slurm { squeue, .. }) => Some(squeue),
+            Some(crate::compute::Detection::Slurm {
+                squeue, scancel, ..
+            }) => Some((squeue, scancel)),
             _ => None,
         }
     };
+    // "Continue on a new node": this job is the one the workspace's launch
+    // record names — the user started it to replace the job still holding
+    // the lease. Stop that job here, as they asked, so the handover never
+    // depends on the app staying open until this job got a node (the old
+    // job's daemon saves its chats on the SIGTERM; the wait below then sees
+    // its manifest go). Any other holder (a job someone started by hand) is
+    // only waited for.
+    if let Some(holder) = other_jobs_manifest(&path, own)
+        .await
+        .and_then(|m| m.slurm_job_id)
+    {
+        if launch_record_names(&path, own).await {
+            if let Some((_, scancel)) = tools().await {
+                tracing::info!(job = %holder, "this job continues the workspace; stopping the job it replaces");
+                match crate::compute::run_checked(
+                    &scancel.to_string_lossy(),
+                    std::slice::from_ref(&holder),
+                )
+                .await
+                {
+                    Some(out) if out.success || out.stderr.contains("Invalid job id") => {}
+                    Some(out) => {
+                        tracing::warn!(job = %holder, err = %out.stderr.trim(), "stopping the replaced job failed; waiting for it instead")
+                    }
+                    None => {
+                        tracing::warn!(job = %holder, "scancel did not answer; waiting for the replaced job instead")
+                    }
+                }
+            }
+        }
+    }
+    let squeue = || async move { tools().await.map(|(squeue, _)| squeue) };
     lease_wait(own, &path, squeue, LEASE_FILE_CHECK, LEASE_SQUEUE_FLOOR).await
+}
+
+/// Whether the workspace's launch record (`<workspace>/launch.json`, beside
+/// the data dir that holds the manifest) names job `own` as its current job.
+async fn launch_record_names(manifest_path: &Path, own: &str) -> bool {
+    let Some(record) = manifest_path
+        .parent()
+        .and_then(Path::parent)
+        .map(|w| w.join("launch.json"))
+    else {
+        return false;
+    };
+    let own = own.to_string();
+    tokio::task::spawn_blocking(move || {
+        std::fs::read_to_string(record)
+            .ok()
+            .and_then(|t| serde_json::from_str::<chimaera_core::cluster::LaunchRecord>(&t).ok())
+            .is_some_and(|r| r.job_id.as_deref() == Some(own.as_str()))
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// The record at `path` when it names a Slurm job other than `own`.
@@ -669,6 +728,30 @@ mod tests {
         .await;
         release.await.unwrap();
         assert_eq!(got.as_deref(), Some("100"), "the job it waited on");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The continue-on-a-new-node check: only a launch record naming this
+    /// exact job counts.
+    #[tokio::test]
+    async fn launch_record_names_only_this_job() {
+        let dir = lease_dir("record");
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let manifest = data.join("manifest.json");
+        assert!(!launch_record_names(&manifest, "200").await, "no record");
+        let record = |job: &str| {
+            serde_json::json!({
+                "job_id": job, "job_name": "chimaera-x~1", "spec": {"time": "1:00:00"},
+                "submitted_ms": 0
+            })
+            .to_string()
+        };
+        std::fs::write(dir.join("launch.json"), record("200")).unwrap();
+        assert!(launch_record_names(&manifest, "200").await);
+        assert!(!launch_record_names(&manifest, "100").await);
+        std::fs::write(dir.join("launch.json"), "{not json").unwrap();
+        assert!(!launch_record_names(&manifest, "200").await);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -1049,11 +1049,15 @@ pub async fn stop(
     s.push_str(&format!(
         "err=$(scancel {target} 2>&1); rc=$?\nprintf '===rc %s\\n===err\\n%s\\n' \"$rc\" \"$err\"\n"
     ));
+    // Marked only when the stop took (or the job was already gone): a stop
+    // that failed must not make a job that later ends on its own read as
+    // "stopped by you".
+    s.push_str("if [ \"$rc\" -eq 0 ] || printf '%s' \"$err\" | grep -qi 'invalid job id'; then\n");
     s.push_str(&write_file_lines(
         "$D/launch.json",
         &serde_json::to_string_pretty(&marked)?,
     ));
-    s.push_str("printf '===end\\n'\n");
+    s.push_str("fi\nprintf '===end\\n'\n");
     let out = run_script(host, &s, EXEC_SECS).await?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let secs = sections(&stdout);
