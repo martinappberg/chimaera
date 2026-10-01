@@ -1,7 +1,16 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SeqEvent } from "./chatWs";
-import { ChatStore, RESEND_FOR_MS, SHOW_UNCONFIRMED_AFTER_MS } from "./store.svelte";
+import { ChatStore, RESEND_FOR_MS, RESEND_GAP_MS, SHOW_UNCONFIRMED_AFTER_MS } from "./store.svelte";
+
+// The store paces its own resends with a timer: no test may leave one behind.
+beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_000_000);
+});
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 /** Build a numbered event stream (seq assigned in order) and fold it through a
  *  fresh store — the reducer's only input, exactly as the wire delivers it. */
@@ -2363,9 +2372,12 @@ describe("ChatStore on a socket kept open while its owner sleeps", () => {
     store.onWaking();
     expect(store.sending).toMatchObject([{ text: "after the nap", images: 0 }]);
     // Attached again: `ready` on the same socket, then the gap. The send has
-    // no echo yet, so it goes out again under its id (the keeper delivers
-    // its own copy too; the daemon runs one).
+    // no echo yet, so it goes out again under its id, but not at once: the
+    // keeper delivers its own copy now, and only a send still without its
+    // echo a few seconds after it last went out is sent again.
     store.onReady(SESSION, 3, 3, { sendIds: true, reattach: true });
+    expect(wire).toEqual([]);
+    vi.advanceTimersByTime(RESEND_GAP_MS);
     expect(wire).toEqual([{ type: "send", blocks: [{ type: "text", text: "after the nap" }], client_id: id }]);
     expect(store.connected).toBe(true);
     expect(store.waking).toBe(false);
@@ -2512,8 +2524,6 @@ function world(sendIds = true) {
   /** Every text the composer sent, in order. */
   const made: string[] = [];
   let reattach = false;
-  let clock = 1_000_000;
-  const now = vi.spyOn(Date, "now").mockImplementation(() => clock);
 
   /** What the daemon answered reaches the client. */
   const answer = (frames: Record<string, unknown>[]): void => {
@@ -2532,6 +2542,15 @@ function world(sendIds = true) {
     while (client.wire.length > 0) answer(daemon.receive(client.wire.shift()!));
     catchUp();
   };
+  /** Everything in flight arrives, and a resend the store put off (it paces
+   *  them) goes out when it is due. */
+  const settle = (): void => {
+    pump();
+    for (let round = 0; round < 8 && vi.getTimerCount() > 0; round++) {
+      vi.runOnlyPendingTimers();
+      pump();
+    }
+  };
 
   return {
     ...client,
@@ -2549,9 +2568,9 @@ function world(sendIds = true) {
       if (to === "held") held.push(frame);
       return id;
     },
-    /** Time passes. */
+    /** Time passes (and what the store had put off until then goes out). */
     wait(ms: number): void {
-      clock += ms;
+      vi.advanceTimersByTime(ms);
     },
     /** The daemon answers `ready` and replays; what was held for this
      *  attach is delivered (before or after the client's own resends),
@@ -2569,7 +2588,7 @@ function world(sendIds = true) {
         while (client.wire.length > 0) answer(daemon.receive(client.wire.shift()!));
         deliverHeld();
       }
-      pump();
+      settle();
     },
     drop(): void {
       held.length = 0;
@@ -2578,9 +2597,8 @@ function world(sendIds = true) {
     },
     catchUp,
     pump,
-    done(): void {
-      now.mockRestore();
-    },
+    settle,
+    done(): void {},
   };
 }
 
@@ -2615,6 +2633,9 @@ describe("ChatStore sends, by id: never delivered and returned, never neither", 
         w.attach();
         w.say("wake up", "held");
         w.store.onWaking();
+        // The wake takes longer than the pause between two copies of a send,
+        // so the client's own copy is due at the `ready`.
+        w.wait(RESEND_GAP_MS);
         w.attach("resend first");
       },
       delivered: ["wake up"],
@@ -2819,6 +2840,21 @@ describe("ChatStore sends, by id: never delivered and returned, never neither", 
       returned: [],
     },
     {
+      name: "a refusal that names no send returns the only send there is",
+      run(w) {
+        w.attach();
+        w.say("the wake failed", "lost");
+        // An older keeper refusing a failed wake names nothing. With one
+        // send unconfirmed it can only be that one: "not sent" must not sit
+        // beside a bubble that never ends.
+        w.store.onCommandFailed("Not sent. Your project is reconnecting.", "send");
+        expect(w.store.sending).toEqual([]);
+        expect(w.store.blocks.at(-1)?.kind).toBe("notice");
+      },
+      delivered: [],
+      returned: ["the wake failed"],
+    },
+    {
       name: "an exit returns what the agent never got, and a late refusal returns nothing more",
       run(w) {
         w.attach();
@@ -3005,3 +3041,251 @@ describe("ChatStore sends, by id: never delivered and returned, never neither", 
     }
   });
 });
+
+/** Whoever holds input for an owner that has not answered (this computer's
+ *  relay, a keeper, the account's gateway), under the rule every holder is
+ *  bound by: the id of a held send counts as accepted. A second copy of it
+ *  is dropped (never refused, never held twice), and a `cancel_send` for it
+ *  is answered here, not passed on. `cap`: how many it holds before it
+ *  refuses what does not fit. */
+class Holder {
+  held: Record<string, unknown>[] = [];
+  constructor(private readonly cap: number) {}
+  private holds(id: unknown): boolean {
+    return typeof id === "string" && this.held.some((frame) => frame.client_id === id);
+  }
+  receive(frame: Record<string, unknown>): Record<string, unknown>[] {
+    if (frame.type === "cancel_send") {
+      return this.holds(frame.client_id) ? [{ type: "send_cancelled", client_id: frame.client_id, cancelled: false }] : [];
+    }
+    if (this.holds(frame.client_id)) return [];
+    if (this.held.length >= this.cap) {
+      return [{ type: "error", code: "command_failed", message: "Still bringing the work here. That was not sent; send it again in a moment.", command: frame.type, client_id: frame.client_id }];
+    }
+    this.held.push(frame);
+    return [];
+  }
+}
+
+describe("ChatStore behind a holder, between two daemons", () => {
+  /** A project another computer runs, viewed here: the user's send is held
+   *  while the work comes to this computer, and the computer it is leaving
+   *  stays attached meanwhile (its `ready` reaches the client). */
+  function moving(cap: number) {
+    const client = wired();
+    const leaving = new FakeDaemon();
+    const arriving = new FakeDaemon();
+    const holder = new Holder(cap);
+    /** Frames that reached the daemon the work is leaving. */
+    const leaked: Record<string, unknown>[] = [];
+    const answer = (frames: Record<string, unknown>[]): void => {
+      for (const frame of frames) {
+        if (frame.type === "send_cancelled") client.store.onSendCancelled(frame.client_id as string, frame.cancelled === true);
+        else client.store.onCommandFailed(frame.message as string, frame.command as string, "bringing", frame.client_id as string);
+      }
+    };
+    /** While the work is coming, everything the client sends meets the
+     *  holder first; what it lets through would reach the leaving daemon. */
+    const pump = (): void => {
+      while (client.wire.length > 0) {
+        const frame = client.wire.shift()!;
+        const kept = holder.held.length;
+        const answers = holder.receive(frame);
+        const held = holder.held.length > kept;
+        const dropped = !held && answers.length === 0 && frame.type !== "cancel_send";
+        if (!held && !dropped && answers.length === 0) {
+          leaked.push(frame);
+          answer(leaving.receive(frame));
+        }
+        answer(answers);
+      }
+    };
+    return {
+      ...client,
+      leaving,
+      arriving,
+      holder,
+      leaked,
+      pump,
+      /** The composer sends: the frame goes to the holder. */
+      say(text: string): string {
+        const id = client.send(text);
+        answer(holder.receive({ type: "send", blocks: [{ type: "text", text }], client_id: id }));
+        client.store.onBringing("here");
+        return id;
+      },
+      /** The daemon the work is leaving answers `ready` on the viewer's socket. */
+      readyFromLeaving(): void {
+        client.store.onReady(SESSION, client.store.lastSeq, leaving.seq, { sendIds: true, reattach: true });
+        for (const entry of leaving.journal) client.store.apply(entry);
+        pump();
+      },
+      /** The work arrived: the holder delivers what it held to the session
+       *  here, the viewer's socket closes and it attaches to that session. */
+      arrive(): void {
+        arriving.journal = [...leaving.journal];
+        arriving.seq = leaving.seq;
+        for (const frame of holder.held.splice(0)) answer(arriving.receive(frame));
+        client.store.onDisconnected();
+        client.store.onReady(SESSION, client.store.lastSeq, arriving.seq, IDS);
+        for (const entry of arriving.journal) client.store.apply(entry);
+        while (client.wire.length > 0) answer(arriving.receive(client.wire.shift()!));
+        for (const entry of arriving.journal) client.store.apply(entry);
+      },
+    };
+  }
+
+  it("a second copy of a held send is dropped by the holder, so it is run once and never returned", () => {
+    // The holder is full with this one send: its copy "does not fit".
+    const w = moving(1);
+    w.readyFromLeaving();
+    w.say("carry on here");
+    // The leaving daemon's `ready` reaches the client while the send is
+    // held. Once the pause between copies has passed, the client sends it
+    // again; the holder must drop that copy, not refuse it.
+    vi.advanceTimersByTime(RESEND_GAP_MS);
+    w.readyFromLeaving();
+    expect(w.returned()).toEqual([]);
+    expect(w.leaked).toEqual([]);
+    expect(w.store.sending.map((send) => send.text)).toEqual(["carry on here"]);
+    // A different send does not fit and is refused under its own id.
+    const second = w.send("and this");
+    w.wire.push({ type: "send", blocks: [{ type: "text", text: "and this" }], client_id: second });
+    w.pump();
+    expect(w.returned()).toEqual(["and this"]);
+    w.arrive();
+    expect(w.leaving.turns).toEqual([]);
+    expect(w.arriving.turns).toEqual(["carry on here"]);
+    expect(w.returned()).toEqual([]);
+    expect(w.store.sending).toEqual([]);
+  });
+
+  it("a cancel for a held send is answered by the holder: not withdrawn, never returned, run once", () => {
+    const w = moving(4);
+    w.readyFromLeaving();
+    w.say("carry on here");
+    // A long move: the send is over two minutes old when the leaving
+    // daemon's `ready` comes, so the client withdraws instead of resending.
+    vi.advanceTimersByTime(RESEND_FOR_MS + 1_000);
+    w.readyFromLeaving();
+    // The daemon the work is leaving never saw the send; asked, it would
+    // have said "withdrawn". It is not asked.
+    expect(w.leaked).toEqual([]);
+    expect(w.returned()).toEqual([]);
+    expect(w.store.sending.map((send) => send.text)).toEqual(["carry on here"]);
+    w.arrive();
+    expect(w.arriving.turns).toEqual(["carry on here"]);
+    expect(w.leaving.turns).toEqual([]);
+    expect(w.returned()).toEqual([]);
+    expect(w.store.sending).toEqual([]);
+  });
+});
+
+describe("ChatStore's own frames", () => {
+  it("a refused cancel_send changes nothing and is asked again at the next ready", () => {
+    const { store, wire, send, returned } = wired();
+    store.onReady(SESSION, 0, 0, IDS);
+    const old = send("an hour old");
+    store.onDisconnected();
+    vi.advanceTimersByTime(RESEND_FOR_MS);
+    store.onReady(SESSION, 0, 0, IDS);
+    expect(wire).toEqual([{ type: "cancel_send", client_id: old }]);
+    // This socket may not act right now: the question is refused.
+    const notices = store.blocks.filter((b) => b.kind === "notice").length;
+    store.onCommandFailed("This project is running in the cloud right now. That was not sent.", "cancel_send", "elsewhere", old);
+    expect(returned()).toEqual([]);
+    expect(store.blocks.filter((b) => b.kind === "notice")).toHaveLength(notices);
+    expect(store.sending.map((pending) => pending.text)).toEqual(["an hour old"]);
+    // Nothing waits on that answer: the next message goes out and confirms
+    // as usual.
+    const next = send("a new message");
+    store.apply(echo(1, "a new message", next));
+    expect(store.sending.map((pending) => pending.text)).toEqual(["an hour old"]);
+    // The next `ready` asks again, and this time is answered.
+    wire.length = 0;
+    store.onDisconnected();
+    store.onReady(SESSION, 1, 1, IDS);
+    expect(wire).toEqual([{ type: "cancel_send", client_id: old }]);
+    store.onSendCancelled(old, true);
+    expect(returned()).toEqual(["an hour old"]);
+    expect(store.sending).toEqual([]);
+  });
+
+  it("a send that keeps taking its socket down goes out again with growing pauses, not at every ready", () => {
+    const store = new ChatStore();
+    let uploads = 0;
+    let withdrawals = 0;
+    let dropped = false;
+    store.bindSender((frame) => {
+      if (frame.type === "cancel_send") withdrawals += 1;
+      else {
+        // The path drops the socket on this frame, every time.
+        uploads += 1;
+        dropped = true;
+      }
+      return true;
+    });
+    store.onReady(SESSION, 0, 0, IDS);
+    const started = Date.now();
+    store.noteSent("client-0001", { type: "send", blocks: [], client_id: "client-0001" }, "with four pictures");
+    dropped = true;
+    while (Date.now() - started < RESEND_FOR_MS) {
+      if (dropped) {
+        // The socket comes back at once, and `ready` resets its backoff.
+        dropped = false;
+        store.onDisconnected();
+        vi.advanceTimersByTime(200);
+        store.onReady(SESSION, 0, 0, IDS);
+      } else {
+        vi.advanceTimersByTime(100);
+      }
+    }
+    // 3 s, 6 s, 12 s, 24 s, then every 30 s: a handful in two minutes, where
+    // a copy at every `ready` would be hundreds.
+    expect(uploads).toBeGreaterThanOrEqual(4);
+    expect(uploads).toBeLessThanOrEqual(7);
+    expect(withdrawals).toBe(0);
+    // Past two minutes it is withdrawn, not sent again.
+    store.onDisconnected();
+    store.onReady(SESSION, 0, 0, IDS);
+    expect(withdrawals).toBe(1);
+    const before = uploads;
+    vi.advanceTimersByTime(60_000);
+    expect(uploads).toBe(before);
+    store.dispose();
+  });
+
+  it("nothing goes out again after the socket dropped, the owner became unreachable, or the store was dropped", () => {
+    for (const end of ["drop", "unreachable", "dispose"] as const) {
+      const { store, wire, send } = wired();
+      store.onReady(SESSION, 0, 0, IDS);
+      send("not yet due");
+      store.onReady(SESSION, 0, 0, { sendIds: true, reattach: true });
+      expect(wire).toEqual([]);
+      if (end === "drop") store.onDisconnected();
+      if (end === "unreachable") store.onUnreachable();
+      if (end === "dispose") store.dispose();
+      vi.advanceTimersByTime(60_000);
+      expect(wire).toEqual([]);
+    }
+  });
+
+  it("returned sends wait in order until the composer takes them", () => {
+    const picture = { media_type: "image/png", data: "AA==", label: "shot" };
+    const { store, send } = wired();
+    const one = send("one", [picture, picture, picture]);
+    const two = send("two", [picture, picture]);
+    store.onCommandFailed("Not sent.", "send", null, one);
+    store.onCommandFailed("Not sent.", "send", null, two);
+    expect(store.restoredDrafts.map((draft) => [draft.text, draft.images.length])).toEqual([
+      ["one", 3],
+      ["two", 2],
+    ]);
+    // The composer had room for the first only: the second stays, whole.
+    store.takeRestoredDrafts(1);
+    expect(store.restoredDrafts.map((draft) => [draft.text, draft.images.length])).toEqual([["two", 2]]);
+    store.takeRestoredDrafts(1);
+    expect(store.restoredDraft).toBeNull();
+  });
+});
+

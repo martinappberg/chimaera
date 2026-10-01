@@ -180,6 +180,21 @@ it("a send into a browser view whose socket is down reconnects once with wake in
   socket.close();
 });
 
+it("a frame the store sends by itself never redials or asks for a wake", () => {
+  vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-one/"));
+  vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => {})));
+  const socket = new ChatSocket("s-chat", handlers());
+  Socket.all[0].onopen?.();
+  // Down (not authenticated yet): the user's own send would dial with wake
+  // intent here; a resend or a withdrawal is simply not written.
+  expect(socket.sendQuietly({ type: "send", blocks: [], client_id: "client-0001" })).toBe(false);
+  expect(socket.sendQuietly({ type: "cancel_send", client_id: "client-0001" })).toBe(false);
+  expect(Socket.all).toHaveLength(1);
+  expect(Socket.all[0].url).not.toContain("wake=");
+  expect(Socket.all.flatMap((s) => s.sent)).toHaveLength(0);
+  socket.close();
+});
+
 it("a native window's send never reconnects early", () => {
   const socket = new ChatSocket("s-chat", handlers());
   Socket.all[0].readyState = 0;

@@ -14,7 +14,7 @@
   } from "./paths";
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { attachImageToComposer, insertIntoComposer, registerFollow } from "./composerBus";
+  import { insertIntoComposer, registerFollow, returnableCount, returnToComposer } from "./composerBus";
   import { isBrowserGateway } from "../net/base";
   import { ownerIsCloud, pauseLabel, placementLabel, projectWhere, sessionPause } from "../net/placement";
   import { accountSignedOut } from "../net/plan";
@@ -1450,19 +1450,30 @@
     return () => clearTimeout(timer);
   });
 
-  // An undelivered send's text goes back into this chat's composer, once,
-  // above whatever is being written there now (it was written first, and
-  // must not land under the caret). Several can come back together (every
-  // send a wake was holding): each its own paragraph, in the order sent.
+  // An undelivered send goes back into this chat's composer, once, above
+  // whatever is being written there now (it was written first, and must not
+  // land under the caret), and without taking focus: nobody asked for it at
+  // this moment. Several can come back together (every send a wake was
+  // holding): each its own paragraph, in the order sent. A send comes back
+  // whole or not yet: while the composer has no room for its pictures it
+  // waits in the store, and `returnRoom` brings this back when it has.
+  let returnRoom = $state(0);
   $effect(() => {
-    if (store.restoredDraft === null) return;
+    void returnRoom;
+    const drafts = store.restoredDrafts;
+    if (drafts.length === 0) return;
     untrack(() => {
-      const texts: string[] = [];
-      for (let draft = store.takeRestoredDraft(); draft !== null; draft = store.takeRestoredDraft()) {
-        if (draft.text.length > 0) texts.push(draft.text);
-        for (const image of draft.images) attachImageToComposer(session.id, image);
-      }
-      if (texts.length > 0) insertIntoComposer(session.id, texts.join("\n\n"), "above");
+      const count = returnableCount(session.id, drafts);
+      if (count === 0) return;
+      const fitting = drafts.slice(0, count);
+      const returned = returnToComposer(session.id, {
+        text: fitting
+          .map((draft) => draft.text)
+          .filter((text) => text.length > 0)
+          .join("\n\n"),
+        images: fitting.flatMap((draft) => draft.images),
+      });
+      if (returned) store.takeRestoredDrafts(count);
     });
   });
 
@@ -2055,11 +2066,13 @@
   function toggleThinking() {
     const next = !thinkingOn;
     store.setThinking(next);
-    if (!sendCommand({ type: "set_thinking", enabled: next }, "thinking change not sent")) {
-      // Keep the user's preference, but mark it unsynchronized so the existing
-      // connected-effect retries it on the next ready frame.
-      store.markThinkingPending();
-    }
+    // Keep the user's preference, but mark it unsynchronized whenever it may
+    // not have reached the driver, so the connected-effect below pushes it at
+    // the next `ready`: the socket refused the frame, or took it while the
+    // conversation is not live (whoever keeps a sleeping owner's socket drops
+    // a `set_thinking`, and a plain reconnect does not push it again).
+    const sent = sendCommand({ type: "set_thinking", enabled: next }, "thinking change not sent");
+    if (!sent || !store.connected) store.markThinkingPending();
   }
   // Push the effective preference to the live driver, once per driver process.
   // It pushes whatever the user's effective choice IS (never forces a value),
@@ -3373,6 +3386,7 @@
     {onSubmit}
     {voiceTerms}
     onDraftState={(active) => (composerEngaged = active)}
+    onReturnRoom={() => (returnRoom += 1)}
     onInterrupt={interrupt}
     onCycleMode={cycleMode}
     {onSlash}

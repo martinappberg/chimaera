@@ -232,6 +232,10 @@ interface UnconfirmedSend extends RestoredDraft {
   shown: boolean;
   /** When it was made (ms). */
   at: number;
+  /** When its frame last went out (ms), and how often it has gone out
+   *  again: what paces the next copy ({@link resendGap}). */
+  sentAt: number;
+  resends: number;
   /** Made while attached to a daemon without send ids: that daemon's echo
    *  carries no id, so the send's exact text confirms it. */
   plain: boolean;
@@ -241,6 +245,18 @@ interface UnconfirmedSend extends RestoredDraft {
  *  younger than this, and withdrawn (`cancel_send`) once it is older: a
  *  message must not turn up in a conversation long after it was written. */
 export const RESEND_FOR_MS = 120_000;
+
+/** The least time between two copies of one send, doubling with every copy
+ *  up to the cap. A send can be megabytes (pictures), and a `ready` resets
+ *  the reconnect backoff: without this, a path that drops the socket on that
+ *  frame would upload it again at every `ready` for two minutes. It also
+ *  gives whoever held the first copy the time to deliver it, after which no
+ *  second copy goes out at all. */
+export const RESEND_GAP_MS = 3_000;
+const RESEND_GAP_MAX_MS = 30_000;
+function resendGap(send: UnconfirmedSend): number {
+  return Math.min(RESEND_GAP_MS * 2 ** send.resends, RESEND_GAP_MAX_MS);
+}
 
 /** A send made on a connection that looks live shows no pending bubble: its
  *  echo follows within the moment. One still without it after this long
@@ -651,6 +667,16 @@ export class ChatStore {
   get restoredDraft(): RestoredDraft | null {
     return this.restored[0] ?? null;
   }
+  /** Every send waiting to go back into the composer, oldest first. They
+   *  wait here until the composer has room for their pictures
+   *  ({@link takeRestoredDrafts}). */
+  get restoredDrafts(): readonly RestoredDraft[] {
+    return this.restored;
+  }
+  /** The composer took the `count` oldest. */
+  takeRestoredDrafts(count: number): void {
+    if (count > 0) this.restored = this.restored.slice(count);
+  }
   /** The composer's sends, oldest first, each until its echo proves the agent
    *  got it. Several can wait at once (whoever keeps the socket of a sleeping
    *  owner queues them). Raw, replaced on every change. */
@@ -665,10 +691,22 @@ export class ChatStore {
   private resendAt: number | null = null;
   /** Puts a frame on this chat's socket (false when it is not open). Only
    *  the store's own unconfirmed sends, and their withdrawals, ever go
-   *  through it. */
+   *  through it, and it must never redial or ask for a wake when the socket
+   *  is down: these are not the user acting. */
   private sender: ((frame: Record<string, unknown>) => boolean) | null = null;
   bindSender(send: (frame: Record<string, unknown>) => boolean): void {
     this.sender = send;
+  }
+  /** Fires when the next unconfirmed send is due to go out again. */
+  private resendTimer: ReturnType<typeof setTimeout> | null = null;
+  private clearResendTimer(): void {
+    if (this.resendTimer !== null) clearTimeout(this.resendTimer);
+    this.resendTimer = null;
+  }
+  /** The store is being dropped (its chat left the pool). */
+  dispose(): void {
+    this.clearResendTimer();
+    this.sender = null;
   }
   /** A send picked a paused project back up and it is waking; cleared by the
    *  next `ready`, a disconnect or a move. */
@@ -931,12 +969,35 @@ export class ChatStore {
   private resendUnconfirmed(): void {
     if (this.resendAt === null || this.lastSeq < this.resendAt) return;
     this.resendAt = null;
-    if (this.unconfirmed.length === 0 || this.sender === null) return;
+    this.resendDue(true);
+  }
+
+  /** Send again what is due, and come back for what is not yet
+   *  ({@link resendGap}). `atReady`: only right after a `ready` is an old
+   *  send withdrawn (whoever keeps the socket drops a `cancel_send` while
+   *  nothing is attached, and a `ready` is the proof something is). */
+  private resendDue(atReady: boolean): void {
+    this.clearResendTimer();
+    if (!this.connected || this.sendIds !== true || this.sender === null || this.unconfirmed.length === 0) return;
     this.showUnconfirmed();
     const now = Date.now();
+    let next: number | null = null;
+    const gone = new Set<number>();
     for (const send of this.unconfirmed) {
-      this.sender(now - send.at < RESEND_FOR_MS ? send.frame : { type: "cancel_send", client_id: send.id });
+      if (now - send.at >= RESEND_FOR_MS) {
+        if (atReady) this.sender({ type: "cancel_send", client_id: send.id });
+        continue;
+      }
+      const due = send.sentAt + resendGap(send);
+      if (now < due) next = next === null ? due : Math.min(next, due);
+      else if (this.sender(send.frame)) gone.add(send.key);
     }
+    if (gone.size > 0) {
+      this.unconfirmed = this.unconfirmed.map((send) =>
+        gone.has(send.key) ? { ...send, sentAt: now, resends: send.resends + 1 } : send,
+      );
+    }
+    if (next !== null) this.resendTimer = setTimeout(() => this.resendDue(false), next - now);
   }
 
   /** The daemon's answer to a `cancel_send`. Withdrawn: no copy of that send
@@ -969,6 +1030,7 @@ export class ChatStore {
     // as pending until the next `ready` sends it again.
     this.showUnconfirmed();
     this.resendAt = null;
+    this.clearResendTimer();
   }
 
   /** The socket is open and kept for an owner that has not answered. */
@@ -1076,7 +1138,18 @@ export class ChatStore {
     this.asleep = false;
     this.unconfirmed = [
       ...this.unconfirmed,
-      { key: this.unconfirmedKey++, id, frame, text, images, shown: !live, at: Date.now(), plain: this.sendIds === false },
+      {
+        key: this.unconfirmedKey++,
+        id,
+        frame,
+        text,
+        images,
+        shown: !live,
+        at: Date.now(),
+        sentAt: Date.now(),
+        resends: 0,
+        plain: this.sendIds === false,
+      },
     ];
   }
 
@@ -1127,13 +1200,16 @@ export class ChatStore {
       this.handBackAt(at);
       return;
     }
-    // A refusal that names no send. Behind a daemon with send ids it comes
-    // from an older relay in between and may answer any of them: none is
-    // returned on a guess, they show as pending and the next `ready` sends
-    // or withdraws each by its id. A daemon without send ids never resends,
-    // so the send just made comes back, as it always did there.
-    if (this.sendIds === true) this.showUnconfirmed();
-    else this.handBackAt(this.unconfirmed.length - 1);
+    // A refusal that names no send. A daemon without send ids never resends,
+    // so the send just made comes back, as it always did there. Behind a
+    // daemon with send ids it comes from an older keeper or relay in
+    // between. With one send unconfirmed it can only be that one, and it
+    // comes back (the words "not sent" beside a bubble that never ends would
+    // be worse). With several it may answer any of them: none is returned on
+    // a guess, they show as pending and the next `ready` sends or withdraws
+    // each by its id.
+    if (this.sendIds !== true || this.unconfirmed.length === 1) this.handBackAt(this.unconfirmed.length - 1);
+    else this.showUnconfirmed();
   }
 
   /** Hand one undelivered send (the oldest waiting) to exactly one composer;
@@ -1147,6 +1223,7 @@ export class ChatStore {
   /** Nothing more will be delivered here: what is still unconfirmed goes
    *  back to the composer. */
   private handBackUnconfirmed(): void {
+    this.clearResendTimer();
     if (this.unconfirmed.length === 0) return;
     this.handBack(this.unconfirmed);
     this.unconfirmed = [];

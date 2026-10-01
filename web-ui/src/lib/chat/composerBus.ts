@@ -9,10 +9,8 @@ import type { ImageAttachment } from "./images";
 
 /** Where inserted text goes in the draft: `inline` joins the draft's last
  *  line after a space (a mention, a provenance tag); `block` starts its own
- *  paragraph (a quoted passage, which must begin a line to read as one);
- *  `above` is its own paragraph ahead of the draft (a message that did not
- *  arrive, coming back without landing under what is being written now). */
-export type InsertPlacement = "inline" | "block" | "above";
+ *  paragraph (a quoted passage, which must begin a line to read as one). */
+export type InsertPlacement = "inline" | "block";
 
 type InsertFn = (text: string, placement: InsertPlacement) => void;
 
@@ -136,4 +134,63 @@ export function attachImageToComposer(sessionId: string, image: ImageAttachment)
   queued.push(image);
   while (queued.length > MAX_PENDING) queued.shift();
   pendingAttach.set(sessionId, queued);
+}
+
+// --- messages that did not arrive ---------------------------------------------
+// A send the agent never got comes back to the composer it was written in, by
+// itself: nobody asked for it at that moment. So, unlike the inserts above, it
+// never takes keyboard focus or moves a caret that is somewhere else, and it
+// is all or nothing: a composer with no room for its pictures does not take
+// the text either (its caller keeps the whole send until there is room; a
+// message must not come back with pictures missing).
+
+/** Messages coming back: their texts (already in the order they were sent,
+ *  one paragraph each) and every picture they carried. */
+export interface ReturnedSends {
+  text: string;
+  images: ImageAttachment[];
+}
+
+interface ReturnTarget {
+  /** Pictures the composer can still take. */
+  room(): number;
+  /** Put the text above the draft and attach the pictures. Only called when
+   *  they fit. */
+  take(sends: ReturnedSends): void;
+}
+
+const returnRegistry = new Map<string, ReturnTarget>();
+
+/** Register a mounted composer as where its session's undelivered messages
+ *  return to. Returns the unregister. */
+export function registerComposerReturn(sessionId: string, target: ReturnTarget): () => void {
+  returnRegistry.set(sessionId, target);
+  return () => {
+    if (returnRegistry.get(sessionId) === target) returnRegistry.delete(sessionId);
+  };
+}
+
+/** How many of `drafts` (oldest first) fit the session's composer now: the
+ *  longest run from the front whose pictures it has room for. 0 while no
+ *  composer is mounted. */
+export function returnableCount(sessionId: string, drafts: readonly { images: readonly unknown[] }[]): number {
+  const target = returnRegistry.get(sessionId);
+  if (target === undefined) return 0;
+  let room = target.room();
+  let count = 0;
+  for (const draft of drafts) {
+    if (draft.images.length > room) break;
+    room -= draft.images.length;
+    count += 1;
+  }
+  return count;
+}
+
+/** Give messages back to the session's composer. False (and nothing taken)
+ *  when none is mounted or their pictures do not fit. */
+export function returnToComposer(sessionId: string, sends: ReturnedSends): boolean {
+  const target = returnRegistry.get(sessionId);
+  if (target === undefined || sends.images.length > target.room()) return false;
+  target.take(sends);
+  return true;
 }

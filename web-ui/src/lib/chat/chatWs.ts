@@ -480,6 +480,16 @@ export class ChatSocket {
     return true;
   }
 
+  /** {@link send} for a frame nobody typed (the store sending an unconfirmed
+   *  send again, or withdrawing one): the same frame on the same socket, but
+   *  a socket that is not open is simply not written to. It must never redial
+   *  with wake intent: only the user acting may wake a machine. */
+  sendQuietly(command: Record<string, unknown>): boolean {
+    if (this.ws?.readyState !== WebSocket.OPEN || this.authenticatedSocket !== this.ws) return false;
+    this.ws.send(JSON.stringify(command));
+    return true;
+  }
+
   /**
    * A user action on a browser view whose socket is down, or on any socket
    * waiting for a sleeping owner: reconnect now, once, carrying wake intent,

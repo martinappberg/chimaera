@@ -372,7 +372,6 @@
     saveRailChrome,
   } from "./lib/layout/railState";
   import { hintsActive, initChordHints } from "./lib/shared/chordHints.svelte";
-  import FolderPicker from "./lib/workspace/FolderPicker.svelte";
   import HomeScreen from "./lib/workspace/HomeScreen.svelte";
   import HomeNavigation from "./lib/workspace/HomeNavigation.svelte";
   import { loadPaneView } from "./lib/layout/lazyViews";
@@ -6304,7 +6303,10 @@
 
 
 {#if pickerOpen}
-  <FolderPicker recents={workspaces} onOpened={activateWorkspace} onClose={closePicker} />
+  <!-- Lazy: opened on demand, so it stays out of the always-loaded shell. -->
+  {#await import("./lib/workspace/FolderPicker.svelte") then { default: FolderPicker }}
+    <FolderPicker recents={workspaces} onOpened={activateWorkspace} onClose={closePicker} />
+  {/await}
 {/if}
 
 {#if quickOpenOpen && activeWsId !== null}

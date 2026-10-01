@@ -16,7 +16,7 @@
   import BrandMark from "../shared/BrandMark.svelte";
   import ChatView from "../chat/ChatView.svelte";
   import { acquireChat, releaseChat } from "../chat/chatPool";
-  import type { ChatStore } from "../chat/store.svelte";
+  import { mintSendId, type ChatStore } from "../chat/store.svelte";
   import type { ChatSocket } from "../chat/chatWs";
   import { dismiss } from "../shared/dismiss";
   import { followToBottom } from "../chat/composerBus";
@@ -213,7 +213,9 @@
    *  (no client-side queue; reconnect replays the daemon's gap, not ours). */
   function sendPrompt(text: string): boolean {
     if (mm === null) return false;
-    const sent = mm.socket.send({ type: "send", blocks: [{ type: "text", text }] });
+    // Under its own id, like any send: a refusal then names this prompt, and
+    // can never be taken for the composer's message.
+    const sent = mm.socket.send({ type: "send", blocks: [{ type: "text", text }], client_id: mintSendId() });
     if (!sent) mm.store.notice("not connected — not sent, try again", "error");
     // The user's click is a send: show the question and follow the reply.
     else if (mmId !== null) followToBottom(mmId);

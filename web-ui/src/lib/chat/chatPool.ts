@@ -85,8 +85,9 @@ function makeSocket(sessionId: string, store: ChatStore): ChatSocket {
     lastSeq: () => store.lastSeq,
   });
   // The store sends its own unconfirmed sends again (by id) on this socket,
-  // and nothing else: there is no queue of commands on this side.
-  store.bindSender((frame) => socket.send(frame));
+  // and nothing else: there is no queue of commands on this side. Quietly: a
+  // frame the store sends by itself never redials or asks for a wake.
+  store.bindSender((frame) => socket.sendQuietly(frame));
   return socket;
 }
 
@@ -220,6 +221,7 @@ export function disposeChat(sessionId: string): void {
   const entry = pool.get(sessionId);
   if (entry === undefined) return;
   entry.socket.close();
+  entry.store.dispose();
   pool.delete(sessionId);
 }
 
