@@ -1,5 +1,6 @@
 <script lang="ts">
   import { tick, untrack } from "svelte";
+  import { paneTabHasKeyboardFocus } from "../shared/tabNavigation";
   import { fsQuickOpen, parentName, type QuickOpenEntry } from "../previews/files";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
@@ -191,7 +192,7 @@
   });
 
   $effect(() => {
-    if (focused) el?.focus();
+    if (focused && !paneTabHasKeyboardFocus()) el?.focus();
   });
 
   // Workbench splits resize without changing the browser viewport. Observe

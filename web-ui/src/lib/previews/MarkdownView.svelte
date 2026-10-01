@@ -25,6 +25,7 @@
 </script>
 
 <script lang="ts">
+  import { tabNavigation } from "../shared/tabNavigation";
   /**
    * Markdown with Obsidian-style modes: live | reading | source.
    *
@@ -653,6 +654,18 @@
     // Live may have folded the panel meanwhile.
     propsCollapsed = readFlag(PROPS_KEY);
     if (!wasRender && place !== null) void placeReading(place);
+  }
+
+  function openModeMenu(button: HTMLElement): void {
+    button.focus({ preventScroll: true });
+    const rect = button.getBoundingClientRect();
+    contextMenu.openAtPoint(rect.left, rect.bottom + 4, (["live", "reading", "source"] as const).map((value) => ({
+      label: value === "live" ? "Live — edit in place" : value === "reading" ? "Reading — read only" : "Source — Markdown text",
+      checked: mode === value,
+      disabled: value !== "reading" && editable === false,
+      hint: disabledReason,
+      onSelect: () => setMode(value),
+    })));
   }
 
   // --- keeping your place across modes ----------------------------------------
@@ -1505,52 +1518,64 @@
 
 <div class="md-view" style:--markdown-line-height={bodyLineHeight} style:--doc-measure="{columnCap}px">
   <div class="md-bar">
-    <div class="toggle" role="tablist" aria-label="markdown mode">
+    <button class="compact-mode" aria-label={`Markdown mode: ${mode}`} aria-haspopup="menu"
+      title="Markdown view mode" onclick={(e) => openModeMenu(e.currentTarget)}>
+      <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><rect x="2.5" y="2" width="11" height="12" rx="2" /><path d="M5 5h6M5 8h6M5 11h3" /></svg>
+      <span>{mode === "live" ? "Live" : mode === "reading" ? "Reading" : "Source"}</span>
+      <svg class="mode-caret" viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
+    </button>
+    <div class="toggle" role="tablist" aria-label="Markdown mode" use:tabNavigation>
       <button
         class="seg"
         class:on={mode === "live"}
         role="tab"
         aria-selected={mode === "live"}
+        tabindex={mode === "live" ? 0 : -1}
         title={editable === false ? disabledReason : "the rendered document — double-click (or Enter with the page focused) to edit in place, Esc to finish"}
         disabled={editable === false}
-        onclick={() => setMode("live")}>live</button
+        onclick={() => setMode("live")}>Live</button
       >
       <button
         class="seg"
         class:on={mode === "reading"}
         role="tab"
         aria-selected={mode === "reading"}
+        tabindex={mode === "reading" ? 0 : -1}
         title="the rendered document, read-only"
-        onclick={() => setMode("reading")}>reading</button
+        onclick={() => setMode("reading")}>Reading</button
       >
       <button
         class="seg"
         class:on={mode === "source"}
         role="tab"
         aria-selected={mode === "source"}
+        tabindex={mode === "source" ? 0 : -1}
         title={editable === false ? disabledReason : "raw markdown source"}
         disabled={editable === false}
-        onclick={() => setMode("source")}>source</button
+        onclick={() => setMode("source")}>Source</button
       >
     </div>
     {#if chunkError !== null}
-      <span class="md-bar-err">{chunkError}</span>
+      <span class="md-bar-err" role="status" title={chunkError}>{chunkError}</span>
     {:else if barNote !== null}
-      <span class="md-bar-note">{barNote}</span>
+      <span class="md-bar-note" role="status" title={barNote}>{barNote}</span>
     {:else if mode === "live" && editable === true}
       <!-- The gesture, where it is looked for: live reads like reading, so
            the bar says how to edit, and how to stop. -->
-      <span class="md-bar-note">{editing ? "esc finishes editing" : "double-click to edit"}</span>
+      <span class="md-bar-note gesture" title={editing ? "Esc finishes editing" : "Double-click the document or press Enter with it focused to edit"}>{editing ? "Esc finishes editing" : "Double-click to edit"}</span>
     {/if}
     <span class="md-bar-fill"></span>
     <DocIssues {path} {wsRoot} mtime={entry?.mtime ?? null} />
     <PublishButton {path} text={docText} links={linkContext} />
     <button
-      class="seg"
+      class="seg outline-toggle"
       class:on={outlineOpen}
       aria-pressed={outlineOpen}
-      title="headings of this document"
-      onclick={toggleOutline}>outline</button
+      aria-label="Document outline"
+      title="Document outline"
+      onclick={toggleOutline}>
+      <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M5 4h8M5 8h8M5 12h8M2 4h.5M2 8h.5M2 12h.5" /></svg>
+      <span class="action-label">Outline</span></button
     >
   </div>
 
@@ -1699,19 +1724,25 @@
 
   /* Quiet mode toggle bar, matching the pane top-bar treatment. */
   .md-bar {
+    container: pane-chrome / inline-size;
     flex: none;
     display: flex;
     align-items: center;
-    gap: 0.6rem;
-    height: 26px;
-    padding: 0 0.6rem;
+    gap: 6px;
+    min-width: 0;
+    height: var(--pane-toolbar-height);
+    padding: 0 8px;
+    white-space: nowrap;
     border-bottom: 1px solid var(--edge);
+    background: color-mix(in srgb, var(--bg) 65%, var(--term-bg));
   }
 
   .toggle {
+    flex: none;
     display: flex;
     align-items: center;
     gap: 1px;
+    padding: 0;
   }
 
   .seg {
@@ -1720,28 +1751,40 @@
     background: none;
     font: inherit;
     font-size: var(--text-xs);
-    letter-spacing: 0.04em;
+    white-space: nowrap;
     color: var(--muted);
     cursor: pointer;
-    padding: 2px 8px;
-    border-radius: 4px;
+    flex: none;
+    height: var(--pane-control-size);
+    padding: 0 8px;
+    border-radius: 5px;
     transition:
       background-color 0.12s ease,
       color 0.12s ease;
   }
 
   .seg:hover:not(:disabled) {
+    background: var(--pane-control-hover);
     color: var(--fg);
   }
 
   .seg.on {
     color: var(--fg);
-    background: var(--row-active);
+    background: var(--pane-control-selected);
   }
+
+  .toggle .seg { padding: 0 8px; }
 
   .seg:disabled {
     opacity: 0.4;
     cursor: default;
+  }
+
+  .md-bar-err, .md-bar-note {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .md-bar-err {
@@ -1754,8 +1797,19 @@
     color: var(--muted);
   }
 
-  .md-bar-fill {
-    flex: 1;
+  .md-bar-fill { flex: 1; }
+  .outline-toggle { display: inline-flex; align-items: center; gap: 5px; }
+  .compact-mode { display: none; align-items: center; gap: 6px; height: var(--pane-control-size); padding: 0 7px; border: 0; border-radius: 5px; background: none; color: var(--fg); font: inherit; font-size: var(--text-xs); cursor: pointer; }
+  .compact-mode:hover { background: var(--pane-control-hover); }
+  .mode-caret { margin-left: 3px; color: var(--muted); }
+  .seg:focus-visible, .compact-mode:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -1px; }
+  @container pane-chrome (max-width: 620px) {
+    .gesture, .action-label { display: none; }
+    .outline-toggle { width: var(--pane-control-size); padding: 0; justify-content: center; }
+  }
+  @container pane-chrome (max-width: 420px) {
+    .toggle { display: none; }
+    .compact-mode { display: inline-flex; flex: none; }
   }
 
   /* The document and, when open, the outline beside it. */

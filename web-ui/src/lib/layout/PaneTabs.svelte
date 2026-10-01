@@ -1,9 +1,9 @@
 <script lang="ts">
   import { gitRepos, openFileHistory, repoForPath } from "../workspace/git";
   /**
-   * The pane's always-present top bar (~26px): type glyph + tab name per
-   * tab (active emphasized by WEIGHT, not color), pane controls at the
-   * right edge (fade in on bar hover; the zoom badge stays persistent
+   * The pane's always-present top bar (28px): type glyph + tab name per
+   * tab (active marked by a quiet fill and underline), pane controls at the
+   * right edge (secondary actions share a menu; the zoom badge stays persistent
    * while zoomed). The bar's empty area is a drag handle for the active
    * tab, so every pane can always be re-tiled by its bar.
    *
@@ -11,6 +11,7 @@
    * name + close, same drag, same middle-click close, same dblclick zoom.
    * A terminal's glyph carries its session-state color.
    */
+  import { tabNavigation } from "../shared/tabNavigation";
   import { untrack } from "svelte";
   import { isPreviewTab, tabKey, type PaneNode, type Tab } from "./layout";
   import { TAB_FADE_PX, revealTabScrollLeft, tabFadeWidths, tabInView, type TabBounds } from "./tabScroll";
@@ -463,11 +464,30 @@
     ctrl.openChangesFrom(node.id, activeTerminal.sessionId, e.metaKey || e.ctrlKey);
   }
 
+  function openPaneMenu(button: HTMLElement): void {
+    const entries: ContextMenuEntry[] = [
+      { label: `Split right (${keyHint("splitRight")})`, onSelect: () => ctrl.splitPaneAt(node.id, "row") },
+      { label: `Split down (${keyHint("splitDown")})`, onSelect: () => ctrl.splitPaneAt(node.id, "col") },
+    ];
+    if (fontTarget) entries.push("separator",
+      { label: `Smaller text (${PINNED.fontMinus})`, onSelect: () => ctrl.adjustFont(node.id, -1) },
+      { label: `Larger text (${PINNED.fontPlus})`, onSelect: () => ctrl.adjustFont(node.id, 1) },
+      { label: `Reset text size (${PINNED.fontReset})`, onSelect: () => ctrl.adjustFont(node.id, 0) });
+    if (touched !== null && activeTerminal !== null) {
+      const sid = activeTerminal.sessionId;
+      entries.push("separator", { label: `Review ${touched.length} changed files`, onSelect: () => ctrl.openChangesFrom(node.id, sid, false) });
+    }
+    entries.push("separator", { label: `Close view (${keyHint("closeView")})`, onSelect: () => ctrl.closeView(node.id) });
+    button.focus({ preventScroll: true });
+    const r = button.getBoundingClientRect();
+    contextMenu.openAtPoint(r.right, r.bottom + 4, entries, { alignRight: true });
+  }
+
   /** Empty bar area drags the pane's ACTIVE tab (capture runs before the
    *  tabs' own handlers; anything inside a tab or a button is theirs). */
   function onBarPointerDown(e: PointerEvent): void {
     if (!(e.target instanceof Element)) return;
-    if (e.target.closest("[data-tab-index], button") !== null) return;
+    if (e.target.closest("[data-tab-index], button, .pane-grip") !== null) return;
     const active = node.tabs[node.active];
     if (active !== undefined) ctrl.dragTab(e, node.id, node.active, active);
   }
@@ -681,33 +701,19 @@
 </script>
 
 <div class="bar" bind:this={el} onpointerdowncapture={onBarPointerDown}>
-  {#if !zoomed}
-    <!-- Pane grip: fades in on bar hover; drag it to move the WHOLE pane (all
-         tabs) to another split. A plain click focuses the pane. Being a
-         <button>, the bar's active-tab drag ignores it (closest("button")). -->
-    <button
-      class="pane-grip"
-      title="drag to move this pane"
-      aria-label="move pane"
-      onpointerdown={(e) => ctrl.dragPane(e, node.id)}
-    >
-      <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
-        <rect x="2.5" y="3" width="11" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3" />
-        <line x1="2.5" y1="6" x2="13.5" y2="6" stroke="currentColor" stroke-width="1.3" />
-      </svg>
-    </button>
-  {/if}
   <!-- .strip owns the edge fades + the "more" control; .tabs is the
        scroller (hidden scrollbar, wheel → sideways). -->
   <div class="strip" class:clip-left={clip.left} class:clip-right={clip.right} class:over={clip.over}
     style:--left-fade="{clip.leftFade}px" style:--right-fade="{clip.rightFade}px">
-    <div class="tabs" role="tablist" bind:this={tabsEl} onscroll={onStripScroll} onwheel={onStripWheel}>
+    <div class="tabs" role="tablist" aria-label="Pane tabs" use:tabNavigation bind:this={tabsEl} onscroll={onStripScroll} onwheel={onStripWheel}>
       {#each node.tabs as tab, i (tabKey(tab))}
         {@const sid = tab.surface === "terminal" ? tab.sessionId : null}
         {@const ts = sid !== null ? (sessions.get(sid) ?? null) : null}
         {@const fEntry = tab.surface === "file" ? $gitIndex.files.get(tab.path) : undefined}
         {@const fDeco = fEntry ? decoFor(fEntry) : null}
         {@const unread = sid !== null && i !== node.active && isUnread(sid)}
+        <!-- Keyboard activation is delegated to tabNavigation on the strip. -->
+        <!-- svelte-ignore a11y_click_events_have_key_events -->
         <div
           class="tab"
           class:active={i === node.active}
@@ -719,8 +725,10 @@
           style:--hue={sid !== null && ts?.kind === "agent" ? agentHue(sid) : null}
           data-link-agent={sid !== null && ts?.kind === "agent" && ts.alive ? sid : undefined}
           role="tab"
+          aria-label={label(tab)}
           aria-selected={i === node.active}
-          tabindex="-1"
+          tabindex={i === node.active ? 0 : -1}
+          onclick={(e) => { if (e.target === e.currentTarget) ctrl.activateTab(node.id, i); }}
           data-tab-index={i}
           title={tab.surface === "file" || tab.surface === "finder" || tab.surface === "diff"
             ? tab.path
@@ -920,7 +928,8 @@
           {/if}
           <button
             class="tab-close"
-            aria-label="close tab"
+            tabindex={i === node.active ? 0 : -1}
+            aria-label={`Close ${label(tab)}`}
             title="close tab"
             onclick={(e) => {
               e.stopPropagation();
@@ -986,9 +995,8 @@
     </div>
   {/if}
 
-  <!-- Pane controls at the bar's right edge: the mouse path to every pane
-       chord (tooltips teach the chords). Faded in on bar hover; the zoom
-       badge stays persistent while zoomed. -->
+  <!-- Find and view actions stay visible; secondary pane commands share
+       the actions menu. Tooltips retain their keyboard shortcuts. -->
   <div
     class="bar-right"
     use:dismiss={{ enabled: linkMenuOpen, onDismiss: () => (linkMenuOpen = false) }}
@@ -1067,6 +1075,25 @@
       </button>
     {/if}
     <div class="controls">
+      {#if !zoomed}
+        <!-- Pointer-only grip, not a click action or an extra keyboard tab stop.
+             Tab context menus provide keyboard moves; Pane actions owns splits. -->
+        <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+        <span
+          class="pane-grip"
+          role="img"
+          title="Drag pane"
+          aria-label="Drag pane"
+          onpointerdown={(e) => ctrl.dragPane(e, node.id)}
+        >
+          <svg viewBox="0 0 12 16" width="10" height="14" fill="currentColor" aria-hidden="true">
+            <circle cx="4" cy="4" r="1" /><circle cx="8" cy="4" r="1" />
+            <circle cx="4" cy="8" r="1" /><circle cx="8" cy="8" r="1" />
+            <circle cx="4" cy="12" r="1" /><circle cx="8" cy="12" r="1" />
+          </svg>
+        </span>
+      {/if}
+
       {#if viewToggle !== null && activeSession !== null}
         <!-- The same conversation, the other surface: stops the process and
              resumes it in chat / as the real TUI (same session id). -->
@@ -1137,42 +1164,10 @@
           </svg>
         </button>
       {/if}
-      {#if fontTarget}
-        <!-- Parity with the Cmd/Ctrl +/−/0 chords: per-pane text size
-             (terminals and rendered markdown alike). -->
-        <button
-          class="ctl ctl-font"
-          title="smaller text ({PINNED.fontMinus})"
-          aria-label="smaller text"
-          onclick={() => ctrl.adjustFont(node.id, -1)}>A−</button
-        >
-        <button
-          class="ctl ctl-font"
-          title="larger text ({PINNED.fontPlus}) · reset {PINNED.fontReset}"
-          aria-label="larger text"
-          onclick={() => ctrl.adjustFont(node.id, 1)}>A+</button
-        >
-      {/if}
-      <button
-        class="ctl"
-        title="split right ({keyHint("splitRight")})"
-        aria-label="split right"
-        onclick={() => ctrl.splitPaneAt(node.id, "row")}
-      >
-        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
-          <rect x="2" y="3" width="12" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3" />
-          <line x1="8" y1="3" x2="8" y2="13" stroke="currentColor" stroke-width="1.3" />
-        </svg>
-      </button>
-      <button
-        class="ctl"
-        title="split down ({keyHint("splitDown")})"
-        aria-label="split down"
-        onclick={() => ctrl.splitPaneAt(node.id, "col")}
-      >
-        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
-          <rect x="2" y="3" width="12" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3" />
-          <line x1="2" y1="8" x2="14" y2="8" stroke="currentColor" stroke-width="1.3" />
+      <button class="ctl" aria-label="Pane actions" title="Pane actions" aria-haspopup="menu"
+        onclick={(e) => openPaneMenu(e.currentTarget)}>
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true">
+          <circle cx="3" cy="8" r="1.2" /><circle cx="8" cy="8" r="1.2" /><circle cx="13" cy="8" r="1.2" />
         </svg>
       </button>
       {#if !zoomed}
@@ -1182,16 +1177,6 @@
           </svg>
         </button>
       {/if}
-      <button
-        class="ctl"
-        title="close view ({keyHint("closeView")})"
-        aria-label="close view"
-        onclick={() => ctrl.closeView(node.id)}
-      >
-        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
-          <path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-        </svg>
-      </button>
     </div>
     {#if mastermindPanel.available && !mastermindPanel.open && mastermindPanel.cornerPaneId === node.id}
       <!-- The window's ONE way into its Mastermind panel: only in the pane
@@ -1234,20 +1219,22 @@
 
 <style>
   .bar {
+    --pane-control-size: 24px;
+    container: pane-chrome / inline-size;
     flex: none;
     display: flex;
     align-items: stretch;
-    height: 26px;
+    height: var(--pane-tab-height);
     overflow: hidden;
     border-bottom: 1px solid var(--edge);
-    padding: 0 4px;
+    padding: 0 4px 0 0;
     user-select: none;
   }
 
   /* --- the tab strip ------------------------------------------------------
      .strip is the positioned frame (edge fades, the "more" control); .tabs
      is the scroller. The scrollbar is hidden: the fades + control ARE the
-     overflow affordance, and a 26px bar has no room for a track. */
+     overflow affordance, without reserving another row for a track. */
   .strip {
     position: relative;
     flex: 1;
@@ -1325,7 +1312,7 @@
     justify-content: center;
     gap: 2px;
     min-width: 32px;
-    height: 18px;
+    height: var(--pane-control-size);
     padding: 0 4px;
     border-radius: 4px;
     font: inherit;
@@ -1353,40 +1340,32 @@
     line-height: 1;
   }
 
-  /* Pane grip: same hover-fade recipe as the right-edge .controls, so the bar
-     height never shifts (opacity, not display). cursor: grab reads as a
-     draggable handle. */
+  /* A grip is a drag affordance: no button-shaped hover fill or pressed state. */
   .pane-grip {
     flex: none;
     align-self: center;
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 20px;
-    height: 18px;
-    margin-right: 2px;
+    width: var(--pane-control-size);
+    height: var(--pane-control-size);
     padding: 0;
     border: none;
     background: none;
-    border-radius: 4px;
     color: var(--muted);
     cursor: grab;
-    opacity: 0;
-    pointer-events: none;
+    opacity: 0.55;
     transition:
       opacity 0.12s ease,
-      background-color 0.12s ease,
       color 0.12s ease;
   }
 
-  .bar:hover .pane-grip,
-  .pane-grip:focus-visible {
+  .bar:hover .pane-grip {
     opacity: 1;
     pointer-events: auto;
   }
 
   .pane-grip:hover {
-    background: var(--row-hover);
     color: var(--fg);
   }
 
@@ -1428,12 +1407,12 @@
     margin-top: 1px;
   }
 
-  /* Active-tab emphasis via weight, not color — the bar stays quiet; a thin
-     accent underline (inset shadow, above the bar's edge line) confirms it
-     without adding a fill. */
+  /* The underline and subtle fill identify the active tab without changing
+     label weight or width when selection moves. */
   .tab.active {
+    background: color-mix(in srgb, var(--fg) 4%, transparent);
+    border-radius: 6px 6px 0 0;
     color: var(--fg);
-    font-weight: 600;
     box-shadow: inset 0 -2px 0 color-mix(in srgb, var(--accent) 70%, transparent);
   }
 
@@ -1562,7 +1541,12 @@
     appearance: none;
     border: none;
     background: none;
-    padding: 0 0.15rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--pane-control-size);
+    height: var(--pane-control-size);
+    padding: 0;
     font: inherit;
     font-size: var(--text-md);
     font-weight: 400;
@@ -1854,15 +1838,7 @@
     display: flex;
     align-items: center;
     gap: 1px;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.12s ease;
-  }
-
-  .bar:hover .controls,
-  .controls:focus-within {
-    opacity: 1;
-    pointer-events: auto;
+    flex: none;
   }
 
   .ctl {
@@ -1872,8 +1848,8 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 20px;
-    height: 18px;
+    width: var(--pane-control-size);
+    height: var(--pane-control-size);
     padding: 0;
     border-radius: 4px;
     color: var(--muted);
@@ -2002,14 +1978,6 @@
     color: var(--fg);
   }
 
-  /* Per-pane text size (parity with the chords); text glyphs, same cluster. */
-  .ctl-font {
-    font-size: var(--text-xs);
-    font-family: var(--mono);
-    letter-spacing: -0.02em;
-    width: 24px;
-  }
-
   /* Persistent while zoomed — the always-visible mouse exit from zoom.
      Collapse glyph + "restore" label: an action, not the "ZOOM" state. */
   .zoom-badge {
@@ -2034,5 +2002,14 @@
   .zoom-badge:hover {
     background: color-mix(in srgb, var(--fg) 12%, transparent);
     color: var(--fg);
+  }
+  .tab:focus-visible, .bar button:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: -2px;
+  }
+  @container pane-chrome (max-width: 560px) {
+    .touched-chip { display: none; }
+    .ref-target { display: none; }
+    .links { max-width: 72px; }
   }
 </style>

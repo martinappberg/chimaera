@@ -19,12 +19,24 @@ describe("tab strip reveal", () => {
     expect(tabFadeWidths(scroll, 240, tab)).toEqual({ left: 24, right: 8 });
   });
 
-  it("reduces both fade margins when a tab nearly fills the strip", () => {
+  it("reveals the close edge without adding gutters when a tab nearly fills the strip", () => {
     const tab = { left: 200, width: 180 };
     const scroll = revealTabScrollLeft(176, 200, 600, tab);
-    expect(scroll).toBe(190);
-    expect(tabFadeWidths(scroll, 200, tab)).toEqual({ left: 10, right: 10 });
+    expect(scroll).toBe(200);
+    expect(tabFadeWidths(scroll, 200, tab)).toEqual({ left: 0, right: 20 });
     expect(revealTabScrollLeft(scroll, 200, 600, tab)).toBe(scroll);
+  });
+
+  it("aligns a previously clipped leading edge flush with the strip", () => {
+    const tab = { left: 200, width: 180 };
+    const scroll = revealTabScrollLeft(225, 240, 600, tab);
+    expect(scroll).toBe(200);
+    expect(tabFadeWidths(scroll, 240, tab).left).toBe(0);
+    expect(revealTabScrollLeft(scroll, 240, 600, tab)).toBe(scroll);
+  });
+
+  it("does not leave the preceding tab's empty tail before a newly revealed tab", () => {
+    expect(revealTabScrollLeft(0, 227, 672, { left: 124, width: 180 })).toBe(124);
   });
 
   it("preserves a revealed tab's position and normal fade margins", () => {

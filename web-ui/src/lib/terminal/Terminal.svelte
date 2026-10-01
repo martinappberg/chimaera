@@ -1,5 +1,6 @@
 <script lang="ts">
   import { tick, untrack } from "svelte";
+  import { paneTabHasKeyboardFocus } from "../shared/tabNavigation";
   import { pastedImageName, uploadAndInsert } from "../net/uploads";
   import { isBrowserGateway } from "../net/base";
   import { isWatching, setWatching } from "./viewerMode.svelte";
@@ -113,7 +114,7 @@
   });
 
   $effect(() => {
-    if (focused && !findOpen) focusTerminal(sessionId);
+    if (focused && !findOpen && !paneTabHasKeyboardFocus()) focusTerminal(sessionId);
   });
 
   /**

@@ -31,6 +31,7 @@
   import { tick, untrack } from "svelte";
   import { APP_MENU, PINNED } from "../shared/keys";
   import { activeModLabel } from "../shared/keybindings";
+  import { paneTabHasKeyboardFocus } from "../shared/tabNavigation";
 
   /** The tab is showing (kept-alive tabs stay mounted while hidden).
    *  `account`: the web's Home, the account's own page. It has no daemon, so
@@ -89,7 +90,8 @@
 
   // Focus the search box when the UI tab shows (VS Code behavior).
   $effect(() => {
-    searchEl?.focus();
+    const input = searchEl;
+    if (!paneTabHasKeyboardFocus()) input?.focus();
   });
 
   function matches(def: SettingDef): boolean {
