@@ -555,7 +555,7 @@ pub fn valid_slurm_job_id(id: &str) -> bool {
 }
 
 /// What the page calls a job without a saved setup's name:
-/// `{partition} · {time}` in plain words (`normal · 7 days`).
+/// `{partition} · {time}` in plain words (`batch · 3 days`).
 pub fn job_display_name(spec: &LaunchSpec) -> String {
     let time = crate::slurm::parse_duration(&spec.time)
         .map(|d| {
@@ -703,8 +703,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            job_display_name(&spec(Some("normal"), "7-00:00:00")),
-            "normal · 7 days"
+            job_display_name(&spec(Some("batch"), "3-00:00:00")),
+            "batch · 3 days"
         );
         assert_eq!(
             job_display_name(&spec(Some("gpu"), "4:00:00")),

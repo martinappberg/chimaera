@@ -1231,8 +1231,8 @@ mod tests {
         };
         let facts = ClusterFacts {
             partitions: vec![
-                part("normal", true, "7-00:00:00", false, false),
-                part("gpu", false, "2-00:00:00", true, true),
+                part("batch", true, "3-00:00:00", false, false),
+                part("accel", false, "1-12:00:00", true, true),
                 slurm::PartitionChoice {
                     up: false,
                     ..part("down", false, "1:00:00", false, false)
@@ -1249,7 +1249,7 @@ mod tests {
         );
         assert!(text.contains("[--mem=…] [--gpus=N] job.sh"), "{text}");
         assert!(
-            text.contains("- normal (default) — 7-00:00:00 — 64 CPUs, 256 GB\n- gpu — 2-00:00:00 — 64 CPUs, 256 GB, GPUs — can be preempted"),
+            text.contains("- batch (default) — 3-00:00:00 — 64 CPUs, 256 GB\n- accel — 1-12:00:00 — 64 CPUs, 256 GB, GPUs — can be preempted"),
             "{text}"
         );
         assert!(

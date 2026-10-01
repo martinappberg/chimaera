@@ -320,9 +320,9 @@ user the job id and stop. Write results somewhere the user can find them.
 
 What you can submit to here:
   partition  max time   largest node            note
-  normal *   7-00:00    64 CPUs · 256 GB        default
-  gpu        2-00:00    32 CPUs · 512 GB · 4 GPUs
-  dev        2:00:00    16 CPUs · 64 GB         interactive only
+  batch *    3-00:00    64 CPUs · 256 GB        default
+  accel      1-12:00    32 CPUs · 512 GB · 4 GPUs
+  short      4:00:00    16 CPUs · 64 GB         interactive only
 <Account: … | No --account needed.> <GPUs: --gpus=N.>
 ```
 

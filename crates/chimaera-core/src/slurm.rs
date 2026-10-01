@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn parse_squeue_rows_caps_and_skips_noise() {
         let out =
-            "34022541|normal|RUNNING|9:54|n058|4|16G|1:02:03|/home/u/proj|None|chimaera-test\n\
+            "34022541|batch|RUNNING|9:54|n058|4|16G|1:02:03|/home/u/proj|None|chimaera-test\n\
                    34022542|batch|PENDING|8:00:00||||0:00|(null)|Priority|align.sh\n\
                    34022543|batch|RUNNING|1:00|n1|2|4G|5:00|/scratch/x|None|my|weird|name\n\
                    slurm_load_jobs: Warning: something\n";
