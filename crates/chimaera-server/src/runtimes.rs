@@ -760,6 +760,29 @@ pub(crate) fn codex_user_theme_set(config_path: &Path) -> bool {
     })
 }
 
+/// Whether the user's codex config sets `developer_instructions` anywhere —
+/// top level, under a profile, quoted key or bare. A `-c` override of that
+/// root string REPLACES the config's value rather than adding to it (CLI
+/// overrides outrank config.toml, the same precedence the theme gate above
+/// relies on), so a spawn that would add its own instructions must not when
+/// the user has some. Line-based and coarse on purpose: over-matching skips
+/// our text, never fights the user's. Blocking (a file read): call it off
+/// the reactor.
+pub(crate) fn codex_user_developer_instructions_set(config_path: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(config_path) else {
+        return false;
+    };
+    contents.lines().any(|line| {
+        let key = line.trim_start().trim_start_matches(['"', '\'']);
+        key.strip_prefix("developer_instructions")
+            .is_some_and(|rest| {
+                rest.trim_start_matches(['"', '\''])
+                    .trim_start()
+                    .starts_with('=')
+            })
+    })
+}
+
 /// The explicit `agents.<kind>.path` overrides from settings, as a map.
 pub(crate) fn explicit_agent_paths(state: &AppState) -> HashMap<AgentKind, String> {
     let mut settings = crate::lock(&state.settings);
@@ -1689,6 +1712,25 @@ esac
         assert!(!codex_user_theme_set(&config));
         std::fs::write(&config, "tui.themes_dir = \"x\"\n").unwrap();
         assert!(!codex_user_theme_set(&config));
+
+        // codex: the user's own developer_instructions, in any spelling.
+        std::fs::write(&config, "model = \"gpt-5.5\"\n").unwrap();
+        assert!(!codex_user_developer_instructions_set(&config));
+        std::fs::write(&config, "developer_instructions = \"be terse\"\n").unwrap();
+        assert!(codex_user_developer_instructions_set(&config));
+        std::fs::write(
+            &config,
+            "[profiles.x]\n  developer_instructions=\"\"\"\nhi\n\"\"\"\n",
+        )
+        .unwrap();
+        assert!(codex_user_developer_instructions_set(&config));
+        std::fs::write(&config, "\"developer_instructions\" = \"x\"\n").unwrap();
+        assert!(codex_user_developer_instructions_set(&config));
+        std::fs::write(&config, "developer_instructions_file = \"x\"\n").unwrap();
+        assert!(!codex_user_developer_instructions_set(&config));
+        assert!(!codex_user_developer_instructions_set(
+            &dir.join("absent.toml")
+        ));
 
         assert_eq!(codex_theme_name("light"), "catppuccin-latte");
         assert_eq!(codex_theme_name("dark"), "catppuccin-mocha");

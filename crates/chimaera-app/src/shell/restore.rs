@@ -265,7 +265,7 @@ pub(super) fn open_compute_window(
     open_shell_window(app, &url, title, record, scope)
 }
 
-fn open_shell_window(
+pub(super) fn open_shell_window(
     app: &AppHandle,
     url: &str,
     title: &str,

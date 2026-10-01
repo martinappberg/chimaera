@@ -35,9 +35,9 @@ enum Command {
         /// POSIX remote (Linux, macOS, the BSDs).
         #[arg(long)]
         daemonize: bool,
-        /// Bind 0.0.0.0 instead of loopback — Mode 2 rung A only (a
-        /// compute-node daemon reached by a direct login-node forward on
-        /// clusters without ssh-to-node); the bearer token is the gate.
+        /// Bind 0.0.0.0 instead of loopback — what a cluster workspace job
+        /// runs with, so a plain `ssh -L` through the login node reaches it;
+        /// the bearer token is the gate.
         #[arg(long)]
         bind_routable: bool,
     },
@@ -75,12 +75,20 @@ enum Command {
         /// no flag: dev-ness is the build's property.
         #[arg(long)]
         update_daemon: bool,
+        /// Run the daemon on the login node of a cluster (a host whose login
+        /// shell reaches a batch scheduler) anyway. Most clusters don't allow
+        /// servers on login nodes — use this only if yours says it's fine;
+        /// otherwise use `chimaera compute`, which runs each workspace as a
+        /// job. Saved per host once used (the app shares the setting).
+        #[arg(long)]
+        login_node: bool,
     },
     /// Check the local environment for common problems.
     Doctor,
     /// Print the shell-integration snippet (for remote hosts' rc files).
     ShellIntegration,
-    /// Mode 2: chimaera sessions running AS Slurm jobs on a cluster.
+    /// Cluster workspaces: each runs chimaera inside its own Slurm job;
+    /// nothing runs on the login node.
     Compute {
         #[command(subcommand)]
         cmd: ComputeCmd,
@@ -153,43 +161,61 @@ enum PluginCmd {
 
 #[derive(Subcommand)]
 enum ComputeCmd {
-    /// List compute sessions (chimaera-named Slurm jobs) on a host.
+    /// The cluster's workspaces and their jobs.
     List { host: String },
-    /// Submit a chimaera daemon as a Slurm job on a host.
-    Launch {
+    /// Add a folder on the cluster as a workspace ($SCRATCH/x and ~/x expand there).
+    Add {
         host: String,
-        /// Display name (slugged into the job name `chimaera-<slug>`).
-        #[arg(long, default_value = "session")]
-        name: String,
-        /// Walltime, e.g. 4:00:00 or 1-00:00:00.
-        #[arg(long, default_value = "2:00:00")]
+        path: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Start a workspace as a Slurm job.
+    Start {
+        host: String,
+        /// Workspace id or name.
+        workspace: String,
+        /// Walltime, e.g. 4:00:00 or 2-00:00:00 (required — every job states one).
+        #[arg(long)]
         time: String,
         #[arg(long)]
         partition: Option<String>,
         #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        qos: Option<String>,
+        #[arg(long)]
+        constraint: Option<String>,
+        #[arg(long)]
         cpus: Option<u32>,
+        /// Memory per node, e.g. 16G.
         #[arg(long)]
         mem: Option<String>,
-        /// GPUs etc., e.g. gpu:1.
         #[arg(long)]
-        gres: Option<String>,
-        /// Workspace id whose environment prelude applies.
+        gpus: Option<u32>,
+        /// Startup commands for this run only (after the cluster's and the
+        /// workspace's).
         #[arg(long)]
-        workspace: Option<String>,
-        /// Launch with a routable bind (rung A clusters only; token-gated).
+        startup: Option<String>,
+        /// Hold the job in this terminal instead of submitting it (for
+        /// partitions that take only interactive jobs); it stops when this
+        /// command ends.
         #[arg(long)]
-        routable: bool,
+        attached: bool,
+        /// Remember this setup under a name.
+        #[arg(long)]
+        save_as: Option<String>,
     },
-    /// Tunnel to a running compute session and open its UI.
-    Connect {
+    /// Open a running workspace's UI (holds the ssh forward until Ctrl-C).
+    Open {
         host: String,
-        job_id: String,
-        /// Do not open the UI in a browser.
+        workspace: String,
+        /// Print the URL without opening a browser.
         #[arg(long)]
         no_open: bool,
     },
-    /// scancel a compute session.
-    Cancel { host: String, job_id: String },
+    /// Stop a workspace's job (its chimaera saves the chats first).
+    Stop { host: String, workspace: String },
 }
 
 /// Parse a `$PORT`-style listen port. An unset, empty, or unparsable value
@@ -272,7 +298,18 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
             binary,
             no_open,
             update_daemon,
-        } => connect::run(&host, local_port, binary.as_deref(), no_open, update_daemon).await,
+            login_node,
+        } => {
+            connect::run(
+                &host,
+                local_port,
+                binary.as_deref(),
+                no_open,
+                update_daemon,
+                login_node,
+            )
+            .await
+        }
         Command::Doctor => doctor::run(),
         Command::ShellIntegration => {
             print!("{}", chimaera_core::shellint::snippet());
@@ -280,36 +317,50 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
         }
         Command::Compute { cmd } => match cmd {
             ComputeCmd::List { host } => compute::list(&host).await,
-            ComputeCmd::Launch {
+            ComputeCmd::Add { host, path, name } => {
+                compute::add(&host, &path, name.as_deref()).await
+            }
+            ComputeCmd::Start {
                 host,
-                name,
+                workspace,
                 time,
                 partition,
+                account,
+                qos,
+                constraint,
                 cpus,
                 mem,
-                gres,
-                workspace,
-                routable,
+                gpus,
+                startup,
+                attached,
+                save_as,
             } => {
-                compute::launch(
-                    &host,
-                    &name,
-                    &time,
-                    partition.as_deref(),
+                let spec = chimaera_core::slurm::LaunchSpec {
+                    time,
+                    partition,
+                    account,
+                    qos,
+                    constraint,
                     cpus,
-                    mem.as_deref(),
-                    gres.as_deref(),
-                    workspace.as_deref(),
-                    routable,
+                    mem,
+                    gpus,
+                };
+                compute::start(
+                    &host,
+                    &workspace,
+                    spec,
+                    startup.as_deref(),
+                    attached,
+                    save_as.as_deref(),
                 )
                 .await
             }
-            ComputeCmd::Connect {
+            ComputeCmd::Open {
                 host,
-                job_id,
+                workspace,
                 no_open,
-            } => compute::connect(&host, &job_id, no_open).await,
-            ComputeCmd::Cancel { host, job_id } => compute::cancel(&host, &job_id).await,
+            } => compute::open(&host, &workspace, no_open).await,
+            ComputeCmd::Stop { host, workspace } => compute::stop(&host, &workspace).await,
         },
         Command::Plugin { cmd } => match cmd {
             PluginCmd::List => plugin::list().await,

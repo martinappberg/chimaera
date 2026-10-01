@@ -82,7 +82,7 @@ trap "$__chimaera_debug_chain" DEBUG
 
 # The trap must ALSO be re-armed at every prompt, inline at top level: on
 # bash < 4.4, when a pre-existing DEBUG trap's handler calls shell functions
-# (HPC audit shells, e.g. Sherlock's user_audit), bash reverts DEBUG-trap
+# (HPC audit shells, e.g. a site's user-audit trap), bash reverts DEBUG-trap
 # changes made while an rc file is being sourced — the install above is
 # silently undone by the first prompt. A bare `trap` run from the
 # PROMPT_COMMAND string itself executes at top level and sticks. It also

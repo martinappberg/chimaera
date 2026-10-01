@@ -338,6 +338,20 @@ fn ssh_cmd(host: &str) -> Command {
     c
 }
 
+/// The argv of an interactive `ssh` to `host` over chimaera's own
+/// ControlMaster (the user's terminal on a cluster's login node): the shared
+/// options along the host's current route, a forced tty, the host. No
+/// password prompt when the master is up; ssh's own prompt in the terminal
+/// when it isn't.
+pub fn interactive_ssh_argv(host: &str) -> Vec<String> {
+    let mut argv = vec!["ssh".to_string()];
+    argv.extend(route_opts(host, &route_of(host)));
+    argv.extend(ssh_opts());
+    argv.push("-t".into());
+    argv.push(host.to_string());
+    argv
+}
+
 /// An `scp` command pre-loaded with the shared options, so a binary copy
 /// reuses the connection the probe already authenticated instead of prompting
 /// again.
@@ -1604,6 +1618,17 @@ impl std::fmt::Display for ProbeFailure {
 /// a remote fork (~300-500 ms on a loaded login node at WAN latency). `None`
 /// = no readable manifest (or ssh itself failed — "nothing running", as the
 /// connect flow has always read an unreachable host).
+/// Which batch scheduler `host`'s login shell reaches — one probe exec (which
+/// also raises the ControlMaster, so it may ask the user to authenticate).
+/// Every later cluster command finds the scheduler on the PATH this learned.
+pub async fn detect_scheduler(host: &str, home: RemoteHome) -> anyhow::Result<SchedulerInfo> {
+    let host = &hosts::normalize_alias(host)?;
+    if let ProbeRun::Failed(f) = probe_run(host, home, true).await? {
+        bail!("could not reach {host}: {f}");
+    }
+    Ok(scheduler_of(host).unwrap_or_default())
+}
+
 pub async fn remote_probe(host: &str, home: RemoteHome) -> anyhow::Result<Option<Probe>> {
     match probe_run(host, home, true).await? {
         ProbeRun::Ran(probe) => Ok(probe),
@@ -3756,7 +3781,7 @@ mod tests {
                 .map(|value| value.to_string_lossy().into_owned())
         }
 
-        assert_eq!(alias(&ssh_cmd("Sherlock")), Some("Sherlock".into()));
+        assert_eq!(alias(&ssh_cmd("cluster")), Some("cluster".into()));
         assert_eq!(alias(&scp_cmd("remote-2")), Some("remote-2".into()));
         assert_eq!(
             alias(&node_ssh_base("login.example.edu", &Route::Alias)),
@@ -5027,7 +5052,7 @@ mod tests {
 
     #[test]
     fn node_names_are_validated_before_ssh_sees_them() {
-        for ok in [LN01, "login1", "sh03-ln06.stanford.edu", "node_7"] {
+        for ok in [LN01, "login1", "login-a.cluster.example", "node_7"] {
             assert!(valid_node_name(ok), "{ok}");
         }
         for bad in [
@@ -5054,7 +5079,7 @@ mod tests {
         assert_eq!(
             routes_to("sh04-ln03", &[a], &[b]),
             vec![Route::NodeViaAlias("sh04-ln03".into())],
-            "resolved elsewhere here (Sherlock's bare names: 10.x inside, public outside)"
+            "resolved elsewhere here (a cluster's bare names: 10.x inside, public outside)"
         );
         assert_eq!(
             routes_to(LN01, &[a], &[]),

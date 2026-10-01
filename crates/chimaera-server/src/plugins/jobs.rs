@@ -392,11 +392,14 @@ async fn login_env(
     state: &Arc<AppState>,
     ws: Option<&str>,
 ) -> Result<Arc<Vec<(String, String)>>, String> {
+    // The cluster job's startup commands are a scope like any other: in the
+    // key, so an edit there re-captures too.
+    let startup = crate::environment::job_startup().await;
     let prelude_text = {
         let mut preludes = crate::lock(&state.env_preludes);
         match ws {
-            Some(ws) => preludes.current().effective(ws, None),
-            None => preludes.current().host_only(),
+            Some(ws) => preludes.current().effective(startup.as_deref(), ws, None),
+            None => preludes.current().host_only(startup.as_deref()),
         }
     };
     let key = format!("{}\u{0}{prelude_text}", crate::launcher::login_shell());

@@ -179,6 +179,37 @@ impl WorkspaceStore {
         Ok(workspace)
     }
 
+    /// Make sure workspace `id` exists, under exactly this id: a cluster
+    /// workspace job registers the workspace it was started for under the
+    /// cluster's id, so every job of that workspace shares one identity
+    /// (timeline, history, preludes and the ledger key by it). Present →
+    /// left as it is (the user may have renamed it); missing → inserted
+    /// FIRST, so a later [`Self::add`] of the same root lands on it even if
+    /// an older record for that root exists. `root` must already be
+    /// canonical. Returns whether it was inserted.
+    pub(crate) fn seed(&mut self, id: &str, name: &str, root: PathBuf) -> anyhow::Result<bool> {
+        if self.items.iter().any(|w| w.id == id) {
+            return Ok(false);
+        }
+        let name = match name.trim() {
+            "" => workspace_name(&root),
+            name => name.to_string(),
+        };
+        self.items.insert(
+            0,
+            Workspace {
+                id: id.to_string(),
+                root,
+                name,
+                last_opened_at: unix_now(),
+                mastermind: None,
+                plugins_on: Vec::new(),
+            },
+        );
+        self.save()?;
+        Ok(true)
+    }
+
     /// Stamp `id` as freshly opened. Returns the workspace, or None if
     /// unknown.
     pub(crate) fn touch(&mut self, id: &str) -> Option<Workspace> {
@@ -371,6 +402,65 @@ impl WorkspaceStore {
     }
 }
 
+/// Boot: register the workspace a cluster workspace job was started for —
+/// the JSON `WorkspaceSeed` (`{id, name, path}`) that
+/// `CHIMAERA_CLUSTER_WORKSPACE` names. A no-op without the variable; a
+/// missing, oversized or malformed seed is logged and skipped (the daemon
+/// still serves; the app can open the folder by path). Blocking (reads and
+/// canonicalizes on a shared filesystem): run it off the reactor, before
+/// the ledger resurrects sessions into the workspace.
+pub(crate) fn seed_cluster_workspace(state: &crate::AppState) {
+    let Some(seed_path) = std::env::var_os(chimaera_core::cluster::ENV_CLUSTER_WORKSPACE)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+    else {
+        return;
+    };
+    match read_seed(&seed_path) {
+        Ok(seed) => {
+            // Every registered root is canonical (fs routes compare against
+            // it); a path that can't be resolved yet is kept as given.
+            let given = PathBuf::from(&seed.path);
+            let root = std::fs::canonicalize(&given).unwrap_or(given);
+            match crate::lock(&state.workspaces).seed(&seed.id, &seed.name, root) {
+                Ok(true) => {
+                    tracing::info!(id = %seed.id, "registered this job's cluster workspace")
+                }
+                Ok(false) => {}
+                Err(err) => tracing::warn!(%err, "could not save this job's cluster workspace"),
+            }
+        }
+        Err(err) => {
+            tracing::warn!(path = %seed_path.display(), %err, "cluster workspace seed skipped");
+        }
+    }
+}
+
+/// The seed file, validated: an id of the shape the cluster folder mints
+/// (`w-` + 8 hex — it names folders and rides shell lines elsewhere) and an
+/// absolute path.
+fn read_seed(path: &Path) -> anyhow::Result<chimaera_core::cluster::WorkspaceSeed> {
+    use std::io::Read;
+    const MAX_SEED_BYTES: u64 = 64 * 1024;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_SEED_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() as u64 <= MAX_SEED_BYTES, "seed too large");
+    let seed: chimaera_core::cluster::WorkspaceSeed = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        chimaera_core::cluster::valid_workspace_id(&seed.id),
+        "invalid workspace id {:?}",
+        seed.id
+    );
+    anyhow::ensure!(
+        Path::new(&seed.path).is_absolute(),
+        "workspace path {:?} is not absolute",
+        seed.path
+    );
+    Ok(seed)
+}
+
 /// Display name for a workspace root: its basename, falling back to the full
 /// path for roots like `/`.
 fn workspace_name(root: &Path) -> String {
@@ -456,6 +546,53 @@ mod tests {
         assert!(reloaded.get(&ws.id).unwrap().mastermind.is_none());
 
         std::fs::remove_file(reloaded.path.clone()).ok();
+    }
+
+    /// A cluster job's seed lands under exactly its id and name, first in
+    /// the list (so opening the same root by path finds it), once; an
+    /// existing record of that id is left as the user has it.
+    #[test]
+    fn seed_inserts_once_under_the_given_id() {
+        let path = test_dir("seed").join("workspaces.json");
+        let root = test_dir("seed-root");
+        let mut store = WorkspaceStore::load(path.clone());
+        let older = store.add(root.clone()).unwrap();
+        assert!(store
+            .seed("w-0000abcd", "Joint fold", root.clone())
+            .unwrap());
+        assert!(!store.seed("w-0000abcd", "renamed?", root.clone()).unwrap());
+        let reloaded = WorkspaceStore::load(path.clone());
+        let seeded = reloaded.get("w-0000abcd").unwrap();
+        assert_eq!(seeded.name, "Joint fold");
+        assert_eq!(seeded.root, root);
+        assert_eq!(reloaded.list()[0].id, "w-0000abcd");
+        let mut reloaded = reloaded;
+        assert_eq!(reloaded.add(root.clone()).unwrap().id, "w-0000abcd");
+        assert!(reloaded.get(&older.id).is_some(), "nothing else is dropped");
+        // A blank name falls back to the folder's.
+        assert!(reloaded.seed("w-0000abce", " ", root.clone()).unwrap());
+        assert_eq!(
+            reloaded.get("w-0000abce").unwrap().name,
+            workspace_name(&root)
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn seed_files_are_validated() {
+        let dir = test_dir("seed-file");
+        let file = dir.join("workspace.json");
+        let write = |v: &str| std::fs::write(&file, v).unwrap();
+        write(r#"{"id":"w-0000abcd","name":"x","path":"/data/x"}"#);
+        assert_eq!(read_seed(&file).unwrap().id, "w-0000abcd");
+        write(r#"{"id":"w-../../x","name":"x","path":"/data/x"}"#);
+        assert!(read_seed(&file).is_err());
+        write(r#"{"id":"w-0000abcd","name":"x","path":"data/x"}"#);
+        assert!(read_seed(&file).is_err());
+        write("not json");
+        assert!(read_seed(&file).is_err());
+        assert!(read_seed(&dir.join("missing.json")).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A plugin switch is written off the store's lock, so two writes can

@@ -855,24 +855,33 @@ pub(crate) fn codex_tui_mcp_args(url: &str, approve: &[String]) -> Vec<String> {
     args
 }
 
+/// `cluster` is the cluster context (`compute::agent_context`) — codex has
+/// no hook carrier, so it rides the same `developer_instructions` string
+/// last; `None` (every daemon off-cluster) leaves the argv byte-identical.
 pub(crate) fn build_codex_chat_command(
     bin: &Path,
     mcp_url: Option<&str>,
     mastermind: Option<crate::workspaces::MastermindMode>,
+    cluster: Option<&str>,
 ) -> Vec<String> {
     let mut cmd = vec![bin.to_string_lossy().into_owned(), "app-server".to_string()];
     if let Some(url) = mcp_url {
         cmd.extend(codex_mcp_overrides(url));
     }
-    // The host frame on every chat spawn, the Mastermind role after it. A
-    // forked branch's `developerInstructions` (driver `thread/start`)
-    // overrides this whole string with the portable context, which opens
-    // with the same host frame.
-    let instructions = if mastermind.is_some() {
-        format!("{CHAT_HOST_PROMPT}\n\n{MASTERMIND_SYSTEM_PROMPT}")
-    } else {
-        CHAT_HOST_PROMPT.to_string()
-    };
+    // The host frame on every chat spawn, the Mastermind role after it, the
+    // cluster context last. A forked branch's `developerInstructions`
+    // (driver `thread/start`) overrides this whole string with the portable
+    // context, which opens with the same host frame (and carries the cluster
+    // context too — `chat::spawn_chat_session`).
+    let mut instructions = CHAT_HOST_PROMPT.to_string();
+    if mastermind.is_some() {
+        instructions.push_str("\n\n");
+        instructions.push_str(MASTERMIND_SYSTEM_PROMPT);
+    }
+    if let Some(cluster) = cluster {
+        instructions.push_str("\n\n");
+        instructions.push_str(cluster);
+    }
     cmd.push("-c".to_string());
     cmd.push(format!(
         "developer_instructions=\"{}\"",
@@ -1590,13 +1599,13 @@ mod tests {
             "developer_instructions=\"{}\"",
             toml_basic_string(CHAT_HOST_PROMPT)
         );
-        let bare = build_codex_chat_command(Path::new("/usr/bin/codex"), None, None);
+        let bare = build_codex_chat_command(Path::new("/usr/bin/codex"), None, None, None);
         assert_eq!(bare, ["/usr/bin/codex", "app-server", "-c", host.as_str()]);
 
         // The URL must be SECRET-FREE (argv is world-readable in /proc); the
         // key rides the spawn env via bearer_token_env_var instead.
         let url = "http://127.0.0.1:4200/api/v1/mcp/s-1a2b3c4d";
-        let cmd = build_codex_chat_command(Path::new("/usr/bin/codex"), Some(url), None);
+        let cmd = build_codex_chat_command(Path::new("/usr/bin/codex"), Some(url), None, None);
         assert_eq!(
             cmd,
             [
@@ -1654,7 +1663,8 @@ mod tests {
             crate::workspaces::MastermindMode::Ask,
             crate::workspaces::MastermindMode::Auto,
         ] {
-            let cmd = build_codex_chat_command(Path::new("/usr/bin/codex"), Some(url), Some(mode));
+            let cmd =
+                build_codex_chat_command(Path::new("/usr/bin/codex"), Some(url), Some(mode), None);
             assert_eq!(
                 cmd,
                 [
@@ -1674,6 +1684,26 @@ mod tests {
                 ]
             );
         }
+
+        // The cluster context rides last — after the role — and its real
+        // newlines (and any quotes a rules file holds) stay valid TOML.
+        let cluster = "You are running inside Slurm job 7.\n\n- Use \"sbatch\".";
+        let cmd = build_codex_chat_command(
+            Path::new("/usr/bin/codex"),
+            None,
+            Some(crate::workspaces::MastermindMode::Ask),
+            Some(cluster),
+        );
+        assert_eq!(
+            cmd.last().unwrap(),
+            &format!(
+                "developer_instructions=\"{}\"",
+                toml_basic_string(&format!(
+                    "{CHAT_HOST_PROMPT}\n\n{MASTERMIND_SYSTEM_PROMPT}\n\n{cluster}"
+                ))
+            )
+        );
+        assert!(cmd.last().unwrap().contains("\\n\\n- Use \\\"sbatch\\\"."));
 
         // The prompt embeds in TOML quotes verbatim only while it stays free
         // of quotes/backslashes/control chars; toml_basic_string covers a

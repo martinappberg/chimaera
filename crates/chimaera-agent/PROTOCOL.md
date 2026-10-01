@@ -2006,7 +2006,7 @@ case and the unscoped defensive case.
 
 ## Pass 29 (2026-07-21 — codex effort survives reopen and honors new-thread config). ADOPTED.
 
-A Sherlock session exposed a different `low` failure after Pass 28. Its
+A session on a production cluster exposed a different `low` failure after Pass 28. Its
 Chimaera journal recorded the parent changing from the model default `low` to
 `xhigh`, then recorded a parent `low` immediately after each app-server process
 restart. The native Codex rollout still contained earlier

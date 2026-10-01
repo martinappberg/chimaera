@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cluster-overview"
+description = "Enables the cluster_overview command without any pre-configured scope."
+commands.allow = ["cluster_overview"]
+
+[[permission]]
+identifier = "deny-cluster-overview"
+description = "Denies the cluster_overview command without any pre-configured scope."
+commands.deny = ["cluster_overview"]

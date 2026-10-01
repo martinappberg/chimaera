@@ -176,7 +176,7 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
   command never produces 133;C — e.g. an rc chain that kills bash's DEBUG trap) fails that exec
   once (504 never-started), and the session degrades to sentinel mode for later execs; any
   shell-emitted 133;C restores integrated mode. The bash integration itself re-arms its DEBUG
-  trap from PROMPT_COMMAND at every prompt, so audit-shell rc chains (Sherlock's user-audit trap
+  trap from PROMPT_COMMAND at every prompt, so audit-shell rc chains (a site's user-audit trap
   on bash 4.2) can't silently revert the hook. Exec refuses agent sessions (409 — typing into a
   claude TUI is chaos; exec is terminals-only). `ExecOutcome` is a wire type. Journal caps:
   `MAX_RECORDS 500`, `TOTAL_OUTPUT_BUDGET 8 MiB`, the scanner runs independent of the alacritty

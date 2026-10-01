@@ -72,7 +72,7 @@ plane `ANY /proxy/{id}[/{*path}]`.
 - **How it works.** A non-loopback target dials direct TCP first (~3s — covers
   `--ip=$(hostname)` binds, the common cluster guidance). On failure the daemon stands
   up its own `ssh -N -L` relay child to the node's loopback (`BatchMode` — login→node
-  ssh is hostbased on clusters like Sherlock; anything interactive fails honestly),
+  ssh is hostbased on many clusters; anything interactive fails honestly),
   connects through it, and caches the proven route per session. Relay children are
   owned by their registry entry: killed on revoke, idle expiry, and graceful daemon
   shutdown (never strand an `ssh -N` on a login node). Failures surface as the pane's

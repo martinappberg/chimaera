@@ -1,169 +1,267 @@
-//! `chimaera compute …` — Mode 2 from the CLI: launch/list/connect/cancel
-//! chimaera sessions running AS Slurm jobs, via the LOGIN daemon's routes
-//! (curl-over-ssh; the daemon owns the detached srun clients and the preludes). Thin by
-//! design: this is the verification harness and the app-parity surface,
-//! not a second implementation.
+//! `chimaera compute …` — cluster workspaces from the CLI: list, add, start,
+//! open, stop. Every command is a short ssh exec through the ControlMaster
+//! (`chimaera_remote::cluster`); nothing runs on the login node, and each
+//! workspace's chimaera runs inside its own Slurm job. Thin by design: the
+//! verification harness and the app-parity surface, not a second
+//! implementation.
 
-use anyhow::Context;
+use anyhow::{bail, Context};
+use chimaera_core::slurm::{LaunchSpec, Scheduler};
+use chimaera_remote::cluster::{self, StartOutcome, StartRefused, StartRequest};
 use chimaera_remote::RemoteHome;
 
-/// The login daemon's manifest, with `host` routed to the login node it runs
-/// on — the curl-over-ssh calls below reach its LOOPBACK port, which exists
-/// only there (a pool alias would otherwise land them on any login node).
-async fn login_manifest(host: &str) -> anyhow::Result<chimaera_core::Manifest> {
-    match chimaera_remote::locate_daemon(host, RemoteHome::current()).await? {
-        Some((manifest, true)) => Ok(manifest),
-        _ => anyhow::bail!("no chimaera daemon on {host} — run `chimaera connect {host}` first"),
+/// Reach the host (may ask to authenticate) and require Slurm on it.
+async fn slurm_host(host: &str) -> anyhow::Result<String> {
+    let host = chimaera_remote::hosts::normalize_alias(host)?;
+    let info = chimaera_remote::detect_scheduler(&host, RemoteHome::current()).await?;
+    match info.kind {
+        Scheduler::Slurm => Ok(host),
+        Scheduler::None => bail!("{host} has no batch scheduler on its login PATH"),
+        other => bail!(
+            "{host} runs {}; starting workspaces is only supported on Slurm so far",
+            other.tag()
+        ),
+    }
+}
+
+/// A workspace by id or (case-insensitive) name.
+fn pick<'a>(
+    ov: &'a cluster::ClusterOverview,
+    which: &str,
+) -> anyhow::Result<&'a cluster::WorkspaceView> {
+    ov.workspaces
+        .iter()
+        .find(|w| w.id == which)
+        .or_else(|| {
+            ov.workspaces
+                .iter()
+                .find(|w| w.name.eq_ignore_ascii_case(which))
+        })
+        .with_context(|| {
+            format!("no workspace {which:?} on this cluster — `chimaera compute list` shows them")
+        })
+}
+
+fn left(ends_at_ms: Option<u64>, now_ms: u64) -> String {
+    match ends_at_ms {
+        Some(end) if end > now_ms => {
+            let mins = (end - now_ms) / 60_000;
+            match (mins / 1440, (mins % 1440) / 60, mins % 60) {
+                (0, 0, m) => format!("{m}m left"),
+                (0, h, m) => format!("{h}h {m}m left"),
+                (d, h, _) => format!("{d}d {h}h left"),
+            }
+        }
+        _ => String::new(),
     }
 }
 
 pub async fn list(host: &str) -> anyhow::Result<()> {
-    let manifest = login_manifest(host).await?;
-    let v = chimaera_remote::compute_sessions(host, &manifest).await?;
-    if v.get("scheduler").and_then(|s| s.as_str()) != Some("slurm") {
-        println!("no scheduler detected on {host}");
-        return Ok(());
+    let host = slurm_host(host).await?;
+    let ov = cluster::overview(&host, RemoteHome::current()).await?;
+    if ov.workspaces.is_empty() {
+        println!("no workspaces on {host} yet — add one with `chimaera compute add {host} <path>`");
     }
-    let sessions = v
-        .get("sessions")
-        .and_then(|s| s.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if sessions.is_empty() {
-        println!("no compute sessions on {host} (launch one with `chimaera compute launch`)");
-        return Ok(());
-    }
-    for s in sessions {
-        let g = |k: &str| {
-            s.get(k)
-                .map(|v| match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
-                .unwrap_or_default()
+    for w in &ov.workspaces {
+        let detail = match w.state {
+            "running" => format!(
+                "on {} · {} CPU · {} · {}",
+                w.node,
+                w.cpus,
+                w.mem,
+                left(w.ends_at_ms, ov.now_ms)
+            ),
+            "starting" => format!("starting on {}", w.node),
+            "waiting" if !w.reason.is_empty() => format!("waiting for a node ({})", w.reason),
+            "waiting" => "waiting for a node".to_string(),
+            _ if w.fresh => "not started yet".to_string(),
+            _ if w.stopped_by_user => "stopped by you".to_string(),
+            _ => format!(
+                "stopped ({})",
+                w.ended.as_deref().unwrap_or("ended").to_lowercase()
+            ),
         };
         println!(
-            "{}  {:<20} {:<10} {:<14} {:<9} left {:<10} cpus {:<3} mem {:<6} ready={}",
-            g("job_id"),
-            g("name"),
-            g("state"),
-            if g("node").is_empty() {
-                "(queued)".into()
+            "{}  {:<20} {:<9} {}  [{}]{}",
+            w.id,
+            w.name,
+            w.state,
+            detail,
+            w.path,
+            if w.attached {
+                " · stops when its connection ends"
             } else {
-                g("node")
-            },
-            g("partition"),
-            g("time_left"),
-            g("cpus"),
-            g("mem"),
-            g("ready"),
+                ""
+            }
         );
     }
+    if ov.other_jobs.running + ov.other_jobs.waiting > 0 {
+        println!(
+            "your other jobs on {host}: {} running · {} waiting",
+            ov.other_jobs.running, ov.other_jobs.waiting
+        );
+    }
+    if ov.degraded {
+        println!("(the queue didn't answer; states are from the last read)");
+    }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)] // mirrors the launch spec, one flag each
-pub async fn launch(
+pub async fn add(host: &str, path: &str, name: Option<&str>) -> anyhow::Result<()> {
+    let host = slurm_host(host).await?;
+    let ws = cluster::add_workspace(&host, RemoteHome::current(), path, name.unwrap_or("")).await?;
+    println!("added {} ({}) at {}", ws.name, ws.id, ws.path);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // one flag per LaunchSpec field
+pub async fn start(
     host: &str,
-    name: &str,
-    time: &str,
-    partition: Option<&str>,
-    cpus: Option<u32>,
-    mem: Option<&str>,
-    gres: Option<&str>,
-    workspace: Option<&str>,
-    routable: bool,
+    which: &str,
+    spec: LaunchSpec,
+    run_startup: Option<&str>,
+    attached: bool,
+    save_as: Option<&str>,
 ) -> anyhow::Result<()> {
-    let manifest = login_manifest(host).await?;
-    let mut spec = serde_json::json!({ "name": name, "time": time, "routable": routable });
-    for (k, v) in [
-        ("partition", partition),
-        ("mem", mem),
-        ("gres", gres),
-        ("workspace_id", workspace),
-    ] {
-        if let Some(v) = v {
-            spec[k] = serde_json::Value::String(v.to_string());
+    let host = slurm_host(host).await?;
+    let home = RemoteHome::current();
+    let ov = cluster::overview(&host, home).await?;
+    let view = pick(&ov, which)?;
+    anyhow::ensure!(
+        view.state == "stopped",
+        "{} is already {} — stop it first",
+        view.name,
+        view.state
+    );
+    let ws = ov
+        .config
+        .workspaces
+        .iter()
+        .find(|w| w.id == view.id)
+        .context("the workspace list changed meanwhile")?
+        .clone();
+    let spec = spec.normalized();
+    spec.validate().map_err(anyhow::Error::msg)?;
+    let facts = cluster::facts(&host, false).await?;
+    cluster::ensure_cluster_binary(&host, home, None, &|phase| {
+        if let chimaera_remote::Phase::Downloading { target } = phase {
+            tracing::info!("downloading the {target} chimaera binary");
         }
+    })
+    .await?;
+    let req = StartRequest {
+        workspace: &ws,
+        spec: &spec,
+        run_startup: run_startup.unwrap_or(""),
+        attached,
+        gpu_flag: facts.gpu_flag,
+    };
+    match cluster::start(&host, home, &ov.config, &req).await {
+        Ok(StartOutcome::Submitted { job_id }) => {
+            cluster::remember_spec(&host, home, &ws.id, &spec, save_as).await?;
+            println!(
+                "submitted {} as job {job_id} — `chimaera compute list {host}` to watch, \
+                 `chimaera compute open {host} {}` once it runs",
+                ws.name, ws.name
+            );
+            Ok(())
+        }
+        Ok(StartOutcome::Attached { job_name }) => {
+            cluster::remember_spec(&host, home, &ws.id, &spec, save_as).await?;
+            let mut child =
+                cluster::spawn_attached(&host, home, &ws.id, &spec, &job_name, facts.gpu_flag)?;
+            println!(
+                "{} starts attached to this terminal: it stops when you press Ctrl-C or this \
+                 connection ends. Open it from another terminal with `chimaera compute open {host} {}`.",
+                ws.name, ws.name
+            );
+            tokio::select! {
+                r = tokio::signal::ctrl_c() => { r.context("failed to listen for ctrl-c")?; }
+                status = child.wait() => {
+                    let status = status.context("the attached job's connection failed")?;
+                    println!("the attached job ended ({status})");
+                }
+            }
+            Ok(())
+        }
+        Err(e) => match e.downcast_ref::<StartRefused>() {
+            Some(refused) => {
+                let partition = spec.partition.as_deref();
+                cluster::learn_refusal(&host, home, partition, refused.kind)
+                    .await
+                    .ok();
+                let hint = match refused.kind {
+                    chimaera_core::slurm::Refusal::BatchNotAllowed => {
+                        "\nthat partition takes only interactive jobs — rerun with --attached \
+                         (it stops when this terminal's connection ends)"
+                    }
+                    chimaera_core::slurm::Refusal::AccountRequired => "\nrerun with --account",
+                    chimaera_core::slurm::Refusal::QosRequired => "\nrerun with --qos",
+                    chimaera_core::slurm::Refusal::ConstraintRequired => {
+                        "\nrerun with --constraint"
+                    }
+                    chimaera_core::slurm::Refusal::Other => "",
+                };
+                bail!("the cluster refused the job: {}{hint}", refused.message)
+            }
+            None => Err(e),
+        },
     }
-    if let Some(c) = cpus {
-        spec["cpus"] = serde_json::json!(c);
-    }
-    let job_id = chimaera_remote::compute_launch(host, &manifest, &spec).await?;
-    println!("submitted: job {job_id} ({name}) — `chimaera compute list {host}` to watch, `chimaera compute connect {host} {job_id}` once running");
-    Ok(())
 }
 
-pub async fn connect(host: &str, job_id: &str, no_open: bool) -> anyhow::Result<()> {
-    let manifest = login_manifest(host).await?;
-    let v = chimaera_remote::compute_sessions(host, &manifest).await?;
-    let session = v
-        .get("sessions")
-        .and_then(|s| s.as_array())
-        .and_then(|arr| {
-            arr.iter()
-                .find(|s| s.get("job_id").and_then(|j| j.as_str()) == Some(job_id))
-        })
-        .with_context(|| {
-            format!("job {job_id} not found on {host} (ended, or not a chimaera session?)")
-        })?
-        .clone();
-    let s = |k: &str| {
-        session
-            .get(k)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
-    let ready = session
-        .get("ready")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    anyhow::ensure!(
-        ready,
-        "job {job_id} is {} on {} — not ready to connect yet (state must be RUNNING with the daemon up)",
-        s("state"),
-        if s("node").is_empty() { "no node yet".to_string() } else { s("node") },
-    );
-    let port = session
-        .get("port")
-        .and_then(|v| v.as_u64())
-        .context("session has no port (manifest missing?)")? as u16;
-    let token = s("token");
-    let routable = session
-        .get("routable")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let tunnel =
-        chimaera_remote::connect_compute_node(host, &s("node"), job_id, port, &token, routable)
-            .await?;
-    let url = tunnel.url();
-    println!("compute session up: {url}");
+pub async fn open(host: &str, which: &str, no_open: bool) -> anyhow::Result<()> {
+    let host = slurm_host(host).await?;
+    let ov = cluster::overview(&host, RemoteHome::current()).await?;
+    let view = pick(&ov, which)?;
+    let endpoint = ov.endpoints.get(&view.id).with_context(|| {
+        format!(
+            "{} is {} — it can be opened once it's running",
+            view.name, view.state
+        )
+    })?;
+    let tunnel = chimaera_remote::connect_compute_node(
+        &host,
+        &endpoint.node,
+        &endpoint.job_id,
+        endpoint.port,
+        &endpoint.token,
+    )
+    .await?;
+    let url = format!("{}&cws={}", tunnel.url(), view.id);
+    println!("{url}");
     println!(
-        "rung: {} · node {} · job {} — Ctrl-C closes the tunnel (the job keeps running)",
-        match tunnel.rung {
-            chimaera_remote::ComputeRung::SshAdopt => "B (ssh-adopt, loopback daemon)",
-            chimaera_remote::ComputeRung::Chained => "B (chained via login node, loopback daemon)",
-            chimaera_remote::ComputeRung::Direct => "A (direct routable forward)",
-        },
-        tunnel.node,
-        tunnel.job_id
+        "{} on {} (job {}) — Ctrl-C closes this connection; the job keeps running",
+        view.name, tunnel.node, tunnel.job_id
     );
     if !no_open {
         let _ = open::that(&url);
     }
-    // Hold like `connect`: the tunnel lives as long as this process.
     let mut tunnel = tunnel;
-    let _ = tunnel.wait().await;
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => { r.context("failed to listen for ctrl-c")?; }
+        _ = tunnel.wait() => {
+            // A forward the ControlMaster holds outlives this child: keep
+            // holding until the user leaves.
+            tokio::signal::ctrl_c().await.context("failed to listen for ctrl-c")?;
+        }
+    }
+    tunnel.close().await;
     Ok(())
 }
 
-pub async fn cancel(host: &str, job_id: &str) -> anyhow::Result<()> {
-    let manifest = login_manifest(host).await?;
-    chimaera_remote::compute_cancel(host, &manifest, job_id).await?;
+pub async fn stop(host: &str, which: &str) -> anyhow::Result<()> {
+    let host = slurm_host(host).await?;
+    let home = RemoteHome::current();
+    let ov = cluster::overview(&host, home).await?;
+    let view = pick(&ov, which)?;
+    let record = ov
+        .records
+        .get(&view.id)
+        .with_context(|| format!("{} has never been started", view.name))?;
+    cluster::stop(&host, home, &view.id, record).await?;
     println!(
-        "cancel requested for job {job_id} (scancel; the card disappears once slurm reaps it)"
+        "stopping {} — its chimaera saves the chats, then the job ends",
+        view.name
     );
     Ok(())
 }

@@ -21,6 +21,7 @@ use tauri::{AppHandle, Manager};
 use crate::daemon::LocalDaemon;
 use crate::windows::{WindowRecord, WindowRegistry};
 
+mod cluster;
 mod commands;
 mod connect;
 mod drag;
@@ -83,15 +84,17 @@ pub struct Shell {
     /// publishing a connect (joiners, healthy-tunnel reuse) never reloads
     /// the file.
     host_entries: Mutex<HashMap<String, chimaera_remote::hosts::HostEntry>>,
-    /// Live tunnels to compute-node daemons (Mode 2), keyed
-    /// `"{alias}#job{job_id}"`. Separate from `tunnels`: a job tunnel is its
-    /// own type with its own two-rung ladder and a walltime-bounded lifetime.
+    /// Live tunnels to cluster workspace jobs, keyed `"{alias}#job{job_id}"`.
+    /// Separate from `tunnels`: a job tunnel is its own type with its own
+    /// ladder and a walltime-bounded lifetime.
     compute_tunnels: tokio::sync::Mutex<HashMap<String, chimaera_remote::ComputeTunnel>>,
-    /// Compute-node endpoints ((alias, job_id) → node/port/token/routable),
-    /// cached by `remote_compute_sessions` so the session list the webview
-    /// gets never carries a port or token — `connect_compute_session` reads
-    /// them back here, in Rust.
-    compute_endpoints: Mutex<HashMap<(String, String), ComputeEndpoint>>,
+    /// Per-cluster state of this process (see `cluster::ClusterLive`): what
+    /// the last connect found, running workspaces' endpoints (kept here so
+    /// no page ever sees a port or token), the notification diff.
+    clusters: Mutex<HashMap<String, cluster::ClusterLive>>,
+    /// Attached jobs (partitions that take only interactive jobs), held in the
+    /// foreground by this app: sending on the channel ends one.
+    attached_jobs: Mutex<HashMap<(String, String), tokio::sync::oneshot::Sender<()>>>,
     /// Composite keys mid-connect: one tunnel build per job at a time (a
     /// click storm must not race N tunnel builds — seen on first live use).
     compute_connecting: Mutex<std::collections::HashSet<String>>,
@@ -387,17 +390,6 @@ impl Shell {
             .map(|(label, _)| label.clone())
             .collect()
     }
-}
-
-/// A compute-node daemon's coordinates — everything `connect_compute_node`
-/// needs. Kept Rust-side only (see `remote_compute_sessions`): the token
-/// leaves this process solely in the URL of the window opened onto the job.
-#[derive(Clone)]
-pub(crate) struct ComputeEndpoint {
-    pub(crate) node: String,
-    pub(crate) port: u16,
-    pub(crate) token: String,
-    pub(crate) routable: bool,
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -912,7 +904,8 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             wedge_suspects: Mutex::new(HashSet::new()),
             host_entries: Mutex::new(HashMap::new()),
             compute_tunnels: tokio::sync::Mutex::new(HashMap::new()),
-            compute_endpoints: Mutex::new(HashMap::new()),
+            clusters: Mutex::new(HashMap::new()),
+            attached_jobs: Mutex::new(HashMap::new()),
             compute_connecting: Mutex::new(std::collections::HashSet::new()),
             connecting: Mutex::new(HashMap::new()),
             windows: Mutex::new(HashMap::new()),
@@ -1003,10 +996,21 @@ pub fn run() {
             commands::local_state,
             commands::update_local_daemon,
             commands::remote_workspaces,
-            commands::remote_compute_sessions,
-            commands::launch_compute_session,
-            commands::cancel_compute_session,
-            commands::connect_compute_session,
+            cluster::cluster_overview,
+            cluster::cluster_facts,
+            cluster::cluster_add_workspace,
+            cluster::cluster_remove_workspace,
+            cluster::cluster_start,
+            cluster::cluster_stop,
+            cluster::cluster_open,
+            cluster::cluster_continue,
+            cluster::cluster_set_startup,
+            cluster::cluster_set_agent_rules,
+            cluster::cluster_set_login_serve,
+            cluster::cluster_stop_login_daemon,
+            cluster::cluster_open_terminal,
+            cluster::cluster_list,
+            cluster::cluster_peek,
             commands::open_window,
             commands::navigate_home,
             commands::open_detached_window,
@@ -1349,12 +1353,12 @@ mod origin_tests {
             ),
             (
                 "legacy-detail".into(),
-                WindowScope::new(Some("Sherlock".into()), None, "legacy-record".into()),
+                WindowScope::new(Some("cluster".into()), None, "legacy-record".into()),
             ),
             (
                 "workspace".into(),
                 WindowScope::new(
-                    Some("Sherlock".into()),
+                    Some("cluster".into()),
                     Some("ws-1".into()),
                     "workspace-record".into(),
                 ),
@@ -1366,11 +1370,11 @@ mod origin_tests {
         ]);
 
         assert_eq!(
-            legacy_host_detail_label(&windows, "Sherlock", "home").as_deref(),
+            legacy_host_detail_label(&windows, "cluster", "home").as_deref(),
             Some("legacy-detail")
         );
         assert_eq!(
-            legacy_host_detail_label(&windows, "Sherlock", "legacy-detail"),
+            legacy_host_detail_label(&windows, "cluster", "legacy-detail"),
             None
         );
         assert_eq!(legacy_host_detail_label(&windows, "Missing", "home"), None);
@@ -1391,28 +1395,28 @@ mod origin_tests {
         assert!(!fallback.allows_askpass(Some("remote-2")));
 
         let mut remote_hub = WindowScope::new(None, None, "remote-home".into());
-        remote_hub.begin_home_navigation(Some("Sherlock".into()), None, "Sherlock Home".into());
+        remote_hub.begin_home_navigation(Some("cluster".into()), None, "cluster Home".into());
         assert!(remote_hub.navigation_pending());
-        assert!(!remote_hub.allows_askpass(Some("Sherlock")));
+        assert!(!remote_hub.allows_askpass(Some("cluster")));
         assert!(!remote_hub.allows_askpass(Some("remote-2")));
         remote_hub.complete_home_navigation();
         assert!(remote_hub.home_hub);
-        assert!(remote_hub.allows_askpass(Some("Sherlock")));
+        assert!(remote_hub.allows_askpass(Some("cluster")));
         assert!(!remote_hub.allows_askpass(Some("remote-2")));
         assert!(!remote_hub.allows_askpass(None));
         remote_hub.begin_home_navigation(None, None, "Home".into());
-        assert!(!remote_hub.allows_askpass(Some("Sherlock")));
+        assert!(!remote_hub.allows_askpass(Some("cluster")));
         remote_hub.complete_home_navigation();
         assert!(remote_hub.allows_askpass(Some("remote-2")));
         remote_hub.begin_home_navigation(
-            Some("Sherlock".into()),
+            Some("cluster".into()),
             Some("workspace".into()),
-            "Sherlock Workspace".into(),
+            "cluster Workspace".into(),
         );
-        assert!(!remote_hub.allows_askpass(Some("Sherlock")));
+        assert!(!remote_hub.allows_askpass(Some("cluster")));
         remote_hub.complete_home_navigation();
         assert!(!remote_hub.home_hub);
-        assert!(remote_hub.allows_askpass(Some("Sherlock")));
+        assert!(remote_hub.allows_askpass(Some("cluster")));
         assert!(!remote_hub.allows_askpass(Some("remote-2")));
 
         let local = WindowScope::new(None, Some("local-workspace".into()), "local".into());
@@ -1420,36 +1424,36 @@ mod origin_tests {
         assert_eq!(local.appearance_alias(), None);
 
         let remote = WindowScope::new(
-            Some("Sherlock".into()),
+            Some("cluster".into()),
             Some("workspace".into()),
             "remote".into(),
         );
-        assert!(remote.allows_askpass(Some("Sherlock")));
+        assert!(remote.allows_askpass(Some("cluster")));
         assert!(!remote.allows_askpass(Some("remote-2")));
         assert!(!remote.allows_askpass(None));
         let mut remote_home = remote.clone();
-        remote_home.report_page_scope(None, "Sherlock Home".into());
+        remote_home.report_page_scope(None, "cluster Home".into());
         assert!(!remote_home.home_hub);
-        assert!(remote_home.allows_askpass(Some("Sherlock")));
+        assert!(remote_home.allows_askpass(Some("cluster")));
 
-        // `Sherlock#job123` is itself a valid ordinary ssh alias. Its shape
-        // must not grant access to Sherlock's prompt.
+        // `cluster#job123` is itself a valid ordinary ssh alias. Its shape
+        // must not grant access to the cluster's prompt.
         let colliding_remote = WindowScope::new(
-            Some("Sherlock#job123".into()),
+            Some("cluster#job123".into()),
             Some("workspace".into()),
             "colliding-remote".into(),
         );
-        assert!(!colliding_remote.allows_askpass(Some("Sherlock")));
-        assert_eq!(colliding_remote.appearance_alias(), Some("Sherlock#job123"));
+        assert!(!colliding_remote.allows_askpass(Some("cluster")));
+        assert_eq!(colliding_remote.appearance_alias(), Some("cluster#job123"));
 
         let compute = WindowScope::new_compute(
-            "Sherlock#job123".into(),
-            "Sherlock".into(),
+            "cluster#job123".into(),
+            "cluster".into(),
             Some("workspace".into()),
             "compute".into(),
         );
-        assert!(compute.allows_askpass(Some("Sherlock")));
-        assert!(!compute.allows_askpass(Some("Sherlock#job123")));
-        assert_eq!(compute.appearance_alias(), Some("Sherlock"));
+        assert!(compute.allows_askpass(Some("cluster")));
+        assert!(!compute.allows_askpass(Some("cluster#job123")));
+        assert_eq!(compute.appearance_alias(), Some("cluster"));
     }
 }

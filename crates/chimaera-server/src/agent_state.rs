@@ -172,8 +172,9 @@ pub(crate) struct AgentRecord {
     /// [`FILES_TOUCHED_CAP`]. Never cleared — the list lives as long as the
     /// session.
     pub(crate) files_touched: Vec<String>,
-    /// Whether the compute-session context (`compute::agent_context`) has
-    /// been delivered to this session via a hook response. Once per record:
+    /// Whether the cluster context (`compute::agent_context`: in a Slurm job,
+    /// or on a login node) has been delivered to this session via a hook
+    /// response. Once per record:
     /// the context lands in the conversation itself, so later hooks — and a
     /// view switch, which respawns the process but keeps the record and the
     /// conversation — must not repeat it. Never true off-cluster.

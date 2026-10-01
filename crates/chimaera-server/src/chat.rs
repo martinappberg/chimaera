@@ -817,11 +817,13 @@ async fn degrade_to_pty(
     );
     // A degrade respawn is a real spawn too — same prelude as the chat
     // process it replaces (the recipe carries the launch scope).
+    let startup = crate::environment::job_startup().await;
     let prelude = crate::environment::materialize_prelude(
         state,
         id,
         &recipe.workspace_id,
         recipe.prelude.as_deref(),
+        startup.as_deref(),
     );
     let env = crate::api::session_env(state, id, &recipe.theme, prelude.as_deref());
     let env_remove = crate::api::spawn_env_remove(&env);
@@ -3104,6 +3106,31 @@ async fn codex_initial_effort(state: &Arc<AppState>, recipe: &ChatRecipe) -> Opt
     }
 }
 
+/// The cluster context (`compute::agent_context`: inside a Slurm job, or on
+/// a login node) for a codex chat spawn, which has no hook carrier: it rides
+/// `developer_instructions` beside the host frame. That `-c` value REPLACES a
+/// `developer_instructions` from the user's own config.toml (CLI overrides
+/// outrank the file — see `runtimes::codex_user_developer_instructions_set`),
+/// so when the user set their own, codex is skipped and their text stands
+/// in our place: we'd rather not inform it than silently clobber theirs.
+/// Off-cluster this returns before any file read.
+async fn codex_cluster_context(state: &Arc<AppState>) -> Option<String> {
+    let context = state.compute.agent_context().await?;
+    let config = state.codex_config_path.clone();
+    let users_own = tokio::task::spawn_blocking(move || {
+        crate::runtimes::codex_user_developer_instructions_set(&config)
+    })
+    .await
+    .unwrap_or(true);
+    if users_own {
+        tracing::info!(
+            "codex config sets developer_instructions; the cluster context is not added to codex chats"
+        );
+        return None;
+    }
+    Some(context)
+}
+
 /// Precedence for what a chat starts with: the recipe's explicit model, then
 /// the conversation's own last settings (a reopened chat; `recovered_effort`
 /// is codex's journal-recovered effort for pre-index rows), then the agent
@@ -3128,6 +3155,16 @@ pub(crate) async fn spawn_chat_session(
     pinned_override: Option<String>,
 ) -> anyhow::Result<ChatInfo> {
     let recovered_effort = codex_initial_effort(state, &recipe).await;
+    // Read before the no-await stretch below: a cluster job's startup
+    // commands (the outermost prelude scope) and, for codex, the cluster
+    // context its developer instructions carry. Both are None off-cluster
+    // without any I/O.
+    let startup = crate::environment::job_startup().await;
+    let codex_cluster_context = if recipe.kind == AgentKind::Codex {
+        codex_cluster_context(state).await
+    } else {
+        None
+    };
     // Re-enforce the journal-dir budget as sessions are created: pruning only
     // at boot lets a weeks-long daemon accumulate one capped journal per
     // session past the documented ceiling.
@@ -3222,6 +3259,7 @@ pub(crate) async fn spawn_chat_session(
                     &recipe.bin,
                     mcp_url.as_deref(),
                     recipe.mastermind,
+                    codex_cluster_context.as_deref(),
                 ),
                 recipe.resume.clone(),
             )
@@ -3238,6 +3276,7 @@ pub(crate) async fn spawn_chat_session(
         &id,
         &recipe.workspace_id,
         recipe.prelude.as_deref(),
+        startup.as_deref(),
     );
     spec.env = crate::api::session_env(state, &id, &recipe.theme, prelude.as_deref());
     // Strip the daemon's own launcher context (same set the PTY path removes)
@@ -3353,7 +3392,12 @@ pub(crate) async fn spawn_chat_session(
     // Same-agent native branch: Claude already receives this through argv;
     // Codex consumes it during the handshake as thread/fork lastTurnId.
     spec.fork_at = recipe.fork_at.clone();
-    spec.portable_context = recipe.portable_context.clone();
+    // A codex portable branch opens with `developerInstructions` that replace
+    // the argv ones, cluster context included — so it rides along there.
+    spec.portable_context = match (recipe.portable_context.clone(), &codex_cluster_context) {
+        (Some(context), Some(cluster)) => Some(format!("{context}\n\n{cluster}")),
+        (context, _) => context,
+    };
     // Resurrection carries the original creation time so age survives the
     // restart; every other path leaves it None → the spawn stamps now.
     spec.created_at_ms = recipe.created_at_ms;
@@ -3547,7 +3591,11 @@ pub(crate) async fn resurrect_chat(
             // the background work, and neither agent restarts them on resume
             // (the conversation survives, its processes do not). Tell the
             // agent once, as a message it can act on (see `pickup_message`).
-            let enabled = crate::lock(&state.settings).resume_after_restart();
+            // Never in a cluster workspace job: a job may start hours after
+            // the click that queued it, with nobody there to watch the turn
+            // it would start — its chats come back idle and wait for the user.
+            let enabled = crate::lock(&state.settings).resume_after_restart()
+                && !state.compute.is_cluster_job();
             let pick_up = pickup_message(
                 &entry.id,
                 carry.as_ref(),
@@ -3662,7 +3710,8 @@ const PICKUP_MIN_INTERVAL_MS: u64 = 10 * 60 * 1000;
 
 /// The message a resurrected chat gets about the work the restart cut off,
 /// or `None` when it gets none: nothing was cut off, the user turned the
-/// setting off, the conversation did not actually resume (a fresh boot has
+/// setting off (or the daemon is a cluster workspace job — the caller folds
+/// that into `enabled`), the conversation did not actually resume (a fresh boot has
 /// no memory of how that work was started), it is a Mastermind (the daemon
 /// never starts its turns — reactive-only, by design), or the last pick-up
 /// went out moments ago (a restart loop).

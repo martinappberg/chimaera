@@ -8,7 +8,6 @@ mod assets;
 mod chat;
 mod comms;
 mod compute;
-mod compute_jobs;
 mod doc_check;
 mod download;
 mod drafts;
@@ -53,12 +52,12 @@ mod ws;
 pub struct ServerConfig {
     /// Port to bind on 127.0.0.1. `None` lets the OS assign a free port.
     pub port: Option<u16>,
-    /// Bind 0.0.0.0 instead of loopback. OPT-IN, for Mode 2 rung A only:
-    /// a compute-node daemon on a cluster without ssh-to-node, where the
-    /// login node forwards straight to the node's port and the per-job
-    /// bearer token is the gate. Loopback stays the default everywhere —
-    /// this deliberately amends the "never accepts non-loopback" security
-    /// note (architecture.md § Security notes).
+    /// Bind 0.0.0.0 instead of loopback (`--bind-routable`). What a cluster
+    /// workspace job's `chimaera serve` passes: the app reaches the job with
+    /// a plain `ssh -L <port>:<node>:<port>` through the login node, and the
+    /// per-job bearer token is the gate. Loopback stays the default for every
+    /// other daemon — this deliberately amends the "never accepts
+    /// non-loopback" security note (architecture.md § Security notes).
     pub routable_bind: bool,
 }
 

@@ -1558,11 +1558,13 @@ pub(crate) async fn install_requirement(
         std::fs::File::create_new(&path)?;
         // Agent-plugin managers need the same modules/PATH as agents in this
         // workspace. Runtime bootstrap installers have a separate contract.
+        let startup = crate::environment::job_startup_blocking();
         let prelude = crate::environment::materialize_prelude(
             &prepare_state,
             &prepare_id,
             &prepare_workspace,
             None,
+            startup.as_deref(),
         );
         Ok::<_, std::io::Error>((path, prelude))
     })

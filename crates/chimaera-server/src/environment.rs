@@ -4,11 +4,20 @@
 //! POSIX shell — the daemon never parses it, which is what keeps every env
 //! tool (lmod, conda, spack, venv, nix) working with zero tool-specific code.
 //!
-//! Scopes concatenate (host ⊕ workspace ⊕ launch) rather than override, and
-//! the result lands in a per-session file that the shell-integration rc and
-//! the agent login-wrapper source via `CHIMAERA_PRELUDE` (guarded by
-//! `CHIMAERA_PRELUDE_DONE`, so nested shells never re-run it and reconnects
-//! — which are not spawns — never see it at all).
+//! Scopes concatenate (startup ⊕ host ⊕ workspace ⊕ launch) rather than
+//! override, and the result lands in a per-session file that the
+//! shell-integration rc and the agent login-wrapper source via
+//! `CHIMAERA_PRELUDE` (guarded by `CHIMAERA_PRELUDE_DONE`, so nested shells
+//! never re-run it and reconnects — which are not spawns — never see it at
+//! all).
+//!
+//! The outermost `startup` scope exists only in a cluster workspace job: the
+//! job's startup commands (the cluster default ⊕ the workspace's ⊕ this
+//! run's, composed by the app into the file `CHIMAERA_HOST_PRELUDE_FILE`
+//! names). The job script deliberately doesn't run them itself; the daemon
+//! applies them per spawn like every other scope. The file is read once per
+//! spawn (edits apply to the next one), capped, off the reactor; without the
+//! variable nothing is read at all.
 //!
 //! Persisted at `~/.config/chimaera/env-profiles.json`; hand-edits are
 //! first-class (reads re-stat the file, like `settings`). Entries are
@@ -61,27 +70,45 @@ pub(crate) struct EnvPreludes {
 }
 
 impl EnvPreludes {
-    /// The effective prelude for one spawn: host ⊕ workspace ⊕ launch, in
-    /// that order (concatenation, not override — commands run in sequence,
-    /// which is the HPC mental model). Empty scopes are skipped; empty
-    /// result means "set no CHIMAERA_PRELUDE at all".
-    pub(crate) fn effective(&self, workspace_id: &str, launch: Option<&str>) -> String {
-        self.compose(Some(workspace_id), launch)
+    /// The effective prelude for one spawn: startup ⊕ host ⊕ workspace ⊕
+    /// launch, in that order (concatenation, not override — commands run in
+    /// sequence, which is the HPC mental model). `startup` is the cluster
+    /// job's startup commands ([`job_startup`]), `None` everywhere else.
+    /// Empty scopes are skipped; empty result means "set no
+    /// CHIMAERA_PRELUDE at all".
+    pub(crate) fn effective(
+        &self,
+        startup: Option<&str>,
+        workspace_id: &str,
+        launch: Option<&str>,
+    ) -> String {
+        self.compose(startup, Some(workspace_id), launch)
     }
 
-    /// The host scope alone (a plugin tool's setup, which no workspace owns).
-    pub(crate) fn host_only(&self) -> String {
-        self.compose(None, None)
+    /// The startup and host scopes alone (a plugin tool's setup, which no
+    /// workspace owns).
+    pub(crate) fn host_only(&self, startup: Option<&str>) -> String {
+        self.compose(startup, None, None)
     }
 
     /// [`Self::effective`] with the workspace scope explicit: None is the
     /// host scope alone, never "whatever an empty id happens to match".
-    fn compose(&self, workspace_id: Option<&str>, launch: Option<&str>) -> String {
+    fn compose(
+        &self,
+        startup: Option<&str>,
+        workspace_id: Option<&str>,
+        launch: Option<&str>,
+    ) -> String {
         let host = self.host.as_ref().map(|e| e.text.as_str());
         let workspace = workspace_id
             .and_then(|id| self.workspaces.get(id))
             .map(|e| e.text.as_str());
-        let parts = [("host", host), ("workspace", workspace), ("launch", launch)];
+        let parts = [
+            ("startup", startup),
+            ("host", host),
+            ("workspace", workspace),
+            ("launch", launch),
+        ];
         let mut out = String::new();
         for (scope, text) in parts {
             let Some(text) = text.filter(|t| !t.trim().is_empty()) else {
@@ -196,35 +223,92 @@ fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+/// The cluster job's startup commands: the text of the file
+/// `CHIMAERA_HOST_PRELUDE_FILE` names, read now (so an edit applies to the
+/// next spawn), capped at [`MAX_SCOPE_BYTES`]. `None` without the variable —
+/// every daemon that isn't a cluster workspace job — or when the file is
+/// missing, empty, or oversized. Blocking: call it off the reactor (or use
+/// [`job_startup`]).
+pub(crate) fn job_startup_blocking() -> Option<String> {
+    let path = std::env::var_os(chimaera_core::cluster::ENV_HOST_PRELUDE_FILE)
+        .filter(|p| !p.is_empty())?;
+    read_startup(std::path::Path::new(&path))
+}
+
+/// [`job_startup_blocking`] from async code: no blocking hop at all without
+/// the variable, a `spawn_blocking` read with it.
+pub(crate) async fn job_startup() -> Option<String> {
+    std::env::var_os(chimaera_core::cluster::ENV_HOST_PRELUDE_FILE).filter(|p| !p.is_empty())?;
+    tokio::task::spawn_blocking(job_startup_blocking)
+        .await
+        .ok()
+        .flatten()
+}
+
+fn read_startup(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        // A job whose startup file was never written runs with none.
+        Err(err) if err.kind() == ErrorKind::NotFound => return None,
+        Err(err) => {
+            tracing::warn!(path = %path.display(), %err, "cannot read the job's startup commands; spawning without them");
+            return None;
+        }
+    };
+    let mut bytes = Vec::new();
+    if let Err(err) = file
+        .take(MAX_SCOPE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+    {
+        tracing::warn!(path = %path.display(), %err, "cannot read the job's startup commands; spawning without them");
+        return None;
+    }
+    // Over the cap, the whole scope is dropped rather than cut mid-command:
+    // half a startup script is worse than none.
+    if bytes.len() > MAX_SCOPE_BYTES {
+        tracing::warn!(path = %path.display(), "the job's startup commands exceed {MAX_SCOPE_BYTES} bytes; spawning without them");
+        return None;
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    (!text.trim().is_empty() && !text.contains('\0')).then_some(text)
+}
+
 /// Compose and write the per-session prelude file; returns its path, or
 /// None when no prelude applies (then no env var is set — zero behavior
-/// delta for users without preludes). Best-effort: a failed write degrades
-/// to "no prelude" with a warning, never a failed spawn. Lives under the
-/// runtime dir — hot state, reconstructible, night-scrub is fine because
-/// the file is only read once at spawn.
+/// delta for users without preludes). `startup` is [`job_startup`]'s text,
+/// read by the async caller. Best-effort: a failed write degrades to "no
+/// prelude" with a warning, never a failed spawn. Lives under the runtime
+/// dir — hot state, reconstructible, night-scrub is fine because the file is
+/// only read once at spawn.
 pub(crate) fn materialize_prelude(
     state: &AppState,
     session_id: &str,
     workspace_id: &str,
     launch: Option<&str>,
+    startup: Option<&str>,
 ) -> Option<PathBuf> {
     let text = crate::lock(&state.env_preludes)
         .current()
-        .effective(workspace_id, launch);
+        .effective(startup, workspace_id, launch);
     write_prelude(&format!("{session_id}.sh"), &text)
 }
 
-/// [`materialize_prelude`] for an agent probe (`agent_probe`): host scope,
-/// plus the workspace's when the answer is per-workspace. The name is
-/// unique per call — concurrent probes and sessions never share a file —
-/// and the caller removes it with [`remove_prelude_path`] when done.
+/// [`materialize_prelude`] for an agent probe (`agent_probe`): the startup
+/// and host scopes, plus the workspace's when the answer is per-workspace.
+/// The name is unique per call — concurrent probes and sessions never share
+/// a file — and the caller removes it with [`remove_prelude_path`] when
+/// done. Blocking (it reads the startup file): callers run it off the
+/// reactor.
 pub(crate) fn materialize_probe_prelude(
     state: &AppState,
     workspace_id: Option<&str>,
 ) -> Option<PathBuf> {
-    let text = crate::lock(&state.env_preludes)
-        .current()
-        .compose(workspace_id, None);
+    let startup = job_startup_blocking();
+    let text =
+        crate::lock(&state.env_preludes)
+            .current()
+            .compose(startup.as_deref(), workspace_id, None);
     let name = format!("probe-{}.sh", chimaera_core::generate_token());
     write_prelude(&name, &text)
 }
@@ -330,7 +414,7 @@ mod tests {
     #[test]
     fn effective_concatenates_in_scope_order_and_skips_empties() {
         let mut data = EnvPreludes::default();
-        assert_eq!(data.effective("w-1", None), "");
+        assert_eq!(data.effective(None, "w-1", None), "");
 
         data.host = Some(PreludeEntry {
             text: "ml bcftools".into(),
@@ -348,24 +432,30 @@ mod tests {
             },
         );
 
-        let text = data.effective("w-1", Some("export DEBUG=1"));
+        let text = data.effective(Some("ml slurm-tools\n"), "w-1", Some("export DEBUG=1"));
+        let startup = text.find("ml slurm-tools").unwrap();
         let host = text.find("ml bcftools").unwrap();
         let ws = text.find("conda activate hello").unwrap();
         let launch = text.find("export DEBUG=1").unwrap();
         assert!(
-            host < ws && ws < launch,
-            "order must be host<workspace<launch"
+            startup < host && host < ws && ws < launch,
+            "order must be startup<host<workspace<launch"
         );
+        assert!(text.starts_with("# chimaera prelude: startup\n"));
         assert!(text.ends_with('\n'));
 
         // Unknown workspace + blank-text workspace both contribute nothing.
-        assert!(!data.effective("w-other", None).contains("conda"));
+        assert!(!data.effective(None, "w-other", None).contains("conda"));
         assert!(!data
-            .effective("w-blank", None)
+            .effective(None, "w-blank", None)
             .contains("prelude: workspace"));
+        // A blank startup scope is skipped like any other.
+        assert!(!data
+            .effective(Some(" \n"), "w-1", None)
+            .contains("prelude: startup"));
 
         // Launch-only works with no stored preludes at all.
-        let launch_only = EnvPreludes::default().effective("w-1", Some("echo hi"));
+        let launch_only = EnvPreludes::default().effective(None, "w-1", Some("echo hi"));
         assert!(launch_only.contains("echo hi"));
     }
 
@@ -382,10 +472,32 @@ mod tests {
                 },
             )]),
         };
-        let host_only = data.compose(None, None);
+        let host_only = data.compose(None, None, None);
         assert!(host_only.contains("ml nodejs"));
         assert!(!host_only.contains("conda"), "{host_only}");
-        assert!(data.compose(Some(""), None).contains("conda"));
+        assert!(data.compose(None, Some(""), None).contains("conda"));
+        let with_startup = data.host_only(Some("ml cluster-default"));
+        assert!(
+            with_startup.find("ml cluster-default").unwrap()
+                < with_startup.find("ml nodejs").unwrap()
+        );
+    }
+
+    #[test]
+    fn startup_file_reads_capped_and_whole() {
+        let dir = std::env::temp_dir().join(format!("chimaera-startup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("startup.sh");
+        std::fs::write(&file, "ml python\n").unwrap();
+        assert_eq!(read_startup(&file).as_deref(), Some("ml python\n"));
+        std::fs::write(&file, "  \n").unwrap();
+        assert_eq!(read_startup(&file), None, "blank is no scope");
+        std::fs::write(&file, "x".repeat(MAX_SCOPE_BYTES)).unwrap();
+        assert!(read_startup(&file).is_some(), "the cap itself fits");
+        std::fs::write(&file, "x".repeat(MAX_SCOPE_BYTES + 1)).unwrap();
+        assert_eq!(read_startup(&file), None, "never half a script");
+        assert_eq!(read_startup(&dir.join("missing.sh")), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

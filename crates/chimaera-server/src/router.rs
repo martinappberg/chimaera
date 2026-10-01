@@ -6,9 +6,9 @@ use tower_http::trace::TraceLayer;
 
 use crate::AppState;
 use crate::{
-    agent_probe, agents, api, chat, compute, compute_jobs, download, drafts, environment, fs, git,
-    launcher, links, mcp, notebook, notices, plugins, proxy, quickopen, recents, runtimes,
-    settings, timeline, update, upload, view_state, voice, ws,
+    agent_probe, agents, api, chat, compute, download, drafts, environment, fs, git, launcher,
+    links, mcp, notebook, notices, plugins, proxy, quickopen, recents, runtimes, settings,
+    timeline, update, upload, view_state, voice, ws,
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
@@ -334,14 +334,9 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             )),
         )
         .route("/compute", get(compute::get_compute))
-        .route(
-            "/compute/sessions",
-            get(compute_jobs::list_compute_sessions).post(compute_jobs::launch_compute_session),
-        )
-        .route(
-            "/compute/sessions/{job_id}",
-            delete(compute_jobs::cancel_compute_session),
-        )
+        // A cluster workspace job's own stop (scancel of SLURM_JOB_ID); 404
+        // on any daemon not running inside a Slurm job.
+        .route("/compute/self", delete(compute::delete_self))
         .route("/git/status", get(git::status))
         .route("/git/diff", get(git::diff))
         .route("/git/branches", get(git::branches))

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cluster-stop"
+description = "Enables the cluster_stop command without any pre-configured scope."
+commands.allow = ["cluster_stop"]
+
+[[permission]]
+identifier = "deny-cluster-stop"
+description = "Denies the cluster_stop command without any pre-configured scope."
+commands.deny = ["cluster_stop"]

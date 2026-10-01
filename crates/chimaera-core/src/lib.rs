@@ -651,13 +651,13 @@ mod tests {
     #[test]
     fn node_identity_is_case_insensitive_and_exact_otherwise() {
         assert!(same_node(
-            "sh03-ln06.stanford.edu",
-            "SH03-LN06.Stanford.EDU"
+            "login-a.cluster.example",
+            "LOGIN-A.Cluster.Example"
         ));
         assert!(same_node(" login1\n", "login1"));
         assert!(!same_node(
-            "sh03-ln06.stanford.edu",
-            "sh04-ln03.stanford.edu"
+            "login-a.cluster.example",
+            "login-b.cluster.example"
         ));
         // A short name vs an FQDN is not provably the same machine.
         assert!(!same_node("login1", "login1.cluster.edu"));

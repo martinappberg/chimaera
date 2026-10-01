@@ -1072,6 +1072,36 @@ pub async fn stop(
     Ok(())
 }
 
+/// `scancel` one job by id, nothing else — the old job of a "continue on a
+/// new node" handoff, whose workspace record already names the new job.
+/// "Invalid job id" (already gone) is success.
+pub async fn cancel_job(host: &str, job_id: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !job_id.is_empty() && job_id.chars().all(|c| c.is_ascii_digit() || c == '_'),
+        "invalid job id"
+    );
+    let mut s = path_line(host);
+    s.push_str(&format!(
+        "err=$(scancel {} 2>&1); rc=$?\nprintf '===rc %s\\n===err\\n%s\\n===end\\n' \"$rc\" \"$err\"\n",
+        sh_quote(job_id)
+    ));
+    let out = run_script(host, &s, EXEC_SECS).await?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let secs = sections(&stdout);
+    invalidate_queue(host);
+    anyhow::ensure!(
+        section(&secs, "end").is_some(),
+        "stopping job {job_id} on {host} failed: {}",
+        super::ssh_failure_line(&out.stderr, &out.status)
+    );
+    let rc = marker_arg(&secs, "rc").unwrap_or("1");
+    let err = section(&secs, "err").unwrap_or("");
+    if rc != "0" && !err.to_ascii_lowercase().contains("invalid job id") {
+        bail!("{}", clean_tool_stderr(err, "scancel"));
+    }
+    Ok(())
+}
+
 /// Ask accounting once how a job ended and keep the answer in its record.
 /// Clusters without accounting answer "ENDED".
 pub async fn record_end(
