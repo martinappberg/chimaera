@@ -169,9 +169,10 @@ pub async fn jobs(host: &str) -> anyhow::Result<()> {
     for j in &live {
         let detail = match j.state {
             "running" => format!(
-                "on {} · {} CPUs · {} · {}",
+                "on {} · {} CPU{} · {} · {}",
                 j.node,
                 j.cpus,
+                if j.cpus == "1" { "" } else { "s" },
                 j.mem,
                 left(j.ends_at_ms, ov.now_ms)
             ),

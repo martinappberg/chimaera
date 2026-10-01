@@ -2802,8 +2802,9 @@ pub struct ComputeTunnel {
     pub port: u16,
     pub token: String,
     pub rung: ComputeRung,
-    /// The `-L` spec of a forward the login ControlMaster holds instead of
-    /// `child`: the direct rung's when its mux client delegated. `None` for
+    /// The `-L` spec of a forward the login ControlMaster may hold instead of
+    /// `child`: always the direct rung's (cancelled on close whether or not
+    /// its mux client delegated — that can happen after the probe). `None` for
     /// the ssh-adopt rung — `node_ssh_base` pins `ControlPath=none`, so that
     /// child owns its forward end-to-end and dies with it.
     master_forward: Option<String>,
@@ -3004,14 +3005,16 @@ pub async fn connect_compute_node(
     match spawn_direct_node_tunnel(host, &route, node, local, port) {
         Ok(mut child) => match wait_for_port(local, &mut child).await {
             Ok(mux) => {
-                if let Some(mux) = tunnel_proven(local, token, 15, mux, &mut child).await {
+                if tunnel_proven(local, token, 15, mux, &mut child)
+                    .await
+                    .is_some()
+                {
                     tracing::info!(%node, %job_id, "workspace job tunnel up (direct)");
-                    return Ok(mk(
-                        local,
-                        ComputeRung::Direct,
-                        mux.then(|| spec.clone()),
-                        child,
-                    ));
+                    // Always cancelled on close, delegated or not: the mux
+                    // client may hand the forward to the master just after
+                    // the probe answers, and a cancel the master doesn't
+                    // hold is a no-op it answers locally.
+                    return Ok(mk(local, ComputeRung::Direct, Some(spec.clone()), child));
                 }
                 // A delegated forward outlives the exited mux client — the
                 // probe failing does not tear it down, so cancel or the
