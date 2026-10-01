@@ -1609,7 +1609,9 @@
       case "mcp":
         if (agentKind === "claude") {
           if (!sendCommand({ type: "get_mcp" }, "MCP request not sent")) return false;
-          store.mcpServers = null;
+          // The inventory already known stays up while this one is fetched:
+          // a read is not the user acting, so nobody answers it while a cloud
+          // machine sleeps (see `UNANSWERED_MS`).
           menu = "mcp";
           return true;
         }
@@ -1881,6 +1883,29 @@
       ? store.rewind
       : null,
   );
+
+  /** A read is not the user acting (`get_mcp`, a rewind's dry run): a keeper
+   *  that keeps a sleeping cloud machine's socket neither holds it nor wakes
+   *  the machine for it, so no answer comes. A surface waiting on one closes
+   *  after this long instead of saying "loading…" for good; asking again
+   *  once the conversation answers works. Only a viewed conversation: a
+   *  local daemon always answers or refuses. */
+  const UNANSWERED_MS = { mcp: 10_000, rewind: 30_000 };
+  $effect(() => {
+    if (!viewed || menu !== "mcp" || store.mcpServers !== null) return;
+    const timer = setTimeout(() => {
+      if (menu === "mcp") menu = null;
+    }, UNANSWERED_MS.mcp);
+    return () => clearTimeout(timer);
+  });
+  $effect(() => {
+    const intent = rewindIntent;
+    if (!viewed || intent === null || intent.stage !== "dry" || rewindReport !== null) return;
+    const timer = setTimeout(() => {
+      if (rewindIntent === intent) rewindIntent = null;
+    }, UNANSWERED_MS.rewind);
+    return () => clearTimeout(timer);
+  });
 
   function askRewind(checkpoint: { id: string; preceding: string | null }) {
     store.rewind = null;

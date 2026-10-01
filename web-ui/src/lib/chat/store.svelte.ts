@@ -218,18 +218,35 @@ export interface RestoredDraft {
 }
 
 /** A send the socket accepted whose echo has not arrived: its text is kept
- *  until the agent's echo proves delivery, a refusal hands it back, or the
- *  `ready` after its socket ended replays no echo for it. */
+ *  until the agent's echo proves delivery, a refusal hands it back, or a
+ *  `ready` it predates replays no echo for it. */
 interface UnconfirmedSend extends RestoredDraft {
   /** Stable key for its pending bubble. */
   key: number;
   /** Shown as a pending bubble ("sending…"). */
   shown: boolean;
-  /** Its socket ended before the echo. Whoever kept that socket discarded
-   *  what it still held, so the next `ready` decides: an echo in the replay
-   *  means it was delivered, none means it never was. */
-  orphaned: boolean;
+  /** Believed to wait in someone's queue for the owner's next `ready` (a
+   *  keeper or this computer's relay holds what is sent before the owner
+   *  answered, and says `waking` when it starts holding on a socket that was
+   *  live): that `ready` delivers it, so that `ready` does not decide it. */
+  held: boolean;
+  /** Decided by the `ready` now being replayed: no echo by its `head` means
+   *  it never reached the agent (it went to a machine in the instant it
+   *  froze, or its socket ended and what was held for it was discarded). */
+  due: boolean;
+  /** It was already unconfirmed when a `ready` arrived. */
+  aged: boolean;
+  /** When the socket accepted it (ms). */
+  at: number;
 }
+
+/** A `waking` (or `bringing`) frame answers the send that made its sender
+ *  start holding, and reaches the client a round trip later. Sends accepted
+ *  within this long before it are taken as held; older ones went out earlier,
+ *  to a machine that then froze. Generous on purpose: taking a lost send for
+ *  a held one only delays its return, the reverse would return a message
+ *  that is about to be delivered. */
+const HELD_BEFORE_WAKING_MS = 15_000;
 
 export interface PendingSend {
   /** Delivery key (the wire's client-minted uuid) — the `UserMessageUpdate` /
@@ -627,8 +644,8 @@ export class ChatStore {
    *  a sleeping owner queues them). Raw, replaced on every change. */
   private unconfirmed = $state.raw<UnconfirmedSend[]>([]);
   private unconfirmedKey = 0;
-  /** The `head` of the `ready` whose replay decides the orphaned sends; null
-   *  when no decision is due. */
+  /** The `head` of the `ready` whose replay decides the due sends; null when
+   *  no decision is pending. */
   private reconcileAt: number | null = null;
   /** A send picked a paused project back up and it is waking; cleared by the
    *  next `ready`, a disconnect or a move. */
@@ -643,8 +660,8 @@ export class ChatStore {
   /** Sends accepted while the conversation is not live (paused, waking,
    *  reconnecting), oldest first: each shown at once as a pending bubble so
    *  it is never typed twice. Its echo removes one; a refusal, an exit, or a
-   *  `ready` that replays no echo after its socket ended hands its text back
-   *  to the composer. */
+   *  `ready` it predates that replays no echo for it hands its text back to
+   *  the composer. */
   get sending(): { key: number; text: string; images: number }[] {
     return this.unconfirmed
       .filter((send) => send.shown)
@@ -863,22 +880,35 @@ export class ChatStore {
     if (!session.alive && this.exited === null) {
       this.exited = { status: session.exit_status };
     }
-    // Sends whose socket ended before their echo are decided by this replay
-    // (through `head`). A daemon that names no head gives no end to wait for:
-    // they stay pending rather than be handed back on a guess.
-    this.reconcileAt = head ?? null;
-    this.settleOrphans();
+    // A fresh attach has none of the driver's client-pushed state for sure
+    // (a keeper drops a `set_thinking` sent while nothing was attached):
+    // push the preference again.
+    this.thinkingPushed = false;
+    // Every `ready` decides the sends that predate it and were not waiting
+    // in a holder's queue for it: one whose echo is not in this replay
+    // (through `head`) never reached the agent. Held ones are delivered now
+    // and decided by the next `ready` should their echo not come. A daemon
+    // that names no head gives no end to wait for: nothing is decided then.
+    if (head === undefined) {
+      this.reconcileAt = null;
+      return;
+    }
+    if (this.unconfirmed.length > 0) {
+      this.unconfirmed = this.unconfirmed.map((send) => ({ ...send, due: !send.held, held: false, aged: true }));
+    }
+    this.reconcileAt = head;
+    this.settleDue();
   }
 
-  /** The replay that decides orphaned sends has been applied: one still
+  /** The replay that decides the due sends has been applied: one still
    *  without its echo never reached the agent, so its text goes back to the
    *  composer exactly as a refused send's does. */
-  private settleOrphans(): void {
+  private settleDue(): void {
     if (this.reconcileAt === null || this.lastSeq < this.reconcileAt) return;
     this.reconcileAt = null;
-    const lost = this.unconfirmed.filter((send) => send.orphaned);
+    const lost = this.unconfirmed.filter((send) => send.due);
     if (lost.length === 0) return;
-    this.unconfirmed = this.unconfirmed.filter((send) => !send.orphaned);
+    this.unconfirmed = this.unconfirmed.filter((send) => !send.due);
     this.handBack(lost);
   }
 
@@ -892,11 +922,11 @@ export class ChatStore {
     this.connected = false;
     this.held = false;
     this.waking = false;
-    // No echo will come on this socket any more, and nothing it carried is
-    // delivered later: show what is unconfirmed as pending, and let the next
-    // `ready` decide it ({@link settleOrphans}).
+    // No echo will come on this socket any more, and whoever held input for
+    // it discards that: show what is unconfirmed as pending, held by nobody,
+    // and let the next `ready` decide it ({@link settleDue}).
     if (this.unconfirmed.length > 0) {
-      this.unconfirmed = this.unconfirmed.map((send) => ({ ...send, shown: true, orphaned: true }));
+      this.unconfirmed = this.unconfirmed.map((send) => ({ ...send, shown: true, held: false, due: false }));
     }
     this.reconcileAt = null;
   }
@@ -913,6 +943,10 @@ export class ChatStore {
     this.held = false;
     this.connected = false;
     this.waking = false;
+    // What was held has been refused by now; nothing else is in a queue.
+    if (this.unconfirmed.some((send) => send.held)) {
+      this.unconfirmed = this.unconfirmed.map((send) => (send.held ? { ...send, held: false } : send));
+    }
   }
 
   /** The owner is paused and nothing has asked it to wake yet. Said by a
@@ -934,12 +968,13 @@ export class ChatStore {
     this.showUnconfirmed();
   }
 
-  /** Accepted sends that have not echoed are waiting somewhere on the way:
-   *  show each as a pending bubble. */
+  /** Someone started holding what this socket sends (`waking`, `bringing`):
+   *  show every unconfirmed send as a pending bubble, and take the recent
+   *  ones (see {@link HELD_BEFORE_WAKING_MS}) as waiting in that queue. */
   private showUnconfirmed(): void {
-    if (this.unconfirmed.some((send) => !send.shown)) {
-      this.unconfirmed = this.unconfirmed.map((send) => (send.shown ? send : { ...send, shown: true }));
-    }
+    if (this.unconfirmed.length === 0) return;
+    const since = Date.now() - HELD_BEFORE_WAKING_MS;
+    this.unconfirmed = this.unconfirmed.map((send) => ({ ...send, shown: true, held: send.held || send.at >= since }));
   }
 
   /** Acting here is bringing the work to this computer (or, from a phone, to
@@ -982,19 +1017,25 @@ export class ChatStore {
     // Sending is what picks a paused project back up: stop inviting it.
     const live = this.connected && !this.waking && this.bringing === null;
     this.asleep = false;
+    // Not live: whoever keeps the socket holds it until the owner answers.
     this.unconfirmed = [
       ...this.unconfirmed,
-      { key: this.unconfirmedKey++, text, images, shown: !live, orphaned: false },
+      { key: this.unconfirmedKey++, text, images, shown: !live, held: !live, due: false, aged: false, at: Date.now() },
     ];
   }
 
   /** The agent received one of the composer's sends. Its text names which
    *  (the echo is the send's own text); an echo that matches none is taken
-   *  for the oldest, so a pending bubble never outlives its message. */
+   *  for the oldest, so a pending bubble never outlives its message. Sends
+   *  are delivered in the order they were made, so an older one that was
+   *  already waiting at the last `ready` and is still without its echo was
+   *  skipped: it never reached the agent and goes back to the composer. */
   private confirmSend(text: string): void {
     if (this.unconfirmed.length === 0) return;
     const at = Math.max(0, this.unconfirmed.findIndex((send) => send.text === text));
-    this.unconfirmed = this.unconfirmed.filter((_, index) => index !== at);
+    const skipped = this.unconfirmed.filter((send, index) => index < at && send.aged);
+    this.unconfirmed = this.unconfirmed.filter((send, index) => index !== at && !(index < at && send.aged));
+    if (skipped.length > 0) this.handBack(skipped);
   }
 
   /** One command was refused before reaching the agent. Say so, and give an
@@ -1110,7 +1151,7 @@ export class ChatStore {
   apply(entry: SeqEvent): void {
     if (entry.seq <= this.lastSeq) return;
     this.reduce(entry);
-    this.settleOrphans();
+    this.settleDue();
   }
 
   private reduce(entry: SeqEvent): void {

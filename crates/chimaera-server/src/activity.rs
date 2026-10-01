@@ -75,11 +75,18 @@ pub(crate) fn record(state: &crate::AppState, id: &str) {
     crate::lock(&state.activity).record(id, crate::session_view::now_ms());
     state.changes.notify_waiters();
 }
+/// The chat commands that are the user acting: they count as interaction
+/// here, and they are the ones a keeper that keeps a sleeping cloud machine's
+/// sockets holds and wakes the machine for (VIEWING.md, "A sleeping cloud
+/// machine's sockets" mirrors this list; change both together). Everything
+/// else (reads, settings, queue housekeeping) neither wakes nor is held.
+/// `SendAfterTurn` is a send: idle it opens a turn like any other.
 pub(crate) fn is_interaction(command: &chimaera_agent::model::AgentCommand) -> bool {
     use chimaera_agent::model::AgentCommand;
     matches!(
         command,
         AgentCommand::Send { .. }
+            | AgentCommand::SendAfterTurn { .. }
             | AgentCommand::Permission { .. }
             | AgentCommand::Answer { .. }
             | AgentCommand::Interrupt
@@ -129,7 +136,15 @@ mod tests {
         use chimaera_agent::model::AgentCommand;
         assert!(!is_interaction(&AgentCommand::GetUsage));
         assert!(!is_interaction(&AgentCommand::GetMcp));
+        assert!(!is_interaction(&AgentCommand::SetThinking {
+            enabled: true
+        }));
         assert!(is_interaction(&AgentCommand::Interrupt));
+        // A message held for the end of the turn is still the user's message.
+        assert!(is_interaction(&AgentCommand::SendAfterTurn {
+            blocks: Vec::new()
+        }));
+        assert!(is_interaction(&AgentCommand::Send { blocks: Vec::new() }));
     }
     #[test]
     fn identifiers_cannot_grow_unbounded_without_a_snapshot() {

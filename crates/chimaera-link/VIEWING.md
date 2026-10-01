@@ -156,20 +156,35 @@ text frames are folded into the remembered frame (its `cols`/`rows` and
 
 What the user does is held whenever the daemon has not answered `ready` on
 the current attach: while nothing is attached, and also after an attach until
-its `ready`. Held are a chat's commands (up to 4 frames and 12 MiB per
+its `ready`. Held are a chat's acting commands (up to 4 frames and 12 MiB per
 socket) and a terminal's typing, which is its binary frames (up to 64 KiB per
 socket), at most 12 MiB across the keeper. The first held frame asks the
 account to wake a sleeping machine; the keeper then attaches with wake
 intent, replays the authentication, waits for the daemon's `ready` and
 delivers the held frames once, in order. Frames that arrive during the wake
-join the queue. When it starts holding, the keeper sends the viewer the
-existing `{"type":"waking"}` frame, once per wake; a client shows a send made
-on a socket that still looked live as "sending…" from that frame. Frames that
-are not the user acting are never held, never wake the machine and count
-toward no cap: a terminal's text frames (folded, as above, and passed on when
-attached) and everything an events socket sends (its `watch` registration,
-dropped while nothing is attached; the client sends it again after every
-attach, below).
+join the queue.
+
+A chat's acting commands are exactly the ones the daemon counts as
+interaction (`chimaera-server` `activity::is_interaction`; the two lists
+change together): `send`, `send_after_turn`, `permission`, `answer`,
+`interrupt`, `compact`, `rewind` when it is not a dry run, `background_tool`
+and `stop_task`. Every other chat command is not the user acting (`set_mode`,
+`set_model`, `set_effort`, `set_thinking`, `set_ultracode`, `get_usage`,
+`get_mcp`, `set_mcp_enabled`, `reconnect_mcp`, `set_remote_control`,
+`cancel_queued`, `steer_queued`, `send_now`, `send_if_running`, a dry-run
+`rewind`, and any command a keeper does not know): it is never held, never
+wakes the machine and counts toward no cap; with nothing attached the keeper
+drops it, attached it passes through. The same holds for a terminal's text
+frames (folded, as above, and passed on when attached) and for everything an
+events socket sends (its `watch` registration, dropped while nothing is
+attached; the client sends it again after every attach, below).
+
+When it starts holding input from a socket, the keeper sends that socket the
+existing `{"type":"waking"}` frame, before anything else and once per holding
+period. For a socket that has already heard `ready` this is required, not
+optional: it is the only thing that tells the client its send is waiting in
+the keeper's queue for the next `ready` rather than lost (next paragraph),
+and a client shows the send as "sending…" from that frame.
 
 When the machine cannot be attached within 150 s, a cap is exceeded, the
 daemon refuses the attach, or ownership moved while holding, every held chat
@@ -183,12 +198,21 @@ delivered only to the project's owner at the current epoch.
 
 **Delivered, handed back, or discarded.** When the viewer's side of a kept
 socket closes while frames are still held, the keeper discards them: nothing
-is ever delivered for a socket that is gone. So for every send the client
-knows the outcome without the keeper's help: its echo (`user_message`), a
-refusal, or, when its socket ended first, the next `ready`: an echo in that
-attach's replay means it was delivered, and none by the replay's `head` means
-it never was, and the client puts the text back into the composer as it does
-for a refusal.
+is ever delivered for a socket that is gone. And a send the keeper passed on
+to a machine in the instant it froze is simply gone. So the client decides
+every send itself: its echo (`user_message`) confirms it, a refusal returns
+it, and otherwise the next `ready` it predates settles it: once that attach's
+replay has arrived (through its `head`), a send still without an echo never
+reached the agent, and the client puts its text back into the composer as it
+does for a refusal. This holds for every `ready`, a reattach on the same open
+socket included. One kind of send is not settled by a `ready`: a send that is
+waiting in a queue for exactly that `ready`, which delivers it afterwards.
+The client takes a send for queued when it was made on a socket that had not
+heard `ready` yet, after a `waking` or `bringing` that no `ready` has
+followed, or within 15 s before such a frame arrived (the frame answers the
+send that started the holding); the following `ready` settles it if its echo
+still has not come. A socket that ends, or `remote_unavailable`, means
+nothing is queued any more.
 
 When the machine is awake again for any reason, the keeper attaches every
 socket it kept, on its own, with the remembered authentication. An events
@@ -220,9 +244,19 @@ What clients do, against either kind of keeper:
   until the next frame. Without it (a hand-back) the socket is still kept,
   and quiet for 1.5 s again returns to the kept presentation.
 - Several sends can be pending at once, each shown as its own "sending…"
-  bubble. An echo confirms the send whose text it carries; a refusal answers
-  the oldest (the newest for `reason:"waking"`/`"bringing"`, which refuse the
-  send that just arrived); `send_after_turn` is a send.
+  bubble. An echo confirms the send whose text it carries (and returns an
+  older one that was already waiting at the last `ready`: sends arrive in
+  order, so it was skipped); a refusal answers the oldest (the newest for
+  `reason:"waking"`/`"bringing"`, which refuse the send that just arrived);
+  `send_after_turn` is a send.
+- Nothing in the UI waits forever on a command that is not the user acting:
+  the thinking preference is pushed again after every `ready`, the MCP panel
+  keeps the inventory it has and closes after 10 s without a first answer,
+  a rewind's dry-run check closes after 30 s. The other settings commands
+  (`set_model`, `set_mode`, `set_effort`, `set_ultracode`,
+  `set_remote_control`, `set_mcp_enabled`, `reconnect_mcp`) change nothing in
+  the UI until the daemon confirms them, so a dropped one leaves the old
+  value showing; they are not sent again.
 - An events client sends its `watch` registration again whenever a `settings`
   frame arrives on a gateway socket: the daemon sends one per attach, and a
   registration lives on the daemon's side of one attach.

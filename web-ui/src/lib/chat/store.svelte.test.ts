@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { SeqEvent } from "./chatWs";
 import { ChatStore } from "./store.svelte";
@@ -2442,6 +2442,100 @@ describe("ChatStore on a socket kept open while its owner sleeps", () => {
     expect(store.takeRestoredDraft()?.text).toBe("lost again");
   });
 
+  it("every ready decides the sends it finds unconfirmed, except the ones held for it", () => {
+    // Sent to a machine in the instant it froze: the socket stayed open, no
+    // one held it, no one said `waking`. The machine wakes for another
+    // reason and the same socket hears `ready` again: no echo in its replay,
+    // so the text comes back.
+    const frozen = new ChatStore();
+    frozen.onReady(session, 0, 0);
+    frozen.noteSent("into the freeze");
+    expect(frozen.restoredDraft).toBeNull();
+    frozen.onReady(session, 0, 1);
+    expect(frozen.restoredDraft).toBeNull();
+    frozen.apply({ seq: 1, ts: 0, ev: { type: "turn_started", turn_id: "t1" } } as SeqEvent);
+    expect(frozen.takeRestoredDraft()?.text).toBe("into the freeze");
+    expect(frozen.sending).toEqual([]);
+
+    // The send that wakes the machine is held for exactly that `ready`: its
+    // echo comes after the replay, so this `ready` must not return it.
+    const woke = new ChatStore();
+    woke.onReady(session, 0, 0);
+    woke.noteSent("wake up");
+    woke.onWaking();
+    woke.onReady(session, 0, 1);
+    woke.apply({ seq: 1, ts: 0, ev: { type: "turn_started", turn_id: "t1" } } as SeqEvent);
+    expect(woke.restoredDraft).toBeNull();
+    expect(woke.sending.map((send) => send.text)).toEqual(["wake up"]);
+    // Delivered into a machine that froze again before it echoed: the next
+    // `ready` finds it still without an echo and returns it.
+    woke.onReady(session, 1, 1);
+    expect(woke.takeRestoredDraft()?.text).toBe("wake up");
+
+    // So is a send made before the socket's first `ready`.
+    const early = new ChatStore();
+    early.onHeld();
+    early.noteSent("before it answered");
+    early.onReady(session, 0, 0);
+    expect(early.restoredDraft).toBeNull();
+    early.apply({ seq: 1, ts: 0, ev: { type: "user_message", text: "before it answered", id: "u1" } } as SeqEvent);
+    expect(early.sending).toEqual([]);
+
+    // And one made after `ready`, while its replay is still arriving.
+    const during = new ChatStore();
+    during.onReady(session, 0, 2);
+    during.noteSent("mid replay");
+    during.apply({ seq: 1, ts: 0, ev: { type: "turn_started", turn_id: "t1" } } as SeqEvent);
+    during.apply({ seq: 2, ts: 0, ev: { type: "message_chunk", turn_id: "t1", text: "hi" } } as SeqEvent);
+    expect(during.restoredDraft).toBeNull();
+  });
+
+  it("only sends made shortly before `waking` count as held; a later echo returns a skipped one", () => {
+    const now = vi.spyOn(Date, "now");
+    try {
+      // Long before the wake: it went to the machine as it froze. The send
+      // that triggers `waking` is held; the old one is decided by the `ready`.
+      now.mockReturnValue(1_000_000);
+      const store = new ChatStore();
+      store.onReady(session, 0, 0);
+      store.noteSent("lost a minute ago");
+      now.mockReturnValue(1_060_000);
+      store.noteSent("triggers the wake");
+      store.onWaking();
+      expect(store.sending.map((send) => send.text)).toEqual(["lost a minute ago", "triggers the wake"]);
+      store.onReady(session, 0, 0);
+      expect(store.takeRestoredDraft()?.text).toBe("lost a minute ago");
+      expect(store.sending.map((send) => send.text)).toEqual(["triggers the wake"]);
+      store.apply({ seq: 1, ts: 0, ev: { type: "user_message", text: "triggers the wake", id: "u1" } } as SeqEvent);
+      expect(store.sending).toEqual([]);
+
+      // Lost only a moment before the wake: taken for held at first. Sends
+      // arrive in order, so the later one's echo shows it was skipped.
+      const close = new ChatStore();
+      close.onReady(session, 0, 0);
+      close.noteSent("lost a moment ago");
+      close.noteSent("held");
+      close.onWaking();
+      close.onReady(session, 0, 0);
+      expect(close.restoredDraft).toBeNull();
+      close.apply({ seq: 1, ts: 0, ev: { type: "user_message", text: "held", id: "u1" } } as SeqEvent);
+      expect(close.takeRestoredDraft()?.text).toBe("lost a moment ago");
+      expect(close.sending).toEqual([]);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("every ready pushes the thinking preference again", () => {
+    const store = new ChatStore();
+    store.onReady(session, 0, 0);
+    store.markThinkingPushed();
+    // A keeper drops a `set_thinking` sent while nothing was attached; the
+    // next attach is where it can land.
+    store.onReady(session, 0, 0);
+    expect(store.thinkingPushed).toBe(false);
+  });
+
   it("an exit hands back what was never delivered", () => {
     const store = new ChatStore();
     store.onHeld();
@@ -2470,9 +2564,10 @@ describe("ChatStore on a socket kept open while its owner sleeps", () => {
     expect(store.awaitingWake).toBe(true);
     // What else ends it: the owner cannot be reached, the socket drops, or
     // `ready`.
-    store.onHeld();
-    store.onUnreachable();
-    expect(store.held).toBe(false);
+    const unreachable = new ChatStore();
+    unreachable.onHeld();
+    unreachable.onUnreachable();
+    expect(unreachable.held).toBe(false);
     // A wake that did not arrive stops saying it is waking, and a
     // conversation that was live is not live until the next `ready`.
     const live = new ChatStore();

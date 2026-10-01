@@ -342,18 +342,31 @@ returns after the quiet window. A kept socket that drops is dialed again
 before the placement's "suspended" parks it.
 
 Sends (both kinds of keeper): `store.unconfirmed` is a FIFO of accepted sends,
-`store.sending` the ones shown as "sending…" bubbles (several at once). An
-echo (`user_message`, no origin) confirms the send whose text it carries
-(else the oldest). `command_failed` for `send`/`send_after_turn` hands back
-the oldest (the newest for `reason:"waking"`/`"bringing"`, which refuse the
-send that just arrived) through `restoredDraft` / `takeRestoredDraft` (a
-queue; ChatView drains it, each text as its own paragraph). A socket that ends
-with unconfirmed sends orphans them (`onDisconnected`; the pool says so too
-when it heals a dead socket): the next `ready` names the replay's `head`, and
-an orphan still without its echo once `lastSeq` reaches it never reached the
-agent and is handed back (`settleOrphans`); an exit hands back everything. A
-move no longer forgets a send: the `ready` from where the conversation runs
-next decides it.
+`store.sending` the ones shown as "sending…" bubbles (several at once, also
+under the loading line). An echo (`user_message`, no origin) confirms the send
+whose text it carries (else the oldest), and returns an older one that was
+already waiting at the last `ready` (skipped: sends arrive in order).
+`command_failed` for `send`/`send_after_turn` hands back the oldest (the
+newest for `reason:"waking"`/`"bringing"`, which refuse the send that just
+arrived) through `restoredDraft` / `takeRestoredDraft` (a queue; ChatView
+drains it, each text as its own paragraph). Every `ready` settles the sends it
+finds unconfirmed (`onReady` marks them `due`, `settleDue` runs once `lastSeq`
+reaches the replay's `head`): no echo means it never reached the agent (a
+machine that froze as it arrived, or a socket that ended, after which the
+keeper discards what it held) and the text goes back to the composer. Exempt
+are sends `held` for that very `ready` (made before the socket's first
+`ready`, during `waking`/`bringing`, or within `HELD_BEFORE_WAKING_MS` before
+such a frame); they are due at the following one. `onDisconnected` (the pool
+calls it too when it heals a dead socket) and `onUnreachable` end `held`; an
+exit hands back everything; a move no longer forgets a send.
+
+Commands that are not the user acting (`set_*`, `get_usage`, `get_mcp`, a
+dry-run `rewind`) are dropped by a keeper while its machine sleeps, so nothing
+may wait on one forever: `onReady` clears `thinkingPushed` (the preference is
+pushed after every attach), `/mcp` keeps the inventory it has and closes after
+10 s without a first answer, a rewind's dry run closes after 30 s (both only
+for a viewed conversation). The other `set_*` have no optimistic state: a
+dropped one leaves the old value showing.
 
 The rest of this paragraph is what happens against a keeper that refuses or
 closes those sockets (today's), and for another computer as owner. In a native window the daemon holds the first command while a paused
