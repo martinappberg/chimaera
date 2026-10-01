@@ -42,6 +42,7 @@ import { BASE_FONT_SIZE, baseFontSize, fontFamily } from "./terminalMetrics";
 import { activeTheme, getSetting, onSettingsChange } from "../settings/store.svelte";
 import { isMac } from "../shared/keys";
 import { copyText } from "../shared/clipboard";
+import { wordNavigationInput } from "./terminalKeys";
 
 const POOL_CAP = 12;
 // Search uses xterm's selection internally; it must never trigger copy-on-select.
@@ -202,7 +203,8 @@ function isVisible(entry: PoolEntry): boolean {
  * Resize-before-reset, the grid-adoption ordering for an incoming snapshot:
  * it was rendered at (cols, rows), and replaying at any other width re-wraps
  * every soft-wrapped row at the wrong column. The onResize echo the resize
- * fires is a server-side no-op.
+ * fires is suppressed by SessionSocket: adopting server state must never
+ * turn an old snapshot size into a fresh resize request.
  */
 function applyReset(term: Terminal, cols?: number, rows?: number): void {
   if (cols !== undefined && rows !== undefined && (term.cols !== cols || term.rows !== rows)) {
@@ -331,6 +333,15 @@ function registerTerminalClipboard(term: Terminal): void {
   });
 
   term.attachCustomKeyEventHandler((e) => {
+    const wordInput = wordNavigationInput(
+      e, isMac, term.buffer.active.type, term.modes.applicationCursorKeysMode,
+    );
+    if (wordInput !== null) {
+      term.input(wordInput, true);
+      e.preventDefault();
+      e.stopPropagation();
+      return false;
+    }
     if (e.type !== "keydown" || (e.key !== "c" && e.key !== "C")) return true;
     const copyChord = isMac
       ? e.metaKey && !e.ctrlKey && !e.altKey
