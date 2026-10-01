@@ -35,6 +35,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use crate::agents::AgentKind;
 use crate::AppState;
 
+pub(crate) mod connections;
+
 const CACHE_TTL: Duration = Duration::from_secs(60);
 const CLI_TIMEOUT: Duration = Duration::from_secs(20);
 const CLI_OUTPUT_CAP: usize = 4 * 1024 * 1024;
@@ -72,6 +74,7 @@ pub(crate) struct ProbeState {
     cache: Mutex<HashMap<String, (Instant, Value)>>,
     generation: AtomicU64,
     changed_epoch: AtomicU64,
+    connection_auth: connections::AuthState,
 }
 
 /// Daemon-wide: at most one agent CLI probe in flight.
@@ -299,9 +302,11 @@ async fn run_until(argv: &[String], prelude: Option<&Path>, limit: Duration) -> 
 
 /// A short-lived codex app-server: initialize once, then requests.
 struct CodexRpc {
+    // Drop the process group before reaping the leader (PID reuse).
+    group: GroupKill,
     child: tokio::process::Child,
     stdin: tokio::process::ChildStdin,
-    lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stdout: BufReader<tokio::process::ChildStdout>,
     next_id: u64,
 }
 
@@ -309,16 +314,20 @@ impl CodexRpc {
     async fn open(bin: &Path, cwd: &Path, prelude: Option<&Path>) -> Result<Self, String> {
         let argv = wrapped(bin, &["app-server"]);
         let mut cmd = base_command(&argv, Some(cwd), prelude);
-        cmd.stdin(Stdio::piped()).stderr(Stdio::null());
+        cmd.stdin(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0);
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("could not start codex app-server: {e}"))?;
+        let group = GroupKill(child.id().map(|pid| nix::unistd::Pid::from_raw(pid as i32)));
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let mut rpc = CodexRpc {
+            group,
             child,
             stdin,
-            lines: BufReader::new(stdout).lines(),
+            stdout: BufReader::new(stdout),
             next_id: 0,
         };
         rpc.request(
@@ -351,19 +360,14 @@ impl CodexRpc {
         self.send(&json!({"id": id, "method": method, "params": params}))
             .await?;
         let read = async {
-            loop {
-                let Some(line) = self
-                    .lines
-                    .next_line()
+            for _ in 0..1024 {
+                let Some(line) = read_rpc_line(&mut self.stdout)
                     .await
                     .map_err(|e| format!("codex app-server read failed: {e}"))?
                 else {
                     return Err("codex app-server closed".to_string());
                 };
-                if line.len() > RPC_LINE_CAP {
-                    return Err("codex answer over the size cap".to_string());
-                }
-                let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                let Ok(msg) = serde_json::from_slice::<Value>(&line) else {
                     continue;
                 };
                 if msg.get("id").and_then(Value::as_u64) != Some(id) {
@@ -379,6 +383,7 @@ impl CodexRpc {
                 }
                 return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
             }
+            Err("too many codex notifications".to_string())
         };
         tokio::time::timeout(RPC_TIMEOUT, read)
             .await
@@ -386,8 +391,35 @@ impl CodexRpc {
     }
 
     async fn close(mut self) {
+        drop(self.group);
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
+    }
+}
+
+/// Bound the allocation before reading an agent-controlled JSON-RPC frame.
+async fn read_rpc_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok((!line.is_empty()).then_some(line));
+        }
+        let n = chunk
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(chunk.len(), |i| i + 1);
+        if line.len() + n > RPC_LINE_CAP {
+            return Err(std::io::Error::other("codex answer over the size cap"));
+        }
+        let end = chunk[n - 1] == b'\n';
+        line.extend_from_slice(&chunk[..n]);
+        reader.consume(n);
+        if end {
+            return Ok(Some(line));
+        }
     }
 }
 

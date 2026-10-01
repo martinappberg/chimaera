@@ -2667,3 +2667,51 @@ The Agent notes plugin became built-in agent communication (plan `docs/agent-com
 - **Hermetic:** codex `agent_message_steers_the_running_turn_under_its_own_key`, `agent_message_with_no_running_turn_settles_dropped`, `agent_message_that_misses_its_turn_is_dropped_not_redriven`, `a_refused_agent_steer_is_dropped`, `send_now_on_an_agent_message_delivers_it`, `a_chimaera_message_call_names_its_recipient`; claude `send_if_running_settles_dropped_without_writing`; `keyed_sends_pair_by_key_never_by_position`; `tests/manager.rs` `annotate_journals_a_daemon_event_in_seq_order`; the server's `tests/comms.rs`.
 - **Live chat-smoke:** 26/26, including the new `driver_codex_send_if_running_joins_the_turn_or_drops` (idle → `Dropped`, no turn; mid-`sleep 8` → queued echo under the caller's key, `Sent`, the word in the reply).
 - **Live, isolated daemon:** a haiku chat asked a codex chat a question with `expect_reply`; the wake request, the UI's Wake, codex's `reply_to` answer waking the asker; KIWI steered into a running codex turn (queued → `sent`, same turn); an auto-mode claude Mastermind's direction to codex and codex's report waking it.
+
+## Pass 40 (2026-09-30 — live inventory probes, Claude 2.1.284 and Codex 0.157.1): Extensions connections. ADOPTED (daemon probes, no driver change).
+
+- `claude mcp list` reports `name: endpoint - status`. This installed version
+  emits `✔ Connected` and **`! Needs authentication`** (not the warning glyph).
+  Keep unrecognized statuses unknown and discard endpoints before serialization.
+- `codex mcp list --json` reports configured MCP servers with `name`, `enabled`,
+  `auth_status` and transport details. A configured server with unsupported auth
+  is not proof of a live connection. The inventory exposes no transport details.
+- A short-lived `codex app-server`, initialized as for Pass 35, answers
+  `app/installed {forceRefresh:true}` with `{apps:[{id,runtimeName,enabled,callable}]}`.
+  The generated 0.157.1 schema and a live request agree. `callable` means effective
+  availability to Codex; it must not be relabeled as authentication status.
+- Both installed CLIs advertise `mcp login --no-browser <name>`; Codex 0.158.0
+  was also checked. Local MCP flows accept the complete browser callback URL on stdin.
+  Real local OAuth fixture probes exposed an additional Claude requirement: **both
+  stdin and stdout must be TTYs**. Piped stdin is refused; a TTY only on stdin prints
+  the link but never offers or reads the pasted callback. An internal raw PTY on all
+  streams prints `Or paste the redirect URL here:` and consumes a URL followed by
+  CR. Its URL may use an OSC hyperlink envelope. Codex accepts ordinary pipes and LF.
+  The daemon was exercised with both installed CLIs through authorization-link
+  generation, pasted callbacks reaching a fixture token endpoint's `invalid_grant`,
+  and cancellation/retry. No real-provider credential was created.
+  Claude's help explicitly includes claude.ai connectors. A live hosted bioRxiv
+  attempt printed `Visit this URL to authorize:` followed by an HTTPS claude.ai
+  `/api/organizations/.../mcp/start-auth/...` URL, then **exited 0 immediately**.
+  No provider authorization had occurred. Following that URL for a custom bioRxiv
+  entry produced Claude's `mcp_registration_failed` page. Claude's own settings
+  reported a server connection/configuration issue for that entry; the directory's
+  public bioRxiv connector requires no sign-in. Thus the hosted CLI status is not
+  proof that OAuth is the appropriate next action. Hosted setup now opens Claude's
+  connector settings without invoking `mcp login`; the dialog waits for an explicit
+  check and only marks success after the agent reports connected. Never map a login
+  process exit alone to successful authentication. The daemon cannot observe browser
+  error pages; the UI must keep the provider's settings available for recovery.
+- Sign-in jobs are workspace-scoped, in-memory, bounded and cancellable. The agent
+  owns OAuth and credentials. No workbench terminal session is created. Account login is separate.
+
+Verification: the isolated daemon returned 12 Claude connections and 16 Codex
+connections/apps; the UI displayed both inventories. No model turn was needed.
+Hermetic route tests cover workspace context, redaction, caching, literal arguments,
+Claude/Codex callback completion, cancellation/retry, provider failure and hosted
+completion verification. A user-driven test exposed a missing JSON content type
+(415); the frontend regression test now pins that transport requirement.
+The corrected hosted path was exercised against the real Claude account: the dialog
+opened connector settings, and Check connection kept the failing custom entry
+unconnected with recovery guidance. A real new-provider authorization has not been
+completed; successful authorization tests use CLI fixtures.
