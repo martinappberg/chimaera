@@ -3052,6 +3052,7 @@
   /** The folder picker's component, once its chunk has loaded (it is opened
    *  on demand and stays out of the always-loaded entry). */
   let FolderPicker = $state<Component<any> | null>(null);
+  let pickerLoadFailed = false;
 
   function openPicker(): void {
     if (pickerOpen) return;
@@ -3064,9 +3065,15 @@
     // drawn: close it (focus goes back) and say so the way a view that
     // failed to load does. Opening it again tries again.
     void loadDialog("folderPicker").then(
-      (view) => (FolderPicker = view),
+      (view) => {
+        FolderPicker = view;
+        // It loaded after an earlier failure was noted: that notice is done.
+        if (pickerLoadFailed) clearChunkFailure();
+        pickerLoadFailed = false;
+      },
       (error: unknown) => {
         console.error("could not load the folder picker", error);
+        pickerLoadFailed = true;
         noteChunkFailure();
         closePicker();
       },
