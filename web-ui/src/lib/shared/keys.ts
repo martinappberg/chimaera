@@ -57,6 +57,12 @@ export interface ActionDef {
  */
 export const ACTIONS = [
   {
+    id: "find",
+    label: "Find in Current Pane",
+    description: "Find text in the active terminal, conversation, or document. Quick Open finds files by name.",
+    def: "Mod+f",
+  },
+  {
     id: "picker",
     label: "Open Folder Picker",
     description: "Toggle the workspace folder picker.",

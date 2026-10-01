@@ -716,6 +716,22 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   completed turns. The branch action remains available at every message, but uses the portable
   handoff elsewhere.
 
+## Find in conversation messages
+
+`Mod+F` and the pane magnifier search retained user, assistant and agent-to-agent
+message text. Results are **messages**, with a source-text excerpt and a visible
+mark on the matching row; Enter / Shift+Enter wrap through up to 500 matching
+messages. Source markdown is searched, so a link target can match even when its
+label is all that is displayed. Tool output and thinking are excluded. The bar
+says when earlier history has been trimmed from the retained conversation.
+
+`ChatFind.svelte` owns the controls and highlights, `chatFind.ts` the bounded
+message lookup, and `ChatView.svelte::revealFindMessage` mounts the target's
+ordinary bounded transcript page by stable block uid. It never renders the whole
+history or changes the journal. Streaming refreshes results at a bounded cadence
+without moving the reader, and finding a reply at the live edge keeps that reply
+streaming. Closing or hiding the view clears marks and pending search work.
+
 ---
 
 ## Intent — human-authored ground truth

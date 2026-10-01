@@ -68,13 +68,14 @@
      */
     createRequest?: { kind: "file" | "dir"; nonce: number } | null;
     /**
-     * The folder an OS-desktop file drag is hovering: a dir row's path (a
+     * The folder an upload or in-app transfer is hovering: a dir row's path (a
      * file row targets its parent — App reads the row's `data-drop-dir`), or
      * the root for the tree background; null while no file drag is over the
      * tree. The tree lights that exact folder and names it, so the drop
      * destination is never a guess.
      */
     dropDir?: string | null;
+    dropAction?: "upload" | "move" | "copy";
     /** The hovered row's tree-position key for the drop (the row's
      *  `data-drop-key`, which App forwards): the same canonical path can sit
      *  under a symlink AND its target, so the highlight resolves by position
@@ -91,6 +92,7 @@
     reveal = null,
     createRequest = null,
     dropDir = null,
+    dropAction = "upload",
     dropKey = null,
   }: Props = $props();
 
@@ -417,7 +419,7 @@
     if (scrollEl !== null) scrollEl.scrollTop = 0;
   }
 
-  // --- OS-desktop drop target ---------------------------------------------------
+  // --- file drop target ---------------------------------------------------
   const rootPath = $derived(root.length > 1 && root.endsWith("/") ? root.slice(0, -1) : root);
   const dropIsRoot = $derived(dropDir !== null && (dropDir === root || dropDir === rootPath));
   /** The targeted dir row and its visible subtree (start, end] — the folder's
@@ -430,6 +432,14 @@
     return i < 0 ? null : { start: i, end: subtreeEnd(i), depth: rows[i].depth };
   });
   const dropLabel = $derived(dropDir === null ? "" : dirLabel(dropIsRoot ? rootPath : dropDir));
+
+  // A pause over a closed folder lets a drag reach deeper destinations.
+  $effect(() => {
+    const dir = dropDir;
+    if (dir === null || dropIsRoot || expanded.has(dir)) return;
+    const timer = setTimeout(() => { if (!expanded.has(dir)) toggle(dir); }, 700);
+    return () => clearTimeout(timer);
+  });
 
   // A native drag suppresses pointer events, so the hover cue would freeze on
   // whatever was last hovered; clear it so only the drop highlight shows.
@@ -724,24 +734,46 @@
     if (edit?.mode === "rename" && edit.path === entry.path) return; // the input owns keys
     // Copy / cut / paste, scoped to the focused tree row.
     if (e.metaKey || e.ctrlKey) {
-      if (e.key === "c" && !entry.broken) {
+      if (e.key.toLowerCase() === "c") {
         e.preventDefault();
         copyFile(entry.path, entry.kind);
         return;
       }
-      if (e.key === "x" && !entry.broken) {
+      if (e.key.toLowerCase() === "x") {
         e.preventDefault();
         cutFile(entry.path, entry.kind);
         return;
       }
-      if (e.key === "v" && fileClip() !== null) {
+      if (e.key.toLowerCase() === "v" && fileClip() !== null) {
         e.preventDefault();
         void pasteInto(pasteDirFor(entry));
         return;
       }
     }
     if (e.key === "Escape" && fileClip() !== null) {
+      e.preventDefault();
+      e.stopPropagation();
       clearClip();
+      return;
+    }
+    if (!e.metaKey && !e.ctrlKey && !e.altKey && ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) {
+      e.preventDefault();
+      const index = Number((e.currentTarget as HTMLElement).dataset.index);
+      let next = index;
+      if (e.key === "Home") next = 0;
+      else if (e.key === "End") next = rows.length - 1;
+      else if (e.key === "ArrowUp") next = Math.max(0, index - 1);
+      else if (e.key === "ArrowDown") next = Math.min(rows.length - 1, index + 1);
+      else if (e.key === "ArrowLeft") {
+        if (entry.kind === "dir" && expanded.has(entry.path)) toggle(entry.path);
+        else if (rows[index].parent >= 0) next = rows[index].parent;
+      } else if (entry.kind === "dir" && !entry.broken) {
+        if (!expanded.has(entry.path)) toggle(entry.path);
+        else if (rows[index + 1]?.parent === index) next = index + 1;
+      }
+      const row = treeEl?.querySelector<HTMLElement>(`.node[data-index="${next}"]`);
+      row?.focus({ preventScroll: true });
+      if (row !== null && row !== undefined) ensureRowVisible(row);
       return;
     }
     if (e.key === "Enter" || e.key === " ") {
@@ -752,6 +784,9 @@
     } else if (e.key === "F2") {
       e.preventDefault();
       beginRename(entry);
+    } else if (e.key === "Delete") {
+      e.preventDefault();
+      requestDelete(entry.path, entry.kind);
     }
   }
 
@@ -792,9 +827,16 @@
   }
 
   function cancelEdit(): void {
+    const restoreFocus = treeEl?.contains(document.activeElement) ?? false;
+    const path = edit?.mode === "rename" ? edit.path : edit?.parent;
     edit = null;
     editDraft = "";
     editError = null;
+    if (restoreFocus) void tick().then(() => {
+      if (document.activeElement !== document.body) return;
+      const row = path === undefined ? null : treeEl?.querySelector<HTMLElement>(`.node[data-path="${CSS.escape(path)}"]`);
+      (row ?? treeEl)?.focus({ preventScroll: true });
+    });
   }
 
   /** Focus the fresh inline input; renames preselect the stem. */
@@ -1021,7 +1063,7 @@
   </div>
   <!-- The tree is its own scroller so the ancestor overlay can stick to ITS
        top edge (the rail body around it does not scroll). -->
-  <div class="tree-scroll" bind:this={scrollEl}>
+  <div class="tree-scroll" bind:this={scrollEl} data-tree-root={root}>
     <!-- Zero-height sticky anchor: what it holds is painted over the top rows
          and never moves the content. During an OS file drag it names the drop
          destination instead of the ancestors — one message at a time. -->
@@ -1064,7 +1106,7 @@
         <!-- Names the destination, pinned just under the shelf so the place
              and the name read together. -->
         <div class="drop-chip folder tree-drop-label" style:--shelf-rows={sticky.length} role="status">
-          upload into <b>{dropLabel}</b>
+          {dropAction} into <b>{dropLabel}</b>
         </div>
       {/if}
     </div>
@@ -1319,7 +1361,7 @@
     flex: 1; /* fill .files-body so the tree's empty area is right-clickable */
     /* Row geometry, shared by real rows, the sticky copies and the JS probe
        (ROW_PAD_PX in the script mirrors --row-pad). */
-    --row-h: calc(var(--text-sm) + 10px);
+    --row-h: calc(var(--text-sm) + 13px);
     --indent: 13px;
     --row-pad: 8px;
     /* Indent guides: one per ancestor level, under that level's chevron
@@ -1446,9 +1488,9 @@
     display: flex;
     align-items: center;
     justify-content: flex-end;
-    gap: 2px;
+    gap: 4px;
     padding: 0 0.55rem 2px;
-    min-height: 20px;
+    min-height: 28px;
   }
 
   .filter-bar.open {
@@ -1464,11 +1506,12 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 2px;
+    padding: 5px;
+    min-width: 26px;
+    min-height: 26px;
     border-radius: 4px;
     color: var(--muted);
     cursor: pointer;
-    opacity: 0.7;
     transition:
       opacity 0.12s ease,
       color 0.12s ease,
@@ -1487,6 +1530,13 @@
     color: var(--muted);
     background: none;
     cursor: default;
+  }
+
+  .filter-toggle:focus-visible,
+  .filter-clear:focus-visible,
+  .sticky-node:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
 
   .filter-icon {
@@ -1603,11 +1653,13 @@
 
   .node:focus-visible {
     background-color: var(--row-hover);
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
 
   .node.active {
-    background-color: var(--row-active);
+    background-color: color-mix(in srgb, var(--accent) 15%, var(--rail-bg));
+    box-shadow: inset 3px 0 0 var(--accent);
   }
 
   /* Reveal flash (terminal dir links): a brief accent wash that fades. */
@@ -1638,7 +1690,7 @@
   .chev {
     flex: none;
     color: var(--muted);
-    opacity: 0.65;
+    opacity: 0.85;
     transition:
       transform 0.1s ease,
       opacity 0.12s ease;
@@ -1700,7 +1752,7 @@
   .node-name {
     font-family: var(--mono);
     font-size: var(--text-sm);
-    color: var(--muted);
+    color: var(--fg);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1759,6 +1811,7 @@
 
   .node.active .node-name {
     color: var(--fg);
+    font-weight: 600;
   }
 
   /* A cut-pending row dims until the paste lands (or Escape clears it). */

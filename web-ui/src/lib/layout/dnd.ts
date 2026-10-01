@@ -11,6 +11,13 @@
 import type { DiffMode } from "../workspace/git";
 import type { DiffTab, GitDetailTab, Side, SplitDir, Tab, Zone } from "./layout";
 
+export interface FolderTarget {
+  paneId: string | null;
+  dir: string;
+  row: boolean;
+  rowKey?: string;
+}
+
 export type DropSpot =
   | { kind: "zone"; paneId: string; zone: Zone }
   | { kind: "tab"; paneId: string; index: number }
@@ -23,6 +30,9 @@ export type DropSpot =
    *  the full pane is the drop zone). Produced by App's window drop handlers,
    *  never by spotAt. */
   | { kind: "upload"; paneId: string }
+  /** A file-manager transfer, distinct from moving its preview tab. Blocked
+   *  targets still consume the drop so they cannot fall through to a split. */
+  | (FolderTarget & { kind: "fileOp"; operation: "move" | "copy"; blocked: string | null })
   /** An OS-DESKTOP file drag over a FOLDER target — a Finder pane/column or a
    *  FILES-tree dir. `dir` is the destination directory; `paneId` is the
    *  Finder pane to frame (null for the rail tree, highlighted separately).
@@ -96,6 +106,7 @@ export interface LayoutCtrl {
    * link) while a plain click still opens the link menu.
    */
   dragSurface(e: PointerEvent, tab: Tab, onClick: () => void): void;
+  dragFileEntry(e: PointerEvent, path: string, kind: "file" | "dir", onClick: () => void): void;
   /** Divider drag lifecycle — gates terminal refits. */
   dividerDrag(active: boolean): void;
   /** Split `paneId` (pane hover cluster; same as the mod+D chords). */
@@ -251,6 +262,53 @@ export function paneIdAt(x: number, y: number): string | null {
   return null;
 }
 
+/** Shared by desktop uploads and in-app transfers. Ghosts/overlays have
+ * pointer-events:none, so the directory under the pointer stays authoritative. */
+export function folderTargetAt(x: number, y: number): FolderTarget | null {
+  const el = document.elementFromPoint(x, y);
+  if (!(el instanceof Element)) return null;
+  const row = el.closest<HTMLElement>("[data-drop-dir]");
+  if (row?.dataset.dropDir != null && el.closest(".tree-scroll") !== null) {
+    return { paneId: null, dir: row.dataset.dropDir, row: false, rowKey: row.dataset.dropKey };
+  }
+  const root = el.closest<HTMLElement>("[data-tree-root]");
+  if (root?.dataset.treeRoot != null) return { paneId: null, dir: root.dataset.treeRoot, row: false };
+  const col = el.closest<HTMLElement>("[data-finder-dir]");
+  if (col?.dataset.finderDir != null) {
+    const paneId = paneIdAt(x, y);
+    if (row?.dataset.dropDir != null && col.contains(row)) {
+      return { paneId, dir: row.dataset.dropDir, row: true };
+    }
+    return { paneId, dir: col.dataset.finderDir, row: false };
+  }
+  return null;
+}
+
+/** Scroll only the file surface under an active pointer drag, and only near
+ * its edges. Returning true schedules the next frame while the pointer rests. */
+function scrollFileTarget(x: number, y: number): boolean {
+  const el = document.elementFromPoint(x, y);
+  if (!(el instanceof Element)) return false;
+  let changed = false;
+  const speed = (p: number, lo: number, hi: number) =>
+    p < lo + 28 ? -Math.ceil((lo + 28 - p) / 3) : p > hi - 28 ? Math.ceil((p - hi + 28) / 3) : 0;
+  const vertical = el.closest<HTMLElement>(".tree-scroll, .col");
+  if (vertical !== null) {
+    const r = vertical.getBoundingClientRect();
+    const before = vertical.scrollTop;
+    vertical.scrollTop += speed(y, r.top, r.bottom);
+    changed ||= before !== vertical.scrollTop;
+  }
+  const horizontal = el.closest<HTMLElement>(".cols");
+  if (horizontal !== null) {
+    const r = horizontal.getBoundingClientRect();
+    const before = horizontal.scrollLeft;
+    horizontal.scrollLeft += speed(x, r.left, r.right);
+    changed ||= before !== horizontal.scrollLeft;
+  }
+  return changed;
+}
+
 export interface DragCallbacks {
   /** Current drop spot under the pointer (null when over nothing). */
   onSpot(spot: DropSpot | null): void;
@@ -289,6 +347,10 @@ export function sameSpot(a: DropSpot | null, b: DropSpot | null): boolean {
   if (a.kind === "upload" && b.kind === "upload") return a.paneId === b.paneId;
   if (a.kind === "uploadDir" && b.kind === "uploadDir") {
     return a.paneId === b.paneId && a.dir === b.dir && a.row === b.row && a.rowKey === b.rowKey;
+  }
+  if (a.kind === "fileOp" && b.kind === "fileOp") {
+    return a.paneId === b.paneId && a.dir === b.dir && a.row === b.row && a.rowKey === b.rowKey &&
+      a.operation === b.operation && a.blocked === b.blocked;
   }
   // Out is one logical spot regardless of coords (update() refreshes the
   // coords in place so the eventual drop still lands at the release point).
@@ -343,6 +405,7 @@ const SPECIAL_SPOTS: ReadonlySet<DropSpot["kind"]> = new Set([
   "linktab",
   "linkrow",
   "out",
+  "fileOp",
 ]);
 
 /**
@@ -373,6 +436,8 @@ function hintFor(spot: DropSpot, opts: DragOptions): string | null {
     case "linktab":
     case "linkrow":
       return "link to this agent";
+    case "fileOp":
+      return spot.blocked ?? `${spot.operation} into ${spot.dir}`;
     case "upload":
     case "uploadDir":
     case "out":
@@ -665,6 +730,9 @@ function drawLeash(
 }
 
 export interface DragOptions {
+  /** File transfers take priority over pane geometry. A blocked fileOp is
+   * still a target: releasing there must never accidentally rearrange panes. */
+  fileTargetAt?: (x: number, y: number, copy: boolean) => DropSpot | null;
   /** Agent panes (paneId → the agent session shown there) whose input band is
    *  a "link to agent" target for a plain shell-terminal TAB drag. */
   linkTargets?: ReadonlyMap<string, string>;
@@ -731,6 +799,7 @@ export function startDrag(
   // client coords are useless outside the viewport.
   let lastSX = e.screenX;
   let lastSY = e.screenY;
+  let copy = e.altKey;
   let spot: DropSpot | null = null;
   let done = false;
   // Out-of-window tracking (native cross-window drags).
@@ -812,9 +881,11 @@ export function startDrag(
       ghost.style.transform = `translate(${gx}px, ${gy}px)`;
       ghost.classList.toggle("out", out);
     }
+    const scrolled = !out && opts.fileTargetAt !== undefined && scrollFileTarget(lastX, lastY);
     const next: DropSpot | null = out
       ? { kind: "out", clientX: lastX, clientY: lastY, screenX: lastSX, screenY: lastSY }
-      : spotAt(lastX, lastY, refFor, opts.linkTargets, opts.linkSessions, opts.linkIntent === true);
+      : opts.fileTargetAt?.(lastX, lastY, copy) ??
+        spotAt(lastX, lastY, refFor, opts.linkTargets, opts.linkSessions, opts.linkIntent === true);
     if (!sameSpot(next, spot)) {
       spot = next;
       cb.onSpot(spot);
@@ -825,6 +896,7 @@ export function startDrag(
       spot = next;
     }
     if (leash !== null) drawLeash(leash, sx, sy, lastX, lastY, spot);
+    if (scrolled && !done) raf = requestAnimationFrame(update);
   };
 
   const onMove = (ev: PointerEvent) => {
@@ -833,6 +905,7 @@ export function startDrag(
     lastY = ev.clientY;
     lastSX = ev.screenX;
     lastSY = ev.screenY;
+    copy = ev.altKey;
     if (!active) {
       if (Math.hypot(lastX - sx, lastY - sy) < DRAG_THRESHOLD_PX) return;
       active = true;
@@ -850,6 +923,8 @@ export function startDrag(
     window.removeEventListener("pointerup", onUp);
     window.removeEventListener("pointercancel", onCancel);
     window.removeEventListener("keydown", onKey, true);
+    window.removeEventListener("keyup", onModifier, true);
+    window.removeEventListener("blur", onBlur);
     if (raf !== 0) cancelAnimationFrame(raf);
     ghost?.remove();
     leash?.svg.remove();
@@ -869,7 +944,19 @@ export function startDrag(
   };
 
   const onUp = (ev: PointerEvent) => {
-    if (ev.pointerId === pointerId) finish(true);
+    if (ev.pointerId !== pointerId) return;
+    // The last pointer move may still be waiting for a frame. Commit the
+    // release coordinates/modifier, never a stale hovered destination.
+    if (active) {
+      lastX = ev.clientX;
+      lastY = ev.clientY;
+      lastSX = ev.screenX;
+      lastSY = ev.screenY;
+      copy = ev.altKey;
+      if (raf !== 0) cancelAnimationFrame(raf);
+      update();
+    }
+    finish(true);
   };
   const onCancel = (ev: PointerEvent) => {
     if (ev.pointerId === pointerId) finish(false);
@@ -880,10 +967,19 @@ export function startDrag(
       ev.stopPropagation();
       finish(false);
     }
+    else onModifier(ev);
   };
+  const onModifier = (ev: KeyboardEvent) => {
+    if (copy === ev.altKey) return;
+    copy = ev.altKey;
+    if (active && raf === 0) raf = requestAnimationFrame(update);
+  };
+  const onBlur = () => finish(false);
 
   window.addEventListener("pointermove", onMove);
   window.addEventListener("pointerup", onUp);
   window.addEventListener("pointercancel", onCancel);
   window.addEventListener("keydown", onKey, true);
+  window.addEventListener("keyup", onModifier, true);
+  window.addEventListener("blur", onBlur);
 }

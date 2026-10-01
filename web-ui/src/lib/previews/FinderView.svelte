@@ -44,6 +44,7 @@
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import Spinner from "./Spinner.svelte";
+  import { isMac } from "../shared/keys";
 
   /** Local-daemon windows hide Download (the file already lives here). */
   const remote = isRemoteHost();
@@ -57,9 +58,10 @@
     onNavigate: (path: string) => void;
     /** Open a file in the workbench (newSplit = Cmd/Ctrl held). */
     onOpenFile: (path: string, newSplit: boolean) => void;
+    onDragStart: (e: PointerEvent, path: string, kind: "file" | "dir", onClick: () => void) => void;
     /**
-     * The folder an OS-desktop file drag hovering this Finder would upload
-     * into (App hit-tests the `data-finder-dir` / `data-drop-dir` attributes
+     * The destination of an upload or in-app transfer hovering this Finder
+     * (dnd hit-tests the `data-finder-dir` / `data-drop-dir` attributes
      * stamped below; Pane passes the spot down). The Finder lights exactly
      * that target — the column, or with `dropOnRow` the dir row under the
      * pointer — and names it, so a drop is never a whole-pane mystery.
@@ -68,9 +70,11 @@
     /** `dropDir` is a dir ROW under the pointer (not a column): light the row
      *  alone, never also a column that happens to show the same dir. */
     dropOnRow?: boolean;
+    dropAction?: "upload" | "move" | "copy";
   }
 
-  let { path, wsRoot, onNavigate, onOpenFile, dropDir = null, dropOnRow = false }: Props = $props();
+  let { path, wsRoot, onNavigate, onOpenFile, onDragStart, dropDir = null, dropOnRow = false, dropAction = "upload" }: Props = $props();
+  const finderId = $props.id();
 
   interface Column {
     dir: string;
@@ -96,6 +100,24 @@
   /** Which column has keyboard focus. */
   let activeCol = $state(0);
   let colsEl = $state<HTMLElement | null>(null);
+  let crumbsEl = $state<HTMLElement | null>(null);
+  const activeColumn = $derived(columns[activeCol]);
+  const selectedIndex = $derived(activeColumn === undefined ? -1 : colSelectedIndex(activeColumn));
+  const selectedEntry = $derived(activeColumn?.entries[selectedIndex]);
+
+  $effect(() => {
+    const dir = dropDir;
+    if (dir === null || !dropOnRow) return;
+    // Read columns at firing time, outside effect tracking: the request's
+    // own state changes must not start another request on a slow host.
+    const timer = setTimeout(() => {
+      const ci = columns.findIndex((col) => col.entries.some((e) => e.path === dir && e.kind === "dir"));
+      if (ci < 0 || columns[ci + 1]?.dir === dir || pendingCol !== null) return;
+      const entry = columns[ci].entries.find((e) => e.path === dir)!;
+      void openDir(ci, entry);
+    }, 700);
+    return () => clearTimeout(timer);
+  });
 
   // Monotonic guard: a slow list must never clobber a newer navigation.
   let navSeq = 0;
@@ -112,7 +134,7 @@
   const outsideWs = $derived(location !== "" && !withinWs(location));
 
   function withinWs(p: string): boolean {
-    return wsNorm !== null && (p === wsNorm || p.startsWith(`${wsNorm}/`));
+    return wsNorm !== null && (wsNorm === "/" || p === wsNorm || p.startsWith(`${wsNorm}/`));
   }
 
   /** Leftmost column for a location: the workspace root when the path is under
@@ -145,6 +167,22 @@
       out.push({ name: part, path: acc });
     }
     return out;
+  });
+
+  $effect(() => {
+    if (location === "" || crumbsEl === null) return;
+    const el = crumbsEl;
+    // When the path overflows, show where the user is, not just /Users/… .
+    void tick().then(() => { el.scrollLeft = el.scrollWidth; });
+  });
+
+  $effect(() => {
+    const el = crumbsEl;
+    if (el === null) return;
+    // Splitting/resizing a pane must keep the path's end in view too.
+    const observer = new ResizeObserver(() => { el.scrollLeft = el.scrollWidth; });
+    observer.observe(el);
+    return () => observer.disconnect();
   });
 
   function message(e: unknown): string {
@@ -191,8 +229,8 @@
   }
 
   /** Descend into (or switch to) `dir` shown in column `colIndex`. */
-  async function openDir(colIndex: number, entry: FsEntry): Promise<void> {
-    if (entry.broken) return; // a dangling symlink leads nowhere
+  async function openDir(colIndex: number, entry: FsEntry): Promise<boolean> {
+    if (entry.broken) return false; // a dangling symlink leads nowhere
     const seq = ++navSeq;
     columns = columns.map((c, i) => (i === colIndex ? { ...c, selected: entry.path } : c));
     location = entry.path; // optimistic; corrected to canonical below
@@ -200,7 +238,7 @@
     pendingCol = { afterIndex: colIndex, seq };
     try {
       const listing = await fsList(entry.path, getSetting("files.showHidden"));
-      if (seq !== navSeq) return;
+      if (seq !== navSeq) return false;
       columns = [
         ...columns.slice(0, colIndex + 1),
         {
@@ -216,13 +254,15 @@
       onNavigate(listing.path);
       await tick();
       revealColumn(colIndex + 1);
+      return seq === navSeq;
     } catch (e) {
-      if (seq !== navSeq) return;
+      if (seq !== navSeq) return false;
       // Couldn't open (permission/gone): drop deeper columns, keep the parent.
       columns = columns.slice(0, colIndex + 1);
       location = columns[colIndex]?.dir ?? location;
       activeCol = colIndex;
       error = message(e);
+      return false;
     } finally {
       if (pendingCol?.seq === seq) pendingCol = null;
     }
@@ -230,11 +270,14 @@
 
   /** Select + open a file shown in column `colIndex`. */
   function openFile(colIndex: number, entry: FsEntry, newSplit: boolean): void {
+    if (entry.broken) return;
     columns = columns.map((c, i) =>
       i > colIndex ? c : i === colIndex ? { ...c, selected: entry.path } : c,
     );
     columns = columns.slice(0, colIndex + 1);
     activeCol = colIndex;
+    location = columns[colIndex].dir;
+    onNavigate(location);
     onOpenFile(entry.path, newSplit);
   }
 
@@ -242,6 +285,15 @@
     if (entry.broken) return; // a dangling symlink opens nothing
     if (entry.kind === "dir") void openDir(colIndex, entry);
     else openFile(colIndex, entry, e.metaKey || e.ctrlKey);
+  }
+
+  function onRowDown(e: PointerEvent, colIndex: number, entry: FsEntry): void {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    colsEl?.focus({ preventScroll: true });
+    activeCol = colIndex;
+    columns = columns.map((c, i) => i === colIndex ? { ...c, selected: entry.path } : c);
+    onDragStart(e, entry.path, entry.kind, () => onRowClick(colIndex, entry, e));
   }
 
   async function goHome(): Promise<void> {
@@ -263,14 +315,28 @@
     if (col === undefined) return;
     const entry = col.entries[entryIndex];
     if (entry === undefined) return;
+    ++navSeq; // keyboard selection supersedes a pending descend
+    pendingCol = null;
+    pending = null;
+    loading = false;
     // Highlight without opening; drop any deeper columns so the view matches.
     columns = columns
       .slice(0, colIndex + 1)
       .map((c, i) => (i === colIndex ? { ...c, selected: entry.path } : c));
     activeCol = colIndex;
+    location = col.dir;
+    onNavigate(location);
+    void tick().then(revealSelection);
+  }
+
+  function revealSelection(): void {
+    const col = colsEl?.querySelector<HTMLElement>(`.col[data-column-index="${activeCol}"]`);
+    const selected = col?.querySelector<HTMLElement>("[aria-selected='true']");
+    (selected ?? col)?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }
 
   function onKeydown(e: KeyboardEvent): void {
+    if (e.target instanceof Element && e.target.closest("input, textarea, [contenteditable='true']")) return;
     const col = columns[activeCol];
     if (col === undefined) return;
     const cur = colSelectedIndex(col);
@@ -278,27 +344,39 @@
     // composer keep their own Cmd+C/X/V.
     if (e.metaKey || e.ctrlKey) {
       const entry = col.entries[cur];
-      if (e.key === "c" && entry !== undefined && !entry.broken) {
+      if (e.key.toLowerCase() === "c" && entry !== undefined) {
         e.preventDefault();
         copyFile(entry.path, entry.kind);
         return;
       }
-      if (e.key === "x" && entry !== undefined && !entry.broken) {
+      if (e.key.toLowerCase() === "x" && entry !== undefined) {
         e.preventDefault();
         cutFile(entry.path, entry.kind);
         return;
       }
-      if (e.key === "v" && fileClip() !== null) {
+      if (e.key.toLowerCase() === "v" && fileClip() !== null) {
         e.preventDefault();
         void pasteInto(col.dir);
         return;
       }
     }
     if (e.key === "Escape" && fileClip() !== null) {
+      e.preventDefault();
+      e.stopPropagation();
       clearClip();
       return;
     }
-    if (e.key === "ArrowDown") {
+    if (e.key === "F2" && col.entries[cur] !== undefined) {
+      e.preventDefault();
+      beginRename(activeCol, col.entries[cur]);
+    } else if (e.key === "Delete" && col.entries[cur] !== undefined) {
+      e.preventDefault();
+      const entry = col.entries[cur];
+      requestDelete(entry.path, entry.kind);
+    } else if (e.key === "Home" || e.key === "End") {
+      e.preventDefault();
+      selectInColumn(activeCol, e.key === "Home" ? 0 : col.entries.length - 1);
+    } else if (e.key === "ArrowDown") {
       e.preventDefault();
       if (col.entries.length > 0) selectInColumn(activeCol, cur < 0 ? 0 : Math.min(cur + 1, col.entries.length - 1));
     } else if (e.key === "ArrowUp") {
@@ -306,7 +384,10 @@
       if (col.entries.length > 0) selectInColumn(activeCol, Math.max(cur - 1, 0));
     } else if (e.key === "ArrowLeft") {
       e.preventDefault();
-      if (activeCol > 0) activeCol -= 1;
+      if (activeCol > 0) {
+        activeCol -= 1;
+        void tick().then(revealSelection);
+      }
     } else if (e.key === "ArrowRight" || e.key === "Enter") {
       e.preventDefault();
       const entry = col.entries[cur];
@@ -336,8 +417,11 @@
 
   /** Create INSIDE a dir entry: open its column first, then edit there. */
   async function beginCreateInside(kind: "file" | "dir", colIndex: number, entry: FsEntry): Promise<void> {
-    await openDir(colIndex, entry);
-    beginCreate(kind, colIndex + 1, entry.path);
+    if (!await openDir(colIndex, entry)) return;
+    const opened = columns[colIndex + 1];
+    if (error === null && opened !== undefined && activeCol === colIndex + 1) {
+      beginCreate(kind, colIndex + 1, opened.dir);
+    }
   }
 
   function beginRename(colIndex: number, entry: FsEntry): void {
@@ -347,9 +431,15 @@
   }
 
   function cancelEdit(): void {
+    const restoreFocus = colsEl?.contains(document.activeElement) ?? false;
     edit = null;
     editDraft = "";
     editError = null;
+    // Removing the input otherwise drops keyboard focus onto the document.
+    // A blur toward a toolbar/control must keep the focus the user chose.
+    if (restoreFocus) void tick().then(() => {
+      if (document.activeElement === document.body) colsEl?.focus({ preventScroll: true });
+    });
   }
 
   /** Focus the fresh inline input; renames preselect the stem. */
@@ -492,6 +582,19 @@
         hint: clip === null ? "nothing copied" : undefined,
         onSelect: () => void pasteInto(dir),
       },
+      "separator",
+      { label: "Copy Path", onSelect: () => void copyPath(dir) },
+    ];
+  }
+
+  function toolbarMenu(): ContextMenuEntry[] {
+    const workspace = wsNorm;
+    const actions = columnMenu(activeCol);
+    return [
+      ...actions,
+      ...(actions.length > 0 ? ["separator" as const] : []),
+      ...(workspace === null ? [] : [{ label: "Go to Workspace", onSelect: () => void navigateTo(workspace) }]),
+      { label: "Go to Home Folder", onSelect: goHome },
     ];
   }
 
@@ -642,32 +745,40 @@
 
 <div class="finder">
   <div class="bar">
-    <div class="crumbs" role="navigation" aria-label="path">
+    <button class="act icon-act" aria-label="go to parent folder" title="Go to parent folder"
+      disabled={location === "" || location === "/"}
+      onclick={() => void navigateTo(dirname(location))}>
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="m6 11 6-6 6 6M12 5v14" />
+      </svg>
+    </button>
+    <div class="crumbs" role="navigation" aria-label="path" bind:this={crumbsEl}>
       {#each crumbs as c, i (c.path)}
-        {#if i > 0}<span class="sep">/</span>{/if}
+        {#if i > 1}<span class="sep">/</span>{/if}
         <button
           class="crumb"
           class:tail={i === crumbs.length - 1}
+          aria-current={i === crumbs.length - 1 ? "location" : undefined}
           title={c.path}
+          data-finder-dir={c.path}
           onclick={() => void navigateTo(c.path)}>{c.name}</button
         >
       {/each}
     </div>
     <div class="actions">
-      {#if outsideWs && wsNorm !== null}
-        <!-- Not just a marker: click to jump back into the workspace. -->
-        <button class="chip" title="back to the workspace" onclick={() => void navigateTo(wsNorm)}>
-          <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M9 14l-4 -4l4 -4" />
-            <path d="M5 10h11a4 4 0 1 1 0 8h-1" />
-          </svg>
-          outside workspace
-        </button>
-      {/if}
-      {#if wsNorm !== null}
-        <button class="act" title="go to the workspace root" onclick={() => void navigateTo(wsNorm)}>workspace</button>
-      {/if}
-      <button class="act" title="go to your home folder" onclick={goHome}>home</button>
+      <button class="act create-act" disabled={activeColumn === undefined}
+        title={`New folder in ${activeColumn?.dir ?? "this folder"}`}
+        onclick={() => activeColumn && beginCreate("dir", activeCol, activeColumn.dir)}>
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+        New folder
+      </button>
+      <button class="act icon-act" aria-label="folder actions" aria-haspopup="menu" title="Folder actions and locations"
+        onclick={(e) => {
+          const r = e.currentTarget.getBoundingClientRect();
+          contextMenu.openAtPoint(r.right, r.bottom, toolbarMenu(), { alignRight: true });
+        }}>
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.5" /><circle cx="12" cy="12" r="1.5" /><circle cx="19" cy="12" r="1.5" /></svg>
+      </button>
     </div>
   </div>
 
@@ -678,6 +789,8 @@
     tabindex="0"
     role="tree"
     aria-label="files"
+    aria-activedescendant={selectedIndex >= 0 ? `${finderId}-${activeCol}-${selectedIndex}` : undefined}
+    data-finder-dir={location || undefined}
     onkeydown={onKeydown}
   >
     {#if error !== null && columns.length === 0}
@@ -704,6 +817,12 @@
         aria-label={col.dir}
         data-finder-dir={col.dir}
         data-column-index={ci}
+        onpointerdown={(e) => {
+          if (e.button !== 0 || (e.target instanceof Element && e.target.closest("button, input"))) return;
+          activeCol = ci;
+          columns = columns.map((c, i) => i === ci ? { ...c, selected: null } : c);
+          colsEl?.focus({ preventScroll: true });
+        }}
         oncontextmenu={(e) => contextMenu.openAt(e, columnMenu(ci))}
       >
         {#if edit?.mode === "create" && edit.colIndex === ci}
@@ -734,9 +853,9 @@
           {/if}
         {/if}
         {#if col.entries.length === 0 && !(edit?.mode === "create" && edit.colIndex === ci)}
-          <div class="empty">empty</div>
+          <div class="empty">This folder is empty</div>
         {/if}
-        {#each col.entries as entry (entry.path)}
+        {#each col.entries as entry, ei (entry.path)}
           {#if edit?.mode === "rename" && edit.path === entry.path}
             <div class="row editing">
               <span class="glyph">
@@ -768,19 +887,26 @@
                  column is the target. -->
             <button
               class="row"
+              id={`${finderId}-${ci}-${ei}`}
+              role="treeitem"
+              tabindex="-1"
+              aria-selected={entry.path === col.selected}
+              aria-expanded={entry.kind === "dir" ? columns[ci + 1]?.dir === entry.path : undefined}
+              aria-level={ci + 1}
               class:sel={entry.path === col.selected}
               class:cut={isCutPending(entry.path)}
               class:drop-target={dropOnRow && dropDir === entry.path}
               data-drop-dir={entry.kind === "dir" && !entry.broken ? entry.path : undefined}
-              title={entry.symlink ? `${entry.path} → ${entry.target ?? ""}${entry.broken ? " (missing)" : ""}` : entry.path}
-              onclick={(e) => onRowClick(ci, entry, e)}
+              title={`${entry.symlink ? `${entry.path} → ${entry.target ?? ""}${entry.broken ? " (missing)" : ""}` : entry.path}\nDrag to move · ${isMac ? "Option" : "Alt"} to copy`}
+              onpointerdown={(e) => onRowDown(e, ci, entry)}
+              onclick={(e) => { if (e.detail === 0) onRowClick(ci, entry, e); }}
               oncontextmenu={(e) => contextMenu.openAt(e, menuFor(ci, entry))}
             >
               <span class="glyph">
                 {#if entry.kind === "dir"}
-                  <FolderIcon size={14} link={entry.symlink} />
+                  <FolderIcon size={16} open={columns[ci + 1]?.dir === entry.path} link={entry.symlink} />
                 {:else}
-                  <FileIcon path={entry.path} size={14} link={entry.symlink} broken={entry.broken} />
+                  <FileIcon path={entry.path} size={16} link={entry.symlink} broken={entry.broken} />
                 {/if}
               </span>
               <span class="name" class:symlink={entry.symlink} class:broken={entry.broken}>{entry.name}</span>
@@ -824,6 +950,21 @@
     {/if}
   </div>
 
+  <div class="status" role="status">
+    {#if dropDir !== null}
+      <span class="transfer-status" title={dropDir}>{dropAction} into {basename(dropDir) || "/"}</span>
+      {#if dropAction === "move"}<span class="gesture-hint">{isMac ? "Option" : "Alt"} to copy</span>{/if}
+    {:else if activeColumn !== undefined}
+      <span class="item-count" title={activeColumn.dir}>{activeColumn.entries.length}{activeColumn.truncated ? "+" : ""} {activeColumn.entries.length === 1 ? "item" : "items"}</span>
+      {#if selectedEntry !== undefined}
+        <span class="selection-status" title={selectedEntry.path}>{selectedEntry.name}</span>
+      {/if}
+      {#if outsideWs && wsNorm !== null}
+        <button class="workspace-return" title="Back to the workspace" onclick={() => void navigateTo(wsNorm)}>Outside workspace ↩</button>
+      {/if}
+    {/if}
+  </div>
+
   {#if error !== null && columns.length > 0}
     <div class="footer-error" title={error}>{error}</div>
   {/if}
@@ -842,10 +983,10 @@
     flex: none;
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-    padding: 5px 10px;
+    gap: 6px;
+    min-width: 0;
+    padding: 7px 10px;
     border-bottom: 1px solid var(--edge);
-    min-height: 30px;
   }
 
   .crumbs {
@@ -866,7 +1007,7 @@
   }
 
   .sep {
-    opacity: 0.5;
+    color: var(--muted);
     padding: 0 1px;
   }
 
@@ -874,7 +1015,8 @@
     appearance: none;
     border: none;
     background: none;
-    padding: 1px 2px;
+    padding: 4px 3px;
+    min-height: 28px;
     font: inherit;
     color: var(--muted);
     cursor: pointer;
@@ -888,55 +1030,76 @@
 
   .crumb.tail {
     color: var(--fg);
+    font-weight: 600;
   }
 
   .actions {
     flex: none;
     display: flex;
     align-items: center;
-    gap: 6px;
-  }
-
-  .chip {
-    display: flex;
-    align-items: center;
     gap: 4px;
-    appearance: none;
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
-    border-radius: 999px;
-    padding: 1px 8px 1px 6px;
-    white-space: nowrap;
-    cursor: pointer;
-    transition:
-      background-color 0.12s ease,
-      color 0.12s ease;
-  }
-
-  .chip:hover {
-    color: var(--fg);
-    background: color-mix(in srgb, var(--accent) 24%, transparent);
   }
 
   .act {
     appearance: none;
     border: 1px solid var(--edge);
     background: none;
-    font-family: var(--mono);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    min-height: 30px;
+    flex: none;
+    font-family: var(--ui-font);
     font-size: var(--text-xs);
-    color: var(--muted);
-    padding: 2px 7px;
-    border-radius: 5px;
+    font-weight: 500;
+    color: var(--fg);
+    padding: 4px 9px;
+    border-radius: 6px;
+    white-space: nowrap;
     cursor: pointer;
   }
 
-  .act:hover {
-    color: var(--fg);
+  .icon-act { width: 30px; padding: 0; border-color: transparent; }
+  .create-act {
+    border-color: color-mix(in srgb, var(--fg) 16%, var(--edge));
     background: var(--row-hover);
   }
+
+  .act:hover:not(:disabled) {
+    color: var(--fg);
+    background: var(--row-active);
+    border-color: color-mix(in srgb, var(--fg) 25%, var(--edge));
+  }
+
+  .act:disabled { opacity: 0.4; cursor: default; }
+  .act:focus-visible, .crumb:focus-visible, .workspace-return:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .cols:focus-visible .col.active .row.sel { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .status {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-height: 30px;
+    padding: 4px 12px;
+    border-top: 1px solid var(--edge);
+    color: var(--muted);
+    font-size: var(--text-xs);
+  }
+  .item-count, .gesture-hint { flex: none; }
+  .selection-status { flex: 1; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .workspace-return {
+    appearance: none;
+    background: none;
+    border: none;
+    padding: 3px 0;
+    font: inherit;
+    color: var(--muted);
+    cursor: pointer;
+    flex: none;
+  }
+  .workspace-return:hover { color: var(--fg); }
+  .transfer-status { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   .cols {
     position: relative;
@@ -952,14 +1115,15 @@
   }
 
   .col {
-    flex: 0 0 216px;
-    min-width: 216px;
+    flex: 0 0 232px;
+    min-width: 232px;
     overflow-y: auto;
     border-right: 1px solid var(--edge);
     padding: 4px;
     scrollbar-width: thin;
     scrollbar-color: color-mix(in srgb, var(--fg) 18%, transparent) transparent;
   }
+
 
   /* The incoming-column placeholder while a descend lists: same width, its own
      positioning context so the delayed Spinner centers inside it. */
@@ -969,7 +1133,7 @@
 
   /* The focused column gets a whisper of emphasis so keyboard nav is legible. */
   .col.active {
-    background: color-mix(in srgb, var(--accent) 4%, transparent);
+    background: color-mix(in srgb, var(--accent) 3%, transparent);
   }
 
   .row {
@@ -983,12 +1147,13 @@
     font: inherit;
     text-align: left;
     color: var(--fg);
-    padding: 4px 6px;
+    padding: 6px 8px;
+    min-height: 32px;
     border-radius: 5px;
     cursor: pointer;
     min-width: 0;
     content-visibility: auto;
-    contain-intrinsic-size: auto 27px;
+    contain-intrinsic-size: auto 32px;
   }
 
   .listing-limit {
@@ -1012,6 +1177,12 @@
     background: var(--row-active);
   }
 
+  .col.active .row.sel {
+    background: color-mix(in srgb, var(--accent) 15%, var(--pane-bg, var(--bg)));
+    box-shadow: inset 3px 0 0 var(--accent);
+  }
+  .col.active .row.sel .name { font-weight: 600; }
+
   /* OS-desktop file drag: the column under the pointer rings + washes — the
      one lit thing says which directory receives the file. An inset ring
      (no border) keeps the column's geometry, so nothing shifts mid-drag. */
@@ -1023,7 +1194,7 @@
 
   /* A dir row under the pointer is the target instead: only the row rings
      (after .sel — a selected row hovered as a target reads as a target). */
-  .row.drop-target {
+  .col .row.drop-target {
     background: color-mix(in srgb, var(--accent) 18%, transparent);
     box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--accent) 70%, transparent);
   }
@@ -1063,7 +1234,6 @@
   .chev {
     flex: none;
     color: var(--muted);
-    opacity: 0.7;
   }
 
   .meta {
@@ -1071,7 +1241,7 @@
     font-family: var(--mono);
     font-size: var(--text-xs);
     color: var(--muted);
-    opacity: 0.75;
+    font-variant-numeric: tabular-nums;
   }
 
   .broken-meta {
@@ -1111,8 +1281,9 @@
   }
 
   .empty {
-    padding: 6px;
-    font-size: var(--text-xs);
+    padding: 24px 12px;
+    text-align: center;
+    font-size: var(--text-sm);
     color: var(--muted);
   }
 
