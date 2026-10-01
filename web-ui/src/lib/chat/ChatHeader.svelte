@@ -149,9 +149,8 @@
       aria-expanded={menu === "model"}
       onclick={() => (menu = menu === "model" ? null : "model")}
     >
-      <!-- Skeleton only in the brief window before the model catalog loads
-           (modelLabel null). Once it's loaded, modelLabel is the session's real
-           model — or the default a fresh chat will use — never a wrong flash. -->
+      <!-- A catalog is not an active model. Keep startup neutral until the
+           session or an acknowledged selection names the model. -->
       {#if modelLabel === null && !store.initialized && !store.exited && !store.fatalError}
         <span class="model-skel" aria-label="loading model"></span>
       {:else}
@@ -167,9 +166,9 @@
         {#each modelChoices as m (m.id)}
           <button
             class="overlay-row menu-row"
-            class:current={m.id === store.model || m.resolved === store.model}
+            class:current={m.id === (store.pendingModel ?? store.model) || m.resolved === (store.pendingModel ?? store.model)}
             role="menuitemradio"
-            aria-checked={m.id === store.model || m.resolved === store.model}
+            aria-checked={m.id === (store.pendingModel ?? store.model) || m.resolved === (store.pendingModel ?? store.model)}
             title={typeof m.description === "string" ? m.description : undefined}
             onclick={() => onPickModel(m.id)}
           >
