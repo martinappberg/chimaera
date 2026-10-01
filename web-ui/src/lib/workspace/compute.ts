@@ -7,13 +7,19 @@
  * first fetch says `scheduler:"none"` and the store goes quiet — one probe per
  * page load on a laptop. On-cluster it refetches every 60s, but ONLY while the
  * window is visible; a hidden tab pauses and catches up on the next
- * visibilitychange. `?refresh=true` is an API knob nothing in the UI calls
- * today: it forces the daemon to re-detect — the "I just module-loaded slurm"
- * path — and a "slurm" answer there restarts polling.
+ * visibilitychange. Nothing here asks more often than once a minute (the
+ * scheduler-politeness floor, docs/hpc-portal-plan.md §2.5): the catch-up and
+ * the first-fetch retry honor the same floor. `?refresh=true` is an API knob
+ * nothing in the UI calls today: it forces the daemon to re-detect — the "I
+ * just module-loaded slurm" path — and a "slurm" answer there restarts polling.
+ *
+ *   DELETE /api/v1/compute/self          a job window ends its own job
+ *                                        (browser fallback; the app asks the
+ *                                        shell's `cluster_stop` instead)
  */
 import { writable, type Readable } from "svelte/store";
 
-import { api } from "../net/api";
+import { api, ApiError } from "../net/api";
 
 export interface ComputeJob {
   id: string;
@@ -32,8 +38,7 @@ export interface ComputePartition {
   avail: boolean;
   nodes: number;
   /** Per-partition ceilings straight from sinfo (`%l` walltime, `%c`
-   *  cpus/node, `%m` MB/node; "+" = varies upward) — "" when unknown.
-   *  The launch dialog shows them and pre-flights the walltime. */
+   *  cpus/node, `%m` MB/node; "+" = varies upward) — "" when unknown. */
   time_limit: string;
   cpus_per_node: string;
   mem_per_node: string;
@@ -90,7 +95,7 @@ function parseJob(raw: unknown): ComputeJob | null {
   };
 }
 
-export function parsePartition(raw: unknown): ComputePartition | null {
+function parsePartition(raw: unknown): ComputePartition | null {
   if (typeof raw !== "object" || raw === null) return null;
   const r = raw as Record<string, unknown>;
   if (typeof r.name !== "string") return null;
@@ -133,32 +138,6 @@ export function parseSlurmTimeLeft(s: string): number | null {
   const days = m[1] !== undefined ? Number(m[1]) : 0;
   const hours = m[2] !== undefined ? Number(m[2]) : 0;
   return ((days * 24 + hours) * 60 + Number(m[3])) * 60 + Number(m[4]);
-}
-
-/**
- * Per-host scheduler memory: what the last successful compute fetch said
- * about a host ("slurm" | "none"), keyed by the user's alias. This is what
- * keeps "checking this host for a scheduler…" states OFF plain remote
- * hosts (maintainer ask) — a probe hint only shows where a scheduler is
- * already KNOWN to live; a first-ever cluster confirms silently and the
- * surface simply appears. localStorage so the memory survives reloads;
- * everything degrades to "unknown" where storage is unavailable.
- */
-export function rememberScheduler(host: string, scheduler: string): void {
-  try {
-    localStorage.setItem(`chimaera.scheduler:${host}`, scheduler);
-  } catch {
-    // storage full/blocked — the probe hint just stays conservative
-  }
-}
-
-/** "slurm" | "none" | null (never fetched / storage unavailable). */
-export function knownScheduler(host: string): string | null {
-  try {
-    return localStorage.getItem(`chimaera.scheduler:${host}`);
-  } catch {
-    return null;
-  }
 }
 
 /** Seconds → Slurm's own duration style (`1-04:00:00`, `1:57:12`, `04:32`). */
@@ -214,14 +193,19 @@ const snapshotStore = writable<ComputeSnapshot | null>(null);
 export const computeStatus: Readable<ComputeSnapshot | null> = snapshotStore;
 
 const POLL_MS = 60_000;
-/** Backstop cadence while NO fetch has ever succeeded (see below). */
-const RETRY_MS = 15_000;
+/** Backstop cadence while NO fetch has ever succeeded (see below) — the
+ *  same one-minute floor as the poll. */
+const RETRY_MS = 60_000;
+/** No two asks closer than this, whatever triggered them. */
+const MIN_GAP_MS = 60_000;
 
 let started = false;
 let timer: ReturnType<typeof setInterval> | null = null;
 /** First-fetch retry timer — armed only while `lastScheduler === null`. */
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
 let fetchSeq = 0;
+/** Client clock of the last ask (0 = never) — the catch-up's floor. */
+let lastAskAt = 0;
 /** The last RESPONSE's scheduler; a failed fetch doesn't change the gate. */
 let lastScheduler: "slurm" | "none" | null = null;
 
@@ -256,6 +240,7 @@ function scheduleFirstFetchRetry(): void {
 
 async function fetchSnapshot(force: boolean): Promise<void> {
   const seq = ++fetchSeq;
+  lastAskAt = Date.now();
   try {
     const res = await api(`/compute${force ? "?refresh=true" : ""}`);
     // Transient failure: keep the shown snapshot; the timer (if any) retries.
@@ -282,11 +267,39 @@ async function fetchSnapshot(force: boolean): Promise<void> {
 
 function onVisibility(): void {
   // Hidden paused the timer, so on return refetch NOW rather than waiting out
-  // a full period with a stale queue.
-  if (document.visibilityState === "visible" && started && lastScheduler === "slurm") {
+  // a full period with a stale queue — unless the last ask was under a
+  // minute ago (rapid hide/show must not turn into rapid asks).
+  if (
+    document.visibilityState === "visible" &&
+    started &&
+    lastScheduler === "slurm" &&
+    Date.now() - lastAskAt >= MIN_GAP_MS
+  ) {
     void fetchSnapshot(false);
   }
   sync();
+}
+
+/**
+ * End the job this window's daemon runs in — the browser fallback for a job
+ * window (the native app ends it through the shell, which also records the
+ * stop). Like every self-ending call, the daemon answering with an error
+ * throws `ApiError` (the job is still running), while a network-level
+ * rejection — the daemon dying under the request — propagates as-is and is
+ * the expected success signal.
+ */
+export async function endOwnJob(): Promise<void> {
+  const res = await api("/compute/self", { method: "DELETE" });
+  if (res.ok) return;
+  let message = `couldn't end the job (status ${res.status})`;
+  try {
+    const body = (await res.json()) as unknown;
+    const e = typeof body === "object" && body !== null ? (body as Record<string, unknown>).error : undefined;
+    if (typeof e === "string" && e !== "") message = e;
+  } catch {
+    // non-JSON error body; keep the status line
+  }
+  throw new ApiError(res.status, message);
 }
 
 /**

@@ -283,7 +283,7 @@ describe("browser tabs (the reverse-proxied web-app pane)", () => {
   });
 
   it("persists target + navigation path across serialize round-trips, never a ticket", () => {
-    const tab = freshBrowserTab("sh03-09n14", 8888, "/lab?token=x");
+    const tab = freshBrowserTab("compute-014", 8888, "/lab?token=x");
     let l = openTab(defaultLayout(), tab);
     l = setBrowserPath(l, tab.id, "/lab/tree/results");
     const blob = JSON.parse(JSON.stringify(serializeLayout(l))) as unknown;
@@ -292,7 +292,7 @@ describe("browser tabs (the reverse-proxied web-app pane)", () => {
     expect(restored).not.toBeNull();
     const loc = findBrowser(restored!, tab.id);
     expect(loc).not.toBeNull();
-    expect(loc!.tab.host).toBe("sh03-09n14");
+    expect(loc!.tab.host).toBe("compute-014");
     expect(loc!.tab.port).toBe(8888);
     expect(loc!.tab.path).toBe("/lab/tree/results");
   });

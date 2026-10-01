@@ -37,7 +37,7 @@ describe("skillCounts", () => {
 
 describe("groupSkills", () => {
   it("groups by origin in a fixed order, dropping empty groups, naming the plugins", () => {
-    const groups = groupSkills(skills, "sherlock");
+    const groups = groupSkills(skills, "cluster");
     expect(groups.map((g) => g.key)).toEqual(["project", "plugin", "user", "builtin-claude", "builtin-codex"]);
     expect(groups.map((g) => g.label)).toEqual([
       "This project",
@@ -47,7 +47,7 @@ describe("groupSkills", () => {
       "Built into codex",
     ]);
     expect(groups[1].hint).toBe("mycelium");
-    expect(groups[2].hint).toBe("every project on sherlock sees these");
+    expect(groups[2].hint).toBe("every project on cluster sees these");
     expect(groups[3].skills.map((s) => s.name)).toEqual(["code-review"]);
     expect(groups[4].skills.map((s) => s.name)).toEqual(["skill-creator"]);
     expect(groupSkills(skills.filter((s) => s.source === "user")).map((g) => g.key)).toEqual(["user"]);

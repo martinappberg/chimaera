@@ -166,7 +166,7 @@
   /** Canvases outside the viewport margin are an LRU, not a document-long leak. */
   const MAX_RENDERED_PAGES = 8;
   /** pdf.js creates roughly one selectable DOM run per item. Scientific plots
-   * can encode every point as text: the Sherlock UMAP repro has 36k items and
+   * can encode every point as text: a UMAP repro from a production cluster has 36k items and
    * produced 60k DOM nodes on one page. Keep selection a bounded enhancement;
    * the canvas remains the authoritative preview. */
   const MAX_TEXT_ITEMS_PER_PAGE = 5_000;

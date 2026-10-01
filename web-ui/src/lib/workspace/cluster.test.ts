@@ -1,0 +1,438 @@
+import { describe, expect, it } from "vitest";
+
+import type {
+  ClusterConfig,
+  ClusterFacts,
+  ClusterOverview,
+  ClusterWorkspaceView,
+  PartitionChoice,
+} from "../net/native";
+import {
+  accountChoices,
+  childPath,
+  agoWords,
+  buildSpec,
+  clockWords,
+  composeWalltime,
+  defaultForm,
+  endedWords,
+  formFromSpec,
+  hostSummary,
+  isInteractiveOnly,
+  limitWords,
+  memWords,
+  nodeSizeWords,
+  otherJobsWords,
+  parentPath,
+  parseSlurmTime,
+  partitionTags,
+  refusalField,
+  resourceWords,
+  shortDuration,
+  sortEntries,
+  splitWalltime,
+  stopsInWords,
+  timeLeftWords,
+  walltimeSecs,
+  workspaceDetail,
+  workspaceNotes,
+  type StartForm,
+} from "./cluster";
+
+const MIN = 60_000;
+const HOUR = 60 * MIN;
+const DAY = 24 * HOUR;
+const NOW = new Date(2026, 8, 30, 10, 0, 0).getTime();
+
+function ws(over: Partial<ClusterWorkspaceView> = {}): ClusterWorkspaceView {
+  return {
+    id: "w-0000aaaa",
+    name: "proj",
+    path: "/scratch/u/proj",
+    state: "stopped",
+    attached: false,
+    stopped_by_user: false,
+    fresh: false,
+    startup: "",
+    ...over,
+  };
+}
+
+function partition(over: Partial<PartitionChoice> = {}): PartitionChoice {
+  return {
+    name: "batch",
+    default: false,
+    max_time: "2-00:00:00",
+    max_time_secs: 2 * 86400,
+    cpus_per_node: "32",
+    mem_per_node: "128000",
+    gpus: false,
+    preemptible: false,
+    up: true,
+    ...over,
+  };
+}
+
+function facts(over: Partial<ClusterFacts> = {}): ClusterFacts {
+  return {
+    scheduler: "slurm",
+    version: "23.11",
+    partitions: [partition({ name: "batch", default: true }), partition({ name: "long", max_time_secs: 7 * 86400 })],
+    accounts: [],
+    default_account: null,
+    fetched_ms: NOW,
+    ...over,
+  };
+}
+
+function config(over: Partial<ClusterConfig> = {}): ClusterConfig {
+  return {
+    version: 1,
+    workspaces: [],
+    startup: "",
+    setups: [],
+    agent_rules: { text: "" },
+    learned: {},
+    ...over,
+  };
+}
+
+function overview(workspaces: ClusterWorkspaceView[]): ClusterOverview {
+  return {
+    scheduler: "slurm",
+    login_node: "login1",
+    now_ms: NOW,
+    workspaces,
+    other_jobs: { running: 0, waiting: 0 },
+    degraded: false,
+    queue_at_ms: NOW,
+    config: config(),
+  };
+}
+
+function form(over: Partial<StartForm> = {}): StartForm {
+  return {
+    partition: "batch",
+    days: 0,
+    hours: 2,
+    mins: 0,
+    cpus: "",
+    mem: "",
+    gpus: "",
+    account: "",
+    qos: "",
+    constraint: "",
+    ...over,
+  };
+}
+
+describe("durations", () => {
+  it("shortens time left to the two largest units", () => {
+    expect(shortDuration(5 * 86400 + 22 * 3600 + 59)).toBe("5d 22h");
+    expect(shortDuration(3 * 3600 + 12 * 60)).toBe("3h 12m");
+    expect(shortDuration(3 * 3600)).toBe("3h");
+    expect(shortDuration(58 * 60 + 30)).toBe("58 min");
+    expect(shortDuration(30)).toBe("under a minute");
+    expect(shortDuration(-5)).toBe("under a minute");
+  });
+
+  it("says time left, and when it ran out", () => {
+    expect(timeLeftWords(NOW + 2 * HOUR, NOW)).toBe("2h left");
+    expect(timeLeftWords(NOW - MIN, NOW)).toBe("time's up");
+  });
+
+  it("words a partition's limit", () => {
+    expect(limitWords(7 * 86400)).toBe("7 days");
+    expect(limitWords(86400)).toBe("1 day");
+    expect(limitWords(2 * 86400 + 12 * 3600)).toBe("2 days 12 hours");
+    expect(limitWords(12 * 3600)).toBe("12 hours");
+    expect(limitWords(30 * 60)).toBe("30 minutes");
+    expect(limitWords(90 * 60)).toBe("1 hour 30 minutes");
+  });
+
+  it("says how long ago", () => {
+    expect(agoWords(NOW - 20_000, NOW)).toBe("just now");
+    expect(agoWords(NOW - 5 * MIN, NOW)).toBe("5 min ago");
+    expect(agoWords(NOW - 3 * HOUR, NOW)).toBe("3 h ago");
+    expect(agoWords(NOW - 30 * HOUR, NOW)).toBe("yesterday");
+    expect(agoWords(NOW - 4 * DAY, NOW)).toBe("4 days ago");
+  });
+
+  it("puts a start estimate on a clock", () => {
+    const later = new Date(2026, 8, 30, 14, 20).getTime();
+    const tomorrow = new Date(2026, 9, 1, 9, 0).getTime();
+    expect(clockWords(later, NOW, "en-GB")).toBe("14:20");
+    expect(clockWords(tomorrow, NOW, "en-GB")).toBe("tomorrow 09:00");
+    expect(clockWords(new Date(2026, 9, 3, 9, 0).getTime(), NOW, "en-GB")).toMatch(/^\S+ 09:00$/);
+  });
+
+  it("words the continue banner", () => {
+    expect(stopsInWords(58 * 60)).toBe("Stops in 58 min.");
+    expect(stopsInWords(20)).toBe("Stops in under a minute.");
+  });
+});
+
+describe("Slurm walltime", () => {
+  it("reads Slurm's input forms", () => {
+    expect(parseSlurmTime("90")).toBe(90 * 60);
+    expect(parseSlurmTime("10:30")).toBe(10 * 60 + 30);
+    expect(parseSlurmTime("04:00:00")).toBe(4 * 3600);
+    expect(parseSlurmTime("2-00:00:00")).toBe(2 * 86400);
+    expect(parseSlurmTime("1-12")).toBe(86400 + 12 * 3600);
+    expect(parseSlurmTime("1-12:30")).toBe(86400 + 12 * 3600 + 30 * 60);
+    expect(parseSlurmTime("UNLIMITED")).toBeNull();
+    expect(parseSlurmTime("")).toBeNull();
+  });
+
+  it("composes D-HH:MM:SS from the boxes", () => {
+    expect(composeWalltime(walltimeSecs({ days: 0, hours: 2, mins: 0 }))).toBe("02:00:00");
+    expect(composeWalltime(walltimeSecs({ days: 2, hours: 0, mins: 5 }))).toBe("2-00:05:00");
+    expect(composeWalltime(walltimeSecs({ days: null, hours: null, mins: 45 }))).toBe("00:45:00");
+    expect(composeWalltime(walltimeSecs({ days: 0, hours: 0, mins: 0 }))).toBe("");
+    // Odd entries floor to whole units and never go negative.
+    expect(walltimeSecs({ days: -1, hours: 1.9, mins: null })).toBe(3600);
+  });
+
+  it("round-trips through the boxes", () => {
+    const secs = parseSlurmTime("1-04:30:00");
+    expect(secs).not.toBeNull();
+    const boxes = splitWalltime(secs ?? 0);
+    expect(boxes).toEqual({ days: 1, hours: 4, mins: 30 });
+    expect(composeWalltime(walltimeSecs(boxes))).toBe("1-04:30:00");
+  });
+
+  it("never shortens a limit with seconds in it", () => {
+    expect(splitWalltime(61)).toEqual({ days: 0, hours: 0, mins: 2 });
+  });
+});
+
+describe("resources", () => {
+  it("words memory", () => {
+    expect(memWords("16G")).toBe("16 GB");
+    expect(memWords("4096M")).toBe("4 GB");
+    expect(memWords("4000M")).toBe("4000 MB");
+    expect(memWords("2048")).toBe("2 GB");
+    expect(memWords("1T")).toBe("1 TB");
+    expect(memWords("")).toBe("");
+    expect(memWords(undefined)).toBe("");
+    expect(memWords("weird")).toBe("weird");
+  });
+
+  it("joins what the job carries", () => {
+    expect(resourceWords({ cpus: "4", mem: "16G", gpus: 1 })).toBe("4 CPU · 16 GB · 1 GPU");
+    expect(resourceWords({ cpus: "8", gpus: 2 })).toBe("8 CPU · 2 GPUs");
+    expect(resourceWords({})).toBe("");
+  });
+});
+
+describe("workspace state in words", () => {
+  it("names why a job ended", () => {
+    expect(endedWords("TIMEOUT", false)).toBe("hit its time limit");
+    expect(endedWords("CANCELLED by 1234", false)).toBe("cancelled");
+    expect(endedWords("CANCELLED+", true)).toBe("stopped by you");
+    expect(endedWords(undefined, true)).toBe("stopped by you");
+    expect(endedWords("stopped", false)).toBe("stopped by you");
+    expect(endedWords("FAILED", false)).toBe("failed");
+    expect(endedWords("PREEMPTED", false)).toBe("preempted");
+    expect(endedWords("NODE_FAIL", false)).toBe("its node failed");
+    expect(endedWords("OUT_OF_MEMORY", false)).toBe("ran out of memory");
+    expect(endedWords("ENDED", false)).toBe("ended");
+    expect(endedWords("COMPLETED", false)).toBe("ended");
+    expect(endedWords(undefined, false)).toBe("ended");
+  });
+
+  it("details a running workspace", () => {
+    const w = ws({
+      state: "running",
+      node: "n042",
+      cpus: "4",
+      mem: "16G",
+      ends_at_ms: NOW + 5 * DAY + 22 * HOUR + 10 * MIN,
+    });
+    expect(workspaceDetail(w, NOW)).toBe("running on n042 · 4 CPU · 16 GB · 5d 22h left");
+  });
+
+  it("details starting and waiting workspaces", () => {
+    expect(workspaceDetail(ws({ state: "starting", node: "n7" }), NOW)).toBe("starting chimaera on n7…");
+    expect(workspaceDetail(ws({ state: "waiting" }), NOW)).toBe("waiting for a node");
+    const est = new Date(2026, 8, 30, 14, 20).getTime();
+    expect(
+      workspaceDetail(ws({ state: "waiting", start_estimate_ms: est, reason: "QOSMaxJobsPerUserLimit" }), NOW, "en-GB"),
+    ).toBe("waiting for a node · Slurm estimates 14:20 · Slurm's reason: QOSMaxJobsPerUserLimit");
+  });
+
+  it("details a stopped workspace", () => {
+    expect(workspaceDetail(ws({ fresh: true }), NOW)).toBe("not started yet");
+    expect(workspaceDetail(ws({ ended: "TIMEOUT", ended_at_ms: NOW - 3 * HOUR }), NOW)).toBe(
+      "hit its time limit 3 h ago · chats saved",
+    );
+    expect(workspaceDetail(ws({ ended: "CANCELLED", stopped_by_user: true }), NOW)).toBe(
+      "stopped by you · chats saved",
+    );
+  });
+
+  it("adds the egress and attached notes only where they apply", () => {
+    expect(workspaceNotes(ws({ state: "running", egress: false, attached: true }))).toEqual([
+      { text: "agents can't reach the internet from this node", warn: true },
+      { text: "stops when you disconnect", warn: false },
+    ]);
+    expect(workspaceNotes(ws({ state: "running", egress: true }))).toEqual([]);
+    expect(workspaceNotes(ws({ state: "stopped", attached: true, egress: false }))).toEqual([]);
+  });
+
+  it("summarizes a cluster for its host row", () => {
+    expect(hostSummary(overview([]), NOW)).toBe("no workspaces yet");
+    expect(
+      hostSummary(overview([ws({ name: "crc", state: "running", ends_at_ms: NOW + 5 * DAY + 22 * HOUR + 5 * MIN })]), NOW),
+    ).toBe("crc running · 5d 22h left");
+    expect(hostSummary(overview([ws({ name: "a" }), ws({ name: "b", id: "w-2" })]), NOW)).toBe(
+      "2 workspaces · none running",
+    );
+    expect(hostSummary(overview([ws({ name: "a" })]), NOW)).toBe("1 workspace · not running");
+    expect(hostSummary(overview([ws({ name: "a", state: "waiting" })]), NOW)).toBe("a waiting for a node");
+    expect(
+      hostSummary(
+        overview([ws({ name: "a", state: "running" }), ws({ id: "w-2", name: "b", state: "waiting" })]),
+        NOW,
+      ),
+    ).toBe("1 running · 1 waiting");
+  });
+
+  it("counts the user's other jobs", () => {
+    expect(otherJobsWords({ running: 2, waiting: 9 })).toBe(
+      "Your other jobs on this cluster: 2 running · 9 waiting",
+    );
+    expect(otherJobsWords({ running: 0, waiting: 0 })).toBe("Your other jobs on this cluster: none");
+  });
+});
+
+describe("the start sheet", () => {
+  it("starts from the default partition and two hours", () => {
+    const f = defaultForm(facts());
+    expect(f.partition).toBe("batch");
+    expect(walltimeSecs(f)).toBe(2 * 3600);
+    expect(defaultForm(null).partition).toBe("");
+  });
+
+  it("restores a saved spec", () => {
+    const f = formFromSpec(
+      { time: "1-00:00:00", partition: "long", cpus: 8, mem: "32G", gpus: 0, account: "lab" },
+      facts(),
+    );
+    expect(f).toMatchObject({ partition: "long", days: 1, hours: 0, mins: 0, cpus: "8", mem: "32G", gpus: "", account: "lab" });
+  });
+
+  it("composes a spec, omitting blanks", () => {
+    const { spec, errors } = buildSpec(form({ cpus: "4", mem: "16g", gpus: "1" }), {
+      partition: partition({ name: "batch" }),
+      requires: [],
+    });
+    expect(errors).toEqual({});
+    expect(spec).toEqual({ time: "02:00:00", partition: "batch", cpus: 4, mem: "16G", gpus: 1 });
+  });
+
+  it("requires a time and pre-flights it against the partition", () => {
+    expect(buildSpec(form({ hours: 0 }), { partition: null, requires: [] }).errors.time).toMatch(/time limit/);
+    const over = buildSpec(form({ days: 3 }), { partition: partition({ name: "batch" }), requires: [] });
+    expect(over.spec).toBeNull();
+    expect(over.errors.time).toBe("batch allows up to 2 days.");
+    // No published limit: Slurm stays the judge.
+    expect(
+      buildSpec(form({ days: 30 }), { partition: partition({ max_time_secs: null }), requires: [] }).errors.time,
+    ).toBeUndefined();
+  });
+
+  it("rejects bad resource entries with a line each", () => {
+    const { spec, errors } = buildSpec(form({ cpus: "0", mem: "16", gpus: "x" }), {
+      partition: null,
+      requires: [],
+    });
+    expect(spec).toBeNull();
+    expect(errors.cpus).toBeDefined();
+    expect(errors.mem).toBe("Add a unit, like 16G or 500M.");
+    expect(errors.gpus).toBeDefined();
+    expect(buildSpec(form({ mem: "lots" }), { partition: null, requires: [] }).errors.mem).toBe(
+      "Like 16G or 500M.",
+    );
+  });
+
+  it("treats zero GPUs as none", () => {
+    expect(buildSpec(form({ gpus: "0" }), { partition: null, requires: [] }).spec).toEqual({
+      time: "02:00:00",
+      partition: "batch",
+    });
+  });
+
+  it("makes learned fields required", () => {
+    const { spec, errors } = buildSpec(form(), { partition: null, requires: ["account", "qos"] });
+    expect(spec).toBeNull();
+    expect(errors.account).toBe("This cluster needs an account.");
+    expect(errors.qos).toBe("This cluster needs a QOS.");
+    expect(errors.constraint).toBeUndefined();
+    const ok = buildSpec(form({ account: " lab ", qos: "normal" }), { partition: null, requires: ["account", "qos"] });
+    expect(ok.spec).toMatchObject({ account: "lab", qos: "normal" });
+  });
+
+  it("limits accounts to the partition's own list", () => {
+    const f = facts({ accounts: ["lab", "other"], default_account: "lab" });
+    expect(accountChoices(f, partition({ accounts: ["other"] }))).toEqual(["other"]);
+    expect(accountChoices(f, partition({ accounts: [] }))).toEqual(["lab", "other"]);
+    expect(accountChoices(null, null)).toEqual([]);
+  });
+
+  it("tags partitions with reported facts only", () => {
+    const cfg = config({ learned: { interactive_only: ["dev"] } });
+    const texts = (p: PartitionChoice) => partitionTags(p, cfg).map((t) => t.text);
+    expect(texts(partition({ name: "batch", default: true }))).toEqual(["default", "up to 2 days"]);
+    expect(texts(partition({ name: "dev", max_time_secs: 3600, preemptible: true, gpus: true }))).toEqual([
+      "up to 1 hour",
+      "can be preempted",
+      "GPUs",
+      "interactive only · stops when you disconnect",
+    ]);
+    expect(texts(partition({ up: false, max_time: "UNLIMITED", max_time_secs: null }))).toEqual([
+      "down",
+      "no time limit",
+    ]);
+    expect(isInteractiveOnly(cfg, "dev")).toBe(true);
+    expect(isInteractiveOnly(cfg, "")).toBe(false);
+  });
+
+  it("words a partition's node size", () => {
+    expect(nodeSizeWords(partition({ cpus_per_node: "32", mem_per_node: "128000" }))).toBe(
+      "Nodes have 32 CPUs · 125 GB",
+    );
+    expect(nodeSizeWords(partition({ cpus_per_node: "", mem_per_node: "256000+" }))).toBe("Nodes have 250+ GB");
+    expect(nodeSizeWords(partition({ cpus_per_node: "", mem_per_node: "" }))).toBe("");
+  });
+
+  it("maps refusals to the field to reveal", () => {
+    expect(refusalField("account_required")).toBe("account");
+    expect(refusalField("qos_required")).toBe("qos");
+    expect(refusalField("constraint_required")).toBe("constraint");
+    expect(refusalField("batch_not_allowed")).toBeNull();
+    expect(refusalField("other")).toBeNull();
+  });
+});
+
+describe("the file peek", () => {
+  it("lists folders first, then names in natural order", () => {
+    const sorted = sortEntries([
+      { name: "b.txt", dir: false },
+      { name: "run10", dir: true },
+      { name: "A.txt", dir: false },
+      { name: "run2", dir: true },
+    ]);
+    expect(sorted.map((e) => e.name)).toEqual(["run2", "run10", "A.txt", "b.txt"]);
+  });
+
+  it("walks paths", () => {
+    expect(childPath("/scratch/u", "data")).toBe("/scratch/u/data");
+    expect(childPath("/scratch/u/", "data")).toBe("/scratch/u/data");
+    expect(childPath("/", "home")).toBe("/home");
+    expect(parentPath("/scratch/u/data")).toBe("/scratch/u");
+    expect(parentPath("/scratch")).toBe("/");
+    expect(parentPath("/")).toBeNull();
+    expect(parentPath("~/x")).toBeNull();
+  });
+});
