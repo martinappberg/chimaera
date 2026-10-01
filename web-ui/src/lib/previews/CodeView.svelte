@@ -249,7 +249,9 @@
       if (command === "open") return openSearchPanel(v);
       if (!searchPanelOpen(v.state)) return false;
       if (command === "close") return closeSearchPanel(v);
-      return command === "previous" ? findPrevious(v) : findNext(v);
+      if (command === "previous") findPrevious(v); else findNext(v);
+      // A query with no matches still owns navigation; never fall through to browser Find.
+      return true;
     });
     const onSuperseded = () => {
       superseded = true;
