@@ -25,7 +25,10 @@ export const toolbarPopover: Action<HTMLElement, { onClose: () => void }> = (nod
     if (disposed) return;
     place();
     const choices = items();
-    (choices.find((item) => item.matches('.current, [aria-checked="true"], [aria-pressed="true"]')) ?? choices[0])?.focus({ preventScroll: true });
+    const selected = choices.find((item) => item.matches('.current, [aria-checked="true"], [aria-pressed="true"]')) ?? choices[0];
+    // A status-only popup still needs to own focus so Tab and focusout close it.
+    if (selected === undefined) node.tabIndex = -1;
+    (selected ?? node).focus({ preventScroll: true });
   });
   const onKey = (event: KeyboardEvent) => {
     if (event.isComposing || event.metaKey || event.ctrlKey || event.altKey) return;

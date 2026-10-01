@@ -2,7 +2,7 @@
   import { gitRepos, openFileHistory, repoForPath } from "../workspace/git";
   /**
    * The pane's always-present top bar (28px): type glyph + tab name per
-   * tab (active emphasized by WEIGHT, not color), pane controls at the
+   * tab (active marked by a quiet fill and underline), pane controls at the
    * right edge (secondary actions share a menu; the zoom badge stays persistent
    * while zoomed). The bar's empty area is a drag handle for the active
    * tab, so every pane can always be re-tiled by its bar.
@@ -1965,8 +1965,6 @@
     background: color-mix(in srgb, var(--fg) 12%, transparent);
     color: var(--fg);
   }
-
-  /* Per-pane text size (parity with the chords); text glyphs, same cluster. */
 
   /* Persistent while zoomed — the always-visible mouse exit from zoom.
      Collapse glyph + "restore" label: an action, not the "ZOOM" state. */
