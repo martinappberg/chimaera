@@ -90,6 +90,8 @@ struct Host {
     stopping: AtomicBool,
     /// Wakes the writer of `workspaces.json` after every change.
     changed: tokio::sync::Notify,
+    /// Every workspace closed: the writer removes the records and stops.
+    finished: AtomicBool,
 }
 
 impl Host {
@@ -112,12 +114,21 @@ fn write_hosting(job_dir: &Path, record: &HostingRecord) {
 }
 
 /// Keep `workspaces.json` current: one writer, so a newer state never lands
-/// under an older one; a burst of changes is one write.
+/// under an older one; a burst of changes is one write. At the end it
+/// removes both records itself, so no write can land after them.
 async fn publish_hosting(host: Arc<Host>) {
     loop {
         host.changed.notified().await;
-        let record = host.hosting();
         let job_dir = host.job_dir.clone();
+        if host.finished.load(Ordering::Relaxed) {
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = std::fs::remove_file(job_dir.join("host.json"));
+                let _ = std::fs::remove_file(job_dir.join("workspaces.json"));
+            })
+            .await;
+            return;
+        }
+        let record = host.hosting();
         let _ = tokio::task::spawn_blocking(move || write_hosting(&job_dir, &record)).await;
     }
 }
@@ -226,8 +237,9 @@ pub async fn run(job_dir: PathBuf) -> anyhow::Result<()> {
         workspaces: Mutex::new(HashMap::new()),
         stopping: AtomicBool::new(false),
         changed: tokio::sync::Notify::new(),
+        finished: AtomicBool::new(false),
     });
-    tokio::spawn(publish_hosting(host.clone()));
+    let publisher = tokio::spawn(publish_hosting(host.clone()));
 
     for wid in &record.open {
         match open(&host, wid).await {
@@ -248,8 +260,9 @@ pub async fn run(job_dir: PathBuf) -> anyhow::Result<()> {
 
     tracing::info!("job-host stopping: closing every workspace");
     close_all(&host).await;
-    let _ = std::fs::remove_file(job_dir.join("host.json"));
-    let _ = std::fs::remove_file(job_dir.join("workspaces.json"));
+    host.finished.store(true, Ordering::Relaxed);
+    host.changed.notify_one();
+    let _ = publisher.await;
     Ok(())
 }
 
@@ -745,7 +758,27 @@ fn keep(tail: &Mutex<VecDeque<String>>, line: &str) {
     if t.len() == TAIL_LINES {
         t.pop_front();
     }
-    t.push_back(line.chars().take(300).collect());
+    t.push_back(plain_text(line).chars().take(300).collect());
+}
+
+/// A log line without its terminal colors (`ESC [ … letter`).
+fn plain_text(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Close one workspace: SIGTERM (its chimaera saves its chats and removes
@@ -830,5 +863,17 @@ mod tests {
         let t = tail.lock().unwrap();
         assert_eq!(t.len(), TAIL_LINES);
         assert_eq!(t.back().map(String::as_str), Some("line 9"));
+    }
+
+    #[test]
+    fn the_tail_drops_colors_and_the_token_line() {
+        let tail = Mutex::new(VecDeque::new());
+        keep(
+            &tail,
+            "\u{1b}[2m2026\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m ready",
+        );
+        keep(&tail, "http://127.0.0.1:1/#token=secret");
+        let t = tail.lock().unwrap();
+        assert_eq!(t.iter().cloned().collect::<Vec<_>>(), ["2026  INFO ready"]);
     }
 }
