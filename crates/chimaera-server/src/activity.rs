@@ -75,11 +75,15 @@ pub(crate) fn record(state: &crate::AppState, id: &str) {
     crate::lock(&state.activity).record(id, crate::session_view::now_ms());
     state.changes.notify_waiters();
 }
-/// The chat commands that are the user acting: they count as interaction
-/// here, and they are the ones a keeper that keeps a sleeping cloud machine's
-/// sockets holds and wakes the machine for (VIEWING.md, "A sleeping cloud
-/// machine's sockets" mirrors this list; change both together). Everything
-/// else (reads, settings, queue housekeeping) neither wakes nor is held.
+/// The chat commands that are the user acting. They count as interaction
+/// here; they are what this daemon's relay holds, wakes a sleeping owner for
+/// and brings work to this computer for (`session_proxy`), and nothing else
+/// is; and a keeper that keeps a sleeping cloud machine's sockets holds and
+/// wakes for the same list (VIEWING.md, "A sleeping cloud machine's sockets"
+/// mirrors it; change both together). A keeper also holds the seven settings
+/// commands the user gives; the relay here drops them while the owner is not
+/// attached. The automatic `SetThinking`, the reads, `cancel_send` (not an
+/// `AgentCommand`) and queue housekeeping neither wake nor are held anywhere.
 /// `SendAfterTurn` is a send: idle it opens a turn like any other.
 pub(crate) fn is_interaction(command: &chimaera_agent::model::AgentCommand) -> bool {
     use chimaera_agent::model::AgentCommand;

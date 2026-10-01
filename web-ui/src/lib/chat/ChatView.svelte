@@ -86,7 +86,7 @@
     PendingSend,
     PlanEntry,
   } from "./store.svelte";
-  import { mintSendId } from "./store.svelte";
+  import { mintSendId, SHOW_UNCONFIRMED_AFTER_MS } from "./store.svelte";
   import {
     advanceTailWindow,
     autoPageEarlier,
@@ -1439,6 +1439,16 @@
     }
     return accepted;
   }
+
+  // A send made on a live connection shows no pending bubble, because its
+  // echo follows at once. One still unconfirmed a moment later shows after
+  // all: a machine that froze as the message arrived says nothing.
+  $effect(() => {
+    const since = store.unshownSince;
+    if (since === null) return;
+    const timer = setTimeout(() => store.showOverdue(), Math.max(0, since + SHOW_UNCONFIRMED_AFTER_MS - Date.now()));
+    return () => clearTimeout(timer);
+  });
 
   // An undelivered send's text goes back into this chat's composer, once,
   // above whatever is being written there now (it was written first, and

@@ -2655,7 +2655,7 @@ async fn a_transport_that_accepts_and_drops_is_remembered_as_keeping_no_sockets(
 
 /// Input a keeping transport still holds when the socket ends is discarded
 /// there, never delivered later: this relay closes the viewer's socket (its
-/// client hands the text back when the next `ready` replays no echo). Both
+/// client sends the message again by its id at the next `ready`). Both
 /// ways a passed-through socket ends: the transport's side closing, and the
 /// project changing owner under it (which also says `moved`).
 #[tokio::test]

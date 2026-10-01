@@ -560,9 +560,13 @@ The computer takes it without its settle wait. The gateway tells the phone
 first input, and delivers them once to the computer when its session
 answers; if the computer has not acquired within about twenty seconds the
 request is withdrawn and the machine is woken as before
-(`{"type":"waking"}`), with the held input delivered to it instead. Held
-input the owner's session does not take is refused to the phone
-(`command_failed` or `read_only` with reason `reconnecting`, so a chat send
+(`{"type":"waking"}`), with the held input delivered to it instead. While
+the work is being brought the gateway holds only a chat's acting commands,
+its seven settings commands and a terminal's typing, as a keeper does
+([VIEWING](VIEWING.md#forwarded-requests)); a view's other frames are not
+held. Held input the owner's session does not take is refused to the phone
+(`command_failed` or `read_only` with reason `reconnecting`; a refused chat
+command carries the `client_id` it was sent under, so exactly that send
 returns to the composer), never dropped.
 
 A cloud machine's drain (`POST /api/v1/pro/drain`) therefore publishes each

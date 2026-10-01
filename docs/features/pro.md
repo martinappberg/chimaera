@@ -549,15 +549,18 @@ to it is down); opening it never silently starts another local agent.
 
 **Opening is viewing; doing wakes.** Attaching to a chat or terminal, polling
 rosters and watching files never wake a paused cloud project. The first real
-input does: a keystroke, a chat message or a permission answer. On a computer,
-the daemon keeps the chat/terminal connection open while the owner is paused or
-reconnecting, holds that first input (a little typing, up to four chat
-commands, within one daemon-wide budget) and delivers it exactly once after the
-owner answers. The message shows at once as a "sending…" bubble and the chat
-says "Waking the cloud machine…"; a terminal says the same over the pane and
-echoes nothing until the owner answers. While it wakes, a second message or more
-typing is not held: it is refused with a short note (a message comes back into
-the composer), so nothing is ever sent or run twice. A browser
+input does: a keystroke, a chat message, a stop or a permission answer. On a
+computer, the daemon keeps the chat/terminal connection open while the owner is
+paused or reconnecting, holds that first input (a little typing, up to four
+chat commands, within one daemon-wide budget) and delivers it once after the
+owner answers. Only what you do counts as input: the thinking preference a
+chat sends by itself, usage and MCP reads and settings changes never wake a
+machine or move work, and a setting changed while the owner is away keeps
+showing its old value. The message shows at once as a "sending…" bubble and
+the chat says "Waking the cloud machine…"; a terminal says the same over the
+pane and echoes nothing until the owner answers. While it wakes, a second
+message or more typing is not held: it is refused with a short note (the
+message comes back into the composer). A browser
 view reconnects once with wake intent when the user types or sends into a
 dropped connection; the action itself is not queued (the composer keeps its
 text; a terminal says it is waking). There is no reconnect or wake button: the
@@ -584,7 +587,9 @@ Against a service that keeps them, a connection opens as usual while the
 machine sleeps and stays open when it sleeps again. What you send or type
 goes out at once (on a computer the daemon passes it straight through and
 holds nothing), the service wakes the machine and delivers it once, in order,
-and more messages or typing during the wake join the same queue. Each message
+and more messages or typing during the wake join the same queue; a model,
+mode or effort you pick meanwhile is kept too and applied in the order you
+made it. Each message
 shows as its own "sending…" bubble until the agent has it; while the machine
 wakes, a terminal says "Waking the cloud machine…" over the pane (as does a
 chat that had not connected before) and echoes nothing until the machine
@@ -596,16 +601,29 @@ what it missed, a terminal repaints, the window's file and Git updates
 resume. If the wake does not arrive, every message it was holding comes back
 into the composer, in order.
 
-**A message is delivered or comes back.** With either kind of service, a
-message that is refused returns to the composer with its pictures (several,
-in the order they were sent). Only a *message* comes back: a refused stop or
-permission answer says so without resurrecting a message that may already
-have been delivered. A message whose connection ended before the agent
-confirmed it stays "sending…" until the conversation next answers; if the
-agent has it, it shows in the transcript, and if not, it returns to the
-composer then. Typing that is refused is said in a small note over the
-terminal; typing that was still on its way when a connection ended is not
-replayed.
+**A message runs once, and is not lost quietly.** Every message you send
+carries its own id, and the machine that runs the agent accepts an id once,
+however many copies of the message reach it. The app uses that in three ways.
+A message that is refused returns to the composer with its pictures, exactly
+the one that was refused (several come back in the order they were sent), and
+lands above whatever you are writing there. Only a *message* comes back: a
+refused stop or permission answer says so without resurrecting a message
+that may already have been delivered. A message the agent has not confirmed
+shows as "sending…": at once when the conversation is not live, after a few
+seconds otherwise. And whenever the conversation answers again (a reconnect,
+a machine waking, work arriving on this computer), the app sends each
+unconfirmed message again under its id: if the first copy had arrived, or
+arrives a moment later from whoever was holding it, the second is dropped,
+and if it had not, this one is delivered. A message that has waited more than
+two minutes is not sent again; the app withdraws it instead, and it returns
+to the composer with the note "not delivered" unless it had arrived after
+all, in which case it shows in the transcript. What this does not cover: a
+machine that runs an older version of Chimaera has no ids, so nothing is sent
+to it twice and a message whose connection ended before it confirmed stays
+"sending…" there; and a message sent to a machine in the instant it fell
+asleep waits, shown as "sending…", until something wakes that machine.
+Typing that is refused is said in a small note over the terminal; typing that
+was still on its way when a connection ended is not replayed.
 
 **Acting brings the work to you; looking doesn't.** When another of your
 computers is running a project and you send a chat message or type into a

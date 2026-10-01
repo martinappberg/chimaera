@@ -242,6 +242,12 @@ interface UnconfirmedSend extends RestoredDraft {
  *  message must not turn up in a conversation long after it was written. */
 export const RESEND_FOR_MS = 120_000;
 
+/** A send made on a connection that looks live shows no pending bubble: its
+ *  echo follows within the moment. One still without it after this long
+ *  shows as "sending…" after all, so a message that went to a machine as it
+ *  froze (nothing says so on a kept socket) is never silently absent. */
+export const SHOW_UNCONFIRMED_AFTER_MS = 3_000;
+
 /** Said when a send that was withdrawn comes back to the composer (the
  *  words a message the agent never saw already carries in the transcript). */
 const NOT_DELIVERED = "not delivered";
@@ -997,6 +1003,27 @@ export class ChatStore {
     this.waking = true;
     this.bringing = null;
     this.showUnconfirmed();
+  }
+
+  /** When the oldest unconfirmed send that shows no bubble yet was made, or
+   *  null: the view shows it once it is {@link SHOW_UNCONFIRMED_AFTER_MS}
+   *  old ({@link showOverdue}). Only behind a daemon with send ids, where a
+   *  bubble always ends (its echo, a refusal, or the next `ready`); a daemon
+   *  without them confirms by text alone, and a bubble its echo failed to
+   *  match would stay for good. */
+  get unshownSince(): number | null {
+    if (this.sendIds !== true) return null;
+    return this.unconfirmed.find((send) => !send.shown)?.at ?? null;
+  }
+
+  /** Show the unconfirmed sends that have waited for their echo too long to
+   *  be on their way still. */
+  showOverdue(now = Date.now()): void {
+    if (this.sendIds !== true) return;
+    const overdue = (send: UnconfirmedSend): boolean => !send.shown && now - send.at >= SHOW_UNCONFIRMED_AFTER_MS;
+    if (this.unconfirmed.some(overdue)) {
+      this.unconfirmed = this.unconfirmed.map((send) => (overdue(send) ? { ...send, shown: true } : send));
+    }
   }
 
   /** Show every unconfirmed send as a pending bubble. */

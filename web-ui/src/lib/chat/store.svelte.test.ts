@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { SeqEvent } from "./chatWs";
-import { ChatStore, RESEND_FOR_MS } from "./store.svelte";
+import { ChatStore, RESEND_FOR_MS, SHOW_UNCONFIRMED_AFTER_MS } from "./store.svelte";
 
 /** Build a numbered event stream (seq assigned in order) and fold it through a
  *  fresh store — the reducer's only input, exactly as the wire delivers it. */
@@ -2877,6 +2877,34 @@ describe("ChatStore sends, by id: never delivered and returned, never neither", 
     }
   });
 
+  it("a send on a live connection shows as pending once its echo is overdue", () => {
+    const w = world();
+    try {
+      w.attach();
+      // To a machine in the instant it froze: the socket stays open and
+      // nothing says so.
+      w.say("into the freeze", "lost");
+      const answered = w.say("answered at once", "daemon");
+      w.catchUp();
+      expect(w.daemon.journal.at(-1)?.ev.client_id).toBe(answered);
+      expect(w.store.sending).toEqual([]);
+      expect(w.store.unshownSince).toBe(Date.now());
+      w.wait(SHOW_UNCONFIRMED_AFTER_MS - 1);
+      w.store.showOverdue();
+      expect(w.store.sending).toEqual([]);
+      w.wait(1);
+      w.store.showOverdue();
+      expect(w.store.sending.map((send) => send.text)).toEqual(["into the freeze"]);
+      expect(w.store.unshownSince).toBeNull();
+      // Something wakes the machine: the reattach sends it again, once.
+      w.attach();
+      expect(w.daemon.turns).toEqual(["answered at once", "into the freeze"]);
+      expect(w.store.sending).toEqual([]);
+    } finally {
+      w.done();
+    }
+  });
+
   it("nothing goes out again before the replay has arrived, or to a socket that is gone", () => {
     const w = world();
     try {
@@ -2938,6 +2966,15 @@ describe("ChatStore sends, by id: never delivered and returned, never neither", 
       expect(w.store.sending.map((send) => send.text)).toEqual(["ok"]);
       w.store.apply(echo(5, "ok"));
       expect(w.store.sending).toEqual([]);
+      // No bubble appears by itself there either: one its echo failed to
+      // match would never go away.
+      w.store.onReady(SESSION, 5, 5, NO_IDS);
+      w.send("live");
+      w.wait(SHOW_UNCONFIRMED_AFTER_MS * 2);
+      expect(w.store.unshownSince).toBeNull();
+      w.store.showOverdue();
+      expect(w.store.sending).toEqual([]);
+      w.store.apply(echo(6, "live"));
       // Its refusals name no send: the one just made comes back, as before.
       w.send("kept");
       w.send("refused");

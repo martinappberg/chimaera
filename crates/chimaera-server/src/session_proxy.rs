@@ -1519,10 +1519,13 @@ const DOUBTFUL_READY: Duration = if cfg!(test) {
 /// replace only that frame's token; application messages remain byte-for-byte.
 ///
 /// The viewer's socket stays open while the owner is unreachable or asleep:
-/// attaching is passive, and the first real input (a keystroke, a chat
-/// command, a permission answer) is held and carries wake intent. Held input
-/// is delivered exactly once after the owner's `ready`, or answered with a
-/// visible refusal when it cannot be delivered; nothing is resent.
+/// attaching is passive, and the first real input (a keystroke, or a chat
+/// command that is the user acting, [`acting`]) is held and carries wake
+/// intent. Held input is delivered once after the owner's `ready`, or
+/// answered with a visible refusal that names the refused command (and, for
+/// a send, the id its client sent it under) when it cannot be delivered.
+/// This relay sends nothing twice; a viewer's client may send an unconfirmed
+/// send again under its id, which the owner's daemon accepts once.
 ///
 /// A cloud machine's transport may keep its sockets instead (it marks every
 /// upgrade it accepts with [`SOCKETS_HEADER`]): it accepts the socket while
@@ -1531,8 +1534,8 @@ const DOUBTFUL_READY: Duration = if cfg!(test) {
 /// relay then holds nothing and says nothing: frames pass straight through in
 /// both directions ([`Opened::Held`]), and when such a socket ends with input
 /// the transport still held, the transport discards it and the viewer's
-/// client learns so from the next `ready` (no echo in its replay), so closing
-/// the viewer's socket is this relay's whole answer. A transport without the
+/// client sends it again by its id at the next `ready`, so closing the
+/// viewer's socket is this relay's whole answer. A transport without the
 /// mark leaves the relay on the path above, whatever the scope probe said.
 ///
 /// When the owner is another of the user's computers, that first input
@@ -1796,8 +1799,8 @@ impl Link<'_> {
         json!({"type":"moved","to":to})
     }
     /// Answer input that arrived while this socket's wake is pending: it is
-    /// not held (a second send must never become a second turn once the owner
-    /// answers), and the viewer is told why in plain words.
+    /// not held, and the viewer is told why in plain words (a refused send is
+    /// named by its id, so exactly that one returns to its composer).
     async fn refuse_waking(
         &self,
         downstream: &mut axum::extract::ws::WebSocket,
@@ -2149,7 +2152,7 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                 }
                 // Input a keeping transport still holds for this socket is
                 // discarded when the socket ends here; the viewer's client
-                // finds no echo after its next `ready` and hands it back.
+                // sends it again by its id at its next `ready`.
                 if let Some(moved) = link.ended() {
                     let refused = held.take();
                     let _ = link.refuse(downstream, &refused).await;
@@ -2204,7 +2207,7 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                     // The owner ended this connection (exit, restart, owner
                     // change). The viewer reconnects and is routed afresh;
                     // what a keeping transport held for it is discarded there
-                    // and handed back by the viewer's client (see above).
+                    // and sent again by the viewer's client (see above).
                     let refused = held.take();
                     let _ = link.refuse(downstream, &refused).await;
                     return;
