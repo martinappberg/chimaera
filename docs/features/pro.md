@@ -549,7 +549,9 @@ opens as usual while the machine sleeps and stays open when it sleeps again,
 what you send or type is taken at once, the account wakes the machine and
 delivers it exactly once, in order, and more messages or typing during the
 wake join the same queue. The message shows as a "sending…" bubble until the
-agent has it; a terminal echoes nothing until the machine answers. A
+agent has it; while the machine wakes, a terminal says "Waking the cloud
+machine…" over the pane (as does a chat that had not connected before) and
+echoes nothing until the machine answers. A
 connection that is open and quiet is not "Reconnecting…", and a conversation
 opened for the first time while its machine sleeps shows its loading line
 until something wakes the machine. On a computer the app's daemon passes
