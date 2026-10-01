@@ -26,6 +26,7 @@
    * the whole file up front); the bearer token never lands in a URL.
    */
   import { onMount, untrack } from "svelte";
+  import { findTarget, type FindCommand } from "../shared/find";
   // The legacy build: pdf.js 6's modern build calls `Map.prototype.
   // getOrInsertComputed` on every render and range read, which WebKit (the
   // macOS app) and Chromium before 145 lack — pages stayed blank, and ranged
@@ -858,6 +859,13 @@
     });
     if (findQuery.trim() !== "" && matches.length === 0 && !searching) startSearch();
   }
+  function find(command: FindCommand): boolean {
+    if (command === "open") { openFind(); return true; }
+    if (!findOpen) return false;
+    if (command === "close") closeFind();
+    else step(command === "previous" ? -1 : 1);
+    return true;
+  }
 
   function closeFind(): void {
     findOpen = false;
@@ -1497,7 +1505,7 @@
 {/snippet}
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="pdf-view" class:area={areaMode} onkeydown={onViewKey}>
+<div class="pdf-view" class:area={areaMode} onkeydown={onViewKey} use:findTarget={find}>
   <div class="pdf-bar">
     {#if outline.length > 0}
       <button

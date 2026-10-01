@@ -64,6 +64,7 @@
     ctrl: LayoutCtrl;
     /** Bound by Pane so the dnd hit-tester can target this bar. */
     el?: HTMLElement | null;
+    onFind?: () => void;
   }
 
   let {
@@ -77,6 +78,7 @@
     dropSpot,
     ctrl,
     el = $bindable(null),
+    onFind,
   }: Props = $props();
 
   const activeSession = $derived.by(() => {
@@ -979,6 +981,14 @@
     class="bar-right"
     use:dismiss={{ enabled: linkMenuOpen, onDismiss: () => (linkMenuOpen = false) }}
   >
+    {#if onFind !== undefined}
+      <button class="ctl" aria-label="Find in current pane" title={`find in current pane${keyHintSuffix("find")}`}
+        onclick={onFind}>
+        <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+          <circle cx="6.8" cy="6.8" r="4.2" /><path d="m10 10 3.5 3.5" />
+        </svg>
+      </button>
+    {/if}
     {#if hasTermSelection}
       <!-- Selection-driven, not hover-driven: visible exactly while the
            terminal holds a selection. Same handler as the chord. -->

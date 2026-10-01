@@ -122,3 +122,7 @@ export function disposeSession(id: string): void {
 export function getSize(id: string): { cols: number; rows: number } | null {
   return runtime !== null && initialized ? runtime.getSize(id) : null;
 }
+
+export function beginFind(id: string, results: (index: number, count: number) => void) {
+  return runtime !== null && initialized ? runtime.beginFind(id, results) : null;
+}

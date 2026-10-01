@@ -131,6 +131,20 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   horizontal movement; refreshes preserve the user's horizontal position and re-list only affected
   visible columns, coalescing mutation and disk-watch bursts.
 
+## Find within a document
+
+The [pane Find command](workbench.md#find-in-the-current-pane) opens the existing
+CodeMirror search panel for code/source editors and the PDF viewer's document
+search, even when focus is in pane chrome. Rendered markdown uses
+`shared/DocumentFind.svelte` / `domFind.ts`: literal, case-optional matching across
+inline formatting, with CSS range highlights that leave renderer-owned DOM and
+reference selections intact. `readingWindow.ts` materializes parked paragraphs
+while search is open, then resumes windowing on close. Search skips collapsed
+content and is bounded to 2 million characters, 50,000 text nodes and 1,000
+matches; a limit notice means results are partial. Closing or leaving the tab
+clears highlights and observers. Opening or closing folded sections refreshes
+matches, including nested folds. PDF keeps its existing page-text search limits.
+
 ## Raw reads & lightweight editing
 
 - **What & when.** Ranged byte reads back the code viewer, image/PDF/HTML previews, and the small

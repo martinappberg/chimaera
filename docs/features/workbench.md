@@ -71,6 +71,30 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   blocking pool (389 guard trips in one day), and the palette's own walk ran inline on a
   reactor worker.
 
+## Find in the current pane
+
+- **What & when.** Find text in the active terminal, conversation, code editor,
+  rendered markdown, or PDF. **Quick Open (`Mod+P`) remains file/path and session
+  lookup**; Find does not scan project files.
+- **How it's used.** `Mod+F` (⌘F on macOS, Ctrl+Shift+F elsewhere), the pane-bar
+  magnifier, or “Find in current pane” in Quick Open. Plain Ctrl+F also works
+  outside PTY panes; a terminal keeps bare Ctrl+F/Ctrl+G for its running program.
+  Enter / Shift+Enter navigate; ⌘G / ⇧⌘G and F3 / Shift+F3 also navigate an open
+  search. Escape in the find bar closes it and returns focus to its view.
+  `keys.find` is rebindable. Modals own their keyboard, and parked tabs never
+  receive a find command. Keyboard focus takes precedence over the last clicked
+  pane when moving between views with Tab.
+- **Where it lives.** `web-ui/src/lib/shared/find.ts` registers each view's search
+  handler; `App.svelte` routes shortcuts to the focused pane, `Pane.svelte` /
+  `PaneTabs.svelte` expose the mouse path. `FindBar.svelte` supplies the terminal,
+  conversation and rendered-document controls. CodeMirror and PDF retain their
+  existing search engines and controls. No daemon route or wire change.
+- **Scope.** Terminals search their retained xterm scrollback; conversations
+  search retained message text, including messages outside the rendered window
+  (not tool output). Markdown searches expanded document text, materializing
+  windowed paragraphs while find is open. Each search shows its own scope and
+  any result limit. Unsupported surfaces retain their ordinary key handling.
+
 ## Splitting, tabs & drag-and-drop
 
 - **What & when.** Divide any pane row/column (recursively) to see surfaces side by side; each
@@ -296,3 +320,15 @@ _Intent pending — drafted from the maintainer's request, 2026-09-06; questionn
 - **Pending.** The fit sizing (vs a shrink-then-scroll hybrid), the 180px cap, the overflow
   count, and the quiet active underline have not been confirmed with the maintainer — capture
   via **capture-feature-intent** when available.
+
+### Find in the current pane — why it exists
+_Captured 2026-10-01 (from the maintainer)._
+
+- **Problem it solves.** A user asked, “Finns de sök funktion cmd f på chimera?” The
+  maintainer asked us to “really think it through and make it good,” and confirmed
+  that finding text and finding files are both important.
+- **Promise vs addition.** “Keep the shortcut distinction; everything else can improve.”
+  Keep Find in the current pane distinct from the existing file/session lookup
+  shortcut. The remaining behavior and presentation are improvable additions.
+- **Open for improvement.** The maintainer requested a separate UI/UX pass on the
+  crowded pane headers, Markdown toolbar, and Find controls at narrow split widths.
