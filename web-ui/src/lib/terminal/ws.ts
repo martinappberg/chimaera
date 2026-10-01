@@ -78,6 +78,10 @@ export class SessionSocket {
    */
   private sawExited = false;
   private everReady = false;
+  /** Server grid adoption synchronously emits xterm.onResize. It is an
+   * observation, not a new request: echoing an older event can undo a newer
+   * resize and start an endless feedback loop across attached clients. */
+  private adoptingServerGrid = false;
   /** The auth frame of the CURRENT connection carried `parked: true`. */
   private sentParkedAuth = false;
   private unknownRetries = 0;
@@ -157,7 +161,7 @@ export class SessionSocket {
         // the server already adopted the auth-frame grid, and for a dead
         // session's last-words replay these are the death-time dims the
         // final screen must parse at — so adopt them like a resync's.
-        if (this.everReady) this.handlers.onReset(msg.cols, msg.rows);
+        if (this.everReady) this.adoptServerGrid(() => this.handlers.onReset(msg.cols, msg.rows));
         this.everReady = true;
         // Reconcile grids: resizes are silently dropped while the socket is
         // down or mid-handshake (the first fit often lands during CONNECTING),
@@ -175,14 +179,15 @@ export class SessionSocket {
         break;
       }
       case "resync":
-        this.handlers.onReset(msg.cols, msg.rows);
+        this.adoptServerGrid(() => this.handlers.onReset(msg.cols, msg.rows));
         break;
       case "title":
         if (typeof msg.title === "string") this.handlers.onTitle(msg.title);
         break;
       case "resized":
         if (typeof msg.cols === "number" && typeof msg.rows === "number") {
-          this.handlers.onResized(msg.cols, msg.rows);
+          const { cols, rows } = msg;
+          this.adoptServerGrid(() => this.handlers.onResized(cols, rows));
         }
         break;
       case "exited":
@@ -215,6 +220,15 @@ export class SessionSocket {
     }
   }
 
+  private adoptServerGrid(update: () => void): void {
+    this.adoptingServerGrid = true;
+    try {
+      update();
+    } finally {
+      this.adoptingServerGrid = false;
+    }
+  }
+
   /** True while the socket is connected and can accept input frames. */
   get isOpen(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
@@ -238,7 +252,7 @@ export class SessionSocket {
 
   /** Send a resize request as a text frame. */
   sendResize(cols: number, rows: number): void {
-    this.sendJson({ type: "resize", cols, rows });
+    if (!this.adoptingServerGrid) this.sendJson({ type: "resize", cols, rows });
   }
 
   /**
