@@ -2187,7 +2187,10 @@ mod tests {
     fn typed_paths_expand_but_never_execute() {
         assert_eq!(plain_path_input("~/x").unwrap(), "$HOME/x");
         assert_eq!(plain_path_input("$SCRATCH/crc").unwrap(), "$SCRATCH/crc");
-        assert_eq!(plain_path_input("/data/lab data").unwrap(), "/data/lab data");
+        assert_eq!(
+            plain_path_input("/data/lab data").unwrap(),
+            "/data/lab data"
+        );
         for bad in ["", "$(rm -rf ~)", "a;b", "`x`", "a|b", "a&b", "x\"y", "x'y"] {
             assert!(plain_path_input(bad).is_err(), "{bad}");
         }
