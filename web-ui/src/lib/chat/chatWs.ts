@@ -54,12 +54,15 @@ export interface ChatSocketHandlers {
    *  delivered once it answers. */
   onWaking?(): void;
   /** The socket is open and authenticated and its owner has said nothing
-   *  yet: the owner's side keeps the connection (the account in front of a
-   *  sleeping cloud machine, or this computer's relay to it) and delivers
-   *  what is sent once the owner answers. Not live, and not reconnecting. */
+   *  yet: the owner's side keeps the connection (a keeper that keeps a
+   *  sleeping cloud machine's sockets, directly or behind this computer's
+   *  relay) and delivers what is sent once the owner answers. Not live, and
+   *  not reconnecting. */
   onHeld?(): void;
-  /** The relay said the owner cannot be reached (`remote_unavailable`): the
-   *  socket stays open while the relay keeps trying. */
+  /** The owner cannot be reached right now (`remote_unavailable`): the
+   *  socket stays open, either while a relay keeps trying (nothing follows
+   *  until it gets through) or kept as before by whoever just handed back a
+   *  wake that did not arrive (`onHeld` follows). */
   onUnreachable?(): void;
   /** Acting here brings the work to this computer (`here`), or a phone's send
    *  brings it to the user's computer (`computer`): the send that asked waits
@@ -299,6 +302,9 @@ export class ChatSocket {
           // Connection states, never fatal: the socket stays (or reconnects)
           // and the next send carries wake intent.
           if (msg.code === "worker_asleep") {
+            // Said by a relay or gateway that keeps no socket for the owner,
+            // possibly after this one had counted as kept (a slow answer).
+            this.kept = false;
             this.asleep = true;
             this.deliveries.push({ kind: "asleep" });
             break;
@@ -306,6 +312,12 @@ export class ChatSocket {
           if (msg.code === "remote_unavailable") {
             this.kept = false;
             this.deliveries.push({ kind: "unreachable" });
+            // A relay that cannot reach the owner says it is retrying
+            // (`reason:"reconnecting"`) and stays silent meanwhile: that
+            // lasts until its next frame. Anyone else saying it has handed
+            // back what it held for a wake that did not arrive and still
+            // keeps this socket: quiet from here on is kept again.
+            if (msg.reason !== "reconnecting") this.awaitQuiet(ws);
             break;
           }
           if (msg.code === "workspace_scope_changed") break;
@@ -358,7 +370,7 @@ export class ChatSocket {
       // A project view's placement read may say the owner sleeps before any
       // frame did (a gateway can close without one). That holds for a
       // connection the owner's side refused. One it kept (answered, or open
-      // and quiet) and then lost is dialed again first: an account that keeps
+      // and quiet) and then lost is dialed again first: a keeper that keeps
       // a sleeping machine's sockets takes it, and one that does not refuses
       // that dial, which parks it here.
       if (!this.asleep && !kept && ownerSuspended()) {
@@ -444,8 +456,9 @@ export class ChatSocket {
    * waiting for a sleeping owner: reconnect now, once, carrying wake intent,
    * instead of waiting out the backoff. The action itself is NOT queued — the
    * caller keeps it (a composer keeps its draft). An open socket never needs
-   * this: whoever keeps it (a native window's daemon, or the account in front
-   * of a sleeping cloud machine) holds the input itself while the owner wakes.
+   * this: whoever keeps it (a native window's daemon, or a keeper that keeps
+   * a sleeping cloud machine's sockets) holds the input itself while the
+   * owner wakes.
    */
   private wakeOnInput(): void {
     if (!(isBrowserGateway() || this.leaveSleepWait !== null) || this.closed || this.fatal || this.ended || this.waking) return;

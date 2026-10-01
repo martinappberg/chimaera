@@ -164,8 +164,9 @@ it("a keystroke into a terminal waiting on a sleeping owner dials once with wake
   session.close();
 });
 
-// The account keeps a sleeping cloud machine's sockets open (VIEWING.md, "A
-// sleeping cloud machine's sockets"); so does this computer's relay to it.
+// Against a keeper that keeps a sleeping cloud machine's sockets open (it
+// marks them `X-Chimaera-Sockets: kept`; VIEWING.md, "A sleeping cloud
+// machine's sockets"), directly or through this computer's relay.
 
 it("typing into a socket kept open for an owner that has not answered is sent, never dropped", () => {
   const kept = vi.fn();
@@ -190,13 +191,26 @@ it("typing into a socket kept open for an owner that has not answered is sent, n
   expect(status).not.toHaveBeenCalled();
   // Open, but nothing echoes for input the owner has not received.
   expect(session.isLive).toBe(false);
-  // Being told the owner cannot be reached ends the kept state and a wake
-  // that was under way.
+  // A wake that does not arrive is handed back ("cannot be reached", from
+  // whoever keeps the socket): the waking note ends, and the socket, still
+  // open and quiet, is kept again rather than "reconnecting" forever.
   Socket.all[0].onmessage?.({ data: JSON.stringify({ type: "waking" }) });
   expect(status).toHaveBeenLastCalledWith("waking");
   Socket.all[0].onmessage?.({ data: JSON.stringify({ type: "error", code: "remote_unavailable" }) });
   expect(kept).toHaveBeenLastCalledWith(false);
   expect(status).toHaveBeenLastCalledWith(null);
+  vi.advanceTimersByTime(QUIET_OPEN_MS);
+  expect(kept).toHaveBeenLastCalledWith(true);
+  // A relay that cannot reach the owner says it is retrying: that lasts.
+  Socket.all[0].onmessage?.({ data: JSON.stringify({ type: "error", code: "remote_unavailable", reason: "reconnecting" }) });
+  vi.advanceTimersByTime(60_000);
+  expect(kept).toHaveBeenLastCalledWith(false);
+  // So does a slow "asleep" from a relay that keeps no socket for the owner.
+  Socket.all[0].onmessage?.({ data: JSON.stringify({ type: "ready", cols: 80, rows: 24 }) });
+  expect(kept).toHaveBeenLastCalledWith(true);
+  Socket.all[0].onmessage?.({ data: JSON.stringify({ type: "error", code: "worker_asleep" }) });
+  expect(kept).toHaveBeenLastCalledWith(false);
+  expect(status).toHaveBeenLastCalledWith("asleep");
   session.close();
 });
 
@@ -213,8 +227,8 @@ it("a second ready on the same socket repaints like a reconnect and settles a gr
   ws.onopen?.();
   frame({ type: "ready", cols: 80, rows: 24 });
   expect(reset).not.toHaveBeenCalled();
-  // The machine sleeps and wakes behind the kept socket. The account replays
-  // the auth frame as first sent, so the owner renders at the old grid.
+  // The machine sleeps and wakes behind the kept socket, attached with a
+  // frame that still names the old grid (a resize that had not arrived).
   dims = { cols: 100, rows: 30 };
   session.sendInput("x");
   frame({ type: "waking" });
@@ -227,13 +241,28 @@ it("a second ready on the same socket repaints like a reconnect and settles a gr
   expect(reset).toHaveBeenCalledExactlyOnceWith(80, 24);
   // ...and the terminal's real grid goes back to the owner.
   expect(last()).toEqual({ type: "resize", cols: 100, rows: 30 });
-  // Parked since: the replayed frame said "shown", so the owner would stream
-  // to a hidden terminal. It is told to stop.
+  // Parked since, and the pool said so on this socket (`park`): a keeper
+  // folds that into the frame it attaches with, so this `ready` answers a
+  // parked attach. No snapshot follows, nothing is reset, nothing is sent.
   parked = true;
-  frame({ type: "ready", cols: 100, rows: 30 });
+  session.sendPark();
+  let before = ws.sent.length;
+  frame({ type: "ready", cols: 80, rows: 24 });
+  expect(reset).toHaveBeenCalledOnce();
+  expect(parkedReady).toHaveBeenCalledOnce();
+  expect(ws.sent).toHaveLength(before);
+  // Shown again (`unpark`), then parked while that frame could not go out:
+  // the attach said "shown", so the owner would stream to a hidden terminal.
+  // It is told to stop, and nothing else: a hidden terminal sends no grid,
+  // even when `ready` names another one.
+  parked = false;
+  session.sendUnpark();
+  parked = true;
+  before = ws.sent.length;
+  frame({ type: "ready", cols: 80, rows: 24 });
   expect(reset).toHaveBeenCalledTimes(2);
-  expect(last()).toEqual({ type: "park" });
-  expect(parkedReady).not.toHaveBeenCalled();
+  expect(ws.sent.slice(before).map((raw) => JSON.parse(raw as string))).toEqual([{ type: "park" }]);
+  expect(parkedReady).toHaveBeenCalledOnce();
   expect(Socket.all).toHaveLength(1);
   session.close();
 });

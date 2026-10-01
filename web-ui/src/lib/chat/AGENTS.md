@@ -323,29 +323,49 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
   chrome the same way rather than inlining it into the host.
 
 Remote chats (Pro): attaching and reconnecting are passive; there is no wake
-button. The account keeps a sleeping cloud machine's sockets open (VIEWING.md,
-"A sleeping cloud machine's sockets"), and a native window's daemon passes
-straight through to it: `ChatSocket.send` on an open socket is simply sent
-(never a wake redial), `QUIET_OPEN_MS` after authentication a socket that
-heard nothing is `store.held` (not live, so a send shows as `store.sending`;
-not reconnecting, so no "Reconnecting…" row, no rail pulse and no "·
-reconnecting" in the header), `{"type":"waking"}` shows the unconfirmed send
-as `store.sending` even when the socket still looked live, and a second
-`ready` on the same socket is a reattach: `onReady` resets nothing, `apply`'s
-seq guard drops what the store has, the pending bubble waits for its echo.
-`remote_unavailable` ends `held`. A kept socket that drops is dialed again
-before the placement's "suspended" parks it. The rest of this paragraph is the
-fallback for an account that refuses or closes those sockets, and for another
-computer as owner. In a native window the daemon holds the first command while a paused
+button. A keeper may keep a sleeping cloud machine's sockets open (it marks them
+`X-Chimaera-Sockets: kept`; VIEWING.md, "A sleeping cloud machine's sockets";
+none is deployed as this is written), and a native window's daemon then passes
+straight through to it. `ChatSocket.send` on an open socket is simply sent
+(never a wake redial). `QUIET_OPEN_MS` after authentication a socket that
+heard nothing is `store.held` (not live, so a send shows pending; not
+reconnecting, so no "Reconnecting…" row, no rail pulse and no "· reconnecting"
+in the header; before the first replay a viewed cloud conversation shows the
+wake hint, `waitsForCloud`). `{"type":"waking"}` shows unconfirmed sends as
+pending even when the socket still looked live, and a second `ready` on the
+same socket is a reattach: `onReady` resets nothing, `apply`'s seq guard drops
+what the store has, pending bubbles wait for their echoes. `worker_asleep`
+ends `held`; so does `remote_unavailable`, which also ends `connected` and
+`waking`: with `reason:"reconnecting"` (a relay retrying) that lasts until the
+next frame, without it (a hand-back) the socket is still kept and `held`
+returns after the quiet window. A kept socket that drops is dialed again
+before the placement's "suspended" parks it.
+
+Sends (both kinds of keeper): `store.unconfirmed` is a FIFO of accepted sends,
+`store.sending` the ones shown as "sending…" bubbles (several at once). An
+echo (`user_message`, no origin) confirms the send whose text it carries
+(else the oldest). `command_failed` for `send`/`send_after_turn` hands back
+the oldest (the newest for `reason:"waking"`/`"bringing"`, which refuse the
+send that just arrived) through `restoredDraft` / `takeRestoredDraft` (a
+queue; ChatView drains it, each text as its own paragraph). A socket that ends
+with unconfirmed sends orphans them (`onDisconnected`; the pool says so too
+when it heals a dead socket): the next `ready` names the replay's `head`, and
+an orphan still without its echo once `lastSeq` reaches it never reached the
+agent and is handed back (`settleOrphans`); an exit hands back everything. A
+move no longer forgets a send: the `ready` from where the conversation runs
+next decides it.
+
+The rest of this paragraph is what happens against a keeper that refuses or
+closes those sockets (today's), and for another computer as owner. In a native window the daemon holds the first command while a paused
 owner wakes (the additive `{"type":"waking"}` → `store.waking`, "Waking the
 cloud machine…"), refuses further commands until it answers, and answers
 anything it cannot deliver with `command_failed`. Every refusal carries the
-additive `command` it answers; the store keeps the composer's last accepted
-send with its pictures (`noteSent`) until its user echo and hands it back
+additive `command` it answers; the store keeps each accepted send with its
+pictures (`noteSent`) until its user echo and hands it back
 (`restoredDraft` → `insertIntoComposer` + `attachImageToComposer`) only for
-`command:"send"` — never for a refused interrupt/permission answer, which could
-resurrect a delivered message. A send accepted while not live shows at once as
-`store.sending` ("sending…") until its echo. Acting on a conversation another
+`command:"send"` / `"send_after_turn"` — never for a refused interrupt/permission
+answer, which could resurrect a delivered message. A send accepted while not
+live shows at once in `store.sending` ("sending…") until its echo. Acting on a conversation another
 of the user's computers runs brings its work here: the daemon holds the send
 and says `{"type":"bringing","to":"here"}` (a browser view's gateway says
 `to:"computer"` when a phone's send on a sleeping cloud goes to a computer) →
@@ -396,3 +416,5 @@ line itself (`TransferNote`'s `kept` prop) instead of a second divider. The line
 nothing waits for a choice.
 `store.awaitingWake` (`hydrating && asleep`) replaces the loading line with one quiet sentence while
 the owner sleeps before the first replay; a wake (`waking`) hands back to the ordinary loading line.
+ChatView's `waitsForCloud` shows the same sentence for a kept, quiet socket (`held`) of a viewed
+conversation that runs on a cloud machine (`net/placement.ts` `ownerIsCloud`), never for a local chat.

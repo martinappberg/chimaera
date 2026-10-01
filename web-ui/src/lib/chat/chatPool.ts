@@ -110,7 +110,11 @@ export function acquireChat(sessionId: string): { store: ChatStore; socket: Chat
     pool.set(sessionId, entry);
   } else if (!entry.socket.healthy) {
     // The socket died while parked; heal it without losing the transcript.
+    // The store never heard it end (a fatal or ended socket reports no
+    // drop): say so now, so sends it left unconfirmed are decided by the new
+    // socket's `ready` instead of waiting on an echo that cannot come.
     entry.socket.close();
+    entry.store.onDisconnected();
     entry.socket = makeSocket(sessionId, entry.store);
     entry.lastUsed = ++tick;
   } else {

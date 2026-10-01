@@ -53,11 +53,13 @@ export const UNKNOWN_SESSION_RETRIES = 12;
 
 /**
  * A chat or terminal socket that authenticated and has heard nothing for this
- * long is open and kept, not reconnecting: the account in front of a sleeping
- * cloud machine (or this computer's relay to it) keeps the connection, takes
- * what is sent and delivers it once the machine answers. A connection that
- * closes sooner was refused. Shorter than the 2 s grace before a view says
- * "Reconnecting…", so a kept socket never shows it.
+ * long is open and kept, not reconnecting. A browser cannot read the mark a
+ * keeper puts on a socket it keeps (`X-Chimaera-Sockets: kept`), so this
+ * silence is how the UI knows: a keeper that keeps a sleeping cloud machine's
+ * sockets (directly, or behind this computer's relay) takes what is sent and
+ * delivers it once the machine answers, and says nothing until then. A
+ * connection that closes sooner was refused. Shorter than the 2 s grace
+ * before a view says "Reconnecting…", so a kept socket never shows it.
  */
 export const QUIET_OPEN_MS = 1500;
 

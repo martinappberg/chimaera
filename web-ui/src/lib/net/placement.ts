@@ -50,8 +50,8 @@ export interface OwnerNote {
    *  must not say it a second time. */
   reconnectingShown?: boolean;
   /** The view's own socket to the owner is answered, or open and kept for it
-   *  (the account keeps a sleeping cloud machine's sockets): the row's failed
-   *  roster read is not this view reconnecting. */
+   *  (by a keeper that keeps a sleeping cloud machine's sockets): the row's
+   *  failed roster read is not this view reconnecting. */
   reachable?: boolean;
 }
 
@@ -166,6 +166,19 @@ function noteProjectWhere(placement: WorkspacePlacement): void {
  *  (`suspended`). A socket that drops meanwhile parks instead of retrying. */
 export function ownerSuspended(): boolean {
   return gatewayWorkspace() !== null && lastSuspended;
+}
+
+/** Whether a viewed conversation's owner is a cloud machine: a routed row
+ *  names its host; a browser view of a project knows from its latest
+ *  placement read (`project`); a browser view of one host names it in its
+ *  path. False for a conversation on this computer. */
+export function ownerIsCloud(placement: unknown, project: ProjectWhere | null): boolean {
+  if (typeof placement === "object" && placement !== null) {
+    const remote = (placement as { remote?: unknown }).remote;
+    return typeof remote === "string" && remote.startsWith("worker-");
+  }
+  if (gatewayWorkspace() !== null) return project?.where === "cloud";
+  return gatewayPrefix().startsWith("/app/worker-");
 }
 
 /** A project view's machine in plain words for its status strip and Home:

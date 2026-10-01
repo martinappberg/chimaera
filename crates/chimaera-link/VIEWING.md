@@ -119,101 +119,139 @@ does, the native proxy relaxes the probe: mutations (and explicitly wake-marked
 requests) are forwarded — the transport wakes the owner, which re-checks scope on
 every write — with a 120 s response budget; passive reads are forwarded with no
 wake marker and are answered from the transport's cache or with `worker_asleep`;
-a socket attach stays passive: for a cloud machine the proxy attaches at once
+a socket attach stays passive: for a cloud machine the proxy makes one attach
 without a wake marker (next paragraph), and when the transport refuses that
-attach it does not connect. (The transport half — answering the probe from
+attach, or refused one in the last five minutes, it does not connect. (The transport half — answering the probe from
 placement state with the scope headers — is a service requirement.)
 
-**A sleeping cloud machine's sockets.** Additive (2026-09-30). No device is
-told that a cloud machine is asleep: the account's transport is the machine's
-front door. For a `worker-` host it accepts the WebSocket upgrade of
-`/ws/chat/{id}`, `/ws/sessions/{id}` and `/ws/events` whether the machine is
-awake or asleep, with or without wake intent, and it never closes such a
-socket because the machine suspended or resumed. On a suspension it closes
-only its own connection to the machine; the viewer's side stays open and quiet
-(pings are answered). It closes the viewer's side only when the viewer closes,
-the outer authorization ends, the machine was replaced (a new boot or a new
-daemon credential), the daemon closed for a reason that is not the suspension
-(an ownership change, `workspace_scope_changed` with close 1013, an exit), or
-a cap below is exceeded. A transport either refuses a passive upgrade to a
-sleeping machine (503 `worker_asleep`, the older behavior) or keeps it;
-accepting and then closing reads as a dropped connection.
+**A sleeping cloud machine's sockets.** Additive (2026-09-30); a contract for
+a keeper that keeps a cloud machine's sockets, which a keeper need not be.
+Such a keeper is the machine's front door, so that no device has to be told
+the machine is asleep. It marks **every** WebSocket upgrade it accepts for a
+`worker-` host with the response header `X-Chimaera-Sockets: kept`, whether
+the machine is awake or asleep at that moment; a keeper that does not send it
+is the older kind (it answers a passive upgrade to a sleeping machine 503
+`worker_asleep` and closes sockets when the machine suspends), and clients
+must work with both. The header alone tells the two apart: what a probe or a
+placement read said a moment ago does not.
 
-The viewer's first frame is its authentication. The transport remembers it,
-with the request it forwarded, and attaches with it again later: a chat's
+A keeping keeper accepts the upgrade of `/ws/chat/{id}`, `/ws/sessions/{id}`
+and `/ws/events` whether the machine is awake or asleep, with or without wake
+intent, and never closes such a socket because the machine suspended or
+resumed. On a suspension it closes only its own connection to the machine;
+the viewer's side stays open and quiet (pings are answered). It closes the
+viewer's side only when the viewer closes, the outer authorization ends, the
+machine was replaced (a new boot or a new daemon credential), the daemon
+closed for a reason that is not the suspension (an ownership change,
+`workspace_scope_changed` with close 1013, an exit), or a cap below is
+exceeded.
+
+The viewer's first frame is its authentication. The keeper remembers it, with
+the request it forwarded, and attaches with it again later. A chat's
 `last_seq` is raised to the highest sequence number relayed on this socket
 (`seq` of an `ev` frame and of every entry of a `batch`), so the daemon
-replays exactly the gap. A terminal's frame carries the grid and `parked` of
-the moment it was sent; a transport may keep them current from the viewer's
-later `resize`, `park` and `unpark`, and the client settles any difference at
-`ready` either way.
+replays exactly the gap. A terminal's later `resize`, `park` and `unpark`
+text frames are folded into the remembered frame (its `cols`/`rows` and
+`parked`), so every attach uses the grid and park state the viewer has now.
 
-While nothing is attached, what the user does is held: a chat's commands (up
-to 4 frames and 12 MiB per socket) and a terminal's typing, which is its
-binary frames (up to 64 KiB per socket), at most 12 MiB across the transport.
-The first held frame asks the account to wake the machine; the transport then
-attaches with wake intent, replays the authentication, waits for the daemon's
-`ready` and delivers the held frames once, in order. Frames that arrive during
-the wake join the queue. When it starts holding, the transport sends the
-viewer the existing `{"type":"waking"}` frame, once per wake; a client shows a
-send made on a socket that still looked live as "sending…" from that frame.
-Frames that are not the user acting are never held, never wake the machine and
-count toward no cap: a terminal's text frames (grid control: `resize`, `park`,
-`unpark`) and everything an events socket sends (its `watch` registration). A
-transport with nothing attached drops them, and the client sends that state
-again after every attach (below).
+What the user does is held whenever the daemon has not answered `ready` on
+the current attach: while nothing is attached, and also after an attach until
+its `ready`. Held are a chat's commands (up to 4 frames and 12 MiB per
+socket) and a terminal's typing, which is its binary frames (up to 64 KiB per
+socket), at most 12 MiB across the keeper. The first held frame asks the
+account to wake a sleeping machine; the keeper then attaches with wake
+intent, replays the authentication, waits for the daemon's `ready` and
+delivers the held frames once, in order. Frames that arrive during the wake
+join the queue. When it starts holding, the keeper sends the viewer the
+existing `{"type":"waking"}` frame, once per wake; a client shows a send made
+on a socket that still looked live as "sending…" from that frame. Frames that
+are not the user acting are never held, never wake the machine and count
+toward no cap: a terminal's text frames (folded, as above, and passed on when
+attached) and everything an events socket sends (its `watch` registration,
+dropped while nothing is attached; the client sends it again after every
+attach, below).
 
 When the machine cannot be attached within 150 s, a cap is exceeded, the
 daemon refuses the attach, or ownership moved while holding, every held chat
 command is handed back with the refusals of the next paragraph
 (`command_failed` tagged with its `command`, so a send returns to the
-composer, then `remote_unavailable`) and held typing with `read_only`,
-`reason:"reconnecting"`. A refused wake is handed back the same way with its
-reason. Held input lives in memory only, is never logged and is handed back
-when the authorization ends. Input is delivered only to the project's owner
-at the current epoch.
+composer) and held typing with `read_only`, `reason:"reconnecting"`, followed
+by one `remote_unavailable` without a `reason`. A refused wake is handed back
+the same way with its reason. The socket stays open and kept after a
+hand-back. Held input lives in memory only and is never logged. Input is
+delivered only to the project's owner at the current epoch.
 
-When the machine is awake again for any reason, the transport attaches every
+**Delivered, handed back, or discarded.** When the viewer's side of a kept
+socket closes while frames are still held, the keeper discards them: nothing
+is ever delivered for a socket that is gone. So for every send the client
+knows the outcome without the keeper's help: its echo (`user_message`), a
+refusal, or, when its socket ended first, the next `ready`: an echo in that
+attach's replay means it was delivered, and none by the replay's `head` means
+it never was, and the client puts the text back into the composer as it does
+for a refusal.
+
+When the machine is awake again for any reason, the keeper attaches every
 socket it kept, on its own, with the remembered authentication. An events
 socket has no `ready`: once attached, frames pass, and the daemon's first
 frames are its full snapshots.
 
-Both sides stay compatible: clients work against a transport that does none of
-this, and a transport that does serves a client that parks and reconnects the
-older way. What clients do:
+What clients do, against either kind of keeper:
 
 - A second `ready` on one socket is a reattach. A chat keeps its transcript
-  and drops every event at or below the last `seq` it applied; a pending send
-  stays pending until its echo. A terminal resets and takes the snapshot that
-  follows, as after a reconnect, then sends its current grid when `ready`
-  names another one, `park` when it was parked since its authentication and
-  `unpark` (which repaints) when it was shown since a parked one.
-- A socket that is open, authenticated and quiet is healthy. After 1.5 s
-  without a frame the UI counts it as kept: no "Reconnecting…", no retry
-  timer, no reconnecting indicator. A send, a decision or a keystroke on an
-  open socket is simply sent. A kept socket that later drops is dialed again
-  before anything is concluded from the placement.
+  and drops every event at or below the last `seq` it applied; pending sends
+  stay pending until their echoes. A terminal treats it as a reconnect's
+  `ready`, answering its auth frame with the `park`/`unpark` it sent since
+  folded in. After a shown attach it resets and takes the snapshot that
+  follows, then sends its grid when `ready` names another one; hidden with
+  its `park` not yet sent, it sends only `park` (a hidden terminal never
+  resizes the PTY). After a parked attach no snapshot follows: a hidden
+  terminal discards its buffer and repaints when shown, and a shown one
+  whose `unpark` never went out resets, sends its grid and `unpark` (which
+  repaints).
+- A browser cannot read the upgrade's header, so the UI infers a kept socket:
+  open, authenticated and without a frame for 1.5 s is kept (no
+  "Reconnecting…", no retry timer, no reconnecting indicator). A send, a
+  decision or a keystroke on an open socket is simply sent. A kept socket
+  that later drops is dialed again before anything is concluded from the
+  placement. `worker_asleep` at any time means the socket is not kept.
+- `remote_unavailable` ends a wake that was under way and means "not live
+  until the next `ready`". With `reason:"reconnecting"` it is a relay that
+  cannot reach the owner and keeps trying: the view says "Reconnecting…"
+  until the next frame. Without it (a hand-back) the socket is still kept,
+  and quiet for 1.5 s again returns to the kept presentation.
+- Several sends can be pending at once, each shown as its own "sending…"
+  bubble. An echo confirms the send whose text it carries; a refusal answers
+  the oldest (the newest for `reason:"waking"`/`"bringing"`, which refuse the
+  send that just arrived); `send_after_turn` is a send.
 - An events client sends its `watch` registration again whenever a `settings`
   frame arrives on a gateway socket: the daemon sends one per attach, and a
   registration lives on the daemon's side of one attach.
-- The native proxy probes as above and, for a sleeping `worker-` owner,
-  attaches at once without wake intent. Accepted: it passes frames straight
-  through in both directions, holds nothing and tells the viewer nothing
-  (before the first `ready` it passes only input; grid control waits for the
-  `ready` reconcile). Refused: the next paragraph applies unchanged, and that
-  viewer socket does not try again. A viewer already told `remote_unavailable`
-  is closed instead of being left saying so, and its reconnect attaches
-  quietly. The proxy's events feed attaches the same way, sends no
-  registration before the owner's first frame, and registers again on every
-  `settings` frame.
+- The native proxy reads the header on the upgrade it makes, and nothing else
+  decides. Kept: it passes every frame straight through in both directions
+  from the first moment, holds nothing and tells the viewer nothing, whatever
+  its scope probe said (a cached "awake" may be seconds stale); when such a
+  socket ends (the keeper's side closes, or the project changes owner, which
+  also says `moved`) it only closes the viewer's socket, and the viewer's
+  client decides its pending sends at the next `ready`. Not kept: the next
+  paragraph applies unchanged. For a `worker-` owner its probe reports
+  asleep, the proxy makes one passive attach (no wake marker) to find out; a
+  refusal, or an unmarked accept that closes before `ready`, is remembered
+  for that host's transport for five minutes, during which no further passive
+  attach is made (viewer sockets and feed retries behave as before). A viewer
+  already told `remote_unavailable` with nothing held is closed when a kept
+  attach succeeds, so its reconnect attaches quietly. The proxy's events feed
+  attaches the same way, sends no registration before the owner's first frame
+  on a kept or sleeping attach, and registers again on every `settings` frame
+  of a `worker-` owner (a computer's feed is as before).
 
 **Reconnects, held input and moves.** Viewing is passive; doing wakes. This is
 what the native proxy does for an owner that is another computer, for one
-that cannot be reached, and for a sleeping cloud machine whose transport keeps
-no sockets (the paragraph above replaces it otherwise). A native
+that cannot be reached, and for a cloud machine whose keeper does not mark its
+sockets kept (the paragraphs above replace it otherwise). A native
 window's chat/terminal socket to its own daemon stays open while the owner is
-unreachable or asleep (`remote_unavailable` / `worker_asleep`, both non-fatal);
-the daemon retries the owner on its own (2 s doubling to 30 s). The first real
+unreachable or asleep (`remote_unavailable` with the additive
+`reason:"reconnecting"`, the relay's own lasting state / `worker_asleep`, both
+non-fatal); the daemon retries the owner on its own (2 s doubling to 30 s). The first real
 input — terminal bytes or any chat command — is held (≤64 KiB of typing, ≤4 chat
 commands, and ≤64 MiB across every socket of the daemon), opens the owner's
 socket with `?wake=interaction`, and is delivered exactly once, in order, right
@@ -226,8 +264,10 @@ cannot be delivered is answered, never dropped: each chat command gets
 `command_failed` (the UI puts a refused send's text and pictures back into the
 composer); typing gets `read_only` with `reason:"reconnecting"`. Every chat
 refusal carries the additive `command` it answers (`send`, `interrupt`,
-`permission`…), and a client restores a draft only for `command:"send"`.
-Nothing is resent automatically.
+`permission`…), and a client restores a draft only for `command:"send"` or
+`"send_after_turn"`. Nothing is resent automatically. A viewer socket that
+closes while this relay still holds input loses that input here; the client
+then finds no echo after its next `ready` and restores the text itself.
 
 When the route is a `device-` route (another of the user's computers owns the
 project) and this computer can take it, the first real input instead brings
@@ -275,7 +315,7 @@ closes; a change of only the host's transport (a tunnel rebind or a new
 credential for the same owner) closes quietly and the client reconnects to the
 same owner. A scoped viewer whose connection changed hears
 `workspace_scope_changed` first. Browser views have no local daemon to hold
-input: an open socket takes it (the transport in front of a cloud machine
+input: an open socket takes it (a keeper that keeps a cloud machine's sockets
 holds it), and a send or keystroke into a dropped socket reconnects once with
 wake intent, and that action is not queued (a terminal says so over the pane).
 
@@ -303,9 +343,10 @@ counter and different per registration, so a local-to-routed switch (or back,
 or between owners) always refetches. A feed ends as soon as its route changes
 (a registration notifies it; a 2 s tick backs that up) and restarts with
 backoff; the window's socket never closes for an owner change. A sleeping
-cloud machine's feed stays open and quiet when its transport keeps it, and
-ends (to be retried, 1 s doubling to 30 s) when the transport refuses it; a
-sleeping computer's is not opened.
+cloud machine's feed stays open and quiet when its keeper keeps it, and ends
+(to be retried, 1 s doubling to 30 s, without another attach while the
+refusal is remembered) when the keeper refuses it; a sleeping computer's is
+not opened.
 `remote_unavailable` and `workspace_scope_changed` on an events socket mean
 "reconnect", not "rejected".
 

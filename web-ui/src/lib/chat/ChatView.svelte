@@ -16,7 +16,7 @@
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { attachImageToComposer, insertIntoComposer, registerFollow } from "./composerBus";
   import { isBrowserGateway } from "../net/base";
-  import { pauseLabel, placementLabel, sessionPause } from "../net/placement";
+  import { ownerIsCloud, pauseLabel, placementLabel, projectWhere, sessionPause } from "../net/placement";
   import { accountSignedOut } from "../net/plan";
   import { pausedConnect } from "../pro/providers";
   import { canOpenOnboarding, cloudOnboarding } from "../pro/onboarding.svelte";
@@ -1436,13 +1436,17 @@
     return accepted;
   }
 
-  // A refused send's text goes back into this chat's composer, once.
+  // An undelivered send's text goes back into this chat's composer, once.
+  // Several can come back together (every send a wake was holding): each as
+  // its own paragraph, in the order they were sent.
   $effect(() => {
     if (store.restoredDraft === null) return;
-    const draft = store.takeRestoredDraft();
-    if (draft === null) return;
-    if (draft.text.length > 0) insertIntoComposer(session.id, draft.text);
-    for (const image of draft.images) attachImageToComposer(session.id, image);
+    untrack(() => {
+      for (let draft = store.takeRestoredDraft(); draft !== null; draft = store.takeRestoredDraft()) {
+        if (draft.text.length > 0) insertIntoComposer(session.id, draft.text, "block");
+        for (const image of draft.images) attachImageToComposer(session.id, image);
+      }
+    });
   });
 
   /** One never-lose-a-click path for every interactive AgentCommand. A closed
@@ -2093,6 +2097,21 @@
   /** A project viewed from another device (a routed row, or a browser view of
    *  a project). An ordinary local chat never grows connection chrome. */
   const viewed = $derived(typeof session.placement === "object" || isBrowserGateway());
+  /** Nothing to load yet and no end to a loading line: the first replay
+   *  waits on a cloud machine that sleeps. Either its relay said so
+   *  (`awaitingWake`), or the socket is kept open for it and has heard
+   *  nothing (until a send goes out, which is what wakes it); only a viewed
+   *  conversation in the cloud, never a local one whose daemon is merely
+   *  slow to answer. */
+  const waitsForCloud = $derived(
+    store.awaitingWake ||
+      (store.hydrating &&
+        store.held &&
+        !store.waking &&
+        store.sending.length === 0 &&
+        viewed &&
+        ownerIsCloud(session.placement, $projectWhere)),
+  );
   /** Name a dropped connection only after a short grace, so the first
    *  handshake and a quick reconnect never flash a status row. A socket that
    *  is open and kept for an owner that has not answered (`held`) is not
@@ -2654,9 +2673,32 @@
     <!-- One real reading column (the Claude Desktop measure): agent prose
          fills it from the left, user bubbles right-align inside it. -->
     <div class="column" bind:this={columnEl}>
-    {#if store.awaitingWake}
+    <!-- Sends made while the conversation is not live (paused, waking,
+         reconnecting): each shown at once, so nobody sends it twice. Its echo
+         replaces it; a send that was not delivered goes back to the composer. -->
+    {#snippet unconfirmedBubbles()}
+      {#if store.sending.length > 0}
+        <div class="pending" aria-live={visible ? "polite" : "off"}>
+          {#each store.sending as pending (pending.key)}
+            <div class="msg user pending-msg">
+              <div class="bubble-row">
+                <div class="bubble">
+                  <UserText text={pending.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />
+                </div>
+              </div>
+              <span class="delivery">sending…</span>
+              {#if pending.images > 0}
+                <span class="attach">{pending.images} image{pending.images > 1 ? "s" : ""}</span>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      {/if}
+    {/snippet}
+    {#if waitsForCloud}
       <!-- Asleep before the first replay: nothing to load yet, and no spinner
-           for a wait that only a send ends (the footer says the same). -->
+           for a wait that only a send ends (the footer says the same when a
+           relay said the machine is asleep). -->
       <div class="empty asleep-note" role="status">
         <span>The conversation shows once the cloud wakes. Sending a message wakes it.</span>
       </div>
@@ -2665,6 +2707,9 @@
         <SessionGlyph kind="agent" {agentKind} size={18} state="alive" />
         <span>loading recent conversation…</span>
       </div>
+      <!-- A send made before the first replay shows under the loading line
+           instead of vanishing from the composer. -->
+      {@render unconfirmedBubbles()}
     {:else}
     {#if store.blocks.length === 0 && store.exited === null}
       <div class="empty">
@@ -3107,24 +3152,7 @@
         {/each}
       </div>
     {/if}
-    <!-- A send made while the conversation is not live (paused, waking,
-         reconnecting): shown at once, so nobody sends it twice. Its echo
-         replaces it; a refusal hands the text back to the composer. -->
-    {#if store.sending !== null}
-      <div class="pending" aria-live={visible ? "polite" : "off"}>
-        <div class="msg user pending-msg">
-          <div class="bubble-row">
-            <div class="bubble">
-              <UserText text={store.sending.text} onOpenPath={openProsePath} resolvePaths={prosePaths} />
-            </div>
-          </div>
-          <span class="delivery">sending…</span>
-          {#if store.sending.images > 0}
-            <span class="attach">{store.sending.images} image{store.sending.images > 1 ? "s" : ""}</span>
-          {/if}
-        </div>
-      </div>
-    {/if}
+    {@render unconfirmedBubbles()}
     {/if}
 
     {#if hasDeferredActivity || !atBottom}

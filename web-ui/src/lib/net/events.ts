@@ -122,10 +122,11 @@ interface ServerEventFrame {
  * state/title/name. Replaces the sessions poll while connected; reconnects
  * forever with exponential backoff on unclean closes.
  *
- * An open socket that says nothing is healthy, however long: in a browser
- * view the account keeps a sleeping cloud machine's socket open and attaches
- * it again by itself once the machine wakes. No timer watches for silence and
- * nothing is retried; the machine's first frames after each attach are the
+ * An open socket that says nothing is healthy, however long: no timer watches
+ * for silence and nothing is retried. That matters in a browser view behind a
+ * keeper that keeps a sleeping cloud machine's sockets open (VIEWING.md, "A
+ * sleeping cloud machine's sockets") and attaches them again by itself once
+ * the machine wakes: the machine's first frames after each attach are the
  * same full snapshots as after a connect, so state is fresh again, and the
  * `settings` frame among them re-sends this window's registration (it lives
  * on the daemon's side of one attach).
@@ -269,7 +270,7 @@ export class EventsSocket {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.handlers.onSettings?.(msg.settings);
         // A daemon sends its settings once per attach (and when they change,
-        // which is rare), and an account that kept this socket open across
+        // which is rare), and a keeper that kept this socket open across
         // its machine's sleep has just attached it afresh: register again.
         // The first one after a connect repeats the registration sent with
         // authentication, which may not have reached a sleeping machine;

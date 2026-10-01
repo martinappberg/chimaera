@@ -261,8 +261,9 @@ it("a project view parks when its placement says the owner sleeps, and dials onc
   socket.close();
 });
 
-// The account keeps a sleeping cloud machine's sockets open (VIEWING.md, "A
-// sleeping cloud machine's sockets"); so does this computer's relay to it.
+// Against a keeper that keeps a sleeping cloud machine's sockets open (it
+// marks them `X-Chimaera-Sockets: kept`; VIEWING.md, "A sleeping cloud
+// machine's sockets"), directly or through this computer's relay.
 
 it("a socket kept open for an owner that has not answered is healthy, and a send goes out on it", async () => {
   const h = handlers();
@@ -311,27 +312,72 @@ it("a second ready on the same socket is one more ready, in order with the gap i
   socket.close();
 });
 
-it("an owner that cannot be reached is not a kept socket", async () => {
+it("a relay that cannot reach the owner is not a kept socket, however long it stays quiet", async () => {
   const h = handlers();
   h.onHeld = vi.fn();
   h.onUnreachable = vi.fn();
   const socket = new ChatSocket("s-chat", h);
   Socket.all[0].onopen?.();
-  // Said before the quiet window passed: never counted as kept.
-  Socket.all[0].frame({ type: "error", code: "remote_unavailable", message: "reconnecting" });
-  await vi.advanceTimersByTimeAsync(QUIET_OPEN_MS + 50);
+  // The relay's own word, said before the quiet window passed: never kept.
+  Socket.all[0].frame({ type: "error", code: "remote_unavailable", reason: "reconnecting", message: "reconnecting" });
+  await vi.advanceTimersByTimeAsync(60_000);
   expect(h.onHeld).not.toHaveBeenCalled();
   expect(h.onUnreachable).toHaveBeenCalledOnce();
   socket.close();
-  // Said after it (a relay whose probe timed out): the kept state ends.
+  // A slow answer (its probe can take seconds) lands after the socket
+  // counted as kept: it ends that, and nothing brings it back but a frame.
   const late = new ChatSocket("s-chat", h);
   Socket.all[1].onopen?.();
   await vi.advanceTimersByTimeAsync(QUIET_OPEN_MS + 50);
   expect(h.onHeld).toHaveBeenCalledOnce();
-  Socket.all[1].frame({ type: "error", code: "remote_unavailable", message: "reconnecting" });
-  await drain();
+  Socket.all[1].frame({ type: "error", code: "remote_unavailable", reason: "reconnecting", message: "reconnecting" });
+  await vi.advanceTimersByTimeAsync(60_000);
   expect(h.onUnreachable).toHaveBeenCalledTimes(2);
+  expect(h.onHeld).toHaveBeenCalledOnce();
   late.close();
+});
+
+it("a wake handed back on a kept socket returns to kept, not to reconnecting forever", async () => {
+  const calls: string[] = [];
+  const h = handlers();
+  h.onHeld = vi.fn(() => void calls.push("held"));
+  h.onWaking = vi.fn(() => void calls.push("waking"));
+  h.onUnreachable = vi.fn(() => void calls.push("unreachable"));
+  h.onCommandFailed = vi.fn((_message: string, command: string | null) => void calls.push(`refused ${command}`));
+  const socket = new ChatSocket("s-chat", h);
+  const ws = Socket.all[0];
+  ws.onopen?.();
+  await vi.advanceTimersByTimeAsync(QUIET_OPEN_MS + 50);
+  expect(socket.send({ type: "send", blocks: [] })).toBe(true);
+  expect(socket.send({ type: "send", blocks: [] })).toBe(true);
+  ws.frame({ type: "waking" });
+  // The wake does not arrive: both held sends come back, then the keeper's
+  // "cannot be reached" (no relay's `reason`), and the socket stays open.
+  ws.frame({ type: "error", code: "command_failed", message: "Not sent.", command: "send" });
+  ws.frame({ type: "error", code: "command_failed", message: "Not sent.", command: "send" });
+  ws.frame({ type: "error", code: "remote_unavailable", message: "Your project is reconnecting." });
+  await vi.advanceTimersByTimeAsync(QUIET_OPEN_MS + 50);
+  expect(calls).toEqual(["held", "waking", "refused send", "refused send", "unreachable", "held"]);
+  expect(Socket.all).toHaveLength(1);
+  expect(h.onDisconnected).not.toHaveBeenCalled();
+  socket.close();
+});
+
+it("a slow \"asleep\" after the socket counted as kept is the asleep state, and its close parks", async () => {
+  const h = handlers();
+  h.onHeld = vi.fn();
+  const socket = new ChatSocket("s-chat", h);
+  Socket.all[0].onopen?.();
+  await vi.advanceTimersByTimeAsync(QUIET_OPEN_MS + 50);
+  expect(h.onHeld).toHaveBeenCalledOnce();
+  Socket.all[0].frame({ type: "error", code: "worker_asleep", message: "asleep" });
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(h.onAsleep).toHaveBeenCalledOnce();
+  expect(h.onHeld).toHaveBeenCalledOnce();
+  Socket.all[0].close();
+  await drain();
+  expect(socket.waitingForOwner).toBe(true);
+  socket.close();
 });
 
 it("a kept socket that drops while the owner sleeps is dialed again, and only a refused dial parks", async () => {
@@ -347,8 +393,8 @@ it("a kept socket that drops while the owner sleeps is dialed again, and only a 
   await readPlacement();
   await vi.advanceTimersByTimeAsync(QUIET_OPEN_MS + 50);
   expect(h.onHeld).toHaveBeenCalledOnce();
-  // The account kept this one, so its drop is not "asleep, wait for a send":
-  // an account that keeps sockets takes the next dial too.
+  // This one was kept, so its drop is not "asleep, wait for a send": a
+  // keeper that keeps sockets takes the next dial too.
   Socket.all[0].close();
   await drain();
   expect(h.onAsleep).not.toHaveBeenCalled();
@@ -356,7 +402,7 @@ it("a kept socket that drops while the owner sleeps is dialed again, and only a 
   await vi.advanceTimersByTimeAsync(1_000);
   expect(Socket.all).toHaveLength(2);
   expect(Socket.all[1].url).not.toContain("wake=");
-  // An account that keeps none refuses it: the old wait, with no timer.
+  // A keeper that keeps none refuses it: the old wait, with no timer.
   Socket.all[1].close();
   await drain();
   expect(h.onAsleep).toHaveBeenCalledOnce();

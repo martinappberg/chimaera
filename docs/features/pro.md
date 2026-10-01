@@ -549,30 +549,7 @@ to it is down); opening it never silently starts another local agent.
 
 **Opening is viewing; doing wakes.** Attaching to a chat or terminal, polling
 rosters and watching files never wake a paused cloud project. The first real
-input does: a keystroke, a chat message or a permission answer. The account
-keeps a sleeping cloud machine's chat, terminal and event connections open
-(the service half ships separately; the app works with either): a connection
-opens as usual while the machine sleeps and stays open when it sleeps again,
-what you send or type is taken at once, the account wakes the machine and
-delivers it exactly once, in order, and more messages or typing during the
-wake join the same queue. The message shows as a "sending…" bubble until the
-agent has it; while the machine wakes, a terminal says "Waking the cloud
-machine…" over the pane (as does a chat that had not connected before) and
-echoes nothing until the machine answers. A
-connection that is open and quiet is not "Reconnecting…", and a conversation
-opened for the first time while its machine sleeps shows its loading line
-until something wakes the machine. On a computer the app's daemon passes
-everything straight through and holds nothing itself; when the machine wakes,
-the same connections carry on (a chat receives exactly what it missed, a
-terminal repaints, the window's file and Git updates resume). Anything that
-cannot be delivered is answered, never dropped — a refused message returns to
-the composer with its pictures, and refused typing is said in a small note
-over the terminal. Only a refused *message* comes back: a refused stop or
-permission answer says so without resurrecting a message that may already
-have been delivered.
-
-Against an account service that does not keep those connections, the earlier
-behavior applies unchanged. On a computer,
+input does: a keystroke, a chat message or a permission answer. On a computer,
 the daemon keeps the chat/terminal connection open while the owner is paused or
 reconnecting, holds that first input (a little typing, up to four chat
 commands, within one daemon-wide budget) and delivers it exactly once after the
@@ -594,6 +571,41 @@ no timer until you send or type (which wakes it) or the project answers again
 (its row becomes reachable, or a browser view's placement reads it awake). A
 browser view of a sleeping project still opens: the account reports it as
 `suspended`, which is routed like any owner and never woken by reading.
+
+**When the service keeps the cloud's connections.** The account service may
+keep a sleeping cloud machine's chat, terminal and event connections itself;
+it marks each connection it keeps (`X-Chimaera-Sockets: kept`), and the app
+works with a service of either kind. No service that keeps them is deployed
+as this is written, so the paragraph above is what happens today, with one
+addition: to learn which kind it talks to, the daemon makes one connection
+attempt to a sleeping cloud machine that carries no wake request (a service
+that keeps none refuses it), at most once every five minutes per machine.
+Against a service that keeps them, a connection opens as usual while the
+machine sleeps and stays open when it sleeps again. What you send or type
+goes out at once (on a computer the daemon passes it straight through and
+holds nothing), the service wakes the machine and delivers it once, in order,
+and more messages or typing during the wake join the same queue. Each message
+shows as its own "sending…" bubble until the agent has it; while the machine
+wakes, a terminal says "Waking the cloud machine…" over the pane (as does a
+chat that had not connected before) and echoes nothing until the machine
+answers. A connection that is open and quiet is not "Reconnecting…". A
+conversation opened for the first time while its machine sleeps says "The
+conversation shows once the cloud wakes. Sending a message wakes it." When
+the machine wakes, the same connections carry on: a chat receives exactly
+what it missed, a terminal repaints, the window's file and Git updates
+resume. If the wake does not arrive, every message it was holding comes back
+into the composer, in order.
+
+**A message is delivered or comes back.** With either kind of service, a
+message that is refused returns to the composer with its pictures (several,
+in the order they were sent). Only a *message* comes back: a refused stop or
+permission answer says so without resurrecting a message that may already
+have been delivered. A message whose connection ended before the agent
+confirmed it stays "sending…" until the conversation next answers; if the
+agent has it, it shows in the transcript, and if not, it returns to the
+composer then. Typing that is refused is said in a small note over the
+terminal; typing that was still on its way when a connection ended is not
+replayed.
 
 **Acting brings the work to you; looking doesn't.** When another of your
 computers is running a project and you send a chat message or type into a

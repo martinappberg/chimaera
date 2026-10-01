@@ -65,8 +65,9 @@ it("a rejected socket still gives up and says why", () => {
   events.close();
 });
 
-// The account keeps a sleeping cloud machine's sockets open (VIEWING.md, "A
-// sleeping cloud machine's sockets") and attaches them again when it wakes.
+// Against a keeper that keeps a sleeping cloud machine's sockets open (it
+// marks them `X-Chimaera-Sockets: kept`; VIEWING.md, "A sleeping cloud
+// machine's sockets"), which attaches them again when it wakes.
 
 it("an open socket that says nothing is healthy: no retry and no status change, however long", () => {
   const h = handlers();

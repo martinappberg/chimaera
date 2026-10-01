@@ -1397,8 +1397,9 @@ async fn a_routed_window_with_an_outside_tab_hears_owner_and_local_changes() {
 ///
 /// With `front_door` it is the newer transport instead (VIEWING.md, "A
 /// sleeping cloud machine's sockets"): it takes every socket upgrade itself
-/// whether the owner sleeps or not, and keeps the viewer's side open across
-/// the owner's suspend and resume (see [`FakeTransport::keep`]).
+/// whether the owner sleeps or not, marks it `X-Chimaera-Sockets: kept`, and
+/// keeps the viewer's side open across the owner's suspend and resume (see
+/// [`FakeTransport::keep`]).
 #[derive(Default)]
 struct FakeTransport {
     asleep: std::sync::atomic::AtomicBool,
@@ -1419,6 +1420,14 @@ struct FakeTransport {
     /// Frames a viewer sent after its first while the owner slept, as
     /// `(path, was binary)`: what the front door had to hold or drop.
     detached: std::sync::Mutex<Vec<(String, bool)>>,
+    /// Scope probes (`/api/v1/health`) that reached the transport.
+    probes: std::sync::atomic::AtomicUsize,
+    /// Accept a socket upgrade and drop it at once.
+    drop_accepted: std::sync::atomic::AtomicBool,
+    /// Close every kept socket (the front door's side ends).
+    close_kept: std::sync::atomic::AtomicBool,
+    /// The authentication each kept terminal would attach with now.
+    remembered: std::sync::Mutex<Vec<serde_json::Value>>,
 }
 impl FakeTransport {
     fn serve(self: &Arc<Self>, daemon: Arc<AppState>) -> axum::Router {
@@ -1431,9 +1440,14 @@ impl FakeTransport {
                 async move {
                     let path = request.uri().path().to_owned();
                     let query = request.uri().query().unwrap_or_default().to_owned();
+                    if path == "/api/v1/health" {
+                        transport.probes.fetch_add(1, Ordering::AcqRel);
+                    }
                     if path.starts_with("/ws/") {
                         transport.upgrades.lock().unwrap().push(query.clone());
-                        if transport.front_door.load(Ordering::Acquire) {
+                        let front_door = transport.front_door.load(Ordering::Acquire);
+                        let dropped = transport.drop_accepted.load(Ordering::Acquire);
+                        if front_door || dropped {
                             use axum::extract::FromRequestParts;
                             let (mut parts, _) = request.into_parts();
                             let upgrade = axum::extract::WebSocketUpgrade::from_request_parts(
@@ -1442,15 +1456,26 @@ impl FakeTransport {
                             )
                             .await
                             .unwrap();
-                            transport.kept.lock().unwrap().push(path.clone());
                             let target = if query.is_empty() {
-                                path
+                                path.clone()
                             } else {
                                 format!("{path}?{query}")
                             };
-                            return upgrade
-                                .max_message_size(16 * 1024 * 1024)
-                                .on_upgrade(move |socket| transport.keep(socket, target));
+                            let mut response = if dropped {
+                                upgrade.on_upgrade(|socket| async move { drop(socket) })
+                            } else {
+                                transport.kept.lock().unwrap().push(path);
+                                upgrade
+                                    .max_message_size(16 * 1024 * 1024)
+                                    .on_upgrade(move |socket| transport.keep(socket, target))
+                            };
+                            // Every upgrade a keeping transport accepts says so.
+                            if front_door {
+                                response
+                                    .headers_mut()
+                                    .insert("x-chimaera-sockets", "kept".parse().unwrap());
+                            }
+                            return response;
                         }
                         if transport.asleep.load(Ordering::Acquire) {
                             if !query.contains("wake=interaction")
@@ -1485,14 +1510,17 @@ impl FakeTransport {
     }
 
     /// One viewer socket behind the front door. The first frame is its
-    /// authentication and is remembered. While the owner sleeps nothing is
-    /// attached: what a chat sends (and what a terminal types) is held and
-    /// wakes the owner, which the viewer hears once as `waking`; a terminal's
-    /// grid control and an events registration are neither held nor a reason
+    /// authentication and is remembered. Until the daemon has answered
+    /// `ready` (asleep, waking, or just attached), what a chat sends and what
+    /// a terminal types is held, and wakes a sleeping owner (unless
+    /// `hold_wake`), which the viewer hears once as `waking`. A terminal's
+    /// grid control is never held: it is folded into the remembered
+    /// authentication; an events registration is neither held nor a reason
     /// to wake. Awake, the socket is attached with the remembered frame (a
     /// chat's `last_seq` raised to what this viewer already received) and,
     /// after the daemon's `ready` (an events socket has none), what was held
-    /// is delivered once, in order. A suspension drops only the attach.
+    /// is delivered once, in order. A suspension drops only the attach. When
+    /// the viewer's side closes, what is still held is discarded.
     async fn keep(self: Arc<Self>, mut viewer: axum::extract::ws::WebSocket, target: String) {
         use axum::extract::ws::Message as Viewer;
         use futures::StreamExt;
@@ -1504,6 +1532,12 @@ impl FakeTransport {
             return;
         };
         let mut auth: serde_json::Value = serde_json::from_str(&first).unwrap();
+        let terminal = !chat && !events;
+        let slot = terminal.then(|| {
+            let mut remembered = self.remembered.lock().unwrap();
+            remembered.push(auth.clone());
+            remembered.len() - 1
+        });
         let mut seen = 0u64;
         let mut held: std::collections::VecDeque<Message> = Default::default();
         let mut upstream = None;
@@ -1511,6 +1545,9 @@ impl FakeTransport {
         let mut said_waking = false;
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(20));
         loop {
+            if self.close_kept.load(Ordering::Acquire) {
+                return;
+            }
             let asleep = self.asleep.load(Ordering::Acquire);
             if asleep && upstream.is_some() {
                 upstream = None;
@@ -1544,6 +1581,20 @@ impl FakeTransport {
                         Some(Ok(Viewer::Close(_))) | None | Some(Err(_)) => return,
                         _ => continue,
                     };
+                    if let (Some(slot), Message::Text(text)) = (slot, &frame) {
+                        let control: serde_json::Value =
+                            serde_json::from_str(text).unwrap_or_default();
+                        match control["type"].as_str() {
+                            Some("resize") => {
+                                auth["cols"] = control["cols"].clone();
+                                auth["rows"] = control["rows"].clone();
+                            }
+                            Some("park") => auth["parked"] = serde_json::json!(true),
+                            Some("unpark") => auth["parked"] = serde_json::json!(false),
+                            _ => {}
+                        }
+                        self.remembered.lock().unwrap()[slot] = auth.clone();
+                    }
                     if let (Some(socket), true) = (upstream.as_mut(), ready) {
                         socket.send(frame).await.unwrap();
                         continue;
@@ -1554,7 +1605,9 @@ impl FakeTransport {
                         continue;
                     }
                     held.push_back(frame);
-                    self.asleep.store(false, Ordering::Release);
+                    if !self.hold_wake.load(Ordering::Acquire) {
+                        self.asleep.store(false, Ordering::Release);
+                    }
                     if !said_waking {
                         said_waking = true;
                         let waking = serde_json::json!({"type":"waking"}).to_string();
@@ -1878,8 +1931,12 @@ async fn a_send_that_cannot_reach_the_owner_is_answered_not_dropped() {
             break;
         }
     }
-    // The socket survives the refusal and says what it is waiting for.
-    assert_eq!(next_json(&mut socket).await["code"], "remote_unavailable");
+    // The socket survives the refusal and says what it is waiting for: the
+    // relay's own lasting state, marked so (a keeping transport's hand-back
+    // uses the same code without the reason).
+    let waiting = next_json(&mut socket).await;
+    assert_eq!(waiting["code"], "remote_unavailable");
+    assert_eq!(waiting["reason"], "reconnecting");
     assert_eq!(user_turns(&fixture.capture, "LOST_MESSAGE"), 0);
 }
 
@@ -2177,8 +2234,8 @@ async fn a_transport_that_keeps_a_sleeping_owners_socket_gets_the_viewers_frames
 }
 
 /// The same for a terminal: typing goes to the transport at once and none
-/// of it is refused while the owner wakes; grid control sent before the
-/// owner answers is not passed on (the `ready` reconcile settles the grid).
+/// of it is refused while the owner wakes; grid control goes to the
+/// transport too, which holds none of it and attaches with the grid it names.
 #[tokio::test]
 async fn a_kept_terminal_takes_typing_at_once_and_refuses_none_of_it() {
     use std::sync::atomic::Ordering;
@@ -2243,8 +2300,13 @@ async fn a_kept_terminal_takes_typing_at_once_and_refuses_none_of_it() {
     let path = format!("/ws/sessions/{}", fixture.id);
     assert_eq!(
         *fixture.transport.detached.lock().unwrap(),
-        vec![(path.clone(), true), (path, true)],
-        "only the typing reached the transport before the owner answered"
+        vec![(path.clone(), false), (path.clone(), true), (path, true)],
+        "the resize and both bursts reached the transport before the owner answered"
+    );
+    let remembered = fixture.transport.remembered.lock().unwrap()[0].clone();
+    assert_eq!(
+        (remembered["cols"].as_u64(), remembered["rows"].as_u64()),
+        (Some(100), Some(30))
     );
 }
 
@@ -2351,8 +2413,8 @@ async fn a_kept_feed_registers_when_the_owner_wakes_and_again_after_each_suspens
 }
 
 /// A transport that keeps no sockets for a sleeping owner refuses the feed's
-/// passive attach: the feed ends and is retried, the window's own socket
-/// stays, and nothing asks the owner to wake.
+/// passive attach: the feed ends and is retried without another attach, the
+/// window's own socket stays, and nothing asks the owner to wake.
 #[tokio::test]
 async fn a_refused_feed_for_a_sleeping_owner_leaves_the_window_connected() {
     use std::sync::atomic::Ordering;
@@ -2394,15 +2456,15 @@ async fn a_refused_feed_for_a_sleeping_owner_leaves_the_window_connected() {
         }
     }
     assert!(fixture.transport.asleep.load(Ordering::Acquire));
-    assert!(
-        fixture
-            .transport
-            .upgrades
-            .lock()
-            .unwrap()
-            .iter()
-            .all(String::is_empty),
-        "no attach carried wake intent"
+    // The refusal is remembered for the host: the feed's retries (after one
+    // second, then two) and a viewer's socket cost no further upgrade.
+    tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+    let mut chat = open_chat(&fixture).await;
+    assert_eq!(next_json(&mut chat).await["code"], "worker_asleep");
+    assert_eq!(
+        *fixture.transport.upgrades.lock().unwrap(),
+        vec![String::new()],
+        "one passive attach, without wake intent, and no more"
     );
 }
 
@@ -2439,4 +2501,164 @@ async fn a_viewer_told_reconnecting_is_reconnected_into_the_kept_socket() {
         Vec::<serde_json::Value>::new()
     );
     assert!(fixture.transport.asleep.load(Ordering::Acquire));
+}
+
+/// A scope answer cached while the machine was awake says nothing about now:
+/// a viewer attaching seconds after it suspended reaches a keeping transport
+/// through that stale "awake", and its send must still go straight to the
+/// transport (which wakes the machine), not into this relay's own hold where
+/// nothing would ever ask for a wake.
+#[tokio::test]
+async fn a_stale_awake_answer_still_passes_input_to_a_keeping_transport() {
+    use std::sync::atomic::Ordering;
+    let quiet = std::time::Duration::from_millis(600);
+    let fixture = sleeping_remote_chat("front-door-stale").await;
+    fixture.transport.front_door.store(true, Ordering::Release);
+    // Awake: the first viewer's attach leaves a fresh scope acknowledgment.
+    fixture.transport.asleep.store(false, Ordering::Release);
+    let mut first = open_chat(&fixture).await;
+    while next_json(&mut first).await["type"] != "ready" {}
+    drop(first);
+    // It suspends; the next viewer arrives well inside the cached answer.
+    fixture.transport.asleep.store(true, Ordering::Release);
+    let probes = fixture.transport.probes.load(Ordering::Acquire);
+    let mut socket = open_chat(&fixture).await;
+    assert_eq!(
+        until_quiet(&mut socket, quiet).await,
+        Vec::<serde_json::Value>::new()
+    );
+    assert_eq!(
+        fixture.transport.probes.load(Ordering::Acquire),
+        probes,
+        "the attach rode the cached answer"
+    );
+    socket.send(send_text("STALE_AWAKE")).await.unwrap();
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "error", "{frame}");
+        if frame["type"] == "ready" {
+            break;
+        }
+    }
+    delivered_once(&fixture.capture, "STALE_AWAKE").await;
+    assert!(
+        fixture
+            .transport
+            .detached
+            .lock()
+            .unwrap()
+            .contains(&(format!("/ws/chat/{}", fixture.id), false)),
+        "the send reached the transport while nothing was attached"
+    );
+}
+
+/// A transport that accepts a passive attach to a sleeping machine without
+/// saying it keeps sockets, and then drops it, keeps none: the viewer's
+/// socket ends once, and from then on that host is on the hold-and-wake
+/// path without another passive attempt.
+#[tokio::test]
+async fn a_transport_that_accepts_and_drops_is_remembered_as_keeping_no_sockets() {
+    use futures::StreamExt;
+    use std::sync::atomic::Ordering;
+    let fixture = sleeping_remote_chat("accept-then-close").await;
+    fixture
+        .transport
+        .drop_accepted
+        .store(true, Ordering::Release);
+    let mut socket = open_chat(&fixture).await;
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+            .await
+            .expect("the socket never ended")
+        {
+            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+            Some(Ok(Message::Text(text))) => panic!("unexpected frame {text}"),
+            Some(Ok(_)) => {}
+        }
+    }
+    fixture
+        .transport
+        .drop_accepted
+        .store(false, Ordering::Release);
+    let mut socket = open_chat(&fixture).await;
+    assert_eq!(next_json(&mut socket).await["code"], "worker_asleep");
+    assert_eq!(
+        *fixture.transport.upgrades.lock().unwrap(),
+        vec![String::new()],
+        "no second passive attempt"
+    );
+    socket.send(send_text("AFTER_DROP")).await.unwrap();
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["code"], "command_failed", "{frame}");
+        if frame["type"] == "ready" {
+            break;
+        }
+    }
+    delivered_once(&fixture.capture, "AFTER_DROP").await;
+}
+
+/// Input a keeping transport still holds when the socket ends is discarded
+/// there, never delivered later: this relay closes the viewer's socket (its
+/// client hands the text back when the next `ready` replays no echo). Both
+/// ways a passed-through socket ends: the transport's side closing, and the
+/// project changing owner under it (which also says `moved`).
+#[tokio::test]
+async fn passed_through_input_is_never_delivered_after_its_socket_ended() {
+    use futures::StreamExt;
+    use std::sync::atomic::Ordering;
+    for moved in [false, true] {
+        let fixture = sleeping_remote_chat(if moved {
+            "through-moved"
+        } else {
+            "through-closed"
+        })
+        .await;
+        fixture.transport.front_door.store(true, Ordering::Release);
+        fixture.transport.hold_wake.store(true, Ordering::Release);
+        let mut socket = open_chat(&fixture).await;
+        socket.send(send_text("NEVER_LATE")).await.unwrap();
+        assert_eq!(next_json(&mut socket).await["type"], "waking");
+        if moved {
+            let (status, _) = request(
+                &fixture.local,
+                Method::POST,
+                "/api/v1/pro/placements",
+                Some(serde_json::json!({
+                    "host_id":"worker-next","endpoint":format!("http://{}", fixture.transport_addr),
+                    "token":"test-token","workspace_id":fixture.workspace,"epoch":5
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        } else {
+            fixture.transport.close_kept.store(true, Ordering::Release);
+        }
+        let mut frames = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+                .await
+                .expect("the socket never ended")
+            {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                Some(Ok(Message::Text(text))) => {
+                    frames.push(serde_json::from_str::<serde_json::Value>(&text).unwrap())
+                }
+                Some(Ok(_)) => {}
+            }
+        }
+        let types: Vec<_> = frames
+            .iter()
+            .map(|frame| frame["type"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        let expected: Vec<String> = if moved { vec!["moved".into()] } else { vec![] };
+        assert_eq!(types, expected, "{frames:?}");
+        // The machine wakes afterwards: nothing held for the ended socket
+        // reaches it.
+        fixture.transport.close_kept.store(false, Ordering::Release);
+        fixture.transport.hold_wake.store(false, Ordering::Release);
+        fixture.transport.asleep.store(false, Ordering::Release);
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert_eq!(user_turns(&fixture.capture, "NEVER_LATE"), 0);
+    }
 }

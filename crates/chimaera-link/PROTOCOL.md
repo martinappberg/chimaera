@@ -492,19 +492,27 @@ WebSocket first frame.
 
 ### Sleeping worker sockets
 
-Additive (2026-09-30). For a worker host the keeper accepts the WebSocket
-upgrade of `/ws/chat/{id}`, `/ws/sessions/{id}` and `/ws/events` whether the
-worker is awake or asleep, with or without the wake marker, and keeps the
-client's side open across the worker's suspend and resume. It remembers the
-client's first frame, holds chat commands and terminal typing sent while
-nothing is attached, wakes the worker for them, attaches, replays the first
-frame (a chat's `last_seq` raised to what it already relayed), waits for the
-daemon's `ready` and delivers what it held once, in order; what it cannot
-deliver it hands back with the daemon's own refusal frames. It adds no frame
-type: the one status it sends is the existing `{"type":"waking"}`. A keeper
-that predates this answers a passive upgrade to a sleeping worker with the 503
-above and closes sockets on a suspension; clients handle both. The rules, the
-caps and what clients do are in
+Additive (2026-09-30). A keeper may keep a worker's sockets. One that does
+marks every WebSocket upgrade it accepts for a worker host (101), awake or
+asleep, with the response header `X-Chimaera-Sockets: kept`; a keeper without
+it is the older kind, which answers a passive upgrade to a sleeping worker
+with the 503 above and closes sockets on a suspension. Clients handle both and
+tell them apart by that header only.
+
+A keeping keeper accepts the upgrade of `/ws/chat/{id}`, `/ws/sessions/{id}`
+and `/ws/events` whether the worker is awake or asleep, with or without the
+wake marker, and keeps the client's side open across the worker's suspend and
+resume. It remembers the client's first frame (folding a terminal's later
+`resize`, `park` and `unpark` into it), holds chat commands and terminal
+typing whenever the daemon has not answered `ready` on the current attach
+(nothing attached, or attached and not yet `ready`), wakes the worker for
+them, attaches, replays the first frame (a chat's `last_seq` raised to what
+it already relayed), waits for `ready` and delivers what it held once, in
+order. What it cannot deliver it hands back with the daemon's own refusal
+frames followed by `remote_unavailable`, and keeps the socket open. When the
+client's side closes while frames are still held it discards them and never
+delivers them later. It adds no frame type: the one status it sends is the
+existing `{"type":"waking"}`. The rules, the caps and what clients do are in
 [VIEWING](VIEWING.md#forwarded-requests) ("A sleeping cloud machine's
 sockets"). HTTP requests are unchanged.
 
