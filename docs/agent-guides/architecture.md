@@ -72,7 +72,10 @@ every multiplexer project — budget accordingly.
 scoped to clients that did NOT initiate the resize: the initiator's xterm reflows natively, and
 a full-reset repaint there is visible as flicker + scroll reset (it was the "terminal resets
 when I change the font size" bug). Mechanics: (1) `Session::resize` no-ops on unchanged dims —
-echoed dims from attached clients must never broadcast; (2) each ws connection tracks the dims
+unchanged dims from attached clients must never broadcast. The client suppresses resize
+requests emitted synchronously while adopting a server `resized`/`resync`/reconnect grid:
+no-op checks alone cannot stop stale echoes from undoing a newer resize and feeding an
+unbounded multi-client resize loop; (2) each ws connection tracks the dims
 it last requested and skips the resync for matching `Resized` events; foreign resizes repaint
 after a 120ms coalescing window (divider drags fire in bursts); (3) `resync` frames are
 dimension-tagged and the client resizes its xterm to match BEFORE replaying — a snapshot
