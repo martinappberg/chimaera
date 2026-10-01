@@ -2975,3 +2975,125 @@ async fn cancel_send_wins_before_acceptance_and_loses_after() {
     );
     assert!(fx.manager.kill("s-cancel"));
 }
+
+/// A send at the text limit, full of characters JSON escapes six to one, is
+/// several times too long for one journal line. Its echo is still journaled
+/// with both ids (the text cut), so the client confirms it, a resend is
+/// dropped, and the next daemon life still knows the id.
+#[tokio::test]
+async fn a_send_too_long_for_one_journal_line_keeps_its_ids_and_runs_once() {
+    use chimaera_agent::model::COMMAND_TEXT_TOTAL_MAX;
+    let mut fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-large", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-large", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+    let unit = "\u{1}\"\\\u{7f}";
+    let mut text = String::from("START ");
+    while text.len() + unit.len() + 4 <= COMMAND_TEXT_TOTAL_MAX {
+        text.push_str(unit);
+    }
+    text.push_str(" END");
+    let outcome = fx
+        .manager
+        .send_from_client("s-large", text_send(&text), Some("client-large"))
+        .await
+        .expect("a send at the limit passes ingress");
+    assert_eq!(outcome, SendOutcome::Accepted);
+    let echo = wait_for(&mut rx, &mut seen, "the echo", |ev| {
+        matches!(
+            ev,
+            AgentEvent::UserMessage { .. } | AgentEvent::Error { .. }
+        )
+    })
+    .await;
+    let AgentEvent::UserMessage {
+        text: kept,
+        id: Some(_),
+        client_id: Some(client_id),
+        ..
+    } = &echo.ev
+    else {
+        panic!("the echo lost its ids: {:?}", echo.ev);
+    };
+    assert_eq!(client_id, "client-large");
+    assert!(kept.starts_with("START ") && kept.ends_with(" END"));
+    assert!(kept.len() < text.len() && kept.contains("bytes omitted"));
+    let again = fx
+        .manager
+        .send_from_client("s-large", text_send(&text), Some("client-large"))
+        .await
+        .expect("resend");
+    assert_eq!(again, SendOutcome::Duplicate);
+
+    assert!(fx.manager.kill("s-large"));
+    tokio::time::timeout(WAIT, fx.exits.recv())
+        .await
+        .expect("exit hook fired")
+        .expect("channel open");
+    let restarted = Arc::new(ChatManager::new(
+        fx.manager.journal_dir().clone(),
+        Box::new(|_, _| {}),
+        Box::new(|_, _| {}),
+    ));
+    restarted
+        .spawn(&ClaudeAdapter, spec("s-large", &fx.cwd, "normal"))
+        .expect("spawn again");
+    let after = restarted
+        .send_from_client("s-large", text_send(&text), Some("client-large"))
+        .await
+        .expect("resend after the restart");
+    assert_eq!(after, SendOutcome::Duplicate);
+    assert!(restarted.kill("s-large"));
+}
+
+/// The documented limit of `cancel_send`: a withdrawn id is remembered for
+/// as long as the session's process. After a respawn (a resume, a view
+/// toggle, a daemon restart) the withdrawal is forgotten, and a copy of the
+/// original that turns up only then is accepted and runs. Holders discard
+/// what they hold when its socket closes and answer a cancel for what they
+/// still hold themselves, so no copy should outlive the withdrawal; this
+/// test pins what happens if one does.
+#[tokio::test]
+async fn a_withdrawn_send_id_is_forgotten_with_its_sessions_process() {
+    let mut fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-forgets", &fx.cwd, "normal"))
+        .expect("spawn");
+    assert!(fx
+        .manager
+        .cancel_send("s-forgets", "client-withdrawn")
+        .await
+        .unwrap());
+    assert_eq!(
+        fx.manager.client_id_state("s-forgets", "client-withdrawn"),
+        Some(ClientIdState::Cancelled)
+    );
+    assert!(fx.manager.kill("s-forgets"));
+    tokio::time::timeout(WAIT, fx.exits.recv())
+        .await
+        .expect("exit hook fired")
+        .expect("channel open");
+    // Dead but still registered: the withdrawal stands.
+    assert_eq!(
+        fx.manager.client_id_state("s-forgets", "client-withdrawn"),
+        Some(ClientIdState::Cancelled)
+    );
+    assert!(fx.manager.remove("s-forgets").is_some());
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-forgets", &fx.cwd, "normal"))
+        .expect("respawn");
+    assert_eq!(
+        fx.manager.client_id_state("s-forgets", "client-withdrawn"),
+        None
+    );
+    let late = fx
+        .manager
+        .send_from_client("s-forgets", text_send("late"), Some("client-withdrawn"))
+        .await
+        .expect("the late original");
+    assert_eq!(late, SendOutcome::Accepted);
+    assert!(fx.manager.kill("s-forgets"));
+}

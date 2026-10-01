@@ -1871,15 +1871,14 @@ fn command(frame: serde_json::Value) -> Message {
     Message::Text(frame.to_string().into())
 }
 
-/// The chat commands that are not the user acting: the automatic thinking
-/// push, the reads, a settings change, withdrawing a send, and a command
+/// The chat commands that are neither the user acting nor a setting: the
+/// automatic thinking push, the reads, withdrawing a send, and a command
 /// this daemon has never heard of.
 fn passive_commands(cancel: &str) -> Vec<Message> {
     vec![
         command(serde_json::json!({"type":"set_thinking","enabled":true})),
         command(serde_json::json!({"type":"get_usage"})),
         command(serde_json::json!({"type":"get_mcp"})),
-        command(serde_json::json!({"type":"set_model","model_id":"default"})),
         command(serde_json::json!({"type":"from_the_future","x":1})),
         command(serde_json::json!({"type":"cancel_send","client_id":cancel})),
     ]
@@ -2830,9 +2829,9 @@ async fn an_accepted_socket_that_never_answers_is_a_refusal_after_its_deadline()
 }
 
 /// Only the user acting wakes a sleeping machine. The thinking preference a
-/// chat pushes by itself, the reads, a settings change, `cancel_send` and a
-/// command this daemon does not know are not held and wake nothing: with the
-/// owner asleep they are dropped.
+/// chat pushes by itself, the reads, `cancel_send` and a command this daemon
+/// does not know are not held and wake nothing: with the owner asleep they
+/// are dropped.
 #[tokio::test]
 async fn chat_commands_that_are_not_the_user_acting_never_wake_the_owner() {
     let fixture = sleeping_remote_chat("passive-commands").await;
@@ -2870,8 +2869,8 @@ async fn chat_commands_that_are_not_the_user_acting_never_wake_the_owner() {
     delivered_once(&fixture.capture, "REAL_MESSAGE").await;
     let stdin = std::fs::read_to_string(&fixture.capture).unwrap_or_default();
     assert!(
-        !stdin.contains("set_max_thinking_tokens") && !stdin.contains("set_model"),
-        "a dropped setting must not reach the agent later: {stdin}"
+        !stdin.contains("set_max_thinking_tokens") && !stdin.contains("get_usage"),
+        "a dropped command must not reach the agent later: {stdin}"
     );
 }
 
@@ -2936,4 +2935,236 @@ async fn chat_commands_that_are_not_the_user_acting_never_bring_the_work_here() 
     }
     assert!(bringing, "the send asked to bring the work here");
     assert_eq!(user_turns(&fixture.capture, "BRING_IT"), 0);
+}
+
+/// An account that takes a connection and never answers: a request to bring
+/// the work here stays under way for as long as a test needs it to.
+async fn silent_account() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut open = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            open.push(socket);
+        }
+    });
+    endpoint
+}
+
+/// A chat on another of the user's computers, viewed from a computer that is
+/// bringing its work here: `first` was sent and is held for the move.
+async fn pulling(
+    label: &str,
+    first: Message,
+) -> (
+    SleepingChat,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+) {
+    let fixture = routed_remote(label, false, "device-other", false).await;
+    pro::device_fixture(&fixture.local, &silent_account().await);
+    let mut socket = open_chat(&fixture).await;
+    loop {
+        if next_json(&mut socket).await["type"] == "ready" {
+            break;
+        }
+    }
+    socket.send(first).await.unwrap();
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["code"], "command_failed", "{frame}");
+        if frame["type"] == "bringing" {
+            break;
+        }
+    }
+    (fixture, socket)
+}
+
+/// A holder treats a held send's id as the daemon treats an accepted one.
+/// While the work is coming here the old owner's `ready` reaches the viewer,
+/// whose client sends its unconfirmed send again: that second copy must be
+/// dropped, not refused. A refusal would return the message to the composer
+/// while the first copy is delivered here a moment later. Both ways the copy
+/// "does not fit": four commands already held, and a send over half the
+/// byte bound.
+#[tokio::test]
+async fn a_second_copy_of_a_held_send_is_dropped_never_refused() {
+    let quiet = std::time::Duration::from_millis(400);
+    let refused = |frames: &[serde_json::Value]| -> Vec<String> {
+        frames
+            .iter()
+            .filter(|frame| frame["code"] == "command_failed")
+            .map(|frame| frame["client_id"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+
+    // Four commands held: a fifth is refused, the copy of the first is not.
+    let (fixture, mut socket) =
+        pulling("held-copy-count", send_as("HELD_X", "client-held-x")).await;
+    for n in 1..=3 {
+        socket
+            .send(send_as(&format!("HELD_{n}"), &format!("client-held-{n}")))
+            .await
+            .unwrap();
+    }
+    socket
+        .send(send_as("HELD_X", "client-held-x"))
+        .await
+        .unwrap();
+    let frames = until_quiet(&mut socket, quiet).await;
+    assert!(refused(&frames).is_empty(), "{frames:?}");
+    socket
+        .send(send_as("ONE_TOO_MANY", "client-held-5"))
+        .await
+        .unwrap();
+    let frames = until_quiet(&mut socket, quiet).await;
+    assert_eq!(refused(&frames), ["client-held-5"], "{frames:?}");
+    assert_eq!(user_turns(&fixture.capture, "HELD_X"), 0);
+
+    // One send over half the byte bound: its copy would not fit beside it.
+    let large = |text: &str| {
+        command(serde_json::json!({
+            "type":"send","client_id":"client-large-x","blocks":[
+                {"type":"image","media_type":"image/png","data":"A".repeat(6 * 1024 * 1024)},
+                {"type":"text","text":text}
+            ]
+        }))
+    };
+    let (fixture, mut socket) = pulling("held-copy-bytes", large("LARGE_X")).await;
+    socket.send(large("LARGE_X")).await.unwrap();
+    let frames = until_quiet(&mut socket, quiet).await;
+    assert!(refused(&frames).is_empty(), "{frames:?}");
+    // Another send of that size does not fit, and says so under its own id.
+    socket
+        .send(command(serde_json::json!({
+            "type":"send","client_id":"client-large-y","blocks":[
+                {"type":"image","media_type":"image/png","data":"A".repeat(6 * 1024 * 1024)}
+            ]
+        })))
+        .await
+        .unwrap();
+    let frames = until_quiet(&mut socket, quiet).await;
+    assert_eq!(refused(&frames), ["client-large-y"], "{frames:?}");
+    assert_eq!(user_turns(&fixture.capture, "LARGE_X"), 0);
+}
+
+/// A `cancel_send` for a send the relay holds is answered by the relay: not
+/// withdrawn. Forwarded, it would reach the owner the work is leaving, which
+/// never saw the send and would call it withdrawn; the client would return
+/// the message and the move would then deliver it. While the work is coming
+/// nothing a chat sends goes to that owner at all.
+#[tokio::test]
+async fn a_cancel_for_a_held_send_is_answered_by_the_holder() {
+    let (fixture, mut socket) = pulling("held-cancel", send_as("HELD_X", "client-held-x")).await;
+    socket
+        .send(command(
+            serde_json::json!({"type":"cancel_send","client_id":"client-held-x"}),
+        ))
+        .await
+        .unwrap();
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["code"], "command_failed", "{frame}");
+        if frame["type"] == "send_cancelled" {
+            assert_eq!(
+                frame,
+                serde_json::json!({"type":"send_cancelled","client_id":"client-held-x","cancelled":false})
+            );
+            break;
+        }
+    }
+    // An id the relay does not hold: neither answered here nor passed on.
+    socket
+        .send(command(
+            serde_json::json!({"type":"cancel_send","client_id":"client-unheld"}),
+        ))
+        .await
+        .unwrap();
+    // Nor is the thinking preference a chat pushes by itself.
+    socket
+        .send(command(
+            serde_json::json!({"type":"set_thinking","enabled":false}),
+        ))
+        .await
+        .unwrap();
+    let frames = until_quiet(&mut socket, std::time::Duration::from_millis(400)).await;
+    assert!(
+        frames.iter().all(|frame| frame["type"] != "send_cancelled"),
+        "{frames:?}"
+    );
+    for id in ["client-held-x", "client-unheld"] {
+        assert_eq!(
+            fixture.remote.chat.client_id_state(&fixture.id, id),
+            None,
+            "the owner the work is leaving never heard about {id}"
+        );
+    }
+    let stdin = std::fs::read_to_string(&fixture.capture).unwrap_or_default();
+    assert!(!stdin.contains("set_max_thinking_tokens"), "{stdin}");
+}
+
+/// A setting picked while the owner is away must apply to what the user sends
+/// next: a stricter permission mode picked before a message is in force when
+/// that message runs. The relay holds the seven settings in order with the
+/// input, the latest pick of each winning, and delivers them when the owner
+/// answers. A setting wakes nothing by itself, and one that cannot be held is
+/// refused by name.
+#[tokio::test]
+async fn a_setting_picked_while_the_owner_sleeps_is_held_and_applies_to_the_next_send() {
+    let fixture = sleeping_remote_chat("held-settings").await;
+    let mut socket = open_chat(&fixture).await;
+    assert_eq!(next_json(&mut socket).await["code"], "worker_asleep");
+    for frame in [
+        serde_json::json!({"type":"set_mode","mode_id":"acceptEdits"}),
+        serde_json::json!({"type":"set_model","model_id":"picked-model"}),
+        serde_json::json!({"type":"set_mode","mode_id":"plan"}),
+        serde_json::json!({"type":"get_usage"}),
+    ] {
+        socket.send(command(frame)).await.unwrap();
+    }
+    let frames = until_quiet(&mut socket, std::time::Duration::from_millis(500)).await;
+    assert!(frames.is_empty(), "held quietly: {frames:?}");
+    assert_eq!(
+        *fixture.transport.upgrades.lock().unwrap(),
+        vec![String::new()],
+        "a setting does not wake the owner"
+    );
+    // Too large to be a setting: refused, and it says which command.
+    socket
+        .send(command(
+            serde_json::json!({"type":"set_model","model_id":"m".repeat(20 * 1024)}),
+        ))
+        .await
+        .unwrap();
+    let refused = next_json(&mut socket).await;
+    assert_eq!(refused["code"], "command_failed", "{refused}");
+    assert_eq!(refused["command"], "set_model", "{refused}");
+
+    socket
+        .send(send_as("UNDER_THE_NEW_MODE", "client-after-settings"))
+        .await
+        .unwrap();
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["code"], "command_failed", "{frame}");
+        if frame["type"] == "ready" {
+            break;
+        }
+    }
+    delivered_once(&fixture.capture, "UNDER_THE_NEW_MODE").await;
+    let stdin = std::fs::read_to_string(&fixture.capture).unwrap();
+    let line = |needle: &str| {
+        stdin
+            .lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} never reached the agent: {stdin}"))
+    };
+    let modes: Vec<&str> = stdin
+        .lines()
+        .filter(|line| line.contains("set_permission_mode"))
+        .collect();
+    assert_eq!(modes.len(), 1, "the latest pick only: {modes:?}");
+    assert!(modes[0].contains("\"plan\""), "{modes:?}");
+    assert!(line("set_permission_mode") < line("UNDER_THE_NEW_MODE"));
+    assert!(line("picked-model") < line("UNDER_THE_NEW_MODE"));
+    assert!(!stdin.contains("get_usage"), "{stdin}");
 }

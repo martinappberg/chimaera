@@ -576,8 +576,9 @@ pub(crate) async fn deliver_held(
     }
 }
 
-/// What a chat command frame says about itself, read without parsing the
-/// command (a refused frame may be one this daemon cannot parse).
+/// What a chat command frame says about itself, read without building the
+/// command: a refused frame may be one this daemon cannot parse, and a relay
+/// that only needs a frame's kind must not copy a send's pictures to learn it.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct CommandTag {
     /// Its `type` (`send`, `interrupt`, `permission`…); `None` for anything
@@ -588,30 +589,100 @@ pub(crate) struct CommandTag {
     pub(crate) client_id: Option<String>,
     /// It carries a `client_id` that is not well formed.
     pub(crate) bad_client_id: bool,
+    /// A `rewind` that only asks what it would do.
+    pub(crate) dry_run: bool,
+    /// The `server` an MCP setting names, when it is short enough to be one.
+    pub(crate) server: Option<String>,
+}
+
+/// A frame's `client_id`, whatever JSON it is, without keeping more of it
+/// than an id can be.
+enum IdProbe {
+    Id(String),
+    NotAnId,
+}
+impl<'de> Deserialize<'de> for IdProbe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Probe;
+        impl<'de> serde::de::Visitor<'de> for Probe {
+            type Value = IdProbe;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<IdProbe, E> {
+                Ok(if chimaera_agent::model::valid_client_id(v) {
+                    IdProbe::Id(v.to_owned())
+                } else {
+                    IdProbe::NotAnId
+                })
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<IdProbe, E> {
+                Ok(IdProbe::NotAnId)
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<IdProbe, E> {
+                Ok(IdProbe::NotAnId)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<IdProbe, E> {
+                Ok(IdProbe::NotAnId)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<IdProbe, E> {
+                Ok(IdProbe::NotAnId)
+            }
+            fn visit_unit<E>(self) -> Result<IdProbe, E> {
+                Ok(IdProbe::NotAnId)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<IdProbe, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(IdProbe::NotAnId)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<IdProbe, A::Error> {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(IdProbe::NotAnId)
+            }
+        }
+        deserializer.deserialize_any(Probe)
+    }
 }
 
 pub(crate) fn command_tag(text: &str) -> CommandTag {
+    // Every other field (a send's `blocks` above all) is skipped unread.
     #[derive(Deserialize)]
-    struct Tag {
-        #[serde(rename = "type")]
-        kind: String,
+    struct Tag<'a> {
+        #[serde(rename = "type", borrow)]
+        kind: std::borrow::Cow<'a, str>,
         #[serde(default)]
-        client_id: Option<serde_json::Value>,
+        client_id: Option<IdProbe>,
+        #[serde(default)]
+        dry_run: bool,
+        #[serde(default, borrow)]
+        server: Option<std::borrow::Cow<'a, str>>,
     }
     let Ok(tag) = serde_json::from_str::<Tag>(text) else {
         return CommandTag::default();
     };
-    let client_id = tag.client_id.as_ref().and_then(|id| {
-        id.as_str()
-            .filter(|id| chimaera_agent::model::valid_client_id(id))
-            .map(str::to_owned)
-    });
+    let small =
+        |kind: &str| kind.len() <= 32 && kind.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
     CommandTag {
-        bad_client_id: tag.client_id.is_some() && client_id.is_none(),
-        client_id,
-        kind: Some(tag.kind).filter(|kind| {
-            kind.len() <= 32 && kind.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
-        }),
+        bad_client_id: matches!(tag.client_id, Some(IdProbe::NotAnId)),
+        client_id: match tag.client_id {
+            Some(IdProbe::Id(id)) => Some(id),
+            _ => None,
+        },
+        dry_run: tag.dry_run,
+        server: tag
+            .server
+            .filter(|server| server.len() <= chimaera_agent::model::COMMAND_MCP_SERVER_MAX)
+            .map(|server| server.into_owned()),
+        kind: small(&tag.kind).then(|| tag.kind.into_owned()),
     }
 }
 
@@ -1580,8 +1651,9 @@ async fn handle_chat(
 
 /// Answer a `cancel_send`: one `send_cancelled` saying whether the id was
 /// withdrawn (no send under it was accepted, and none will be), or the same
-/// refusal a send would get where this socket may not act. It is not the user
-/// acting: nothing is recorded as interaction.
+/// refusal a send would get where this socket may not act or the session
+/// does not answer in time (the client asks again at its next `ready`). It is
+/// not the user acting: nothing is recorded as interaction.
 async fn cancel_send(
     state: &Arc<AppState>,
     id: &str,
@@ -1599,11 +1671,19 @@ async fn cancel_send(
             text,
         );
     };
-    match state.chat.cancel_send(id, client_id).await {
-        Ok(cancelled) => {
+    // It waits its turn behind a send that is being queued, which a driver
+    // that takes nothing can stall: bounded like a forwarded viewer's send,
+    // because the caller may hold that viewer's admission while it waits.
+    let answer = tokio::time::timeout(
+        Duration::from_secs(5),
+        state.chat.cancel_send(id, client_id),
+    )
+    .await;
+    match answer {
+        Ok(Ok(cancelled)) => {
             json!({"type": "send_cancelled", "client_id": client_id, "cancelled": cancelled})
         }
-        Err(_) => command_refusal(
+        _ => command_refusal(
             json!({"type": "error", "code": "command_failed", "message": "agent unavailable"}),
             text,
         ),

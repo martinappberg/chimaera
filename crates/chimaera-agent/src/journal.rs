@@ -226,15 +226,21 @@ impl Journal {
                     bytes = line.len(),
                     "journal entry exceeded size cap; replaced"
                 );
-                entry = Arc::new(SeqEvent {
-                    seq,
-                    ts,
-                    ev: AgentEvent::Error {
-                        message: format!("event exceeded the {MAX_ENTRY_BYTES}-byte journal cap"),
-                        fatal: false,
-                    },
+                let replacement = shortened_user_message(&entry.ev, seq, ts).unwrap_or_else(|| {
+                    let entry = Arc::new(SeqEvent {
+                        seq,
+                        ts,
+                        ev: AgentEvent::Error {
+                            message: format!(
+                                "event exceeded the {MAX_ENTRY_BYTES}-byte journal cap"
+                            ),
+                            fatal: false,
+                        },
+                    });
+                    let line = serde_json::to_vec(&*entry).expect("Error event serializes");
+                    (entry, line)
                 });
-                line = serde_json::to_vec(&*entry).expect("Error event serializes");
+                (entry, line) = replacement;
             }
             line.push(b'\n');
             debug_assert_eq!(
@@ -484,6 +490,43 @@ impl WriterThread {
         fs::rename(&tmp, &self.path)?;
         self.file = fs::OpenOptions::new().append(true).open(&self.path)?;
         Ok(())
+    }
+}
+
+/// A user's message too long for one journal line, cut to fit instead of
+/// replaced. A send near the text limit, or a shorter one full of characters
+/// JSON escapes six to one, serializes past the line cap; an `Error` in its
+/// place would drop the message's delivery id and its client's send id with
+/// it, so the client could never confirm the send, and the next process
+/// would run a resend of it a second time. Every field but the text is kept
+/// (they are all small and bounded), and the text keeps its head and tail
+/// around the marker tool output uses. `None` for any other event.
+fn shortened_user_message(ev: &AgentEvent, seq: u64, ts: u64) -> Option<(Arc<SeqEvent>, Vec<u8>)> {
+    let AgentEvent::UserMessage { text, .. } = ev else {
+        return None;
+    };
+    // The serialized size depends on how the kept text escapes: halve what
+    // is kept until the line fits. Bounded: the text is at most the command
+    // limit, so this is a handful of rounds.
+    let mut keep = MAX_ENTRY_BYTES / 2;
+    loop {
+        let mut shortened = ev.clone();
+        if let AgentEvent::UserMessage { text: kept, .. } = &mut shortened {
+            *kept = crate::model::cap_head_tail(text, keep / 2, keep / 2).0;
+        }
+        let entry = Arc::new(SeqEvent {
+            seq,
+            ts,
+            ev: shortened,
+        });
+        let line = serde_json::to_vec(&*entry).expect("AgentEvent serializes");
+        if line.len() <= MAX_ENTRY_BYTES {
+            return Some((entry, line));
+        }
+        if keep == 0 {
+            return None;
+        }
+        keep /= 2;
     }
 }
 
@@ -1065,6 +1108,84 @@ mod tests {
                 "client-{:04}",
                 crate::model::CLIENT_IDS_REMEMBERED + 2
             ))
+        );
+    }
+
+    /// A send at the text limit whose characters escape six to one serializes
+    /// to several times the line cap. Its echo must still be journaled as a
+    /// user message with both ids: the client confirms by the id, and the
+    /// next process reads the id back so a resend does not run it again.
+    #[tokio::test]
+    async fn an_oversize_user_message_is_cut_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        // Control characters, quotes and backslashes: the worst escaping.
+        let unit = "\u{1}\"\\\u{7f}é";
+        let mut text = String::from("START ");
+        while text.len() + unit.len() + 4 <= crate::model::COMMAND_TEXT_TOTAL_MAX {
+            text.push_str(unit);
+        }
+        text.push_str(" END");
+        let sent = AgentEvent::UserMessage {
+            text: text.clone(),
+            attachments: 2,
+            attachment_paths: vec!["/uploads/a.png".into(), "/uploads/b.png".into()],
+            id: Some("u-large".into()),
+            queued: true,
+            after_turn: true,
+            origin: None,
+            client_id: Some("client-large-1".into()),
+        };
+        assert!(serde_json::to_vec(&sent).unwrap().len() > 2 * MAX_ENTRY_BYTES);
+        {
+            let journal = Journal::open(dir.path(), "s").unwrap();
+            let entry = journal.append(sent).await;
+            assert!(serde_json::to_vec(&*entry).unwrap().len() <= MAX_ENTRY_BYTES);
+            let AgentEvent::UserMessage {
+                text: kept,
+                attachments,
+                attachment_paths,
+                id,
+                queued,
+                after_turn,
+                origin,
+                client_id,
+            } = &entry.ev
+            else {
+                panic!("replaced by {:?}", entry.ev);
+            };
+            assert_eq!(id.as_deref(), Some("u-large"));
+            assert_eq!(client_id.as_deref(), Some("client-large-1"));
+            assert_eq!((*attachments, attachment_paths.len()), (2, 2));
+            assert!(*queued && *after_turn && origin.is_none());
+            assert!(
+                kept.starts_with("START ") && kept.ends_with(" END"),
+                "head and tail kept"
+            );
+            assert!(kept.contains("bytes omitted"), "and says what was cut");
+            assert!(kept.len() < text.len());
+            // An ordinary long message is untouched.
+            let plain = journal
+                .append(AgentEvent::UserMessage {
+                    text: "x".repeat(200 * 1024),
+                    attachments: 0,
+                    attachment_paths: Vec::new(),
+                    id: Some("u-plain".into()),
+                    queued: false,
+                    after_turn: false,
+                    origin: None,
+                    client_id: Some("client-plain-1".into()),
+                })
+                .await;
+            assert!(
+                matches!(&plain.ev, AgentEvent::UserMessage { text, .. } if text.len() == 200 * 1024)
+            );
+            journal.sync_async().await;
+        }
+        // The file holds it, and the next process reads its id back.
+        let journal = Journal::open(dir.path(), "s").unwrap();
+        assert_eq!(
+            journal.client_ids_at_open(),
+            ["client-large-1", "client-plain-1"]
         );
     }
 

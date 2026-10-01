@@ -100,9 +100,172 @@ pub(crate) fn is_interaction(command: &chimaera_agent::model::AgentCommand) -> b
             | AgentCommand::StopTask { .. }
     )
 }
+/// What a chat frame is to whoever holds input for an owner that has not
+/// answered (this daemon's relay; a keeper sorts the same way).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChatFrame {
+    /// The user acting: exactly [`is_interaction`]. Held in order, and a
+    /// reason to wake a machine or bring work to this computer.
+    Acting,
+    /// One of the seven settings the user gives. Held (coalesced) and
+    /// delivered in order with what the user did, but no reason to wake or
+    /// move anything.
+    Setting,
+    /// Everything else (the automatic `set_thinking`, reads, `cancel_send`,
+    /// queue housekeeping, a command nobody knows): never held.
+    Passive,
+}
+/// [`ChatFrame`] from a frame's `type` (and a rewind's `dry_run`) alone, so a
+/// relay need not build the command, a send's pictures included, to sort it.
+/// `Acting` is [`is_interaction`], which the tests hold it to for every
+/// command.
+pub(crate) fn chat_frame(kind: &str, dry_run: bool) -> ChatFrame {
+    match kind {
+        "send" | "send_after_turn" | "permission" | "answer" | "interrupt" | "compact"
+        | "background_tool" | "stop_task" => ChatFrame::Acting,
+        "rewind" if !dry_run => ChatFrame::Acting,
+        "set_model" | "set_mode" | "set_effort" | "set_ultracode" | "set_remote_control"
+        | "set_mcp_enabled" | "reconnect_mcp" => ChatFrame::Setting,
+        _ => ChatFrame::Passive,
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// One of every chat command. The match has no wildcard: a new command
+    /// does not compile until it is sorted here, and so in [`chat_frame`].
+    fn every_command() -> Vec<chimaera_agent::model::AgentCommand> {
+        use chimaera_agent::model::AgentCommand as C;
+        let all = vec![
+            C::Send { blocks: Vec::new() },
+            C::Permission {
+                request_id: "r".into(),
+                option_id: "o".into(),
+                destination: None,
+                feedback: None,
+            },
+            C::Interrupt,
+            C::SetMode {
+                mode_id: "m".into(),
+            },
+            C::SetModel {
+                model_id: "m".into(),
+            },
+            C::SetEffort {
+                effort_id: "e".into(),
+            },
+            C::SetThinking { enabled: true },
+            C::SetUltracode { enabled: true },
+            C::Answer {
+                request_id: "r".into(),
+                answers: Default::default(),
+            },
+            C::GetUsage,
+            C::Compact,
+            C::Rewind {
+                user_message_id: "u".into(),
+                dry_run: false,
+            },
+            C::Rewind {
+                user_message_id: "u".into(),
+                dry_run: true,
+            },
+            C::BackgroundTool {
+                tool_call_id: "t".into(),
+            },
+            C::StopTask {
+                task_id: "t".into(),
+            },
+            C::GetMcp,
+            C::SetMcpEnabled {
+                server: "s".into(),
+                enabled: true,
+            },
+            C::ReconnectMcp { server: "s".into() },
+            C::CancelQueued { id: "q".into() },
+            C::SteerQueued { id: "q".into() },
+            C::SetRemoteControl {
+                enabled: true,
+                name: None,
+            },
+            C::SendAfterTurn { blocks: Vec::new() },
+            C::SendNow { id: "q".into() },
+            C::SendIfRunning {
+                id: "k".into(),
+                blocks: Vec::new(),
+            },
+        ];
+        for command in &all {
+            match command {
+                C::Send { .. }
+                | C::Permission { .. }
+                | C::Interrupt
+                | C::SetMode { .. }
+                | C::SetModel { .. }
+                | C::SetEffort { .. }
+                | C::SetThinking { .. }
+                | C::SetUltracode { .. }
+                | C::Answer { .. }
+                | C::GetUsage
+                | C::Compact
+                | C::Rewind { .. }
+                | C::BackgroundTool { .. }
+                | C::StopTask { .. }
+                | C::GetMcp
+                | C::SetMcpEnabled { .. }
+                | C::ReconnectMcp { .. }
+                | C::CancelQueued { .. }
+                | C::SteerQueued { .. }
+                | C::SetRemoteControl { .. }
+                | C::SendAfterTurn { .. }
+                | C::SendNow { .. }
+                | C::SendIfRunning { .. } => {}
+            }
+        }
+        all
+    }
+    /// What a relay reads from a frame's `type` agrees with the daemon's own
+    /// list for every command, and the seven settings are exactly seven.
+    #[test]
+    fn a_frame_sorted_by_its_type_agrees_with_the_daemons_list() {
+        let mut settings = Vec::new();
+        for command in every_command() {
+            let text = serde_json::to_string(&command).unwrap();
+            let tag = crate::ws::command_tag(&text);
+            let kind = tag.kind.as_deref().unwrap_or_default();
+            let sorted = chat_frame(kind, tag.dry_run);
+            assert_eq!(
+                sorted == ChatFrame::Acting,
+                is_interaction(&command),
+                "{text}"
+            );
+            if sorted == ChatFrame::Setting {
+                settings.push(kind.to_owned());
+            }
+        }
+        settings.sort();
+        assert_eq!(
+            settings,
+            [
+                "reconnect_mcp",
+                "set_effort",
+                "set_mcp_enabled",
+                "set_mode",
+                "set_model",
+                "set_remote_control",
+                "set_ultracode"
+            ]
+        );
+        for passive in [
+            "cancel_send",
+            "set_thinking",
+            "get_usage",
+            "from_the_future",
+            "",
+        ] {
+            assert_eq!(chat_frame(passive, false), ChatFrame::Passive, "{passive}");
+        }
+    }
     #[test]
     fn user_changes_count_but_transfer_control_and_view_state_do_not() {
         use axum::http::Method;
