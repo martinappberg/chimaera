@@ -273,9 +273,9 @@ export function endedLine(j: ClusterJob, nowMs: number, locale?: string): string
 
 /** What a workspace row says about itself (plan §4.2). */
 export function workspaceActivity(w: ClusterWorkspaceView, nowMs: number, locale?: string): string {
+  if (w.failed !== undefined) return "stopped unexpectedly";
   switch (w.state) {
     case "open":
-      if (w.failed !== undefined) return "stopped unexpectedly";
       if (w.closing) return "closing — saving its chats…";
       if (w.working === undefined) return "";
       if (w.working === 0) return "idle";

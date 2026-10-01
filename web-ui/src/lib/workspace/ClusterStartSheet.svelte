@@ -410,7 +410,7 @@
                     class="chip"
                     class:on={activeChip === "job"}
                     onclick={() => continueJob !== null && applySpec(continueJob.spec, "job")}
-                    >{continueJob.name}'s</button
+                    >Same as now</button
                   >
                 {:else if lastSpec !== null}
                   <button

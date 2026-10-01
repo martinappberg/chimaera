@@ -54,13 +54,17 @@
     }
     return out;
   });
+  /** Home, then up to four folders holding workspaces — named by their last
+   *  part, or their last two where two would read the same. */
   const quick = $derived.by(() => {
-    const seen = new Set<string>();
+    const picked = [...new Set(places)].slice(0, 4);
+    const tail = (p: string, n: number) =>
+      p.split("/").filter((s) => s !== "").slice(-n).join("/") || "/";
     const out: { label: string; path: string }[] = [{ label: "Home", path: "~" }];
-    for (const p of places) {
-      if (seen.has(p) || seen.size >= 4) continue;
-      seen.add(p);
-      out.push({ label: p.split("/").filter((s) => s !== "").pop() ?? p, path: p });
+    for (const p of picked) {
+      const short = tail(p, 1);
+      const clash = picked.some((o) => o !== p && tail(o, 1) === short);
+      out.push({ label: clash ? tail(p, 2) : short, path: p });
     }
     return out;
   });
@@ -212,7 +216,7 @@
       {#if listing !== null}
         <div class="pick">
           <span class="pick-lab">Workspace</span>
-          <span class="pick-path" title={here}>{here}</span>
+          <span class="pick-path" title={here}><bdi>{here}</bdi></span>
           <input
             class="in name"
             bind:value={name}

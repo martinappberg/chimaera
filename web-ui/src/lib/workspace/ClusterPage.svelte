@@ -245,7 +245,7 @@
   function wsMenu(e: MouseEvent, w: ClusterWorkspaceView): void {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const items: ContextMenuEntry[] = [];
-    if (w.state === "open") {
+    if (w.state === "open" && !w.closing) {
       for (const j of running.filter((j) => j.id !== w.job)) {
         items.push({
           label: `Move to ${j.name}`,
@@ -454,7 +454,7 @@
                   : "Removing…"}</span
           >
         {:else}
-          {#if w.state !== "queued"}
+          {#if w.state !== "queued" && !w.closing}
             <button class="act primary" onclick={(e) => openClicked(e, w)}>
               Open{#if w.state === "closed" && running.length > 1}
                 <svg class="chev-down" viewBox="0 0 16 16" width="9" height="9" aria-hidden="true">
@@ -474,7 +474,7 @@
       </span>
     </div>
     {#if activity !== ""}
-      <div class="detail" class:warn={w.failed !== undefined}>{activity}</div>
+      <div class="detail" class:warn={w.failed !== undefined} title={w.failed || undefined}>{activity}</div>
     {/if}
     {#if wsError[w.id] !== undefined}
       <div class="detail row-err">{wsError[w.id]}</div>

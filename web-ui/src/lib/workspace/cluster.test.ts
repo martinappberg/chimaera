@@ -317,6 +317,9 @@ describe("jobs in words", () => {
     expect(workspaceActivity(ws({ state: "open", working: 0 }), NOW)).toBe("idle");
     expect(workspaceActivity(ws({ state: "open" }), NOW)).toBe("");
     expect(workspaceActivity(ws({ state: "open", failed: "boom" }), NOW)).toBe("stopped unexpectedly");
+    expect(workspaceActivity(ws({ state: "closed", job: "j-0000aaaa", failed: "" }), NOW)).toBe(
+      "stopped unexpectedly",
+    );
     expect(workspaceActivity(ws({ state: "queued" }), NOW)).toBe("opens when it starts");
     expect(workspaceActivity(ws({ state: "queued", opening: true }), NOW)).toBe("opening…");
     expect(workspaceActivity(ws({ state: "open", working: 1, closing: true }), NOW)).toBe(
