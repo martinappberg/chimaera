@@ -59,7 +59,8 @@
 
   // Focus the search box when the UI tab shows (VS Code behavior).
   $effect(() => {
-    if (!paneTabHasKeyboardFocus()) searchEl?.focus();
+    const input = searchEl;
+    if (!paneTabHasKeyboardFocus()) input?.focus();
   });
 
   function matches(def: SettingDef): boolean {
