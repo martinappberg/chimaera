@@ -3540,3 +3540,45 @@ async fn a_session_that_never_starts_here_refuses_the_whole_batch_after_one_wait
         started.elapsed()
     );
 }
+
+/// A viewer told the owner cannot be reached is closed when a kept attach
+/// succeeds, so it reconnects quietly. A setting held alone must not keep
+/// that socket open: it is refused by name, and the socket still closes.
+#[tokio::test]
+async fn a_held_setting_does_not_keep_a_socket_from_reattaching_quietly() {
+    use futures::StreamExt;
+    use std::sync::atomic::Ordering;
+    let fixture = sleeping_remote_chat("front-door-setting").await;
+    fixture.transport.front_door.store(true, Ordering::Release);
+    fixture.transport.fail_health.store(true, Ordering::Release);
+    let mut socket = open_chat(&fixture).await;
+    assert_eq!(next_json(&mut socket).await["code"], "remote_unavailable");
+    socket.send(set_mode("plan")).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    fixture
+        .transport
+        .fail_health
+        .store(false, Ordering::Release);
+    let mut frames = Vec::new();
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+            .await
+            .expect("the socket never ended")
+        {
+            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+            Some(Ok(Message::Text(text))) => {
+                frames.push(serde_json::from_str::<serde_json::Value>(&text).unwrap())
+            }
+            Some(Ok(_)) => {}
+        }
+    }
+    assert_eq!(
+        refusals(&frames),
+        [("set_mode".to_owned(), String::new())],
+        "{frames:?}"
+    );
+    assert!(
+        fixture.transport.asleep.load(Ordering::Acquire),
+        "nothing was woken"
+    );
+}
