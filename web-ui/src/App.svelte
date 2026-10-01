@@ -258,9 +258,11 @@
   } from "./lib/plugins/store";
   import { platformFrame, pluginViewTitle, setViewOpener } from "./lib/plugins/platform";
   import ExtensionsGlyph from "./lib/plugins/ExtensionsGlyph.svelte";
+  import { transferBlock, transferInto, type FileSource } from "./lib/workspace/fileTransfer";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import {
     dropSpotAt,
+    folderTargetAt,
     paneContentEl,
     paneIdAt,
     paneRootEl,
@@ -2076,45 +2078,6 @@
     return s !== undefined && s.alive ? s : null;
   }
 
-  /** The FOLDER an OS-desktop file drop at (x, y) should land in — a Finder
-   *  column, a FILES-tree dir row, or the tree root — or null when the point
-   *  is over neither. Hit-tests the data attributes those surfaces stamp
-   *  (elementFromPoint is valid during an HTML5 drag; there is no in-DOM ghost
-   *  to occlude). `paneId` is the Finder pane to wash (null for the rail tree). */
-  function osFolderTargetAt(
-    x: number,
-    y: number,
-  ): { paneId: string | null; dir: string; row: boolean; rowKey?: string } | null {
-    const el = document.elementFromPoint(x, y);
-    if (!(el instanceof Element)) return null;
-    // A FILES-tree dir row (files target their parent; broken links have
-    // none) — real rows and the sticky ancestor copies alike, so the whole
-    // scroller is one target surface.
-    const row = el.closest<HTMLElement>("[data-drop-dir]");
-    if (row?.dataset.dropDir != null && el.closest(".tree-scroll") !== null) {
-      // The row's position key rides along: the tree highlights by position
-      // (one canonical path can sit under a symlink and its target).
-      return { paneId: null, dir: row.dataset.dropDir, row: false, rowKey: row.dataset.dropKey };
-    }
-    // The tree background → the workspace root.
-    const treeRoot = el.closest<HTMLElement>("[data-tree-root]");
-    if (treeRoot?.dataset.treeRoot != null) {
-      return { paneId: null, dir: treeRoot.dataset.treeRoot, row: false };
-    }
-    // A Finder column → that column's directory — unless the pointer is on a
-    // dir ROW it lists, which wins: the row is the exact thing under the
-    // pointer, and `row` lets the Finder light it alone.
-    const col = el.closest<HTMLElement>("[data-finder-dir]");
-    if (col?.dataset.finderDir != null) {
-      const paneId = paneIdAt(x, y);
-      if (row?.dataset.dropDir != null && col.contains(row)) {
-        return { paneId, dir: row.dataset.dropDir, row: true };
-      }
-      return { paneId, dir: col.dataset.finderDir, row: false };
-    }
-    return null;
-  }
-
   /** Depth-counted dragenter/leave so child enter/leave churn never flickers
    *  the drop overlay off mid-drag. */
   let osDragDepth = 0;
@@ -2139,7 +2102,7 @@
     e.preventDefault();
     // A folder target (Finder column / FILES-tree dir) wins over the session
     // pane it may sit inside — dropping onto the file manager uploads THERE.
-    const folder = osFolderTargetAt(e.clientX, e.clientY);
+    const folder = folderTargetAt(e.clientX, e.clientY);
     // dragover fires continuously (every pointer move, and on a timer while
     // still): rewrite dropSpot only on a logical change, or every event
     // re-derives the Finder/tree highlights for nothing.
@@ -2189,7 +2152,7 @@
       .map((i) => ({ file: i.getAsFile(), dir: i.webkitGetAsEntry?.()?.isDirectory === true }));
     // A folder target (file manager) uploads INTO that directory; otherwise
     // fall back to the live-session upload+reference flow.
-    const folder = osFolderTargetAt(e.clientX, e.clientY);
+    const folder = folderTargetAt(e.clientX, e.clientY);
     if (folder !== null) {
       void dropFilesInDir(folder.dir, picked);
       return;
@@ -4182,6 +4145,7 @@
       // (rail row or pane band) is a no-op, never a tab move.
       beginDrag(e, tab, onClick, true);
     },
+    dragFileEntry: onTreeEntryDown,
     dividerDrag(active) {
       pool.setDragging(active);
     },
@@ -4590,6 +4554,11 @@
    * Null for the geometric spots (dnd's generic reading covers them).
    */
   function describeSpot(spot: DropSpot): string | null {
+    if (spot.kind === "fileOp") {
+      const folder = spot.dir === "/" ? "/" : `${basename(spot.dir)}/`;
+      const modifier = spot.operation === "move" ? ` · ${isMac ? "Option" : "Alt"} to copy` : "";
+      return spot.blocked ?? `${spot.operation} into ${folder}${modifier}`;
+    }
     if (spot.kind === "ref" || spot.kind === "link") {
       const s = osDropSession(spot.paneId);
       if (s === null) return null;
@@ -4608,7 +4577,13 @@
    * terminal to link-only drops — anywhere but an agent is a no-op, never a
    * tab move.
    */
-  function beginDrag(e: PointerEvent, tab: Tab, onClick: () => void, linkIntent = false): void {
+  function beginDrag(
+    e: PointerEvent,
+    tab: Tab,
+    onClick: () => void,
+    linkIntent = false,
+    source: FileSource | null = tab.surface === "file" ? { path: tab.path, kind: "file" } : null,
+  ): void {
     const label = tabLabel(tab);
     const dragId = ++dragSeq;
     // Arm the bottom bands for this drag: reference targets for path drags
@@ -4644,6 +4619,10 @@
       {
         onSpot: (s) => (dropSpot = s),
         onDrop: (spot) => {
+          if (spot.kind === "fileOp") {
+            if (source !== null && spot.blocked === null) void transferInto(source, spot.dir, spot.operation);
+            return;
+          }
           if (spot.kind === "ref") {
             // Drag-to-reference: type into the session, never open a tab.
             if (tab.surface === "file") referenceFileDrop(spot.paneId, tab.path, "file");
@@ -4718,6 +4697,12 @@
         linkTargets,
         linkSessions,
         linkIntent,
+        fileTargetAt: source === null || linkIntent ? undefined : (x, y, copy) => {
+          const folder = folderTargetAt(x, y);
+          if (folder === null) return null;
+          const operation = copy ? "copy" : "move";
+          return { ...folder, kind: "fileOp", operation, blocked: transferBlock(source, folder.dir, operation) };
+        },
         describe: describeSpot,
         // Realm-local unsaved state never arms the out spot: the ghost must
         // not advertise "open as new window" for a move the drop refuses.
@@ -4932,7 +4917,7 @@
     onEntryClick: () => void,
   ): void {
     const tab: Tab = kind === "dir" ? freshFinderTab(path) : { surface: "file", path };
-    beginDrag(e, tab, onEntryClick);
+    beginDrag(e, tab, onEntryClick, false, { path, kind });
   }
 
   /** Svelte action: register an agent rail row as a link-drop target, so a
@@ -5653,11 +5638,12 @@
                 onOpen={openFilePath}
                 onOpenPinned={(p) => openFilePath(p, true)}
                 onDragStart={onTreeEntryDown}
+                dropAction={dropSpot?.kind === "fileOp" ? dropSpot.operation : "upload"}
                 activePath={focusedFilePath}
                 reveal={treeReveal}
                 createRequest={treeCreate}
-                dropDir={dropSpot?.kind === "uploadDir" && dropSpot.paneId === null ? dropSpot.dir : null}
-                dropKey={dropSpot?.kind === "uploadDir" && dropSpot.paneId === null
+                dropDir={(dropSpot?.kind === "uploadDir" || (dropSpot?.kind === "fileOp" && dropSpot.blocked === null)) && dropSpot.paneId === null ? dropSpot.dir : null}
+                dropKey={(dropSpot?.kind === "uploadDir" || (dropSpot?.kind === "fileOp" && dropSpot.blocked === null)) && dropSpot.paneId === null
                   ? (dropSpot.rowKey ?? null)
                   : null}
               />
@@ -7184,12 +7170,12 @@
     flex-grow: 0;
   }
 
-  /* Header row: the collapse toggle (left, fills the row) + the new-finder
-     button (right), mirroring how .workspace pairs its button with an action. */
+  /* Keep file actions visible, with full hit targets even in a narrow rail. */
   .files-head {
     flex: none;
     display: flex;
     align-items: center;
+    padding-right: 8px;
   }
 
   .files-header {
@@ -7224,11 +7210,12 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 3px;
-    margin-right: 10px;
+    padding: 6px;
+    min-width: 28px;
+    min-height: 28px;
+    margin-right: 2px;
     border-radius: 5px;
     color: var(--muted);
-    opacity: 0.75;
     cursor: pointer;
     transition:
       color 0.12s ease,
@@ -7240,6 +7227,12 @@
     color: var(--fg);
     opacity: 1;
     background: var(--row-hover);
+  }
+
+  .files-finder:focus-visible,
+  .files-header:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
 
   .files-chev {

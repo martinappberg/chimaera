@@ -1,4 +1,4 @@
-# Drag-to-reference & desktop uploads
+# File dragging, references & desktop uploads
 
 Getting a **path** or a **file** into the session you're talking to, by dragging. Two intake
 edges share one destination — the live session's input (a chat composer or a PTY):
@@ -21,12 +21,35 @@ Wire: `POST /api/v1/sessions/{id}/upload?name=`. Reuses `web-ui/src/lib/shared/r
 (`composeAgentPathReference`/`composeShellPathReference`) — the same path-composition as terminal
 selection references (see [terminals.md](terminals.md)).
 
+## Move and copy between folders
+
+- **How it's used.** Drag a file or folder from the FILES tree or a Finder row onto a
+  folder, a Finder column/background, or a Finder breadcrumb. File-preview tabs can also
+  be dragged onto folders. Release to **move**; hold **Option/Alt** to **copy**. The
+  destination lights up and the drag hint names the operation. Hover a closed folder
+  for 700 ms to open it; the tree and Finder scroll when held near their edges.
+  Escape or losing window focus cancels the gesture. A plain click keeps its usual action.
+- **Targets stay distinct.** File-manager targets take priority over pane split zones.
+  Other panes and tab bars still open/reposition the surface; a session's reference band
+  still inserts the path. Finder *tabs* rearrange the browsing surface rather than moving
+  the folder it happens to display.
+- **Safety.** Same-parent moves and folder-into-itself drops show a reason and do nothing.
+  Moves never overwrite an existing destination; copies use the daemon's unique-name
+  policy. Symlink and permission checks remain authoritative on the daemon. Progress and
+  errors use the shared file-operation notifications. Open tabs and editor buffers follow
+  successful moves through the existing filesystem mutation bus.
+- **Where it lives.** `layout/dnd.ts` owns shared `folderTargetAt` hit testing, the `fileOp`
+  drop spot, modifier tracking, and edge scrolling. `App.svelte` routes the transfer;
+  `workspace/fileTransfer.ts` shares validation and execution with clipboard paste.
+  `FileTree.svelte` and `previews/FinderView.svelte` own folder highlights and hover opening.
+  Reuses `POST /api/v1/fs/move` and `/api/v1/fs/copy`; no wire change.
+
 ## Folder drag-to-reference
 
 - **What & when.** Reference a *directory* (not just a file) in a live session by dragging its row
-  from the left file tree — e.g. `@src/lib/` into an agent, or a shell-quoted dir path into a
+  from the left file tree or a Finder row — e.g. `@src/lib/` into an agent, or a shell-quoted dir path into a
   terminal.
-- **How it's used.** Drag any tree row over a live-session pane; its lower ~22% grows the
+- **How it's used.** Drag any tree or Finder row over a live-session pane; its lower ~22% grows the
   **"@ reference in ⟨session⟩"** band (named, so two session panes side by side read differently)
   and the drag ghost's hint says the same; release there to type the path. A sub-threshold release (a plain click)
   keeps the tree's own action — open the file, or expand/collapse the folder — so a click never
@@ -60,8 +83,8 @@ selection references (see [terminals.md](terminals.md)).
   session/window receives the bytes, so an agent (or a shell) on a remote host can read a file
   you dragged from your laptop. Folder uploads go through `POST /api/v1/fs/upload?dir=&name=`
   (`upload::upload_to_dir`), stream the same way, cap one user-chosen file at 2 GB, then bump the fs epoch
-  so the tree/Finder re-list. In-app **move between folders** is done via copy/cut/paste (a
-  pointer-drag folder-move is a follow-up); dragging files **out to the desktop** is punted —
+  so the tree/Finder re-list. In-app moves use dragging or copy/cut/paste (above).
+  Dragging files **out to the desktop** is punted —
   the pointer-drag stack plus remote-over-tunnel bytes make it not worth it in two of three
   runtimes; the per-row Download menu covers remote→local retrieval.
 - **What & when (session pane).** Drop a file onto a live-session pane. The daemon that
