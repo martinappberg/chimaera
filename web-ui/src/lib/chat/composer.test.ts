@@ -87,4 +87,11 @@ describe("draftWithInsert", () => {
     expect(draftWithInsert("why\n", quote, "block")).toBe(`why\n\n${quote}`);
     expect(draftWithInsert(`> p\n\n`, quote, "block")).toBe(`> p\n\n${quote}`);
   });
+  it("puts a returned message above the draft in progress, as its own paragraph", () => {
+    expect(draftWithInsert("", "it did not arrive", "above")).toBe("it did not arrive");
+    expect(draftWithInsert("  \n", "it did not arrive", "above")).toBe("it did not arrive");
+    // What is being written now stays last, exactly as typed, where the caret is.
+    expect(draftWithInsert("and another thi", "it did not arrive", "above")).toBe("it did not arrive\n\nand another thi");
+    expect(draftWithInsert("\nnext ", "first\n\nsecond\n", "above")).toBe("first\n\nsecond\n\nnext ");
+  });
 });

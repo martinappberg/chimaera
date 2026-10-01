@@ -9,8 +9,10 @@ import type { ImageAttachment } from "./images";
 
 /** Where inserted text goes in the draft: `inline` joins the draft's last
  *  line after a space (a mention, a provenance tag); `block` starts its own
- *  paragraph (a quoted passage, which must begin a line to read as one). */
-export type InsertPlacement = "inline" | "block";
+ *  paragraph (a quoted passage, which must begin a line to read as one);
+ *  `above` is its own paragraph ahead of the draft (a message that did not
+ *  arrive, coming back without landing under what is being written now). */
+export type InsertPlacement = "inline" | "block" | "above";
 
 type InsertFn = (text: string, placement: InsertPlacement) => void;
 

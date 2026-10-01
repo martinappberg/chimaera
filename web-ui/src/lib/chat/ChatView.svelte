@@ -86,6 +86,7 @@
     PendingSend,
     PlanEntry,
   } from "./store.svelte";
+  import { mintSendId } from "./store.svelte";
   import {
     advanceTailWindow,
     autoPageEarlier,
@@ -1406,7 +1407,13 @@
     for (const img of images) {
       blocks.push({ type: "image", media_type: img.media_type, data: img.data });
     }
-    return socket.send({ type: afterTurn ? "send_after_turn" : "send", blocks });
+    // The id this send goes out under: the daemon runs an id once, so the
+    // store may send the same frame again until its echo names it.
+    const id = mintSendId();
+    const frame = { type: afterTurn ? "send_after_turn" : "send", blocks, client_id: id };
+    if (!socket.send(frame)) return false;
+    store.noteSent(id, frame, text, images);
+    return true;
   }
 
   // A send made outside the composer (the Mastermind panel's one-click
@@ -1425,9 +1432,6 @@
     // when the socket isn't open so the composer keeps the draft.
     const accepted = sendMessage(text, images, afterTurn);
     if (accepted) {
-      // Kept until the agent's echo: a send the daemon could not deliver
-      // (the project was reconnecting) comes back into the composer.
-      store.noteSent(text, images);
       // Submission is stronger intent than merely clearing a draft: the user
       // expects to see the delivered/queued bubble and the reply it starts.
       atBottom = true;
@@ -1436,16 +1440,19 @@
     return accepted;
   }
 
-  // An undelivered send's text goes back into this chat's composer, once.
-  // Several can come back together (every send a wake was holding): each as
-  // its own paragraph, in the order they were sent.
+  // An undelivered send's text goes back into this chat's composer, once,
+  // above whatever is being written there now (it was written first, and
+  // must not land under the caret). Several can come back together (every
+  // send a wake was holding): each its own paragraph, in the order sent.
   $effect(() => {
     if (store.restoredDraft === null) return;
     untrack(() => {
+      const texts: string[] = [];
       for (let draft = store.takeRestoredDraft(); draft !== null; draft = store.takeRestoredDraft()) {
-        if (draft.text.length > 0) insertIntoComposer(session.id, draft.text, "block");
+        if (draft.text.length > 0) texts.push(draft.text);
         for (const image of draft.images) attachImageToComposer(session.id, image);
       }
+      if (texts.length > 0) insertIntoComposer(session.id, texts.join("\n\n"), "above");
     });
   });
 

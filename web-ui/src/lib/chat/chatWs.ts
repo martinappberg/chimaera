@@ -33,10 +33,21 @@ export interface ChatSessionInfo {
   pending_permission: boolean;
 }
 
+/** What a `ready` says about its attach, beyond the session. */
+export interface ReadyAttach {
+  /** The daemon accepts a send at most once under its `client_id` and
+   *  answers `cancel_send` (`ready.send_ids`, additive): unconfirmed sends
+   *  may be sent again. False for a daemon that predates it. */
+  sendIds: boolean;
+  /** Not this socket's first `ready`: whoever keeps the socket attached it
+   *  again after the owner slept. */
+  reattach: boolean;
+}
+
 export interface ChatSocketHandlers {
   /** `head` is the journal's highest seq now; when it is below our own
    *  lastSeq the journal was recreated (seq reset) and we must hard-reset. */
-  onReady(session: ChatSessionInfo, replayFrom: number, head: number | undefined): void;
+  onReady(session: ChatSessionInfo, replayFrom: number, head: number | undefined, attach: ReadyAttach): void;
   onEvent(entry: SeqEvent): void;
   /** The session degraded (or toggled) to a terminal under the same id. */
   onDegraded(): void;
@@ -46,8 +57,12 @@ export interface ChatSocketHandlers {
   /** One command was refused (`command_failed` or `invalid_command`): the
    *  socket stays up and keeps reconnecting — surface it, don't die.
    *  `command` names the refused command (`send`, `interrupt`…) when the
-   *  daemon tagged it (additive); null from older daemons. */
-  onCommandFailed(message: string, command: string | null, reason?: string | null): void;
+   *  daemon tagged it (additive); null from older daemons. `clientId` is the
+   *  id that command was sent under (additive): which send was refused. */
+  onCommandFailed(message: string, command: string | null, reason?: string | null, clientId?: string | null): void;
+  /** The daemon's answer to `cancel_send`: whether the send under that id
+   *  was withdrawn (true: none will run) or had already been accepted. */
+  onSendCancelled?(clientId: string, cancelled: boolean): void;
   /** The conversation's project is paused; the next send picks it back up. */
   onAsleep?(): void;
   /** A send picked the paused project back up: it is waking and the send is
@@ -87,12 +102,14 @@ type ChatDelivery =
       session: ChatSessionInfo;
       replayFrom: number;
       head: number | undefined;
+      attach: ReadyAttach;
     }
   | { kind: "event"; entry: SeqEvent }
   | { kind: "degraded" }
   | { kind: "exited"; status: number | null }
   | { kind: "error"; message: string }
-  | { kind: "command_failed"; message: string; command: string | null; reason: string | null }
+  | { kind: "command_failed"; message: string; command: string | null; reason: string | null; clientId: string | null }
+  | { kind: "send_cancelled"; clientId: string; cancelled: boolean }
   | { kind: "asleep" }
   | { kind: "waking" }
   | { kind: "held" }
@@ -147,7 +164,7 @@ export class ChatSocket {
     try {
       switch (delivery.kind) {
         case "ready":
-          this.handlers.onReady(delivery.session, delivery.replayFrom, delivery.head);
+          this.handlers.onReady(delivery.session, delivery.replayFrom, delivery.head, delivery.attach);
           break;
         case "event":
           this.handlers.onEvent(delivery.entry);
@@ -162,7 +179,10 @@ export class ChatSocket {
           this.handlers.onError(delivery.message);
           break;
         case "command_failed":
-          this.handlers.onCommandFailed(delivery.message, delivery.command, delivery.reason);
+          this.handlers.onCommandFailed(delivery.message, delivery.command, delivery.reason, delivery.clientId);
+          break;
+        case "send_cancelled":
+          this.handlers.onSendCancelled?.(delivery.clientId, delivery.cancelled);
           break;
         case "asleep":
           this.handlers.onAsleep?.();
@@ -204,6 +224,8 @@ export class ChatSocket {
     this.kept = false;
     const ws = new WebSocket(daemonSocketUrl(`/ws/chat/${this.sessionId}${interaction ? "?wake=interaction" : ""}`));
     this.ws = ws;
+    // `ready` frames heard on this socket: a second one is a reattach.
+    let readies = 0;
 
     ws.onopen = () => {
       sendSocketAuth(ws, {
@@ -242,7 +264,13 @@ export class ChatSocket {
             session: msg.session as ChatSessionInfo,
             replayFrom: (msg.replay_from as number) ?? 0,
             head: msg.head as number | undefined,
+            attach: { sendIds: msg.send_ids === true, reattach: readies++ > 0 },
           });
+          break;
+        case "send_cancelled":
+          if (typeof msg.client_id === "string") {
+            this.deliveries.push({ kind: "send_cancelled", clientId: msg.client_id, cancelled: msg.cancelled === true });
+          }
           break;
         case "batch":
           this.deliveries.pushMany(
@@ -340,6 +368,7 @@ export class ChatSocket {
               message: (msg.message as string) ?? "command failed",
               command: typeof msg.command === "string" ? msg.command : null,
               reason: typeof msg.reason === "string" ? msg.reason : null,
+              clientId: typeof msg.client_id === "string" ? msg.client_id : null,
             });
             break;
           }
@@ -440,8 +469,8 @@ export class ChatSocket {
 
   /** Send an AgentCommand frame; false when the socket is not open. An open
    *  socket takes it whether or not its owner has answered: whoever keeps
-   *  the connection for a sleeping owner holds the command, wakes the owner
-   *  and delivers it once (or refuses it, which hands a send's text back). */
+   *  the connection for a sleeping owner holds an acting command, wakes the
+   *  owner and delivers it (or refuses it, which hands a send's text back). */
   send(command: Record<string, unknown>): boolean {
     if (this.ws?.readyState !== WebSocket.OPEN || this.authenticatedSocket !== this.ws) {
       this.wakeOnInput();

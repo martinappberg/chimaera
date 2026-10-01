@@ -14,7 +14,7 @@
  * carry reactivity; the pool map itself must never be $state.
  */
 
-import { ChatSocket, type ChatSessionInfo, type SeqEvent } from "./chatWs";
+import { ChatSocket, type ChatSessionInfo, type ReadyAttach, type SeqEvent } from "./chatWs";
 import type { MovedTo } from "../net/placement";
 import { ChatStore } from "./store.svelte";
 
@@ -62,17 +62,18 @@ let tick = 0;
  *  used to live in ChatView. The store IS the sink — every handler is a pure
  *  store mutation, so the same wiring works whether the store is new or warm. */
 function makeSocket(sessionId: string, store: ChatStore): ChatSocket {
-  return new ChatSocket(sessionId, {
-    onReady: (info: ChatSessionInfo, replayFrom: number, head: number | undefined) =>
-      store.onReady(info, replayFrom, head),
+  const socket = new ChatSocket(sessionId, {
+    onReady: (info: ChatSessionInfo, replayFrom: number, head: number | undefined, attach: ReadyAttach) =>
+      store.onReady(info, replayFrom, head, attach),
     onEvent: (entry: SeqEvent) => store.apply(entry),
     onDegraded: () => store.onDegraded(),
     onExited: (status: number | null) => store.onExited(status),
     onError: (message: string) => store.onFatalError(message),
     // A refused command is a notice, not a dead pane — the socket keeps
     // reconnecting and the user keeps their transcript and their text.
-    onCommandFailed: (message: string, command: string | null, reason?: string | null) =>
-      store.onCommandFailed(message, command, reason ?? null),
+    onCommandFailed: (message: string, command: string | null, reason?: string | null, clientId?: string | null) =>
+      store.onCommandFailed(message, command, reason ?? null, clientId ?? null),
+    onSendCancelled: (clientId: string, cancelled: boolean) => store.onSendCancelled(clientId, cancelled),
     onAsleep: () => store.onAsleep(),
     onWaking: () => store.onWaking(),
     onHeld: () => store.onHeld(),
@@ -83,6 +84,10 @@ function makeSocket(sessionId: string, store: ChatStore): ChatSocket {
     onDisconnected: () => store.onDisconnected(),
     lastSeq: () => store.lastSeq,
   });
+  // The store sends its own unconfirmed sends again (by id) on this socket,
+  // and nothing else: there is no queue of commands on this side.
+  store.bindSender((frame) => socket.send(frame));
+  return socket;
 }
 
 /**
@@ -111,8 +116,8 @@ export function acquireChat(sessionId: string): { store: ChatStore; socket: Chat
   } else if (!entry.socket.healthy) {
     // The socket died while parked; heal it without losing the transcript.
     // The store never heard it end (a fatal or ended socket reports no
-    // drop): say so now, so sends it left unconfirmed are decided by the new
-    // socket's `ready` instead of waiting on an echo that cannot come.
+    // drop): say so now, so sends it left unconfirmed show as pending until
+    // the new socket's `ready` sends them again.
     entry.socket.close();
     entry.store.onDisconnected();
     entry.socket = makeSocket(sessionId, entry.store);

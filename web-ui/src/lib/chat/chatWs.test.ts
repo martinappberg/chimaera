@@ -119,9 +119,12 @@ it("a refused command keeps the socket and reports the refusal", async () => {
   expect(socket.send({ type: "send", blocks: [] })).toBe(true);
   Socket.all[0].frame({ type: "error", code: "command_failed", message: "not sent", command: "send" });
   Socket.all[0].frame({ type: "error", code: "command_failed", message: "old daemon" });
+  // The refused send, named by the id it went out under.
+  Socket.all[0].frame({ type: "error", code: "read_only", message: "named", command: "send", client_id: "client-0001" });
   await drain();
-  expect(h.onCommandFailed).toHaveBeenCalledWith("not sent", "send", null);
-  expect(h.onCommandFailed).toHaveBeenCalledWith("old daemon", null, null);
+  expect(h.onCommandFailed).toHaveBeenCalledWith("not sent", "send", null, null);
+  expect(h.onCommandFailed).toHaveBeenCalledWith("old daemon", null, null, null);
+  expect(h.onCommandFailed).toHaveBeenCalledWith("named", "send", null, "client-0001");
   expect(socket.healthy).toBe(true);
   socket.close();
 });
@@ -147,6 +150,7 @@ it("acting brings the work here: the socket says so and a kept refusal names why
     "Your other computer is still working on this. Try again when it pauses.",
     "send",
     "still_working",
+    null,
   );
   expect(socket.healthy).toBe(true);
   socket.close();
@@ -309,6 +313,48 @@ it("a second ready on the same socket is one more ready, in order with the gap i
   expect(calls).toEqual(["ready from 0", "seq 1", "waking", "ready from 1", "seq 2"]);
   expect(h.onDisconnected).not.toHaveBeenCalled();
   expect(Socket.all).toHaveLength(1);
+  socket.close();
+});
+
+it("a ready says whether the daemon takes send ids and whether it is a reattach", async () => {
+  const h = handlers();
+  const socket = new ChatSocket("s-chat", h);
+  Socket.all[0].onopen?.();
+  // A daemon that predates send ids says nothing about them.
+  Socket.all[0].frame({ type: "ready", session: {}, replay_from: 0, head: 0 });
+  // The same socket attached again by whoever keeps it, to a daemon with them.
+  Socket.all[0].frame({ type: "ready", session: {}, replay_from: 0, head: 0, send_ids: true });
+  await drain();
+  expect(h.onReady).toHaveBeenNthCalledWith(1, {}, 0, 0, { sendIds: false, reattach: false });
+  expect(h.onReady).toHaveBeenNthCalledWith(2, {}, 0, 0, { sendIds: true, reattach: true });
+  // A new socket's first `ready` is a plain reconnect again.
+  Socket.all[0].close();
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(Socket.all.length).toBeGreaterThan(1);
+  Socket.all.at(-1)?.onopen?.();
+  Socket.all.at(-1)?.frame({ type: "ready", session: {}, replay_from: 0, head: 0, send_ids: true });
+  await drain();
+  expect(h.onReady).toHaveBeenLastCalledWith({}, 0, 0, { sendIds: true, reattach: false });
+  socket.close();
+});
+
+it("the answer to cancel_send reaches the store, in order with the journal", async () => {
+  const calls: string[] = [];
+  const h = handlers();
+  h.onEvent = vi.fn((entry: { seq: number }) => void calls.push(`seq ${entry.seq}`));
+  h.onSendCancelled = vi.fn((id: string, cancelled: boolean) => void calls.push(`${id} ${cancelled}`));
+  const socket = new ChatSocket("s-chat", h);
+  const ws = Socket.all[0];
+  ws.onopen?.();
+  ws.frame({ type: "ready", session: {}, replay_from: 0, head: 0, send_ids: true });
+  ws.frame({ type: "ev", seq: 1, ts: 1, ev: { type: "user_message", text: "one", client_id: "client-0001" } });
+  ws.frame({ type: "send_cancelled", client_id: "client-0001", cancelled: false });
+  ws.frame({ type: "send_cancelled", client_id: "client-0002", cancelled: true });
+  // Not an answer this client can use.
+  ws.frame({ type: "send_cancelled", cancelled: true });
+  await drain();
+  expect(calls).toEqual(["seq 1", "client-0001 false", "client-0002 true"]);
+  expect(socket.healthy).toBe(true);
   socket.close();
 });
 
