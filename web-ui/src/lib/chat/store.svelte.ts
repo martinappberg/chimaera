@@ -571,6 +571,12 @@ export class ChatStore {
   exited = $state<null | { status: number | null }>(null);
   degraded = $state(false);
   connected = $state(false);
+  /** The socket is open and its owner has not answered yet, quietly: the
+   *  owner's side keeps the connection (the account in front of a sleeping
+   *  cloud machine, or this computer's relay to it) and delivers what is sent
+   *  once the owner answers. Not live (a send shows as "sending…") and not
+   *  reconnecting. The next `ready`, a drop or "cannot be reached" ends it. */
+  held = $state(false);
   /** The project's owner (the cloud machine) is asleep; the next send wakes
    *  it. It outlives a dropped socket — a gateway may close after saying so,
    *  and a reconnect that finds it still asleep must not flicker through
@@ -789,8 +795,14 @@ export class ChatStore {
    *  the "made this turn" window. */
   private turnStartedAt: number | null = null;
 
+  /** Also a later `ready` on the same socket: the account kept it open while
+   *  the cloud machine slept and attached it again. Nothing here resets the
+   *  transcript for that (only a journal whose head fell below `lastSeq`
+   *  does), the gap replays through the seq guard in {@link apply}, and a
+   *  pending "sending…" bubble stays until its echo. */
   onReady(session: ChatSessionInfo, _replayFrom: number, head: number | undefined): void {
     this.connected = true;
+    this.held = false;
     this.asleep = false;
     this.waking = false;
     this.bringing = null;
@@ -827,6 +839,21 @@ export class ChatStore {
    *  asleep owner stays asleep: dropping the socket wakes nothing. */
   onDisconnected(): void {
     this.connected = false;
+    this.held = false;
+    this.waking = false;
+  }
+
+  /** The socket is open and kept for an owner that has not answered. */
+  onHeld(): void {
+    this.held = true;
+  }
+
+  /** The owner cannot be reached: the socket stays open while whoever keeps
+   *  it retries, but nothing sent now is heard, and a wake that was under way
+   *  did not arrive. Not live until the next `ready`. */
+  onUnreachable(): void {
+    this.held = false;
+    this.connected = false;
     this.waking = false;
   }
 
@@ -835,11 +862,23 @@ export class ChatStore {
     this.asleep = true;
   }
 
-  /** A send picked the paused project back up; it is waking now. */
+  /** A send picked the paused project back up; it is waking now. The send
+   *  that asked is held until it answers: show it pending, also when it went
+   *  out on a socket that still looked live (the machine had gone to sleep
+   *  behind a connection the account kept open). */
   onWaking(): void {
     this.asleep = false;
     this.waking = true;
     this.bringing = null;
+    this.showUnconfirmed();
+  }
+
+  /** An accepted send that has not echoed is waiting somewhere on the way:
+   *  show it as the pending bubble. */
+  private showUnconfirmed(): void {
+    if (this.sending === null && this.unconfirmedSend !== null) {
+      this.sending = { text: this.unconfirmedSend.text, images: this.unconfirmedSend.images.length };
+    }
   }
 
   /** Acting here is bringing the work to this computer (or, from a phone, to
@@ -848,9 +887,7 @@ export class ChatStore {
   onBringing(to: "here" | "computer"): void {
     this.asleep = false;
     this.bringing = to;
-    if (this.sending === null && this.unconfirmedSend !== null) {
-      this.sending = { text: this.unconfirmedSend.text, images: this.unconfirmedSend.images.length };
-    }
+    this.showUnconfirmed();
   }
 
   /** The conversation moved to another machine; it did not exit. */

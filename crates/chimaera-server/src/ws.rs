@@ -1748,9 +1748,12 @@ enum LocalWatch {
 /// A window watching a project that currently runs on another machine gets
 /// that project's session, file, Git and Timeline frames from its owner,
 /// merged into this window's own loop; everything else (settings, recents,
-/// notices, updates, plugins) stays this daemon's. When the owner changes or
-/// sleeps the feed ends and restarts; the window's socket never closes for
-/// it. A project with no route (every free user's) stays in local mode.
+/// notices, updates, plugins) stays this daemon's. When the owner changes
+/// the feed ends and restarts, and so it does for a sleeping owner whose
+/// transport refuses the feed (one that keeps a sleeping cloud machine's
+/// sockets leaves it open and quiet instead); the window's socket never
+/// closes for it. A project with no route (every free user's) stays in local
+/// mode.
 struct ProjectView {
     /// The window's watched project and its mounted/listed paths.
     watched: Option<(String, Vec<String>, Vec<String>)>,
@@ -1837,7 +1840,7 @@ impl ProjectView {
             None => std::future::pending().await,
         }
     }
-    /// The feed ended (owner change, sleeping owner, transient failure).
+    /// The feed ended (owner change, a refused sleeping owner, transient failure).
     fn ended(&mut self) {
         self.feed = None;
         self.retry_at = Some(tokio::time::Instant::now() + self.backoff);

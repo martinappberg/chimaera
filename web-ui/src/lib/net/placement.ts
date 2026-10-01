@@ -49,20 +49,25 @@ export interface OwnerNote {
   /** The view's own status line already says it is reconnecting: the label
    *  must not say it a second time. */
   reconnectingShown?: boolean;
+  /** The view's own socket to the owner is answered, or open and kept for it
+   *  (the account keeps a sleeping cloud machine's sockets): the row's failed
+   *  roster read is not this view reconnecting. */
+  reachable?: boolean;
 }
 
 /** Where a routed session runs, in plain words; null for a session here.
  *  `available: false` means its owner cannot be reached right now — which is
  *  also what a sleeping owner looks like to the daemon's passive roster read,
  *  so a view that heard the owner is asleep (or waking) says that instead of
- *  "reconnecting". */
+ *  "reconnecting", and one whose own socket is answered or kept open says
+ *  only where it runs. */
 export function placementLabel(placement: unknown, available: boolean | undefined, note: OwnerNote = {}): string | null {
   if (typeof placement !== "object" || placement === null) return null;
   const remote = (placement as { remote?: unknown }).remote;
   const where = typeof remote === "string" && remote.startsWith("device-") ? ON_ANOTHER_COMPUTER : IN_THE_CLOUD;
   if (note.owner === "asleep") return where + ASLEEP;
   if (note.owner === "waking") return where + WAKING;
-  return available === false && note.reconnectingShown !== true ? where + RECONNECTING : where;
+  return available === false && note.reconnectingShown !== true && note.reachable !== true ? where + RECONNECTING : where;
 }
 
 /**

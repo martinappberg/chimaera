@@ -2265,3 +2265,102 @@ describe("ChatStore messages from other agents", () => {
     expect(ends.map((b) => b.kind === "turn_end" && b.artifacts)).toEqual([["/w/plot.png"], []]);
   });
 });
+
+// The account keeps a sleeping cloud machine's sockets open (VIEWING.md, "A
+// sleeping cloud machine's sockets"): the same socket hears `ready` again
+// when the machine wakes, and a send goes out on it meanwhile.
+describe("ChatStore on a socket kept open while its owner sleeps", () => {
+  const session = {
+    id: "s",
+    agent: "claude",
+    alive: true,
+    exit_status: null,
+    native_session_id: null,
+    model: null,
+    current_mode: null,
+    pending_permission: false,
+  };
+  const userTexts = (store: ChatStore): string[] =>
+    store.blocks.filter((b) => b.kind === "user").map((b) => (b as { text: string }).text);
+
+  it("a second ready keeps the transcript, takes only the gap and keeps the pending send until its echo", () => {
+    const store = new ChatStore();
+    store.onReady(session, 0, 3);
+    const journal: Record<string, unknown>[] = [
+      { type: "user_message", text: "first", id: "u1" },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "message_chunk", turn_id: "t1", text: "done" },
+    ];
+    journal.forEach((ev, i) => store.apply({ seq: i + 1, ts: i, ev } as SeqEvent));
+    expect(store.hydrating).toBe(false);
+    const blocks = store.blocks.length;
+    const epoch = store.epoch;
+    // The machine went to sleep behind the kept socket: the send goes out on
+    // a conversation that still looks live, then the account says it is
+    // waking the machine for it.
+    store.noteSent("after the nap");
+    expect(store.sending).toBeNull();
+    store.onWaking();
+    expect(store.sending).toEqual({ text: "after the nap", images: 0 });
+    // Attached again: `ready` on the same socket, then the gap.
+    store.onReady(session, 3, 3);
+    expect(store.connected).toBe(true);
+    expect(store.waking).toBe(false);
+    expect(store.hydrating).toBe(false);
+    expect(store.epoch).toBe(epoch);
+    expect(store.blocks.length).toBe(blocks);
+    expect(store.sending).not.toBeNull();
+    // An overlap (an account that replayed from an older point) is dropped.
+    journal.forEach((ev, i) => store.apply({ seq: i + 1, ts: i, ev } as SeqEvent));
+    expect(store.blocks.length).toBe(blocks);
+    expect(store.sending).not.toBeNull();
+    store.apply({ seq: 4, ts: 4, ev: { type: "user_message", text: "after the nap", id: "u2" } } as SeqEvent);
+    expect(store.sending).toBeNull();
+    expect(userTexts(store)).toEqual(["first", "after the nap"]);
+    expect(store.lastSeq).toBe(4);
+  });
+
+  it("a held send that cannot be delivered comes back to the composer", () => {
+    const store = new ChatStore();
+    store.onReady(session, 0, 0);
+    store.noteSent("too late");
+    store.onWaking();
+    expect(store.sending?.text).toBe("too late");
+    store.onCommandFailed("Not sent. Your project is reconnecting.", "send");
+    expect(store.sending).toBeNull();
+    expect(store.takeRestoredDraft()?.text).toBe("too late");
+  });
+
+  it("an open, quiet socket is neither live nor reconnecting, and a send on it shows as sending", () => {
+    const store = new ChatStore();
+    store.onHeld();
+    expect(store.held).toBe(true);
+    expect(store.connected).toBe(false);
+    expect(store.asleep).toBe(false);
+    // Before the first replay it is still the ordinary loading state.
+    expect(store.hydrating).toBe(true);
+    expect(store.awaitingWake).toBe(false);
+    store.noteSent("good morning");
+    expect(store.sending).toEqual({ text: "good morning", images: 0 });
+    // What ends it: the owner cannot be reached, the socket drops, or `ready`.
+    store.onUnreachable();
+    expect(store.held).toBe(false);
+    // A wake that did not arrive stops saying it is waking, and a
+    // conversation that was live is not live until the next `ready`.
+    const live = new ChatStore();
+    live.onReady(session, 0, 0);
+    live.onWaking();
+    live.onUnreachable();
+    expect(live.connected).toBe(false);
+    expect(live.waking).toBe(false);
+    store.onHeld();
+    store.onDisconnected();
+    expect(store.held).toBe(false);
+    store.onHeld();
+    store.onReady(session, 0, 0);
+    expect(store.held).toBe(false);
+    expect(store.connected).toBe(true);
+    // The send made while it was held is still pending until its echo.
+    expect(store.sending).not.toBeNull();
+  });
+});

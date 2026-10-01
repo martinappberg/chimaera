@@ -2094,10 +2094,12 @@
    *  a project). An ordinary local chat never grows connection chrome. */
   const viewed = $derived(typeof session.placement === "object" || isBrowserGateway());
   /** Name a dropped connection only after a short grace, so the first
-   *  handshake and a quick reconnect never flash a status row. */
+   *  handshake and a quick reconnect never flash a status row. A socket that
+   *  is open and kept for an owner that has not answered (`held`) is not
+   *  reconnecting. */
   let reconnectingShown = $state(false);
   $effect(() => {
-    if (!viewed || store.connected || store.exited !== null || store.degraded) {
+    if (!viewed || store.connected || store.held || store.exited !== null || store.degraded) {
       reconnectingShown = false;
       return;
     }
@@ -2106,13 +2108,15 @@
   });
   /** "In the cloud" / "On another computer" for a routed conversation. A
    *  sleeping owner fails the daemon's passive roster read like an
-   *  unreachable one, so what this socket heard (asleep, waking) wins over
-   *  the row's "reconnecting"; and the status line under the transcript says
-   *  "Reconnecting…" itself when it is showing, so the header does not. */
+   *  unreachable one, so what this socket heard (asleep, waking) or is
+   *  (answered, or kept open) wins over the row's "reconnecting"; and the
+   *  status line under the transcript says "Reconnecting…" itself when it is
+   *  showing, so the header does not. */
   const runsElsewhere = $derived(
     placementLabel(session.placement, session.placement_available, {
       owner: store.asleep ? "asleep" : store.waking && !store.connected ? "waking" : null,
       reconnectingShown: reconnectingShown && !continuing && !store.waking && !store.asleep,
+      reachable: store.connected || store.held,
     }),
   );
   const activityLabel = $derived.by(() => {

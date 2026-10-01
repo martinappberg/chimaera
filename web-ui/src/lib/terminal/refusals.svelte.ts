@@ -11,6 +11,9 @@ type Owner = "cloud" | "computer" | "other" | null;
 const notes = $state<Record<string, { reason: string | null; message: string | null }>>({});
 /** Lasting connection states (asleep, waking), shown until the terminal is live. */
 const statuses = $state<Record<string, TerminalStatus>>({});
+/** Terminals whose socket is answered, or open and kept for an owner that has
+ *  not answered yet. One entry per such terminal, removed when it drops. */
+const kept = $state<Record<string, true>>({});
 const timers = new Map<string, ReturnType<typeof setTimeout>>();
 const SHOWN_MS = 4000;
 
@@ -66,6 +69,20 @@ export function refuse(id: string, reason: string | null, message: string | null
 export function setTerminalStatus(id: string, status: TerminalStatus | null): void {
   if (status === null) delete statuses[id];
   else statuses[id] = status;
+}
+
+/** The terminal's socket is answered or kept open (see `SessionSocket`'s
+ *  `onKept`), or not. */
+export function setTerminalKept(id: string, value: boolean): void {
+  if (value) kept[id] = true;
+  else delete kept[id];
+}
+
+/** Whether the terminal's own socket reaches its owner's side, for the
+ *  pane's placement label: the row's failed roster read is then not this
+ *  terminal reconnecting. */
+export function terminalKept(id: string): boolean {
+  return kept[id] === true;
 }
 
 /** What the terminal's socket heard about the owner (asleep, waking), for

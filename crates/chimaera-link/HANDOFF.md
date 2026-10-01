@@ -463,7 +463,10 @@ Lease expiry fences execution only on a cloud worker, and a resumed worker
 renews before fencing: after a suspension (seen as a clock discontinuity) its
 daemon first renews the recorded epoch, which the account grants to a suspended
 owner at the same epoch with no fork; only a refused renewal (or no answer within
-20 seconds) fences. A personal computer is
+20 seconds) fences. That renewal starts the moment the thaw is noticed (by the
+daemon's 100 ms watchdog, or by the first request or socket frame to arrive
+after it), never at the next 5-second renewal tick, because a viewer's socket
+is admitted only once it answers. A personal computer is
 fenced only by a verified other owner (an authenticated read naming another
 holder) or its own in-progress transfer: account unreachability, sign-out, a
 lapsed plan, the privacy switch or a daemon restart stop publication, never its
@@ -539,9 +542,12 @@ passive ownership read when it could take the project now (a negotiated
 personal computer, the project registered there, not handed to the cloud on
 quit, allowed to leave its computer). While a cloud machine holds the project
 the account remembers that computer for a few seconds. When a phone sends or
-types with wake intent into a project whose owner is a sleeping cloud machine
-(`suspended`), the account's browser gateway asks one such computer to take
-the work home instead: it must be reachable over the keeper (its app online),
+types into a project whose owner is a sleeping cloud machine (`suspended`) —
+the first input the account would hold for that machine
+([VIEWING](VIEWING.md#forwarded-requests), "A sleeping cloud machine's
+sockets"), or a reconnect carrying wake intent from a client that parks — the
+account's browser gateway asks one such computer to take the work home
+instead: it must be reachable over the keeper (its app online),
 seen in the last fifteen seconds, and the machine must have gone to sleep
 cleanly — its latest checkpoint is its own, of its current epoch, with
 continuation `idle`, acknowledged no earlier than two minutes before the

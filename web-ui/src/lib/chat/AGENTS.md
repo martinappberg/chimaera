@@ -323,7 +323,20 @@ per-chunk work proportional to the TRAILING OPEN SEGMENT, not the message:
   chrome the same way rather than inlining it into the host.
 
 Remote chats (Pro): attaching and reconnecting are passive; there is no wake
-button. In a native window the daemon holds the first command while a paused
+button. The account keeps a sleeping cloud machine's sockets open (VIEWING.md,
+"A sleeping cloud machine's sockets"), and a native window's daemon passes
+straight through to it: `ChatSocket.send` on an open socket is simply sent
+(never a wake redial), `QUIET_OPEN_MS` after authentication a socket that
+heard nothing is `store.held` (not live, so a send shows as `store.sending`;
+not reconnecting, so no "Reconnecting…" row, no rail pulse and no "·
+reconnecting" in the header), `{"type":"waking"}` shows the unconfirmed send
+as `store.sending` even when the socket still looked live, and a second
+`ready` on the same socket is a reattach: `onReady` resets nothing, `apply`'s
+seq guard drops what the store has, the pending bubble waits for its echo.
+`remote_unavailable` ends `held`. A kept socket that drops is dialed again
+before the placement's "suspended" parks it. The rest of this paragraph is the
+fallback for an account that refuses or closes those sockets, and for another
+computer as owner. In a native window the daemon holds the first command while a paused
 owner wakes (the additive `{"type":"waking"}` → `store.waking`, "Waking the
 cloud machine…"), refuses further commands until it answers, and answers
 anything it cannot deliver with `command_failed`. Every refusal carries the

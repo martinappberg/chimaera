@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { SessionSocket } from "./ws";
+import { QUIET_OPEN_MS, reconnectingSockets } from "../net/reconnect";
+import { get } from "svelte/store";
 
 class Socket {
   static OPEN = 1;
@@ -159,5 +161,108 @@ it("a keystroke into a terminal waiting on a sleeping owner dials once with wake
   expect(Socket.all[1].url).toContain("?wake=interaction");
   expect(refused).toHaveBeenCalledWith("waking", null);
   expect(session.waitingForOwner).toBe(false);
+  session.close();
+});
+
+// The account keeps a sleeping cloud machine's sockets open (VIEWING.md, "A
+// sleeping cloud machine's sockets"); so does this computer's relay to it.
+
+it("typing into a socket kept open for an owner that has not answered is sent, never dropped", () => {
+  const kept = vi.fn();
+  const refused = vi.fn();
+  const status = vi.fn();
+  const session = new SessionSocket("s-fixture", { ...quiet, onKept: kept, onRefused: refused, onStatus: status });
+  Socket.all[0].onopen?.();
+  vi.advanceTimersByTime(QUIET_OPEN_MS - 1);
+  expect(kept).not.toHaveBeenCalled();
+  vi.advanceTimersByTime(1);
+  expect(kept).toHaveBeenLastCalledWith(true);
+  // However long it stays quiet: no retry, no parked wait, no indicator.
+  vi.advanceTimersByTime(60 * 60_000);
+  expect(Socket.all).toHaveLength(1);
+  expect(session.waitingForOwner).toBe(false);
+  expect(get(reconnectingSockets)).toBe(0);
+  session.sendInput("ls\r");
+  session.sendInput("pwd\r");
+  expect(Socket.all).toHaveLength(1);
+  expect(Socket.all[0].sent).toHaveLength(3);
+  expect(refused).not.toHaveBeenCalled();
+  expect(status).not.toHaveBeenCalled();
+  // Open, but nothing echoes for input the owner has not received.
+  expect(session.isLive).toBe(false);
+  // Being told the owner cannot be reached ends the kept state and a wake
+  // that was under way.
+  Socket.all[0].onmessage?.({ data: JSON.stringify({ type: "waking" }) });
+  expect(status).toHaveBeenLastCalledWith("waking");
+  Socket.all[0].onmessage?.({ data: JSON.stringify({ type: "error", code: "remote_unavailable" }) });
+  expect(kept).toHaveBeenLastCalledWith(false);
+  expect(status).toHaveBeenLastCalledWith(null);
+  session.close();
+});
+
+it("a second ready on the same socket repaints like a reconnect and settles a grid or park that changed since", () => {
+  let parked = false;
+  let dims = { cols: 80, rows: 24 };
+  const reset = vi.fn();
+  const parkedReady = vi.fn();
+  const status = vi.fn();
+  const session = new SessionSocket("s-fixture", { ...quiet, parked: () => parked, dims: () => dims, onReset: reset, onParkedReady: parkedReady, onStatus: status });
+  const ws = Socket.all[0];
+  const frame = (value: unknown): void => ws.onmessage?.({ data: JSON.stringify(value) });
+  const last = (): unknown => JSON.parse(ws.sent.at(-1) as string);
+  ws.onopen?.();
+  frame({ type: "ready", cols: 80, rows: 24 });
+  expect(reset).not.toHaveBeenCalled();
+  // The machine sleeps and wakes behind the kept socket. The account replays
+  // the auth frame as first sent, so the owner renders at the old grid.
+  dims = { cols: 100, rows: 30 };
+  session.sendInput("x");
+  frame({ type: "waking" });
+  expect(status).toHaveBeenLastCalledWith("waking");
+  expect(session.isLive).toBe(false);
+  frame({ type: "ready", cols: 80, rows: 24 });
+  expect(status).toHaveBeenLastCalledWith(null);
+  expect(session.isLive).toBe(true);
+  // Reset before the snapshot that follows, at the grid it was rendered at...
+  expect(reset).toHaveBeenCalledExactlyOnceWith(80, 24);
+  // ...and the terminal's real grid goes back to the owner.
+  expect(last()).toEqual({ type: "resize", cols: 100, rows: 30 });
+  // Parked since: the replayed frame said "shown", so the owner would stream
+  // to a hidden terminal. It is told to stop.
+  parked = true;
+  frame({ type: "ready", cols: 100, rows: 30 });
+  expect(reset).toHaveBeenCalledTimes(2);
+  expect(last()).toEqual({ type: "park" });
+  expect(parkedReady).not.toHaveBeenCalled();
+  expect(Socket.all).toHaveLength(1);
+  session.close();
+});
+
+it("a terminal shown since its parked attach asks for the repaint it was not sent", () => {
+  let parked = true;
+  const reset = vi.fn();
+  const parkedReady = vi.fn();
+  const session = new SessionSocket("s-fixture", { ...quiet, parked: () => parked, dims: () => ({ cols: 90, rows: 20 }), onReset: reset, onParkedReady: parkedReady });
+  const ws = Socket.all[0];
+  ws.onopen?.();
+  expect(JSON.parse(ws.sent[0] as string)).toMatchObject({ parked: true });
+  parked = false;
+  ws.onmessage?.({ data: JSON.stringify({ type: "ready", cols: 80, rows: 24 }) });
+  expect(ws.sent.slice(1).map((raw) => JSON.parse(raw as string))).toEqual([{ type: "resize", cols: 90, rows: 20 }, { type: "unpark" }]);
+  expect(parkedReady).not.toHaveBeenCalled();
+  // The repaint arrives as a resync, which resets; `ready` itself did not.
+  expect(reset).not.toHaveBeenCalled();
+  session.close();
+});
+
+it("a still-parked attach is unchanged: no snapshot, no reset, the buffer desyncs", () => {
+  const reset = vi.fn();
+  const parkedReady = vi.fn();
+  const session = new SessionSocket("s-fixture", { ...quiet, parked: () => true, dims: () => ({ cols: 90, rows: 20 }), onReset: reset, onParkedReady: parkedReady });
+  Socket.all[0].onopen?.();
+  Socket.all[0].onmessage?.({ data: JSON.stringify({ type: "ready", cols: 80, rows: 24 }) });
+  expect(parkedReady).toHaveBeenCalledOnce();
+  expect(reset).not.toHaveBeenCalled();
+  expect(Socket.all[0].sent).toHaveLength(1);
   session.close();
 });

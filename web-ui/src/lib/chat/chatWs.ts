@@ -1,7 +1,7 @@
 import { daemonSocketUrl, isBrowserGateway } from "../net/base";
 import { movedTo, ownerSuspended, parsePause, sendSocketAuth, type MovedTo, type SessionPause } from "../net/placement";
 import { getToken } from "../net/api";
-import { ownerAwake, parkUntilAwake, Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
+import { ownerAwake, parkUntilAwake, QUIET_OPEN_MS, Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 import { CooperativeQueue } from "./cooperativeQueue";
 
 /**
@@ -53,6 +53,14 @@ export interface ChatSocketHandlers {
   /** A send picked the paused project back up: it is waking and the send is
    *  delivered once it answers. */
   onWaking?(): void;
+  /** The socket is open and authenticated and its owner has said nothing
+   *  yet: the owner's side keeps the connection (the account in front of a
+   *  sleeping cloud machine, or this computer's relay to it) and delivers
+   *  what is sent once the owner answers. Not live, and not reconnecting. */
+  onHeld?(): void;
+  /** The relay said the owner cannot be reached (`remote_unavailable`): the
+   *  socket stays open while the relay keeps trying. */
+  onUnreachable?(): void;
   /** Acting here brings the work to this computer (`here`), or a phone's send
    *  brings it to the user's computer (`computer`): the send that asked waits
    *  for it rather than for the current owner. */
@@ -84,6 +92,8 @@ type ChatDelivery =
   | { kind: "command_failed"; message: string; command: string | null; reason: string | null }
   | { kind: "asleep" }
   | { kind: "waking" }
+  | { kind: "held" }
+  | { kind: "unreachable" }
   | { kind: "bringing"; to: "here" | "computer" }
   | { kind: "moved"; to: MovedTo }
   | { kind: "paused"; pause: SessionPause }
@@ -110,6 +120,11 @@ export class ChatSocket {
    *  timer runs; a send (with wake intent) or a sign the owner answers again
    *  dials it. Calling it leaves the waiting set. */
   private leaveSleepWait: (() => void) | null = null;
+  /** This connection was answered (`ready`) or stayed open quietly
+   *  ({@link QUIET_OPEN_MS}): its owner's side keeps it. One that closes
+   *  before either was refused. */
+  private kept = false;
+  private quietTimer: ReturnType<typeof setTimeout> | null = null;
   private unknownRetries = 0;
   private readonly recon = new Reconnector(() => this.connect());
   /** Replay, live events, and terminal frames share one cooperative FIFO.
@@ -152,6 +167,12 @@ export class ChatSocket {
         case "waking":
           this.handlers.onWaking?.();
           break;
+        case "held":
+          this.handlers.onHeld?.();
+          break;
+        case "unreachable":
+          this.handlers.onUnreachable?.();
+          break;
         case "bringing":
           this.handlers.onBringing?.(delivery.to);
           break;
@@ -176,13 +197,18 @@ export class ChatSocket {
   private connect(interaction = false): void {
     if (this.closed) return;
     this.stopSleepWait();
+    this.stopQuiet();
+    this.kept = false;
     const ws = new WebSocket(daemonSocketUrl(`/ws/chat/${this.sessionId}${interaction ? "?wake=interaction" : ""}`));
     this.ws = ws;
 
     ws.onopen = () => {
       sendSocketAuth(ws, {
         type: "auth", token: getToken() ?? "", last_seq: this.handlers.lastSeq(),
-      }, () => this.ws === ws && !this.closed, () => { this.authenticatedSocket = ws; });
+      }, () => this.ws === ws && !this.closed, () => {
+        this.authenticatedSocket = ws;
+        this.awaitQuiet(ws);
+      });
     };
 
     ws.onmessage = (ev: MessageEvent) => {
@@ -193,12 +219,18 @@ export class ChatSocket {
       } catch {
         return;
       }
+      // Any frame ends the quiet wait: the owner's side spoke.
+      this.stopQuiet();
       switch (msg.type) {
         case "ready":
+          // Also a kept socket's later `ready`: the account attached it to
+          // the woken machine again with `last_seq` raised, so only the gap
+          // follows and the reducer's seq guard drops anything it has.
           this.recon.succeeded();
           this.unknownRetries = 0;
           this.waking = false;
           this.asleep = false;
+          this.kept = true;
           // The project answers on this socket: whatever waited for it (a
           // parked socket, a panel that met "asleep" or "unreachable") reads again.
           ownerAwake();
@@ -271,7 +303,12 @@ export class ChatSocket {
             this.deliveries.push({ kind: "asleep" });
             break;
           }
-          if (msg.code === "remote_unavailable" || msg.code === "workspace_scope_changed") break;
+          if (msg.code === "remote_unavailable") {
+            this.kept = false;
+            this.deliveries.push({ kind: "unreachable" });
+            break;
+          }
+          if (msg.code === "workspace_scope_changed") break;
           // Mid view-switch the driver may not be registered yet — the
           // normal onclose reconnect path retries before this goes fatal.
           if (
@@ -308,6 +345,9 @@ export class ChatSocket {
     ws.onclose = () => {
       if (this.ws === ws) this.ws = null;
       this.waking = false;
+      const kept = this.kept;
+      this.kept = false;
+      this.stopQuiet();
       if (this.closed || this.fatal || this.ended) {
         this.recon.clear();
         return;
@@ -316,8 +356,12 @@ export class ChatSocket {
       // stop clearing drafts into a closed socket until we reconnect.
       this.deliveries.push({ kind: "disconnected" });
       // A project view's placement read may say the owner sleeps before any
-      // frame did (a gateway can close without one).
-      if (!this.asleep && ownerSuspended()) {
+      // frame did (a gateway can close without one). That holds for a
+      // connection the owner's side refused. One it kept (answered, or open
+      // and quiet) and then lost is dialed again first: an account that keeps
+      // a sleeping machine's sockets takes it, and one that does not refuses
+      // that dial, which parks it here.
+      if (!this.asleep && !kept && ownerSuspended()) {
         this.asleep = true;
         this.deliveries.push({ kind: "asleep" });
       }
@@ -347,6 +391,26 @@ export class ChatSocket {
     this.leaveSleepWait = null;
   }
 
+  /** Authenticated: if nothing is heard for {@link QUIET_OPEN_MS} the socket
+   *  is kept open for an owner that has not answered. That is healthy: it
+   *  leaves the reconnecting indicator (keeping its backoff, which a later
+   *  drop continues) and the view stops counting it as down. */
+  private awaitQuiet(ws: WebSocket): void {
+    this.stopQuiet();
+    this.quietTimer = setTimeout(() => {
+      this.quietTimer = null;
+      if (this.ws !== ws || this.closed) return;
+      this.kept = true;
+      this.recon.clear();
+      this.deliveries.push({ kind: "held" });
+    }, QUIET_OPEN_MS);
+  }
+
+  private stopQuiet(): void {
+    if (this.quietTimer !== null) clearTimeout(this.quietTimer);
+    this.quietTimer = null;
+  }
+
   /** Waiting for a sleeping owner (no socket, no retry timer). */
   get waitingForOwner(): boolean {
     return this.leaveSleepWait !== null;
@@ -362,7 +426,10 @@ export class ChatSocket {
     return !this.closed && !this.fatal && !this.ended;
   }
 
-  /** Send an AgentCommand frame; false when the socket is not open. */
+  /** Send an AgentCommand frame; false when the socket is not open. An open
+   *  socket takes it whether or not its owner has answered: whoever keeps
+   *  the connection for a sleeping owner holds the command, wakes the owner
+   *  and delivers it once (or refuses it, which hands a send's text back). */
   send(command: Record<string, unknown>): boolean {
     if (this.ws?.readyState !== WebSocket.OPEN || this.authenticatedSocket !== this.ws) {
       this.wakeOnInput();
@@ -376,9 +443,9 @@ export class ChatSocket {
    * A user action on a browser view whose socket is down, or on any socket
    * waiting for a sleeping owner: reconnect now, once, carrying wake intent,
    * instead of waiting out the backoff. The action itself is NOT queued — the
-   * caller keeps it (a composer keeps its draft). A native window's open
-   * socket never needs this: its daemon holds the first input itself while
-   * the owner wakes.
+   * caller keeps it (a composer keeps its draft). An open socket never needs
+   * this: whoever keeps it (a native window's daemon, or the account in front
+   * of a sleeping cloud machine) holds the input itself while the owner wakes.
    */
   private wakeOnInput(): void {
     if (!(isBrowserGateway() || this.leaveSleepWait !== null) || this.closed || this.fatal || this.ended || this.waking) return;
@@ -408,6 +475,7 @@ export class ChatSocket {
   close(): void {
     this.closed = true;
     this.stopSleepWait();
+    this.stopQuiet();
     this.recon.cancel();
     this.recon.clear();
     this.deliveries.clear();

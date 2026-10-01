@@ -1480,6 +1480,13 @@ const READY_SCAN_BYTES: usize = 64 * 1024;
 /// is delivered exactly once after the owner's `ready`, or answered with a
 /// visible refusal when it cannot be delivered; nothing is resent.
 ///
+/// A sleeping cloud machine's transport may be its front door instead: it
+/// accepts the socket while the machine sleeps, keeps it open across suspend
+/// and resume, holds what the viewer sends, wakes the machine for it and
+/// delivers it once. This relay then holds nothing and says nothing: frames
+/// pass straight through in both directions ([`Opened::Held`]). A transport
+/// that refuses the passive attach leaves the relay on the path above.
+///
 /// When the owner is another of the user's computers, that first input
 /// instead brings the work here (`pro::bring_here`): it is held while the
 /// other computer finishes its step and hands the project over, then
@@ -1530,6 +1537,11 @@ struct Link<'a> {
 }
 enum Opened {
     Live(Box<Upstream>),
+    /// The owner (a cloud machine) is asleep and its transport took the
+    /// socket anyway: it holds the authentication frame and whatever the
+    /// viewer sends, and attaches to the machine by itself once it wakes.
+    /// No `ready` comes before that.
+    Held(Box<Upstream>),
     /// The owner is asleep and this attempt carried no interaction.
     Sleeping,
     /// The owner is asleep and this attempt carries interaction: the relay
@@ -1552,17 +1564,36 @@ impl Link<'_> {
             RouteChange::Owner => Some(Some(self.moved())),
         }
     }
-    async fn open(&self, wake: bool) -> Result<Opened> {
+    /// `front_door`: a sleeping owner's transport may accept a passive
+    /// attach (see [`Opened::Held`]); try it instead of reporting it asleep.
+    async fn open(&self, wake: bool, front_door: bool) -> Result<Opened> {
         let reach = verify_scope(&self.state.session_proxy, &self.route, &self.workspace).await?;
         // Viewing never wakes a sleeping owner; only interaction may.
         match (reach, wake) {
-            (Reach::Sleeping, false) => Ok(Opened::Sleeping),
+            (Reach::Sleeping, false) => {
+                // Still passive: no wake marker rides this attach. A
+                // transport that does not hold sockets for a sleeping owner
+                // refuses it at once (503 `worker_asleep`), and any failure
+                // reads as "asleep", exactly as before the attempt existed.
+                if front_door {
+                    if let Ok(Opened::Live(socket)) = self.connect(false, Reach::Awake).await {
+                        return Ok(Opened::Held(socket));
+                    }
+                }
+                Ok(Opened::Sleeping)
+            }
             (Reach::Sleeping, true) => Ok(Opened::Waking),
             (Reach::Awake, _) => self.connect(wake, reach).await,
         }
     }
+    /// Whether this socket's owner is a cloud machine, whose transport may
+    /// hold its sockets while it sleeps. Another computer's never does.
+    fn cloud(&self) -> bool {
+        self.route.host_id.starts_with("worker-")
+    }
     /// The owner's socket, opened with wake intent when `wake`. A sleeping
-    /// owner gets the wake deadline to resume before it answers.
+    /// owner gets the wake deadline to resume before it answers (`reach`
+    /// only picks that deadline).
     async fn connect(&self, wake: bool, reach: Reach) -> Result<Opened> {
         let address = self.route.address.context("remote placement unavailable")?;
         let query = if self.read_only {
@@ -1678,7 +1709,7 @@ impl Link<'_> {
     /// Where this socket's owner is: a cloud machine (`worker-` route) or a
     /// computer — the additive `owner` of this relay's `read_only` refusals.
     fn owner(&self) -> &'static str {
-        if self.route.host_id.starts_with("worker-") {
+        if self.cloud() {
             "cloud"
         } else {
             "computer"
@@ -1857,10 +1888,17 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
     let mut pull: Option<tokio::sync::watch::Receiver<crate::pro::MoveOutcome>> = None;
     let mut upstream: Option<Box<Upstream>> = None;
     let mut ready = false;
+    // A passive attach to a sleeping cloud machine is tried until its
+    // transport refuses one; from then on this socket stays on the
+    // hold-and-wake path (that transport would only refuse again).
+    let mut front_door = link.cloud();
+    // The upstream was accepted while its owner slept ([`Opened::Held`]): the
+    // transport holds input itself, so input passes through before `ready`.
+    let mut through = false;
     // The last connection status told to the viewer, sent once per change.
     let mut told: Option<&'static str> = None;
     let mut attempt: Option<futures::future::BoxFuture<'_, Result<Opened>>> =
-        Some(Box::pin(link.open(wake)));
+        Some(Box::pin(link.open(wake, front_door)));
     let mut backoff = RETRY_MIN;
     let retry = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(retry);
@@ -1879,6 +1917,28 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                     Ok(Opened::Live(socket)) => {
                         upstream = Some(socket);
                         ready = false;
+                        through = false;
+                        backoff = RETRY_MIN;
+                    }
+                    Ok(Opened::Held(mut socket)) => {
+                        // The viewer was told the owner cannot be reached,
+                        // and no frame takes that back before `ready`, which
+                        // a sleeping owner does not send: end this socket so
+                        // the viewer reconnects into the quiet attach.
+                        if told.is_some() {
+                            let refused = held.take();
+                            let _ = link.refuse(downstream, &refused).await;
+                            return;
+                        }
+                        // What was typed while this attach was in flight goes
+                        // to the transport now: it holds it and wakes the owner.
+                        for frame in held.take() {
+                            let Some(frame) = upward(frame) else { continue };
+                            if bounded_send(socket.as_mut(), frame).await.is_err() { return; }
+                        }
+                        upstream = Some(socket);
+                        ready = false;
+                        through = true;
                         backoff = RETRY_MIN;
                     }
                     Ok(Opened::Waking) => {
@@ -1889,10 +1949,12 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                         attempt = Some(Box::pin(link.connect(true, Reach::Sleeping)));
                     }
                     Ok(Opened::Sleeping) if !held.frames.is_empty() && pull.is_none() => {
+                        front_door = false;
                         wake = true;
-                        attempt = Some(Box::pin(link.open(true)));
+                        attempt = Some(Box::pin(link.open(true, false)));
                     }
                     Ok(Opened::Sleeping) => {
+                        front_door = false;
                         if told != Some("worker_asleep") {
                             told = Some("worker_asleep");
                             if bounded_send(downstream, Down::Text(asleep().to_string().into())).await.is_err() { return; }
@@ -1919,7 +1981,7 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
             }
             _ = &mut retry, if retry_armed => {
                 retry_armed = false;
-                attempt = Some(Box::pin(link.open(wake)));
+                attempt = Some(Box::pin(link.open(wake, front_door)));
             }
             outcome = settled(&mut pull) => {
                 pull = None;
@@ -1942,7 +2004,7 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                 if link.refuse_kept(downstream, &refused).await.is_err() { return; }
                 if upstream.is_none() && attempt.is_none() {
                     retry_armed = false;
-                    attempt = Some(Box::pin(link.open(false)));
+                    attempt = Some(Box::pin(link.open(false, front_door)));
                 }
             }
             _ = ownership.tick() => {
@@ -2025,7 +2087,10 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                         continue;
                     }
                     match upstream.as_mut() {
-                        Some(socket) if ready => {
+                        // Before `ready` only input goes to a transport that
+                        // holds it; grid control waits for the `ready`
+                        // reconcile either way.
+                        Some(socket) if ready || (through && input) => {
                             if let Some(moved) = link.ended() {
                                 let _ = link.refuse(downstream, input.then_some(&frame)).await;
                                 if let Some(moved) = moved {
@@ -2054,7 +2119,7 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                             if upstream.is_none() && attempt.is_none() {
                                 wake = true;
                                 retry_armed = false;
-                                attempt = Some(Box::pin(link.open(true)));
+                                attempt = Some(Box::pin(link.open(true, front_door)));
                             }
                         }
                         // Grid control before the owner answers: the auth frame
@@ -2072,8 +2137,12 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
 /// own `/ws/events` loop. The window's daemon stays authoritative for
 /// everything else: the owner's settings, recents, updates and plugin frames
 /// describe the owner's machine and are never forwarded, and the feed ending
-/// (an owner change, a sleeping owner) never closes the window's socket — its
-/// loop simply starts another feed. The owner's notices about the project's
+/// (an owner change, a sleeping owner whose transport does not keep its
+/// sockets) never closes the window's socket — its loop simply starts another
+/// feed. A sleeping cloud machine's transport may instead keep the feed open
+/// and quiet, and attach it again by itself when the machine wakes: the
+/// owner's first frames then bring fresh state, and the registration is sent
+/// again (`settings` below). The owner's notices about the project's
 /// conversations are not forwarded as frames either: they are relayed into
 /// this daemon's own notice feed (`notices::relay`), which the window's loop
 /// already sends and the native app already polls.
@@ -2150,7 +2219,13 @@ async fn feed(
         .for_workspace(workspace)
         .context("project route retired")?;
     let _permit = SOCKETS.try_acquire().context("remote stream limit")?;
-    if verify_scope(&state.session_proxy, &route, workspace).await? == Reach::Sleeping {
+    let reach = verify_scope(&state.session_proxy, &route, workspace).await?;
+    // Viewing never wakes a sleeping owner, so the attach below stays
+    // passive. A cloud machine's transport may take it while the machine
+    // sleeps and keep it open; one that refuses (503 `worker_asleep`) fails
+    // the connect, which ends this feed for the window's loop to retry, as a
+    // sleeping owner always did. Another computer's is never tried.
+    if reach == Reach::Sleeping && !route.host_id.starts_with("worker-") {
         bail!("owner asleep");
     }
     let address = route.address.context("remote placement unavailable")?;
@@ -2192,8 +2267,14 @@ async fn feed(
         };
         json!({"type":"watch","workspace_id":workspace,"files":map(files),"dirs":map(dirs)})
     };
-    let initial = registration(&paths.borrow_and_update());
-    bounded_send(&mut upstream, Up::Text(initial.to_string().into())).await?;
+    // The owner hears this socket. Until a sleeping owner's first frame it
+    // does not, and a registration is not input: nothing is sent that its
+    // transport would have to hold (and might wake the machine for).
+    let mut attached = reach == Reach::Awake;
+    if attached {
+        let initial = registration(&paths.borrow_and_update());
+        bounded_send(&mut upstream, Up::Text(initial.to_string().into())).await?;
+    }
     let mut ownership = tokio::time::interval(Duration::from_secs(2));
     ownership.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let retired = || {
@@ -2224,12 +2305,28 @@ async fn feed(
                 if changed.is_err() {
                     return Ok(());
                 }
-                let watch = registration(&paths.borrow_and_update());
-                bounded_send(&mut upstream, Up::Text(watch.to_string().into())).await?;
+                // Not attached yet: the owner's first frame sends the
+                // registration as it stands then.
+                if attached {
+                    let watch = registration(&paths.borrow_and_update());
+                    bounded_send(&mut upstream, Up::Text(watch.to_string().into())).await?;
+                }
             }
             next = upstream.next() => match next {
                 Some(Ok(Up::Text(text))) => {
                     let Ok(mut value) = serde_json::from_str::<Value>(&text) else { continue };
+                    // The owner sends its settings once per attach (and when
+                    // they change, which is rare). A registration lives on
+                    // the owner's side of one attach, and a transport that
+                    // kept this socket open across the owner's sleep attached
+                    // it afresh: register again, as on a held socket's first
+                    // frame of any kind. Repeating an unchanged registration
+                    // changes nothing there.
+                    if !attached || value["type"] == "settings" {
+                        attached = true;
+                        let watch = registration(&paths.borrow_and_update());
+                        bounded_send(&mut upstream, Up::Text(watch.to_string().into())).await?;
+                    }
                     match value["type"].as_str() {
                         Some("sessions") => {
                             // The same rows the roster poll installs, just

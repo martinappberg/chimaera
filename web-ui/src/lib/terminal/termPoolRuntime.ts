@@ -28,7 +28,7 @@
  */
 
 import { isWatching } from "./viewerMode.svelte";
-import { refuse, setTerminalStatus } from "./refusals.svelte";
+import { refuse, setTerminalKept, setTerminalStatus } from "./refusals.svelte";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -487,6 +487,7 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
     // plain words, instead of vanishing into the console.
     onRefused: (reason, message) => refuse(id, reason, message),
     onStatus: (status) => setTerminalStatus(id, status),
+    onKept: (kept) => setTerminalKept(id, kept),
     parked: () => entry.buf.isParked(),
     onParkedReady: () => {
       // A parked (re)connect carries no snapshot, and pre-drop buffered

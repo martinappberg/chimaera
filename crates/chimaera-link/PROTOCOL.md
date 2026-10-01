@@ -490,6 +490,24 @@ always suppresses wake. Background health checks and viewer attachments must
 never mark interaction. An awake daemon still requires its normal authenticated
 WebSocket first frame.
 
+### Sleeping worker sockets
+
+Additive (2026-09-30). For a worker host the keeper accepts the WebSocket
+upgrade of `/ws/chat/{id}`, `/ws/sessions/{id}` and `/ws/events` whether the
+worker is awake or asleep, with or without the wake marker, and keeps the
+client's side open across the worker's suspend and resume. It remembers the
+client's first frame, holds chat commands and terminal typing sent while
+nothing is attached, wakes the worker for them, attaches, replays the first
+frame (a chat's `last_seq` raised to what it already relayed), waits for the
+daemon's `ready` and delivers what it held once, in order; what it cannot
+deliver it hands back with the daemon's own refusal frames. It adds no frame
+type: the one status it sends is the existing `{"type":"waking"}`. A keeper
+that predates this answers a passive upgrade to a sleeping worker with the 503
+above and closes sockets on a suspension; clients handle both. The rules, the
+caps and what clients do are in
+[VIEWING](VIEWING.md#forwarded-requests) ("A sleeping cloud machine's
+sockets"). HTTP requests are unchanged.
+
 ### Background handoff HTTP adapter
 
 `/v1/hosts/{host_id}/http/{path}` accepts a device or daemon-delegation bearer and

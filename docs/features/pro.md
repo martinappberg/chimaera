@@ -537,12 +537,33 @@ A transferred session keeps its public ID, pinned title, linked terminals and
 workspace tabs. The local workbench merges remote session rows under those IDs
 and forwards their chat and terminal connections through the signed-in app. A
 routed session is labelled "In the cloud" or "On another computer" ("·
-reconnecting" while its owner cannot be reached); opening it never silently
-starts another local agent.
+reconnecting" while its owner cannot be reached and this view's own connection
+to it is down); opening it never silently starts another local agent.
 
 **Opening is viewing; doing wakes.** Attaching to a chat or terminal, polling
 rosters and watching files never wake a paused cloud project. The first real
-input does: a keystroke, a chat message or a permission answer. On a computer,
+input does: a keystroke, a chat message or a permission answer. The account
+keeps a sleeping cloud machine's chat, terminal and event connections open
+(the service half ships separately; the app works with either): a connection
+opens as usual while the machine sleeps and stays open when it sleeps again,
+what you send or type is taken at once, the account wakes the machine and
+delivers it exactly once, in order, and more messages or typing during the
+wake join the same queue. The message shows as a "sending…" bubble until the
+agent has it; a terminal echoes nothing until the machine answers. A
+connection that is open and quiet is not "Reconnecting…", and a conversation
+opened for the first time while its machine sleeps shows its loading line
+until something wakes the machine. On a computer the app's daemon passes
+everything straight through and holds nothing itself; when the machine wakes,
+the same connections carry on (a chat receives exactly what it missed, a
+terminal repaints, the window's file and Git updates resume). Anything that
+cannot be delivered is answered, never dropped — a refused message returns to
+the composer with its pictures, and refused typing is said in a small note
+over the terminal. Only a refused *message* comes back: a refused stop or
+permission answer says so without resurrecting a message that may already
+have been delivered.
+
+Against an account service that does not keep those connections, the earlier
+behavior applies unchanged. On a computer,
 the daemon keeps the chat/terminal connection open while the owner is paused or
 reconnecting, holds that first input (a little typing, up to four chat
 commands, within one daemon-wide budget) and delivers it exactly once after the
@@ -550,11 +571,7 @@ owner answers. The message shows at once as a "sending…" bubble and the chat
 says "Waking the cloud machine…"; a terminal says the same over the pane and
 echoes nothing until the owner answers. While it wakes, a second message or more
 typing is not held: it is refused with a short note (a message comes back into
-the composer), so nothing is ever sent or run twice. Anything that cannot be
-delivered is answered, never dropped — a refused message returns to the composer
-with its pictures, and refused typing is said in a small note over the terminal.
-Only a refused *message* comes back: a refused stop or permission answer says so
-without resurrecting a message that may already have been delivered. A browser
+the composer), so nothing is ever sent or run twice. A browser
 view reconnects once with wake intent when the user types or sends into a
 dropped connection; the action itself is not queued (the composer keeps its
 text; a terminal says it is waking). There is no reconnect or wake button: the

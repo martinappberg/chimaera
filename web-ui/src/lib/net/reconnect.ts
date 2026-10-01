@@ -52,6 +52,16 @@ export const NUDGE_SPREAD_MS = 2_000;
 export const UNKNOWN_SESSION_RETRIES = 12;
 
 /**
+ * A chat or terminal socket that authenticated and has heard nothing for this
+ * long is open and kept, not reconnecting: the account in front of a sleeping
+ * cloud machine (or this computer's relay to it) keeps the connection, takes
+ * what is sent and delivers it once the machine answers. A connection that
+ * closes sooner was refused. Shorter than the 2 s grace before a view says
+ * "Reconnecting…", so a kept socket never shows it.
+ */
+export const QUIET_OPEN_MS = 1500;
+
+/**
  * The actual delay for one retry: the backoff, floored at the slow tier while
  * the document is hidden — but only once `attempt` (1-based count of
  * consecutive failures) has spent the grace attempts — then jittered ±JITTER

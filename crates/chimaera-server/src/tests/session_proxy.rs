@@ -1394,6 +1394,11 @@ async fn a_routed_window_with_an_outside_tab_hears_owner_and_local_changes() {
 /// daemon: while "asleep" it answers health for the owner (marked sleeping)
 /// and refuses socket upgrades that carry no interaction, exactly as the
 /// transport contract says. A wake-marked upgrade resumes the owner.
+///
+/// With `front_door` it is the newer transport instead (VIEWING.md, "A
+/// sleeping cloud machine's sockets"): it takes every socket upgrade itself
+/// whether the owner sleeps or not, and keeps the viewer's side open across
+/// the owner's suspend and resume (see [`FakeTransport::keep`]).
 #[derive(Default)]
 struct FakeTransport {
     asleep: std::sync::atomic::AtomicBool,
@@ -1402,6 +1407,18 @@ struct FakeTransport {
     hold_wake: std::sync::atomic::AtomicBool,
     release: tokio::sync::Notify,
     upgrades: std::sync::Mutex<Vec<String>>,
+    front_door: std::sync::atomic::AtomicBool,
+    /// The scope probe fails outright: the owner cannot be reached.
+    fail_health: std::sync::atomic::AtomicBool,
+    /// The daemon itself, for the front door's own attaches.
+    daemon: std::sync::OnceLock<std::net::SocketAddr>,
+    /// Sockets the front door took, by path.
+    kept: std::sync::Mutex<Vec<String>>,
+    /// Times the front door attached a kept socket to the daemon.
+    attaches: std::sync::atomic::AtomicUsize,
+    /// Frames a viewer sent after its first while the owner slept, as
+    /// `(path, was binary)`: what the front door had to hold or drop.
+    detached: std::sync::Mutex<Vec<(String, bool)>>,
 }
 impl FakeTransport {
     fn serve(self: &Arc<Self>, daemon: Arc<AppState>) -> axum::Router {
@@ -1416,6 +1433,25 @@ impl FakeTransport {
                     let query = request.uri().query().unwrap_or_default().to_owned();
                     if path.starts_with("/ws/") {
                         transport.upgrades.lock().unwrap().push(query.clone());
+                        if transport.front_door.load(Ordering::Acquire) {
+                            use axum::extract::FromRequestParts;
+                            let (mut parts, _) = request.into_parts();
+                            let upgrade = axum::extract::WebSocketUpgrade::from_request_parts(
+                                &mut parts,
+                                &(),
+                            )
+                            .await
+                            .unwrap();
+                            transport.kept.lock().unwrap().push(path.clone());
+                            let target = if query.is_empty() {
+                                path
+                            } else {
+                                format!("{path}?{query}")
+                            };
+                            return upgrade
+                                .max_message_size(16 * 1024 * 1024)
+                                .on_upgrade(move |socket| transport.keep(socket, target));
+                        }
                         if transport.asleep.load(Ordering::Acquire) {
                             if !query.contains("wake=interaction")
                                 || transport.refuse_wake.load(Ordering::Acquire)
@@ -1431,6 +1467,10 @@ impl FakeTransport {
                             }
                             transport.asleep.store(false, Ordering::Release);
                         }
+                    } else if path == "/api/v1/health"
+                        && transport.fail_health.load(Ordering::Acquire)
+                    {
+                        return StatusCode::BAD_GATEWAY.into_response();
                     } else if path == "/api/v1/health" && transport.asleep.load(Ordering::Acquire) {
                         let mut response = axum::Json(serde_json::json!({"pid":1})).into_response();
                         response
@@ -1442,6 +1482,117 @@ impl FakeTransport {
                 }
             },
         ))
+    }
+
+    /// One viewer socket behind the front door. The first frame is its
+    /// authentication and is remembered. While the owner sleeps nothing is
+    /// attached: what a chat sends (and what a terminal types) is held and
+    /// wakes the owner, which the viewer hears once as `waking`; a terminal's
+    /// grid control and an events registration are neither held nor a reason
+    /// to wake. Awake, the socket is attached with the remembered frame (a
+    /// chat's `last_seq` raised to what this viewer already received) and,
+    /// after the daemon's `ready` (an events socket has none), what was held
+    /// is delivered once, in order. A suspension drops only the attach.
+    async fn keep(self: Arc<Self>, mut viewer: axum::extract::ws::WebSocket, target: String) {
+        use axum::extract::ws::Message as Viewer;
+        use futures::StreamExt;
+        use std::sync::atomic::Ordering;
+        let path = target.split('?').next().unwrap_or_default().to_owned();
+        let chat = path.starts_with("/ws/chat/");
+        let events = path == "/ws/events";
+        let Some(Ok(Viewer::Text(first))) = viewer.recv().await else {
+            return;
+        };
+        let mut auth: serde_json::Value = serde_json::from_str(&first).unwrap();
+        let mut seen = 0u64;
+        let mut held: std::collections::VecDeque<Message> = Default::default();
+        let mut upstream = None;
+        let mut ready = false;
+        let mut said_waking = false;
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(20));
+        loop {
+            let asleep = self.asleep.load(Ordering::Acquire);
+            if asleep && upstream.is_some() {
+                upstream = None;
+                ready = false;
+                said_waking = false;
+            }
+            if !asleep && upstream.is_none() {
+                let daemon = self.daemon.get().unwrap();
+                let (mut socket, _) =
+                    tokio_tungstenite::connect_async(format!("ws://{daemon}{target}"))
+                        .await
+                        .unwrap();
+                if chat {
+                    auth["last_seq"] =
+                        serde_json::json!(seen.max(auth["last_seq"].as_u64().unwrap_or(0)));
+                }
+                socket
+                    .send(Message::Text(auth.to_string().into()))
+                    .await
+                    .unwrap();
+                self.attaches.fetch_add(1, Ordering::AcqRel);
+                ready = events;
+                upstream = Some(socket);
+            }
+            tokio::select! {
+                _ = tick.tick() => {}
+                frame = viewer.recv() => {
+                    let frame = match frame {
+                        Some(Ok(Viewer::Text(text))) => Message::Text(text.as_str().into()),
+                        Some(Ok(Viewer::Binary(bytes))) => Message::Binary(bytes),
+                        Some(Ok(Viewer::Close(_))) | None | Some(Err(_)) => return,
+                        _ => continue,
+                    };
+                    if let (Some(socket), true) = (upstream.as_mut(), ready) {
+                        socket.send(frame).await.unwrap();
+                        continue;
+                    }
+                    let binary = matches!(frame, Message::Binary(_));
+                    self.detached.lock().unwrap().push((path.clone(), binary));
+                    if !(chat || binary) {
+                        continue;
+                    }
+                    held.push_back(frame);
+                    self.asleep.store(false, Ordering::Release);
+                    if !said_waking {
+                        said_waking = true;
+                        let waking = serde_json::json!({"type":"waking"}).to_string();
+                        if viewer.send(Viewer::Text(waking.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                frame = async { upstream.as_mut().unwrap().next().await }, if upstream.is_some() => {
+                    match frame {
+                        Some(Ok(Message::Text(text))) => {
+                            let value: serde_json::Value =
+                                serde_json::from_str(&text).unwrap_or_default();
+                            for event in value["events"].as_array().into_iter().flatten().chain([&value]) {
+                                seen = seen.max(event["seq"].as_u64().unwrap_or(0));
+                            }
+                            if viewer.send(Viewer::Text(text.as_str().into())).await.is_err() {
+                                return;
+                            }
+                            if value["type"] == "ready" && !ready {
+                                ready = true;
+                                let socket = upstream.as_mut().unwrap();
+                                for frame in held.drain(..) {
+                                    socket.send(frame).await.unwrap();
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Binary(bytes))) => {
+                            if viewer.send(Viewer::Binary(bytes)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1536,6 +1687,14 @@ async fn sleeping_remote(label: &str, terminal: bool) -> SleepingChat {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let transport_addr = listener.local_addr().unwrap();
     let router = transport.serve(remote.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    // The daemon without the transport in front: where a front door attaches.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    transport
+        .daemon
+        .set(listener.local_addr().unwrap())
+        .unwrap();
+    let router = app(remote.clone());
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let (status, error) = request(
         &local,
@@ -1636,9 +1795,12 @@ async fn a_viewer_send_wakes_a_sleeping_owner_once_and_an_owner_change_says_move
     let first = next_json(&mut socket).await;
     assert_eq!(first["type"], "error");
     assert_eq!(first["code"], "worker_asleep");
-    assert!(
-        fixture.transport.upgrades.lock().unwrap().is_empty(),
-        "attaching never tried to reach, or wake, the owner"
+    // The one attach it tried carried no wake intent, and this transport
+    // (which keeps no sockets for a sleeping owner) refused it.
+    assert_eq!(
+        *fixture.transport.upgrades.lock().unwrap(),
+        vec![String::new()],
+        "attaching never tried to wake the owner"
     );
     // The first real input carries wake intent and is delivered after ready.
     socket.send(send_text("WAKE_MESSAGE")).await.unwrap();
@@ -1665,7 +1827,7 @@ async fn a_viewer_send_wakes_a_sleeping_owner_once_and_an_owner_change_says_move
     }
     assert_eq!(
         *fixture.transport.upgrades.lock().unwrap(),
-        vec!["wake=interaction".to_string()],
+        vec![String::new(), "wake=interaction".to_string()],
         "one connection, opened by the interaction"
     );
 
@@ -1843,7 +2005,10 @@ async fn a_permission_answer_to_a_suspended_owner_wakes_it() {
     let fixture = sleeping_remote_chat("wake-permission").await;
     let mut socket = open_chat(&fixture).await;
     assert_eq!(next_json(&mut socket).await["code"], "worker_asleep");
-    assert!(fixture.transport.upgrades.lock().unwrap().is_empty());
+    assert_eq!(
+        *fixture.transport.upgrades.lock().unwrap(),
+        vec![String::new()]
+    );
     socket
         .send(Message::Text(
             serde_json::json!({"type":"permission","request_id":"ask-1","option_id":"allow_once"})
@@ -1860,7 +2025,418 @@ async fn a_permission_answer_to_a_suspended_owner_wakes_it() {
     }
     assert_eq!(
         *fixture.transport.upgrades.lock().unwrap(),
-        vec!["wake=interaction".to_string()],
+        vec![String::new(), "wake=interaction".to_string()],
         "the answer opened the connection with wake intent"
     );
+}
+
+/// Frames until the socket has been quiet for `quiet`; the socket must still
+/// be open then.
+async fn until_quiet<S>(socket: &mut S, quiet: std::time::Duration) -> Vec<serde_json::Value>
+where
+    S: futures::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    use futures::StreamExt;
+    let mut frames = Vec::new();
+    loop {
+        match tokio::time::timeout(quiet, socket.next()).await {
+            Err(_) => return frames,
+            Ok(Some(Ok(Message::Text(text)))) => frames.push(serde_json::from_str(&text).unwrap()),
+            Ok(Some(Ok(Message::Close(frame)))) => panic!("the socket closed: {frame:?}"),
+            Ok(Some(Ok(_))) => {}
+            Ok(other) => panic!("the socket ended: {other:?}"),
+        }
+    }
+}
+
+/// `user_message` echoes of `text` in one chat frame (`ev`, or a replay `batch`).
+fn echoes(frame: &serde_json::Value, text: &str) -> usize {
+    frame["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| &entry["ev"])
+        .chain([&frame["ev"]])
+        .filter(|ev| ev["type"] == "user_message" && ev["text"] == text)
+        .count()
+}
+
+async fn delivered_once(capture: &std::path::Path, text: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while user_turns(capture, text) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{text} never delivered"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(user_turns(capture, text), 1, "{text} delivered once");
+}
+
+/// A transport that keeps a sleeping cloud machine's sockets: the relay
+/// attaches at once (passively), says nothing to the viewer, holds nothing
+/// itself and passes the viewer's frames straight through; the transport
+/// wakes the owner and delivers them. The viewer's socket then stays open
+/// across the owner's next suspension and resume.
+#[tokio::test]
+async fn a_transport_that_keeps_a_sleeping_owners_socket_gets_the_viewers_frames_at_once() {
+    use std::sync::atomic::Ordering;
+    let quiet = std::time::Duration::from_millis(600);
+    let fixture = sleeping_remote_chat("front-door-chat").await;
+    fixture.transport.front_door.store(true, Ordering::Release);
+    let mut socket = open_chat(&fixture).await;
+    // Opening is passive and quiet: no "asleep", no "reconnecting", nothing.
+    assert_eq!(
+        until_quiet(&mut socket, quiet).await,
+        Vec::<serde_json::Value>::new()
+    );
+    assert_eq!(
+        *fixture.transport.upgrades.lock().unwrap(),
+        vec![String::new()],
+        "one attach, without wake intent"
+    );
+    assert!(
+        fixture.transport.asleep.load(Ordering::Acquire),
+        "viewing woke nothing"
+    );
+    assert_eq!(fixture.transport.attaches.load(Ordering::Acquire), 0);
+
+    // Two sends while it sleeps and wakes: both reach the transport at once
+    // and neither is refused by the relay.
+    socket.send(send_text("FIRST_THROUGH")).await.unwrap();
+    socket.send(send_text("SECOND_THROUGH")).await.unwrap();
+    let mut waking = 0;
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "error", "{frame}");
+        if frame["type"] == "waking" {
+            waking += 1;
+        }
+        if frame["type"] == "ready" {
+            break;
+        }
+    }
+    assert_eq!(waking, 1, "the transport's one status, passed through");
+    // The agent got the first; the second waits its turn on the owner (a
+    // mid-turn send), which its echo proves.
+    delivered_once(&fixture.capture, "FIRST_THROUGH").await;
+    let mut echoed = (0, 0);
+    while echoed != (1, 1) {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "error", "{frame}");
+        echoed.0 += echoes(&frame, "FIRST_THROUGH");
+        echoed.1 += echoes(&frame, "SECOND_THROUGH");
+    }
+    assert_eq!(
+        *fixture.transport.detached.lock().unwrap(),
+        vec![
+            (format!("/ws/chat/{}", fixture.id), false),
+            (format!("/ws/chat/{}", fixture.id), false)
+        ],
+        "the relay held neither send back"
+    );
+
+    // The owner suspends: the transport drops only its own attach, and the
+    // viewer's socket stays open and quiet.
+    until_quiet(&mut socket, quiet).await;
+    fixture.transport.asleep.store(true, Ordering::Release);
+    assert_eq!(
+        until_quiet(&mut socket, quiet).await,
+        Vec::<serde_json::Value>::new()
+    );
+
+    // A send on that same socket wakes it again; the second `ready` and the
+    // replayed gap pass through and the message is delivered once.
+    socket.send(send_text("AFTER_SUSPEND")).await.unwrap();
+    let (mut readies, mut echoed) = (0, 0);
+    while echoed == 0 {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "error", "{frame}");
+        readies += usize::from(frame["type"] == "ready");
+        echoed += echoes(&frame, "AFTER_SUSPEND");
+        assert_eq!(
+            echoes(&frame, "FIRST_THROUGH"),
+            0,
+            "only the gap is replayed"
+        );
+    }
+    assert_eq!(readies, 1, "delivered after the second `ready`");
+    assert_eq!(user_turns(&fixture.capture, "FIRST_THROUGH"), 1);
+    assert_eq!(fixture.transport.attaches.load(Ordering::Acquire), 2);
+    assert_eq!(
+        *fixture.transport.upgrades.lock().unwrap(),
+        vec![String::new()],
+        "the relay never redialed"
+    );
+}
+
+/// The same for a terminal: typing goes to the transport at once and none
+/// of it is refused while the owner wakes; grid control sent before the
+/// owner answers is not passed on (the `ready` reconcile settles the grid).
+#[tokio::test]
+async fn a_kept_terminal_takes_typing_at_once_and_refuses_none_of_it() {
+    use std::sync::atomic::Ordering;
+    let fixture = sleeping_remote("front-door-term", true).await;
+    fixture.transport.front_door.store(true, Ordering::Release);
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{}/ws/sessions/{}",
+        fixture.local_addr, fixture.id
+    ))
+    .await
+    .unwrap();
+    socket
+        .send(Message::Text(
+            serde_json::json!({"type":"auth","token":"test-token","cols":80,"rows":24})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        until_quiet(&mut socket, std::time::Duration::from_millis(600)).await,
+        Vec::<serde_json::Value>::new()
+    );
+    socket
+        .send(Message::Text(
+            serde_json::json!({"type":"resize","cols":100,"rows":30})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(Message::Binary(b"FIRST_BURST\r".to_vec().into()))
+        .await
+        .unwrap();
+    socket
+        .send(Message::Binary(b"SECOND_BURST\r".to_vec().into()))
+        .await
+        .unwrap();
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "error", "{frame}");
+        if frame["type"] == "ready" {
+            break;
+        }
+    }
+    let captured = || std::fs::read_to_string(&fixture.capture).unwrap_or_default();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !captured().contains("SECOND_BURST") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "typing never delivered"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let captured = captured();
+    assert_eq!(captured.matches("FIRST_BURST").count(), 1);
+    assert!(
+        captured.find("FIRST_BURST") < captured.find("SECOND_BURST"),
+        "in order"
+    );
+    let path = format!("/ws/sessions/{}", fixture.id);
+    assert_eq!(
+        *fixture.transport.detached.lock().unwrap(),
+        vec![(path.clone(), true), (path, true)],
+        "only the typing reached the transport before the owner answered"
+    );
+}
+
+/// A window watching a sleeping cloud project: its feed attaches passively
+/// to a transport that keeps the socket and sends nothing it would have to
+/// hold. When the owner wakes the same feed registers the window's paths,
+/// and it registers them again after the next suspension, because a
+/// registration lives on the owner's side of one attach.
+#[tokio::test]
+async fn a_kept_feed_registers_when_the_owner_wakes_and_again_after_each_suspension() {
+    use std::sync::atomic::Ordering;
+    let fixture = sleeping_remote_chat("front-door-feed").await;
+    fixture.transport.front_door.store(true, Ordering::Release);
+    let owner_root = lock(&fixture.remote.workspaces)
+        .get(&fixture.workspace)
+        .unwrap()
+        .root;
+    let viewer_root = lock(&fixture.local.workspaces)
+        .get(&fixture.workspace)
+        .unwrap()
+        .root;
+    let note = owner_root.join("note.txt");
+    std::fs::write(&note, "v0").unwrap();
+    let viewer_note = viewer_root.join("note.txt").to_string_lossy().into_owned();
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(format!("ws://{}/ws/events", fixture.local_addr))
+            .await
+            .unwrap();
+    for frame in [
+        serde_json::json!({"type":"auth","token":"test-token"}),
+        serde_json::json!({"type":"watch","workspace_id":fixture.workspace,"files":[viewer_note],"dirs":[]}),
+    ] {
+        socket
+            .send(Message::Text(frame.to_string().into()))
+            .await
+            .unwrap();
+    }
+    let kept = || {
+        fixture
+            .transport
+            .kept
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.as_str() == "/ws/events")
+            .count()
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while kept() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the feed never attached"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        fixture.transport.asleep.load(Ordering::Acquire),
+        "watching woke nothing"
+    );
+    assert!(
+        fixture.transport.detached.lock().unwrap().is_empty(),
+        "nothing was sent for the transport to hold"
+    );
+
+    // The owner's change reaches the window once it is awake: its paths were
+    // registered by the same feed. `rounds` suspends and resumes once more.
+    let mut writes = 0;
+    for round in 0..2 {
+        fixture.transport.asleep.store(false, Ordering::Release);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        'fs: loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no fs frame after wake {round}"
+            );
+            writes += 1;
+            std::fs::write(&note, format!("v{writes}")).unwrap();
+            let wait = tokio::time::Instant::now() + std::time::Duration::from_millis(700);
+            while let Ok(Some(Ok(Message::Text(text)))) =
+                tokio::time::timeout_at(wait, futures::StreamExt::next(&mut socket)).await
+            {
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_ne!(frame["type"], "error", "{frame}");
+                if frame["type"] == "fs"
+                    && frame["files"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|path| path == viewer_note.as_str())
+                {
+                    break 'fs;
+                }
+            }
+        }
+        assert_eq!(
+            fixture.transport.attaches.load(Ordering::Acquire),
+            round + 1
+        );
+        fixture.transport.asleep.store(true, Ordering::Release);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    assert_eq!(kept(), 1, "one feed, kept open across the suspension");
+}
+
+/// A transport that keeps no sockets for a sleeping owner refuses the feed's
+/// passive attach: the feed ends and is retried, the window's own socket
+/// stays, and nothing asks the owner to wake.
+#[tokio::test]
+async fn a_refused_feed_for_a_sleeping_owner_leaves_the_window_connected() {
+    use std::sync::atomic::Ordering;
+    let fixture = sleeping_remote_chat("refused-feed").await;
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(format!("ws://{}/ws/events", fixture.local_addr))
+            .await
+            .unwrap();
+    for frame in [
+        serde_json::json!({"type":"auth","token":"test-token"}),
+        serde_json::json!({"type":"watch","workspace_id":fixture.workspace,"files":[],"dirs":[]}),
+    ] {
+        socket
+            .send(Message::Text(frame.to_string().into()))
+            .await
+            .unwrap();
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while fixture.transport.upgrades.lock().unwrap().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the feed never tried"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let (status, _) = request(
+        &fixture.local,
+        Method::PUT,
+        "/api/v1/settings",
+        Some(serde_json::json!({"test.viewer_marker":"still-here"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    loop {
+        let frame = next_json(&mut socket).await;
+        assert_ne!(frame["type"], "error", "{frame}");
+        if frame["type"] == "settings" && frame["settings"]["test.viewer_marker"] == "still-here" {
+            break;
+        }
+    }
+    assert!(fixture.transport.asleep.load(Ordering::Acquire));
+    assert!(
+        fixture
+            .transport
+            .upgrades
+            .lock()
+            .unwrap()
+            .iter()
+            .all(String::is_empty),
+        "no attach carried wake intent"
+    );
+}
+
+/// A viewer already told the owner cannot be reached is not left saying so
+/// once a keeping transport takes the socket: nothing takes "reconnecting"
+/// back before `ready`, which a sleeping owner does not send. The relay ends
+/// that socket instead, and the viewer's reconnect attaches quietly.
+#[tokio::test]
+async fn a_viewer_told_reconnecting_is_reconnected_into_the_kept_socket() {
+    use futures::StreamExt;
+    use std::sync::atomic::Ordering;
+    let fixture = sleeping_remote_chat("front-door-late").await;
+    fixture.transport.front_door.store(true, Ordering::Release);
+    fixture.transport.fail_health.store(true, Ordering::Release);
+    let mut socket = open_chat(&fixture).await;
+    assert_eq!(next_json(&mut socket).await["code"], "remote_unavailable");
+    fixture
+        .transport
+        .fail_health
+        .store(false, Ordering::Release);
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+            .await
+            .expect("the socket never ended")
+        {
+            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+            Some(Ok(Message::Text(text))) => panic!("unexpected frame {text}"),
+            Some(Ok(_)) => {}
+        }
+    }
+    let mut socket = open_chat(&fixture).await;
+    assert_eq!(
+        until_quiet(&mut socket, std::time::Duration::from_millis(600)).await,
+        Vec::<serde_json::Value>::new()
+    );
+    assert!(fixture.transport.asleep.load(Ordering::Acquire));
 }

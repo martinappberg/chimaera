@@ -75,6 +75,8 @@ function makeSocket(sessionId: string, store: ChatStore): ChatSocket {
       store.onCommandFailed(message, command, reason ?? null),
     onAsleep: () => store.onAsleep(),
     onWaking: () => store.onWaking(),
+    onHeld: () => store.onHeld(),
+    onUnreachable: () => store.onUnreachable(),
     onBringing: (to: "here" | "computer") => store.onBringing(to),
     onMoved: (to: MovedTo) => store.onMoved(to),
     onPaused: (pause) => store.onPaused(pause),

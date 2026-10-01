@@ -9,7 +9,7 @@
   import { dirLabel } from "../previews/files";
   import { pauseLabel, placementLabel, sessionPause } from "../net/placement";
   import { accountSignedOut } from "../net/plan";
-  import { terminalStatus } from "../terminal/refusals.svelte";
+  import { terminalKept, terminalStatus } from "../terminal/refusals.svelte";
   import { pausedConnect } from "../pro/providers";
   import { canOpenOnboarding, cloudOnboarding } from "../pro/onboarding.svelte";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
@@ -410,7 +410,7 @@
           sessionId={tab.sessionId}
           focused={focused && active}
           fontSize={node.fontSize}
-          placement={placementLabel(s.placement, s.placement_available, { owner: terminalStatus(s.id) })}
+          placement={placementLabel(s.placement, s.placement_available, { owner: terminalStatus(s.id), reachable: terminalKept(s.id) })}
           reach={`${typeof s.placement === "object" ? s.placement.remote : "here"}|${s.placement_available !== false}`}
         />
       {:else if viewErrors.terminal}
