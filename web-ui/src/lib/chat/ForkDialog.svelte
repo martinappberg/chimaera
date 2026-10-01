@@ -34,7 +34,7 @@
 
 <div class="dialog-veil">
   <div class="dialog" role="dialog" aria-label="fork conversation">
-    <div class="dialog-title">fork the conversation from here</div>
+    <div class="dialog-title">continue in a new chat</div>
     <div class="dialog-note">
       {restoreDraft
         ? "opens before this message and restores it as an unsent draft; this session keeps running"
@@ -50,16 +50,21 @@
             <span class="name">{agent.name}</span>
             <span class="method">
               {native
-                ? "native fork"
-                : agent.id === sourceAgent
-                  ? "portable handoff · no exact native boundary here"
-                  : "portable transcript handoff"}
+                ? "preserves the agent’s conversation state"
+                : "copies the conversation as context"}
             </span>
           </span>
           <span class="arrow">{applying ? "…" : "→"}</span>
         </button>
       {/each}
     </div>
+
+    <details class="dialog-note fork-details">
+      <summary>What carries over?</summary>
+      <p>Conversation copies include messages and tool results. Long histories may
+      be shortened; images and running tasks are not transferred.
+      All chats share this workspace’s files.</p>
+    </details>
 
     <div class="dialog-actions">
       <button class="opt quiet" disabled={applying} onclick={onCancel}>cancel</button>
@@ -99,6 +104,7 @@
     gap: 5px;
     margin-top: 12px;
   }
+  .fork-details { margin-top: 12px; line-height: 1.45; }
   .agent {
     display: grid;
     grid-template-columns: auto 1fr auto;

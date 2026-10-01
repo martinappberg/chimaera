@@ -75,12 +75,12 @@
   }
 
   let skSeq = 0;
-  async function loadSkills(): Promise<void> {
+  async function loadSkills(refresh = false): Promise<void> {
     if (wsId === null) return;
     const mine = ++skSeq;
     skills = { ...skills, state: "loading" };
     try {
-      const data = await fetchSkills(wsId);
+      const data = await fetchSkills(wsId, refresh);
       if (mine !== skSeq) return;
       skills = { state: "ok", data, error: null };
     } catch (e) {
@@ -188,7 +188,7 @@
         {#if connectionsMounted && wsId !== null}
           <div class="inner">
             {#key wsId}
-              <ConnectionsView {wsId} visible={visible && view === "connections"} />
+              <ConnectionsView {wsId} onOpenSession={dash.onOpenSession} visible={visible && view === "connections"} />
             {/key}
           </div>
         {/if}
@@ -204,7 +204,7 @@
               {host}
               {wsRoot}
               onOpenFile={(p) => ctrl.openFileFrom(paneId, p, false)}
-              onRefresh={() => void loadSkills()}
+              onRefresh={() => void loadSkills(true)}
             />
           </div>
         {/if}

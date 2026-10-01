@@ -62,8 +62,8 @@ pub(crate) fn models(kind: AgentKind) -> &'static [(&'static str, &'static str)]
             ("gpt-6-luna", "GPT-6 Luna"),
             ("gpt-5.6-sol", "GPT-5.6 Sol"),
         ],
-        // agy picks its own model; no curated list until its integration.
-        AgentKind::Antigravity => &[],
+        // ACP catalogs come from the signed-in session; never guess a model.
+        AgentKind::Antigravity | AgentKind::Grok => &[],
         // Static list (gemini is not installed here to probe): the models
         // the gemini-cli README documents for interactive use.
         AgentKind::Gemini => &[
@@ -71,6 +71,61 @@ pub(crate) fn models(kind: AgentKind) -> &'static [(&'static str, &'static str)]
             ("gemini-2.5-flash", "Gemini 2.5 Flash"),
         ],
     }
+}
+
+/// Extension operations are fixed argv, never shell snippets or guessed
+/// provider fallbacks. Unknown agents/actions have no executable path.
+pub(crate) fn extension_action(
+    kind: AgentKind,
+    action: &str,
+    target: Option<&str>,
+) -> Result<Vec<String>, &'static str> {
+    use AgentKind::*;
+    if matches!(action, "manage_plugins" | "manage_connections") {
+        let command = if action == "manage_plugins" {
+            "/plugins"
+        } else {
+            "/mcp"
+        };
+        return Ok(match kind {
+            Antigravity => vec![
+                if action == "manage_plugins" {
+                    "plugin"
+                } else {
+                    "mcp"
+                }
+                .into(),
+                "--help".into(),
+            ],
+            Grok => vec![if action == "manage_connections" {
+                "/mcps"
+            } else {
+                command
+            }
+            .into()],
+            Claude | Codex => return Err("Manage extensions in this agent’s own settings."),
+            Gemini => return Err("Choose Antigravity to manage Google agent extensions."),
+        });
+    }
+    if !matches!(kind, Antigravity | Grok) {
+        return Err("Use this agent's extension manager for this action.");
+    }
+    let target = target
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= 2048
+                && !s.starts_with('-')
+                && !s.chars().any(char::is_control)
+        })
+        .ok_or("Choose a plugin name or installation source.")?;
+    let verb = match action {
+        "install_plugin" => "install",
+        "enable_plugin" => "enable",
+        "disable_plugin" => "disable",
+        "update_plugin" if kind == Grok => "update",
+        _ => return Err("This agent doesn't support this extension action here."),
+    };
+    Ok(vec!["plugin".into(), verb.into(), target.into()])
 }
 
 /// Install command for a missing agent — pre-typed (never executed) into a
@@ -85,6 +140,7 @@ pub(crate) fn install_command(kind: AgentKind) -> &'static str {
         // (matters on HPC login nodes).
         AgentKind::Antigravity => "curl -fsSL https://antigravity.google/cli/install.sh | bash",
         AgentKind::Gemini => "npm install -g @google/gemini-cli",
+        AgentKind::Grok => "curl -fsSL https://x.ai/cli/install.sh | bash",
     }
 }
 
@@ -95,6 +151,7 @@ pub(crate) fn docs_url(kind: AgentKind) -> &'static str {
         AgentKind::Codex => "https://developers.openai.com/codex/cli",
         AgentKind::Antigravity => "https://antigravity.google/docs",
         AgentKind::Gemini => "https://github.com/google-gemini/gemini-cli",
+        AgentKind::Grok => "https://docs.x.ai/build/overview",
     }
 }
 
@@ -410,7 +467,7 @@ fn agy_is_ide_shim(path: &Path) -> bool {
 const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// First non-empty line of `<bin> --version`, or `None` on any failure.
-async fn probe_version(bin: &Path) -> Option<String> {
+pub(crate) async fn probe_version(bin: &Path) -> Option<String> {
     let output = tokio::process::Command::new(bin)
         .arg("--version")
         .stdin(std::process::Stdio::null())
@@ -452,7 +509,14 @@ pub(crate) async fn list_agents(
     // optional upstream check rides the same await.
     let detect_all = futures::future::join_all(AgentKind::ALL.into_iter().map(|kind| {
         let state = state.clone();
-        async move { (kind, detect(&state, kind, query.refresh).await) }
+        async move {
+            let detection = detect(&state, kind, query.refresh).await;
+            let chat_ready = match &detection.path {
+                Ok(bin) if kind.chat_capable() => chat_executable(&state, kind, bin).await.is_ok(),
+                _ => false,
+            };
+            (kind, detection, chat_ready)
+        }
     }));
     let detections = if query.check {
         let (detections, ()) = tokio::join!(detect_all, crate::agent_updates::check_all(&state));
@@ -470,11 +534,14 @@ pub(crate) async fn list_agents(
 
     let rows = detections
         .into_iter()
-        .map(|(kind, detection)| {
+        .map(|(kind, detection, chat_ready)| {
             let mut row = serde_json::Map::new();
             row.insert("id".into(), json!(kind.as_str()));
             row.insert("name".into(), json!(kind.product_name()));
             row.insert("installed".into(), json!(detection.path.is_ok()));
+            if let Some(status) = crate::runtimes::installation_status(&state, kind) {
+                row.insert("installation".into(), status);
+            }
             if let Ok(path) = &detection.path {
                 row.insert("path".into(), json!(path));
             }
@@ -490,7 +557,12 @@ pub(crate) async fn list_agents(
                 // The newest known upstream release (agent_updates); the UI
                 // shows an update affordance only when strictly newer —
                 // one-click for a managed binary, informational for yours.
-                row.insert("latest_version".into(), json!(latest.version));
+                if !latest.version.is_empty() {
+                    row.insert("latest_version".into(), json!(latest.version));
+                }
+                if let Some(error) = &latest.error {
+                    row.insert("latest_error".into(), json!(error));
+                }
                 row.insert("latest_checked_at".into(), json!(latest.checked_at));
                 if detection.path.is_ok()
                     && crate::agent_updates::update_available(
@@ -532,12 +604,18 @@ pub(crate) async fn list_agents(
                 live.iter().map(|m| json!(m)).collect()
             };
             row.insert("models".into(), json!(models));
+            row.insert("fork_capable".into(), json!(chat_ready));
+            row.insert(
+                "chat_setup_required".into(),
+                json!(kind.chat_capable() && detection.path.is_ok() && !chat_ready),
+            );
+            row.insert("view_switchable".into(), json!(kind.native_chat_controls()));
             // Whether this agent can spawn as a structured chat session
             // (claude stream-json / codex app-server drivers).
             row.insert(
                 "chat_capable".into(),
                 json!(
-                    kind.chat_capable()
+                    chat_ready
                         && detection.path.is_ok()
                         && !is_outdated(kind, detection.version.as_deref())
                 ),
@@ -1220,6 +1298,58 @@ fn first_prompt_text(value: &serde_json::Value) -> Option<String> {
     Some(text.to_string())
 }
 
+/// Some harnesses ship distinct interactive and structured executables. The
+/// picker still presents one agent; only runtime discovery knows this detail.
+pub(crate) async fn chat_executable(
+    state: &AppState,
+    kind: AgentKind,
+    terminal: &Path,
+) -> anyhow::Result<PathBuf> {
+    if kind != AgentKind::Antigravity {
+        return Ok(terminal.to_path_buf());
+    }
+    let explicit = crate::lock(&state.settings)
+        .current()
+        .get("agents.agy.chatPath")
+        .and_then(|v| v.as_str())
+        .filter(|p| !p.trim().is_empty())
+        .map(str::to_owned);
+    if let Some(path) = explicit.map(PathBuf::from) {
+        anyhow::ensure!(
+            is_executable(&path),
+            "Antigravity chat executable is not runnable"
+        );
+        return Ok(tokio::fs::canonicalize(path).await?);
+    }
+    if let Some(path) = managed_fallback(
+        "agy-acp",
+        &crate::runtimes::managed_bin_dir(&state.managed_root),
+    ) {
+        return Ok(tokio::fs::canonicalize(path).await?);
+    }
+    if let Some(path) = resolve_via_login_shell(&login_shell(), "agy_acp_server.par")
+        .await
+        .filter(|p| is_executable(p))
+    {
+        return Ok(tokio::fs::canonicalize(path).await?);
+    }
+    anyhow::bail!("Antigravity chat isn't set up yet. Choose ‘set up chat’ beside Antigravity in the new-agent menu.")
+}
+
+pub(crate) fn build_acp_chat_command(kind: AgentKind, bin: &Path) -> Vec<String> {
+    let mut argv = vec![bin.to_string_lossy().into_owned()];
+    match kind {
+        AgentKind::Grok => argv.extend(["agent", "--no-leader", "stdio"].map(str::to_owned)),
+        AgentKind::Antigravity => {
+            if cfg!(target_os = "linux") {
+                argv.push("--uid=".into());
+            }
+        }
+        _ => unreachable!("ACP command requires an ACP registration"),
+    }
+    argv
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1227,6 +1357,22 @@ mod tests {
     /// The IDE launcher masquerading as `agy` must be refused on every
     /// platform: via the macOS bundle path AND via the launcher binary's
     /// own name (Linux hand-symlink shape). The real CLI passes.
+    #[test]
+    fn native_extension_actions_preserve_arguments_and_reject_unknown_controls() {
+        assert_eq!(
+            extension_action(
+                AgentKind::Grok,
+                "install_plugin",
+                Some("/tmp/a space/$(file)")
+            )
+            .unwrap(),
+            vec!["plugin", "install", "/tmp/a space/$(file)"]
+        );
+        assert!(extension_action(AgentKind::Grok, "install_plugin", Some("--trust")).is_err());
+        assert!(extension_action(AgentKind::Antigravity, "update_plugin", Some("test")).is_err());
+        assert!(extension_action(AgentKind::Gemini, "manage_plugins", None).is_err());
+    }
+
     #[test]
     fn agy_shim_detection_spans_platforms() {
         let dir = std::env::temp_dir().join(format!("chimaera-agy-shim-{}", std::process::id()));

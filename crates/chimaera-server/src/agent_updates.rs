@@ -37,8 +37,9 @@ pub(crate) struct AgentLatest {
     /// Bare version ("0.146.0") — prefix-stripped and charset-gated, safe
     /// for the wire and the UI.
     pub(crate) version: String,
-    /// When the successful probe ran, unix seconds.
+    /// When the most recent attempt ran, unix seconds.
     pub(crate) checked_at: u64,
+    pub(crate) error: Option<String>,
 }
 
 /// Periodic checker. Gated by the same `update.autoCheck` setting as the
@@ -74,25 +75,34 @@ pub(crate) async fn check_all(state: &Arc<AppState>) {
     {
         let mut cache = crate::lock(&state.agent_updates);
         for (kind, result) in results {
-            match result {
-                Ok(version) => {
-                    let fresh = AgentLatest {
-                        version,
-                        checked_at: now,
-                    };
-                    if cache.get(&kind).map(|l| &l.version) != Some(&fresh.version) {
-                        changed = true;
-                    }
-                    cache.insert(kind, fresh);
-                }
-                Err(err) => {
-                    tracing::debug!(agent = kind.as_str(), %err, "agent release check failed");
-                }
-            }
+            let fresh = checked_result(cache.get(&kind), result, now);
+            changed |= cache.get(&kind) != Some(&fresh);
+            cache.insert(kind, fresh);
         }
     }
     if changed {
         state.changes.notify_waiters();
+    }
+}
+
+// Keep a known release after a failed re-check, but never represent that
+// stale knowledge as a successful check. Bound network diagnostics on the wire.
+fn checked_result(
+    previous: Option<&AgentLatest>,
+    result: anyhow::Result<String>,
+    now: u64,
+) -> AgentLatest {
+    match result {
+        Ok(version) => AgentLatest {
+            version,
+            checked_at: now,
+            error: None,
+        },
+        Err(error) => AgentLatest {
+            version: previous.map(|p| p.version.clone()).unwrap_or_default(),
+            checked_at: now,
+            error: Some(error.to_string().chars().take(512).collect()),
+        },
     }
 }
 
@@ -162,8 +172,11 @@ async fn fetch_latest(kind: AgentKind) -> anyhow::Result<String> {
             .await?;
             parse_agy_manifest(&body)
         }
-        // No managed install exists (node runtime, phase 2), but a personal
-        // npm install still deserves the "newer exists" signal.
+        // The official registry carries the same release as the standalone CLI.
+        AgentKind::Grok => {
+            let body = curl("https://registry.npmjs.org/@xai-official/grok/latest", &[]).await?;
+            parse_npm_latest(&body)
+        }
         AgentKind::Gemini => {
             let body = curl("https://registry.npmjs.org/@google/gemini-cli/latest", &[]).await?;
             parse_npm_latest(&body)
@@ -353,6 +366,20 @@ fn parse_npm_latest(body: &[u8]) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_rechecks_keep_the_release_but_report_failure() {
+        let good = checked_result(None, Ok("1.2.3".into()), 10);
+        let failed = checked_result(Some(&good), Err(anyhow::anyhow!("offline")), 20);
+        assert_eq!(failed.version, "1.2.3");
+        assert_eq!(failed.checked_at, 20);
+        assert_eq!(failed.error.as_deref(), Some("offline"));
+        let recovered = checked_result(Some(&failed), Ok("1.2.3".into()), 30);
+        assert_eq!(recovered.error, None);
+        let unknown = checked_result(None, Err(anyhow::anyhow!("offline")), 40);
+        assert!(unknown.version.is_empty());
+        assert!(unknown.error.is_some());
+    }
 
     #[tokio::test]
     async fn downloads_without_a_content_length_still_have_a_body_cap() {

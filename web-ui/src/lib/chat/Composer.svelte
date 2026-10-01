@@ -85,6 +85,7 @@
     /** The pictures attached here changed (or the composer just mounted):
      *  a returned message that was waiting for room may fit now. */
     onReturnRoom?: () => void;
+    imageInput?: boolean;
   }
 
   let {
@@ -105,6 +106,7 @@
     onDraftState,
     voiceTerms = [],
     onReturnRoom = undefined,
+    imageInput = true,
   }: Props = $props();
 
   const uid = $props.id();
@@ -140,6 +142,10 @@
   }
 
   function addImage(image: ImageAttachment): boolean {
+    if (!imageInput) {
+      attachmentError = "this agent does not support images in chat";
+      return false;
+    }
     if (images.length >= IMAGE_MAX_ATTACHMENTS) {
       attachmentError = `maximum ${IMAGE_MAX_ATTACHMENTS} images per message`;
       return false;

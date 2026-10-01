@@ -37,6 +37,7 @@
   import { formatElapsedSeconds, messageTimestampRefreshIn } from "../shared/time";
   import ChatHeader from "./ChatHeader.svelte";
   import ChatFind from "./ChatFind.svelte";
+  import { legacyCapabilities } from "./capabilities";
   import Markdown from "./Markdown.svelte";
   import UserText from "./UserText.svelte";
   import ThoughtRow from "./ThoughtRow.svelte";
@@ -166,7 +167,9 @@
   // Curated model choices for this agent's picker (daemon-cached catalog).
   let models = $state<{ id: string; label: string }[]>([]);
   // svelte-ignore state_referenced_locally
-  const agentKind = session.agent_kind ?? "claude";
+  const agentKind = session.agent_kind ?? session.name ?? "agent";
+  const capabilities = $derived(store.capabilities ?? legacyCapabilities(agentKind));
+  const supports = (command: string) => capabilities.commands.includes(command);
   /** Product name for the identity chip. Prefer the daemon catalog's own name;
    *  fall back to a built-in map until it resolves (a workspace can mix agents,
    *  so the surface always says WHICH one this is). */
@@ -174,14 +177,14 @@
   let forkAgents = $state<{ id: string; name: string }[]>([]);
   const agentName = $derived(
     agentCatalogName ??
-      (agentKind === "claude" ? "Claude Code" : agentKind === "codex" ? "Codex" : agentKind),
+      (agentKind === "claude" ? "Claude Code" : agentKind === "codex" ? "Codex" : agentKind === "agy" ? "Antigravity" : agentKind === "grok" ? "Grok Build" : agentKind),
   );
   void listAgents().then((agents) => {
     const info = agents.find((a) => a.id === agentKind);
     models = info?.models ?? [];
     agentCatalogName = info?.name ?? null;
     forkAgents = agents
-      .filter((agent) => agent.installed && !agent.outdated && agent.chatCapable)
+      .filter((agent) => agent.installed && !agent.outdated && agent.chatCapable && agent.forkCapable)
       .map((agent) => ({ id: agent.id, name: agent.name }));
   });
   const availableForkAgents = $derived(
@@ -938,11 +941,11 @@
   /** Agent read-back is the only displayed truth. Both drivers emit an
    *  effort_state after applying a selection. */
   const effortShown = $derived(store.effort);
-  const hasEffort = $derived(effortChoices.length > 0);
+  const hasEffort = $derived(supports("set_effort") && effortChoices.length > 0);
   /** Ultracode: session-scoped xhigh + standing workflow orchestration —
    *  offered when the live model supports xhigh (the extension's gate). */
   const hasUltracode = $derived(
-    agentKind === "claude" && (currentModel?.efforts.includes("xhigh") ?? false),
+    supports("set_ultracode") && (currentModel?.efforts.includes("xhigh") ?? false),
   );
 
   // The chat scale is deliberately local: every child uses the shared
@@ -1318,7 +1321,7 @@
         nativeAt:
           agentKind === "claude"
             ? (block.checkpoint?.preceding ?? null)
-            : previous?.kind === "message" && previous.nativeTurnComplete
+            : agentKind === "codex" && previous?.kind === "message" && previous.nativeTurnComplete
               ? previous.turnId
               : null,
         beforeUserId,
@@ -1417,6 +1420,10 @@
    *  instead of having the agent read it at its next step. Idle, the daemon
    *  treats both as an ordinary send. */
   function sendMessage(text: string, images: ImageAttachment[], afterTurn: boolean): boolean {
+    if (images.length > 0 && !capabilities.image_input) {
+      store.notice(`${agentName} does not support images in this chat. Your draft is kept.`, "error");
+      return false;
+    }
     const blocks: Record<string, unknown>[] = [];
     if (text.length > 0) blocks.push({ type: "text", text });
     // Codex exposes skills through `skills/list`; an exact `/skill-name`
@@ -1599,6 +1606,7 @@
         return true;
       }
       case "model": {
+        if (!supports("set_model")) return false;
         const hit = modelChoices.find(
           (m) => m.id.toLowerCase() === arg || m.label.toLowerCase() === arg,
         );
@@ -1650,16 +1658,17 @@
         // Answered by a usage_report event (plan-limit windows — the honest
         // signal on subscription plans; dollars are not shown). Codex reads
         // the same data from account/read.
+        if (!supports("get_usage")) return false;
         return sendCommand({ type: "get_usage" }, "usage request not sent");
       case "compact":
         // Codex has no slash catalog; thread/compact/start is the native
         // path (the compaction turn's notice confirms completion). Claude's
         // own /compact rides its catalog — fall through to the CLI send.
-        if (agentKind !== "codex") return false;
+        if (!supports("compact")) return false;
         if (!sendCommand({ type: "compact" }, "compact request not sent")) return false;
         return true;
       case "mcp":
-        if (agentKind === "claude") {
+        if (supports("get_mcp")) {
           if (!sendCommand({ type: "get_mcp" }, "MCP request not sent")) return false;
           // The inventory already known stays up while this one is fetched:
           // a read is not the user acting, so nobody answers it while a cloud
@@ -1852,7 +1861,7 @@
   const composerCommands = $derived.by((): ComposerCommand[] => {
     const native: ComposerCommand[] = [];
     native.push({ name: "rename", description: "rename this session — chimaera" });
-    native.push({
+    if (supports("set_model")) native.push({
       name: "model",
       description: `switch model — chimaera picker`,
       options: modelChoices.map((model) => ({
@@ -1864,7 +1873,7 @@
             : model.id,
       })),
     });
-    if (store.modes.length > 0) {
+    if (supports("set_mode") && store.modes.length > 0) {
       native.push({
         name: "mode",
         description: "permission mode — chimaera picker",
@@ -1888,7 +1897,7 @@
         ],
       });
     }
-    native.push({ name: "usage", description: "plan usage limits — chimaera panel" });
+    if (supports("get_usage")) native.push({ name: "usage", description: "plan usage limits — chimaera panel" });
     native.push({
       name: "voice",
       description: "voice dictation: show or hide the mic (on/off) — Claude's speech service",
@@ -1903,11 +1912,11 @@
         description: "take this session with you — Claude app / claude.ai/code",
       });
     }
+    if (supports("get_mcp")) native.push({ name: "mcp", description: "MCP servers — chimaera panel" });
     if (agentKind === "claude") {
-      native.push({ name: "mcp", description: "MCP servers — chimaera panel" });
       native.push({ name: "login", description: "sign in — opens the terminal for Claude's native auth" });
     }
-    if (agentKind === "codex") {
+    if (supports("compact")) {
       native.push({ name: "compact", description: "compact conversation context" });
     }
     const nativeNames = new Set(native.map((n) => n.name.toLowerCase()));
@@ -2081,7 +2090,7 @@
    *  the chip shows an explicit on/off and tints when on, so the state (and the
    *  cost) is never hidden, and one click turns it off. The preference lives in
    *  the pooled store, not here, so a tab remount keeps it. */
-  const hasThinking = $derived(agentKind === "claude");
+  const hasThinking = $derived(supports("set_thinking"));
   /** Effective thinking state: the user's explicit choice, or ON by default
    *  (the reasoning pass earns its keep in a coding workbench). `null` in the
    *  store means "unchosen" — so a toggle-off (a real `false`) is never
@@ -2711,6 +2720,8 @@
     {agentKind}
     {agentName}
     bind:menu
+    canPickModel={supports("set_model") && modelChoices.length > 0}
+    canPickMode={supports("set_mode")}
     {modelChoices}
     {modelLabel}
     {modeLabel}
@@ -2796,7 +2807,7 @@
     {#if store.blocks.length === 0 && store.exited === null}
       <div class="empty">
         <SessionGlyph kind="agent" {agentKind} size={18} />
-        <span>{store.connected ? `${agentName} is ready` : `connecting to ${agentName}…`}</span>
+        <span>{store.connected && store.initialized ? `${agentName} is ready` : `connecting to ${agentName}…`}</span>
       </div>
     {/if}
     {#if renderStart > 0}
@@ -2831,8 +2842,8 @@
           {visible}
           onOpenPath={openProsePath}
           resolvePaths={prosePaths}
-          onBackground={agentKind === "claude" ? backgroundTool : undefined}
-          onStopTask={agentKind === "claude" ? stopTask : undefined}
+          onBackground={supports("background_tool") ? backgroundTool : undefined}
+          onStopTask={supports("stop_task") ? stopTask : undefined}
         />
       {:else}
         <ThoughtRow
@@ -3098,6 +3109,8 @@
       {:else}
         <PermissionCard
           {request}
+          canFeedback={supports("permission_feedback")}
+          canChooseDestination={supports("permission_destination")}
           {visible}
           onDecide={(opt, dest, feedback) => decide(request.requestId, opt, dest, feedback)}
         />
@@ -3261,7 +3274,7 @@
     <AgentsTray
       agents={pinnedAgents}
       {visible}
-      onStop={agentKind === "claude" ? stopTask : undefined}
+      onStop={supports("stop_task") ? stopTask : undefined}
     />
   {/if}
 
@@ -3271,7 +3284,7 @@
     <BackgroundTray
       tasks={pinnedBackgroundTasks}
       {visible}
-      onStop={agentKind === "claude" ? stopTask : undefined}
+      onStop={supports("stop_task") ? stopTask : undefined}
     />
   {/if}
 
@@ -3401,6 +3414,7 @@
 
   <Composer
     sessionId={session.id}
+    imageInput={capabilities.image_input}
     view={quoteOwner}
     running={agentBusy}
     disabled={continuing || composerDisabled}

@@ -300,16 +300,59 @@ dest="$root/agy/$version/bin"
 mkdir -p "$dest"
 mv -f "$bin" "$dest/agy"
 if [ "$os" = darwin ]; then xattr -d com.apple.quarantine "$dest/agy" 2>/dev/null || true; fi
+# Google distributes chat as a separate runtime. Keep its companion harness
+# beside the server and activate it only after the entire package is present.
+if [ "$musl" = yes ]; then
+  echo "chimaera: Google's chat runtime requires glibc; terminal remains available" >&2
+else
+  command -v unzip >/dev/null || {{ echo "chimaera: install unzip to finish Antigravity chat setup" >&2; exit 1; }}
+  case "$os" in darwin) acp_os=macos ;; *) acp_os=linux ;; esac
+  case "$arch" in aarch64) acp_arch=arm64 ;; *) acp_arch=x86_64 ;; esac
+  acp_version='{acp_version}'
+  curl -fsSL -o "$tmp/chat.zip" "https://dl.google.com/agy-extensions/releases/$acp_os/agy-acp-server-$acp_version-$os-$acp_arch.zip"
+  mkdir -p "$tmp/chat"
+  unzip -q "$tmp/chat.zip" -d "$tmp/chat"
+  test -f "$tmp/chat/agy_acp_server.par"
+  test -f "$tmp/chat/localharness_external"
+  chmod +x "$tmp/chat/agy_acp_server.par" "$tmp/chat/localharness_external"
+  acp_release="$acp_version-$(date +%s)-$$"
+  mkdir -p "$root/agy/$version/chat" "$root/bin"
+  mv "$tmp/chat" "$root/agy/$version/chat/$acp_release"
+  ln -sfn "../agy/$version/chat/$acp_release/agy_acp_server.par" "$root/bin/.agy-acp.new"
+  mv -f "$root/bin/.agy-acp.new" "$root/bin/agy-acp"
+fi
 swap agy "$version"
 echo "chimaera: installed agy -> $root/bin/agy"
 echo "chimaera: (the official installer would now run 'agy install' to edit your shell config; chimaera skips that on purpose)"
 "$root/bin/agy" --version
 "#,
             base = AGY_MANIFEST_BASE,
+            acp_version = chimaera_agent::acp::TESTED_AGY_VERSION,
         ),
-        // gemini-cli genuinely needs a node runtime (DESIGN: phase 2); no
-        // official standalone artifact exists to curate.
+        // Retained for existing records, retired from the new-agent catalog.
         AgentKind::Gemini => return None,
+        AgentKind::Grok => r#"base='https://x.ai/cli'
+version="$(curl -fsSL "$base/stable")"
+case "$version" in
+  *[!0-9.A-Za-z-]*|'') echo "chimaera: unexpected Grok version" >&2; exit 1 ;;
+  [0-9]*.[0-9]*) ;;
+  *) echo "chimaera: invalid Grok release version" >&2; exit 1 ;;
+esac
+if [ "$musl" = yes ]; then echo "chimaera: Grok requires glibc on Linux" >&2; exit 1; fi
+case "$os" in darwin) grok_os=macos ;; *) grok_os=linux ;; esac
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/chimaera-grok.XXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
+echo "chimaera: installing Grok Build $version from $base"
+curl -fsSL -o "$tmp/grok.gz" "$base/grok-$version-$grok_os-$arch.gz"
+gzip -dc "$tmp/grok.gz" > "$tmp/grok"
+chmod +x "$tmp/grok"
+dest="$root/grok/$version/bin"
+mkdir -p "$dest"
+mv -f "$tmp/grok" "$dest/grok"
+swap grok "$version"
+"$root/bin/grok" --version
+"#
+        .to_string(),
     };
     Some(format!("{prelude}{body}"))
 }
@@ -357,8 +400,8 @@ pub(crate) async fn install_agent(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": format!(
-                "no managed install for {}: gemini-cli needs a node runtime (phase 2); \
-                 use `{}` yourself instead",
+                "Chimaera no longer installs {}. Choose Antigravity for new Google conversations, \
+                 or manage your existing installation with `{}`",
                 kind.product_name(),
                 crate::launcher::install_command(kind),
             )})),
@@ -546,6 +589,23 @@ pub(crate) fn start_install(
     }
 }
 
+#[derive(Clone, serde::Serialize)]
+pub(crate) struct InstallResult {
+    session_id: String,
+    exit_status: Option<i32>,
+}
+
+/// One shared catalog shape for Settings and future extension-provided agents.
+/// PTY rows disappear at exit, so clients must not infer success from absence.
+pub(crate) fn installation_status(state: &AppState, kind: AgentKind) -> Option<serde_json::Value> {
+    if let Some((id, _)) = crate::lock(&state.installs).get(&kind) {
+        return Some(json!({"session_id": id, "running": true}));
+    }
+    crate::lock(&state.install_results).get(&kind).map(|result| {
+        json!({"session_id": result.session_id, "running": false, "exit_status": result.exit_status})
+    })
+}
+
 /// Watch an install session; when it ends, re-detect that agent (bypassing
 /// the daemon-lifetime cache) and regenerate the shims so the next spawn —
 /// and the open popover, via the change notification — sees the new binary.
@@ -554,6 +614,10 @@ fn spawn_install_watch(state: Arc<AppState>, kind: AgentKind, session_id: String
         while state.sessions.get(&session_id).is_some() {
             tokio::time::sleep(crate::agents::poll_interval()).await;
         }
+        let exit_status = state
+            .sessions
+            .last_words(&session_id)
+            .and_then(|w| w.info.exit_status);
         let detection = crate::launcher::detect(&state, kind, true).await;
         tracing::info!(
             agent = kind.as_str(),
@@ -566,6 +630,13 @@ fn spawn_install_watch(state: Arc<AppState>, kind: AgentKind, session_id: String
         // have installed a newer reservation under the same agent.
         let mut installs = crate::lock(&state.installs);
         if installs.get(&kind).map(|(sid, _)| sid.as_str()) == Some(session_id.as_str()) {
+            crate::lock(&state.install_results).insert(
+                kind,
+                InstallResult {
+                    session_id: session_id.clone(),
+                    exit_status,
+                },
+            );
             installs.remove(&kind);
         }
         drop(installs);
@@ -630,6 +701,15 @@ pub(crate) async fn uninstall_agent(
     // then the version tree.
     let link = managed_bin.join(kind.as_str());
     let tree = state.managed_root.join(kind.as_str());
+    if kind == AgentKind::Antigravity {
+        if let Err(err) = remove_if_exists(&managed_bin.join("agy-acp")) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":err.to_string()})),
+            )
+                .into_response();
+        }
+    }
     if let Err(err) = remove_if_exists(&link).and_then(|()| remove_dir_if_exists(&tree)) {
         tracing::error!(%err, agent = kind.as_str(), "failed to uninstall managed agent");
         return (
@@ -964,7 +1044,7 @@ exec "$real" "$@"
         // No theme mechanism (verified: no flag in --help, no env; the
         // settings.json theme is the user's own file). ANSI-16 UIs follow
         // the pane palette.
-        AgentKind::Gemini | AgentKind::Antigravity => "exec \"$real\" \"$@\"\n".to_string(),
+        AgentKind::Gemini | AgentKind::Antigravity | AgentKind::Grok => "exec \"$real\" \"$@\"\n".to_string(),
     };
     match kind {
         AgentKind::Antigravity => format!("{resolve}{agy_guard}{fallback}{exec}"),
@@ -1008,7 +1088,7 @@ mod tests {
     #[test]
     fn install_scripts_are_curated_and_safe() {
         let root = PathBuf::from("/home/u/.chimaera/agents");
-        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Antigravity] {
+        for kind in AgentKind::ALL {
             let script = install_script(kind, &root).expect("curated install");
             // Strict mode, official HTTPS sources only, never sudo.
             assert!(script.starts_with("set -euo pipefail"), "{kind:?}");
@@ -1266,7 +1346,7 @@ esac
     #[test]
     fn quoted_prefix_survives_script_interpolation() {
         let root = PathBuf::from("/home/o'brien/.chimaera/agents");
-        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Antigravity] {
+        for kind in AgentKind::ALL {
             let script = install_script(kind, &root).expect("curated install");
             assert!(
                 script.contains(r#"root='/home/o'\''brien/.chimaera/agents'"#),
@@ -1313,9 +1393,10 @@ esac
         // The user-theme grep covers both the [tui] `theme =` and the
         // dotted `tui.theme =` spellings.
         assert!(codex.contains(r#"(tui\.)?theme[[:space:]]*="#), "{codex}");
-        // gemini/agy: no verified theme lever — plain exec, no injection.
-        let gemini = std::fs::read_to_string(shim_dir.join("gemini")).unwrap();
-        assert!(!gemini.contains("CHIMAERA_THEME"));
+        // Retired identities do not get new shims; new providers stay plain.
+        assert!(!shim_dir.join("gemini").exists());
+        let grok = std::fs::read_to_string(shim_dir.join("grok")).unwrap();
+        assert!(!grok.contains("CHIMAERA_THEME"));
         let agy = std::fs::read_to_string(shim_dir.join("agy")).unwrap();
         assert!(!agy.contains("CHIMAERA_THEME"));
         // The IDE-launcher trap guard rides in the agy shim.

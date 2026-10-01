@@ -1,589 +1,257 @@
 <script lang="ts">
-  /**
-   * The Agents settings section: one row per agent CLI showing what chimaera
-   * resolves for it (yours / chimaera-managed / a path you set / not found) with
-   * the version and resolved path, an explicit-path override, and — for a
-   * chimaera-managed binary — Update (when a newer release is known) and
-   * Uninstall buttons. A newer release for the user's OWN binary renders as
-   * quiet information only: chimaera never touches an install it doesn't own.
-   *
-   * Bespoke rather than generic SettingRows because it fuses live daemon state
-   * (GET /api/v1/agents) with the `agents.<id>.path` settings and imperative
-   * update/uninstall. The path override still persists as a normal setting (so
-   * the JSON editor and the store stay in sync); only the presentation is custom.
-   */
-  import { onDestroy, onMount } from "svelte";
+  import { onMount } from "svelte";
   import { getActiveWorkspaceId } from "../net/api";
+  import { pageVisible } from "../shared/visibility";
+  import { openInSystemBrowser } from "../shared/urlOpen";
   import {
-    listAgents,
-    pollAgents,
-    relativeAge,
-    uninstallAgent,
-    updateAgent,
-    versionNumber,
-    type AgentInfo,
+    agentCatalog, installAgent, listAgents, pollAgents, uninstallAgent, updateAgent,
+    versionNumber, type AgentInfo,
   } from "../workspace/launcher";
   import ConfirmDialog from "../shared/ConfirmDialog.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { flushSettings, getSetting, isModified, setSetting } from "./store.svelte";
+  import { flushSettings, getSetting, setSetting } from "./store.svelte";
+  import { agentUpdateStatus, installationResult } from "./agentStatus";
 
-  // The four per-agent path keys are all string-typed, so this cast is sound.
-  type AgentPathKey =
-    | "agents.claude.path"
-    | "agents.codex.path"
-    | "agents.gemini.path"
-    | "agents.agy.path";
-  const pathKey = (id: string): AgentPathKey => `agents.${id}.path` as AgentPathKey;
-
-  // The window's workspace identity is fixed for the pane's lifetime
-  // (window = workspace) — where an update session spawns.
+  let { visible = true }: { visible?: boolean } = $props();
+  type AgentPathKey = "agents.claude.path" | "agents.codex.path" | "agents.agy.path" | "agents.grok.path" | "agents.agy.chatPath";
+  // Only built-ins own schema keys. Extension identities must never be
+  // coerced into settings belonging to an unrelated built-in agent.
+  const pathKeys: Partial<Record<string, AgentPathKey>> = {
+    claude: "agents.claude.path", codex: "agents.codex.path",
+    agy: "agents.agy.path", grok: "agents.grok.path",
+  };
+  const pathKey = (id: string): AgentPathKey | undefined => pathKeys[id];
   const wsId = getActiveWorkspaceId();
-
-  let agents = $state<AgentInfo[]>([]);
   let loading = $state(true);
   let loadError = $state<string | null>(null);
-  // Per-agent editable path field + busy/error state, keyed by agent id.
-  let inputs = $state<Record<string, string>>({});
+  let inputs = $state<Partial<Record<AgentPathKey, string>>>({});
+  let baseline: Partial<Record<AgentPathKey, string>> = {};
   let saving = $state<Record<string, boolean>>({});
-  let removing = $state<Record<string, boolean>>({});
-  let updating = $state<Record<string, boolean>>({});
   let rowError = $state<Record<string, string | null>>({});
+  let messages = $state<Record<string, string | null>>({});
+  let operations = $state<Record<string, { session: string | null; until: number }>>({});
+  let uninstallAsk = $state<AgentInfo | null>(null);
+  let uninstallError = $state<string | null>(null);
+  let removing = $state(false);
+
+  function syncInputs(list: AgentInfo[]): void {
+    const next = { ...inputs };
+    const keys = [...list.flatMap(a => pathKey(a.id) ? [pathKey(a.id)!] : []), "agents.agy.chatPath" as const];
+    for (const key of keys) {
+      const value = getSetting(key);
+      // Re-checking or saving another row must preserve an unfinished edit.
+      if (next[key] === undefined || next[key] === baseline[key]) next[key] = value;
+      baseline[key] = value;
+    }
+    inputs = next;
+    for (const a of list) {
+      const install = a.installation;
+      if (install?.running && !operations[a.id]) {
+        operations[a.id] = { session: install.sessionId, until: Date.now() + 180_000 };
+      } else if (install && !install.running && install.exitStatus !== null) {
+        if (install.exitStatus !== 0) rowError[a.id] = `Installation failed (exit ${install.exitStatus}). You can try again.`;
+      }
+    }
+  }
 
   async function load(check = false): Promise<void> {
     loading = true;
     loadError = null;
     try {
-      // refresh=true so the rows reflect the current settings + managed state
-      // (the daemon busts its detection cache on an install/uninstall/edit);
-      // check=true (the re-check button) also probes upstream for each
-      // agent's latest release before answering.
-      const list = await listAgents(true, check);
-      agents = list;
-      const next: Record<string, string> = {};
-      for (const a of list) next[a.id] = getSetting(pathKey(a.id));
-      inputs = next;
-    } catch (e) {
-      loadError = e instanceof Error ? e.message : "failed to list agents";
-    } finally {
-      loading = false;
+      let list = await listAgents(true, check);
+      // A fast installer can finish during the initial executable probes.
+      // Reconcile once after that result so a reload cannot retain stale
+      // “needs setup” rows after successful installation.
+      if (list.some(a => a.installation && !a.installation.running)) list = await pollAgents();
+      syncInputs(list);
     }
+    catch (e) { loadError = e instanceof Error ? e.message : "Couldn't load agents"; }
+    finally { loading = false; }
   }
+  onMount(() => { void load(); });
 
-  onMount(() => void load());
-
-  function provenance(a: AgentInfo): { label: string; cls: string; title: string } {
-    if (!a.installed)
-      return { label: "not found", cls: "missing", title: "not resolvable — set a path below" };
-    if (a.explicit)
-      return { label: "set path", cls: "set", title: "resolved from the path you set below" };
-    if (a.managed)
-      return { label: "chimaera", cls: "managed", title: "installed by chimaera in ~/.chimaera/agents" };
-    return { label: "yours", cls: "yours", title: "your own install, resolved from your login shell" };
-  }
-
-  async function save(id: string): Promise<void> {
-    if (saving[id]) return;
-    saving = { ...saving, [id]: true };
-    rowError = { ...rowError, [id]: null };
+  async function save(a: AgentInfo): Promise<void> {
+    const key = pathKey(a.id);
+    if (saving[a.id] || key === undefined) return;
+    saving[a.id] = true;
+    rowError[a.id] = null;
     try {
-      setSetting(pathKey(id), (inputs[id] ?? "").trim());
+      const keys = a.id === "agy" ? [key, "agents.agy.chatPath" as const] : [key];
+      for (const key of keys) {
+        const value = (inputs[key] ?? "").trim();
+        setSetting(key, value);
+        inputs[key] = baseline[key] = value;
+      }
       await flushSettings();
       await load();
-    } catch (e) {
-      rowError = { ...rowError, [id]: e instanceof Error ? e.message : "failed to save" };
-    } finally {
-      saving = { ...saving, [id]: false };
-    }
+    } catch (e) { rowError[a.id] = e instanceof Error ? e.message : "Couldn't save"; }
+    finally { saving[a.id] = false; }
   }
 
-  /** Start the daemon's curated update for a MANAGED binary: it streams into
-   *  an "update <agent>" terminal (visible in the rail), and a bounded poll
-   *  clears the row's affordance when the new build lands. */
-  async function startUpdate(a: AgentInfo): Promise<void> {
-    if (updating[a.id] || wsId === null) return;
-    updating = { ...updating, [a.id]: true };
-    rowError = { ...rowError, [a.id]: null };
+  async function install(a: AgentInfo, update = false): Promise<void> {
+    if (operations[a.id] || wsId === null) return;
+    rowError[a.id] = messages[a.id] = null;
+    operations[a.id] = { session: null, until: Date.now() + 180_000 };
     try {
-      await updateAgent(a.id, wsId);
-      ensurePoll();
+      const session = await (update ? updateAgent : installAgent)(a.id, wsId);
+      operations[a.id] = { session, until: Date.now() + 180_000 };
     } catch (e) {
-      updating = { ...updating, [a.id]: false };
-      rowError = {
-        ...rowError,
-        [a.id]: e instanceof Error ? e.message : "failed to start the update",
-      };
+      delete operations[a.id];
+      rowError[a.id] = e instanceof Error ? e.message : "Couldn't start installation";
     }
   }
 
-  // While an update session runs, re-probe the catalog every few seconds so
-  // the row reconciles itself (the affordance disappears once the swap
-  // lands). Bounded: a wedged download stops the poll after ~2 minutes and
-  // re-enables the button — the daemon 409s a double-start anyway.
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
-  let pollTicks = 0;
-
-  function ensurePoll(): void {
-    if (pollTimer !== null) return;
-    pollTicks = 0;
-    pollTimer = setInterval(() => {
-      pollTicks += 1;
-      if (pollTicks > 24) {
-        stopPoll();
-        updating = {};
-        return;
+  let refreshing = false;
+  async function refreshProgress(): Promise<void> {
+    if (refreshing) return;
+    refreshing = true;
+    const abort = new AbortController();
+    const timeout = setTimeout(() => abort.abort(), 15_000);
+    try {
+      const agents = await pollAgents(abort.signal);
+      for (const [id, operation] of Object.entries(operations)) {
+        if (operation.session === null) continue;
+        const status = agents.find(a => a.id === id)?.installation;
+        const result = installationResult(status?.sessionId === operation.session ? status : undefined);
+        if (result === "done" || result === "failed") {
+          delete operations[id];
+          if (result === "failed") rowError[id] = `Installation failed (exit ${status?.exitStatus}). Check your connection and try again.`;
+          else messages[id] = "Installation finished.";
+        } else if (status?.sessionId === operation.session && !status.running) {
+          delete operations[id];
+          messages[id] = "Couldn't confirm installation. Check for updates or try again.";
+        } else if (Date.now() >= operation.until) {
+          delete operations[id];
+          messages[id] = "Installation is taking longer. Check its terminal in the sidebar, then refresh here.";
+        }
       }
-      void refreshRows();
-    }, 5000);
+    } catch { /* A transient disconnect retries while this surface is visible. */ }
+    finally { clearTimeout(timeout); refreshing = false; }
   }
 
-  function stopPoll(): void {
-    if (pollTimer !== null) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
-  }
-
-  onDestroy(stopPoll);
-
-  /** Refresh only the daemon-state side of the rows (never `inputs` — a
-   *  path edit in progress must not be clobbered by a background poll).
-   *  pollAgents, not listAgents(true): the daemon's install watcher already
-   *  re-detected when the update session ended — forcing `refresh` here
-   *  would spawn four login-shell re-resolutions every 5s tick. */
-  async function refreshRows(): Promise<void> {
-    try {
-      const list = await pollAgents();
-      agents = list;
-      const next = { ...updating };
-      for (const a of list) if (!a.updateAvailable) next[a.id] = false;
-      updating = next;
-      if (!list.some((a) => updating[a.id])) stopPoll();
-    } catch {
-      // transient fetch hiccup; the next tick retries
-    }
-  }
-
-  /** The agent whose uninstall is being confirmed (ConfirmDialog — the
-   *  native app's web view has no `window.confirm`). A failure stays in the
-   *  dialog as its inline error. */
-  let uninstallAsk = $state<AgentInfo | null>(null);
-  let uninstallError = $state<string | null>(null);
+  const pending = $derived(Object.values(operations).some(o => o.session !== null));
+  $effect(() => {
+    if (!visible || !$pageVisible || !pending) return;
+    void refreshProgress();
+    const timer = setInterval(() => void refreshProgress(), 3000);
+    return () => clearInterval(timer);
+  });
 
   async function uninstall(a: AgentInfo): Promise<void> {
-    if (removing[a.id]) return;
-    removing = { ...removing, [a.id]: true };
+    if (removing) return;
+    removing = true;
     uninstallError = null;
-    rowError = { ...rowError, [a.id]: null };
     try {
       await uninstallAgent(a.id);
       uninstallAsk = null;
+      messages[a.id] = null;
       await load();
-    } catch (e) {
-      uninstallError = e instanceof Error ? e.message : "failed to uninstall";
-    } finally {
-      removing = { ...removing, [a.id]: false };
-    }
-  }
-
-  /** Version tooltip: the full --version line plus the newest upstream
-   *  release the daemon knows (and how fresh that knowledge is) — "am I
-   *  current?" answerable without adding a visible element. */
-  function verTitle(a: AgentInfo): string {
-    let title = a.version ?? "";
-    if (a.latestVersion !== null) {
-      const age = a.latestCheckedAt !== null ? relativeAge(a.latestCheckedAt) : null;
-      const checked = age === null ? "" : age === "now" ? ", checked just now" : `, checked ${age} ago`;
-      title += ` — latest: ${a.latestVersion}${checked}`;
-    }
-    return title;
+    } catch (e) { uninstallError = e instanceof Error ? e.message : "Couldn't uninstall"; }
+    finally { removing = false; }
   }
 </script>
 
 <section class="agents">
   <div class="cat-row">
-    <h2 class="cat">Agents</h2>
-    <button
-      class="recheck"
-      title="re-detect installed agents and check upstream for their latest releases"
-      onclick={() => void load(true)}
-      disabled={loading}
-    >
-      {loading ? "checking…" : "re-check"}
-    </button>
+    <h2>Agents</h2>
+    <button class="link" disabled={loading} onclick={() => void load(true)}>{loading ? "Checking…" : "Check for updates"}</button>
   </div>
-  <p class="intro">
-    Which binary chimaera runs for each agent — for both a launched agent and when
-    you type its name in a chimaera terminal. Leave a path empty to resolve it
-    from your login shell, then a chimaera-managed install. chimaera only shadows
-    your own binary when it manages one or you set a path here.
-  </p>
-
-  {#if loadError !== null}
-    <div class="err" role="alert">{loadError}</div>
-  {/if}
-
-  {#each agents as a (a.id)}
-    {@const p = provenance(a)}
-    {@const modified = isModified(pathKey(a.id))}
-    <div class="row" class:modified>
-      <div class="gutter" title={modified ? "path override set" : undefined}></div>
-      <div class="text">
-        <div class="head">
-          <span class="glyph"><SessionGlyph kind="agent" agentKind={a.id} size={13} title={a.name} /></span>
-          <span class="title">{a.name}</span>
-          <span class="badge {p.cls}" title={p.title}>{p.label}</span>
-          {#if a.version}<span class="ver" title={verTitle(a)}>{versionNumber(a.version)}</span>{/if}
-          {#if a.outdated}<span class="badge missing" title="installed but too old to run usefully">outdated</span>{/if}
-          {#if a.updateAvailable && a.latestVersion !== null && !a.managed}
-            <!-- The user's own binary: a newer release is information, never
-                 an action — chimaera doesn't touch installs it doesn't own. -->
-            <span
-              class="newver"
-              title="{a.latestVersion} is out — this is your own install; update it your way"
-              >{a.latestVersion} available</span
-            >
-          {/if}
+  <p class="intro">Choose which agents are ready to use on this computer. Chimaera can install and update its own copies.</p>
+  {#if loadError}<p class="err" role="alert">{loadError}</p>{/if}
+  <div class="cards">
+    {#each $agentCatalog as a (a.id)}
+      {@const status = agentUpdateStatus(a)}
+      {@const busy = !!operations[a.id]}
+      {@const key = pathKey(a.id)}
+      <article>
+        <div class="main">
+          <span class="glyph"><SessionGlyph kind="agent" agentKind={a.id} size={20} title={a.name} /></span>
+          <div class="text">
+            <div class="head"><h3>{a.name}</h3>{#if a.version}<span class="version" title={a.version}>{versionNumber(a.version)}</span>{/if}</div>
+            <p class="state">{!a.installed ? "Not installed" : a.outdated ? "Needs an update" : a.chatSetupRequired ? "Terminal ready · Chat needs setup" : a.chatCapable ? "Ready for chat and terminal" : "Terminal ready"}</p>
+            {#if a.installed}<p class="detail" title={a.latestError ?? undefined}>{a.managed ? "Managed by Chimaera" : "Your installation"}{#if status.text} · {status.text}{/if}</p>{/if}
+          </div>
+          <div class="actions">
+            {#if busy}<span class="detail" role="status">Installing…</span>
+            {:else if (!a.installed || a.chatSetupRequired) && a.managedInstall}
+              <button class="btn primary" disabled={wsId === null} onclick={() => void install(a)}>{a.chatSetupRequired ? "Set up chat" : "Install"}</button>
+            {:else if a.managed && (a.updateAvailable || a.outdated)}
+              <button class="btn primary" disabled={wsId === null} onclick={() => void install(a, true)}>Update</button>
+            {:else if (!a.installed || a.updateAvailable || a.outdated) && a.installUrl}
+              <button class="link" onclick={() => openInSystemBrowser(a.installUrl!)}>{a.installed ? "Update instructions ↗" : "Install instructions ↗"}</button>
+            {/if}
+          </div>
         </div>
-        <p class="desc" title={a.path ?? undefined}>
-          {a.path ?? "not on your PATH — set a path below, or install it and re-check"}
-        </p>
-        <code class="id" title="settings.json key">{pathKey(a.id)}</code>
-        {#if rowError[a.id]}<div class="err row-err" role="alert">{rowError[a.id]}</div>{/if}
-      </div>
-
-      <div class="control">
-        <input
-          class="textbox"
-          bind:value={inputs[a.id]}
-          placeholder="resolve from login shell"
-          spellcheck="false"
-          autocapitalize="off"
-          autocorrect="off"
-          disabled={saving[a.id]}
-          onkeydown={(e) => {
-            if (e.key === "Enter") void save(a.id);
-          }}
-        />
-        <button
-          class="btn"
-          disabled={saving[a.id] || (inputs[a.id] ?? "") === getSetting(pathKey(a.id))}
-          onclick={() => void save(a.id)}
-        >
-          {saving[a.id] ? "saving…" : "save"}
-        </button>
-        {#if a.managed && a.updateAvailable && a.latestVersion !== null}
-          <button
-            class="btn update"
-            disabled={updating[a.id] || wsId === null}
-            title="downloads the official {a.name} build into ~/.chimaera/agents — runs in a terminal you can watch"
-            onclick={() => void startUpdate(a)}
-          >
-            {updating[a.id] ? "updating…" : `update → ${a.latestVersion}`}
-          </button>
+        {#if busy}<p class="notice">You can follow installation in its terminal in the sidebar.</p>{/if}
+        {#if messages[a.id]}<p class="notice" role="status">{messages[a.id]}</p>{/if}
+        {#if rowError[a.id]}<p class="err" role="alert">{rowError[a.id]}</p>{/if}
+        {#if key !== undefined || a.managed}
+        <details>
+          <summary>Advanced</summary>
+          <div class="advanced">
+            {#if a.path}<p class="detail">Using <code>{a.path}</code></p>{/if}
+            {#if key !== undefined}
+            <label>Custom executable
+              <input bind:value={inputs[key]} placeholder="Automatic" spellcheck="false" disabled={saving[a.id]} onkeydown={e => { if (e.key === "Enter") void save(a); }} />
+            </label>
+            {/if}
+            {#if a.id === "agy"}
+              <label>Custom chat executable
+                <input bind:value={inputs["agents.agy.chatPath"]} placeholder="Automatic" spellcheck="false" disabled={saving[a.id]} />
+              </label>
+              <p class="detail">Chat uses Google's separate companion. Set up chat installs it alongside Antigravity.</p>
+            {/if}
+            <div class="advanced-actions">
+              {#if key !== undefined}<button class="btn" disabled={saving[a.id] || ((inputs[key] ?? "") === getSetting(key) && (a.id !== "agy" || (inputs["agents.agy.chatPath"] ?? "") === getSetting("agents.agy.chatPath")))} onclick={() => void save(a)}>{saving[a.id] ? "Saving…" : "Save"}</button>{/if}
+              {#if a.managed}
+                <button class="link" disabled={busy || wsId === null} onclick={() => void install(a, true)}>Reinstall</button>
+                <button class="link danger" disabled={busy || removing} onclick={() => { uninstallError = null; uninstallAsk = a; }}>Uninstall</button>
+              {/if}
+            </div>
+          </div>
+        </details>
         {/if}
-        {#if a.managed}
-          <button
-            class="btn danger"
-            disabled={removing[a.id]}
-            title="remove chimaera's managed copy (your own install is untouched)"
-            onclick={() => {
-              uninstallError = null;
-              uninstallAsk = a;
-            }}
-          >
-            {removing[a.id] ? "removing…" : "uninstall"}
-          </button>
-        {/if}
-      </div>
-    </div>
-  {/each}
+      </article>
+    {/each}
+  </div>
 </section>
 
 {#if uninstallAsk !== null}
   {@const a = uninstallAsk}
-  <ConfirmDialog
-    title="Uninstall the chimaera-managed {a.name}?"
-    body="This removes only chimaera's own copy under ~/.chimaera/agents. Your own install, if any, is left untouched."
-    confirmLabel={removing[a.id] ? "uninstalling…" : "uninstall"}
-    danger
-    enterConfirms
-    error={uninstallError}
-    onConfirm={() => void uninstall(a)}
-    onCancel={() => {
-      if (removing[a.id]) return;
-      // A failure the user dismisses stays on the row, as it did before.
-      if (uninstallError !== null) rowError = { ...rowError, [a.id]: uninstallError };
-      uninstallAsk = null;
-    }}
-  />
+  <ConfirmDialog title="Uninstall {a.name}?" body="This removes Chimaera's copy. Your other installations and conversations are kept." confirmLabel={removing ? "Uninstalling…" : "Uninstall"} danger enterConfirms error={uninstallError} onConfirm={() => void uninstall(a)} onCancel={() => { if (!removing) uninstallAsk = null; }} />
 {/if}
 
 <style>
-  /* Matches the shared settings grammar: an uppercase category header, then a
-     flat two-column row per agent (label + detail left, controls right) with
-     the modified-gutter, hover-revealed key, and container-query stacking —
-     the same recipe as SettingRow, so this section reads as one system. */
-  .agents {
-    display: flex;
-    flex-direction: column;
-  }
-
-  .cat-row {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 12px;
-    margin: 18px 0 4px;
-    padding: 0 14px;
-  }
-  .cat {
-    margin: 0;
-    font-size: var(--text-xs);
-    font-weight: 600;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--muted);
-  }
-  .recheck {
-    appearance: none;
-    border: none;
-    background: none;
-    font: inherit;
-    font-size: var(--text-xs);
-    color: var(--muted);
-    cursor: pointer;
-    padding: 0 4px;
-    border-radius: 4px;
-    transition: color 0.12s ease;
-  }
-  .recheck:hover:not(:disabled) {
-    color: var(--fg);
-  }
-  .recheck:disabled {
-    opacity: 0.6;
-    cursor: default;
-  }
-  .intro {
-    margin: 0 0 6px;
-    padding: 0 14px;
-    font-size: var(--text-sm);
-    line-height: 1.45;
-    color: var(--muted);
-    max-width: 60ch;
-  }
-
-  /* --- one agent, as a SettingRow-shaped row --- */
-  .row {
-    position: relative;
-    display: flex;
-    align-items: flex-start;
-    gap: 24px;
-    padding: 14px 18px 14px 41px;
-    border-radius: 8px;
-    transition: background-color 0.12s ease;
-  }
-  .row:hover {
-    background: color-mix(in srgb, var(--fg) 3%, transparent);
-  }
-
-  .gutter {
-    position: absolute;
-    left: 14px;
-    top: 14px;
-    bottom: 14px;
-    width: 3px;
-    border-radius: 2px;
-    background: transparent;
-  }
-  .row.modified .gutter {
-    background: color-mix(in srgb, var(--accent) 70%, transparent);
-  }
-
-  .text {
-    flex: 1;
-    min-width: 0;
-  }
-  .head {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    min-width: 0;
-  }
-  .glyph {
-    align-self: center;
-    display: flex;
-    color: var(--muted);
-  }
-  .title {
-    font-size: var(--text-md);
-    font-weight: 600;
-    color: var(--fg);
-  }
-
-  /* Provenance / outdated badges: the quiet bordered-mono idiom of the shared
-     "daemon" scope tag, tinted by state (accent = resolvable, warn = not). */
-  .badge {
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--muted);
-    border: 1px solid var(--edge);
-    border-radius: 4px;
-    padding: 0 5px;
-  }
-  .badge.yours,
-  .badge.managed,
-  .badge.set {
-    color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 45%, var(--edge));
-  }
-  .badge.missing {
-    color: var(--warn);
-    border-color: color-mix(in srgb, var(--warn) 45%, var(--edge));
-  }
-
-  .ver {
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    color: var(--muted);
-    font-variant-numeric: tabular-nums;
-  }
-
-  /* A newer release for the user's OWN binary: quiet information (their
-     updater is theirs — no action here), tinted just enough to be found. */
-  .newver {
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-    color: color-mix(in srgb, var(--accent) 80%, var(--muted));
-    white-space: nowrap;
-  }
-
-  .desc {
-    margin: 3px 0 0;
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    line-height: 1.45;
-    color: var(--muted);
-    overflow-wrap: anywhere;
-  }
-
-  .id {
-    display: inline-block;
-    max-width: 100%;
-    overflow-wrap: anywhere;
-    margin-top: 5px;
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    color: var(--muted);
-    opacity: 0;
-    transition: opacity 0.12s ease;
-    user-select: all;
-  }
-  .row:hover .id {
-    opacity: 0.75;
-  }
-
-  .control {
-    flex: none;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    min-height: 24px;
-    padding-top: 2px;
-  }
-
-  .textbox {
-    width: 200px;
-    min-width: 0;
-    font: inherit;
-    font-family: var(--mono);
-    font-size: var(--text-sm);
-    color: var(--fg);
-    background: var(--term-bg);
-    border: 1px solid var(--edge);
-    border-radius: 6px;
-    padding: 3px 8px;
-  }
-  .textbox:focus {
-    outline: none;
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-  }
-
-  .btn {
-    appearance: none;
-    flex: none;
-    border: 1px solid var(--edge);
-    background: var(--term-bg);
-    color: var(--muted);
-    font: inherit;
-    font-size: var(--text-xs);
-    cursor: pointer;
-    padding: 3px 9px;
-    border-radius: 6px;
-    transition:
-      color 0.12s ease,
-      border-color 0.12s ease,
-      background-color 0.12s ease;
-  }
-  .btn:hover:not(:disabled) {
-    color: var(--fg);
-    background: color-mix(in srgb, var(--fg) 3%, transparent);
-  }
-  .btn:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-  .btn.danger:hover:not(:disabled) {
-    color: var(--warn);
-    border-color: color-mix(in srgb, var(--warn) 45%, var(--edge));
-    background: color-mix(in srgb, var(--warn) 8%, transparent);
-  }
-
-  /* The one-click managed update: accent = the row's single actionable
-     affordance, present only while a strictly newer release is known. */
-  .btn.update {
-    color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 40%, var(--edge));
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-
-  .btn.update:hover:not(:disabled) {
-    color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 65%, var(--edge));
-    background: color-mix(in srgb, var(--accent) 8%, transparent);
-  }
-
-  .err {
-    margin: 4px 14px;
-    font-size: var(--text-sm);
-    color: var(--warn);
-    background: color-mix(in srgb, var(--warn) 10%, transparent);
-    padding: 4px 8px;
-    border-radius: 5px;
-  }
-  .err.row-err {
-    margin: 5px 0 0;
-  }
-
-  /* Narrow pane: stack the controls under the label, matching SettingRow. */
-  @container settings (max-width: 640px) {
-    .row {
-      flex-direction: column;
-      align-items: stretch;
-      gap: 10px;
-      padding-left: 22px;
-      padding-right: 14px;
-    }
-    .control {
-      padding-top: 0;
-      min-height: 0;
-    }
-    .textbox {
-      flex: 1;
-      width: auto;
-    }
-  }
+  .cat-row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:18px 14px 8px; }
+  h2 { margin:0; font-size:var(--text-xs); font-weight:600; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); }
+  .intro { margin:0 14px 14px; font-size:var(--text-sm); color:var(--muted); line-height:1.5; }
+  .cards { margin:0 14px 12px; border:1px solid var(--edge); border-radius:10px; overflow:hidden; }
+  article { padding:16px; background:color-mix(in srgb,var(--fg) 2%,transparent); }
+  article + article { border-top:1px solid var(--edge); }
+  .main { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  .glyph { color:var(--muted); align-self:flex-start; margin-top:3px; }
+  .text { flex:1; min-width:170px; }
+  .head { display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; }
+  h3 { margin:0; font-size:var(--text-md); font-weight:550; }
+  .version { font:var(--text-xs) var(--mono); color:var(--muted); }
+  p { margin:3px 0 0; }
+  .state { font-size:var(--text-sm); }
+  .detail,.notice { font-size:var(--text-xs); color:var(--muted); line-height:1.5; overflow-wrap:anywhere; }
+  .notice { margin-top:8px; }
+  button { font:inherit; font-size:var(--text-xs); cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  .link { border:0; padding:3px 0; background:none; color:var(--accent); }
+  .link:hover:not(:disabled) { text-decoration:underline; }
+  .btn { border:1px solid var(--edge); border-radius:6px; padding:6px 12px; background:var(--term-bg); color:var(--fg); }
+  .primary { border-color:color-mix(in srgb,var(--accent) 45%,var(--edge)); color:var(--accent); }
+  .btn:hover:not(:disabled) { background:color-mix(in srgb,var(--accent) 8%,transparent); }
+  details { margin-top:10px; }
+  summary { width:fit-content; cursor:pointer; font-size:var(--text-xs); color:var(--muted); }
+  .advanced { display:flex; flex-direction:column; gap:10px; margin-top:12px; }
+  label { display:flex; flex-direction:column; gap:5px; font-size:var(--text-xs); color:var(--muted); }
+  input { width:100%; box-sizing:border-box; border:1px solid var(--edge); background:var(--term-bg); color:var(--fg); border-radius:6px; padding:7px 9px; font:var(--text-xs) var(--mono); }
+  .advanced-actions { display:flex; gap:16px; align-items:center; }
+  .danger,.err { color:var(--err); }
+  .err { font-size:var(--text-sm); margin:8px 0; overflow-wrap:anywhere; }
+  code { font:var(--text-xs) var(--mono); }
 </style>

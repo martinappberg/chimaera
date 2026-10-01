@@ -286,6 +286,73 @@ async fn chat_handshake_failure_without_recipe_stays_visible_errored() {
     );
 }
 
+/// Resuming after an update may fail to authenticate or negotiate the new
+/// binary. That must keep the saved chat visible, never silently change view.
+#[tokio::test]
+async fn resumed_handshake_failure_keeps_chat_for_every_provider() {
+    for kind in agents::AgentKind::ALL {
+        let state = test_state();
+        chat::spawn_signal_task(state.clone());
+        let dir = test_dir(&format!("resume-failure-{}", kind.as_str()));
+        let id = format!("s-{}", kind.as_str());
+        crate::lock(&state.agents).insert(id.clone(), agents::AgentRecord::new("key".into(), kind));
+        crate::lock(&state.chat_recipes).insert(
+            id.clone(),
+            chat::ChatRecipe {
+                workspace_root: dir.clone(),
+                workspace_id: "w-test".into(),
+                kind,
+                bin: "/bin/cat".into(),
+                version: None,
+                settings: None,
+                mcp_config: None,
+                model: None,
+                resume: Some("saved-native-id".into()),
+                fork_at: None,
+                fork_head: false,
+                rollback_turns: None,
+                revert_before_turn: None,
+                remote_control: chat::RemoteControlAtStart::No,
+                carry_ultracode: false,
+                theme: "dark".into(),
+                prelude: None,
+                mastermind: None,
+                portable_context: None,
+                created_at_ms: None,
+            },
+        );
+        let mut spec =
+            chimaera_agent::driver::SpawnSpec::new(id.clone(), vec!["/bin/cat".into()], dir);
+        spec.handshake_timeout = std::time::Duration::from_millis(100);
+        state
+            .chat
+            .spawn(kind.chat_adapter().unwrap(), spec)
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !crate::lock(&state.agents)
+            .get(&id)
+            .is_some_and(|a| a.state == agent_state::AgentState::Errored)
+        {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(state.chat.contains(&id));
+        assert!(!state.chat.get(&id).unwrap().alive);
+        assert!(
+            state.sessions.get(&id).is_none(),
+            "{kind:?} switched to terminal"
+        );
+        assert_eq!(
+            crate::lock(&state.chat_recipes)
+                .get(&id)
+                .unwrap()
+                .resume
+                .as_deref(),
+            Some("saved-native-id")
+        );
+    }
+}
+
 /// An agent updated IN PLACE (same path, new binary) must be noticed by the
 /// next spawn-time detect: the cached version is re-probed from the new
 /// binary without a full re-resolution — the login shell is never consulted,
@@ -430,7 +497,7 @@ async fn agents_endpoint_lists_catalog_with_installed_and_missing() {
     );
     preset_agent(
         &state,
-        agents::AgentKind::Gemini,
+        agents::AgentKind::Grok,
         Err("gemini not found (test)".to_string()),
         None,
     );
@@ -444,13 +511,14 @@ async fn agents_endpoint_lists_catalog_with_installed_and_missing() {
     // install, and known for the uninstalled gemini too.
     for (kind, version) in [
         (agents::AgentKind::Claude, "2.1.207"),
-        (agents::AgentKind::Gemini, "0.9.0"),
+        (agents::AgentKind::Grok, "0.9.0"),
     ] {
         lock(&state.agent_updates).insert(
             kind,
             agent_updates::AgentLatest {
                 version: version.to_string(),
                 checked_at: 1_000,
+                error: None,
             },
         );
     }
@@ -460,7 +528,7 @@ async fn agents_endpoint_lists_catalog_with_installed_and_missing() {
     let list = list.as_array().unwrap();
     assert_eq!(list.len(), 4);
     let ids: Vec<&str> = list.iter().map(|a| a["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, ["claude", "codex", "gemini", "agy"]);
+    assert_eq!(ids, ["claude", "codex", "agy", "grok"]);
 
     // Installed and current: path + version present, no outdated flag.
     // A known-newer upstream release marks it update_available.
@@ -494,15 +562,15 @@ async fn agents_endpoint_lists_catalog_with_installed_and_missing() {
 
     // Not installed but latest known: the info rides along (the row can say
     // what an install would get), never an update flag.
-    let gemini = &list[2];
-    assert_eq!(gemini["installed"], false);
-    assert_eq!(gemini["latest_version"], "0.9.0");
-    assert!(!gemini.as_object().unwrap().contains_key("update_available"));
+    let grok = &list[3];
+    assert_eq!(grok["installed"], false);
+    assert_eq!(grok["latest_version"], "0.9.0");
+    assert!(!grok.as_object().unwrap().contains_key("update_available"));
 
     // Not installed: muted row material — no path/version, but the
     // install action and docs link are still there.
-    let agy = &list[3];
-    assert_eq!(agy["name"], "Antigravity CLI");
+    let agy = &list[2];
+    assert_eq!(agy["name"], "Antigravity");
     assert_eq!(agy["installed"], false);
     let obj = agy.as_object().unwrap();
     assert!(!obj.contains_key("path"), "{agy}");
@@ -583,7 +651,10 @@ async fn install_endpoint_contract_and_session_mechanics() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(
-        body["error"].as_str().unwrap().contains("node runtime"),
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("Choose Antigravity"),
         "{body}"
     );
 
@@ -658,6 +729,49 @@ async fn install_endpoint_contract_and_session_mechanics() {
     .expect("slot free after the session ended");
     state.sessions.kill(&again).ok();
     state.sessions.kill(&other).ok();
+}
+
+#[tokio::test]
+async fn installer_result_survives_the_terminal_disappearing() {
+    let state = test_state();
+    let ws = make_workspace(&state, "install-result").await;
+    let workspace = lock(&state.workspaces).get(&ws).unwrap();
+    for code in [0, 7] {
+        let sid = runtimes::start_install(
+            &state,
+            agents::AgentKind::Grok,
+            &workspace,
+            "install",
+            format!("sleep 0.1; exit {code}"),
+        )
+        .unwrap();
+        let status = runtimes::installation_status(&state, agents::AgentKind::Grok).unwrap();
+        assert_eq!(status["session_id"], sid);
+        assert_eq!(status["running"], true);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let status = runtimes::installation_status(&state, agents::AgentKind::Grok).unwrap();
+            if status["running"] == false {
+                assert!(state.sessions.get(&sid).is_none());
+                assert_eq!(status["session_id"], sid);
+                assert_eq!(status["exit_status"], code);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "installer result never settled"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (_, list) = request(&state, Method::GET, "/api/v1/agents", None).await;
+        let row = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "grok")
+            .unwrap();
+        assert_eq!(row["installation"]["exit_status"], code);
+    }
 }
 
 /// POST /api/v1/agents/{id}/update: managed-only. 404 unknown agent /
@@ -960,8 +1074,11 @@ async fn agents_rows_flag_managed_installs() {
     assert_eq!(codex["installed"], true);
     assert_eq!(codex["managed"], true);
     assert_eq!(codex["managed_install"], true);
-    // gemini: no curated managed install (node runtime, phase 2).
-    assert_eq!(row("gemini")["managed_install"], false);
+    assert!(
+        list.iter().all(|a| a["id"] != "gemini"),
+        "legacy Gemini must not reappear in the new-agent picker"
+    );
+    assert_eq!(row("grok")["managed_install"], true);
     assert_eq!(row("agy")["managed_install"], true);
 }
 
@@ -1845,6 +1962,7 @@ async fn the_cloud_never_offers_agent_updates() {
         agent_updates::AgentLatest {
             version: "2.1.207".to_string(),
             checked_at: 1_000,
+            error: None,
         },
     );
     let (status, list) = request(&state, Method::GET, "/api/v1/agents?check=true", None).await;

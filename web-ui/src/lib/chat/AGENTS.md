@@ -1,7 +1,7 @@
 # web-ui/src/lib/chat — the structured chat surface
 
 Orientation for coding agents. This directory is the **front half of chat mode**:
-the rich UI that renders the daemon's structured agent stream (Claude & Codex),
+the rich UI that renders Claude, Codex, Antigravity and Grok agent streams,
 the sibling of the xterm.js terminal surface. Parent map: repo-root
 [AGENTS.md](../../../../AGENTS.md). The back half it talks to is
 [`crates/chimaera-agent`](../../../../crates/chimaera-agent/AGENTS.md).
@@ -477,3 +477,11 @@ nothing waits for a choice.
 the owner sleeps before the first replay; a wake (`waking`) hands back to the ordinary loading line.
 ChatView's `waitsForCloud` shows the same sentence for a kept, quiet socket (`held`) of a viewed
 conversation that runs on a cloud machine (`net/placement.ts` `ownerIsCloud`), never for a local chat.
+
+## Session capabilities
+
+`capabilities.ts` consumes the driver’s additive `capabilities` event; unknown agents have no
+implicit controls. `catalog` refreshes model/mode/command choices without replaying Init or
+resetting a turn. Header/composer controls follow those facts. `ForkDialog` includes every
+ready chat adapter; native history and a conversation copy have different transfer semantics.
+See [integration design](../../../../docs/agent-harness-design.md).

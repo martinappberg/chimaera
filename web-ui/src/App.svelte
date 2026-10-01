@@ -725,7 +725,7 @@
   );
   /** Known-missing: the catalog is loaded and says the default isn't here.
    *  (Null catalog / unknown agent falls back to spawn — the common path.) */
-  const defaultMissing = $derived(defaultAgentInfo !== null && !defaultAgentInfo.installed);
+  const defaultMissing = $derived(agents !== null && (defaultAgentInfo === null || !defaultAgentInfo.installed || (defaultAgentInfo.chatSetupRequired && getSetting("agents.defaultView") === "chat")));
   /** Missing but chimaera can install it in place (managed runtime). */
   const defaultInstallable = $derived(defaultMissing && (defaultAgentInfo?.managedInstall ?? false));
   let launcherOpen = $state(false);
@@ -4194,11 +4194,10 @@
    *  showing a bare "claude" until a new turn regenerates one. */
   function openRecent(r: RecentConvo): void {
     const titleHint = r.title !== "" ? r.title : undefined;
-    // Reopen in the SURFACE it last ran on (TUI vs chat). Null (old entries,
-    // scanned transcripts) leaves `ui` undefined so createSession falls back
-    // to the launcher's sticky default. createSession's own guards
-    // (claude/codex-only + chatCapable) keep a "chat" row honest.
-    const ui = r.ui ?? undefined;
+    // Reopening is independent of the preference for NEW conversations.
+    // Legacy/scanned CLI histories predate an explicit chat choice.
+    // Preserve their terminal surface instead of migrating them on an update.
+    const ui = r.ui ?? "term";
     void spawnSession(
       "agent",
       r.resume !== null
@@ -5651,10 +5650,10 @@
             class="row new primary main"
             class:want-install={defaultMissing}
             title={defaultMissing
-              ? defaultInstallable
-                ? `${agentDefault.agent} isn’t installed — download the official build into ~/.chimaera/agents, in a terminal you can watch`
-                : `${agentDefault.agent} isn’t installed — choose an agent to set up`
-              : `start ${agentDefault.agent} (${keyHint("newAgent")})`}
+              ? defaultAgentInfo?.chatSetupRequired
+                ? `set up chat for ${defaultAgentInfo.name}`
+                : `choose an agent to set up`
+              : `start ${defaultAgentInfo?.name ?? agentDefault.agent} (${keyHint("newAgent")})`}
             onclick={newAgentPrimary}
           >
             <!-- When the default isn't installed the surface installs it
@@ -5662,9 +5661,9 @@
                  the shim's error — so the label becomes the action and the
                  agent name takes the accent. -->
             <span class="new-label"
-              >{defaultMissing ? (defaultInstallable ? "install" : "set up") : "+ new agent"}</span
+              >{defaultMissing ? (defaultAgentInfo?.chatSetupRequired ? "set up chat" : defaultInstallable ? "install" : "set up") : "+ new agent"}</span
             >
-            <span class="new-default" class:accent={defaultMissing}>{agentDefault.agent}</span>
+            <span class="new-default" class:accent={defaultMissing}>{defaultAgentInfo?.name ?? agentDefault.agent}</span>
           </button>
           <button
             class="new-chev"

@@ -25,6 +25,8 @@
     /** The one-of-N open overlay; two-way so the host can open /mcp and the
      *  outside-dismiss action can close everything. */
     menu: "model" | "mode" | "effort" | "mcp" | "remote" | null;
+    canPickModel: boolean;
+    canPickMode: boolean;
     modelChoices: ModelChoice[];
     modelLabel: string | null;
     modeLabel: string | null;
@@ -51,6 +53,8 @@
     agentKind,
     agentName,
     menu = $bindable(),
+    canPickModel,
+    canPickMode,
     modelChoices,
     modelLabel,
     modeLabel,
@@ -145,7 +149,8 @@
   <div class="menu-host">
     <button
       class="chip pick"
-      title={modelLabel === null ? "resolving model…" : "model — click to switch"}
+      disabled={!canPickModel}
+      title={canPickModel ? "model — click to switch" : "model selected by the agent"}
       aria-haspopup="menu"
       aria-expanded={menu === "model"}
       onclick={() => (menu = menu === "model" ? null : "model")}
@@ -153,14 +158,14 @@
       <!-- Skeleton only in the brief window before the model catalog loads
            (modelLabel null). Once it's loaded, modelLabel is the session's real
            model — or the default a fresh chat will use — never a wrong flash. -->
-      {#if modelLabel === null}
+      {#if modelLabel === null && !store.initialized && !store.exited && !store.fatalError}
         <span class="model-skel" aria-label="loading model"></span>
       {:else}
-        {modelLabel}
+        {modelLabel ?? "agent default"}
       {/if}
-      {@render caret()}
+      {#if canPickModel}{@render caret()}{/if}
     </button>
-    {#if menu === "model"}
+    {#if canPickModel && menu === "model"}
       <div class="overlay-surface menu" role="menu" aria-label="model">
         {#if modelChoices.length === 0}
           <span class="menu-empty">no known models</span>
@@ -179,7 +184,7 @@
       </div>
     {/if}
   </div>
-  {#if store.modes.length > 0}
+  {#if canPickMode && store.modes.length > 0}
     <div class="menu-host">
       <button
         class="chip pick"

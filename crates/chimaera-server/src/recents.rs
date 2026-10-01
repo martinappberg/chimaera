@@ -314,7 +314,7 @@ pub(crate) fn retire_with_resume(
     let skip =
         was_mastermind || (record.kind == AgentKind::Claude && title == record.kind.as_str());
     if let Some(workspace_id) = workspace_id.filter(|_| !skip) {
-        // Codex owns its durable thread store and resumes by id in-protocol;
+        // Non-Claude chat agents own their durable store and resume by id;
         // there is no Claude-style transcript path to validate. ChatInfo is
         // therefore the authority, with resumed_from as the fallback for a
         // resumed process that died before initialization completed.
@@ -327,7 +327,7 @@ pub(crate) fn retire_with_resume(
         let workspace_root = crate::lock(&state.workspaces)
             .get(&workspace_id)
             .map(|w| w.root);
-        let resume = if record.kind == AgentKind::Codex && ui == SessionUi::Chat {
+        let resume = if ui == SessionUi::Chat && record.kind != AgentKind::Claude {
             resume_hint.or_else(|| record.resumed_from.clone())
         } else if record.kind == AgentKind::Codex {
             record.resume_id().filter(|_| {

@@ -1,7 +1,6 @@
 # Agents — launch, lifecycle & runtimes
 
-Launching and managing coding agents (`claude`, `codex`; `gemini`/`antigravity` are
-detected but not first-class yet). An agent runs either as its **real interactive TUI** in
+Launching and managing Claude Code, Codex, Antigravity and Grok Build. An agent runs either as its **real interactive TUI** in
 a daemon-owned PTY (Tier A — looks, behaves, and *bills* like any terminal) or as a
 **structured chat session** (Tier B — see [chat-mode.md](chat-mode.md)) on the same session
 identity. This page covers getting an agent running, the session rail that tracks it,
@@ -18,7 +17,7 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
 
 - **What & when.** Start a coding agent in the focused pane, as a TUI or a chat session.
 - **How it's used.** `POST /api/v1/sessions` with `kind:"agent"`, `agent:"claude"|"codex"|…`,
-  optional `model` (from the curated list), `resume` (Claude session id or Codex thread id),
+  optional `model` (an agent-provided id), `resume` (the saved native conversation id),
   `theme`, `cols`/`rows`, and
   `ui:"term"` (default, real TUI) or `ui:"chat"` (structured driver). New agent sessions default
   to chat when `agents.defaultView === "chat"` and the agent is chat-capable.
@@ -31,46 +30,42 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   hit is cached for the daemon's life, a miss left uncached to self-heal. `model`/`resume` are
   charset-validated (`safe_arg` refuses flag-shaped/control-byte values). The launcher env scrubs
   the daemon's own `CLAUDE_CODE_*`/`CLAUDE_AGENT_*` markers so a spawned claude doesn't think it's
-  a nested child. `resume` is accepted for Claude and Codex (400 for agents without a native
-  resume contract); Codex TUI resumes map to `codex resume <thread-id>`. Chat is gated to
-  `chat_capable()` agents (claude / codex); gemini/agy are refused chat.
+  a nested child. Terminal `resume` is accepted for Claude and Codex (400 for other
+  agents); all four chat adapters resume saved native sessions. Codex TUI resumes map to
+  `codex resume <thread-id>`. Chat is gated to
+  `chat_capable()` agents: Claude, Codex, Antigravity and Grok Build. Gemini CLI remains readable in old records but is retired from the new-agent catalog.
 
 ## The launcher — split button & popover
 
 - **What & when.** The primary way to start an agent: one click spawns your persisted default;
   the popover answers "*which* agent" with provenance and install state.
-- **How it's used.** In the rail's "agents" section, click `+ new agent <default>` (or `Mod2+E`)
-  to spawn the default instantly. Hover/click the chevron for the popover: one row per known CLI —
-  the name over a quiet subheader (provenance · version · `docs ↗`) — with install/update chips.
-  The hot row offers the two ways in: **`open`** (the whole row, and `↵`) starts the structured
-  chat view — always the default — and a small **terminal-icon button** (`⌘↵`, delayed tooltip)
-  starts the agent's own TUI. Agents with no chat view get one `open` that says it opens the
-  terminal.
+- **How it's used.** The split button starts the saved default. Its chevron opens a ready-first
+  agent menu with one **chat** action per ready agent and a secondary terminal button. Agents
+  needing installation or Antigravity chat setup appear below. Provider labels are visible;
+  binary/version provenance lives in the tooltip and Agents settings. Arrow keys navigate,
+  Enter follows the visible chat action, and Command/Ctrl+Enter opens terminal.
 - **Where it lives.** `App.svelte` (`.new-split`, `spawnDefaultAgent`), `Launcher.svelte`,
   `launcher.ts` (`listAgents` → `GET /api/v1/agents`; `?refresh=true` bypasses the detection cache;
   `LaunchPick.ui` carries the explicit surface choice into `createSession`).
 - **Key behaviors.** Default persists in localStorage (`chimaera.agentDefault`, falls back to
   `claude`). If the default is missing, the main surface doesn't spawn a doomed pane — it installs
-  in place (if managed) or opens the popover. Provenance is stated in words: **"yours"** (your
-  binary on PATH) vs **"chimaera"** (a build under `~/.chimaera/agents`), with the resolved path in
-  the tooltip. When the daemon knows a strictly newer release, the version line grows **`→ <new>`**:
+  in place (if managed) or opens the popover. Binary provenance and the resolved path stay in the tooltip. When the daemon knows a strictly newer release, the version line grows **`→ <new>`**:
   an accent one-click curated update for a chimaera-managed build, quiet muted information for your
   own (chimaera never touches an install it doesn't own — the docs link is the affordance). The
   popover paints INSTANTLY from the window's last-known catalog (no "checking…"
   flash per open) and re-detects in the background, swapping in the truth; only a window that has
-  never seen a catalog shows the pulse. The explicit open/terminal choice overrides the
+  never seen a catalog shows the pulse. The picker’s chat/terminal choice overrides the
   `agents.defaultView` setting for that one spawn (the setting still governs the split button's
-  instant spawn). Agents with no curated managed install (e.g. gemini) get no chip, only the docs
-  link.
+  instant spawn). Agents with no curated managed install get only the official setup link.
 
 ## Managed runtimes — install / update / theming shims
 
 - **What & when.** Chimaera installs and updates the agent CLIs itself (curated scripts, official
-  sources, checksum-verified, never sudo), streaming the installer into a visible terminal pane —
+  sources, checksums when published, never sudo), streaming the installer into a visible terminal pane —
   and writes tiny theming "shims" that inject a scheme-matched theme into agent spawns.
 - **How it's used.** Click an install chip → `POST /api/v1/agents/{id}/install {workspace_id}`
   spawns the curated command as an ordinary shell session you watch. Click an update affordance
-  (launcher `→ <new>`, or Settings → Agents "update → \<new\>") → `POST /api/v1/agents/{id}/update`
+  (launcher `→ <new>`, or Settings → Agents "Update") → `POST /api/v1/agents/{id}/update`
   re-runs the same curated script (it always fetches latest and re-swaps atomically) as a session
   named `update <agent>` — **managed binaries only**; for your own binary the daemon 400s and the
   UI never offers it. `DELETE /api/v1/agents/{id}/install` uninstalls the managed copy (driven
@@ -85,8 +80,10 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   whole release package rather than just the entrypoint — it spawns companions
   (`codex-code-mode-host`, bundled rg/zsh) from beside its own executable, and an entrypoint-only
   install shipped a codex whose code mode failed closed. One install/update per agent (409 while
-  running, either verb). Gemini has no managed install (needs a node runtime — phase 2; POST →
-  honest 400). Shims are written **only**
+  running, either verb). Antigravity installs its complete Google chat package alongside the
+  terminal executable. Grok uses xAI’s standalone release. These two chat/runtime artifacts are
+  fetched over HTTPS from the vendor; they do not publish separate checksums at these endpoints.
+  Gemini CLI is retained for reading existing records, with no new managed install. Shims are written **only**
   when chimaera owns the binary (never shadow your own install) and theme injection is skipped when
   your own config already sets a theme (fill the gap, never fight a choice). Typing
   `<agent> update` in a chimaera terminal against a **managed** binary is intercepted by the shim
@@ -181,14 +178,16 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   Route `GET /api/v1/recents?workspace_id=` (server `recents.rs`); reopening rides
   `POST /sessions` with `resume` + `title_hint`. History replay: `chimaera-agent/src/transcript.rs`
   (`import_transcript`) + `journal.rs` (`seed_journal`), glued in `chat.rs`
-  (`seed_resumed_journal`) and `api/sessions.rs` (`spawn_chat_ui`, the terminal fallback). Refetch
+  (`seed_resumed_journal`) and `api/sessions.rs` (`spawn_chat_ui`, explicit resume validation). Refetch
   driven by a `recents` epoch on `/ws/events`.
-- **Key behaviors.** A reopened claude recent lands in **chat with its name and full history**:
+- **Key behaviors.** Reopening honors the conversation's last surface; legacy/scanned histories
+  default to terminal, independently of the preference for new chats. A saved chat reopens with
+  its name and history:
   the row's title seeds the soft `ai_title` (`title_hint`), and the journal is seeded from the
   previous life — copied when a chat journal exists, otherwise **imported from the claude
   transcript** (`~/.claude/projects/<enc>/<id>.jsonl` → `AgentEvent`s, bounded newest-tail with an
-  explicit `Truncated` marker). A claude recent whose history can't be reconstructed opens **in
-  the terminal instead** (`claude --resume` renders natively there) — never a blank chat. A Codex
+  explicit `Truncated` marker). A saved Claude chat whose history cannot be reconstructed reports
+  a recoverable error with a terminal suggestion, rather than silently changing views. A Codex
   recent resumes on its last surface: `thread/resume` in chat, `codex resume <thread-id>` in the
   TUI. A normally finished Codex chat copies its native `ChatInfo` thread id into Recents before
   registry removal. Resume stays **honest per row**: a row with no captured native handle starts
@@ -269,10 +268,11 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
 
 ## Status: partial
 
-- **Gemini / Antigravity** are detected but not first-class: gemini has no managed install (400),
-  antigravity's `agy` is refused, neither has hook-driven attention state.
-- **Attention state** is claude-only for TUIs. Hook-less TUIs do get an honest busy/idle dot from
-  output recency (see the session rail), but no needs_permission/idle_prompt/finished states.
+- Antigravity and Grok Build share ACP chat; their same-session terminal/chat switch and native
+  rewind are not offered. Managed installs include their official native runtimes. Google's
+  chat package is pinned independently of `agy`; Linux chat needs glibc. Third-party harness
+  registration (including Pi) is [designed, not yet implemented](../agent-harness-design.md).
+- Gemini CLI is retired from new launches; existing records retain their identity.
 
 ---
 
@@ -355,3 +355,14 @@ _Captured 2026-07-11 (from the maintainer)._
   [lifecycle-and-persistence.md](lifecycle-and-persistence.md) (restart).
 - **Grade — addition:** the keeper is the *principle* (status must be honest), not the specific state
   machine.
+
+
+### More agents, one understandable experience
+_Captured 2026-10-01 from the maintainer's requests in this session._
+
+- **Problem it solves (verbatim):** “both Grok and Gemini are coming out with new models that I think we should 100% also be able to serve in Chat UIs the same way.”
+- **Forks and correctness (verbatim):** “Can we not fix so one can fork all of those ? and we should not falsilely mislead users”. Reopening after updates was described as “quite wonky”, including a Claude terminal conversation opening in chat instead.
+- **UX priority (verbatim):** “UI / UX needs to be an extreme priority and how easy it is to use for the user” and “we dont want weird jargon and too much stuff for the user that it can't understand”.
+- **Google choice (verbatim):** “Only agy if that is the new one, I think we can even retire Gemini CLI if that is not supported”. This is a product choice for new integrations, not a claim that upstream Gemini CLI is unsupported.
+- **Open direction (verbatim):** “how you can extend this to Pi harness etc as well (or any other harness you want) with plugins” and “whether or not we should keep only the main providers active right now and have other harnesses as plugins”.
+- **How settled / core versus addition (verbatim):** “Four built-ins; others through Extensions, set can evolve.” The chosen set is an evolving addition, not a permanent list.

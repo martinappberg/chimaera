@@ -1542,7 +1542,7 @@ pub(crate) fn observe_chat(state: &AppState, sid: &str, ev: &AgentEvent) {
                         prior.and_then(|p| p.tout),
                     );
                 }
-            } else {
+            } else if l.rec.agent == AgentKind::Claude.as_str() {
                 // Claude's result carries the turn's own tokens.
                 l.tokens_summed = true;
                 l.tin_sum = l.tin_sum.saturating_add(usage.input_tokens);

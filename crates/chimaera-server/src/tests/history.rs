@@ -628,3 +628,29 @@ async fn deleting_a_workspace_deletes_its_history() {
         "nothing resurrects a deleted workspace's file"
     );
 }
+
+#[tokio::test]
+async fn acp_turns_without_usage_do_not_claim_zero_tokens() {
+    use chimaera_agent::model::{AgentEvent, Usage};
+    let state = test_state();
+    let ws = make_workspace(&state, "history-acp-usage").await;
+    for kind in [agents::AgentKind::Antigravity, agents::AgentKind::Grok] {
+        let sid = format!("s-{}-usage", kind.as_str());
+        plant_agent_record(&state, &sid, &ws, kind, Some("Usage check"), None);
+        history::open(&state, &sid, StartedBy::You);
+        history::observe_chat(
+            &state,
+            &sid,
+            &AgentEvent::TurnCompleted {
+                turn_id: "turn-1".into(),
+                usage: Usage::default(),
+            },
+        );
+    }
+    let rows = records(&state, &ws);
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_eq!(row.usage.tokens_in, None);
+        assert_eq!(row.usage.tokens_out, None);
+    }
+}

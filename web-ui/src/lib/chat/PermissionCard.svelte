@@ -7,9 +7,11 @@
     /** False while the owning retained chat tab is hidden. Hidden prompts
      *  remain mounted so typed feedback survives, but may never steal focus. */
     visible?: boolean;
+    canFeedback?: boolean;
+    canChooseDestination?: boolean;
   }
 
-  let { request, onDecide, visible = true }: Props = $props();
+  let { request, onDecide, visible = true, canFeedback = true, canChooseDestination = true }: Props = $props();
   let showInput = $state(false);
 
   /** Deny-with-feedback: the typed reason rides the deny so the agent reacts
@@ -57,7 +59,7 @@
     }
   }
   let destination = $state(loadDestination());
-  const hasDestination = $derived(request.options.some((o) => o.id === "allow_always"));
+  const hasDestination = $derived(canChooseDestination && request.options.some((o) => o.id === "allow_always"));
   function cycleDestination() {
     const next =
       DESTINATIONS[(DESTINATIONS.indexOf(destination as never) + 1) % DESTINATIONS.length];
@@ -69,7 +71,7 @@
     }
   }
   function decide(optionId: string) {
-    onDecide(optionId, optionId === "allow_always" ? destination : undefined);
+    onDecide(optionId, hasDestination && optionId === "allow_always" ? destination : undefined);
   }
 
   let cardEl = $state<HTMLDivElement | null>(null);
@@ -135,7 +137,7 @@
         {option.label}
       </button>
     {/each}
-    {#if rejectOption !== undefined}
+    {#if canFeedback && rejectOption !== undefined}
       <button
         class="fb-toggle"
         class:open={feedbackOpen}
