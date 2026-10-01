@@ -101,7 +101,9 @@
   const lastSpec = $derived<LaunchSpec | null>(workspace.last_spec ?? config.last_spec ?? null);
   const selected = $derived(facts?.partitions.find((p) => p.name === form.partition) ?? null);
   const accounts = $derived(accountChoices(facts, selected));
-  const showAccount = $derived(accounts.length > 0 || requires.includes("account"));
+  // One account and nothing requiring it: there is no choice to make, and
+  // Slurm uses that account anyway — no field, no --account.
+  const showAccount = $derived(accounts.length > 1 || requires.includes("account"));
   const qosRequired = $derived(requires.includes("qos"));
   const constraintRequired = $derived(requires.includes("constraint"));
   const attachedRun = $derived(isInteractiveOnly(effectiveConfig, form.partition));
@@ -165,6 +167,10 @@
 
   /** Keep the account on one the select offers (default first). */
   function reconcileAccount(): void {
+    if (!showAccount) {
+      form.account = "";
+      return;
+    }
     if (accounts.length === 0) return;
     if (accounts.includes(form.account)) return;
     const def = facts?.default_account ?? null;

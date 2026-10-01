@@ -93,8 +93,9 @@ pub struct AgentRules {
     /// A file on the cluster holding its published rules for agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
-    /// Text the user wrote or pasted.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Text the user wrote or pasted (always on the wire: pages read it as
+    /// a string).
+    #[serde(default)]
     pub text: String,
 }
 
