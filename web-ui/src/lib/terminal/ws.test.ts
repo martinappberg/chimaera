@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionSocket } from "./ws";
 import { QUIET_OPEN_MS, reconnectingSockets } from "../net/reconnect";
 import { get } from "svelte/store";
@@ -294,4 +294,69 @@ it("a still-parked attach is unchanged: no snapshot, no reset, the buffer desync
   expect(reset).not.toHaveBeenCalled();
   expect(Socket.all[0].sent).toHaveLength(1);
   session.close();
+});
+
+describe("terminal resize direction", () => {
+  const frames = (ws: Socket) => ws.sent.map((raw) => JSON.parse(raw as string));
+  function client() {
+    let dims = { cols: 100, rows: 30 };
+    const resized = (cols?: number, rows?: number) => {
+      if (cols === undefined || rows === undefined) return;
+      if (cols === dims.cols && rows === dims.rows) return;
+      dims = { cols, rows };
+      // xterm.resize synchronously emits onResize, including server adoption.
+      socket.sendResize(cols, rows);
+    };
+    const socket = new SessionSocket("s-fixture", { ...quiet, dims: () => dims, onReset: resized, onResized: resized });
+    const ws = Socket.all.at(-1)!;
+    ws.onopen?.();
+    ws.onmessage?.({ data: JSON.stringify({ type: "ready", ...dims }) });
+    ws.sent = [];
+    return { socket, ws, resized, dims: () => dims };
+  }
+  const receive = (ws: Socket, frame: object) => ws.onmessage?.({ data: JSON.stringify(frame) });
+
+  it("adopts crossed foreign resizes without reflecting stale sizes to the daemon", () => {
+    const a = client();
+    // Two other clients have resized before this client receives the events.
+    receive(a.ws, { type: "resized", cols: 80, rows: 24 });
+    receive(a.ws, { type: "resized", cols: 120, rows: 40 });
+    expect(a.dims()).toEqual({ cols: 120, rows: 40 });
+    expect(a.ws.sent).toEqual([]);
+    a.socket.close();
+  });
+
+  it("adopts a snapshot's grid without turning it into a resize request", () => {
+    const a = client();
+    receive(a.ws, { type: "resync", cols: 80, rows: 24 });
+    expect(a.dims()).toEqual({ cols: 80, rows: 24 });
+    expect(a.ws.sent).toEqual([]);
+    a.socket.close();
+  });
+
+  it("reconciles a fit during reconnect without echoing the snapshot's older grid", () => {
+    const a = client();
+    a.socket.resync();
+    const reconnect = Socket.all.at(-1)!;
+    expect(reconnect).not.toBe(a.ws);
+    reconnect.onopen?.();
+    a.resized(110, 35);
+    reconnect.sent = [];
+    receive(reconnect, { type: "ready", cols: 100, rows: 30 });
+    expect(a.dims()).toEqual({ cols: 100, rows: 30 });
+    expect(frames(reconnect)).toEqual([{ type: "resize", cols: 110, rows: 35 }]);
+    receive(reconnect, { type: "resized", cols: 110, rows: 35 });
+    expect(a.dims()).toEqual({ cols: 110, rows: 35 });
+    expect(reconnect.sent).toHaveLength(1);
+    a.socket.close();
+  });
+
+  it("still sends a real fit after receiving a foreign grid", () => {
+    const a = client();
+    receive(a.ws, { type: "resized", cols: 80, rows: 24 });
+    a.ws.sent = [];
+    a.resized(110, 35);
+    expect(frames(a.ws)).toEqual([{ type: "resize", cols: 110, rows: 35 }]);
+    a.socket.close();
+  });
 });
