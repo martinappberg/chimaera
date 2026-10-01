@@ -26,6 +26,8 @@
     /** The one-of-N open overlay; two-way so the host can open /mcp and the
      *  outside-dismiss action can close everything. */
     menu: "model" | "mode" | "effort" | "mcp" | "remote" | "options" | null;
+    canPickModel: boolean;
+    canPickMode: boolean;
     modelChoices: ModelChoice[];
     modelLabel: string | null;
     modeLabel: string | null;
@@ -52,6 +54,8 @@
     agentKind,
     agentName,
     menu = $bindable(),
+    canPickModel,
+    canPickMode,
     modelChoices,
     modelLabel,
     modeLabel,
@@ -129,7 +133,7 @@
 {/snippet}
 
 <div class="chat-header">
-<header class="strip">
+<header class="strip" class:no-mode={!canPickMode || store.modes.length === 0} class:no-effort={!hasEffort}>
   <span class="agent-id" title="{agentName} chat session">
     <SessionGlyph kind="agent" {agentKind} size={11} />
     <span class="agent-name">{agentName}</span>
@@ -138,8 +142,9 @@
   <div class="menu-host primary-picker model-picker">
     <button
       class="chip pick"
-      title={modelLabel === null ? "Resolving model…" : `Model: ${modelLabel}`}
-      aria-label={`Model: ${modelLabel ?? "loading"}`}
+      disabled={!canPickModel}
+      title={canPickModel ? (modelLabel === null ? "Resolving model…" : `Model: ${modelLabel}`) : "Model selected by the agent"}
+      aria-label={`Model: ${modelLabel ?? "agent default"}`}
       aria-haspopup="menu"
       aria-expanded={menu === "model"}
       onclick={() => (menu = menu === "model" ? null : "model")}
@@ -147,14 +152,14 @@
       <!-- Skeleton only in the brief window before the model catalog loads
            (modelLabel null). Once it's loaded, modelLabel is the session's real
            model — or the default a fresh chat will use — never a wrong flash. -->
-      {#if modelLabel === null}
+      {#if modelLabel === null && !store.initialized && !store.exited && !store.fatalError}
         <span class="model-skel" aria-label="loading model"></span>
       {:else}
-        <span class="pick-label">{modelLabel}</span>
+        <span class="pick-label">{modelLabel ?? "agent default"}</span>
       {/if}
-      {@render caret()}
+      {#if canPickModel}{@render caret()}{/if}
     </button>
-    {#if menu === "model"}
+    {#if canPickModel && menu === "model"}
       <div class="overlay-surface menu" use:toolbarPopover={{ onClose: () => (menu = null) }} role="menu" aria-label="model">
         {#if modelChoices.length === 0}
           <span class="menu-empty">no known models</span>
@@ -174,7 +179,7 @@
       </div>
     {/if}
   </div>
-  {#if store.modes.length > 0}
+  {#if canPickMode && store.modes.length > 0}
     <div class="menu-host primary-picker mode-picker">
       <button
         class="chip pick"
@@ -393,10 +398,11 @@
       color 0.12s ease,
       background-color 0.12s ease;
   }
-  .chip.pick:hover, .chip.pick[aria-expanded="true"], .more:hover {
+  .chip.pick:hover:not(:disabled), .chip.pick[aria-expanded="true"], .more:hover {
     color: var(--fg);
     background: var(--pane-control-hover);
   }
+  .chip.pick:disabled { cursor: default; color: var(--muted); }
   .mode-picker .chip, .effort-picker .chip { color: var(--muted); }
   .caret {
     flex: none;
@@ -580,6 +586,10 @@
     .primary-picker .chip { width: 100%; justify-content: space-between; }
     .session-status { grid-row: 1; grid-column: 2 / 5; justify-self: end; max-width: 100%; }
     .spacer { display: none; }
+    .strip.no-mode .model-picker,
+    .strip.no-effort .model-picker { grid-column: 1 / 3; }
+    .strip.no-effort .mode-picker { grid-column: 3; }
+    .strip.no-mode.no-effort .model-picker { grid-column: 1 / 4; }
   }
   .stop {
     font: inherit;

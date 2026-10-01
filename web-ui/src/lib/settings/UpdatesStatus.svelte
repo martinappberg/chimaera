@@ -19,12 +19,13 @@
   import { pageVisible } from "../shared/visibility";
   import { openInSystemBrowser } from "../shared/urlOpen";
   import {
+    agentCatalog,
     listAgents,
     relativeAge,
     versionNumber,
-    type AgentInfo,
   } from "../workspace/launcher";
   import { applyAppStatus, checkForUpdates, updateState } from "../workspace/update.svelte";
+  import { agentUpdateStatus } from "./agentStatus";
   import { getSetting } from "./store.svelte";
 
   let {
@@ -53,7 +54,7 @@
     link?: { label: string; url?: string; section?: string };
   }
 
-  let agents = $state<AgentInfo[]>([]);
+  const agents = $derived($agentCatalog);
   let checking = $state(false);
   let busy = $state<string | null>(null);
   let actionError = $state<string | null>(null);
@@ -69,10 +70,7 @@
   });
 
   onMount(() => {
-    void listAgents().then(
-      (list) => (agents = list),
-      () => {},
-    );
+    void listAgents().catch(() => {});
     // The shell broadcasts only found updates; a failed or quiet periodic
     // check lives in its cache, so read it rather than trust the last event.
     void appUpdateStatus(false).then(
@@ -240,17 +238,23 @@
     const installed = agents.filter((a) => a.installed);
     if (installed.length === 0) return null;
     const newer = installed.filter((a) => a.updateAvailable && a.latestVersion !== null);
-    const known = installed.filter((a) => a.version !== null && a.latestVersion !== null);
+    const known = installed.filter((a) => agentUpdateStatus(a).current);
+    const failed = installed.filter((a) => a.latestError);
     const sub = installed
       .map((a) => {
+        if (a.latestError) return `${a.name} (couldn't check)`;
         if (a.version === null) return `${a.name} (version unknown)`;
         const ver = versionNumber(a.version);
         if (a.updateAvailable && a.latestVersion !== null) return `${a.name} ${ver} → ${a.latestVersion}`;
-        return a.latestVersion === null ? `${a.name} ${ver} (latest unknown)` : `${a.name} ${ver}`;
+        return `${a.name} ${ver}`;
       })
       .join(" · ");
     const checks = installed.map((a) => a.latestCheckedAt).filter((t): t is number => t !== null);
     const checked = checks.length > 0 ? ago(Math.min(...checks)) : null;
+    // An unrequested check is neither a problem nor evidence of being current.
+    if (checked === null && newer.length === 0 && failed.length === 0 && known.length === 0) {
+      return null;
+    }
     const base = {
       key: "agents",
       name: "agents",
@@ -266,12 +270,15 @@
         sub: withChecked,
       };
     }
+    if (failed.length > 0) {
+      return { ...base, verdict: "couldn't check every agent", tone: "warn", sub: withChecked };
+    }
     if (known.length === installed.length) {
       return { ...base, verdict: "up to date", tone: "ok", sub: withChecked };
     }
     return {
       ...base,
-      verdict: known.length === 0 ? "latest not known yet" : "no updates found",
+      verdict: "couldn't compare every installed version",
       tone: "idle",
       sub: withChecked,
     };
@@ -286,14 +293,15 @@
     checking = true;
     actionError = null;
     try {
-      const [, list] = await Promise.all([
+      await Promise.all([
         checkForUpdates(false),
-        listAgents(false, true).catch(() => null),
+        listAgents(false, true),
       ]);
-      if (list !== null) agents = list;
       if (updateState.askError !== null) {
         actionError = `couldn't reach the daemon: ${updateState.askError}`;
       }
+    } catch (e) {
+      actionError = e instanceof Error ? e.message : "Couldn't check for updates";
     } finally {
       checking = false;
     }

@@ -445,7 +445,7 @@ async fn spawn_chat_ui(
     let seeded =
         tokio::task::block_in_place(|| crate::chat::seed_resumed_journal(state, &id, &recipe));
     if agent_kind == crate::agents::AgentKind::Claude && recipe.resume.is_some() && !seeded {
-        tracing::info!(%id, "resumed claude recent has no chat history to render; opening in the terminal");
+        tracing::info!(%id, "resumed claude chat history could not be loaded");
         crate::lock(&state.agents).remove(&id);
         crate::lock(&state.session_workspaces).remove(&id);
         // Discard the chat-only scaffolding (the temp settings/mcp for the id we drop).
@@ -455,35 +455,9 @@ async fn spawn_chat_ui(
         {
             let _ = std::fs::remove_file(path);
         }
-        let spec = crate::spawn::SpawnSpec {
-            workspace,
-            id: None,
-            name: body.name,
-            cwd: None,
-            cols: body.cols,
-            rows: body.rows,
-            theme: theme.to_string(),
-            title_hint: body
-                .title_hint
-                .as_deref()
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(crate::agents::truncate_prompt),
-            prelude: body.prelude.filter(|p| !p.trim().is_empty()),
-            kind: crate::spawn::SpawnKind::Agent {
-                kind: agent_kind,
-                model: body.model,
-                resume: body.resume,
-            },
-            started_by: crate::history::StartedBy::You,
-        };
-        return match crate::spawn::spawn_session(state, spec).await {
-            Ok(session) => Json(session).into_response(),
-            Err(crate::spawn::SpawnFailure::AgentUnavailable(msg)) => {
-                (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response()
-            }
-            Err(crate::spawn::SpawnFailure::Internal(err)) => internal(err),
-        };
+        return (StatusCode::CONFLICT, Json(json!({"error":
+            "This conversation's chat history could not be loaded. Its terminal conversation is still available; reopen it in terminal."
+        }))).into_response();
     }
 
     match crate::chat::spawn_chat_session(state, id.clone(), recipe, None).await {

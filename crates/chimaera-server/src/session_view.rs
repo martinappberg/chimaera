@@ -210,6 +210,12 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
                 map.insert("ui".to_string(), json!("term"));
                 let chat_capable = agents.get(&info.id).is_some_and(|a| a.kind.chat_capable());
                 map.insert("chat_capable".to_string(), json!(chat_capable));
+                map.insert(
+                    "view_switchable".to_string(),
+                    json!(agents
+                        .get(&info.id)
+                        .is_some_and(|a| a.kind.native_chat_controls())),
+                );
             }
             (info.created_at, row)
         })
@@ -268,6 +274,7 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
                 "display_name": record.display_name(None),
                 "ui": target,
                 "chat_capable": true,
+                "view_switchable": record.kind.native_chat_controls(),
             }),
         ));
     }

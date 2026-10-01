@@ -276,15 +276,14 @@
             {@const comms = group.defs.filter(isCommsDef)}
             <section data-section={group.category}>
               {#if q === "" || group.defs.some((d) => !isCommsDef(d))}
-                <AgentsSettings />
+                <AgentsSettings visible={tabVisible} />
               {:else}
                 <h2 class="cat">{group.category}</h2>
               {/if}
               {#if comms.length > 0}
                 <h3 class="subcat">Agent communication</h3>
                 <p class="subnote">
-                  Agents in a workspace see each other and send messages that arrive. The
-                  Mastermind is part of it.
+                  Let agents share progress and ask each other for help.
                 </p>
                 {#each comms as def (def.id)}
                   <SettingRow {def} />

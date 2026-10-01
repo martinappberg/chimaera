@@ -434,3 +434,21 @@ describe("agentSideBlocks", () => {
     expect(marketplaceUrl("javascript:alert(1)")).toBeNull();
   });
 });
+
+
+it("does not turn a failed native inventory into a missing plugin or installation offer", () => {
+  const inventory = report([{agent:"grok"}]);
+  inventory.agents[0].error = "Checking timed out";
+  const model = requirementsModel(input({requires:[myc("grok")], report:inventory}));
+  expect(model.rows[0].status).toBe("unknown");
+  expect(model.rows[0].offerInstall).toBe(false);
+  expect(agentsForSetup(model,["grok"])).toEqual([]);
+});
+
+it("keeps unknown Antigravity enablement separate from a confirmed loaded project copy", () => {
+  const inventory = report([{agent:"agy", plugins:[{id:"kit",scope:"user",enabled:null}]}]);
+  const make = () => requirementsModel(input({requires:[{agent:"agy",id:"kit",marketplace:"",installable:true}], report:inventory}));
+  expect(make().rows[0].status).toBe("unknown");
+  inventory.agents[0].plugins.push({id:"kit",scope:"project",enabled:true});
+  expect(make().rows[0].status).toBe("installed");
+});

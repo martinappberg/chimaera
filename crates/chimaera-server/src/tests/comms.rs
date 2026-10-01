@@ -554,6 +554,68 @@ async fn a_working_chat_hears_it_at_its_next_step_and_its_transcript_shows_it() 
     }
 }
 
+/// ACP chats cannot be steered mid-turn. Their direct messages must still meet
+/// the wake policy at turn end, without being lost or asking more than once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn busy_acp_messages_reach_the_wake_policy_after_the_turn() {
+    for kind in [agents::AgentKind::Antigravity, agents::AgentKind::Grok] {
+        let state = test_state();
+        set_comms(&state, true, "ask").await;
+        let ws = make_workspace(&state, "comms-acp-busy").await;
+        let a = tui(&state, &ws, "ka");
+        // The fake supplies a live chat transport; the reader's native identity
+        // drives delivery, independently of the driver behind that transport.
+        let (c, _) = chat(&state, &ws, "comms-acp-fake").await;
+        {
+            let mut agents = lock(&state.agents);
+            let record = agents.get_mut(&c).unwrap();
+            record.kind = kind;
+            record.state = agent_state::AgentState::Running;
+        }
+        let (failed, text) = send(
+            &state,
+            &a,
+            "ka",
+            serde_json::json!({"to":c,"text":"queued-acp-message"}),
+        )
+        .await;
+        assert!(!failed, "{text}");
+        assert!(!text.contains("next step"), "{text}");
+        assert!(comms(&state, &ws).await["wake_requests"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        lock(&state.agents).get_mut(&c).unwrap().state = agent_state::AgentState::Finished;
+        crate::comms::on_chat_event(
+            &state,
+            &c,
+            &chimaera_agent::model::AgentEvent::TurnCompleted {
+                turn_id: "t".into(),
+                usage: Default::default(),
+            },
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let body = comms(&state, &ws).await;
+            if !body["wake_requests"].as_array().unwrap().is_empty() {
+                assert_eq!(body["wake_requests"].as_array().unwrap().len(), 1);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "queued message was stranded: {body}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            !journal(&state, &c).contains("queued-acp-message"),
+            "Ask must not start a turn"
+        );
+        state.chat.kill(&c);
+        state.sessions.kill(&a).ok();
+    }
+}
+
 /// Switched off: nothing is offered, carried, sent or woken — and what was
 /// waiting is still there when it comes back.
 #[tokio::test]

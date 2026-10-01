@@ -59,7 +59,7 @@ describe("groupSkills", () => {
     const groups = groupSkills([both, orphan]);
     expect(groups.map((g) => [g.key, g.skills.map((s) => s.name)])).toEqual([
       ["builtin-claude", ["help"]],
-      ["builtin-codex", ["help", "ghost"]],
+      ["builtin-codex", ["help"]],
     ]);
   });
 });
@@ -103,4 +103,17 @@ describe("shortName + pluginSections", () => {
       ["pdf", 1, ["codex"]],
     ]);
   });
+});
+
+// Agent identities and invocation syntax come from native inventories.
+it("handles future agents without impersonating Codex", () => {
+  const item: Skill = {name: "review", description: "Review", source: "builtin", paths: {}, agents: {
+    "vendor.pi": {state: "available", invoke: "/review"},
+    grok: {state: "available", invoke: null},
+  }};
+  expect(filterSkills([item], "vendor.pi", "")).toEqual([item]);
+  expect(invokeSyntax(item, "vendor.pi")).toBe("/review");
+  expect(invokeSyntax(item, "grok")).toBe("");
+  expect(invokeSyntax(item, "unknown")).toBe("");
+  expect(groupSkills([item]).map(g => g.key)).toEqual(["builtin-vendor.pi", "builtin-grok"]);
 });

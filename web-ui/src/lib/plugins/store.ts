@@ -38,9 +38,15 @@ import { api, ApiError } from "../net/api";
 import { refreshKnowledge } from "../workspace/knowledge";
 import { normalizePlatform, type PlatformTables } from "./platform";
 
-export type AgentId = "claude" | "codex";
+/** Stable provider identity; extension surfaces never default unknown IDs to Codex. */
+export type AgentId = string;
+export function agentName(id: AgentId): string {
+  return ({claude: "Claude Code", codex: "Codex", agy: "Antigravity", grok: "Grok Build"} as Record<string,string>)[id] ?? id;
+}
 
 export interface PluginRequirement {
+  source?: string;
+  installable?: boolean;
   agent: string;
   id: string;
   marketplace: string;
@@ -221,7 +227,10 @@ export interface AgentPlugin {
   id: string;
   version?: string;
   scope?: string;
-  enabled: boolean;
+  enabled: boolean | null;
+  origin?: string;
+  actions?: string[];
+  has_hooks?: boolean;
   skills_n?: number;
   hooks_n?: number;
   always_on_tokens?: number;
@@ -245,6 +254,8 @@ export interface AgentPluginsEntry {
   available: boolean;
   version?: string;
   error?: string;
+  notice?: string;
+  actions?: string[];
   plugins: AgentPlugin[];
   /** Codex only: its hook registry with trust state. */
   hooks?: AgentHook[];
@@ -262,25 +273,23 @@ export type SkillState = "available" | "off" | "absent";
 export interface SkillAgentState {
   state: SkillState;
   reason?: string;
-  invoke?: string;
+  invoke?: string | null;
 }
 
 export interface Skill {
+  id?: string;
   name: string;
   description: string;
   source: SkillSource | string;
   plugin?: string;
-  paths: { claude?: string; codex?: string };
-  agents: { claude: SkillAgentState; codex: SkillAgentState };
+  paths: Record<string, string | undefined>;
+  agents: Record<string, SkillAgentState>;
 }
 
 export interface SkillsReport {
   schema: number;
   host: string;
-  agents: {
-    claude: { available: boolean; version?: string; live: boolean };
-    codex: { available: boolean; version?: string };
-  };
+  agents: Record<string, { available: boolean; version?: string; live?: boolean }>;
   skills: Skill[];
   errors: { agent: string; path?: string; message: string }[];
 }
@@ -464,8 +473,8 @@ export async function fetchAgentPlugins(workspaceId: string, refresh = false): P
   };
 }
 
-export async function fetchSkills(workspaceId: string): Promise<SkillsReport> {
-  const body = await json<SkillsReport>(await api(`${ws(workspaceId)}/skills`));
+export async function fetchSkills(workspaceId: string, refresh = false): Promise<SkillsReport> {
+  const body = await json<SkillsReport>(await api(`${ws(workspaceId)}/skills${refresh ? "?refresh=true" : ""}`));
   const agents = (body.agents ?? {}) as Partial<SkillsReport["agents"]>;
   return {
     schema: body.schema ?? 1,
@@ -473,6 +482,7 @@ export async function fetchSkills(workspaceId: string): Promise<SkillsReport> {
     agents: {
       claude: { available: false, live: false, ...(agents.claude ?? {}) },
       codex: { available: false, ...(agents.codex ?? {}) },
+      ...agents,
     },
     skills: arr<Skill>(body.skills).map((s) => ({
       ...s,
@@ -480,6 +490,7 @@ export async function fetchSkills(workspaceId: string): Promise<SkillsReport> {
       agents: {
         claude: s.agents?.claude ?? { state: "absent" },
         codex: s.agents?.codex ?? { state: "absent" },
+        ...s.agents,
       },
     })),
     errors: arr<SkillsReport["errors"][number]>(body.errors),
@@ -868,4 +879,12 @@ export function openAttachSheet(pluginId: string): void {
 
 export function closeAttachSheet(): void {
   attachRequest.set(null);
+}
+
+/** Explicit native management, in a retained terminal owned by the user. */
+export async function agentExtensionAction(workspaceId: string, agent: AgentId, action: string, target?: string): Promise<string> {
+  const result = await json<{session_id: string}>(await api(`${ws(workspaceId)}/agent-extensions/action`, {
+    method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({agent, action, target}),
+  }));
+  return result.session_id;
 }

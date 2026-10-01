@@ -190,6 +190,8 @@ pub(crate) struct AppState {
     /// younger than `runtimes::INSTALL_RESERVATION_GRACE` is busy even with
     /// no visible session. Cleaned up by the install watcher.
     pub(crate) installs: Mutex<HashMap<agents::AgentKind, (String, Instant)>>,
+    /// Latest installer result per built-in agent; bounded by the catalog.
+    pub(crate) install_results: Mutex<HashMap<agents::AgentKind, crate::runtimes::InstallResult>>,
     /// The user's own Claude Code settings file (`~/.claude/settings.json`);
     /// an explicit theme there suppresses chimaera's theme injection. Tests
     /// point it at a fixture.
@@ -331,6 +333,7 @@ impl AppState {
             drafts_root: data_dir.join("drafts"),
             fs_touched: tokio::sync::broadcast::channel(crate::fs_watch::TOUCHED_CAPACITY).0,
             installs: Mutex::new(HashMap::new()),
+            install_results: Mutex::new(HashMap::new()),
             claude_settings_path: home.join(".claude").join("settings.json"),
             codex_config_path: home.join(".codex").join("config.toml"),
             timeline: timeline::TimelineService::new(data_dir.join("workspace")),

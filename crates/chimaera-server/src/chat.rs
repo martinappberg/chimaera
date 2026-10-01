@@ -497,6 +497,9 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
         return;
     };
     let next = match ev {
+        AgentEvent::Init { .. } if record.state == AgentState::Unknown => {
+            Some(AgentState::Finished)
+        }
         // Structured questions block the turn on a human exactly like
         // permission prompts — the rail badges both the same way.
         AgentEvent::PermissionRequest { .. } | AgentEvent::QuestionRequest { .. } => {
@@ -660,8 +663,14 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
             reason,
             stderr_tail,
         } => {
-            tracing::warn!(%id, %reason, %stderr_tail, "chat handshake failed; degrading to terminal");
+            tracing::warn!(%id, %reason, %stderr_tail, "chat handshake failed");
             match recipe {
+                Some(recipe) if recipe.resume.is_some() || !recipe.kind.native_chat_controls() => {
+                    crate::lock(&state.chat_recipes).insert(id.to_string(), recipe);
+                    if let Some(record) = crate::lock(&state.agents).get_mut(id) {
+                        record.state = AgentState::Errored;
+                    }
+                }
                 Some(recipe) => {
                     // Carry any pinned name onto the fallback PTY (usually none
                     // this early, but resurrection could have set one).
@@ -945,6 +954,7 @@ pub(crate) fn chat_session_json(
         "display_name": display_name,
         "ui": "chat",
         "chat_capable": true,
+        "view_switchable": agent.is_some_and(|a| a.kind.native_chat_controls()),
         "chat_model": info.model,
         "chat_mode": info.current_mode,
         "pending_permission": info.pending_permission,
@@ -1335,10 +1345,13 @@ pub(crate) async fn switch_view(
             "only agent sessions can switch views".to_string(),
         );
     };
-    if !record.kind.chat_capable() {
+    if !record.kind.native_chat_controls() {
         return err(
             StatusCode::BAD_REQUEST,
-            format!("chat view not yet available for {}", record.kind.as_str()),
+            format!(
+                "Switching this conversation between chat and terminal is not supported for {}",
+                record.kind.product_name()
+            ),
         );
     }
     // Busy guard: interrupting a mid-task agent is a user decision.
@@ -2292,6 +2305,16 @@ fn recover_portable_context(entries: &[Arc<SeqEvent>], target: AgentKind) -> Opt
         .iter()
         .map(|entry| entry.ev.clone())
         .collect();
+    // ACP attaches the handoff to the first real user prompt. Once accepted,
+    // it lives in the provider's persisted session and must not be reattached
+    // on every daemon restart. A fork closed before its first send still needs it.
+    if matches!(target, AgentKind::Antigravity | AgentKind::Grok)
+        && entries[marker_index + 1..]
+            .iter()
+            .any(|entry| matches!(entry.ev, AgentEvent::ForkContextConsumed))
+    {
+        return None;
+    }
     portable_context_prompt(&events, source, target)
 }
 
@@ -3127,6 +3150,7 @@ pub(crate) async fn spawn_chat_session(
     recipe: ChatRecipe,
     pinned_override: Option<String>,
 ) -> anyhow::Result<ChatInfo> {
+    let chat_bin = crate::launcher::chat_executable(state, recipe.kind, &recipe.bin).await?;
     let recovered_effort = codex_initial_effort(state, &recipe).await;
     // Re-enforce the journal-dir budget as sessions are created: pruning only
     // at boot lets a weeks-long daemon accumulate one capped journal per
@@ -3226,6 +3250,10 @@ pub(crate) async fn spawn_chat_session(
                 recipe.resume.clone(),
             )
         }
+        AgentKind::Grok | AgentKind::Antigravity => (
+            crate::launcher::build_acp_chat_command(recipe.kind, &chat_bin),
+            recipe.resume.clone(),
+        ),
         other => anyhow::bail!("no chat driver for {}", other.as_str()),
     };
     let argv = crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), argv);
@@ -3245,6 +3273,21 @@ pub(crate) async fn spawn_chat_session(
     // the chat agent it spawns.
     spec.env_remove = crate::api::spawn_env_remove(&spec.env);
     spec.pinned_native_id = pinned;
+    if matches!(recipe.kind, AgentKind::Grok | AgentKind::Antigravity) {
+        // ACP starts the signed-in harness and its configured MCP servers
+        // before session/new completes; a cold start exceeded the native
+        // drivers' 20-second budget in the live restart test.
+        spec.handshake_timeout = std::time::Duration::from_secs(60);
+        if let Some(key) = crate::lock(&state.agents).get(&id).map(|r| r.key.clone()) {
+            spec.mcp_servers
+                .push(json!({"type":"http","name":"chimaera",
+                "url":crate::agents::mcp_url_bare(&id, state.port),
+                "headers":[{"name":"Authorization","value":format!("Bearer {key}")}]}));
+        }
+        spec.initial_model = model.clone();
+        spec.initial_mode = initial_mode.clone();
+        spec.initial_effort = initial_effort.clone();
+    }
     // The codex MCP key rides the env, never argv (see mcp_url_bare): the
     // record is re-read here rather than threaded — the spawn paths insert
     // it before this runs, matching the mcp_url lookup above.
@@ -3345,7 +3388,11 @@ pub(crate) async fn spawn_chat_session(
     // harness journals it on Init and warns (non-fatally) when it drifts from
     // the driver's tested pin. `None` when the probe failed — the harness then
     // simply skips the drift check.
-    spec.agent_version = recipe.version.clone();
+    spec.agent_version = if recipe.kind == AgentKind::Antigravity {
+        None
+    } else {
+        recipe.version.clone()
+    };
     // Conversation rewind (codex): the driver rolls the resumed thread back
     // right after thread/resume. Claude's driver ignores it (fork rides argv).
     spec.rollback_turns = recipe.rollback_turns;
@@ -3373,13 +3420,17 @@ pub(crate) async fn spawn_chat_session(
         let _ = tokio::task::block_in_place(|| seed_resumed_journal(state, &id, &recipe));
     }
 
+    if matches!(recipe.kind, AgentKind::Grok | AgentKind::Antigravity) {
+        // Also covers a copied chat closed before its first real send: Recents
+        // has a new Chimaera id, but seed_resumed_journal copied its marker.
+        spec.portable_context = recover_portable_context_from_disk(state, &id, recipe.kind).await;
+    }
     crate::lock(&state.chat_recipes).insert(id.clone(), recipe.clone());
-    let info = match recipe.kind {
-        AgentKind::Claude => state
-            .chat
-            .spawn(&chimaera_agent::claude::ClaudeAdapter, spec),
-        _ => state.chat.spawn(&chimaera_agent::codex::CodexAdapter, spec),
-    };
+    let adapter = recipe
+        .kind
+        .chat_adapter()
+        .ok_or_else(|| anyhow::anyhow!("no chat adapter registered"))?;
+    let info = state.chat.spawn(adapter, spec);
     if info.is_err() {
         crate::lock(&state.chat_recipes).remove(&id);
     }
@@ -3883,6 +3934,15 @@ mod tests {
         assert!(recover_portable_context(&durable, AgentKind::Codex)
             .as_deref()
             .is_some_and(|context| context.contains(r#"{"role":"assistant","content":"answer"}"#)));
+        for target in [AgentKind::Antigravity, AgentKind::Grok] {
+            let mut resumed = durable.clone();
+            assert!(recover_portable_context(&resumed, target).is_some());
+            // Sending is not acceptance: the provider may reject a request.
+            resumed.push(seq_event(6, entries[0].ev.clone()));
+            assert!(recover_portable_context(&resumed, target).is_some());
+            resumed.push(seq_event(7, AgentEvent::ForkContextConsumed));
+            assert!(recover_portable_context(&resumed, target).is_none());
+        }
 
         let native = build_fork_bootstrap(
             &entries,
@@ -4308,6 +4368,19 @@ mod tests {
 
         let row = chat_session_json(&chat_info(2), None, None, false);
         assert_eq!(row["background_running"], json!(2));
+    }
+
+    #[test]
+    fn initial_chat_response_only_offers_verified_terminal_switches() {
+        for kind in AgentKind::ALL {
+            let record = crate::agent_state::AgentRecord::new("test-key".into(), kind);
+            let row = chat_session_json(&chat_info(0), None, Some(&record), false);
+            assert_eq!(row["agent_kind"], kind.as_str());
+            assert_eq!(
+                row["view_switchable"],
+                matches!(kind, AgentKind::Claude | AgentKind::Codex)
+            );
+        }
     }
 
     /// The rewind cut drops the SELECTED user message and everything after it,
@@ -4970,11 +5043,12 @@ mod tests {
     }
 
     #[test]
-    fn chat_capable_is_claude_and_codex_only() {
+    fn chat_adapters_are_registered_explicitly() {
         assert!(AgentKind::Claude.chat_capable());
         assert!(AgentKind::Codex.chat_capable());
         assert!(!AgentKind::Gemini.chat_capable());
-        assert!(!AgentKind::Antigravity.chat_capable());
+        assert!(AgentKind::Antigravity.chat_capable());
+        assert!(AgentKind::Grok.chat_capable());
     }
 
     #[test]
