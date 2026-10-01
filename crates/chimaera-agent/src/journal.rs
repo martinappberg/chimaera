@@ -221,12 +221,19 @@ impl Journal {
             let mut entry = Arc::new(SeqEvent { seq, ts, ev });
             let mut line = serde_json::to_vec(&*entry).expect("AgentEvent serializes");
             if line.len() > MAX_ENTRY_BYTES {
+                let bytes = line.len();
+                let replacement = shortened_user_message(&entry.ev, seq, ts);
                 tracing::warn!(
                     seq,
-                    bytes = line.len(),
-                    "journal entry exceeded size cap; replaced"
+                    bytes,
+                    "{}",
+                    if replacement.is_some() {
+                        "journal entry exceeded size cap; user message cut"
+                    } else {
+                        "journal entry exceeded size cap; replaced"
+                    }
                 );
-                let replacement = shortened_user_message(&entry.ev, seq, ts).unwrap_or_else(|| {
+                let replacement = replacement.unwrap_or_else(|| {
                     let entry = Arc::new(SeqEvent {
                         seq,
                         ts,

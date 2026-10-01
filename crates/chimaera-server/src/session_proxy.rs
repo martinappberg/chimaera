@@ -1474,6 +1474,15 @@ const HELD_CHAT_BYTES: usize = 11 * 1024 * 1024;
 /// command cap above: they are small, and coalesce (see [`Held::setting`]).
 const HELD_SETTINGS: usize = 16;
 const HELD_SETTING_BYTES: usize = 16 * 1024;
+/// How long a held setting waits for the viewer's next input. A setting only
+/// ever rides in front of what this viewer does next; a window left open must
+/// not apply a mode picked long ago to a turn started much later, so past
+/// this it is refused by name instead.
+const HELD_SETTING_FOR: Duration = if cfg!(test) {
+    Duration::from_secs(5)
+} else {
+    Duration::from_secs(10 * 60)
+};
 /// Input held across every relay at once. Per-socket caps alone let a window
 /// full of chats to a sleeping owner pin gigabytes (128 sockets × 11 MiB);
 /// past this, new input is refused visibly instead of held.
@@ -1506,6 +1515,12 @@ impl HeldBudget {
 /// Owner-socket retry pacing while nobody is typing.
 const RETRY_MIN: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(30);
+/// How often a viewer socket looks again at an owner reported asleep.
+const ASLEEP_RETRY: Duration = if cfg!(test) {
+    Duration::from_secs(3)
+} else {
+    RETRY_MAX
+};
 /// Frames larger than this are replay batches, never a `ready` frame.
 const READY_SCAN_BYTES: usize = 64 * 1024;
 /// How long an awake owner gets to accept a socket.
@@ -1524,7 +1539,7 @@ const DOUBTFUL_READY: Duration = if cfg!(test) {
 ///
 /// The viewer's socket stays open while the owner is unreachable or asleep:
 /// attaching is passive, and the first real input (a keystroke, or a chat
-/// command that is the user acting, [`acting`]) is held and carries wake
+/// command that is the user acting, [`Viewer::Input`]) is held and carries wake
 /// intent. Held input is delivered once after the owner's `ready`, or
 /// answered with a visible refusal that names the refused command (and, for
 /// a send, the id its client sent it under) when it cannot be delivered.
@@ -1856,8 +1871,9 @@ enum Viewer {
     /// and the only thing that wakes a sleeping owner or brings the work to
     /// this computer. `client_id`: the id a send was made under.
     Input { client_id: Option<String> },
-    /// One of a chat's seven settings commands. Held and delivered in order
-    /// with the input, but it wakes nothing and moves nothing. `key`: what
+    /// One of a chat's seven settings commands. Held, and delivered only in
+    /// front of this viewer's next input: it wakes nothing, moves nothing,
+    /// and is never delivered by itself when the owner answers. `key`: what
     /// it replaces when the user picks the same setting again.
     Setting { key: String },
     /// A chat's `cancel_send` for this id.
@@ -1908,6 +1924,8 @@ struct HeldFrame {
     client_id: Option<String>,
     /// `Some` for a setting: what a later pick of the same setting replaces.
     setting: Option<String>,
+    /// When it was held: a setting waits [`HELD_SETTING_FOR`] at most.
+    since: tokio::time::Instant,
 }
 
 /// What a viewer did before the owner's socket was ready, in order. Bounded
@@ -1935,9 +1953,6 @@ impl Held<'_> {
             Down::Binary(bytes) => bytes.len(),
             _ => 0,
         }
-    }
-    fn is_empty(&self) -> bool {
-        self.frames.is_empty()
     }
     /// Whether anything held is the user acting (a reason to wake the owner).
     fn has_input(&self) -> bool {
@@ -1973,6 +1988,7 @@ impl Held<'_> {
             size,
             client_id,
             setting: None,
+            since: tokio::time::Instant::now(),
         });
         Ok(())
     }
@@ -2002,6 +2018,7 @@ impl Held<'_> {
             self.bytes = self.bytes - earlier.size + size;
             earlier.frame = frame;
             earlier.size = size;
+            earlier.since = tokio::time::Instant::now();
             return Ok(());
         }
         let settings = self
@@ -2018,8 +2035,39 @@ impl Held<'_> {
             size,
             client_id: None,
             setting: Some(key),
+            since: tokio::time::Instant::now(),
         });
         Ok(())
+    }
+    /// Take the held frames `gone` picks out, in order.
+    fn remove(&mut self, gone: impl Fn(&HeldFrame) -> bool) -> Vec<Down> {
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.frames)
+            .into_iter()
+            .partition(|held| gone(held));
+        self.frames = kept.into();
+        let freed: usize = gone.iter().map(|held| held.size).sum();
+        self.bytes -= freed;
+        self.budget.release(freed);
+        gone.into_iter().map(|held| held.frame).collect()
+    }
+    /// The user picked setting `key` on an owner that is attached: it applies
+    /// now, so an earlier pick of it still held is stale and must not be
+    /// delivered after it.
+    fn supersede(&mut self, key: &str) {
+        self.remove(|held| held.setting.as_deref() == Some(key));
+    }
+    /// The settings that have waited [`HELD_SETTING_FOR`] for input that did
+    /// not come, taken out to be refused.
+    fn expired(&mut self, now: tokio::time::Instant) -> Vec<Down> {
+        self.remove(|held| held.setting.is_some() && now >= held.since + HELD_SETTING_FOR)
+    }
+    /// When the next held setting expires.
+    fn next_expiry(&self) -> Option<tokio::time::Instant> {
+        self.frames
+            .iter()
+            .filter(|held| held.setting.is_some())
+            .map(|held| held.since + HELD_SETTING_FOR)
+            .min()
     }
     fn take(&mut self) -> std::collections::VecDeque<Down> {
         self.budget.release(std::mem::take(&mut self.bytes));
@@ -2149,6 +2197,7 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
     let mut waking = false;
     let mut noted: Option<tokio::time::Instant> = None;
     loop {
+        let expiry = held.next_expiry();
         tokio::select! {
             Some(result) = futures::future::OptionFuture::from(attempt.as_mut()), if attempt.is_some() => {
                 attempt = None;
@@ -2170,13 +2219,19 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                         // machine sends no `ready`, and nothing is waiting to
                         // wake it. End this socket so the viewer reconnects
                         // into the quiet attach.
-                        if told == Some("remote_unavailable") && held.is_empty() {
+                        // A setting held with no input does not keep it open:
+                        // it is refused by name, since it cannot wait across
+                        // the reconnect.
+                        if told == Some("remote_unavailable") && !held.has_input() {
+                            let refused = held.take();
+                            let _ = link.refuse(downstream, &refused).await;
                             return;
                         }
                         // What was sent while this attach was in flight goes
                         // to the transport now: it holds it and wakes the
-                        // machine (input held for a move here waits for that).
-                        if pull.is_none() {
+                        // machine (input held for a move here waits for that;
+                        // a setting held with no input waits for input).
+                        if pull.is_none() && held.has_input() {
                             for frame in held.take() {
                                 let Some(frame) = upward(frame) else { continue };
                                 if bounded_send(socket.as_mut(), frame).await.is_err() { return; }
@@ -2209,7 +2264,7 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                             told = Some("worker_asleep");
                             if bounded_send(downstream, Down::Text(asleep().to_string().into())).await.is_err() { return; }
                         }
-                        retry.as_mut().reset(tokio::time::Instant::now() + RETRY_MAX);
+                        retry.as_mut().reset(tokio::time::Instant::now() + ASLEEP_RETRY);
                         retry_armed = true;
                     }
                     Err(_) => {
@@ -2235,6 +2290,17 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                 retry_armed = false;
                 attempt = Some(Box::pin(link.open(wake, passive)));
             }
+            // A held setting waited too long for input that did not come: it
+            // is refused by name rather than applied to whatever runs next.
+            _ = async {
+                match expiry {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let expired = held.expired(tokio::time::Instant::now());
+                if link.refuse(downstream, &expired).await.is_err() { return; }
+            }
             // Accepted for an owner reported asleep and silent since: nothing
             // is behind this socket. That is a refusal: input held for it
             // wakes the owner (a held setting alone does not), and otherwise
@@ -2252,7 +2318,7 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                         told = Some("worker_asleep");
                         if bounded_send(downstream, Down::Text(asleep().to_string().into())).await.is_err() { return; }
                     }
-                    retry.as_mut().reset(tokio::time::Instant::now() + RETRY_MAX);
+                    retry.as_mut().reset(tokio::time::Instant::now() + ASLEEP_RETRY);
                     retry_armed = true;
                 }
             }
@@ -2262,13 +2328,21 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                     // The project runs here now: deliver what the user sent,
                     // once, to the session on this computer, then close so
                     // the viewer reconnects to it (it replays the message).
+                    // One wait for the session to come up covers the whole
+                    // batch (a session that never starts must not stall this
+                    // socket once per frame). And once a setting could not be
+                    // applied, nothing after it is run: a message must not go
+                    // out under a mode the user had just changed.
+                    let deadline = tokio::time::Instant::now() + crate::ws::HELD_DELIVERY;
+                    let mut stopped = false;
                     for frame in held.take() {
-                        let answer = if link.chat { Some(frame.clone()) } else { None };
-                        if crate::ws::deliver_held(link.state, &link.session, link.chat, frame).await.is_err() {
-                            match answer {
-                                Some(frame) => { let _ = link.refuse(downstream, [&frame]).await; }
-                                None => { let _ = link.refuse(downstream, [&Down::Binary(Default::default())]).await; }
-                            }
+                        let setting = matches!(Viewer::of(link.chat, &frame), Viewer::Setting { .. });
+                        let answer = if link.chat { frame.clone() } else { Down::Binary(Default::default()) };
+                        if stopped
+                            || crate::ws::deliver_held(link.state, &link.session, link.chat, frame, deadline).await.is_err()
+                        {
+                            stopped |= setting;
+                            let _ = link.refuse(downstream, [&answer]).await;
                         }
                     }
                     return;
@@ -2311,7 +2385,11 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                         waking = false;
                         // Deliver what the viewer typed while connecting, once,
                         // in order (input held for a move here waits for it).
-                        if let (Some(socket), None) = (upstream.as_mut(), pull.as_ref()) {
+                        // A setting held with no input is not delivered now:
+                        // it rides in front of this viewer's next input or
+                        // expires, so an owner that answers hours later is
+                        // never handed a mode nobody is asking for any more.
+                        if let (Some(socket), None, true) = (upstream.as_mut(), pull.as_ref(), held.has_input()) {
                             for frame in held.take() {
                                 let Some(frame) = upward(frame) else { continue };
                                 if bounded_send(socket.as_mut(), frame).await.is_err() { return; }
@@ -2397,24 +2475,35 @@ async fn relay(link: &Link<'_>, mut wake: bool, downstream: &mut axum::extract::
                         // A keeping transport takes everything at once: it
                         // holds input until `ready` and folds grid control
                         // into the authentication it attaches with.
-                        (Some(socket), _) if ready || through => {
+                        (Some(socket), what) if ready || through => {
                             if let Some(moved) = link.ended() {
-                                let _ = link.refuse(downstream, input.then_some(&frame)).await;
+                                // Input and settings are answered, never
+                                // dropped: this one, and settings still held.
+                                let mut refused = if pull.is_none() { held.take() } else { Default::default() };
+                                if input || matches!(what, Viewer::Setting { .. }) {
+                                    refused.push_back(frame);
+                                }
+                                let _ = link.refuse(downstream, &refused).await;
                                 if let Some(moved) = moved {
                                     let _ = bounded_send(downstream, Down::Text(moved.to_string().into())).await;
                                 }
                                 return;
                             }
-                            // Anything still held for this owner goes first:
-                            // what the viewer sends now is delivered after it,
-                            // in order. (What is held for a move here is not
-                            // for this owner: a terminal's grid control still
-                            // passes while its typing waits.)
-                            if pull.is_none() {
-                                for earlier in held.take() {
-                                    let Some(earlier) = upward(earlier) else { continue };
-                                    if bounded_send(socket.as_mut(), earlier).await.is_err() { return; }
+                            match what {
+                                // Settings held for this owner ride in front
+                                // of what the user does now, in order. (What
+                                // is held for a move here is not for this
+                                // owner.)
+                                Viewer::Input { .. } if pull.is_none() => {
+                                    for earlier in held.take() {
+                                        let Some(earlier) = upward(earlier) else { continue };
+                                        if bounded_send(socket.as_mut(), earlier).await.is_err() { return; }
+                                    }
                                 }
+                                // Applied now: an earlier pick of the same
+                                // setting still held is stale.
+                                Viewer::Setting { key } => held.supersede(&key),
+                                _ => {}
                             }
                             let Some(frame) = upward(frame) else { continue };
                             if bounded_send(socket.as_mut(), frame).await.is_err() { return; }

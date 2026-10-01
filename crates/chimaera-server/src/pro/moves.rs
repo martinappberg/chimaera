@@ -214,6 +214,15 @@ pub(crate) fn device_fixture(state: &AppState, endpoint: &str) {
     *lock(&state.pro.runtime) = Some(config);
 }
 
+/// Ends the request under way to bring `workspace` here with `outcome`, for
+/// fixtures that need a move to settle without an account behind it.
+#[cfg(test)]
+pub(crate) fn settle_fixture(state: &AppState, workspace: &str, outcome: Outcome) {
+    if let Some(sender) = lock(&state.pro.moves.pulls).remove(workspace) {
+        let _ = sender.send(outcome);
+    }
+}
+
 /// The account asked this computer to take `workspace` (a phone acted while
 /// the cloud slept, or this computer's own earlier request outlived the
 /// daemon that made it): take it at once, unless a request is under way.

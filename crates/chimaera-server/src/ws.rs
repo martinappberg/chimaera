@@ -502,20 +502,30 @@ fn acted_here(state: &AppState, id: &str) {
     }
 }
 
+/// How long the frames a relay held get, together, for the resumed session
+/// to come up after its project arrived.
+pub(crate) const HELD_DELIVERY: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(20)
+};
+
 /// Delivers, once, input a viewer relay held while it brought the work to this
 /// computer (`session_proxy`): the chat commands and typing the user sent
 /// before the session ran here. Each goes through the same checks as input on
-/// this daemon's own socket. `Err` when the session cannot take it (nothing
-/// was delivered for that frame).
+/// this daemon's own socket. `deadline`: until when the session may still be
+/// starting; the caller sets one for the whole batch (see [`HELD_DELIVERY`]),
+/// so a session that never comes up costs one wait, not one per frame. `Err`
+/// when the session cannot take it (nothing was delivered for that frame).
 pub(crate) async fn deliver_held(
     state: &Arc<AppState>,
     id: &str,
     chat: bool,
     frame: axum::extract::ws::Message,
+    deadline: tokio::time::Instant,
 ) -> anyhow::Result<()> {
     // The resumed session may need a moment to come up after its project
     // arrived; the relay is still holding the input meanwhile.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while !(if chat {
         state.chat.get(id).is_some_and(|chat| chat.alive)
     } else {
@@ -595,94 +605,107 @@ pub(crate) struct CommandTag {
     pub(crate) server: Option<String>,
 }
 
-/// A frame's `client_id`, whatever JSON it is, without keeping more of it
-/// than an id can be.
-enum IdProbe {
-    Id(String),
-    NotAnId,
+/// One of a frame's tag fields, whatever JSON it turned out to be: a field
+/// of the wrong type must not make the others unreadable (a refusal still
+/// has to name the send it answers), and nothing longer than a tag can be is
+/// kept.
+enum Probe {
+    Bool(bool),
+    Text(String),
+    Other,
 }
-impl<'de> Deserialize<'de> for IdProbe {
+/// The longest text a tag field can hold (an MCP server's name).
+const TAG_TEXT_MAX: usize = chimaera_agent::model::COMMAND_MCP_SERVER_MAX;
+impl<'de> Deserialize<'de> for Probe {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Probe;
-        impl<'de> serde::de::Visitor<'de> for Probe {
-            type Value = IdProbe;
+        struct Any;
+        impl<'de> serde::de::Visitor<'de> for Any {
+            type Value = Probe;
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("any value")
             }
-            fn visit_str<E>(self, v: &str) -> Result<IdProbe, E> {
-                Ok(if chimaera_agent::model::valid_client_id(v) {
-                    IdProbe::Id(v.to_owned())
+            fn visit_str<E>(self, v: &str) -> Result<Probe, E> {
+                Ok(if v.len() <= TAG_TEXT_MAX {
+                    Probe::Text(v.to_owned())
                 } else {
-                    IdProbe::NotAnId
+                    Probe::Other
                 })
             }
-            fn visit_bool<E>(self, _: bool) -> Result<IdProbe, E> {
-                Ok(IdProbe::NotAnId)
+            fn visit_bool<E>(self, v: bool) -> Result<Probe, E> {
+                Ok(Probe::Bool(v))
             }
-            fn visit_i64<E>(self, _: i64) -> Result<IdProbe, E> {
-                Ok(IdProbe::NotAnId)
+            fn visit_i64<E>(self, _: i64) -> Result<Probe, E> {
+                Ok(Probe::Other)
             }
-            fn visit_u64<E>(self, _: u64) -> Result<IdProbe, E> {
-                Ok(IdProbe::NotAnId)
+            fn visit_u64<E>(self, _: u64) -> Result<Probe, E> {
+                Ok(Probe::Other)
             }
-            fn visit_f64<E>(self, _: f64) -> Result<IdProbe, E> {
-                Ok(IdProbe::NotAnId)
+            fn visit_f64<E>(self, _: f64) -> Result<Probe, E> {
+                Ok(Probe::Other)
             }
-            fn visit_unit<E>(self) -> Result<IdProbe, E> {
-                Ok(IdProbe::NotAnId)
+            fn visit_unit<E>(self) -> Result<Probe, E> {
+                Ok(Probe::Other)
             }
             fn visit_seq<A: serde::de::SeqAccess<'de>>(
                 self,
                 mut seq: A,
-            ) -> Result<IdProbe, A::Error> {
+            ) -> Result<Probe, A::Error> {
                 while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
-                Ok(IdProbe::NotAnId)
+                Ok(Probe::Other)
             }
             fn visit_map<A: serde::de::MapAccess<'de>>(
                 self,
                 mut map: A,
-            ) -> Result<IdProbe, A::Error> {
+            ) -> Result<Probe, A::Error> {
                 while map
                     .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
                     .is_some()
                 {}
-                Ok(IdProbe::NotAnId)
+                Ok(Probe::Other)
             }
         }
-        deserializer.deserialize_any(Probe)
+        deserializer.deserialize_any(Any)
+    }
+}
+impl Probe {
+    fn text(self) -> Option<String> {
+        match self {
+            Probe::Text(text) => Some(text),
+            _ => None,
+        }
     }
 }
 
 pub(crate) fn command_tag(text: &str) -> CommandTag {
-    // Every other field (a send's `blocks` above all) is skipped unread.
+    // Every other field (a send's `blocks` above all) is skipped unread, and
+    // each of these is read by itself: one of the wrong type is only absent.
     #[derive(Deserialize)]
-    struct Tag<'a> {
-        #[serde(rename = "type", borrow)]
-        kind: std::borrow::Cow<'a, str>,
+    struct Tag {
+        #[serde(rename = "type", default)]
+        kind: Option<Probe>,
         #[serde(default)]
-        client_id: Option<IdProbe>,
+        client_id: Option<Probe>,
         #[serde(default)]
-        dry_run: bool,
-        #[serde(default, borrow)]
-        server: Option<std::borrow::Cow<'a, str>>,
+        dry_run: Option<Probe>,
+        #[serde(default)]
+        server: Option<Probe>,
     }
     let Ok(tag) = serde_json::from_str::<Tag>(text) else {
         return CommandTag::default();
     };
     let small =
         |kind: &str| kind.len() <= 32 && kind.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    let sent_as = tag.client_id.is_some();
+    let client_id = tag
+        .client_id
+        .and_then(Probe::text)
+        .filter(|id| chimaera_agent::model::valid_client_id(id));
     CommandTag {
-        bad_client_id: matches!(tag.client_id, Some(IdProbe::NotAnId)),
-        client_id: match tag.client_id {
-            Some(IdProbe::Id(id)) => Some(id),
-            _ => None,
-        },
-        dry_run: tag.dry_run,
-        server: tag
-            .server
-            .filter(|server| server.len() <= chimaera_agent::model::COMMAND_MCP_SERVER_MAX)
-            .map(|server| server.into_owned()),
-        kind: small(&tag.kind).then(|| tag.kind.into_owned()),
+        bad_client_id: sent_as && client_id.is_none(),
+        client_id,
+        dry_run: matches!(tag.dry_run, Some(Probe::Bool(true))),
+        server: tag.server.and_then(Probe::text),
+        kind: tag.kind.and_then(Probe::text).filter(|kind| small(kind)),
     }
 }
 
@@ -2707,6 +2730,28 @@ mod tests {
             assert!(refused.get("client_id").is_none(), "{bad}");
         }
         assert!(!command_tag(r#"{"type":"send","blocks":[]}"#).bad_client_id);
+        // A sibling field of the wrong type never hides the id (or the kind):
+        // the refusal of such a frame still names the send.
+        for odd in [
+            r#"{"type":"send","client_id":"client-0001","dry_run":"yes","blocks":[]}"#,
+            r#"{"type":"send","dry_run":{"a":[1]},"server":7,"client_id":"client-0001"}"#,
+            r#"{"server":["x"],"client_id":"client-0001","type":"send"}"#,
+        ] {
+            let tag = command_tag(odd);
+            assert_eq!(tag.kind.as_deref(), Some("send"), "{odd}");
+            assert_eq!(tag.client_id.as_deref(), Some("client-0001"), "{odd}");
+            assert!(!tag.dry_run && tag.server.is_none(), "{odd}");
+        }
+        // And a `type` that is no tag leaves the id readable.
+        let tag = command_tag(r#"{"type":7,"client_id":"client-0001"}"#);
+        assert_eq!(
+            (tag.kind, tag.client_id.as_deref()),
+            (None, Some("client-0001"))
+        );
+        let tag = command_tag(r#"{"type":"rewind","dry_run":true,"user_message_id":"u"}"#);
+        assert!(tag.dry_run);
+        let tag = command_tag(r#"{"type":"reconnect_mcp","server":"files"}"#);
+        assert_eq!(tag.server.as_deref(), Some("files"));
         // An older daemon's parser: the additive field does not break a send.
         assert!(serde_json::from_str::<AgentCommand>(
             r#"{"type":"send","blocks":[],"client_id":"client-0001"}"#
