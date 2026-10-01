@@ -301,6 +301,8 @@ pub struct ClusterOverview {
     pub scheduler: Scheduler,
     /// The login node these commands ran on.
     pub login_node: String,
+    /// The user's home folder there (the page shows paths under it as `~/…`).
+    pub home: String,
     pub now_ms: u64,
     pub jobs: Vec<JobView>,
     pub workspaces: Vec<WorkspaceView>,
@@ -386,7 +388,8 @@ pub async fn overview(host: &str, home: RemoteHome) -> anyhow::Result<ClusterOve
         home.config_dir_sh()
     ));
     script.push_str(
-        "printf '===now %s\\n' \"$(date +%s)\"\nprintf '===node %s\\n' \"$(uname -n)\"\n",
+        "printf '===now %s\\n' \"$(date +%s)\"\nprintf '===node %s\\n' \"$(uname -n)\"\n\
+         printf '===home %s\\n' \"$HOME\"\n",
     );
     if ask_queue {
         script.push_str(&format!(
@@ -479,6 +482,12 @@ pub async fn overview(host: &str, home: RemoteHome) -> anyhow::Result<ClusterOve
             .map(|s| s.kind)
             .unwrap_or(Scheduler::Slurm),
         login_node: marker_arg(&secs, "node").unwrap_or("").to_string(),
+        home: secs
+            .iter()
+            .find_map(|(k, _)| k.strip_prefix("home "))
+            .unwrap_or("")
+            .trim()
+            .to_string(),
         now_ms: remote_now_ms,
         jobs: built.jobs,
         workspaces: built.workspaces,
@@ -1532,6 +1541,42 @@ pub async fn stop_job(host: &str, home: RemoteHome, record: &JobRecord) -> anyho
             clean_tool_stderr(section(&secs, "err").unwrap_or(""), "scancel")
         );
     }
+    Ok(())
+}
+
+/// Add a workspace to a job's start list while the job waits: its job-host
+/// opens it when the job starts. A job-host that read its record a moment
+/// before is the caller's to cover (open it through the job-host once the
+/// job runs).
+pub async fn queue_open(
+    host: &str,
+    home: RemoteHome,
+    record: &JobRecord,
+    wid: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(valid_job_id(&record.id), "unknown job");
+    anyhow::ensure!(valid_workspace_id(wid), "unknown workspace");
+    if record.open.iter().any(|w| w == wid) {
+        return Ok(());
+    }
+    let mut next = record.clone();
+    next.open.push(wid.to_string());
+    let mut s = format!(
+        "umask 077\nD=\"{}\"\n[ -f \"$D/job.json\" ] || exit 3\n",
+        job_dir(home, &record.id)
+    );
+    s.push_str(&write_file_lines(
+        "$D/job.json",
+        &serde_json::to_string_pretty(&next)?,
+    ));
+    s.push_str("printf '===end\\n'\n");
+    let out = run_script(host, &s, EXEC_SECS).await?;
+    anyhow::ensure!(
+        section(&sections(&String::from_utf8_lossy(&out.stdout)), "end").is_some(),
+        "couldn't update the job on {host}: {}",
+        super::ssh_failure_line(&out.stderr, &out.status)
+    );
+    invalidate_queue(host);
     Ok(())
 }
 

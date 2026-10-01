@@ -32,6 +32,8 @@ import {
   otherJobsWords,
   parentPath,
   parseSlurmTime,
+  shortHost,
+  tildePath,
   partitionTags,
   reasonWords,
   refusalField,
@@ -277,12 +279,19 @@ describe("jobs in words", () => {
     });
     expect(jobStatusLine(running, NOW)).toBe("On n042 · 8 CPUs · 32 GB · ends in 5d 22h");
     expect(jobStatusLine(job({ state: "starting", node: "n7" }), NOW)).toBe("Starting on n7…");
-    expect(jobStatusLine(job({ state: "waiting" }), NOW)).toBe("Waiting for a node");
+    expect(jobStatusLine(job({ state: "waiting", submitted_ms: NOW - 20_000 }), NOW)).toBe(
+      "Waiting for a node",
+    );
+    expect(jobStatusLine(job({ state: "waiting", submitted_ms: NOW - 4 * MIN - 5_000 }), NOW)).toBe(
+      "Waiting for a node · 4 min so far",
+    );
     const est = new Date(2026, 8, 30, 14, 20).getTime();
     expect(
       jobStatusLine(job({ state: "waiting", start_estimate_ms: est, reason: "Resources" }), NOW, "en-GB"),
-    ).toBe("Waiting for a node · Slurm estimates 14:20 · waiting for the nodes it needs to free up");
-    expect(jobStatusLine(job({ state: "waiting", attached: true }), NOW)).toBe(
+    ).toBe(
+      "Waiting for a node · 1h so far · Slurm estimates 14:20 · waiting for the nodes it needs to free up",
+    );
+    expect(jobStatusLine(job({ state: "waiting", attached: true, submitted_ms: NOW }), NOW)).toBe(
       "Waiting for a node · stops if this app disconnects",
     );
   });
@@ -333,7 +342,9 @@ describe("jobs in words", () => {
 
   it("decides what Open does from the running jobs", () => {
     expect(openPlan([])).toEqual({ kind: "sheet" });
-    expect(openPlan([job({ state: "waiting" })])).toEqual({ kind: "sheet" });
+    const waiting = job({ id: "j-0000000w", state: "waiting" });
+    expect(openPlan([waiting])).toEqual({ kind: "queue", jobs: [waiting] });
+    expect(openPlan([job({ state: "ended" })])).toEqual({ kind: "sheet" });
     const one = job({ id: "j-0000bbbb" });
     expect(openPlan([one, job({ state: "waiting" })])).toEqual({ kind: "job", job: one });
     const two = job({ id: "j-0000cccc", name: "GPU" });
@@ -367,6 +378,16 @@ describe("jobs in words", () => {
       "1 job running · 1 waiting",
     );
     expect(hostSummary(overview([job({ state: "starting" })]), NOW)).toBe("1 job starting");
+  });
+
+  it("shortens paths under the cluster's home and login node names", () => {
+    expect(tildePath("/home/u/projects/crc", "/home/u")).toBe("~/projects/crc");
+    expect(tildePath("/home/u", "/home/u/")).toBe("~");
+    expect(tildePath("/home/user2/x", "/home/u")).toBe("/home/user2/x");
+    expect(tildePath("/scratch/u/x", "/home/u")).toBe("/scratch/u/x");
+    expect(tildePath("/scratch/u/x", undefined)).toBe("/scratch/u/x");
+    expect(shortHost("login2.cluster.example.edu")).toBe("login2");
+    expect(shortHost("login2")).toBe("login2");
   });
 
   it("counts the user's other Slurm jobs", () => {

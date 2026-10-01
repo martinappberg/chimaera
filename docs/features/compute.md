@@ -60,8 +60,11 @@ startup commands, the lease) in `crates/chimaera-server/src/{compute,lifecycle,e
 - **Workspaces.** Added with a folder picker (`chimaera browse --dir`: folders only, git
   and already-added marks, a typed path) — the only browsing outside a workspace window.
   A workspace is open in at most one job; a job may hold several, or none. **Open** goes
-  where it is open, else to the one running job, else asks which (or "In a new job…"),
-  else opens the start sheet with it ticked. **Move to** another running job closes it
+  where it is open, else to the one running job, else asks which (or "In a new job…");
+  while jobs only wait, it offers "When <job> starts" (added to that job's start list;
+  the app opens it through job-host once the job runs, in case the job read its list a
+  moment before); with no job, it opens the start sheet with it ticked. Paths under the
+  cluster's home folder show as `~/…`. **Move to** another running job closes it
   there (its chimaera saves the chats) and opens it here; its window follows.
 - **Wire.** Tauri commands `cluster_*` (see `web-ui/src/lib/net/native.ts`); events
   `cluster-changed` and `host-status` (`ended` with a reason for a workspace window:
@@ -109,9 +112,12 @@ Nothing site-specific is ever coded.
   person starts every job.
 - **Notifications** (native app, even when looking elsewhere; windows never open by
   themselves): ready, an hour left, ten minutes left (the watcher wakes at those marks),
-  stopped. A background check runs only while a job this app knows of is alive: the
-  queue at most once a minute while something waits or starts, every five minutes while
-  things only run.
+  stopped, and "didn't start" with Slurm's own words for an attached job that ended before
+  it ran. A background check runs only while a job this app knows of is alive: the queue
+  at most once a minute while something waits, a starting job's record every 15 s (no
+  queue question — "ready" comes within seconds of job-host being up), every five
+  minutes while things only run. The cluster page says so, with a way to turn them on,
+  when the OS has notifications off while a job is alive.
 
 ## A workspace chimaera's side
 

@@ -31,6 +31,7 @@
     nodeSizeWords,
     partitionTags,
     refusalField,
+    tildePath,
     walltimeSecs,
     type StartField,
     type StartForm,
@@ -45,6 +46,8 @@
     clusterStartup: string;
     /** Every workspace on the cluster (the closed ones can open in the job). */
     workspaces: ClusterWorkspaceView[];
+    /** The cluster's home folder (paths under it show as `~/…`). */
+    home?: string;
     /** Workspaces ticked to open when it starts. */
     preselect?: string[];
     /** Continue this running job in a new one (its setup, its workspaces). */
@@ -62,6 +65,7 @@
     config,
     clusterStartup,
     workspaces,
+    home = "",
     preselect = [],
     continueJob = null,
     initialSpec = null,
@@ -735,7 +739,7 @@
                         onchange={() => toggleOpen(w.id)}
                       />
                       <span class="open-name">{w.name}</span>
-                      <span class="open-path" title={w.path}>{w.path}</span>
+                      <span class="open-path" title={w.path}>{tildePath(w.path, home)}</span>
                     </label>
                   {/each}
                 </div>

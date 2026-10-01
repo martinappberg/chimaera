@@ -51,6 +51,10 @@ pub(crate) struct ClusterLive {
     moving: HashSet<String>,
     /// When this app last opened each workspace's window (see [`OPEN_GRACE`]).
     opened_at: HashMap<String, Instant>,
+    /// Workspaces this app added to a waiting job's start list, as
+    /// (job, workspace): opened through its job-host once it runs, in case
+    /// it read its record just before the change.
+    queued_opens: HashSet<(String, String)>,
     /// One notification per (kind, job).
     notified: HashSet<String>,
     /// Slurm start estimates for waiting jobs, asked at most every 5 min.
@@ -73,6 +77,10 @@ pub(crate) struct ClusterInfo {
 /// folder says: a manifest written on the compute node can take a minute to
 /// show on the login node (the shared filesystem's attribute cache).
 const OPEN_GRACE: Duration = Duration::from_secs(120);
+
+/// How often a job that has a node but whose job-host isn't up yet is
+/// looked at (its record, not the queue).
+const STARTING_CHECK: Duration = Duration::from_secs(15);
 
 fn home() -> RemoteHome {
     RemoteHome::current()
@@ -196,6 +204,8 @@ async fn absorb(app: &AppHandle, alias: &str, ov: &ClusterOverview) {
     let mut ended: Vec<(String, String)> = Vec::new();
     let mut moved: Vec<(String, String, cluster::Endpoint)> = Vec::new();
     let mut ask_end: Vec<chimaera_core::cluster::JobRecord> = Vec::new();
+    // (job, workspace) this app queued while the job waited: open them now.
+    let mut ensure_open: Vec<(String, String)> = Vec::new();
     let mut live = false;
     {
         let mut clusters = lock(&shell.clusters);
@@ -248,6 +258,16 @@ async fn absorb(app: &AppHandle, alias: &str, ov: &ClusterOverview) {
                 .map(|w| w.name.clone())
                 .collect();
             if j.state == "running" {
+                let queued: Vec<String> = c
+                    .queued_opens
+                    .iter()
+                    .filter(|(jid, _)| jid == &j.id)
+                    .map(|(_, wid)| wid.clone())
+                    .collect();
+                for wid in queued {
+                    c.queued_opens.remove(&(j.id.clone(), wid.clone()));
+                    ensure_open.push((j.id.clone(), wid));
+                }
                 if prev.is_some_and(|p| p != "running")
                     && c.notified.insert(format!("ready:{}", j.id))
                 {
@@ -384,6 +404,25 @@ async fn absorb(app: &AppHandle, alias: &str, ov: &ClusterOverview) {
     for (wid, old_slurm, endpoint) in moved {
         follow_move(app, alias, &wid, &old_slurm, &endpoint).await;
     }
+    for (jid, wid) in ensure_open {
+        let Some(endpoint) = ov.hosts.get(&jid).cloned() else {
+            continue;
+        };
+        let app = app.clone();
+        let alias = alias.to_string();
+        // Idempotent at job-host (already opening = fine); in the
+        // background, and never a window — windows open only on a click.
+        tauri::async_runtime::spawn(async move {
+            let opened = match host_forward(&app, &alias, &jid, &endpoint).await {
+                Ok((port, token)) => cluster::host_open(port, &token, &wid).await.map_err(err),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = opened {
+                tracing::warn!("{alias}: opening {wid} in {jid} as queued: {e}");
+            }
+            let _ = app.emit("cluster-changed", json!({ "alias": alias }));
+        });
+    }
     if !ask_end.is_empty() {
         let app = app.clone();
         let alias = alias.to_string();
@@ -435,9 +474,10 @@ async fn follow_move(
 }
 
 /// Watch a cluster while a job this app knows of is alive: the queue at most
-/// once a minute while a job waits or starts, every five minutes while jobs
-/// only run (an early end — failure, preemption — still gets told), and not
-/// at all once nothing is alive. It ends with the app.
+/// once a minute while a job waits, a starting job's record every 15 s (no
+/// queue question), every five minutes while jobs only run (woken at the
+/// end-of-job marks; an early end — failure, preemption — still gets told),
+/// and not at all once nothing is alive. It ends with the app.
 fn ensure_watcher(app: &AppHandle, alias: &str) {
     let shell = app.state::<Shell>();
     {
@@ -472,15 +512,19 @@ fn ensure_watcher(app: &AppHandle, alias: &str) {
             };
             absorb(&app, &alias, &ov).await;
             let _ = app.emit("cluster-changed", json!({ "alias": alias }));
-            let waiting = ov
-                .jobs
-                .iter()
-                .any(|j| j.state == "waiting" || j.state == "starting");
+            let starting = ov.jobs.iter().any(|j| j.state == "starting");
+            let waiting = ov.jobs.iter().any(|j| j.state == "waiting");
             let alive = ov.jobs.iter().any(|j| j.state != "ended");
             if !alive {
                 break;
             }
-            interval = if waiting {
+            // A job with a node is usable the moment its job-host writes its
+            // record — a file read, not a scheduler question (the overview
+            // asks the queue at most once a minute whatever we do), so
+            // "ready" comes within seconds of it.
+            interval = if starting {
+                STARTING_CHECK
+            } else if waiting {
                 cluster::SQUEUE_FLOOR
             } else {
                 Duration::from_secs(300)
@@ -1080,6 +1124,17 @@ async fn host_port(app: &AppHandle, alias: &str, jid: &str) -> Result<(u16, Stri
                 .ok_or("that job isn't running yet")?
         }
     };
+    host_forward(app, alias, jid, &endpoint).await
+}
+
+/// Reuse or build the forward to job-host at `endpoint` (no overview read).
+async fn host_forward(
+    app: &AppHandle,
+    alias: &str,
+    jid: &str,
+    endpoint: &cluster::HostEndpoint,
+) -> Result<(u16, String), String> {
+    let shell = app.state::<Shell>();
     let key = host_key(alias, jid);
     let existing = {
         let tunnels = shell.compute_tunnels.lock().await;
@@ -1087,7 +1142,7 @@ async fn host_port(app: &AppHandle, alias: &str, jid: &str) -> Result<(u16, Stri
     };
     if let Some(port) = existing {
         if chimaera_remote::http_alive_authed(port, &endpoint.token).await {
-            return Ok((port, endpoint.token));
+            return Ok((port, endpoint.token.clone()));
         }
         if let Some(t) = shell.compute_tunnels.lock().await.remove(&key) {
             t.close().await;
@@ -1104,7 +1159,7 @@ async fn host_port(app: &AppHandle, alias: &str, jid: &str) -> Result<(u16, Stri
     .map_err(err)?;
     let port = tunnel.local_port;
     shell.compute_tunnels.lock().await.insert(key, tunnel);
-    Ok((port, endpoint.token))
+    Ok((port, endpoint.token.clone()))
 }
 
 /// Ask job `jid` to open workspace `wid` and wait (bounded) until it's open.
@@ -1407,6 +1462,53 @@ pub(super) async fn cluster_move(
         follow_move(&app, &alias, &workspace_id, &old.slurm_job_id, &endpoint).await;
     }
     absorb(&app, &alias, &ov).await;
+    let _ = app.emit("cluster-changed", json!({ "alias": alias }));
+    Ok(())
+}
+
+/// Open a workspace when a job that is still waiting starts: added to that
+/// job's start list (its job-host opens it at start; this app makes sure
+/// once it runs).
+#[tauri::command]
+pub(super) async fn cluster_queue_open(
+    app: AppHandle,
+    alias: String,
+    workspace_id: String,
+    job_id: String,
+) -> Result<(), String> {
+    valid_ws(&workspace_id)?;
+    valid_job(&job_id)?;
+    ensure_cluster(&app, &alias).await?;
+    tracing::info!("ipc: cluster_queue_open {alias} {workspace_id} when {job_id} starts");
+    let ov = fresh_overview(&alias).await?;
+    let view = ov
+        .workspaces
+        .iter()
+        .find(|w| w.id == workspace_id)
+        .ok_or("unknown workspace")?;
+    if view.state != "closed" {
+        return Err(format!("{} is already open or opening in a job", view.name));
+    }
+    let job = ov
+        .jobs
+        .iter()
+        .find(|j| j.id == job_id)
+        .ok_or("unknown job")?;
+    if job.state == "running" || job.state == "ended" {
+        return Err(format!(
+            "{} is {} — open it there instead",
+            job.name, job.state
+        ));
+    }
+    let record = ov.records.get(&job_id).ok_or("unknown job")?;
+    cluster::queue_open(&alias, home(), record, &workspace_id)
+        .await
+        .map_err(err)?;
+    lock(&app.state::<Shell>().clusters)
+        .entry(alias.clone())
+        .or_default()
+        .queued_opens
+        .insert((job_id, workspace_id));
     let _ = app.emit("cluster-changed", json!({ "alias": alias }));
     Ok(())
 }

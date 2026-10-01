@@ -233,6 +233,19 @@ export function endsInWords(endsAtMs: number, nowMs: number): string {
   return `ends in ${shortDuration(secs)}`;
 }
 
+/** "/home/u/x" → "~/x" under the cluster's home folder; anything else as is. */
+export function tildePath(path: string, home: string | undefined): string {
+  const h = (home ?? "").replace(/\/+$/, "");
+  if (h === "") return path;
+  if (path === h) return "~";
+  return path.startsWith(`${h}/`) ? `~${path.slice(h.length)}` : path;
+}
+
+/** "sh01.cluster.example.edu" → "sh01": a login node's short name. */
+export function shortHost(host: string): string {
+  return host.split(".")[0] || host;
+}
+
 /** A job card's one status line (plan §4.2). */
 export function jobStatusLine(j: ClusterJob, nowMs: number, locale?: string): string {
   let line: string;
@@ -250,6 +263,8 @@ export function jobStatusLine(j: ClusterJob, nowMs: number, locale?: string): st
       break;
     case "waiting": {
       line = "Waiting for a node";
+      const waited = (nowMs - j.submitted_ms) / 1000;
+      if (waited >= MINUTE) line += ` · ${shortDuration(waited)} so far`;
       if (j.start_estimate_ms !== undefined && j.start_estimate_ms !== null) {
         line += ` · Slurm estimates ${clockWords(j.start_estimate_ms, nowMs, locale)}`;
       }
@@ -293,11 +308,16 @@ export function workspaceActivity(w: ClusterWorkspaceView, nowMs: number, locale
 export type OpenPlan =
   | { kind: "sheet" }
   | { kind: "job"; job: ClusterJob }
-  | { kind: "choose"; jobs: ClusterJob[] };
+  | { kind: "choose"; jobs: ClusterJob[] }
+  /** None runs yet, but these will: open when one starts, or in a new job. */
+  | { kind: "queue"; jobs: ClusterJob[] };
 
 export function openPlan(jobs: readonly ClusterJob[]): OpenPlan {
   const running = jobs.filter((j) => j.state === "running");
-  if (running.length === 0) return { kind: "sheet" };
+  if (running.length === 0) {
+    const pending = jobs.filter((j) => j.state === "waiting" || j.state === "starting");
+    return pending.length === 0 ? { kind: "sheet" } : { kind: "queue", jobs: pending };
+  }
   if (running.length === 1) return { kind: "job", job: running[0] };
   return { kind: "choose", jobs: running };
 }

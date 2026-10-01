@@ -19,6 +19,11 @@
     clusterDismissJob,
     clusterFacts,
     clusterMove,
+    clusterQueueOpen,
+    notificationPermission,
+    openNotificationSettings,
+    requestNotificationPermission,
+    type NativeNotificationPermission,
     clusterOpen,
     clusterOpenTerminal,
     clusterRemoveWorkspace,
@@ -44,6 +49,8 @@
     liveJobs,
     openPlan,
     otherJobsWords,
+    shortHost,
+    tildePath,
     parentPath,
     workspaceActivity,
   } from "./cluster";
@@ -168,6 +175,19 @@
     return () => clearInterval(t);
   });
 
+  /** Notifications are how you hear a job started — say so when they're off. */
+  let notify = $state<NativeNotificationPermission | null>(null);
+  const jobsAlive = $derived(jobs.length > 0);
+  $effect(() => {
+    if (!jobsAlive || !$pageVisible) return;
+    void notificationPermission().then((p) => (notify = p));
+  });
+
+  async function turnOnNotifications(): Promise<void> {
+    if (notify === "not_determined") notify = await requestNotificationPermission();
+    else await openNotificationSettings();
+  }
+
   function errText(e: unknown): string {
     return e instanceof Error ? e.message : String(e);
   }
@@ -226,7 +246,15 @@
     const plan = openPlan(overview?.jobs ?? []);
     if (plan.kind === "sheet") startSheet([w.id]);
     else if (plan.kind === "job") openIn(w, plan.job.id);
-    else {
+    else if (plan.kind === "queue") {
+      const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      const items: ContextMenuEntry[] = plan.jobs.map((j) => ({
+        label: `When ${j.name} starts`,
+        onSelect: () => void wsAction(w, "opening", () => clusterQueueOpen(alias, w.id, j.id)),
+      }));
+      items.push("separator", { label: "In a new job…", onSelect: () => startSheet([w.id]) });
+      contextMenu.openAtPoint(r.right, r.bottom + 4, items, { alignRight: true });
+    } else {
       const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
       const items: ContextMenuEntry[] = plan.jobs.map((j) => ({
         label: `In ${j.name}`,
@@ -435,13 +463,37 @@
   </svg>
 {/snippet}
 
+{#snippet refreshButton()}
+  <button
+    class="ghost refresh"
+    class:spinning={entry?.loading === true}
+    title={overview !== null && overview.queue_at_ms > 0
+      ? `Refresh — the queue was read ${agoWords(overview.queue_at_ms, clusterTime)}`
+      : "Refresh"}
+    aria-label="Refresh"
+    disabled={entry?.loading === true}
+    onclick={refresh}
+  >
+    <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+      <path
+        d="M13.2 8a5.2 5.2 0 1 1-1.5-3.7M13.4 2.5v2.3h-2.3"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.4"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+    </svg>
+  </button>
+{/snippet}
+
 {#snippet wsRow(w: ClusterWorkspaceView)}
   {@const busy = wsBusy[w.id]}
   {@const activity = workspaceActivity(w, clusterTime)}
   <div class="ws" class:live={w.state === "open"}>
     <div class="ws-main">
       <span class="name" title={w.name}>{w.name}</span>
-      <span class="path" title={w.path}>{w.path}</span>
+      <span class="path" title={w.path}>{tildePath(w.path, overview?.home)}</span>
       <span class="acts">
         {#if busy !== undefined}
           <span class="busy-word"
@@ -456,7 +508,7 @@
         {:else}
           {#if w.state !== "queued" && !w.closing}
             <button class="act primary" onclick={(e) => openClicked(e, w)}>
-              Open{#if w.state === "closed" && running.length > 1}
+              Open{#if w.state === "closed" && (running.length > 1 || (running.length === 0 && jobs.length > 0))}
                 <svg class="chev-down" viewBox="0 0 16 16" width="9" height="9" aria-hidden="true">
                   <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
                 </svg>
@@ -529,20 +581,30 @@
     <h1>{alias}</h1>
     <div class="kind">
       <span class="sched">Slurm cluster</span>
-      <span>· Chimaera runs inside jobs you start</span>
+      {#if overview !== null && overview.login_node !== ""}
+        <span title="Connected through {overview.login_node}"
+          >· via <span class="mono">{shortHost(overview.login_node)}</span></span
+        >
+      {/if}
       {#if loginServe}
         <span class="pill-warn" title="Allowed on the login node (from the … menu)">login node</span>
       {/if}
     </div>
-    {#if overview !== null}
-      <div class="login-line">connected through <span class="mono">{overview.login_node}</span></div>
-    {/if}
     {#if mastError !== null}
       <div class="err-line">{mastError}</div>
     {:else if mastNote !== null}
       <div class="note-line">{mastNote}</div>
     {/if}
   </header>
+
+  {#if jobsAlive && (notify === "denied" || notify === "not_determined")}
+    <div class="notice" role="note">
+      <p>Notifications are off, so you won't hear when a job starts or is about to end.</p>
+      <button class="notice-act" onclick={() => void turnOnNotifications()}>
+        {notify === "denied" ? "Open settings" : "Turn on"}
+      </button>
+    </div>
+  {/if}
 
   {#if loginDaemon !== null}
     <div class="notice" role="note">
@@ -595,6 +657,10 @@
 
     {#if jobs.length > 0}
       <section class="jobs" aria-label="Jobs">
+        <div class="sec-head">
+          <span class="sec-title">jobs</span>
+          {@render refreshButton()}
+        </div>
         {#each jobs as j (j.id)}
           {@const busy = jobBusy[j.id]}
           {@const inside = wsIn(j)}
@@ -693,26 +759,10 @@
     <section aria-label="Not open">
       {#if closedWs.length > 0}
         <div class="sec-head">
-          <span class="sec-title">{jobs.length > 0 ? "not open" : "workspaces"}</span>
-          <button
-            class="ghost refresh"
-            class:spinning={entry?.loading === true}
-            title="Refresh"
-            aria-label="Refresh"
-            disabled={entry?.loading === true}
-            onclick={refresh}
-          >
-            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
-              <path
-                d="M13.2 8a5.2 5.2 0 1 1-1.5-3.7M13.4 2.5v2.3h-2.3"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.4"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              />
-            </svg>
-          </button>
+          <span class="sec-title">{closedWs.length < (overview.workspaces.length ?? 0)
+              ? "other workspaces"
+              : "workspaces"}</span>
+          {#if jobs.length === 0}{@render refreshButton()}{/if}
         </div>
         <div class="rows">
           {#each closedWs as w (w.id)}
@@ -740,6 +790,7 @@
     config={overview.config}
     clusterStartup={overview.startup.cluster}
     workspaces={overview.workspaces}
+    home={overview.home}
     preselect={sheet.kind === "start" ? sheet.preselect : []}
     initialSpec={sheet.kind === "start" ? sheet.spec : null}
     continueJob={sheet.kind === "continue" ? sheet.job : null}
@@ -943,11 +994,6 @@
     border-radius: 999px;
     padding: 0 7px;
     margin-left: 3px;
-  }
-
-  .login-line {
-    font-size: var(--text-xs);
-    color: var(--muted);
   }
 
   .mono {

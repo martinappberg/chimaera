@@ -1013,6 +1013,7 @@ pub fn run() {
             cluster::cluster_open,
             cluster::cluster_close,
             cluster::cluster_move,
+            cluster::cluster_queue_open,
             cluster::cluster_set_startup,
             cluster::cluster_forget_setup,
             cluster::cluster_set_agent_rules,

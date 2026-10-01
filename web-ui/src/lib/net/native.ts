@@ -461,6 +461,8 @@ export interface ClusterWorkspaceView {
 export interface ClusterOverview {
   scheduler: Scheduler;
   login_node: string;
+  /** The user's home folder on the cluster (paths under it show as `~/…`). */
+  home?: string;
   now_ms: number;
   jobs: ClusterJob[];
   workspaces: ClusterWorkspaceView[];
@@ -638,6 +640,11 @@ export async function clusterClose(alias: string, workspaceId: string): Promise<
 /** Move an open workspace to another running job; its chats and windows follow. */
 export async function clusterMove(alias: string, workspaceId: string, jobId: string): Promise<void> {
   await shell().core.invoke<void>("cluster_move", { alias, workspaceId, jobId });
+}
+
+/** Open a workspace when a job that is still waiting starts. */
+export async function clusterQueueOpen(alias: string, workspaceId: string, jobId: string): Promise<void> {
+  await shell().core.invoke<void>("cluster_queue_open", { alias, workspaceId, jobId });
 }
 
 /** Save startup commands: the cluster's (`workspaceId` null) or one workspace's. */
