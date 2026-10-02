@@ -101,8 +101,8 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
 
 - **What & when.** Divide any pane row/column (recursively) to see surfaces side by side; each
   pane is a tab stack.
-  In the sidebar, an agent working in a linked worktree shows its branch on a secondary
-  line, with the full branch and path on hover. Agents in the main checkout have no branch line.
+  In the sidebar, an agent working in a linked worktree shows its branch beside its name on the same
+  line, with the full branch and path on hover. Agents in the main checkout have no branch chip.
 - **How it's used.** Split via **Pane actions** (the tab bar’s ellipsis menu), `Mod+D` (right) / `Mod2+D` (down), or drag
   a tab to a pane edge. Drag the divider to reratio (double-click snaps 50/50; Escape restores).
   Open a surface → it appends a tab to the focused pane (VS Code "no duplicates": if already
@@ -269,11 +269,13 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   (see [lifecycle-and-persistence.md](lifecycle-and-persistence.md)), which is what lets persisted
   tabs rebind with no client migration.
 
-Agent rows reserve two text lines and anchor the name to the first. Linked-worktree branches
-and provider status share the second line with separate truncation, so changing a status/title
-does not move either the name or the rows below.
+Agent rows keep one compact, vertically centered line, including while renaming or confirming
+close. Linked-worktree branches share that line with separate truncation; provider activity is
+available in the name's tooltip, so changing a status/title never shifts the rows below.
 Their ordering uses the first known creation time throughout view switches and respawns;
 attention-state changes do not reorder the sidebar or its numbered shortcuts.
+The session list, expanded Recents and file tree share a slim, theme-aware scrollbar
+with a transparent track; its drag area is wider than the visible thumb.
 
 ---
 

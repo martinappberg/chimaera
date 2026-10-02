@@ -69,8 +69,9 @@ async fn handshake_failure_for_every_provider(submit: bool) {
                 .await
                 .unwrap();
         }
+        let journal_path = state.chat.journal_dir().join(format!("{id}.jsonl"));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
+        let journal = loop {
             let settled = if submit {
                 crate::lock(&state.agents)
                     .get(&id)
@@ -79,15 +80,23 @@ async fn handshake_failure_for_every_provider(submit: bool) {
             } else {
                 !crate::lock(&state.agents).contains_key(&id)
             };
-            if settled && crate::lock(&state.chat_switching).is_empty() {
-                break;
+            // Exited updates the in-memory row before the journal writer's
+            // drain barrier. A slow writer must not race the disk assertion.
+            let journal = tokio::fs::read_to_string(&journal_path)
+                .await
+                .unwrap_or_default();
+            if settled
+                && crate::lock(&state.chat_switching).is_empty()
+                && journal.contains("no handshake within")
+            {
+                break journal;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "{kind:?} did not settle"
+                "{kind:?} startup state or diagnostic journal did not settle"
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        };
         assert!(
             state.sessions.get(&id).is_none(),
             "{kind:?} switched to a terminal"
@@ -99,9 +108,6 @@ async fn handshake_failure_for_every_provider(submit: bool) {
             crate::lock(&state.session_workspaces).contains_key(&id),
             submit
         );
-        let journal =
-            std::fs::read_to_string(state.chat.journal_dir().join(format!("{id}.jsonl"))).unwrap();
-        assert!(journal.contains("no handshake within"));
         assert!(!journal.contains("mode_switch"));
     }
 }

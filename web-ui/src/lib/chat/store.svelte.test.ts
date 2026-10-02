@@ -2047,3 +2047,32 @@ describe("model selection before the first prompt", () => {
     }
   });
 });
+
+
+describe("startup progress", () => {
+  it("replays the latest phase without adding transcript messages or claiming readiness", () => {
+    const store = fold([
+      { type: "startup_progress", detail: "Waiting for agent initialization…" },
+      { type: "startup_progress", detail: "Running startup hooks…" },
+    ]);
+    expect(store.startupDetail).toBe("Running startup hooks…");
+    expect(store.initialized).toBe(false);
+    expect(store.blocks).toEqual([]);
+    store.apply({ seq: 3, ts: 3, ev: { type: "init", native_session_id: "ready" } } as SeqEvent);
+    expect(store.initialized).toBe(true);
+    expect(store.startupDetail).toBeNull();
+  });
+
+  it.each([
+    { type: "error", message: "failed to start", fatal: true },
+    { type: "exited", status: 1 },
+  ])("clears startup on $type and starts fresh on retry", (terminal) => {
+    const store = fold([{ type: "startup_progress", detail: "Loading…" }, terminal]);
+    expect(store.startupDetail).toBeNull();
+    store.apply({ seq: 3, ts: 3, ev: { type: "startup_progress", detail: "Opening conversation…" } } as SeqEvent);
+    expect(store.startupDetail).toBe("Opening conversation…");
+    expect(store.fatalError).toBeNull();
+    expect(store.exited).toBeNull();
+    expect(store.initialized).toBe(false);
+  });
+});

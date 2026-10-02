@@ -139,6 +139,11 @@ pub const COMMAND_MCP_SERVER_MAX: usize = 512;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
+    /// Latest startup phase, cleared by Init/Error/Exited. Additive and
+    /// journaled so an attaching client can explain a slow initialization.
+    StartupProgress {
+        detail: String,
+    },
     /// The agent accepted the copied fork context. ACP attaches it to the
     /// first real prompt; persist acceptance so retries/restarts don't lose
     /// a rejected handoff or repeatedly inject an accepted one.

@@ -24,7 +24,8 @@
 //! and a Monitor whose closes follow after `FAKE_SHOWCASE_SETTLE_MS`), `hang`
 //! (opens a turn, streams content, never ends it, and acks an interrupt with NO
 //! result — the interrupt-watchdog recovery tests), `silent` (never answers —
-//! handshake watchdog tests), `die` (exit 3 immediately — spawn-crash tests),
+//! handshake watchdog tests), `startup-hooks` (SessionStart hooks, held until
+//! `FAKE_STARTUP_HOOK_RELEASE` exists when set), `die` (exit 3 immediately — spawn-crash tests),
 //! `die-after-handshake` (answer initialize, print a diagnostic on stderr, exit
 //! 2 — the post-update failure-at-birth tests), `artifacts` (self-ending turns
 //! that really write files under the cwd — documents by Write, a figure, a
@@ -77,6 +78,31 @@ fn main() {
         };
 
         if frame["type"] == "control_request" && frame["request"]["subtype"] == "initialize" {
+            if mode == "startup-hooks" {
+                for id in ["hook-1", "hook-2"] {
+                    emit(
+                        json!({"type":"system","subtype":"hook_started","hook_id":id,"hook_name":"SessionStart:startup"}),
+                    );
+                }
+                emit(
+                    json!({"type":"system","subtype":"hook_response","hook_id":"hook-1","outcome":"success","stdout":"private hook context"}),
+                );
+                if let Some(release) = std::env::var_os("FAKE_STARTUP_HOOK_RELEASE") {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    while !std::path::Path::new(&release).exists() {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "startup hook not released"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                emit(
+                    json!({"type":"system","subtype":"hook_response","hook_id":"hook-2","outcome":"cancelled"}),
+                );
+            }
             emit(json!({
                 "type": "control_response",
                 "response": {

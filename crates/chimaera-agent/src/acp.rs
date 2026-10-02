@@ -89,6 +89,7 @@ impl Driver for AcpAdapter {
         sink: &mut JsonlSink,
         stream: &mut JsonlStream,
         spec: &SpawnSpec,
+        progress: &tokio::sync::mpsc::Sender<AgentEvent>,
     ) -> Result<Handshake<AcpMapper>, String> {
         if spec.fork_at.is_some() || spec.rollback_turns.is_some() {
             return Err("This ACP adapter requires a conversation-copy fork".into());
@@ -97,6 +98,7 @@ impl Driver for AcpAdapter {
         if init["protocolVersion"] != 1 {
             return Err("ACP protocol version 1 required".into());
         }
+        crate::driver::startup_progress(progress, "Checking agent sign-in…").await;
         rpc(
             sink,
             stream,
@@ -124,6 +126,7 @@ impl Driver for AcpAdapter {
         } else {
             "session/new"
         };
+        crate::driver::startup_progress(progress, "Opening conversation and loading tools…").await;
         let session = rpc(sink, stream, 3, method, params).await?;
         let native = session["sessionId"]
             .as_str()

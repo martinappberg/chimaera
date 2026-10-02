@@ -757,6 +757,17 @@ streaming. Closing or hiding the view clears marks and pending search work.
 
 ---
 
+### Startup visibility
+
+While an agent starts, the chat shows its current phase instead of leaving every
+wait labelled as a connection problem. Claude reports running startup hooks;
+Codex reports loading configuration and opening a conversation; Antigravity and
+Grok report checking sign-in and opening the conversation/tools. These updates
+stay out of the transcript and disappear when the agent becomes ready or exits.
+You can write and queue a message while it starts. User-configured hooks and
+cloud-backed workspace files can delay readiness; Chimaera keeps those hooks
+intact rather than bypassing them.
+
 ## Intent — human-authored ground truth
 
 > Captured from the people who built these features via the **capture-feature-intent**

@@ -250,8 +250,9 @@ impl Driver for CodexDriver {
         sink: &'a mut JsonlSink,
         stream: &'a mut JsonlStream,
         spec: &'a SpawnSpec,
+        progress: &'a tokio::sync::mpsc::Sender<AgentEvent>,
     ) -> std::result::Result<Handshake<CodexMapper>, String> {
-        let hs = codex_handshake(sink, stream, spec).await?;
+        let hs = codex_handshake(sink, stream, spec, progress).await?;
         let mut initial = vec![DriverStep {
             events: vec![AgentEvent::EffortState {
                 effort: hs.effort.clone(),
@@ -349,6 +350,7 @@ async fn codex_handshake(
     sink: &mut JsonlSink,
     stream: &mut JsonlStream,
     spec: &SpawnSpec,
+    progress: &tokio::sync::mpsc::Sender<AgentEvent>,
 ) -> std::result::Result<CodexHandshake, String> {
     let mut side = HandshakeSideband::default();
     if sink.send(&initialize_request(0)).await.is_err() {
@@ -367,6 +369,7 @@ async fn codex_handshake(
     // selected model's catalog default, and learn whether the user chose a
     // reasoning-summary mode. The config read is optional for older
     // app-server builds; a Chimaera-carried resumed-thread selection wins.
+    crate::driver::startup_progress(progress, "Loading agent configuration…").await;
     let config_id = 1u64;
     let config = if sink
         .send(&json!({
@@ -396,6 +399,7 @@ async fn codex_handshake(
     let summary_configured = config.as_ref().is_some_and(summary_configured);
     let opening_effort = spec.initial_effort.clone().or(configured_effort);
 
+    crate::driver::startup_progress(progress, "Opening conversation…").await;
     let open_id = 2u64;
     let open = thread_open_request(spec, open_id, opening_effort.as_deref());
     if sink.send(&open).await.is_err() {
