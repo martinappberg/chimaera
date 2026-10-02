@@ -31,8 +31,171 @@ use tokio::process::{Child, Command};
 /// show one host's authentication prompt in another host's windows.
 pub const ASKPASS_ALIAS_ENV: &str = "CHIMAERA_ASKPASS_ALIAS";
 
+tokio::task_local! {
+    static EXISTING_MASTER_ONLY: MasterHandle;
+}
+
+/// Opaque identity of the actual expanded OpenSSH control socket. Alias names
+/// and configured hostname tuples cannot identify a routed/shared master.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MasterIdentity([u8; 32]);
+
+/// An exact captured mux leg, with no credential or authority to authenticate.
+/// Deliberately no Debug: control paths and routing metadata stay out of logs.
+#[derive(Clone)]
+pub struct MasterHandle {
+    host: String,
+    route: Route,
+    path: String,
+    identity: MasterIdentity,
+}
+impl MasterHandle {
+    pub fn identity(&self) -> MasterIdentity {
+        self.identity
+    }
+    pub async fn present(&self) -> anyhow::Result<bool> {
+        let mut command = self.command();
+        command.args(["-O", "check"]).arg(&self.host);
+        master_presence(command, 5).await
+    }
+    /// Owned teardown is pinned before spawning; a later route/config change
+    /// cannot redirect it, and caller cancellation does not abandon the leg.
+    pub async fn close(&self) -> anyhow::Result<()> {
+        let mut command = self.command();
+        command.args(["-O", "exit"]).arg(&self.host);
+        captured_master_close(command).await
+    }
+    fn command(&self) -> Command {
+        let mut command = mux_prologue(&self.host, &self.route);
+        // -S sets the exact socket after the ordinary %C option, without
+        // recomputing it from a changed hostname/jump/configuration.
+        command.arg("-S").arg(&self.path);
+        command
+    }
+    pub async fn with_existing<F: std::future::Future>(&self, future: F) -> F::Output {
+        EXISTING_MASTER_ONLY.scope(self.clone(), future).await
+    }
+}
+async fn captured_master_close(command: Command) -> anyhow::Result<()> {
+    tokio::spawn(master_exit(command, Duration::from_secs(5)))
+        .await
+        .map_err(|_| anyhow::anyhow!("SSH captured login cleanup unavailable"))?
+}
+
+/// Run SSH helpers using an already authenticated ControlMaster only. If its
+/// socket disappears, SSH must fail rather than dial, run a configured proxy,
+/// or ask for credentials. Ordinary explicit connections retain their defaults.
+///
+/// This scope follows the current async task, including nested helpers, and is
+/// restored on cancellation. Spawned tasks do not inherit it: an owned worker
+/// must establish the scope inside that task before constructing SSH commands.
+pub async fn with_existing_master<F: std::future::Future>(
+    host: &str,
+    future: F,
+) -> anyhow::Result<F::Output> {
+    let host = hosts::normalize_alias(host)?;
+    let handle = capture_master(&host, route_of(&host)).await?;
+    Ok(handle.with_existing(future).await)
+}
+
+fn existing_master_opts(host: &str, route: &Route) -> Vec<String> {
+    if let Ok(handle) = EXISTING_MASTER_ONLY.try_with(Clone::clone) {
+        // First values win in OpenSSH. BatchMode alone still allows a fresh
+        // public-key login and ProxyJump; the failed proxy prevents all fallback
+        // transport after the mux lookup, including its disappearance race.
+        let mut options: Vec<String> = [
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPersist=no",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ProxyCommand=false",
+            "-o",
+            "ProxyJump=none",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        options.extend([
+            "-o".into(),
+            format!(
+                "ControlPath={}",
+                if handle.host == host && handle.route == *route {
+                    &handle.path
+                } else {
+                    "none"
+                }
+            ),
+        ]);
+        options
+    } else {
+        vec![]
+    }
+}
+
+/// Capture the routed and alias legs while the caller owns its SSH effect gate.
+/// Resolution is a bounded local ssh -G, never a network/authentication attempt.
+pub async fn master_handles(host: &str) -> anyhow::Result<Vec<MasterHandle>> {
+    let host = hosts::normalize_alias(host)?;
+    let route = route_of(&host);
+    let first = capture_master(&host, route.clone()).await?;
+    let mut handles = vec![first];
+    if route != Route::Alias {
+        let alias = capture_master(&host, Route::Alias).await?;
+        if alias.identity != handles[0].identity {
+            handles.push(alias);
+        }
+    }
+    Ok(handles)
+}
+async fn capture_master(host: &str, route: Route) -> anyhow::Result<MasterHandle> {
+    // Do not inherit a surrounding existing-only scope: ProxyJump contributes
+    // to %C. Resolve the original socket before replacing fallback transport.
+    let mut command = transport_command("ssh");
+    command
+        .args(route_opts(host, &route))
+        .args(ssh_opts())
+        .args(["-T", "-G"])
+        .arg(host);
+    capture_master_command(host, route, command).await
+}
+async fn capture_master_command(
+    host: &str,
+    route: Route,
+    mut command: Command,
+) -> anyhow::Result<MasterHandle> {
+    let output = output_bounded(&mut command, 5, "SSH master identity")
+        .await
+        .map_err(|_| anyhow::anyhow!("SSH master identity unavailable"))?;
+    anyhow::ensure!(output.status.success(), "SSH master identity unavailable");
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| anyhow::anyhow!("SSH master identity invalid"))?;
+    let paths: Vec<_> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("controlpath "))
+        .take(2)
+        .collect();
+    anyhow::ensure!(
+        paths.len() == 1
+            && paths[0].starts_with('/')
+            && paths[0].len() <= 1024
+            && !paths[0].chars().any(char::is_control)
+            && !paths[0].contains('%'),
+        "SSH master identity invalid"
+    );
+    use sha2::Digest;
+    Ok(MasterHandle {
+        host: host.into(),
+        route,
+        path: paths[0].into(),
+        identity: MasterIdentity(sha2::Sha256::digest(paths[0].as_bytes()).into()),
+    })
+}
+
 /// The ssh ControlMaster socket path pattern for chimaera connections. `%C`
-/// is ssh's own hash of (localhost, remotehost, port, user): unique per
+/// is ssh's own hash of (localhost, remotehost, port, user, ProxyJump): unique per
 /// destination and short. The parent dir is created on demand (ssh will not
 /// create it for the socket).
 ///
@@ -341,6 +504,7 @@ fn ssh_base(host: &str) -> Command {
 fn ssh_base_via(host: &str, route: &Route) -> Command {
     let mut c = transport_command("ssh");
     c.env(ASKPASS_ALIAS_ENV, host);
+    c.args(existing_master_opts(host, route));
     c.args(route_opts(host, route));
     c.args(ssh_opts());
     c
@@ -376,6 +540,7 @@ pub fn interactive_ssh_argv(host: &str) -> Vec<String> {
 fn scp_cmd(host: &str) -> Command {
     let mut c = transport_command("scp");
     c.env(ASKPASS_ALIAS_ENV, host);
+    c.args(existing_master_opts(host, &route_of(host)));
     c.args(route_opts(host, &route_of(host)));
     c.args(ssh_opts());
     c
@@ -859,6 +1024,46 @@ pub async fn close_master(host: &str) -> anyhow::Result<()> {
     })
     .await
     .context("SSH login cleanup task did not finish")?
+}
+
+/// Bounded local mux evidence only; no network session, authentication or
+/// destructive wedge check. `false` requires the exact absent-socket receipt;
+/// an unknown/refused/stalled check is an error, never disappearance proof.
+pub async fn master_present(host: &str) -> anyhow::Result<bool> {
+    let host = hosts::normalize_alias(host)?;
+    capture_master(&host, route_of(&host))
+        .await?
+        .present()
+        .await
+}
+
+async fn master_presence(mut command: Command, seconds: u64) -> anyhow::Result<bool> {
+    command.env("LC_ALL", "C").env("LANG", "C");
+    let output = output_bounded(&mut command, seconds, "SSH master check")
+        .await
+        .map_err(|_| anyhow::anyhow!("SSH master check unavailable"))?;
+    if master_already_absent(&output) {
+        return Ok(false);
+    }
+    let running = output.status.success()
+        && output.stdout.is_empty()
+        && output.stderr.len() <= 128
+        && std::str::from_utf8(&output.stderr)
+            .ok()
+            .is_some_and(|stderr| {
+                let line = stderr.strip_suffix('\n').unwrap_or(stderr);
+                line.strip_suffix('\r')
+                    .unwrap_or(line)
+                    .strip_prefix("Master running (pid=")
+                    .and_then(|rest| rest.strip_suffix(')'))
+                    .is_some_and(|pid| {
+                        !pid.is_empty()
+                            && pid.bytes().all(|b| b.is_ascii_digit())
+                            && pid.parse::<u32>().ok().is_some_and(|pid| pid > 0)
+                    })
+            });
+    anyhow::ensure!(running, "SSH master check unverified");
+    Ok(true)
 }
 
 fn close_masters_owned<F, Fut>(
@@ -3100,9 +3305,13 @@ fn node_proxy_command(host: &str, route: &Route) -> String {
 fn node_ssh_base(host: &str, route: &Route) -> Command {
     let mut c = transport_command("ssh");
     c.env(ASKPASS_ALIAS_ENV, host);
+    // The node rung is a different endpoint, not another mux session on the
+    // login master. Never substitute that master for the intended node leg.
+    c.args(["-o", "ControlPath=none"]);
+    // This rung owns a fresh node connection rather than a mux. It must not
+    // turn a background existing-only scope into node authentication.
+    c.args(existing_master_opts(host, route));
     c.args([
-        "-o",
-        "ControlPath=none",
         "-o",
         "BatchMode=yes",
         "-o",
@@ -3349,6 +3558,321 @@ async fn tunnel_proven(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixture_master(path: &str) -> MasterHandle {
+        use sha2::Digest;
+        MasterHandle {
+            host: "fixture".into(),
+            route: Route::Alias,
+            path: path.into(),
+            identity: MasterIdentity(sha2::Sha256::digest(path.as_bytes()).into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_master_scope_is_nested_cancel_safe_and_task_local() {
+        let handle = fixture_master("/tmp/fixture-master");
+        assert!(existing_master_opts("fixture", &Route::Alias).is_empty());
+        let (protected, ordinary) = tokio::join!(
+            handle.with_existing(async {
+                assert!(!existing_master_opts("fixture", &Route::Alias).is_empty());
+                handle
+                    .with_existing(async {
+                        tokio::task::yield_now().await;
+                        assert!(!existing_master_opts("fixture", &Route::Alias).is_empty());
+                    })
+                    .await;
+                assert!(!existing_master_opts("fixture", &Route::Alias).is_empty());
+                // An owned task must opt in itself; parent scopes do not leak.
+                tokio::spawn(async { existing_master_opts("fixture", &Route::Alias).is_empty() })
+                    .await
+                    .unwrap()
+            }),
+            async {
+                tokio::task::yield_now().await;
+                existing_master_opts("fixture", &Route::Alias).is_empty()
+            }
+        );
+        assert!(protected && ordinary);
+        let timed = tokio::time::timeout(
+            Duration::from_millis(1),
+            handle.with_existing(async {
+                assert!(!existing_master_opts("fixture", &Route::Alias).is_empty());
+                std::future::pending::<()>().await;
+            }),
+        )
+        .await;
+        assert!(timed.is_err());
+        assert!(existing_master_opts("fixture", &Route::Alias).is_empty());
+    }
+
+    #[tokio::test]
+    async fn existing_master_restrictions_precede_route_and_shared_options() {
+        let handle = fixture_master("/tmp/fixture-master");
+        handle
+            .with_existing(async {
+                for command in [
+                    ssh_base_via("fixture", &Route::NodeViaAlias("node-fixture".into())),
+                    scp_cmd("fixture"),
+                    node_ssh_base("fixture", &Route::Alias),
+                ] {
+                    let args: Vec<_> = command
+                        .as_std()
+                        .get_args()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect();
+                    let first = |prefix: &str| {
+                        args.iter()
+                            .find(|arg| arg.starts_with(prefix))
+                            .cloned()
+                            .unwrap()
+                    };
+                    assert_eq!(first("ControlMaster="), "ControlMaster=no");
+                    assert_eq!(first("BatchMode="), "BatchMode=yes");
+                    assert_eq!(first("ProxyCommand="), "ProxyCommand=false");
+                    assert_eq!(first("ProxyJump="), "ProxyJump=none");
+                }
+            })
+            .await;
+        assert!(ssh_base("fixture")
+            .as_std()
+            .get_args()
+            .any(|arg| arg == "ControlMaster=auto"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn master_presence_requires_bounded_exact_receipts() {
+        for (script, expected) in [
+            ("printf 'Master running (pid=123)\\n' >&2", Some(true)),
+            ("printf 'Master running (pid=123)\\r\\n' >&2", Some(true)),
+            ("printf 'Control socket connect(/tmp/fixture): No such file or directory\\n' >&2; exit 255", Some(false)),
+            ("printf 'Master running (pid=0)\\n' >&2", None),
+            ("printf 'Master running (pid=4294967296)\\n' >&2", None),
+            ("printf 'Master running (pid=123)\\nnoise\\n' >&2", None),
+            ("printf 'fixture-secret'; printf 'Master running (pid=123)\\n' >&2", None),
+            ("printf 'fixture-secret refusal\\n' >&2; exit 255", None),
+            ("exit 0", None),
+        ] {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", script]);
+            let result = master_presence(command, 2).await;
+            assert_eq!(result.as_ref().ok().copied(), expected);
+            if let Err(error) = result { assert!(!error.to_string().contains("fixture-secret")); }
+        }
+        assert!(master_presence(Command::new("/fixture-missing-ssh"), 1)
+            .await
+            .is_err());
+        let mut stalled = Command::new("/bin/sh");
+        stalled.args(["-c", "exec sleep 10"]);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), master_presence(stalled, 1))
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_openssh_mux_disappearance_never_dials_proxies_or_askpass() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture = Fixture(PathBuf::from(format!(
+            "/tmp/chimaera-mux-{}",
+            &chimaera_core::generate_token()[..12]
+        )));
+        std::fs::create_dir(&fixture.0).unwrap();
+        let socket = fixture.0.join("control");
+        let config = fixture.0.join("config");
+        let proxy = fixture.0.join("proxy-ran");
+        let askpass = fixture.0.join("askpass");
+        let asked = fixture.0.join("askpass-ran");
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        std::fs::write(&config, format!("Host fixture\n HostName 127.0.0.1\n Port {}\n User fixture\n ControlPath {}\n ControlMaster auto\n BatchMode no\n ProxyCommand sh -c 'printf attempted > {}'\n",
+            tcp.local_addr().unwrap().port(), socket.display(), proxy.display())).unwrap();
+        std::fs::write(
+            &askpass,
+            format!("#!/bin/sh\nprintf attempted > {}\n", asked.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // Minimal OpenSSH mux v4 hello/alive exchange with the actual client;
+        // no SSH server, real user key, remote process or network account.
+        let mux = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            async fn read_packet(stream: &mut tokio::net::UnixStream) -> Vec<u8> {
+                let length = stream.read_u32().await.unwrap();
+                assert!(length <= 1024);
+                let mut bytes = vec![0; length as usize];
+                stream.read_exact(&mut bytes).await.unwrap();
+                bytes
+            }
+            let hello = read_packet(&mut stream).await;
+            assert_eq!(&hello[..8], &[0, 0, 0, 1, 0, 0, 0, 4]);
+            stream
+                .write_all(&[0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0, 4])
+                .await
+                .unwrap();
+            let alive = read_packet(&mut stream).await;
+            assert_eq!(&alive[..4], &[0x10, 0, 0, 4]);
+            let mut reply = vec![0, 0, 0, 12, 0x80, 0, 0, 5];
+            reply.extend_from_slice(&alive[4..8]);
+            reply.extend_from_slice(&123u32.to_be_bytes());
+            stream.write_all(&reply).await.unwrap();
+        });
+        let handle = fixture_master(socket.to_str().unwrap());
+        let mut check = Command::new("ssh");
+        check
+            .arg("-F")
+            .arg(&config)
+            .args(["-O", "check"])
+            .arg("fixture");
+        assert!(master_presence(check, 5).await.unwrap());
+        mux.await.unwrap();
+        std::fs::remove_file(&socket).unwrap();
+        handle
+            .with_existing(async {
+                for node in [false, true] {
+                    let mut command = if node {
+                        node_ssh_base("fixture", &Route::Alias)
+                    } else {
+                        ssh_base_via("fixture", &Route::Alias)
+                    };
+                    command
+                        .arg("-F")
+                        .arg(&config)
+                        .arg("-S")
+                        .arg(&socket)
+                        .arg("fixture")
+                        .arg("true")
+                        .env("SSH_ASKPASS", &askpass)
+                        .env("SSH_ASKPASS_REQUIRE", "force")
+                        .env("DISPLAY", "fixture");
+                    assert!(!output_bounded(&mut command, 5, "fixture SSH")
+                        .await
+                        .unwrap()
+                        .status
+                        .success());
+                }
+            })
+            .await;
+        assert!(!proxy.exists());
+        assert!(!asked.exists());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), tcp.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn captured_master_keeps_original_proxyjump_socket_and_close_leg() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture = Fixture(PathBuf::from(format!(
+            "/tmp/chimaera-captured-{}",
+            &chimaera_core::generate_token()[..8]
+        )));
+        std::fs::create_dir(&fixture.0).unwrap();
+        let config = fixture.0.join("config");
+        let pattern = fixture.0.join("%C");
+        std::fs::write(&config, format!("Host fixture\n HostName 127.0.0.1\n User fixture\n ProxyJump jump-one.invalid\n ControlPath {}\n", pattern.display())).unwrap();
+        let resolve = |guarded: bool| {
+            let mut command = Command::new("ssh");
+            if guarded {
+                command.args(["-o", "ProxyCommand=false", "-o", "ProxyJump=none"]);
+            }
+            command
+                .arg("-F")
+                .arg(&config)
+                .args(["-T", "-G"])
+                .arg("fixture");
+            command
+        };
+        let captured = capture_master_command("fixture", Route::Alias, resolve(false))
+            .await
+            .unwrap();
+        let altered = capture_master_command("fixture", Route::Alias, resolve(true))
+            .await
+            .unwrap();
+        assert!(captured.identity != altered.identity); // %C includes ProxyJump.
+        captured
+            .with_existing(async {
+                let command = ssh_base_via("fixture", &Route::Alias);
+                let control = command
+                    .as_std()
+                    .get_args()
+                    .find(|arg| arg.to_string_lossy().starts_with("ControlPath="))
+                    .unwrap();
+                assert_eq!(
+                    control.to_string_lossy(),
+                    format!("ControlPath={}", captured.path)
+                );
+                let wrong_route = ssh_base_via("fixture", &Route::Node("new-node.invalid".into()));
+                assert!(wrong_route
+                    .as_std()
+                    .get_args()
+                    .any(|arg| arg == "ControlPath=none"));
+            })
+            .await;
+        let listener = tokio::net::UnixListener::bind(&captured.path).unwrap();
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let (e, r) = (entered.clone(), release.clone());
+        let mux = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let length = stream.read_u32().await.unwrap();
+            assert!(length <= 1024);
+            let mut hello = vec![0; length as usize];
+            stream.read_exact(&mut hello).await.unwrap();
+            stream
+                .write_all(&[0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0, 4])
+                .await
+                .unwrap();
+            let length = stream.read_u32().await.unwrap();
+            assert!(length <= 1024);
+            let mut request = vec![0; length as usize];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request[..4], &[0x10, 0, 0, 5]); // exact terminate, not check/dial
+            e.notify_one();
+            r.acquire().await.unwrap().forget();
+            let mut reply = vec![0, 0, 0, 8, 0x80, 0, 0, 1];
+            reply.extend_from_slice(&request[4..8]);
+            stream.write_all(&reply).await.unwrap();
+        });
+        // Retargeting config no longer selects the socket used by this handle.
+        std::fs::write(&config, format!("Host fixture\n HostName changed.invalid\n User changed\n ProxyJump jump-two.invalid\n ControlPath {}\n", fixture.0.join("different").display())).unwrap();
+        let mut command = captured.command();
+        command
+            .arg("-F")
+            .arg(&config)
+            .args(["-O", "exit"])
+            .arg("fixture");
+        let caller = tokio::spawn(captured_master_close(command));
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        let _ = caller.await;
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(3), mux)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!fixture.0.join("different").exists());
+    }
 
     #[cfg(unix)]
     #[tokio::test]
