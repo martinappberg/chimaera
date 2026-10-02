@@ -141,17 +141,19 @@ generation/credential digest under the registration gate. No matching active
 operation, any changed authority or an account/worker outage refuses; no
 unregistered or cached-validation fallback exists.
 
-The keeper performs that fresh check through the account's fixed private
-`POST /internal/v1/personal/providers/publications/authorize` endpoint. The
-caller is authenticated by the current keeper service bearer, scoped to exactly
-one account. The closed JSON body is at most 12 KiB and has exactly three fields:
-`authorization` (the complete worker-private request above, itself at most
-8 KiB), `device_token` (the original device access bearer retained by the live
-operation), and `worker_token` (the currently registered worker service bearer).
-Both bearer values are 16–256 ASCII base64url bytes; neither may be a delegation,
-workspace grant or runtime capability. They remain in private live memory and
-are never returned, persisted in operation records, or included in diagnostics.
-Missing fields, extra fields and exceeded bounds refuse before authorization.
+Before starting official login or Disconnect, the original explicit command
+creates a private account admission through `POST
+/internal/v1/personal/providers/admissions`. The caller is authenticated by the
+current keeper service bearer, scoped to exactly one account. The closed JSON
+body is at most 12 KiB and has exactly four fields: `authorization` (the complete
+worker-private request above, itself at most 8 KiB), `device_token` (the full
+device access bearer that authenticated that explicit command), `worker_token`
+(the current registered worker service bearer), and `device_authority` (exactly
+32 random bytes encoded as 43 unpadded base64url ASCII bytes). Both service/device
+bearers are 16–256 ASCII base64url bytes. The keeper generates and retains the
+random authority before its first request so an exact retry after a lost reply
+can reuse it. Delegations, workspace grants and runtime capabilities refuse.
+No caller supplies an expiry or extends an existing admission.
 
 The account transaction locks the exact account first, then its keeper and
 worker cell rows in that order, before checking the device and service credential
@@ -164,14 +166,56 @@ lock ordering; no external call or provider effect occurs while these locks are
 held. A changed or expired credential, delegation, missing current cell, account
 mismatch or absent entitlement refuses. The account does not infer a process
 boot or registration from caller fields: the keeper must still match those
-fields to its retained operation and registration after this fresh call returns.
+fields to its retained operation and registration after each fresh call returns.
 
-Success is at most 12 KiB and exactly
+The account stores only the random authority's SHA-256 hash, the exact immutable
+operation tuple (with the pending operation nonce hashed), the original device
+and account epoch, current keeper/worker credential hashes and database-clock
+expiry. Admission lasts at most fifteen minutes from original creation. At most
+eight unexpired admissions per device and twenty-four per account are allowed;
+active records are never evicted. Expired nonsecret tombstones are retained for
+at least twenty-four hours, with at most 256 retained records per account;
+capacity refuses before another admission. Maintenance removes at most 1000
+expired retained rows per pass. The record is shared durably across account
+replicas/restarts; no process-memory cache grants publication authority.
+
+A successful admission reply is at most 12 KiB and exactly
+`{"version":1,"authorized":true,"authorization":<the complete exact request>,"expires_in":1..900}`.
+The remaining lifetime is rounded down from the original database expiry. The
+keeper's local deadline starts before its first admission request and uses the
+returned remaining lifetime, additionally capped by the original command's
+fifteen-minute absolute deadline; RPC time cannot extend login. Exact operation,
+authority and tuple retries reuse that same original expiry without extension.
+Changed identity/nonce/tuple or an expired record refuses; a retry or passive poll
+cannot mint replacement admission. An evicted expired record cannot authorize a
+publication; another explicit command requires a new operation and authority.
+An exact already-admitted retry observes the original record after fresh
+session/epoch/current-credential checks, even if routine rotation retired the
+original access bearer. A missing record still requires a current full device
+access bearer before creating admission.
+
+Successful canonical publication uses `POST
+/internal/v1/personal/providers/publications/authorize`, authenticated by the
+current keeper service bearer. Its closed body is at most 12 KiB and has exactly
+`authorization`, `worker_token` and `device_authority` with the bounds above.
+The account takes the same ordered locks and compares the entire original
+admission, current keeper/worker hashes, holder, unrevoked original device/session
+epoch, expiry and entitlement afresh. Ordinary device access-token rotation does
+not invalidate this original session admission; device revocation, account epoch
+change and keeper/worker replacement do. This exchange never creates, renews or
+restores admission. Success is at most 12 KiB and exactly
 `{"version":1,"authorized":true,"authorization":<the complete exact request>}`.
-The keeper requires every field and the full tuple to match, then rechecks its
-current registration and live operation before minting the private one-use
-publication nonce. It never forwards the account reply or either bearer to a
-browser or project. Legacy account validation replies without an explicit
+After original admission, the keeper's active-login validator uses this fresh
+session-authority check to bound its existing thirty-second pending-login lease;
+it does not keep testing a retired access bearer. That background validation
+starts no login, extends no database expiry, and does not mint a publication nonce
+without an actual canonical-publication request from the matching live operation.
+
+The keeper requires every response field and the full tuple to match, then
+rechecks its current registration and live operation before minting the private
+one-use publication nonce. Neither bearer nor the random authority is returned
+to a browser/project, persisted in keeper operation records or included in
+diagnostics. Legacy account validation replies without an explicit
 `delegated:false` cannot authorize personal control; ordinary legacy data-plane
 validation retains its existing compatibility behavior. Unsupported services,
 network/parser failures and account lock timeouts refuse without fallback.
