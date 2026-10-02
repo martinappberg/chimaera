@@ -5,6 +5,7 @@
  * construction — there is no separate "catch up" code to get wrong.
  */
 
+import { isRealModel } from "./modelPicker";
 import { isImagePath } from "../previews/files";
 import { artifactMentions, isArtifactPath, proseCovered, proseEmbedTargets } from "./artifacts";
 import { agentMessageFromEvent, isAgentOrigin, parseAgentText, type AgentMessage } from "./agentMessages";
@@ -774,7 +775,7 @@ export class ChatStore {
       // it cannot give us a hydration boundary, so preserve the old live fold.
       this.hydrating = false;
     }
-    if (session.model !== null) this.model = session.model;
+    if (isRealModel(session.model)) this.model = session.model;
     if (session.current_mode !== null) this.currentMode = session.current_mode;
     if (!session.alive && this.exited === null) {
       this.exited = { status: session.exit_status };
@@ -944,7 +945,7 @@ export class ChatStore {
         // Init is a complete catalog snapshot. Optional/empty serde fields are
         // omitted on the wire, so absence must CLEAR prior process state — a
         // resumed agent with no commands/models must not inherit stale rows.
-        this.model = typeof ev.model === "string" ? ev.model : null;
+        this.model = isRealModel(ev.model) ? ev.model : null;
         this.currentMode = typeof ev.current_mode === "string" ? ev.current_mode : null;
         // Offer flags are Init-scoped (absent = false on the wire). The bridge
         // rides Init as a SNAPSHOT: claude re-emits system/init mid-process
@@ -1539,8 +1540,9 @@ export class ChatStore {
         // The serving model changed under us (safety reroute, Fable credit
         // fallback): the chip follows the truth, and a retracting switch
         // withdraws the current turn's trailing prose before the retry.
-        this.model = ev.to as string;
-        this.pendingModel = null;
+        if (!isRealModel(ev.to)) break;
+        this.model = ev.to;
+        if (ev.reason == null || this.pendingModel === ev.to) this.pendingModel = null;
         if (ev.retract_current_turn === true) {
           this.dropTrailingProse();
           this.touchTranscript();

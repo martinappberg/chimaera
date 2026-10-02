@@ -110,6 +110,12 @@ fn data_dir_in(home: Option<&Path>) -> PathBuf {
     }
 }
 
+/// Managed executables belong to the user on this host, not to a cluster
+/// workspace. Keep explicit/dev homes isolated, but ignore CHIMAERA_DATA_DIR.
+pub fn managed_agents_dir() -> PathBuf {
+    data_dir_in(state_home().as_deref()).join("agents")
+}
+
 /// Per-user data directory (`~/.chimaera`, or `$CHIMAERA_HOME/data` when
 /// isolated), created on demand.
 pub fn data_dir() -> PathBuf {

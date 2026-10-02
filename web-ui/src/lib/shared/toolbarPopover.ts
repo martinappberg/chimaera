@@ -18,7 +18,7 @@ export const toolbarPopover: Action<HTMLElement, { onClose: () => void }> = (nod
     node.style.top = `${Math.max(8, Math.min(anchor.bottom + 4, window.innerHeight - rect.height - 8))}px`;
   };
   node.setAttribute("popover", "manual");
-  Object.assign(node.style, { position: "fixed", inset: "auto", margin: "0", maxWidth: "calc(100vw - 16px)", maxHeight: "calc(100vh - 16px)", overflowY: "auto" });
+  Object.assign(node.style, { position: "fixed", inset: "auto", margin: "0", maxWidth: "calc(100vw - 16px)", maxHeight: "min(var(--toolbar-menu-height, 100vh), calc(100vh - 16px))", overflowY: "auto" });
   const topLayer = typeof node.showPopover === "function";
   if (topLayer) node.showPopover();
   void tick().then(() => {
@@ -52,6 +52,15 @@ export const toolbarPopover: Action<HTMLElement, { onClose: () => void }> = (nod
     event.stopPropagation();
     choices[next].focus();
   };
+  const onPointerDown = (event: PointerEvent) => {
+    // WebKit focuses the containing pane when a menu button is clicked.
+    // Keep focus in the popup until click dispatch, or focusout dismisses the
+    // option before its command runs. Touch keeps its native scroll behavior.
+    if (event.button === 0 && event.pointerType === "mouse" &&
+        event.target instanceof Element && event.target.closest("button")) {
+      event.preventDefault();
+    }
+  };
   const onFocusOut = (event: FocusEvent) => {
     // Use the intended destination: activeElement can briefly be body between
     // blur and focus, which would dismiss a clicked option before its click.
@@ -60,6 +69,7 @@ export const toolbarPopover: Action<HTMLElement, { onClose: () => void }> = (nod
       current.onClose();
     }
   };
+  node.addEventListener("pointerdown", onPointerDown);
   node.addEventListener("keydown", onKey);
   node.addEventListener("focusout", onFocusOut);
   window.addEventListener("resize", place);
@@ -68,6 +78,7 @@ export const toolbarPopover: Action<HTMLElement, { onClose: () => void }> = (nod
     const restore = node.contains(document.activeElement) || document.activeElement === document.body;
     if (topLayer) node.hidePopover();
     if (restore && opener?.isConnected) opener.focus({ preventScroll: true });
+    node.removeEventListener("pointerdown", onPointerDown);
     node.removeEventListener("keydown", onKey);
     node.removeEventListener("focusout", onFocusOut);
     window.removeEventListener("resize", place);

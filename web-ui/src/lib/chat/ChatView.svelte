@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { modelChoice } from "./modelPicker";
   import { onDestroy, tick, untrack } from "svelte";
   import { displayName, forkSession, rewindSession, renameSession, type Session } from "../workspace/sessions";
   import { fsValidate } from "../previews/files";
@@ -904,22 +905,7 @@
    *  model is not yet known (store.model === null, before init/ready resolves)
    *  this is undefined so the header shows a neutral loading chip — NOT a
    *  concrete "default" that would flash the wrong name (slow on remote). */
-  const currentModel = $derived.by(() => {
-    const target = store.model;
-    if (target === null) return undefined;
-    const exact = store.models.find((m) => m.id === target || m.resolved === target);
-    if (exact !== undefined) return exact;
-    const norm = (s: string) => s.replace(/\[[^\]]*\]$/, "");
-    const targetN = norm(target);
-    const named = store.models.find(
-      (m) => m.id !== "default" && m.resolved !== null && norm(m.resolved) === targetN,
-    );
-    return (
-      named ??
-      store.models.find((m) => m.resolved !== null && norm(m.resolved) === targetN) ??
-      store.models.find((m) => norm(m.id) === targetN)
-    );
-  });
+  const currentModel = $derived(modelChoice(store.models, store.model));
   /** Reasoning-effort choices: per-model when the agent reports them;
    *  codex falls back to its known ladder, claude to none (no effort knob
    *  on that model — e.g. haiku). */

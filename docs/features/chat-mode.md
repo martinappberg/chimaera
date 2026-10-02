@@ -19,6 +19,22 @@ and the TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branc
 [rules/agent-protocol.md](../../.claude/rules/agent-protocol.md); working skill:
 [chat-mode](../../.claude/skills/chat-mode/SKILL.md).
 
+## Model selection after provider errors
+
+The model menu shows the agent's catalog descriptions beneath each name and marks one
+active choice using the same alias/resolved-id matching as the header. The menu scrolls
+within the window; pointer selection keeps popup focus through the click so WebKit
+does not dismiss the option before it runs. Claude's
+`<synthetic>` error-message model is never a real selection: quota errors retain the
+last known model, and the user can select another model. Observed serving-model changes
+are distinct from explicit selections, so they do not replace the user's next-chat
+preference. Old synthetic values are filtered from journal replay, saved preferences,
+and resume settings. An unrelated model observation does not clear a pending pick.
+
+Implementation: `claude.rs`, `journal.rs`, `chat.rs::resolve_start_settings`, and
+`web-ui/src/lib/chat/{modelPicker.ts,ChatHeader.svelte,store.svelte.ts}` and
+`web-ui/src/lib/shared/toolbarPopover.ts`.
+
 ## Agents and available controls
 
 Claude Code, Codex, Antigravity (Gemini models), and Grok Build share the transcript,

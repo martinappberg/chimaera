@@ -54,8 +54,9 @@ pub struct HostState {
     /// scheduler the last connect recorded in hosts.json (a hint until the
     /// next probe). Never for a host the user said isn't one.
     cluster: Option<ClusterWire>,
-    /// The user said this host isn't a cluster (its row offers to undo it).
+    /// Legacy field retained on the native wire; saved overrides migrate to login_serve.
     not_cluster: bool,
+    cluster_setup_complete: bool,
 }
 
 /// A cluster host as the page sees it (see `ClusterHostInfo` in native.ts).
@@ -189,6 +190,7 @@ pub(super) fn state_for(
         node: tunnel.and_then(|t| t.route.node().map(str::to_string)),
         cluster: None,
         not_cluster: entry.not_cluster,
+        cluster_setup_complete: entry.cluster_setup_complete,
     }
 }
 
@@ -622,6 +624,7 @@ async fn landed_on_cluster(
         added_at: 0,
         last_connected_at: None,
         login_serve: false,
+        cluster_setup_complete: false,
         not_cluster: false,
         scheduler: Some(found.scheduler),
     });
@@ -678,6 +681,7 @@ async fn host_entry(alias: &str) -> HostEntry {
             added_at: 0,
             last_connected_at: None,
             login_serve: false,
+            cluster_setup_complete: false,
             not_cluster: false,
             scheduler: None,
         })

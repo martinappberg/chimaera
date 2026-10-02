@@ -3116,7 +3116,10 @@ fn resolve_start_settings(
     prefs: &chimaera_agent::journal::AgentPrefs,
 ) -> chimaera_agent::journal::ConversationSettings {
     chimaera_agent::journal::ConversationSettings {
-        model: explicit_model.or(own.model).or(prefs.model.clone()),
+        model: [explicit_model, own.model, prefs.model.clone()]
+            .into_iter()
+            .flatten()
+            .find(|m| chimaera_agent::model::is_real_model(m)),
         effort: recovered_effort.or(own.effort).or(prefs.effort.clone()),
         mode: own.mode.or(prefs.mode.clone()),
     }
@@ -4740,6 +4743,25 @@ mod tests {
             mode: Some("plan".into()),
         };
         assert_eq!(resolve_start_settings(None, own.clone(), None, &prefs), own);
+        // Old restart recipes could contain a provider's error placeholder.
+        assert_eq!(
+            resolve_start_settings(Some("<synthetic>".into()), own.clone(), None, &prefs),
+            own
+        );
+        assert_eq!(
+            resolve_start_settings(
+                Some("<synthetic>".into()),
+                ConversationSettings {
+                    model: Some("<synthetic>".into()),
+                    ..Default::default()
+                },
+                None,
+                &prefs
+            )
+            .model
+            .as_deref(),
+            Some("opus")
+        );
         // Partial knowledge: only the missing setting falls back to the prefs.
         let partial = ConversationSettings {
             model: None,

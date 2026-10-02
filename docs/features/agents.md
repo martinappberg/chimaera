@@ -87,11 +87,15 @@ for the current session; see [chat mode](chat-mode.md) for provider behavior.
 - **Key behaviors.** Scripts are composed by the daemon (never the client), `set -euo pipefail`,
   HTTPS-only, no sudo, version charset-whitelisted, downloads in a `mktemp` dir. Layout
   `~/.chimaera/agents/<agent>/<version>/bin/` with an atomic per-agent symlink swap (running
-  sessions keep their exec'd inode — the update session says so up front). Codex installs as its
+  sessions keep their exec'd inode — the update session says so up front). Cluster workspace
+  daemons share this directory instead of installing into each workspace's `data/agents`;
+  `CHIMAERA_HOME` still isolates development installs. Existing workspace-local copies are
+  read fallbacks; updates install into the shared directory. A shared per-agent file lock
+  serializes installation, updates, and removal across workspace daemons. Codex installs as its
   whole release package rather than just the entrypoint — it spawns companions
   (`codex-code-mode-host`, bundled rg/zsh) from beside its own executable, and an entrypoint-only
   install shipped a codex whose code mode failed closed. One install/update per agent (409 while
-  running, either verb). Antigravity installs its complete Google chat package alongside the
+  running, either verb, including another workspace sharing the install). Antigravity installs its complete Google chat package alongside the
   terminal executable. Grok uses xAI’s standalone release. These two chat/runtime artifacts are
   fetched over HTTPS from the vendor; they do not publish separate checksums at these endpoints.
   Gemini CLI is retained for reading existing records, with no new managed install. Shims are written **only**

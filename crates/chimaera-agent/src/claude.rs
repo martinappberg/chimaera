@@ -2367,16 +2367,17 @@ impl ClaudeMapper {
             self.coalescer.reset_scope();
         }
         let message = &frame["message"];
-        // Every assistant message names the model that ACTUALLY served it —
-        // the chip follows any auto-switch (safety reroute, capacity
+        // Real assistant messages name the model that served them; local
+        // errors use <synthetic>. Observations are not user preferences.
+        // The model chip follows any auto-switch (safety reroute, capacity
         // fallback) the moment it happens, not at the next turn's init.
         if let Some(served) = message["model"].as_str() {
-            if !served.is_empty() && self.model.as_deref() != Some(served) {
+            if crate::model::is_real_model(served) && self.model.as_deref() != Some(served) {
                 let from = self.model.replace(served.to_string());
                 step.events.push(AgentEvent::ModelSwitched {
                     from,
                     to: served.to_string(),
-                    reason: None,
+                    reason: Some("reported".into()),
                     retract_current_turn: false,
                 });
             }
@@ -8515,6 +8516,38 @@ pub(crate) mod tests {
                 interrupted: true,
                 ..
             }
+        )));
+    }
+
+    #[test]
+    fn quota_error_preserves_model_and_observations_are_not_preferences() {
+        let mut m = mapper();
+        m.model = Some("fable".into());
+        let error = m.on_frame(&json!({"type": "assistant", "message": {
+            "id": "error-1", "model": "<synthetic>",
+            "content": [{"type": "text", "text": "Out of usage credits. Switch to another model."}]
+        }}));
+        assert_eq!(m.model.as_deref(), Some("fable"));
+        assert!(!error
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ModelSwitched { .. })));
+        let served = m.on_frame(&json!({"type": "assistant", "message": {
+            "id": "real-1", "model": "claude-sonnet-4-6", "content": []
+        }}));
+        assert!(served.events.iter().any(|e| matches!(e,
+            AgentEvent::ModelSwitched { to, reason: Some(reason), .. }
+            if to == "claude-sonnet-4-6" && reason == "reported"
+        )));
+        let request = m.on_command(AgentCommand::SetModel {
+            model_id: "opus[1m]".into(),
+        });
+        let id = request.outbound[0]["request_id"].as_str().unwrap();
+        let ack = m.on_frame(&json!({"type":"control_response", "response": {
+            "subtype":"success", "request_id":id, "response":{}
+        }}));
+        assert!(ack.events.iter().any(|e| matches!(e,
+            AgentEvent::ModelSwitched { to, reason: None, .. } if to == "opus[1m]"
         )));
     }
 

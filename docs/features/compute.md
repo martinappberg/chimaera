@@ -33,19 +33,22 @@ startup commands, the lease) in `crates/chimaera-server/src/{compute,lifecycle,e
   Every automatic path inherits this because they all connect through the same flight:
   launch-time window restore, a window's reconnect after sleep or a 401, a job window
   healing its connection. Saved windows onto an old login-node daemon are forgotten.
-- **The override.** "Run Chimaera on the login node" (the cluster page's ⋯ menu; per
-  host, `hosts.json` `login_serve`, off unless set; the CLI's `--login-node`) — for
-  clusters whose admins allow it. Turning it on shows one warning and needs a confirm;
-  the host row then connects to a login-node daemon like any remote, and the cluster
-  page (jobs) stays one click away. An older build that rewrites `hosts.json` drops the
-  field, which turns the override off.
-- **Not a cluster.** For a host that only looks like one (Slurm's tools on a
-  workstation's `PATH`): "This isn't a cluster…" in the cluster page's ⋯ menu, with a
-  confirm (`hosts.json` `not_cluster`; it replaces the override). The host then connects
-  like any remote, its row loses the cluster page, and a daemon started there runs with
-  `CHIMAERA_NOT_A_CLUSTER=1`, so its agents aren't told they're on a shared login node.
-  The row's "it's a cluster" undoes it (disconnects, then connects onto the cluster
-  page). `chimaera connect` honors it too.
+- **First setup and connection settings.** After the first cluster probe, Home shows
+  a setup dialog before opening the cluster page. **Run workspaces in scheduled jobs**
+  is on by default. Turning it off shows an informational notice: Chimaera and agents
+  run directly on the login host and can remain after disconnect, so the user must
+  follow that cluster's policy. The choice is reversible in the host row's **⋯** connection-settings action or the cluster page's **⋯ → Connection settings…**.
+  `hosts.json` keeps `login_serve` (the inverse of this switch) and
+  `cluster_setup_complete`; the CLI's `--login-node` remains supported.
+- **Detected facts stay separate.** Direct-host mode preserves the scheduler and
+  login-node guidance agents receive. Older `not_cluster` choices migrate to direct-host
+  mode; there is no separate “not a cluster” UI. Changing back to scheduled jobs does
+  not stop an existing login daemon: the dialog explains that, and the cluster page
+  offers to shut it down.
+- **Shared agents.** Managed executables use the user's shared Chimaera agent directory,
+  independent of each workspace's data directory. Personal installations still win;
+  an older workspace-only managed copy remains a fallback until a shared copy exists.
+  Developer homes stay isolated. See [agents](agents.md).
 - **The CLI.** `chimaera connect <cluster>` explains cluster mode and exits;
   `chimaera status <cluster>` says it is a cluster.
 
@@ -62,8 +65,7 @@ startup commands, the lease) in `crates/chimaera-server/src/{compute,lifecycle,e
   anywhere; one quiet count of the user's other Slurm jobs. Masthead: Home, Terminal (a
   terminal-only window, "<host> · login node", running `ssh <host>` over the app's
   ControlMaster — never listed as a workspace, never restored, its session ends when the
-  window closes), ⋯ (startup commands, rules for agents, refresh partitions, the
-  override, not a cluster) and **Start a job**. The app's own binary install on the
+  window closes), ⋯ (startup commands, rules for agents, refresh partitions, connection settings) and **Start a job**. The app's own binary install on the
   cluster shows on the Home row while it runs and ends with a `done` progress event.
 - **Workspaces.** Added with a folder picker (`chimaera browse --dir`: folders only, git
   and already-added marks) — the only browsing outside a workspace window. It types like

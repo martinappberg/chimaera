@@ -27,8 +27,6 @@
     clusterOpen,
     clusterOpenTerminal,
     clusterRemoveWorkspace,
-    clusterSetLoginServe,
-    setNotCluster,
     clusterStopJob,
     clusterStopLoginDaemon,
     onClusterChanged,
@@ -72,13 +70,10 @@
      *  goes back to it here instead of opening another window). */
     here?: string | null;
     onHere?: () => void;
-    /** The shell returned a new state for this host (the override toggle). */
-    onHostState: (state: HostState) => void;
     /** Something changed the host list (a login daemon was shut down). */
     onHostsChanged: () => void;
-    /** The user said this host isn't a cluster (its new state); the ⋯ menu
-     *  offers it only when given. */
-    onNotCluster?: (state: HostState) => void;
+    /** Connection placement and recovery, available from the local Home hub. */
+    onConnectionSettings?: () => void;
   }
 
   let {
@@ -88,9 +83,8 @@
     backLabel = "Home",
     here = null,
     onHere,
-    onHostState,
     onHostsChanged,
-    onNotCluster,
+    onConnectionSettings,
   }: Props = $props();
 
   const entry = $derived(clusterOverviews.entry(alias));
@@ -158,10 +152,6 @@
   let confirmClose = $state<ClusterWorkspaceView | null>(null);
   let confirmRemove = $state<ClusterWorkspaceView | null>(null);
   let confirmRemoveError = $state<string | null>(null);
-  let confirmLoginServe = $state(false);
-  let confirmNotCluster = $state(false);
-  let notClusterError = $state<string | null>(null);
-  let loginServeError = $state<string | null>(null);
 
   let mastError = $state<string | null>(null);
   let mastNote = $state<string | null>(null);
@@ -409,28 +399,6 @@
     }
   }
 
-  async function setLoginServe(on: boolean): Promise<void> {
-    loginServeError = null;
-    try {
-      onHostState(await clusterSetLoginServe(alias, on));
-      confirmLoginServe = false;
-    } catch (e) {
-      if (on) loginServeError = errText(e);
-      else mastError = errText(e);
-    }
-  }
-
-  async function markNotCluster(): Promise<void> {
-    notClusterError = null;
-    try {
-      const state = await setNotCluster(alias, true);
-      confirmNotCluster = false;
-      onNotCluster?.(state);
-    } catch (e) {
-      notClusterError = errText(e);
-    }
-  }
-
   async function shutDownLoginDaemon(): Promise<void> {
     daemonBusy = true;
     daemonError = null;
@@ -463,27 +431,9 @@
         onSelect: () => (setting = { mode: "rules" }),
       },
       { label: "Refresh partitions", onSelect: () => void refreshPartitions() },
-      "separator",
-      {
-        label: "Run Chimaera on the login node",
-        checked: loginServe,
-        onSelect: () => {
-          if (loginServe) void setLoginServe(false);
-          else {
-            loginServeError = null;
-            confirmLoginServe = true;
-          }
-        },
-      },
     ];
-    if (onNotCluster !== undefined) {
-      items.push({
-        label: "This isn't a cluster…",
-        onSelect: () => {
-          notClusterError = null;
-          confirmNotCluster = true;
-        },
-      });
+    if (onConnectionSettings !== undefined) {
+      items.push("separator", { label: "Connection settings…", onSelect: onConnectionSettings });
     }
     contextMenu.openAtPoint(r.right, r.bottom + 4, items, { alignRight: true });
   }
@@ -921,29 +871,6 @@
     error={confirmRemoveError}
     onConfirm={() => void removeNow()}
     onCancel={() => (confirmRemove = null)}
-  />
-{/if}
-
-{#if confirmNotCluster}
-  <ConfirmDialog
-    title={`Treat ${alias} as a regular server?`}
-    body={`Its login shell reaches Slurm, so it looked like a cluster. As a regular server, Chimaera runs on ${alias} itself, like on any remote, and this page goes away. If it is a cluster's login node, leave it as it is: many clusters don't allow that. You can switch back from its row on Home.`}
-    confirmLabel="Treat as a server"
-    error={notClusterError}
-    onConfirm={() => void markNotCluster()}
-    onCancel={() => (confirmNotCluster = false)}
-  />
-{/if}
-
-{#if confirmLoginServe}
-  <ConfirmDialog
-    title="Run Chimaera on the login node?"
-    body="Chimaera and its agents would keep running on a shared login node after you disconnect. Many clusters don't allow that. Turn this on only if your cluster's admins say it's fine."
-    confirmLabel="Turn on anyway"
-    danger
-    error={loginServeError}
-    onConfirm={() => void setLoginServe(true)}
-    onCancel={() => (confirmLoginServe = false)}
   />
 {/if}
 

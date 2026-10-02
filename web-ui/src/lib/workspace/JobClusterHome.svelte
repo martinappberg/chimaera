@@ -44,9 +44,6 @@
     backLabel={hereName}
     {here}
     onHere={onClose}
-    onHostState={(state) => {
-      hosts = hosts.map((h) => (h.alias === state.alias ? state : h));
-    }}
     onHostsChanged={refreshHosts}
   />
 </div>

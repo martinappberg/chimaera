@@ -2862,3 +2862,11 @@ reports config/thread opening, and ACP reports authentication/session opening.
 These are status telemetry, not transcript messages or proof of readiness. Init,
 fatal Error and Exited clear them in the client. Progress never makes an unused
 failed launch non-disposable; cancellation still interrupts the handshake.
+
+### Error-message model markers and selection provenance (2026-10-02)
+
+The reported quota failure rendered an assistant message's `model: "<synthetic>"`
+into the model picker. Such placeholders must not produce `ModelSwitched` or enter
+resume/pref state. Real assistant-message model observations use `reason: "reported"`;
+only the successful `set_model` acknowledgement uses `reason: null` to persist a user
+preference. The catalog's `value` remains the exact argument sent to `set_model`.

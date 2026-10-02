@@ -591,7 +591,7 @@ impl JournalIndex {
             let bounded = |value: Option<String>| {
                 value.filter(|v| !v.is_empty() && v.len() <= crate::model::COMMAND_SELECTOR_MAX)
             };
-            entry.model = bounded(settings.model);
+            entry.model = bounded(settings.model).filter(|m| crate::model::is_real_model(m));
             entry.effort = bounded(settings.effort);
             entry.mode = bounded(settings.mode);
         });
@@ -606,7 +606,7 @@ impl JournalIndex {
             .rev()
             .find(|e| e.native_id == native_id)
             .map(|e| ConversationSettings {
-                model: e.model.clone(),
+                model: e.model.clone().filter(|m| crate::model::is_real_model(m)),
                 effort: e.effort.clone(),
                 mode: e.mode.clone(),
             })
@@ -707,18 +707,23 @@ impl AgentPrefsStore {
     }
 
     pub fn get(&self, agent: &str) -> AgentPrefs {
-        self.prefs
+        let mut prefs = self
+            .prefs
             .lock()
             .expect("prefs lock")
             .get(agent)
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        prefs.model = prefs.model.filter(|m| crate::model::is_real_model(m));
+        prefs
     }
 
     /// Remember a user-chosen model (the picker value the agent accepts).
     /// Blocking fs — call from a blocking worker.
     pub fn record_model(&self, agent: &str, model: &str) {
-        self.update(agent, |p| p.model = Some(model.to_string()));
+        if crate::model::is_real_model(model) {
+            self.update(agent, |p| p.model = Some(model.to_string()));
+        }
     }
 
     /// Remember the effort the user picked for the agent kind. Blocking fs.
@@ -1166,6 +1171,29 @@ mod tests {
         let before = fs::read(dir.path().join("s-seed.jsonl")).unwrap();
         assert!(seed_journal(dir.path(), "s-seed", &seeded).is_err());
         assert_eq!(fs::read(dir.path().join("s-seed.jsonl")).unwrap(), before);
+    }
+
+    #[test]
+    fn old_synthetic_models_are_not_reused_for_resume_or_new_chats() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("index.json"),
+            r#"[{"native_id":"old","session_id":"s-1","ts":1,"model":"<synthetic>"}]"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("prefs.json"),
+            r#"{"claude":{"model":"<synthetic>","ts":1}}"#,
+        )
+        .unwrap();
+        let index = JournalIndex::load(dir.path());
+        assert_eq!(index.lookup("old").as_deref(), Some("s-1"));
+        assert_eq!(index.settings("old").model, None);
+        let prefs = AgentPrefsStore::load(dir.path());
+        assert_eq!(prefs.get("claude").model, None);
+        prefs.record_model("claude", "sonnet");
+        prefs.record_model("claude", "<synthetic>");
+        assert_eq!(prefs.get("claude").model.as_deref(), Some("sonnet"));
     }
 
     #[test]

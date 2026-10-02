@@ -542,6 +542,7 @@ async fn install_endpoint_contract_and_session_mechanics() {
         "install",
         "echo stub-install-output; sleep 30".to_string(),
     )
+    .await
     .expect("stub install spawned");
     let entry = session_entry(&state, &sid).await;
     assert_eq!(entry["kind"], "shell");
@@ -571,6 +572,7 @@ async fn install_endpoint_contract_and_session_mechanics() {
         "install",
         "echo second".to_string(),
     )
+    .await
     .expect_err("second install must conflict");
     assert_eq!(err.status(), StatusCode::CONFLICT);
     let other = runtimes::start_install(
@@ -580,6 +582,7 @@ async fn install_endpoint_contract_and_session_mechanics() {
         "install",
         "echo other; sleep 30".to_string(),
     )
+    .await
     .expect("other agent installs in parallel");
 
     // Kill the codex install; the watcher re-detects and clears the
@@ -600,6 +603,7 @@ async fn install_endpoint_contract_and_session_mechanics() {
         "install",
         "echo again; sleep 30".to_string(),
     )
+    .await
     .expect("slot free after the session ended");
     state.sessions.kill(&again).ok();
     state.sessions.kill(&other).ok();
@@ -618,6 +622,7 @@ async fn installer_result_survives_the_terminal_disappearing() {
             "install",
             format!("sleep 0.1; exit {code}"),
         )
+        .await
         .unwrap();
         let status = runtimes::installation_status(&state, agents::AgentKind::Grok).unwrap();
         assert_eq!(status["session_id"], sid);
@@ -736,6 +741,7 @@ async fn update_endpoint_is_managed_only_and_shares_the_install_slot() {
         "update",
         "echo stub-update; sleep 30".to_string(),
     )
+    .await
     .expect("stub update spawned");
     let entry = session_entry(&state, &sid).await;
     assert_eq!(entry["kind"], "shell");
@@ -782,6 +788,7 @@ async fn install_reservation_blocks_the_spawn_registration_race() {
         "install",
         "echo racer".to_string(),
     )
+    .await
     .expect_err("a fresh reservation must read as busy");
     assert_eq!(err.status(), StatusCode::CONFLICT);
 
@@ -801,6 +808,7 @@ async fn install_reservation_blocks_the_spawn_registration_race() {
         "install",
         "echo reclaimed; sleep 30".to_string(),
     )
+    .await
     .expect("a stale reservation is reclaimable");
     assert_eq!(
         lock(&state.installs)

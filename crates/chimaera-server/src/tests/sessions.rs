@@ -254,6 +254,7 @@ async fn session_env_reaches_spawned_session() {
         "install",
         "/usr/bin/env; sleep 30".to_string(),
     )
+    .await
     .expect("stub env session spawned");
     let needles = [
         format!("CHIMAERA_SESSION={sid}"),
