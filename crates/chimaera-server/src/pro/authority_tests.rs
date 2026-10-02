@@ -517,3 +517,55 @@ async fn rejected_or_stale_renewal_does_not_count_as_a_refresh() {
         "synthetic-rotated"
     );
 }
+
+#[tokio::test]
+async fn supervised_revision_comparison_preserves_every_other_latched_identity() {
+    let fixture = Fixture::new();
+    fixture.bind().await;
+    let state = Arc::new(AppState::new(
+        "fixture-token".into(),
+        "fixture".into(),
+        4242,
+        0,
+        fixture.root.clone(),
+        fixture.root.join("config"),
+    ));
+    state.stopping.store(true, Ordering::Release);
+    let Authority::Bound(previous) = Authority::load(&state.pro.root) else {
+        panic!("saved authority missing");
+    };
+    let mut incoming = previous.clone();
+    incoming.workspace.revision += 1;
+    let receipt = serde_json::from_value(json!({"version":1,"workspace_id":"w-a","account_id":"account-a",
+        "root_identity":{"device":previous.identity.0,"inode":previous.identity.1},"registration_revision":8,
+        "launch_generation":1,"previous_generation":0,"os_boot_id":crate::pro::execution::supervisor::fixture_boot(&state).unwrap()})).unwrap();
+    crate::pro::execution::supervisor::stage(&state, Some(receipt));
+    revision_advance(&state, &previous, &incoming).unwrap();
+    for mismatch in 0..7 {
+        let mut changed = incoming.clone();
+        match mismatch {
+            0 => changed.account_id = "other".into(),
+            1 => changed.endpoint = "http://127.0.0.1:10".into(),
+            2 => changed.workspace.workspace_id = "w-other".into(),
+            3 => changed.root = fixture.root.join("other"),
+            4 => changed.identity.0 += 1,
+            5 => changed.identity.1 += 1,
+            6 => changed.workspace.revision = 7,
+            _ => unreachable!(),
+        }
+        assert!(
+            revision_advance(&state, &previous, &changed).is_err(),
+            "mismatch {mismatch}"
+        );
+    }
+    assert!(crate::pro::execution::supervisor::pending(&state));
+    assert!(crate::pro::execution::supervisor::ack(&state).is_none());
+    assert_eq!(
+        lock(&state.pro.authority)
+            .acknowledgment()
+            .unwrap()
+            .workspace
+            .revision,
+        7
+    );
+}

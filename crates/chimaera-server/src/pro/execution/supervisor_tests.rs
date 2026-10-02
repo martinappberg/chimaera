@@ -51,6 +51,31 @@ impl Fixture {
         let meta = std::fs::metadata(&self.project).unwrap();
         decode(&serde_json::to_vec(&json!({"version":1,"workspace_id":"w-a","account_id":"a-fixture","root_identity":{"device":meta.dev(),"inode":meta.ino()},"registration_revision":7,"launch_generation":generation,"previous_generation":previous,"os_boot_id":state.pro.execution.boot.clone().unwrap()})).unwrap()).unwrap()
     }
+    async fn previously_bound(&self) -> Arc<AppState> {
+        let state = self.state();
+        crate::pro::ensure_root(&state.pro.root).await.unwrap();
+        let config: Configure = serde_json::from_value(self.config()).unwrap();
+        let accepted = crate::pro::authority::prepare(&state, &config, self.project.clone())
+            .await
+            .unwrap();
+        crate::pro::authority::save(&state, &accepted)
+            .await
+            .unwrap();
+        lock(&state.pro.preferences)
+            .entry("w-a".into())
+            .or_default()
+            .supervisor_generation = Some(1);
+        crate::pro::persist(&state).await.unwrap();
+        drop(state);
+        self.state()
+    }
+    fn advance(&self, state: &AppState) -> (Value, CleanupReceipt) {
+        let mut config = self.config();
+        config["delegation"]["workspace"]["revision"] = json!(8);
+        let mut receipt = self.receipt(state, 2, 1);
+        receipt.registration_revision = 8;
+        (config, receipt)
+    }
     async fn dirty(&self) -> Arc<AppState> {
         let state = self.state();
         crate::pro::install_execution_fixture(&state, "w-a", 2).unwrap();
@@ -374,4 +399,196 @@ async fn unreadable_state_cannot_be_repaired_by_process_cleanup() {
     );
     assert!(pending(&state) && ack(&state).is_none());
     assert!(!crate::pro::may_execute(&state, "w-a"));
+}
+
+#[tokio::test]
+async fn fresh_supervised_restart_advances_only_revision_and_persists_before_ack() {
+    let fixture = Fixture::new();
+    let state = fixture.previously_bound().await;
+    let (config, receipt) = fixture.advance(&state);
+    stage(&state, Some(receipt));
+    let (status, value) = request(&state, "/api/v1/pro/configure/execution", Some(config)).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["workspace_configuration"]["workspace"]["revision"], 8);
+    assert_eq!(ack(&state).unwrap().registration_revision, 8);
+    assert_eq!(ack(&state).unwrap().launch_generation, 2);
+    assert!(!crate::pro::may_execute(&state, "w-a"));
+    let authority: Value = serde_json::from_slice(
+        &std::fs::read(state.pro.root.join("workspace-authority.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(authority["workspace"]["revision"], 8);
+    assert_eq!(authority["account_id"], "a-fixture");
+    drop(state);
+    let restored = fixture.state();
+    assert_eq!(
+        lock(&restored.pro.authority)
+            .acknowledgment()
+            .unwrap()
+            .workspace
+            .revision,
+        8
+    );
+    assert_eq!(
+        lock(&restored.pro.preferences)["w-a"].supervisor_generation,
+        Some(2)
+    );
+}
+
+#[tokio::test]
+async fn revision_advance_rejects_missing_replayed_wrong_or_ordinary_configuration_receipts() {
+    let fixture = Fixture::new();
+    let state = fixture.previously_bound().await;
+    let (config, receipt) = fixture.advance(&state);
+    assert_eq!(
+        request(
+            &state,
+            "/api/v1/pro/configure/execution",
+            Some(config.clone())
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    for mismatch in 0..7 {
+        let mut wrong = receipt.clone();
+        match mismatch {
+            0 => wrong.registration_revision = 7,
+            1 => wrong.launch_generation = 1,
+            2 => wrong.previous_generation = 0,
+            3 => wrong.account_id = "a-other".into(),
+            4 => wrong.root_identity.inode += 1,
+            5 => wrong.workspace_id = "w-other".into(),
+            6 => wrong.os_boot_id = "00000000-0000-0000-0000-000000000000".into(),
+            _ => unreachable!(),
+        }
+        stage(&state, Some(wrong));
+        assert_eq!(
+            request(
+                &state,
+                "/api/v1/pro/configure/execution",
+                Some(config.clone())
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST,
+            "mismatch {mismatch}"
+        );
+        assert!(pending(&state));
+        assert!(ack(&state).is_none());
+        assert_eq!(
+            lock(&state.pro.authority)
+                .acknowledgment()
+                .unwrap()
+                .workspace
+                .revision,
+            7
+        );
+        assert_eq!(
+            lock(&state.pro.preferences)["w-a"].supervisor_generation,
+            Some(1)
+        );
+    }
+    stage(&state, Some(receipt));
+    let mut legacy = config.clone();
+    legacy.as_object_mut().unwrap().remove("execution");
+    assert_eq!(
+        request(&state, "/api/v1/pro/configure/workspace", Some(legacy))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(pending(&state));
+    for revision in [6, 7] {
+        let mut body = config.clone();
+        body["delegation"]["workspace"]["revision"] = json!(revision);
+        assert_eq!(
+            request(&state, "/api/v1/pro/configure/execution", Some(body))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+}
+
+#[tokio::test]
+async fn revision_advance_rejects_changed_identity_and_replaced_root_before_persistence() {
+    let fixture = Fixture::new();
+    let state = fixture.previously_bound().await;
+    let (config, receipt) = fixture.advance(&state);
+    stage(&state, Some(receipt.clone()));
+    for mismatch in 0..4 {
+        let mut body = config.clone();
+        match mismatch {
+            0 => body["account_id"] = json!("a-other"),
+            1 => body["delegation"]["workspace"]["workspace_id"] = json!("w-other"),
+            2 => body["endpoint"] = json!("http://127.0.0.1:10"),
+            3 => body["workspace_root"] = json!(fixture.root.join("outside")),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            request(&state, "/api/v1/pro/configure/execution", Some(body))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(pending(&state));
+    }
+    assert!(!fixture.root.join("outside").exists());
+    std::fs::rename(&fixture.project, fixture.root.join("previous-project")).unwrap();
+    std::fs::create_dir(&fixture.project).unwrap();
+    let mut replacement = receipt;
+    let metadata = std::fs::metadata(&fixture.project).unwrap();
+    replacement.root_identity.device = metadata.dev();
+    replacement.root_identity.inode = metadata.ino();
+    stage(&state, Some(replacement));
+    assert_eq!(
+        request(&state, "/api/v1/pro/configure/execution", Some(config))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        lock(&state.pro.preferences)["w-a"].supervisor_generation,
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn revision_advance_rejects_live_unmapped_pty_and_rechecks_before_apply() {
+    let fixture = Fixture::new();
+    let state = fixture.previously_bound().await;
+    let (config, receipt) = fixture.advance(&state);
+    stage(&state, Some(receipt));
+    let config: Configure = serde_json::from_value(config).unwrap();
+    let accepted = crate::pro::authority::prepare(&state, &config, fixture.project.clone())
+        .await
+        .unwrap();
+    let session = state
+        .sessions
+        .spawn(chimaera_pty::SpawnOpts {
+            cwd: fixture.project.clone(),
+            name: Some("fixture live process".into()),
+            cols: 80,
+            rows: 24,
+            command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()]),
+            id: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            scrollback: None,
+        })
+        .unwrap();
+    assert!(
+        crate::pro::authority::prepare(&state, &config, fixture.project.clone())
+            .await
+            .is_err()
+    );
+    assert!(apply(&state, Some(&accepted)).await.is_err());
+    assert!(pending(&state));
+    assert!(ack(&state).is_none());
+    assert_eq!(
+        lock(&state.pro.preferences)["w-a"].supervisor_generation,
+        Some(1)
+    );
+    state.sessions.kill(&session.id).unwrap();
 }

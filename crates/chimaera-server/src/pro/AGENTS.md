@@ -7,7 +7,7 @@ revocable delegation over the authenticated local API.
 | File | Responsibility |
 | --- | --- |
 | `mod.rs` | Bounded, credential-free persistent state, ownership/import fences and deferred-command policy. |
-| `authority.rs` / `authority_tests.rs` | Immutable workspace-bound worker acceptance, credential-free persisted latch, renewal/route/root guards and synthetic side-effect regressions. |
+| `authority.rs` / `authority_tests.rs` | Fixed-identity workspace-bound worker acceptance, startup-only validated revision advancement, credential-free persisted latch, renewal/route/root guards and synthetic side-effect regressions. |
 | `routes.rs` | Authenticated configure/status/privacy/profile/power/hydration HTTP handlers. Profile GET returns an account-generation-bound ETag; PUT optionally checks one exact If-Match under the same preference lock as replacement (412 on change). Older unconditional PUT remains supported. Accepted writes retain configuration/job reservations through durable persistence even if the caller disconnects. `profile_tests.rs` covers stale confirmation, generation changes and disk failure. `/pro/status` rows carry additive `parked`, `working_agents` and `cloud_handoff` (see the quit handover below). |
 | `projects.rs` / `projects/catalog.rs` | Passive published-account discovery (negotiated `/v2/projects`, at most 128 rows/pages; legacy capability absence or 404 falls back to passive worker discovery), explicit copy/takeover routes, native-picked folder validation and inode/account-bound retry. Catalog rows infer no host or execution authority; errors retain cached rows and destination bindings. Legacy `/open` refuses rather than transferring execution. |
 | `project_copy.rs` / `project_copy/tests.rs` | Immutable read-only checkpoint copies with the existing file/Git transaction, independent durable copy enrollment, exact pending baselines, counted admission and explicit post-commit role promotion. Copy selects its receipt through passive `/v2/baton` GET; the legacy v1 response has no checkpoint and is never a fallback. Missing negotiated receipt refuses enrollment/install. No agent/session/configuration restore or copied-edit publication. |
@@ -524,6 +524,14 @@ no keeper URL and exactly baton/mirror scopes. Its versioned nonsecret ack and
 status field must match the supervisor's registered root before enabling work.
 Legacy configure never accepts such a binding. The accepted origin/account/root
 and directory identity survive disconnect/restart; invalid records fail closed.
+Only negotiated `POST /api/v1/pro/configure/execution` with a fresh inherited
+supervisor receipt may advance the registration revision, strictly upward, for
+that same account/project/origin/root and captured inode.
+Preparation and durable application share the exact startup, boot, launch-generation
+and quiescence checks; application checks again before consuming the receipt.
+A configured runtime, live chat/PTY, outstanding mutation or wrong/replayed receipt
+refuses advancement. Ordinary Configure and delegation renewal gain no revision
+replacement authority. Cleanup still grants neither a lease nor execution.
 Pro operations reject foreign workspace IDs before filesystem/network work and
 hydrate only into the accepted root. Renew cannot drop/change the binding or
 holder or add keeper scope. This does not replace service-side authorization,

@@ -140,16 +140,25 @@ pub(crate) fn ack(state: &AppState) -> Option<CleanupAck> {
 pub(super) fn supervised(state: &AppState) -> bool {
     lock(&state.pro.execution.supervisor_ack).is_some()
 }
-pub(in crate::pro) async fn apply(
+/// Shared startup admission. It has no effects and does not consume the pipe
+/// receipt; both authority preparation and durable application use it.
+pub(in crate::pro) fn validate(
     state: &AppState,
-    accepted: Option<&crate::pro::authority::Accepted>,
+    accepted: &crate::pro::authority::Accepted,
 ) -> Result<()> {
-    let Some(receipt) = lock(&state.pro.execution.supervisor_pending).clone() else {
-        return Ok(());
-    };
-    let accepted = accepted.context("supervisor cleanup requires workspace-bound configuration")?;
+    let receipt = lock(&state.pro.execution.supervisor_pending)
+        .clone()
+        .context("supervisor cleanup receipt required")?;
+    validate_receipt(state, accepted, &receipt)
+}
+fn validate_receipt(
+    state: &AppState,
+    accepted: &crate::pro::authority::Accepted,
+    receipt: &CleanupReceipt,
+) -> Result<()> {
     ensure!(
         !state.pro.configured.load(Ordering::Acquire)
+            && lock(&state.pro.runtime).is_none()
             && lock(&state.pro.execution.proofs).is_empty(),
         "supervisor cleanup is startup-only"
     );
@@ -170,20 +179,37 @@ pub(in crate::pro) async fn apply(
         !state.pro.execution.supervisor_state_invalid,
         "managed state requires recovery"
     );
-    let ids = lock(&state.session_workspaces)
-        .iter()
-        .filter(|(_, w)| *w == &receipt.workspace_id)
-        .map(|(s, _)| s.clone())
-        .collect::<Vec<_>>();
     ensure!(
         mutation::idle(state, &receipt.workspace_id)
             && !setup::active(state, &receipt.workspace_id)
-            && ids
-                .iter()
-                .all(|id| !state.chat.get(id).is_some_and(|v| v.alive)
-                    && !state.sessions.get(id).is_some_and(|v| v.alive)),
+            && !state.chat.list().iter().any(|session| session.alive)
+            && !state.sessions.list().iter().any(|session| session.alive),
         "supervisor cleanup cannot replace live local work"
     );
+    let preferences = lock(&state.pro.preferences);
+    ensure!(
+        preferences.len() < 128 || preferences.contains_key(&receipt.workspace_id),
+        "supervisor workspace limit"
+    );
+    let last = preferences
+        .get(&receipt.workspace_id)
+        .and_then(|entry| entry.supervisor_generation)
+        .unwrap_or(0);
+    ensure!(
+        receipt.launch_generation > last && receipt.previous_generation >= last,
+        "supervisor cleanup generation replay"
+    );
+    Ok(())
+}
+pub(in crate::pro) async fn apply(
+    state: &AppState,
+    accepted: Option<&crate::pro::authority::Accepted>,
+) -> Result<()> {
+    let Some(receipt) = lock(&state.pro.execution.supervisor_pending).clone() else {
+        return Ok(());
+    };
+    let accepted = accepted.context("supervisor cleanup requires workspace-bound configuration")?;
+    validate_receipt(state, accepted, &receipt)?;
     let previous = {
         let mut preferences = lock(&state.pro.preferences);
         ensure!(
@@ -229,6 +255,10 @@ pub(in crate::pro) async fn apply(
     });
     *lock(&state.pro.execution.supervisor_pending) = None;
     Ok(())
+}
+#[cfg(test)]
+pub(in crate::pro) fn fixture_boot(state: &AppState) -> Option<String> {
+    state.pro.execution.boot.clone()
 }
 #[cfg(test)]
 #[path = "supervisor_tests.rs"]

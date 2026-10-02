@@ -257,6 +257,18 @@ pub(super) fn account_request(
     ensure!(allowed, "workspace authority denied");
     Ok(())
 }
+fn revision_advance(state: &AppState, previous: &Accepted, incoming: &Accepted) -> Result<()> {
+    ensure!(
+        previous.account_id == incoming.account_id
+            && previous.endpoint == incoming.endpoint
+            && previous.workspace.workspace_id == incoming.workspace.workspace_id
+            && previous.root == incoming.root
+            && previous.identity == incoming.identity
+            && incoming.workspace.revision > previous.workspace.revision,
+        "workspace authority cannot be changed"
+    );
+    super::execution::supervisor::validate(state, incoming)
+}
 pub(super) async fn prepare(
     state: &AppState,
     config: &Configure,
@@ -272,13 +284,25 @@ pub(super) async fn prepare(
     );
     // Reject changed authority before even probing a caller-supplied path.
     match &*lock(&state.pro.authority) {
-        Authority::Bound(previous) => ensure!(
-            config.delegation.workspace.as_ref() == Some(&previous.workspace)
-                && config.account_id.as_ref() == Some(&previous.account_id)
-                && config.endpoint == previous.endpoint
-                && root == previous.root,
-            "workspace authority cannot be changed"
-        ),
+        Authority::Bound(previous) => {
+            ensure!(
+                config.account_id.as_ref() == Some(&previous.account_id)
+                    && config.endpoint == previous.endpoint
+                    && root == previous.root,
+                "workspace authority cannot be changed"
+            );
+            if config.delegation.workspace.as_ref() != Some(&previous.workspace) {
+                ensure!(
+                    config.execution.is_some(),
+                    "registration revision requires supervised startup"
+                );
+                let mut incoming = previous.clone();
+                incoming.workspace = config.delegation.workspace.clone().unwrap();
+                // The receipt must match the already captured inode before any
+                // filesystem probing, then the actual reopened inode below.
+                revision_advance(state, previous, &incoming)?;
+            }
+        }
         Authority::Invalid => anyhow::bail!("workspace authority record needs recovery"),
         Authority::Unbound => ensure!(
             lock(&state.pro.runtime).is_none(),
@@ -318,7 +342,13 @@ pub(super) async fn prepare(
     }
     match &*lock(&state.pro.authority) {
         Authority::Bound(previous) => {
-            ensure!(previous == &value, "workspace authority cannot be changed")
+            if previous != &value {
+                ensure!(
+                    config.execution.is_some(),
+                    "registration revision requires supervised startup"
+                );
+                revision_advance(state, previous, &value)?;
+            }
         }
         Authority::Invalid => anyhow::bail!("workspace authority record needs recovery"),
         Authority::Unbound => ensure!(
