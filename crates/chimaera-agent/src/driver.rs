@@ -285,7 +285,7 @@ pub trait Driver: Send {
     }
 
     /// Prove the wire works, build the mapper, and return any post-`Init`
-    /// steps. An `Err` is the degrade-to-PTY signal. The harness applies the
+    /// steps. An `Err` reports a startup failure. The harness applies the
     /// handshake timeout around this, so it may block on stream reads without
     /// its own deadline.
     fn handshake<'a>(
@@ -293,7 +293,17 @@ pub trait Driver: Send {
         sink: &'a mut JsonlSink,
         stream: &'a mut JsonlStream,
         spec: &'a SpawnSpec,
+        progress: &'a mpsc::Sender<AgentEvent>,
     ) -> impl Future<Output = std::result::Result<Handshake<Self::Mapper>, String>> + Send + 'a;
+}
+
+/// Phases are adapter-owned static labels, never raw hook output or paths.
+pub(crate) async fn startup_progress(events: &mpsc::Sender<AgentEvent>, detail: &'static str) {
+    let _ = events
+        .send(AgentEvent::StartupProgress {
+            detail: detail.into(),
+        })
+        .await;
 }
 
 /// Bounded outbound write. A child that stops draining stdin while the mapper
@@ -414,6 +424,8 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
     };
     let (mut sink, mut stream, guard) = child.split();
 
+    startup_progress(&io.events, "Waiting for agent initialization…").await;
+
     // Closing a still-starting chat must not wait for the watchdog. Prefer a
     // deliberate kill when initialization and cancellation race.
     let handshake = tokio::select! {
@@ -427,7 +439,7 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
         }
         result = tokio::time::timeout(
             spec.handshake_timeout,
-            driver.handshake(&mut sink, &mut stream, &spec),
+            driver.handshake(&mut sink, &mut stream, &spec, &io.events),
         ) => result,
     };
     let Handshake {

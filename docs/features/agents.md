@@ -148,7 +148,7 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   the roster refetched, so the truth returns. Rail rows are drag sources.
 - **Agent status line (chat sessions).** When claude emits a `post_turn_summary` (its own post-turn
   "where things stand" one-liner, e.g. "workflow launched, 2 agents spawning"), the driver maps it
-  to a latest-wins `SessionStatus` event: the chat row's second line shows the line (`status_detail`
+  to a latest-wins `SessionStatus` event: the chat row's name tooltip includes the line (`status_detail`
   on the row JSON), and a summary flagged `needs_action` lands the amber `idle_prompt` attention
   state. Emission is conditional and CLI-version-dependent (see `chimaera-agent/PROTOCOL.md`
   Pass 17) — the surface is dormant when the CLI stays quiet. TUI rows never carry it.

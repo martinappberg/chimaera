@@ -3006,3 +3006,20 @@ in chat; a stalled Codex launch closed at 60.6 seconds with no terminal or
 Recent row, retaining its diagnostic journal. The shared lifecycle tests cover
 unused/submitted/resumed startup failures and immediate cancellation for every
 provider.
+
+
+### Startup progress (Claude 2.1.287, Codex 0.159.3, ACP)
+
+Claude emits `system/hook_started {hook_id, hook_name, hook_event}` before the
+`initialize` response, followed by `system/hook_response {hook_id, outcome}`.
+Concurrent SessionStart hooks can block the handshake; a workspace hook opening
+cloud-only files was cancelled at its configured 15-second timeout. The same
+workspace initialized in 4.6 seconds once those files were local and every hook
+succeeded. Chimaera must not silently disable user hooks to shorten startup.
+
+The driver journals additive `startup_progress {detail}` phase updates before
+Init: Claude tracks bounded pending hook IDs (never hook stdout/context), Codex
+reports config/thread opening, and ACP reports authentication/session opening.
+These are status telemetry, not transcript messages or proof of readiness. Init,
+fatal Error and Exited clear them in the client. Progress never makes an unused
+failed launch non-disposable; cancellation still interrupts the handshake.

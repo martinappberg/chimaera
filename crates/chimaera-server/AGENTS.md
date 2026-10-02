@@ -206,8 +206,9 @@ decides **which** driver runs and **what happens around** its lifecycle.
   SAME chimaera session id in the other surface / at a fork point. A term→chat
   switch seeds native or previous-Chimaera history **before** appending its
   `ModeSwitch` marker: the journal seeder is create-new/never-clobber, so
-  reversing that order produces a marker-only transcript. A resurrected TUI
-  may not have emitted a fresh transcript hook yet, so its durable
+  reversing that order produces a marker-only transcript. Repair treats startup
+  progress as lifecycle telemetry, so it cannot block recovering real history.
+  A resurrected TUI may not have emitted a fresh transcript hook yet, so its durable
   `AgentRecord.resumed_from` is the resume-handle fallback.
 - **`fork_session`** snapshots a source journal prefix without stopping it and
   creates a distinct session. Same-agent exact boundaries use native history;

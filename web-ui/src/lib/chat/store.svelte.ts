@@ -621,6 +621,7 @@ export class ChatStore {
   questions = $state<PendingQuestion[]>([]);
   plan = $state<PlanEntry[]>([]);
   initialized = $state(false);
+  startupDetail = $state<string | null>(null);
   model = $state<string | null>(null);
   /** Accepted model command awaiting the provider's read-back. */
   pendingModel = $state<string | null>(null);
@@ -1308,6 +1309,7 @@ export class ChatStore {
     this.structuralVersion += 1;
     this.lastSeq = 0;
     this.initialized = false;
+    this.startupDetail = null;
     this.capabilities = null;
     this.model = null;
     this.pendingModel = null;
@@ -1366,6 +1368,12 @@ export class ChatStore {
     if (this.hydrating && this.lastSeq >= this.replayHead) this.hydrating = false;
     const ev = entry.ev;
     switch (ev.type) {
+      case "startup_progress":
+        this.startupDetail = typeof ev.detail === "string" ? ev.detail.slice(0, 512) : null;
+        this.initialized = false;
+        this.exited = null;
+        this.clearFatal();
+        break;
       case "catalog":
         this.applyCatalog(ev);
         break;
@@ -1374,6 +1382,7 @@ export class ChatStore {
         break;
       case "init": {
         this.initialized = true;
+        this.startupDetail = null;
         // A fresh driver handshake: the session is live again whatever a
         // replayed exit or fatal error said (toggle round-trips, resumes, a
         // relaunch after a protocol error) — a red banner pinned above a
@@ -2153,6 +2162,7 @@ export class ChatStore {
           // model catalog, limits, context meter, controls, or error state
           // masquerade as destination telemetry while the target initializes.
           this.initialized = false;
+          this.startupDetail = null;
           this.model = null;
           this.capabilities = null;
           this.modes = [];
@@ -2186,6 +2196,7 @@ export class ChatStore {
         break;
       }
       case "error":
+        if (ev.fatal) this.startupDetail = null;
         this.pendingModel = null;
         this.notice(ev.message as string, "error");
         if (ev.fatal === true) {
@@ -2205,6 +2216,7 @@ export class ChatStore {
         }
         break;
       case "exited":
+        this.startupDetail = null;
         this.pendingModel = null;
         this.running = false;
         this.compacting = false;

@@ -485,3 +485,9 @@ implicit controls. `catalog` refreshes model/mode/command choices without replay
 resetting a turn. Header/composer controls follow those facts. `ForkDialog` includes every
 ready chat adapter; native history and a conversation copy have different transfer semantics.
 See [integration design](../../../../docs/agent-harness-design.md).
+
+
+Startup status is separate from transcript activity: `startup_progress` stores
+one latest phase until Init, fatal Error or Exited. A reconnect replays that same
+phase; a fresh progress event marks a respawn uninitialized even when history is
+already present. The composer can accept a queued message while startup runs.

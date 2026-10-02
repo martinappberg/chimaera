@@ -467,13 +467,14 @@ impl Driver for ClaudeDriver {
         sink: &'a mut JsonlSink,
         stream: &'a mut JsonlStream,
         spec: &'a SpawnSpec,
+        progress: &'a tokio::sync::mpsc::Sender<AgentEvent>,
     ) -> std::result::Result<Handshake<ClaudeMapper>, String> {
         // The spawn handshake is a client-initiated `initialize` control
         // request; the CLI answers with the slash-command + model catalog.
         if let Err(err) = sink.send(&initialize_request("init")).await {
             return Err(format!("initialize write failed: {err:#}"));
         }
-        let commands_catalog = await_initialize(stream).await?;
+        let commands_catalog = await_initialize(stream, progress).await?;
 
         let mut mapper = ClaudeMapper::new(
             spec.pinned_native_id.clone(),
@@ -578,10 +579,17 @@ fn effort_applies(models: &[crate::model::ModelInfo], model: Option<&str>) -> bo
     }
 }
 
-async fn await_initialize(stream: &mut JsonlStream) -> std::result::Result<Value, String> {
+async fn await_initialize(
+    stream: &mut JsonlStream,
+    progress: &tokio::sync::mpsc::Sender<AgentEvent>,
+) -> std::result::Result<Value, String> {
+    let mut hooks = StartupHooks::default();
     loop {
         match stream.next().await {
             Ok(Some(frame)) => {
+                if let Some(detail) = hooks.observe(&frame) {
+                    crate::driver::startup_progress(progress, detail).await;
+                }
                 if frame["type"] == "control_response" && frame["response"]["request_id"] == "init"
                 {
                     if frame["response"]["subtype"] != "success" {
@@ -592,6 +600,34 @@ async fn await_initialize(stream: &mut JsonlStream) -> std::result::Result<Value
             }
             Ok(None) => return Err("claude exited during handshake".to_string()),
             Err(err) => return Err(format!("{err:#}")),
+        }
+    }
+}
+
+/// Claude emits these while SessionStart hooks block initialize. Retain only
+/// bounded IDs; hook stdout can contain private context and is never a status.
+#[derive(Default)]
+struct StartupHooks {
+    pending: std::collections::HashSet<String>,
+}
+impl StartupHooks {
+    fn observe(&mut self, frame: &Value) -> Option<&'static str> {
+        if frame["type"] != "system" {
+            return None;
+        }
+        let id = frame["hook_id"]
+            .as_str()
+            .filter(|id| !id.is_empty() && id.len() <= 512)?;
+        match frame["subtype"].as_str()? {
+            "hook_started" if self.pending.len() < 128 => {
+                let was_empty = self.pending.is_empty();
+                self.pending.insert(id.to_owned());
+                was_empty.then_some("Running startup hooks…")
+            }
+            "hook_response" if self.pending.remove(id) && self.pending.is_empty() => {
+                Some("Loading agent settings and tools…")
+            }
+            _ => None,
         }
     }
 }
@@ -5046,6 +5082,30 @@ use crate::model::cap_preview;
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn startup_hooks_wait_for_every_hook_and_bound_native_ids() {
+        let mut hooks = super::StartupHooks::default();
+        let start =
+            |id: &str| serde_json::json!({"type":"system","subtype":"hook_started","hook_id":id});
+        let done =
+            |id: &str| serde_json::json!({"type":"system","subtype":"hook_response","hook_id":id});
+        assert_eq!(hooks.observe(&start("a")), Some("Running startup hooks…"));
+        assert_eq!(hooks.observe(&start("b")), None);
+        assert_eq!(hooks.observe(&start("a")), None);
+        assert_eq!(hooks.observe(&done("unknown")), None);
+        assert_eq!(hooks.observe(&done("a")), None);
+        assert_eq!(
+            hooks.observe(&done("b")),
+            Some("Loading agent settings and tools…")
+        );
+        assert_eq!(hooks.observe(&done("b")), None);
+        assert_eq!(hooks.observe(&start(&"a".repeat(513))), None);
+        for id in 0..200 {
+            hooks.observe(&start(&id.to_string()));
+        }
+        assert_eq!(hooks.pending.len(), 128);
+    }
+
     use super::*;
 
     fn mapper() -> ClaudeMapper {
