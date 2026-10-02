@@ -1533,6 +1533,50 @@ async fn permission_deny_with_feedback_continues_turn() {
 }
 
 #[tokio::test]
+async fn startup_hooks_are_visible_before_init_and_replay_without_private_output() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("hooks", &fx.cwd, "startup-hooks"))
+        .unwrap();
+    let mut attached = fx.manager.attach("hooks", 0).unwrap();
+    let mut seen = attached.replay.clone();
+    wait_for(&mut attached.live, &mut seen, "startup hooks", |ev| {
+        matches!(ev, AgentEvent::StartupProgress { detail } if detail == "Running startup hooks…")
+    }).await;
+    assert!(
+        fx.manager.is_unused_startup("hooks"),
+        "progress alone must not retain an unused failed chat"
+    );
+    assert!(!seen
+        .iter()
+        .any(|entry| matches!(entry.ev, AgentEvent::Init { .. })));
+    wait_for(&mut attached.live, &mut seen, "init", |ev| {
+        matches!(ev, AgentEvent::Init { .. })
+    })
+    .await;
+    let replay = fx.manager.attach("hooks", 0).unwrap().replay;
+    let phases: Vec<_> = replay
+        .iter()
+        .filter_map(|entry| match &entry.ev {
+            AgentEvent::StartupProgress { detail } => Some(detail.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            "Waiting for agent initialization…",
+            "Running startup hooks…",
+            "Loading agent settings and tools…"
+        ]
+    );
+    assert!(!serde_json::to_string(&replay)
+        .unwrap()
+        .contains("private hook context"));
+    fx.manager.kill("hooks");
+}
+
+#[tokio::test]
 async fn closing_during_startup_cancels_every_provider_without_a_failure() {
     use chimaera_agent::driver::AgentAdapter;
     let adapters: [&dyn AgentAdapter; 4] = [
@@ -1547,6 +1591,17 @@ async fn closing_during_startup_cancels_every_provider_without_a_failure() {
         launch.initial_model = Some("chosen-before-start".into());
         let info = fx.manager.spawn(adapter, launch).expect("spawn");
         assert_eq!(info.model.as_deref(), Some("chosen-before-start"));
+        let mut attached = fx.manager.attach("closing", 0).unwrap();
+        let mut seen = attached.replay;
+        if !seen
+            .iter()
+            .any(|entry| matches!(entry.ev, AgentEvent::StartupProgress { .. }))
+        {
+            wait_for(&mut attached.live, &mut seen, "startup", |ev| {
+                matches!(ev, AgentEvent::StartupProgress { .. })
+            })
+            .await;
+        }
         assert!(fx.manager.is_unused_startup("closing"));
         assert!(fx.manager.kill("closing"));
         let exit = tokio::time::timeout(Duration::from_secs(5), fx.exits.recv())

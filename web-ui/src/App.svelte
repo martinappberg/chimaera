@@ -5280,7 +5280,7 @@
                      the row itself (F2), which carries the button role. -->
                 <span
                   class="labels"
-                  title="double-click to rename (F2)"
+                  title={[displayNames.get(s.id) ?? displayName(s), s.status_detail || s.title, "Double-click to rename (F2)"].filter(Boolean).join("\n")}
                   ondblclick={() => startRename(s)}
                 >
                   <span class="name">
@@ -5292,20 +5292,8 @@
                       <span class="remote-badge" title="Remote Control on — pick this session up in the Claude app or at claude.ai/code">remote</span>
                     {/if}
                   </span>
-                  {#if s.kind === "agent"}
-                    <!-- Keep the name anchored above one reserved context
-                         line. Worktree and status share it rather than adding
-                         a third line when the provider reports new activity. -->
-                    <span class="row-context">
-                      {#if s.git && s.git.worktree !== s.git.repo}
-                        <span class="wt-mark"><BranchChip git={s.git} /></span>
-                      {/if}
-                      {#if s.title && s.title !== displayName(s) && s.title !== s.agent_title}
-                        <span class="title" title={s.title}>{s.title}</span>
-                      {:else if s.status_detail && s.status_detail !== displayName(s)}
-                        <span class="title" title={s.status_detail}>{s.status_detail}</span>
-                      {/if}
-                    </span>
+                  {#if s.kind === "agent" && s.git && s.git.worktree !== s.git.repo}
+                    <span class="wt-mark"><BranchChip git={s.git} /></span>
                   {/if}
                 </span>
               {/if}
@@ -6560,15 +6548,12 @@
     transition: background-color 0.12s ease;
   }
 
-  /* Agent status/title changes must never move the rows beneath them.
-     Reserve both text lines, including during rename and kill confirmation. */
+  /* Transient activity lives in the tooltip. Keep a compact, centered row
+     through status changes, rename and kill confirmation. */
   .row.agent-row {
     box-sizing: border-box;
     flex-shrink: 0;
-    height: calc((var(--text-sm) + var(--text-xs)) * 1.3 + 12px);
-  }
-  .row.agent-row .labels {
-    align-self: stretch;
+    height: calc(var(--text-sm) * 1.3 + 12px);
   }
 
   /* The dashboard home row: fixed above the session sections, quiet until
@@ -6667,7 +6652,8 @@
     flex: 1;
     min-width: 0;
     display: flex;
-    flex-direction: column;
+    align-items: center;
+    gap: 6px;
     line-height: 1.3;
   }
 
@@ -6686,41 +6672,22 @@
     outline: none;
   }
 
-  .name,
-  .title {
+  .name {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  .name {
+    flex: 1;
+    min-width: 0;
     font-family: var(--mono);
     font-size: var(--text-sm);
   }
-  .row-context {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    min-width: 0;
-    min-height: calc(var(--text-xs) * 1.3);
-    font-size: var(--text-xs);
-  }
-
-  /* Branch and activity each keep a truncation budget on the second line. */
+  /* A branch shares the name's line without taking its full width. */
   .wt-mark {
     display: flex;
     min-width: 0;
+    max-width: 45%;
     opacity: 0.85;
-  }
-  .wt-mark:not(:last-child) {
-    max-width: 50%;
-  }
-
-  .title {
-    flex: 1;
-    min-width: 0;
     font-size: var(--text-xs);
-    color: var(--muted);
   }
 
   /* Remote Control badge on a rail row: an accent pill inline after the

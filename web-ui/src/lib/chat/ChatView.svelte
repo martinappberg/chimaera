@@ -2563,10 +2563,13 @@
         <span>loading recent conversation…</span>
       </div>
     {:else}
-    {#if store.blocks.length === 0 && store.exited === null}
-      <div class="empty">
+    {#if store.exited === null && !store.fatalError && (!store.initialized || store.blocks.length === 0)}
+      <div class="empty" role="status">
         <SessionGlyph kind="agent" {agentKind} size={18} />
-        <span>{store.connected && store.initialized ? `${agentName} is ready` : `connecting to ${agentName}…`}</span>
+        <span>{!store.connected ? `connecting to ${agentName}…` : store.initialized ? `${agentName} is ready` : `starting ${agentName}…`}</span>
+        {#if store.connected && !store.initialized && store.startupDetail}
+          <span class="startup-detail">{store.startupDetail}</span>
+        {/if}
       </div>
     {/if}
     {#if renderStart > 0}
@@ -3267,6 +3270,10 @@
      is the boundary (the Claude Desktop treatment). */
   .chat > :global(.composer) {
     border-top: none;
+  }
+  .startup-detail {
+    font-size: var(--text-sm);
+    color: var(--muted);
   }
   .empty {
     margin: auto;
