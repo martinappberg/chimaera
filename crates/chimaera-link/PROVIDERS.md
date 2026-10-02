@@ -515,3 +515,64 @@ Synthetic tests use task-owned homes and loopback fake providers. They do not
 prove live subscription billing or hosted deployment readiness. Actual provider
 acceptance needs separately authorized vendor calls; this contract alone does
 not authorize them or enable startup.
+
+### Supervisor-local login helper
+
+The disabled `chimaera personal-provider-control` entrypoint delegates to the
+fixed login consumer. Its only inputs are two inherited descriptors: the one-shot
+startup pipe described above and a supervisor-private Unix socketpair. It accepts
+no path, executable, HOME, upstream, environment override or TCP listener. The
+socket is never mounted in a project. The startup pipe is consumed and closed
+before a CLI child can start; the control descriptor is close-on-exec. The
+supervisor verifies the exact registration ACK before advertising the capability.
+
+Each socket message has a four-byte unsigned big-endian payload length followed
+by one closed JSON object. Requests are at most 20 KiB and replies at most 128 KiB.
+A complete request/read or reply/write has a five-second deadline. The helper
+serves one bounded request at a time, while its separately owned login runners
+continue independently of observations. Every request includes the exact
+startup `capability`; it is never printed, returned or accepted as a project or
+ordinary daemon bearer. The fixed request variants are:
+
+- `type:"command"`, `device_id`, `command` (the existing fixed command object),
+  and `lease_deadline_ns` (integer for Connect, null for Submit/Cancel). A helper
+  cannot start a new login without that positive lease. Disconnect is performed
+  by the private canonical writer and does not invoke a CLI logout helper.
+- `type:"renew"`, `operation_id` (the original Connect UUID), and
+  `lease_deadline_ns`.
+- `type:"status"`, `operation_id`.
+- `type:"credential"`, `operation_id`.
+- `type:"release"`, `operation_id` (after canonical publication or confirmed
+  failure, to discard the retained credential and login writer).
+- `type:"shutdown"` (revoke all pending attempts and wait for bounded cleanup).
+
+`lease_deadline_ns` is the absolute same-host `CLOCK_MONOTONIC` nanosecond
+boundary computed from the worker's lease-request start plus the exact keeper
+TTL. The helper verifies that it is future and at most thirty seconds away, and
+uses that same boundary for its pending login. Renew does not resurrect an
+expired/canceled attempt or exceed its existing fifteen-minute local ceiling.
+Transport delay and helper reception cannot add time. Only the supervisor that
+has just validated the exact original keeper lease sends command/renew; this
+local deadline is not independent authority or a caller-selected duration.
+
+The unsolicited startup reply is exactly `{type:"ready",registration}`.
+Subsequent replies are closed variants: `{type:"status",status}` with the fixed
+runner's redacted `attempt_id,provider,phase,action,error_code`; or
+`{type:"credential",operation_id,credential}` with the bounded typed
+credential-only leaf; or `{type:"released",operation_id}`; or
+`{type:"stopped",cleanup_confirmed}`; or `{type:"refused",error_code}` containing
+only a fixed category. A credential reply exists only on this private socket,
+only after positive stop/reap/home cleanup and while the original lease remains
+valid. It is never copied into a public status, catalog or HTTP response. The
+supervisor retains the completion through the fresh publication exchange and
+canonical generation CAS, then explicitly releases it. Lost responses cannot
+create a second login or resend a consumed submission nonce.
+
+The helper retains at most twenty-four immutable operation/alias records, evicts
+only positively terminal records, and admits at most one writer per known
+provider (three total). Unknown cleanup never becomes terminal merely because
+its authorization expired. EOF, supervisor revocation or shutdown cancels
+pending admissions; bounded cleanup retains a failed writer/home fence rather
+than extracting a leaf or claiming success. Worker bootstrap must refuse a new
+provider capability until any previous login owner has been stopped and its
+cleanup positively established. No ordinary worker startup enables this helper.
