@@ -1884,7 +1884,9 @@ impl Viewer {
     /// send's pictures are megabytes).
     fn of(chat: bool, frame: &Down) -> Self {
         let text = match frame {
-            Down::Binary(_) if !chat => return Viewer::Input { client_id: None },
+            Down::Binary(bytes) if !chat && !bytes.is_empty() => {
+                return Viewer::Input { client_id: None }
+            }
             Down::Text(text) if chat => text,
             _ => return Viewer::Other,
         };
@@ -1963,6 +1965,14 @@ impl Held<'_> {
     /// Hold input, or hand it back when it does not fit.
     fn input(&mut self, frame: Down, client_id: Option<String>) -> std::result::Result<(), Down> {
         let size = Self::size(&frame);
+        if !self.chat {
+            if !matches!(frame, Down::Binary(_)) {
+                return Err(frame);
+            }
+            if size == 0 {
+                return Ok(());
+            }
+        }
         let (count, bytes) = self
             .frames
             .iter()
@@ -1979,6 +1989,22 @@ impl Held<'_> {
             return Err(frame);
         }
         self.bytes += size;
+        // A byte ceiling alone does not bound the number of WebSocket frames:
+        // many tiny keystrokes must occupy one buffer, not one queue allocation
+        // each. Recover the uniquely owned BytesMut capacity for amortized appends.
+        if !self.chat {
+            if let (Some(last), Down::Binary(incoming)) = (self.frames.back_mut(), &frame) {
+                if let Down::Binary(bytes) = &mut last.frame {
+                    let mut combined = std::mem::take(bytes)
+                        .try_into_mut()
+                        .unwrap_or_else(|bytes| bytes::BytesMut::from(bytes.as_ref()));
+                    combined.extend_from_slice(incoming);
+                    *bytes = combined.freeze();
+                    last.size += size;
+                    return Ok(());
+                }
+            }
+        }
         self.frames.push_back(HeldFrame {
             frame,
             size,
@@ -3096,7 +3122,7 @@ mod tests {
             Viewer::Other
         ));
         assert!(matches!(
-            Viewer::of(false, &Down::Binary(Default::default())),
+            Viewer::of(false, &Down::Binary(vec![b'x'].into())),
             Viewer::Input { client_id: None }
         ));
         assert!(matches!(
@@ -3258,6 +3284,38 @@ mod tests {
         assert_eq!(first.take().len(), 1);
         assert!(second.input(frame(6 * 1024), None).is_ok());
         drop(second);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn terminal_input_holds_one_bounded_buffer_and_empty_frames_never_wake() {
+        let budget = HeldBudget::new(HELD_TERMINAL_BYTES);
+        let mut queue = held(&budget);
+        queue.chat = false;
+        let empty = Down::Binary(Default::default());
+        assert!(matches!(Viewer::of(false, &empty), Viewer::Other));
+        for _ in 0..1024 {
+            queue.input(empty.clone(), None).unwrap();
+        }
+        assert!(queue.frames.is_empty());
+        assert!(!queue.has_input());
+        for index in 0..HELD_TERMINAL_BYTES {
+            queue
+                .input(Down::Binary(vec![(index % 251) as u8].into()), None)
+                .unwrap();
+        }
+        assert_eq!(queue.frames.len(), 1);
+        assert_eq!(queue.bytes, HELD_TERMINAL_BYTES);
+        assert_eq!(budget.used.load(Ordering::Acquire), HELD_TERMINAL_BYTES);
+        assert!(queue.input(Down::Binary(vec![b'x'].into()), None).is_err());
+        let frames = queue.take();
+        let Down::Binary(bytes) = &frames[0] else {
+            panic!("terminal bytes")
+        };
+        assert!(bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| *byte == (index % 251) as u8));
         assert_eq!(budget.used.load(Ordering::Acquire), 0);
     }
 

@@ -104,6 +104,7 @@ pub(crate) struct ResolveTargetsRequest {
 /// decoded.
 pub(crate) async fn resolve_targets(
     State(state): State<Arc<AppState>>,
+    filesystem: Option<axum::Extension<crate::workspace_scope::files::Context>>,
     Json(body): Json<ResolveTargetsRequest>,
 ) -> Response {
     if !Path::new(&body.base).is_absolute() {
@@ -139,7 +140,9 @@ pub(crate) async fn resolve_targets(
             }
             let answer = target_path(target)
                 .and_then(|path| resolve(&path, &bases, root.as_deref()))
-                .and_then(|path| describe(&state, &path))
+                .and_then(|path| {
+                    describe_scoped(&state, &path, filesystem.as_ref().map(|scope| &scope.0))
+                })
                 .unwrap_or_else(|| json!({"missing": true}));
             results.insert(target.clone(), answer);
         }
@@ -291,13 +294,55 @@ fn describe(state: &AppState, path: &Path) -> Option<serde_json::Value> {
     Some(info)
 }
 
+fn describe_scoped(
+    state: &AppState,
+    path: &Path,
+    filesystem: Option<&crate::workspace_scope::files::Context>,
+) -> Option<serde_json::Value> {
+    let Some(filesystem) = filesystem else {
+        return describe(state, path);
+    };
+    let bound = filesystem.read(&path.to_string_lossy()).ok()?;
+    let file = bound.open_any().ok()?;
+    let meta = file.metadata().ok()?;
+    let version = crate::fs::mtime_token(&meta);
+    let mut info = json!({
+        "path":bound.canonical.to_string_lossy(),
+        "kind": if meta.is_dir() { "dir" } else { "file" },
+        "size": if meta.is_dir() { 0 } else { meta.len() },
+        "version": version,
+        "mtime_ms":meta.modified().ok().and_then(|time|time.duration_since(UNIX_EPOCH).ok()).map(|time|u64::try_from(time.as_millis()).unwrap_or(u64::MAX)),
+        "mime":if meta.is_dir() { "inode/directory".to_owned() } else { mime_guess::from_path(&bound.canonical).first_or_octet_stream().essence_str().to_owned() },
+    });
+    if meta.is_file() {
+        let ext = bound
+            .canonical
+            .extension()
+            .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if SIZED.contains(&ext.as_str()) {
+            if let Some((width, height)) = image_dimensions_opened(file, &ext) {
+                info["width"] = json!(width);
+                info["height"] = json!(height);
+            }
+        }
+        if TICKETED.contains(&ext.as_str()) {
+            info["ticket"] = json!(crate::lock(&state.tickets).mint_bound(bound, Some(version)));
+        }
+    }
+    Some(info)
+}
+
 /// An image's pixel size from its header, or `None` when the header does not
 /// say (or is not what the extension claims). Raster formats are sniffed by
 /// their magic bytes, so a JPEG saved as `.png` still answers.
 pub(crate) fn image_dimensions(path: &Path, ext: &str) -> Option<(u32, u32)> {
     // `O_NONBLOCK` + an fstat re-check: a FIFO or device swapped in after
     // the stat cannot block.
-    let (mut file, _) = crate::fs::open_regular(path).ok()?;
+    let (file, _) = crate::fs::open_regular(path).ok()?;
+    image_dimensions_opened(file, ext)
+}
+fn image_dimensions_opened(mut file: std::fs::File, ext: &str) -> Option<(u32, u32)> {
     let dims = if ext == "svg" {
         let mut text = Vec::new();
         (&mut file)

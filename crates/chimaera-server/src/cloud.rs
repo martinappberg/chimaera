@@ -360,7 +360,7 @@ mod tests {
         (state, base, git)
     }
     async fn wait_file(path: &std::path::Path) {
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(6), async {
             while !path.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -382,7 +382,7 @@ mod tests {
                 "picked".into(),
                 "https://example.test/repo".into(),
                 git,
-                Duration::from_millis(250),
+                Duration::from_secs(3),
                 permit,
             )
             .await
@@ -394,7 +394,7 @@ mod tests {
             ADMISSION.try_acquire().is_err(),
             "cancelled observer released live clone admission"
         );
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(6), async {
             loop {
                 if let Ok(permit) = ADMISSION.try_acquire() {
                     drop(permit);

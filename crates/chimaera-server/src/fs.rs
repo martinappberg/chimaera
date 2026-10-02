@@ -26,6 +26,31 @@ use serde_json::json;
 use crate::AppState;
 
 mod row_index;
+mod scoped;
+#[cfg(test)]
+pub(crate) fn scoped_rename_fixture(
+    scope: &crate::workspace_scope::files::Context,
+    from: &str,
+    to: &str,
+    before_publish: impl FnOnce(),
+) -> anyhow::Result<bool> {
+    Ok(matches!(
+        scoped::rename_checked(scope, from, to, before_publish)?,
+        MutateOutcome::Done(_)
+    ))
+}
+#[cfg(test)]
+pub(crate) fn scoped_cross_device_move_fixture(
+    scope: &crate::workspace_scope::files::Context,
+    from: &str,
+    to: &str,
+    after_copy: impl FnOnce(),
+) -> anyhow::Result<bool> {
+    Ok(matches!(
+        scoped::cross_device_move(scope, from, to, after_copy)?,
+        MutateOutcome::Done(_)
+    ))
+}
 
 /// Hard cap on a single `fs/file` read.
 const MAX_FILE_CHUNK: u64 = 2 * 1024 * 1024;
@@ -150,6 +175,55 @@ pub(crate) fn canonical_file(raw: &str) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+/// One preview source. Scoped callers keep the descriptor-rooted proof;
+/// unrestricted callers retain their ordinary local filesystem semantics.
+pub(crate) struct FileSource {
+    pub(crate) path: PathBuf,
+    bound: Option<crate::workspace_scope::files::Resolved>,
+}
+impl FileSource {
+    pub(crate) fn new(
+        raw: &str,
+        scope: Option<&crate::workspace_scope::files::Context>,
+    ) -> anyhow::Result<Self> {
+        match scope {
+            Some(scope) => {
+                let bound = scope.read(raw)?;
+                let path = bound.canonical.clone();
+                Ok(Self {
+                    path,
+                    bound: Some(bound),
+                })
+            }
+            None => Ok(Self {
+                path: canonical_file(raw)?,
+                bound: None,
+            }),
+        }
+    }
+    #[cfg(test)]
+    fn plain(path: &Path) -> Self {
+        Self {
+            path: path.to_owned(),
+            bound: None,
+        }
+    }
+    pub(crate) fn open(&self) -> anyhow::Result<std::fs::File> {
+        match &self.bound {
+            Some(bound) => Ok(bound.open(false)?),
+            None => open_regular(&self.path)
+                .map(|(file, _)| file)
+                .with_context(|| format!("{}: failed to open", self.path.display())),
+        }
+    }
+    pub(crate) fn metadata(&self) -> anyhow::Result<std::fs::Metadata> {
+        match &self.bound {
+            Some(_) => Ok(self.open()?.metadata()?),
+            None => Ok(std::fs::metadata(&self.path)?),
+        }
+    }
+}
+
 /// Open `path` for reading, only as a regular file: `O_NONBLOCK`, then an
 /// `fstat` of the descriptor itself. Callers stat (or canonicalize) first,
 /// but a FIFO swapped in after that check would park a plain `open` until a
@@ -190,8 +264,8 @@ fn gz_inner_from_path(path: &Path) -> Option<String> {
 
 /// The stored FNAME of the first gzip member, if the compressor recorded one
 /// (`gzip file.tsv` does; pipelines often don't).
-fn gz_inner_from_header(path: &Path) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
+fn gz_inner_from_header_source(source: &FileSource) -> Option<String> {
+    let file = source.open().ok()?;
     let mut decoder = GzDecoder::new(file);
     if decoder.header().is_none() {
         // Header parsing is lazy in flate2's read decoder; a short read
@@ -206,11 +280,12 @@ fn gz_inner_from_header(path: &Path) -> Option<String> {
 /// Content type for a gzip file, from the inner (decompressed) name: the path
 /// minus its .gz/.bgz suffix, falling back to the member FNAME, else
 /// octet-stream. `foo.tsv.gz` reads as a TSV, not as a gzip blob.
-fn gz_mime(path: &Path) -> mime_guess::Mime {
+fn gz_mime_source(source: &FileSource) -> mime_guess::Mime {
+    let path = &source.path;
     let guess = |name: String| mime_guess::from_path(Path::new(&name)).first();
     gz_inner_from_path(path)
         .and_then(guess)
-        .or_else(|| gz_inner_from_header(path).and_then(guess))
+        .or_else(|| gz_inner_from_header_source(source).and_then(guess))
         .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM)
 }
 
@@ -307,8 +382,15 @@ struct DirEntry {
 }
 
 /// GET /api/v1/fs/dirs?path=<path>&hidden=<bool>
-pub(crate) async fn dirs(Query(query): Query<DirsQuery>) -> Response {
-    blocking_json(move || list_dirs(&query.path, query.hidden)).await
+pub(crate) async fn dirs(
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
+    Query(query): Query<DirsQuery>,
+) -> Response {
+    blocking_json(move || match filesystem {
+        Some(scope) => list_scoped(&scope, &query.path, query.hidden, true),
+        None => list_dirs(&query.path, query.hidden),
+    })
+    .await
 }
 
 /// Run JSON-producing filesystem/preview work on a blocking thread. NFS and
@@ -470,6 +552,7 @@ struct FsEntry {
 /// (dirs and files) for the file tree.
 pub(crate) async fn list(
     State(state): State<Arc<AppState>>,
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     Query(query): Query<DirsQuery>,
 ) -> Response {
     // A listing that shows a `.git` names a repository for free (the git
@@ -478,7 +561,10 @@ pub(crate) async fn list(
     let seen = saw_git.clone();
     let response = blocking_json(move || {
         let mut found = None;
-        let body = list_entries(&query.path, query.hidden, &mut found);
+        let body = match filesystem {
+            Some(scope) => list_scoped(&scope, &query.path, query.hidden, false),
+            None => list_entries(&query.path, query.hidden, &mut found),
+        };
         *crate::lock(&seen) = found;
         body
     })
@@ -488,6 +574,100 @@ pub(crate) async fn list(
         crate::git::note_listed_dir(&state, &dir).await;
     }
     response
+}
+
+fn list_scoped(
+    scope: &crate::workspace_scope::files::Context,
+    raw: &str,
+    hidden: bool,
+    dirs_only: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let resolved = scope.read(raw)?;
+    let directory = resolved.open(true)?;
+    let path = &resolved.canonical;
+    let mut entries = Vec::new();
+    let mut dirs = Vec::new();
+    let mut truncated = false;
+    let names = resolved.names(MAX_DIR_ENTRIES + 1)?;
+    if names.len() > MAX_DIR_ENTRIES {
+        truncated = true;
+    }
+    for name in names {
+        let text = name.to_string_lossy().into_owned();
+        if text.starts_with(crate::persist::PROJECT_STAGING_PREFIX)
+            || !hidden && text.starts_with('.')
+        {
+            continue;
+        }
+        let entry_path = path.join(&name);
+        let link = rustix::fs::readlinkat(&directory, &name, Vec::new()).ok();
+        // Metadata and content follow only resolved in-project targets. A
+        // broken or outside link remains visible/removable as a link.
+        let meta = scope
+            .read(&entry_path.to_string_lossy())
+            .ok()
+            .and_then(|entry| entry.open_any().ok())
+            .and_then(|file| file.metadata().ok());
+        let is_dir = meta.as_ref().is_some_and(|meta| meta.is_dir());
+        if dirs_only {
+            if !is_dir {
+                continue;
+            }
+            dirs.push(DirEntry {
+                name: text,
+                path: entry_path.to_string_lossy().into_owned(),
+            });
+            if dirs.len() > MAX_DIR_ENTRIES {
+                dirs.pop();
+                truncated = true;
+                break;
+            }
+        } else {
+            if meta.is_none() && link.is_none() {
+                continue;
+            }
+            entries.push(FsEntry {
+                name: text,
+                path: entry_path.to_string_lossy().into_owned(),
+                kind: if is_dir { "dir" } else { "file" },
+                size: meta
+                    .as_ref()
+                    .filter(|meta| meta.is_file())
+                    .map_or(0, |meta| meta.len()),
+                mtime: meta
+                    .as_ref()
+                    .and_then(|meta| meta.modified().ok())
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |time| time.as_secs()),
+                symlink: link.is_some(),
+                target: link.map(|link| link.to_string_lossy().into_owned()),
+                broken: meta.is_none(),
+            });
+            if entries.len() > MAX_DIR_ENTRIES {
+                entries.pop();
+                truncated = true;
+                break;
+            }
+        }
+    }
+    resolved.open(true)?; // refuse replaced roots before publishing metadata
+    if dirs_only {
+        dirs.sort_by_cached_key(|entry| (entry.name.to_lowercase(), entry.name.clone()));
+        Ok(
+            json!({"path":path.to_string_lossy(),"parent":path.parent().map(|parent|parent.to_string_lossy()),"dirs":dirs,"truncated":truncated}),
+        )
+    } else {
+        entries.sort_by_cached_key(|entry| {
+            (
+                entry.kind != "dir",
+                entry.name.to_lowercase(),
+                entry.name.clone(),
+            )
+        });
+        Ok(
+            json!({"path":path.to_string_lossy(),"parent":path.parent().map(|parent|parent.to_string_lossy()),"entries":entries,"truncated":truncated}),
+        )
+    }
 }
 
 /// List all entries of a directory: dirs first then files, each group sorted
@@ -615,27 +795,43 @@ pub(crate) struct FileQuery {
 /// address DECOMPRESSED bytes (sequential decode, capped), the Content-Type
 /// comes from the inner name, and `X-File-Size` is only present once the
 /// total decompressed size is known (i.e. this slice reached EOF).
-pub(crate) async fn file(Query(query): Query<FileQuery>) -> Response {
+pub(crate) async fn file(
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
+    Query(query): Query<FileQuery>,
+) -> Response {
     let limit = query
         .limit
         .unwrap_or(DEFAULT_FILE_CHUNK)
         .min(MAX_FILE_CHUNK);
-    blocking_response(move || read_file_response(&query.path, query.offset, limit)).await
+    blocking_response(move || {
+        let source = FileSource::new(&query.path, filesystem.as_ref().map(|scope| &scope.0))?;
+        read_file_response_source(&source, query.offset, limit)
+    })
+    .await
 }
 
 /// Build the `fs/file` response for a plain or gzip-compressed file.
-fn read_file_response(raw: &str, offset: u64, limit: u64) -> anyhow::Result<Response> {
-    let path = canonical_file(raw)?;
-
-    let (mime, total, bytes, truncated, mtime, hash) = if is_gzip_path(&path) {
-        let meta = std::fs::metadata(&path)
-            .with_context(|| format!("{}: failed to stat", path.display()))?;
-        let (total, bytes, more) = read_gz_slice(&path, offset, limit)?;
-        (gz_mime(&path), total, bytes, more, mtime_token(&meta), None)
+fn read_file_response_source(
+    source: &FileSource,
+    offset: u64,
+    limit: u64,
+) -> anyhow::Result<Response> {
+    let path = &source.path;
+    let (mime, total, bytes, truncated, mtime, hash) = if is_gzip_path(path) {
+        let meta = source.metadata()?;
+        let (total, bytes, more) = read_gz_slice_source(source, offset, limit)?;
+        (
+            gz_mime_source(source),
+            total,
+            bytes,
+            more,
+            mtime_token(&meta),
+            None,
+        )
     } else {
-        let slice = read_file_slice(&path, offset, limit)?;
+        let slice = read_file_slice_racing_source(source, offset, limit, &mut || {})?;
         let hash = slice.whole_file_hash(offset);
-        let mime = mime_guess::from_path(&path).first_or_octet_stream();
+        let mime = mime_guess::from_path(path).first_or_octet_stream();
         (
             mime,
             Some(slice.total),
@@ -708,33 +904,43 @@ impl FileSlice {
 /// landed in between; on a change the read is retried once (reopened: a
 /// rename-replace is a new inode), and a second change leaves the slice
 /// unstable (no content hash).
+#[cfg(test)]
 fn read_file_slice(path: &Path, offset: u64, limit: u64) -> anyhow::Result<FileSlice> {
     read_file_slice_racing(path, offset, limit, &mut || {})
 }
 
 /// [`read_file_slice`] with `racer` run between each attempt's first fstat
 /// and its read — the window a concurrent writer can hit (tests use it).
+#[cfg(test)]
 fn read_file_slice_racing(
     path: &Path,
     offset: u64,
     limit: u64,
     racer: &mut dyn FnMut(),
 ) -> anyhow::Result<FileSlice> {
-    let slice = read_file_slice_once(path, offset, limit, racer)?;
-    if slice.stable {
-        return Ok(slice);
-    }
-    read_file_slice_once(path, offset, limit, racer)
+    read_file_slice_racing_source(&FileSource::plain(path), offset, limit, racer)
 }
-
-fn read_file_slice_once(
-    path: &Path,
+fn read_file_slice_racing_source(
+    source: &FileSource,
     offset: u64,
     limit: u64,
     racer: &mut dyn FnMut(),
 ) -> anyhow::Result<FileSlice> {
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("{}: failed to open", path.display()))?;
+    let slice = read_file_slice_once_source(source, offset, limit, racer)?;
+    if slice.stable {
+        return Ok(slice);
+    }
+    read_file_slice_once_source(source, offset, limit, racer)
+}
+
+fn read_file_slice_once_source(
+    source: &FileSource,
+    offset: u64,
+    limit: u64,
+    racer: &mut dyn FnMut(),
+) -> anyhow::Result<FileSlice> {
+    let path = &source.path;
+    let mut file = source.open()?;
     let meta = file
         .metadata()
         .with_context(|| format!("{}: failed to stat", path.display()))?;
@@ -787,19 +993,19 @@ fn read_file_slice_once(
 /// (bgzip/BGZF, concatenated gzips) decode transparently. Returns the total
 /// decompressed size when this read hit EOF (`None` while unknown), the
 /// bytes, and whether more decompressed bytes remain.
-fn read_gz_slice(
-    path: &Path,
+fn read_gz_slice_source(
+    source: &FileSource,
     offset: u64,
     limit: u64,
 ) -> anyhow::Result<(Option<u64>, Vec<u8>, bool)> {
+    let path = &source.path;
     if offset > MAX_GZ_DECOMPRESS {
         anyhow::bail!(
             "{}: offset {offset} is beyond the {MAX_GZ_DECOMPRESS}-byte sequential decode cap for compressed files",
             path.display()
         );
     }
-    let file =
-        std::fs::File::open(path).with_context(|| format!("{}: failed to open", path.display()))?;
+    let file = source.open()?;
     let ctx = || format!("{}: failed to decompress", path.display());
     // flate2's read decoders buffer their input internally.
     let mut decoder = MultiGzDecoder::new(file);
@@ -885,6 +1091,7 @@ enum WriteOutcome {
 /// - `expect_mtime` (a previous `X-Mtime`): the metadata token must match.
 pub(crate) async fn put_file(
     State(state): State<Arc<AppState>>,
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Query(query): Query<PutFileQuery>,
     body: Bytes,
@@ -905,16 +1112,27 @@ pub(crate) async fn put_file(
     let owner = state.clone();
     // A plugin that claims the file hears this write as `file-saved`.
     crate::plugins::files::mark_saved(&state, &dirty_path);
+    let permit = if filesystem.is_some() {
+        Some(FILESYSTEM_WORK.acquire().await.expect("filesystem limiter"))
+    } else {
+        None
+    };
     let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let expect_hash = query.expect_hash.map(|h| h.to_ascii_lowercase());
         let pre = match (expect_hash.as_deref(), query.expect_mtime.as_deref()) {
             (Some(hash), _) => Precondition::Hash(hash),
             (None, Some(mtime)) => Precondition::Mtime(mtime),
             (None, None) => Precondition::None,
         };
-        write_file(&query.path, &body, pre, || {
-            crate::workspace_scope::begin_mutation(&owner, &mutation)
-        })
+        match filesystem {
+            Some(scope) => scoped::write(&scope, &query.path, &body, pre, || {
+                crate::workspace_scope::begin_mutation(&owner, &mutation)
+            }),
+            None => write_file(&query.path, &body, pre, || {
+                crate::workspace_scope::begin_mutation(&owner, &mutation)
+            }),
+        }
     })
     .await;
     match result {
@@ -1434,9 +1652,13 @@ pub(crate) struct MarkdownQuery {
 /// as sanitized GFM HTML (see [`markdown_to_html`] for what it carries), and
 /// the raw text of a leading YAML frontmatter block (see [`frontmatter`];
 /// delimiter lines excluded) or null.
-pub(crate) async fn markdown(Query(query): Query<MarkdownQuery>) -> Response {
+pub(crate) async fn markdown(
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
+    Query(query): Query<MarkdownQuery>,
+) -> Response {
     blocking_json(move || {
-        let text = read_markdown(&query.path)?;
+        let source = FileSource::new(&query.path, filesystem.as_ref().map(|scope| &scope.0))?;
+        let text = read_markdown_source(&source)?;
         Ok(json!({
             "html": sanitize_markdown(&markdown_to_html(&text)),
             "frontmatter": frontmatter(&text).map(|f| f.inner),
@@ -1447,9 +1669,10 @@ pub(crate) async fn markdown(Query(query): Query<MarkdownQuery>) -> Response {
 
 /// Read the markdown file at `raw` as (lossy) UTF-8. Files over 4MB are
 /// rejected.
-fn read_markdown(raw: &str) -> anyhow::Result<String> {
-    let path = canonical_file(raw)?;
-    let size = std::fs::metadata(&path)
+fn read_markdown_source(source: &FileSource) -> anyhow::Result<String> {
+    let path = &source.path;
+    let size = source
+        .metadata()
         .with_context(|| format!("{}: failed to stat", path.display()))?
         .len();
     if size > MAX_MARKDOWN_BYTES {
@@ -1458,8 +1681,15 @@ fn read_markdown(raw: &str) -> anyhow::Result<String> {
             path.display()
         );
     }
-    let bytes =
-        std::fs::read(&path).with_context(|| format!("{}: failed to read", path.display()))?;
+    let mut bytes = Vec::new();
+    source
+        .open()?
+        .take(MAX_MARKDOWN_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_MARKDOWN_BYTES,
+        "markdown grew beyond preview cap"
+    );
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -2988,15 +3218,19 @@ impl TableOpts {
 /// answers `scan_limited` with how far it got (`scanned_to`) — asking again
 /// resumes from there. The response also carries `total_rows` once a scan has
 /// reached the end, else `est_rows` (a byte-rate estimate, plain files only).
-pub(crate) async fn table(Query(query): Query<TableQuery>) -> Response {
+pub(crate) async fn table(
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
+    Query(query): Query<TableQuery>,
+) -> Response {
     let limit = query.limit_rows.unwrap_or(200).min(MAX_TABLE_ROWS);
     let opts = match TableOpts::from_query(&query) {
         Ok(opts) => opts,
         Err(err) => return bad_request(&err),
     };
     blocking_json(move || {
-        read_table(
-            &query.path,
+        let source = FileSource::new(&query.path, filesystem.as_ref().map(|scope| &scope.0))?;
+        read_table_source(
+            &source,
             query.offset_rows,
             limit,
             &opts,
@@ -3145,6 +3379,7 @@ fn window_line_rate(file: &mut std::fs::File, at: u64, len: u64) -> Option<f64> 
 
 /// Parse one page of the delimited (possibly gzip-compressed) file at `raw`,
 /// walking at most `budget` bytes of a plain file.
+#[cfg(test)]
 fn read_table(
     raw: &str,
     offset_rows: usize,
@@ -3152,16 +3387,32 @@ fn read_table(
     opts: &TableOpts,
     budget: u64,
 ) -> anyhow::Result<serde_json::Value> {
-    let path = canonical_file(raw)?;
+    read_table_source(
+        &FileSource::new(raw, None)?,
+        offset_rows,
+        limit_rows,
+        opts,
+        budget,
+    )
+}
+fn read_table_source(
+    source: &FileSource,
+    offset_rows: usize,
+    limit_rows: usize,
+    opts: &TableOpts,
+    budget: u64,
+) -> anyhow::Result<serde_json::Value> {
+    let path = source.path.clone();
     let gz = is_gzip_path(&path);
     let delimiter = match opts.delim.as_str() {
-        "auto" => sniff_delimiter(&path, gz, &opts.comments)?,
+        "auto" => sniff_delimiter_source(source, gz, &opts.comments)?,
         "," | "comma" => b',',
         "\t" | "tab" => b'\t',
         other => anyhow::bail!("unsupported delimiter {other:?} (want auto, comma, or tab)"),
     };
 
-    let file = std::fs::File::open(&path)
+    let file = source
+        .open()
         .with_context(|| format!("{}: failed to open", path.display()))?;
     let mut builder = csv::ReaderBuilder::new();
     // Headers are read by hand (comment lines may precede them), so the csv
@@ -3391,15 +3642,20 @@ pub(crate) struct XlsxQuery {
 /// resolved `sheet`, so the UI can offer a sheet picker and reuse the CSV grid.
 /// The first row is the header (parity with the CSV viewer). Runs on a blocking
 /// worker (calamine parses the whole file) after a source-size gate.
-pub(crate) async fn xlsx(Query(query): Query<XlsxQuery>) -> Response {
+pub(crate) async fn xlsx(
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
+    Query(query): Query<XlsxQuery>,
+) -> Response {
     let limit = query.limit_rows.unwrap_or(200).min(MAX_TABLE_ROWS);
+    let permit = if filesystem.is_some() {
+        Some(FILESYSTEM_WORK.acquire().await.expect("filesystem limiter"))
+    } else {
+        None
+    };
     let result = tokio::task::spawn_blocking(move || {
-        read_xlsx(
-            &query.path,
-            query.sheet.as_deref(),
-            query.offset_rows,
-            limit,
-        )
+        let _permit = permit;
+        let source = FileSource::new(&query.path, filesystem.as_ref().map(|scope| &scope.0))?;
+        read_xlsx_source(&source, query.sheet.as_deref(), query.offset_rows, limit)
     })
     .await;
     match result {
@@ -3424,16 +3680,26 @@ fn xlsx_cell(cell: &calamine::Data) -> String {
 /// `sheets`/`sheet`). calamine has no lazy row iterator, so the whole sheet is
 /// materialized once per request — the [`MAX_XLSX_BYTES`] gate keeps that
 /// bounded, and the caller runs us off the reactor.
-fn read_xlsx(
-    raw: &str,
+fn read_xlsx_source(
+    source: &FileSource,
     sheet: Option<&str>,
     offset_rows: usize,
     limit_rows: usize,
 ) -> anyhow::Result<serde_json::Value> {
+    read_xlsx_source_checked(source, sheet, offset_rows, limit_rows, || {})
+}
+fn read_xlsx_source_checked(
+    source: &FileSource,
+    sheet: Option<&str>,
+    offset_rows: usize,
+    limit_rows: usize,
+    after_capture: impl FnOnce(),
+) -> anyhow::Result<serde_json::Value> {
     use calamine::Reader;
 
-    let path = canonical_file(raw)?;
-    let size = std::fs::metadata(&path)
+    let path = &source.path;
+    let size = source
+        .metadata()
         .with_context(|| format!("{}: failed to stat", path.display()))?
         .len();
     if size > MAX_XLSX_BYTES {
@@ -3444,9 +3710,19 @@ fn read_xlsx(
         );
     }
 
-    preflight_workbook_expansion(&path)?;
-
-    let mut workbook = calamine::open_workbook_auto(&path)
+    let mut bytes = Vec::new();
+    source
+        .open()?
+        .take(MAX_XLSX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_XLSX_BYTES,
+        "spreadsheet grew beyond preview cap"
+    );
+    let captured = std::io::Cursor::new(Arc::<[u8]>::from(bytes));
+    after_capture();
+    preflight_workbook_expansion(path, captured.clone())?;
+    let mut workbook = calamine::open_workbook_auto_from_rs(captured)
         .with_context(|| format!("{}: not a readable spreadsheet", path.display()))?;
     let sheets: Vec<String> = workbook.sheet_names().to_vec();
     let sheet_name = match sheet {
@@ -3498,19 +3774,21 @@ fn read_xlsx(
 /// Legacy `.xls` is not a ZIP container and is already bounded directly by
 /// [`MAX_XLSX_BYTES`]. Central-directory sizes are cheap to inspect and give
 /// us a hard expansion/entry ceiling for xlsx/xlsm/ods.
-fn preflight_workbook_expansion(path: &Path) -> anyhow::Result<()> {
+fn preflight_workbook_expansion(path: &Path, input: impl Read + Seek) -> anyhow::Result<()> {
     let extension = path
         .extension()
         .and_then(|ext| ext.to_str())
         .map(str::to_ascii_lowercase);
-    if !matches!(extension.as_deref(), Some("xlsx" | "xlsm" | "ods")) {
-        return Ok(());
-    }
-
-    let file =
-        std::fs::File::open(path).with_context(|| format!("{}: failed to open", path.display()))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .with_context(|| format!("{}: invalid spreadsheet ZIP", path.display()))?;
+    let mut archive = match zip::ZipArchive::new(input) {
+        Ok(archive) => archive,
+        // Calamine's stream reader identifies the actual format, so an XLS
+        // name must not bypass the ZIP budget for renamed XLSX/XLSB bytes.
+        Err(error) if matches!(extension.as_deref(), Some("xlsx" | "xlsm" | "xlsb" | "ods")) => {
+            return Err(error)
+                .with_context(|| format!("{}: invalid spreadsheet ZIP", path.display()));
+        }
+        Err(_) => return Ok(()), // legacy OLE/XLS is bounded by source bytes
+    };
     if archive.len() > MAX_XLSX_ENTRIES {
         anyhow::bail!(
             "spreadsheet contains {} ZIP entries — over the {MAX_XLSX_ENTRIES}-entry preview cap",
@@ -3549,7 +3827,12 @@ fn delimiter_from_name(name: &str) -> Option<u8> {
 /// that is the path minus its .gz/.bgz suffix — `foo.tsv.gz` -> tsv — then
 /// the gzip member's stored FNAME); with no telling name, sniff the first
 /// (decoded) line that is not a comment: any tab means tab, otherwise comma.
-fn sniff_delimiter(path: &Path, gz: bool, comments: &[Vec<u8>]) -> anyhow::Result<u8> {
+fn sniff_delimiter_source(
+    source: &FileSource,
+    gz: bool,
+    comments: &[Vec<u8>],
+) -> anyhow::Result<u8> {
+    let path = &source.path;
     let effective = if gz {
         gz_inner_from_path(path)
     } else {
@@ -3559,15 +3842,16 @@ fn sniff_delimiter(path: &Path, gz: bool, comments: &[Vec<u8>]) -> anyhow::Resul
         return Ok(delim);
     }
     if gz {
-        if let Some(delim) = gz_inner_from_header(path)
+        if let Some(delim) = gz_inner_from_header_source(source)
             .as_deref()
             .and_then(delimiter_from_name)
         {
             return Ok(delim);
         }
     }
-    let file =
-        std::fs::File::open(path).with_context(|| format!("{}: failed to open", path.display()))?;
+    let file = source
+        .open()
+        .with_context(|| format!("{}: failed to open", path.display()))?;
     let input: Box<dyn Read> = if gz {
         Box::new(MultiGzDecoder::new(file))
     } else {
@@ -3773,6 +4057,7 @@ fn judge_index_matches(
 /// misses this round (clients retry misses).
 pub(crate) async fn validate(
     State(state): State<Arc<AppState>>,
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     Json(body): Json<ValidateRequest>,
 ) -> Response {
     if !Path::new(&body.base).is_absolute() {
@@ -3853,6 +4138,24 @@ pub(crate) async fn validate(
                 IndexAnswer::Miss => {}
             }
         }
+        if let Some(scope) = filesystem {
+            let check = |entry: &serde_json::Value| {
+                entry["path"]
+                    .as_str()
+                    .and_then(|path| scope.read(path).ok())
+                    .and_then(|bound| bound.open_any().ok())
+                    .is_some()
+            };
+            valid.retain(|_, entry| check(entry));
+            ambiguous.retain(|_, entries| {
+                if let Some(entries) = entries.as_array_mut() {
+                    entries.retain(check);
+                    !entries.is_empty()
+                } else {
+                    false
+                }
+            });
+        }
         Ok(json!({"valid": valid, "ambiguous": ambiguous}))
     })
     .await
@@ -3871,11 +4174,24 @@ pub(crate) struct MkdirRequest {
 /// so a workspace can be opened on a path that does not exist yet.
 pub(crate) async fn mkdir(
     State(state): State<Arc<AppState>>,
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Json(body): Json<MkdirRequest>,
 ) -> Response {
+    let permit = if filesystem.is_some() {
+        Some(FILESYSTEM_WORK.acquire().await.expect("filesystem limiter"))
+    } else {
+        None
+    };
     let work = move || -> anyhow::Result<serde_json::Value> {
+        let _permit = permit;
         let _commit = crate::workspace_scope::begin_mutation(&state, &mutation)?;
+        if let Some(scope) = filesystem {
+            return match scoped::mkdir(&scope, &body.path)? {
+                MutateOutcome::Done(value) => Ok(value),
+                MutateOutcome::Conflict(message) => anyhow::bail!(message),
+            };
+        }
         let expanded = expand_tilde(&body.path)?;
         if expanded.as_os_str().is_empty() {
             anyhow::bail!("empty path");
@@ -3922,8 +4238,14 @@ async fn run_mutation<F>(
 where
     F: FnOnce() -> anyhow::Result<MutateOutcome> + Send + 'static,
 {
+    let permit = if mutation.is_some() {
+        Some(FILESYSTEM_WORK.acquire().await.expect("filesystem limiter"))
+    } else {
+        None
+    };
     let owner = state.clone();
     match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let _commit = crate::workspace_scope::begin_mutation(&owner, &mutation)?;
         work()
     })
@@ -3972,11 +4294,15 @@ pub(crate) struct CreateRequest {
 /// model as PUT /fs/file: the daemon runs as the user.
 pub(crate) async fn create(
     State(state): State<Arc<AppState>>,
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Json(body): Json<CreateRequest>,
 ) -> Response {
     let raw = body.path.clone();
     let work = move || -> anyhow::Result<MutateOutcome> {
+        if let Some(scope) = filesystem {
+            return scoped::create(&scope, &body.path, matches!(body.kind, CreateKind::Dir));
+        }
         let expanded = expand_tilde(&body.path)?;
         if expanded.as_os_str().is_empty() {
             anyhow::bail!("empty path");
@@ -4040,11 +4366,15 @@ pub(crate) struct RenameRequest {
 /// new path.
 pub(crate) async fn rename(
     State(state): State<Arc<AppState>>,
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Json(body): Json<RenameRequest>,
 ) -> Response {
     let (raw_from, raw_to) = (body.from.clone(), body.to.clone());
     let work = move || -> anyhow::Result<MutateOutcome> {
+        if let Some(scope) = filesystem {
+            return scoped::rename(&scope, &body.from, &body.to);
+        }
         let from = canonical_parent_join(&body.from)?;
         if std::fs::symlink_metadata(&from).is_err() {
             anyhow::bail!("{}: No such file or directory", from.display());
@@ -4099,11 +4429,15 @@ pub(crate) struct DeleteRequest {
 /// directory. 204 on success.
 pub(crate) async fn delete(
     State(state): State<Arc<AppState>>,
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Json(body): Json<DeleteRequest>,
 ) -> Response {
     let raw = body.path.clone();
     let work = move || -> anyhow::Result<MutateOutcome> {
+        if let Some(scope) = filesystem {
+            return scoped::delete(&scope, &body.path);
+        }
         let target = canonical_parent_join(&body.path)?;
         let home = home_dir()
             .and_then(|h| std::fs::canonicalize(&h).with_context(|| h.display().to_string()));
@@ -4233,11 +4567,20 @@ pub(crate) struct CopyRequest {
 /// into itself or a descendant. Returns the canonical new path.
 pub(crate) async fn copy(
     State(state): State<Arc<AppState>>,
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Json(body): Json<CopyRequest>,
 ) -> Response {
     let (raw_from, raw_to) = (body.from.clone(), body.to.clone());
     let work = move || -> anyhow::Result<MutateOutcome> {
+        if let Some(scope) = filesystem {
+            return scoped::copy(
+                &scope,
+                &body.from,
+                &body.to,
+                body.on_conflict == OnConflict::Unique,
+            );
+        }
         let from = canonical_parent_join(&body.from)?;
         if std::fs::symlink_metadata(&from).is_err() {
             anyhow::bail!("{}: No such file or directory", from.display());
@@ -4288,11 +4631,15 @@ pub(crate) struct MoveRequest {
 /// 409 if `to` already exists. Returns the canonical new path.
 pub(crate) async fn move_(
     State(state): State<Arc<AppState>>,
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Json(body): Json<MoveRequest>,
 ) -> Response {
     let (raw_from, raw_to) = (body.from.clone(), body.to.clone());
     let work = move || -> anyhow::Result<MutateOutcome> {
+        if let Some(scope) = filesystem {
+            return scoped::move_entry(&scope, &body.from, &body.to);
+        }
         let from = canonical_parent_join(&body.from)?;
         if std::fs::symlink_metadata(&from).is_err() {
             anyhow::bail!("{}: No such file or directory", from.display());
@@ -4373,10 +4720,25 @@ pub(crate) struct TicketStore {
     tickets: HashMap<String, Ticket>,
     /// (path, version) -> the live ticket minted for it.
     by_version: HashMap<(PathBuf, String), String>,
+    by_scoped_version: HashMap<
+        (
+            PathBuf,
+            String,
+            crate::workspace_scope::files::TicketIdentity,
+        ),
+        String,
+    >,
+}
+
+pub(crate) struct TicketSnapshot {
+    pub(crate) path: PathBuf,
+    pub(crate) bound: Option<crate::workspace_scope::files::Resolved>,
+    pub(crate) fresh_for: Duration,
 }
 
 struct Ticket {
     path: PathBuf,
+    bound: Option<crate::workspace_scope::files::Resolved>,
     version: Option<String>,
     expires: Instant,
 }
@@ -4388,6 +4750,46 @@ impl TicketStore {
         self.create(path, version, TICKET_TTL)
     }
 
+    pub(crate) fn mint_bound(
+        &mut self,
+        bound: crate::workspace_scope::files::Resolved,
+        version: Option<String>,
+    ) -> String {
+        self.purge();
+        let key = version
+            .as_ref()
+            .zip(bound.ticket_identity())
+            .map(|(version, identity)| (bound.canonical.clone(), version.clone(), identity));
+        if let Some(key) = &key {
+            if let Some(id) = self.by_scoped_version.get(key) {
+                if let Some(ticket) = self.tickets.get_mut(id) {
+                    ticket.expires = Instant::now() + TICKET_TTL;
+                    return id.clone();
+                }
+            }
+        }
+        // Scoped renewals never cross an unrestricted path or a different
+        // account generation/epoch/root inode, even at the same file version.
+        let id = self.create(bound.canonical.clone(), None, TICKET_TTL);
+        let ticket = self.tickets.get_mut(&id).expect("new ticket");
+        ticket.version = version;
+        ticket.bound = Some(bound);
+        if let Some(key) = key {
+            self.by_scoped_version.insert(key, id.clone());
+        }
+        id
+    }
+    /// Snapshot path and optional scoped authority under one lookup. Missing
+    /// or evicted tickets never degrade to an unrestricted path capability.
+    pub(crate) fn snapshot(&mut self, ticket: &str) -> Option<TicketSnapshot> {
+        self.purge();
+        let now = Instant::now();
+        self.tickets.get(ticket).map(|entry| TicketSnapshot {
+            path: entry.path.clone(),
+            bound: entry.bound.clone(),
+            fresh_for: entry.expires.saturating_duration_since(now),
+        })
+    }
     fn create(&mut self, path: PathBuf, version: Option<String>, ttl: Duration) -> String {
         self.purge();
         if let Some(version) = &version {
@@ -4410,7 +4812,20 @@ impl TicketStore {
             {
                 if let Some(evicted) = self.tickets.remove(&oldest) {
                     if let Some(version) = evicted.version {
-                        self.by_version.remove(&(evicted.path, version));
+                        match evicted.bound {
+                            Some(bound) => {
+                                if let Some(identity) = bound.ticket_identity() {
+                                    self.by_scoped_version.remove(&(
+                                        evicted.path,
+                                        version,
+                                        identity,
+                                    ));
+                                }
+                            }
+                            None => {
+                                self.by_version.remove(&(evicted.path, version));
+                            }
+                        }
                     }
                 }
             }
@@ -4424,6 +4839,7 @@ impl TicketStore {
             ticket.clone(),
             Ticket {
                 path,
+                bound: None,
                 version,
                 expires: Instant::now() + ttl,
             },
@@ -4434,11 +4850,12 @@ impl TicketStore {
     /// The path bound to `ticket`, if it exists and has not expired.
     /// Shared with the download module — same store, same capability model.
     pub(crate) fn lookup(&mut self, ticket: &str) -> Option<PathBuf> {
-        self.lookup_ttl(ticket).map(|(path, _)| path)
+        self.snapshot(ticket).map(|snapshot| snapshot.path)
     }
 
     /// [`Self::lookup`] plus how long the ticket has left — the `max-age`
     /// a `/raw` response may be cached for.
+    #[cfg(test)]
     pub(crate) fn lookup_ttl(&mut self, ticket: &str) -> Option<(PathBuf, Duration)> {
         self.purge();
         let now = Instant::now();
@@ -4452,6 +4869,8 @@ impl TicketStore {
         self.tickets.retain(|_, t| t.expires > now);
         let tickets = &self.tickets;
         self.by_version.retain(|_, id| tickets.contains_key(id));
+        self.by_scoped_version
+            .retain(|_, id| tickets.contains_key(id));
     }
 
     /// Force a ticket to be already expired (test hook for the expiry path).
@@ -4527,15 +4946,26 @@ pub(crate) struct TicketRequest {
 /// `/raw/{ticket}/{name}` (see [`raw_asset`]).
 pub(crate) async fn create_ticket(
     State(state): State<Arc<AppState>>,
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     Json(body): Json<TicketRequest>,
 ) -> Response {
     let minted = tokio::task::spawn_blocking(move || {
-        let path = canonical(&body.path)?;
-        let version = std::fs::metadata(&path).ok().map(|m| mtime_token(&m));
-        anyhow::Ok((path, version))
+        let bound = filesystem
+            .as_ref()
+            .map(|scope| scope.read(&body.path))
+            .transpose()?;
+        let path = match &bound {
+            Some(bound) => bound.canonical.clone(),
+            None => canonical(&body.path)?,
+        };
+        let version = match &bound {
+            Some(bound) => Some(mtime_token(&bound.open_any()?.metadata()?)),
+            None => std::fs::metadata(&path).ok().map(|m| mtime_token(&m)),
+        };
+        anyhow::Ok((path, version, bound))
     })
     .await;
-    let (path, version) = match minted {
+    let (path, version, bound) = match minted {
         Ok(Ok(minted)) => minted,
         Ok(Err(err)) => return bad_request(&err),
         Err(join) => {
@@ -4547,7 +4977,10 @@ pub(crate) async fn create_ticket(
         }
     };
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-    let ticket = crate::lock(&state.tickets).mint(path, version);
+    let ticket = match bound {
+        Some(bound) => crate::lock(&state.tickets).mint_bound(bound, version),
+        None => crate::lock(&state.tickets).mint(path, version),
+    };
     Json(json!({"ticket": ticket, "name": name})).into_response()
 }
 
@@ -4599,7 +5032,12 @@ pub(crate) async fn raw(
     axum::extract::Path(ticket): axum::extract::Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let Some((path, fresh_for)) = crate::lock(&state.tickets).lookup_ttl(&ticket) else {
+    let Some(TicketSnapshot {
+        path,
+        bound,
+        fresh_for,
+    }) = crate::lock(&state.tickets).snapshot(&ticket)
+    else {
         return raw_not_found();
     };
     // `open_regular` (non-blocking open + fstat re-check): a FIFO or device
@@ -4608,7 +5046,15 @@ pub(crate) async fn raw(
     // (folder downloads); /raw itself stays file-only — a 404, not a listing.
     let opened = {
         let path = path.clone();
-        tokio::task::spawn_blocking(move || open_regular(&path)).await
+        tokio::task::spawn_blocking(move || match bound {
+            Some(bound) => {
+                let file = bound.open(false)?;
+                let metadata = file.metadata()?;
+                Ok((file, metadata))
+            }
+            None => open_regular(&path),
+        })
+        .await
     };
     let (file, meta) = match opened {
         Ok(Ok((file, meta))) => (tokio::fs::File::from_std(file), meta),
@@ -4651,7 +5097,8 @@ pub(crate) async fn raw_asset(
     axum::extract::Path((ticket, rest)): axum::extract::Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(path) = crate::lock(&state.tickets).lookup(&ticket) else {
+    let Some(TicketSnapshot { path, bound, .. }) = crate::lock(&state.tickets).snapshot(&ticket)
+    else {
         return raw_not_found();
     };
     if !opens_its_folder(&path) {
@@ -4674,7 +5121,14 @@ pub(crate) async fn raw_asset(
     let target = relative.clone();
     let opened = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        open_asset(&dir, &target)
+        match bound {
+            Some(bound) => {
+                let file = bound.asset(&target)?;
+                let metadata = file.metadata()?;
+                Ok((file, metadata))
+            }
+            None => open_asset(&dir, &target),
+        }
     })
     .await;
     let (file, meta) = match opened {
@@ -4927,4 +5381,74 @@ async fn serve_raw(
         }
     }
     response
+}
+
+#[cfg(test)]
+mod source_safety_tests {
+    use super::*;
+    #[test]
+    fn plain_source_refuses_a_fifo_substituted_after_path_proof() {
+        let base = std::env::temp_dir().join(format!(
+            "chimaera-source-fifo-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("notebook.ipynb");
+        std::fs::write(&path, "{}").unwrap();
+        let source = FileSource::new(&path.to_string_lossy(), None).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || send.send(source.open().map(|_| ())).unwrap());
+        assert!(receive
+            .recv_timeout(Duration::from_secs(3))
+            .expect("plain source blocked on FIFO")
+            .is_err());
+        worker.join().unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn workbook_preflight_and_parser_share_exact_captured_bytes() {
+        let original = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tests/fixtures/sample.xlsx"),
+        )
+        .unwrap();
+        let mut bomb = original.clone();
+        let central = bomb
+            .windows(4)
+            .position(|bytes| bytes == b"PK\x01\x02")
+            .unwrap();
+        // No expanded allocation: the central directory alone declares a
+        // payload over the preview ceiling and must be refused pre-parse.
+        bomb[central + 24..central + 28]
+            .copy_from_slice(&((MAX_XLSX_EXPANDED_BYTES + 1) as u32).to_le_bytes());
+        assert!(preflight_workbook_expansion(
+            Path::new("renamed.xls"),
+            std::io::Cursor::new(&bomb)
+        )
+        .is_err());
+        let base = std::env::temp_dir().join(format!(
+            "chimaera-workbook-snapshot-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("book.xlsx");
+        std::fs::write(&path, &original).unwrap();
+        let source = FileSource::new(&path.to_string_lossy(), None).unwrap();
+        assert!(
+            read_xlsx_source_checked(&source, None, 0, 10, || std::fs::write(&path, &bomb)
+                .unwrap())
+            .is_ok()
+        );
+        let error = read_xlsx_source_checked(&source, None, 0, 10, || {
+            std::fs::write(&path, &original).unwrap()
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("expands past"), "{error}");
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }

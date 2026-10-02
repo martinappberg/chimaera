@@ -20,6 +20,9 @@ use serde_json::json;
 use tokio::io::AsyncWriteExt;
 
 use crate::AppState;
+mod scoped;
+#[cfg(test)]
+pub(crate) use scoped::upload_with_limits;
 
 /// A session upload lands under bounded daemon state, so one reference/drop
 /// stays comfortably below the session-wide quota.
@@ -311,6 +314,7 @@ pub(crate) struct DirUploadQuery {
 /// non-directory `dir`, 413 past the per-file cap.
 pub(crate) async fn upload_to_dir(
     State(state): State<Arc<AppState>>,
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Query(query): Query<DirUploadQuery>,
     body: Body,
@@ -322,6 +326,9 @@ pub(crate) async fn upload_to_dir(
         )
             .into_response();
     };
+    if let Some(filesystem) = filesystem {
+        return scoped::upload(state, filesystem.0, mutation, query.dir, name, body).await;
+    }
     let dir = match tokio::fs::canonicalize(&query.dir).await {
         Ok(dir) if dir.is_dir() => dir,
         Ok(_) => {

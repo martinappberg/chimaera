@@ -672,6 +672,7 @@ pub(crate) struct DiffQuery {
 /// computes the diff); binary and over-cap files bail with a flag.
 pub(crate) async fn diff(
     State(state): State<Arc<AppState>>,
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     scope: Option<Extension<crate::workspace_scope::Scope>>,
     Query(q): Query<DiffQuery>,
 ) -> Response {
@@ -821,7 +822,13 @@ pub(crate) async fn diff(
     };
     let b = match b_spec {
         Some(spec) => show_blob(&git.path, &state.git, &repo, &spec).await,
-        None => read_worktree(&repo.toplevel.join(&rel)).await,
+        None => {
+            read_worktree_scoped(
+                &repo.toplevel.join(&rel),
+                filesystem.as_ref().map(|scope| scope.0.clone()),
+            )
+            .await
+        }
     };
     let (a, b) = match (a, b) {
         (Ok(a), Ok(b)) => (a, b),
@@ -905,6 +912,42 @@ async fn read_worktree(path: &Path) -> Result<Option<Vec<u8>>, String> {
         },
         Err(_) => Ok(None), // deleted / never existed
     }
+}
+
+async fn read_worktree_scoped(
+    path: &Path,
+    filesystem: Option<crate::workspace_scope::files::Context>,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(filesystem) = filesystem else {
+        return read_worktree(path).await;
+    };
+    let path = path.to_owned();
+    let permit = crate::fs::FILESYSTEM_WORK
+        .acquire()
+        .await
+        .map_err(|_| "file_read_failed".to_owned())?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        use std::io::Read;
+        let resolved = match filesystem.read(&path.to_string_lossy()) {
+            Ok(resolved) => resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("outside_project".into()),
+        };
+        let file = resolved
+            .open(false)
+            .map_err(|_| "outside_project".to_owned())?;
+        let mut bytes = Vec::new();
+        file.take(MAX_DIFF_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "file_read_failed".to_owned())?;
+        if bytes.len() > MAX_DIFF_BYTES {
+            return Err("too_large".into());
+        }
+        Ok(Some(bytes))
+    })
+    .await
+    .map_err(|_| "file_read_failed".to_owned())?
 }
 
 /// git's own heuristic: a NUL byte in the first 8000 bytes means binary.

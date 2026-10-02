@@ -21,6 +21,7 @@ use std::{
 pub(crate) const WORKSPACE_HEADER: &str = "x-chimaera-workspace";
 pub(crate) const EPOCH_HEADER: &str = "x-chimaera-epoch";
 mod commands;
+pub(crate) mod files;
 pub(crate) mod paths;
 const MAX_JSON: usize = 1024 * 1024;
 
@@ -108,7 +109,14 @@ pub(crate) fn begin_mutation(
 }
 pub(crate) fn mutation_failure(error: &anyhow::Error) -> Option<Response> {
     error
-        .is::<crate::pro::mutation::Changed>()
+        .chain()
+        .any(|cause| {
+            cause.is::<crate::pro::mutation::Changed>()
+                || cause
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::get_ref)
+                    .is_some_and(|inner| inner.is::<crate::pro::mutation::Changed>())
+        })
         .then(|| denied(StatusCode::CONFLICT))
 }
 
@@ -221,8 +229,7 @@ impl Scope {
             .get(&self.workspace_id)
             .context("unknown workspace")?
             .root;
-        let _permit = crate::fs::FILESYSTEM_WORK.acquire().await?;
-        tokio::task::spawn_blocking(move || {
+        blocking_paths(&crate::fs::FILESYSTEM_WORK, move || {
             let root = root.canonicalize()?;
             for path in paths {
                 ensure!(within(&root, &path)?, "path outside workspace");
@@ -250,8 +257,7 @@ impl Scope {
             .filter(|(_, workspace)| **workspace == self.workspace_id)
             .map(|(session, _)| state.uploads_root.join(session))
             .collect();
-        let _permit = crate::fs::FILESYSTEM_WORK.acquire().await?;
-        tokio::task::spawn_blocking(move || {
+        blocking_paths(&crate::fs::FILESYSTEM_WORK, move || {
             let root = root.canonicalize()?;
             // A conversation that never saved an image has no folder.
             let uploads: Vec<_> = uploads
@@ -278,8 +284,7 @@ impl Scope {
         // answer: nothing here means the viewer's own computer can (its own
         // file); something here means the viewer must not show a different
         // file that happens to share the path. Contents never leave.
-        let _permit = crate::fs::FILESYSTEM_WORK.acquire().await?;
-        let missing = tokio::task::spawn_blocking(move || {
+        let missing = blocking_paths(&crate::fs::FILESYSTEM_WORK, move || {
             crate::fs::expand_tilde(&path).is_ok_and(|path| {
                 matches!(std::fs::symlink_metadata(path), Err(error)
                     if error.kind() == std::io::ErrorKind::NotFound)
@@ -289,6 +294,19 @@ impl Scope {
         Err(Outside { missing }.into())
     }
 }
+/// The blocking job owns capacity even when its HTTP observer disappears.
+async fn blocking_paths<T: Send + 'static>(
+    limiter: &'static tokio::sync::Semaphore,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    let permit = limiter.acquire().await?;
+    Ok(tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await?)
+}
+
 /// A refused scoped request. A read outside the project: `not_found` lets
 /// the viewer's own computer answer with its own file; `outside_project`
 /// tells it this machine has a different one it must not stand in for.
@@ -419,6 +437,20 @@ async fn scoped_request(
     let alias = match scope.alias(&state) {
         Ok(alias) => alias,
         Err(_) => return denied(StatusCode::BAD_REQUEST),
+    };
+    let filesystem = if path.starts_with("/fs/") || path.starts_with("/git/") {
+        let owner = state.clone();
+        let binding = scope.clone();
+        match blocking_paths(&crate::fs::FILESYSTEM_WORK, move || {
+            files::Context::pin(&owner, binding, generation)
+        })
+        .await
+        {
+            Ok(Ok(filesystem)) => Some(filesystem),
+            _ => return denied(StatusCode::CONFLICT),
+        }
+    } else {
+        None
     };
     let mut query: HashMap<String, String> =
         match Query::<Vec<(String, String)>>::try_from_uri(request.uri()) {
@@ -623,6 +655,9 @@ async fn scoped_request(
         generation,
     });
     request.extensions_mut().insert(scope);
+    if let Some(filesystem) = filesystem {
+        request.extensions_mut().insert(filesystem);
+    }
     let response = if commands::reserved(&method, &path) {
         commands::run(state, request, next).await
     } else {
@@ -1018,6 +1053,29 @@ pub(crate) async fn ticket_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cancelled_path_observer_keeps_capacity_until_its_worker_drains() {
+        let limiter = Box::leak(Box::new(tokio::sync::Semaphore::new(1)));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(blocking_paths(limiter, move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            limiter.try_acquire().is_err(),
+            "cancelled observer must not release blocked filesystem capacity"
+        );
+        release_tx.send(()).unwrap();
+        let _permit = tokio::time::timeout(std::time::Duration::from_secs(5), limiter.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[test]
     fn forwarded_scope_requires_one_complete_exact_pair() {
         let mut headers = HeaderMap::new();

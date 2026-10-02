@@ -353,6 +353,7 @@ fn client_ms(value: Option<&serde_json::Value>) -> Option<u64> {
 /// counted) the least recently updated drafts are evicted.
 pub(crate) async fn put_draft(
     State(state): State<Arc<AppState>>,
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Json(body): Json<PutDraftRequest>,
 ) -> Response {
@@ -385,6 +386,9 @@ pub(crate) async fn put_draft(
     let root = state.drafts_root.clone();
     let mut usage = DRAFTS_WRITE.lock().await;
     blocking(move || {
+        if let Some(scope) = &filesystem {
+            scope.key(&body.path)?;
+        }
         let _commit = crate::workspace_scope::begin_mutation(&state, &mutation)?;
         let stored = StoredDraft {
             bytes: body.text.len() as u64,
@@ -491,10 +495,14 @@ pub(crate) struct DraftQuery {
 /// stored without them.
 pub(crate) async fn get_draft(
     State(state): State<Arc<AppState>>,
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     Query(query): Query<DraftQuery>,
 ) -> Response {
     let root = state.drafts_root.clone();
     blocking(move || {
+        if let Some(scope) = &filesystem {
+            scope.key(&query.path)?;
+        }
         let file = draft_file(&root, &draft_id(&query.path));
         let stored = match std::fs::read(&file) {
             Ok(bytes) => serde_json::from_slice::<StoredDraft>(&bytes).ok(),
@@ -541,12 +549,16 @@ fn stored_writer(root: &Path, id: &str, path: &str) -> Option<Option<String>> {
 /// 204 whether or not one existed or went.
 pub(crate) async fn delete_draft(
     State(state): State<Arc<AppState>>,
+    filesystem: Option<Extension<crate::workspace_scope::files::Context>>,
     mutation: Option<Extension<crate::workspace_scope::Mutation>>,
     Query(query): Query<DraftQuery>,
 ) -> Response {
     let root = state.drafts_root.clone();
     let mut usage = DRAFTS_WRITE.lock().await;
     blocking(move || {
+        if let Some(scope) = &filesystem {
+            scope.key(&query.path)?;
+        }
         let _commit = crate::workspace_scope::begin_mutation(&state, &mutation)?;
         let id = draft_id(&query.path);
         if let Some(writer) = &query.writer {
