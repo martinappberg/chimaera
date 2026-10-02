@@ -580,7 +580,15 @@ nobody runs the project (released, or a computer's lapsed lease) the same
 request reserves the next acquisition. A project a cloud machine holds is
 never asked for this way, whatever the machine's state (awake, asleep, or
 stopped with its lease lapsed): 409 `held`. An epoch the caller did not see
-is 409 `stale_epoch`. The holder asking for its own project is its user
+is 409 `stale_epoch`. A signed-out computer whose lease is still live also
+returns 409 `held`. That temporary conflict may include `retry_after_ms` (a
+positive integer no greater than 300000) beside the exact `baton`, computed from
+the lease remainder on the account's clock. Clients may retry only this explicit
+hint while the workspace, holder, epoch and local account generation remain the
+same, within the existing five-minute action deadline. An absent/invalid hint or
+another conflict ends the request; a cloud-holder refusal never carries the hint.
+Expiry still does not bypass the thirty-second reconnect grace before acquisition.
+The holder asking for its own project is its user
 acting there: the last actor wins (by the account's clock) and any request
 for the project ends. `DELETE /v2/baton/{workspace}/move` withdraws the
 caller's own request (204; the same call from any other computer changes
