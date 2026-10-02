@@ -150,8 +150,9 @@ under `~/.chimaera/chat/`, ring + gap-replay on reconnect), and the pane-bar tog
 one conversation between chat and the real TUI via resume on the same session id. Risk
 posture, unchanged in spirit: the wire formats are unversioned, so drivers are pinned to
 live-verified CLI versions (`TESTED_*_VERSION` + `just chat-smoke`; facts ledger in
-`crates/chimaera-agent/PROTOCOL.md`), a per-spawn handshake watchdog degrades a failing
-driver to a Tier A PTY on the same session id, and Tier A remains fully supported — one
+`crates/chimaera-agent/PROTOCOL.md`), and a 60-second startup watchdog closes an unused
+failed launch or keeps existing work visible in chat. A failure never switches surfaces
+without the user choosing it. Tier A remains fully supported — one
 settings default (`agents.defaultView`) flips the world back if the paused billing split
 ever lands.
 

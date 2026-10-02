@@ -787,6 +787,7 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                     let switching = crate::lock(&state.chat_switching).get(&id).cloned();
                     let frame = match switching.as_deref() {
                         Some("term") => json!({"type": "degraded"}),
+                        Some("closed") => json!({"type": "exited", "status": null}),
                         Some(_) => json!({"type": "error", "code": "unknown_session",
                                           "message": "session switching"}),
                         None if state.sessions.get(&id).is_some() => json!({"type": "degraded"}),

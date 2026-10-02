@@ -322,6 +322,9 @@ async fn mastermind_acts_land_in_the_audit_trail() {
         Some("re-run   DE\nwithout S3"),
     );
     history::act(&state, &ws, "you", "deliver_note", Some("s-mm"), None);
+    // Acts are queued to the background writer; the route reads durable
+    // history. Synchronize those writes before asserting the route's result.
+    state.history.flush(std::time::Duration::from_secs(5));
     let (_, body) = request(
         &state,
         Method::GET,

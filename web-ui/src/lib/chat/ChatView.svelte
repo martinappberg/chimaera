@@ -192,7 +192,7 @@
   // position instead of snapping to the bottom.
   // svelte-ignore state_referenced_locally
   let atBottom = $state(chatScroll(session.id).atBottom);
-  let menu = $state<"model" | "mode" | "effort" | "mcp" | "remote" | null>(null);
+  let menu = $state<"model" | "mode" | "effort" | "mcp" | "remote" | "options" | null>(null);
 
   // --- bounded transcript DOM ------------------------------------------------
   // The reducer/socket always fold the complete bounded journal so background
@@ -1958,6 +1958,7 @@
 
   function pickModel(id: string): boolean {
     if (!sendCommand({ type: "set_model", model_id: id }, "model change not sent")) return false;
+    store.markModelPending(id);
     menu = null;
     return true;
   }
@@ -2005,8 +2006,7 @@
 
   /** Extended-thinking toggle (claude). ON by default — chimaera's chat is a
    *  workbench for real coding work, where the reasoning pass earns its keep;
-   *  the chip shows an explicit on/off and tints when on, so the state (and the
-   *  cost) is never hidden, and one click turns it off. The preference lives in
+   *  Chat options shows an explicit on/off beside the toggle. The preference lives in
    *  the pooled store, not here, so a tab remount keeps it. */
   const hasThinking = $derived(supports("set_thinking"));
   /** Effective thinking state: the user's explicit choice, or ON by default
@@ -2042,16 +2042,19 @@
   /** Model chip: the catalog's own display name when known ("Opus",
    *  "Fable"), else a readable fallback from the raw id. */
   const modelLabel = $derived.by(() => {
+    if (store.pendingModel !== null) {
+      const pending = modelChoices.find((m) => m.id === store.pendingModel);
+      return `${pending?.label ?? store.pendingModel} · applying…`;
+    }
     if (currentModel !== undefined) return currentModel.label;
     const m = store.model;
     if (m === null) {
-      // A fresh session never reports a model until its first turn — don't
-      // skeleton forever. Once the catalog is loaded, show the DEFAULT it will
-      // use (correct for a new chat); only the brief pre-catalog window (no
-      // choices yet) stays null → skeleton.
-      const def = modelChoices.find((c) => c.id === "default") ?? modelChoices[0];
-      return def?.label ?? null;
+      // Catalog order is not the user's configured model. In particular a
+      // failed handshake must never claim the first curated model is active.
+      return store.initialized ? "agent default" : null;
     }
+    const choice = modelChoices.find((c) => c.id === m);
+    if (choice !== undefined) return choice.label;
     const match = /claude-(\w+)-(\d+)-(\d+)/.exec(m);
     return match !== null ? `${match[1]} ${match[2]}.${match[3]}` : m;
   });
@@ -2401,7 +2404,7 @@
   // break. A chat that can't take a message offers no quote.
   const quoteOwner = {};
   let quoteChip = $state<{ x: number; y: number } | null>(null);
-  const composerDisabled = $derived(store.exited !== null || store.degraded);
+  const composerDisabled = $derived(store.exited !== null || store.degraded || store.fatalError !== null);
 
   function dropQuote(): void {
     quoteChip = null;
@@ -2508,7 +2511,7 @@
     {agentKind}
     {agentName}
     bind:menu
-    canPickModel={supports("set_model") && modelChoices.length > 0}
+    canPickModel={supports("set_model") && modelChoices.length > 0 && store.connected && store.exited === null && store.fatalError === null && store.pendingModel === null}
     canPickMode={supports("set_mode")}
     {modelChoices}
     {modelLabel}
@@ -3248,6 +3251,7 @@
      padding rides OUTSIDE the measure so text edges line up with it. */
   .chat > :global(.composer),
   .chat > .suggestion-row,
+  .chat > .branch-line,
   /* Every pinned strip (subagents, background, plan) — they were full-bleed
      while the plan alone was inset, so the group never lined up. */
   .chat > :global(.tray) {
@@ -3691,7 +3695,7 @@
     justify-content: space-between;
     gap: 12px;
     min-width: 0;
-    padding: 4px 14px 0;
+    padding-top: 4px;
   }
   .branch-slot {
     display: inline-flex;

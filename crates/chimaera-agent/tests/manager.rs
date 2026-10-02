@@ -1533,7 +1533,37 @@ async fn permission_deny_with_feedback_continues_turn() {
 }
 
 #[tokio::test]
-async fn handshake_failure_is_classified_for_degrade() {
+async fn closing_during_startup_cancels_every_provider_without_a_failure() {
+    use chimaera_agent::driver::AgentAdapter;
+    let adapters: [&dyn AgentAdapter; 4] = [
+        &ClaudeAdapter,
+        &chimaera_agent::codex::CodexAdapter,
+        &chimaera_agent::acp::ANTIGRAVITY,
+        &chimaera_agent::acp::GROK,
+    ];
+    for adapter in adapters {
+        let mut fx = fixture();
+        let mut launch = spec("closing", &fx.cwd, "silent");
+        launch.initial_model = Some("chosen-before-start".into());
+        let info = fx.manager.spawn(adapter, launch).expect("spawn");
+        assert_eq!(info.model.as_deref(), Some("chosen-before-start"));
+        assert!(fx.manager.is_unused_startup("closing"));
+        assert!(fx.manager.kill("closing"));
+        let exit = tokio::time::timeout(Duration::from_secs(5), fx.exits.recv())
+            .await
+            .expect("close must not wait for startup timeout")
+            .unwrap();
+        assert_eq!(exit, "closing:Killed");
+        let attached = fx.manager.attach("closing", 0).unwrap();
+        assert!(!attached
+            .replay
+            .iter()
+            .any(|entry| matches!(entry.ev, AgentEvent::Error { .. })));
+    }
+}
+
+#[tokio::test]
+async fn handshake_failure_is_classified_for_startup_cleanup() {
     let mut fx = fixture();
     let mut spec = spec("s-3", &fx.cwd, "silent");
     spec.handshake_timeout = Duration::from_millis(300);
