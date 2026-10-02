@@ -49,7 +49,6 @@
   let seq = 0;
 
   const here = $derived(listing?.path ?? "");
-  const hereName = $derived(here.split("/").filter((s) => s !== "").pop() ?? "/");
   /** The folder we're in is already a workspace. */
   const hereIsWorkspace = $derived(listing?.workspace !== undefined && listing?.workspace !== null);
   /** The breadcrumb: "/", "home", "u", "proj" with each one's full path. */
@@ -82,6 +81,13 @@
   // A path in the box lists its folder (once per folder, debounced: each
   // listing is an ssh exec) and matches the part after the last `/`.
   const typedPath = $derived(isTypedPath(input) ? input.trim() : null);
+  /** What Add adds: a path typed in the box (resolved on the cluster, `~` and
+   *  `$VARS` included), else the folder you're in. */
+  const target = $derived(typedPath ?? here);
+  const targetName = $derived(target.split("/").filter((s) => s !== "").pop() ?? "/");
+  /** Only a browsed folder is known to be a workspace already; a typed one
+   *  is checked when it's added. */
+  const targetIsWorkspace = $derived(typedPath === null && hereIsWorkspace);
   let pathListing = $state<ClusterDirListing | null>(null);
   /** The folder `pathListing` (or `pathError`) answers for, as typed. */
   let pathBase = $state("");
@@ -137,8 +143,8 @@
   });
 
   async function go(path: string): Promise<void> {
-    const target = path.trim();
-    if (target === "") return;
+    const dest = path.trim();
+    if (dest === "") return;
     const mine = ++seq;
     loading = true;
     slow = false;
@@ -148,7 +154,7 @@
       if (mine === seq) slow = true;
     }, 3000);
     try {
-      const next = await clusterListDir(alias, target);
+      const next = await clusterListDir(alias, dest);
       if (mine !== seq) return;
       listing = next;
       input = "";
@@ -180,7 +186,7 @@
     busy = true;
     addError = null;
     try {
-      const ws = await clusterAddWorkspace(alias, listing.path, name.trim());
+      const ws = await clusterAddWorkspace(alias, target, name.trim());
       onAdded(ws, openAfter);
     } catch (e) {
       addError = e instanceof Error ? e.message : String(e);
@@ -195,7 +201,7 @@
     }
   }
 
-  const canAdd = $derived(!busy && listing !== null && !hereIsWorkspace);
+  const canAdd = $derived(!busy && listing !== null && !targetIsWorkspace && target !== "");
 
   /** The box's keys (Escape is the window's: it closes from anywhere). */
   function onFilterKeydown(e: KeyboardEvent): void {
@@ -361,11 +367,11 @@
       {#if listing !== null}
         <div class="pick">
           <span class="pick-lab">Workspace</span>
-          <span class="pick-path" title={here}><bdi>{here}</bdi></span>
+          <span class="pick-path" title={target}><bdi>{target}</bdi></span>
           <input
             class="in name"
             bind:value={name}
-            placeholder={hereName}
+            placeholder={targetName}
             spellcheck="false"
             autocomplete="off"
             aria-label="Name (optional)"
@@ -373,20 +379,20 @@
         </div>
       {/if}
       {#if addError !== null}<div class="err-line">{addError}</div>{/if}
-      {#if hereIsWorkspace}<div class="note-line">This folder is already a workspace.</div>{/if}
+      {#if targetIsWorkspace}<div class="note-line">This folder is already a workspace.</div>{/if}
       <div class="acts">
         <button type="button" class="quiet" disabled={busy} onclick={onClose}>Cancel</button>
         {#if canOpen}
           <button
             type="button"
             class="quiet"
-            disabled={busy || listing === null || hereIsWorkspace}
+            disabled={!canAdd}
             onclick={() => void add(false)}>Add</button
           >
           <button
             type="button"
             class="cta"
-            disabled={busy || listing === null || hereIsWorkspace}
+            disabled={!canAdd}
             title="⌘↩"
             onclick={() => void add(true)}>{busy ? "Adding…" : "Add and open"}</button
           >
@@ -394,9 +400,9 @@
           <button
             type="button"
             class="cta"
-            disabled={busy || listing === null || hereIsWorkspace}
+            disabled={!canAdd}
             title="⌘↩"
-            onclick={() => void add(false)}>{busy ? "Adding…" : `Add ${hereName}`}</button
+            onclick={() => void add(false)}>{busy ? "Adding…" : `Add ${targetName}`}</button
           >
         {/if}
       </div>

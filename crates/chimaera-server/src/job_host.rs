@@ -38,7 +38,7 @@ use chimaera_core::cluster::{
     valid_job_id, valid_workspace_id, ClusterConfig, HeldElsewhere, HostRecord, HostedState,
     HostedWorkspace, HostingRecord, JobHostStatus, JobRecord, WorkspaceSeed, ENV_AGENT_RULES_FILE,
     ENV_CLUSTER_FACTS_FILE, ENV_CLUSTER_WORKSPACE, ENV_DATA_DIR, ENV_HOST_PRELUDE_FILE,
-    ENV_RUNTIME_DIR,
+    ENV_JOB_ATTACHED, ENV_RUNTIME_DIR,
 };
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -646,6 +646,11 @@ async fn spawn_workspace(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if host.record.attached {
+        cmd.env(ENV_JOB_ATTACHED, "1");
+    } else {
+        cmd.env_remove(ENV_JOB_ATTACHED);
+    }
     let tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
     let (exited_tx, exited_rx) = watch::channel(false);
     // Spawned under the lock, into the reservation: a close that came while

@@ -61,6 +61,9 @@ export interface ComputeSelf {
   cpus: string;
   mem: string;
   gres: string;
+  /** Held by the app that started it (absent otherwise): it ends when that
+   *  app disconnects, and can't continue in a new job. */
+  attached?: boolean;
 }
 
 export interface ComputeSnapshot {

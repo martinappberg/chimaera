@@ -61,6 +61,10 @@ pub(crate) struct ClusterLive {
     estimates: HashMap<String, (Instant, Option<u64>)>,
     /// Jobs whose end reason was already asked of accounting.
     ended_asked: HashSet<String>,
+    /// Each job's Slurm id as last seen. An attached job's record never has
+    /// one (srun starts it), yet its windows are keyed by it — so once it
+    /// leaves the queue, only this still knows which windows were its.
+    slurm_ids: HashMap<String, String>,
     /// This build's binary is on the cluster (checked once per run).
     binary_ok: bool,
     /// The background watcher is running.
@@ -161,6 +165,16 @@ fn toast(alias: &str, jid: &str, kind: &str, title: String, job_name: &str, body
     });
 }
 
+/// Time left as a notification says it: "1 hour", "9 minutes", "1 minute".
+fn left_words(ms: u64) -> String {
+    let mins = ms.div_ceil(60_000).max(1);
+    match mins {
+        60.. => "1 hour".to_string(),
+        1 => "1 minute".to_string(),
+        n => format!("{n} minutes"),
+    }
+}
+
 /// "crc is", "crc and atlas are", "3 workspaces are".
 fn ready_words(names: &[String]) -> String {
     match names {
@@ -215,13 +229,20 @@ async fn absorb(app: &AppHandle, alias: &str, ov: &ClusterOverview) {
         for w in &ov.workspaces {
             c.ws_names.insert(w.id.clone(), w.name.clone());
         }
-        let slurm_of = |jid: &str| {
-            ov.jobs
-                .iter()
-                .find(|j| j.id == jid)
-                .and_then(|j| j.slurm_job_id.clone())
-                .unwrap_or_default()
-        };
+        for j in &ov.jobs {
+            if let Some(id) = &j.slurm_job_id {
+                c.slurm_ids.insert(j.id.clone(), id.clone());
+            }
+        }
+        for (jid, h) in &ov.hosts {
+            c.slurm_ids
+                .entry(jid.clone())
+                .or_insert_with(|| h.slurm_job_id.clone());
+        }
+        c.slurm_ids
+            .retain(|jid, _| ov.jobs.iter().any(|j| &j.id == jid));
+        let slurm_ids = c.slurm_ids.clone();
+        let slurm_of = |jid: &str| slurm_ids.get(jid).cloned().unwrap_or_default();
         // How a job's windows are told it ended: "stopped" for the user's
         // stop, else Slurm's word.
         let end_reason = |jid: &str| {
@@ -282,27 +303,34 @@ async fn absorb(app: &AppHandle, alias: &str, ov: &ClusterOverview) {
                 }
                 if let Some(end) = j.ends_at_ms {
                     let left = end.saturating_sub(ov.now_ms);
-                    let body = "Continue in a new job to keep working.".to_string();
-                    if left < 10 * 60_000 {
-                        if c.notified.insert(format!("10m:{}", j.id)) {
+                    // A mark is news only for a job longer than it: a
+                    // 30-minute job isn't told "an hour left" as it starts.
+                    let walltime = chimaera_core::slurm::parse_duration(&j.spec.time)
+                        .map(|d| d.as_millis() as u64);
+                    let crosses = |mark: u64| walltime.is_none_or(|w| w > mark);
+                    let body = if j.attached {
+                        "It stops then. Start a new job to keep working.".to_string()
+                    } else {
+                        "Continue in a new job to keep working.".to_string()
+                    };
+                    let mark = if left < 10 * 60_000 && crosses(10 * 60_000) {
+                        Some("10m")
+                    } else if left < 60 * 60_000 && crosses(60 * 60_000) {
+                        Some("1h")
+                    } else {
+                        None
+                    };
+                    if let Some(mark) = mark {
+                        if c.notified.insert(format!("{mark}:{}", j.id)) {
                             toast(
                                 alias,
                                 &j.id,
-                                "10m",
-                                format!("Your job on {alias} ends in 10 minutes"),
+                                mark,
+                                format!("Your job on {alias} ends in {}", left_words(left)),
                                 &j.name,
                                 body,
                             );
                         }
-                    } else if left < 60 * 60_000 && c.notified.insert(format!("1h:{}", j.id)) {
-                        toast(
-                            alias,
-                            &j.id,
-                            "1h",
-                            format!("Your job on {alias} ends in 1 hour"),
-                            &j.name,
-                            body,
-                        );
                     }
                 }
             }
@@ -322,7 +350,7 @@ async fn absorb(app: &AppHandle, alias: &str, ov: &ClusterOverview) {
                     let reason = end_reason(&j.id);
                     // Every window of a workspace this job held — except one
                     // on its way to another job (told below; it follows).
-                    let slurm = j.slurm_job_id.clone().unwrap_or_default();
+                    let slurm = slurm_of(&j.id);
                     for (wid, jid) in c.last_ws.iter() {
                         if jid == &j.id && !heading_elsewhere(&c.moving, wid, jid) {
                             ended.push((ws_key(alias, &slurm, wid), reason.clone()));
@@ -332,7 +360,13 @@ async fn absorb(app: &AppHandle, alias: &str, ov: &ClusterOverview) {
                 }
                 if j.ended.is_none() && !j.stopped_by_user && c.ended_asked.insert(j.id.clone()) {
                     if let Some(r) = ov.records.get(&j.id) {
-                        ask_end.push(r.clone());
+                        // An attached job's record learns its Slurm id here,
+                        // so accounting can say how it ended.
+                        let mut r = r.clone();
+                        if r.slurm_job_id.is_none() {
+                            r.slurm_job_id = slurm_ids.get(&j.id).cloned();
+                        }
+                        ask_end.push(r);
                     }
                 }
             }
@@ -593,8 +627,19 @@ async fn overlay_live(app: &AppHandle, alias: &str, ov: &mut ClusterOverview) {
             })
             .collect()
     };
+    // All at once, each briefly: one job's dead forward must not hold up
+    // every page and every Open behind it.
+    let mut asks = tokio::task::JoinSet::new();
     for (jid, port, token) in held {
-        if let Ok(status) = cluster::host_status(port, &token).await {
+        asks.spawn(async move {
+            let status =
+                tokio::time::timeout(Duration::from_secs(4), cluster::host_status(port, &token))
+                    .await;
+            (jid, status)
+        });
+    }
+    while let Some(done) = asks.join_next().await {
+        if let Ok((jid, Ok(Ok(status)))) = done {
             cluster::apply_hosting(ov, &jid, &status);
         }
     }
@@ -1067,7 +1112,23 @@ pub(super) async fn cluster_stop_job(
         let _ = held.stop.send(());
     }
     // The windows learn at once (the next overview would, a minute later).
-    let slurm = record.slurm_job_id.clone().unwrap_or_default();
+    // An attached job's record has no Slurm id; the live view (or what the
+    // app last saw) does, and its windows are keyed by it.
+    let slurm = record
+        .slurm_job_id
+        .clone()
+        .or_else(|| {
+            ov.jobs
+                .iter()
+                .find(|j| j.id == job_id)
+                .and_then(|j| j.slurm_job_id.clone())
+        })
+        .or_else(|| {
+            lock(&state.clusters)
+                .get(&alias)
+                .and_then(|c| c.slurm_ids.get(&job_id).cloned())
+        })
+        .unwrap_or_default();
     let keys: Vec<String> = {
         let mut clusters = lock(&state.clusters);
         let c = clusters.entry(alias.clone()).or_default();
@@ -1883,5 +1944,19 @@ pub(crate) fn sweep_terminals(port: u16, token: String) {
             tracing::info!("ending login-node terminal {id} left without a window");
             end_terminal_session(port, token.clone(), id.to_string());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_notice_says_the_time_actually_left() {
+        assert_eq!(left_words(59 * 60_000 + 1), "1 hour");
+        assert_eq!(left_words(29 * 60_000), "29 minutes");
+        assert_eq!(left_words(9 * 60_000 + 30_000), "10 minutes");
+        assert_eq!(left_words(40_000), "1 minute");
+        assert_eq!(left_words(0), "1 minute");
     }
 }

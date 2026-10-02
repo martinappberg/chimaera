@@ -136,11 +136,15 @@ Nothing site-specific is ever coded.
   once it runs, its job-host stops the old job (once, by the Slurm id in its record); each
   workspace's chimaera waits for the old lease to go, then resumes its chats idle. The
   old windows say "moving" and reopen in the new job. Nothing restarts on its own: a
-  person starts every job.
+  person starts every job. An attached job can't continue (the app holds it); its window
+  says when it ends without offering to (job-host sets `CHIMAERA_JOB_ATTACHED` on its
+  workspaces' chimaeras, and their `/compute` `self` block carries `attached`).
 - **Notifications** (native app, even when looking elsewhere; windows never open by
-  themselves): ready, an hour left, ten minutes left (the watcher wakes at those marks),
-  stopped, and "didn't start" with Slurm's own words for an attached job that ended before
-  it ran. A background check runs only while a job this app knows of is alive: the queue
+  themselves): ready, an hour left, ten minutes left (only for a job longer than the mark,
+  worded with the time actually left; the watcher wakes at those marks), stopped, and
+  "didn't start" with Slurm's own words for an attached job that ended before it ran. An
+  attached job's windows are found by the Slurm id the app saw it run under (its record
+  has none), which its record also learns at its end, so accounting can say why. A background check runs only while a job this app knows of is alive: the queue
   at most once a minute while something waits, a starting job's record every 15 s (no
   queue question — "ready" comes within seconds of job-host being up), every five
   minutes while things only run. The cluster page says so, with a way to turn them on,

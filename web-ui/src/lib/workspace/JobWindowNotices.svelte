@@ -41,13 +41,17 @@
 
   let { alias, cws, self: alloc, receivedAt, ended, stacked = false }: Props = $props();
 
-  const canContinue = $derived(isNativeShell() && cws !== null);
+  const nativeJob = $derived(isNativeShell() && cws !== null);
+  /** An attached job (held by the app) can't continue: its reminder only
+   *  says when it ends. */
+  const attached = $derived(alloc?.attached === true);
+  const canContinue = $derived(nativeJob && !attached);
 
   // A minute's resolution is all "Stops in 58 min" needs; paused while
   // hidden, caught up on return (the effect re-runs).
   let now = $state(Date.now());
   $effect(() => {
-    if (!$pageVisible || ended !== null || !canContinue) return;
+    if (!$pageVisible || ended !== null || !nativeJob) return;
     now = Date.now();
     const t = setInterval(() => (now = Date.now()), 60_000);
     return () => clearInterval(t);
@@ -76,7 +80,7 @@
   let waitingHidden = $state(false);
 
   const showBanner = $derived(
-    canContinue &&
+    nativeJob &&
       ended === null &&
       (phase === "waiting"
         ? !waitingHidden
@@ -165,12 +169,18 @@
     {:else}
       <span class="copy">
         <strong>{stopsInWords(remaining ?? 0)}</strong>
-        Continue in a new job and your chats come with you.
+        {#if attached}
+          It's held by this app, so it can't continue in a new job — start one from the cluster page to keep working. Your chats are saved.
+        {:else}
+          Continue in a new job and your chats come with you.
+        {/if}
         {#if continueError !== null}<span class="err">{continueError}</span>{/if}
       </span>
-      <button class="primary" disabled={phase === "asking"} onclick={() => void continueOnNewNode()}
-        >{phase === "asking" ? "Queuing…" : "Continue in a new job"}</button
-      >
+      {#if canContinue}
+        <button class="primary" disabled={phase === "asking"} onclick={() => void continueOnNewNode()}
+          >{phase === "asking" ? "Queuing…" : "Continue in a new job"}</button
+        >
+      {/if}
     {/if}
     <button class="dismiss" aria-label="Dismiss" title="Dismiss" onclick={dismiss}>×</button>
   </div>

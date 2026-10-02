@@ -41,6 +41,10 @@ pub const ENV_RUNTIME_DIR: &str = "CHIMAERA_RUNTIME_DIR";
 /// shared login node.
 pub const ENV_NOT_A_CLUSTER: &str = "CHIMAERA_NOT_A_CLUSTER";
 
+/// Set (to `1`) on a workspace's chimaera when its job is attached: held by
+/// the app that started it, it can't continue in a new job.
+pub const ENV_JOB_ATTACHED: &str = "CHIMAERA_JOB_ATTACHED";
+
 /// Path of the [`WorkspaceSeed`] a workspace chimaera registers at boot.
 pub const ENV_CLUSTER_WORKSPACE: &str = "CHIMAERA_CLUSTER_WORKSPACE";
 /// A file of startup commands (this job's) applied as the outermost prelude

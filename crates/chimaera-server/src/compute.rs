@@ -138,6 +138,10 @@ pub(crate) struct SelfAllocation {
     pub(crate) cpus: String,
     pub(crate) mem: String,
     pub(crate) gres: String,
+    /// The job is attached (held by the app that started it): it ends when
+    /// that app disconnects, and can't continue in a new job.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) attached: bool,
 }
 
 impl SelfAllocation {
@@ -352,6 +356,9 @@ impl ComputeService {
         // Holding the lock across the fetch IS the single-flight: concurrent
         // requests queue here briefly instead of stampeding the controller.
         let mut snap = fetch_snapshot(&squeue, &sinfo, ask_self).await;
+        if let Some(own) = snap.self_alloc.as_mut() {
+            own.attached = env_nonempty(chimaera_core::cluster::ENV_JOB_ATTACHED).is_some();
+        }
         if ask_self.is_some() {
             inner.self_asked = Some((asked_at, snap.self_alloc.clone()));
         } else if let Some((at, alloc)) = &inner.self_asked {
@@ -697,6 +704,7 @@ fn parse_self_allocation(out: &str) -> Option<SelfAllocation> {
         } else {
             gres
         },
+        attached: false,
     })
 }
 
@@ -1080,6 +1088,20 @@ mod tests {
         }
     }
 
+    /// `attached` is additive: absent unless set, so the window's offer to
+    /// continue is withheld only for an attached job.
+    #[test]
+    fn the_self_block_says_attached_only_when_it_is() {
+        let plain = serde_json::to_value(alloc()).unwrap();
+        assert!(plain.get("attached").is_none());
+        let held = serde_json::to_value(SelfAllocation {
+            attached: true,
+            ..alloc()
+        })
+        .unwrap();
+        assert_eq!(held["attached"], true);
+    }
+
     fn alloc() -> SelfAllocation {
         SelfAllocation {
             job_id: "4242".into(),
@@ -1090,6 +1112,7 @@ mod tests {
             cpus: "8".into(),
             mem: "64G".into(),
             gres: "gpu:1".into(),
+            attached: false,
         }
     }
 
@@ -1177,6 +1200,7 @@ mod tests {
             cpus: "2".into(),
             mem: String::new(),
             gres: String::new(),
+            attached: false,
         };
         let text = job_context_text(&sparse, None, now, &AgentRules::default(), None);
         assert!(
