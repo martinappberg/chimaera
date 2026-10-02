@@ -336,6 +336,108 @@ or queue response never causes value resubmission. Catalog and operation reads
 remain passive; controller recovery may finish an already durable applying
 transition but cannot manufacture a new queued intent or execution grant.
 
+## Active-runtime automatic idle fence
+
+This is a separately negotiated, initially disabled extension. Automatic apply
+may first support only a positively stopped registry entry: no active or
+quarantined runtime, daemon or published route. A running project stays queued
+until the complete active-runtime fence below is verified. An ordinary health
+reply, `/pro/drain`, handoff pause, execution quiescence or a startup cleanup
+receipt does not advertise or prove this extension.
+
+The supervisor owns one inherited, bidirectional control socket for the exact
+project launch. It has no filesystem pathname and is not an HTTP route. Neither
+a project bearer nor keeper forwarding can access it. Before accepting control,
+the daemon sets the descriptor nonblocking and close-on-exec, prevents child
+inheritance, and disables same-UID ptrace and `/proc` descriptor/memory access to
+itself. The trusted launcher verifies those protections and drops project
+ptrace capabilities. The supervisor retains its own endpoint and pinned daemon
+pidfd. A changed executable, unsupported protection or missing channel refuses
+active automatic apply; it cannot fall back to a bearer-authenticated endpoint.
+
+Control messages carry no values, admission authority or service/device tokens.
+Each closed request is at most 16 KiB; a closed reply is at most 32 KiB. There is
+one active fence per project and at most four owned control operations. Their
+capacity remains held through actual blocking preparation and cleanup, including
+caller cancellation. Unsupported versions, duplicate fields and unknown commands
+refuse. The exact binding is account, workspace, registration revision, launch
+generation, OS boot and registered root device/inode, established by the trusted
+launch. Requests cannot choose another process, executable, root or control URL.
+
+The fixed `prepare` command additionally binds the original secret operation,
+pending batch and expected applied revision. Admission closes under the same
+in-memory lock as final command/input, spawn and mutation reservations. It also
+excludes setup, import, profile/configuration, mirror/transfer and other owned
+project effects through their final commit/registration windows. Existing work
+must have actually settled; a canceled HTTP observer or an empty task queue does
+not settle its owner. Passive reads remain permitted. New work is refused with
+a fixed maintenance result before input is accepted or a process is spawned.
+
+Only structured chats with authoritative idle/completed-turn evidence qualify.
+Every session must have no active turn, accepted or queued send, pending input,
+background task, permission/question or action wait, and a verified resumable
+native conversation. Active external-input/Remote Control modes, terminal agent
+UIs, hooks-only evidence, any plain terminal and unknown or unresumable sessions
+keep the batch queued with Apply now available. Quiet output is never idle proof.
+Preparation holds each chat's input-pause and lifecycle guard, captures its exact
+spawned process identity, and reversibly SIGSTOPs only positively idle leaders
+through pidfds. It never stops a whole process group by association. Already
+produced protocol and journal tails must drain under a bound; strict idle is
+checked again after that drain. Unexpected work aborts preparation.
+
+Before returning `prepared`, the daemon durably records suspended conversations,
+native resume identity, journals and delivery receipts, with a distinct manual
+resume reason. This reuses the checked local conversation export primitives,
+without Git publication, handoff, ownership/home/epoch change or process killing.
+A high-entropy fence identifier binds that durable record and the exact stopped
+leader identities; no caller-supplied PID gains authority. There are at most 64
+sessions. A preparation has one absolute 30-second deadline measured from the
+original request, including filesystem work. An exact retry returns the original
+result and remaining deadline; it never extends or replaces the fence. Timed-out
+or canceled preparation retains its owned guards until actual work settles and
+cannot deliver late authority.
+
+The supervisor then freezes its exact descriptor-pinned project cgroup and waits
+boundedly for positive completion. A freezer request alone is insufficient. It
+rechecks cgroup/root/launch currency and performs a bounded census of at most 128
+processes, using pidfds, start identities and namespace-PID translation. Allowed
+members are only the exact protected daemon, fixed trusted runtime plumbing and
+prepared idle leaders. Any necessary agent wrapper must have an independently
+verified exact identity; descendant/UID/process-group membership alone is not an
+allowlist. A shell, detached child, replaced process or unexplained member keeps
+the update queued. Fork/migration or identity ambiguity refuses. Project code
+cannot migrate processes into or out of this supervisor-owned cgroup.
+
+Only after that census does the serialized controller obtain fresh five-second
+application authorization. Before its deadline it rechecks the exact pending
+intent, registration, launch, prepared fence and stopped identities, durably
+begins the existing applying/revocation-floor transition, and consumes its local
+one-use fence. No daemon request is needed while the entire cgroup is frozen.
+The owned continuation stops and verifies the complete old project runtime;
+partial or ambiguous cleanup remains fenced and cannot yield an applied receipt.
+No new launch or route can be admitted between the census and positive cleanup.
+A successful update leaves the project stopped. Deferred chats are available for
+explicit manual resumption; lease renewal, polling, restoration and a new cleanup
+receipt never resume them automatically or send a pickup message.
+
+Before durable applying begins, exact `abort` or expiry restores the original
+suspension metadata and SIGCONTs only the same still-pinned old leaders. It never
+starts replacement agents. The supervisor thaws only that original cgroup after
+rejecting its application fence. Lost replies are reconciled against the same
+operation and binding, not a new idle attempt. Once applying is durable, timeout,
+channel loss or observer cancellation cannot reopen old authority; the controller
+finishes positive cleanup or preserves recovery-required state. A daemon restart
+retains durable parking until exact supervised recovery or an explicit user
+resumption, never inferring success from a missing live process.
+
+Enablement additionally requires real Linux process and restart fixtures: input
+and spawn races, permission/background work, plain shells, detached descendants,
+PID reuse, stale launch/root, failed drains/fsync, caller cancellation, freeze and
+cleanup ambiguity, and delivery preservation without automatic resumption. A
+sibling project must continue throughout. Kernel freezer and kill behavior is
+specified by the [Linux cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html);
+process census and daemon idle evidence are separate required proofs.
+
 ## Acceptance gate
 
 Capability enablement requires the real account, keeper, supervisor, daemon and
