@@ -194,6 +194,7 @@ pub(crate) struct AppState {
     pub(crate) installs: Mutex<HashMap<agents::AgentKind, (String, Instant)>>,
     /// Latest installer result per built-in agent; bounded by the catalog.
     pub(crate) install_results: Mutex<HashMap<agents::AgentKind, crate::runtimes::InstallResult>>,
+    pub(crate) agent_setup: Mutex<HashMap<agents::AgentKind, Arc<crate::agent_setup::Operation>>>,
     /// The user's own Claude Code settings file (`~/.claude/settings.json`);
     /// an explicit theme there suppresses chimaera's theme injection. Tests
     /// point it at a fixture.
@@ -337,6 +338,7 @@ impl AppState {
             fs_touched: tokio::sync::broadcast::channel(crate::fs_watch::TOUCHED_CAPACITY).0,
             installs: Mutex::new(HashMap::new()),
             install_results: Mutex::new(HashMap::new()),
+            agent_setup: Mutex::new(HashMap::new()),
             claude_settings_path: home.join(".claude").join("settings.json"),
             codex_config_path: home.join(".codex").join("config.toml"),
             timeline: timeline::TimelineService::new(data_dir.join("workspace")),

@@ -4,13 +4,14 @@
   import { pageVisible } from "../shared/visibility";
   import { openInSystemBrowser } from "../shared/urlOpen";
   import {
-    agentCatalog, installAgent, listAgents, pollAgents, uninstallAgent, updateAgent,
+    agentCatalog, listAgents, pollAgents, uninstallAgent,
     versionNumber, type AgentInfo,
   } from "../workspace/launcher";
+  import { openAgentSetup, type SetupAction } from "../workspace/agentSetup";
   import ConfirmDialog from "../shared/ConfirmDialog.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { flushSettings, getSetting, setSetting } from "./store.svelte";
-  import { agentUpdateStatus, installationResult } from "./agentStatus";
+  import { agentUpdateStatus } from "./agentStatus";
 
   let { visible = true }: { visible?: boolean } = $props();
   type AgentPathKey = "agents.claude.path" | "agents.codex.path" | "agents.agy.path" | "agents.grok.path" | "agents.agy.chatPath";
@@ -29,7 +30,6 @@
   let saving = $state<Record<string, boolean>>({});
   let rowError = $state<Record<string, string | null>>({});
   let messages = $state<Record<string, string | null>>({});
-  let operations = $state<Record<string, { session: string | null; until: number }>>({});
   let uninstallAsk = $state<AgentInfo | null>(null);
   let uninstallError = $state<string | null>(null);
   let removing = $state(false);
@@ -44,14 +44,7 @@
       baseline[key] = value;
     }
     inputs = next;
-    for (const a of list) {
-      const install = a.installation;
-      if (install?.running && !operations[a.id]) {
-        operations[a.id] = { session: install.sessionId, until: Date.now() + 180_000 };
-      } else if (install && !install.running && install.exitStatus !== null) {
-        if (install.exitStatus !== 0) rowError[a.id] = `Installation failed (exit ${install.exitStatus}). You can try again.`;
-      }
-    }
+
   }
 
   async function load(check = false): Promise<void> {
@@ -88,52 +81,19 @@
     finally { saving[a.id] = false; }
   }
 
-  async function install(a: AgentInfo, update = false): Promise<void> {
-    if (operations[a.id] || wsId === null) return;
-    rowError[a.id] = messages[a.id] = null;
-    operations[a.id] = { session: null, until: Date.now() + 180_000 };
-    try {
-      const session = await (update ? updateAgent : installAgent)(a.id, wsId);
-      operations[a.id] = { session, until: Date.now() + 180_000 };
-    } catch (e) {
-      delete operations[a.id];
-      rowError[a.id] = e instanceof Error ? e.message : "Couldn't start installation";
-    }
+  function install(a: AgentInfo, action: SetupAction = "install", showResult = false): void {
+    if (wsId !== null) openAgentSetup(a, wsId, action, showResult);
   }
 
-  let refreshing = false;
-  async function refreshProgress(): Promise<void> {
-    if (refreshing) return;
-    refreshing = true;
-    const abort = new AbortController();
-    const timeout = setTimeout(() => abort.abort(), 15_000);
-    try {
-      const agents = await pollAgents(abort.signal);
-      for (const [id, operation] of Object.entries(operations)) {
-        if (operation.session === null) continue;
-        const status = agents.find(a => a.id === id)?.installation;
-        const result = installationResult(status?.sessionId === operation.session ? status : undefined);
-        if (result === "done" || result === "failed") {
-          delete operations[id];
-          if (result === "failed") rowError[id] = `Installation failed (exit ${status?.exitStatus}). Check your connection and try again.`;
-          else messages[id] = "Installation finished.";
-        } else if (status?.sessionId === operation.session && !status.running) {
-          delete operations[id];
-          messages[id] = "Couldn't confirm installation. Check for updates or try again.";
-        } else if (Date.now() >= operation.until) {
-          delete operations[id];
-          messages[id] = "Installation is taking longer. Check its terminal in the sidebar, then refresh here.";
-        }
-      }
-    } catch { /* A transient disconnect retries while this surface is visible. */ }
-    finally { clearTimeout(timeout); refreshing = false; }
-  }
-
-  const pending = $derived(Object.values(operations).some(o => o.session !== null));
   $effect(() => {
-    if (!visible || !$pageVisible || !pending) return;
-    void refreshProgress();
-    const timer = setInterval(() => void refreshProgress(), 3000);
+    if (!visible || !$pageVisible || !$agentCatalog.some(a => a.setup?.running || a.installation?.running)) return;
+    let pending = false;
+    const timer = setInterval(async () => {
+      if (pending) return;
+      pending = true;
+      try { await pollAgents(AbortSignal.timeout(15_000)); } catch { /* Next visible tick retries. */ }
+      finally { pending = false; }
+    }, 3000);
     return () => clearInterval(timer);
   });
 
@@ -156,33 +116,33 @@
     <h2>Agents</h2>
     <button class="link" disabled={loading} onclick={() => void load(true)}>{loading ? "Checking…" : "Check for updates"}</button>
   </div>
-  <p class="intro">Choose which agents are ready to use on this computer. Chimaera can install and update its own copies.</p>
+  <p class="intro">Manage agents on this workspace’s host. Installation, account sign-in, and chat startup are separate steps.</p>
   {#if loadError}<p class="err" role="alert">{loadError}</p>{/if}
   <div class="cards">
     {#each $agentCatalog as a (a.id)}
       {@const status = agentUpdateStatus(a)}
-      {@const busy = !!operations[a.id]}
+      {@const busy = a.setup?.running || a.installation?.running}
       {@const key = pathKey(a.id)}
       <article>
         <div class="main">
           <span class="glyph"><SessionGlyph kind="agent" agentKind={a.id} size={20} title={a.name} /></span>
           <div class="text">
             <div class="head"><h3>{a.name}</h3>{#if a.version}<span class="version" title={a.version}>{versionNumber(a.version)}</span>{/if}</div>
-            <p class="state">{!a.installed ? "Not installed" : a.outdated ? "Needs an update" : a.chatSetupRequired ? "Terminal ready · Chat needs setup" : a.chatCapable ? "Ready for chat and terminal" : "Terminal ready"}</p>
+            <p class="state">{!a.installed ? "Not installed" : a.outdated ? "Needs an update" : a.chatSetupRequired ? "Installed · Chat companion missing" : a.chatCapable ? "Installed · Supports chat and terminal" : "Installed · Terminal only"}</p>
             {#if a.installed}<p class="detail" title={a.latestError ?? undefined}>{a.managed ? "Managed by Chimaera" : "Your installation"}{#if status.text} · {status.text}{/if}</p>{/if}
           </div>
           <div class="actions">
-            {#if busy}<span class="detail" role="status">Installing…</span>
+            {#if busy}<button class="btn" onclick={() => install(a, "install", true)}>View progress</button>
             {:else if (!a.installed || a.chatSetupRequired) && a.managedInstall}
               <button class="btn primary" disabled={wsId === null} onclick={() => void install(a)}>{a.chatSetupRequired ? "Set up chat" : "Install"}</button>
             {:else if a.managed && (a.updateAvailable || a.outdated)}
-              <button class="btn primary" disabled={wsId === null} onclick={() => void install(a, true)}>Update</button>
+              <button class="btn primary" disabled={wsId === null} onclick={() => void install(a, "update")}>Update</button>
             {:else if (!a.installed || a.updateAvailable || a.outdated) && a.installUrl}
               <button class="link" onclick={() => openInSystemBrowser(a.installUrl!)}>{a.installed ? "Update instructions ↗" : "Install instructions ↗"}</button>
             {/if}
           </div>
         </div>
-        {#if busy}<p class="notice">You can follow installation in its terminal in the sidebar.</p>{/if}
+        {#if a.setup && !busy}<button class="link setup-result" onclick={() => install(a, "install", true)}>{a.setup.phase === "failed" ? "Setup needs attention — view result" : a.setup.phase === "cancelled" ? "Installation cancelled — view result" : "View installation result"}</button>{/if}
         {#if messages[a.id]}<p class="notice" role="status">{messages[a.id]}</p>{/if}
         {#if rowError[a.id]}<p class="err" role="alert">{rowError[a.id]}</p>{/if}
         {#if key !== undefined || a.managed}
@@ -204,7 +164,7 @@
             <div class="advanced-actions">
               {#if key !== undefined}<button class="btn" disabled={saving[a.id] || ((inputs[key] ?? "") === getSetting(key) && (a.id !== "agy" || (inputs["agents.agy.chatPath"] ?? "") === getSetting("agents.agy.chatPath")))} onclick={() => void save(a)}>{saving[a.id] ? "Saving…" : "Save"}</button>{/if}
               {#if a.managed}
-                <button class="link" disabled={busy || wsId === null} onclick={() => void install(a, true)}>Reinstall</button>
+                <button class="link" disabled={busy || wsId === null} onclick={() => void install(a, "reinstall")}>Reinstall</button>
                 <button class="link danger" disabled={busy || removing} onclick={() => { uninstallError = null; uninstallAsk = a; }}>Uninstall</button>
               {/if}
             </div>
@@ -222,6 +182,7 @@
 {/if}
 
 <style>
+  .setup-result { margin:4px 14px 12px; }
   .cat-row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:18px 14px 8px; }
   h2 { margin:0; font-size:var(--text-xs); font-weight:600; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); }
   .intro { margin:0 14px 14px; font-size:var(--text-sm); color:var(--muted); line-height:1.5; }

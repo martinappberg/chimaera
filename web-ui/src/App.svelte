@@ -1,5 +1,8 @@
 <script lang="ts">
   import { RecentSessions } from "./lib/workspace/recentSessions";
+  import AgentSetupDialog from "./lib/workspace/AgentSetupDialog.svelte";
+  import { agentSetup, openAgentSetup } from "./lib/workspace/agentSetup";
+  import { agentCatalog } from "./lib/workspace/launcher";
   import { onMount, tick, untrack } from "svelte";
   import { paneTabHasKeyboardFocus } from "./lib/shared/tabNavigation";
   import { flip } from "svelte/animate";
@@ -66,12 +69,10 @@
   import { foldUnread, isUnread, markSeen } from "./lib/workspace/unread.svelte";
   import {
     getAgentDefault,
-    installAgent,
     listAgents,
     listRecents,
     relativeAge,
     setAgentDefault,
-    updateAgent,
     type AgentInfo,
     type LaunchPick,
     type RecentConvo,
@@ -753,9 +754,7 @@
    *  can reflect whether its default is installed. Null until first fetched;
    *  the launcher popover reports its fresher probe back via onAgents. */
   let agents = $state<AgentInfo[] | null>(null);
-  /** Install sessions we spawned; when one exits the catalog is re-probed so
-   *  the button flips from "install" to spawn without a manual refresh. */
-  const pendingInstalls = new Set<string>();
+  $effect(() => { if ($agentCatalog.length) agents = $agentCatalog; });
   /** The catalog row for the default agent, once the catalog is loaded. */
   const defaultAgentInfo = $derived(
     agents?.find((a) => a.id === agentDefault.agent) ?? null,
@@ -3230,17 +3229,6 @@
       if (s.ui === "chat") pool.disposeSession(s.id);
       else if (s.ui === "term") chatPool.disposeChat(s.id);
     }
-    // An install session that has exited (gone from the roster, or alive:false)
-    // means the catalog may have changed: re-probe so the button reflects it.
-    if (pendingInstalls.size > 0) {
-      for (const id of pendingInstalls) {
-        const s = list.find((x) => x.id === id);
-        if (s === undefined || !s.alive) {
-          pendingInstalls.delete(id);
-          void refreshAgents(true);
-        }
-      }
-    }
     const agentIds = new Set(list.filter((s) => s.kind === "agent").map((s) => s.id));
     const changed =
       agentIds.size !== prevAgentIds.size || [...prevAgentIds].some((id) => !agentIds.has(id));
@@ -3916,59 +3904,16 @@
     void spawnSession("agent", pick);
   }
 
-  /** Install/update flow (managed runtimes): the daemon builds its own
-   *  curated command — official artifacts only, into ~/.chimaera/agents —
-   *  and runs it as an ordinary shell session here. The affordance's tooltip
-   *  said exactly what runs; this one explicit click executes it, and the
-   *  session opens like any other so the output streams in a visible pane. */
   function launcherInstall(a: AgentInfo): void {
-    managedRuntimeFlow(a, installAgent, "install");
-  }
-
-  /** Update, same trusted shape: the daemon re-runs its curated script
-   *  (fetch latest, verify, atomic symlink re-swap) in a visible
-   *  "update <agent>" session. Managed binaries only — the launcher and
-   *  settings never offer this for the user's own install. */
-  function launcherUpdate(a: AgentInfo): void {
-    managedRuntimeFlow(a, updateAgent, "update");
-  }
-
-  function managedRuntimeFlow(
-    a: AgentInfo,
-    run: (agentId: string, workspaceId: string) => Promise<string>,
-    verb: "install" | "update",
-  ): void {
     launcherOpen = false;
-    const ws = activeWsId;
-    if (ws === null) {
-      openPicker();
-      return;
-    }
-    createError = null;
-    void run(a.id, ws)
-      .then(async (sessionId) => {
-        recentlyCreated.add(sessionId);
-        // Watch this session: when it exits, re-probe the catalog so the
-        // split button / rows reflect the new binary.
-        pendingInstalls.add(sessionId);
-        // The daemon spawned the session; a racing events snapshot may not
-        // carry it yet, so fetch the roster before surfacing it exactly
-        // like any new session (active tab in the focused pane).
-        if (!sessions.some((s) => s.id === sessionId)) {
-          try {
-            applySessions(await listSessions());
-          } catch {
-            // roster fetch hiccup; the next events snapshot reconciles
-          }
-        }
-        openSess(sessionId);
-      })
-      .catch((e) => {
-        // Inline error, same surface as any create failure (404 unknown
-        // agent, 409 an install/update for it is already running).
-        createError =
-          e instanceof ApiError ? e.message : `failed to start the ${a.name} ${verb}`;
-      });
+    if (activeWsId === null) { openPicker(); return; }
+    openAgentSetup(a, activeWsId, "install");
+  }
+
+  function launcherUpdate(a: AgentInfo): void {
+    launcherOpen = false;
+    if (activeWsId === null) { openPicker(); return; }
+    openAgentSetup(a, activeWsId, "update");
   }
 
   // --- the rail's Recents section ---
@@ -5160,6 +5105,12 @@
     railWidth = RAIL_DEFAULT;
   }
 </script>
+
+{#if $agentSetup}
+  {#key $agentSetup}
+    <AgentSetupDialog request={$agentSetup} onclose={() => agentSetup.set(null)} onlaunch={launcherPick} />
+  {/key}
+{/if}
 
 <div class="shell" class:native-titlebar-overlay={nativeTitlebarOverlay}>
   {#if nativeTitlebarOverlay && (activeWsId === null || !layout.focusMode)}
