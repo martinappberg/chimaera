@@ -1,5 +1,8 @@
 //! Fixed login-only startup and command consumer. This module is not attached to
 //! ordinary daemon routes; a runtime/project bearer cannot enroll it.
+pub use super::control_login::{
+    FinishedLogin, LoginAction, LoginAttempt, LoginPhase, LoginStatus, PendingLogin,
+};
 pub use super::login_home::{Credential, LoginHome};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -115,6 +118,9 @@ impl ControlBinding {
             registration,
             capability: s.capability,
         })
+    }
+    pub(super) fn agrees(&self, command: &ControlCommand) -> bool {
+        self.registration == command.registration
     }
     pub fn acknowledgment(&self) -> Registration {
         self.registration.clone()
@@ -277,6 +283,9 @@ pub struct ControlCommand {
     command: Action,
 }
 impl ControlCommand {
+    pub(super) fn into_action(self) -> Action {
+        self.command
+    }
     pub fn operation_id(&self) -> &str {
         &self.operation_id
     }

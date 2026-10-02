@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, watch};
 #[path = "claude.rs"]
 pub(super) mod claude;
 #[path = "github.rs"]
-mod github;
+pub(super) mod github;
 
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 pub(crate) fn active() -> usize {
@@ -430,7 +430,7 @@ async fn install(
         .map_err(|_| "installation_failed")?;
     Ok(())
 }
-fn device_action(value: &Value) -> Result<(String, Action), &'static str> {
+pub(super) fn device_action(value: &Value) -> Result<(String, Action), &'static str> {
     if value["type"] != "chatgptDeviceCode" {
         return Err("unsupported_login");
     }

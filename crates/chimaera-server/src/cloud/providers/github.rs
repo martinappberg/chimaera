@@ -102,15 +102,15 @@ fn device_page(candidate: &str) -> bool {
 }
 
 #[derive(Debug, Default, PartialEq)]
-struct Prompt {
-    code: Option<String>,
-    page: Option<String>,
-    enter: bool,
+pub(in crate::cloud::providers) struct Prompt {
+    pub(in crate::cloud::providers) code: Option<String>,
+    pub(in crate::cloud::providers) page: Option<String>,
+    pub(in crate::cloud::providers) enter: bool,
 }
 
 /// What the CLI has asked for so far. The code and page come from complete
 /// lines only, so a pipe read that ends mid-line never publishes half of one.
-fn prompt(bytes: &[u8]) -> Prompt {
+pub(in crate::cloud::providers) fn prompt(bytes: &[u8]) -> Prompt {
     let text = plain(bytes);
     let mut found = Prompt {
         enter: text.contains("Press Enter"),

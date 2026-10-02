@@ -61,6 +61,24 @@ impl Child {
         self.child.wait().await
     }
 
+    #[cfg(feature = "provider-authority-prototype")]
+    pub async fn terminate(&mut self, original: Option<u32>) -> Result<(), &'static str> {
+        #[cfg(unix)]
+        self.stop_group();
+        let _ = self.child.start_kill();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            self.child.wait().await.map_err(|_| "cleanup_failed")?;
+            // Only observe after reap. Never signal this numeric identity again:
+            // reuse can produce a conservative refusal, never a foreign kill.
+            while original.is_some_and(group_alive) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| "cleanup_failed")?
+    }
+
     #[cfg(unix)]
     fn stop_group(&mut self) {
         if let Some(group) = self.group.take() {
@@ -161,22 +179,36 @@ impl Rpc {
         self._child.child.id()
     }
     pub async fn open(bin: &Path, cwd: &Path) -> Result<Self, &'static str> {
-        let mut cmd = command(bin, &["app-server"], cwd);
+        Self::open_command(command(bin, &["app-server"], cwd)).await
+    }
+    pub async fn open_command(mut cmd: tokio::process::Command) -> Result<Self, &'static str> {
+        cmd.stdin(Stdio::piped()).stderr(Stdio::null());
+        let mut rpc = Self::spawn_command(cmd)?;
+        rpc.initialize().await?;
+        Ok(rpc)
+    }
+    pub fn spawn_command(mut cmd: tokio::process::Command) -> Result<Self, &'static str> {
         cmd.stdin(Stdio::piped()).stderr(Stdio::null());
         let mut child = Child::spawn(&mut cmd)?;
-        let mut rpc = Self {
+        Ok(Self {
             input: child.child.stdin.take().ok_or("start_failed")?,
             output: BufReader::new(child.child.stdout.take().ok_or("start_failed")?),
             _child: child,
             next_id: 0,
-        };
-        rpc.request(
+        })
+    }
+    #[cfg(feature = "provider-authority-prototype")]
+    pub async fn terminate(&mut self, original: Option<u32>) -> Result<(), &'static str> {
+        self._child.terminate(original).await
+    }
+    pub async fn initialize(&mut self) -> Result<(), &'static str> {
+        self.request(
             "initialize",
             json!({"clientInfo":{"name":"chimaera-provider","version":chimaera_core::VERSION}}),
         )
         .await?;
-        rpc.send(json!({"method":"initialized"})).await?;
-        Ok(rpc)
+        self.send(json!({"method":"initialized"})).await?;
+        Ok(())
     }
     async fn send(&mut self, value: Value) -> Result<(), &'static str> {
         let mut bytes = serde_json::to_vec(&value).map_err(|_| "protocol_error")?;

@@ -5,7 +5,7 @@ use crate::AppState;
 use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn authorization_url(bytes: &[u8]) -> Option<String> {
+pub(in crate::cloud::providers) fn authorization_url(bytes: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(bytes).ok()?;
     for (start, _) in text.match_indices("https://") {
         let candidate = text[start..]

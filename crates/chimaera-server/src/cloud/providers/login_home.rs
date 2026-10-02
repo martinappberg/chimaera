@@ -87,12 +87,19 @@ impl LoginHome {
     pub fn prepare(command: &ControlCommand) -> Result<Self, Error> {
         Self::prepare_at(Path::new(LOGIN_ROOT), command)
     }
-    fn prepare_at(prefix: &Path, command: &ControlCommand) -> Result<Self, Error> {
+    pub(super) fn prepare_at(prefix: &Path, command: &ControlCommand) -> Result<Self, Error> {
         if !matches!(command.action(), Action::Connect) {
             return Err(Error::InvalidCommand);
         }
+        Self::prepare_for_pending(prefix, command.operation_id(), command.provider())
+    }
+    pub(super) fn prepare_for_pending(
+        prefix: &Path,
+        operation: &str,
+        selected: Provider,
+    ) -> Result<Self, Error> {
         let parent = pin(prefix)?;
-        let name = match command.provider() {
+        let name = match selected {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
             Provider::Github => "github",
@@ -108,17 +115,13 @@ impl LoginHome {
         );
         directory(&provider, true)?;
         // A previous attempt cannot be silently reused, even after caller abort.
-        rustix::fs::mkdirat(
-            &provider,
-            command.operation_id(),
-            Mode::from_raw_mode(0o700),
-        )
-        .map_err(|_| Error::InvalidStartup)?;
+        rustix::fs::mkdirat(&provider, operation, Mode::from_raw_mode(0o700))
+            .map_err(|_| Error::InvalidStartup)?;
         provider.sync_all().map_err(|_| Error::InvalidStartup)?;
         let root = File::from(
             openat(
                 &provider,
-                command.operation_id(),
+                operation,
                 flags() | OFlags::DIRECTORY,
                 Mode::empty(),
             )
@@ -127,8 +130,8 @@ impl LoginHome {
         directory(&root, true)?;
         Ok(Self {
             root,
-            path: prefix.join(name).join(command.operation_id()),
-            provider: command.provider(),
+            path: prefix.join(name).join(operation),
+            provider: selected,
         })
     }
     pub fn path(&self) -> &Path {
@@ -162,7 +165,7 @@ impl LoginHome {
         self.configure(&mut command);
         Ok(command)
     }
-    fn configure(&self, command: &mut tokio::process::Command) {
+    pub(super) fn configure(&self, command: &mut tokio::process::Command) {
         command
             .env_clear()
             .current_dir(&self.path)
@@ -188,6 +191,145 @@ impl LoginHome {
                 Ok(())
             });
         }
+    }
+    #[cfg(test)]
+    pub(super) fn fixture_command(&self) -> Option<tokio::process::Command> {
+        let script =
+            std::fs::read_to_string(self.path.parent()?.parent()?.join("fixture-script")).ok()?;
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", &script]);
+        self.configure(&mut command);
+        Some(command)
+    }
+    pub(super) fn github_probe(&self, token: bool) -> Result<tokio::process::Command, Error> {
+        if self.provider != Provider::Github {
+            return Err(Error::InvalidCommand);
+        }
+        self.check()?;
+        #[cfg(test)]
+        if let Some(path) = self
+            .path
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| {
+                p.join(if token {
+                    "fixture-token"
+                } else {
+                    "fixture-user"
+                })
+            })
+            .filter(|p| p.exists())
+        {
+            let mut command = tokio::process::Command::new("/bin/cat");
+            command.arg(path);
+            self.configure(&mut command);
+            return Ok(command);
+        }
+        let mut command = tokio::process::Command::new("/usr/bin/gh");
+        if token {
+            command.args(["auth", "token", "--hostname", "github.com"]);
+        } else {
+            command.args(["api", "--hostname", "github.com", "user"]);
+        }
+        self.configure(&mut command);
+        Ok(command)
+    }
+    /// Call only after the owned login group has a positive cleanup receipt.
+    /// Descriptor-relative removal never follows CLI-created links.
+    pub fn cleanup(self) -> Result<(), Error> {
+        self.check()?;
+        fn remove(directory: &File, depth: usize, budget: &mut usize) -> Result<(), Error> {
+            if depth > 16 {
+                return Err(Error::Changed);
+            }
+            let mut entries = rustix::fs::Dir::read_from(directory).map_err(|_| Error::Changed)?;
+            for entry in &mut entries {
+                let entry = entry.map_err(|_| Error::Changed)?;
+                let name = entry.file_name();
+                if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                    continue;
+                }
+                *budget = budget.checked_sub(1).ok_or(Error::Changed)?;
+                let stat =
+                    rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                        .map_err(|_| Error::Changed)?;
+                let is_dir = rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                    == rustix::fs::FileType::Directory;
+                if is_dir {
+                    let child = File::from(
+                        openat(directory, name, flags() | OFlags::DIRECTORY, Mode::empty())
+                            .map_err(|_| Error::Changed)?,
+                    );
+                    super::login_home::directory(&child, true)?;
+                    remove(&child, depth + 1, budget)?;
+                    let actual =
+                        rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                            .map_err(|_| Error::Changed)?;
+                    if actual.st_ino != stat.st_ino || actual.st_dev != stat.st_dev {
+                        return Err(Error::Changed);
+                    }
+                }
+                rustix::fs::unlinkat(
+                    directory,
+                    name,
+                    if is_dir {
+                        rustix::fs::AtFlags::REMOVEDIR
+                    } else {
+                        rustix::fs::AtFlags::empty()
+                    },
+                )
+                .map_err(|_| Error::Changed)?;
+            }
+            Ok(())
+        }
+        remove(&self.root, 0, &mut 4096)?;
+        self.check()?;
+        let parent = pin(self.path.parent().ok_or(Error::Changed)?)?;
+        rustix::fs::unlinkat(
+            &parent,
+            self.path.file_name().ok_or(Error::Changed)?,
+            rustix::fs::AtFlags::REMOVEDIR,
+        )
+        .map_err(|_| Error::Changed)?;
+        parent.sync_all().map_err(|_| Error::Changed)
+    }
+    pub(super) fn github_leaf(
+        token: Zeroizing<Vec<u8>>,
+        user: Zeroizing<Vec<u8>>,
+    ) -> Result<Credential, Error> {
+        #[derive(Deserialize)]
+        struct User {
+            id: u64,
+            login: String,
+        }
+        if token.len() > MAX_SECRET + 1 || user.len() > MAX_LEAF as usize {
+            return Err(Error::InvalidCommand);
+        }
+        let token = std::str::from_utf8(&token)
+            .map_err(|_| Error::InvalidCommand)?
+            .trim();
+        let account: User = serde_json::from_slice(&user).map_err(|_| Error::InvalidCommand)?;
+        if account.id == 0
+            || !bounded(&account.login, 256)
+            || token.chars().any(char::is_whitespace)
+        {
+            return Err(Error::InvalidCommand);
+        }
+        let credential = Credential {
+            access: Zeroizing::new(token.to_owned()),
+            refresh: None,
+            id_token: None,
+            expires_at: None,
+            identity: Identity {
+                user: account.id.to_string(),
+                workspace: None,
+                plan: None,
+            },
+            scopes: vec![],
+            claude: None,
+        };
+        credential.validate_for(Provider::Github)?;
+        Ok(credential)
     }
     pub fn check(&self) -> Result<(), Error> {
         let actual = pin(&self.path)?
@@ -360,6 +502,9 @@ fn bounded(s: &str, maximum: usize) -> bool {
 }
 impl Credential {
     fn validate(&self) -> Result<(), Error> {
+        self.validate_for(Provider::Claude)
+    }
+    fn validate_for(&self, provider: Provider) -> Result<(), Error> {
         if !bounded(&self.access, MAX_SECRET)
             || self
                 .refresh
@@ -370,17 +515,18 @@ impl Credential {
                 .as_ref()
                 .is_some_and(|s| !bounded(s, MAX_SECRET))
             || !bounded(&self.identity.user, 256)
-            || !self
-                .identity
-                .workspace
-                .as_deref()
-                .is_some_and(|s| bounded(s, 256))
+            || (provider != Provider::Github
+                && !self
+                    .identity
+                    .workspace
+                    .as_deref()
+                    .is_some_and(|s| bounded(s, 256)))
             || self
                 .identity
                 .plan
                 .as_deref()
                 .is_some_and(|s| !bounded(s, 256))
-            || self.expires_at.is_none_or(|n| n <= 0)
+            || (provider != Provider::Github && self.expires_at.is_none_or(|n| n <= 0))
             || self.scopes.len() > 32
             || self
                 .scopes

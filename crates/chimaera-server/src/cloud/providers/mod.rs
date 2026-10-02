@@ -3,6 +3,8 @@
 #[cfg(feature = "provider-authority-prototype")]
 pub mod authority;
 mod connect;
+#[cfg(feature = "provider-authority-prototype")]
+mod control_login;
 mod disconnect;
 #[cfg(feature = "provider-authority-prototype")]
 mod login_home;

@@ -14,7 +14,8 @@ Worker-only readiness and explicitly requested provider authentication. Parent:
 | `disconnect.rs` | Official CLI logout adapters and fresh negative verification; personal-cloud scope, no credential-file reads or claims of vendor-wide revocation. |
 | `tests.rs`, `connect_tests.rs` | Status isolation, cache/freshness, real child/PTY cleanup, cancellation/retry races and device completion verification. GitHub's CLI is found on the login shell's PATH, so tests register a fake per fixture home (`preset_github`). |
 | `authority.rs`, `authority_tests.rs` | Default-off provider-authority prototype: fixed private-pipe enrollment, exact login-only registration/capability and closed command validation; secret values never enter dedupe digests. No ordinary HTTP route or startup caller. |
-| `login_home.rs`, `login_home_tests.rs` | Descriptor-confined fixed attempt homes and bounded credential-only Claude/Codex leaf selection for the trusted control coordinator; filesystem methods belong in its owned blocking worker. No provider history/config copy. |
+| `login_home.rs`, `login_home_tests.rs` | Descriptor-confined fixed attempt homes, bounded credential-only Claude/Codex selection and fixed GitHub token/account probes for the trusted control coordinator; filesystem methods belong in its owned blocking worker. Bounded descriptor-relative cleanup follows positive process receipts, never copies provider history/config. |
+| `control_login.rs`, `control_login_tests.rs` | Default-off fixed official login runner: exact opaque pending admission, renewable 30-second lease within a 15-minute attempt, owned cleanup across observer cancellation and one-use code nonce; typed private completion awaits a separate fresh canonical-publication authorization. |
 
 ## Contract
 
@@ -57,6 +58,21 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
 
 ## Invariants
 
+- The prototype runner is uncalled by normal startup/HTTP handlers. Its positive
+  private control binding alone can create a pending login for the exact account,
+  device, worker credential/boot/registration generation, provider and operation.
+  The trusted personal coordinator renews only after a keeper lease exchange; an
+  observer cannot extend lifetime. Revocation/lease expiry stops the owned login
+  group; uncertain cleanup retains the provider fence and reads no credential.
+  A positive stop/reap/group-disappearance receipt precedes credential selection
+  and bounded home removal. Success is `awaiting_publication`, never a connected
+  claim. Its private completion/writer expires with the lease even if retained;
+  canonical import additionally requires fresh exact keeper authorization and a
+  durable connection-generation CAS. Code values never enter nonce/digest
+  equality: the consumed one-use nonce is sufficient, including changed retries.
+  GitHub uses only fixed `gh auth token --hostname github.com` and `gh api
+  --hostname github.com user` after official login; it copies neither global Git
+  configuration nor enterprise hosts. No vendor/model calls are made by tests.
 - Passive status never installs, logs in, starts a model turn, or wakes compute.
   Readiness is auth configuration reported by the official CLI, not a promise
   about its billing, quota or model entitlement. Legacy readiness and ordinary
