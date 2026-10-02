@@ -236,6 +236,51 @@ bounded publication fence. The supervisor must stop the old project namespace
 before acknowledging removal of access to a secret; revoking network authority
 alone cannot erase a value a running process already received.
 
+An optional supporting account also exposes
+`PUT /internal/v1/worker/workspaces/{workspace}/registration` with
+`{"revision": <positive revocation floor>}`. This is supervisor-only, with the
+same current worker service authentication as scoped mint; device, keeper and
+project grants cannot call it. The workspace is a bounded stable identifier
+(1–128 ASCII letters, digits, hyphens or underscores). The body is at most
+1 KiB, contains only `revision`, and accepts an integer from 1 through
+9,223,372,036,854,775,807. The floor comes from the supervisor's durable trusted
+registry, never a project process or caller-selected path. It contains no
+secret value and grants no execution or other authority.
+
+Under the existing account lock, the service revalidates the current worker
+credential, parent lifetime, account and provisioned holder before effects. An
+absent registration is created as a revoked tombstone at the requested floor;
+an existing revision at or below it is advanced to that floor and revoked. The
+same transaction removes that project's delegation. A matching revoked floor
+is idempotent. A registration newer than the requested floor returns 409
+`workspace_registration_changed` without changing the registration or its
+grant. The 128-record ceiling includes these tombstones; a full registry refuses
+a new record rather than forgetting another project's fence. A later mint must
+be strictly above the floor, so a delayed mint at or below it cannot restore
+authority. Existing exact-revision DELETE and same-live-revision token rotation
+retain their established behavior.
+
+A successful transaction returns 200 with a bounded (at most 1 KiB) positive
+acknowledgment:
+
+```json
+{"registration_version":1,"account_id":"a-example","holder_id":"worker-example","workspace_id":"w-example","revision":7,"revoked":true}
+```
+
+The supervisor checks the version and exact account, current worker holder,
+workspace, requested floor and `revoked:true`. A missing, malformed or different
+acknowledgment, an unreachable service, or 404 is not proof of revocation and
+cannot fall back to account-wide mint. It retains its durable pending operation
+and refuses launch. It persists the exact floor acknowledgment before issuing
+any fresh mint: replacement from local revision N to N+1 first fences remote
+revision N, then mints N+1; revoke advances the local tombstone and fences that
+new revision without minting. Restart always verifies old namespace cleanup;
+after a persisted floor acknowledgment it remints only the current desired
+revision, using same-live-revision rotation when a mint reply was lost. It does
+not replay an older floor against a newer live grant. No token or submitted
+secret is persisted in the acknowledgment, and a successful network fence
+alone is not completion of secret removal from a running namespace.
+
 Only exact-workspace baton reads/acquire/renew/release, holder policy publication,
 mirror credentials and self-renewal accept this bearer. All account-wide routes
 continue to use their existing authentication and reject it. Foreign workspace
