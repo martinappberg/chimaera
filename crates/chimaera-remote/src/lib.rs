@@ -98,6 +98,19 @@ pub async fn with_existing_master<F: std::future::Future>(
     Ok(handle.with_existing(future).await)
 }
 
+fn scoped_master(host: &str, route: &Route) -> anyhow::Result<Option<MasterHandle>> {
+    match EXISTING_MASTER_ONLY.try_with(Clone::clone) {
+        Ok(handle) => {
+            anyhow::ensure!(
+                handle.host == host && handle.route == *route,
+                "SSH captured login route changed"
+            );
+            Ok(Some(handle))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
 fn existing_master_opts(host: &str, route: &Route) -> Vec<String> {
     if let Ok(handle) = EXISTING_MASTER_ONLY.try_with(Clone::clone) {
         // First values win in OpenSSH. BatchMode alone still allows a fresh
@@ -962,12 +975,36 @@ impl Tunnel {
 /// forward must cancel it by the exact spec it was opened with, on the
 /// master (the `route`) it was registered with.
 async fn cancel_master_forward(host: &str, route: &Route, spec: &str) {
-    if bounded_mux_ssh(host, route, &["-O", "cancel", "-L", spec], &[], 10)
-        .await
-        .is_none()
-    {
-        tracing::warn!("ssh -O cancel -L {spec} to {host} did not finish within 10s");
+    let command = scoped_master(host, route)
+        .and_then(|captured| forward_cancel_command(host, route, spec, captured.as_ref()));
+    if let Ok(command) = command {
+        if forward_cancel(command, Duration::from_secs(10))
+            .await
+            .is_ok()
+        {
+            return;
+        }
     }
+    tracing::warn!("SSH forward cleanup unavailable");
+}
+
+fn forward_cancel_command(
+    host: &str,
+    route: &Route,
+    spec: &str,
+    captured: Option<&MasterHandle>,
+) -> anyhow::Result<Command> {
+    let mut command = if let Some(handle) = captured {
+        anyhow::ensure!(
+            handle.host == host && handle.route == *route,
+            "SSH captured forward route changed"
+        );
+        handle.command()
+    } else {
+        mux_prologue(host, route)
+    };
+    command.args(["-O", "cancel", "-L", spec]).arg(host);
+    Ok(command)
 }
 
 /// Detect and `-O exit` a ControlMaster to `host` whose TCP link is dead:
@@ -3126,6 +3163,9 @@ pub struct ComputeTunnel {
     /// the ssh-adopt rung — `node_ssh_base` pins `ControlPath=none`, so that
     /// child owns its forward end-to-end and dies with it.
     master_forward: Option<String>,
+    /// Captured before an existing-only scope ends. Cleanup's owned task must
+    /// never recompute a %C socket from later SSH config or task-local state.
+    master_handle: Option<MasterHandle>,
     /// The login alias's [`Route`] when the tunnel opened — which master
     /// holds `master_forward`.
     route: Route,
@@ -3168,11 +3208,11 @@ impl ComputeTunnel {
         let host = self.host.clone();
         let route = self.route.clone();
         let spec = self.master_forward.clone();
+        let captured = self.master_handle.clone();
         compute_cleanup_owned(child, permit, route, spec, move |route, spec| {
             let host = host.clone();
             async move {
-                let mut command = mux_prologue(&host, &route);
-                command.args(["-O", "cancel", "-L", &spec]).arg(&host);
+                let command = forward_cancel_command(&host, &route, &spec, captured.as_ref())?;
                 forward_cancel(command, Duration::from_secs(10)).await
             }
         })
@@ -3441,6 +3481,7 @@ pub async fn connect_compute_node(
     // own close) must reach the same one even if a login reconnect re-routes
     // the alias meanwhile.
     let route = route_of(host);
+    let master_handle = scoped_master(host, &route)?;
     let mk = |local_port, rung, master_forward, child| ComputeTunnel {
         host: host.to_string(),
         node: node.to_string(),
@@ -3450,6 +3491,7 @@ pub async fn connect_compute_node(
         token: token.to_string(),
         rung,
         master_forward,
+        master_handle: master_handle.clone(),
         route: route.clone(),
         child: std::sync::Arc::new(tokio::sync::Mutex::new(child)),
         closing: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -3872,6 +3914,138 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!fixture.0.join("different").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compute_captured_forward_ignores_config_drift_and_survives_caller_abort() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture = Fixture(PathBuf::from(format!(
+            "/tmp/chimaera-forward-{}",
+            &chimaera_core::generate_token()[..8]
+        )));
+        std::fs::create_dir(&fixture.0).unwrap();
+        let config = fixture.0.join("config");
+        let old = fixture.0.join("old.sock");
+        let new = fixture.0.join("new.sock");
+        let write_config = |path: &Path| {
+            std::fs::write(
+                &config,
+                format!(
+                    "Host fixture\n HostName old-login.invalid\n User fixture\n ControlPath {}\n",
+                    path.display()
+                ),
+            )
+            .unwrap();
+        };
+        write_config(&old);
+        let mut resolve = Command::new("ssh");
+        resolve.arg("-F").arg(&config).args(["-T", "-G", "fixture"]);
+        let captured = capture_master_command("fixture", Route::Alias, resolve)
+            .await
+            .unwrap();
+        let pinned = captured
+            .with_existing(async { scoped_master("fixture", &Route::Alias).unwrap().unwrap() })
+            .await;
+        assert!(scoped_master("fixture", &Route::Alias).unwrap().is_none());
+        assert!(captured
+            .with_existing(async { scoped_master("fixture", &Route::Node("changed-login".into())) })
+            .await
+            .is_err());
+        write_config(&new);
+        let listener = tokio::net::UnixListener::bind(&old).unwrap();
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let (e, r) = (entered.clone(), release.clone());
+        let mux = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let length = stream.read_u32().await.unwrap();
+                assert!(length <= 1024);
+                let mut hello = vec![0; length as usize];
+                stream.read_exact(&mut hello).await.unwrap();
+                stream
+                    .write_all(&[0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0, 4])
+                    .await
+                    .unwrap();
+                let length = stream.read_u32().await.unwrap();
+                assert!(length <= 1024);
+                let mut request = vec![0; length as usize];
+                stream.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request[..4], &0x10000007u32.to_be_bytes());
+                let mut expected = Vec::new();
+                expected.extend(1u32.to_be_bytes()); // local forward
+                expected.extend(0u32.to_be_bytes()); // default listening host
+                expected.extend(50001u32.to_be_bytes());
+                expected.extend(15u32.to_be_bytes());
+                expected.extend(b"compute-fixture");
+                expected.extend(9000u32.to_be_bytes());
+                assert_eq!(&request[8..], expected);
+                if index == 1 {
+                    e.notify_one();
+                    r.acquire().await.unwrap().forget();
+                }
+                let mut response = Vec::from(8u32.to_be_bytes());
+                response.extend(0x80000001u32.to_be_bytes());
+                response.extend(&request[4..8]);
+                stream.write_all(&response).await.unwrap();
+            }
+        });
+        // Failed-rung cleanup happens while the existing-only scope is active.
+        captured
+            .with_existing(async {
+                cancel_master_forward("fixture", &Route::Alias, "50001:compute-fixture:9000").await
+            })
+            .await;
+        let child = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let child = std::sync::Arc::new(tokio::sync::Mutex::new(child));
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let mut tunnel = ComputeTunnel {
+            host: "fixture".into(),
+            node: "compute-fixture".into(),
+            job_id: "123".into(),
+            local_port: 50001,
+            port: 9000,
+            token: "fixture".into(),
+            rung: ComputeRung::Direct,
+            master_forward: Some("50001:compute-fixture:9000".into()),
+            master_handle: Some(pinned),
+            route: Route::Alias,
+            child: child.clone(),
+            closing: budget.clone(),
+        };
+        // Successful opens retain their captured leg after the scope has ended.
+        let caller = tokio::spawn(async move { tunnel.try_close().await });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        let _ = caller.await;
+        assert_eq!(budget.available_permits(), 0);
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), mux)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while budget.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(child.lock().await.try_wait().unwrap().is_some());
+        assert!(!new.exists());
     }
 
     #[cfg(unix)]
