@@ -24,6 +24,8 @@ use zeroize::Zeroizing;
 
 const LEASE: Duration = Duration::from_secs(30);
 const ATTEMPT: Duration = Duration::from_secs(900);
+#[cfg(test)]
+pub(super) static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static WRITERS: [AtomicBool; 3] = [
     AtomicBool::new(false),
     AtomicBool::new(false),
@@ -103,6 +105,34 @@ impl ControlBinding {
     }
 }
 impl PendingLogin {
+    /// Same-host private supervisor transfer of an already validated keeper
+    /// deadline. Reception/renewal never begins another authorization period.
+    pub(super) fn limit_initial(&self, deadline: Instant) -> Result<(), Error> {
+        let now = Instant::now();
+        if deadline <= now || deadline > now + LEASE {
+            return Err(Error::Unauthorized);
+        }
+        let mut state = crate::lock(&self.0.state);
+        if self.0.started.load(Ordering::Acquire) || state.canceled || now >= state.deadline {
+            return Err(Error::Changed);
+        }
+        state.deadline = state.deadline.min(deadline);
+        Ok(())
+    }
+    pub(super) fn renew_until(&self, deadline: Instant) -> Result<(), Error> {
+        self.check()?;
+        let now = Instant::now();
+        if deadline <= now || deadline > now + LEASE {
+            return Err(Error::Unauthorized);
+        }
+        let mut state = crate::lock(&self.0.state);
+        if state.canceled || now >= state.deadline || now >= self.0.absolute {
+            return Err(Error::Changed);
+        }
+        state.deadline = deadline.min(self.0.absolute);
+        self.0.changes.send_modify(|v| *v = v.wrapping_add(1));
+        Ok(())
+    }
     fn matches(&self, command: &ControlCommand) -> bool {
         self.0.registration == *command.registration()
             && self.0.device == command.authenticated_device()
@@ -299,7 +329,7 @@ impl PendingLogin {
     pub fn start(&self) -> Result<LoginAttempt, Error> {
         self.start_with(None)
     }
-    fn start_with(
+    pub(super) fn start_with(
         &self,
         #[cfg_attr(not(test), allow(unused_variables))] test: Option<std::path::PathBuf>,
     ) -> Result<LoginAttempt, Error> {

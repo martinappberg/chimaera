@@ -5,6 +5,8 @@ pub mod authority;
 mod connect;
 #[cfg(feature = "provider-authority-prototype")]
 mod control_login;
+#[cfg(feature = "provider-authority-prototype")]
+pub(crate) mod control_service;
 mod disconnect;
 #[cfg(feature = "provider-authority-prototype")]
 mod login_home;

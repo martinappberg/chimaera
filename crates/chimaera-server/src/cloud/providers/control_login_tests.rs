@@ -1,7 +1,6 @@
 use super::*;
 use serde_json::json;
 use std::{os::unix::fs::PermissionsExt, path::PathBuf};
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const CAP: &str = "synthetic-private-control-capability-not-runtime-00000";
 const OP: &str = "01234567-89ab-4def-8012-3456789abcd0";
 fn binding() -> ControlBinding {
@@ -55,7 +54,7 @@ const LEAF: &str = "mkdir -p .claude; printf '%s' '{\"claudeAiOauth\":{\"accessT
 #[tokio::test]
 async fn official_flow_consumes_one_nonce_stops_tree_before_credential_and_never_serializes_secrets(
 ) {
-    let _serial = SERIAL.lock().await;
+    let _serial = TEST_SERIAL.lock().await;
     let b = binding();
     let connect = command(&b, "device-one", "claude", OP, json!({"type":"connect"}));
     let pending = b.pending_login(&connect).unwrap();
@@ -112,7 +111,7 @@ async fn official_flow_consumes_one_nonce_stops_tree_before_credential_and_never
 }
 #[tokio::test]
 async fn observer_abort_does_not_release_writer_but_revocation_cleans_home_and_descendants() {
-    let _serial = SERIAL.lock().await;
+    let _serial = TEST_SERIAL.lock().await;
     let b = binding();
     let c = command(&b, "device-one", "claude", OP, json!({"type":"connect"}));
     let pending = b.pending_login(&c).unwrap();
@@ -140,7 +139,7 @@ async fn observer_abort_does_not_release_writer_but_revocation_cleans_home_and_d
 }
 #[tokio::test]
 async fn exact_authority_and_expiry_required_for_renewal_and_submission() {
-    let _serial = SERIAL.lock().await;
+    let _serial = TEST_SERIAL.lock().await;
     let b = binding();
     let c = command(&b, "device-one", "claude", OP, json!({"type":"connect"}));
     let pending = b.pending_login(&c).unwrap();
@@ -172,7 +171,7 @@ async fn exact_authority_and_expiry_required_for_renewal_and_submission() {
 }
 #[tokio::test]
 async fn noisy_or_failed_child_returns_fixed_error_and_cleans_the_owned_tree() {
-    let _serial = SERIAL.lock().await;
+    let _serial = TEST_SERIAL.lock().await;
     for script in [
         "printf 'sensitive-provider-error'; exit 7",
         "head -c 70000 /dev/zero; sleep 60",
@@ -194,7 +193,7 @@ async fn noisy_or_failed_child_returns_fixed_error_and_cleans_the_owned_tree() {
 }
 #[tokio::test]
 async fn codex_fixed_rpc_device_flow_keeps_secret_errors_out_and_reaps_after_completion() {
-    let _serial = SERIAL.lock().await;
+    let _serial = TEST_SERIAL.lock().await;
     let b = binding();
     let c = command(&b, "device-one", "codex", OP, json!({"type":"connect"}));
     let pending = b.pending_login(&c).unwrap();
@@ -245,7 +244,7 @@ fn cleanup_never_follows_cli_created_links_into_another_home() {
 }
 #[tokio::test]
 async fn completed_credential_and_writer_expire_even_if_supervisor_observer_retains_completion() {
-    let _serial = SERIAL.lock().await;
+    let _serial = TEST_SERIAL.lock().await;
     let b = binding();
     let c = command(&b, "device-one", "claude", OP, json!({"type":"connect"}));
     let pending = b.pending_login(&c).unwrap();
@@ -269,7 +268,7 @@ async fn completed_credential_and_writer_expire_even_if_supervisor_observer_reta
 }
 #[tokio::test]
 async fn github_official_device_parser_and_fixed_probes_return_one_account_without_git_setup() {
-    let _serial = SERIAL.lock().await;
+    let _serial = TEST_SERIAL.lock().await;
     let b = binding();
     let c = command(&b, "device-one", "github", OP, json!({"type":"connect"}));
     let pending = b.pending_login(&c).unwrap();
@@ -294,7 +293,7 @@ async fn github_official_device_parser_and_fixed_probes_return_one_account_witho
 #[tokio::test]
 async fn codex_successful_device_rpc_returns_exact_account_after_killing_its_refresh_owner() {
     use base64::Engine;
-    let _serial = SERIAL.lock().await;
+    let _serial = TEST_SERIAL.lock().await;
     let b = binding();
     let c = command(&b, "device-one", "codex", OP, json!({"type":"connect"}));
     let pending = b.pending_login(&c).unwrap();
@@ -313,7 +312,7 @@ async fn codex_successful_device_rpc_returns_exact_account_after_killing_its_ref
 }
 #[tokio::test]
 async fn zz_detached_login_child_stops_or_retains_fence_without_credential_on_uncertain_receipt() {
-    let _serial = SERIAL.lock().await;
+    let _serial = TEST_SERIAL.lock().await;
     let b = binding();
     let c = command(&b, "device-one", "claude", OP, json!({"type":"connect"}));
     let pending = b.pending_login(&c).unwrap();

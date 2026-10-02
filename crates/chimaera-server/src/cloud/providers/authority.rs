@@ -122,6 +122,16 @@ impl ControlBinding {
     pub(super) fn agrees(&self, command: &ControlCommand) -> bool {
         self.registration == command.registration
     }
+    pub(super) fn capability_for_service(&self) -> &str {
+        &self.capability
+    }
+    pub(super) fn authenticates(&self, capability: &str) -> bool {
+        let mut unequal = self.capability.len() ^ capability.len();
+        for (i, expected) in self.capability.bytes().enumerate() {
+            unequal |= usize::from(expected ^ capability.as_bytes().get(i).copied().unwrap_or(0));
+        }
+        unequal == 0
+    }
     pub fn acknowledgment(&self) -> Registration {
         self.registration.clone()
     }
@@ -137,11 +147,7 @@ impl ControlBinding {
         bytes: Vec<u8>,
     ) -> Result<ControlCommand, Error> {
         let bytes = Zeroizing::new(bytes);
-        let mut unequal = self.capability.len() ^ capability.len();
-        for (i, expected) in self.capability.bytes().enumerate() {
-            unequal |= usize::from(expected ^ capability.as_bytes().get(i).copied().unwrap_or(0));
-        }
-        if unequal != 0 {
+        if !self.authenticates(capability) {
             return Err(Error::Unauthorized);
         }
         if &self.registration != registration {
