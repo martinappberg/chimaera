@@ -17,7 +17,7 @@ use std::{
 use tokio::sync::{mpsc, watch};
 
 #[path = "claude.rs"]
-mod claude;
+pub(super) mod claude;
 #[path = "github.rs"]
 mod github;
 

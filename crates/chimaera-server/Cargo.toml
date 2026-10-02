@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Consumers are explicit trusted-supervisor entrypoints, never normal startup.
+provider-authority-prototype = ["dep:zeroize"]
+
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
@@ -17,6 +22,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
+zeroize = { version = "1.9", optional = true, features = ["serde"] }
 rust-embed.workspace = true
 mime_guess.workspace = true
 hostname.workspace = true

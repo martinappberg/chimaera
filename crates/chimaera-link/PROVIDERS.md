@@ -41,11 +41,14 @@ shell startup files or custom-secret overlays.
 Registration is an optional authenticated worker-registration extension:
 
 ```json
-{"providers_control":{"version":1,"account_id":"a-example","holder_id":"worker-example","process_boot":"00000000-0000-4000-8000-000000000000","registration_generation":1,"capability":"opaque-random-secret"}}
+{"providers_control":{"version":1,"account_id":"a-example","holder_id":"worker-example","process_boot":"00000000-0000-4000-8000-000000000000","registration_generation":1,"worker_credential_digest":"0000000000000000000000000000000000000000000000000000000000000000","capability":"opaque-random-secret"}}
 ```
 
 The account and holder must match the freshly validated current worker
-credential. The keeper derives the fixed worker target from that authenticated
+credential. `worker_credential_digest` is its SHA-256 digest, 64 lowercase hex
+characters; the keeper computes and compares it from the validated bearer,
+never trusts a claimed digest. It is an identity binding, not a bearer or
+authorization proof. The keeper derives the fixed worker target from that authenticated
 identity; no target address is carried by this extension. The supervisor persists
 the monotonic registration generation outside project state before enrollment.
 Registration replacement requires a greater generation; an equal-generation
@@ -80,6 +83,34 @@ revocation cancels its pending login attempts and prevents their credential
 publication. It does not silently disconnect an already established named
 provider connection. Explicit Disconnect is the cloud-wide removal operation.
 
+Each pending login has a keeper-owned admission, independent of the browser
+response lifetime. Its opaque random nonce binds account, device/session epoch,
+worker credential digest, registration generation and immutable operation ID.
+The supervisor retains that admission; runtime capabilities cannot name or mint
+it. Its monotonic lease is at most 30 seconds and its entire attempt at most 15
+minutes. The keeper renews only while its owned pending-login validator proves
+the same authority; revocation, registration replacement or unavailable
+validation closes it or lets that bounded lease expire. Polling remains passive
+and does not itself mint or restore login admission.
+
+An unexpired lease governs bounded login-tree cleanup, not successful canonical
+import. After the official login tree is stopped, publication requires a fresh
+keeper authorization exchange for the exact admission nonce, operation,
+device/account epoch, worker credential digest and registration generation.
+The keeper freshly checks account authorization using its existing ordered
+account/epoch locking semantics; cached device validation cannot authorize this
+exchange. Missing/replaced authority or an account outage refuses publication.
+Only the bounded pending attempt may remain until its deadline. The authorization
+reply is private, single-use and exact-bound; root import then also checks the
+connection generation and durably records its operation receipt. It cannot be
+replayed for another provider, account, registration or operation.
+
+The account's fresh authorization check is the finite cross-service
+linearization point: signout before it refuses import; signout after it cancels
+remaining admission/use but cannot undo an already authorized local publication
+or provider effect. The contract does not promise instantaneous distributed
+rollback. A later account/worker generation must never consume that reply.
+
 The browser gateway exposes the equivalent same-origin personal routes under
 `/home/providers`, using its existing authenticated browser session and mutation
 Origin/CSRF checks. Native uses the device-authenticated typed personal adapter.
@@ -97,7 +128,7 @@ account attendance/allowance rules. Polling never repeatedly wakes a machine.
 
 The supervisor gives the fixed control daemon a private startup pipe followed
 by EOF, at most 4096 bytes, with version, exact account/holder/boot/generation
-and the control capability. It must be a pipe, read within three seconds and
+and current worker credential digest plus the control capability. It must be a pipe, read within three seconds and
 consumed before serving. The coordinator exposes only the fixed adapter on its
 supervisor-owned Unix socket. That socket and login HOME are never mounted in
 a project. Ordinary HTTP bearer authentication cannot enroll this consumer.
@@ -156,8 +187,8 @@ token/identity from the official CLI in its trusted login home; it invents no
 refresh grant. Secret payloads cross only a supervisor-private authenticated
 channel; they never pass through keeper/account/browser/native APIs.
 
-The broker commits a complete validated leaf under exact account, login
-admission and expected connection generation. It fsyncs the atomic credential
+The broker commits a complete validated leaf under exact account, freshly
+authorized login admission and expected connection generation. It fsyncs the atomic credential
 publication before reporting Connected. Disconnect first durably advances its
 generation/tombstone and cancels old runtime transports; bounded official
 cleanup follows. A late login/refresh cannot resurrect the previous generation.

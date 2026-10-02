@@ -13,6 +13,8 @@ Worker-only readiness and explicitly requested provider authentication. Parent:
 | `connect.rs` | Short-lived connection/disconnection jobs, one writer per provider, curated runtime installation (its visible install terminal), Codex and GitHub device codes, cancellation and cleanup acknowledgement. |
 | `disconnect.rs` | Official CLI logout adapters and fresh negative verification; personal-cloud scope, no credential-file reads or claims of vendor-wide revocation. |
 | `tests.rs`, `connect_tests.rs` | Status isolation, cache/freshness, real child/PTY cleanup, cancellation/retry races and device completion verification. GitHub's CLI is found on the login shell's PATH, so tests register a fake per fixture home (`preset_github`). |
+| `authority.rs`, `authority_tests.rs` | Default-off provider-authority prototype: fixed private-pipe enrollment, exact login-only registration/capability and closed command validation; secret values never enter dedupe digests. No ordinary HTTP route or startup caller. |
+| `login_home.rs`, `login_home_tests.rs` | Descriptor-confined fixed attempt homes and bounded credential-only Claude/Codex leaf selection for the trusted control coordinator; filesystem methods belong in its owned blocking worker. No provider history/config copy. |
 
 ## Contract
 
@@ -57,7 +59,11 @@ All routes are behind the daemon bearer middleware, under `/api/v1/pro/cloud`:
 
 - Passive status never installs, logs in, starts a model turn, or wakes compute.
   Readiness is auth configuration reported by the official CLI, not a promise
-  about its billing, quota or model entitlement. Never read credential files.
+  about its billing, quota or model entitlement. Legacy readiness and ordinary
+  HTTP handlers never read credential files. The separately enrolled,
+  default-off personal-control consumer selects only the credential/identity
+  fields documented in [PROVIDERS](../../../../chimaera-link/PROVIDERS.md);
+  it is not a runtime attachment or a project bearer route.
   Provider CLIs run with `HOME` set to the worker's provider home and Claude in
   its default layout there (no `CLAUDE_CONFIG_DIR`), exactly as its sessions read it.
 - Codex uses only auth app-server requests: initialize, account/read with

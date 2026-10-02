@@ -135,7 +135,7 @@ pub(super) async fn login(
 }
 
 /// A pasted Claude authorization is `code#state`, both halves present.
-pub(super) fn complete_code(code: &str) -> bool {
+pub(in crate::cloud::providers) fn complete_code(code: &str) -> bool {
     code.split_once('#')
         .is_some_and(|(code, state)| !code.is_empty() && !state.is_empty() && !state.contains('#'))
 }
