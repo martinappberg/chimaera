@@ -73,7 +73,8 @@ for the current session; see [chat mode](chat-mode.md) for provider behavior.
 
 - **What & when.** Chimaera installs and updates its own agent copies from official sources,
   with checksums when published and no sudo. Launcher and Settings → Agents open the same setup
-  dialog, showing the host, installation folder, progress, output, and final result. Installers
+  dialog with a short progress or result message. Host, paths, exit code, and installer output
+  are available under Details. Installers
   run without a terminal or a session tab; opening or closing the dialog never starts an agent.
 - **How it's used.** Choose Install, Update, or Advanced → Reinstall, then start the operation
   in the dialog. Keep working closes the dialog; View progress/result in Agents settings returns
@@ -82,9 +83,10 @@ for the current session; see [chat mode](chat-mode.md) for provider behavior.
   system-library failures explain what to fix. Results last until the daemon restarts; a lost
   connection is unknown status, never success.
 - **Installation is one step.** A zero installer exit code says files were installed, not that
-  the account is signed in or structured chat works. Afterward, Open terminal to sign in opens the
-  provider's interactive agent; Try chat explicitly starts a chat, whose normal startup UI reports
-  authentication, compatibility, or handshake errors. Settings says “Installed · Supports chat and
+  the account is signed in or structured chat works. Afterward, Sign in opens the
+  provider's interactive agent in a terminal; Open chat starts a chat using the existing account.
+  The dialog tells users who aren't signed in to sign in first. Open chat does not perform login;
+  authentication failures appear in the normal chat startup or turn UI. Settings says “Installed · Supports chat and
   terminal” rather than claiming readiness. Running conversations and account data are kept.
 - **Where it lives.** `agent_setup.rs`, `workspace/agentSetup.ts`, and
   `workspace/AgentSetupDialog.svelte`: authenticated `GET/POST /api/v1/agents/{id}/setup` and
@@ -95,7 +97,9 @@ for the current session; see [chat mode](chat-mode.md) for provider behavior.
   bounded. Polling pauses with a hidden document. Legacy `/install` and `/update` PTY endpoints
   remain compatible. Curated scripts/shims live in `runtimes.rs`; update discovery in
   `agent_updates.rs`. `DELETE /api/v1/agents/{id}/install` still removes only the managed copy,
-  after Settings' confirmation, leaving account data and other installations alone.
+  after Settings' confirmation, leaving account data and other installations alone. Removal refuses
+  while any workspace holds a package or terminal lease, or an older daemon may still use it.
+  Shared and legacy roots are checked together before any files are removed.
 - **Key behaviors.** Scripts are composed by the daemon (never the client), `set -euo pipefail`,
   HTTPS-only, no sudo, version charset-whitelisted, downloads in a `mktemp` dir. Layout
   `~/.chimaera/agents/<agent>/<package>/bin/` with an atomic per-agent symlink swap (running

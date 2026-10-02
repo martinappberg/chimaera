@@ -136,6 +136,8 @@ Nothing site-specific is ever coded.
   when the stop took. Confirming closes the dialog immediately; progress and any
   retryable error appear on the job card. The card and its workspace rows switch to
   stopping together, with workspace actions hidden while shutdown is in progress.
+  Workspaces stay associated with that job while its allocation is still running,
+  even when their daemon manifests remain; connection endpoints are withheld.
   The card keeps “Stopping…” until Slurm finishes cancellation;
   a disappearing daemon cannot turn it back into “Starting…”. Slurm's `COMPLETING`
   state also reads as stopping, including after reopening the page. These jobs are

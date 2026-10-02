@@ -763,11 +763,10 @@ fn remove_dir_if_exists(path: &Path) -> anyhow::Result<()> {
 /// DELETE /api/v1/agents/{id}/install — uninstall a chimaera-MANAGED agent: the
 /// active symlink plus its version tree under `~/.chimaera/agents`. Only ever
 /// touches chimaera's own prefix — the user's own install (and its auth in
-/// `$HOME`) is never touched. A running session keeps its already-exec'd binary
-/// (the inode survives the unlink), but NOT companions its package resolves by
-/// path later: a live codex loses its code-mode host and bundled rg/zsh the
-/// moment its tree goes. 404 unknown id; 409 while an install for the
-/// same agent is in flight; 200 `{"removed": bool}` otherwise (`false` = nothing
+/// `$HOME`) is never touched. Usage leases protect companions a running agent
+/// resolves by path later, including sessions in other workspace daemons.
+/// 404 unknown id; 409 while an install or a session using the package is
+/// in flight; 200 `{"removed": bool}` otherwise (`false` = nothing
 /// chimaera-managed to remove).
 pub(crate) async fn uninstall_agent(
     State(state): State<Arc<AppState>>,
@@ -810,8 +809,17 @@ pub(crate) async fn uninstall_agent(
             Err(response) => return *response,
         }
     }
-    let removed = match tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+    let removed = match tokio::task::spawn_blocking(move || -> anyhow::Result<Option<bool>> {
         let _locks = locks;
+        // Check every root before removing anything: a lease in the legacy
+        // tree must not leave the shared installation partially uninstalled.
+        let mut _usage = Vec::new();
+        for root in &roots {
+            let Some(leases) = crate::runtime_retention::lock_removal(root, kind)? else {
+                return Ok(None);
+            };
+            _usage.extend(leases);
+        }
         let mut removed = false;
         for root in roots {
             let bin = managed_bin_dir(&root);
@@ -825,11 +833,21 @@ pub(crate) async fn uninstall_agent(
             remove_dir_if_exists(&root.join(kind.as_str()))?;
             removed = true;
         }
-        Ok(removed)
+        Ok(Some(removed))
     })
     .await
     {
-        Ok(Ok(removed)) => removed,
+        Ok(Ok(Some(removed))) => removed,
+        Ok(Ok(None)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": format!(
+                    "{} is still in use. Close sessions and terminals using this installation, then try again.",
+                    kind.product_name()
+                )})),
+            )
+                .into_response();
+        }
         error => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,

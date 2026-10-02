@@ -22,7 +22,7 @@
   const running = $derived(setupRunning(operation));
   const agent = $derived($agentCatalog.find(a => a.id === request.agent.id) ?? request.agent);
   const verb = $derived(({ install: "Install", update: "Update", reinstall: "Reinstall" })[request.action]);
-  const title = $derived(operation?.phase === "succeeded" ? `${agent.name} installed` : operation?.phase === "failed" ? `${agent.name} setup needs attention` : operation?.phase === "cancelled" ? "Installation cancelled" : operation?.phase === "cancelling" ? "Stopping installation" : running ? `${operation?.action === "update" ? "Updating" : operation?.action === "reinstall" ? "Reinstalling" : "Installing"} ${agent.name}` : `${verb} ${agent.name}`);
+  const title = $derived(operation?.phase === "succeeded" ? `${agent.name} ${operation.action === "update" ? "updated" : operation.action === "reinstall" ? "reinstalled" : "installed"}` : operation?.phase === "failed" ? `Couldn't install ${agent.name}` : operation?.phase === "cancelled" ? "Installation cancelled" : operation?.phase === "cancelling" ? "Stopping installation…" : running ? `${operation?.action === "update" ? "Updating" : operation?.action === "reinstall" ? "Reinstalling" : "Installing"} ${agent.name}…` : `${verb} ${agent.name}`);
 
   async function check(): Promise<void> {
     if (checking) return;
@@ -89,43 +89,45 @@
   <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="setup-title" tabindex="-1" use:modalFocus onclick={e => e.stopPropagation()} onkeydown={e => { if (e.key === "Escape") onclose(); e.stopPropagation(); }}>
     <header>
       <span class="glyph"><SessionGlyph kind="agent" agentKind={agent.id} size={25} title={agent.name} /></span>
-      <div><p class="eyebrow">AGENT SETUP · {details?.host ?? "This workspace’s host"}</p><h2 id="setup-title">{title}</h2></div>
+      <h2 id="setup-title" role="status">{title}</h2>
       <button class="close" aria-label="Close setup" onclick={onclose}>×</button>
     </header>
     <div class="body">
-      <p class="intro">{running ? "You can keep working. Close this dialog and return through Agents settings to see the result." : "Chimaera installs its own copy on this workspace’s host. Your account data and conversations are kept."}</p>
-      <div class="steps" aria-label="Setup stages">
-        <div class:active={running} class:done={operation?.phase === "succeeded"}><span>1</span><strong>Install files</strong><small>{operation?.phase === "succeeded" ? "Finished" : running ? "In progress" : "Official release"}</small></div>
-        <div><span>2</span><strong>Sign in</strong><small>In the agent’s terminal</small></div>
-        <div><span>3</span><strong>Start chat</strong><small>Checked when opened</small></div>
-      </div>
-      <div class="location"><span>Install location</span><code>{details?.root ?? "Checking…"}</code></div>
-      {#if operation}
-        <div class="result" class:failed={operation.phase === "failed"} role="status">
-          <strong>{operation.message}</strong>
-          {#if operation.exit_status !== null}<span>Installer exit code: {operation.exit_status}</span>{/if}
-        </div>
-        <details class="output" open={operation.phase === "failed" || running}>
-          <summary>Installer output{operation.truncated ? " · latest 64 KB" : ""}</summary>
-          {#if agent.path}<div class="selected-path">Executable for new sessions: <code>{agent.path}</code></div>{/if}
+      {#if operation?.phase === "succeeded"}
+        <p class="intro">Already signed in? Open chat. Otherwise, sign in first.</p>
+      {:else if running}
+        <p class="intro">You can keep working. Check back in Settings → Agents.</p>
+      {:else if operation}
+        <p class="intro" class:error={operation.phase === "failed"} role="status">{operation.message}</p>
+      {:else}
+        <p class="intro">Install the latest version. Your account and conversations are kept.</p>
+      {/if}
+      <details class="details">
+        <summary>Details</summary>
+        <dl>
+          <dt>Host</dt><dd>{details?.host ?? "Checking…"}</dd>
+          <dt>Install location</dt><dd><code>{details?.root ?? "Checking…"}</code></dd>
+          {#if agent.path}<dt>Executable for new sessions</dt><dd><code>{agent.path}</code></dd>{/if}
+          {#if operation?.exit_status !== null && operation?.exit_status !== undefined}<dt>Installer exit code</dt><dd>{operation.exit_status}</dd>{/if}
+        </dl>
+        {#if operation}
+          <p class="output-label">Installer output{operation.truncated ? " · latest 64 KB" : ""}</p>
           <!-- svelte-ignore a11y_no_noninteractive_tabindex (keyboard users must be able to scroll the bounded output region) -->
           <pre role="region" aria-label="Installer output" tabindex="0">{operation.output || (running ? "Waiting for installer output…" : "The installer produced no output.")}</pre>
-        </details>
-      {:else}
-        <p class="note">Installation does not sign you in or verify chat. Provider availability and host compatibility are checked when you open the agent.</p>
-      {/if}
+        {/if}
+      </details>
       {#if error}<p class="error" role="alert">{error}</p>{/if}
       {#if refreshError}<p class="error" role="alert">{refreshError}</p>{/if}
       {#if !connected}<button class="link" disabled={checking} onclick={() => void check()}>Refresh status</button>{/if}
     </div>
     <footer>
-      <button class="btn" onclick={onclose}>{running ? "Keep working" : "Close"}</button>
+      <button class="btn" onclick={onclose}>{running ? "Keep working" : operation?.phase === "succeeded" ? "Done" : operation ? "Close" : "Cancel"}</button>
       <div class="next">
         {#if running}
           <button class="btn" disabled={busy || operation?.phase === "cancelling" || !connected} onclick={() => void cancel()}>{operation?.phase === "cancelling" ? "Stopping…" : "Cancel installation"}</button>
         {:else if operation?.phase === "succeeded"}
-          {#if agent.installed}<button class="btn" onclick={() => launch("term")}>Open terminal to sign in</button>{/if}
-          {#if agent.chatCapable}<button class="btn primary" onclick={() => launch("chat")}>Try chat</button>{/if}
+          {#if agent.installed}<button class="btn" title={`Open ${agent.name} in a terminal to sign in`} onclick={() => launch("term")}>Sign in</button>{/if}
+          {#if agent.chatCapable}<button class="btn primary" onclick={() => launch("chat")}>Open chat</button>{/if}
         {:else}
           <button class="btn primary" disabled={busy || !connected} onclick={() => void start()}>{busy ? "Starting…" : operation ? "Retry installation" : verb}</button>
         {/if}
@@ -136,30 +138,20 @@
 
 <style>
   .backdrop { position:fixed; inset:0; z-index:1500; background:var(--scrim); display:grid; place-items:center; padding:24px; }
-  .dialog { width:min(640px, 100%); max-height:calc(100vh - 48px); overflow:auto; background:var(--bg); color:var(--fg); border:1px solid var(--edge); border-radius:16px; box-shadow:0 24px 80px var(--scrim); }
-  header { display:flex; align-items:center; gap:14px; padding:24px 24px 18px; border-bottom:1px solid var(--edge); }
-  .glyph { color:var(--accent); padding:12px; background:var(--rail-bg); border-radius:12px; }
-  .eyebrow { margin:0 0 6px; font-size:10px; font-weight:650; letter-spacing:.08em; color:var(--muted); overflow-wrap:anywhere; }
-  h2 { font-size:20px; line-height:1.3; margin:0; font-weight:600; letter-spacing:-.025em; }
+  .dialog { width:min(480px, 100%); max-height:calc(100vh - 48px); overflow:auto; background:var(--bg); color:var(--fg); border:1px solid var(--edge); border-radius:16px; box-shadow:0 24px 80px var(--scrim); }
+  header { display:flex; align-items:center; gap:12px; padding:24px 24px 0; }
+  .glyph { color:var(--accent); display:flex; }
+  h2 { font-size:18px; line-height:1.3; margin:0; font-weight:600; letter-spacing:-.025em; }
   .close { margin-left:auto; align-self:flex-start; background:none; border:0; color:var(--muted); font-size:24px; cursor:pointer; }
   .body { padding:20px 24px; }
-  .intro,.note { color:var(--muted); font-size:13px; line-height:1.6; margin:0 0 20px; }
-  .steps { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:20px; }
-  .steps div { display:flex; flex-direction:column; gap:7px; padding:14px 10px; border:1px solid var(--edge); border-radius:10px; }
-  .steps span { width:22px; height:22px; display:grid; place-items:center; border-radius:50%; background:var(--rail-bg); color:var(--muted); font-size:11px; }
-  .steps strong { font-size:12px; font-weight:600; }
-  .steps small { color:var(--muted); font-size:11px; }
-  .steps .active,.steps .done { border-color:var(--accent); }
-  .steps .active span,.steps .done span { background:var(--accent); color:var(--bg); }
-  .location { display:flex; flex-direction:column; gap:7px; margin-bottom:18px; font-size:11px; color:var(--muted); }
+  .intro { color:var(--muted); font-size:13px; line-height:1.6; margin:0 0 16px; }
   code { overflow-wrap:anywhere; color:var(--fg); font-size:11px; }
-  .result { border-left:3px solid var(--accent); padding:10px 14px; margin:16px 0; background:var(--rail-bg); line-height:1.6; font-size:12px; }
-  .result strong { font-weight:500; } .result span { display:block; color:var(--muted); font-size:11px; margin-top:6px; }
-  .failed { border-color:var(--err); }
-  .selected-path { padding:0 12px 12px; overflow-wrap:anywhere; color:var(--muted); font-size:11px; line-height:1.6; }
-  .output { border:1px solid var(--edge); border-radius:8px; overflow:hidden; }
-  summary { cursor:pointer; padding:12px; color:var(--muted); font-size:12px; }
-  pre { margin:0; padding:12px; max-height:220px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; background:var(--rail-bg); font-size:11px; line-height:1.6; }
+  .details { color:var(--muted); font-size:12px; }
+  summary { cursor:pointer; width:fit-content; }
+  dl { margin:16px 0; font-size:11px; line-height:1.6; }
+  dt { margin-top:10px; } dd { margin:2px 0 0; overflow-wrap:anywhere; color:var(--fg); }
+  .output-label { font-size:11px; margin:12px 0 6px; }
+  pre { margin:0; padding:12px; max-height:220px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; background:var(--rail-bg); border-radius:7px; font-size:11px; line-height:1.6; }
   .error { color:var(--err); font-size:12px; line-height:1.6; }
   footer { display:flex; justify-content:space-between; flex-wrap:wrap; gap:10px; padding:16px 24px; border-top:1px solid var(--edge); }
   .next { display:flex; gap:8px; flex-wrap:wrap; }
@@ -167,5 +159,5 @@
   .primary { background:var(--accent); border-color:var(--accent); color:var(--bg); }
   button:disabled { opacity:.5; cursor:default; }
   .link { background:none; border:0; padding:0; color:var(--accent); cursor:pointer; font-size:12px; }
-  @media(max-width:520px) { .backdrop { padding:10px; } header,.body { padding:16px; } footer { padding:14px 16px; } .steps { gap:5px; } .steps div { padding:10px 7px; } }
+  @media(max-width:520px) { .backdrop { padding:10px; } header { padding:16px 16px 0; } .body { padding:16px; } footer { padding:14px 16px; } }
 </style>

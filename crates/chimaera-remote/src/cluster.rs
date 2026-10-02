@@ -607,14 +607,18 @@ fn build(
             if let Some(m) = state.manifests.get(&ws.id) {
                 if let Some(job) = jobs.iter().find(|j| {
                     j.state == "running"
-                        && !j.stopping
                         && j.slurm_job_id.is_some()
                         && j.slurm_job_id == m.slurm_job_id
                         && held_in(&j.id) != Some(HostedState::Failed)
                 }) {
                     v.state = "open";
                     v.job = Some(job.id.clone());
-                    v.closing = held_in(&job.id) == Some(HostedState::Closing);
+                    v.closing = job.stopping || held_in(&job.id) == Some(HostedState::Closing);
+                    // Keep ownership visible while Slurm finishes cancellation,
+                    // but never offer a connection into a stopping allocation.
+                    if job.stopping {
+                        return v;
+                    }
                     endpoints.insert(
                         ws.id.clone(),
                         Endpoint {
@@ -2221,7 +2225,7 @@ mod tests {
         };
         let mut waiting = record("j-0000bbbb", Some("78"), NOW);
         waiting.open = vec!["w-2222abcd".into()];
-        let state = BrowseState {
+        let mut state = BrowseState {
             config: config.clone(),
             jobs: vec![
                 JobFiles {
@@ -2275,6 +2279,18 @@ mod tests {
         );
         assert_eq!(b.hosts["j-0000aaaa"].port, 41000);
         assert!(!b.hosts.contains_key("j-0000bbbb"));
+        for (cancelled, slurm_state) in [(true, "RUNNING"), (false, "COMPLETING")] {
+            state.jobs[0].record.stopped_by_user = cancelled;
+            let queue = [queue_row("77", slurm_state, "n042", "1:00:00", "None")];
+            let stopping = build(&config, &state, &queue, true, NOW);
+            let workspace = &stopping.workspaces[0];
+            assert_eq!(workspace.state, "open");
+            assert_eq!(workspace.job.as_deref(), Some("j-0000aaaa"));
+            assert!(workspace.closing);
+            assert!(!workspace.opening);
+            assert!(!stopping.endpoints.contains_key("w-0000abcd"));
+            assert!(!stopping.hosts.contains_key("j-0000aaaa"));
+        }
     }
 
     /// A running job's job-host says what it holds: a workspace it is

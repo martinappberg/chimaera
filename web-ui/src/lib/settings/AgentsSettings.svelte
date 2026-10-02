@@ -117,7 +117,7 @@
     <h2>Agents</h2>
     <button class="link" disabled={loading} onclick={() => void load(true)}>{loading ? "Checking…" : "Check for updates"}</button>
   </div>
-  <p class="intro">Manage agents on this workspace’s host. Installation, account sign-in, and chat startup are separate steps.</p>
+  <p class="intro">Existing installations are detected automatically.</p>
   {#if loadError}<p class="err" role="alert">{loadError}</p>{/if}
   <div class="cards">
     {#each $agentCatalog as a (a.id)}
