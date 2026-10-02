@@ -1,10 +1,11 @@
-# Lifecycle & persistence — "close the laptop, nothing dies"
+# Lifecycle & persistence
 
-The property that defines Chimaera: sessions are **daemon-owned processes**, and windows are just
-views onto them. A dropped socket, a closed laptop, or a quit app leaves everything running;
-reconnecting re-attaches with full state. A *daemon restart* (update, crash, `chimaera kill`)
-necessarily ends the child processes — the **session ledger + restart handoff** make even that
-survivable.
+Sessions are **daemon-owned processes**, and windows are views onto them. Disconnecting or
+quitting the client leaves sessions running while their host and daemon remain alive. A remote
+host can keep working while your laptop sleeps; work hosted on that laptop pauses with it.
+Compute work also ends when its allocation ends. Reconnecting to a live session restores its
+view. After a daemon restart, the **session ledger + restart handoff** resume conversations
+and respawn shells as new processes; they do not preserve the old terminal screen or process memory.
 
 **Where it lives:** `crates/chimaera-server/src/{ledger.rs,lifecycle.rs,persist.rs,update.rs,
 state.rs,api/shutdown.rs}`; `Manifest`/`Handoff`/token in `chimaera-core`; CLI daemon-stop in
@@ -15,7 +16,8 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
 ## Daemon-owned persistence
 
 - **What & when.** Every terminal and chat session is a daemon child, not owned by any window.
-  Close a window → the session keeps running; reopen → it re-attaches exactly where it was.
+  Close a window → the session keeps running on its live host; reopen → it re-attaches to that
+  live session. Restarting the daemon follows the restoration path below.
 - **Key behaviors.** The **manifest** (`~/.chimaera/manifest.json`, 0600, carries the bearer token) is
   the single source of truth for "is a local daemon running". Terminals rebuild from a server-side
   snapshot; chat rebuilds by replaying the journal gap. Chat sessions survive a *disconnect* — the chat
@@ -32,10 +34,11 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   continuously-reconciled `sessions.json` records each session's *semantic* identity (workspace, cwd,
   agent kind, **surface** (term/chat), native conversation/thread id + transcript path, chat model,
   pinned name, dims, theme, linked-terminal edges). On boot the daemon **resurrects**: shells respawn at
-  their last cwd, claude TUI agents respawn with `--resume`, Codex TUIs with a verified rollout
-  respawn with `codex resume <thread-id>`, **chat sessions respawn as chat** — both
-  agents, via `chat::resurrect_chat`, resuming the native conversation (claude `--resume`, codex
-  `thread/resume`) and replaying the on-disk journal. Sessions Chimaera cannot resurrect live retire
+  their last cwd, Claude TUI agents respawn with `--resume`, and Codex TUIs with a verified
+  rollout respawn with `codex resume <thread-id>`. **Chat sessions respawn as chat** through
+  `chat::resurrect_chat`, retaining all four providers' native handles (Claude `--resume`, Codex
+  `thread/resume`, ACP session load/resume) and replaying the on-disk journal. Native resume
+  still depends on the provider accepting that handle. Sessions Chimaera cannot resurrect live retire
   into Recents; a row resumes when its native handle was captured, otherwise its tooltip honestly
   says that this specific row must start fresh. A finished Codex chat carries its `ChatInfo` thread id
   into Recents before the chat registry entry is removed.
@@ -56,7 +59,9 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   (`Handoff::consume`/`rebind`), `state.rs` (the `restored` watch gate).
 - **Key behaviors.** The ledger stores **no argv** — resurrection rebuilds commands through the normal
   spawn path so hook URLs / shims / themes match the *new* daemon. **Session ids are preserved**, so
-  every persisted layout tab, linked-terminal edge, and open window rebinds with no client migration. A
+  persisted layout tabs and open windows rebind without id migration. Linked-terminal edges
+  restore only when both endpoints appear in the restored PTY roster; chat-agent links currently
+  need re-granting (see [linked-terminals.md](linked-terminals.md)). A
   recorded claude resume id is a *claim*, not a promise — restore verifies the transcript on disk first
   (claude 2.1.204 interactive sessions persist no transcript, so a missing file boots fresh, not "No
   conversation found"). A client connecting mid-restore waits `wait_restored()` (cap 15s) so it never
@@ -80,7 +85,7 @@ conversation. All four chat providers retain their native resume handle through 
 
 - **What & when.** Resuming the conversation brings back what the agent *said*, not what its process
   *held*. On an update or restart, each chat also comes back with the parts that die with the
-  process: the **Remote Control bridge** (on if it was on, off if you turned it off — this wins over
+  process: supported native controls such as the **Remote Control bridge** (on if it was on, off if you turned it off — this wins over
   `chat.remoteControlAtStart`), **ultracode**, and, when the restart cut work off, **one message to
   the agent** listing what stopped — a turn that was still running, and background commands,
   monitors, workflows and background agents — asking it to restart each one the way it started it
@@ -88,7 +93,8 @@ conversation. All four chat providers retain their native resume handle through 
 - **How it's used.** Nothing to do. The message appears in the transcript as a user bubble tagged
   **sent by chimaera after a restart** and starts a turn on your account. It is sent only when work
   was actually cut off and the conversation really resumed (a chat that had to boot fresh has no
-  memory of that work), never to a workspace Mastermind (the daemon never starts its turns), and not
+  memory of that work), never to a workspace Mastermind or a cluster workspace job (those restored chats wait for
+  the user), and not
   again within 10 minutes of the chat's last one — a daemon crashing in a loop would otherwise start
   a billed turn on every crash. Setting **Pick Up Interrupted Work After a Restart**
   (`chat.resumeAfterRestart`, default on) turns the message off; the bridge and ultracode come back
@@ -176,7 +182,7 @@ conversation. All four chat providers retain their native resume handle through 
 > be "helpfully" changed without asking.
 
 ### Why persistence is the central bet
-_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+_Captured 2026-07-09 — drafted from docs/design/README.md + code, confirmed live with the maintainer._
 
 - **Problem it solves.** "Close the laptop, nothing dies" — tmux's ownership model, the exact inverse
   of code-server's failure. The daemon owns everything; windows are just views.

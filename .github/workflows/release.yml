@@ -13,7 +13,7 @@ name: release
 # Releases are PUBLISHED (not draft) so the installed app auto-updates; the
 # required-CI branch protection on main is the safety gate that a merge is
 # already green. App update signing needs TAURI_SIGNING_PRIVATE_KEY[_PASSWORD]
-# repo secrets (see CONTRIBUTING.md); auto-update only resolves once the repo
+# repo secrets (see .github/CONTRIBUTING.md); auto-update only resolves once the repo
 # (or its releases) is public.
 on:
   push:

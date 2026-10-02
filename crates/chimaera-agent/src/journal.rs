@@ -6,7 +6,7 @@
 //! attach-with-recent-last_seq case without touching disk. Sequence numbers
 //! are assigned once, before fan-out, so the journal, the live broadcast,
 //! and every client agree on them — this is the seq-replay contract from
-//! DESIGN.md's transport section, realized for structured streams.
+//! docs/design/README.md's transport section, realized for structured streams.
 //!
 //! Disk writes happen on a dedicated writer thread fed over a bounded tokio
 //! channel: `~/.chimaera` may be NFS on an HPC login node, and a hung write

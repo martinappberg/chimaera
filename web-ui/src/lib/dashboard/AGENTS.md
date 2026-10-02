@@ -2,7 +2,7 @@
 
 Orientation for coding agents. The workspace-first landing surface (the
 feature page: [docs/features/dashboard.md](../../../../docs/features/dashboard.md);
-the design spine: [docs/agent-dashboard-plan.md](../../../../docs/agent-dashboard-plan.md)).
+the design spine: [docs/design/agent-dashboard-plan.md](../../../../docs/design/agent-dashboard-plan.md)).
 Parent map: repo-root [AGENTS.md](../../../../AGENTS.md).
 
 ## File map

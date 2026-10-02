@@ -1,6 +1,6 @@
 //! Agent communication: every agent in a workspace sees the others and
 //! messages them, and the Mastermind is the coordinator role inside it.
-//! Plan and contract: docs/agent-communication-plan.md (§12).
+//! Plan and contract: docs/design/agent-communication-plan.md (§12).
 //!
 //! A message is a `note` entry on the workspace Timeline whose `delivery` is
 //! set (a plugin's own Timeline notes carry none and are never delivered);

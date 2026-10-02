@@ -8,10 +8,10 @@ installed only through their own plugin managers). Beside them: the **Skills** s
 skill each agent can use here) and in-app **codex hook trust**. Agents talking to each other is
 built in now, no plugin: Agent communication (Settings → Agents). **Browse** (searching the
 marketplaces the agents already have) renders disabled, "later". Design: the WASM host, versions
-and updates in [docs/plugin-system-plan.md](../plugin-system-plan.md); trust — what a plugin can
-do and who approved it — in [docs/plugin-platform-plan.md](../plugin-platform-plan.md) §1–§2
+and updates in [docs/design/plugin-system-plan.md](../design/plugin-system-plan.md); trust — what a plugin can
+do and who approved it — in [docs/design/plugin-platform-plan.md](../design/plugin-platform-plan.md) §1–§2
 (its phase P6, [below](#trust-what-a-plugin-can-do-and-who-approved-it)); the seam and the tab in
-[docs/timeline-knowledge-plugins-plan.md](../timeline-knowledge-plugins-plan.md) §6–§7. Writing a
+[docs/design/timeline-knowledge-plugins-plan.md](../design/timeline-knowledge-plugins-plan.md) §6–§7. Writing a
 plugin: [docs/agent-guides/plugins.md](../agent-guides/plugins.md).
 
 **Where it lives (shared):** daemon `crates/chimaera-server/src/plugins/` — `mod.rs` (the
@@ -156,9 +156,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     switch drops the plugin's instance there and clears a fault. Detection is a few
     `stat`s off the reactor, cached 30 s per workspace, re-run on every switch and before any
     answer that decides what an agent sees.
-  - **Core never changes what agents see; a plugin changes it only where active.** With none
-    active, MCP `tools/list`, the `initialize` instructions, generated claude settings and codex
-    argv are byte-identical — pinned by `crates/chimaera-server/src/tests/agent_view.rs`. Where
+  - **A plugin changes what agents see only where it is active.** With none active, the
+    plugin integration adds nothing to MCP `tools/list`, `initialize` instructions, generated
+    Claude settings or Codex argv; the baseline respects Chimaera's built-in communication
+    settings and tools — pinned by `crates/chimaera-server/src/tests/agent_view.rs`. Where
     active, a plugin's tools join `tools/list`, pass the call gate (elsewhere a call is refused,
     JSON-RPC -32602, "… isn't switched on in this workspace …"), and its instruction paragraph
     joins `initialize`, in catalog (id) order. A plugin that can't answer (refused, faulted)
@@ -168,11 +169,12 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     TUI — `-c mcp_servers.chimaera.url=…` + `bearer_token_env_var="CHIMAERA_MCP_KEY"` (the key
     in the PTY env, never argv) + per-tool `approval_mode="approve"` (live: a pre-approved
     tool runs with no prompt, a linked-terminal tool still asks — PROTOCOL.md Pass 35). **A
-    codex TUI gets the chimaera MCP server at all only while a plugin with tools is active in its
-    workspace, or a Mastermind is appointed there** — with neither, its argv is unchanged.
+    Codex TUI gets the chimaera MCP server when agent communication is on (default), a
+    workbench plugin with tools is active, or a Mastermind is appointed there**. ACP chats
+    receive the same tools but retain their native approval requests.
     Pre-allows are baked at spawn: a claude session or codex chat started before the switch
     sees the tools (tools/list is per call) but its agent asks per call, and a codex TUI
-    started before it has no chimaera server until respawned; switching off gates calls at
+    started without any MCP injection needs a respawn to gain it; switching off gates calls at
     once.
   - **A plugin is a manifest plus a sandboxed component.** The manifest (`plugin.toml`) is TOML
     parsed `deny_unknown_fields`; a test fails a locked release that doesn't say what it adds.
@@ -195,8 +197,8 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     line per installed agent with its state in words and at most one action — "claude ·
     installed 0.7.2", "codex · not installed [Install]", "codex · 2 hooks not trusted
     [Review]", "claude · installed, disabled"; "asking claude and codex…" while the agents are
-    asked. `requires` is a genuine hard requirement (no plugin has one today; "It needs claude
-    or codex, and neither is installed on this host." when none is). `recommends` helps the
+    asked. `requires` is a hard requirement ("It needs claude or codex, and neither is installed
+    on this host." when none is). `recommends` helps the
     agents the user runs but is never needed — mycelium's `mycelium@mycelium` is the example:
     the Knowledge reader works with no agent plugin at all. Both ride
     `GET /workspaces/{id}/plugins` as lists of `{agent, id, marketplace}`, beside
@@ -231,31 +233,30 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     the installed plugin. Setup is a fresh chat plus one Send (502 if the prompt didn't land —
     the session still exists).
     Chimaera never installs or updates anything on its own.
-  - **Status: partial.** Built and proven live on an isolated daemon (2026-09-26, a stand-in
-    agent, nothing billed): the WASM host, both plugins as components, versions, installs,
-    updates, Use previous and Remove ([plan status](../plugin-system-plan.md#status-2026-09-27)).
-    Since then both plugins moved to their own repositories, and (2026-09-27) the daemon stopped
-    carrying plugin bytes: the lock is the curated list, and first-party plugins install from
-    their releases like any plugin. Later: Browse renders disabled, "later"; the `switched-on` /
-    `switched-off` events (declarable, never delivered); the UI-facing `query` route (the export
-    exists, no route calls it); screens, programs, side-program installs and trust by
-    capability (WIT 0.2), planned in the [plugin platform plan](../plugin-platform-plan.md),
-    with LaTeX and Typst as its first plugins ([plan](../latex-reports-plan.md)).
+  - **Current platform.** The initial isolated live proof (2026-09-26, stand-in agent,
+    nothing billed) covered the WASM host, the two components then present, versions,
+    installs, updates, Use previous and Remove
+    ([dated plan status](../design/plugin-system-plan.md#status-2026-09-27)). Plugins now live
+    in separate repositories and install from locked releases; the daemon carries no plugin
+    bytes. Capability trust, both WIT worlds, plugin screens and file views, query routes,
+    switch events, program jobs and tool downloads are implemented (sections below).
+    LaTeX and Typst use the 0.2 platform. **Browse** remains disabled, "later".
 
 ## The plugin host
 
-- **What & when.** A workbench plugin is a Rust crate compiled for `wasm32-wasip2` into one
-  portable `plugin.wasm` (the same file on a Mac, an x86 login node or an ARM box) beside its
-  `plugin.toml`, run by the daemon's host through the pinned WIT world `chimaera:plugin@0.1.0`.
-  It exports `tools`, `instructions`, `call-tool`, `knowledge`, `query` and `on-event`, and
-  reaches nothing but the host's imports. Every plugin, a first-party one included, runs from
+- **What & when.** A workbench plugin is a WebAssembly component (first-party plugins use
+  Rust compiled for `wasm32-wasip2`) in one portable `plugin.wasm` (the same file on a Mac, an x86 login node or an ARM box) beside its
+  `plugin.toml`, run by the daemon's host through the pinned WIT worlds `chimaera:plugin@0.1.0` and `@0.2.0`.
+  Both export `tools`, `instructions`, `call-tool`, `knowledge`, `query` and `on-event`.
+  A component reaches nothing but the host's imports. The 0.2 world adds platform imports and screen/action
+  exports, including declared program jobs; 0.1 remains supported unchanged. Every plugin, a first-party one included, runs from
   an installed copy under `~/.chimaera/plugins/<id>/<version>/`
   ([below](#versions-installs--updates)); the daemon binary carries no plugin bytes, so a daemon
   with nothing installed has nothing to load.
 - **Where it lives.** `plugins/runtime.rs` (engine, instances, deadlines, faults; the entry
   points `offer` / `call_tool` / `knowledge` / `on_event`, `hook`, `session_ended`),
   `plugins/hostfns.rs` (the WIT `host` interface), `crates/chimaera-plugin-api/wit/chimaera.wit`
-  (the world; the daemon's `bindgen!` reads the same file). Tests:
+  (the 0.2 world; `wit-0.1/chimaera.wit` retains 0.1; the daemon binds both). Tests:
   `crates/chimaera-server/src/tests/plugin_host.rs`, against `plugins/test-fixture` (embedded
   only by test builds, from `plugins/dist-test`, never shipped).
 - **Key behaviors** (every limit is the host's, so no plugin can forget one):
@@ -293,7 +294,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     schema must be a JSON object schema (≤ 16 KiB) — and a component whose `tools()` names differ
     from its manifest's `provides.mcp_tools` is refused everywhere (the card's Adds line and the
     call gate come from the manifest). Tool names are unique within a manifest, 1–64 ASCII
-    letters, digits, underscores, dots or dashes; built-in tool names are reserved. If active
+    letters, digits, underscores or dashes (dots are refused to keep Codex approval keys literal); built-in tool names are reserved. If active
     plugins share a tool name, the first in catalog order both advertises and handles it.
   - **Events reach only the plugins that declare them** (`provides.events`): a hook never
     instantiates a plugin that ignores hooks.
@@ -379,7 +380,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     when none), `homepage`, `adds {ui, agents}`, `provides {knowledge, mcp_tools, views}`,
     `setup`, `detect`, `requires_summary` / `recommends_summary` (the author's sentence about
     the agent-side plugin, null when none), then `version` (the installed
-    copy's), `api` (the WIT version it targets, `"0.1"`), `source: "installed"`,
+    copy's), `api` (the WIT version it targets, `"0.1"` or `"0.2"`), `source: "installed"`,
     `installed: true`, `first_party`, `verified`, `sha256_wasm` (the loaded copy's
     `plugin.wasm`), `path` (the version directory), and only when they hold something: `repo`
     (the `owner/repo` it updates from, its `[release] github`), `pinned_version` (first-party
@@ -433,8 +434,10 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     is in the lock — the maintainers' curated list — AND the installed copy's
     `[release] github` matches the lock's `repo` (case-insensitive), with either exact pinned
     bytes or a `source-github` marker recorded by the host when installing from that repository.
-    A local build cannot grant itself the badge through its manifest or copied marker. Available
-    lock entries are first-party by definition; updates from the official repository keep it.
+    This origin test cannot be self-granted by a local build's manifest or copied marker.
+    On the wire, `first_party` also requires **Verified** trust standing: an update that grows
+    capabilities, or an unpinned privileged build, loses the badge and requires trust.
+    Available lock entries carry the badge; eligible official updates keep it.
   - **`verified`** — the integrity check, never shown on the card (only a failure is, as the
     fault line) — checked every time the catalog loads a copy (off the reactor): both files are
     re-hashed against the `SHA256SUMS` kept beside them. A match → `verified`; no `SHA256SUMS`
@@ -478,7 +481,7 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     under a fresh name, renamed over the old). At most two versions stay on disk; **Use
     previous** swaps the two links, so it is reversible; **Remove** deletes the id's directory,
     and a first-party plugin then shows as available again.
-  - **Gates before anything loads:** `api` must be a WIT version this host serves (`0.1`) and
+  - **Gates before anything loads:** `api` must be a WIT version this host serves (`0.1` or `0.2`) and
     `requires.chimaera` must match this daemon (a dev build matches every requirement). A plugin
     failing one stays listed, off, with its reason; its switch refuses on (409), and a switch
     already on is kept for when the gate passes again.
@@ -498,8 +501,9 @@ installation or hook trust and on reconnect; it carries no plugin payload.
     `CHIMAERA_PLUGIN_RELEASES_API` is set) and on **Check for updates**, reads only the release's
     `plugin.toml`, and offers a version only when it is strictly newer than the one that runs
     and passes the gates. Offers live in memory. **Update** installs it through the release path
-    (its `SHA256SUMS` kept). A first-party plugin updated past the pin keeps its check badge
-    (and stays `verified`); the card names the pin ("chimaera pins 0.1.0") only in a tooltip. What the lock
+    (its `SHA256SUMS` kept). An update retains checksum integrity (`verified`); a first-party
+    update keeps its check badge only while it retains Verified trust standing
+    (sandboxed with the pinned capabilities, or the exact pinned privileged release); the card names the pin ("chimaera pins 0.1.0") only in a tooltip. What the lock
     pins changes only with a chimaera release, and that follows a plugin release on its own: the
     hourly `plugin-lock` workflow checks the newer release, bumps the lock in a `fix:` PR with
     auto-merge, CI installs it, and the merge cuts a patch release (setup and how to turn a
@@ -666,8 +670,8 @@ installation or hook trust and on reconnect; it carries no plugin payload.
 - **What & when.** A 0.2 plugin may run programs on your computer (a LaTeX build, a
   formatter) and download the ones it needs. It names each one in its manifest; nothing else
   can run. The host runs them as **jobs** under fixed limits, and downloads a **tool** only
-  when you click Install. Shipped as the platform plan's phase P8; no first-party plugin uses it
-  yet (the LaTeX and Typst plugins will).
+  when you click Install. The locked first-party LaTeX and Typst plugins use this tier
+  for document compilation, diagnostics, and agent compilation tools.
 - **How to use.** Such a plugin's card says **runs programs** and lists every program under
   **Can** ("Runs latexmk"; a shell gets "Runs sh: this plugin can run any command on this
   host"; a program that reaches the network says so: "tlmgr uses the network: CTAN mirrors"). Before install, **Downloads** says what its tools would fetch and from where ("TeX
@@ -864,7 +868,7 @@ _Captured 2026-09-25 (from the maintainer, via capture-feature-intent)._
 - **Do not change (or: open to change):** open to change — an addition to the core, not a core bet. Offered four candidates to freeze (nothing changes for agents unless a plugin is on; Chimaera never curates knowledge; notes never start a turn; hook trust is never silent), the maintainer answered "all can change". They are how it was built today, not locked contracts.
 
 The design's maintainer decisions (2026-09-25) are in the
-[plan](../timeline-knowledge-plugins-plan.md#decisions-maintainer-2026-09-25).
+[plan](../design/timeline-knowledge-plugins-plan.md#decisions-maintainer-2026-09-25).
 
 ### WASM plugins, versions & updates — why it exists
 _Intent for the WASM plugin system: pending capture._
@@ -878,9 +882,9 @@ _Captured 2026-09-29 (from the maintainer, via capture-feature-intent)._
   platform's shape (the `ui/1` format, the surfaces, the job limits, the trust prompt) is how it
   works today.
 - **Do not change (or: open to change):** open to change, as long as it keeps chimaera's core
-  principles (the plan's [principles](../plugin-platform-plan.md#principles) are how it holds
+  principles (the plan's [principles](../design/plugin-platform-plan.md#principles) are how it holds
   them today).
 
 The design decisions of 2026-09-29 are recorded in the
-[plugin platform plan](../plugin-platform-plan.md#decisions-maintainer-2026-09-29) and the
-[LaTeX and Typst plan](../latex-reports-plan.md#decisions).
+[plugin platform plan](../design/plugin-platform-plan.md#decisions-maintainer-2026-09-29) and the
+[LaTeX and Typst plan](../design/latex-reports-plan.md#decisions).

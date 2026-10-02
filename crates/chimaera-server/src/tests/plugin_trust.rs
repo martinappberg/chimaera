@@ -1,4 +1,4 @@
-//! Trust (docs/plugin-platform-plan.md §2, phase P6), over the wire: the
+//! Trust (docs/design/plugin-platform-plan.md §2, phase P6), over the wire: the
 //! trust prompt for a plugin the maintainers haven't verified, an update
 //! that asks for more, Skip this version, withdrawing trust, the kill
 //! switch's two levels, the admin policy, the activity log, and `[access]`

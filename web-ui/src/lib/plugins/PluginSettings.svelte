@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
    * One plugin's declared settings (`[[settings]]`,
-   * docs/plugin-platform-plan.md §9), drawn with the same row language as
+   * docs/design/plugin-platform-plan.md §9), drawn with the same row language as
    * core settings: title and description on the left, the typed control on
    * the right, a quiet accent bar and a reset when changed. Host settings
    * hold on this host; workspace settings for the workspace shown (and

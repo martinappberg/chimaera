@@ -5,7 +5,7 @@
 //!
 //! The Rust side of the `chimaera:plugin` WIT world (`wit/chimaera.wit`):
 //! what a Chimaera plugin implements ([`Plugin`]) and what it may ask the
-//! host ([`host`]). Design: `docs/plugin-system-plan.md`.
+//! host ([`host`]). Design: `docs/design/plugin-system-plan.md`.
 //!
 //! A plugin is a `cdylib` crate built for `wasm32-wasip2`:
 //!

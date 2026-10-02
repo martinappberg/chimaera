@@ -71,7 +71,6 @@ check 'web-ui/src/lib/workspace/[Tt]imeline' 'docs/features/timeline-and-knowled
 check 'web-ui/src/lib/workspace/knowledge.ts' 'docs/features/timeline-and-knowledge.md' 'feature: timeline & knowledge'
 check 'crates/chimaera-server/src/plugins/'     'docs/features/plugins.md'         'feature: plugins'
 check 'crates/chimaera-server/src/agent_probe.rs' 'docs/features/plugins.md'       'feature: plugins'
-check 'crates/chimaera-server/src/notes.rs'     'docs/features/plugins.md'         'feature: plugins'
 check 'plugins/plugins.lock'                    'docs/features/plugins.md'         'feature: plugins'
 check 'crates/chimaera-plugin-api/'             'docs/agent-guides/plugins.md'     'plugin authoring guide'
 check 'plugins/'                                'plugins/AGENTS.md'                'plugins map'

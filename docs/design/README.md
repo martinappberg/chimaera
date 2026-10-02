@@ -4,21 +4,53 @@
 ecosystem (agent session managers, remote-dev prior art, Claude Code integration surfaces, HPC
 constraints) and three competing architecture proposals, each adversarially critiqued.*
 
-## One-liner
+## Current orientation — October 2026
 
-**Chimaera is an agent workbench.** A single static Rust binary runs as a
-tmux-grade session daemon on whatever host owns the work — a remote server, an HPC login node,
-or your laptop — and serves a workspace-oriented UI where the primary objects are *agent
-sessions* living inside *folders*, surrounded by the file previews, terminals, and git state
-that show what those agents actually produced.
+**Chimaera is an agent workbench: a workspace for everything you do with agents.**
+Open a project folder and bring agents, outputs, tools, and project context together.
+The current product includes structured chats and agent terminals, coordination and
+an attention dashboard, broad document and file viewing, lightweight editing,
+session and Git history, plugin-backed Knowledge, and an extension platform. The
+same workspace model reaches local folders, SSH hosts, and Slurm compute jobs.
 
-**Chimaera is a general-purpose coding tool** — any language, any repo, any host. The author's
-bioinformatics-on-Slurm workflow is the founding use case and the harshest deployment test
-(no root, old glibc, SSH-only), not the product boundary: a design that survives an HPC login
-node runs anywhere, and the scientific-format previews are one instance of a general
-rich-preview layer.
+The public story leads with directing work, inspecting results, and returning with
+context. It is general-purpose across code, documents, and data. The maintainer's
+framing decisions are recorded in [the product story](../product-story.md).
 
-## The problem
+For shipped behavior use the [feature catalog](../features/README.md); for the
+current implementation use the [architecture guide](../agent-guides/architecture.md)
+and area maps. The [documentation index](../README.md) separates these from plans.
+
+## Design records
+
+These records preserve the proposals and decisions behind major features. Each
+links to current behavior; a planned item in a record is not a shipping promise.
+
+| Area | Design record | Current guide |
+|---|---|---|
+| Workspace and files | [Document workbench](document-workbench-plan.md) | [Files and previews](../features/files-and-previews.md) |
+| Agent coordination | [Communication](agent-communication-plan.md), [dashboard](agent-dashboard-plan.md) | [Agent communication](../features/agent-communication.md), [dashboard](../features/dashboard.md) |
+| Project context | [Timeline and Knowledge](timeline-knowledge-plugins-plan.md), [Knowledge redesign](knowledge-redesign-plan.md) | [Timeline and Knowledge](../features/timeline-and-knowledge.md) |
+| Git and history | [Git and session history](git-and-session-history-plan.md) | [Git](../features/git.md), [session history](../features/session-history.md) |
+| Extensions | [Plugin system](plugin-system-plan.md), [extension platform](plugin-platform-plan.md), [LaTeX workflows](latex-reports-plan.md) | [Plugins](../features/plugins.md), [extension authoring](../agent-guides/plugins.md) |
+| Remote and compute | [Remote performance](perf-remote-plan.md), [cluster workspaces](hpc-portal-plan.md) | [Remote connections](../features/remote-connect.md), [compute](../features/compute.md) |
+| Windows | [Windows and WSL](windows-wsl-plan.md) | [Native app](../features/native-app.md) |
+
+For ongoing implementation work, use the [architecture guide](../agent-guides/architecture.md)
+and [agent integration guide](../agent-guides/agent-integrations.md).
+
+## Reading the founding design
+
+The material below records the July 2026 starting point and subsequent dated
+choices. It preserves the reasoning that led to the product, **not a current
+competitor survey or a delivery forecast**. The original niche framing, milestone
+estimates, provider observations, and planned architecture must be read in that
+historical context. In particular, structured chat, native apps, editing,
+extensions, and Slurm job-host workspaces now have implemented feature guides.
+The October orientation above supersedes the original audience framing; consult
+current code and feature pages before treating an old proposal as a constraint.
+
+## Founding problem — July 2026
 
 The current state of the art for "Claude Code on a remote machine" is a two-tool split:
 
@@ -35,7 +67,7 @@ Anthropic's own surfaces don't close the gap either: the Claude Code desktop app
 **chat-first, workspace-weak** — the folder is an attribute of the chat, so it's hard to see
 outputs and what exists on disk. Chimaera inverts that: **workspace-first, chat-many**.
 
-## What exists (July 2026) and the gap
+## Founding landscape assessment — July 2026
 
 The multi-session manager space is crowded but consolidating (Terragon shut down 2026-02,
 Omnara archived 2026-02 noting CLI-wrapping "became unfeasible to maintain", CUI archived,
@@ -92,7 +124,7 @@ The deep architecture + rationale — one-binary/two-roles, the SSH transport an
 lossless reconnect, HPC-realistic state storage, the three-tier agent event model,
 the web-first client, in-window layout, naming/orientation, file previews, linked
 terminals, and Git + Slurm — lives in
-**[docs/agent-guides/architecture.md](docs/agent-guides/architecture.md)** (moved out
+**[docs/agent-guides/architecture.md](../agent-guides/architecture.md)** (moved out
 to keep this document a readable spine). Nested `AGENTS.md` maps link straight to the
 section they need.
 
@@ -154,7 +186,7 @@ After-1.0 (sequencing, not compromise — these need a working product to be des
    partial completion still pays; and the graveyard (Terragon, Omnara, CUI, Crystal — all dead
    within a year) says keep the core small and the Claude coupling behind one seam.
 
-## Roadmap
+## Original roadmap — July 2026
 
 Estimates are the adversarially corrected ones (~2x the optimistic drafts), for a strong solo
 dev working with AI agents, part-time.
@@ -389,8 +421,8 @@ which is the survival property that matters.
   `ssh -L` through the login node — **reversing the 2026-07-16 loopback decision** (the
   maintainer: "I reverse my July decision"); a person starts every job (no restarts,
   scheduled starts, or requeues); nothing site-specific anywhere. Plan:
-  [docs/hpc-portal-plan.md](docs/hpc-portal-plan.md); feature page:
-  [docs/features/compute.md](docs/features/compute.md).
+  [docs/design/hpc-portal-plan.md](hpc-portal-plan.md); feature page:
+  [docs/features/compute.md](../features/compute.md).
 
 Still open:
 
@@ -405,7 +437,7 @@ Still open:
 ## Field notes & verified-component log
 
 Dated live-verification findings and first-deployment notes live in
-**[docs/history/field-notes.md](docs/history/field-notes.md)** — a running log kept
+**[docs/history/field-notes.md](../history/field-notes.md)** — a running log kept
 out of the spine.
 
 ## Sources

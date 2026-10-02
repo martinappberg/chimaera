@@ -1,6 +1,6 @@
 //! Data surfaces: data a plugin publishes in a versioned shape that core
 //! draws with views it owns (problems in the editor, a build's result, jumps
-//! between a source and its PDF). Design: docs/plugin-platform-plan.md §4.
+//! between a source and its PDF). Design: docs/design/plugin-platform-plan.md §4.
 //!
 //! - `publish(surface, key, data)` is checked here against the surface's
 //!   shape and cap; the latest per (plugin, workspace, surface, key) is

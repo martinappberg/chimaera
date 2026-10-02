@@ -5,8 +5,11 @@ paths: ["crates/chimaera-server/**", "crates/chimaera/**"]
 
 # Daemon rules (server + binary)
 
-The daemon lives on shared HPC **login nodes**. These are review criteria, not
-nice-to-haves. Depth + module map: [chimaera-server/AGENTS.md](../../crates/chimaera-server/AGENTS.md).
+The daemon runs on local and remote hosts; cluster workspaces default to
+Slurm allocations managed by job-host. A login-node daemon is an explicit
+`--login-node` override. Shared-host resource discipline remains a review
+criterion in every placement. Depth + module map:
+[chimaera-server/AGENTS.md](../../crates/chimaera-server/AGENTS.md).
 
 - **Bounded resources.** Target ~150 MB RSS, <1 core steady-state. No unbounded
   buffers, no busy loops, hard ceilings on preview/extraction. A change that works

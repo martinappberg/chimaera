@@ -4,10 +4,28 @@ The third public interface Chimaera pins (beside the daemon↔UI wire and the
 agent protocols): the `chimaera:plugin` WIT world and the Rust bindings a
 plugin author uses. A plain rlib in the root workspace (it compiles natively);
 plugins depend on it from their own workspace ([plugins/](../../plugins/AGENTS.md)).
-Design and phases: [docs/plugin-system-plan.md](../../docs/plugin-system-plan.md);
+Design and phases: [docs/design/plugin-system-plan.md](../../docs/design/plugin-system-plan.md);
 writing a plugin against it: [docs/agent-guides/plugins.md](../../docs/agent-guides/plugins.md).
 The host that serves it: `crates/chimaera-server/src/plugins/`
 ([server map](../chimaera-server/AGENTS.md)).
+
+## Author entry point
+
+For a new workbench plugin, begin with the guide's
+[complete API 0.2 starter](../../docs/agent-guides/plugins.md#minimal-api-02-plugin)
+and [author checklist](../../docs/agent-guides/plugins.md#author-checklist).
+Keep the plugin crate in its own repository/workspace; the fixtures here are
+host-test inputs. Pin this SDK to a commit for a release, make manifest `api`
+match the component's WIT, and declare `[access]` explicitly (0.2 omitted
+access means none). A workbench plugin supplies semantic `ui/1` trees through
+this API; agent-native plugins/skills have their agent's own packaging.
+
+To choose a capability or example, see the guide's
+[extension seams](../../docs/agent-guides/plugins.md#start-here-choose-the-extension-seam)
+and [worked examples](../../docs/agent-guides/plugins.md#worked-examples-and-acceptance-checks).
+Programs and downloaded tools make a plugin privileged: native jobs run
+outside WASM with the daemon user's access. The sandbox protects the guest
+component; job resource limits do not isolate native filesystem/network access.
 
 ## Files
 
@@ -30,8 +48,10 @@ The host that serves it: `crates/chimaera-server/src/plugins/`
   field to JSON never breaks the ABI. Small fixed things are typed records.
 - **The exports are the complete set; imports are additive.** Removing or
   changing an export (or a record a plugin returns) breaks every built
-  plugin. A new host import does not: a host may offer more than a component
-  uses. Bump the package version with any WIT
+  plugin targeting that world. A host may offer imports an old component
+  does not use; preserve that component's frozen world and bindings rather
+  than assuming a trait default makes a compiled component compatible.
+  Bump the package version with any WIT
   change, and the host's `plugins::API` with it (adding the new version to
   `plugins::SERVED_APIS` beside the ones it still serves: a manifest's `api`
   must be one of them to load).

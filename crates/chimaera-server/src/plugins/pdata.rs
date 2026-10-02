@@ -1,5 +1,5 @@
 //! What a plugin keeps across restarts: its durable state (`state-keep`)
-//! and its settings' values. Design: docs/plugin-platform-plan.md §7
+//! and its settings' values. Design: docs/design/plugin-platform-plan.md §7
 //! ("Durable state") and §9.
 //!
 //! Small capped JSON, rewritten atomically (never SQLite, never edited in

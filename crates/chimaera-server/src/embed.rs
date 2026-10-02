@@ -3,7 +3,7 @@
 //! trip: the resolved path, kind, size, version, mime, image dimensions read
 //! from the header bytes, and a `/raw` ticket for the kinds that load through
 //! one. Over an ssh tunnel each cold request costs about two round trips
-//! (docs/perf-remote-plan.md, finding F2), so a document with thirty embeds
+//! (docs/design/perf-remote-plan.md, finding F2), so a document with thirty embeds
 //! must not make thirty; knowing the dimensions up front is what lets the
 //! placeholders reserve their final size, so nothing jumps as bytes arrive.
 //!

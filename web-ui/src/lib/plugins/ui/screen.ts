@@ -2,7 +2,7 @@
  * What a `ui/1` screen's nodes share (the host `PluginScreen` provides it
  * through context) and the pure pieces its nodes use: tones, the node set
  * this client draws, the built-in actions, and the prose diff.
- * Design: docs/plugin-platform-plan.md §3; every node and prop:
+ * Design: docs/design/plugin-platform-plan.md §3; every node and prop:
  * docs/agent-guides/plugins.md ("Screens").
  */
 import { getContext, setContext } from "svelte";

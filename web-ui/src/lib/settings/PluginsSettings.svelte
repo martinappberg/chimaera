@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
    * Settings → Plugins: each installed plugin's declared settings
-   * (`[[settings]]`, docs/plugin-platform-plan.md §9), a second, declared
+   * (`[[settings]]`, docs/design/plugin-platform-plan.md §9), a second, declared
    * source beside `schema.ts` (the way Environment and Documents are
    * bespoke). Drawn by `plugins/PluginSettings.svelte`, the same rows the
    * plugin's card shows. Renders its own <h2>.

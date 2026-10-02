@@ -1,6 +1,6 @@
 //! Workbench plugins: opt-in add-ons that say exactly what they add.
-//! Design: docs/timeline-knowledge-plugins-plan.md §6; the plugin host:
-//! docs/plugin-system-plan.md.
+//! Design: docs/design/timeline-knowledge-plugins-plan.md §6; the plugin host:
+//! docs/design/plugin-system-plan.md.
 //!
 //! A plugin is a small TOML manifest (data, never code) plus its behaviour:
 //! a WASM component (`plugin.wasm`). Every plugin lives in its own

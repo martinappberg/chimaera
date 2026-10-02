@@ -104,7 +104,7 @@ selection references (see [terminals.md](terminals.md)).
   in-flight upload shows byte progress plus a cancel action in a quiet chip bottom-center; failures
   briefly explain what happened. A two-minute no-progress watchdog turns a dead SSH tunnel or stuck
   destination filesystem into an actionable error instead of an endless spinner. Dropping an **image**
-  onto a *chat* pane additionally attaches its pixels to the composer (the model sees it now); the
+  onto a *chat* pane that advertises image input additionally attaches its pixels to the composer; the
   uploaded path stays the durable, host-side artifact the agent can re-read later.
 - **In a chat, a dropped file reads as its name, where you referenced it.** The composer shows the
   mention as `@Screenshot-….png` in place of the ~100-character landing-pad path, as a quiet pill

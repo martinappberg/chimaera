@@ -1,13 +1,15 @@
 # Knowledge redesign — a real UI on top of Mycelium
 
-Status: **plan** (2026-09-28, nothing built). The maintainer's decisions
+> **Dated design record.** The Knowledge redesign shipped in PR #218. Use [Timeline and Knowledge](../features/timeline-and-knowledge.md) for current behavior; the diagnosis and proposals below describe the pre-implementation project and parser snapshots.
+
+Original planning snapshot: **plan** (2026-09-28, before implementation). The maintainer's decisions
 from 2026-09-28 are folded in and listed at the end. It supersedes the
 Knowledge parts of
 [timeline-knowledge-plugins-plan.md](timeline-knowledge-plugins-plan.md) §5
 and the Knowledge rows of its §9 experience bar where they conflict (named
-below). It is written to fit the plugin platform plan on
-`origin/claude/brave-hamilton-afhtt3` (`docs/plugin-platform-plan.md`, not
-yet on main) — see [Knowledge belongs to the plugin](#knowledge-belongs-to-the-plugin).
+below). It was written to fit the plugin platform plan then on
+`origin/claude/brave-hamilton-afhtt3` (`docs/design/plugin-platform-plan.md`, before
+that platform merged) — see [Knowledge belongs to the plugin](#knowledge-belongs-to-the-plugin).
 
 The ask: the Knowledge tab should be a good, intuitive UI on top of *regular*
 Mycelium — it should be obvious where every status, piece of evidence,

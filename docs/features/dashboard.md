@@ -5,9 +5,9 @@ lane), what happened while I was away (**Since you left**), where the project st
 (**Where things stand**), and who is running (the one-line **Now**) — every element one click
 from the live session, the Timeline, or Knowledge. An empty workspace layout opens onto it;
 ⌘0 / the rail's `dashboard` row reach it any time. This is the dashboard/Mastermind design
-([docs/agent-dashboard-plan.md](../agent-dashboard-plan.md)) through v1 — the surface (v0.1),
+([docs/design/agent-dashboard-plan.md](../design/agent-dashboard-plan.md)) through v1 — the surface (v0.1),
 the status-feed depth (v0.2), the Mastermind (v1, now a window panel) — re-centred by
-[docs/timeline-knowledge-plugins-plan.md](../timeline-knowledge-plugins-plan.md) §3 and §8.
+[docs/design/timeline-knowledge-plugins-plan.md](../design/timeline-knowledge-plugins-plan.md) §3 and §8.
 
 **Where it lives (shared):** UI `web-ui/src/lib/dashboard/` (`DashboardView.svelte`,
 `SinceYouLeft.svelte`, `WhereThingsStand.svelte`, `NowLine.svelte`, `AgentCard.svelte`,
@@ -354,9 +354,9 @@ the store-tier work drop-down rendering subagents ∪ background tasks simultane
 ## Intent
 
 Captured from the maintainer's design review (2026-07-15) — the full record is the
-decisions block + §10 of [docs/agent-dashboard-plan.md](../agent-dashboard-plan.md).
+decisions block + §10 of [docs/design/agent-dashboard-plan.md](../design/agent-dashboard-plan.md).
 
-- **Core bet (this page's reason to exist):** the dashboard is one leg of DESIGN.md's
+- **Core bet (this page's reason to exist):** the dashboard is one leg of docs/design/README.md's
   founding moat ("attention-aware multi-agent dashboard") — an *attention router into live
   sessions*, never a monitor that replaces them, and never a second IDE. The wedge is the
   attention lane: answering an agent's ask, workspace-wide, surviving laptop-close.

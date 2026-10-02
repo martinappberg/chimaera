@@ -1,8 +1,8 @@
 //! The Rust side of the `chimaera:plugin` WIT world (`wit/chimaera.wit`,
 //! package `chimaera:plugin@0.2.0`): what a Chimaera plugin implements
 //! ([`Plugin`]), what it may ask the host ([`host`], and the platform's
-//! [`platform`]). Design: `docs/plugin-system-plan.md` (the host) and
-//! `docs/plugin-platform-plan.md` (screens, surfaces, files, settings,
+//! [`platform`]). Design: `docs/design/plugin-system-plan.md` (the host) and
+//! `docs/design/plugin-platform-plan.md` (screens, surfaces, files, settings,
 //! output folders, programs). A 0.1 plugin moves to 0.2 by bumping this
 //! dependency and its manifest's `api`: every new export has a default.
 //!

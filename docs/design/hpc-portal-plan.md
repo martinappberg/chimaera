@@ -1,7 +1,9 @@
 # HPC clusters — Chimaera in Slurm jobs, workspaces open inside them
 
-Status: **plan, revision 2** (2026-10-01, branch
-`claude/chimaera-compute-nodes-373200`, PR #236, not merged). Revision 1
+> **Dated design record.** The job-host workspace model shipped in PR #236. Use [compute](../features/compute.md) and [remote connections](../features/remote-connect.md) for current behavior; the revisions below preserve the design and its original proposals.
+
+Original planning snapshot: **revision 2** (2026-10-01, branch
+`claude/chimaera-compute-nodes-373200`, before PR #236 merged). Revision 1
 (one job per workspace) is built on that branch; this revision keeps its
 foundations and changes the model the user sees: **you start jobs, and you
 open workspaces inside them** — several jobs at once if you want, several
@@ -10,9 +12,9 @@ its chats. §11 says what carries over, what changes and what goes. The
 maintainer's decisions are in §12.
 
 Regular remotes (dev servers, lab machines, cloud VMs) do not change. Builds
-on [features/compute.md](features/compute.md),
-[features/remote-connect.md](features/remote-connect.md) and
-[features/environment.md](features/environment.md).
+on [features/compute.md](../features/compute.md),
+[features/remote-connect.md](../features/remote-connect.md) and
+[features/environment.md](../features/environment.md).
 
 ## 1. Why
 

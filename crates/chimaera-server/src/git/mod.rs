@@ -1,10 +1,10 @@
 //! Git integration: status, diff, and worktree orchestration for a workspace's
 //! repo.
 //!
-//! Shells out to system `git` and parses porcelain v2 (DESIGN.md "Git + Slurm":
+//! Shells out to system `git` and parses porcelain v2 (docs/design/README.md "Git + Slurm":
 //! gitoxide's diff gaps make a library a two-backend liability; shelling out is
 //! adequate for read-mostly status/log/diff/show). Every invocation is bounded
-//! because the daemon shares a login node (DESIGN.md resource budget): a hard
+//! because the daemon shares a login node (docs/design/README.md resource budget): a hard
 //! timeout that KILLS the child (a wedged NFS mount must never pin a thread), an
 //! output-size cap, an entry-count cap, and a daemon-wide concurrency permit.
 //!

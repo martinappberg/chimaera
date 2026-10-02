@@ -1,5 +1,5 @@
 // Passive byte counter: open one WS per session id (a "window"), count for N seconds.
-// Findings + fix plan: docs/perf-remote-plan.md
+// Findings + fix plan: docs/design/perf-remote-plan.md
 // Usage: node scripts/perf/tunnel-count.mjs <base> <token> <seconds> <label> <id...>
 //   PARK=1 auths every socket parked (the post-R1 realistic second window —
 //   without it this measures the pre-park protocol and overstates traffic).

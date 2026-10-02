@@ -1,7 +1,7 @@
 # Chimaera — field notes & verified-component log
 
 > A dated running log of live-verification findings and field deployments, moved
-> out of DESIGN.md to keep it a lean spine. Historical record: where it conflicts
+> out of docs/design/README.md to keep it a lean spine. Historical record: where it conflicts
 > with the current code, the code wins.
 
 ## Verified component notes (2026-07-06)
@@ -267,7 +267,7 @@ Verified clean by the finders, no action: idle-stamp teardown, turn-end/abort se
 
 ### Remote-performance batch (2026-09-01, measured on a production cluster, R1–R5 in one pass)
 
-The perf series (#124–#131) fixed local CPU and it held (re-gauged: 8.3 ms frames, zero long tasks under flood) — but the *remote* feel is RTT- and bandwidth-bound, which it never touched. Measured against a real login node through the app's own ControlMaster: typing echo = exactly 1×RTT (165 ms on a 186 ms-ping link; the daemon path adds ~nothing), a cold HTTP fetch ≈ 2×RTT (~335 ms — the ssh mux channel-open costs a full RTT before the request starts), four busy **parked** terminals shipped ~6 MB/s of invisible tunnel traffic, and every window duplicated the whole stream (2 windows = 140 MB/15 s of nothing anyone saw). Plan + numbers: `docs/perf-remote-plan.md`; the gauge that produced them: `scripts/perf/tunnel-gauge.mjs` (`PARK=1` exercises the new protocol).
+The perf series (#124–#131) fixed local CPU and it held (re-gauged: 8.3 ms frames, zero long tasks under flood) — but the *remote* feel is RTT- and bandwidth-bound, which it never touched. Measured against a real login node through the app's own ControlMaster: typing echo = exactly 1×RTT (165 ms on a 186 ms-ping link; the daemon path adds ~nothing), a cold HTTP fetch ≈ 2×RTT (~335 ms — the ssh mux channel-open costs a full RTT before the request starts), four busy **parked** terminals shipped ~6 MB/s of invisible tunnel traffic, and every window duplicated the whole stream (2 windows = 140 MB/15 s of nothing anyone saw). Plan + numbers: `docs/design/perf-remote-plan.md`; the gauge that produced them: `scripts/perf/tunnel-gauge.mjs` (`PARK=1` exercises the new protocol).
 
 - **Park is now a wire state, not just a client one.** `/ws/sessions/{id}` gains `park`/`unpark` client frames and `auth.parked`. Parked, the server disables the output select arm — the session's bounded broadcast ring (shared by every attachment; parking costs no extra daemon memory) becomes the catch-up buffer; events still flow; an exit drains the withheld tail in bounded slices ahead of the `exited` frame; a foreign resize defers its repaint to unpark (`parked_stale`). Unpark just re-enables the arm: the ring replays contiguously, and an overflow surfaces as the *existing* `Lagged`→repaint path. Gauged: parked+flooding sockets went 27.5 MB → **0 bytes**; unpark caught up with one 813 KB resync.
 - **`auth.parked` attaches without a snapshot** (`attach_quiet`: subscribe-only, no ~95 ms render under the term lock). The client desyncs its ParkedBuffer on a parked ready — no snapshot is coming, and pre-drop bytes predate an output gap — so the first adopt resyncs into ONE fresh visible attach. A wake-from-sleep reconnect of 12 parked terminals now ships ~0 snapshots instead of 12. Compat is graceful both ways (old servers ignore unknown frames — verified live against v0.40.8 on a production cluster; old clients never send park).

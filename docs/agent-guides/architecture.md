@@ -1,10 +1,40 @@
 # Chimaera — Architecture
 
 > The deep architecture + rationale: the source of truth for **how** Chimaera is
-> built and **why**. The high-level [DESIGN.md](../../DESIGN.md) links here, and the
+> built and **why**. The high-level [docs/design/README.md](../design/README.md) links here, and the
 > nested `AGENTS.md` maps point at the section they need. Docs drift — verify a
 > detail against the code before relying on it, and fix this file when you find it
 > wrong (see the anti-drift note in the root [AGENTS.md](../../AGENTS.md)).
+
+## Current implementation
+
+The daemon serves one workspace UI containing structured agent chats, persistent
+PTYs, files and artifacts, git review/history, workspace context, and extensions.
+Claude Code and Codex use their native structured protocols; Antigravity and Grok
+Build use the shared ACP v1 adapter. All four support chat and conversation-copy
+forks. Native terminal/chat switching and the Mastermind role are currently
+limited to Claude/Codex. See [the agent map](../../crates/chimaera-agent/AGENTS.md)
+and [the server map](../../crates/chimaera-server/AGENTS.md).
+
+Views can disconnect without stopping daemon-owned work while the host and daemon
+remain alive. Restart restoration starts new processes and resumes supported
+conversations through their native handles and Chimaera journals; it does not
+preserve shell or agent process state. See [lifecycle and persistence](../features/lifecycle-and-persistence.md).
+The Tauri app is implemented for macOS, Linux and Windows (the Windows engine
+runs in WSL2); see [the native map](../../crates/chimaera-app/AGENTS.md).
+
+Cluster connections use `chimaera-remote::cluster` to discover and submit Slurm
+jobs. A job runs `chimaera job-host` on its compute node and opens a separate
+workspace daemon per hosted workspace. Those daemons bind routably behind bearer
+tokens and are reached through SSH forwards via the login node. The cluster's
+shared folder holds configuration, job/host records and workspace leases;
+allocation end bounds process lifetime. A login-node daemon is an explicit
+`--login-node` override. See [compute](../features/compute.md).
+
+The dated passages below preserve design rationale and historical iterations.
+They are not a shipped-feature checklist: use current code, maps and the
+[feature catalog](../features/README.md) for that distinction, especially where a
+founding sketch says “today”, “later” or “post-v1”.
 
 ## Architecture
 
@@ -15,11 +45,12 @@
 │      xterm.js·previews·git  │ -L fwd │   ├─ workspace registry (folders)         │
 └─────────────────────────────┘        │   ├─ session supervisor                   │
                                        │   │   ├─ claude (stream-json / PTY+hooks) │
-        any browser, zero install      │   │   ├─ gemini --acp / codex-acp         │
+        any browser, zero install      │   │   ├─ codex app-server / PTY          │
+                                       │   │   ├─ Antigravity / Grok (ACP v1)     │
                                        │   │   └─ plain shells (PTY)               │
-                                       │   ├─ file service (previews, Arrow paging)│
+                                       │   ├─ files · previews · ranged raw bytes │
                                        │   ├─ git service · Slurm poller           │
-                                       │   ├─ event bus (seq-numbered replay)      │
+                                       │   ├─ chat replay · roster snapshots      │
                                        │   └─ notifier (ntfy/webhook)              │
                                        └───────────────────────────────────────────┘
 ```
@@ -38,14 +69,16 @@ whole stack needs only SSH + `$HOME`.
   the musl binary into `~/.chimaera/bin` on first use (Zed's model, with a manual-upload
   fallback for air-gapped clusters), starts-or-finds the daemon, forwards the port, opens the
   UI.
-- `chimaera doctor` — per-site sanity checks (glibc, quotas, cgroup policing, tmp-scrubbing,
-  outbound HTTPS, login-node process-reaper policies).
+- `chimaera doctor` — checks that the data/runtime dirs are writable and that
+  `ssh` / `claude` are on PATH. Site policies, quotas and outbound access require
+  separate checks.
 
 ### Transport: SSH only, lossless reconnect
 
-No new listening ports, no relay, no inbound firewall asks — ever. The daemon binds a Unix
-socket + localhost-only TCP with a per-daemon bearer token (localhost on a multi-user login
-node is not trusted alone).
+Ordinary connections use SSH forwards to loopback TCP with a per-daemon bearer
+token (localhost on a multi-user host is not trusted alone). `--bind-routable`
+explicitly binds 0.0.0.0 for compute workspace daemons reached through the login
+node; the job-host uses that path. The HTTP daemon does not bind a Unix socket.
 
 Reconnect semantics are Eternal-Terminal-style at the application layer: structured streams
 carry monotonic per-session sequence numbers backed by a bounded replay ring; a reconnecting
@@ -56,8 +89,8 @@ full-snapshot by design.)
 **Critical correction from adversarial review:** raw byte replay is *not* sufficient for PTY
 panes — it breaks on resize and multi-attach at different dimensions. Terminal panes therefore
 keep **full server-side terminal state** (headless `alacritty_terminal::Term`, tmux's actual
-model) and re-render for late joiners; seq-replay applies to the event bus and structured
-streams. This exact pattern was independently proposed in Zed's pty-host RFC
+model) and re-render for late joiners; seq-replay applies to structured chat
+streams, while the session-list bus sends full snapshots. This exact pattern was independently proposed in Zed's pty-host RFC
 ([zed#50584](https://github.com/zed-industries/zed/discussions/50584), Mar 2026) — validated,
 with one amendment from verification: **don't serialize `Term` grid state across the wire**
 (that only works when both ends share the same Rust crate; our client is xterm.js). Instead,
@@ -100,9 +133,11 @@ on the alternate screen cannot restore the primary screen's scrollback
   reconstructible.
 - Durable state as append-only, size-capped JSONL under `~/.chimaera` (opencode's multi-GB
   unbounded-growth mistake is a named anti-goal; HPC home quotas are small).
-- Claude's own `~/.claude/projects` JSONL transcripts are the agent's source of truth;
-  chimaerad stores only an overlay (attention events, tags, Slurm links). Crash recovery is
-  nearly free: cold-restart → re-attach every session via `--resume` with preserved cwd.
+- Native conversation stores provide resume handles; Chimaera also persists its
+  normalized chat journals, session ledger, timeline/history, settings and workspace
+  state. With restoration enabled, a restart respawns shells and resumes supported
+  conversations in their saved view; agents without a usable restoration path retire
+  into Recents. Previous PTY/process state is lost.
 - A tiny `~/.chimaera/manifest.json` (hostname, port, 0600 token, pid, version) is the
   registry. On a login-node pool (one round-robin name over nodes that share `$HOME`) every
   node sees the same file, but its pid and loopback port mean something only on the node
@@ -125,17 +160,20 @@ on the alternate screen cannot restore the primary screen's scrollback
 
 All adapters normalize into one internal **ACP-shaped event model** (message/thought chunks,
 tool calls with kinds + diffs, plan entries, permission requests with options, turn lifecycle).
-The UI renders that model, so Claude/Gemini/Codex/PTY sessions all look the same.
+The chat UI renders that model across the four structured agents. PTY sessions
+render each agent’s own interactive TUI.
 
-**Tier A — PTY + injected hooks (the product's primary mode, by author decision 2026-07-06).**
+**Tier A — PTY + injected hooks (the founding primary mode, 2026-07-06;
+chat became the new-session default on 2026-07-07).**
 Sessions run the **real interactive `claude` TUI in a daemon-owned PTY** — the same integration
-mode as VS Code's integrated terminal, so it looks, behaves, and bills exactly like Claude Code
-everywhere else (normal subscription limits). Chimaerad **never scrapes ANSI for state**; it
+mode as an integrated terminal, with Claude Code's own interactive UI and login.
+Billing policy belongs to the provider and must be checked against its current guidance. Chimaerad **never scrapes ANSI for state**; it
 injects Claude Code hooks (`http` type: `Notification(permission_prompt|idle_prompt)`,
 `PermissionRequest`, `Stop`, `StopFailure`, `SessionStart/End` → POST to the daemon) so TUI
 sessions get reliable needs-attention/finished/errored badges, and rich *read-only* transcript
-rendering comes from the `~/.claude` JSONL. This tier is billing-safe (see Risks),
-agent-agnostic, and survives any protocol churn.
+rendering comes from the `~/.claude` JSONL. Other interactive TUIs can run in
+PTYs, but Claude's injected-hook attention integration is specific to Claude;
+protocol and hook behavior still need live verification.
 
 **Tier B — structured chat mode (SHIPPED 2026-07-07; the default view for new
 claude/codex sessions).** Chimaerad drives the native binaries through their structured
@@ -156,9 +194,13 @@ without the user choosing it. Tier A remains fully supported — one
 settings default (`agents.defaultView`) flips the world back if the paused billing split
 ever lands.
 
-**Tier C — ACP client (other agents, post-v1).** `gemini --acp` natively; Codex via Zed's
-`codex-acp`; the ACP registry (40–50 agents) for the long tail. ACP's
-`session/request_permission` maps onto the same attention states.
+**Tier C — ACP client (implemented for Antigravity and Grok Build).** The shared
+`acp.rs` driver negotiates protocol v1, runtime catalogs and capabilities, approval
+replies, queued turns, cancellation and conversation-copy forks. Antigravity's
+chat executable is resolved separately from its terminal executable. Gemini
+identities remain readable in saved records but are absent from new launches.
+`just chat-smoke-acp` verifies the real ACP agents alongside the native-driver
+`just chat-smoke` gate; an ACP version number does not guarantee CLI behavior.
 
 **Attention states are first-class enums** — `running / needs_permission / idle_prompt /
 finished / errored / rate_limited` — computed per tier, driving sidebar badges, the event bus,
@@ -166,7 +208,7 @@ and the notifier (ntfy topics + generic webhooks, dedup + quiet hours). Optional
 sessions with `--remote-control` to free-ride Anthropic's mobile app and push notifications
 instead of building any relay — correct scope discipline.
 
-### Client: web-first, native shell later
+### Client: web UI and native shell
 
 **Client zero is a web UI embedded in the daemon** (rust-embed): any browser, zero install,
 one SSH port-forward. This is the decisive call, and it deserves honesty since the founding
@@ -182,9 +224,9 @@ instinct was "Rust + GPU like Ghostty":
   story (static musl, SSH-native) is the Ghostty-grade part. Terminals use xterm.js with the
   WebGL renderer (VS Code's stack) — fast enough for agent supervision, honestly not Ghostty
   for raw typing. You keep Ghostty for bare shells; Chimaera is the workbench.
-- A **Tauri 2 native shell** wrapping the same UI is part of v1 (M6): real windows per
-  workspace ("open folder → window" without a browser tab), menubar attention badge, native
-  notifications. The one thing deliberately *not* on the roadmap is a bespoke GPU-native
+- The implemented **Tauri 2 native shell** wraps the same UI: real workspace
+  windows, remote-host management, native notifications, SSH askpass and a signed
+  updater. Windows runs the daemon in WSL2. The one thing deliberately *not* on the roadmap is a bespoke GPU-native
   client (GPUI): adversarial review priced it at 18–24 solo-months on a pre-1.0
   Zed-source-as-docs framework, buying only raw-typing latency that WebGL xterm.js mostly
   matches — that's not the optimal build, it's a different and riskier project. The
@@ -656,13 +698,19 @@ non-negotiable.
 
 ### File previews: the moat
 
-Server extracts, client renders; **never load whole files**. One `preview/open|page` dispatch
-so each new format is one server match-arm + one UI component.
+The daemon bounds file reads and extraction work; the client renders the result.
+Large tables, PDFs and Parquet use paging or ranges. Word, PowerPoint and diagram
+boards parse bounded whole files in the browser, and small editable text files
+load whole. `FileView.svelte` dispatches to format-specific viewers; the daemon's
+`fs.rs` routes, notebook pager and streamed `/raw` reads supply their data. See
+[files and previews](../features/files-and-previews.md) for the current format
+list and limits.
 
-- **HTML reports (MultiQC/FastQC/Nextflow) — the killer feature**: served byte-for-byte under a
-  `/raw/` path into a sandboxed iframe (`sandbox=allow-scripts`, no `allow-same-origin`, strict
-  CSP, all external network blocked). MultiQC is self-contained by design, so it just works.
-  Nobody else ships this.
+- **HTML reports (MultiQC/FastQC/Nextflow)**: streamed under a ticketed `/raw/`
+  path into an iframe with `sandbox=allow-scripts` and no `allow-same-origin`.
+  Response CSP repeats the sandbox. Relative assets resolve through the ticket's
+  folder-confined route; the daemon's bearer token never enters the iframe URL.
+  The sandbox is not an external-network block.
 - **CSV/TSV**: server-side paging with a sparse byte-offset row index; hard memory caps;
   paginated JSON slices into a virtualized table.
 - **Parquet**: read in the *browser* with `hyparquet` over ranged `/raw` requests — footer
@@ -671,20 +719,22 @@ so each new format is one server match-arm + one UI component.
   a 50 GB file costs it no memory and the binary no Arrow dependency; the tunnel carries only
   what's on screen. Scope honestly: paging and schema, not full-scan sort or global statistics.
   Details: [files and previews](../features/files-and-previews.md#rendered-previews).
-- **Compressed reality check (from adversarial review)**: bioinformatics tabular files are
-  overwhelmingly `.tsv.gz`/`.csv.gz`/`.vcf.gz`/bgzip. Gzip has no random access — the preview
-  layer needs a decompression tier from day one: stream the head immediately, background-spool
-  to a node-local cache for random access on files under a size cap, honest "sequential only"
-  UX above it. bgzip (BGZF) *does* allow block random access — worth exploiting, it's the
-  bioinformatics-native compression.
+- **Compressed tables**: gzip and BGZF tables decode sequentially from the
+  start under the request's scan budget. Plain files have the sparse row index;
+  gzip does not. A page beyond the scan budget reports `scan_limited` and an
+  honest continuation point. The founding cache/random-access proposal is not
+  implemented.
 - **Jupyter notebooks**: ipynb is just JSON — parse server-side into a cell stream; markdown
   cells through the same renderer, code cells highlighted, PNG outputs inline, ANSI outputs
   through the terminal renderer, HTML/plotly outputs in sandboxed iframes. No kernel, no
   Python dependency, read-only.
-- Images (+ server-side thumbnails), Markdown (server-rendered, sanitized, repo-relative images
-  resolved), PDF (pdf.js via range requests), JSON/JSONL tree view, chunked text/code for giant
-  files, hex fallback.
-- Directory listings decorated with git status and scratch-vs-home filesystem hints.
+- **Other rendered formats**: images/SVG, Markdown with live/reading/source modes,
+  PDF via pdf.js ranges, JSON/JSONL tree views, program logs, video/audio, Marp
+  decks, Mermaid diagrams, Excel workbooks, Word documents, PowerPoint decks,
+  and JSON Canvas/Excalidraw/draw.io boards. Text/code uses chunked reads, with
+  full editing within its size cap; binary files have an information card.
+- Directory listings carry git decorations and support file-management actions.
+  Rendering and parsing limits apply equally to local, SSH and cluster files.
 
 **The context bridge (author request 2026-07-06): selection knows its source.** Select text
 in a file view and a quiet floating affordance appears (plus a chord — parity principle):
@@ -857,7 +907,7 @@ setup into a new session. Distinctive, deferred.
 
 ### Agent communication: agents that see and reach each other
 
-*Added 2026-09-30. Plan: [agent-communication-plan.md](../agent-communication-plan.md); what
+*Added 2026-09-30. Plan: [agent-communication-plan.md](../design/agent-communication-plan.md); what
 users see: [features/agent-communication.md](../features/agent-communication.md).*
 
 The same per-session MCP server gives every agent in a workspace four tools — who is here,
@@ -885,15 +935,15 @@ hook's `additionalContext`, a chat send or steer, a billed wake. One switch
 
 ### Workbench plugins: WASM on a small host
 
-*Added 2026-09-26. Plan: [plugin-system-plan.md](../plugin-system-plan.md); what users see:
+*Added 2026-09-26. Plan: [plugin-system-plan.md](../design/plugin-system-plan.md); what users see:
 [features/plugins.md](../features/plugins.md); authoring: [plugins.md](plugins.md).*
 
 Opt-in capabilities beyond the core (Mycelium's Knowledge reader, LaTeX, Typst) are **workbench
-plugins**, and none of their behaviour is daemon code. (The host is planned to grow into a
-platform where plugins draw screens in Chimaera's format, run declared programs and install
-side programs, with LaTeX and Typst as its first plugins:
-[plugin-platform-plan.md](../plugin-platform-plan.md),
-[latex-reports-plan.md](../latex-reports-plan.md).) A plugin is a
+plugins**, with their feature logic in separate repositories. API 0.2 implements
+semantic screens, declared native programs, downloaded tools, output folders,
+settings and durable plugin state. LaTeX and Typst use that platform:
+[plugin-platform-plan.md](../design/plugin-platform-plan.md),
+[latex-reports-plan.md](../design/latex-reports-plan.md). A plugin is a
 Rust crate compiled to one portable WebAssembly component (`plugin.wasm`, `wasm32-wasip2`)
 beside a `plugin.toml` manifest; the same file runs on a laptop, an x86 login node and an ARM
 box, so the one-static-binary model survives: the binary carries no plugin bytes, only
@@ -904,14 +954,17 @@ checksum-verified release (a first-party one at the pinned version, checked agai
 too) or, for a local build or a host without network, from a directory. The daemon's host
 (`crates/chimaera-server/src/plugins/`) runs each under wasmtime through a pinned WIT world,
 `chimaera:plugin` (`crates/chimaera-plugin-api`) — the third public interface Chimaera pins,
-beside the daemon↔UI wire and the agent protocols. The sandbox
-is the trust model: a plugin reaches nothing but bounded host functions (workspace-relative
-reads with symlinks refused, 64 KiB of state, note-only Timeline appends under a rate cap),
-each call has a deadline and a 64 MiB memory cap, WASI grants nothing, and a trap costs the
-plugin its instance, never the daemon. Login-node discipline holds by construction: nothing
-compiles until a plugin is first used (the release daemon measured 5.8 MB idle, 28.8 MB after
-the first plugin call), and with no plugin active an agent's view is byte-identical to a
-plugin-free daemon's.
+beside the daemon↔UI wire and the agent protocols. A guest component reaches only
+declared, bounded host functions: workspace-relative reads with symlinks refused,
+state, and note-only Timeline appends under a rate cap. Each call has a deadline
+and a 64 MiB memory cap; WASI grants no filesystem or network access. A trap drops
+the guest instance. Plugins declaring programs or downloaded tools are privileged:
+their native jobs run outside WASM with the daemon user's filesystem and network
+access. Manifest capability review and either curated lock approval or the user's
+trust grant cover this boundary; process limits do not sandbox native access. Nothing compiles until a
+plugin is first used. The initial 2026-09-26 release measured 5.8 MB idle and
+28.8 MB after its first plugin call; those historical measurements are not the
+current daemon's resource budget.
 
 ### Git + Slurm
 
@@ -1053,6 +1106,12 @@ plugin-free daemon's.
 
 ### Environment prelude & compute-node sessions
 
+**Historical design sketch.** The environment injection below remains the basis
+of the implementation. The two compute-placement modes, negotiated tunnel ladder
+and `~/.chimaera/compute/<jobid>` manifest layout describe the 2026-07 proposal,
+not the current job-host/cluster-folder architecture summarized above. Refer to
+[compute](../features/compute.md) for the implemented workflow.
+
 *Design pass 2026-07-14 (author idea, developed in-session; tunnel reachability verified live on
 a production cluster). Two independent axes were deliberately separated — **environment** (what runs before
 your shell/agent) and **placement** (where it runs). Keeping them apart is what makes this
@@ -1161,6 +1220,7 @@ not either/or:
   token theft): use short-lived per-file tokens or a separate cookie-scoped origin.
 - The daemon accepts only loopback connections **by default**. The one deliberate exception
   (2026-07-15, Mode 2 rung A): `chimaera serve --bind-routable` opts a *compute-node* daemon
-  into 0.0.0.0 for clusters whose ladder has no ssh-to-node path, with the per-job bearer token
-  as the gate. Never the default, never implied — the launch request must ask for it. Users who
+  into 0.0.0.0, with the bearer token as the gate. Current job-host launches
+  workspace daemons with this flag so its SSH forwards can reach them. Ordinary
+  local/remote daemons still default to loopback. Users who
   want LAN/Tailscale still do it with their own tunnels.

@@ -33,8 +33,8 @@ route + per-session materialization) and `crates/chimaera-core/src/shellint.rs`
   carries `CHIMAERA_PRELUDE`; the shell-integration rc (bash `--init-file`, zsh ZDOTDIR
   shim) sources it after the user's rc, and the agent login-wrapper
   (`launcher::wrap_login_shell`) sources it before `exec`ing the agent. All spawn surfaces
-  funnel through it: PTY shells and agent TUIs (`spawn.rs`), chat drivers + the
-  degrade-to-PTY respawn (`chat.rs`), and agent-plugin installs (`plugins/mod.rs`),
+  funnel through it: PTY shells and agent TUIs (`spawn.rs`), chat drivers and deliberate
+  view-switch respawns (`chat.rs`), and agent-plugin installs (`plugins/mod.rs`),
   each via `api::session_env`. The agent probes behind the Extensions and Skills views
   (`agent_probe.rs`) run under it too, through `materialize_probe_prelude`: the host scope
   for claude's host-wide `plugin list`/`details`, host ⊕ workspace for codex's
@@ -47,7 +47,7 @@ route + per-session materialization) and `crates/chimaera-core/src/shellint.rs`
     (`api::spawn_env_remove`) so children start with a clean slate; the remove-list is
     kept disjoint from the add-list because the two spawn layers apply them in opposite
     orders.
-  - **Respawns re-materialize.** View-switch/rewind/degrade re-run the current config (the
+  - **Respawns re-materialize.** View-switch/rewind respawns re-run the current config (the
     `ChatRecipe` carries `workspace_id` + the launch text); daemon-restart resurrection
     re-runs the durable scopes only (launch text is not in the ledger — deliberate).
   - **Caps:** 32 KB per scope (413), 256 KB whole store; NUL bytes rejected (400). Empty
@@ -65,8 +65,9 @@ route + per-session materialization) and `crates/chimaera-core/src/shellint.rs`
   - **Trust boundary:** a prelude is the user's own commands (same privilege as their rc),
     entering only via the bearer-authed route. Any future "read a prelude from a
     checked-in workspace file" needs an explicit confirmation gate (supply-chain vector).
-  - A hanging prelude hangs session startup exactly like a hanging rc would — accepted,
-    same trust model.
+  - A hanging prelude can stall a PTY startup just like a hanging rc. Chat startup is
+    bounded by the shared 60-second watchdog, including the login shell and prelude; a
+    failed chat stays in chat when it carries user work, without an automatic TUI fallback.
 
 ---
 

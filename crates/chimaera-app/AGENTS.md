@@ -23,7 +23,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
    detect/provision/spawn/adopt; `--daemon` and `chimaera-server` are cfg'd out of
    that build). No WSL yet → startup opens the shell-local wizard
    (`assets/setup.html`) instead of failing. Design + research evidence:
-   [docs/windows-wsl-plan.md](../../docs/windows-wsl-plan.md); live gate:
+   [docs/design/windows-wsl-plan.md](../../docs/design/windows-wsl-plan.md); live gate:
    `.github/workflows/wsl-smoke.yml` (real WSL2 on a Windows runner). macOS
    cannot compile the Windows target locally — app.yml's `windows` job is the
    compile gate.

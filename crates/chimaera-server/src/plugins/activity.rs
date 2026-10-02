@@ -1,7 +1,7 @@
 //! The activity log: what each plugin did that the user should be able to
 //! look back on — installs, updates, rollbacks and removals, trust granted
 //! and withdrawn, blocks — and, once plugins run programs, every run and
-//! download. Design: docs/plugin-platform-plan.md §2 ("The activity log").
+//! download. Design: docs/design/plugin-platform-plan.md §2 ("The activity log").
 //!
 //! Append-only JSONL per plugin under `<data dir>/plugins/.activity/<id>.jsonl`
 //! (a dot-name: the catalog's scan never reads it), capped at `FILE_MAX`:

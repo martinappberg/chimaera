@@ -29,9 +29,12 @@ Every page separates two kinds of knowledge, and the split is load-bearing:
   **Never auto-generated or inferred from code.** Each page carries an `## Intent`
   section at the end; until a `feat:` in that area records it, entries read *pending*.
 
-A future agent must treat the Intent section as constraints, not suggestions — but read the
-*grade* of each one. Intent distinguishes **core bets** (a handful of load-bearing product
-decisions — workspace-first, daemon-owns-everything / nothing-dies, never-silently-kill,
+Read each Intent entry with its capture date and later addenda: it records what the
+maintainer decided then, not a list of shipped capabilities. When an older capture predates
+current behavior, preserve it and describe present behavior in the derived section; never
+infer a new maintainer decision from code. Treat still-applicable product decisions as
+constraints, with the *grade* of each one in mind. Intent distinguishes **core bets** (a handful of load-bearing product
+decisions — workspace-first, daemon-owned live sessions, never-silently-kill,
 server-side terminal state, no-root ssh deployment — that are genuinely don't-change) from
 **additions to the core** (git, previews, chat specifics, linked terminals, the native-app
 teardown UX, …) which are *deliberate for now but improvable*. Reserve "must not change" for the
@@ -44,13 +47,13 @@ core; an addition can change when there's a clear improvement. Don't be too stri
 | [workbench.md](workbench.md) | Workspaces, home screen, the pane/tab/split workbench, drag-and-drop, zoom, focus mode, quick-open, folder picker, layout persistence, keybindings |
 | [dashboard.md](dashboard.md) | The workspace dashboard (landing surface), re-centred on questions: the attention lane with inline permission answering, Since you left, Where things stand, the one-line Now (or density-adaptive agent cards with provenance tiers), and the Mastermind dock with Brief me |
 | [session-history.md](session-history.md) | A lasting record per agent session (who started it, files written, tokens and time, transcript pointer, the Mastermind's acts), All sessions from Recents, archiving Recents, what a session changed with or without git, the same-file notice and hook line, the Activity page and the dashboard's activity line |
-| [agent-communication.md](agent-communication.md) | Agents seeing and messaging each other (`workspace_agents`, `read_agent`, `message_agent`, `read_messages`), how a message reaches claude/codex chat/terminal without starting a turn, wakes and the Needs-you wake requests, the Mastermind as the coordinator inside it, the on/off switch |
+| [agent-communication.md](agent-communication.md) | Agents seeing and messaging each other (`workspace_agents`, `read_agent`, `message_agent`, `read_messages`), provider-specific chat and terminal delivery, including carriers that do not start a turn, wakes and the Needs-you wake requests, the Mastermind as the coordinator inside it, the on/off switch |
 | [timeline-and-knowledge.md](timeline-and-knowledge.md) | The per-workspace Timeline the daemon writes (agent turns, notable commands, ended Slurm jobs, crashes, knowledge changes, messages between agents) and the read-only Knowledge view over what agents recorded (mycelium's `.living/`, guidance files, claude memory) |
-| [plugins.md](plugins.md) | The Extensions tab (Plugins · Skills · Browse): opt-in workbench plugins as sandboxed WASM components (manifests, per-workspace switch, requires / recommends, install/setup, plugin MCP tools, the plugin host and its limits), the plugins lock and the three install kinds (first-party at the pinned release, a repository's release, a local build), `SHA256SUMS` verification, updates and rollback (`chimaera plugin`), agent plugins + the Skills view (asked of claude/codex themselves), in-app codex hook trust, retired plugins |
+| [plugins.md](plugins.md) | The Extensions tab (Plugins · Connections · Skills · Browse): opt-in WASM workbench plugins, permissions and trust, plugin screens and file views, programs and tools, per-workspace setup, install/update/rollback (`chimaera plugin`), configured MCP services and hosted connectors with in-app setup, agent plugins and skills, Codex hook trust; Browse is disabled |
 | [terminals.md](terminals.md) | Persistent daemon-owned terminals, reconnect/resize/resync, clickable path links, clipboard & provenance, live theming, the exec engine, the command journal |
-| [agents.md](agents.md) | Launching coding agents (real TUI + structured chat), the launcher, managed install/update, agent detection, the session rail & attention state, rename/kill, recents & resume |
-| [chat-mode.md](chat-mode.md) | Structured chat mode (Tier B): the composer, model/effort/mode/thinking/ultracode controls, tool cards, permission & question prompts, rewind, MCP panel, usage, inline artifacts, the seq journal & gap-replay, view-switch |
-| [files-and-previews.md](files-and-previews.md) | The file tree with git decorations, file previews (code, markdown, CSV/TSV incl. gzip, PDF, image, sandboxed HTML, binary, Finder), lightweight editing, raw tickets, pointing an agent at part of any file (lines, PDF areas, image regions, table cells, media moments, notebook cells, slides) |
+| [agents.md](agents.md) | Claude Code, Codex, Antigravity and Grok Build (real TUI + structured chat), the launcher, managed install/update, agent detection, the session rail & attention state, rename/kill, recents & resume |
+| [chat-mode.md](chat-mode.md) | Structured chat for Claude, Codex, Antigravity and Grok: composer and queues, provider-specific controls, tool cards, permissions and questions, inline artifacts, journal and gap-replay, restart recovery; Claude/Codex also support view-switch and rewind |
+| [files-and-previews.md](files-and-previews.md) | File tree and Finder, code/text and live Markdown editing, CSV/TSV/gzip, spreadsheets, PDF/images, Word/PowerPoint, Parquet, notebooks, media, diagrams and boards, sandboxed HTML, bounded reads and draft/conflict recovery, pointing an agent at a file selection |
 | [browser-pane.md](browser-pane.md) | Live web apps (Jupyter, marimo, Streamlit) as panes — the daemon's ticketed reverse proxy (HTTP+WS, remote-transparent, compute-node second hop), terminal URL detection, the iframe pane |
 | [drag-drop-and-uploads.md](drag-drop-and-uploads.md) | Drag a file/folder from the tree to reference it in a session, OS-desktop file drops + screenshot paste that stream to the session's owning host (remote-transparent), the size-capped session-scoped upload route, the native-shell drop handler |
 | [git.md](git.md) | Source-control panel (status/diff), several repositories per workspace, history (log, commits, file history, changes on a branch), sessions' branches, worktree create/remove/lock, the session-scoped changes view, git-binary remediation |
@@ -59,7 +62,7 @@ core; an addition can change when there's a clear improvement. Don't be too stri
 | [pro.md](pro.md) | Optional native account sign-in, kept host connections, relayed SSH prompts, reverse serve and device controls |
 | [notifications.md](notifications.md) | The notice feed (agent finished / awaiting approval / error / agent `notify`), native OS + browser notifications with click-to-session, the approval-only counts and the unread mark |
 | [native-app.md](native-app.md) | The Tauri shell: real OS windows, window restore, the signed app+daemon self-updater, the update toast |
-| [lifecycle-and-persistence.md](lifecycle-and-persistence.md) | "Close the laptop, nothing dies" — daemon-owned sessions, the session ledger + restart handoff, graceful shutdown, update awareness |
+| [lifecycle-and-persistence.md](lifecycle-and-persistence.md) | Daemon-owned session lifetime, live reconnect, conversation resume and shell respawn after restart, graceful shutdown, update awareness |
 | [environment.md](environment.md) | Environment preludes — per-host/workspace/launch startup commands (`module load`, `conda activate`) run once per session before the shell or agent |
 | [compute.md](compute.md) | Clusters (HPC + Slurm) — nothing on the login node; you start Slurm jobs from the app's cluster page or `chimaera compute` and open workspaces inside them (several per job, moving between jobs with their chats); discovery, start sheet, folder picker, continue in a new job, notifications, what agents in a job are told, the passive rail chip |
 | [settings.md](settings.md) | The dotted-key `settings.json` model (hand-edit-aware), the settings UI, theme palettes |
@@ -71,15 +74,22 @@ Cross-cutting *infrastructure* — not user features — lives with the code, no
 
 - **Auth** (bearer / WS first-frame / `/raw` ticket / key-in-URL) → [rules/daemon.md](../../.claude/rules/daemon.md) + [chimaera-server/AGENTS.md](../../crates/chimaera-server/AGENTS.md).
 - **The daemon↔UI wire contract** (`SessionInfo`, `SessionEvent`, `ExecOutcome`, chat `SeqEvent`/`AgentCommand`) → the same two places. Feature pages name the routes/WS channels a feature uses; the wire *invariants* are a rule, not a feature.
-- **How it's built and why** → the [architecture guide](../agent-guides/architecture.md) and [DESIGN.md](../../DESIGN.md).
+- **How it's built and why** → the [architecture guide](../agent-guides/architecture.md) and [docs/design/README.md](../design/README.md).
 
 ## Honest gaps
 
 Some behavior can't be documented from code alone — it needs product intent — and a few
 capabilities are half-built. Rather than guess, the pages flag these inline
-(**Intent: pending** for the former; **Status: partial** for the latter). Known
-half-built items today: Codex chat drops the create-time model; Gemini/Antigravity aren't
-first-class agents yet (see [agents.md](agents.md)).
+(**Intent: pending** for the former; **Status: partial** for the latter). Current limits include
+Antigravity/Grok's unavailable same-session terminal/chat switch and native rewind, and
+third-party harness registration that is still planned ([agents.md](agents.md)); the disabled
+Extensions **Browse** segment and Connections' lack of add/remove configuration
+([plugins.md](plugins.md)); and Timeline turn records that are unavailable for hook-less TUIs
+([timeline-and-knowledge.md](timeline-and-knowledge.md)). Knowledge needs an enabled provider
+plugin. Gemini CLI is retired from new launches, while old records remain readable.
+Codex's launch model is applied, and saved chats resume after daemon restarts; see
+[chat-mode.md](chat-mode.md) and [lifecycle-and-persistence.md](lifecycle-and-persistence.md)
+for recovery behavior and limits.
 
 ## Keeping this catalog current
 

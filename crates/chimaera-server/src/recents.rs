@@ -1,5 +1,5 @@
 //! Rail "Recents": daemon-persisted, per-workspace history of ENDED agent
-//! conversations (DESIGN.md "The agent launcher" — Rail Recents). When an
+//! conversations (docs/design/README.md "The agent launcher" — Rail Recents). When an
 //! agent session's PTY dies, its record retires here instead of vanishing,
 //! so the conversation can still be found — and resumed where the CLI
 //! supports it (`claude --resume`; codex `thread/resume` / `codex resume`).

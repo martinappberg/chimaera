@@ -7,10 +7,11 @@ Parent map: repo-root [AGENTS.md](../../AGENTS.md).
 
 ## The invariant that defines this crate
 
-**core depends on NOTHING internal, and nothing transport/UI-shaped.** No axum,
-no tokio runtime, no websocket, no server/pty/agent/remote. Verified: the only
-"transport" strings in here are prose in doc comments. If you're tempted to put a
-thing here, it must be genuinely shared *and* free of the daemon's machinery.
+**core depends on NOTHING internal and owns no transport implementation.** No
+axum, no tokio runtime, no websocket, no server/pty/agent/remote dependencies.
+It does contain shared serializable cluster and job-host API types in
+`cluster.rs`; their wire shapes are public contracts. A type belongs here when
+it is shared and can stay free of the daemon's machinery.
 
 **core is a path-dep of TWO workspaces** — the root daemon workspace AND the
 standalone `crates/chimaera-app` (Tauri) workspace. Any change to core's
@@ -45,6 +46,9 @@ versions). Run `cargo test` in the app workspace too when you touch core deps.
   on its own graceful shutdown** (a crash leaves none) — not by "the app/connect".
 - **`CHIMAERA_HOME` moves only the daemon's bookkeeping dirs.** Spawned shells/agents
   keep the real `$HOME`, so `~/.claude` auth still works under an isolated daemon.
+  Unstamped dev builds default to `~/.chimaera-dev`; release builds use
+  `~/.chimaera`. `CHIMAERA_DATA_DIR` / `CHIMAERA_RUNTIME_DIR` override the
+  corresponding paths for cluster workspace daemons.
 - Dir resolvers are **best-effort**: on `create_dir_all` failure they `warn!` and
   still return the path (callers fail on the later read/write). Don't `panic!` in a
   dir resolver.

@@ -2,7 +2,7 @@
 //! plugin claims), `file-changed` (a claimed or watched file changed on
 //! disk), and the plugins' watch sets. Also where `settings-changed` and
 //! `switched-on` / `switched-off` are delivered. Design:
-//! docs/plugin-platform-plan.md §5.
+//! docs/design/plugin-platform-plan.md §5.
 //!
 //! - **Where changes come from.** Every write the daemon knows of already
 //!   funnels through `git::mark_path_dirty` (saves, file operations,

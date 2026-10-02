@@ -90,16 +90,16 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
 
 ## Agent-sent notifications (`notify` tool)
 
-- **What & when.** Every session that has the chimaera MCP server (claude TUI + chat, codex
-  chat) can call `notify(message, title?)` — "ping me when the job finishes" now works. The
+- **What & when.** Every session that has the chimaera MCP server (all four chat providers, Claude
+  terminals and eligible Codex terminals) can call `notify(message, title?)` — "ping me when the job finishes" now works. The
   tool description and the MCP instructions steer agents to use it only for news the user
   asked for or would want while away: turn ends and permission asks are already automatic.
 - **Where it lives.** `mcp.rs` (`notify_tool_def`, `notify`, `ALWAYS_ALLOWED_TOOLS`),
   `notices.rs::push_agent_notice`.
-- **Key behaviors.** Pre-approved for every session so it never raises a permission prompt
-  of its own — claude via `permissions.allow: ["mcp__chimaera__notify", …]` in the generated
+- **Key behaviors.** Pre-approved for native Claude/Codex sessions — Claude via `permissions.allow: ["mcp__chimaera__notify", …]` in the generated
   settings, codex via `SpawnSpec.mcp_auto_approve` (the driver answers those tools'
-  elicitations); `ALWAYS_ALLOWED_TOOLS` also holds the read-only document tools. Rate-limited per session (one per 5s, 20 per hour; the refusal text tells the
+  elicitations). ACP sessions retain their provider's native approval behavior.
+  `ALWAYS_ALLOWED_TOOLS` also holds the read-only document tools. Rate-limited per session (one per 5s, 20 per hour; the refusal text tells the
   agent why). An agent message supersedes the automatic `done`/`input` notice for the same
   session for 2 minutes, so "notify me when done" pings once, in the agent's words. With
   "Messages from Agents" off, the tool answers that the user turned it off.
@@ -108,7 +108,8 @@ and in `App.svelte` the view reporting + `focusFromNotification`.
 
 - **What & when.** Real OS notifications from the shell, posted once however many windows
   are open, for every workspace on every daemon the app has open — including workspaces with
-  no window. (Closing the last window quits the app, so notifications stop with it.)
+  no window. (Closing the final workspace window opens Home; closing the final local Home window or
+  quitting the app stops notifications.)
 - **How it's used.** Automatic. Clicking one raises the window already showing that session
   (else a window on its workspace, else opens one) and focuses its tab. Settings →
   Notifications shows whether the OS allows them, with **Allow notifications** (asks now),
@@ -190,8 +191,10 @@ remote host's alerts follow that host's settings.
 
 - Linux and Windows notifications are build-checked only; the click route and the Dock/launcher
   badge there have not been driven on real desktops.
-- Hook-less agent TUIs (codex/gemini/agy terminals) have no attention state, so they produce no
-  notices — honest absence, same as their rail dots. Codex in chat mode is covered.
+- Hook-less agent TUIs (Codex, Antigravity and Grok; legacy Gemini records) have no
+  authoritative attention edges, so they produce no automatic turn/approval notices. Their
+  rail dots use output activity. All four chat providers use protocol state; an eligible
+  Codex terminal can still call `notify` explicitly.
 
 ---
 

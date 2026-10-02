@@ -5,7 +5,7 @@ are running and what they're doing, read one's recent work, and send them messag
 actually arrive. The workspace **Mastermind** is part of it: the one coordinator the user
 appoints, whose messages carry direction. Built into Chimaera (it replaced the Agent notes
 plugin), **on by default**, switchable off in Settings → Agents. Plan and wire contract:
-[docs/agent-communication-plan.md](../agent-communication-plan.md) (§12).
+[docs/design/agent-communication-plan.md](../design/agent-communication-plan.md) (§12).
 
 **Where it lives (shared):** daemon `crates/chimaera-server/src/comms.rs` (the tools, delivery,
 wakes, read state, routes), `mcp.rs` (tool lists, instructions, the Mastermind tier),
@@ -108,8 +108,9 @@ on the per-session MCP endpoint ([linked-terminals.md](linked-terminals.md#the-m
   uses the same four tools; its extra tier is `workspace_status`, `list_changed_files`,
   `read_timeline`, `spawn_agent`, `spawn_terminal`, `interrupt_agent`.
 - **Key behaviors.** Its `message_agent` carries direction (`origin: "mastermind"`, the
-  Mastermind header): to a chat worker an ordinary send — read at its next step when working,
-  a turn when idle — gated by its own ask-first/auto mode, not the wake policy; to a claude
+  Mastermind header): to a chat worker an ordinary send — Claude/Codex read it at their next
+  step while working, ACP workers queue it for the next turn, and an idle worker starts a turn —
+  gated by the Mastermind's own ask-first/auto mode, not the wake policy; to a claude
   terminal the hook carrier. Messages to it (`to: "mastermind"`) wake an auto-mode Mastermind
   within the caps and wait in the panel's inbox in ask-first mode.
 

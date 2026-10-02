@@ -1,7 +1,7 @@
 /**
  * The shared UI pieces (Badge, Callout, Row, KeyValue, FileCard) take the
  * `ui/1` prop names and its semantic tones — Knowledge draws with them, and
- * the plugin screen renderer (docs/plugin-platform-plan.md) will too. A
+ * the plugin screen renderer (docs/design/plugin-platform-plan.md) will too. A
  * tone is never a colour on its own: every toned piece carries its word.
  */
 export type Tone = "neutral" | "accent" | "good" | "warn" | "bad";

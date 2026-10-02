@@ -1,6 +1,6 @@
 /**
  * Client + reactive store for agent communication's per-workspace state
- * (docs/agent-communication-plan.md §12):
+ * (docs/design/agent-communication-plan.md §12):
  *   GET  /workspaces/{id}/comms                {enabled, wakes, unread, wake_requests}
  *   POST /workspaces/{id}/comms/wakes/{wid}    {wake}     answer a wake request
  *   POST /workspaces/{id}/comms/deliver        {session}  hand an inbox over

@@ -293,7 +293,7 @@ with a transparent track; its drag area is wider than the visible thumb.
 > be "helpfully" changed without asking.
 
 ### Why the workbench is shaped this way
-_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+_Captured 2026-07-09 — drafted from docs/design/README.md + code, confirmed live with the maintainer._
 
 - **Problem it solves.** Workspace-first, chat-many — the deliberate inversion of the Claude
   desktop app's chat-first / workspace-weak model. The folder *is* the window (file tree, previews,

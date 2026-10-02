@@ -2,7 +2,7 @@
 
 A native app — macOS and Linux today, Windows via WSL2 (beta) — that wraps the same web UI in
 **real OS windows** onto a local or ssh-tunnelled daemon. It adds what a browser tab can't:
-real windows that survive quit/crash, a window set that restores itself, in-app SSH auth, and
+a window set that restores after quit/crash, in-app SSH auth, and
 a signed one-click updater for the app and its daemon. The app is a *view layer* — the daemon
 it talks to is a separate, longer-lived process (see
 [lifecycle-and-persistence.md](lifecycle-and-persistence.md)).
@@ -152,16 +152,18 @@ app-build` (never the root `cargo`).
 ## Signed self-update (app + daemon)
 
 - **What & when.** One-click update: download/verify/install the signed app bundle (it relaunches),
-  then — in the new process's startup — replace the local daemon. Because the daemon binary *is* the
-  app binary, the daemon must go second.
+  then — in the new process's startup — replace the local daemon. On macOS/Linux the daemon
+  binary *is* the app binary, so it must go second. Windows replaces the separate Linux
+  daemon in the selected WSL2 distro.
 - **Where it lives.** `update.rs` (`begin_update`/`consume_intent`/`spawn_update_watch`, `check`/`status`,
   `CHECK_INTERVAL 6h`, `INTENT_MAX_AGE 10m`), `commands.rs` (`check_app_update`, `app_update_status`),
   `daemon.rs::update_local_daemon`, `menu.rs` ("Check for Updates…").
 - **Key behaviors.** The download is verified against the embedded **minisign** pubkey regardless — only
   a validly-signed release installs; the web UI can only *ask*, never drive. `begin_update` writes a
   consume-once intent file (10-min expiry) so the new process finishes the daemon swap without a second
-  ask. The daemon's restart handoff + session ledger make that swap state-safe — windows/tabs/sessions
-  survive. Version stamping matches the literal `0.0.1` sentinel via `sed`; a pre-bumped value silently
+  ask. The restart handoff and session ledger restore windows/tabs and eligible session
+  identities; conversations resume and shells respawn in new processes, with the limits in
+  [lifecycle-and-persistence.md](lifecycle-and-persistence.md). Version stamping matches the literal `0.0.1` sentinel via `sed`; a pre-bumped value silently
   no-ops and ships the wrong version. Signing is release-only.
 - **Every check's outcome is kept** (`update::status`: this version, `checked_at`, `available`, the
   failure's `error`, `dev`): `app_update_status(refresh)` answers from it instantly, so a window opened
@@ -208,7 +210,7 @@ app-build` (never the root `cargo`).
   spawn/probe/stop — module header documents the researched constraints), `daemon.rs` (windows
   half of `ensure_local_daemon`), `shell.rs::finish_startup` (the startup the wizard resumes),
   commands `wsl_status`/`wsl_install`/`wsl_install_distro`/`wsl_setup_daemon`. Deep design +
-  evidence: [docs/windows-wsl-plan.md](../windows-wsl-plan.md).
+  evidence: [docs/design/windows-wsl-plan.md](../design/windows-wsl-plan.md).
 - **Key behaviors.** The daemon start line is the Podman persistence pattern (`setsid nohup` in
   a wsl.exe session) so sessions survive closing the app; `wsl --shutdown` is treated as a
   normal event (health-check + re-adopt/respawn); adoption always requires the token health
@@ -223,8 +225,8 @@ app-build` (never the root `cargo`).
   refuses with the real reason if the transport is absent). **Gotcha that needs UX copy
   wherever hosts surface:** ssh runs in the distro, so aliases/keys resolve against the
   DISTRO's `~/.ssh`, not the Windows-side config the user's terminal uses. The interop
-  prompt chain still needs a real-hardware pass; the site deliberately doesn't advertise the
-  Windows download until then.
+  prompt chain still needs a real-hardware pass. The site offers the Windows download
+  explicitly labeled **beta**, matching that verification gap.
 
 ## Menu bar & tray
 
@@ -303,7 +305,7 @@ app-build` (never the root `cargo`).
 > be "helpfully" changed without asking.
 
 ### Why the native app behaves this way
-_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+_Captured 2026-07-09 — drafted from docs/design/README.md + code, confirmed live with the maintainer._
 
 - **Problem it solves.** The Claude-desktop-app replacement — real windows per workspace, native
   notifications, a menubar badge — with the daemon binary doubling as the app, spawned detached so

@@ -61,8 +61,9 @@ solely because a newer version exists.
    just app-check        # when native-shell code or automation changed
    ```
 
-3. Use `/verify-app` for runtime-observable changes. Run `just chat-smoke` only
-   when a pinned agent protocol or CLI driver changed; it uses live credentials,
+3. Use `/verify-app` for runtime-observable changes. Run `just chat-smoke` for
+   Claude/Codex or `just chat-smoke-acp` for ACP when a pinned agent protocol or
+   CLI driver changed; these use live credentials,
    network access, and billable turns.
 4. Report fixes separately from residual risks. Include exact verification and
    explain anything that could not be run.

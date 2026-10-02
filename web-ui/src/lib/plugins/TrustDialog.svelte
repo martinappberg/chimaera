@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * The trust prompt (docs/plugin-platform-plan.md §2): shown when the
+   * The trust prompt (docs/design/plugin-platform-plan.md §2): shown when the
    * daemon refuses an install, update, switch or trust with 409 and what the
    * plugin can do (`TrustAsk`). Who asks and from where; for an update that
    * asks for more, what it would also do (the running version keeps running

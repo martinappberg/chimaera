@@ -30,7 +30,8 @@ has subtle repaint invariants — read the architecture guide before touching th
 
 ## Invariants (breaking these is a review failure)
 
-- **Bounded allocations.** The daemon runs on shared HPC login nodes (~150 MB RSS).
+- **Bounded allocations.** The daemon targets ~150 MB RSS on shared hosts,
+  including compute allocations and explicitly allowed login-node deployments.
   Viewports are capped at 500×200 cells and scrollback at 200,000 lines; validate
   dimensions before constructing or resizing a `Term`. The per-session output
   broadcast is capped; a lagging client is `Lagged`→resynced, not buffered without

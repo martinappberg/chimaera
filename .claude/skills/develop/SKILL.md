@@ -27,18 +27,19 @@ just dev-ui        # Vite dev server (assumes a daemon is already running)
 cargo run -p chimaera -- serve --port 9700
 ```
 
-**Auth is automatic in dev.** Vite exposes the local daemon's
-`~/.chimaera/manifest.json` at `/dev/manifest` (dev-only middleware, absent from
-production builds), so the page picks up the bearer token itself — don't
-hand-copy tokens. Point a second UI at a different daemon with
-`CHIMAERA_DEV_TARGET=http://127.0.0.1:<port>` (see the `web-ui-sandbox` config).
+**Auth depends on which daemon Vite targets.** Its dev-only `/dev/manifest`
+middleware reads `~/.chimaera/manifest.json`; an unstamped debug daemon instead
+uses `~/.chimaera-dev` by default. Open Vite with the debug daemon's printed
+`#token=…` fragment to authenticate. `CHIMAERA_DEV_TARGET=http://127.0.0.1:<port>`
+changes the proxy target (see `web-ui-sandbox`), but does not change that manifest
+path. The isolated served-UI loop below avoids this mismatch.
 
 ## Isolated per-worktree run (coding agents — use this in a worktree)
 
-The default `chimaerad` / `web-ui` configs hardcode ports 9700 / 5173 and share
-`~/.chimaera`. That collides the moment a second worktree or chat is live:
-`serve` **writes the manifest on start and REMOVES it on stop**, so a shared
-daemon deletes a sibling's manifest and breaks its dev auth. When another
+The default `chimaerad` / `web-ui` configs hardcode ports 9700 / 5173. Unstamped
+Rust builds also share the default `~/.chimaera-dev` state dir. A second worktree
+can collide on ports or state. `serve` writes its manifest at startup and removes
+its owned record at shutdown; separate worktrees should use separate state dirs. When another
 daemon may be up, run **`chimaerad-isolated`** instead — a self-contained
 daemon just for this worktree:
 
@@ -57,7 +58,7 @@ no Node needed at run time.
 
 ```sh
 nvm use 22 && npm --prefix web-ui ci \
-  && npm --prefix web-ui run build            # Node 22 — the nvm default (16) errors
+  && npm --prefix web-ui run build            # Node version is pinned in .nvmrc
 cargo build -p chimaera                       # rust-embed requires web-ui/dist to exist first
 ```
 
@@ -80,7 +81,20 @@ fragment). A **debug** daemon reads `web-ui/dist` from disk per request, so afte
 a UI change just rebuild the UI and reload the page — no daemon restart.
 Plugin installs take effect at once, with no restart either.
 
-To reset this worktree's isolated daemon state, delete `.chimaera-dev/`.
+If `preview_start` is unavailable, run the same launcher in a managed terminal:
+
+```sh
+bash .claude/skills/develop/serve-isolated.sh
+```
+
+It chooses a free port when `PORT` is unset. Read the token URL from its output
+and open it with the available browser tooling. Keep the terminal attached, or
+redirect stdout and stderr to a file when starting a background process. Use that
+terminal or file for daemon logs; browser inspection depends on the tools exposed
+in your session.
+
+To reset this worktree's isolated daemon state, stop its daemon first, then delete
+`.chimaera-dev/`.
 
 ## Running the built daemon (production-like)
 
@@ -109,9 +123,9 @@ just app-dev-isolated   # the app on an ISOLATED state dir — use this in a wor
 just app-build          # bundle the .app/.dmg
 ```
 
-**Isolated app — the app counterpart of `chimaerad-isolated`.** `app-dev` (and a
-released app) share `~/.chimaera` — a dev build would fight your real app over
-the manifest, port, saved hosts, and window registry. `app-dev-isolated` runs
+**Isolated app — the app counterpart of `chimaerad-isolated`.** Unstamped
+`app-dev` builds use `~/.chimaera-dev`, separate from the released app's
+`~/.chimaera`, but two dev worktrees still share state and app identity. `app-dev-isolated` runs
 [`run-app-isolated.sh`](run-app-isolated.sh), which sets `CHIMAERA_HOME=
 ~/.chimaera-dev-app/<worktree-key>` before launching the built binary. The key
 includes a stable checksum of the absolute worktree path because linked
@@ -267,9 +281,17 @@ surfaces in the app's askpass overlay. Now they can exercise remote-only paths
 ## Which build is actually running? (debug workflow)
 
 - **Health = ground truth.** Read `port` + `token` from the manifest —
-  `$CHIMAERA_HOME/data/manifest.json` for an isolated daemon/app, the plain
-  `~/.chimaera/manifest.json` otherwise — then
-  `curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:$PORT/api/v1/health`.
+  `$CHIMAERA_HOME/data/manifest.json` for an isolated daemon/app,
+  `~/.chimaera-dev/data/manifest.json` for a default unstamped dev build, or
+  `~/.chimaera/manifest.json` for a release — then
+  query `/api/v1/health`. Keep the token out of process arguments by passing
+  curl configuration on stdin (replace the manifest path for your daemon):
+
+  ```sh
+  jq -r '"url = \"http://127.0.0.1:\(.port)/api/v1/health\"\nheader = \"Authorization: Bearer \(.token)\""' \
+    .chimaera-dev/data/manifest.json | curl --silent --show-error --fail --config -
+  ```
+
   Its `build` must match your HEAD (`git rev-parse --short HEAD`, `-dirty` if
   the tree is). Run the same check against the app's TUNNEL port to verify a
   remote dev daemon end to end; `chimaera status <host>` (from the dev build) asks the host

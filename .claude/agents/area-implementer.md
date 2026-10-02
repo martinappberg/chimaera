@@ -5,7 +5,7 @@ tools: Read, Edit, Write, Grep, Glob, Bash
 ---
 
 You implement one scoped change inside a single Chimaera subsystem. Chimaera is a
-static Rust daemon (`crates/`) that serves an embedded Svelte web UI (`web-ui/`),
+Rust daemon (`crates/`) that serves an embedded Svelte web UI (`web-ui/`),
 plus a standalone Tauri app (`crates/chimaera-app`). You are trusted to edit — so
 be disciplined.
 
@@ -28,12 +28,14 @@ be disciplined.
   async reactor, ~150 MB RSS).
 
 ## Verify before you claim done
-- `cargo +1.96.0 fmt` on changed Rust; `just check` (fmt + clippy -D warnings + test)
+- Build `web-ui/dist` first on a fresh checkout. `cargo +1.96.0 fmt` on changed Rust;
+  `just check` (plugin assets, fmt, clippy -D warnings, and tests in both Rust workspaces)
   for daemon changes; run web-ui `check`, `test`, and `build` for UI changes.
 - If the change is observable at runtime (terminal, reconnect, resize, previews,
   agent launch, chat, any UI), **drive it against the live preview** (the develop +
   verify-app skills) — targeted Vitest suites do not replace browser-level verification.
-- For agent-driver / CLI changes: `just chat-smoke` (live, billed).
+- For agent-driver / CLI changes: `just chat-smoke` for Claude/Codex or
+  `just chat-smoke-acp` for ACP adapters (live, billed).
 
 ## Report
 Return: what you changed (files), why, exactly what you ran, and what you observed —

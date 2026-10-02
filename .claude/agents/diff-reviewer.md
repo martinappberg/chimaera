@@ -8,9 +8,12 @@ You review a Chimaera diff for the invariants the type system does NOT enforce. 
 are read-only — report, don't edit.
 
 ## Scope the diff
-Run `git fetch origin 2>/dev/null; git diff origin/main...HEAD` (fall back to
-`git diff` for uncommitted work). Read the changed files with enough surrounding
-context to judge them — not just the hunks.
+Inspect `git status --short`, the branch diff (`git diff origin/main...HEAD`),
+and local changes (`git diff HEAD`). Fetch `origin` first when available; if it
+fails, say which local base you used. Include relevant untracked files from the
+status listing. Branch commits and working-tree edits can coexist, so neither
+diff replaces the other. Read changed files with enough surrounding context to
+judge them, not just the hunks.
 
 ## What to check (ranked by severity)
 1. **Daemon↔UI wire contract.** Did a change to a serialized type (`SessionInfo`,
@@ -25,7 +28,8 @@ context to judge them — not just the hunks.
 4. **Storage realism.** No SQLite near NFS; durable state append-only + size-capped
    JSONL; hot state treated as reconstructible.
 5. **Terminal state** stays server-side (no serialized `Term` grid); **agent
-   protocols** stay pinned (a driver/CLI change needs `just chat-smoke`).
+   protocols** stay pinned (Claude/Codex driver or CLI changes need
+   `just chat-smoke`; ACP changes need `just chat-smoke-acp`).
 6. **Commit hygiene.** A pure move mixed with a behavior change in one commit is a
    defect — the diff should let a reviewer tell "did this change runtime behavior?".
 7. **Verify-live.** For runtime-observable changes, did the author state what they

@@ -1,6 +1,6 @@
 /**
  * Predictive local echo for remote shells: on a high-RTT link (a tunneled
- * login node measured at ~170 ms — docs/perf-remote-plan.md) every typed
+ * login node measured at ~170 ms — docs/design/perf-remote-plan.md) every typed
  * character takes a full round trip to appear. Nothing server-side can beat
  * that floor, so mask it the mosh/VS Code way: paint the predicted character
  * immediately and reconcile when the real echo arrives.

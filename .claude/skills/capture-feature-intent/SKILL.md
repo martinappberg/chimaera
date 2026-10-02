@@ -1,6 +1,6 @@
 ---
 name: capture-feature-intent
-description: Run a short questionnaire with the human to capture WHY a newly-shipped feature exists and what about it is intentional, then write their answers into that feature's Intent section in docs/features/. Use only when a feat: ships new user-facing capability. Never for fix/refactor/chore/docs. Never fabricate intent — if the human isn't available, the page ships with Intent marked pending.
+description: "Run a short questionnaire with the human to capture WHY a newly-shipped feature exists and what about it is intentional, then write their answers into that feature's Intent section in docs/features/. Use only when a feat: ships new user-facing capability. Never for fix/refactor/chore/docs. Never fabricate intent — if the human isn't available, the page ships with Intent marked pending."
 ---
 
 # Capturing feature intent
@@ -30,6 +30,10 @@ If you're unsure whether a change is a `feat:`, resolve *that* first (the
 
 Ask these directly, in the session, of the person who built or is shipping the feature. Keep it to
 these — short is the point. Use their words; do not answer on their behalf or infer from code.
+
+Reuse answers or explicit decisions the human already supplied in this session.
+Ask only for missing intent; do not repeat answered questions. Record the source
+and capture date so later agents can distinguish those answers from derived facts.
 
 1. **Why does this feature exist — what problem does it solve for the user?**
 2. **How settled is it — what's a real promise you intend to keep, versus "this is just how it works

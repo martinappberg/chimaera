@@ -1,5 +1,5 @@
 /**
- * The client half of the plugin platform (docs/plugin-platform-plan.md
+ * The client half of the plugin platform (docs/design/plugin-platform-plan.md
  * §3–§9): a plugin's 0.2 tables on the wire, the pure rules that pick what
  * a plugin draws where (the file kinds it claims, its file menu items, its
  * panels, cards and status chips), and the fetchers for its screens,

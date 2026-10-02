@@ -1,4 +1,4 @@
-//! Managed agent runtimes + theming shims (DESIGN.md "Managed agent
+//! Managed agent runtimes + theming shims (docs/design/README.md "Managed agent
 //! runtimes" / "Agent theming + shell shims").
 //!
 //! Chimaera installs and updates the agent CLIs itself — credentials stay

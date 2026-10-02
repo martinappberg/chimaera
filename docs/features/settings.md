@@ -21,9 +21,11 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
 - **Where it lives.** `settings.rs` (`get_settings`/`put_settings`, `SettingsStore`); UI schema in
   `web-ui/src/lib/settings/schema.ts` (where defaults live).
 - **Key behaviors.** Reads **re-stat the file** so external edits surface without a restart, bumping a
-  content generation that `/ws/events` diffs against. Only a handful of keys are daemon-consumed
-  (`git.path`, `agents.*.path`, `daemon.scrollbackLines`, `daemon.restoreSessions`, `chat.remoteControlAtStart`, `chat.toolSummaries`, `chat.resumeAfterRestart`, `update.autoCheck`,
-  `quickOpen.ignoreDirs`); everything else is opaque and preserved verbatim (forward-compat — a newer
+  content generation that `/ws/events` diffs against. Daemon-consumed keys include
+  `git.path`, `agents.*.path`, `agents.communication.*`, `notifications.*`,
+  `daemon.scrollbackLines`, `daemon.restoreSessions`, `chat.remoteControlAtStart`,
+  `chat.toolSummaries`, `chat.resumeAfterRestart`, `update.autoCheck` and
+  `quickOpen.ignoreDirs`; unknown keys are opaque and preserved verbatim (forward-compat — a newer
   UI's keys survive an older daemon). A corrupt/oversized/non-object file degrades to an empty map with
   a warning — settings must never brick the daemon. A changed `agents.*.path` triggers shim regeneration
   + a detection-cache drop.
@@ -33,9 +35,10 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
 - **The schema is the contract.** Every typed row, default, range, category, JSON completion, and
   validation message derives from `schema.ts`; default values remain sparse (choosing a default
   deletes that key). The UI covers Appearance, Agents, Environment, Dashboard, Chat, Terminal,
-  Editor, Files, Quick Open, Git, Daemon, Updates, and Keyboard. Environment is the deliberate
-  exception: its multiline preludes use `/api/v1/environment` and `env-profiles.json`. Documents
-  is the other: opt-in writes of the documents dialect into the workspace's `AGENTS.md` or a
+  Editor, Files, Quick Open, Git, Extensions, Notifications, Daemon, Updates, and Keyboard.
+  Bespoke sections use their own stores: Environment's multiline preludes use
+  `/api/v1/environment` and `env-profiles.json`; Plugins exposes each plugin's declared
+  settings; Activity reads session records. Documents offers opt-in writes of the documents dialect into the workspace's `AGENTS.md` or a
   Claude Code skill over `/api/v1/agent-docs`
   ([agents.md](agents.md#documents-the-portable-dialect-check_document-and-the-issues-chip)).
 - **Interface typography applies app-wide.** `appearance.interfaceFontSize` (13 px by default)

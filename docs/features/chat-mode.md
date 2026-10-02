@@ -4,15 +4,15 @@ The rich chat surface: instead of running an agent as a raw TUI, Chimaera drives
 CLI over its **structured JSON protocol** (Claude Code over bidirectional `stream-json`,
 Codex over `codex app-server` JSON-RPC, Grok Build and Google Antigravity over ACP v1) and renders a first-class chat UI — streamed prose
 and thinking, tool cards, permission and question prompts, inline artifacts, model/effort
-controls, and lossless reconnect. The same session identity can toggle between chat and the
-TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
+controls, and lossless reconnect. Claude/Codex can toggle the same session identity between chat
+and the TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 
 **Where it lives (shared):** UI `web-ui/src/lib/chat/` (`ChatView.svelte`, `Composer.svelte`,
 `ChatHeader.svelte`, `Markdown.svelte`, `ToolGroup`/`ToolCallCard`, `PermissionCard`,
 `QuestionCard`, `RewindDialog`, `ForkDialog`, `McpPanel`, `UsagePanel`, `store.svelte.ts`, `chatWs.ts`,
-`paths.ts`). Engine `crates/chimaera-agent/src/` (`driver.rs`, `claude.rs`, `codex.rs`,
+`paths.ts`). Engine `crates/chimaera-agent/src/` (`driver.rs`, `claude.rs`, `codex.rs`, `acp.rs`,
 `model.rs`, `journal.rs`). Daemon glue `crates/chimaera-server/src/chat.rs`, WS
-`ws.rs::chat_ws`. Wire: `GET /ws/chat/{id}` (events + the 22 `AgentCommand`s),
+`ws.rs::chat_ws`. Wire: `GET /ws/chat/{id}` (events + the 23 `AgentCommand`s),
 `POST /api/v1/sessions/{id}/view`, `POST /api/v1/sessions/{id}/rewind`,
 `POST /api/v1/sessions/{id}/fork`. Deep protocol facts:
 [PROTOCOL.md](../../crates/chimaera-agent/PROTOCOL.md); rules:
@@ -27,16 +27,17 @@ control the available header/composer actions. ACP model choices come from the a
 provider; unsupported actions are not guessed from the agent's brand. Forking works across all
 four using native history where available or a conversation copy. Same-session chat/terminal
 switching and rewind remain Claude/Codex-only until the new providers' native boundaries are
-verified. See [integration design](../agent-harness-design.md) for the plugin boundary.
+verified. See [integration design](../agent-guides/agent-integrations.md) for the plugin boundary.
 
 ## Composing & sending
 
-- **Send while the agent works.** Type, Enter to send (Shift+Enter = newline). A message sent
-  while a turn runs is read at the agent's **next step** — after its current tool call, inside the
+- **Send while the agent works.** Type, Enter to send (Shift+Enter = newline). For
+  Claude/Codex, a message sent while a turn runs is read at the agent's **next step** — after its current tool call, inside the
   same turn, several waiting messages together — the way Claude Code and the Codex app behave
   (claude: the CLI's own queue, `priority:"next"`; codex: `turn/steer`). **⌥↩ / Alt+Enter** sends one
   for **after this turn** instead (claude `priority:"later"`; codex's next-run queue). The running
-  placeholder names the chord. `socket.send` returns `false` when the socket isn't OPEN, so the
+  placeholder names the chord. ACP providers queue both send forms for the next turn; they
+  do not support mid-turn steering. `socket.send` returns `false` when the socket isn't OPEN, so the
   draft is only cleared on an accepted send — a message during a reconnect window is preserved, not
   lost; reconnect replays the daemon-owned state.
 - **Delivery honesty + pending stack.** A waiting message is not a history block yet — it sits in a
@@ -46,13 +47,14 @@ verified. See [integration design](../agent-harness-design.md) for the plugin bo
   the transcript right there, solid — mid-turn if that is where it was read. Each waiting bubble
   has **Send now** (stops the current turn; every waiting message is then read at once — claude
   keeps its queue through the interrupt, and Chimaera re-sends the steers Codex drops) and **✕**
-  (pulls it back — claude `cancel_async_message`; a Codex steer can't be withdrawn and says so).
+  (pulls it back — Claude `cancel_async_message`, an ACP or Codex next-turn queue item
+  removed locally; a Codex steer can't be withdrawn and says so).
   Stop never drops the queue. A genuinely undeliverable entry stays marked **"not delivered"**
   (text kept readable/copyable, never auto-dumped into a draft you may have started); ✕ dismisses
   it. This is driven by the single `pendingSends` reducer and journaled via `user_message`
   `id`/`queued`/`after_turn` + `user_message_update`, so replay rebuilds the same order and delivery
   truth (see PROTOCOL.md passes 8, 21 and 38).
-- **Image attachments.** Paste (or drop) an image → a picture tile above the composer
+- **Image attachments.** Where the provider advertises image input, paste (or drop) an image → a picture tile above the composer
   (`AttachmentStrip`): one 56px row, each tile as wide as its picture's aspect ratio, a small
   always-visible ✕, and a click that shows it large (`ImagePreview`: Esc / backdrop / ✕ close,
   "remove" drops it). Sent as base64 blocks. Downscaled to 1568px max dim, 2 MiB post-encode cap,
@@ -64,8 +66,7 @@ verified. See [integration design](../agent-harness-design.md) for the plugin bo
 - **Your pictures stay in your message.** At WebSocket ingress the daemon saves each sent image
   into the session's upload landing pad (`upload::save_send_images`: same per-session caps as OS
   drops, a client-supplied `path` is always discarded, a failed save never refuses the send) and
-  the `user_message` echo carries their paths as `attachment_paths` (PROTOCOL.md Pass 37) — both
-  drivers, Claude and Codex. The sent (or queued) bubble shows them as the same tiles, a 112px row
+  the `user_message` echo carries their paths as `attachment_paths` (PROTOCOL.md Pass 37), across the shared send path. The sent (or queued) bubble shows them as the same tiles, a 112px row
   above the text on the user's side; a click opens the picture in a pane, as an agent's figure
   does. So reloads, other windows and replay show the pictures too. The journal still never holds
   the bytes. Old journals, Remote Control messages and seeded history carry only a count and keep
@@ -102,7 +103,7 @@ verified. See [integration design](../agent-harness-design.md) for the plugin bo
   send) instead flips the session to its real TUI (the [view switch](#view-switch-rewind-and-branch)),
   where claude's own `/login` runs the native auth flow (OAuth / setup-token / SSO); chimaera
   never touches the credentials. Sign in there, toggle back to chat.
-- **Voice dictation — the mic button.** Every chat composer, Claude or Codex, has a mic beside
+- **Voice dictation — the mic button.** Every chat composer has a mic beside
   send (on by default; shown only where the daemon's host can dictate — `GET /api/v1/voice`,
   asked once per window and again after a login failure). Click it and speak: the words fill the
   message box at the caret as they're heard — spaced like typed words, settled phrases slightly
@@ -191,9 +192,9 @@ verified. See [integration design](../agent-harness-design.md) for the plugin bo
   an explicit choice) and is pushed to the live driver once per driver process, re-synced on each
   respawn (a fresh CLI defaults thinking off) but never re-forced, so a tab remount can't reset it and
   a toggle-off always sticks.
-- **Remembered model, effort and mode.** Both agents' in-session picks are session-scoped on
-  their wires (claude `set_model` / `apply_flag_settings` / `set_permission_mode`, codex
-  `thread/settings/update`), so the daemon remembers the last model, effort and permission/approval
+- **Remembered model, effort and mode.** In-session picks are session-scoped on the
+  providers' wires (Claude `set_model` / `apply_flag_settings` / `set_permission_mode`,
+  Codex `thread/settings/update`, ACP session configuration), so the daemon remembers the last model, effort and permission/approval
   mode **you picked**, per agent kind (`prefs.json` beside the chat journals), and starts the next
   chat of that kind with them. Only picks count: a safety reroute, a credits fallback, the spawn's
   bootstrap read-back, codex resetting effort on a model switch, or claude leaving plan mode on its
@@ -201,11 +202,11 @@ verified. See [integration design](../agent-harness-design.md) for the plugin bo
   handshake (effort skipped when the catalog says the model has no effort knob, e.g. haiku); codex
   gets the model and effort on `thread/start` (a resumed codex thread keeps its own indexed effort)
   and the mode — Auto review, Read only, Auto, Full access, Plan — as a settings update before the
-  first turn. An explicit launch-time model still wins, and a workspace Mastermind keeps its own
+  first turn. ACP launch picks are applied through advertised session configuration
+  after initialization. An explicit launch-time model still wins, and a workspace Mastermind keeps its own
   ask/auto mode. **A reopened chat is not a new chat:** resuming, rewinding, forking, or a
   resurrection after a daemon restart brings the conversation back with *its own* last model,
-  effort and mode (the journal index carries them per native conversation, since neither agent
-  rehydrates them from its history); the prefs only fill in what that chat never carried. This
+  effort and mode (the journal index carries them per native conversation); the prefs only fill in what that chat never carried. This
   mirrors the official TUIs, which persist the same choices in their config.
 - **Remote Control (claude).** **Chat options → Remote Control** turns on Claude Code's own Remote
   Control bridge for this session — the same `remote_control` control the official VS Code and
@@ -654,8 +655,9 @@ verified. See [integration design](../agent-harness-design.md) for the plugin bo
 
 ## The engine — journal, protocol, startup
 
-- **Normalized event/command model** (`model.rs`): one ACP-shaped vocabulary both drivers translate
-  into, so the journal/WS/UI all speak it and a future generic ACP agent slots in. **Size caps live at
+- **Normalized event/command model** (`model.rs`): one shared vocabulary the native drivers
+  and ACP adapters translate into, so the journal/WS/UI all speak it. Capability events gate
+  provider-specific actions; arbitrary third-party agent registration is still planned. **Size caps live at
   event construction** (`TOOL_OUTPUT_HEAD 12k`/`TAIL 4k`, diff budgets) so a giant tool input never
   reaches the journal, ring, or a client.
 - **Seq-numbered journal + gap-replay** (`journal.rs`): every event gets a monotonic, gap-free `seq`
@@ -668,11 +670,12 @@ verified. See [integration design](../agent-harness-design.md) for the plugin bo
   `chat::prune_journals` runs on every spawn and once boot restore settles). Resuming a finished
   conversation seed-copies the old journal so `attach` replays the whole history (via a native-id →
   chimaera-session index).
-- **Pinned protocols** (`claude.rs`/`codex.rs`): the `stream-json` and `app-server` wire formats are
-  **unversioned and pinned, not trusted** — each driver is verified against its `TESTED_*_VERSION`
-  constant (the current pins live at the top of `claude.rs` / `codex.rs`). Touching a driver or
-  bumping a CLI **requires `just chat-smoke`** (live, bills a few cents). The two drivers must stay
-  **symmetric**.
+- **Pinned protocols** (`claude.rs`/`codex.rs`/`acp.rs`): native `stream-json` and
+  `app-server` formats, plus the ACP adapters, are **pinned, not trusted**. Each adapter records
+  its `TESTED_*_VERSION` constants. Driver or CLI changes require the relevant live gate:
+  `just chat-smoke` for Claude/Codex, `just chat-smoke-acp` for Grok/Antigravity
+  (existing credentials, billed turns). Keep shared behavior consistent while preserving
+  provider-specific capability limits.
 - **Startup watchdog** (`driver.rs`, `chat.rs`): all providers have 60 seconds for login-shell
   setup, workspace startup hooks, MCP discovery and protocol initialization. Once initialized,
   leaving a chat idle does not expire it. An unused failed launch closes without switching to a
@@ -687,14 +690,15 @@ verified. See [integration design](../agent-harness-design.md) for the plugin bo
 ## View switch, rewind, and branch
 
 - **View switch.** `POST /api/v1/sessions/{id}/view {ui:"chat"|"term", force?}` flips a session
-  between chat and TUI on the same id (same AgentRecord, resume target). Kill-then-respawn is **not
+  between chat and TUI for Claude/Codex on the same id (same AgentRecord, resume target).
+  ACP providers do not support this transition. Kill-then-respawn is **not
   atomic** — every respawn precondition is resolved before the kill; concurrent toggles serialize on
   `chat_switching` (double-click → 409). On term→chat, native or earlier Chimaera history is imported
   before the transition marker, so the chat reopens with its transcript rather than only “continued
   in chat”; a terminal resurrected after daemon restart uses its durable resume handle even before a
   fresh transcript hook arrives. A busy `Running` agent needs `force` (409); the UI then asks in an
-  in-app `ConfirmDialog` ("Open as chat?", Enter switches, Escape keeps the turn). **Billing note:**
-  the TUI side bills like an interactive session; the chat side drives the structured protocol. This
+  in-app `ConfirmDialog` ("Open as chat?", Enter switches, Escape keeps the turn). **Account use:**
+  the agent runs under its own credentials and settings; the chat side drives its structured protocol. This
   is also the **`/login` recovery** path (see [Composing & sending](#composing--sending)): an
   expired-auth session flips to its TUI so claude's native auth flow can run.
 - **Branch at any message, without stopping the source.** Hover an assistant response and choose its
@@ -727,9 +731,10 @@ verified. See [integration design](../agent-harness-design.md) for the plugin bo
 ## Status: partial
 
 - Chat sessions survive a *disconnect* **and a daemon restart** — the ledger resurrects them live
-  (resuming the native conversation, carrying the pinned title, the Remote Control bridge and
-  ultracode; a turn or background work the restart cut off is handed back to the agent in one
-  message tagged **sent by chimaera after a restart**, setting `chat.resumeAfterRestart`). A normally finished Codex chat
+  (resuming the native conversation, carrying the pinned title and supported controls such as
+  Claude Remote Control and ultracode; a turn or background work the restart cut off is handed back to the agent in one
+  message tagged **sent by chimaera after a restart**, setting `chat.resumeAfterRestart`,
+  except Mastermind and cluster workspace jobs, which reopen idle). A normally finished Codex chat
   preserves its native thread id in Recents, whose click starts `thread/resume` under a new Chimaera
   session id (see [lifecycle-and-persistence.md](lifecycle-and-persistence.md)).
 - [Pro transfers](pro.md) preserve finished conversations without starting another
@@ -843,7 +848,7 @@ _Captured 2026-07-16 (from the maintainer, PR #69)._
 - **Do not change:** nothing — the **whole area is open**. Grade: an addition, no core bets.
 
 ### Why chat mode exists
-_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+_Captured 2026-07-09 — drafted from docs/design/README.md + code, confirmed live with the maintainer._
 
 - **Problem it solves.** The rich Tier-B surface that replaces the Claude desktop app. It became the
   *default* agent view on 2026-07-07, deliberately accepting the billing exposure (Tier B is exactly

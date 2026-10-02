@@ -2,7 +2,7 @@
 
 The single source of truth for how Chimaera versions and ships. The root
 [AGENTS.md](../../AGENTS.md), the [ship-pr skill](../../.claude/skills/ship-pr/SKILL.md),
-[CONTRIBUTING.md](../../CONTRIBUTING.md), and `.github/workflows/release.yml` all
+[.github/CONTRIBUTING.md](../../.github/CONTRIBUTING.md), and `.github/workflows/release.yml` all
 point here — change the policy here (and in the script + its test), not by editing
 five copies.
 
@@ -28,8 +28,8 @@ already-tagged commit finds none and skips.
 |---|---|---|
 | `feat:` | **minor** (0.3.2 → 0.4.0) | a genuinely new user-facing capability |
 | `fix:` · `perf:` · `revert:` | **patch** (0.3.2 → 0.3.3) | a small change that ships |
-| any `!:` (e.g. `feat!:`) | **major** (0.3.2 → 1.0.0) | a breaking change |
-| `refactor:` · `chore:` · `docs:` · `test:` · `ci:` · `build:` · `style:` | **no release** | rebuilds, but ships no new version |
+| conventional type with `!:` (e.g. `feat!:`), or `BREAKING CHANGE` / `BREAKING-CHANGE` in the subject | **major** (0.3.2 → 1.0.0) | a breaking change |
+| `refactor:` · `chore:` · `docs:` · `test:` · `ci:` · `build:` · `style:` | **no release requested** | contributes no bump; CI still checks the merge |
 | `[skip release]` in the subject | **no release** for that merge | explicit opt-out (wins over its own type; its code still ships with the next release) |
 | anything else / no prefix | **patch** | safe default — never a silent skip |
 
@@ -52,14 +52,16 @@ never a body.
 On squash-merge GitHub folds the whole PR description into the commit body, so
 reading the type / `!` / `[skip release]` from the entire message would let a stray
 body line flip the bump or skip a release. Put the load-bearing bits in the **PR
-title**. A breaking change must carry `!` in the subject (`feat!:`) — a
-`BREAKING CHANGE` footer in the body is deliberately not honored, for the same reason.
+title**. Use `!` in the subject for a breaking change (`feat!:`). The script also
+recognizes `BREAKING CHANGE` or `BREAKING-CHANGE` in the subject; a footer in the
+body is deliberately not honored, for the same reason.
 
 ## Skipping a release
 
 Put `[skip release]` in the **PR title** (it becomes the squash subject), or simply
-use a no-release type (`refactor:` / `chore:` / `docs:` / …). Both stop the release
-without touching the build.
+use a no-release type (`refactor:` / `chore:` / `docs:` / …). Both request no
+release for that merge; CI still checks it. An earlier unreleased merge can still
+request a release in the same run.
 
 ## The logic is tested (change the two together)
 

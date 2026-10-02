@@ -2,7 +2,7 @@
 //! a `current` link naming the version that loads and a `previous` link
 //! naming the one Use previous goes back to. Written only by a visible
 //! install or update (the user's click, or `chimaera plugin add|update`).
-//! Design: docs/plugin-system-plan.md ("Versions and updates").
+//! Design: docs/design/plugin-system-plan.md ("Versions and updates").
 //!
 //! - **Three ways in, one layout.** A first-party plugin installs the
 //!   release the lock pins (`POST /plugins/{pid}/install`), fetched by
