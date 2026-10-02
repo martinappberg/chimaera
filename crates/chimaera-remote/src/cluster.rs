@@ -1827,6 +1827,260 @@ pub async fn record_end(host: &str, home: RemoteHome, record: &JobRecord) -> any
     Ok(ended)
 }
 
+/// Positive scheduler evidence for one keeper-stable submission, independent
+/// of queue absence and the presentation-only `ENDED` fallback. Unknown,
+/// failed, malformed, mismatched or conflicting observations never prove idle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalEvidence {
+    pub job_id: String,
+    pub slurm_job_id: String,
+    pub state: &'static str,
+    pub source: TerminalSource,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalSource {
+    Accounting,
+    Controller,
+}
+
+/// Uses routed SSH, bounded output/deadline and exact stable scheduler name.
+/// `observed_id` is the last positively observed interactive allocation id;
+/// omission still permits exact-name accounting recovery, never name guessing.
+/// Call at the existing scheduler polling floor, never once per viewer.
+pub async fn terminal_evidence(
+    host: &str,
+    record: &JobRecord,
+    observed_id: Option<&str>,
+) -> anyhow::Result<Option<TerminalEvidence>> {
+    let expected = terminal_identity(record, observed_id)?;
+    let age = terminal_query_age(record.submitted_ms, now_ms());
+    if age.is_none() && expected.is_none() {
+        return Ok(None);
+    }
+    let nonce = chimaera_core::generate_token();
+    let script = format!(
+        "{}{}",
+        path_line(host),
+        terminal_script(&record.job_name, expected, age, &nonce)
+    );
+    let output = run_script(host, &script, EXEC_SECS).await?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(terminal_receipt(&output.stdout, &nonce, record, expected))
+}
+fn terminal_identity<'a>(
+    record: &'a JobRecord,
+    observed_id: Option<&'a str>,
+) -> anyhow::Result<Option<&'a str>> {
+    anyhow::ensure!(
+        valid_job_id(&record.id)
+            && record.job_name.starts_with("chimaera-")
+            && record.job_name.ends_with(&format!("~{}", &record.id[2..]))
+            && record.job_name.len() <= 128
+            && record
+                .job_name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-~".contains(&b)),
+        "invalid stable job identity"
+    );
+    if let (Some(a), Some(b)) = (record.slurm_job_id.as_deref(), observed_id) {
+        anyhow::ensure!(a == b, "scheduler job identity changed");
+    }
+    let id = record.slurm_job_id.as_deref().or(observed_id);
+    anyhow::ensure!(
+        id.is_none_or(|id| valid_slurm_job_id(id) && id.starts_with(|c: char| c.is_ascii_digit())),
+        "invalid scheduler job identity"
+    );
+    Ok(id)
+}
+// Ten minutes allows clock skew; a month bounds accounting history even for
+// a damaged/ancient journal. Older entries still permit exact controller proof.
+fn terminal_query_age(submitted_ms: u64, now: u64) -> Option<u64> {
+    const MONTH: u64 = 31 * 24 * 3600;
+    if submitted_ms == 0 || submitted_ms > now.saturating_add(600_000) {
+        return None;
+    }
+    let age = now.saturating_sub(submitted_ms) / 1000;
+    (age <= MONTH - 600).then_some(age + 600)
+}
+fn terminal_script(name: &str, id: Option<&str>, age: Option<u64>, nonce: &str) -> String {
+    let select = id
+        .map(|id| format!("-j {}", sh_quote(id)))
+        .unwrap_or_default();
+    let accounting = age.map(|age| format!("sacct -nPXD {select} -S now-{age}seconds --name={} -o JobID%64,JobName%128,State%64,UID 2>/dev/null; rc=$?", sh_quote(name))).unwrap_or_else(|| "rc=1".into());
+    let controller = id
+        .map(|id| format!("scontrol -o show job {} 2>/dev/null; rc=$?", sh_quote(id)))
+        .unwrap_or_else(|| "rc=1".into());
+    format!(
+        "printf '===begin {nonce}\n===sacct\n'\n\
+        {accounting}\n\
+        printf '\n===sacct_rc %s\n===scontrol\n' \"$rc\"\n\
+        {controller}\n\
+        printf '\n===scontrol_rc %s\n===uid %s\n===end\n' \"$rc\" \"$(id -u)\"\n"
+    )
+}
+#[derive(Clone, Debug)]
+enum TerminalObservation {
+    Unknown,
+    Live,
+    Terminal(TerminalEvidence),
+    Conflict,
+}
+fn terminal_receipt(
+    bytes: &[u8],
+    nonce: &str,
+    record: &JobRecord,
+    expected: Option<&str>,
+) -> Option<TerminalEvidence> {
+    if bytes.len() > 64 * 1024 {
+        return None;
+    }
+    let stdout = std::str::from_utf8(bytes).ok()?;
+    let begin = format!("===begin {nonce}\n");
+    let start = stdout.lines().position(|line| line == begin.trim_end())?;
+    let framed = stdout.lines().skip(start).collect::<Vec<_>>().join("\n");
+    let secs = sections(&framed);
+    if secs.len() != 7
+        || secs[0].0 != format!("begin {nonce}")
+        || secs[1].0 != "sacct"
+        || !secs[2].0.starts_with("sacct_rc ")
+        || secs[3].0 != "scontrol"
+        || !secs[4].0.starts_with("scontrol_rc ")
+        || !secs[5].0.starts_with("uid ")
+        || secs[6].0 != "end"
+        || secs
+            .iter()
+            .enumerate()
+            .any(|(i, (_, body))| i != 1 && i != 3 && !body.trim().is_empty())
+    {
+        return None;
+    }
+    let rc = |index: usize| secs[index].0.split_once(' ')?.1.parse::<u8>().ok();
+    let uid = secs[5].0.strip_prefix("uid ")?.parse::<u32>().ok()?;
+    let accounting = if rc(2)? == 0 {
+        terminal_accounting(&secs[1].1, record, expected, uid)
+    } else {
+        TerminalObservation::Unknown
+    };
+    let controller = if rc(4)? == 0 {
+        terminal_controller(&secs[3].1, record, expected, uid)
+    } else {
+        TerminalObservation::Unknown
+    };
+    match (accounting, controller) {
+        (TerminalObservation::Live | TerminalObservation::Conflict, _)
+        | (_, TerminalObservation::Live | TerminalObservation::Conflict) => None,
+        (TerminalObservation::Terminal(a), TerminalObservation::Terminal(b))
+            if a.slurm_job_id != b.slurm_job_id || a.state != b.state =>
+        {
+            None
+        }
+        (TerminalObservation::Terminal(a), _) => Some(a),
+        (_, TerminalObservation::Terminal(b)) => Some(b),
+        _ => None,
+    }
+}
+fn terminal_accounting(
+    body: &str,
+    record: &JobRecord,
+    expected: Option<&str>,
+    uid: u32,
+) -> TerminalObservation {
+    let mut evidence: Option<TerminalEvidence> = None;
+    for (n, line) in body.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+        if n >= 1 {
+            return TerminalObservation::Conflict;
+        }
+        let fields: Vec<_> = line.split('|').map(str::trim).collect();
+        if fields.len() != 4
+            || !valid_slurm_job_id(fields[0])
+            || !fields[0].starts_with(|c: char| c.is_ascii_digit())
+            || expected.is_some_and(|id| id != fields[0])
+            || fields[1] != record.job_name
+            || fields[3].parse::<u32>().ok() != Some(uid)
+        {
+            return TerminalObservation::Conflict;
+        }
+        let Some(state) = exact_terminal_state(fields[2]) else {
+            return TerminalObservation::Live;
+        };
+        let next = TerminalEvidence {
+            job_id: record.id.clone(),
+            slurm_job_id: fields[0].into(),
+            state,
+            source: TerminalSource::Accounting,
+        };
+        if evidence
+            .as_ref()
+            .is_some_and(|e| e.slurm_job_id != next.slurm_job_id || e.state != next.state)
+        {
+            return TerminalObservation::Conflict;
+        }
+        evidence = Some(next);
+    }
+    evidence
+        .map(TerminalObservation::Terminal)
+        .unwrap_or(TerminalObservation::Unknown)
+}
+fn terminal_controller(
+    body: &str,
+    record: &JobRecord,
+    expected: Option<&str>,
+    uid: u32,
+) -> TerminalObservation {
+    let mut lines = body.lines().filter(|l| !l.trim().is_empty());
+    let Some(line) = lines.next() else {
+        return TerminalObservation::Unknown;
+    };
+    if lines.next().is_some() {
+        return TerminalObservation::Conflict;
+    }
+    let mut fields = std::collections::BTreeMap::new();
+    for part in line.split_whitespace() {
+        if let Some((key, value)) = part.split_once('=') {
+            if fields.insert(key, value).is_some() {
+                return TerminalObservation::Conflict;
+            }
+        }
+    }
+    let Some(id) = fields.get("JobId") else {
+        return TerminalObservation::Conflict;
+    };
+    let owner = fields
+        .get("UserId")
+        .and_then(|u| u.rsplit_once('('))
+        .and_then(|(_, n)| n.strip_suffix(')'))
+        .and_then(|n| n.parse::<u32>().ok());
+    if expected != Some(*id)
+        || fields.get("JobName").copied() != Some(record.job_name.as_str())
+        || owner != Some(uid)
+    {
+        return TerminalObservation::Conflict;
+    }
+    let Some(state) = fields.get("JobState").and_then(|s| exact_terminal_state(s)) else {
+        return TerminalObservation::Live;
+    };
+    TerminalObservation::Terminal(TerminalEvidence {
+        job_id: record.id.clone(),
+        slurm_job_id: (*id).into(),
+        state,
+        source: TerminalSource::Controller,
+    })
+}
+fn exact_terminal_state(state: &str) -> Option<&'static str> {
+    slurm::TERMINAL_STATES
+        .iter()
+        .find(|candidate| {
+            state == **candidate
+                || (**candidate == "CANCELLED"
+                    && state
+                        .strip_prefix("CANCELLED by ")
+                        .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())))
+        })
+        .copied()
+}
+
 /// Forget an ended job: remove its folder (its script and Slurm's output).
 /// Workspaces keep their chats in their own folders.
 pub async fn dismiss_job(host: &str, home: RemoteHome, jid: &str) -> anyhow::Result<()> {
@@ -2686,6 +2940,201 @@ mod tests {
         )
         .unwrap();
         assert_eq!(marker_arg(&batch, "id"), Some("12345"));
+    }
+
+    fn terminal_record() -> JobRecord {
+        JobRecord {
+            id: "j-1234abcd".into(),
+            job_name: "chimaera-fixture~1234abcd".into(),
+            slurm_job_id: Some("123".into()),
+            ..Default::default()
+        }
+    }
+    fn terminal_frame(accounting: &str, acct_rc: u8, controller: &str, control_rc: u8) -> Vec<u8> {
+        format!("noise\n===begin fresh\n===sacct\n{accounting}\n===sacct_rc {acct_rc}\n===scontrol\n{controller}\n===scontrol_rc {control_rc}\n===uid 1000\n===end\n").into_bytes()
+    }
+    #[test]
+    fn terminal_proof_requires_exact_name_id_uid_and_successful_fresh_complete_frame() {
+        let record = terminal_record();
+        let row = "123|chimaera-fixture~1234abcd|COMPLETED|1000";
+        let valid = terminal_frame(row, 0, "", 1);
+        let proof = terminal_receipt(&valid, "fresh", &record, Some("123")).unwrap();
+        assert_eq!(
+            (
+                proof.job_id.as_str(),
+                proof.slurm_job_id.as_str(),
+                proof.state,
+                proof.source
+            ),
+            ("j-1234abcd", "123", "COMPLETED", TerminalSource::Accounting)
+        );
+        for bad in [
+            "124|chimaera-fixture~1234abcd|COMPLETED|1000",
+            "123|chimaera-other~1234abcd|COMPLETED|1000",
+            "123|chimaera-fixture~1234abcd|COMPLETED|1001",
+            "123.batch|chimaera-fixture~1234abcd|COMPLETED|1000",
+            "123|chimaera-fixture~1234abcd|COMPLETED+|1000",
+            "123|chimaera-fixture~1234abcd|RUNNING|1000",
+            "123|chimaera-fixture~1234abcd|ENDED|1000",
+            "123|chimaera-fixture~1234abcd|CANCELLED_REQUEUED|1000",
+            "123|chimaera-fixture~1234abcd|COMPLETED|1000|extra",
+        ] {
+            assert!(terminal_receipt(
+                &terminal_frame(bad, 0, "", 1),
+                "fresh",
+                &record,
+                Some("123")
+            )
+            .is_none());
+        }
+        assert!(terminal_receipt(
+            &terminal_frame(row, 1, "", 1),
+            "fresh",
+            &record,
+            Some("123")
+        )
+        .is_none());
+        assert!(terminal_receipt(&valid, "different", &record, Some("123")).is_none());
+        for damaged in [
+            valid[..valid.len() - 8].to_vec(),
+            [valid.clone(), b"===end\n".to_vec()].concat(),
+            [valid.clone(), b"unexpected\n".to_vec()].concat(),
+            vec![b'x'; 65537],
+        ] {
+            assert!(terminal_receipt(&damaged, "fresh", &record, Some("123")).is_none());
+        }
+        let mut wrong = record.clone();
+        wrong.job_name = "chimaera-other~99999999".into();
+        assert!(terminal_identity(&wrong, None).is_err());
+        assert!(terminal_identity(&record, Some("124")).is_err());
+    }
+    #[test]
+    fn terminal_controller_fallback_refuses_live_conflicting_and_unknown_observations() {
+        let record = terminal_record();
+        let control =
+            "JobId=123 JobName=chimaera-fixture~1234abcd UserId=fixture(1000) JobState=CANCELLED";
+        let proof = terminal_receipt(
+            &terminal_frame("", 1, control, 0),
+            "fresh",
+            &record,
+            Some("123"),
+        )
+        .unwrap();
+        assert_eq!(
+            (proof.state, proof.source),
+            ("CANCELLED", TerminalSource::Controller)
+        );
+        for bad in [
+            control.replace("JobId=123", "JobId=124"),
+            control.replace("UserId=fixture(1000)", "UserId=fixture(1001)"),
+            control.replace("CANCELLED", "RUNNING"),
+            control.replace("CANCELLED", "UNKNOWN"),
+            format!("{control} JobId=123"),
+        ] {
+            assert!(terminal_receipt(
+                &terminal_frame("", 1, &bad, 0),
+                "fresh",
+                &record,
+                Some("123")
+            )
+            .is_none());
+        }
+        let completed = "123|chimaera-fixture~1234abcd|COMPLETED|1000";
+        for contradiction in [control.replace("CANCELLED", "RUNNING"), control.to_string()] {
+            assert!(terminal_receipt(
+                &terminal_frame(completed, 0, &contradiction, 0),
+                "fresh",
+                &record,
+                Some("123")
+            )
+            .is_none());
+        }
+        assert!(
+            terminal_receipt(&terminal_frame("", 0, "", 1), "fresh", &record, Some("123"))
+                .is_none()
+        );
+        assert!(
+            terminal_receipt(&terminal_frame("", 1, "", 1), "fresh", &record, Some("123"))
+                .is_none()
+        );
+        assert!(terminal_receipt(
+            &terminal_frame(
+                "123|chimaera-fixture~1234abcd|CANCELLED by 1000|1000",
+                0,
+                "",
+                1
+            ),
+            "fresh",
+            &record,
+            Some("123")
+        )
+        .is_some());
+        assert!(terminal_receipt(&terminal_frame("123|chimaera-fixture~1234abcd|COMPLETED|1000\n124|chimaera-fixture~1234abcd|COMPLETED|1000",0,"",1),"fresh",&record,None).is_none());
+    }
+    #[test]
+    fn terminal_accounting_window_is_bounded_by_submission_time_not_epoch_history() {
+        let now = 1_900_000_000_000u64;
+        assert_eq!(terminal_query_age(now - 5_000, now), Some(605));
+        assert_eq!(terminal_query_age(now + 5_000, now), Some(600));
+        assert!(terminal_query_age(0, now).is_none());
+        assert!(terminal_query_age(now + 600_001, now).is_none());
+        assert!(terminal_query_age(now - 31 * 24 * 3600 * 1000, now).is_none());
+        let script = terminal_script("chimaera-fixture~1234abcd", None, Some(605), "fresh");
+        assert!(script.contains("-S now-605seconds"));
+        assert!(script.contains("-nPXD"));
+        assert!(!script.contains("1970"));
+        let record = terminal_record();
+        let row = "123|chimaera-fixture~1234abcd|COMPLETED|1000";
+        assert!(terminal_receipt(
+            &terminal_frame(&format!("{row}\n{row}"), 0, "", 1),
+            "fresh",
+            &record,
+            Some("123")
+        )
+        .is_none());
+    }
+    #[test]
+    fn terminal_probe_real_shell_retains_status_and_controller_fallback_without_queue_guessing() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = SubmissionFixture::new("exit 0");
+        let record = terminal_record();
+        for (accounting,controller,source) in [
+            ("printf '123|chimaera-fixture~1234abcd|COMPLETED|%s\\n' \"$(id -u)\"","exit 1",Some(TerminalSource::Accounting)),
+            ("exit 1","printf 'JobId=123 JobName=chimaera-fixture~1234abcd UserId=fixture(%s) JobState=TIMEOUT\\n' \"$(id -u)\"",Some(TerminalSource::Controller)),
+            ("exit 1","exit 1",None),
+            ("printf '123|chimaera-fixture~1234abcd|RUNNING|%s\\n' \"$(id -u)\"","exit 1",None),
+        ] {
+            for (name,body) in [("sacct",accounting),("scontrol",controller)] {
+                let path=fixture.0.join("bin").join(name);std::fs::write(&path,format!("#!/bin/sh\n{body}\n")).unwrap();std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let output=fixture.run(&terminal_script(&record.job_name,Some("123"),Some(600),"fresh"));
+            assert!(output.status.success());
+            assert_eq!(terminal_receipt(&output.stdout,"fresh",&record,Some("123")).map(|p|p.source),source);
+        }
+    }
+
+    #[test]
+    fn terminal_old_or_missing_submission_still_allows_exact_controller_proof() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = SubmissionFixture::new("exit 0");
+        let control = fixture.0.join("bin/scontrol");
+        std::fs::write(&control,"#!/bin/sh\nprintf 'JobId=123 JobName=chimaera-fixture~1234abcd UserId=fixture(%s) JobState=COMPLETED\\n' \"$(id -u)\"\n").unwrap();
+        std::fs::set_permissions(control, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let record = terminal_record();
+        let now = 1_900_000_000_000u64;
+        for submitted in [0, now - 32 * 24 * 3600 * 1000, now + 600_001] {
+            let age = terminal_query_age(submitted, now);
+            assert!(age.is_none());
+            let script = terminal_script(&record.job_name, Some("123"), age, "fresh");
+            assert!(!script.contains("sacct -"));
+            let output = fixture.run(&script);
+            assert!(output.status.success());
+            let evidence = terminal_receipt(&output.stdout, "fresh", &record, Some("123")).unwrap();
+            assert_eq!(
+                (evidence.state, evidence.source),
+                ("COMPLETED", TerminalSource::Controller)
+            );
+        }
     }
 
     struct SubmissionFixture(std::path::PathBuf);

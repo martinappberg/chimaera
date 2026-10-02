@@ -1,7 +1,9 @@
 # Logical project viewing
 
 Opening a synced project on another computer creates or updates a local copy
-without acquiring ownership, waking a worker or changing its preferred home.
+without acquiring ownership or changing its preferred home. The copy transfer
+itself does not wake compute. An explicit user open may carry wake intent for
+the current cloud owner; background polls, refreshes and passive attaches never do.
 A passive owner view and ordinary input keep their route to the current owner;
 only explicit Take over moves execution. Copy edits are not automatically
 published. A browser gateway may still apply its separately negotiated sleeping
@@ -29,8 +31,8 @@ Availability is `owned`, `suspended`, `unowned`, `expired`, or `privacy_disabled
 (clients read any newer value as unknown and never route it). `suspended` is a
 cloud machine that went to sleep keeping ownership: its lease reads expired by
 design, it keeps its `worker-` route, and it is routable like `owned` (the
-account refuses anyone else's acquire with 409 `held`). Viewing it never wakes
-it; a send or a permission answer carries wake intent (`X-Chimaera-Wake:
+account refuses anyone else's acquire with 409 `held`). Passive viewing never wakes
+it. An explicit user open, a send or a permission answer can carry wake intent (`X-Chimaera-Wake:
 interaction` on HTTP, `wake=interaction` on a socket; any non-GET counts) and
 the transport wakes it. A frozen owner cannot answer the native shell's full
 project check, so for a `suspended` placement the shell accepts the transport's

@@ -326,37 +326,45 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
             rows.push((entry.created_at, row));
         }
     }
-    for remote in state.session_proxy.rows() {
-        // The app registers only a verified remote epoch; an old local row
-        // must not shadow the current owner after a handoff.
+    finish_rows(rows, state.session_proxy.rows(), |row| {
+        // Additive: `git` ({repo, worktree, branch, detached, head} or
+        // null outside a repository), and an agent's hook-reported cwd
+        // as its `cwd_current` (a shell's polled cwd is already there).
+        if let serde_json::Value::Object(map) = row {
+            let facts = map
+                .get("id")
+                .and_then(|id| id.as_str())
+                .and_then(|id| git_rows.get(id));
+            if let Some(cwd) = facts.and_then(|f| f.hook_cwd.as_ref()) {
+                if map.get("kind").and_then(|k| k.as_str()) == Some("agent") {
+                    map.insert("cwd_current".to_string(), json!(cwd));
+                }
+            }
+            map.insert(
+                "git".to_string(),
+                facts.map_or(serde_json::Value::Null, |f| f.git.clone()),
+            );
+        }
+    })
+}
+
+fn finish_rows(
+    mut rows: Vec<(u64, serde_json::Value)>,
+    remote: Vec<serde_json::Value>,
+    mut enrich_local: impl FnMut(&mut serde_json::Value),
+) -> Vec<serde_json::Value> {
+    // Local tracker facts belong only to rows assembled on this daemon.
+    // A verified owner row supersedes them intact, including its Git and cwd.
+    for (_, row) in &mut rows {
+        enrich_local(row);
+    }
+    for remote in remote {
         rows.retain(|(_, row)| row["id"] != remote["id"]);
         let created = remote["created_at"].as_u64().unwrap_or(0);
         rows.push((created, remote));
     }
     rows.sort_by_key(|(created, _)| *created);
-    rows.into_iter()
-        .map(|(_, mut row)| {
-            // Additive: `git` ({repo, worktree, branch, detached, head} or
-            // null outside a repository), and an agent's hook-reported cwd
-            // as its `cwd_current` (a shell's polled cwd is already there).
-            if let serde_json::Value::Object(map) = &mut row {
-                let facts = map
-                    .get("id")
-                    .and_then(|id| id.as_str())
-                    .and_then(|id| git_rows.get(id));
-                if let Some(cwd) = facts.and_then(|f| f.hook_cwd.as_ref()) {
-                    if map.get("kind").and_then(|k| k.as_str()) == Some("agent") {
-                        map.insert("cwd_current".to_string(), json!(cwd));
-                    }
-                }
-                map.insert(
-                    "git".to_string(),
-                    facts.map_or(serde_json::Value::Null, |f| f.git.clone()),
-                );
-            }
-            row
-        })
-        .collect()
+    rows.into_iter().map(|(_, row)| row).collect()
 }
 
 /// How long a built events-bus sessions frame stays reusable within one
@@ -488,6 +496,34 @@ pub(crate) fn display_name_now(state: &AppState, id: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::agent_state::{AgentKind, AgentRecord};
+
+    #[test]
+    fn routed_owner_git_and_cwd_survive_stale_local_enrichment() {
+        let owner = json!({"id":"s-shared", "created_at":2, "kind":"agent",
+            "cwd_current":"/owner/worktree", "git":{"branch":"owner"},
+            "placement":{"remote":"verified-host"}});
+        let fresh = json!({"id":"s-remote-only", "created_at":3,
+            "git":{"branch":"owner-new"}, "cwd_current":"/owner/new"});
+        let rows = finish_rows(
+            vec![
+                (1, json!({"id":"s-shared","kind":"agent","git":null})),
+                (0, json!({"id":"s-local","kind":"agent"})),
+            ],
+            vec![owner.clone(), fresh.clone()],
+            |row| {
+                if row["id"] == "s-shared" || row["id"] == "s-local" {
+                    row["cwd_current"] = json!("/local/stale");
+                    row["git"] = json!({"branch":"local"});
+                } else {
+                    row["git"] = serde_json::Value::Null;
+                }
+            },
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["git"]["branch"], "local");
+        assert_eq!(rows[1], owner);
+        assert_eq!(rows[2], fresh);
+    }
 
     fn info(alive: bool, last_output_at: u64) -> chimaera_pty::SessionInfo {
         chimaera_pty::SessionInfo {
