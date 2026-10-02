@@ -133,7 +133,10 @@ Nothing site-specific is ever coded.
   as the job runs and the app is open. Fallback: ssh into the node; else "can't reach
   compute nodes here". Every rung is proven by an authenticated 200 through our forward.
 - **Stop.** `scancel`; "Invalid job id" is success; the record says "stopped by you" only
-  when the stop took. The card keeps “Stopping…” until Slurm finishes cancellation;
+  when the stop took. Confirming closes the dialog immediately; progress and any
+  retryable error appear on the job card. The card and its workspace rows switch to
+  stopping together, with workspace actions hidden while shutdown is in progress.
+  The card keeps “Stopping…” until Slurm finishes cancellation;
   a disappearing daemon cannot turn it back into “Starting…”. Slurm's `COMPLETING`
   state also reads as stopping, including after reopening the page. These jobs are
   no longer offered as destinations for opening a workspace.

@@ -288,7 +288,10 @@ export function endedLine(j: ClusterJob, nowMs: number, locale?: string): string
 }
 
 /** What a workspace row says about itself (plan §4.2). */
-export function workspaceActivity(w: ClusterWorkspaceView, nowMs: number, locale?: string): string {
+export function workspaceActivity(w: ClusterWorkspaceView, nowMs: number, locale?: string, jobStopping = false): string {
+  // A job's stop intent supersedes its last workspace snapshot, even before
+  // the remote command returns or job-host publishes its closing state.
+  if (jobStopping) return w.state === "open" ? "closing with job…" : "job is stopping…";
   if (w.failed !== undefined) return "stopped unexpectedly";
   switch (w.state) {
     case "open":

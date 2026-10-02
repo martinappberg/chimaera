@@ -354,6 +354,19 @@ describe("jobs in words", () => {
     expect(workspaceActivity(ws(), NOW)).toBe("not opened yet");
   });
 
+  it("lets job shutdown override stale workspace opening and working snapshots", () => {
+    for (const opening of [true, false]) {
+      expect(workspaceActivity(ws({ state: "queued", opening }), NOW, undefined, true)).toBe(
+        "job is stopping…",
+      );
+    }
+    for (const closing of [true, false]) {
+      expect(workspaceActivity(ws({ state: "open", working: 2, closing }), NOW, undefined, true)).toBe(
+        "closing with job…",
+      );
+    }
+  });
+
   it("lets you pick where Open goes whenever a job is alive", () => {
     expect(openPlan([])).toEqual({ kind: "sheet" });
     expect(openPlan([job({ state: "ended" })])).toEqual({ kind: "sheet" });

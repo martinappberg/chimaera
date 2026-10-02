@@ -97,7 +97,9 @@
   const loginServe = $derived(host?.cluster?.login_serve === true);
   const loginDaemon = $derived(loginServe ? null : (host?.cluster?.login_daemon ?? null));
 
-  const jobs = $derived(overview === null ? [] : liveJobs(overview.jobs));
+  const jobs = $derived(overview === null ? [] : liveJobs(overview.jobs).map((j) =>
+    jobBusy[j.id] === "stopping" || jobBusy[j.id] === "cancelling" ? { ...j, stopping: true } : j,
+  ));
   const running = $derived(jobs.filter((j) => j.state === "running" && !isJobStopping(j)));
   const ended = $derived(
     (overview?.jobs ?? [])
@@ -162,7 +164,6 @@
     { mode: "startup"; workspace: { id: string; name: string } | null } | { mode: "rules" } | null
   >(null);
   let confirmStop = $state<ClusterJob | null>(null);
-  let confirmStopError = $state<string | null>(null);
   let confirmClose = $state<ClusterWorkspaceView | null>(null);
   let confirmRemove = $state<ClusterWorkspaceView | null>(null);
   let confirmRemoveError = $state<string | null>(null);
@@ -257,6 +258,8 @@
   }
 
   function openIn(w: ClusterWorkspaceView, jobId: string | null): void {
+    const target = jobs.find((j) => j.id === (jobId ?? w.job));
+    if (target !== undefined && isJobStopping(target)) return;
     void wsAction(w, "opening", () => clusterOpen(alias, w.id, jobId));
   }
 
@@ -273,7 +276,7 @@
       else openIn(w, null);
       return;
     }
-    const plan = openPlan(overview?.jobs ?? []);
+    const plan = openPlan(jobs);
     if (plan.kind === "sheet") {
       startSheet([w.id]);
       return;
@@ -349,20 +352,11 @@
     contextMenu.openAtPoint(r.left, r.bottom + 4, items);
   }
 
-  async function confirmStopNow(): Promise<void> {
+  function confirmStopNow(): void {
     const j = confirmStop;
     if (j === null) return;
-    confirmStopError = null;
-    jobBusy = setIn(jobBusy, j.id, "stopping");
-    try {
-      await clusterStopJob(alias, j.id);
-      confirmStop = null;
-    } catch (e) {
-      confirmStopError = errText(e);
-      jobBusy = setIn(jobBusy, j.id, null);
-    } finally {
-      refresh();
-    }
+    confirmStop = null;
+    void jobAction(j, "stopping", () => clusterStopJob(alias, j.id));
   }
 
   async function removeNow(): Promise<void> {
@@ -503,53 +497,55 @@
   </button>
 {/snippet}
 
-{#snippet wsRow(w: ClusterWorkspaceView)}
+{#snippet wsRow(w: ClusterWorkspaceView, stopping = false)}
   {@const busy = wsBusy[w.id]}
-  {@const activity = workspaceActivity(w, clusterTime)}
-  <div class="ws" class:live={w.state === "open"}>
+  {@const activity = workspaceActivity(w, clusterTime, undefined, stopping)}
+  <div class="ws" class:live={w.state === "open" && !stopping}>
     <div class="ws-main">
       <span class="name" title={w.name}>{w.name}</span>
       <span class="path" title={w.path}>{tildePath(w.path, overview?.home)}</span>
       {#if w.id === here}<span class="here-tag">this window</span>{/if}
-      <span class="acts">
-        {#if busy !== undefined}
-          <span class="busy-word"
-            >{busy === "opening"
-              ? "Opening…"
-              : busy === "closing"
-                ? "Closing…"
-                : busy === "moving"
-                  ? "Moving…"
-                  : "Removing…"}</span
-          >
-        {:else}
-          {#if w.state !== "queued" && !w.closing}
-            <button
-              class="act primary"
-              aria-haspopup={w.state === "closed" && jobs.length > 0 ? "menu" : undefined}
-              onclick={(e) => openClicked(e, w)}
+      {#if !stopping}
+        <span class="acts">
+          {#if busy !== undefined}
+            <span class="busy-word"
+              >{busy === "opening"
+                ? "Opening…"
+                : busy === "closing"
+                  ? "Closing…"
+                  : busy === "moving"
+                    ? "Moving…"
+                    : "Removing…"}</span
             >
-              Open{#if w.state === "closed" && jobs.length > 0}
-                <svg class="chev-down" viewBox="0 0 16 16" width="9" height="9" aria-hidden="true">
-                  <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-              {/if}
-            </button>
+          {:else}
+            {#if w.state !== "queued" && !w.closing}
+              <button
+                class="act primary"
+                aria-haspopup={w.state === "closed" && jobs.length > 0 ? "menu" : undefined}
+                onclick={(e) => openClicked(e, w)}
+              >
+                Open{#if w.state === "closed" && jobs.length > 0}
+                  <svg class="chev-down" viewBox="0 0 16 16" width="9" height="9" aria-hidden="true">
+                    <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                {/if}
+              </button>
+            {/if}
+            <button
+              class="act icon"
+              aria-label="More for {w.name}"
+              aria-haspopup="menu"
+              title="More"
+              onclick={(e) => wsMenu(e, w)}>{@render dots()}</button
+            >
           {/if}
-          <button
-            class="act icon"
-            aria-label="More for {w.name}"
-            aria-haspopup="menu"
-            title="More"
-            onclick={(e) => wsMenu(e, w)}>{@render dots()}</button
-          >
-        {/if}
-      </span>
+        </span>
+      {/if}
     </div>
     {#if activity !== ""}
-      <div class="detail" class:warn={w.failed !== undefined} title={w.failed || undefined}>{activity}</div>
+      <div class="detail" class:warn={!stopping && w.failed !== undefined} title={!stopping ? w.failed || undefined : undefined}>{activity}</div>
     {/if}
-    {#if wsError[w.id] !== undefined}
+    {#if !stopping && wsError[w.id] !== undefined}
       <div class="detail row-err">{wsError[w.id]}</div>
     {/if}
   </div>
@@ -684,11 +680,12 @@
         </div>
         {#each jobs as j (j.id)}
           {@const busy = jobBusy[j.id] ?? (isJobStopping(j) ? "stopping" : undefined)}
+          {@const stopping = isJobStopping(j)}
           {@const inside = wsIn(j)}
           {@const next = continuation(j)}
-          <div class="job" class:running={j.state === "running"}>
+          <div class="job" class:running={j.state === "running" && !stopping}>
             <div class="job-head">
-              <span class="dot {jobDot(j)}" title={j.state}></span>
+              <span class="dot {jobDot(j)}" title={stopping ? "stopping" : j.state}></span>
               <span class="job-name" title={j.slurm_job_id ? `Slurm job ${j.slurm_job_id}` : j.name}>{j.name}</span>
               <span class="acts">
                 {#if busy === "stopping"}
@@ -709,21 +706,18 @@
                   {/if}
                   <button
                     class="act"
-                    onclick={() => {
-                      confirmStopError = null;
-                      confirmStop = j;
-                    }}>Stop</button
+                    onclick={() => (confirmStop = j)}>Stop</button
                   >
                 {/if}
               </span>
             </div>
             <div class="job-line">{busy === "stopping" || busy === "cancelling" ? "Waiting for Slurm to finish…" : jobStatusLine(j, clusterTime)}</div>
-            {#if j.replaces !== undefined}
+            {#if !stopping && j.replaces !== undefined}
               <div class="job-line note">
                 Continues {jobName(j.replaces)} — its workspaces move here when this one starts.
               </div>
             {/if}
-            {#if next !== undefined}
+            {#if !stopping && next !== undefined}
               <div class="job-line note">Continuing in a new job — waiting for a node.</div>
             {/if}
             {#if j.state === "running" && j.egress === false}
@@ -735,7 +729,7 @@
             {#if inside.length > 0 || j.state === "running"}
               <div class="job-ws">
                 {#each inside as w (w.id)}
-                  {@render wsRow(w)}
+                  {@render wsRow(w, stopping)}
                 {/each}
                 {#if j.state === "running" && busy === undefined}
                   <button class="open-here" onclick={(e) => openHereMenu(e, j)}>
@@ -858,8 +852,7 @@
     body={stopBody(confirmStop)}
     confirmLabel="Stop job"
     danger
-    error={confirmStopError}
-    onConfirm={() => void confirmStopNow()}
+    onConfirm={confirmStopNow}
     onCancel={() => (confirmStop = null)}
   />
 {/if}
