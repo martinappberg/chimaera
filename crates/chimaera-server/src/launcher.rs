@@ -992,10 +992,6 @@ pub(crate) fn build_codex_chat_command(
     cmd
 }
 
-/// Escape a string for embedding in TOML basic-string quotes (`-c key="…"`).
-/// The prompt is a compile-time constant without quotes, backslashes, or
-/// control characters today; this keeps a future edit (say, a multi-line
-/// rewrite with real newlines) from silently breaking the config parse —
 /// An argv-only config override; the per-session secret stays inside the shim.
 pub(crate) fn codex_notify_args(path: &Path) -> Vec<String> {
     vec![

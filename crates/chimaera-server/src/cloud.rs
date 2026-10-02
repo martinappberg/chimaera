@@ -120,6 +120,30 @@ impl CloneChild {
             group,
         })
     }
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(unix)]
+        if let Some(group) = self.group {
+            use rustix::process::{waitid, WaitId, WaitIdOptions};
+            let mut changed =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
+            loop {
+                match waitid(
+                    WaitId::Pid(group),
+                    WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+                ) {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {}
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(error) => return Err(error.into()),
+                }
+                tokio::select! { _ = changed.recv() => {}, _ = tokio::time::sleep(Duration::from_millis(100)) => {} }
+            }
+            // Signal while the leader is still waitable, then clear its
+            // identity before reaping can allow the PID to be reused.
+            self.stop_group();
+        }
+        self.child.wait().await
+    }
     fn stop_group(&mut self) {
         #[cfg(unix)]
         if let Some(group) = self.group.take() {
@@ -138,9 +162,9 @@ async fn clone_status(command: &mut tokio::process::Command, limit: Duration) ->
     let Ok(mut child) = CloneChild::spawn(command) else {
         return false;
     };
-    let result = tokio::time::timeout(limit, child.child.wait()).await;
+    let result = tokio::time::timeout(limit, child.wait()).await;
     child.stop_group();
-    if result.is_err() {
+    if !matches!(result, Ok(Ok(_))) {
         let _ = child.child.kill().await;
     }
     matches!(result, Ok(Ok(status)) if status.success())
@@ -152,7 +176,7 @@ pub(crate) async fn project(
     if !enabled() {
         return unavailable();
     }
-    let Ok(_operation) = OPERATIONS.try_acquire() else {
+    let Ok(operation) = OPERATIONS.try_acquire() else {
         return (
             StatusCode::CONFLICT,
             Json(json!({"error":"another cloud project is still cloning"})),
@@ -179,7 +203,55 @@ pub(crate) async fn project(
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return error("home directory is unavailable");
     };
-    let projects = home.join("projects");
+    let operation = start_clone(
+        state,
+        home.join("projects"),
+        name,
+        url.to_string(),
+        PathBuf::from("git"),
+        Duration::from_secs(300),
+        operation,
+    );
+    operation
+        .await
+        .unwrap_or_else(|_| error("clone operation could not finish"))
+}
+fn publish_clone(staging: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
+    // No check/rename gap and no plain-rename fallback: a newly arrived file
+    // or empty directory belongs to its creator, even on clone completion.
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        staging,
+        rustix::fs::CWD,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(Into::into)
+}
+fn start_clone(
+    state: Arc<AppState>,
+    projects: PathBuf,
+    name: String,
+    url: String,
+    git: PathBuf,
+    limit: Duration,
+    operation: tokio::sync::SemaphorePermit<'static>,
+) -> tokio::task::JoinHandle<Response> {
+    tokio::spawn(async move {
+        // The detached operation owns the child, stage, publication and
+        // registration through caller cancellation, including failure cleanup.
+        let _operation = operation;
+        clone_project(state, projects, name, url, git, limit).await
+    })
+}
+async fn clone_project(
+    state: Arc<AppState>,
+    projects: PathBuf,
+    name: String,
+    url: String,
+    git: PathBuf,
+    limit: Duration,
+) -> Response {
     if tokio::fs::create_dir_all(&projects).await.is_err() {
         return error("could not create projects directory");
     }
@@ -193,7 +265,7 @@ pub(crate) async fn project(
     if tokio::fs::create_dir(&staging).await.is_err() {
         return error("could not reserve clone directory");
     }
-    let mut command = tokio::process::Command::new("git");
+    let mut command = tokio::process::Command::new(git);
     command
         .args([
             "-c",
@@ -203,30 +275,35 @@ pub(crate) async fn project(
             "clone",
             "--",
         ])
-        .arg(url.to_string())
+        .arg(&url)
         .arg(&staging)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let cloned = clone_status(&mut command, Duration::from_secs(300)).await;
+    let cloned = clone_status(&mut command, limit).await;
     if !cloned {
         let _ = tokio::fs::remove_dir_all(&staging).await;
         return error("clone failed; connect GitHub or check the repository URL");
     }
-    if tokio::fs::try_exists(&destination).await.unwrap_or(true)
-        || tokio::fs::rename(&staging, &destination).await.is_err()
-    {
+    let from = staging.clone();
+    let to = destination.clone();
+    if !matches!(
+        tokio::task::spawn_blocking(move || publish_clone(&from, &to)).await,
+        Ok(Ok(()))
+    ) {
         let _ = tokio::fs::remove_dir_all(&staging).await;
         return error("project name became unavailable");
     }
-    match crate::lock(&state.workspaces).add(PathBuf::from(&destination)) {
-        Ok(workspace) => {
+    let owner = state.clone();
+    let root = destination.clone();
+    match tokio::task::spawn_blocking(move || crate::lock(&owner.workspaces).add(root)).await {
+        Ok(Ok(workspace)) => {
             state.changes.notify_waiters();
             Json(json!({"workspace_id":workspace.id,"root":destination})).into_response()
         }
-        Err(_) => error("project cloned but could not be registered"),
+        _ => error("project cloned but could not be registered"),
     }
 }
 #[cfg(test)]
@@ -260,6 +337,128 @@ mod tests {
             remainder.is_empty(),
             "forked clone writer survived cancellation"
         );
+    }
+    fn clone_fixture() -> (Arc<AppState>, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!(
+            "chimaera-owned-clone-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(base.join("projects")).unwrap();
+        let base = base.canonicalize().unwrap();
+        let git = base.join("fake-git");
+        std::fs::write(&git,"#!/bin/sh\nfor stage do :; done\nprintf cloned > \"$stage/payload\"\nprintf ready > \"$stage/../ready\"\nwhile [ ! -f \"$stage/../release\" ]; do /bin/sleep 0.02; done\n").unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = Arc::new(AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            base.join("data"),
+            base.join("config"),
+        ));
+        (state, base, git)
+    }
+    async fn wait_file(path: &std::path::Path) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn cancelled_cloud_clone_retains_admission_until_timeout_cleanup() {
+        static ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let (state, base, git) = clone_fixture();
+        let owner = state.clone();
+        let projects = base.join("projects");
+        let permit = ADMISSION.acquire().await.unwrap();
+        let caller = tokio::spawn(async move {
+            start_clone(
+                owner,
+                projects,
+                "picked".into(),
+                "https://example.test/repo".into(),
+                git,
+                Duration::from_millis(250),
+                permit,
+            )
+            .await
+        });
+        wait_file(&base.join("projects/ready")).await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(
+            ADMISSION.try_acquire().is_err(),
+            "cancelled observer released live clone admission"
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(permit) = ADMISSION.try_acquire() {
+                    drop(permit);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!base.join("projects/picked").exists());
+        assert!(!std::fs::read_dir(base.join("projects"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".clone-")));
+        state
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+    #[tokio::test]
+    async fn completed_cloud_clone_preserves_an_arriving_empty_destination() {
+        use std::os::unix::fs::MetadataExt;
+        static ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let (state, base, git) = clone_fixture();
+        let worker = start_clone(
+            state.clone(),
+            base.join("projects"),
+            "picked".into(),
+            "https://example.test/repo".into(),
+            git,
+            Duration::from_secs(3),
+            ADMISSION.acquire().await.unwrap(),
+        );
+        wait_file(&base.join("projects/ready")).await;
+        let destination = base.join("projects/picked");
+        std::fs::create_dir(&destination).unwrap();
+        let inode = destination.metadata().unwrap().ino();
+        std::fs::write(base.join("projects/release"), "").unwrap();
+        assert_eq!(worker.await.unwrap().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(destination.metadata().unwrap().ino(), inode);
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+        assert!(!std::fs::read_dir(base.join("projects"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".clone-")));
+        // Exercise the actual publication primitive after its prior empty
+        // name observation: even an empty newly created directory survives.
+        let stage = base.join("projects/stage");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join("payload"), "cloned").unwrap();
+        assert!(publish_clone(&stage, &destination).is_err());
+        assert!(stage.join("payload").is_file());
+        assert_eq!(destination.metadata().unwrap().ino(), inode);
+        state
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+        std::fs::remove_dir_all(base).unwrap();
     }
     #[test]
     fn cloud_clone_cannot_accept_credentials_or_shell_protocols() {
