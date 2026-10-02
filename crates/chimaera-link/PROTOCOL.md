@@ -185,9 +185,11 @@ Optional additive fields, omitted by older services:
   read.
 - `keeper_restart_at` (RFC 3339 string or null): the account's always-on keeper
   connection will restart to update. A future time is when; a time in the past
-  means shortly, as soon as no Git transfer runs. The restart drops the SSH
-  logins the keeper holds, so a kept host asks for its sign-in again on next
-  use. Null (or absent) when no restart is planned; clients stop showing it
+  means pending, subject to safe rollout admission. With negotiated job holds,
+  held/unknown jobs or missing/stale supported reports defer every automated
+  restart; a past timestamp never authorizes interrupting an allocation. Git
+  transfers and the existing ordinary activity rules also apply. A safe idle
+  restart can drop idle SSH logins, which may need sign-in on next explicit use. Null (or absent) when no restart is planned; clients stop showing it
   when it returns to null. Presentation only, read like `returning_until`: a
   value that is not an RFC 3339 timestamp reads as absent.
 - `plans`: the account's current offers,
@@ -304,8 +306,9 @@ expiry. Device-code endpoints do not require an existing device bearer token.
 
 Capability-gated cluster control and keeper-owned job lifetimes are specified in
 [CLUSTER.md](CLUSTER.md). They are additive; absent negotiation preserves the
-ordinary host contract below. Host-bound key signing is not advertised by that
-contract.
+ordinary host contract below. Destination-bound native SSH signing has separate
+negotiation and authority in [SSH_AUTH.md](SSH_AUTH.md); cluster support never
+implies signing support.
 
 | Method and path | Request | Response |
 | --- | --- | --- |

@@ -4,7 +4,7 @@ Additive version 1 contract. Implementations advertise each capability only afte
 its acceptance gates pass. This document defines the wire; it does not claim a
 keeper deployment supports it. Existing Jobs, job records and workspace hosting
 remain the product model. Host-bound SSH signing is a separate, unadvertised
-follow-up.
+follow-up specified in [SSH_AUTH.md](SSH_AUTH.md).
 
 ## Negotiation and host policy
 
@@ -43,9 +43,12 @@ closing one cannot invalidate the other's job.
 
 Passive overview polling returns bounded cached state when an idle cluster has
 no authenticated connection. It never opens SSH, requests a password/signature
-or starts a cloud worker. A deliberate connect, refresh or operation may
-authenticate. While jobs hold the connection, queue reads are shared across
-all devices with the existing sixty-second floor. Missing or failed scheduler
+or starts a cloud worker. Explicit Connect/Reconnect may authenticate. A deliberate
+overview/facts refresh uses only the exact established SSH master; a missing
+master requires Connect/Reconnect. It fences cached routes before waiting or
+reading the scheduler and republishes only the verified current placement.
+Background queue reads are shared across all devices with the existing
+sixty-second floor. An explicit bounded, owned refresh may run inside that floor. Missing or failed scheduler
 reads make the snapshot degraded; they never prove a job has ended.
 
 ## Typed control operations
@@ -179,6 +182,27 @@ A stale condition is `412 jobs_changed`, never an unconditional replacement.
 Omitting `jobs` never changes its revision/state. Lost replies reconcile through
 the getter, with no submission until a current held reservation is acknowledged.
 Late idle reports therefore cannot overwrite a newer held/unknown reservation.
+
+The getter and an accepted conditional `unknown` report acknowledgment may add
+`empty_journal_recovery_v1:true`. Omission or false grants no recovery proof. The
+account computes this field under the same cell/job-hold transaction: the
+negotiated maintenance fence was reserved from authoritative `idle`, the exact
+original provider instance/effect is settled, and the authenticated current
+keeper credential matches the dedicated rollout-key reconstruction for that
+account, machine and fence. Legacy revision zero, generic unfenced `unknown`,
+prior `held`, incomplete/ambiguous replacement and a different credential never
+qualify. No timeout, image match or absence of viewers substitutes for this proof.
+
+The keeper consumes proof only when both the locked getter at revision r and the
+exact conditional `unknown` acknowledgment at r+1 qualify in one arm attempt.
+The account recomputes qualification in that report transaction; a changed
+credential, scope or fence cannot reuse an earlier true field. A lost response
+restarts this bounded proof exchange with a fresh getter, never a stored bare
+boolean. This permits an empty durable job journal with no children, forwards or
+in-flight open/cleanup resources to reconcile maintenance `unknown` to `idle`.
+Any nonempty job/resource evidence still needs the ordinary scheduler and cleanup
+proofs. The subsequent conditional `idle` report remains the only action clearing
+that exact maintenance fence.
 
 Account report acceptance and automated keeper-rollout reservation are mutually
 exclusive durable transactions, bound to the current keeper machine. Rollout
