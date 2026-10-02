@@ -652,7 +652,7 @@ verified. See [integration design](../agent-harness-design.md) for the plugin bo
 - **Where.** `chatWs.ts` (`ChatSocket`, `Reconnector`), `store.svelte.ts` (`apply` seq-dedupe).
   Engine: the seq-numbered journal in `crates/chimaera-agent/src/journal.rs`.
 
-## The engine — journal, protocol, degrade
+## The engine — journal, protocol, startup
 
 - **Normalized event/command model** (`model.rs`): one ACP-shaped vocabulary both drivers translate
   into, so the journal/WS/UI all speak it and a future generic ACP agent slots in. **Size caps live at
@@ -673,9 +673,16 @@ verified. See [integration design](../agent-harness-design.md) for the plugin bo
   constant (the current pins live at the top of `claude.rs` / `codex.rs`). Touching a driver or
   bumping a CLI **requires `just chat-smoke`** (live, bills a few cents). The two drivers must stay
   **symmetric**.
-- **Handshake watchdog** (`driver.rs`, `chat.rs`): a session that cannot initialize in 20s fails
-  visibly. A fresh Claude/Codex launch retains its one-time terminal fallback. A resumed chat
-  stays in chat on failure, preserving its handle and diagnostics; ACP never silently changes view.
+- **Startup watchdog** (`driver.rs`, `chat.rs`): all providers have 60 seconds for login-shell
+  setup, workspace startup hooks, MCP discovery and protocol initialization. Once initialized,
+  leaving a chat idle does not expire it. An unused failed launch closes without switching to a
+  terminal or raising an attention notification. A submitted prompt, existing journal, resumed
+  conversation or portable branch keeps the failed chat visible with its diagnostic and recovery
+  recipe. Switching to a terminal is always a deliberate action.
+- **Before the first prompt:** the model chip uses the configured launch model when known,
+  otherwise a neutral startup placeholder / “agent default”; catalog order never selects it.
+  Model picks show “applying…” until the provider acknowledges them. Failure clears the pending
+  indicator, and a dead chat does not offer a model switch.
 
 ## View switch, rewind, and branch
 

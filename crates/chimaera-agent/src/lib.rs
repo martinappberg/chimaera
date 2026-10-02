@@ -29,6 +29,7 @@ pub mod transcript;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,8 +43,7 @@ use model::{AgentCommand, AgentEvent, ModelInfo};
 /// Called after every journaled event (server: derive AgentState, poke the
 /// event bus). Runs on the pump task — keep it cheap.
 pub type EventHook = Box<dyn Fn(&str, &Arc<SeqEvent>) + Send + Sync>;
-/// Called once when a driver ends (server: degrade-to-PTY on handshake
-/// failure, retire recents).
+/// Called once when a driver ends (server: settle failed startup or retire).
 pub type ExitHook = Box<dyn Fn(&str, &DriverExit) + Send + Sync>;
 
 /// Bounded channels: an unresponsive driver stalls its callers instead of
@@ -598,6 +598,9 @@ fn fold_session_metadata(info: &mut ChatInfo, ev: &AgentEvent) {
 }
 
 struct ChatSession {
+    /// Cleared by initialization or a submitted prompt; prior history also
+    /// makes a startup non-disposable. Kept off the public session wire.
+    unused_startup: AtomicBool,
     /// The pump's own event queue, weakly: the daemon's `annotate` rides it
     /// so its events take a seq in order with the driver's, while the
     /// channel still closes (ending the pump) when the driver drops its
@@ -781,8 +784,8 @@ impl ChatManager {
             alive: true,
             exit_status: None,
             native_session_id: spec.pinned_native_id.clone(),
-            model: None,
-            current_mode: None,
+            model: spec.initial_model.clone(),
+            current_mode: spec.initial_mode.clone(),
             pending_permission: false,
             status_detail: None,
             status_category: None,
@@ -792,6 +795,7 @@ impl ChatManager {
         };
         let process_control = Arc::new(ndjson::ProcessControl::default());
         let session = Arc::new(ChatSession {
+            unused_startup: AtomicBool::new(journal.last_seq() == 0),
             annotate_tx: ev_tx.downgrade(),
             info: Mutex::new(info.clone()),
             background_work: Mutex::new(BackgroundWork::default()),
@@ -872,6 +876,9 @@ impl ChatManager {
 
     /// Journal + broadcast one event and fold it into the session info.
     async fn absorb(&self, id: &str, session: &ChatSession, mut ev: AgentEvent) {
+        if matches!(ev, AgentEvent::Init { .. } | AgentEvent::UserMessage { .. }) {
+            session.unused_startup.store(false, Ordering::Relaxed);
+        }
         {
             // A delivered input may precede TurnStarted. Fold both sides of
             // that boundary under the same locks used by input_activity.
@@ -1219,7 +1226,13 @@ impl ChatManager {
         } else {
             None
         };
-        session.cmd_tx.send(cmd).await.context("driver gone")?;
+        let permit = session.cmd_tx.reserve().await.context("driver gone")?;
+        if reservation.is_some() {
+            // Mark before enqueue: an exit can race the first prompt while
+            // the driver is still negotiating and has not echoed it yet.
+            session.unused_startup.store(false, Ordering::Relaxed);
+        }
+        permit.send(cmd);
         if let Some(reservation) = &mut reservation {
             // The driver channel now owns the command. Keep its quota until
             // the pump observes delivery/update/exit.
@@ -1327,6 +1340,13 @@ impl ChatManager {
         let budget = session.command_budget.lock().expect("command budget lock");
         let carry = session.carryover.lock().expect("carryover lock").clone();
         Some((carry, budget.sends != 0 || budget.awaiting_turn))
+    }
+
+    /// A new session with no initialization, prior history or submitted
+    /// prompt. Only these may be automatically closed on startup failure.
+    pub fn is_unused_startup(&self, id: &str) -> bool {
+        self.get_session(id)
+            .is_ok_and(|session| session.unused_startup.load(Ordering::Relaxed))
     }
 
     /// The live process's [`Carryover`] — what a restart would cut off.

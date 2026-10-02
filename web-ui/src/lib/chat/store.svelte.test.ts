@@ -3317,3 +3317,28 @@ describe("ChatStore's own frames", () => {
   });
 });
 
+
+describe("model selection before the first prompt", () => {
+  for (const agent of ["claude", "codex", "agy", "grok"]) {
+    it(`${agent}: keeps a selection pending through initialization until read-back`, () => {
+      const store = new ChatStore();
+      store.markModelPending("chosen-model");
+      store.apply({ seq: 1, ts: 1, ev: { type: "init", agent, model: "configured-model" } } as SeqEvent);
+      expect(store.model).toBe("configured-model");
+      expect(store.pendingModel).toBe("chosen-model");
+      store.apply({ seq: 2, ts: 2, ev: { type: "model_switched", to: "resolved-model" } } as SeqEvent);
+      expect(store.pendingModel).toBeNull();
+      expect(store.model).toBe("resolved-model");
+      expect(store.blocks).toHaveLength(0);
+    });
+  }
+  it("clears a rejected or failed selection without changing the active model", () => {
+    for (const ev of [{ type: "error", message: "model unavailable", fatal: false }, { type: "exited", status: 1 }]) {
+      const store = fold([{ type: "init", agent: "claude", model: "original" }]);
+      store.markModelPending("unavailable");
+      store.apply({ seq: 2, ts: 2, ev } as SeqEvent);
+      expect(store.pendingModel).toBeNull();
+      expect(store.model).toBe("original");
+    }
+  });
+});

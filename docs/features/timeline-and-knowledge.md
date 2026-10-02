@@ -43,7 +43,7 @@ and the Mastermind-tier MCP tool `read_timeline`.
     Slurm's own terminal state when squeue last showed one, else `ENDED` — never a guessed
     COMPLETED.
   - `session` — a chat session died on its own (non-zero exit, protocol error). Clean exits,
-    kills, and handshake failures (which degrade to a terminal) are not history.
+    kills, and startup handshake failures are not history.
   - `knowledge` — a finding's status moved, or a finding appeared that couldn't be
     attributed to one turn (see Knowledge below); its id opens the entry.
   - `note` — a message between agents ([agent-communication.md](agent-communication.md); its

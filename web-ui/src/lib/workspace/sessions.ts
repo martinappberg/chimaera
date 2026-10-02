@@ -582,8 +582,7 @@ export async function createSession(
   /**
    * Whether this agent can run as a structured chat session (AgentInfo.
    * chatCapable, version-gated by the daemon). `false` routes a would-be chat
-   * spawn straight to the terminal instead of eating the 20s handshake
-   * watchdog before degrading; `undefined` (catalog not loaded) trusts the
+   * spawn straight to the terminal; `undefined` (catalog not loaded) trusts the
    * default view, as before.
    */
   chatCapable?: boolean,
@@ -605,10 +604,9 @@ export async function createSession(
     // New agent sessions open in the structured chat view by default (the
     // agents.defaultView setting); an explicit launcher choice (its terminal
     // button vs "open") overrides the setting for that one spawn. The
-    // terminal is one pane-bar toggle away either way, and the daemon
-    // degrades to a PTY on its own if the protocol handshake fails. An agent
-    // the catalog knows is NOT chat-capable (outdated CLI) skips chat
-    // entirely — it would only handshake-watchdog then degrade.
+    // terminal is one pane-bar toggle away either way. A startup failure
+    // never changes surfaces automatically. An agent the catalog knows is
+    // NOT chat-capable (outdated CLI) skips chat for an implicit launch.
     extras.ui = sessionSurface(spawn, getSetting("agents.defaultView") === "chat", chatCapable);
   }
   if (spawn.cwd !== undefined && spawn.cwd !== "") extras.cwd = spawn.cwd;

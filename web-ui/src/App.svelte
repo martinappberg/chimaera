@@ -3246,11 +3246,11 @@
   let prevAgentIds = new Set<string>();
 
   /**
-   * Last-known non-zero created_at per session id. The daemon's mid-switch
+   * First-known non-zero created_at per session id. The daemon's mid-switch
    * placeholder row carries created_at:0 (a sentinel); sorting by it verbatim
    * would teleport a switching session to the rail top and renumber every
-   * ⌘1–9 chord for the switch's duration. Substituting its last-known
-   * created_at keeps the row in place. Pruned to live ids each snapshot.
+   * ⌘1–9 chord for the switch's duration. Keeping its original
+   * created_at through placeholders AND respawns keeps the row in place. Pruned to live ids each snapshot.
    */
   const lastCreatedAt = new Map<string, number>();
 
@@ -3276,12 +3276,12 @@
       if (killing.size > 0) list = list.filter((s) => !killing.has(s.id));
     }
     for (const s of list) {
-      if (s.created_at !== 0) lastCreatedAt.set(s.id, s.created_at);
+      if (s.created_at !== 0 && !lastCreatedAt.has(s.id)) lastCreatedAt.set(s.id, s.created_at);
     }
     const ids = new Set(list.map((s) => s.id));
     for (const id of lastCreatedAt.keys()) if (!ids.has(id)) lastCreatedAt.delete(id);
     const sortKey = (s: Session): number =>
-      s.created_at !== 0 ? s.created_at : (lastCreatedAt.get(s.id) ?? 0);
+      lastCreatedAt.get(s.id) ?? s.created_at;
     list.sort((a, b) => sortKey(a) - sortKey(b) || a.id.localeCompare(b.id));
     // Unread marks fold BEFORE the swap: the transitions ("was running, now
     // finished") need the previous rows. The focused session is exempt —
@@ -5422,6 +5422,7 @@
           {#if confirmKillId === s.id}
             <div
               class="row confirm"
+              class:agent-row={s.kind === "agent"}
               role="alertdialog"
               tabindex="-1"
               aria-label="kill session?"
@@ -5443,6 +5444,7 @@
           {:else}
             <div
               class="row"
+              class:agent-row={s.kind === "agent"}
               class:active={s.id === focusedSessionId}
               class:unread={renamingId !== s.id && isUnread(s.id)}
               class:link-target={dropSpot?.kind === "linkrow" && dropSpot.sessionId === s.id}
@@ -5526,22 +5528,20 @@
                       <span class="remote-badge" title="Remote Control on — pick this session up in the Claude app or at claude.ai/code">remote</span>
                     {/if}
                   </span>
-                  {#if s.kind === "agent" && s.git && s.git.worktree !== s.git.repo}
-                    <!-- Give worktree context its own line so a long branch
-                         never truncates the agent's identity. -->
-                    <span class="wt-mark"><BranchChip git={s.git} /></span>
-                  {/if}
-                  <!-- Second line only when it adds something over the name.
-                       Shells never do: the name already resolves to the title
-                       (program-set) or the cwd (the shell's "user@host:dir"
-                       prompt title is dropped server-side). Agents show their
-                       own PTY title as context when it differs from the name;
-                       chat agents (no PTY title) show the agent's own
-                       post-turn status line instead. -->
-                  {#if s.kind === "agent" && s.title && s.title !== displayName(s) && s.title !== s.agent_title}
-                    <span class="title">{s.title}</span>
-                  {:else if s.kind === "agent" && s.status_detail && s.status_detail !== displayName(s)}
-                    <span class="title" title={s.status_detail}>{s.status_detail}</span>
+                  {#if s.kind === "agent"}
+                    <!-- Keep the name anchored above one reserved context
+                         line. Worktree and status share it rather than adding
+                         a third line when the provider reports new activity. -->
+                    <span class="row-context">
+                      {#if s.git && s.git.worktree !== s.git.repo}
+                        <span class="wt-mark"><BranchChip git={s.git} /></span>
+                      {/if}
+                      {#if s.title && s.title !== displayName(s) && s.title !== s.agent_title}
+                        <span class="title" title={s.title}>{s.title}</span>
+                      {:else if s.status_detail && s.status_detail !== displayName(s)}
+                        <span class="title" title={s.status_detail}>{s.status_detail}</span>
+                      {/if}
+                    </span>
                   {/if}
                 </span>
               {/if}
@@ -6853,6 +6853,17 @@
     transition: background-color 0.12s ease;
   }
 
+  /* Agent status/title changes must never move the rows beneath them.
+     Reserve both text lines, including during rename and kill confirmation. */
+  .row.agent-row {
+    box-sizing: border-box;
+    flex-shrink: 0;
+    height: calc((var(--text-sm) + var(--text-xs)) * 1.3 + 12px);
+  }
+  .row.agent-row .labels {
+    align-self: stretch;
+  }
+
   /* The dashboard home row: fixed above the session sections, quiet until
      hovered or active — furniture, not a session. */
   .dash-row {
@@ -6979,15 +6990,28 @@
     font-family: var(--mono);
     font-size: var(--text-sm);
   }
-  /* Worktree context stays secondary and gets its own truncation budget. */
+  .row-context {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    min-height: calc(var(--text-xs) * 1.3);
+    font-size: var(--text-xs);
+  }
+
+  /* Branch and activity each keep a truncation budget on the second line. */
   .wt-mark {
     display: flex;
     min-width: 0;
-    margin-top: 2px;
     opacity: 0.85;
+  }
+  .wt-mark:not(:last-child) {
+    max-width: 50%;
   }
 
   .title {
+    flex: 1;
+    min-width: 0;
     font-size: var(--text-xs);
     color: var(--muted);
   }

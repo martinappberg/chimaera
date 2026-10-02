@@ -622,6 +622,8 @@ export class ChatStore {
   plan = $state<PlanEntry[]>([]);
   initialized = $state(false);
   model = $state<string | null>(null);
+  /** Accepted model command awaiting the provider's read-back. */
+  pendingModel = $state<string | null>(null);
   modes = $state<ModeInfo[]>([]);
   capabilities = $state<ChatCapabilities | null>(null);
   currentMode = $state<string | null>(null);
@@ -1264,8 +1266,14 @@ export class ChatStore {
     this.touchTranscript();
   }
 
+  /** Keep the requested model distinct from the provider's confirmed model. */
+  markModelPending(model: string): void {
+    this.pendingModel = model;
+  }
+
   /** A socket/handshake failure can precede `ready`; reveal it immediately. */
   onFatalError(message: string): void {
+    this.pendingModel = null;
     this.hydrating = false;
     this.fatalError = message;
     this.fatalSource = "socket";
@@ -1302,6 +1310,7 @@ export class ChatStore {
     this.initialized = false;
     this.capabilities = null;
     this.model = null;
+    this.pendingModel = null;
     this.currentMode = null;
     this.models = [];
     this.modes = [];
@@ -1999,6 +2008,7 @@ export class ChatStore {
         // fallback): the chip follows the truth, and a retracting switch
         // withdraws the current turn's trailing prose before the retry.
         this.model = ev.to as string;
+        this.pendingModel = null;
         if (ev.retract_current_turn === true) {
           this.dropTrailingProse();
           this.touchTranscript();
@@ -2176,6 +2186,7 @@ export class ChatStore {
         break;
       }
       case "error":
+        this.pendingModel = null;
         this.notice(ev.message as string, "error");
         if (ev.fatal === true) {
           this.fatalError = ev.message as string;
@@ -2194,6 +2205,7 @@ export class ChatStore {
         }
         break;
       case "exited":
+        this.pendingModel = null;
         this.running = false;
         this.compacting = false;
         this.activity = null;

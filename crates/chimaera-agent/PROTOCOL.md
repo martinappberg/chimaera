@@ -2982,3 +2982,27 @@ Terminal MCP injection remains Claude/Codex-only. Grok 1.0.46 rejected the
 was found for the Antigravity terminal CLI either. Chat uses ACP's `mcpServers`
 parameter without rewriting global settings. Do not infer terminal parity from
 these passing Chat tests.
+
+
+### Startup lifecycle verification (2026-10-01)
+
+Claude 2.1.287 emits `system/hook_started` and `system/hook_response` before
+answering `initialize`. In a configured workspace, one `SessionStart:startup`
+hook took about 15 seconds and ended with `outcome: "cancelled"`; only then did
+the initialize response arrive. A fresh temporary workspace initialized in
+under 3 seconds. The daemon's previous 20-second deadline included these hooks,
+login-shell initialization and MCP discovery, leaving little cold-start margin.
+The shared harness now allows 60 seconds for every provider and races startup
+against the kill signal. An idle initialized session has no expiry. The server
+closes unused failed launches and preserves existing work; it never automatically
+switches a failure to a PTY.
+
+The final verification passed `just chat-smoke` (26 real Claude/Codex tests)
+plus `just chat-smoke-acp` (Antigravity ACP 1.2.1 and Grok 1.0.46, including
+stream/replay/resume). In the isolated daemon/UI, all four providers initialized
+without a prompt and accepted their native model controls. A real Claude start
+with a 25-second launch prelude initialized after 26.2 seconds and stayed idle
+in chat; a stalled Codex launch closed at 60.6 seconds with no terminal or
+Recent row, retaining its diagnostic journal. The shared lifecycle tests cover
+unused/submitted/resumed startup failures and immediate cancellation for every
+provider.
