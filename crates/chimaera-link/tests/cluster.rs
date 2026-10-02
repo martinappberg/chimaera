@@ -476,3 +476,162 @@ async fn authenticated_upgrade_cannot_dial_after_revocation_at_its_barrier() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn positive_batch_refusal_replays_exact_non_submission_without_a_holder() {
+    let f = Fixture::start().await;
+    let h = f.host().await;
+    let c = f.client();
+    let op = start();
+    f.keeper
+        .set_cluster_batch_refusal(&h.id, Some(BatchRefusalKind::BatchNotAllowed))
+        .await
+        .unwrap();
+    assert!(
+        matches!(c.cluster_operation(&h.id,&op).await.unwrap(),ClusterReply::Refused {job_id,refusal:BatchRefusalKind::BatchNotAllowed,..} if job_id==jid(&op))
+    );
+    assert_eq!(f.keeper.cluster_submissions(&h.id).await, 0);
+    assert!(f
+        .keeper
+        .cluster_snapshot(&h.id)
+        .await
+        .unwrap()
+        .records
+        .is_empty());
+    f.keeper
+        .set_cluster_batch_refusal(&h.id, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        c.cluster_operation(&h.id, &op).await.unwrap(),
+        ClusterReply::Refused { .. }
+    ));
+    assert!(
+        matches!(c.cluster_operation_state(&h.id,&op).await.unwrap(),ClusterOperationState::Completed {reply} if matches!(reply.as_ref(),ClusterReply::Refused {job_id,..} if job_id==jid(&op)))
+    );
+    assert_eq!(f.keeper.cluster_submissions(&h.id).await, 0);
+    let mut changed = op.clone();
+    if let ClusterOperation::StartJob { startup, .. } = &mut changed {
+        *startup = "changed".into();
+    }
+    assert!(c.cluster_operation(&h.id, &changed).await.is_err());
+    c.delete_host(&h.id).await.unwrap();
+}
+#[tokio::test]
+async fn refusal_setting_never_reclassifies_an_accepted_uncertain_submission() {
+    let f = Fixture::start().await;
+    let h = f.host().await;
+    let c = f.client();
+    let op = start();
+    c.cluster_operation(&h.id, &op).await.unwrap();
+    f.keeper
+        .set_cluster_operation_state(
+            &h.id,
+            op.operation_id().unwrap(),
+            ClusterOperationState::Uncertain,
+        )
+        .await;
+    f.keeper
+        .set_cluster_batch_refusal(&h.id, Some(BatchRefusalKind::AccountRequired))
+        .await
+        .unwrap();
+    assert!(c.cluster_operation(&h.id, &op).await.is_err());
+    assert!(matches!(
+        c.cluster_operation_state(&h.id, &op).await.unwrap(),
+        ClusterOperationState::Uncertain
+    ));
+    assert_eq!(f.keeper.cluster_submissions(&h.id).await, 1);
+    assert!(c.delete_host(&h.id).await.is_err());
+    assert!(c.cluster_tcp(&h.id, jid(&op), None).await.is_err());
+}
+#[test]
+fn positive_refusal_is_exact_batch_only_and_unknown_classification_is_not_proof() {
+    let mut operation = start();
+    let reply = ClusterReply::Refused {
+        job_id: jid(&operation).into(),
+        refusal: BatchRefusalKind::Other,
+        slurm_job_id: None,
+    };
+    assert!(reply.validate().is_ok());
+    assert!(operation.accepts(&reply));
+    if let ClusterOperation::StartJob { attached, .. } = &mut operation {
+        *attached = true;
+    }
+    assert!(!operation.accepts(&reply));
+    if let ClusterOperation::StartJob { attached, .. } = &mut operation {
+        *attached = false;
+    }
+    let wrong = ClusterReply::Refused {
+        job_id: new_job_id(),
+        refusal: BatchRefusalKind::BatchNotAllowed,
+        slurm_job_id: None,
+    };
+    assert!(!operation.accepts(&wrong));
+    let unknown: ClusterReply = serde_json::from_value(
+        serde_json::json!({"result":"refused","job_id":jid(&operation),"refusal":"future_reason"}),
+    )
+    .unwrap();
+    assert!(!operation.accepts(&unknown));
+    assert!(unknown.validate().is_err());
+    assert!(serde_json::from_value::<ClusterReply>(
+        serde_json::json!({"result":"refused","job_id":jid(&operation)})
+    )
+    .is_err());
+    assert!(ClusterOperationState::Completed {
+        reply: Box::new(unknown)
+    }
+    .validate_for(&operation)
+    .is_err());
+}
+
+#[test]
+fn refusal_retains_and_rejects_additive_scheduler_identity_in_reply_and_history() {
+    let operation = start();
+    for id in ["12345", "", "unrecognized"] {
+        let reply: ClusterReply = serde_json::from_value(serde_json::json!({
+            "result":"refused", "job_id":jid(&operation), "refusal":"other", "slurm_job_id":id
+        }))
+        .unwrap();
+        assert!(!operation.accepts(&reply));
+        assert!(reply.validate().is_err());
+        let history: ClusterOperationState = serde_json::from_value(serde_json::json!({
+            "state":"completed", "reply":reply
+        }))
+        .unwrap();
+        assert!(history.validate_for(&operation).is_err());
+    }
+}
+
+#[tokio::test]
+async fn scheduler_identity_in_refusal_is_refused_over_http_and_history() {
+    let f = Fixture::start().await;
+    let host = f.host().await;
+    let client = f.client();
+    let operation = start();
+    f.keeper.set_cluster_reply(&host.id, Some(serde_json::json!({
+        "result":"refused", "job_id":jid(&operation), "refusal":"other", "slurm_job_id":"12345"
+    }))).await;
+    assert!(client
+        .cluster_operation(&host.id, &operation)
+        .await
+        .is_err());
+    assert_eq!(f.keeper.cluster_submissions(&host.id).await, 1);
+    f.keeper
+        .set_cluster_operation_state(
+            &host.id,
+            operation.operation_id().unwrap(),
+            ClusterOperationState::Completed {
+                reply: Box::new(ClusterReply::Refused {
+                    job_id: jid(&operation).into(),
+                    refusal: BatchRefusalKind::Other,
+                    slurm_job_id: Some("12345".into()),
+                }),
+            },
+        )
+        .await;
+    assert!(client
+        .cluster_operation_state(&host.id, &operation)
+        .await
+        .is_err());
+    assert!(client.delete_host(&host.id).await.is_err());
+}

@@ -1242,7 +1242,8 @@ pub enum StartOutcome {
 
 /// The scheduler said no. `message` is its own text, cleaned; `kind` is
 /// what it seems to say (remembered so the next start doesn't fail the same
-/// way).
+/// way). A stable submission additionally requires an intact empty-ID refusal
+/// frame; any emitted allocation identity remains [`StartUncertain`].
 #[derive(Clone, Debug, Serialize)]
 pub struct StartRefused {
     pub message: String,
@@ -1450,6 +1451,9 @@ async fn start_job_inner(
     }
     let rc = marker_arg(&secs, "rc").unwrap_or("1");
     if rc != "0" {
+        if stable && !stable_batch_non_submission(&secs) {
+            return Err(StartUncertain { job: jid }.into());
+        }
         let message = clean_tool_stderr(section(&secs, "err").unwrap_or(""), "sbatch");
         return Err(StartRefused {
             kind: classify_refusal(&message),
@@ -1516,6 +1520,38 @@ fn submission_receipt(stdout: &str, nonce: &str, attached: bool) -> Option<Vec<(
     Some(secs)
 }
 
+/// A scheduler command can print an allocation ID and still fail afterward.
+/// Its nonzero exit then cannot prove that no job was accepted. Called only
+/// after the fresh nonce/exact frame parser succeeds, never on SSH diagnostics.
+/// Shell execution errors and signal termination are not scheduler refusals.
+fn stable_batch_non_submission(sections: &[(String, String)]) -> bool {
+    let rejected = marker_arg(sections, "rc")
+        .and_then(|rc| rc.parse::<u8>().ok())
+        .is_some_and(|rc| (1..126).contains(&rc) && !matches!(rc, 96..=98));
+    rejected
+        && sections.get(1).is_some_and(|(marker, _)| marker == "id")
+        && positive_scheduler_refusal(section(sections, "err").unwrap_or(""))
+}
+
+fn positive_scheduler_refusal(stderr: &str) -> bool {
+    // SchedMD sbatch reports both controller rejection and send/receive failure
+    // through the same nonzero exit. Only exact known controller policy codes
+    // are evidence here; the broad UI classifier is deliberately not authority.
+    // See src/sbatch/sbatch.c, src/api/submit.c and src/common/slurm_errno.c.
+    let Some(reason) = stderr
+        .trim()
+        .strip_prefix("sbatch: error: Batch job submission failed: ")
+    else {
+        return false;
+    };
+    matches!(
+        reason,
+        "Invalid account or account/partition combination specified"
+            | "Invalid qos specification"
+            | "Invalid feature specification"
+    )
+}
+
 fn submission_claim(dir: &str, stable: bool) -> String {
     if stable {
         // mkdir is the remote, non-expiring claim, before any sbatch effect.
@@ -1528,12 +1564,13 @@ fn submission_claim(dir: &str, stable: bool) -> String {
 fn submission_lines(args: &str, stable: bool) -> String {
     let before = if stable { "set +e\n" } else { "" };
     let after = if stable { "set -e\n" } else { "" };
+    let locale = if stable { "LC_ALL=C LANG=C " } else { "" };
     let remove = if stable {
         ""
     } else {
         "rm -f \"$D/job.pending\"\n[ \"$rc\" -eq 0 ] || rm -rf \"$D\"\n"
     };
-    format!("{before}out=$(sbatch {args} \"$D/job.sh\" 2>\"$D/.sbatch.err\"); rc=$?\n{after}\
+    format!("{before}out=$({locale}sbatch {args} \"$D/job.sh\" 2>\"$D/.sbatch.err\"); rc=$?\n{after}\
              id=${{out%%;*}}\n\
              case \"$id\" in ''|*[!0-9_]*) if [ \"$rc\" -eq 0 ]; then rc=97; fi ;; esac\n\
              if [ \"$rc\" -eq 0 ]; then\n\
@@ -3222,6 +3259,63 @@ mod tests {
             assert!(f.0.join("cluster/j/j-1234abcd/job.pending").is_file());
             f.run(&script);
             assert_eq!(f.calls(), 1);
+        }
+    }
+    #[test]
+    fn stable_refusal_requires_nonzero_empty_id_frame_and_never_clears_claim() {
+        for (command, positive) in [
+            ("printf 'sbatch: error: Batch job submission failed: Socket timed out on send/recv operation\n' >&2; exit 1", false),
+            ("printf 'sbatch: error: Batch job submission failed: Message receive failure\n' >&2; exit 1", false),
+            ("printf 'account required but controller unavailable\n' >&2; exit 1", false),
+            ("printf 'Batch jobs not allowed here\n' >&2; exit 1", false),
+            ("printf 'sbatch: error: Batch job submission failed: Invalid qos specification\n' >&2; exit 1", true),
+            ("printf 'sbatch: error: Batch job submission failed: Invalid account or account/partition combination specified\n' >&2; exit 1", true),
+            ("printf 'sbatch: error: Batch job submission failed: Invalid feature specification\n' >&2; exit 1", true),
+            ("printf 'sbatch: error: Batch job submission failed: Invalid qos specification\nsbatch: error: Message receive failure\n' >&2; exit 1", false),
+            ("printf '12345\n'; printf 'sbatch: error: Batch job submission failed: Invalid qos specification\n' >&2; exit 1", false),
+            (
+                "printf '12345;cluster\n'; printf 'post-submit error\n' >&2; exit 1",
+                false,
+            ),
+            ("printf 'unrecognized scheduler output\n'; exit 1", false),
+            ("printf '12345\n'", false),
+        ] {
+            let fixture = SubmissionFixture::new(command);
+            let script = format!(
+                "printf '===begin refusal_probe\n'\n{}",
+                fixture.submit_script()
+            );
+            let output = fixture.run(&script);
+            assert!(output.status.success());
+            let sections = submission_receipt(
+                &String::from_utf8_lossy(&output.stdout),
+                "refusal_probe",
+                false,
+            )
+            .unwrap();
+            assert_eq!(stable_batch_non_submission(&sections), positive);
+            // Claim survives both the positive refusal and ambiguous ID/error.
+            // A later retry can't turn old evidence into another submission.
+            let retry = fixture.run(&script);
+            let sections = submission_receipt(
+                &String::from_utf8_lossy(&retry.stdout),
+                "refusal_probe",
+                false,
+            )
+            .unwrap();
+            assert!(!stable_batch_non_submission(&sections));
+            assert_eq!(fixture.calls(), 1);
+        }
+        for frame in [
+            "===begin refusal_probe\n===rc 256\n===id\n===err\n===end\n",
+            "===begin refusal_probe\n===rc 137\n===id\n===err\n===end\n",
+            "===begin refusal_probe\n===rc 126\n===id\n===err\n===end\n",
+            "===begin refusal_probe\n===rc 127\n===id\n===err\n===end\n",
+            "===begin refusal_probe\n===rc 96\n===id\n===err\n===end\n",
+            "===begin refusal_probe\n===rc 97\n===id\n===err\n===end\n",
+        ] {
+            let sections = submission_receipt(frame, "refusal_probe", false).unwrap();
+            assert!(!stable_batch_non_submission(&sections));
         }
     }
     #[test]

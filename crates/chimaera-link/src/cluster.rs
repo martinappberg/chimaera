@@ -286,6 +286,20 @@ impl ClusterOperation {
                 },
             ) => job_id == actual && attached == actual_attached,
             (
+                Self::StartJob {
+                    job_id,
+                    attached: false,
+                    ..
+                },
+                ClusterReply::Refused {
+                    job_id: actual,
+                    refusal,
+                    slurm_job_id,
+                },
+            ) => {
+                job_id == actual && *refusal != BatchRefusalKind::Unknown && slurm_job_id.is_none()
+            }
+            (
                 Self::StopJob { job_id, .. },
                 ClusterReply::StopPending { job_id: actual }
                 | ClusterReply::Stopped { job_id: actual },
@@ -446,6 +460,20 @@ pub struct ClusterStartup {
     pub workspaces: BTreeMap<String, String>,
 }
 
+/// A positively framed batch refusal, never arbitrary SSH failure text.
+/// Unknown classifications cannot authorize allocation/hold cleanup.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchRefusalKind {
+    BatchNotAllowed,
+    AccountRequired,
+    QosRequired,
+    ConstraintRequired,
+    Other,
+    #[serde(other)]
+    Unknown,
+}
+
 // No Debug on a route or any enclosing response: these carry daemon bearers.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ClusterRoute {
@@ -497,6 +525,12 @@ pub enum ClusterReply {
         #[serde(default)]
         slurm_job_id: Option<String>,
         attached: bool,
+    },
+    Refused {
+        job_id: String,
+        refusal: BatchRefusalKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slurm_job_id: Option<String>,
     },
     StopPending {
         job_id: String,
@@ -589,6 +623,21 @@ impl ClusterReply {
                 if let Some(id) = slurm_job_id {
                     ensure!(cluster::valid_slurm_job_id(id), "invalid scheduler job id");
                 }
+            }
+            Self::Refused {
+                job_id,
+                refusal,
+                slurm_job_id,
+            } => {
+                ensure!(
+                    slurm_job_id.is_none(),
+                    "refusal contains scheduler identity"
+                );
+                ensure!(cluster::valid_job_id(job_id), "invalid cluster job id");
+                ensure!(
+                    *refusal != BatchRefusalKind::Unknown,
+                    "unsupported cluster refusal"
+                );
             }
             Self::StopPending { job_id }
             | Self::Stopped { job_id }

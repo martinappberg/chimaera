@@ -280,8 +280,18 @@ the registered personal-control capability, carried respectively in
 is copied into response bodies, browser/native traffic or diagnostics. A worker
 without this separate positively enrolled adapter refuses before effects.
 
-The cached catalog returns `providers_control` containing the exact registration
-fields above without its capability, plus redacted `connections`. The keeper
+The cached catalog is a closed object with exactly `providers_control` containing
+the exact registration fields above without its capability, and `connections`.
+`connections` contains exactly three distinct closed rows, one for each known
+provider, each with exactly `provider`, `state`, `generation` and `revision`.
+`state` is `disconnected`, `connected`, `needs_sign_in` or `recovery_needed`;
+`generation` and `revision` are exact unsigned 64-bit integers, including zero
+for initial disconnected state, with the existing nonwrapping counter rules.
+Consumers unable to represent a counter exactly refuse actions using it rather
+than rounding. These are broker connection states; the personal UI adapter maps
+them to its existing named-provider status presentation. The catalog carries no
+account/user profile, secret value, token, credential leaf or provider history.
+The keeper
 requires that exact registration acknowledgment before enrolling a target;
 ordinary daemon health or an HTTP 200 alone is insufficient. Catalog and status
 are bounded to 64 KiB and are passive. Unknown, missing or partial acknowledgment

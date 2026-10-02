@@ -241,10 +241,41 @@ Replies use `result` as discriminator:
 - generic saved mutations: {"result":"saved"}
 - list_dir: {"result":"directory","directory":<existing directory listing>}
 - add_workspace: {"result":"workspace","workspace":<existing cluster workspace>}
-- start_job: {"result":"job","job_id":"j-0000abcd","slurm_job_id":null,"attached":true}
+- start_job: {"result":"job","job_id":"j-0000abcd","slurm_job_id":null,"attached":true}; a positively refused batch submission may instead return {"result":"refused","job_id":"j-0000abcd","refusal":"batch_not_allowed"}
 - stop_job: {"result":"stop_pending","job_id":"j-0000abcd"} or {"result":"stopped","job_id":"j-0000abcd"}
 - set_policy/stop_login_daemon: {"result":"host","host":<existing host plus cluster metadata>}
 - start_estimate: {"result":"estimate","job_id":"j-0000abcd","at_ms":null}
+
+A `refused` completion is valid only for the exact immutable operation and
+stable job ID of `start_job` with `attached:false`. Its closed reason is
+`batch_not_allowed`, `account_required`, `qos_required`, `constraint_required`
+or `other` (the existing scheduler-refusal classifications). Missing/unknown
+reasons, a different job, an interactive start or a receipt reporting a scheduler
+ID are not positive non-submission proof. The service may produce it only from
+an intact nonce-framed result of that fresh batch attempt: the scheduler command
+positively rejected submission with a recognized policy result, no allocation
+ID was returned, and no child,
+compute tunnel or other allocation resource was acquired. A scheduler ID combined
+with an error, an already claimed start, a lost/incomplete receipt and arbitrary
+SSH/process failure remain uncertain and keep their hold. An empty-ID/nonzero
+`sbatch` exit alone is insufficient: receive timeouts can occur after controller
+acceptance. Current stable remote proof accepts only exact C-locale controller
+account/QOS/feature rejection diagnostics; generic/site-specific text (including
+`other` guidance) remains uncertain until another authoritative proof exists.
+This distinction follows the separate controller-response and communication-error
+paths in [SchedMD submission code](https://github.com/SchedMD/slurm/blob/master/src/api/submit.c)
+and the shared failure exit in [sbatch](https://github.com/SchedMD/slurm/blob/master/src/sbatch/sbatch.c).
+
+The keeper durably records that fresh refusal as a terminal non-allocation and
+its operation as completed before releasing the exact submission reservation.
+A persistence/cleanup/report failure retains protection. It must never relabel
+an already submitted, held or previously uncertain allocation from a later error
+or different attempt. Exact operation retries/history replay the fixed refusal
+without invoking SSH again. Only the bounded reason/job ID is stored or sent;
+raw scheduler stderr, startup text and credentials are not refusal journal data.
+Native clients display fixed guidance and retain the existing refusal field for
+the Jobs start sheet. Mixed-version/unknown replies stay unresolved, with no new
+submission or resource cleanup inferred from an unsupported result.
 
 Protected overview routes are a list of {job_id,workspace_id?:<id>,daemon:<existing Daemon>}. An omitted workspace_id addresses the job-host. They contain no node, port or client-supplied SSH destination. Daemon credentials have no Debug representation and remain native RAM only.
 

@@ -158,6 +158,14 @@ impl FakeKeeper {
     pub async fn cluster_submissions(&self, host: &str) -> usize {
         self.inner.clusters.submissions(host).await
     }
+    /// Positive batch refusal only; never rewrites an existing immutable operation.
+    pub async fn set_cluster_batch_refusal(
+        &self,
+        host: &str,
+        refusal: Option<BatchRefusalKind>,
+    ) -> Result<()> {
+        self.inner.clusters.batch_refusal(host, refusal).await
+    }
     pub async fn set_cluster_reply(&self, host: &str, value: Option<serde_json::Value>) {
         self.inner.clusters.override_reply(host, value).await;
     }

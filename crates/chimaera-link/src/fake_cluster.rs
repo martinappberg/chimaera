@@ -34,6 +34,7 @@ struct FixtureHost {
     targets: HashMap<(String, Option<String>), Target>,
     submissions: usize,
     reply_override: Option<serde_json::Value>,
+    batch_refusal: Option<BatchRefusalKind>,
 }
 struct Target {
     address: SocketAddr,
@@ -60,6 +61,7 @@ impl FixtureCluster {
                 targets: HashMap::new(),
                 submissions: 0,
                 reply_override: None,
+                batch_refusal: None,
             },
         );
     }
@@ -166,6 +168,23 @@ impl FixtureCluster {
             .hosts
             .get(host)
             .map_or(0, |h| h.submissions)
+    }
+    pub(crate) async fn batch_refusal(
+        &self,
+        host: &str,
+        refusal: Option<BatchRefusalKind>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            refusal != Some(BatchRefusalKind::Unknown),
+            "unknown fixture batch refusal"
+        );
+        let mut data = self.data.lock().await;
+        let host = data
+            .hosts
+            .get_mut(host)
+            .ok_or_else(|| anyhow::anyhow!("unknown fixture cluster"))?;
+        host.batch_refusal = refusal;
+        Ok(())
     }
     pub(crate) async fn override_reply(&self, host: &str, reply: Option<serde_json::Value>) {
         if let Some(host) = self.data.lock().await.hosts.get_mut(host) {
@@ -429,6 +448,15 @@ fn apply(
             }
             if o.records.len() >= CLUSTER_ITEMS_MAX {
                 return Err((StatusCode::TOO_MANY_REQUESTS, "jobs_held"));
+            }
+            if !attached {
+                if let Some(refusal) = host.batch_refusal {
+                    return Ok(ClusterReply::Refused {
+                        job_id: job_id.clone(),
+                        refusal,
+                        slurm_job_id: None,
+                    });
+                }
             }
             host.submissions += 1;
             o.jobs.push(ClusterJobView {
