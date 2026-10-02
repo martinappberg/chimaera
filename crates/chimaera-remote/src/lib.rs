@@ -11,6 +11,10 @@
 //! opening new things on the host stays instant. The same options set a
 //! trust-on-first-use host-key policy, so a freshly installed app can connect
 //! to a host it has never seen without a tty to confirm the key.
+//! An explicit [`SshAuthentication`] scope instead freezes strict caller-selected
+//! public trust and a destination-bound agent for one effect. Unsupported local
+//! identity/proxy configuration cannot silently widen that authority; background
+//! captured-master scopes remain unable to authenticate.
 
 pub mod cluster;
 pub mod hosts;
@@ -33,6 +37,282 @@ pub const ASKPASS_ALIAS_ENV: &str = "CHIMAERA_ASKPASS_ALIAS";
 
 tokio::task_local! {
     static EXISTING_MASTER_ONLY: MasterHandle;
+    static SSH_AUTHENTICATION: SshAuthentication;
+}
+
+/// One explicit destination-bound authentication effect. Paths belong to the
+/// caller, which must retain its agent/trust-file lease until the effect ends.
+/// No Debug implementation: socket paths and selected identity stay private.
+#[derive(Clone)]
+pub struct SshAuthentication {
+    alias: String,
+    hostname: String,
+    user: String,
+    port: u16,
+    socket: String,
+    known_hosts: String,
+    masters: Vec<MasterHandle>,
+    fresh: bool,
+}
+impl SshAuthentication {
+    /// Resolve and freeze one canonical destination locally, without dialing.
+    /// Configured private keys/certificates are unsupported. Configured jump or
+    /// proxy routing is usable only through an already established captured mux.
+    pub async fn new(
+        alias: &str,
+        hostname: &str,
+        user: &str,
+        port: u16,
+        agent_socket: &Path,
+        known_hosts: &Path,
+    ) -> anyhow::Result<Self> {
+        let alias = hosts::normalize_alias(alias)?;
+        anyhow::ensure!(
+            auth_word(hostname) && auth_word(user) && port != 0,
+            "invalid SSH authentication destination"
+        );
+        let socket = authentication_path(agent_socket)?;
+        let known_hosts = authentication_path(known_hosts)?;
+        validate_authentication_files(agent_socket, Path::new(&known_hosts)).await?;
+        let mut command = transport_command("ssh");
+        command.args(ssh_opts());
+        command.args([
+            "-o",
+            "IdentityFile=none",
+            "-o",
+            "CertificateFile=none",
+            "-G",
+        ]);
+        command.arg(&alias);
+        let output = output_bounded(&mut command, 5, "SSH authentication configuration")
+            .await
+            .map_err(|_| anyhow::anyhow!("SSH authentication configuration unavailable"))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "SSH authentication configuration unavailable"
+        );
+        let config = std::str::from_utf8(&output.stdout)
+            .map_err(|_| anyhow::anyhow!("SSH authentication configuration invalid"))?;
+        let (fresh, master) =
+            authentication_snapshot(&alias, Route::Alias, config, hostname, user, port)?;
+        // Destination and mux identity must come from the same resolution:
+        // a second config read could bind an old grant to a different master.
+        let mut masters = vec![master];
+        let route = route_of(&alias);
+        if route != Route::Alias && route.node() == Some(hostname) {
+            let mut command = transport_command("ssh");
+            command.args(route_opts(&alias, &route));
+            command.args(["-o", &format!("User={user}"), "-o", &format!("Port={port}")]);
+            command.args(ssh_opts());
+            command.args([
+                "-o",
+                "IdentityFile=none",
+                "-o",
+                "CertificateFile=none",
+                "-G",
+            ]);
+            command.arg(&alias);
+            let output = output_bounded(&mut command, 5, "SSH authentication route")
+                .await
+                .map_err(|_| anyhow::anyhow!("SSH authentication route unavailable"))?;
+            anyhow::ensure!(
+                output.status.success(),
+                "SSH authentication route unavailable"
+            );
+            let config = std::str::from_utf8(&output.stdout)
+                .map_err(|_| anyhow::anyhow!("SSH authentication route invalid"))?;
+            masters.push(authentication_snapshot(&alias, route, config, hostname, user, port)?.1);
+        }
+        if !fresh {
+            let mut established = false;
+            for master in &masters {
+                established |= master.present().await?;
+            }
+            anyhow::ensure!(
+                established,
+                "SSH authentication routing requires an existing master"
+            );
+        }
+        Ok(Self {
+            alias,
+            hostname: hostname.into(),
+            user: user.into(),
+            port,
+            socket,
+            known_hosts,
+            masters,
+            fresh,
+        })
+    }
+    /// Task-local and cancellation-safe; spawned owned work must enter its own
+    /// scope. An existing-master-only scope always has stronger authority.
+    pub async fn with_authentication<F: std::future::Future>(&self, future: F) -> F::Output {
+        SSH_AUTHENTICATION.scope(self.clone(), future).await
+    }
+    fn options(&self, host: &str, route: &Route, node: bool) -> Vec<String> {
+        let captured = self
+            .masters
+            .iter()
+            .find(|master| master.host == host && master.route == *route);
+        let allowed = host == self.alias && *route == Route::Alias && self.fresh && !node;
+        // Freeze the validated config instead of re-reading identity/proxy
+        // directives after validation. Exact captured sockets preserve routing.
+        let mut options = vec!["-F".into(), "/dev/null".into()];
+        let settings = [
+            (
+                "IdentityAgent",
+                if allowed {
+                    self.socket.as_str()
+                } else {
+                    "none"
+                },
+            ),
+            ("IdentityFile", "none"),
+            ("CertificateFile", "none"),
+            ("IdentitiesOnly", "no"),
+            ("ForwardAgent", "no"),
+            ("AddKeysToAgent", "no"),
+            ("GlobalKnownHostsFile", "/dev/null"),
+            ("UserKnownHostsFile", self.known_hosts.as_str()),
+            ("StrictHostKeyChecking", "yes"),
+            ("KnownHostsCommand", "none"),
+            ("VerifyHostKeyDNS", "no"),
+            ("UpdateHostKeys", "no"),
+            ("BatchMode", "yes"),
+            ("PasswordAuthentication", "no"),
+            ("KbdInteractiveAuthentication", "no"),
+            ("HostbasedAuthentication", "no"),
+            ("GSSAPIAuthentication", "no"),
+            ("PreferredAuthentications", "publickey"),
+            ("PubkeyAuthentication", "host-bound"),
+            ("ProxyCommand", if allowed { "none" } else { "false" }),
+            ("ProxyJump", "none"),
+        ];
+        for (key, value) in settings {
+            options.extend(["-o".into(), format!("{key}={value}")]);
+        }
+        options.extend([
+            "-o".into(),
+            format!(
+                "ControlPath={}",
+                captured
+                    .filter(|_| !node)
+                    .map_or("none", |master| master.path.as_str())
+            ),
+        ]);
+        if allowed {
+            for (key, value) in [
+                ("HostName", self.hostname.clone()),
+                ("User", self.user.clone()),
+                ("Port", self.port.to_string()),
+            ] {
+                options.extend(["-o".into(), format!("{key}={value}")]);
+            }
+        } else {
+            options.extend([
+                "-o".into(),
+                "ControlMaster=no".into(),
+                "-o".into(),
+                "ControlPersist=no".into(),
+            ]);
+        }
+        options
+    }
+}
+fn authentication_opts(host: &str, route: &Route, node: bool) -> Vec<String> {
+    SSH_AUTHENTICATION
+        .try_with(|scope| scope.options(host, route, node))
+        .unwrap_or_default()
+}
+fn auth_word(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !value.starts_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-@:[]".contains(&byte))
+}
+fn authentication_path(path: &Path) -> anyhow::Result<String> {
+    let text = path
+        .to_str()
+        .filter(|text| {
+            path.is_absolute()
+                && text.len() <= 1024
+                && text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() && !b"%$\"'\\".contains(&byte))
+        })
+        .context("invalid SSH authentication path")?;
+    Ok(text.into())
+}
+async fn validate_authentication_files(socket: &Path, known_hosts: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let socket = tokio::fs::symlink_metadata(socket)
+            .await
+            .map_err(|_| anyhow::anyhow!("SSH authentication socket unavailable"))?;
+        let trust = tokio::fs::symlink_metadata(known_hosts)
+            .await
+            .map_err(|_| anyhow::anyhow!("SSH authentication trust unavailable"))?;
+        anyhow::ensure!(
+            socket.file_type().is_socket() && trust.is_file() && trust.len() <= 128 * 1024,
+            "invalid SSH authentication files"
+        );
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (socket, known_hosts);
+        bail!("SSH authentication scope unsupported")
+    }
+}
+fn authentication_config(
+    config: &str,
+    hostname: &str,
+    user: &str,
+    port: u16,
+) -> anyhow::Result<bool> {
+    let destination = parse_ssh_destination(config)?;
+    anyhow::ensure!(
+        destination == (hostname.into(), Some(user.into()), port),
+        "SSH authentication destination changed"
+    );
+    let values = |key: &'static str| {
+        config
+            .lines()
+            .filter_map(move |line| line.strip_prefix(key))
+    };
+    for key in ["identityfile ", "certificatefile "] {
+        let mut found = false;
+        for value in values(key) {
+            found = true;
+            anyhow::ensure!(
+                value == "none",
+                "SSH authentication configuration uses local identities"
+            );
+        }
+        anyhow::ensure!(
+            found,
+            "SSH authentication identity configuration unavailable"
+        );
+    }
+    Ok(!values("proxyjump ")
+        .chain(values("proxycommand "))
+        .any(|value| value != "none"))
+}
+fn authentication_snapshot(
+    alias: &str,
+    route: Route,
+    config: &str,
+    hostname: &str,
+    user: &str,
+    port: u16,
+) -> anyhow::Result<(bool, MasterHandle)> {
+    let fresh = authentication_config(config, hostname, user, port)?;
+    let master = capture_master_config(alias, route, config)?;
+    authentication_path(Path::new(&master.path))?;
+    Ok((fresh, master))
 }
 
 /// Opaque identity of the actual expanded OpenSSH control socket. Alias names
@@ -185,6 +465,9 @@ async fn capture_master_command(
     anyhow::ensure!(output.status.success(), "SSH master identity unavailable");
     let text = std::str::from_utf8(&output.stdout)
         .map_err(|_| anyhow::anyhow!("SSH master identity invalid"))?;
+    capture_master_config(host, route, text)
+}
+fn capture_master_config(host: &str, route: Route, text: &str) -> anyhow::Result<MasterHandle> {
     let paths: Vec<_> = text
         .lines()
         .filter_map(|line| line.strip_prefix("controlpath "))
@@ -518,6 +801,7 @@ fn ssh_base_via(host: &str, route: &Route) -> Command {
     let mut c = transport_command("ssh");
     c.env(ASKPASS_ALIAS_ENV, host);
     c.args(existing_master_opts(host, route));
+    c.args(authentication_opts(host, route, false));
     c.args(route_opts(host, route));
     c.args(ssh_opts());
     c
@@ -540,6 +824,8 @@ fn ssh_cmd(host: &str) -> Command {
 /// when it isn't.
 pub fn interactive_ssh_argv(host: &str) -> Vec<String> {
     let mut argv = vec!["ssh".to_string()];
+    argv.extend(existing_master_opts(host, &route_of(host)));
+    argv.extend(authentication_opts(host, &route_of(host), false));
     argv.extend(route_opts(host, &route_of(host)));
     argv.extend(ssh_opts());
     argv.push("-t".into());
@@ -554,6 +840,7 @@ fn scp_cmd(host: &str) -> Command {
     let mut c = transport_command("scp");
     c.env(ASKPASS_ALIAS_ENV, host);
     c.args(existing_master_opts(host, &route_of(host)));
+    c.args(authentication_opts(host, &route_of(host), false));
     c.args(route_opts(host, &route_of(host)));
     c.args(ssh_opts());
     c
@@ -1192,6 +1479,8 @@ fn mux_prologue(host: &str, route: &Route) -> Command {
     let mut command = transport_command("ssh");
     command
         .env(ASKPASS_ALIAS_ENV, host)
+        .args(existing_master_opts(host, route))
+        .args(authentication_opts(host, route, false))
         .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
         .args(route_opts(host, route))
         .args(ssh_opts());
@@ -3351,6 +3640,7 @@ fn node_ssh_base(host: &str, route: &Route) -> Command {
     // This rung owns a fresh node connection rather than a mux. It must not
     // turn a background existing-only scope into node authentication.
     c.args(existing_master_opts(host, route));
+    c.args(authentication_opts(host, route, true));
     c.args([
         "-o",
         "BatchMode=yes",
@@ -3600,6 +3890,290 @@ async fn tunnel_proven(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixture_authentication() -> SshAuthentication {
+        SshAuthentication {
+            alias: "fixture".into(),
+            hostname: "login.example.invalid".into(),
+            user: "person".into(),
+            port: 2222,
+            socket: "/tmp/fixture-agent".into(),
+            known_hosts: "/tmp/fixture-trust".into(),
+            masters: vec![fixture_master("/tmp/fixture-master")],
+            fresh: true,
+        }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authentication_files_are_exact_caller_owned_leases_not_symlinks_or_fifos() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+        let root = std::env::temp_dir().join(format!(
+            "cx-auth-files-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let socket = root.join("agent");
+        let trust = root.join("trust");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::write(&trust, b"public trust fixture").unwrap();
+        validate_authentication_files(&socket, &trust)
+            .await
+            .unwrap();
+        let link = root.join("link");
+        symlink(&trust, &link).unwrap();
+        assert!(validate_authentication_files(&socket, &link).await.is_err());
+        assert!(validate_authentication_files(&trust, &trust).await.is_err());
+        let fifo = root.join("fifo");
+        let mut command = Command::new("mkfifo");
+        command.arg(&fifo);
+        assert!(output_bounded(&mut command, 5, "fixture FIFO")
+            .await
+            .unwrap()
+            .status
+            .success());
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            validate_authentication_files(&socket, &fifo)
+        )
+        .await
+        .unwrap()
+        .is_err());
+        let oversized = std::fs::File::create(&trust).unwrap();
+        oversized.set_len(128 * 1024 + 1).unwrap();
+        assert!(validate_authentication_files(&socket, &trust)
+            .await
+            .is_err());
+        assert!(
+            socket.exists() && trust.exists(),
+            "validation never removes caller leases"
+        );
+        drop(listener);
+        drop(oversized);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn authentication_config_refuses_accumulated_keys_and_destination_changes() {
+        let config = "hostname login.example.invalid\nuser person\nport 2222\nidentityfile none\ncertificatefile none\n";
+        assert!(authentication_config(config, "login.example.invalid", "person", 2222).unwrap());
+        for extra in [
+            "identityfile /tmp/private-key\n",
+            "certificatefile /tmp/certificate\n",
+        ] {
+            assert!(authentication_config(
+                &format!("{config}{extra}"),
+                "login.example.invalid",
+                "person",
+                2222
+            )
+            .is_err());
+        }
+        assert!(!authentication_config(
+            &format!("{config}proxyjump jump.example.invalid\n"),
+            "login.example.invalid",
+            "person",
+            2222
+        )
+        .unwrap());
+        assert!(
+            authentication_config(config, "different.example.invalid", "person", 2222).is_err()
+        );
+        for path in [
+            "relative",
+            "/tmp/%h",
+            "/tmp/${SOCKET}",
+            "/tmp/a b",
+            "/tmp/a\nb",
+            "/tmp/'quoted'",
+        ] {
+            assert!(authentication_path(Path::new(path)).is_err());
+        }
+    }
+    #[test]
+    fn authentication_snapshot_correlates_destination_and_master_before_config_changes() {
+        let original = "hostname login.example.invalid\nuser person\nport 2222\nidentityfile none\ncertificatefile none\ncontrolpath /tmp/original-master\n";
+        let (_, master) = authentication_snapshot(
+            "fixture",
+            Route::Alias,
+            original,
+            "login.example.invalid",
+            "person",
+            2222,
+        )
+        .unwrap();
+        let changed = original
+            .replace("login.example.invalid", "other.example.invalid")
+            .replace("original-master", "other-master");
+        let expanded = original.replace("original-master", "${OTHER_MASTER}");
+        assert!(authentication_snapshot(
+            "fixture",
+            Route::Alias,
+            &expanded,
+            "login.example.invalid",
+            "person",
+            2222
+        )
+        .is_err());
+        assert!(authentication_snapshot(
+            "fixture",
+            Route::Alias,
+            &changed,
+            "login.example.invalid",
+            "person",
+            2222
+        )
+        .is_err());
+        assert_eq!(master.path, "/tmp/original-master");
+        let mut scope = fixture_authentication();
+        scope.masters = vec![master];
+        assert!(scope
+            .options("fixture", &Route::Alias, false)
+            .contains(&"ControlPath=/tmp/original-master".into()));
+        assert!(scope
+            .options(
+                "fixture",
+                &Route::Node("other.example.invalid".into()),
+                false
+            )
+            .contains(&"ControlPath=none".into()));
+    }
+    #[tokio::test]
+    async fn authentication_scope_is_nested_isolated_and_existing_master_always_wins() {
+        let scope = fixture_authentication();
+        let mut nested = scope.clone();
+        nested.socket = "/tmp/nested-agent".into();
+        assert!(authentication_opts("fixture", &Route::Alias, false).is_empty());
+        scope
+            .with_authentication(async {
+                assert!(authentication_opts("fixture", &Route::Alias, false)
+                    .contains(&"IdentityAgent=/tmp/fixture-agent".into()));
+                nested
+                    .with_authentication(async {
+                        assert!(authentication_opts("fixture", &Route::Alias, false)
+                            .contains(&"IdentityAgent=/tmp/nested-agent".into()));
+                    })
+                    .await;
+                assert!(authentication_opts("fixture", &Route::Alias, false)
+                    .contains(&"IdentityAgent=/tmp/fixture-agent".into()));
+                assert!(tokio::spawn(async {
+                    authentication_opts("fixture", &Route::Alias, false).is_empty()
+                })
+                .await
+                .unwrap());
+                let protected = fixture_master("/tmp/protected-master");
+                protected
+                    .with_existing(async {
+                        let command = ssh_base_via("fixture", &Route::Alias);
+                        let args: Vec<_> = command
+                            .as_std()
+                            .get_args()
+                            .map(|a| a.to_string_lossy().into_owned())
+                            .collect();
+                        for expected in [
+                            "ProxyCommand=false",
+                            "ControlMaster=no",
+                            "ControlPath=/tmp/protected-master",
+                        ] {
+                            let prefix = expected.split('=').next().unwrap().to_string() + "=";
+                            assert_eq!(
+                                args.iter()
+                                    .find(|value| value.starts_with(&prefix))
+                                    .unwrap(),
+                                expected
+                            );
+                        }
+                    })
+                    .await;
+                for (host, route, node) in [
+                    ("different", Route::Alias, false),
+                    ("fixture", Route::Node("changed".into()), false),
+                    ("fixture", Route::Alias, true),
+                ] {
+                    let args = authentication_opts(host, &route, node);
+                    for expected in [
+                        "IdentityAgent=none",
+                        "ProxyCommand=false",
+                        "ControlPath=none",
+                        "ForwardAgent=no",
+                    ] {
+                        assert!(args.contains(&expected.into()));
+                    }
+                }
+            })
+            .await;
+        assert!(authentication_opts("fixture", &Route::Alias, false).is_empty());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(1),
+            scope.with_authentication(std::future::pending::<()>())
+        )
+        .await
+        .is_err());
+        assert!(authentication_opts("fixture", &Route::Alias, false).is_empty());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authentication_effective_ssh_config_never_loads_extra_keys_or_dials_on_scope_loss() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-auth-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let config = root.join("config");
+        std::fs::write(&config, "Host fixture\n HostName login.example.invalid\n User person\n Port 2222\n IdentityFile /tmp/forbidden-key\n CertificateFile /tmp/forbidden-cert\n ProxyJump jump.example.invalid\n").unwrap();
+        let mut command = Command::new("/usr/bin/ssh");
+        command.arg("-F").arg(&config).args([
+            "-o",
+            "IdentityFile=none",
+            "-o",
+            "CertificateFile=none",
+            "-G",
+            "fixture",
+        ]);
+        let output = output_bounded(&mut command, 5, "fixture configuration")
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert!(authentication_config(
+            std::str::from_utf8(&output.stdout).unwrap(),
+            "login.example.invalid",
+            "person",
+            2222
+        )
+        .is_err());
+        let mut scope = fixture_authentication();
+        scope.masters[0].path = root.join("missing-master").to_str().unwrap().into();
+        scope
+            .with_authentication(async {
+                let mut command = ssh_base_via("fixture", &Route::Alias);
+                command.args(["-G", "fixture"]);
+                let output = output_bounded(&mut command, 5, "fixture frozen configuration")
+                    .await
+                    .unwrap();
+                assert!(output.status.success());
+                let text = std::str::from_utf8(&output.stdout).unwrap();
+                assert!(
+                    authentication_config(text, "login.example.invalid", "person", 2222).unwrap()
+                );
+                assert!(text
+                    .lines()
+                    .any(|line| line == "stricthostkeychecking true"));
+                assert!(text.lines().any(|line| line == "forwardagent no"));
+                let mut command = ssh_base_via("fixture", &Route::Node("127.0.0.1".into()));
+                command.args(["-o", "ConnectTimeout=1", "fixture", "true"]);
+                let output = output_bounded(&mut command, 5, "fixture changed route")
+                    .await
+                    .unwrap();
+                assert!(!output.status.success());
+            })
+            .await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
     fn fixture_master(path: &str) -> MasterHandle {
         use sha2::Digest;
         MasterHandle {
