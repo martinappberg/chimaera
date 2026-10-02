@@ -438,6 +438,115 @@ sibling project must continue throughout. Kernel freezer and kill behavior is
 specified by the [Linux cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html);
 process census and daemon idle evidence are separate required proofs.
 
+### Inherited idle control v1
+
+The launch cleanup envelope gains only the optional closed field
+`maintenance_control:{version:1,fd,channel_nonce}`. Omission preserves existing
+startup behavior. `fd` is a non-stdio descriptor for the supervisor-created
+unnamed connected Unix stream socket, not a caller-selected file or HTTP target.
+The fixed launcher preserves exactly that descriptor through its exec gate.
+The daemon validates its socket type and trusted launch provenance, sets
+nonblocking/close-on-exec, excludes child inheritance, and establishes the
+process protections above before enabling the channel.
+
+Every message uses the exact existing inherited cleanup binding, restricted to:
+
+```json
+{
+  "account_id": "ID",
+  "workspace_id": "ID",
+  "root_identity": {"device": 1, "inode": 1},
+  "registration_revision": 1,
+  "launch_generation": 1,
+  "os_boot_id": "UUID"
+}
+```
+
+Account/workspace IDs and root/boot validation follow that startup contract.
+Registration and launch revisions are positive nonwrapping integers. The
+`channel_nonce` and each `fence_id` are independent 256-bit random values,
+43-character unpadded base64url, never logged or exposed to project code. The
+sole server-first frame is exactly
+`{version:1,type:"ready",binding,channel_nonce,project_secrets_idle:1}`. Supervisor
+requires the exact selected nonce and binding within three seconds of starting
+its channel handshake. Missing, repeated or mismatched Ready refuses the
+extension. Ready describes support, not idle or execution authority. Prepare
+also requires the daemon's current accepted scoped configuration, root/revision,
+supervisor launch acknowledgment and captured account/execution generation.
+
+Frames are a four-byte big-endian byte length followed by UTF-8 JSON. Reject
+zero length, requests above 16 KiB, replies above 32 KiB, duplicate/unknown fields,
+trailing JSON and unknown discriminants. Each request has a positive, strictly
+increasing `request_id:u64`; exhaustion closes the channel. Replies echo it.
+There is one serialized effect and at most four queued/owned requests; blocking
+workers retain capacity through actual completion after observer cancellation.
+
+All command requests and replies have these required common fields:
+`{version:1,type,request_id,binding,attempt_id,operation_id,pending_id,
+expected_applied_revision}`. The operation and pending UUIDs and applied revision
+are the exact original secret intent, using the external bounds above. The
+supervisor generates a separate canonical UUID `attempt_id` for one maintenance
+attempt. That identity also belongs in the durable parking record. A new request
+ID retries that same immutable attempt; it does not create a new idle decision.
+The following table specifies all additional fields; no others are accepted.
+
+| Request type | Additional fields | Meaning |
+| --- | --- | --- |
+| `prepare` | `expires_in_ms` | Admit one exact idle attempt with an original deadline of at most 30 seconds |
+| `inspect` | None | Observe that retained attempt, without starting preparation |
+| `abort` | `fence_id` | Roll back only that exact prepared attempt before durable Applying |
+
+The supervisor starts its deadline before the first Prepare, and sends only its
+remaining `expires_in_ms` in `1..30000`. The daemon also fixes a local deadline at
+first admission. Exact retries retain both original bounds. A reply's remaining
+time never extends the supervisor deadline, including across transport or
+filesystem waits. A late preparation cannot deliver authority.
+
+| Reply type | Additional fields | Meaning |
+| --- | --- | --- |
+| `busy` | `reason` | Positive no-fence result; metadata/leader restoration is complete |
+| `prepared` | `fence_id`, `remaining_ms`, `leaders` | Exact durably parked attempt and positively stopped leaders |
+| `aborted` | `fence_id` | Positive exact rollback; no replacement process was started |
+| `expired` | `fence_id` | Deadline passed and exact rollback completed |
+| `recovery_required` | `reason` | Cleanup or durable parking is unknown; admission remains closed |
+| `conflict` | `reason` | Mismatched immutable identity or another retained active attempt |
+| `not_found` | None | No retained receipt for that exact attempt; not idle/cleanup proof |
+
+Busy reasons are the closed enum `active_turn`, `pending_input`,
+`background_work`, `permission_wait`, `external_input`, `terminal_work`,
+`setup_or_mutation`, `lifecycle_or_transfer`, `unresumable`, `process_unknown`,
+`limit_reached`, `expired`. Recovery reasons are `parking_cleanup_unknown` or
+`park_record_unknown`; conflict reasons are `identity_changed`, `binding_changed`,
+`attempt_in_progress`, `outcome_unknown`. None includes OS output, a transcript,
+command, path or environment. `remaining_ms` is positive and never exceeds the
+original remaining deadline. Each leader is exactly
+`{session_id,namespace_pid,start_ticks}`, with a valid session ID and positive
+PID/start identity. There are at most 64 unique session/PID pairs. A wrapper or
+extra descendant does not gain authority from this list. Even an empty leader
+list requires the supervisor's complete positive process census.
+
+An exact retry returns the original attempt's outcome and never repeats a stop
+or export. Inspect cannot create a receipt. At most one attempt result is
+retained per project/channel. A new maintenance attempt may replace only a
+positive Busy/Aborted/Expired result for the same or a different pending intent,
+only while the exact launch binding is current and no guards, stopped leaders or
+admission latch remain. Prepared or RecoveryRequired cannot be replaced. The
+controller compares the new attempt with its actual current durable pending
+intent before sending; the attempt itself grants no secret-update authority.
+New attempts require a separate serialized controller maintenance pass, at least
+30 seconds after the previous attempt; a Busy reply
+cannot recursively retry or spawn another pass. A missing older receipt grants
+nothing. Unknown rollback retains its closed admission and recovery record.
+
+Consume is deliberately not a channel command. The supervisor derives an opaque
+local token from the exact authenticated Prepared reply, performs the pinned
+frozen-cgroup census, and consumes that token once with fresh authorization and
+the durable Applying transition under its existing controller owner. Its original
+deadline and bindings remain mandatory after every wait. Abort/expiry can thaw
+only before that durable transition and after positive exact rollback. After
+Applying, failed kill, timeout or a lost acknowledgment must never thaw the old
+cgroup or reopen its execution authority.
+
 ## Acceptance gate
 
 Capability enablement requires the real account, keeper, supervisor, daemon and
