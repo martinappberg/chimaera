@@ -158,10 +158,39 @@ survival, not migration of live SSH processes between keepers.
 Authenticated `POST /internal/v1/keeper/report` accepts optional
 `jobs:"idle"|"held"|"unknown"` alongside the existing held-work/volume report.
 An account that durably stores and enforces it returns
-`{"job_hold_v1":true}`. Missing/false acknowledgment, 204 or a missing route
+`{"job_hold_v1":true,"jobs_revision":42}`. Missing/false acknowledgment, 204 or a missing route
 means unsupported. Report negotiation precedes job admission/capability
 advertisement. `held` includes waiting/running allocations and retained attached
 children/tunnels; `unknown` includes unverified recovery or lost scheduler state.
+
+The keeper reserves a local job hold and obtains an acknowledged `held` report
+**before** any remote submission or attached child starts. It drains older
+reports first and keeps that reservation through uncertain outcomes. Clearing a
+hold requires terminal proof, not a disconnected caller or a failed request.
+
+Authenticated keeper-only `GET /internal/v1/keeper/job-hold` returns
+`{version:1,revision:<nonnegative integer>,jobs:null|"idle"|"held"|"unknown"}`.
+Revision zero with null jobs means no supported report has been committed. A
+report carrying `jobs` must also carry `jobs_revision` equal to that revision.
+The first supported report is `unknown`; it arms persistent protection before
+recovery or job admission. A successful conditional report increments the
+revision and includes `jobs_revision` in its `job_hold_v1:true` acknowledgment.
+A stale condition is `412 jobs_changed`, never an unconditional replacement.
+Omitting `jobs` never changes its revision/state. Lost replies reconcile through
+the getter, with no submission until a current held reservation is acknowledged.
+Late idle reports therefore cannot overwrite a newer held/unknown reservation.
+
+Account report acceptance and automated keeper-rollout reservation are mutually
+exclusive durable transactions, bound to the current keeper machine. Rollout
+must reserve its restart while checking the job state under the same database
+fence used by report acceptance; a read followed by an unfenced provider call is
+insufficient. A report attempting job admission after rollout owns that fence
+gets `409 rollout_pending` before SSH side effects. The rollout reservation
+persists through the provider operation and uncertain outcomes, and is cleared
+only after reconciliation proves that admission is safe. A timeout or expired
+process lease does not by itself reopen admission. Every automated restart path
+(including urgent/overdue rollout) observes this fence. Ordinary bookkeeping
+reports cannot release it or erase negotiated job protection.
 
 Once an account records a supported job state, older reports omitting `jobs`
 cannot clear that state or its negotiated protection. A held/unknown job state or
