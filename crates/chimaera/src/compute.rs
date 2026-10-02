@@ -442,7 +442,7 @@ pub async fn open(host: &str, which: &str, job: Option<&str>, no_open: bool) -> 
         &endpoint.token,
     )
     .await?;
-    let url = format!("{}&cws={}", tunnel.url(), view.id);
+    let url = format!("{}&ws={id}&cws={id}", tunnel.url(), id = view.id);
     println!("{url}");
     println!(
         "{} on {} — Ctrl-C closes this connection; the job keeps running",

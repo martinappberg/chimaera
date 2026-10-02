@@ -47,6 +47,7 @@
     endedLine,
     jobStatusLine,
     liveJobs,
+    openInHint,
     openPlan,
     otherJobsWords,
     shortHost,
@@ -62,15 +63,30 @@
     alias: string;
     /** The host's shell state (cluster info: login daemon, override). */
     host: HostState | null;
-    /** Back to the host list. */
+    /** Back to the host list (or, in a workspace's window, to the workspace). */
     onBack: () => void;
+    /** What the back button says. */
+    backLabel?: string;
+    /** In a workspace's window: that workspace (its row says so, and Open
+     *  goes back to it here instead of opening another window). */
+    here?: string | null;
+    onHere?: () => void;
     /** The shell returned a new state for this host (the override toggle). */
     onHostState: (state: HostState) => void;
     /** Something changed the host list (a login daemon was shut down). */
     onHostsChanged: () => void;
   }
 
-  let { alias, host, onBack, onHostState, onHostsChanged }: Props = $props();
+  let {
+    alias,
+    host,
+    onBack,
+    backLabel = "Home",
+    here = null,
+    onHere,
+    onHostState,
+    onHostsChanged,
+  }: Props = $props();
 
   const entry = $derived(clusterOverviews.entry(alias));
   const overview = $derived(entry?.overview ?? null);
@@ -236,33 +252,39 @@
     sheet = { kind: "start", preselect, spec };
   }
 
-  /** Open, as plan §4.2's table says: where it's open; else the one running
-   *  job; else a choice; else the start sheet with it ticked. */
+  /** Open: where it's open (this window's own workspace: back to it here).
+   *  Anywhere else is your pick — a running job, when a waiting one starts,
+   *  or a new job; with no job alive, the start sheet with it ticked. */
   function openClicked(e: MouseEvent, w: ClusterWorkspaceView): void {
     if (w.state === "open") {
-      openIn(w, null);
+      if (w.id === here && onHere !== undefined) onHere();
+      else openIn(w, null);
       return;
     }
     const plan = openPlan(overview?.jobs ?? []);
-    if (plan.kind === "sheet") startSheet([w.id]);
-    else if (plan.kind === "job") openIn(w, plan.job.id);
-    else if (plan.kind === "queue") {
-      const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-      const items: ContextMenuEntry[] = plan.jobs.map((j) => ({
-        label: `When ${j.name} starts`,
-        onSelect: () => void wsAction(w, "opening", () => clusterQueueOpen(alias, w.id, j.id)),
-      }));
-      items.push("separator", { label: "In a new job…", onSelect: () => startSheet([w.id]) });
-      contextMenu.openAtPoint(r.right, r.bottom + 4, items, { alignRight: true });
-    } else {
-      const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-      const items: ContextMenuEntry[] = plan.jobs.map((j) => ({
-        label: `In ${j.name}`,
-        onSelect: () => openIn(w, j.id),
-      }));
-      items.push("separator", { label: "In a new job…", onSelect: () => startSheet([w.id]) });
-      contextMenu.openAtPoint(r.right, r.bottom + 4, items, { alignRight: true });
+    if (plan.kind === "sheet") {
+      startSheet([w.id]);
+      return;
     }
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const items: ContextMenuEntry[] = [];
+    for (const j of plan.running) {
+      const detail = openInHint(j, wsIn(j).map((x) => x.name), clusterTime);
+      items.push({
+        label: `In ${j.name}`,
+        detail: detail === "" ? undefined : detail,
+        onSelect: () => openIn(w, j.id),
+      });
+    }
+    for (const j of plan.pending) {
+      items.push({
+        label: `When ${j.name} starts`,
+        detail: j.state === "starting" ? "starting now" : "waiting for a node",
+        onSelect: () => void wsAction(w, "opening", () => clusterQueueOpen(alias, w.id, j.id)),
+      });
+    }
+    items.push("separator", { label: "In a new job…", onSelect: () => startSheet([w.id]) });
+    contextMenu.openAtPoint(r.right, r.bottom + 4, items, { alignRight: true });
   }
 
   function closeWs(w: ClusterWorkspaceView): void {
@@ -308,7 +330,7 @@
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const items: ContextMenuEntry[] = closedWs.map((w) => ({
       label: w.name,
-      hint: w.path,
+      detail: tildePath(w.path, overview?.home),
       onSelect: () => openIn(w, job.id),
     }));
     items.push("separator", { label: "Add a workspace…", onSelect: () => (picker = { job }) });
@@ -347,8 +369,10 @@
     }
   }
 
+  /** Added from a job's "Open a workspace here": open it there. Added from
+   *  the list, it's just added — its Open asks where. */
   function added(ws: ClusterWorkspace, openAfter: boolean): void {
-    const target = picker?.job ?? (running.length === 1 ? running[0] : null);
+    const target = picker?.job ?? null;
     picker = null;
     refresh();
     if (!openAfter || target === null) return;
@@ -494,6 +518,7 @@
     <div class="ws-main">
       <span class="name" title={w.name}>{w.name}</span>
       <span class="path" title={w.path}>{tildePath(w.path, overview?.home)}</span>
+      {#if w.id === here}<span class="here-tag">this window</span>{/if}
       <span class="acts">
         {#if busy !== undefined}
           <span class="busy-word"
@@ -507,8 +532,12 @@
           >
         {:else}
           {#if w.state !== "queued" && !w.closing}
-            <button class="act primary" onclick={(e) => openClicked(e, w)}>
-              Open{#if w.state === "closed" && (running.length > 1 || (running.length === 0 && jobs.length > 0))}
+            <button
+              class="act primary"
+              aria-haspopup={w.state === "closed" && jobs.length > 0 ? "menu" : undefined}
+              onclick={(e) => openClicked(e, w)}
+            >
+              Open{#if w.state === "closed" && jobs.length > 0}
                 <svg class="chev-down" viewBox="0 0 16 16" width="9" height="9" aria-hidden="true">
                   <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
                 </svg>
@@ -537,7 +566,7 @@
 <div class="inner">
   <header class="masthead">
     <div class="topline">
-      <button class="back-home" aria-label="Back to Home" title="Back to Home" onclick={onBack}>
+      <button class="back-home" aria-label="Back to {backLabel}" title="Back to {backLabel}" onclick={onBack}>
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
           <path
             d="M10.5 3.5 6 8l4.5 4.5M6.5 8H14"
@@ -548,7 +577,7 @@
             stroke-linejoin="round"
           />
         </svg>
-        <span>Home</span>
+        <span>{backLabel}</span>
       </button>
       <div class="mast-acts">
         <button class="mast-btn" title="A terminal on {alias}'s login node" onclick={() => void openTerminal()}>
@@ -806,7 +835,7 @@
   <ClusterFolderPicker
     {alias}
     {places}
-    canOpen={picker.job !== null || running.length === 1}
+    canOpen={picker.job !== null}
     onAdded={added}
     onClose={() => (picker = null)}
   />
@@ -1274,6 +1303,16 @@
     font-family: var(--mono);
     font-size: var(--text-sm);
     color: var(--muted);
+  }
+
+  .here-tag {
+    flex: none;
+    font-size: var(--text-xs);
+    color: var(--accent);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    border-radius: 999px;
+    padding: 0 7px;
+    white-space: nowrap;
   }
 
   .acts {

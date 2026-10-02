@@ -304,22 +304,29 @@ export function workspaceActivity(w: ClusterWorkspaceView, nowMs: number, locale
   }
 }
 
-/** Where Open sends a workspace that isn't open (plan §4.2's table). */
+/** Where Open sends a workspace that isn't open: always the user's pick —
+ *  a running job (it shares that job's node and time), a waiting one (it
+ *  opens when that one starts), or a new job. With no job alive, straight
+ *  to the start sheet. */
 export type OpenPlan =
   | { kind: "sheet" }
-  | { kind: "job"; job: ClusterJob }
-  | { kind: "choose"; jobs: ClusterJob[] }
-  /** None runs yet, but these will: open when one starts, or in a new job. */
-  | { kind: "queue"; jobs: ClusterJob[] };
+  | { kind: "choose"; running: ClusterJob[]; pending: ClusterJob[] };
 
 export function openPlan(jobs: readonly ClusterJob[]): OpenPlan {
   const running = jobs.filter((j) => j.state === "running");
-  if (running.length === 0) {
-    const pending = jobs.filter((j) => j.state === "waiting" || j.state === "starting");
-    return pending.length === 0 ? { kind: "sheet" } : { kind: "queue", jobs: pending };
-  }
-  if (running.length === 1) return { kind: "job", job: running[0] };
-  return { kind: "choose", jobs: running };
+  const pending = jobs.filter((j) => j.state === "waiting" || j.state === "starting");
+  if (running.length === 0 && pending.length === 0) return { kind: "sheet" };
+  return { kind: "choose", running, pending };
+}
+
+/** The Open menu's line under a running job: where it runs, how long it
+ *  has, and what's already open in it ("sh04 · ends in 27 min · with crc"). */
+export function openInHint(j: ClusterJob, openNames: readonly string[], nowMs: number): string {
+  const parts: string[] = [];
+  if (j.node) parts.push(shortHost(j.node));
+  if (j.ends_at_ms !== undefined) parts.push(endsInWords(j.ends_at_ms, nowMs));
+  if (openNames.length > 0) parts.push(`with ${openNames.join(", ")}`);
+  return parts.join(" · ");
 }
 
 /** Jobs shown as cards: everything not ended, newest first. */

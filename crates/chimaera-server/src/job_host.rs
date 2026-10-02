@@ -269,17 +269,27 @@ pub async fn run(job_dir: PathBuf) -> anyhow::Result<()> {
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        let mut term =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(term) => term,
-                Err(_) => {
-                    let _ = tokio::signal::ctrl_c().await;
-                    return;
-                }
-            };
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(term) => term,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        // An attached job's session hanging up (the app that held it quit
+        // or lost its connection) is a stop too: close every workspace, as
+        // for walltime or scancel, instead of dying mid-write.
+        let mut hangup = signal(SignalKind::hangup()).ok();
         tokio::select! {
             _ = term.recv() => {}
             _ = tokio::signal::ctrl_c() => {}
+            Some(_) = async {
+                match hangup.as_mut() {
+                    Some(h) => h.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {}
         }
     }
     #[cfg(not(unix))]

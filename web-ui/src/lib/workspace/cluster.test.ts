@@ -28,6 +28,7 @@ import {
   liveJobs,
   memWords,
   nodeSizeWords,
+  openInHint,
   openPlan,
   otherJobsWords,
   parentPath,
@@ -340,15 +341,22 @@ describe("jobs in words", () => {
     expect(workspaceActivity(ws(), NOW)).toBe("not opened yet");
   });
 
-  it("decides what Open does from the running jobs", () => {
+  it("lets you pick where Open goes whenever a job is alive", () => {
     expect(openPlan([])).toEqual({ kind: "sheet" });
-    const waiting = job({ id: "j-0000000w", state: "waiting" });
-    expect(openPlan([waiting])).toEqual({ kind: "queue", jobs: [waiting] });
     expect(openPlan([job({ state: "ended" })])).toEqual({ kind: "sheet" });
+    const waiting = job({ id: "j-0000000w", state: "waiting" });
+    expect(openPlan([waiting])).toEqual({ kind: "choose", running: [], pending: [waiting] });
+    // One running job is still a choice: it shares that job's node and time.
     const one = job({ id: "j-0000bbbb" });
-    expect(openPlan([one, job({ state: "waiting" })])).toEqual({ kind: "job", job: one });
+    expect(openPlan([one, waiting])).toEqual({ kind: "choose", running: [one], pending: [waiting] });
     const two = job({ id: "j-0000cccc", name: "GPU" });
-    expect(openPlan([one, two])).toEqual({ kind: "choose", jobs: [one, two] });
+    expect(openPlan([one, two])).toEqual({ kind: "choose", running: [one, two], pending: [] });
+  });
+
+  it("says where a running job would open a workspace", () => {
+    const j = job({ node: "node042.cluster.example", ends_at_ms: NOW + 27 * MIN });
+    expect(openInHint(j, ["crc"], NOW)).toBe("node042 · ends in 27 min · with crc");
+    expect(openInHint(job({ node: "" }), [], NOW)).toBe("");
   });
 
   it("shows live jobs newest first", () => {

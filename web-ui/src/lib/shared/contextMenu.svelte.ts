@@ -18,6 +18,8 @@ export interface ContextMenuItem {
   /** Rendered but inert; `hint` says why (shown as the row's title). */
   disabled?: boolean;
   hint?: string;
+  /** A muted second line under the label (where a pick leads). */
+  detail?: string;
   onSelect: () => void;
 }
 

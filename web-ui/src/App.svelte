@@ -263,6 +263,7 @@
   import { transferBlock, transferInto, type FileSource } from "./lib/workspace/fileTransfer";
   import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import type JobWindowNotices from "./lib/workspace/JobWindowNotices.svelte";
+  import type JobClusterHome from "./lib/workspace/JobClusterHome.svelte";
   import {
     dropSpotAt,
     folderTargetAt,
@@ -512,6 +513,27 @@
       (err: unknown) => console.error("job window notices failed to load", err),
     );
   }
+  /** A cluster workspace window's cluster page (its own chunk), shown over
+   *  the workspace in place of the folder picker: this window's chimaera
+   *  knows only its one workspace; the cluster page knows them all. */
+  const clusterWs = isNativeShell() ? (jobCtx?.cws ?? null) : null;
+  let clusterHomeOpen = $state(false);
+  let ClusterHomeView = $state<typeof JobClusterHome | null>(null);
+
+  function openClusterHome(): void {
+    clusterHomeOpen = true;
+    if (ClusterHomeView !== null) return;
+    import("./lib/workspace/JobClusterHome.svelte").then(
+      (m) => {
+        ClusterHomeView = m.default;
+      },
+      (err: unknown) => {
+        clusterHomeOpen = false;
+        console.error("cluster page failed to load", err);
+      },
+    );
+  }
+
   /** Context from the shell's liveness monitor for the current drop. */
   let reconnectReason = $state<string | null>(null);
   /** Dismissing a failed reconnect downgrades it to an ambient Retry instead
@@ -2961,6 +2983,12 @@
   }
 
   function openPicker(): void {
+    // A folder opened here would belong to this job's chimaera alone, not
+    // the cluster: a cluster workspace's window picks from the cluster page.
+    if (clusterWs !== null) {
+      openClusterHome();
+      return;
+    }
     if (pickerOpen) return;
     pickerRestoreEl = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     refreshWorkspaces();
@@ -5177,7 +5205,7 @@
         <button
           class="ws-btn"
           class:placeholder={workspace === null && activeWsId === null}
-          title={workspace?.root}
+          title={clusterWs !== null ? `${workspace?.root ?? ""} — every workspace on ${hostAlias}` : workspace?.root}
           onclick={openPicker}
         >
           <span class="ws-label">
@@ -6313,6 +6341,15 @@
       </div>
     {/each}
   </div>
+{/if}
+
+{#if clusterWs !== null && clusterHomeOpen && ClusterHomeView !== null}
+  <ClusterHomeView
+    alias={hostAlias}
+    here={clusterWs}
+    hereName={workspace?.name ?? "workspace"}
+    onClose={() => (clusterHomeOpen = false)}
+  />
 {/if}
 
 {#if jobCtx !== null && JobNoticesView !== null}

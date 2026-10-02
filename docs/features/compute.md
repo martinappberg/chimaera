@@ -60,12 +60,25 @@ startup commands, the lease) in `crates/chimaera-server/src/{compute,lifecycle,e
 - **Workspaces.** Added with a folder picker (`chimaera browse --dir`: folders only, git
   and already-added marks, a typed path) — the only browsing outside a workspace window.
   A workspace is open in at most one job; a job may hold several, or none. **Open** goes
-  where it is open, else to the one running job, else asks which (or "In a new job…");
-  while jobs only wait, it offers "When <job> starts" (added to that job's start list;
-  the app opens it through job-host once the job runs, in case the job read its list a
-  moment before); with no job, it opens the start sheet with it ticked. Paths under the
-  cluster's home folder show as `~/…`. **Move to** another running job closes it
-  there (its chimaera saves the chats) and opens it here; its window follows.
+  where it is open. Anywhere else is the user's pick, never a silent default: each
+  running job (its node, time left, and what's already open in it, since it shares
+  them), "When <job> starts" for each waiting job (added to that job's start list; the
+  app opens it through job-host once the job runs, in case the job read its list a
+  moment before), and "In a new job…"; with no job, it opens the start sheet with it
+  ticked. Paths under the cluster's home folder show as `~/…`. **Move to** another
+  running job closes it there (its chimaera saves the chats) and opens it here; its
+  window follows.
+- **A workspace's window.** It opens straight into its workspace (`ws=` with the
+  cluster's id, which its chimaera registered before it listened). Its chimaera knows
+  only that one workspace, so the window's way to the rest of the cluster is the cluster
+  page: the sidebar's workspace button (and ⌘O) shows it over the workspace, with this
+  window's row marked "this window"; Open there, or the back button, returns to it. A
+  job window that lands on its home shows the same page. A folder is never opened on a
+  job's own chimaera.
+- **Fresh state.** The page, Open/Close/Move and the watcher ask each running job's
+  job-host what it holds (over the forward the app already has; a read never builds
+  one) and lay that over the cluster folder, which can show an open or a close on the
+  login node a minute late.
 - **Wire.** Tauri commands `cluster_*` (see `web-ui/src/lib/net/native.ts`); events
   `cluster-changed` and `host-status` (`ended` with a reason for a workspace window:
   Slurm's state, `stopped`, `closed`, `workspace-failed`, or `moving`). Ports and tokens

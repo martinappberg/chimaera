@@ -259,6 +259,10 @@ pub struct WorkspaceView {
     /// again). The client adds the last lines it printed when it can.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed: Option<String>,
+    /// Agents working in it right now, when its job-host was asked
+    /// ([`apply_hosting`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working: Option<u32>,
 }
 
 /// Where a running job's job-host listens — kept by the client, never sent
@@ -586,6 +590,7 @@ fn build(
                 opening: false,
                 closing: false,
                 failed: None,
+                working: None,
             };
             let held_in = |jid: &str| {
                 hosting
@@ -1872,6 +1877,62 @@ pub fn endpoint_from(status: &JobHostStatus, jid: &str, wid: &str) -> Option<End
     })
 }
 
+/// Overlay what running job `jid`'s own job-host says it holds now. The
+/// cluster folder can show an open or a close on the login node only a
+/// minute later; job-host's word can't be stale. A workspace it doesn't
+/// list isn't open there, whatever the folder still says (startup opens are
+/// listed before it answers at all).
+pub fn apply_hosting(ov: &mut ClusterOverview, jid: &str, status: &JobHostStatus) {
+    if !ov.jobs.iter().any(|j| j.id == jid && j.state == "running") {
+        return;
+    }
+    let endpoints = &mut ov.endpoints;
+    for v in &mut ov.workspaces {
+        let held = status.workspaces.iter().find(|w| w.id == v.id);
+        let here = v.job.as_deref() == Some(jid);
+        match held.map(|w| w.state) {
+            Some(HostedState::Starting) => {
+                v.state = "queued";
+                v.opening = true;
+                v.closing = false;
+                v.failed = None;
+            }
+            Some(state @ (HostedState::Open | HostedState::Closing)) => {
+                v.state = "open";
+                v.opening = false;
+                v.closing = state == HostedState::Closing;
+                v.failed = None;
+                if let Some(e) = endpoint_from(status, jid, &v.id) {
+                    endpoints.insert(v.id.clone(), e);
+                }
+            }
+            Some(HostedState::Failed) => {
+                v.state = "closed";
+                v.opening = false;
+                v.closing = false;
+                v.failed = held.map(|w| w.detail.clone());
+            }
+            None if here => {
+                v.state = "closed";
+                v.job = None;
+                v.opening = false;
+                v.closing = false;
+                v.failed = None;
+            }
+            None => continue,
+        }
+        if held.is_some() {
+            v.job = Some(jid.to_string());
+        }
+        v.working = held
+            .filter(|w| w.state == HostedState::Open)
+            .map(|w| w.working);
+        if v.state == "closed" && endpoints.get(&v.id).is_some_and(|e| e.job == jid) {
+            endpoints.remove(&v.id);
+        }
+    }
+}
+
 pub async fn host_status(local_port: u16, token: &str) -> anyhow::Result<JobHostStatus> {
     let (status, body) = host_request(local_port, token, "GET", "/api/v1/job", 8).await?;
     anyhow::ensure!(status == 200, "the job answered HTTP {status}");
@@ -2259,6 +2320,105 @@ mod tests {
         );
         let json = serde_json::to_value(by_id("w-0000000a")).unwrap();
         assert!(json.get("opening").is_none() && json.get("closing").is_none());
+    }
+
+    /// The folder lags (a new manifest, a close, a failure); the running
+    /// job's job-host says what it holds now, and that wins.
+    #[test]
+    fn a_running_jobs_job_host_overrides_a_lagging_folder() {
+        let ws = |id: &str| ClusterWorkspace {
+            id: id.into(),
+            name: id.into(),
+            path: format!("/s/{id}"),
+            created_ms: 0,
+        };
+        let config = ClusterConfig {
+            workspaces: ["a", "b", "c", "d", "e"]
+                .iter()
+                .map(|s| ws(&format!("w-0000000{s}")))
+                .collect(),
+            ..Default::default()
+        };
+        let files = |jid: &str, slurm: &str| JobFiles {
+            record: record(jid, Some(slurm), NOW - 10_000_000),
+            host: Some(host(slurm)),
+            egress: None,
+            hosting: None,
+        };
+        let state = BrowseState {
+            config: config.clone(),
+            jobs: vec![files("j-0000aaaa", "77"), files("j-0000bbbb", "78")],
+            manifests: [
+                ("w-0000000b".to_string(), manifest("77")),
+                ("w-0000000e".to_string(), manifest("78")),
+            ]
+            .into_iter()
+            .collect(),
+            last_open_ms: Default::default(),
+        };
+        let queue = [
+            queue_row("77", "RUNNING", "n1", "1:00:00", "None"),
+            queue_row("78", "RUNNING", "n2", "1:00:00", "None"),
+        ];
+        let b = build(&config, &state, &queue, true, NOW);
+        let mut ov = ClusterOverview {
+            jobs: b.jobs,
+            workspaces: b.workspaces,
+            endpoints: b.endpoints,
+            ..Default::default()
+        };
+        assert!(ov.endpoints.contains_key("w-0000000b"));
+        let held =
+            |id: &str, state: HostedState, port: Option<u16>, detail: &str| HostedWorkspace {
+                id: id.into(),
+                state,
+                port,
+                working: 2,
+                token: port.map(|_| "tok".to_string()),
+                detail: detail.into(),
+            };
+        let status = JobHostStatus {
+            job: "j-0000aaaa".into(),
+            slurm_job_id: "77".into(),
+            node: "n1".into(),
+            workspaces: vec![
+                held("w-0000000a", HostedState::Open, Some(45000), ""),
+                held("w-0000000c", HostedState::Starting, None, ""),
+                held("w-0000000d", HostedState::Failed, None, "address in use"),
+            ],
+        };
+        apply_hosting(&mut ov, "j-0000aaaa", &status);
+        let by_id = |id: &str| ov.workspaces.iter().find(|w| w.id == id).unwrap().clone();
+        // Just opened: no manifest on the login node yet.
+        let a = by_id("w-0000000a");
+        assert_eq!(
+            (a.state, a.job.as_deref(), a.working),
+            ("open", Some("j-0000aaaa"), Some(2))
+        );
+        assert_eq!(ov.endpoints["w-0000000a"].port, 45000);
+        // Closed since: its manifest still names 77.
+        let b = by_id("w-0000000b");
+        assert_eq!((b.state, b.job.as_deref()), ("closed", None));
+        assert!(!ov.endpoints.contains_key("w-0000000b"));
+        let c = by_id("w-0000000c");
+        assert_eq!(
+            (c.state, c.job.as_deref(), c.opening, c.working),
+            ("queued", Some("j-0000aaaa"), true, None)
+        );
+        let d = by_id("w-0000000d");
+        assert_eq!(
+            (d.state, d.job.as_deref(), d.failed.as_deref()),
+            ("closed", Some("j-0000aaaa"), Some("address in use"))
+        );
+        // Open in the other job: not this job-host's to say.
+        let e = by_id("w-0000000e");
+        assert_eq!((e.state, e.job.as_deref()), ("open", Some("j-0000bbbb")));
+        assert!(ov.endpoints.contains_key("w-0000000e"));
+
+        // A job that isn't running has nothing to say.
+        let before = ov.clone();
+        apply_hosting(&mut ov, "j-0000cccc", &status);
+        assert_eq!(ov, before);
     }
 
     #[test]

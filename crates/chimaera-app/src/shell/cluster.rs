@@ -495,7 +495,7 @@ fn ensure_watcher(app: &AppHandle, alias: &str) {
         let mut failures = 0u32;
         loop {
             tokio::time::sleep(interval).await;
-            let ov = match cluster::overview(&alias, home()).await {
+            let mut ov = match cluster::overview(&alias, home()).await {
                 Ok(ov) => {
                     failures = 0;
                     ov
@@ -510,6 +510,7 @@ fn ensure_watcher(app: &AppHandle, alias: &str) {
                     continue;
                 }
             };
+            overlay_live(&app, &alias, &mut ov).await;
             absorb(&app, &alias, &ov).await;
             let _ = app.emit("cluster-changed", json!({ "alias": alias }));
             let starting = ov.jobs.iter().any(|j| j.state == "starting");
@@ -569,12 +570,40 @@ async fn fresh_overview(alias: &str) -> Result<ClusterOverview, String> {
     }
 }
 
+/// A fresh overview with each running job's own word on what it holds.
+async fn live_overview(app: &AppHandle, alias: &str) -> Result<ClusterOverview, String> {
+    let mut ov = fresh_overview(alias).await?;
+    overlay_live(app, alias, &mut ov).await;
+    Ok(ov)
+}
+
+/// Ask the job-host of every running job this app already holds a forward
+/// to (a read never builds one) what it holds — opening, open, closing,
+/// failed, and its working agents. The cluster folder can show an open or a
+/// close on the login node a minute late; job-host can't.
+async fn overlay_live(app: &AppHandle, alias: &str, ov: &mut ClusterOverview) {
+    let shell = app.state::<Shell>();
+    let held: Vec<(String, u16, String)> = {
+        let tunnels = shell.compute_tunnels.lock().await;
+        ov.hosts
+            .iter()
+            .filter_map(|(jid, h)| {
+                let t = tunnels.get(&host_key(alias, jid))?;
+                Some((jid.clone(), t.local_port, h.token.clone()))
+            })
+            .collect()
+    };
+    for (jid, port, token) in held {
+        if let Ok(status) = cluster::host_status(port, &token).await {
+            cluster::apply_hosting(ov, &jid, &status);
+        }
+    }
+}
+
 /// The overview as a page gets it: no endpoints, plus Slurm's start
-/// estimate for waiting jobs (asked at most every five minutes per job) and
-/// what's happening in each open workspace (its job-host's count of working
-/// agents, when the job's forward is up).
+/// estimate for waiting jobs (asked at most every five minutes per job).
 async fn page_overview(app: &AppHandle, alias: &str) -> Result<serde_json::Value, String> {
-    let ov = fresh_overview(alias).await?;
+    let ov = live_overview(app, alias).await?;
     absorb(app, alias, &ov).await;
     let shell = app.state::<Shell>();
     let mut wanted: Vec<String> = Vec::new();
@@ -603,30 +632,6 @@ async fn page_overview(app: &AppHandle, alias: &str) -> Result<serde_json::Value
             .estimates
             .insert(slurm, (Instant::now(), est));
     }
-    // Activity per open workspace, from the jobs whose forward this app
-    // already holds (a page view never builds one just to count), and a
-    // failed workspace's last words.
-    let mut working: HashMap<String, u32> = HashMap::new();
-    let mut failed: HashMap<String, String> = HashMap::new();
-    for (jid, h) in &ov.hosts {
-        let key = host_key(alias, jid);
-        let port = shell
-            .compute_tunnels
-            .lock()
-            .await
-            .get(&key)
-            .map(|t| t.local_port);
-        if let Some(port) = port {
-            if let Ok(status) = cluster::host_status(port, &h.token).await {
-                for w in status.workspaces {
-                    if w.state == HostedState::Failed {
-                        failed.insert(w.id.clone(), w.detail.clone());
-                    }
-                    working.insert(w.id, w.working);
-                }
-            }
-        }
-    }
     let mut v = serde_json::to_value(&ov).map_err(|e| e.to_string())?;
     if let Some(list) = v.get_mut("jobs").and_then(|w| w.as_array_mut()) {
         for j in list {
@@ -636,23 +641,6 @@ async fn page_overview(app: &AppHandle, alias: &str) -> Result<serde_json::Value
                 .and_then(|s| estimates.get(s).copied().flatten());
             if let (Some(obj), Some(est)) = (j.as_object_mut(), est) {
                 obj.insert("start_estimate_ms".into(), json!(est));
-            }
-        }
-    }
-    if let Some(list) = v.get_mut("workspaces").and_then(|w| w.as_array_mut()) {
-        for w in list {
-            let id = w
-                .get("id")
-                .and_then(|i| i.as_str())
-                .unwrap_or("")
-                .to_string();
-            if let Some(obj) = w.as_object_mut() {
-                if let Some(n) = working.get(&id) {
-                    obj.insert("working".into(), json!(n));
-                }
-                if let Some(detail) = failed.get(&id).filter(|_| obj.contains_key("failed")) {
-                    obj.insert("failed".into(), json!(detail));
-                }
             }
         }
     }
@@ -854,12 +842,23 @@ async fn submit_job(
 /// Hold an attached job in the foreground for as long as this app runs (or
 /// until the user stops it). Dropping the child — app quit included — ends
 /// the job.
+/// An attached job's hold: its ssh (`srun` in the foreground on the login
+/// node). `stop` ends it from a running app; at quit, its pid does.
+pub(crate) struct Attached {
+    stop: tokio::sync::oneshot::Sender<()>,
+    pid: Option<u32>,
+}
+
 fn hold_attached(app: &AppHandle, alias: &str, jid: &str, mut child: tokio::process::Child) {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let shell = app.state::<Shell>();
     let key = (alias.to_string(), jid.to_string());
-    if let Some(old) = lock(&shell.attached_jobs).insert(key.clone(), tx) {
-        let _ = old.send(());
+    let held = Attached {
+        stop: tx,
+        pid: child.id(),
+    };
+    if let Some(old) = lock(&shell.attached_jobs).insert(key.clone(), held) {
+        let _ = old.stop.send(());
     }
     let app = app.clone();
     let alias = alias.to_string();
@@ -1054,8 +1053,8 @@ pub(super) async fn cluster_stop_job(
     cluster::stop_job(&alias, home(), record)
         .await
         .map_err(err)?;
-    if let Some(tx) = lock(&state.attached_jobs).remove(&(alias.clone(), job_id.clone())) {
-        let _ = tx.send(());
+    if let Some(held) = lock(&state.attached_jobs).remove(&(alias.clone(), job_id.clone())) {
+        let _ = held.stop.send(());
     }
     // The windows learn at once (the next overview would, a minute later).
     let slurm = record.slurm_job_id.clone().unwrap_or_default();
@@ -1116,7 +1115,7 @@ async fn host_port(app: &AppHandle, alias: &str, jid: &str) -> Result<(u16, Stri
     let endpoint = match endpoint {
         Some(e) => e,
         None => {
-            let ov = fresh_overview(alias).await?;
+            let ov = live_overview(app, alias).await?;
             absorb(app, alias, &ov).await;
             ov.hosts
                 .get(jid)
@@ -1256,13 +1255,16 @@ async fn open_ws_window(
         lock(&shell.compute_connecting).remove(&key);
         result?;
     }
+    // Straight into the workspace (`ws=`): its chimaera registered it under
+    // the cluster's id before it listened. Without it the window lands on
+    // that chimaera's own one-workspace home.
     let (url, node, local_port) = {
         let tunnels = shell.compute_tunnels.lock().await;
         let t = tunnels
             .get(&key)
             .ok_or_else(|| format!("{name} disconnected while connecting"))?;
         (
-            format!("{}&cws={wid}", t.url()),
+            format!("{}&ws={wid}&cws={wid}", t.url()),
             t.node.clone(),
             t.local_port,
         )
@@ -1327,7 +1329,7 @@ pub(super) async fn cluster_open(
     ensure_cluster(&app, &alias).await?;
     tracing::info!("ipc: cluster_open {alias} {workspace_id} in {job_id:?}");
     // Always a fresh read: a cached endpoint may name an earlier job.
-    let ov = fresh_overview(&alias).await?;
+    let ov = live_overview(&app, &alias).await?;
     absorb(&app, &alias, &ov).await;
     let view = ov
         .workspaces
@@ -1362,7 +1364,7 @@ pub(super) async fn cluster_close(
     valid_ws(&workspace_id)?;
     ensure_cluster(&app, &alias).await?;
     tracing::info!("ipc: cluster_close {alias} {workspace_id}");
-    let ov = fresh_overview(&alias).await?;
+    let ov = live_overview(&app, &alias).await?;
     let view = ov
         .workspaces
         .iter()
@@ -1409,7 +1411,7 @@ pub(super) async fn cluster_move(
     valid_job(&job_id)?;
     ensure_cluster(&app, &alias).await?;
     tracing::info!("ipc: cluster_move {alias} {workspace_id} → {job_id}");
-    let ov = fresh_overview(&alias).await?;
+    let ov = live_overview(&app, &alias).await?;
     absorb(&app, &alias, &ov).await;
     let view = ov
         .workspaces
@@ -1439,7 +1441,7 @@ pub(super) async fn cluster_move(
         }
         let _ = app.emit("cluster-changed", json!({ "alias": alias }));
         let endpoint = open_in_job(&app, &alias, &job_id, &workspace_id).await?;
-        let ov = fresh_overview(&alias).await?;
+        let ov = live_overview(&app, &alias).await?;
         Ok::<_, String>((ov, endpoint))
     }
     .await;
@@ -1450,7 +1452,7 @@ pub(super) async fn cluster_move(
         Ok(done) => done,
         Err(e) => {
             // Its window learns where it stands from a fresh look.
-            if let Ok(ov) = fresh_overview(&alias).await {
+            if let Ok(ov) = live_overview(&app, &alias).await {
                 absorb(&app, &alias, &ov).await;
             }
             let _ = app.emit("cluster-changed", json!({ "alias": alias }));
@@ -1480,7 +1482,7 @@ pub(super) async fn cluster_queue_open(
     valid_job(&job_id)?;
     ensure_cluster(&app, &alias).await?;
     tracing::info!("ipc: cluster_queue_open {alias} {workspace_id} when {job_id} starts");
-    let ov = fresh_overview(&alias).await?;
+    let ov = live_overview(&app, &alias).await?;
     let view = ov
         .workspaces
         .iter()
@@ -1778,6 +1780,27 @@ pub(crate) fn terminal_window_closed(app: &AppHandle, stable_id: &str, quitting:
         end_terminal_session(port, token, session);
     } else {
         std::thread::spawn(move || end_terminal_session(port, token, session));
+    }
+}
+
+/// The app is exiting: end every attached job, inline. Its ssh is this
+/// process's child, and the task that would end it never runs again — left
+/// alone it outlives the app and holds the job (and its `srun` on the login
+/// node) to the time limit, though the page promised it stops when the app
+/// disconnects. Ending ssh hangs up the remote session, which ends `srun` and
+/// the job with it.
+pub(crate) fn end_attached_jobs(app: &AppHandle) {
+    let shell = app.state::<Shell>();
+    let held: Vec<Attached> = lock(&shell.attached_jobs).drain().map(|(_, a)| a).collect();
+    for a in held {
+        #[cfg(unix)]
+        if let Some(pid) = a.pid.and_then(|p| i32::try_from(p).ok()) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+        let _ = a.stop.send(());
     }
 }
 

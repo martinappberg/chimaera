@@ -93,8 +93,8 @@ pub struct Shell {
     /// no page ever sees a port or token), the notification diff.
     clusters: Mutex<HashMap<String, cluster::ClusterLive>>,
     /// Attached jobs (partitions that take only interactive jobs), held in the
-    /// foreground by this app: sending on the channel ends one.
-    attached_jobs: Mutex<HashMap<(String, String), tokio::sync::oneshot::Sender<()>>>,
+    /// foreground by this app; quitting ends them (`cluster::end_attached_jobs`).
+    attached_jobs: Mutex<HashMap<(String, String), cluster::Attached>>,
     /// Open login-node terminal windows: stable window id → their session on
     /// the local daemon, ended when the window goes (`cluster::
     /// terminal_window_closed`).
@@ -1307,6 +1307,7 @@ pub fn run() {
                     // Login-node terminals end with the app: a quit does not
                     // reliably deliver each window's Destroyed first.
                     cluster::end_all_terminals(app);
+                    cluster::end_attached_jobs(app);
                     tauri::async_runtime::block_on(async {
                         let tunnels: Vec<_> =
                             state.tunnels.lock().await.drain().map(|(_, t)| t).collect();

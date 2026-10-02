@@ -185,6 +185,9 @@
   const jobScoped = $derived(
     getJobContext() !== null || ($computeStatus?.self ?? null) !== null,
   );
+  /** A cluster workspace's window: its home is the cluster page (its own
+   *  chimaera knows only this one workspace; the page knows them all). */
+  const clusterWs = $derived(native && ownAlias !== null ? (getJobContext()?.cws ?? null) : null);
 
   // --- local daemon build parity (native shell, local window only) ------------
 
@@ -261,6 +264,11 @@
   };
 
   onMount(() => {
+    if (clusterWs !== null && ownAlias !== null) {
+      showCluster(ownAlias);
+      void refreshHosts();
+      return;
+    }
     // A remote window's home has no remote-hosts machinery (that section is
     // the LOCAL first screen's); a job window's compute UI is its banner.
     if (!native || ownAlias !== null) return;
@@ -629,7 +637,12 @@
     <ClusterPageView
       {alias}
       host={hosts.find((h) => h.alias === alias) ?? null}
-      onBack={() => (clusterView = null)}
+      onBack={clusterWs !== null ? () => void backToHome() : () => (clusterView = null)}
+      here={clusterWs}
+      onHere={() => {
+        const own = workspaces.find((w) => w.id === clusterWs);
+        if (own !== undefined) onOpen(own);
+      }}
       onHostState={(state) => {
         hosts = hosts.map((h) => (h.alias === state.alias ? state : h));
       }}

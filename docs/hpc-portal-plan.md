@@ -138,13 +138,19 @@ node…**) and **Start a job**.
 open 2 days ago · chats saved`, **Open**, and `…` (**Startup commands…**,
 **Remove from this list** — "Your files and chats stay where they are").
 
-**Open** never makes the user think about jobs they don't need to:
+**Open** on a workspace that isn't open always lets the user pick where — a
+workspace in a running job shares that job's node and time, so it is never a
+silent default (changed after the first click-through: opening straight into
+the one running job "feels weird"):
 
-| Jobs running | Open does |
+| Jobs alive | Open does |
 |---|---|
 | none | opens the start sheet with this workspace ticked |
-| one | opens the workspace in that job |
-| several | a small menu: `In Long` · `In GPU` · `In a new job…` |
+| any | a small menu: `In Long` (`node042 · ends in 5d 22h · with crc`) for each running job, `When GPU starts` for each waiting one, then `In a new job…` |
+
+A workspace's window opens straight into its workspace, and its way to the
+rest of the cluster is this page (the sidebar's workspace button), shown over
+the workspace with its own row marked "this window".
 
 Below everything, **+ Add a workspace…**, then one quiet line: `Your other
 Slurm jobs: 37 running · 4 waiting` (a count, no controls).
