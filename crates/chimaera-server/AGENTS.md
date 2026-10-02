@@ -23,7 +23,7 @@ the module you need and read its header doc.
 | `session_view.rs` | The session-row JSON builders (`session_json`/`sessions_json`), shared by `api/` and `ws.rs` (so `ws` doesn't depend on `api`). |
 | `ws.rs` | WebSockets: `/ws/sessions/{id}` (PTY byte pipe; 1 MiB frames chunked to the input queue; output coalesced — leading-edge first chunk, then one frame per ~8 ms tick or 32 KiB, and always flushed ahead of event frames and resizes so the byte stream is never overtaken; attach/resync snapshot renders AND resizes run under `spawn_blocking`, off the reactor; a reset-bearing frame and its snapshot are sent adjacently — a client contract; `park`/`unpark` client frames stop and resume output forwarding for hidden pooled terminals, with the session's broadcast ring as the catch-up buffer and a repaint when it can't cover the gap — `auth.parked` attaches without a snapshot at all), **`/ws/chat/{id}`** (structured events; 10 MiB command frames and ~512 KiB replay batches), `/ws/events` (the session-list bus; the sessions frame is built ONCE per change generation and shared across every connected window — per-client state like fs_watch, git epochs, and the last-sent compare stays per-client — and the settings frame reads only the cached generation, never a reactor stat: external edits arrive via `settings::watch_external_edits`). |
 | `chat.rs` | **The chat-mode glue** (see below). |
-| `launcher.rs` | argv assembly (`build_agent_command`, `build_chat_command`, `build_agent_resume_command` — the degrade/toggle-to-TUI argv), binary `detect`, login-shell wrapping, per-agent binary resolution. Unit-tested — argv logic lives HERE, not in drivers or `chat.rs`. |
+| `launcher.rs` | argv assembly (`build_agent_command`, `build_chat_command`, `build_agent_resume_command` — the switch-to-TUI argv), binary `detect`, login-shell wrapping, per-agent binary resolution. Unit-tested — argv logic lives HERE, not in drivers or `chat.rs`. |
 | `agent_state.rs` | The pure state core: `AgentKind`/`AgentState`/`AgentRecord` + the hook→state / title helpers. A leaf (no transport/fs/`AppState`) — this is what lets `chat.rs` depend on it without the old agents↔chat cycle. |
 | `agents.rs` | The agent glue over `agent_state`: hook ingest, settings/mcp writers, the transcript watcher. |
 | `spawn.rs` | PTY session spawn (the Tier-A TUI path), theme injection. |
@@ -183,13 +183,13 @@ decides **which** driver runs and **what happens around** its lifecycle.
   `launcher`, materializes Claude's quiet portable-context file, seeds the
   journal from a previous life on resume, and hands a `SpawnSpec` to
   `state.chat.spawn` (Codex consumes that context during thread open).
-- **`handle_chat_exit`** degrades a failed handshake to a PTY TUI (marking the
-  in-flight degrade in `chat_switching` so attached chat sockets report
-  `degraded`, not `exited`, and stamping a `ModeSwitch` in the journal on
-  success), keeps a handshake failure with no recipe visible-and-Errored (like
-  `ProtocolError`), or retires a clean exit — EXCEPT during a deliberate view
-  switch (`chat_switching`), which it leaves intact for the respawn. Startup
-  failures are already journaled by the driver harness before this runs.
+- **`handle_chat_exit`** closes unused failed startups without a terminal
+  fallback. Submitted prompts, prior journals, resumes and portable branches
+  stay visible-and-Errored with their recipe and diagnostic. The startup
+  cleanup owns `chat_switching` as `closed` so sockets report exit without a
+  phantom successor. Deliberate switches still own their respawn. All providers
+  get a 60-second startup budget, including login setup, hooks and MCP discovery;
+  initialized idle chats have no expiry. Failures remain journaled.
 - **`switch_view` / `rewind_session`** stop the current process and respawn the
   SAME chimaera session id in the other surface / at a fork point. A term→chat
   switch seeds native or previous-Chimaera history **before** appending its
@@ -214,7 +214,7 @@ the lifecycle, keep them consistent:
 | `state.chat` (the `ChatManager`) | the live driver registry | dead `ProtocolError` entries are kept visible — presence ≠ alive. |
 | `state.agents` | `AgentRecord` (state, title, files, `custom_title`) | survives a view switch; the identity that both surfaces share. |
 | `state.chat_recipes` | respawn recipe per id | retained by a PTY successor when launch/portable context must survive a round trip; always remove when the session ends. |
-| `state.chat_switching` | ids mid view-switch (or mid auto-degrade) | serialize entry (one switch per id); the exit path keys on it; the degrade inserts "term" around its respawn window. |
+| `state.chat_switching` | ids mid view-switch or startup cleanup | serialize entry (one switch per id); the exit path keys on it; startup cleanup uses "closed" and never creates a placeholder. |
 | `state.session_workspaces` | id → workspace | resolve the workspace root from here. |
 
 ## Invariants / gotchas

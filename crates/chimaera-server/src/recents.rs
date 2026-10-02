@@ -265,6 +265,24 @@ pub(crate) fn retire_with_resume(
     ui: SessionUi,
     resume_hint: Option<String>,
 ) {
+    retire_inner(state, session_id, pinned, osc, ui, resume_hint, true);
+}
+
+/// Failed initialization never created a conversation to reopen. Retain its
+/// diagnostic history and perform normal cleanup without adding a Recent row.
+pub(crate) fn retire_unused_startup(state: &Arc<AppState>, session_id: &str) {
+    retire_inner(state, session_id, None, None, SessionUi::Chat, None, false);
+}
+
+fn retire_inner(
+    state: &Arc<AppState>,
+    session_id: &str,
+    pinned: Option<&str>,
+    osc: Option<&str>,
+    ui: SessionUi,
+    resume_hint: Option<String>,
+    remember: bool,
+) {
     let Some(record) = crate::lock(&state.agents).remove(session_id) else {
         return;
     };
@@ -310,8 +328,9 @@ pub(crate) fn retire_with_resume(
     // empty boots, nothing a human could recognize in a list. Codex/gemini
     // have no title machinery yet, so their bare-name rows stay (dropping
     // them would keep those agents out of recents entirely).
-    let skip =
-        was_mastermind || (record.kind == AgentKind::Claude && title == record.kind.as_str());
+    let skip = !remember
+        || was_mastermind
+        || (record.kind == AgentKind::Claude && title == record.kind.as_str());
     if let Some(workspace_id) = workspace_id.filter(|_| !skip) {
         // Non-Claude chat agents own their durable store and resume by id;
         // there is no Claude-style transcript path to validate. ChatInfo is

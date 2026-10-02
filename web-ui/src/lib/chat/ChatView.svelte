@@ -1958,6 +1958,7 @@
 
   function pickModel(id: string): boolean {
     if (!sendCommand({ type: "set_model", model_id: id }, "model change not sent")) return false;
+    store.markModelPending(id);
     menu = null;
     return true;
   }
@@ -2041,16 +2042,19 @@
   /** Model chip: the catalog's own display name when known ("Opus",
    *  "Fable"), else a readable fallback from the raw id. */
   const modelLabel = $derived.by(() => {
+    if (store.pendingModel !== null) {
+      const pending = modelChoices.find((m) => m.id === store.pendingModel);
+      return `${pending?.label ?? store.pendingModel} · applying…`;
+    }
     if (currentModel !== undefined) return currentModel.label;
     const m = store.model;
     if (m === null) {
-      // A fresh session never reports a model until its first turn — don't
-      // skeleton forever. Once the catalog is loaded, show the DEFAULT it will
-      // use (correct for a new chat); only the brief pre-catalog window (no
-      // choices yet) stays null → skeleton.
-      const def = modelChoices.find((c) => c.id === "default") ?? modelChoices[0];
-      return def?.label ?? null;
+      // Catalog order is not the user's configured model. In particular a
+      // failed handshake must never claim the first curated model is active.
+      return store.initialized ? "agent default" : null;
     }
+    const choice = modelChoices.find((c) => c.id === m);
+    if (choice !== undefined) return choice.label;
     const match = /claude-(\w+)-(\d+)-(\d+)/.exec(m);
     return match !== null ? `${match[1]} ${match[2]}.${match[3]}` : m;
   });
@@ -2400,7 +2404,7 @@
   // break. A chat that can't take a message offers no quote.
   const quoteOwner = {};
   let quoteChip = $state<{ x: number; y: number } | null>(null);
-  const composerDisabled = $derived(store.exited !== null || store.degraded);
+  const composerDisabled = $derived(store.exited !== null || store.degraded || store.fatalError !== null);
 
   function dropQuote(): void {
     quoteChip = null;
@@ -2507,7 +2511,7 @@
     {agentKind}
     {agentName}
     bind:menu
-    canPickModel={supports("set_model") && modelChoices.length > 0}
+    canPickModel={supports("set_model") && modelChoices.length > 0 && store.connected && store.exited === null && store.fatalError === null && store.pendingModel === null}
     canPickMode={supports("set_mode")}
     {modelChoices}
     {modelLabel}

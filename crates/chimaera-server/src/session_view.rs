@@ -236,6 +236,9 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     // make every window prune the session's tabs, so synthesize a
     // placeholder carrying the TARGET surface until the respawn registers.
     for (id, target) in crate::lock(&state.chat_switching).iter() {
+        if target == "closed" {
+            continue;
+        }
         if rows.iter().any(|(_, row)| row["id"] == json!(id)) {
             continue;
         }

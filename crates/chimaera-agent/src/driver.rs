@@ -3,8 +3,8 @@
 //! A driver is a tokio task that owns one child process's stdio, translates
 //! its native protocol into [`AgentEvent`]s, and consumes [`AgentCommand`]s.
 //! The harness fixes the contract around it: spawn inputs, the handshake
-//! watchdog (a session that can't handshake degrades to a PTY — it must
-//! never hang a pane), kill semantics, and exit classification.
+//! watchdog, cancellation during startup, and exit classification. The
+//! server decides how to present a failed startup without changing surfaces.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -17,9 +17,10 @@ use tokio::task::JoinHandle;
 use crate::model::{cap_output, AgentCommand, AgentEvent, COALESCE_INTERVAL_MS};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
-/// Cold NFS caches make agent CLIs slow to first output; `--version` alone
-/// is budgeted 2s elsewhere in the repo. Generous, but bounded.
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Login setup, workspace hooks and MCP discovery can precede initialization
+/// (a real SessionStart hook alone took 15s). Shared by every provider; this
+/// is a startup deadline, never an idle-chat expiry.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Polite-shutdown grace before SIGKILL.
 pub const KILL_GRACE: Duration = Duration::from_secs(3);
 
@@ -186,7 +187,7 @@ pub enum DriverExit {
     /// Child exited on its own (agent finished or crashed mid-session).
     Clean(Option<i32>),
     /// The protocol handshake never completed: wrong binary version, wrong
-    /// flags, or a CLI that changed its wire format. Auto-degrade candidate.
+    /// flags, slow startup, or a CLI that changed its wire format.
     HandshakeFailed { reason: String, stderr_tail: String },
     /// Handshake succeeded but the stream later became unintelligible.
     ProtocolError(String),
@@ -357,8 +358,9 @@ async fn report_startup_failure(
         message.push_str(tail);
     }
     message.push_str(&format!(
-        "\n\nIf {kind} was just updated, its chat protocol may have changed — \
-         reopen this session as a terminal, or check that `{kind}` still runs in one."
+        "\n\nCheck that `{kind}` can start and sign in, and that its startup hooks \
+         and MCP servers finish loading. You can retry this chat or open a terminal \
+         to inspect the agent's startup."
     ));
     let _ = io
         .events
@@ -403,13 +405,22 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
     };
     let (mut sink, mut stream, guard) = child.split();
 
-    // Handshake watchdog: a session that cannot prove the protocol works must
-    // fail fast so the server can respawn it as a PTY instead of hanging a pane.
-    let handshake = tokio::time::timeout(
-        spec.handshake_timeout,
-        driver.handshake(&mut sink, &mut stream, &spec),
-    )
-    .await;
+    // Closing a still-starting chat must not wait for the watchdog. Prefer a
+    // deliberate kill when initialization and cancellation race.
+    let handshake = tokio::select! {
+        biased;
+        _ = io.kill.changed() => {
+            guard.terminate();
+            drop(sink);
+            let status = guard.shutdown(KILL_GRACE).await;
+            let _ = io.events.send(AgentEvent::Exited { status }).await;
+            return DriverExit::Killed;
+        }
+        result = tokio::time::timeout(
+            spec.handshake_timeout,
+            driver.handshake(&mut sink, &mut stream, &spec),
+        ) => result,
+    };
     let Handshake {
         mut mapper,
         initial,
