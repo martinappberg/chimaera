@@ -1887,8 +1887,8 @@ mod tests {
         );
     }
 
-    /// A driver that ends before handling a queued send takes that send with
-    /// it, so its id must be free again: the client's resend is the only copy.
+    /// A dead driver's reservations disappear from process-local correlation.
+    /// The independent dispatch store still decides whether retry is safe.
     #[test]
     fn a_send_id_is_forgotten_with_a_driver_that_never_handled_it() {
         let mut budget = CommandBudget::default();

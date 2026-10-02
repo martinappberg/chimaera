@@ -19,6 +19,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 /// stderr kept for diagnostics only — a runaway child must not grow memory.
 const STDERR_TAIL_BUDGET: usize = 8 * 1024;
+// Empty lines still allocate ring entries; byte limits alone do not bound them.
+const STDERR_TAIL_LINES: usize = 256;
 /// Hard ceiling on a single stdout line. A real stream-json / app-server frame
 /// (diffs, small inline images) fits well under this; a child that emits bytes
 /// without a newline (binary garbage, a wedged CLI) must never grow the read
@@ -158,7 +160,7 @@ impl JsonlChild {
                 let mut tail = tail.lock().expect("stderr tail lock");
                 tail.push_back(line);
                 let mut total: usize = tail.iter().map(|l| l.len()).sum();
-                while total > STDERR_TAIL_BUDGET {
+                while total > STDERR_TAIL_BUDGET || tail.len() > STDERR_TAIL_LINES {
                     match tail.pop_front() {
                         Some(dropped) => total -= dropped.len(),
                         None => break,
@@ -477,6 +479,9 @@ impl ProcessControl {
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
+        // A detached descendant may retain stderr after the bounded drain.
+        // The reader belongs to this guard, including canceled shutdowns.
+        self.stderr_task.abort();
         if !self.managed_group {
             return;
         }
@@ -493,6 +498,53 @@ impl Drop for ChildGuard {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn blank_stderr_lines_cannot_grow_the_diagnostic_ring() {
+        let child = JsonlChild::spawn(
+            "/bin/sh",
+            &["-c".into(), "i=0; while [ $i -lt 10000 ]; do printf '\\n' >&2; i=$((i+1)); done; printf 'tail-marker\\n' >&2".into()],
+            Path::new("/"),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let (sink, _stream, guard) = child.split();
+        drop(sink);
+        let (status, tail) = guard.shutdown_with_stderr(Duration::from_secs(5)).await;
+        assert_eq!(status, Some(0));
+        assert!(tail.ends_with("tail-marker"));
+        assert!(tail.lines().count() <= STDERR_TAIL_LINES);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_guard_cancels_its_owned_stderr_reader() {
+        let child = JsonlChild::spawn(
+            "/bin/sh",
+            &["-c".into(), "read ignored".into()],
+            Path::new("/"),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let (_sink, _stream, mut guard) = child.split();
+        // Model a pipe kept open by a detached descendant: killing the direct
+        // child cannot make this reader finish by itself.
+        let reader = std::mem::replace(
+            &mut guard.stderr_task,
+            tokio::spawn(std::future::pending::<()>()),
+        );
+        reader.abort();
+        let reader = guard.stderr_task.abort_handle();
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !reader.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
     /// A managed child that exits on its own is reaped at once (a stop, view
     /// switch or rewind no longer waits out a fixed two seconds), and what it
     /// left running in its process group is still ended.
