@@ -18,7 +18,7 @@ contracts are [PROTOCOL](../../crates/chimaera-link/PROTOCOL.md),
 
 ## The rules a reviewer holds the code to
 
-These are the maintainer's decisions (2026-09-26 to 2026-09-29). A change that
+These are the maintainer's decisions through 2026-10-02. A change that
 violates one is a defect regardless of tests.
 
 - **Laptop first.** The laptop never stops its own agents or shells because the
@@ -38,10 +38,13 @@ violates one is a defect regardless of tests.
   browser view. Every Codex terminal keeps its plain argument list unless the
   project is Pro-configured; no agent brief is injected into a local session
   unless its project returned from the cloud in this daemon life.
-- **No placement controls.** No "reconnect and wake", no keep-running pin, no
-  "open a repository in the cloud" from the laptop, no visible cloud-setup
-  terminal. Sends and permission answers carry wake intent themselves; opening
-  a view never wakes anything.
+- **Sync and execution are separate.** Opening a synced project on another
+  Mac creates or updates its local copy. **Take over** explicitly moves execution
+  at a safe pause; opening and ordinary chat/terminal input keep the current
+  owner. The normal automatic laptop/cloud continuity policy still applies.
+  Explicit project/session opens may wake cloud. Lists, refreshes, polls and
+  passive socket attaches never do. Sends and permission answers carry their
+  own wake intent. The laptop offers no cloud-setup terminal or keep-running pin.
 - **Plain words.** User-facing text never says baton, epoch, hydrate, keeper,
   worker, placement, delegation, canonical, receipt, fence, mirror, publication
   or host. Errors reach the UI as stable codes with sentences, not raw text.
@@ -141,7 +144,7 @@ daemon-sent but not a pick-up.
 The private repository carries a loopback end-to-end harness that starts the
 account, keeper and a cloud machine as local processes (no vendors, no cloud)
 against this branch's daemon and plays the app's configure sequence. It proves,
-in one run of about 22 minutes with production timings:
+in one run with production lease, reconnect and idle timings:
 
 1. Account, keeper and an uncreated cloud machine come up.
 2. A laptop daemon with a Git project, a chat agent mid-turn, and a private
@@ -165,13 +168,13 @@ in one run of about 22 minutes with production timings:
    edited on both sides.
 9. The private project never reaches the account; signing out leaves the local
    chat and shell running.
-10. A second daemon reopening the same folder gets the same project and takes
-    it (with it the home).
-11. Acting brings the work to you: a message sent on another computer while
-    the first is mid-turn is held there, the first finishes its turn and hands
-    over, and the message runs once on the other computer (same conversation,
-    no fork); typing into that computer's terminal from the first brings the
-    work back the same way.
+10. A second Mac opens a local copy with the same project identity while
+    owner and preferred execution remain unchanged. If the former owner signs
+    out or disappears, explicit takeover waits for its lease and reconnect
+    grace to expire. Local conflicting edits and their review report survive.
+11. Ordinary input from Mac B still runs on Mac A. Explicit **Take over** then
+    moves execution A → B → A at safe pauses, retaining the logical conversation,
+    independent local copies and exactly one executor.
 12. The cloud asleep with the project and a computer online on power: a phone
     read wakes nothing, and a phone send brings the work to the computer,
     which answers it, while the cloud machine stays asleep.
@@ -213,35 +216,41 @@ Known intermittent tests under a loaded full run (they pass alone):
 | Agents and context | `agent_state.rs`, `spawn.rs`, `pro/provider_gate.rs`, `mcp/cloud_context.rs`, `codex_notify.rs`, [providers map](../../crates/chimaera-server/src/cloud/providers/AGENTS.md) | pause detection, prompts only for interrupted turns, per-session gate, the shortened brief, notify shim only for Pro projects |
 | Web UI | [pro map](../../web-ui/src/lib/pro/AGENTS.md), [settings map](../../web-ui/src/lib/settings/AGENTS.md), [net map](../../web-ui/src/lib/net/AGENTS.md), [chat map](../../web-ui/src/lib/chat/AGENTS.md) | free-user gating, the account page state machine, copy, paused rows |
 
-## What is still open
+## Implemented behavior and remaining acceptance
 
-- A failed return cannot yet restore the pre-install state (needs a staged
-  install); it retries with a short backoff instead.
-- Acting brings the work to you (`pro/moves.rs`): a plain terminal is never
-  stopped by a handover, so after a move between two computers the old one
-  keeps its shell running while the new one opens a fresh one under the same
-  session id. In a browser view the send that
-  starts a move is not queued (the composer keeps it, as for a wake); a
-  second send while "Bringing the work to your computer…" is held and
-  delivered once.
-- Codex rollout lookups use the daemon's `CODEX_HOME`, not the login shell's.
-- A routed project's conversations notify on the viewing computer only while a
-  window has that project open (the relay rides a window's events feed); its
-  approvals still count on the Dock from the roster poll.
-- The `kept_both` notice names kept `@cloud` branches only once
-  `engine::hydrate_scoped` passes `repository::receive`'s result to
-  `pro::report_return` (it reports files only today).
-- A second computer has no native viewer; adoption of a cloud-created project
-  gives it no home, so it never returns automatically after its first cloud stint.
-- The account browser's `HEAD` plan check and the settings gateway view are not
-  exercised by the loopback harness (they need the private browser gateway).
-- The web's Home (the account's own `/`, [pro feature](../features/pro.md#on-the-web))
-  opens a project view, but a project view has no way back to it other than the
-  browser's Back button.
-- Live acceptance on staging (real sleep, real vendors, two devices) follows a
-  coordinated private deploy: the branch fails closed against a service without
-  the negotiated protocol, so nothing here can be tested against an older
-  staging.
+Returns now stage file, Git-index and session changes in a durable transaction.
+Retries replay the sealed transaction; uncertain or damaged recovery state
+refuses new execution. Local copies retain their checkpoint baseline and report
+kept files across later takeover. The recovery fixtures and full combined run
+must pass on the revision being proposed for release.
+
+The native app has project viewing, local-copy destinations and explicit
+Take over. The account browser has a Home link and opens the same project
+workbench. Codex rollout discovery probes the login shell's `CODEX_HOME`; kept
+Git branches reach `pro::report_return`. These are implemented review targets,
+not missing features. The real-service harness checks account Home routing;
+responsive browser rendering and native multi-window behavior still need live
+acceptance on the integrated build.
+
+Remaining completion work is tracked in the private review ledger:
+
+- Keeper must preserve interactive and batch Slurm connections and compute-node
+  forwards for the job lifetime. Idle HPC login connections require the existing
+  opt-in. Destination-bound Mac SSH-agent signing and an advanced direct
+  connection choice must work through the real native/service flow.
+- Selected-project custom secrets require the complete isolated worker,
+  authenticated routing, provider separation and grant/revoke UI. Disabled
+  isolation fixtures alone do not establish completion.
+- Provider authentication and credential renewal must be checked against the
+  pinned CLI versions without copying provider history or unrelated settings
+  between projects. Image and client revisions must agree before private merge.
+- A routed project's conversation notifications reach the viewing computer while
+  a window has that project open; blocking approvals also join the Dock attention
+  set through roster polling. Wider background notification coverage is separate.
+- Extensive automated local acceptance precedes a personal walkthrough. Real
+  sleep, real providers and two physical devices need a compatible staging
+  deployment and separate live acceptance. No source or loopback pass implies
+  those checks have happened.
 
 ## Reporting
 

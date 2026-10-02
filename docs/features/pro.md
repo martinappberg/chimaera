@@ -354,7 +354,8 @@ connection operations keep the worker active only until they finish or expire.
 Repository-provider connections remain optional. On the cloud machine's own page
 (an account browser), an HTTPS Git URL clones into its persistent projects folder
 and navigates to the new project (`/workspace/{id}/` in a project tab). The desktop
-app has no such control: where work runs is never a user choice. Duplicate names
+app opens synced local copies and offers **Take over** separately; it has no
+cloud-page clone control. Duplicate names
 and embedded URL credentials are rejected. Only one clone runs at a time;
 incomplete clones are not registered. The cloud machine's SSH public key is under
 advanced connections. In an account browser, Settings shows a **Cloud** section
@@ -664,7 +665,7 @@ asleep waits, shown as "sending…", until something wakes that machine.
 Typing that is refused is said in a small note over the terminal; typing that
 was still on its way when a connection ended is not replayed.
 
-**Execution moves only with Take over.** Opening a synced project creates or
+**Opening and ordinary input leave execution with its owner.** Opening a synced project creates or
 updates its local copy. Chat messages and terminal input still route to the
 current owner; they do not implicitly acquire execution. **Take over** asks that
 owner to finish its current step, save and release, then establishes execution
@@ -812,21 +813,23 @@ human review step or promise exactly-once external actions. The old strict manag
 mode remains supported and is never silently changed during a live grant.
 
 Returning home adopts canonical cloud files and sessions after stopping its
-registered managed work. Unsynchronized local conflicts are retained privately
-outside the mirrored project within explicit storage bounds. Launch evidence
+registered managed work. Unsynchronized local file conflicts remain in excluded
+`.mine-…` siblings; Git staging conflicts retain both index snapshots and their
+objects in the local recovery area, within explicit storage bounds. Launch evidence
 records the process groups of live managed agents: a graceful daemon stop (an
 update or restart) clears it once they exit, and a successor after a crash waits
 only for recorded groups that still exist. Process groups alone cannot contain
 detached descendants or guarantee OS-resume ordering. Local non-Pro execution is
-unchanged; no machine chooser or new secret-sharing capability is introduced.
+unchanged. Explicit takeover between computers is separate from this automatic
+recovery policy; selected-project custom secrets have their own acceptance gate.
 
 A cloud machine suspends only after draining: the supervisor asks the daemon to
 refuse new transfers and wait until every transfer, Git helper and project cache
 is idle and state is on disk (`POST /api/v1/pro/drain`; see
-[HANDOFF](../../crates/chimaera-link/HANDOFF.md)). Waking it keeps everything as it
-was: the request that woke it is admitted at once while it renews its own
-lease, its agents keep their processes, and nothing is reinstalled over its
-work or told again that it moved. Ownership state, the
+[HANDOFF](../../crates/chimaera-link/HANDOFF.md)). Waking it retains the saved
+processes and files. The viewer waits for fresh execution authority before its
+input is admitted; nothing is reinstalled over the owner's work or told again
+that it moved. Ownership state, the
 execution latch and handoff ledger writes are synced to stable storage, and an
 unreadable ownership state fails closed instead of silently forgetting fences, for
 the affected projects only: they keep running on your computer and resume saving
@@ -887,6 +890,18 @@ _Captured 2026-09-30 from the maintainer's decision, relayed with the task that 
   opening, reading and watching never do.
 - **Phone:** "if you are on your phone, and the laptop is connected, it should
   still run on the computer and not the cloud (to minimize cloud usage)".
+
+### Sync a local copy; take over separately
+_Captured 2026-10-02 from the maintainer's direct answers in this conversation._
+
+- **Open on another Mac:** “Yes—sync a local copy on open; take over separately”.
+  This supersedes automatic takeover on ordinary input between computers in the
+  earlier “Acting brings the work to you” decision. Opening copies files; the
+  separate takeover action moves execution.
+- **Wake:** “Explicit opens may wake the cloud; polls and refreshes never do
+  (latest recorded decision)”. The phone-to-available-computer policy remains.
+- **Custom secrets:** “Include selected-project custom secrets in this completion”.
+  Named provider connections and custom project permissions remain distinct.
 
 ### Cloud connections — scope and experience
 _Captured 2026-09-28 from the maintainer's instructions in this conversation._
