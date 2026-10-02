@@ -489,3 +489,6 @@ async fn grant_connection_budget_cannot_be_reset_by_closing_connections() {
     ));
     assert_eq!(v.seen_connections.len(), SSH_AUTH_CONNECTIONS_MAX);
 }
+
+#[path = "control_tests.rs"]
+mod control_tests;
