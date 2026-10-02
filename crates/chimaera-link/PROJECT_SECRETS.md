@@ -269,6 +269,73 @@ Each complete request is at most 12 KiB and rejects duplicate/unknown fields;
 credential-bearing request types have no Debug implementation. Service tokens
 are 16–256 ASCII letters, digits, `_` or `-`; no credential is logged.
 
+## Private keeper and supervisor bridge
+
+This bridge is separate from provider login control. It uses the existing
+authenticated current personal-worker registration, with a separately negotiated
+`project_secrets:1` acknowledgment. A provider registration, a cached project
+catalog or the worker's ordinary shared daemon cannot supply that acknowledgment.
+Replacing or withdrawing the registration immediately closes command admission.
+No ordinary startup enables this bridge before the acceptance gate below.
+
+The worker exposes only these fixed supervisor routes to its authenticated
+keeper. They are not forwarded into a project namespace:
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /internal/v1/personal/project-secrets` | Redacted registered-project catalog |
+| `POST /internal/v1/personal/project-secrets/commands` | One owned queue or explicit edit |
+| `POST /internal/v1/personal/project-secrets/operations/read` | Original-device receipt read |
+
+A command envelope is exactly `{version:1,authorization,command,admission}`.
+`authorization` is the account tuple above. `command` is the original external
+command, unchanged. For `set`, `admission` is exactly
+`{authorization,device_authority}` for the already admitted original intent;
+for other actions it is JSON null. The two tuples and all command identity,
+revision, pending, action and resulting-name fields must agree. This envelope
+has an 80 KiB ceiling including escaping and rejects duplicate/unknown fields.
+It never contains a device access bearer. Receipt reads accept exactly
+`{version:1,operation_id,device_id}` and cannot create or resume an operation.
+
+The worker obtains fresh authorization through fixed keeper callbacks before
+the serialized local effect. Every callback authenticates the current worker
+service token and rechecks the current personal registration and credential
+digest after waits. No URL, host, account or credential chosen by project code
+can select its target. The callback routes are:
+
+| Method and path | Closed body and effect |
+| --- | --- |
+| `POST /v1/personal/project-secrets/admissions/validate` | `{authorization,device_authority}`; validate an existing `set` admission before persisting its queue |
+| `POST /v1/personal/project-secrets/applications/authorize` | `{authorization,device_authority}`; freshly authorize the exact durable pending batch |
+| `POST /v1/personal/project-secrets/edits/authorize` | `{authorization}`; validate a currently owned explicit apply/cancel/remove decision |
+| `POST /v1/personal/project-secrets/admissions/retire` | `{authorization,device_authority}`; retire an original admission after its durable local transition |
+
+Queue validation and automatic application use the account's existing
+secret-purpose application check; neither can create an admission. The queue
+validation additionally requires the keeper's still-owned original `set`
+command. An explicit edit callback must find the keeper's original bounded
+command and its still-current full device session. It cannot restore that
+decision from a worker-supplied tuple, a status read or an old receipt. Keeper
+command ownership ends after a terminal worker receipt or a bounded ambiguous
+outcome; a new explicit decision is required after it ends.
+
+Every successful callback repeats exactly the account reply shape above. Bodies
+and replies are at most 12 KiB. The worker measures a five-second deadline from
+its callback request start; the keeper also limits its account exchange to the
+same maximum from its request start. There is no refreshed TTL on receipt or
+cached positive reply. A private local proof is consumed once, under the same
+owner that rechecks the exact pending identity and registration and persists
+the change. Expiry before that effect leaves the queue unchanged. Once durable
+application begins, its cleanup and floor-confirmation continuation remains
+owned even when the observer disconnects or the proof subsequently expires.
+
+Only the trusted encrypted queue stores the admission tuple and authority.
+Automatic application reuses that exact original bundle after restart, while
+retirement preserves it until positive account acknowledgment. A lost admission
+or queue response never causes value resubmission. Catalog and operation reads
+remain passive; controller recovery may finish an already durable applying
+transition but cannot manufacture a new queued intent or execution grant.
+
 ## Acceptance gate
 
 Capability enablement requires the real account, keeper, supervisor, daemon and
