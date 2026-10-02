@@ -21,8 +21,10 @@ versions). Run `cargo test` in the app workspace too when you touch core deps.
 
 | File | What it owns |
 |---|---|
-| `lib.rs` | `Manifest` + `Handoff` (the daemon's on-disk lifecycle records), `VERSION`/`REPOSITORY`/`BUILD_ID` + build-match helpers (`builds_match`, `build_ref`, `parse_version`, `release_is_newer`), `data_dir`/`config_dir`/`runtime_dir` (honoring `CHIMAERA_HOME`), `login_shell` (+ pure `resolve_login_shell`), `generate_token`. |
+| `lib.rs` | `Manifest` + `Handoff` (the daemon's on-disk lifecycle records), `VERSION`/`REPOSITORY`/`BUILD_ID` + build-match helpers (`builds_match`, `build_ref`, `parse_version`, `release_is_newer`), `data_dir`/`config_dir`/`runtime_dir` (honoring `CHIMAERA_HOME`, and `CHIMAERA_DATA_DIR`/`CHIMAERA_RUNTIME_DIR` for a cluster workspace job's daemon), `login_shell` (+ pure `resolve_login_shell`), `generate_token`. |
 | `shellint.rs` + `shellint/` | The shell-integration subsystem: materialize OSC 133/633/7 scripts, compose per-shell launch argv/env, and the remote-install snippet. |
+| `slurm.rs` | The scheduler vocabulary, pure: `Scheduler`, the `squeue`/`sinfo` format strings + parsers (`Job`, `Partition`), Slurm's duration grammar, `clean_tool_stderr`, partition access from `sacctmgr` associations + `scontrol show partition` (`usable_partitions`), refusal classification, `LaunchSpec` (validation, `sbatch`/`srun` argv), job names. Shared by the daemon and every client; nothing site-specific, ever. |
+| `cluster.rs` | A cluster's own folder on its shared home (`cluster/`): `ClusterConfig` (`cluster.json`: workspaces, saved setups, the last setup, rules for agents, learned facts), `ClusterFacts`, a job's records (`j/<id>/`: `JobRecord` `job.json`, `HostRecord` `host.json`, `HostingRecord` `workspaces.json`), `WorkspaceSeed`, job-host's API types (`HostedState`/`HostedWorkspace`/`JobHostStatus`/`HeldElsewhere`), the job script (`job_script`: `exec`s `chimaera job-host`), `browse_state` / `browse_dir` (what `chimaera browse` prints — read-only, bounded), `expand_path` (no shell), id makers/validators, and the env names job-host gives each workspace chimaera (`CHIMAERA_DATA_DIR`, `CHIMAERA_RUNTIME_DIR`, `CHIMAERA_CLUSTER_WORKSPACE`, `CHIMAERA_HOST_PRELUDE_FILE`, `CHIMAERA_AGENT_RULES_FILE`, `CHIMAERA_CLUSTER_FACTS_FILE`). |
 
 ## Invariants / gotchas
 

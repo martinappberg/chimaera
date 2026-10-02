@@ -712,7 +712,7 @@ async fn start_relay(host: &str, port: u16) -> Result<(tokio::process::Child, u1
             "BatchMode=yes",
             "-o",
             "ExitOnForwardFailure=yes",
-            // Login-node OpenSSH can be ancient (Sherlock's rejects
+            // Login-node OpenSSH can be ancient (one production cluster's rejects
             // `accept-new` — found live, again). `no` + a null known_hosts is
             // the old-ssh-safe form, and right for cluster-internal hops
             // anyway: node host keys churn on reimage, and the login→node

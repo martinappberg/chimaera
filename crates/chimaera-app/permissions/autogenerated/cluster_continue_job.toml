@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cluster-continue-job"
+description = "Enables the cluster_continue_job command without any pre-configured scope."
+commands.allow = ["cluster_continue_job"]
+
+[[permission]]
+identifier = "deny-cluster-continue-job"
+description = "Denies the cluster_continue_job command without any pre-configured scope."
+commands.deny = ["cluster_continue_job"]

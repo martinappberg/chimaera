@@ -30,7 +30,14 @@ async fn remote(host: &str, home: RemoteHome) -> anyhow::Result<()> {
     // single ssh round trip, sent through `sh -c` so a tcsh/fish login
     // shell on the host reads it. A manifest another login node wrote is
     // reported as such, not judged from this one (connect routes there).
-    match chimaera_remote::remote_probe(host, home).await? {
+    let probe = chimaera_remote::remote_probe(host, home).await?;
+    if let Some(info) = chimaera_remote::scheduler_of(host).filter(|i| i.kind.is_cluster()) {
+        println!(
+            "{host} is a {} cluster: workspaces run as jobs (`chimaera compute list {host}`)",
+            info.kind.tag()
+        );
+    }
+    match probe {
         None => println!("not running"),
         Some(p) if !p.here() => report_elsewhere(&p.manifest, &p.node),
         Some(p) if p.alive => report_running(&p.manifest),

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-not-cluster"
+description = "Enables the set_not_cluster command without any pre-configured scope."
+commands.allow = ["set_not_cluster"]
+
+[[permission]]
+identifier = "deny-set-not-cluster"
+description = "Denies the set_not_cluster command without any pre-configured scope."
+commands.deny = ["set_not_cluster"]

@@ -1118,7 +1118,7 @@ mod tests {
             "Ctrl-C"
         );
         assert!(!command_is_notable(&meta("vim notes.md", Some(0), 900)));
-        assert!(!command_is_notable(&meta("ssh sherlock", Some(255), 3600)));
+        assert!(!command_is_notable(&meta("ssh cluster", Some(255), 3600)));
         assert!(
             !command_is_notable(&meta("python3", Some(0), 600)),
             "a REPL"

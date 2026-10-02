@@ -1,70 +1,66 @@
-//! Compute-scheduler awareness (M5 HPC layer, detection slice): detect Slurm
-//! on THIS host and serve a bounded snapshot of the user's queue — the
-//! daemon-side, git-service-style answer to "is this an HPC, and what do I
-//! have running?". A remote daemon detects its own cluster locally, so the
-//! feature lights up on HPC and is a no-op on a laptop; nothing is probed
-//! over ssh at connect time.
+//! Compute-scheduler awareness: detect Slurm on THIS host and serve a bounded
+//! snapshot of the user's queue, plus — when this daemon IS a cluster
+//! workspace job — its own allocation, the context its agents are told, and
+//! the one verb it offers about itself (`DELETE /compute/self`). A daemon
+//! detects its own scheduler locally, so the feature lights up on a cluster
+//! and is a no-op on a laptop; nothing is probed over ssh.
 //!
-//! Resource discipline is the design (shared login nodes; sysadmins ban
-//! tools that hammer `squeue`): detection runs once per daemon lifetime
-//! (`?refresh=true` re-detects), every child process gets a hard
-//! kill-on-timeout and an output cap, snapshots are cached ~30s, and
-//! concurrent requests coalesce on one refresh. Nothing is persisted.
+//! The scheduler vocabulary (row structs, parsers, the time grammar, format
+//! strings) is `chimaera_core::slurm`, shared with the clients that drive a
+//! cluster over ssh; this module owns only the daemon's processes and caches.
 //!
-//! Command output is format-string based (`squeue -o`, `sinfo -o`), not
-//! `--json`: the format flags are stable across the old Slurm versions real
-//! clusters run, and the output is bounded by construction.
+//! Resource discipline is the design (shared clusters; schedulers are shared
+//! too): detection runs once per daemon lifetime (`?refresh=true`
+//! re-detects), every child process gets a hard kill-on-timeout and an output
+//! cap, snapshots are cached 60 s (at least a minute between scheduler status
+//! checks), the in-job `squeue -j` is floored at once a minute even across
+//! refreshes, and concurrent requests coalesce on one refresh. Nothing is
+//! persisted.
+//!
+//! Site-agnostic by rule: nothing here — code or the text agents are told —
+//! names a cluster, a partition, a site command or a site path. What a
+//! cluster is like comes from standard Slurm output and environment, or from
+//! files the user pointed at.
 //!
 //! Test knob: `CHIMAERA_SLURM_BINDIR` points at a directory of stand-in
-//! `srun`/`scancel`/`squeue`/`sinfo` executables so the whole surface can be driven
+//! `scancel`/`squeue`/`sinfo` executables so the whole surface can be driven
 //! live without a cluster (the `CHIMAERA_RELEASES_API` pattern).
 
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use chimaera_core::slurm::{self, Job, Partition};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::AppState;
+
+pub(crate) use chimaera_core::slurm::is_live_state;
 
 /// Hard runtime cap per scheduler command (squeue on a busy cluster can be
 /// slow, but a wedged controller must never wedge the daemon).
 const CMD_TIMEOUT: Duration = Duration::from_secs(5);
 /// Output cap per command; queues are line-capped far below this anyway.
 const MAX_OUTPUT: usize = 256 * 1024;
-/// Row caps (the UI shows a strip, not a dashboard); `truncated` says so.
-const MAX_JOBS: usize = 50;
-const MAX_PARTITIONS: usize = 50;
-/// Snapshot TTL: fresh enough for a queue strip, polite to the controller.
-const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct Job {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) partition: String,
-    pub(crate) state: String,
-    pub(crate) time_left: String,
-    pub(crate) nodes: String,
-    /// Requested/allocated CPUs (`%C`) and min memory (`%m`) — squeue's own
-    /// resource truth, so a job with no launch record (a launch whose id
-    /// was never adopted, or one launched outside chimaera) still shows
-    /// what it holds. "" when the wire lacked them.
-    pub(crate) cpus: String,
-    pub(crate) mem: String,
-    /// Elapsed run time (`%M`) and working directory (`%Z`) — the Timeline
-    /// names a finished job's runtime and attributes it to the workspace
-    /// whose root contains the workdir. Additive on the /compute wire;
-    /// omitted when squeue gave nothing.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) elapsed: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) workdir: String,
-}
+/// Snapshot TTL: at least a minute between scheduler status checks — the
+/// etiquette shared clusters ask of every tool that polls their controller.
+const SNAPSHOT_TTL: Duration = Duration::from_secs(60);
+/// The in-job `squeue -j $SLURM_JOB_ID` is asked at most once per this, even
+/// when `?refresh=true` drops the snapshot cache; in between, the last answer
+/// is served with its time left aged locally.
+const SELF_ASK_FLOOR: Duration = Duration::from_secs(60);
+/// Rules-for-agents text up to this size rides the agent context verbatim;
+/// a longer file is named instead, for the agent to read itself (the hook
+/// carrier and codex's argv are not the place for a manual).
+const RULES_INLINE_MAX: u64 = 12 * 1024;
 
 /// A job that left the queue (or reached a terminal state) since the last
 /// good snapshot — drained by the Timeline's job task.
@@ -76,34 +72,10 @@ pub(crate) struct JobEnd {
     pub(crate) state: String,
 }
 
-/// Terminal squeue states — a job seen in one of these has ended.
-const TERMINAL_STATES: [&str; 9] = [
-    "COMPLETED",
-    "FAILED",
-    "CANCELLED",
-    "TIMEOUT",
-    "OUT_OF_MEMORY",
-    "NODE_FAIL",
-    "PREEMPTED",
-    "BOOT_FAIL",
-    "DEADLINE",
-];
 /// Ended-job reports buffered for the Timeline, and ids already reported
 /// (a job seen COMPLETING, then gone, must yield one entry, not two).
 const ENDED_QUEUE_MAX: usize = 64;
 const ENDED_SEEN_MAX: usize = 256;
-
-/// Still queued or running (not yet ended).
-pub(crate) fn is_live_state(state: &str) -> bool {
-    terminal_state(state).is_none()
-}
-
-fn terminal_state(state: &str) -> Option<&'static str> {
-    TERMINAL_STATES
-        .iter()
-        .find(|t| state.starts_with(**t))
-        .copied()
-}
 
 #[derive(Default)]
 struct EndedJobs {
@@ -139,11 +111,11 @@ fn note_transitions(ended: &mut EndedJobs, prev: &[Job], next: &[Job], next_comp
         match next.iter().find(|j| j.id == old.id) {
             None if !next_complete => {}
             None => {
-                let state = terminal_state(&old.state).unwrap_or("ENDED");
+                let state = slurm::terminal_state(&old.state).unwrap_or("ENDED");
                 ended.report(old, state);
             }
             Some(now) => {
-                if let Some(state) = terminal_state(&now.state) {
+                if let Some(state) = slurm::terminal_state(&now.state) {
                     ended.report(now, state);
                 }
             }
@@ -151,25 +123,9 @@ fn note_transitions(ended: &mut EndedJobs, prev: &[Job], next: &[Job], next_comp
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct Partition {
-    pub(crate) name: String,
-    /// Per-partition ceilings straight from sinfo (`%l` walltime,
-    /// `%c` cpus/node, `%m` MB/node — "+" suffixes mean "varies upward").
-    /// Raw strings, "" when the wire lacked them: the launch dialog shows
-    /// them as hints and pre-flights the walltime, because "what can I
-    /// request here" is standard Slurm the UI should know (maintainer ask).
-    pub(crate) time_limit: String,
-    pub(crate) cpus_per_node: String,
-    pub(crate) mem_per_node: String,
-    pub(crate) default: bool,
-    pub(crate) avail: bool,
-    pub(crate) nodes: u64,
-}
-
-/// The daemon's OWN allocation, when it runs inside a Slurm job (a Mode 2
-/// compute-node daemon): the window's bottom bar wears `time_left` — the
-/// honest "this workspace lives until walltime" indicator.
+/// The daemon's OWN allocation, when it runs inside a Slurm job (a cluster
+/// workspace job): the window's bottom bar wears `time_left` — the honest
+/// "this workspace lives until its time limit" indicator.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct SelfAllocation {
     pub(crate) job_id: String,
@@ -182,6 +138,36 @@ pub(crate) struct SelfAllocation {
     pub(crate) cpus: String,
     pub(crate) mem: String,
     pub(crate) gres: String,
+    /// The job is attached (held by the app that started it): it ends when
+    /// that app disconnects, and can't continue in a new job.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) attached: bool,
+}
+
+impl SelfAllocation {
+    /// This answer as it stands `elapsed` after squeue gave it: the time
+    /// left counts down locally instead of asking the controller again.
+    /// Sentinels (`UNLIMITED`, …) and unparseable values stay as they were.
+    fn aged(mut self, elapsed: Duration) -> Self {
+        if let Some(left) = slurm::parse_duration(&self.time_left) {
+            self.time_left = slurm_clock(left.saturating_sub(elapsed));
+        }
+        self
+    }
+}
+
+/// A duration in squeue's own `%L` shape — `M:SS`, `H:MM:SS`,
+/// `D-HH:MM:SS` — so an aged self block reads like a fresh one.
+fn slurm_clock(d: Duration) -> String {
+    let s = d.as_secs();
+    let (days, h, m, sec) = (s / 86_400, (s % 86_400) / 3_600, (s % 3_600) / 60, s % 60);
+    if days > 0 {
+        format!("{days}-{h:02}:{m:02}:{sec:02}")
+    } else if h > 0 {
+        format!("{h}:{m:02}:{sec:02}")
+    } else {
+        format!("{m}:{sec:02}")
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -199,7 +185,7 @@ pub(crate) struct ComputeSnapshot {
     /// True when this refresh's `squeue` failed (timeout/error) and `jobs`
     /// carries the previous snapshot forward — "may be stale", not "empty".
     /// One wedged controller call must not make every card vanish for a
-    /// poll cycle (and must not turn live jobs into "ended" tombstones).
+    /// poll cycle (and must not read as every job having ended).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(crate) degraded: bool,
 }
@@ -218,20 +204,25 @@ impl ComputeSnapshot {
     }
 }
 
-/// Where the scheduler binaries live once detected. All four client tools
-/// are required together: the snapshot needs squeue/sinfo, Mode 2's
-/// launch/cancel routes need srun/scancel — a cluster with a partial
-/// toolset is not one we can operate on.
+/// Where the scheduler binaries live once detected. The snapshot needs
+/// squeue/sinfo and the in-job self-stop needs scancel — a cluster with a
+/// partial toolset is not one we can read.
 #[derive(Clone, Debug)]
 pub(crate) enum Detection {
     None,
     Slurm {
-        srun: PathBuf,
         scancel: PathBuf,
         squeue: PathBuf,
         sinfo: PathBuf,
     },
 }
+
+/// [`ComputeService::detected`]: what the cached detection said, readable
+/// without the async lock (the agent-context path must stay a single atomic
+/// load off-cluster).
+const DET_UNKNOWN: u8 = 0;
+const DET_NONE: u8 = 1;
+const DET_SLURM: u8 = 2;
 
 pub(crate) struct ComputeService {
     /// One async lock covers detection + the snapshot cache: refreshes are
@@ -240,10 +231,20 @@ pub(crate) struct ComputeService {
     inner: tokio::sync::Mutex<Inner>,
     /// Test knob dir (`CHIMAERA_SLURM_BINDIR`), read once at construction.
     bindir: Option<PathBuf>,
-    /// Set when THIS daemon runs inside a Slurm allocation (a Mode 2
-    /// compute-node daemon): `SLURM_JOB_ID` at construction. Drives the
-    /// snapshot's `self` block.
+    /// Set when THIS daemon runs inside a Slurm allocation: `SLURM_JOB_ID`
+    /// at construction. Drives the snapshot's `self` block, the in-job agent
+    /// context and `DELETE /compute/self`.
     self_job: Option<String>,
+    /// This daemon is a cluster workspace job: in a Slurm allocation AND
+    /// started by a workspace job script (`CHIMAERA_CLUSTER_WORKSPACE`).
+    cluster_job: bool,
+    /// The user said this host isn't a cluster (`CHIMAERA_NOT_A_CLUSTER`,
+    /// set by connect): Slurm on its PATH doesn't make it a login node.
+    not_a_cluster: bool,
+    /// Mirror of the cached detection (`DET_*`), updated wherever detection
+    /// is (re)run. Unknown until the first `/compute` (every window asks once
+    /// at boot) — never triggered from the agent-context path.
+    detected: AtomicU8,
     /// Jobs that ended between good snapshots, for the Timeline (std lock:
     /// never held across an await).
     ended: std::sync::Mutex<EndedJobs>,
@@ -253,17 +254,27 @@ pub(crate) struct ComputeService {
 struct Inner {
     detection: Option<Detection>,
     cache: Option<(Instant, ComputeSnapshot)>,
-    /// The rendered compute-session agent context, baked once per daemon
-    /// lifetime (see [`ComputeService::agent_context`]).
+    /// When the in-job self block was last asked, and what squeue said
+    /// (None = the call failed or the job wasn't listed) — the
+    /// [`SELF_ASK_FLOOR`] gate.
+    self_asked: Option<(Instant, Option<SelfAllocation>)>,
+    /// The rendered in-job agent context, baked once per daemon lifetime
+    /// (see [`ComputeService::agent_context`]).
     agent_context: Option<String>,
 }
 
 impl ComputeService {
     pub(crate) fn new() -> Self {
+        let self_job = env_nonempty("SLURM_JOB_ID");
+        let cluster_job = self_job.is_some()
+            && env_nonempty(chimaera_core::cluster::ENV_CLUSTER_WORKSPACE).is_some();
         ComputeService {
             inner: tokio::sync::Mutex::new(Inner::default()),
             bindir: std::env::var_os("CHIMAERA_SLURM_BINDIR").map(PathBuf::from),
-            self_job: std::env::var("SLURM_JOB_ID").ok().filter(|s| !s.is_empty()),
+            self_job,
+            cluster_job,
+            not_a_cluster: env_nonempty(chimaera_core::cluster::ENV_NOT_A_CLUSTER).is_some(),
+            detected: AtomicU8::new(DET_UNKNOWN),
             ended: std::sync::Mutex::new(EndedJobs::default()),
         }
     }
@@ -274,6 +285,9 @@ impl ComputeService {
             inner: tokio::sync::Mutex::new(Inner::default()),
             bindir: Some(dir),
             self_job: None,
+            cluster_job: false,
+            not_a_cluster: false,
+            detected: AtomicU8::new(DET_UNKNOWN),
             ended: std::sync::Mutex::new(EndedJobs::default()),
         }
     }
@@ -281,20 +295,24 @@ impl ComputeService {
     #[cfg(test)]
     pub(crate) fn with_bindir_and_job(dir: PathBuf, job: &str) -> Self {
         ComputeService {
-            inner: tokio::sync::Mutex::new(Inner::default()),
-            bindir: Some(dir),
             self_job: Some(job.to_string()),
-            ended: std::sync::Mutex::new(EndedJobs::default()),
+            ..Self::with_bindir(dir)
         }
     }
 
-    /// The detected scheduler toolset (for the Mode 2 launch/cancel routes);
-    /// runs detection if it hasn't happened yet. A TRANSIENT probe failure
-    /// (the login shell timing out under load) is not cached — the next call
-    /// retries — while a definitive "no tools" answer is; otherwise one slow
-    /// boot-time profile would brand a real cluster "no scheduler" for the
-    /// daemon's whole lifetime (the UI then stops polling and never asks
-    /// again).
+    /// Whether this daemon runs as a cluster workspace job — a job may start
+    /// hours after the click that queued it, with nobody watching (the
+    /// restart pick-up message is withheld there).
+    pub(crate) fn is_cluster_job(&self) -> bool {
+        self.cluster_job
+    }
+
+    /// The detected scheduler toolset; runs detection if it hasn't happened
+    /// yet. A TRANSIENT probe failure (the login shell timing out under
+    /// load) is not cached — the next call retries — while a definitive "no
+    /// tools" answer is; otherwise one slow boot-time profile would brand a
+    /// real cluster "no scheduler" for the daemon's whole lifetime (the UI
+    /// then stops polling and never asks again).
     pub(crate) async fn detection(&self) -> Detection {
         let mut inner = self.inner.lock().await;
         if inner.detection.is_none() {
@@ -326,9 +344,26 @@ impl ComputeService {
                 return snap.clone();
             }
         }
+        // The self block has its own floor: a refresh drops the snapshot
+        // cache, never the once-a-minute promise for `squeue -j`.
+        let ask_self = self.self_job.as_deref().filter(|_| {
+            inner
+                .self_asked
+                .as_ref()
+                .is_none_or(|(at, _)| at.elapsed() >= SELF_ASK_FLOOR)
+        });
+        let asked_at = Instant::now();
         // Holding the lock across the fetch IS the single-flight: concurrent
         // requests queue here briefly instead of stampeding the controller.
-        let mut snap = fetch_snapshot(&squeue, &sinfo, self.self_job.as_deref()).await;
+        let mut snap = fetch_snapshot(&squeue, &sinfo, ask_self).await;
+        if let Some(own) = snap.self_alloc.as_mut() {
+            own.attached = env_nonempty(chimaera_core::cluster::ENV_JOB_ATTACHED).is_some();
+        }
+        if ask_self.is_some() {
+            inner.self_asked = Some((asked_at, snap.self_alloc.clone()));
+        } else if let Some((at, alloc)) = &inner.self_asked {
+            snap.self_alloc = alloc.clone().map(|a| a.aged(at.elapsed()));
+        }
         // Only two GOOD reads say a job ended: a failed squeue carries the
         // old jobs forward and must never read as "everything finished".
         if !snap.degraded {
@@ -367,97 +402,185 @@ impl ComputeService {
         inner.cache.clone()
     }
 
-    /// The context block a compute-node daemon injects into its agent
-    /// sessions (delivered via the claude hook response — see
-    /// `agents::ingest`). `None` for a normal daemon: the `self_job` check
-    /// is the whole off-cluster path — no lock, no subprocess, no allocation
-    /// — so this is provably inert unless `SLURM_JOB_ID` was set at boot.
+    /// What this daemon's agents are told about where they run, delivered
+    /// once per session (claude: the hook response, `agents::ingest`; codex
+    /// chat: `developer_instructions`). `None` for a normal daemon.
     ///
-    /// Baked ONCE per daemon lifetime, at first use: the allocation's facts
-    /// (job/node/partition/resources) are constant for the job's life, and
-    /// the walltime end is stored as an ABSOLUTE estimate (bake-time now +
-    /// squeue's time_left) rather than re-derived per spawn — any bake
-    /// moment yields the same end instant (modulo squeue's minute rounding),
-    /// one bake keeps every session's text identical, and a relative
-    /// "3:59 left" would go stale in the transcript.
+    /// - Inside a Slurm job: the job, its node and resources, its absolute
+    ///   end, how to use it, and the cluster's rules for agents.
+    /// - Not in a job, on a host where Slurm was detected (a login-node
+    ///   daemon the user allowed): the short login-node version — unless
+    ///   the user said the host isn't a cluster.
+    ///
+    /// Off-cluster this is one `Option` check and one atomic load — no lock,
+    /// no subprocess, no file read: the login-node branch reads only the
+    /// CACHED detection (which every window's first `/compute` fills) and
+    /// never runs one itself.
     pub(crate) async fn agent_context(&self) -> Option<String> {
-        self.self_job.as_ref()?;
+        if self.self_job.is_none() {
+            return (!self.not_a_cluster && self.detected.load(Ordering::Acquire) == DET_SLURM)
+                .then(|| LOGIN_NODE_CONTEXT.to_string());
+        }
+        // Baked ONCE per daemon lifetime, at first use: the allocation's
+        // facts are constant for the job's life, and the end is stored as
+        // an ABSOLUTE instant (bake-time now + squeue's time left) rather
+        // than re-derived per spawn — one bake keeps every session's text
+        // identical, and a relative "3:59 left" would go stale in the
+        // transcript.
         if let Some(ctx) = &self.inner.lock().await.agent_context {
             return Some(ctx.clone());
         }
         // Not baked yet. The snapshot is cached + single-flight (worst case
-        // one 5s-capped squeue); a failed squeue yields no self block, and
-        // the bake simply retries on the next call rather than caching
-        // an absence forever.
+        // one 5 s-capped squeue); a failed squeue yields no self block, and
+        // the bake simply retries on a later call rather than caching an
+        // absence forever.
         let alloc = self.snapshot(false).await.self_alloc?;
-        let text = self_context_text(&alloc, SystemTime::now());
+        let (rules, facts) =
+            tokio::task::spawn_blocking(|| (AgentRules::from_env(), read_cluster_facts()))
+                .await
+                .unwrap_or_default();
+        let text = job_context_text(
+            &alloc,
+            env_nonempty("SLURM_CLUSTER_NAME").as_deref(),
+            SystemTime::now(),
+            &rules,
+            facts.as_ref(),
+        );
         let mut inner = self.inner.lock().await;
         // get_or_insert: a concurrent first bake wins and both callers hand
         // out the SAME string (the two candidates differ only by seconds).
         Some(inner.agent_context.get_or_insert(text).clone())
     }
 
-    /// Drop the cached snapshot (detection stays): the next list refetches
-    /// the queue NOW. Launch/cancel call this so the instant refresh the UI
-    /// fires right after sees the queue change instead of a ≤30s-stale
-    /// cache — a fresh launch otherwise reads as an orphaned record and
-    /// briefly wears an "ended" card (found live, maintainer's 4th round).
-    pub(crate) async fn invalidate(&self) {
-        self.inner.lock().await.cache = None;
+    /// `DELETE /compute/self`: end this daemon's own job. Slurm then
+    /// SIGTERMs the daemon, whose graceful stop saves the ledger — the
+    /// workspace's chats come back with its next job.
+    async fn cancel_self(&self) -> (StatusCode, serde_json::Value) {
+        // Digits only (an array task's id is still numeric in SLURM_JOB_ID):
+        // it lands in argv, and a dash-led value would read as an option.
+        let Some(job) = self
+            .self_job
+            .as_deref()
+            .filter(|j| !j.is_empty() && j.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            return (
+                StatusCode::NOT_FOUND,
+                json!({"error": "this daemon does not run inside a Slurm job"}),
+            );
+        };
+        let Detection::Slurm { scancel, .. } = self.detection().await else {
+            return (
+                StatusCode::CONFLICT,
+                json!({"error": "no Slurm tools found on this node"}),
+            );
+        };
+        // A job already on its way out answers "Invalid job id" — the stop
+        // asked for has happened, so that is success too.
+        match run_checked(&scancel.to_string_lossy(), &[job.to_string()]).await {
+            Some(out) if out.success || out.stderr.contains("Invalid job id") => {
+                tracing::info!(job, "stop of this daemon's own job requested");
+                (StatusCode::ACCEPTED, json!({"job_id": job}))
+            }
+            Some(out) => (
+                StatusCode::BAD_GATEWAY,
+                json!({"error": format!("scancel: {}", slurm::clean_tool_stderr(&out.stderr, "scancel"))}),
+            ),
+            None => (
+                StatusCode::BAD_GATEWAY,
+                json!({"error": "scancel did not answer (controller busy?) — the job was NOT stopped"}),
+            ),
+        }
     }
 
-    /// Find the Slurm client tools. The knob dir wins (tests / unusual
-    /// installs); otherwise ask the user's login shell for its PATH and walk
-    /// it here — the profile-managed-PATH reasoning of the git resolution,
-    /// WITHOUT `command -v`: real clusters wrap the tools in profile shell
-    /// functions (Sherlock's login rc does — found live: `command -v squeue`
-    /// prints the bare function name, not a path), and a PATH walk is also
-    /// the only form that works identically under bash/zsh/fish.
-    /// `None` = the probe itself failed (login shell timed out — transient,
-    /// don't cache); `Some(Detection::None)` = the shell answered and the
-    /// tools are genuinely absent (definitive, cache it).
+    /// Detect, mirroring the verdict into [`Self::detected`].
     async fn detect(&self) -> Option<Detection> {
-        if let Some(dir) = &self.bindir {
-            let tools = ["srun", "scancel", "squeue", "sinfo"].map(|n| dir.join(n));
-            if tools.iter().all(|p| p.is_file()) {
-                tracing::info!(dir = %dir.display(), "slurm tools from CHIMAERA_SLURM_BINDIR");
-                let [srun, scancel, squeue, sinfo] = tools;
-                return Some(Detection::Slurm {
-                    srun,
-                    scancel,
-                    squeue,
-                    sinfo,
-                });
-            }
-            tracing::warn!(dir = %dir.display(), "CHIMAERA_SLURM_BINDIR set but srun/scancel/squeue/sinfo not all present");
-            return Some(Detection::None);
-        }
-        let shell = chimaera_core::login_shell();
-        let out = run_capped(&shell, &["-lc".into(), "printf %s \"$PATH\"".into()]).await;
-        let Some(path) = out else {
-            tracing::warn!("login-shell PATH probe failed; scheduler detection will retry");
-            return None;
+        let found = detect_tools(self.bindir.as_deref()).await;
+        let mirror = match &found {
+            Some(Detection::Slurm { .. }) => DET_SLURM,
+            Some(Detection::None) => DET_NONE,
+            None => DET_UNKNOWN,
         };
-        // The walk stats PATH entries that may live on slow network mounts —
-        // off the reactor with it (detection runs once per daemon lifetime).
-        let found = tokio::task::spawn_blocking(move || {
-            ["srun", "scancel", "squeue", "sinfo"].map(|n| find_on_path(path.trim(), n))
-        })
-        .await
-        .unwrap_or([None, None, None, None]);
-        match found {
-            [Some(srun), Some(scancel), Some(squeue), Some(sinfo)] => {
-                tracing::info!(squeue = %squeue.display(), "slurm detected");
-                Some(Detection::Slurm {
-                    srun,
-                    scancel,
-                    squeue,
-                    sinfo,
-                })
-            }
-            _ => Some(Detection::None),
-        }
+        self.detected.store(mirror, Ordering::Release);
+        found
     }
+}
+
+/// Find the Slurm client tools. The knob dir wins (tests / unusual
+/// installs); otherwise ask the user's login shell for its PATH and walk it
+/// here — the profile-managed-PATH reasoning of the git resolution, WITHOUT
+/// `command -v`: some clusters wrap the tools in profile shell functions
+/// (`command -v squeue` then prints the bare function name, not a path), and
+/// a PATH walk is also the only form that works identically under
+/// bash/zsh/fish. `None` = the probe itself failed (login shell timed out —
+/// transient, don't cache); `Some(Detection::None)` = the shell answered and
+/// the tools are genuinely absent (definitive, cache it).
+pub(crate) async fn detect_tools(bindir: Option<&Path>) -> Option<Detection> {
+    const TOOLS: [&str; 3] = ["scancel", "squeue", "sinfo"];
+    if let Some(dir) = bindir {
+        let tools = TOOLS.map(|n| dir.join(n));
+        if tools.iter().all(|p| p.is_file()) {
+            tracing::info!(dir = %dir.display(), "slurm tools from CHIMAERA_SLURM_BINDIR");
+            let [scancel, squeue, sinfo] = tools;
+            return Some(Detection::Slurm {
+                scancel,
+                squeue,
+                sinfo,
+            });
+        }
+        tracing::warn!(dir = %dir.display(), "CHIMAERA_SLURM_BINDIR set but scancel/squeue/sinfo not all present");
+        return Some(Detection::None);
+    }
+    let shell = chimaera_core::login_shell();
+    let out = run_capped(&shell, &["-lc".into(), "printf %s \"$PATH\"".into()]).await;
+    let Some(path) = out else {
+        tracing::warn!("login-shell PATH probe failed; scheduler detection will retry");
+        return None;
+    };
+    // The walk stats PATH entries that may live on slow network mounts —
+    // off the reactor with it (detection runs once per daemon lifetime).
+    let found = tokio::task::spawn_blocking(move || TOOLS.map(|n| find_on_path(path.trim(), n)))
+        .await
+        .unwrap_or([None, None, None]);
+    match found {
+        [Some(scancel), Some(squeue), Some(sinfo)] => {
+            tracing::info!(squeue = %squeue.display(), "slurm detected");
+            Some(Detection::Slurm {
+                scancel,
+                squeue,
+                sinfo,
+            })
+        }
+        _ => Some(Detection::None),
+    }
+}
+
+/// Whether Slurm job `job` is still queued or running: `squeue -h -j <id>
+/// -o %T`, one bounded call. `Some(false)` when the controller no longer
+/// lists it (finished long ago: "Invalid job id"; recently: a terminal
+/// state, or nothing), `None` when the question went unanswered (timeout,
+/// any other failure) — the caller keeps waiting rather than guessing.
+pub(crate) async fn job_is_live(squeue: &Path, job: &str) -> Option<bool> {
+    let out = run_checked(
+        &squeue.to_string_lossy(),
+        &[
+            "-h".into(),
+            "-j".into(),
+            job.to_string(),
+            "-o".into(),
+            "%T".into(),
+        ],
+    )
+    .await?;
+    if !out.success {
+        return out.stderr.contains("Invalid job id").then_some(false);
+    }
+    Some(
+        out.stdout
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .is_some_and(is_live_state),
+    )
 }
 
 /// First executable `name` on the colon-separated `path` (the login shell's
@@ -471,7 +594,7 @@ fn find_on_path(path: &str, name: &str) -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-fn is_executable(p: &std::path::Path) -> bool {
+fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     p.metadata()
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
@@ -479,15 +602,13 @@ fn is_executable(p: &std::path::Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_executable(p: &std::path::Path) -> bool {
+fn is_executable(p: &Path) -> bool {
     p.is_file()
 }
 
-async fn fetch_snapshot(
-    squeue: &std::path::Path,
-    sinfo: &std::path::Path,
-    self_job: Option<&str>,
-) -> ComputeSnapshot {
+/// One refresh: the user's queue, the partitions, and — when `self_job` is
+/// given (the floor allows it) — the daemon's own allocation.
+async fn fetch_snapshot(squeue: &Path, sinfo: &Path, self_job: Option<&str>) -> ComputeSnapshot {
     // The daemon's own allocation, when it has one: one bounded squeue -j.
     let self_fut = async {
         match self_job {
@@ -509,9 +630,7 @@ async fn fetch_snapshot(
     };
     // `-u <user>`, not `--me`: --me is newer than the Slurm versions real
     // clusters still run. No USER (exotic) → skip the queue rather than
-    // listing the whole cluster's jobs. %j goes LAST: job names are the one
-    // user-controlled field and may contain the `|` delimiter — splitn can
-    // only protect the final field from shifting every later one.
+    // listing the whole cluster's jobs.
     let jobs_fut = async {
         match std::env::var("USER") {
             Ok(user) => {
@@ -522,7 +641,7 @@ async fn fetch_snapshot(
                         user,
                         "--noheader".into(),
                         "-o".into(),
-                        "%i|%P|%T|%L|%N|%C|%m|%M|%Z|%j".into(),
+                        slurm::SQUEUE_FORMAT.into(),
                     ],
                 )
                 .await
@@ -533,7 +652,7 @@ async fn fetch_snapshot(
     let parts_fut = async {
         run_capped(
             &sinfo.to_string_lossy(),
-            &["--noheader".into(), "-o".into(), "%P|%a|%D|%l|%c|%m".into()],
+            &["--noheader".into(), "-o".into(), slurm::SINFO_FORMAT.into()],
         )
         .await
     };
@@ -543,8 +662,8 @@ async fn fetch_snapshot(
     // the sum).
     let (self_alloc, jobs_out, parts_out) = tokio::join!(self_fut, jobs_fut, parts_fut);
 
-    let (jobs, jobs_truncated) = parse_squeue(jobs_out.as_deref().unwrap_or(""));
-    let (partitions, parts_truncated) = parse_sinfo(parts_out.as_deref().unwrap_or(""));
+    let (jobs, jobs_truncated) = slurm::parse_squeue(jobs_out.as_deref().unwrap_or(""));
+    let (partitions, parts_truncated) = slurm::parse_sinfo(parts_out.as_deref().unwrap_or(""));
     ComputeSnapshot {
         scheduler: "slurm".to_string(),
         jobs,
@@ -580,219 +699,294 @@ fn parse_self_allocation(out: &str) -> Option<SelfAllocation> {
         time_left: time_left.to_string(),
         cpus,
         mem,
-        gres: if gres.eq_ignore_ascii_case("n/a") {
+        gres: if gres.eq_ignore_ascii_case("n/a") || gres.eq_ignore_ascii_case("(null)") {
             String::new()
         } else {
             gres
         },
+        attached: false,
     })
 }
 
-/// Render the compute-session context for one [`SelfAllocation`]: what a
-/// model on this node needs to know that nothing else tells it — it is on a
-/// compute node (not the login node it may assume), what the allocation
-/// provides, and that everything here dies at walltime. `now` is the bake
-/// time (threaded in so tests can pin it); the walltime end lands in the
-/// text as an absolute UTC instant. Missing resource fields (older squeue
-/// rows degrade to "") are simply omitted, never rendered empty.
-fn self_context_text(alloc: &SelfAllocation, now: SystemTime) -> String {
+/// What a login-node daemon's agents are told (a daemon the user allowed on
+/// a cluster's login node, not in a job). Short on purpose: the point is
+/// where they are and what that place is for.
+const LOGIN_NODE_CONTEXT: &str = "\
+You are running on a shared login node of a Slurm cluster, not inside a job. \
+Login nodes are for light work: editing, inspecting files and preparing jobs. \
+Submit anything heavy (builds, test suites, data processing, long runs) as a job \
+with sbatch and an explicit --time, and check on it at most once a minute. Leave \
+nothing running here: no background processes, servers or polling loops.";
+
+/// Used when the cluster has no rules for agents of its own (neither a rules
+/// file on the cluster nor text from the user).
+const GENERIC_RULES: &str = "\
+Rules for agents on shared clusters: every job you submit states an explicit \
+--time. Check the queue no more than once a minute, and never in a loop. Leave \
+nothing running on login nodes. Never start anything that keeps itself alive or \
+resubmits itself.";
+
+/// The cluster's Slurm setup as the app discovered it, from the job's
+/// `CHIMAERA_CLUSTER_FACTS_FILE`. Blocking (a shared filesystem): run off
+/// the reactor.
+fn read_cluster_facts() -> Option<chimaera_core::cluster::ClusterFacts> {
+    let path = env_nonempty(chimaera_core::cluster::ENV_CLUSTER_FACTS_FILE)?;
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(256 * 1024).read_to_end(&mut bytes).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// What agents may submit to: one line per partition that is up (at most
+/// 12), its time limit and largest node, then accounts and the GPU flag.
+fn facts_text(f: &chimaera_core::cluster::ClusterFacts) -> Option<String> {
+    const ROWS: usize = 12;
+    let up: Vec<&slurm::PartitionChoice> = f.partitions.iter().filter(|p| p.up).collect();
+    if up.is_empty() {
+        return None;
+    }
+    let mut t = String::from(
+        "What you can submit to on this cluster (partition — time limit — largest node):",
+    );
+    for p in up.iter().take(ROWS) {
+        let time = if p.max_time.eq_ignore_ascii_case("UNLIMITED") || p.max_time.is_empty() {
+            "no limit".to_string()
+        } else {
+            p.max_time.clone()
+        };
+        let mut node: Vec<String> = Vec::new();
+        let cpus = p.cpus_per_node.trim_end_matches('+');
+        if !cpus.is_empty() {
+            node.push(format!("{cpus} CPUs"));
+        }
+        if let Some(mem) = mem_words(&p.mem_per_node) {
+            node.push(mem);
+        }
+        if p.gpus {
+            node.push("GPUs".to_string());
+        }
+        let mut line = format!(
+            "\n- {}{} — {time}",
+            p.name,
+            if p.default { " (default)" } else { "" }
+        );
+        if !node.is_empty() {
+            line.push_str(&format!(" — {}", node.join(", ")));
+        }
+        if p.preemptible {
+            line.push_str(" — can be preempted");
+        }
+        t.push_str(&line);
+    }
+    if up.len() > ROWS {
+        t.push_str(&format!(
+            "\n- and {} more (sinfo lists them)",
+            up.len() - ROWS
+        ));
+    }
+    match (&f.default_account, f.accounts.as_slice()) {
+        (_, []) => t.push_str("\nNo --account is needed here."),
+        (Some(d), accounts) => t.push_str(&format!(
+            "\nAccounts: {} (default {d}); pass --account=… for another.",
+            accounts.join(", ")
+        )),
+        (None, accounts) => t.push_str(&format!(
+            "\nPass --account= one of: {}.",
+            accounts.join(", ")
+        )),
+    }
+    Some(t)
+}
+
+/// sinfo's `%m` (megabytes, maybe `+`-suffixed) in plain words.
+fn mem_words(raw: &str) -> Option<String> {
+    let mb: u64 = raw.trim_end_matches('+').parse().ok()?;
+    Some(if mb >= 1000 {
+        format!("{} GB", (mb + 500) / 1000)
+    } else {
+        format!("{mb} MB")
+    })
+}
+
+/// One rules-for-agents source, as read at bake time.
+#[derive(Clone, Debug, PartialEq)]
+enum RulesText {
+    /// Short enough to ride the context verbatim.
+    Inline(String),
+    /// Too long to inline: the agent is told to read it.
+    TooLong(PathBuf),
+}
+
+/// The cluster's rules for agents, from the workspace job's environment:
+/// a file on the cluster the user pointed at (`CHIMAERA_AGENT_RULES_SOURCE`,
+/// read now so it is always the cluster's current text) and the user's own
+/// text (`CHIMAERA_AGENT_RULES_FILE`).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct AgentRules {
+    source: Option<RulesText>,
+    user: Option<RulesText>,
+}
+
+impl AgentRules {
+    /// Blocking (file reads on a shared filesystem): run off the reactor.
+    fn from_env() -> Self {
+        let read = |var: &str| env_nonempty(var).and_then(|p| read_rules(Path::new(&p)));
+        AgentRules {
+            source: read(chimaera_core::cluster::ENV_AGENT_RULES_SOURCE),
+            user: read(chimaera_core::cluster::ENV_AGENT_RULES_FILE),
+        }
+    }
+}
+
+/// A rules file, read with a cap: `None` unless it is a readable regular
+/// file with something in it.
+fn read_rules(path: &Path) -> Option<RulesText> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        tracing::warn!(path = %path.display(), "rules for agents: not a regular file; skipped");
+        return None;
+    }
+    let file = std::fs::File::open(path)
+        .inspect_err(|err| {
+            tracing::warn!(path = %path.display(), %err, "rules for agents: unreadable; skipped");
+        })
+        .ok()?;
+    let mut bytes = Vec::new();
+    file.take(RULES_INLINE_MAX + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > RULES_INLINE_MAX {
+        return Some(RulesText::TooLong(path.to_path_buf()));
+    }
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+    (!text.is_empty()).then_some(RulesText::Inline(text))
+}
+
+/// Render the in-job agent context for one [`SelfAllocation`]: where the
+/// agent runs (which nothing else tells it — it may assume a login node),
+/// what the allocation provides, when it ends, how to use it, and the
+/// cluster's rules for agents. `now` is the bake time (threaded in so tests
+/// can pin it); the end lands as an absolute UTC instant. Missing fields
+/// (older squeue rows degrade to "") are omitted, never rendered empty.
+fn job_context_text(
+    alloc: &SelfAllocation,
+    cluster: Option<&str>,
+    now: SystemTime,
+    rules: &AgentRules,
+    facts: Option<&chimaera_core::cluster::ClusterFacts>,
+) -> String {
     let mut place = format!("Slurm job {}", alloc.job_id);
     if !alloc.node.is_empty() {
         place.push_str(&format!(" on node {}", alloc.node));
     }
+    let mut known = Vec::new();
+    if let Some(cluster) = cluster.filter(|c| !c.is_empty()) {
+        known.push(format!("cluster {cluster}"));
+    }
     if !alloc.partition.is_empty() {
-        place.push_str(&format!(" (partition {})", alloc.partition));
+        known.push(format!("partition {}", alloc.partition));
+    }
+    if !known.is_empty() {
+        place.push_str(&format!(" ({})", known.join(", ")));
     }
     let mut resources = Vec::new();
     if !alloc.cpus.is_empty() {
         resources.push(format!("{} CPUs", alloc.cpus));
     }
     if !alloc.mem.is_empty() {
-        resources.push(format!("{} memory", alloc.mem));
+        resources.push(format!("{} of memory", alloc.mem));
     }
     if !alloc.gres.is_empty() {
-        resources.push(format!("gres {}", alloc.gres));
+        resources.push(alloc.gres.clone());
     }
-    let resources = if resources.is_empty() {
-        String::new()
-    } else {
-        format!(" The allocation provides {}.", resources.join(", "))
+    let resources = match resources.split_last() {
+        None => String::new(),
+        Some((last, [])) => format!(" with {last}"),
+        Some((last, rest)) => format!(" with {} and {last}", rest.join(", ")),
     };
-    // "UNLIMITED"/"NOT_SET"/noise parse to None: state the walltime rule
-    // without inventing an end time.
-    let ends = match parse_slurm_time_left(&alloc.time_left)
-        .and_then(|left| format_utc_minute(now + left))
+    // "UNLIMITED"/"NOT_SET"/noise parse to None: state the rule without
+    // inventing an end time.
+    let ends = match slurm::parse_duration(&alloc.time_left)
+        .and_then(|left| slurm::format_utc_minute(now + left))
     {
-        Some(end) => format!("approximately {end}"),
-        None => "its walltime".to_string(),
+        Some(end) => format!("around {end}"),
+        None => "at its time limit".to_string(),
     };
-    format!(
-        "This session runs on a Slurm COMPUTE NODE inside an allocation \
-         ({place}), not on a login node.{resources} Heavy computation \
-         belongs here and can run directly (no need to submit it as a \
-         separate job). The allocation ends at {ends}, and everything \
-         running on this node — including this session — is killed then. \
-         Tools or services that exist only on login nodes (for example \
-         outbound network access or job submission on some clusters) may \
-         behave differently or be unavailable here."
-    )
-}
-
-/// Parse Slurm's elapsed/remaining time format (`squeue %L` / `sinfo %l`):
-/// `days-hours:minutes:seconds` with zero leading components omitted, so
-/// `9:54` is min:sec and `8:00:00` is h:min:sec. `UNLIMITED`, `NOT_SET`,
-/// `INVALID`, and bare numbers (ambiguous) are `None`.
-fn parse_slurm_time_left(s: &str) -> Option<Duration> {
-    let s = s.trim();
-    let (days, rest) = match s.split_once('-') {
-        Some((d, rest)) => (d.parse::<u64>().ok()?, rest),
-        None => (0, s),
+    // A chimaera job (its job-host passes the cluster's facts) may host
+    // several workspaces; a daemon started by hand in an allocation is alone.
+    let shared = if facts.is_some() {
+        " Other workspaces may be open in this job and share its resources."
+    } else {
+        ""
     };
-    let parts: Vec<u64> = rest
-        .split(':')
-        .map(|p| p.parse::<u64>().ok())
-        .collect::<Option<_>>()?;
-    let (h, m, sec) = match (days > 0 || s.contains('-'), parts.as_slice()) {
-        // With a days prefix Slurm writes H:M:S; tolerate truncated forms.
-        (true, [h]) => (*h, 0, 0),
-        (true, [h, m]) => (*h, *m, 0),
-        // Without days the shortest real form is min:sec.
-        (false, [m, s]) => (0, *m, *s),
-        (_, [h, m, s]) => (*h, *m, *s),
-        _ => return None,
+    let gpu_arg = match facts {
+        Some(f) if f.partitions.iter().any(|p| p.gpus) => match f.gpu_flag {
+            slurm::GpuFlag::Gpus => " [--gpus=N]",
+            slurm::GpuFlag::Gres => " [--gres=gpu:N]",
+        },
+        _ => "",
     };
-    Some(Duration::from_secs(((days * 24 + h) * 60 + m) * 60 + sec))
-}
-
-/// `SystemTime` → `"YYYY-MM-DD HH:MM UTC"`, minute precision (walltime ends
-/// are estimates; seconds would be false precision). Hand-rolled civil-date
-/// conversion (Howard Hinnant's `civil_from_days`) because the workspace
-/// deliberately carries no date-time dependency. Valid for any post-1970
-/// time; `None` only for pre-epoch input.
-fn format_utc_minute(t: SystemTime) -> Option<String> {
-    let secs = t.duration_since(UNIX_EPOCH).ok()?.as_secs();
-    let (h, min) = ((secs % 86_400) / 3_600, (secs % 3_600) / 60);
-    let z = secs / 86_400 + 719_468;
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + u64::from(m <= 2);
-    Some(format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02} UTC"))
-}
-
-/// `squeue --noheader -o "%i|%P|%T|%L|%N|%C|%m|%j"` → jobs. Unparseable
-/// lines are skipped, never fatal (Slurm banners/warnings sometimes precede
-/// output). %j sits LAST because job names are user-controlled and may
-/// contain `|` — splitn(8) folds any embedded delimiters into the name
-/// instead of shifting the fields before it. The mid-row resource fields
-/// are tolerated missing — older rows or exotic formats degrade to "".
-fn parse_squeue(out: &str) -> (Vec<Job>, bool) {
-    let mut jobs = Vec::new();
-    let mut truncated = false;
-    for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let mut f = line.splitn(10, '|').map(str::trim);
-        let (Some(id), Some(partition), Some(state), Some(time_left)) =
-            (f.next(), f.next(), f.next(), f.next())
-        else {
-            continue;
-        };
-        if id.is_empty() || !id.starts_with(|c: char| c.is_ascii_digit()) {
-            continue; // not a job row
-        }
-        if jobs.len() >= MAX_JOBS {
-            truncated = true;
-            break;
-        }
-        // %N is empty while pending — an empty string is the honest value.
-        let nodes = f.next().unwrap_or("").to_string();
-        let cpus = f.next().unwrap_or("").to_string();
-        let mem = f.next().unwrap_or("").to_string();
-        let elapsed = f.next().unwrap_or("").to_string();
-        // %Z prints "(null)"/"n/a" on some builds when unknown.
-        let workdir = f
-            .next()
-            .filter(|w| w.starts_with('/'))
-            .unwrap_or("")
-            .to_string();
-        jobs.push(Job {
-            id: id.to_string(),
-            name: f.next().unwrap_or("").to_string(),
-            partition: partition.to_string(),
-            state: state.to_string(),
-            time_left: time_left.to_string(),
-            nodes,
-            cpus,
-            mem,
-            elapsed,
-            workdir,
-        });
+    let mut text = format!(
+        "You are running inside {place}{resources}. The job ends {ends}; anything \
+         still running then is stopped.{shared}\n\n\
+         - Commands you run execute inside this job. Use its CPUs and memory fully \
+         (match thread counts to $SLURM_CPUS_PER_TASK).\n\
+         - For work that needs more time than is left, more resources, or a GPU \
+         this job doesn't have, submit your own job with sbatch and an explicit \
+         --time; it keeps running after this one ends: `sbatch --time=… \
+         [--partition=…] [--cpus-per-task=…] [--mem=…]{gpu_arg} job.sh`. Chain steps \
+         with --dependency=afterok:<id>. Check on your jobs at most once a minute \
+         (squeue -j <id>, sacct -j <id>), never in a loop, or tell the user the job \
+         id and stop."
+    );
+    if let Some(table) = facts.and_then(facts_text) {
+        text.push_str("\n\n");
+        text.push_str(&table);
     }
-    (jobs, truncated)
-}
-
-/// `sinfo --noheader -o "%P|%a|%D|%l|%c|%m"` → partitions. sinfo groups
-/// rows by the non-numeric format fields, so this yields one row per
-/// (partition, avail); the default partition carries a `*` suffix on its
-/// name. The limit tail (%l walltime, %c cpus/node, %m MB/node) is
-/// tolerated missing.
-fn parse_sinfo(out: &str) -> (Vec<Partition>, bool) {
-    let mut partitions: Vec<Partition> = Vec::new();
-    let mut truncated = false;
-    for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let mut f = line.splitn(6, '|').map(str::trim);
-        let (Some(raw_name), Some(avail)) = (f.next(), f.next()) else {
-            continue;
-        };
-        if raw_name.is_empty() {
-            continue;
-        }
-        let (name, default) = match raw_name.strip_suffix('*') {
-            Some(base) => (base, true),
-            None => (raw_name, false),
-        };
-        let nodes: u64 = f.next().and_then(|n| n.trim().parse().ok()).unwrap_or(0);
-        let time_limit = f.next().unwrap_or("").to_string();
-        let cpus_per_node = f.next().unwrap_or("").to_string();
-        let mem_per_node = f.next().unwrap_or("").to_string();
-        // A partition briefly listed under two avail states: keep one row,
-        // sum the nodes, "up" wins, first non-empty limits stick
-        // (orientation, not accounting).
-        if let Some(existing) = partitions.iter_mut().find(|p| p.name == name) {
-            existing.nodes += nodes;
-            existing.avail |= avail == "up";
-            existing.default |= default;
-            if existing.time_limit.is_empty() {
-                existing.time_limit = time_limit;
+    let mut any_rules = false;
+    if let Some(source) = &rules.source {
+        any_rules = true;
+        text.push_str("\n\n");
+        match source {
+            RulesText::Inline(rules) => {
+                text.push_str("This cluster's rules for agents:\n");
+                text.push_str(rules);
             }
-            continue;
+            RulesText::TooLong(path) => text.push_str(&format!(
+                "This cluster's rules for agents are in {}. Read that file before \
+                 doing significant work.",
+                path.display()
+            )),
         }
-        if partitions.len() >= MAX_PARTITIONS {
-            truncated = true;
-            break;
-        }
-        partitions.push(Partition {
-            name: name.to_string(),
-            time_limit,
-            cpus_per_node,
-            mem_per_node,
-            default,
-            avail: avail == "up",
-            nodes,
-        });
     }
-    (partitions, truncated)
+    if let Some(user) = &rules.user {
+        any_rules = true;
+        text.push_str("\n\n");
+        match user {
+            RulesText::Inline(rules) => {
+                text.push_str("The user's rules for agents on this cluster:\n");
+                text.push_str(rules);
+            }
+            RulesText::TooLong(path) => text.push_str(&format!(
+                "The user's rules for agents on this cluster are in {}. Read that \
+                 file before doing significant work.",
+                path.display()
+            )),
+        }
+    }
+    if !any_rules {
+        text.push_str("\n\n");
+        text.push_str(GENERIC_RULES);
+    }
+    text
 }
 
 /// One child's outcome under the poll discipline. `None` from
 /// [`run_checked`] means the child never ran to completion (spawn failure
 /// or the deadline); an exit is always `Some` — success or not — with both
 /// streams captured (capped), so callers can tell "the tool said no" from
-/// "the tool never answered" (cancel needs that split: scancel of an
-/// already-gone job fails with words, a wedged controller fails silently).
+/// "the tool never answered" (scancel of an already-gone job fails with
+/// words, a wedged controller fails silently).
 pub(crate) struct CmdResult {
     pub(crate) success: bool,
     pub(crate) stdout: String,
@@ -801,8 +995,6 @@ pub(crate) struct CmdResult {
 
 /// Run one child with the default timeout + output cap; None on spawn
 /// failure, non-zero exit, or timeout (the caller degrades, never errors).
-/// Shared with `compute_jobs` (the launch/cancel verbs ride the same
-/// discipline).
 pub(crate) async fn run_capped(bin: &str, args: &[String]) -> Option<String> {
     let out = run_checked(bin, args).await?;
     out.success.then_some(out.stdout)
@@ -840,45 +1032,8 @@ fn capped_lossy(mut bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// Slurm's stderr/log text, made presentable: `<tool>: error: ` prefixes
-/// stripped, ASCII ruler lines dropped, whitespace collapsed, length
-/// capped. What remains is the admin-authored message — the most
-/// cluster-specific, user-actionable text we will ever have (a detached
-/// srun's refusals land in its log file; `compute_jobs` tails it through
-/// this when a launch never reaches the queue).
-pub(crate) fn clean_tool_stderr(raw: &str, tool: &str) -> String {
-    let tool_prefix = format!("{tool}: ");
-    let mut cleaned: Vec<String> = Vec::new();
-    for line in raw.lines() {
-        let mut line = line.trim();
-        if !tool.is_empty() {
-            while let Some(rest) = line.strip_prefix(&tool_prefix) {
-                line = rest.trim_start();
-            }
-        }
-        while let Some(rest) = line.strip_prefix("error:") {
-            line = rest.trim_start();
-        }
-        if line.is_empty() || line.chars().all(|c| c == '=' || c == '-') {
-            continue;
-        }
-        cleaned.push(line.to_string());
-    }
-    let mut s = cleaned.join(" ");
-    if s.is_empty() {
-        s = "the command failed without a message".to_string();
-    }
-    if s.len() > 400 {
-        let cut = s
-            .char_indices()
-            .take_while(|(i, _)| *i < 400)
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(400);
-        s.truncate(cut);
-        s.push('…');
-    }
-    s
+fn env_nonempty(var: &str) -> Option<String> {
+    std::env::var(var).ok().filter(|v| !v.trim().is_empty())
 }
 
 fn now_ms() -> u64 {
@@ -902,6 +1057,13 @@ pub(crate) async fn get_compute(
     Json(state.compute.snapshot(q.refresh).await).into_response()
 }
 
+/// DELETE /api/v1/compute/self — stop this daemon's own Slurm job (202), or
+/// 404 when the daemon doesn't run inside one.
+pub(crate) async fn delete_self(State(state): State<Arc<AppState>>) -> Response {
+    let (status, body) = state.compute.cancel_self().await;
+    (status, Json(body)).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,45 +1075,45 @@ mod tests {
         dir
     }
 
-    #[test]
-    fn parse_squeue_rows_caps_and_skips_noise() {
-        // Shapes measured on Sherlock 2026-07-14, %C|%m resource tail
-        // 2026-07-16, %j moved LAST 2026-07-16 (user-controlled names may
-        // contain the `|` delimiter — the final field absorbs them).
-        // %M|%Z (elapsed, workdir) joined before %j 2026-09-25.
-        let out =
-            "34022541|normal|RUNNING|9:54|sh02-01n58|4|16G|1:02:03|/home/u/proj|chimaera-test\n\
-                   34022542|owners|PENDING|8:00:00||||0:00|(null)|align.sh\n\
-                   34022543|owners|RUNNING|1:00|n1|2|4G|5:00|/scratch/x|my|weird|name\n\
-                   slurm_load_jobs: Warning: something\n";
-        let (jobs, truncated) = parse_squeue(out);
-        assert!(!truncated);
-        assert_eq!(jobs.len(), 3);
-        assert_eq!(jobs[0].id, "34022541");
-        assert_eq!(jobs[0].name, "chimaera-test");
-        assert_eq!(jobs[0].state, "RUNNING");
-        assert_eq!(jobs[0].time_left, "9:54");
-        assert_eq!(jobs[0].nodes, "sh02-01n58");
-        assert_eq!(jobs[0].cpus, "4");
-        assert_eq!(jobs[0].mem, "16G");
-        assert_eq!(jobs[0].elapsed, "1:02:03");
-        assert_eq!(jobs[0].workdir, "/home/u/proj");
-        assert_eq!(jobs[1].workdir, "", "(null) is not a path");
-        assert_eq!(jobs[1].nodes, "", "pending job has no nodes yet");
-        assert_eq!(jobs[1].cpus, "", "pending rows degrade to empty resources");
-        assert_eq!(jobs[1].name, "align.sh");
-        assert_eq!(
-            jobs[2].name, "my|weird|name",
-            "embedded delimiters fold into the trailing name, never shift fields"
-        );
-        assert_eq!(jobs[2].state, "RUNNING");
+    /// Write executable stand-ins into `dir`.
+    fn tools(dir: &Path, scripts: &[(&str, &str)]) {
+        for (name, body) in scripts {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+    }
 
-        let many: String = (0..60)
-            .map(|i| format!("{i}|p|RUNNING|1:00|n{i}|1|1G|0:10|/w|j{i}\n"))
-            .collect();
-        let (jobs, truncated) = parse_squeue(&many);
-        assert_eq!(jobs.len(), MAX_JOBS);
-        assert!(truncated);
+    /// `attached` is additive: absent unless set, so the window's offer to
+    /// continue is withheld only for an attached job.
+    #[test]
+    fn the_self_block_says_attached_only_when_it_is() {
+        let plain = serde_json::to_value(alloc()).unwrap();
+        assert!(plain.get("attached").is_none());
+        let held = serde_json::to_value(SelfAllocation {
+            attached: true,
+            ..alloc()
+        })
+        .unwrap();
+        assert_eq!(held["attached"], true);
+    }
+
+    fn alloc() -> SelfAllocation {
+        SelfAllocation {
+            job_id: "4242".into(),
+            node: "n042".into(),
+            partition: "batch".into(),
+            state: "RUNNING".into(),
+            time_left: "3:59:00".into(),
+            cpus: "8".into(),
+            mem: "64G".into(),
+            gres: "gpu:1".into(),
+            attached: false,
+        }
     }
 
     #[test]
@@ -967,6 +1129,7 @@ mod tests {
             mem: String::new(),
             elapsed: "1:00".into(),
             workdir: "/w".into(),
+            reason: String::new(),
         };
         let mut ended = EndedJobs::default();
         let a = vec![
@@ -1002,129 +1165,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_sinfo_default_star_dedupe_avail_and_limits() {
-        // Sherlock-shaped rows with the %l|%c|%m limit tail (2026-07-16);
-        // short rows (older callers / exotic sinfo) degrade to "".
-        let out = "normal*|up|123|7-00:00:00|20+|128000+\n\
-                   owners|up|1200\n\
-                   gpu|down|48|2-00:00:00|20+|191000+\n\
-                   normal*|up|7|7-00:00:00|20+|128000+\n";
-        let (parts, truncated) = parse_sinfo(out);
-        assert!(!truncated);
-        assert_eq!(parts.len(), 3);
-        let normal = &parts[0];
-        assert_eq!(normal.name, "normal");
-        assert!(normal.default);
-        assert!(normal.avail);
-        assert_eq!(normal.nodes, 130, "duplicate avail-state rows sum");
-        assert_eq!(normal.time_limit, "7-00:00:00");
-        assert_eq!(normal.cpus_per_node, "20+");
-        assert_eq!(normal.mem_per_node, "128000+");
-        assert_eq!(parts[1].time_limit, "", "short rows degrade to empty");
-        assert!(!parts[2].avail);
-        assert!(!parts[1].default);
-    }
-
-    #[test]
-    fn clean_tool_stderr_keeps_the_admin_message() {
-        // The real Sherlock dev-partition refusal, verbatim shape.
-        let raw = "sbatch: error: =============================================================================\n\
-                   sbatch: error:  ERROR: batch job not allowed\n\
-                   sbatch: error: =============================================================================\n\
-                   sbatch: error:  Batch jobs are not allowed in the 'dev' partition, which is reserved for\n\
-                   sbatch: error:  interactive sessions (salloc/srun/sdev and OnDemand). Please submit\n\
-                   sbatch: error:  batch jobs to another partition (e.g. 'normal').\n\
-                   sbatch: error: -----------------------------------------------------------------------------\n\
-                   sbatch: error: Batch job submission failed: Invalid partition name specified\n";
-        let msg = clean_tool_stderr(raw, "sbatch");
-        assert!(msg.starts_with("ERROR: batch job not allowed"));
-        assert!(msg.contains("reserved for interactive sessions"));
-        assert!(msg.contains("Please submit batch jobs to another partition"));
-        assert!(!msg.contains("====="), "ruler lines dropped");
-        assert!(!msg.contains("sbatch:"), "tool prefixes stripped");
-        assert_eq!(
-            clean_tool_stderr("", "sbatch"),
-            "the command failed without a message"
-        );
-    }
-
-    #[test]
-    fn parse_slurm_time_left_covers_squeue_forms() {
-        // Real %L shapes: min:sec, h:min:sec, days-h:min:sec.
-        assert_eq!(
-            parse_slurm_time_left("9:54"),
-            Some(Duration::from_secs(9 * 60 + 54))
-        );
-        assert_eq!(
-            parse_slurm_time_left("8:00:00"),
-            Some(Duration::from_secs(8 * 3600))
-        );
-        assert_eq!(
-            parse_slurm_time_left("7-00:00:00"),
-            Some(Duration::from_secs(7 * 86_400))
-        );
-        assert_eq!(
-            parse_slurm_time_left("1-12:30:05"),
-            Some(Duration::from_secs(86_400 + 12 * 3600 + 30 * 60 + 5))
-        );
-        // Truncated day forms (sinfo %l on some clusters) parse as H / H:M.
-        assert_eq!(
-            parse_slurm_time_left("2-12"),
-            Some(Duration::from_secs(2 * 86_400 + 12 * 3600))
-        );
-        // Sentinels and ambiguous bare numbers stay None.
-        for junk in ["UNLIMITED", "NOT_SET", "INVALID", "", "45", "a:b"] {
-            assert_eq!(parse_slurm_time_left(junk), None, "{junk}");
-        }
-    }
-
-    #[test]
-    fn format_utc_minute_matches_date_u() {
-        // Vectors verified with `date -u -r <epoch>` on this machine.
-        let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
-        assert_eq!(
-            format_utc_minute(at(0)).as_deref(),
-            Some("1970-01-01 00:00 UTC")
-        );
-        assert_eq!(
-            format_utc_minute(at(1_784_118_840)).as_deref(),
-            Some("2026-07-15 12:34 UTC")
-        );
-        // Leap-day, end of day (rollover boundaries).
-        assert_eq!(
-            format_utc_minute(at(1_709_251_140)).as_deref(),
-            Some("2024-02-29 23:59 UTC")
-        );
-    }
-
-    #[test]
-    fn self_context_text_bakes_facts_and_absolute_end() {
-        let alloc = SelfAllocation {
-            job_id: "4242".into(),
-            node: "sh03-01n52".into(),
-            partition: "gpu".into(),
-            state: "RUNNING".into(),
-            time_left: "3:59:00".into(),
-            cpus: "8".into(),
-            mem: "64G".into(),
-            gres: "gpu:1".into(),
-        };
+    fn job_context_bakes_facts_absolute_end_and_generic_rules() {
         // Bake at 2026-07-15 12:34 UTC; 3:59:00 left → ends 16:33 UTC.
         let now = UNIX_EPOCH + Duration::from_secs(1_784_118_840);
-        let text = self_context_text(&alloc, now);
-        assert!(text.contains("COMPUTE NODE"), "{text}");
-        assert!(text.contains("Slurm job 4242 on node sh03-01n52"), "{text}");
-        assert!(text.contains("(partition gpu)"), "{text}");
-        assert!(text.contains("8 CPUs, 64G memory, gres gpu:1"), "{text}");
+        let text = job_context_text(&alloc(), Some("c1"), now, &AgentRules::default(), None);
         assert!(
-            text.contains("approximately 2026-07-15 16:33 UTC"),
+            text.starts_with(
+                "You are running inside Slurm job 4242 on node n042 (cluster c1, \
+                 partition batch) with 8 CPUs, 64G of memory and gpu:1."
+            ),
             "{text}"
         );
-        assert!(text.contains("killed then"), "{text}");
-        assert!(text.contains("login node"), "{text}");
+        assert!(
+            text.contains(
+                "The job ends around 2026-07-15 16:33 UTC; anything still running then is stopped."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("$SLURM_CPUS_PER_TASK"), "{text}");
+        assert!(text.contains("sbatch and an explicit --time"), "{text}");
+        assert!(text.contains("--dependency"), "{text}");
+        // No rules of the cluster's own → the generic paragraph.
+        assert!(text.ends_with(GENERIC_RULES), "{text}");
 
         // Sparse allocation (short squeue row): omitted fields never render
-        // empty, and an unparseable time_left states the rule without an
+        // empty, and an unparseable time left states the rule without an
         // invented end time.
         let sparse = SelfAllocation {
             job_id: "7".into(),
@@ -1132,16 +1197,146 @@ mod tests {
             partition: String::new(),
             state: "RUNNING".into(),
             time_left: "UNLIMITED".into(),
-            cpus: String::new(),
+            cpus: "2".into(),
             mem: String::new(),
             gres: String::new(),
+            attached: false,
         };
-        let text = self_context_text(&sparse, now);
-        assert!(text.contains("(Slurm job 7)"), "{text}");
-        assert!(!text.contains("The allocation provides"), "{text}");
-        assert!(text.contains("ends at its walltime"), "{text}");
-        assert!(!text.contains("approximately"), "{text}");
+        let text = job_context_text(&sparse, None, now, &AgentRules::default(), None);
+        assert!(
+            text.starts_with("You are running inside Slurm job 7 with 2 CPUs."),
+            "{text}"
+        );
+        assert!(text.contains("The job ends at its time limit;"), "{text}");
+        assert!(!text.contains("around"), "{text}");
         assert!(!text.contains("  "), "no double spaces: {text}");
+    }
+
+    #[test]
+    fn job_context_appends_the_clusters_rules_instead_of_the_generic_ones() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_784_118_840);
+        let rules = AgentRules {
+            source: Some(RulesText::Inline("No jobs over a day.".into())),
+            user: Some(RulesText::Inline("Use the scratch space.".into())),
+        };
+        let text = job_context_text(&alloc(), None, now, &rules, None);
+        assert!(
+            text.contains("This cluster's rules for agents:\nNo jobs over a day.\n\nThe user's rules for agents on this cluster:\nUse the scratch space."),
+            "{text}"
+        );
+        assert!(!text.contains(GENERIC_RULES), "{text}");
+
+        let long = AgentRules {
+            source: Some(RulesText::TooLong(PathBuf::from("/shared/rules.md"))),
+            user: None,
+        };
+        let text = job_context_text(&alloc(), None, now, &long, None);
+        assert!(
+            text.ends_with(
+                "This cluster's rules for agents are in /shared/rules.md. Read that file \
+                 before doing significant work."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains(GENERIC_RULES), "{text}");
+    }
+
+    #[test]
+    fn a_chimaera_job_tells_agents_what_they_can_submit_to() {
+        use chimaera_core::cluster::ClusterFacts;
+        let now = UNIX_EPOCH + Duration::from_secs(1_784_118_840);
+        let part = |name: &str, default: bool, time: &str, gpus: bool, preempt: bool| {
+            slurm::PartitionChoice {
+                name: name.into(),
+                default,
+                max_time: time.into(),
+                max_time_secs: None,
+                cpus_per_node: "64+".into(),
+                mem_per_node: "256000".into(),
+                gpus,
+                preemptible: preempt,
+                up: true,
+                accounts: Vec::new(),
+            }
+        };
+        let facts = ClusterFacts {
+            partitions: vec![
+                part("batch", true, "3-00:00:00", false, false),
+                part("accel", false, "1-12:00:00", true, true),
+                slurm::PartitionChoice {
+                    up: false,
+                    ..part("down", false, "1:00:00", false, false)
+                },
+            ],
+            accounts: vec!["lab".into(), "other".into()],
+            default_account: Some("lab".into()),
+            ..Default::default()
+        };
+        let text = job_context_text(&alloc(), None, now, &AgentRules::default(), Some(&facts));
+        assert!(
+            text.contains("still running then is stopped. Other workspaces may be open in this job and share its resources."),
+            "{text}"
+        );
+        assert!(text.contains("[--mem=…] [--gpus=N] job.sh"), "{text}");
+        assert!(
+            text.contains("- batch (default) — 3-00:00:00 — 64 CPUs, 256 GB\n- accel — 1-12:00:00 — 64 CPUs, 256 GB, GPUs — can be preempted"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("- down"),
+            "a partition that is down isn't offered: {text}"
+        );
+        assert!(
+            text.contains("Accounts: lab, other (default lab)"),
+            "{text}"
+        );
+        assert!(text.ends_with(GENERIC_RULES), "{text}");
+
+        let alone = job_context_text(&alloc(), None, now, &AgentRules::default(), None);
+        assert!(!alone.contains("Other workspaces"), "{alone}");
+        assert!(!alone.contains("--gpus=N"), "{alone}");
+    }
+
+    #[test]
+    fn rules_files_inline_under_the_cap_and_point_past_it() {
+        let dir = test_dir("rules");
+        let short = dir.join("short.md");
+        std::fs::write(&short, "  Be kind to the scheduler.\n").unwrap();
+        assert_eq!(
+            read_rules(&short),
+            Some(RulesText::Inline("Be kind to the scheduler.".into()))
+        );
+        let exact = dir.join("exact.md");
+        std::fs::write(&exact, "x".repeat(RULES_INLINE_MAX as usize)).unwrap();
+        assert!(matches!(read_rules(&exact), Some(RulesText::Inline(_))));
+        let long = dir.join("long.md");
+        std::fs::write(&long, "x".repeat(RULES_INLINE_MAX as usize + 1)).unwrap();
+        assert_eq!(read_rules(&long), Some(RulesText::TooLong(long.clone())));
+        let blank = dir.join("blank.md");
+        std::fs::write(&blank, " \n\n").unwrap();
+        assert_eq!(read_rules(&blank), None, "nothing to say");
+        assert_eq!(read_rules(&dir), None, "a directory is not a rules file");
+        assert_eq!(read_rules(&dir.join("missing.md")), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn aged_self_blocks_count_down_in_squeues_shape() {
+        let a = alloc().aged(Duration::from_secs(90));
+        assert_eq!(a.time_left, "3:57:30");
+        let mut b = alloc();
+        b.time_left = "1-00:00:30".into();
+        assert_eq!(b.aged(Duration::from_secs(60)).time_left, "23:59:30");
+        let mut c = alloc();
+        c.time_left = "0:30".into();
+        assert_eq!(c.aged(Duration::from_secs(90)).time_left, "0:00");
+        let mut d = alloc();
+        d.time_left = "UNLIMITED".into();
+        assert_eq!(d.aged(Duration::from_secs(90)).time_left, "UNLIMITED");
+        assert_eq!(
+            slurm_clock(Duration::from_secs(2 * 86_400 + 61)),
+            "2-00:01:01"
+        );
     }
 
     #[test]
@@ -1149,15 +1344,10 @@ mod tests {
         let dir = test_dir("path");
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
+        tools(&bin, &[("squeue", "#!/bin/sh\n")]);
         let exe = bin.join("squeue");
-        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        // Plain file, not executable: must not count (the Sherlock lesson —
-        // detection must find real binaries, not whatever a profile says).
+        // Plain file, not executable: must not count — detection must find
+        // real binaries, not whatever a profile says.
         std::fs::write(bin.join("sinfo"), "not a binary").unwrap();
 
         let path = format!("/nonexistent::{}", bin.display());
@@ -1174,40 +1364,54 @@ mod tests {
         let empty = test_dir("empty");
         let svc = ComputeService::with_bindir(empty.clone());
         assert_eq!(svc.snapshot(false).await.scheduler, "none");
+        assert_eq!(svc.agent_context().await, None, "no scheduler, no context");
 
         // Fake tools → slurm, parsed snapshot, cached second read. squeue
-        // answers both forms: -u (the queue) and -j (the self allocation).
+        // answers both forms: -u (the queue) and -j (the self allocation),
+        // and counts its -j calls.
         let dir = test_dir("fake");
-        for (name, body) in [
-            ("srun", "#!/bin/sh\nexit 0\n"),
-            ("scancel", "#!/bin/sh\nexit 0\n"),
-            (
-                "squeue",
-                "#!/bin/sh\nif [ \"$1\" = \"-j\" ]; then echo \"$2|gpu|RUNNING|3:59:00|node7\"; else echo '1|normal|RUNNING|59:00|node1|4|8G|0:30|/home/u|myjob'; fi\n",
-            ),
-            ("sinfo", "#!/bin/sh\necho 'normal*|up|10'\n"),
-        ] {
-            let p = dir.join(name);
-            std::fs::write(&p, body).unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-        }
+        let asks = dir.join("self-asks");
+        tools(
+            &dir,
+            &[
+                ("scancel", "#!/bin/sh\nexit 0\n"),
+                (
+                    "squeue",
+                    &format!(
+                        "#!/bin/sh\nif [ \"$1\" = \"-j\" ]; then echo x >> '{}'; echo \"$2|batch|RUNNING|3:59:00|node7\"; else echo '1|batch|PENDING|59:00||4|8G|0:00|/home/u|Priority|myjob'; fi\n",
+                        asks.display()
+                    ),
+                ),
+                ("sinfo", "#!/bin/sh\necho 'batch*|up|10|1-00:00:00|8|64000|gpu:2'\n"),
+            ],
+        );
         let svc = ComputeService::with_bindir(dir.clone());
         let snap = svc.snapshot(false).await;
         assert_eq!(snap.scheduler, "slurm");
         assert_eq!(snap.jobs.len(), 1);
         assert_eq!(snap.jobs[0].name, "myjob");
+        assert_eq!(snap.jobs[0].reason, "Priority", "the %r field rides along");
         assert_eq!(snap.partitions.len(), 1);
         assert!(snap.partitions[0].default);
+        assert!(snap.partitions[0].gpus);
         // No SLURM_JOB_ID → no self block, and the wire omits the key.
         assert!(snap.self_alloc.is_none());
         assert!(!serde_json::to_string(&snap).unwrap().contains("\"self\""));
         // Cached: a second call inside the TTL returns the same fetch.
         let again = svc.snapshot(false).await;
         assert_eq!(again.fetched_at_ms, snap.fetched_at_ms);
+        // Not in a job, Slurm detected: the login-node context.
+        assert_eq!(
+            svc.agent_context().await.as_deref(),
+            Some(LOGIN_NODE_CONTEXT)
+        );
+        // ...unless the user said this host isn't a cluster.
+        let workstation = ComputeService {
+            not_a_cluster: true,
+            ..ComputeService::with_bindir(dir.clone())
+        };
+        workstation.snapshot(false).await;
+        assert_eq!(workstation.agent_context().await, None);
 
         // Inside an allocation: the self block rides the snapshot.
         let svc = ComputeService::with_bindir_and_job(dir.clone(), "4242");
@@ -1217,30 +1421,140 @@ mod tests {
         assert_eq!(own.job_id, "4242");
         assert_eq!(own.node, "node7");
         assert_eq!(own.time_left, "3:59:00");
+        // A forced refresh refetches the queue but NOT `squeue -j`: once a
+        // minute, whatever the UI asks.
+        let refreshed = svc.snapshot(true).await;
+        assert!(refreshed.self_alloc.is_some(), "the last answer is served");
+        assert_eq!(
+            std::fs::read_to_string(&asks).unwrap().lines().count(),
+            1,
+            "squeue -j asked once"
+        );
 
         // The agent context bakes from that self block, once: a second call
-        // returns the SAME string (walltime end included — it must not
-        // re-derive and drift).
+        // returns the SAME string (end included — it must not re-derive and
+        // drift).
         let ctx = svc.agent_context().await.expect("agent context");
         assert!(ctx.contains("Slurm job 4242 on node node7"), "{ctx}");
-        assert!(ctx.contains("(partition gpu)"), "{ctx}");
-        assert!(ctx.contains("approximately"), "{ctx}");
+        assert!(ctx.contains("partition batch"), "{ctx}");
+        assert!(ctx.contains("around"), "{ctx}");
         assert_eq!(svc.agent_context().await.as_deref(), Some(ctx.as_str()));
 
         std::fs::remove_dir_all(&empty).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Off-cluster (no SLURM_JOB_ID at construction) the agent context is
-    /// None without touching detection or the snapshot — the inertness
-    /// guarantee for normal daemons (an empty bindir would otherwise make
-    /// this probe the login shell).
+    /// Off-cluster (no SLURM_JOB_ID at construction, no cached Slurm
+    /// detection) the agent context is None without touching detection or
+    /// the snapshot — the inertness guarantee for normal daemons (an
+    /// unreachable bindir would otherwise make this probe something).
     #[tokio::test]
-    async fn agent_context_is_none_without_a_self_job() {
+    async fn agent_context_is_none_without_a_self_job_or_a_cached_detection() {
         let svc = ComputeService::with_bindir(PathBuf::from("/nonexistent"));
         assert_eq!(svc.agent_context().await, None);
         // Nothing was detected or cached as a side effect.
         assert!(svc.inner.lock().await.detection.is_none());
         assert!(svc.inner.lock().await.agent_context.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_self_stops_only_its_own_job() {
+        // Not in a job → 404, without detecting anything.
+        let svc = ComputeService::with_bindir(PathBuf::from("/nonexistent"));
+        assert_eq!(svc.cancel_self().await.0, StatusCode::NOT_FOUND);
+        assert!(svc.inner.lock().await.detection.is_none());
+
+        let dir = test_dir("cancel");
+        let log = dir.join("scancel.args");
+        tools(
+            &dir,
+            &[
+                (
+                    "scancel",
+                    &format!("#!/bin/sh\necho \"$@\" > '{}'\n", log.display()),
+                ),
+                ("squeue", "#!/bin/sh\nexit 0\n"),
+                ("sinfo", "#!/bin/sh\nexit 0\n"),
+            ],
+        );
+        let svc = ComputeService::with_bindir_and_job(dir.clone(), "4242");
+        let (status, body) = svc.cancel_self().await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "4242");
+
+        // A job already gone: Slurm's "Invalid job id" is still success.
+        tools(
+            &dir,
+            &[(
+                "scancel",
+                "#!/bin/sh\necho 'scancel: error: Kill job error on job id 4242: Invalid job id specified' >&2\nexit 1\n",
+            )],
+        );
+        assert_eq!(svc.cancel_self().await.0, StatusCode::ACCEPTED);
+
+        // Any other refusal is surfaced, Slurm's words cleaned.
+        tools(
+            &dir,
+            &[(
+                "scancel",
+                "#!/bin/sh\necho 'scancel: error: Access/permission denied' >&2\nexit 1\n",
+            )],
+        );
+        let (status, body) = svc.cancel_self().await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "scancel: Access/permission denied");
+
+        // A non-numeric SLURM_JOB_ID never reaches scancel's argv.
+        let odd = ComputeService::with_bindir_and_job(dir.clone(), "--user=x");
+        assert_eq!(odd.cancel_self().await.0, StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn job_is_live_reads_state_absence_and_refusal() {
+        let dir = test_dir("live");
+        let squeue = dir.join("squeue");
+        // One stand-in, written once; each case is a file it sources. A
+        // script rewritten and run at once can fail with "Text file busy"
+        // on Linux when another test forks meanwhile (the child briefly
+        // holds the write descriptor) — which reads as "unanswered".
+        tools(
+            &dir,
+            &[("squeue", "#!/bin/sh\n. \"$(dirname \"$0\")/case.sh\"\n")],
+        );
+        let case = |body: &str| std::fs::write(dir.join("case.sh"), body).unwrap();
+        case("exit 0\n");
+        runnable(&squeue);
+        case("echo RUNNING\n");
+        assert_eq!(job_is_live(&squeue, "1").await, Some(true));
+        case("echo COMPLETING\n");
+        assert_eq!(
+            job_is_live(&squeue, "1").await,
+            Some(true),
+            "still draining"
+        );
+        case("echo 'CANCELLED by 1000'\n");
+        assert_eq!(job_is_live(&squeue, "1").await, Some(false));
+        case("exit 0\n");
+        assert_eq!(job_is_live(&squeue, "1").await, Some(false), "not listed");
+        case("echo 'slurm_load_jobs error: Invalid job id specified' >&2\nexit 1\n");
+        assert_eq!(job_is_live(&squeue, "1").await, Some(false));
+        case("echo 'Socket timed out' >&2\nexit 1\n");
+        assert_eq!(job_is_live(&squeue, "1").await, None, "unanswered");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Run a just-written stand-in until the kernel lets it (a fork in
+    /// another test can hold it busy for a moment), so the asserted calls
+    /// that follow never meet "Text file busy".
+    fn runnable(script: &Path) {
+        for _ in 0..100 {
+            match std::process::Command::new(script).output() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                _ => return,
+            }
+        }
     }
 }

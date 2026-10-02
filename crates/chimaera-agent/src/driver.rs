@@ -104,6 +104,12 @@ pub struct SpawnSpec {
     /// `--append-system-prompt-file`. ACP holds it until the first real send.
     /// Opening a fork never creates a synthetic turn or agent response.
     pub portable_context: Option<String>,
+    /// Developer-role context added to the thread's history right after it
+    /// opens — a cluster job's facts. Codex-only (`thread/inject_items`, over
+    /// stdin, never argv); Claude gets the same text through its hook carrier.
+    /// It reaches resumed threads too, whose opening instructions Codex never
+    /// replaces (PROTOCOL.md Pass 41).
+    pub developer_note: Option<String>,
     /// ACP MCP servers, supplied by the embedder over stdin (never argv).
     pub mcp_servers: Vec<Value>,
     /// MCP tool calls the embedder has already consented to: the driver
@@ -161,6 +167,7 @@ impl SpawnSpec {
             rollback_turns: None,
             fork_at: None,
             portable_context: None,
+            developer_note: None,
             mcp_servers: Vec::new(),
             mcp_auto_approve: None,
             remote_control: None,

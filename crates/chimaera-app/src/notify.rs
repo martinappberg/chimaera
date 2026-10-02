@@ -457,7 +457,7 @@ mod tests {
     #[test]
     fn route_round_trips_through_the_identifier() {
         let remote = Route {
-            alias: Some("Sherlock".into()),
+            alias: Some("cluster".into()),
             ws: Some("w-1".into()),
             session: "s-abc".into(),
         };

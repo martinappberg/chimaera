@@ -1,5 +1,6 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use tokio::net::TcpListener;
@@ -9,6 +10,23 @@ use crate::{app, lock, AppState, ServerConfig};
 
 /// Bind on 127.0.0.1, write the manifest, and serve until SIGINT/SIGTERM.
 pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
+    // A cluster workspace job: its data dir is the workspace's folder on the
+    // shared filesystem, and the manifest there is the workspace's lease. A
+    // previous job of the same workspace may still be shutting down (a
+    // "continue on a new node" handoff) — wait it out before reading a
+    // single store from that dir.
+    let own_job = std::env::var("SLURM_JOB_ID")
+        .ok()
+        .filter(|j| !j.trim().is_empty());
+    // Only a cluster workspace job holds a lease: a daemon someone starts by
+    // hand inside an allocation keeps today's single-daemon check below.
+    let workspace_job = std::env::var_os(chimaera_core::cluster::ENV_CLUSTER_WORKSPACE)
+        .is_some_and(|v| !v.is_empty());
+    let previous_job = match own_job.as_deref() {
+        Some(own) if workspace_job => wait_for_previous_job(own).await,
+        _ => None,
+    };
+
     // One daemon per state dir: the manifest is the registry, and a second
     // daemon over the same ledger respawns every session AGAIN (duplicate
     // agent processes), while each failed-connect retry piles one more daemon
@@ -18,20 +36,32 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // must not block startup. Best-effort (not a lock) — it closes the retry
     // pile-up, not a deliberate simultaneous double-start race.
     if let Ok(Some(m)) = chimaera_core::Manifest::load() {
-        // On a home shared across nodes the record may be another node's,
-        // whose pid and port can't be checked from here. Not refused: a
-        // renamed host (a laptop's DHCP-assigned name) looks the same and must
-        // still start. `chimaera connect` only lands here after proving that
-        // node's daemon gone — by probing it there, or because the node's
-        // name no longer resolves on this one.
-        if !m.written_here() {
+        // The previous job's record, left standing by a job the lease wait
+        // proved ended: its pid and port say nothing here (another node's,
+        // or a dead process on this one that a recycled pid could
+        // impersonate), so it is simply overwritten below.
+        let left_by_previous_job = previous_job.is_some() && m.slurm_job_id == previous_job;
+        if left_by_previous_job {
+            tracing::info!(
+                job = m.slurm_job_id.as_deref().unwrap_or(""),
+                node = %m.hostname,
+                "taking over this workspace from its previous job"
+            );
+        } else if !m.written_here() {
+            // On a home shared across nodes the record may be another
+            // node's, whose pid and port can't be checked from here. Not
+            // refused: a renamed host (a laptop's DHCP-assigned name) looks
+            // the same and must still start. `chimaera connect` only lands
+            // here after proving that node's daemon gone — by probing it
+            // there, or because the node's name no longer resolves on this
+            // one.
             tracing::warn!(
                 node = %m.hostname,
                 pid = m.pid,
                 "the manifest was written on another node; this daemon takes over the registry — a daemon still running there is no longer reachable through it"
             );
         }
-        if m.is_alive() && port_answers_http(m.port).await {
+        if !left_by_previous_job && m.is_alive() && port_answers_http(m.port).await {
             anyhow::bail!(
                 "a chimaera daemon for {} is already running (pid {}, \
                  http://127.0.0.1:{}) — refusing to start a second",
@@ -47,8 +77,19 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // a plain reconnect — the "update without losing your windows" half of
     // the restart story (the ledger is the sessions half). An explicit
     // conflicting --port wins over the handoff; a crash never leaves one.
-    let (listener, token) = match chimaera_core::Handoff::consume()
-        .filter(|h| cfg.port.is_none() || cfg.port == Some(h.port))
+    // A cluster workspace never restarts in place — job-host starts its
+    // chimaera fresh on every open — so a handoff there is one a close left
+    // (in this job or another, maybe on another node): consumed, never
+    // honored. Each open gets its own token.
+    let handoff = chimaera_core::Handoff::consume().filter(|_| {
+        if workspace_job {
+            tracing::info!(
+                "a closed workspace's restart handoff was dropped: this open gets its own token"
+            );
+        }
+        !workspace_job
+    });
+    let (listener, token) = match handoff.filter(|h| cfg.port.is_none() || cfg.port == Some(h.port))
     {
         Some(handoff) => match listener_after_handoff(handoff.port, cfg.routable_bind).await? {
             (listener, true) => (listener, handoff.token),
@@ -82,6 +123,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         version: chimaera_core::VERSION.to_string(),
         started_at,
         build: Some(chimaera_core::BUILD_ID.to_string()),
+        slurm_job_id: own_job.clone(),
     };
     manifest.write().context("failed to write manifest")?;
 
@@ -96,6 +138,16 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         chimaera_core::data_dir(),
         chimaera_core::config_dir(),
     ));
+
+    // A cluster workspace job registers the workspace it was started for
+    // (under the cluster's id) before anything — the ledger's resurrection
+    // included — looks the workspace up.
+    {
+        let state = state.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || crate::workspaces::seed_cluster_workspace(&state))
+                .await;
+    }
 
     // Theming shims: regenerated at every daemon start (and after installs /
     // uninstalls / settings edits) so they always match this build's resolution
@@ -216,6 +268,114 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Lease poll cadence: the manifest is a cheap stat, the scheduler is asked
+/// at most once a minute (the etiquette every scheduler check here keeps).
+const LEASE_FILE_CHECK: Duration = Duration::from_secs(15);
+const LEASE_SQUEUE_FLOOR: Duration = Duration::from_secs(60);
+
+/// The workspace lease, for a daemon running inside Slurm job `own`: when
+/// the data dir's manifest names a DIFFERENT job, that job may still be
+/// shutting down (or, during a "continue on a new node", still serving until
+/// the app stops it) — two daemons over one data dir would both write its
+/// ledger and journals. So wait until the manifest is gone (the previous
+/// daemon's graceful stop removes it last) or Slurm says that job is no
+/// longer live. Returns the job waited on — the last holder, whose record
+/// may still stand (the caller overwrites it, and drops the handoff its
+/// graceful stop left) — or `None` when no other job held the workspace.
+///
+/// Bounded per step and cheap: a stat every 15 s, one 5 s-capped `squeue -j`
+/// per minute, logged at info. Overall it is bounded by this job's own time
+/// limit — taking over a live workspace is never the fallback; the person
+/// who started both jobs stops one.
+async fn wait_for_previous_job(own: &str) -> Option<String> {
+    let path = chimaera_core::Manifest::path();
+    // Only resolved once another job is found holding the lease: the common
+    // boot (no manifest, or our own) runs no login shell for it. Stopping
+    // the job this one replaces is job-host's (once, for the whole job).
+    let squeue = || async {
+        let bindir = std::env::var_os("CHIMAERA_SLURM_BINDIR").map(PathBuf::from);
+        match crate::compute::detect_tools(bindir.as_deref()).await {
+            Some(crate::compute::Detection::Slurm { squeue, .. }) => Some(squeue),
+            _ => None,
+        }
+    };
+    lease_wait(own, &path, squeue, LEASE_FILE_CHECK, LEASE_SQUEUE_FLOOR).await
+}
+
+/// The record at `path` when it names a Slurm job other than `own`.
+async fn other_jobs_manifest(path: &Path, own: &str) -> Option<chimaera_core::Manifest> {
+    let (path, own) = (path.to_path_buf(), own.to_string());
+    tokio::task::spawn_blocking(move || {
+        let text = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str::<chimaera_core::Manifest>(&text)
+            .ok()
+            .filter(|m| m.slurm_job_id.as_deref().is_some_and(|j| j != own))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// [`wait_for_previous_job`] with its inputs explicit (tests drive it with
+/// a stand-in squeue and short cadences).
+async fn lease_wait<F, Fut>(
+    own: &str,
+    manifest_path: &Path,
+    find_squeue: F,
+    file_check: Duration,
+    squeue_floor: Duration,
+) -> Option<String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<PathBuf>>,
+{
+    let mut manifest = other_jobs_manifest(manifest_path, own).await?;
+    let mut waiting_on = manifest.slurm_job_id.clone()?;
+    tracing::info!(job = %waiting_on, node = %manifest.hostname,
+        "this workspace's previous job still holds it; waiting for it to end");
+    let squeue = find_squeue().await;
+    if squeue.is_none() {
+        tracing::warn!("no squeue found; waiting for the previous job's manifest to go away");
+    }
+    let mut asked: Option<Instant> = None;
+    loop {
+        if asked.is_none_or(|at| at.elapsed() >= squeue_floor) {
+            asked = Some(Instant::now());
+            let live = match &squeue {
+                Some(squeue) => crate::compute::job_is_live(squeue, &waiting_on).await,
+                // No scheduler to ask: a record written on this node by a
+                // process that is gone is the one thing still provable.
+                None => (manifest.written_here() && !manifest.is_alive()).then_some(false),
+            };
+            match live {
+                Some(false) => {
+                    tracing::info!(job = %waiting_on, "the previous job has ended; taking over this workspace");
+                    return Some(waiting_on);
+                }
+                Some(true) => {
+                    tracing::info!(job = %waiting_on, "the previous job is still live; asking again in a minute");
+                }
+                None => {
+                    tracing::info!(job = %waiting_on, "could not ask Slurm about the previous job; asking again in a minute");
+                }
+            }
+        }
+        tokio::time::sleep(file_check).await;
+        let Some(next) = other_jobs_manifest(manifest_path, own).await else {
+            tracing::info!(job = %waiting_on, "the previous job released this workspace");
+            return Some(waiting_on);
+        };
+        if next.slurm_job_id.as_deref() != Some(waiting_on.as_str()) {
+            // Another job took the lease meanwhile: that one is now the
+            // holder to wait out, asked about right away.
+            waiting_on = next.slurm_job_id.clone()?;
+            tracing::info!(job = %waiting_on, "another job now holds this workspace; waiting for it instead");
+            asked = None;
+        }
+        manifest = next;
+    }
+}
+
 /// Whether an HTTP server answers on `127.0.0.1:port` within 2s. Any status
 /// counts — even a 401 had to come from a live server. The manifest's pid
 /// check alone can't be trusted on a long-lived login node (pids recycle), so
@@ -246,8 +406,9 @@ async fn port_answers_http(port: u16) -> bool {
         .is_some()
 }
 
-/// Loopback is the rule; 0.0.0.0 is the explicit Mode 2 rung-A opt-in
-/// (compute-node daemon reached by a login-node forward; token-gated).
+/// Loopback is the rule; 0.0.0.0 is `--bind-routable`, which a cluster
+/// workspace job's `chimaera serve` passes (reached by a plain `ssh -L`
+/// through the login node; token-gated).
 /// Every listener bind — fresh or handoff-rebind — must resolve its host
 /// here, or a restart silently demotes a routable daemon to loopback-only.
 fn bind_host(routable: bool) -> &'static str {
@@ -399,6 +560,124 @@ mod tests {
         assert!(!port_answers_http(free_port).await);
     }
 
+    fn lease_dir(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("chimaera-lease-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_manifest(path: &Path, job: Option<&str>) {
+        let m = chimaera_core::Manifest {
+            hostname: "elsewhere".into(),
+            port: 1,
+            token: "t".into(),
+            pid: 1,
+            version: "0".into(),
+            started_at: 0,
+            build: None,
+            slurm_job_id: job.map(str::to_string),
+        };
+        std::fs::write(path, serde_json::to_vec(&m).unwrap()).unwrap();
+    }
+
+    /// A stand-in squeue that answers with whatever `state` holds (empty =
+    /// not listed) and logs each question.
+    fn fake_squeue(dir: &Path) -> PathBuf {
+        let squeue = dir.join("squeue");
+        std::fs::write(
+            &squeue,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> '{log}'\ncat '{state}' 2>/dev/null\n",
+                log = dir.join("asks").display(),
+                state = dir.join("state").display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&squeue, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        squeue
+    }
+
+    const FAST: Duration = Duration::from_millis(20);
+
+    /// No manifest, our own, or a non-job daemon's: nothing to wait for,
+    /// and squeue is never even looked for.
+    #[tokio::test]
+    async fn lease_wait_is_free_without_another_jobs_manifest() {
+        let dir = lease_dir("free");
+        let path = dir.join("manifest.json");
+        let never = || async { panic!("squeue looked up without a previous job") };
+        assert_eq!(lease_wait("200", &path, never, FAST, FAST).await, None);
+        write_manifest(&path, Some("200"));
+        assert_eq!(lease_wait("200", &path, never, FAST, FAST).await, None);
+        write_manifest(&path, None);
+        assert_eq!(lease_wait("200", &path, never, FAST, FAST).await, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A previous job that is still live is waited out — squeue asked at
+    /// most once per floor — and taken over once Slurm says it ended.
+    #[tokio::test]
+    async fn lease_wait_holds_until_the_previous_job_ends() {
+        let dir = lease_dir("ends");
+        let path = dir.join("manifest.json");
+        write_manifest(&path, Some("100"));
+        let squeue = fake_squeue(&dir);
+        std::fs::write(dir.join("state"), "RUNNING\n").unwrap();
+        let state = dir.join("state");
+        let flip = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            std::fs::write(state, "CANCELLED by 1000\n").unwrap();
+        });
+        let squeue_path = squeue.clone();
+        let got = lease_wait(
+            "200",
+            &path,
+            || async move { Some(squeue_path) },
+            FAST,
+            Duration::from_millis(150),
+        )
+        .await;
+        flip.await.unwrap();
+        assert_eq!(got.as_deref(), Some("100"));
+        let asks = std::fs::read_to_string(dir.join("asks")).unwrap();
+        assert!(asks.lines().all(|l| l == "-h -j 100 -o %T"), "{asks}");
+        // ~400 ms at one ask per 150 ms: a handful, never one per file check.
+        assert!(asks.lines().count() <= 5, "{asks}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The previous daemon's graceful stop removes its manifest last: that
+    /// releases the lease even while squeue still lists the job.
+    #[tokio::test]
+    async fn lease_wait_ends_when_the_manifest_goes() {
+        let dir = lease_dir("released");
+        let path = dir.join("manifest.json");
+        write_manifest(&path, Some("100"));
+        let squeue = fake_squeue(&dir);
+        std::fs::write(dir.join("state"), "COMPLETING\n").unwrap();
+        let gone = path.clone();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            std::fs::remove_file(gone).unwrap();
+        });
+        let got = lease_wait(
+            "200",
+            &path,
+            || async move { Some(squeue) },
+            FAST,
+            Duration::from_secs(60),
+        )
+        .await;
+        release.await.unwrap();
+        assert_eq!(got.as_deref(), Some("100"), "the job it waited on");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A free handoff port is rebound and its token reused.
     #[tokio::test]
     async fn handoff_reuses_a_free_port() {
@@ -417,7 +696,7 @@ mod tests {
 
     /// A --bind-routable daemon consuming a handoff must come back routable:
     /// `rebind` honors the flag like `fresh_listener` does, instead of
-    /// hardcoding loopback (which silently demoted a Mode 2 compute-node
+    /// hardcoding loopback (which silently demoted a cluster workspace job's
     /// daemon to unreachable-from-the-login-forward after a restart).
     #[tokio::test]
     async fn handoff_rebind_honors_routable_bind() {

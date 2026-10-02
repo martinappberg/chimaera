@@ -109,7 +109,7 @@ export function setBrowserTitle(tabId: string, title: string | null): void {
   });
 }
 
-/** A target formatted for people: `localhost:8888`, `sh03-09n14:8080`. */
+/** A target formatted for people: `localhost:8888`, `compute-014:8080`. */
 export function targetLabel(host: string, port: number): string {
   return host === "" ? "Browser" : `${host}:${port}`;
 }

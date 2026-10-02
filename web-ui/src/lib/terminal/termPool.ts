@@ -32,6 +32,12 @@ export interface PoolHandlers {
    * threshold, and the shell at its OSC 133 prompt. Read per keystroke.
    */
   echoArmed?(id: string): boolean;
+  /**
+   * No path or URL links at all: a terminal on another machine than the
+   * daemon (the login-node terminal) prints paths and addresses that mean
+   * nothing here, so nothing underlines.
+   */
+  plainText?: boolean;
 }
 
 type Runtime = typeof import("./termPoolRuntime");

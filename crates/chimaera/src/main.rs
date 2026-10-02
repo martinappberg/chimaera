@@ -21,6 +21,8 @@ struct Cli {
     command: Command,
 }
 
+// Parsed once per run: a variant's size is irrelevant.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Run the chimaera daemon in the foreground.
@@ -35,9 +37,9 @@ enum Command {
         /// POSIX remote (Linux, macOS, the BSDs).
         #[arg(long)]
         daemonize: bool,
-        /// Bind 0.0.0.0 instead of loopback — Mode 2 rung A only (a
-        /// compute-node daemon reached by a direct login-node forward on
-        /// clusters without ssh-to-node); the bearer token is the gate.
+        /// Bind 0.0.0.0 instead of loopback — what a cluster workspace job
+        /// runs with, so a plain `ssh -L` through the login node reaches it;
+        /// the bearer token is the gate.
         #[arg(long)]
         bind_routable: bool,
     },
@@ -75,12 +77,20 @@ enum Command {
         /// no flag: dev-ness is the build's property.
         #[arg(long)]
         update_daemon: bool,
+        /// Run the daemon on the login node of a cluster (a host whose login
+        /// shell reaches a batch scheduler) anyway. Most clusters don't allow
+        /// servers on login nodes — use this only if yours says it's fine;
+        /// otherwise use `chimaera compute`, which runs each workspace as a
+        /// job. Saved per host once used (the app shares the setting).
+        #[arg(long)]
+        login_node: bool,
     },
     /// Check the local environment for common problems.
     Doctor,
     /// Print the shell-integration snippet (for remote hosts' rc files).
     ShellIntegration,
-    /// Mode 2: chimaera sessions running AS Slurm jobs on a cluster.
+    /// Clusters: start Slurm jobs and open workspaces inside them; nothing
+    /// runs on the login node.
     Compute {
         #[command(subcommand)]
         cmd: ComputeCmd,
@@ -91,6 +101,30 @@ enum Command {
     Plugin {
         #[command(subcommand)]
         cmd: PluginCmd,
+    },
+    /// A cluster job's main process (what the job script runs, on the job's
+    /// compute node): opens workspaces inside the job on the app's request
+    /// and closes them all when the job ends.
+    #[command(hide = true)]
+    JobHost {
+        /// The job's folder (`…/cluster/j/<id>`).
+        #[arg(long)]
+        job_dir: PathBuf,
+    },
+    /// Read-only look at a cluster folder, for the app's ssh commands: print
+    /// JSON and exit. Never writes, locks or starts anything — it is the one
+    /// chimaera command run on a cluster's login node.
+    #[command(hide = true)]
+    Browse {
+        /// Print the cluster folder's state (workspaces, jobs, leases).
+        #[arg(long, conflicts_with = "dir")]
+        state: bool,
+        /// List one folder's subfolders (`~` and `$VARS` expand here).
+        #[arg(long)]
+        dir: Option<String>,
+        /// The cluster folder.
+        #[arg(long)]
+        cluster_dir: Option<PathBuf>,
     },
 }
 
@@ -151,51 +185,123 @@ enum PluginCmd {
     Activity { id: String },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum ComputeCmd {
-    /// List compute sessions (chimaera-named Slurm jobs) on a host.
-    List { host: String },
-    /// Submit a chimaera daemon as a Slurm job on a host.
-    Launch {
+    /// The cluster's jobs and the workspaces open in them.
+    Jobs { host: String },
+    /// Add a folder on the cluster as a workspace ($SCRATCH/x and ~/x expand there).
+    Add {
         host: String,
-        /// Display name (slugged into the job name `chimaera-<slug>`).
-        #[arg(long, default_value = "session")]
-        name: String,
-        /// Walltime, e.g. 4:00:00 or 1-00:00:00.
-        #[arg(long, default_value = "2:00:00")]
+        path: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Start a job; workspaces open inside it.
+    Start {
+        host: String,
+        /// Time limit, e.g. 4:00:00 or 2-00:00:00 (required — every job states one).
+        #[arg(long)]
         time: String,
         #[arg(long)]
         partition: Option<String>,
         #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        qos: Option<String>,
+        #[arg(long)]
+        constraint: Option<String>,
+        #[arg(long)]
         cpus: Option<u32>,
+        /// Memory per node, e.g. 16G.
         #[arg(long)]
         mem: Option<String>,
-        /// GPUs etc., e.g. gpu:1.
         #[arg(long)]
-        gres: Option<String>,
-        /// Workspace id whose environment prelude applies.
+        gpus: Option<u32>,
+        /// Workspaces (id or name) to open when it starts.
+        #[arg(long, value_delimiter = ',')]
+        open: Vec<String>,
+        /// What to call the job (default: its partition and time).
         #[arg(long)]
-        workspace: Option<String>,
-        /// Launch with a routable bind (rung A clusters only; token-gated).
+        name: Option<String>,
+        /// Startup commands for this job only (after the cluster's and each
+        /// workspace's).
         #[arg(long)]
-        routable: bool,
+        startup: Option<String>,
+        /// Hold the job in this terminal instead of submitting it (for
+        /// partitions that take only interactive jobs); it stops when this
+        /// command ends.
+        #[arg(long)]
+        attached: bool,
+        /// Remember this setup under a name.
+        #[arg(long)]
+        save_as: Option<String>,
     },
-    /// Tunnel to a running compute session and open its UI.
-    Connect {
+    /// Open a workspace's UI: where it's open, else in the running job (or
+    /// the one named). Holds the ssh forward until Ctrl-C.
+    Open {
         host: String,
-        job_id: String,
-        /// Do not open the UI in a browser.
+        workspace: String,
+        /// The job to open it in when several run.
+        #[arg(long)]
+        job: Option<String>,
+        /// Print the URL without opening a browser.
         #[arg(long)]
         no_open: bool,
     },
-    /// scancel a compute session.
-    Cancel { host: String, job_id: String },
+    /// Close a workspace in its job (it saves its chats first).
+    Close { host: String, workspace: String },
+    /// Move an open workspace to another running job; its chats come along.
+    Move {
+        host: String,
+        workspace: String,
+        /// The job to move it to.
+        #[arg(long)]
+        to: String,
+    },
+    /// Start a new job with this one's setup; when it runs it stops this one
+    /// and takes its workspaces over.
+    Continue {
+        host: String,
+        job: String,
+        /// A new time limit for the new job.
+        #[arg(long)]
+        time: Option<String>,
+    },
+    /// Stop a job (every workspace in it saves its chats first).
+    Stop { host: String, job: String },
 }
 
 /// Parse a `$PORT`-style listen port. An unset, empty, or unparsable value
 /// yields `None` — the daemon then binds an OS-assigned free port.
 fn parse_port(raw: Option<String>) -> Option<u16> {
     raw?.trim().parse().ok()
+}
+
+/// `chimaera browse`: one JSON document on stdout, or an error on stderr and
+/// exit 2 (the app shows the message as is).
+fn browse(
+    state: bool,
+    dir: Option<&str>,
+    cluster_dir: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let out = if state {
+        let cluster_dir =
+            cluster_dir.ok_or_else(|| anyhow::anyhow!("--state needs --cluster-dir"))?;
+        serde_json::to_string(&chimaera_core::cluster::browse_state(cluster_dir))?
+    } else if let Some(dir) = dir {
+        match chimaera_core::cluster::browse_dir(dir, cluster_dir) {
+            Ok(listing) => serde_json::to_string(&listing)?,
+            Err(message) => {
+                eprintln!("{message}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        anyhow::bail!("browse needs --state or --dir");
+    };
+    println!("{out}");
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -220,6 +326,16 @@ fn main() -> anyhow::Result<()> {
     // logged. A daemon that outlives its launch channel (ssh pipe, terminal)
     // with stderr unredirected would otherwise turn every logging request
     // handler into an empty reply once that channel dies.
+    // `browse` prints JSON for a machine and exits: no logging, no runtime.
+    if let Command::Browse {
+        state,
+        dir,
+        cluster_dir,
+    } = &cli.command
+    {
+        return browse(*state, dir.as_deref(), cluster_dir.as_deref());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -272,45 +388,86 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
             binary,
             no_open,
             update_daemon,
-        } => connect::run(&host, local_port, binary.as_deref(), no_open, update_daemon).await,
+            login_node,
+        } => {
+            connect::run(
+                &host,
+                local_port,
+                binary.as_deref(),
+                no_open,
+                update_daemon,
+                login_node,
+            )
+            .await
+        }
         Command::Doctor => doctor::run(),
         Command::ShellIntegration => {
             print!("{}", chimaera_core::shellint::snippet());
             Ok(())
         }
         Command::Compute { cmd } => match cmd {
-            ComputeCmd::List { host } => compute::list(&host).await,
-            ComputeCmd::Launch {
+            ComputeCmd::Jobs { host } => compute::jobs(&host).await,
+            ComputeCmd::Add { host, path, name } => {
+                compute::add(&host, &path, name.as_deref()).await
+            }
+            ComputeCmd::Start {
                 host,
-                name,
                 time,
                 partition,
+                account,
+                qos,
+                constraint,
                 cpus,
                 mem,
-                gres,
-                workspace,
-                routable,
+                gpus,
+                open,
+                name,
+                startup,
+                attached,
+                save_as,
             } => {
-                compute::launch(
-                    &host,
-                    &name,
-                    &time,
-                    partition.as_deref(),
+                let spec = chimaera_core::slurm::LaunchSpec {
+                    time,
+                    partition,
+                    account,
+                    qos,
+                    constraint,
                     cpus,
-                    mem.as_deref(),
-                    gres.as_deref(),
-                    workspace.as_deref(),
-                    routable,
+                    mem,
+                    gpus,
+                };
+                compute::start(
+                    &host,
+                    compute::StartArgs {
+                        spec,
+                        name: name.as_deref(),
+                        open,
+                        run_startup: startup.as_deref(),
+                        attached,
+                        save_as: save_as.as_deref(),
+                    },
                 )
                 .await
             }
-            ComputeCmd::Connect {
+            ComputeCmd::Open {
                 host,
-                job_id,
+                workspace,
+                job,
                 no_open,
-            } => compute::connect(&host, &job_id, no_open).await,
-            ComputeCmd::Cancel { host, job_id } => compute::cancel(&host, &job_id).await,
+            } => compute::open(&host, &workspace, job.as_deref(), no_open).await,
+            ComputeCmd::Close { host, workspace } => compute::close(&host, &workspace).await,
+            ComputeCmd::Move {
+                host,
+                workspace,
+                to,
+            } => compute::move_ws(&host, &workspace, &to).await,
+            ComputeCmd::Continue { host, job, time } => {
+                compute::continue_job(&host, &job, time).await
+            }
+            ComputeCmd::Stop { host, job } => compute::stop(&host, &job).await,
         },
+        Command::JobHost { job_dir } => chimaera_server::run_job_host(job_dir).await,
+        Command::Browse { .. } => unreachable!("browse returns before the runtime starts"),
         Command::Plugin { cmd } => match cmd {
             PluginCmd::List => plugin::list().await,
             PluginCmd::Add {

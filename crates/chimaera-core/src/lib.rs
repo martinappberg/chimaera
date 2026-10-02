@@ -1,7 +1,9 @@
 //! Shared types and helpers for the chimaera daemon and CLI.
 
+pub mod cluster;
 #[cfg(unix)]
 pub mod shellint;
+pub mod slurm;
 
 use std::io::ErrorKind;
 use std::io::Write;
@@ -86,6 +88,17 @@ fn state_home() -> Option<PathBuf> {
     }
 }
 
+/// A directory override from the environment: a cluster workspace job points
+/// its daemon's data dir at the workspace's folder on the shared filesystem
+/// and its runtime dir at node-local scratch, while config and caches stay
+/// where [`state_home`] puts them (shared by every job on the cluster).
+/// Empty or relative means unset.
+fn env_dir(name: &str) -> Option<PathBuf> {
+    let v = std::env::var_os(name)?;
+    let p = PathBuf::from(v);
+    p.is_absolute().then_some(p)
+}
+
 /// Resolve the data dir given an optional isolated [`state_home`] (pure; the
 /// public [`data_dir`] wraps this and creates the directory).
 fn data_dir_in(home: Option<&Path>) -> PathBuf {
@@ -100,7 +113,10 @@ fn data_dir_in(home: Option<&Path>) -> PathBuf {
 /// Per-user data directory (`~/.chimaera`, or `$CHIMAERA_HOME/data` when
 /// isolated), created on demand.
 pub fn data_dir() -> PathBuf {
-    let dir = data_dir_in(state_home().as_deref());
+    let dir = match env_dir(cluster::ENV_DATA_DIR) {
+        Some(dir) => dir,
+        None => data_dir_in(state_home().as_deref()),
+    };
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("failed to create data dir {}: {e}", dir.display());
     }
@@ -154,9 +170,10 @@ pub fn cache_dir() -> PathBuf {
 /// `%LOCALAPPDATA%\chimaera\run` — already per-user, no /tmp analogue).
 /// Created with mode 0700 on demand where the platform has modes.
 pub fn runtime_dir() -> PathBuf {
-    let dir = match state_home() {
-        Some(home) => home.join("run"),
-        None => default_runtime_dir(),
+    let dir = match (env_dir(cluster::ENV_RUNTIME_DIR), state_home()) {
+        (Some(dir), _) => dir,
+        (None, Some(home)) => home.join("run"),
+        (None, None) => default_runtime_dir(),
     };
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -249,7 +266,7 @@ pub fn generate_token() -> String {
 /// shared login nodes, where the usual `write` then `chmod(0600)` sequence has
 /// a real read window between the two syscalls. A random `create_new` sibling
 /// also keeps concurrent writers from truncating each other's temporary file.
-fn atomic_write_private(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+pub fn atomic_write_private(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy())
@@ -275,7 +292,7 @@ fn atomic_write_private(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
 }
 
 /// On-disk record of a running chimaera daemon.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
     pub hostname: String,
     pub port: u16,
@@ -288,6 +305,12 @@ pub struct Manifest {
     /// itself the signal: missing = ancient = outdated.
     #[serde(default)]
     pub build: Option<String>,
+    /// The Slurm job this daemon runs inside (`SLURM_JOB_ID` at `serve`
+    /// time) — a cluster workspace's lease: the next job of the same
+    /// workspace waits while this one is still in the queue. Flat like every
+    /// other field (the probe's `sed` reads this file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slurm_job_id: Option<String>,
 }
 
 impl Manifest {
@@ -574,6 +597,7 @@ mod tests {
             version: VERSION.to_string(),
             started_at: 1_750_000_000,
             build: Some(BUILD_ID.to_string()),
+            slurm_job_id: None,
         };
         manifest.write().unwrap();
 
@@ -627,13 +651,13 @@ mod tests {
     #[test]
     fn node_identity_is_case_insensitive_and_exact_otherwise() {
         assert!(same_node(
-            "sh03-ln06.stanford.edu",
-            "SH03-LN06.Stanford.EDU"
+            "login-a.cluster.example",
+            "LOGIN-A.Cluster.Example"
         ));
         assert!(same_node(" login1\n", "login1"));
         assert!(!same_node(
-            "sh03-ln06.stanford.edu",
-            "sh04-ln03.stanford.edu"
+            "login-a.cluster.example",
+            "login-b.cluster.example"
         ));
         // A short name vs an FQDN is not provably the same machine.
         assert!(!same_node("login1", "login1.cluster.edu"));
@@ -646,6 +670,7 @@ mod tests {
             version: VERSION.to_string(),
             started_at: 0,
             build: None,
+            slurm_job_id: None,
         };
         assert!(manifest(&here).written_here());
         assert!(!manifest("chimaera-test-other-node.invalid").written_here());

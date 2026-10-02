@@ -220,7 +220,7 @@ and launches the generated `chimaera-dev` app identity. Computer Use must
 target `chimaera-dev`, which prevents it from driving the user's released app.
 Then tell the human: open a folder → start an agent → here's what to click.
 
-**2. To test against a REMOTE host from that isolated app** (e.g. Sherlock): a
+**2. To test against a REMOTE host from that isolated app** (e.g. an HPC cluster): a
 dev connect deploys **your** build, never a release, so a musl daemon of this
 branch must exist where THIS app looks. The trap: the in-app hint says
 `~/.chimaera/dist`, but an **isolated** app reads its own
@@ -228,7 +228,7 @@ branch must exist where THIS app looks. The trap: the in-app hint says
 `chimaera-<arch>-linux-musl` name (`dist_name`, `chimaera-remote`):
 
 ```sh
-# needs zig + cargo-zigbuild; arch = the host's (Sherlock = x86_64)
+# needs zig + cargo-zigbuild; arch = the host's (most clusters are x86_64)
 cargo zigbuild --release --target x86_64-unknown-linux-musl -p chimaera
 HOME_DIR="$(bash .claude/skills/develop/run-app-isolated.sh --print-home)"
 mkdir -p "$HOME_DIR/data/dist"

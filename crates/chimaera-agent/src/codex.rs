@@ -488,6 +488,40 @@ async fn codex_handshake(
         }
     }
 
+    // The developer note (a cluster job's facts) rides `thread/inject_items`:
+    // stdin, never argv, which anyone on a shared node can read. Codex keeps
+    // a thread's opening instructions for good — neither `-c
+    // developer_instructions` nor thread/resume's `developerInstructions`
+    // reach a resumed thread (live 0.157.1, Pass 41) — so this is also what
+    // tells a chat continued in a new job where it now runs. After the
+    // rewind, which could otherwise drop it. Best-effort: an app-server
+    // without the method still opens the chat.
+    if let Some(note) = spec
+        .developer_note
+        .as_deref()
+        .filter(|n| !n.trim().is_empty())
+    {
+        let id = next_id;
+        next_id += 1;
+        match bounded_rpc(
+            sink,
+            stream,
+            &mut side,
+            id,
+            "thread/inject_items",
+            developer_note_params(&thread_id, note),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(RpcFailure::Transport(msg)) => return Err(msg),
+            Err(failure) => tracing::warn!(
+                "{}; the chat opens without its developer note",
+                failure.describe("thread/inject_items")
+            ),
+        }
+    }
+
     // The agent's own catalog beats any curated list; absence (older
     // binaries) is not a handshake failure.
     let list_id = next_id;
@@ -765,6 +799,20 @@ impl RpcFailure {
 /// One handshake RPC under the 5 s bound every optional handshake step uses
 /// (a binary that silently drops an unknown method must not wedge the
 /// handshake until the watchdog fires).
+/// `thread/inject_items` params appending one developer-role message — a
+/// raw Responses API item, model-visible but outside any turn, so it never
+/// shows in the transcript (`thread/turns/list`) and starts no turn.
+fn developer_note_params(thread_id: &str, note: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "items": [{
+            "type": "message",
+            "role": "developer",
+            "content": [{ "type": "input_text", "text": note }],
+        }],
+    })
+}
+
 async fn bounded_rpc(
     sink: &mut JsonlSink,
     stream: &mut JsonlStream,
@@ -6824,6 +6872,22 @@ mod tests {
         assert_eq!(
             contextual["params"]["developerInstructions"],
             "quiet imported transcript"
+        );
+    }
+
+    #[test]
+    fn developer_note_is_one_developer_message_for_inject_items() {
+        // The live-verified shape (Pass 41): a raw Responses API item.
+        assert_eq!(
+            developer_note_params("thr-1", "You are inside Slurm job 7."),
+            json!({
+                "threadId": "thr-1",
+                "items": [{
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{ "type": "input_text", "text": "You are inside Slurm job 7." }],
+                }],
+            })
         );
     }
 

@@ -186,7 +186,7 @@
           onpointerenter={() => {
             if (entry.disabled !== true) activeIndex = i;
           }}
-        >{#if hasMarks}<span class="ctx-mark" aria-hidden="true">{entry.checked === true ? "✓" : ""}</span>{/if}{entry.label}</button>
+        >{#if hasMarks}<span class="ctx-mark" aria-hidden="true">{entry.checked === true ? "✓" : ""}</span>{/if}{entry.label}{#if entry.detail}<span class="ctx-detail">{entry.detail}</span>{/if}</button>
       {/if}
     {/each}
   </div>
@@ -218,6 +218,13 @@
     width: 14px;
     color: var(--accent);
     font-weight: 600;
+  }
+
+  .ctx-detail {
+    display: block;
+    margin-top: 1px;
+    color: var(--muted);
+    font-size: var(--text-xs);
   }
 
   /* The roving active row: keyboard and hover share one highlight. */

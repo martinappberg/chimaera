@@ -114,7 +114,7 @@ on the alternate screen cannot restore the primary screen's scrollback
   and pins every later ssh call for the alias to it (for the life of the process). Nothing is started unless the daemon is provably dead on its
   node or the node's name no longer resolves inside the cluster; an unreachable node is an
   honest error. Reaching another login node is a fresh ssh login — on a Duo cluster, one more
-  prompt (verified on Sherlock, 2026-09-25: login→login ssh isn't hostbased there). Sites
+  prompt (verified on a production cluster, 2026-09-25: login→login ssh isn't hostbased there). Sites
   that don't allow addressing individual login nodes get the error, never a second daemon.
 - Resource discipline is a feature: <1 core steady-state, target ~150 MB RSS, no server-side
   rendering (tmux's CPU model, not zellij's ~4x), hard memory ceilings on preview extraction —
@@ -1045,16 +1045,16 @@ plugin-free daemon's.
   `gitStatus`, and a job strip in the rail; job↔session linking (detect agent-submitted
   `sbatch`) is still to come on this seam. **Inbound and outbound are
   different facts and must not be conflated** (the earlier note here did): the *login node CAN
-  reach a compute node's ports* — verified on Sherlock 2026-07-14, both a direct TCP route and
+  reach a compute node's ports* — verified on a production cluster 2026-07-14, both a direct TCP route and
   `pam_slurm_adopt` ssh — so a daemon *on* a compute node is reachable through the one login-node
   hop; what compute nodes *may* lack is *outbound* internet to `api.anthropic.com`, which is the
-  real gate on running an agent there — a per-cluster fact (Sherlock's nodes have direct egress,
+  real gate on running an agent there — a per-cluster fact (the test cluster's nodes have direct egress,
   verified 2026-07-14; `http(s)_proxy` passthrough where centers allowlist a proxy). See below.
 
 ### Environment prelude & compute-node sessions
 
 *Design pass 2026-07-14 (author idea, developed in-session; tunnel reachability verified live on
-Sherlock). Two independent axes were deliberately separated — **environment** (what runs before
+a production cluster). Two independent axes were deliberately separated — **environment** (what runs before
 your shell/agent) and **placement** (where it runs). Keeping them apart is what makes this
 extendable instead of a pile of per-scheduler special-cases; they compose (a compute-node job
 still applies your prelude).*
@@ -1131,16 +1131,16 @@ not either/or:
     never guessed per-cluster. **B (preferred):** loopback bind + `ssh`-forward through the login
     node (`ProxyJump`, reusing the login-node ControlMaster) — the port is *not exposed to
     co-tenants* at all, and with `pam_slurm_adopt` the ssh channel is adopted into the job cgroup
-    (verified on Sherlock). **A (fallback):** routable bind + direct login→node forward (the
+    (verified on a production cluster). **A (fallback):** routable bind + direct login→node forward (the
     existing `spawn_tunnel`, with the `%N` node name as the `-L` target instead of `127.0.0.1`) +
-    per-session token as the only gate (verified reachable on Sherlock). **Neither → Mode 2
+    per-session token as the only gate (verified reachable on a production cluster). **Neither → Mode 2
     unsupported on this cluster:** degrade to Mode 1 and *say so plainly* in the compute panel —
     no reverse-tunnel heroics (that rung was dropped 2026-07-14 as scope, not lock-in; the ladder
     stays open for a third rung if a real cluster ever needs it). "Not supported" here means only
     *own-the-session-on-the-node* — detection, the job strip, and Mode 1 still work.
   - **Compute-node outbound is a per-cluster fact — probe it, never assume it.** Mode 2 runs the
     agent on the node, so it must reach `api.anthropic.com` from there — directly or via an
-    allowlisted `http(s)_proxy`. Verified on Sherlock 2026-07-14: **direct egress works from a
+    allowlisted `http(s)_proxy`. Verified on a production cluster 2026-07-14: **direct egress works from a
     compute node** (HTTP 405 from the API endpoint — TLS + HTTP path intact, no proxy configured),
     so Mode 2 is fully viable there. Other centers differ (many do block node egress), so the
     generalizable mechanism is a probe at job start: the serve script checks outbound and records

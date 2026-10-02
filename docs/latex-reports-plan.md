@@ -259,7 +259,7 @@ machine would open but never build.
 The document still opens and edits; the result pane shows a calm empty state, drawn
 with the platform's `empty` node:
 
-- **No TeX Live on this host.** "No TeX Live on *sherlock*: Chimaera looked on the PATH
+- **No TeX Live on this host.** "No TeX Live on *cluster*: Chimaera looked on the PATH
   your terminals get, including your environment prelude." The main button is **Install
   TeX Live (TinyTeX, about 150 MB)**, which says what it downloads and from where
   before it runs. Beside it, quietly: "Have your own? On a cluster, load it in
@@ -909,7 +909,7 @@ highlights in the editor through `codemirror-lang-typst`'s Lezer grammar
 (`web-ui/src/lib/previews/languages.ts`: its parser and editing aids in the app's
 `--syn-*` colors, not its own styles or syntax linter; about 29 KB gzipped, loaded
 for `.typ` only). A file the plugin claims where it is installed but off offers
-**Turn on** in the file bar. Verified on a Sherlock login node (2026-09-29, a musl
+**Turn on** in the file bar. Verified on a cluster login node (2026-09-29, a musl
 daemon under `$SCRATCH`): with `module load system` and `module load texlive` (TeX Live
 2019, latexmk 4.65; the two must be separate commands there) in the host's Environment
 prelude a build runs the module's TeX Live (`from: path`), and still does once TinyTeX

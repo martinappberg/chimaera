@@ -70,11 +70,13 @@ pub(crate) async fn run(
             chimaera_core::generate_token()
         ));
         std::fs::File::create_new(&completion)?;
+        let startup = crate::environment::job_startup_blocking();
         let prelude = crate::environment::materialize_prelude(
             &prepare_state,
             &prepare_sid,
             &prepare_ws,
             None,
+            startup.as_deref(),
         );
         Ok::<_, std::io::Error>((completion, prelude))
     })

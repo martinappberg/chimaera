@@ -2006,7 +2006,7 @@ case and the unscoped defensive case.
 
 ## Pass 29 (2026-07-21 — codex effort survives reopen and honors new-thread config). ADOPTED.
 
-A Sherlock session exposed a different `low` failure after Pass 28. Its
+A session on a production cluster exposed a different `low` failure after Pass 28. Its
 Chimaera journal recorded the parent changing from the model default `low` to
 `xhigh`, then recorded a parent `low` immediately after each app-server process
 restart. The native Codex rollout still contained earlier
@@ -2716,6 +2716,16 @@ opened connector settings, and Check connection kept the failing custom entry
 unconnected with recovery guidance. A real new-provider authorization has not been
 completed; successful authorization tests use CLI fixtures.
 
+## Pass 41 (2026-10-01 — live probes, codex 0.157.1): a resumed thread keeps its opening instructions; `thread/inject_items` reaches it. ADOPTED.
+
+A cluster workspace job tells its agents which job they are in, on which node, until when, and the cluster's rules for agents. Claude gets that through the hook carrier. For codex the text rode `-c developer_instructions` on the app-server's argv, which anyone on a shared compute node can read with `ps`. These probes asked where else it can go, and found that the argv seam was also stale after a resume.
+
+- **Codex fixes a thread's developer instructions at its first turn, for good.** They are recorded once in the rollout as a `developer` message. A thread spawned with `-c developer_instructions="… ZEBRA"` and opened with `thread/start {developerInstructions: "… OTTER"}` answered OTTER: the open param replaces the argv value on a fresh thread. Resumed in a new app-server with a different argv value (YAK) and `thread/resume {developerInstructions: "… HERON"}`, it still answered OTTER; resumed with only a new argv value (ELK), OTTER again. The rollout held only the OTTER message. So a chat continued in a new job kept the first job's facts under the argv design, and a portable branch's `developerInstructions` on resume is a no-op (the branch already carries its context from the open).
+- **`thread/inject_items {threadId, items}`** (generated 0.157.1 schema: "Raw Responses API items to append to the thread's model-visible history") answers `{}` and starts no turn. A `{"type":"message","role":"developer","content":[{"type":"input_text","text":…}]}` item was followed on a fresh thread before its first turn (INJECTFRESH) and right after a resume, where a newer code word superseded the older one (INJECTRESUME). It emits no item notifications and does not appear in `thread/turns/list`, so the transcript stays as it was.
+
+Adopted: `SpawnSpec.developer_note` (the cluster context, codex chats only) rides `thread/inject_items` once the thread opens, after any rewind (a revert could otherwise drop it). Nothing of it is on argv any more, and the user's own `developer_instructions` stay untouched (the argv design replaced them, so it skipped codex whenever the user had set one). A failed inject is logged and the chat opens without it.
+
+Gate: live `driver_codex_developer_note_reaches_fresh_and_resumed_threads` through the real driver (fresh FIRSTOTTER; resumed in a new process with a new note, SECONDHERON); hermetic `developer_note_is_one_developer_message_for_inject_items`; full `just chat-smoke` 27/27.
 
 ## ACP v1 — Grok Build and Google Antigravity (2026-10-01)
 
