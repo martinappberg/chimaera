@@ -176,7 +176,15 @@ explicit password/MFA or direct-SSH guidance. Never silently forward an
 unrestricted agent, copy a key, downgrade a refused request or reinterpret an
 unbound signature as authorized. Native verifier support for any older local
 agent must preserve all destination checks and that agent's own constraints;
-otherwise it is unsupported. An explicit destination-bound key attempt may continue to keyboard-interactive MFA through the existing bounded askpass flow. That prompt is admitted only after a native-verified key-signature receipt, is confined to the original device/session and exact authentication context, and is freshly authorized before publication and before an answer returns. Channel loss, revocation or grant expiry cancels pending MFA. It never enables password-only fallback after a failed signing attempt. Separate explicit password/Duo connections retain their existing path, and no unattended monitor opens either authentication channel.
+otherwise it is unsupported. An explicit destination-bound key attempt may
+continue to keyboard-interactive MFA through the existing bounded askpass flow.
+That prompt is admitted only after a native-verified key-signature receipt, is
+confined to the original device/session and exact authentication context, and is
+freshly authorized before publication and before an answer returns. Channel
+loss, revocation or grant expiry cancels pending MFA. It never enables password-
+only fallback after a failed signing attempt. Separate explicit password/Duo
+connections retain their existing path, and no unattended monitor opens either
+authentication channel.
 
 ## Acceptance before advertisement
 
