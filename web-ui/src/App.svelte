@@ -5181,7 +5181,7 @@
         </button>
       </div>
 
-      <nav class="sessions">
+      <nav class="sessions sidebar-scrollbar">
         {#snippet sessionRow(s: Session)}
           {#if confirmKillId === s.id}
             <div
@@ -5518,7 +5518,7 @@
               </button>
               </span>
             </div>
-            <div class="recents-list" class:expanded={recentsExpanded} bind:this={recentsListEl}>
+            <div class="recents-list sidebar-scrollbar" class:expanded={recentsExpanded} bind:this={recentsListEl}>
               {#each recentsExpanded ? visibleRecents : visibleRecents.slice(0, recentsFit) as r (r.key)}
                 <button
                   class="recent-row"
@@ -6981,7 +6981,6 @@
   /* Expanded: a scrollable window, soft edge fade when it overflows. */
   .recents-list.expanded {
     overflow-y: auto;
-    scrollbar-width: thin;
     mask-image: linear-gradient(to bottom, black calc(100% - 10px), transparent);
   }
 

@@ -274,6 +274,8 @@ close. Linked-worktree branches share that line with separate truncation; provid
 available in the name's tooltip, so changing a status/title never shifts the rows below.
 Their ordering uses the first known creation time throughout view switches and respawns;
 attention-state changes do not reorder the sidebar or its numbered shortcuts.
+The session list, expanded Recents and file tree share a slim, theme-aware scrollbar
+with a transparent track; its drag area is wider than the visible thumb.
 
 ---
 
