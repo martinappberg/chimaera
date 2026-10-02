@@ -5,6 +5,10 @@ and scoped Git access. Its independent `baton_version` is 1. Existing Link v0
 connections and clients remain compatible. Requests use the account origin,
 JSON, and the same device bearer authorization as `/v1/me`.
 
+Optional named-provider login and isolated runtime authority use the separate
+[provider authority contract](PROVIDERS.md). Workspace delegations and runtime
+attachments grant no personal-cloud Connect/Disconnect permission.
+
 ## Workspace baton
 
 One workspace has one recorded writer. Workspace ids are stable across hosts.

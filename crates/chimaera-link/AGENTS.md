@@ -5,6 +5,7 @@
 | [PROTOCOL.md](PROTOCOL.md) | Versioned account/keeper contract; change it with code |
 | [CLUSTER.md](CLUSTER.md) | Capability-gated typed cluster control, job-scoped transports and account rollout job holds; implementation advertises only verified support |
 | [HANDOFF.md](HANDOFF.md) | Additive baton, mirror credential and scoped daemon delegation contracts |
+| [PROVIDERS.md](PROVIDERS.md) | Optional fixed personal-control login adapter and separate project-runtime provider authority; neither is enabled by contract publication |
 | `src/continuity.rs` | Negotiated managed execution, immutable checkpoint receipts and exact recovery acknowledgments; recovery secrets have no Debug representation |
 | [VIEWING.md](VIEWING.md) | Passive logical project routes, target acknowledgment, path aliases and installation binding |
 | `src/placement.rs` | Exact passive placement/capability DTOs and native-only installation identity |
