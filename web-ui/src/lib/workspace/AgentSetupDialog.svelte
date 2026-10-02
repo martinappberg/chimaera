@@ -4,8 +4,8 @@
   import { modalFocus } from "../shared/modalFocus";
   import { pageVisible } from "../shared/visibility";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { agentCatalog, listAgents, pollAgents, type LaunchPick } from "./launcher";
-  import { cancelAgentSetup, getAgentSetup, setupRunning, startAgentSetup, type SetupDetails, type SetupRequest } from "./agentSetup";
+  import { agentCatalog, pollAgents, type LaunchPick } from "./launcher";
+  import { cancelAgentSetup, getAgentSetup, recoverSetupResult, setupRunning, startAgentSetup, type SetupDetails, type SetupRequest } from "./agentSetup";
 
   let { request, onclose, onlaunch }: { request: SetupRequest; onclose(): void; onlaunch(pick: LaunchPick): void } = $props();
   let details = $state<SetupDetails | null>(null);
@@ -30,15 +30,21 @@
     try {
       const next = await getAgentSetup(agent.id);
       if (disposed) return;
-      if (initial && !request.showResult && !setupRunning(next.operation)) ignoredOperationId = next.operation?.id ?? null;
+      if (next.operation && !setupRunning(next.operation) && (initial || next.operation.phase !== details?.operation?.phase)) {
+        // Refresh before deciding whether this is an old result: nobody polls
+        // the catalog while the dialog and Settings are both closed.
+        const catalog = await pollAgents(AbortSignal.timeout(15_000));
+        if (disposed) return;
+        if (initial && !recoverSetupResult(request, next.operation, catalog.find(a => a.id === agent.id)?.installed === true)) {
+          ignoredOperationId = next.operation.id;
+        }
+      }
       if (next.operation?.id === ignoredOperationId && !setupRunning(next.operation)) next.operation = null;
       initial = false;
       if (next.operation?.id === requestId) requestId = null;
-      const changed = next.operation?.phase !== details?.operation?.phase;
       details = next;
       connected = true;
       refreshError = null;
-      if (changed && next.operation && !setupRunning(next.operation)) void listAgents(true).catch(() => {});
     } catch (e) {
       if (!disposed) {
         connected = false;
@@ -127,7 +133,7 @@
           <button class="btn" disabled={busy || operation?.phase === "cancelling" || !connected} onclick={() => void cancel()}>{operation?.phase === "cancelling" ? "Stopping…" : "Cancel installation"}</button>
         {:else if operation?.phase === "succeeded"}
           {#if agent.installed}<button class="btn" title={`Open ${agent.name} in a terminal to sign in`} onclick={() => launch("term")}>Sign in</button>{/if}
-          {#if agent.chatCapable}<button class="btn primary" onclick={() => launch("chat")}>Open chat</button>{/if}
+          {#if agent.installed && agent.chatCapable}<button class="btn primary" onclick={() => launch("chat")}>Open chat</button>{/if}
         {:else}
           <button class="btn primary" disabled={busy || !connected} onclick={() => void start()}>{busy ? "Starting…" : operation ? "Retry installation" : verb}</button>
         {/if}

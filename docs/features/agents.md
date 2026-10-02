@@ -78,7 +78,7 @@ for the current session; see [chat mode](chat-mode.md) for provider behavior.
   run without a terminal or a session tab; opening or closing the dialog never starts an agent.
 - **How it's used.** Choose Install, Update, or Advanced → Reinstall, then start the operation
   in the dialog. Keep working closes the dialog; View progress/result in Agents settings returns
-  to it. Cancel stops only that installer. Failure and cancellation keep the last 64 KiB of output
+  to it. Reopening from a stale launcher refreshes the catalog and recovers a completed background result rather than starting another install. Cancel stops only that installer. Failure and cancellation keep the last 64 KiB of output
   and the exit code when available; Retry is explicit. Storage/quota, permission, and incompatible
   system-library failures explain what to fix. Results last until the daemon restarts; a lost
   connection is unknown status, never success.

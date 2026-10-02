@@ -22,6 +22,13 @@ export function openAgentSetup(agent: AgentInfo, workspaceId: string, action: Se
 }
 export const setupRunning = (p: SetupProgress | null) => p?.phase === "running" || p?.phase === "cancelling";
 
+/** A launcher may still show Install after a background operation finished. */
+export function recoverSetupResult(request: SetupRequest, operation: SetupProgress, installed: boolean): boolean {
+  return request.showResult
+    || (request.agent.setup?.running === true && request.agent.setup.id === operation.id)
+    || (request.action === "install" && !request.agent.installed && installed && operation.phase === "succeeded");
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await api(path, { ...init, signal: AbortSignal.timeout(15_000) });
   if (!res.ok) {

@@ -636,6 +636,14 @@ fn build(
                     return v;
                 }
             }
+            // Graceful shutdown removes manifests before Slurm finishes.
+            // job-host retains its final closing rows for this interval.
+            if let Some(job) = jobs.iter().find(|j| j.stopping && held_in(&j.id).is_some()) {
+                v.state = "open";
+                v.job = Some(job.id.clone());
+                v.closing = true;
+                return v;
+            }
             // Opening in a running job, or opening when a job starts. A
             // running job's start list says nothing once its job-host
             // reports — a workspace closed there since is closed.
@@ -2291,6 +2299,28 @@ mod tests {
             assert!(!stopping.endpoints.contains_key("w-0000abcd"));
             assert!(!stopping.hosts.contains_key("j-0000aaaa"));
         }
+        // Both live endpoint records disappear on graceful shutdown. The
+        // durable closing row still owns the workspace until Slurm is done.
+        state.manifests.clear();
+        state.jobs[0].host = None;
+        state.jobs[0].hosting = Some(chimaera_core::cluster::HostingRecord {
+            workspaces: [("w-0000abcd".into(), HostedState::Closing)]
+                .into_iter()
+                .collect(),
+        });
+        for (cancelled, slurm_state) in [(true, "RUNNING"), (false, "COMPLETING")] {
+            state.jobs[0].record.stopped_by_user = cancelled;
+            let queue = [queue_row("77", slurm_state, "n042", "1:00:00", "None")];
+            let stopping = build(&config, &state, &queue, true, NOW);
+            let workspace = &stopping.workspaces[0];
+            assert_eq!(workspace.job.as_deref(), Some("j-0000aaaa"));
+            assert!(workspace.closing);
+            assert!(stopping.endpoints.is_empty());
+            assert!(stopping.hosts.is_empty());
+        }
+        let ended = build(&config, &state, &[], true, NOW);
+        assert_eq!(ended.workspaces[0].state, "closed");
+        assert!(ended.workspaces[0].job.is_none());
     }
 
     /// A running job's job-host says what it holds: a workspace it is
