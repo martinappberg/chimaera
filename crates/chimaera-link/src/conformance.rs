@@ -34,6 +34,16 @@ pub async fn run_cluster(client: &Client, host_id: &str) -> Result<Vec<String>> 
     Ok(report)
 }
 
+/// Read-only negotiation, not proof that native cryptographic signing works.
+pub async fn run_ssh_auth(client: &Client) -> Result<Vec<String>> {
+    let caps = client.ssh_auth_capabilities().await?;
+    ensure!(
+        caps.registration_supported(),
+        "inert SSH registration unsupported"
+    );
+    Ok(vec!["SSH auth version, hostbound and inert registration flags verified; no grant, SSH or signature requested".into()])
+}
+
 pub async fn run(
     endpoint: &str,
     token: &str,

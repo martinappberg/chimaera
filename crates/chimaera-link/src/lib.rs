@@ -13,6 +13,8 @@ mod placement;
 pub use handoff::*;
 pub use placement::*;
 pub mod protocol;
+pub mod ssh_auth;
+pub use ssh_auth::*;
 mod transport;
 pub use bridge::{bridge, websocket_config};
 pub use client::{Client, EventConnection, LinkTunnel, Serve};
@@ -29,3 +31,6 @@ mod fake_handoff;
 
 #[cfg(feature = "fixtures")]
 mod fake_cluster;
+
+#[cfg(feature = "fixtures")]
+mod fake_ssh_auth;

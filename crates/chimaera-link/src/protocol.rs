@@ -360,6 +360,8 @@ pub struct Host {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AddHost {
     pub alias: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub register_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -456,6 +458,10 @@ pub enum ServeEvent {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApiError {
     pub error: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[cfg(test)]
@@ -702,5 +708,14 @@ mod tests {
             let catalog: PlanCatalog = serde_json::from_value(none).unwrap();
             assert_eq!(catalog.plans, None);
         }
+    }
+    #[test]
+    fn ordinary_host_creation_omits_inert_registration_and_old_bodies_default_false() {
+        let old: AddHost = serde_json::from_value(serde_json::json!({"alias":"cluster"})).unwrap();
+        assert!(!old.register_only);
+        assert!(serde_json::to_value(old)
+            .unwrap()
+            .get("register_only")
+            .is_none());
     }
 }

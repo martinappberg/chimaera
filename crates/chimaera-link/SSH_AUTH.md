@@ -54,6 +54,15 @@ an already live grant socket. Upgrade and pre-dial authorization are revalidated
 revocation races close the channel before any signature can be accepted. Grant
 ids and all packet contents have no Debug/log representation.
 
+A reserved upgrade is not an active signing channel. After the upgrade and fresh
+current-device/session/boot validation, the server sends exactly one first text
+frame `{type:"ready",version:1,grant_id:<exact id>,keeper_boot:<exact boot>}`.
+The native client validates it before its socket API returns or Reconnect may
+use that channel. Ready has a thirty-second maximum deadline within the grant's
+absolute lifetime. Missing, duplicate/later Ready, unknown fields/kinds or a
+mismatched identity fail closed. No request may precede Ready, and a paused or
+failed upgrade cannot admit SSH authentication.
+
 Authenticated `DELETE` of that same grant path is idempotent for its owner and
 cancels pending authentication requests. Expiry, device sign-out, channel loss or
 revocation does the same. They do not disconnect an already authenticated SSH
@@ -101,6 +110,10 @@ Unknown kinds/fields, replay, out-of-order replies, duplicate bindings, oversize
 or malformed packets fail closed with fixed errors. Each request has a thirty-
 second deadline within the grant's absolute 180-second lifetime. Disconnect or
 expiry drains pending requests with failure, never a usable partial signature.
+
+The base64 packet contains the SSH agent message body starting at its message-
+type byte; the four-byte Unix socket length prefix is excluded. The receiver
+validates the complete body before adding framing on a local agent socket.
 
 Keeper-to-native requests are:
 

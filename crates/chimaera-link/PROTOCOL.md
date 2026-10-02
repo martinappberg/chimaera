@@ -306,7 +306,9 @@ expiry. Device-code endpoints do not require an existing device bearer token.
 
 Capability-gated cluster control and keeper-owned job lifetimes are specified in
 [CLUSTER.md](CLUSTER.md). They are additive; absent negotiation preserves the
-ordinary host contract below. Destination-bound native SSH signing has separate
+ordinary host contract below. Optional selected-project provider authority and
+separate personal login control are specified in [PROVIDERS.md](PROVIDERS.md).
+Destination-bound native SSH signing has separate
 negotiation and authority in [SSH_AUTH.md](SSH_AUTH.md); cluster support never
 implies signing support.
 

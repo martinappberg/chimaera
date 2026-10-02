@@ -695,6 +695,16 @@ impl Client {
         segments: &[&str],
         body: Option<serde_json::Value>,
     ) -> Result<reqwest::Response> {
+        self.keeper_request_raw_grant(method, segments, body, None)
+            .await
+    }
+    async fn keeper_request_raw_grant(
+        &self,
+        method: Method,
+        segments: &[&str],
+        body: Option<serde_json::Value>,
+        grant: Option<&str>,
+    ) -> Result<reqwest::Response> {
         let url = path(&self.keeper().await?, segments);
         for attempt in 0..2 {
             let token = self.access_token().await?;
@@ -703,6 +713,11 @@ impl Client {
                 .http
                 .request(method.clone(), url.clone())
                 .bearer_auth(&token);
+            if let Some(grant) = grant {
+                // This helper is private; only the exact reconnect method below
+                // selects a grant. No mutable global/header inheritance exists.
+                request = request.header(crate::SSH_AUTH_GRANT_HEADER, grant);
+            }
             if let Some(body) = &body {
                 request = request.json(body);
             }
@@ -729,6 +744,191 @@ impl Client {
             bail!("keeper request rejected ({})", response.status().as_u16());
         }
         Ok(response)
+    }
+    pub async fn ssh_auth_capabilities(&self) -> Result<crate::SshAuthCapabilities> {
+        let response = self
+            .keeper_request_raw(Method::GET, &["v1", "ssh", "auth", "capabilities"], None)
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(crate::ServiceUnsupported.into());
+        }
+        let value: crate::SshAuthCapabilities = json_response(response).await?;
+        if !value.supported() {
+            return Err(crate::ServiceUnsupported.into());
+        }
+        Ok(value)
+    }
+    /// Native key-only Connect first saves an inert host. Never send an unknown
+    /// additive field to an old keeper and hope it did not start authentication.
+    pub async fn register_ssh_auth_host(
+        &self,
+        alias: &str,
+        ssh: crate::SshTarget,
+        policy: Option<crate::ClusterPolicy>,
+    ) -> Result<crate::Host> {
+        let destination = crate::SshAuthDestination {
+            hostname: ssh.hostname.clone(),
+            user: ssh.user.clone().unwrap_or_default(),
+            port: ssh.port,
+        };
+        destination.validate()?;
+        let caps = self.ssh_auth_capabilities().await?;
+        if !caps.registration_supported() {
+            return Err(crate::ServiceUnsupported.into());
+        }
+        if policy.is_some() {
+            self.cluster_capabilities().await?;
+        }
+        let value: crate::Host = json_response(
+            self.keeper_request(
+                Method::POST,
+                &["v1", "hosts"],
+                Some(serde_json::to_value(crate::AddHost {
+                    alias: alias.into(),
+                    ssh: Some(ssh),
+                    cluster_policy: policy,
+                    register_only: true,
+                })?),
+            )
+            .await?,
+        )
+        .await?;
+        anyhow::ensure!(
+            crate::placement::valid_id(&value.id)
+                && value.alias == alias
+                && value.kind == crate::HostKind::Ssh
+                && value.status == crate::HostStatus::Offline
+                && value.daemon.is_none(),
+            "SSH registration was not inert"
+        );
+        Ok(value)
+    }
+    pub async fn create_ssh_auth_grant(
+        &self,
+        host: &str,
+        request: &crate::SshAuthGrantRequest,
+    ) -> Result<crate::SshAuthGrant> {
+        anyhow::ensure!(
+            crate::placement::valid_id(host),
+            "invalid SSH authentication host"
+        );
+        request.validate()?;
+        let caps = self.ssh_auth_capabilities().await?;
+        anyhow::ensure!(
+            caps.keeper_boot == request.keeper_boot,
+            "SSH authentication boot changed"
+        );
+        let value: crate::SshAuthGrant = json_response(
+            self.keeper_request(
+                Method::POST,
+                &["v1", "hosts", host, "ssh", "auth", "grants"],
+                Some(serde_json::to_value(request)?),
+            )
+            .await?,
+        )
+        .await?;
+        value.validate()?;
+        Ok(value)
+    }
+    /// The socket is caller-owned and never reconnects/replays authentication.
+    pub async fn ssh_auth_socket(
+        &self,
+        host: &str,
+        grant: &crate::SshAuthGrant,
+    ) -> Result<crate::Socket> {
+        anyhow::ensure!(
+            crate::placement::valid_id(host),
+            "invalid SSH authentication host"
+        );
+        grant.validate()?;
+        let caps = self.ssh_auth_capabilities().await?;
+        let mut socket = self
+            .open_socket(
+                &[
+                    "v1",
+                    "hosts",
+                    host,
+                    "ssh",
+                    "auth",
+                    "grants",
+                    &grant.grant_id,
+                    "ws",
+                ],
+                true,
+            )
+            .await?;
+        let ready = tokio::time::timeout(
+            Duration::from_secs(30.min(grant.expires_in.into())),
+            socket.next(),
+        )
+        .await
+        .map_err(|_| anyhow!("SSH authentication readiness expired"))?;
+        match ready {
+            Some(Ok(Message::Text(value))) => {
+                crate::SshAuthHello::from_frame(value.as_bytes(), grant, &caps.keeper_boot)?;
+            }
+            _ => bail!("SSH authentication readiness failed"),
+        }
+        Ok(socket)
+    }
+    pub async fn delete_ssh_auth_grant(
+        &self,
+        host: &str,
+        grant: &crate::SshAuthGrant,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            crate::placement::valid_id(host),
+            "invalid SSH authentication host"
+        );
+        grant.validate()?;
+        self.keeper_request(
+            Method::DELETE,
+            &[
+                "v1",
+                "hosts",
+                host,
+                "ssh",
+                "auth",
+                "grants",
+                &grant.grant_id,
+            ],
+            None,
+        )
+        .await
+        .map_err(|error| {
+            if error.is::<crate::AuthorizationRevoked>() {
+                error
+            } else {
+                anyhow!("SSH authentication grant deletion failed")
+            }
+        })?;
+        Ok(())
+    }
+    pub async fn reconnect_host_with_ssh_auth(
+        &self,
+        host: &str,
+        grant: &crate::SshAuthGrant,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            crate::placement::valid_id(host),
+            "invalid SSH authentication host"
+        );
+        grant.validate()?;
+        self.ssh_auth_capabilities().await?;
+        let response = self
+            .keeper_request_raw_grant(
+                Method::POST,
+                &["v1", "hosts", host, "reconnect"],
+                None,
+                Some(&grant.grant_id),
+            )
+            .await?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "SSH authentication reconnect rejected ({})",
+            response.status().as_u16()
+        );
+        Ok(())
     }
     pub async fn cluster_capabilities(&self) -> Result<crate::ClusterCapabilities> {
         let response = self
@@ -879,6 +1079,7 @@ impl Client {
                 &["v1", "hosts"],
                 Some(serde_json::to_value(AddHost {
                     alias: alias.into(),
+                    register_only: false,
                     ssh,
                     cluster_policy,
                 })?),

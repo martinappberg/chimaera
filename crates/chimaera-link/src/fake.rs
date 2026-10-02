@@ -42,7 +42,9 @@ struct Inner {
     streams: Arc<Semaphore>,
     handoff: crate::fake_handoff::FixtureHandoff,
     clusters: crate::fake_cluster::FixtureCluster,
+    ssh_auth: crate::fake_ssh_auth::FixtureSshAuth,
     cluster_upgrade_pause: Mutex<Option<(Arc<Semaphore>, Arc<Semaphore>)>>,
+    ssh_auth_upgrade_pause: Mutex<Option<(Arc<Semaphore>, Arc<Semaphore>)>>,
 }
 struct Data {
     hosts: HashMap<String, Host>,
@@ -77,7 +79,9 @@ impl FakeKeeper {
                 streams: Arc::new(Semaphore::new(MAX_STREAMS)),
                 handoff: Default::default(),
                 clusters: Default::default(),
+                ssh_auth: Default::default(),
                 cluster_upgrade_pause: Mutex::new(None),
+                ssh_auth_upgrade_pause: Mutex::new(None),
                 state: Mutex::new(Data {
                     hosts: HashMap::new(),
                     targets: HashMap::new(),
@@ -102,6 +106,30 @@ impl FakeKeeper {
                 }),
             }),
         }
+    }
+    /// Opt-in authority fixture only; never performs SSH or key operations.
+    pub async fn set_ssh_auth_supported(&self, enabled: bool) {
+        self.inner.ssh_auth.enabled(enabled).await;
+    }
+    pub async fn pause_ssh_auth_upgrade(&self, entered: Arc<Semaphore>, release: Arc<Semaphore>) {
+        *self.inner.ssh_auth_upgrade_pause.lock().await = Some((entered, release));
+    }
+    pub async fn expire_ssh_auth_grant(&self, grant: &str) {
+        self.inner.ssh_auth.expire(grant).await;
+    }
+    pub async fn ssh_auth_reconnects(&self) -> usize {
+        self.inner.ssh_auth.reconnect_count().await
+    }
+    pub async fn set_ssh_auth_destination(
+        &self,
+        host: &str,
+        target: SshAuthDestination,
+    ) -> Result<()> {
+        self.inner
+            .ssh_auth
+            .target(host, target)
+            .await
+            .map_err(|_| anyhow::anyhow!("fixture destination rejected"))
     }
     pub(crate) fn clusters(&self) -> &crate::fake_cluster::FixtureCluster {
         &self.inner.clusters
@@ -203,6 +231,10 @@ impl FakeKeeper {
             let _ = self.inner.events.send(Event::Host { host });
         }
     }
+    pub async fn tokens_for_device(&self, device: &str) -> Result<Tokens> {
+        anyhow::ensure!(crate::placement::valid_id(device), "invalid fixture device");
+        Ok(issue_tokens(&mut *self.inner.state.lock().await, device))
+    }
     pub fn tokens() -> Tokens {
         Tokens {
             access_token: STATIC_TOKEN.into(),
@@ -298,6 +330,16 @@ impl FakeKeeper {
             .route("/v1/billing/checkout", post(fixture_checkout))
             .route("/v1/billing/portal", post(fixture_portal))
             .merge(crate::fake_cluster::router())
+            .route("/v1/ssh/auth/capabilities", get(ssh_auth_capabilities))
+            .route("/v1/hosts/{id}/ssh/auth/grants", post(ssh_auth_grant))
+            .route(
+                "/v1/hosts/{id}/ssh/auth/grants/{grant}",
+                axum::routing::delete(ssh_auth_delete),
+            )
+            .route(
+                "/v1/hosts/{id}/ssh/auth/grants/{grant}/ws",
+                get(ssh_auth_ws),
+            )
             .route("/v1/hosts", get(hosts).post(add_host))
             .route("/v1/hosts/{id}", axum::routing::delete(delete_host))
             .route("/v1/hosts/{id}/reconnect", post(reconnect))
@@ -390,6 +432,13 @@ async fn auth(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
+    if request.headers().contains_key(SSH_AUTH_GRANT_HEADER)
+        && !(request.method() == axum::http::Method::POST
+            && request.uri().path().starts_with("/v1/hosts/")
+            && request.uri().path().ends_with("/reconnect"))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let mut generation = keeper.inner.generation.subscribe();
     let (authorized, epoch) = if let Some(token) = bearer {
         let data = keeper.inner.state.lock().await;
@@ -413,7 +462,9 @@ async fn auth(
     };
     if delegated
         && !authorized
-        && (request.uri().path().contains("/cluster/") || request.uri().path().contains("/jobs/"))
+        && (request.uri().path().contains("/cluster/")
+            || request.uri().path().contains("/jobs/")
+            || request.uri().path().contains("/ssh/auth/"))
     {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -468,8 +519,40 @@ async fn add_host(State(keeper): State<FakeKeeper>, Json(request): Json<AddHost>
     if request.alias.is_empty() || request.alias.len() > 255 {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    if request.register_only
+        && !keeper
+            .inner
+            .ssh_auth
+            .capabilities()
+            .await
+            .is_some_and(|caps| caps.registration_supported())
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let destination = request.ssh.as_ref().map(|ssh| SshAuthDestination {
+        hostname: ssh.hostname.clone(),
+        user: ssh.user.clone().unwrap_or_default(),
+        port: ssh.port,
+    });
+    if request.register_only
+        && destination
+            .as_ref()
+            .is_none_or(|target| target.validate().is_err())
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let mut state = keeper.inner.state.lock().await;
     if let Some(host) = state.hosts.values().find(|h| h.alias == request.alias) {
+        if request.register_only {
+            let matches = if let Some(target) = destination.as_ref() {
+                keeper.inner.ssh_auth.matches_target(&host.id, target).await
+            } else {
+                false
+            };
+            if !matches {
+                return StatusCode::CONFLICT.into_response();
+            }
+        }
         return Json(host.clone()).into_response();
     }
     if state.hosts.len() >= MAX_STREAMS {
@@ -484,6 +567,11 @@ async fn add_host(State(keeper): State<FakeKeeper>, Json(request): Json<AddHost>
         error: Some("No --host fixture target for this alias".into()),
         cluster: None,
     };
+    if let Some(target) = destination {
+        if let Err(status) = keeper.inner.ssh_auth.target(&host.id, target).await {
+            return status.into_response();
+        }
+    }
     state.hosts.insert(host.id.clone(), host.clone());
     let _ = keeper.inner.events.send(Event::Host { host: host.clone() });
     (StatusCode::CREATED, Json(host)).into_response()
@@ -501,10 +589,39 @@ async fn delete_host(State(keeper): State<FakeKeeper>, Path(id): Path<String>) -
     if state.hosts.remove(&id).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
+    keeper.inner.ssh_auth.remove(&id).await;
     let _ = keeper.inner.events.send(Event::HostRemoved { host_id: id });
     StatusCode::NO_CONTENT.into_response()
 }
-async fn reconnect(State(keeper): State<FakeKeeper>, Path(id): Path<String>) -> StatusCode {
+async fn reconnect(
+    State(keeper): State<FakeKeeper>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> StatusCode {
+    if headers.contains_key(SSH_AUTH_GRANT_HEADER) {
+        let Some(grant) = auth_grant_header(&headers) else {
+            return StatusCode::BAD_REQUEST;
+        };
+        let Some((device, epoch)) = ssh_auth_owner(&keeper, &headers).await else {
+            return StatusCode::UNAUTHORIZED;
+        };
+        let data = keeper.inner.state.lock().await;
+        if !data.hosts.contains_key(&id) {
+            return StatusCode::NOT_FOUND;
+        }
+        if !ssh_auth_current(&data, &headers, &device) || *keeper.inner.generation.borrow() != epoch
+        {
+            return StatusCode::UNAUTHORIZED;
+        }
+        if let Err(status) = keeper
+            .inner
+            .ssh_auth
+            .reconnect(&id, &grant, &device, epoch)
+            .await
+        {
+            return status;
+        }
+    }
     let state = keeper.inner.state.lock().await;
     let Some(host) = state.hosts.get(&id) else {
         return StatusCode::NOT_FOUND;
@@ -1055,4 +1172,182 @@ pub async fn bridge_axum<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
             }))
         });
     bridge(tcp, socket).await
+}
+
+async fn ssh_auth_capabilities(State(keeper): State<FakeKeeper>) -> Response {
+    match keeper.inner.ssh_auth.capabilities().await {
+        Some(value) => Json(value).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+async fn ssh_auth_owner(keeper: &FakeKeeper, headers: &HeaderMap) -> Option<(String, u64)> {
+    let token = headers
+        .get("authorization")?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")?;
+    let data = keeper.inner.state.lock().await;
+    if data
+        .access
+        .get(token)
+        .is_none_or(|expiry| *expiry <= Instant::now())
+    {
+        return None;
+    }
+    Some((
+        data.event_devices.get(token)?.clone(),
+        *keeper.inner.generation.borrow(),
+    ))
+}
+fn ssh_auth_current(data: &Data, headers: &HeaderMap, device: &str) -> bool {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|token| {
+            data.access
+                .get(token)
+                .is_some_and(|expiry| *expiry > Instant::now())
+                && data
+                    .event_devices
+                    .get(token)
+                    .is_some_and(|owner| owner == device)
+        })
+}
+fn auth_grant_header(headers: &HeaderMap) -> Option<String> {
+    let values: Vec<_> = headers.get_all(SSH_AUTH_GRANT_HEADER).iter().collect();
+    if values.len() != 1 {
+        return None;
+    }
+    let value = values[0].to_str().ok()?;
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    {
+        return None;
+    }
+    Some(value.into())
+}
+async fn ssh_auth_grant(
+    State(keeper): State<FakeKeeper>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SshAuthGrantRequest>,
+) -> Response {
+    let Some((device, epoch)) = ssh_auth_owner(&keeper, &headers).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let data = keeper.inner.state.lock().await;
+    if !data.hosts.contains_key(&id)
+        || !ssh_auth_current(&data, &headers, &device)
+        || *keeper.inner.generation.borrow() != epoch
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match keeper
+        .inner
+        .ssh_auth
+        .issue(&id, &device, epoch, request)
+        .await
+    {
+        Ok(grant) => (StatusCode::CREATED, Json(grant)).into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+async fn ssh_auth_delete(
+    State(keeper): State<FakeKeeper>,
+    Path((id, grant)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> StatusCode {
+    let Some((device, epoch)) = ssh_auth_owner(&keeper, &headers).await else {
+        return StatusCode::UNAUTHORIZED;
+    };
+    let data = keeper.inner.state.lock().await;
+    if !ssh_auth_current(&data, &headers, &device) || *keeper.inner.generation.borrow() != epoch {
+        return StatusCode::UNAUTHORIZED;
+    }
+    match keeper
+        .inner
+        .ssh_auth
+        .delete(&id, &grant, &device, epoch)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(status) => status,
+    }
+}
+async fn ssh_auth_ws(
+    State(keeper): State<FakeKeeper>,
+    Path((id, grant)): Path<(String, String)>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    if headers.contains_key("origin") {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some((device, epoch)) = ssh_auth_owner(&keeper, &headers).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let mut revoked = keeper.inner.generation.subscribe();
+    {
+        let data = keeper.inner.state.lock().await;
+        if *revoked.borrow_and_update() != epoch || !ssh_auth_current(&data, &headers, &device) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if let Err(status) = keeper
+            .inner
+            .ssh_auth
+            .attach(&id, &grant, &device, epoch)
+            .await
+        {
+            return status.into_response();
+        }
+    }
+    let pause = { keeper.inner.ssh_auth_upgrade_pause.lock().await.take() };
+    if let Some((entered, release)) = pause {
+        entered.add_permits(1);
+        if release.acquire().await.is_err() {
+            keeper.inner.ssh_auth.detach(&grant).await;
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    }
+    let cleanup = keeper.clone();
+    let cleanup_id = grant.clone();
+    upgrade.max_message_size(SSH_AUTH_FRAME_MAX).max_frame_size(SSH_AUTH_FRAME_MAX)
+        .on_failed_upgrade(move |_| { tokio::spawn(async move { cleanup.inner.ssh_auth.detach(&cleanup_id).await; }); })
+        .on_upgrade(move |mut socket| async move {
+            let ready = {
+                let data = keeper.inner.state.lock().await;
+                if *revoked.borrow() != epoch || !ssh_auth_current(&data, &headers, &device) { None }
+                else { keeper.inner.ssh_auth.activate(&id, &grant, &device, epoch).await.ok() }
+            };
+            if let Some(ready) = ready {
+                let text = serde_json::to_string(&ready).expect("fixed hello serializes");
+                let sent = tokio::select! {
+                    biased;
+                    _ = revoked.changed() => false,
+                    result = tokio::time::timeout(Duration::from_secs(30), socket.send(AxumMessage::Text(text.into()))) => matches!(result, Ok(Ok(()))),
+                };
+                if sent {
+                    // This fixture proves channel authority, not an SSH verifier.
+                    // Replies without a requested live packet are rejected.
+                    loop {
+                        tokio::select! {
+                            _ = revoked.changed() => break,
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                                if !keeper.inner.ssh_auth.live(&id, &grant, &device, epoch).await { break; }
+                            }
+                            frame = socket.recv() => match frame {
+                                Some(Ok(AxumMessage::Ping(value))) => { if socket.send(AxumMessage::Pong(value)).await.is_err() { break; } },
+                                _ => break,
+                            },
+                        }
+                    }
+                }
+            }
+            keeper.inner.ssh_auth.detach(&grant).await;
+            let _ = socket.close().await;
+        }).into_response()
 }

@@ -13,7 +13,9 @@
 | `src/handoff.rs` | Typed ownership and credential bodies, immutable workspace binding and bounded exact daemon acknowledgment; secrets redact Debug |
 | `src/fake_handoff.rs` | Bounded baton and credential-fencing fixture |
 | `src/protocol.rs` | Serializable wire types and resource ceilings |
+| `src/ssh_auth.rs` | Native-only bounded grant/control DTOs and exact reply correlation; no crypto authority or capability enablement |
 | `src/cluster.rs` | Capability-gated control DTOs, bounded request validation and exact reply/history identity checks; credential-bearing responses omit Debug |
+| `src/fake_ssh_auth.rs` | Opt-in disposable native-grant authority fixture; inert save, exact device/epoch/boot/destination, bounded admission, no SSH/key effects |
 | `src/fake_cluster.rs` | Immutable operation/dedup and job-scoped socket fixture; no SSH or scheduler implementation |
 | `src/client.rs` | Account REST, refresh serialization, events reconnect with connection-local prompt IDs, loopback tunnels, reverse serve |
 | `src/error.rs` | Typed outcomes callers must tell apart from network failures: `AuthorizationRevoked`, `ServiceUnsupported`, `AlreadySubscribed` (checkout conflict requires a fresh account read) |
