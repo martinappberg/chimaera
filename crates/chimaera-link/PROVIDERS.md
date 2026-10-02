@@ -266,6 +266,84 @@ Passive catalog/status reads never wake, refresh a token or run a login CLI.
 Connect, Submit and explicitly confirmed Disconnect may wake through existing
 account attendance/allowance rules. Polling never repeatedly wakes a machine.
 
+## Internal fixed worker command and lease exchange
+
+The keeper's fixed adapter selects the worker address only from fresh account
+worker identity and the current positively acknowledged registration. Its
+internal paths are `GET /internal/v1/personal/providers`, `POST
+/internal/v1/personal/providers/commands` and `GET
+/internal/v1/personal/providers/operations/{operation_id}`. These are private
+supervisor routes, never a project daemon route, generic path proxy or fallback
+TCP tunnel. Requests require both the exact current worker service bearer and
+the registered personal-control capability, carried respectively in
+`Authorization: Bearer ...` and `X-Chimaera-Personal-Control`. Neither credential
+is copied into response bodies, browser/native traffic or diagnostics. A worker
+without this separate positively enrolled adapter refuses before effects.
+
+The cached catalog returns `providers_control` containing the exact registration
+fields above without its capability, plus redacted `connections`. The keeper
+requires that exact registration acknowledgment before enrolling a target;
+ordinary daemon health or an HTTP 200 alone is insufficient. Catalog and status
+are bounded to 64 KiB and are passive. Unknown, missing or partial acknowledgment
+refuses; registration discovery never itself runs a login command.
+
+An internal command is a closed object with exactly `version:1`,
+`authorization` and `command`. `authorization` is the complete original pending
+operation tuple above, at most 8 KiB. `command` is the fixed login-only consumer's
+closed command, at most 8 KiB; its provider, expected connection generation and
+authenticated device must match that original tuple. The complete envelope is
+at most 20 KiB, rejects duplicate/unknown fields and has no debug representation.
+It never carries a selected process, HOME, executable, endpoint or upstream.
+Submit codes remain bounded live memory and are excluded from durable digests.
+
+Before forwarding a new Connect or Disconnect, the keeper generates and retains
+the original pending-operation nonce, creates the exact durable account
+admission and receives its positive acknowledgment. The operation ID and
+nonsensitive command digest must match that tuple; Disconnect includes the
+existing explicit acknowledgment. The worker then installs that immutable
+identity into an opaque supervisor-owned operation, without starting a CLI or
+writing a provider credential. Submit and Cancel refer only to the same live
+original operation and exact device/epoch/provider/connection generation; they
+cannot enroll another admission. The fixed consumer retains its existing
+one-use submission nonce behavior, including a retry with a different code.
+
+Before the first login effect, and for each renewal, the worker requests `POST
+/v1/personal/providers/leases/authorize` at its fixed keeper. It authenticates
+with its current worker service bearer and sends only the complete original
+authorization tuple, within 8 KiB. The keeper matches that tuple to its retained
+original explicit device operation and current worker registration, freshly
+validates the existing durable account admission, then rechecks those exact
+identities under its admission gate before replying. This endpoint never creates
+or restores a grant or operation and is unavailable to browser/project tokens.
+Account outage, signout, expired/terminal operation or replaced registration
+refuses; no cached positive read permits renewal.
+
+The closed lease reply has exactly `version:1`, `authorized:true`,
+`authorization` repeating the complete exact tuple and `expires_in:1..30` seconds.
+Its total body is at most 12 KiB. The keeper rounds down the minimum of thirty
+seconds, the remaining original explicit-command lifetime and the remaining
+durable account-admission lifetime, using its lease-request receipt/start as
+the origin and subtracting elapsed authorization/gate time before the reply.
+Less than one remaining second refuses. The original command deadline begins
+at the keeper's accepted explicit user intent, never at later worker delivery;
+neither first forwarding nor renewal may restart that fifteen-minute bound.
+The worker's monotonic deadline starts before its lease request, uses that exact
+returned lifetime and requires every identity and positive field to match.
+Delayed round trips cannot extend either original deadline. An already expired
+or canceled worker operation cannot consume a later reply; a renewable lease
+cannot resurrect it. Renewal belongs to the retained operation owner and is
+independent of any browser viewer or status poll. It neither wakes compute nor
+starts a new login.
+
+The command owner and lease validator survive an HTTP observer leaving, with
+at most sixteen requests and four control writers retained through their actual
+bounded effect/cleanup. The registration/account gate also covers worker
+replacement and revocation, with fresh account checks repeated after any gate
+wait before forwarding. Old captured commands cannot reach a new registration.
+After login-tree stop and verified cleanup, canonical credential publication
+still requires the distinct five-second one-use publication exchange above;
+a login lease never substitutes for that proof or its connection-generation CAS.
+
 ## Fixed login-only consumer
 
 The supervisor gives the fixed control daemon a private startup pipe followed
