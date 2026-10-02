@@ -281,7 +281,7 @@ impl Selected {
                         break Ok(*reply);
                     }
                     Ok(Ok(ClusterOperationState::Uncertain | ClusterOperationState::Unknown)) => {
-                        break Err(UNCERTAIN.into())
+                        break Err(UNCERTAIN.into());
                     }
                     _ if tokio::time::Instant::now() >= until => break Err(UNCERTAIN.into()),
                     _ => tokio::time::sleep(Duration::from_millis(500)).await,
@@ -605,6 +605,7 @@ fn convert(snapshot: ClusterSnapshot) -> Result<ClusterOverview, String> {
                 ended: j.ended,
                 ended_at_ms: j.ended_at_ms,
                 stopped_by_user: j.stopped_by_user,
+                stopping: j.stopping,
                 egress: j.egress,
                 open: j.open,
                 replaces: j.replaces,
@@ -642,7 +643,7 @@ fn convert(snapshot: ClusterSnapshot) -> Result<ClusterOverview, String> {
             .iter()
             .find(|j| j.id == route.job_id)
             .ok_or("The keeper route names an unknown job")?;
-        if job.state != "running" {
+        if job.state != "running" || job.stopping {
             return Err("The keeper route names a job that isn't running".into());
         }
         let slurm = job
@@ -746,8 +747,8 @@ mod tests {
     use super::*;
     use chimaera_core::{cluster::new_job_id, slurm::LaunchSpec};
     use chimaera_link::{
-        fake::FakeKeeper, ClusterCapabilities, ClusterJobState, ClusterJobView, ClusterRoute,
-        ClusterScheduler, Daemon,
+        ClusterCapabilities, ClusterJobState, ClusterJobView, ClusterRoute, ClusterScheduler,
+        Daemon, fake::FakeKeeper,
     };
     struct Fixture {
         keeper: FakeKeeper,
@@ -972,16 +973,18 @@ mod tests {
             fixture.keeper.cluster_submissions(&selected.host.id).await,
             1
         );
-        assert!(selected
-            .settle(
-                || 8,
-                Op::StopJob {
-                    operation_id: operation_id(),
-                    job_id: job.clone()
-                }
-            )
-            .await
-            .is_err());
+        assert!(
+            selected
+                .settle(
+                    || 8,
+                    Op::StopJob {
+                        operation_id: operation_id(),
+                        job_id: job.clone()
+                    }
+                )
+                .await
+                .is_err()
+        );
         selected
             .settle(
                 || 7,
@@ -1185,6 +1188,7 @@ mod tests {
             ended: None,
             ended_at_ms: None,
             stopped_by_user: false,
+            stopping: false,
             egress: None,
             open: vec![],
             replaces: None,
@@ -1207,6 +1211,12 @@ mod tests {
         let wire = serde_json::to_string(&overview).unwrap();
         assert!(!wire.contains("private-route-token"));
         assert!(!wire.contains("routes"));
+        snapshot.jobs[0].stopping = true;
+        assert!(convert(snapshot.clone()).is_err());
+        let mut stopping = snapshot.clone();
+        stopping.routes.clear();
+        assert!(convert(stopping).unwrap().jobs[0].stopping);
+        snapshot.jobs[0].stopping = false;
         snapshot.routes.push(snapshot.routes[0].clone());
         assert!(convert(snapshot.clone()).is_err());
         snapshot.routes.clear();

@@ -13,7 +13,7 @@
    * most once a minute whatever we call; a degraded round keeps the last read
    * on screen and says so.
    */
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import {
     clusterClose,
     clusterDismissJob,
@@ -27,8 +27,6 @@
     clusterOpen,
     clusterOpenTerminal,
     clusterRemoveWorkspace,
-    clusterSetLoginServe,
-    setNotCluster,
     clusterStopJob,
     clusterStopLoginDaemon,
     onClusterChanged,
@@ -47,6 +45,7 @@
     agoWords,
     endedLine,
     jobStatusLine,
+    isJobStopping,
     liveJobs,
     openInHint,
     openPlan,
@@ -72,13 +71,10 @@
      *  goes back to it here instead of opening another window). */
     here?: string | null;
     onHere?: () => void;
-    /** The shell returned a new state for this host (the override toggle). */
-    onHostState: (state: HostState) => void;
     /** Something changed the host list (a login daemon was shut down). */
     onHostsChanged: () => void;
-    /** The user said this host isn't a cluster (its new state); the ⋯ menu
-     *  offers it only when given. */
-    onNotCluster?: (state: HostState) => void;
+    /** Connection placement and recovery, available from the local Home hub. */
+    onConnectionSettings?: () => void;
   }
 
   let {
@@ -88,9 +84,8 @@
     backLabel = "Home",
     here = null,
     onHere,
-    onHostState,
     onHostsChanged,
-    onNotCluster,
+    onConnectionSettings,
   }: Props = $props();
 
   const entry = $derived(clusterOverviews.entry(alias));
@@ -102,8 +97,10 @@
   const loginServe = $derived(host?.cluster?.login_serve === true);
   const loginDaemon = $derived(loginServe ? null : (host?.cluster?.login_daemon ?? null));
 
-  const jobs = $derived(overview === null ? [] : liveJobs(overview.jobs));
-  const running = $derived(jobs.filter((j) => j.state === "running"));
+  const jobs = $derived(overview === null ? [] : liveJobs(overview.jobs).map((j) =>
+    jobBusy[j.id] === "stopping" || jobBusy[j.id] === "cancelling" ? { ...j, stopping: true } : j,
+  ));
+  const running = $derived(jobs.filter((j) => j.state === "running" && !isJobStopping(j)));
   const ended = $derived(
     (overview?.jobs ?? [])
       .filter((j) => j.state === "ended")
@@ -144,6 +141,19 @@
   let jobBusy = $state<Record<string, JobBusy>>({});
   let jobError = $state<Record<string, string>>({});
 
+  // scancel returning means cancellation was accepted, not that Slurm has
+  // finished. Preserve the action through stale overview reads and SSH errors.
+  $effect(() => {
+    const current = overview;
+    if (current === null) return;
+    untrack(() => {
+      const next = Object.fromEntries(Object.entries(jobBusy).filter(([id]) =>
+        current.jobs.some((job) => job.id === id && job.state !== "ended"),
+      ));
+      if (Object.keys(next).length !== Object.keys(jobBusy).length) jobBusy = next;
+    });
+  });
+
   type Sheet =
     | { kind: "start"; preselect: string[]; spec: LaunchSpec | null }
     | { kind: "continue"; job: ClusterJob };
@@ -154,14 +164,9 @@
     { mode: "startup"; workspace: { id: string; name: string } | null } | { mode: "rules" } | null
   >(null);
   let confirmStop = $state<ClusterJob | null>(null);
-  let confirmStopError = $state<string | null>(null);
   let confirmClose = $state<ClusterWorkspaceView | null>(null);
   let confirmRemove = $state<ClusterWorkspaceView | null>(null);
   let confirmRemoveError = $state<string | null>(null);
-  let confirmLoginServe = $state(false);
-  let confirmNotCluster = $state(false);
-  let notClusterError = $state<string | null>(null);
-  let loginServeError = $state<string | null>(null);
 
   let mastError = $state<string | null>(null);
   let mastNote = $state<string | null>(null);
@@ -249,13 +254,16 @@
       await run();
     } catch (e) {
       jobError = setIn(jobError, j.id, errText(e));
-    } finally {
       jobBusy = setIn(jobBusy, j.id, null);
+    } finally {
+      if (busy === "dismissing") jobBusy = setIn(jobBusy, j.id, null);
       refresh();
     }
   }
 
   function openIn(w: ClusterWorkspaceView, jobId: string | null): void {
+    const target = jobs.find((j) => j.id === (jobId ?? w.job));
+    if (target !== undefined && isJobStopping(target)) return;
     void wsAction(w, "opening", () => clusterOpen(alias, w.id, jobId));
   }
 
@@ -272,7 +280,7 @@
       else openIn(w, null);
       return;
     }
-    const plan = openPlan(overview?.jobs ?? []);
+    const plan = openPlan(jobs);
     if (plan.kind === "sheet") {
       startSheet([w.id]);
       return;
@@ -348,20 +356,11 @@
     contextMenu.openAtPoint(r.left, r.bottom + 4, items);
   }
 
-  async function confirmStopNow(): Promise<void> {
+  function confirmStopNow(): void {
     const j = confirmStop;
     if (j === null) return;
-    confirmStopError = null;
-    jobBusy = setIn(jobBusy, j.id, "stopping");
-    try {
-      await clusterStopJob(alias, j.id);
-      confirmStop = null;
-    } catch (e) {
-      confirmStopError = errText(e);
-    } finally {
-      jobBusy = setIn(jobBusy, j.id, null);
-      refresh();
-    }
+    confirmStop = null;
+    void jobAction(j, "stopping", () => clusterStopJob(alias, j.id));
   }
 
   async function removeNow(): Promise<void> {
@@ -413,28 +412,6 @@
     }
   }
 
-  async function setLoginServe(on: boolean): Promise<void> {
-    loginServeError = null;
-    try {
-      onHostState(await clusterSetLoginServe(alias, on));
-      confirmLoginServe = false;
-    } catch (e) {
-      if (on) loginServeError = errText(e);
-      else mastError = errText(e);
-    }
-  }
-
-  async function markNotCluster(): Promise<void> {
-    notClusterError = null;
-    try {
-      const state = await setNotCluster(alias, true);
-      confirmNotCluster = false;
-      onNotCluster?.(state);
-    } catch (e) {
-      notClusterError = errText(e);
-    }
-  }
-
   async function shutDownLoginDaemon(): Promise<void> {
     daemonBusy = true;
     daemonError = null;
@@ -467,33 +444,15 @@
         onSelect: () => (setting = { mode: "rules" }),
       },
       { label: "Refresh partitions", onSelect: () => void refreshPartitions() },
-      "separator",
-      {
-        label: "Run Chimaera on the login node",
-        checked: loginServe,
-        onSelect: () => {
-          if (loginServe) void setLoginServe(false);
-          else {
-            loginServeError = null;
-            confirmLoginServe = true;
-          }
-        },
-      },
     ];
-    if (onNotCluster !== undefined) {
-      items.push({
-        label: "This isn't a cluster…",
-        onSelect: () => {
-          notClusterError = null;
-          confirmNotCluster = true;
-        },
-      });
+    if (onConnectionSettings !== undefined) {
+      items.push("separator", { label: "Connection settings…", onSelect: onConnectionSettings });
     }
     contextMenu.openAtPoint(r.right, r.bottom + 4, items, { alignRight: true });
   }
 
   function jobDot(j: ClusterJob): string {
-    if (jobBusy[j.id] === "stopping" || jobBusy[j.id] === "cancelling") return "ending";
+    if (isJobStopping(j) || jobBusy[j.id] === "stopping" || jobBusy[j.id] === "cancelling") return "ending";
     return j.state === "running" ? "alive" : j.state === "starting" ? "booting" : "queued";
   }
 
@@ -542,53 +501,55 @@
   </button>
 {/snippet}
 
-{#snippet wsRow(w: ClusterWorkspaceView)}
+{#snippet wsRow(w: ClusterWorkspaceView, stopping = false)}
   {@const busy = wsBusy[w.id]}
-  {@const activity = workspaceActivity(w, clusterTime)}
-  <div class="ws" class:live={w.state === "open"}>
+  {@const activity = workspaceActivity(w, clusterTime, undefined, stopping)}
+  <div class="ws" class:live={w.state === "open" && !stopping}>
     <div class="ws-main">
       <span class="name" title={w.name}>{w.name}</span>
       <span class="path" title={w.path}>{tildePath(w.path, overview?.home)}</span>
       {#if w.id === here}<span class="here-tag">this window</span>{/if}
-      <span class="acts">
-        {#if busy !== undefined}
-          <span class="busy-word"
-            >{busy === "opening"
-              ? "Opening…"
-              : busy === "closing"
-                ? "Closing…"
-                : busy === "moving"
-                  ? "Moving…"
-                  : "Removing…"}</span
-          >
-        {:else}
-          {#if w.state !== "queued" && !w.closing}
-            <button
-              class="act primary"
-              aria-haspopup={w.state === "closed" && jobs.length > 0 ? "menu" : undefined}
-              onclick={(e) => openClicked(e, w)}
+      {#if !stopping}
+        <span class="acts">
+          {#if busy !== undefined}
+            <span class="busy-word"
+              >{busy === "opening"
+                ? "Opening…"
+                : busy === "closing"
+                  ? "Closing…"
+                  : busy === "moving"
+                    ? "Moving…"
+                    : "Removing…"}</span
             >
-              Open{#if w.state === "closed" && jobs.length > 0}
-                <svg class="chev-down" viewBox="0 0 16 16" width="9" height="9" aria-hidden="true">
-                  <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-              {/if}
-            </button>
+          {:else}
+            {#if w.state !== "queued" && !w.closing}
+              <button
+                class="act primary"
+                aria-haspopup={w.state === "closed" && jobs.length > 0 ? "menu" : undefined}
+                onclick={(e) => openClicked(e, w)}
+              >
+                Open{#if w.state === "closed" && jobs.length > 0}
+                  <svg class="chev-down" viewBox="0 0 16 16" width="9" height="9" aria-hidden="true">
+                    <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                {/if}
+              </button>
+            {/if}
+            <button
+              class="act icon"
+              aria-label="More for {w.name}"
+              aria-haspopup="menu"
+              title="More"
+              onclick={(e) => wsMenu(e, w)}>{@render dots()}</button
+            >
           {/if}
-          <button
-            class="act icon"
-            aria-label="More for {w.name}"
-            aria-haspopup="menu"
-            title="More"
-            onclick={(e) => wsMenu(e, w)}>{@render dots()}</button
-          >
-        {/if}
-      </span>
+        </span>
+      {/if}
     </div>
     {#if activity !== ""}
-      <div class="detail" class:warn={w.failed !== undefined} title={w.failed || undefined}>{activity}</div>
+      <div class="detail" class:warn={!stopping && w.failed !== undefined} title={!stopping ? w.failed || undefined : undefined}>{activity}</div>
     {/if}
-    {#if wsError[w.id] !== undefined}
+    {#if !stopping && wsError[w.id] !== undefined}
       <div class="detail row-err">{wsError[w.id]}</div>
     {/if}
   </div>
@@ -722,12 +683,13 @@
           {@render refreshButton()}
         </div>
         {#each jobs as j (j.id)}
-          {@const busy = jobBusy[j.id]}
+          {@const busy = jobBusy[j.id] ?? (isJobStopping(j) ? "stopping" : undefined)}
+          {@const stopping = isJobStopping(j)}
           {@const inside = wsIn(j)}
           {@const next = continuation(j)}
-          <div class="job" class:running={j.state === "running"}>
+          <div class="job" class:running={j.state === "running" && !stopping}>
             <div class="job-head">
-              <span class="dot {jobDot(j)}" title={j.state}></span>
+              <span class="dot {jobDot(j)}" title={stopping ? "stopping" : j.state}></span>
               <span class="job-name" title={j.slurm_job_id ? `Slurm job ${j.slurm_job_id}` : j.name}>{j.name}</span>
               <span class="acts">
                 {#if busy === "stopping"}
@@ -748,21 +710,18 @@
                   {/if}
                   <button
                     class="act"
-                    onclick={() => {
-                      confirmStopError = null;
-                      confirmStop = j;
-                    }}>Stop</button
+                    onclick={() => (confirmStop = j)}>Stop</button
                   >
                 {/if}
               </span>
             </div>
-            <div class="job-line">{jobStatusLine(j, clusterTime)}</div>
-            {#if j.replaces !== undefined}
+            <div class="job-line">{busy === "stopping" || busy === "cancelling" ? "Waiting for Slurm to finish…" : jobStatusLine(j, clusterTime)}</div>
+            {#if !stopping && j.replaces !== undefined}
               <div class="job-line note">
                 Continues {jobName(j.replaces)} — its workspaces move here when this one starts.
               </div>
             {/if}
-            {#if next !== undefined}
+            {#if !stopping && next !== undefined}
               <div class="job-line note">Continuing in a new job — waiting for a node.</div>
             {/if}
             {#if j.state === "running" && j.egress === false}
@@ -774,9 +733,9 @@
             {#if inside.length > 0 || j.state === "running"}
               <div class="job-ws">
                 {#each inside as w (w.id)}
-                  {@render wsRow(w)}
+                  {@render wsRow(w, stopping)}
                 {/each}
-                {#if j.state === "running"}
+                {#if j.state === "running" && busy === undefined}
                   <button class="open-here" onclick={(e) => openHereMenu(e, j)}>
                     <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
                       <path d="M8 3v10M3 8h10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
@@ -897,8 +856,7 @@
     body={stopBody(confirmStop)}
     confirmLabel="Stop job"
     danger
-    error={confirmStopError}
-    onConfirm={() => void confirmStopNow()}
+    onConfirm={confirmStopNow}
     onCancel={() => (confirmStop = null)}
   />
 {/if}
@@ -925,29 +883,6 @@
     error={confirmRemoveError}
     onConfirm={() => void removeNow()}
     onCancel={() => (confirmRemove = null)}
-  />
-{/if}
-
-{#if confirmNotCluster}
-  <ConfirmDialog
-    title={`Treat ${alias} as a regular server?`}
-    body={`Its login shell reaches Slurm, so it looked like a cluster. As a regular server, Chimaera runs on ${alias} itself, like on any remote, and this page goes away. If it is a cluster's login node, leave it as it is: many clusters don't allow that. You can switch back from its row on Home.`}
-    confirmLabel="Treat as a server"
-    error={notClusterError}
-    onConfirm={() => void markNotCluster()}
-    onCancel={() => (confirmNotCluster = false)}
-  />
-{/if}
-
-{#if confirmLoginServe}
-  <ConfirmDialog
-    title="Run Chimaera on the login node?"
-    body="Chimaera and its agents would keep running on a shared login node after you disconnect. Many clusters don't allow that. Turn this on only if your cluster's admins say it's fine."
-    confirmLabel="Turn on anyway"
-    danger
-    error={loginServeError}
-    onConfirm={() => void setLoginServe(true)}
-    onCancel={() => (confirmLoginServe = false)}
   />
 {/if}
 

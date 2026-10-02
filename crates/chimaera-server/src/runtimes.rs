@@ -17,7 +17,8 @@
 //! entrypoint needs its siblings, so the whole tree lands around its `bin/`
 //! — and it is the TREE, not just the exec'd inode, that a running session
 //! still needs (it spawns its code-mode host and bundled rg/zsh by path).
-//! That is why an update never reclaims the version dir it replaced.
+//! Cleanup keeps the activated package and defers while sessions hold shared
+//! usage locks; older workspace daemons also prevent reclamation until closed.
 //!
 //! Artifact sources, each verified against the real endpoint on 2026-07-06:
 //! - claude: `https://downloads.claude.ai/claude-code-releases` — the exact
@@ -103,6 +104,29 @@ use crate::AppState;
 /// shell misses.
 pub(crate) fn managed_bin_dir(managed_root: &Path) -> PathBuf {
     managed_root.join("bin")
+}
+
+/// Prefer the shared install; retain access to an older workspace-only copy
+/// until the user installs/updates the shared one. Never move a running package.
+pub(crate) fn managed_bin_for(state: &AppState, bin: &str) -> PathBuf {
+    let shared = managed_bin_dir(&state.managed_root);
+    if managed_fallback(bin, &shared).is_none() {
+        if let Some(legacy) = &state.legacy_managed_root {
+            let legacy = managed_bin_dir(legacy);
+            if managed_fallback(bin, &legacy).is_some() {
+                return legacy;
+            }
+        }
+    }
+    shared
+}
+
+pub(crate) fn owns_binary(state: &AppState, path: &Path) -> bool {
+    is_managed(path, &state.managed_root)
+        || state
+            .legacy_managed_root
+            .as_ref()
+            .is_some_and(|root| is_managed(path, root))
 }
 
 /// Whether a resolved binary lives under the managed prefix (the
@@ -408,7 +432,7 @@ pub(crate) async fn install_agent(
         )
             .into_response();
     };
-    match start_install(&state, kind, &workspace, "install", script) {
+    match start_install(&state, kind, &workspace, "install", script).await {
         Ok(session_id) => Json(json!({"session_id": session_id})).into_response(),
         Err(response) => *response,
     }
@@ -497,7 +521,7 @@ pub(crate) async fn update_agent(
             managed_path,
         )),
     );
-    match start_install(&state, kind, &workspace, "update", script) {
+    match start_install(&state, kind, &workspace, "update", script).await {
         Ok(session_id) => Json(json!({"session_id": session_id})).into_response(),
         Err(response) => *response,
     }
@@ -509,7 +533,7 @@ pub(crate) async fn update_agent(
 /// bulky next to the id). Factored from the handlers so tests can drive the
 /// session mechanics with a stub script instead of the real (network-bound)
 /// curated one.
-pub(crate) fn start_install(
+pub(crate) async fn start_install(
     state: &Arc<AppState>,
     kind: AgentKind,
     workspace: &crate::workspaces::Workspace,
@@ -545,6 +569,19 @@ pub(crate) fn start_install(
         installs.insert(kind, (session_id.clone(), std::time::Instant::now()));
     }
 
+    let install_lock = match lock_install(&state.managed_root, kind).await {
+        Ok(lock) => lock,
+        Err(response) => {
+            let mut installs = crate::lock(&state.installs);
+            if installs.get(&kind).map(|(sid, _)| sid.as_str()) == Some(session_id.as_str()) {
+                installs.remove(&kind);
+            }
+            return Err(response);
+        }
+    };
+
+    prune_install_versions(state.managed_root.clone(), kind).await;
+
     // Installer sessions run a chimaera-authored script — never a user
     // prelude (None), and inherited prelude vars are scrubbed like
     // everywhere else.
@@ -565,7 +602,7 @@ pub(crate) fn start_install(
     match state.sessions.spawn(opts) {
         Ok(info) => {
             crate::lock(&state.session_workspaces).insert(info.id.clone(), workspace.id.clone());
-            spawn_install_watch(state.clone(), kind, info.id.clone());
+            spawn_install_watch(state.clone(), kind, info.id.clone(), install_lock);
             state.changes.notify_waiters();
             Ok(info.id)
         }
@@ -589,6 +626,64 @@ pub(crate) fn start_install(
     }
 }
 
+async fn prune_install_versions(root: PathBuf, kind: AgentKind) {
+    // Cleanup is best-effort; a read-only/stale manifest must not turn a
+    // working install into a failure. The caller retains the install lock.
+    match tokio::task::spawn_blocking(move || crate::runtime_retention::prune_locked(&root, kind))
+        .await
+    {
+        Ok(Ok(())) => {}
+        error => tracing::warn!(?error, "agent package cleanup deferred"),
+    }
+}
+
+/// All workspace daemons share this advisory lock. The descriptor stays alive
+/// until the installer exits; process death releases it without a stale lockdir.
+async fn lock_install(root: &Path, kind: AgentKind) -> Result<std::fs::File, Box<Response>> {
+    let lock_root = root.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+        std::fs::create_dir_all(&lock_root)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_root.join(format!(".{}.lock", kind.as_str())))?;
+        file.try_lock().map_err(std::io::Error::from)?;
+        Ok(file)
+    })
+    .await;
+    match result {
+        Ok(Ok(file)) => Ok(file),
+        Ok(Err(error)) => Err(install_lock_error(root, kind, error)),
+        Err(error) => Err(Box::new((StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Could not prepare the {} installation: {error}. Try again.", kind.product_name())})),
+        ).into_response())),
+    }
+}
+
+fn install_lock_error(root: &Path, kind: AgentKind, error: std::io::Error) -> Box<Response> {
+    use std::io::ErrorKind;
+    let (status, message) = match error.kind() {
+        ErrorKind::WouldBlock => (
+            StatusCode::CONFLICT,
+            format!("{} is being installed or changed in another workspace. Try again when it finishes.", kind.product_name()),
+        ),
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => (
+            StatusCode::INSUFFICIENT_STORAGE,
+            format!("Not enough storage to change the {} installation at {}. Free space or check your storage quota on this host, then try again.", kind.product_name(), root.display()),
+        ),
+        ErrorKind::PermissionDenied => (
+            StatusCode::FORBIDDEN,
+            format!("Chimaera cannot write to {}. Check this folder's permissions, then try again.", root.display()),
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not prepare the {} installation at {}: {error}", kind.product_name(), root.display()),
+        ),
+    };
+    Box::new((status, Json(json!({"error": message}))).into_response())
+}
+
 #[derive(Clone, serde::Serialize)]
 pub(crate) struct InstallResult {
     session_id: String,
@@ -609,7 +704,12 @@ pub(crate) fn installation_status(state: &AppState, kind: AgentKind) -> Option<s
 /// Watch an install session; when it ends, re-detect that agent (bypassing
 /// the daemon-lifetime cache) and regenerate the shims so the next spawn —
 /// and the open popover, via the change notification — sees the new binary.
-fn spawn_install_watch(state: Arc<AppState>, kind: AgentKind, session_id: String) {
+fn spawn_install_watch(
+    state: Arc<AppState>,
+    kind: AgentKind,
+    session_id: String,
+    install_lock: std::fs::File,
+) {
     tokio::spawn(async move {
         while state.sessions.get(&session_id).is_some() {
             tokio::time::sleep(crate::agents::poll_interval()).await;
@@ -618,6 +718,10 @@ fn spawn_install_watch(state: Arc<AppState>, kind: AgentKind, session_id: String
             .sessions
             .last_words(&session_id)
             .and_then(|w| w.info.exit_status);
+        if exit_status == Some(0) {
+            prune_install_versions(state.managed_root.clone(), kind).await;
+        }
+        drop(install_lock);
         let detection = crate::launcher::detect(&state, kind, true).await;
         tracing::info!(
             agent = kind.as_str(),
@@ -692,37 +796,52 @@ pub(crate) async fn uninstall_agent(
             }
         }
     }
-    let managed_bin = managed_bin_dir(&state.managed_root);
-    if managed_fallback(kind.as_str(), &managed_bin).is_none() {
-        // Nothing of ours to remove (a user's own install is not ours to touch).
-        return Json(json!({"removed": false})).into_response();
-    }
-    // Drop the active symlink first (so nothing resolves a half-deleted tree),
-    // then the version tree.
-    let link = managed_bin.join(kind.as_str());
-    let tree = state.managed_root.join(kind.as_str());
-    if kind == AgentKind::Antigravity {
-        if let Err(err) = remove_if_exists(&managed_bin.join("agy-acp")) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error":err.to_string()})),
-            )
-                .into_response();
+    let mut roots = vec![state.managed_root.clone()];
+    if let Some(legacy) = &state.legacy_managed_root {
+        if legacy.join("bin").exists() {
+            roots.push(legacy.clone());
         }
     }
-    if let Err(err) = remove_if_exists(&link).and_then(|()| remove_dir_if_exists(&tree)) {
-        tracing::error!(%err, agent = kind.as_str(), "failed to uninstall managed agent");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": err.to_string()})),
-        )
-            .into_response();
+    let mut locks = Vec::new();
+    for root in &roots {
+        match lock_install(root, kind).await {
+            Ok(lock) => locks.push(lock),
+            Err(response) => return *response,
+        }
     }
+    let removed = match tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        let _locks = locks;
+        let mut removed = false;
+        for root in roots {
+            let bin = managed_bin_dir(&root);
+            if managed_fallback(kind.as_str(), &bin).is_none() {
+                continue;
+            }
+            remove_if_exists(&bin.join(kind.as_str()))?;
+            if kind == AgentKind::Antigravity {
+                remove_if_exists(&bin.join("agy-acp"))?;
+            }
+            remove_dir_if_exists(&root.join(kind.as_str()))?;
+            removed = true;
+        }
+        Ok(removed)
+    })
+    .await
+    {
+        Ok(Ok(removed)) => removed,
+        error => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("failed to uninstall managed agent: {error:?}")})),
+            )
+                .into_response()
+        }
+    };
     // The shim for it now disappears (unless an explicit path keeps it), and the
     // detection cache must forget the managed binary.
     regenerate_shims(&state);
     state.changes.notify_waiters();
-    Json(json!({"removed": true})).into_response()
+    Json(json!({"removed": removed})).into_response()
 }
 
 // --- theming shims ------------------------------------------------------------
@@ -858,9 +977,9 @@ pub(crate) fn explicit_agent_paths(state: &AppState) -> HashMap<AgentKind, Strin
 /// settings edit to `agents.*.path`.
 pub(crate) fn regenerate_shims(state: &AppState) {
     let explicit = explicit_agent_paths(state);
-    if let Err(err) = write_shims(
+    if let Err(err) = write_shims_for(
         &state.shims_dir,
-        &managed_bin_dir(&state.managed_root),
+        |kind| managed_bin_for(state, kind.as_str()),
         &explicit,
     ) {
         tracing::warn!(%err, "failed to regenerate shims");
@@ -880,9 +999,18 @@ pub(crate) fn regenerate_shims(state: &AppState) {
 /// `agents.<kind>.path`. Otherwise the shim is REMOVED (or never created), so
 /// typing `<bin>` resolves through the user's own PATH exactly like a plain
 /// terminal — chimaera never shadows an install it doesn't own and then fails.
+#[cfg(test)]
 pub(crate) fn write_shims(
     shim_dir: &Path,
     managed_bin: &Path,
+    explicit: &HashMap<AgentKind, String>,
+) -> anyhow::Result<()> {
+    write_shims_for(shim_dir, |_| managed_bin.to_path_buf(), explicit)
+}
+
+fn write_shims_for(
+    shim_dir: &Path,
+    managed_bin: impl Fn(AgentKind) -> PathBuf,
     explicit: &HashMap<AgentKind, String>,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(shim_dir)
@@ -900,11 +1028,12 @@ pub(crate) fn write_shims(
     for kind in AgentKind::ALL {
         let path = shim_dir.join(kind.as_str());
         let explicit_path = explicit.get(&kind).map(String::as_str);
-        let managed = managed_fallback(kind.as_str(), managed_bin).is_some();
+        let managed_bin = managed_bin(kind);
+        let managed = managed_fallback(kind.as_str(), &managed_bin).is_some();
         if explicit_path.is_some() || managed {
             write_atomic(
                 &path,
-                shim_script(kind, shim_dir, managed_bin, explicit_path).as_bytes(),
+                shim_script(kind, shim_dir, &managed_bin, explicit_path).as_bytes(),
                 0o755,
             )?;
         } else {
@@ -1055,6 +1184,79 @@ exec "$real" "$@"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cluster_workspaces_share_installs_and_retain_legacy_fallbacks() {
+        let dir = test_dir("shared-installs");
+        let shared = dir.join("agents");
+        let make_state = |name: &str| {
+            let data = dir.join(name);
+            let mut state = AppState::new(
+                "token".into(),
+                "host".into(),
+                1,
+                0,
+                data.clone(),
+                dir.join("config"),
+            );
+            state.legacy_managed_root = Some(data.join("agents"));
+            state.managed_root = shared.clone();
+            state
+        };
+        let first = make_state("workspace-a");
+        let second = make_state("workspace-b");
+        let legacy = first.legacy_managed_root.as_ref().unwrap().join("bin");
+        std::fs::create_dir_all(&legacy).unwrap();
+        write_exec(&legacy.join("codex"), "#!/bin/sh\n");
+        assert_eq!(managed_bin_for(&first, "codex"), legacy);
+        assert_eq!(managed_bin_for(&second, "codex"), shared.join("bin"));
+        std::fs::create_dir_all(shared.join("bin")).unwrap();
+        write_exec(&shared.join("bin/codex"), "#!/bin/sh\n");
+        assert_eq!(
+            managed_bin_for(&first, "codex"),
+            managed_bin_for(&second, "codex")
+        );
+        assert!(owns_binary(&first, &legacy.join("codex")));
+        assert!(!owns_binary(&first, &dir.join("personal/codex")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_install_lock_excludes_other_workspace_daemons_and_releases() {
+        let dir = test_dir("install-lock");
+        let first = lock_install(&dir, AgentKind::Codex).await.unwrap();
+        let second = lock_install(&dir, AgentKind::Codex).await.unwrap_err();
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        let other = lock_install(&dir, AgentKind::Claude).await.unwrap();
+        drop(first);
+        let next = lock_install(&dir, AgentKind::Codex).await.unwrap();
+        drop((other, next));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn install_storage_errors_explain_the_location_and_recovery() {
+        for error in [
+            std::io::ErrorKind::StorageFull,
+            std::io::ErrorKind::QuotaExceeded,
+        ] {
+            let response = install_lock_error(
+                Path::new("/home/user/.chimaera/agents"),
+                AgentKind::Antigravity,
+                error.into(),
+            );
+            assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let message = body["error"].as_str().unwrap();
+            assert!(message.contains("/home/user/.chimaera/agents"));
+            assert!(message.contains("storage quota"));
+            assert!(message.contains("try again"));
+            assert!(!message.contains("Ok(Err"));
+        }
+    }
 
     fn test_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

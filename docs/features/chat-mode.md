@@ -19,6 +19,22 @@ and the TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branc
 [rules/agent-protocol.md](../../.claude/rules/agent-protocol.md); working skill:
 [chat-mode](../../.claude/skills/chat-mode/SKILL.md).
 
+## Model selection after provider errors
+
+The model menu shows the agent's catalog descriptions beneath each name and marks one
+active choice using the same alias/resolved-id matching as the header. The menu scrolls
+within the window; pointer selection keeps popup focus through the click so WebKit
+does not dismiss the option before it runs. Claude's
+`<synthetic>` error-message model is never a real selection: quota errors retain the
+last known model, and the user can select another model. Observed serving-model changes
+are distinct from explicit selections, so they do not replace the user's next-chat
+preference. Old synthetic values are filtered from journal replay, saved preferences,
+and resume settings. An unrelated model observation does not clear a pending pick.
+
+Implementation: `claude.rs`, `journal.rs`, `chat.rs::resolve_start_settings`, and
+`web-ui/src/lib/chat/{modelPicker.ts,ChatHeader.svelte,store.svelte.ts}` and
+`web-ui/src/lib/shared/toolbarPopover.ts`.
+
 ## Agents and available controls
 
 Claude Code, Codex, Antigravity (Gemini models), and Grok Build share the transcript,
@@ -678,10 +694,10 @@ verified. See [integration design](../agent-guides/agent-integrations.md) for th
   provider-specific capability limits.
 - **Startup watchdog** (`driver.rs`, `chat.rs`): all providers have 60 seconds for login-shell
   setup, workspace startup hooks, MCP discovery and protocol initialization. Once initialized,
-  leaving a chat idle does not expire it. An unused failed launch closes without switching to a
-  terminal or raising an attention notification. A submitted prompt, existing journal, resumed
-  conversation or portable branch keeps the failed chat visible with its diagnostic and recovery
-  recipe. Switching to a terminal is always a deliberate action.
+  leaving a chat idle does not expire it. Failed launches stay visible with their diagnostic and
+  recovery recipe, even before the first prompt. Missing Linux library versions get a plain-language
+  explanation alongside expandable startup details; reinstalling the same incompatible package
+  cannot repair the host's libraries. Switching to a terminal is always a deliberate action.
 - **Before the first prompt:** the model chip uses the configured launch model when known,
   otherwise a neutral startup placeholder / “agent default”; catalog order never selects it.
   Model picks show “applying…” until the provider acknowledges them. Failure clears the pending

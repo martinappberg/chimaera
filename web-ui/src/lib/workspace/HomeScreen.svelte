@@ -1,4 +1,5 @@
 <script lang="ts">
+  import RemoteSettingsDialog from "./RemoteSettingsDialog.svelte";
   import { onMount } from "svelte";
   import HomeNavigation from "./HomeNavigation.svelte";
   import HomeActions from "./HomeActions.svelte";
@@ -29,8 +30,8 @@
     proOpenCloudProject,
     remoteWorkspaces,
     removeHost,
-    setNotCluster,
     setHostDirectSsh,
+    clusterSetLoginServe,
     shutdownHost,
     updateLocalDaemon,
     type ConnectProgress,
@@ -160,6 +161,7 @@
   let addOpen = $state(false);
   let addAlias = $state("");
   let addError = $state<string | null>(null);
+  let remoteSettings = $state<{ alias: string; firstSetup: boolean } | null>(null);
   let confirmForget = $state<string | null>(null);
   /** Host pending a "end all sessions" / "shut down" confirm (alias). */
   let confirmEnd = $state<string | null>(null);
@@ -449,7 +451,7 @@
     }
   }
 
-  async function connect(alias: string, updateDaemon = false): Promise<void> {
+  async function connect(alias: string, updateDaemon = false, reportFailure = false): Promise<void> {
     hostErrors = mapWithout(hostErrors, alias);
     hosts = hosts.map((h) => (h.alias === alias ? { ...h, status: "connecting" } : h));
     if (updateDaemon) phases = new Map(phases).set(alias, PHASE_LABEL.updating);
@@ -459,7 +461,8 @@
       if (state.status === "cluster") {
         // No tunnel, no daemon on the login node: the cluster page opens in
         // place, right here in the local home.
-        showCluster(alias);
+        if (state.cluster_setup_complete === false) remoteSettings = { alias, firstSetup: true };
+        else showCluster(alias);
         return;
       }
       // Host browsing is navigation inside the singleton Home hub. A workspace
@@ -469,6 +472,7 @@
     } catch (e) {
       hostErrors = new Map(hostErrors).set(alias, e instanceof Error ? e.message : String(e));
       void refreshHosts();
+      if (reportFailure) throw e;
     } finally {
       phases = mapWithout(phases, alias);
     }
@@ -515,18 +519,24 @@
     void refreshHosts();
   }
 
-  /** A host the user said isn't a cluster is one after all: drop its tunnel
-   *  (a daemon on it keeps running, as on any disconnect), then connect,
-   *  which lands on its cluster page. */
-  async function backToCluster(alias: string): Promise<void> {
+  async function saveRemoteSettings(alias: string, hpc: boolean): Promise<void> {
+    const state = await clusterSetLoginServe(alias, !hpc);
+    await disconnectHost(alias);
+    remoteWs = mapWithout(remoteWs, alias);
+    hosts = hosts.map((h) => h.alias === alias ? state : h);
+    clusterView = null;
+    await connect(alias, false, true);
+  }
+
+  async function repairRemote(alias: string): Promise<void> {
     hostErrors = mapWithout(hostErrors, alias);
     try {
-      if (hosts.find((h) => h.alias === alias)?.status === "connected") await disconnectHost(alias);
-      const state = await setNotCluster(alias, false);
-      hosts = hosts.map((h) => (h.alias === alias ? state : h));
-      await connect(alias);
-    } catch (e) {
-      hostErrors = new Map(hostErrors).set(alias, e instanceof Error ? e.message : String(e));
+      const state = await connectHost(alias, true);
+      hosts = hosts.map((h) => h.alias === alias ? state : h);
+      if (state.outdated) throw new Error("The previous Chimaera process is still running. Close its sessions and try repairing again.");
+      remoteWs = mapWithout(remoteWs, alias);
+    } finally {
+      phases = mapWithout(phases, alias);
     }
   }
 
@@ -773,17 +783,8 @@
         const own = workspaces.find((w) => w.id === clusterWs);
         if (own !== undefined) onOpen(own);
       }}
-      onHostState={(state) => {
-        hosts = hosts.map((h) => (h.alias === state.alias ? state : h));
-      }}
       onHostsChanged={() => void refreshHosts()}
-      onNotCluster={clusterWs === null
-        ? (state) => {
-            hosts = hosts.map((h) => (h.alias === state.alias ? state : h));
-            clusterView = null;
-            void connect(state.alias);
-          }
-        : undefined}
+      onConnectionSettings={clusterWs === null ? () => (remoteSettings = { alias, firstSetup: false }) : undefined}
     />
     {/if}
     </div>
@@ -1020,7 +1021,7 @@
             <p class="hint">
               No remotes yet. Add a server's or a cluster's ssh alias — chimaera installs itself in
               <code>~/.chimaera{localState?.dev_build ? "-dev" : ""}</code> over ssh, no root needed. On a
-              cluster it runs only inside your jobs, never on the login node.
+              cluster, choose scheduled jobs or run directly on the login node.
             </p>
           {:else}
             <div class="rows">
@@ -1105,14 +1106,11 @@
                         <span class="when">{ago(h.last_connected_at)}</span>
                       {/if}
                     </button>
-                    {#if h.direct_ssh !== undefined && ($paidPlan !== null || h.direct_ssh === true)}
-                      <HomeActions label={`Actions for ${h.alias}`}>
-                        <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}>Forget machine</button>
-                        {@render directPreference(h)}
-                      </HomeActions>
-                    {:else}
-                      <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}>&times;</button>
-                    {/if}
+                    <HomeActions label={`Actions for ${h.alias}`}>
+                      <button class="side" disabled={h.status === "connecting"} onclick={() => (remoteSettings = { alias: h.alias, firstSetup: false })}>Connection settings</button>
+                      <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}>Forget machine</button>
+                      {@render directPreference(h)}
+                    </HomeActions>
                   </div>
                   {#if err !== undefined}
                     <div class="err-line">{err}</div>
@@ -1149,7 +1147,7 @@
                             : "not connected"}
                       ></span>
                       <span class="workspace-label">
-                        <span class="host-name"><span class="name">{h.alias}</span>{#if h.via_pro}<span class="via-pro" title="Connected through Chimaera Pro">via Pro</span>{/if}{#if cluster}<span class="pill-sched">{schedulerLabel(h.cluster?.scheduler)}</span><span class="pill-dev" title="chimaera runs on {h.alias}'s login node (turned on in the cluster page's … menu)">login node</span>{/if}{#if localState?.dev_build}<span
+                        <span class="host-name"><span class="name">{h.alias}</span>{#if h.via_pro}<span class="via-pro" title="Connected through Chimaera Pro">via Pro</span>{/if}{#if cluster}<span class="pill-sched">{schedulerLabel(h.cluster?.scheduler)}</span><span class="pill-dev" title="chimaera runs on {h.alias}'s login node (scheduled jobs are off in connection settings)">login node</span>{/if}{#if localState?.dev_build}<span
                           class="pill-dev"
                           title="dev build — every connection targets this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
                           >dev</span
@@ -1191,13 +1189,7 @@
                       <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}
                         >Forget machine</button
                       >
-                      {#if h.not_cluster}
-                        <button
-                          class="side"
-                          title="you said {h.alias} isn't a cluster — treat it as one again (Chimaera then runs only inside jobs there)"
-                          onclick={() => void backToCluster(h.alias)}>it's a cluster</button
-                        >
-                      {/if}
+                      <button class="side" disabled={h.status === "connecting"} onclick={() => (remoteSettings = { alias: h.alias, firstSetup: false })}>Connection settings</button>
                       {@render directPreference(h)}
                     </HomeActions>
                   </div>
@@ -1252,6 +1244,16 @@
   {/if}
 
 </div>
+
+{#if remoteSettings !== null}
+  {@const host = hosts.find((h) => h.alias === remoteSettings?.alias)}
+  {#if host}
+    {#key remoteSettings.alias}
+      <RemoteSettingsDialog {host} firstSetup={remoteSettings.firstSetup} phase={phases.get(host.alias) ?? null}
+        onSave={(hpc) => saveRemoteSettings(host.alias, hpc)} onRepair={() => repairRemote(host.alias)} onClose={() => (remoteSettings = null)} />
+    {/key}
+  {/if}
+{/if}
 
 <style>
   .host-advanced { max-width: 320px; padding: 8px 10px; color: var(--fg); font-size: var(--text-sm); }

@@ -81,9 +81,12 @@ pub struct HostEntry {
     /// the safe direction.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub login_serve: bool,
-    /// The user said this host is not a cluster, though its login shell
-    /// reaches a batch scheduler (a workstation with Slurm's tools): it
-    /// connects like any remote, and nothing cluster-shaped is shown.
+    /// The initial HPC setup has been reviewed. Older entries default to
+    /// the safe cluster behavior until the user saves their choice.
+    #[serde(default)]
+    pub cluster_setup_complete: bool,
+    /// Legacy direct-host choice, migrated to `login_serve` on load so
+    /// scheduler detection remains available independently of placement.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub not_cluster: bool,
     /// The scheduler the last connect found on the host — a display hint for
@@ -134,6 +137,13 @@ impl HostsStore {
             }
         };
         for entry in &mut items {
+            // The former two overrides are one connection choice now. Keep
+            // the user's direct-host choice without suppressing scheduler facts.
+            if entry.not_cluster || entry.login_serve {
+                entry.login_serve = true;
+                entry.not_cluster = false;
+                entry.cluster_setup_complete = true;
+            }
             if let Ok(normalized) = normalize_alias(&entry.alias) {
                 entry.alias = normalized;
             }
@@ -190,6 +200,7 @@ impl HostsStore {
             kept: false,
             direct_ssh: false,
             login_serve: false,
+            cluster_setup_complete: false,
             not_cluster: false,
             scheduler: None,
         };
@@ -255,6 +266,7 @@ impl HostsStore {
                     kept: false,
                     direct_ssh: false,
                     login_serve: false,
+                    cluster_setup_complete: false,
                     not_cluster: false,
                     scheduler: None,
                 };
@@ -279,31 +291,19 @@ impl HostsStore {
             .find(|h| h.alias == *alias)
             .expect("just added");
         entry.login_serve = on;
+        entry.not_cluster = false;
+        entry.cluster_setup_complete = true;
         let entry = entry.clone();
         self.save()?;
         Ok(entry)
     }
 
     /// Say `alias` is (`on`) or isn't a cluster after all (adding the host if
-    /// unknown); "not a cluster" replaces the login-node override, which it
-    /// makes moot. Returns the updated entry.
+    /// unknown). Kept for older clients; maps to the direct-host choice.
     pub fn set_not_cluster(&mut self, alias: &str, on: bool) -> anyhow::Result<HostEntry> {
-        let alias = &normalize_alias(alias)?;
-        if !self.items.iter().any(|h| h.alias == *alias) {
-            self.add(alias, None)?;
-        }
-        let entry = self
-            .items
-            .iter_mut()
-            .find(|h| h.alias == *alias)
-            .expect("just added");
-        entry.not_cluster = on;
-        if on {
-            entry.login_serve = false;
-        }
-        let entry = entry.clone();
-        self.save()?;
-        Ok(entry)
+        // Compatibility for older clients: direct-host mode still records
+        // the detected scheduler and keeps shared-host advice available.
+        self.set_login_serve(alias, on)
     }
 
     /// Remember which scheduler the last connect found (a display hint).
@@ -435,8 +435,31 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The login-node override is off unless set, survives a reload, and an
-    /// entry without the field (an older build's rewrite) reads as off.
+    #[test]
+    fn cluster_setup_is_saved_and_legacy_overrides_keep_the_detected_scheduler() {
+        let (mut store, dir) = tmp_store("cluster-setup");
+        assert!(!store.add("cluster", None).unwrap().cluster_setup_complete);
+        assert!(
+            store
+                .set_login_serve("cluster", false)
+                .unwrap()
+                .cluster_setup_complete
+        );
+        let saved = HostsStore::load(dir.join("hosts.json"))
+            .get("cluster")
+            .unwrap();
+        assert!(saved.cluster_setup_complete && !saved.login_serve);
+        std::fs::write(
+            dir.join("hosts.json"),
+            r#"[{"alias":"old","added_at":1,"not_cluster":true,"scheduler":"slurm"}]"#,
+        )
+        .unwrap();
+        let old = HostsStore::load(dir.join("hosts.json")).get("old").unwrap();
+        assert!(old.cluster_setup_complete && old.login_serve && !old.not_cluster);
+        assert_eq!(old.scheduler, Some(chimaera_core::slurm::Scheduler::Slurm));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn login_serve_is_opt_in_and_persists() {
         let (mut store, dir) = tmp_store("login-serve");
@@ -461,16 +484,15 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// "Not a cluster" persists, clears the login-node override, and turns
-    /// back off.
+    /// Older clients can still toggle placement without hiding the scheduler.
     #[test]
-    fn not_cluster_persists_and_replaces_the_override() {
+    fn legacy_not_cluster_action_uses_direct_mode_and_preserves_awareness() {
         let (mut store, dir) = tmp_store("not-cluster");
         store.set_login_serve("box", true).unwrap();
         let e = store.set_not_cluster("box", true).unwrap();
-        assert!(e.not_cluster && !e.login_serve);
+        assert!(!e.not_cluster && e.login_serve && e.cluster_setup_complete);
         let reloaded = HostsStore::load(dir.join("hosts.json"));
-        assert!(reloaded.get("box").unwrap().not_cluster);
+        assert!(reloaded.get("box").unwrap().login_serve);
         assert!(!store.set_not_cluster("box", false).unwrap().not_cluster);
         std::fs::remove_dir_all(&dir).ok();
     }

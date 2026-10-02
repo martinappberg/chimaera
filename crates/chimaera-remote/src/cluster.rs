@@ -229,6 +229,9 @@ pub struct JobView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at_ms: Option<u64>,
     pub stopped_by_user: bool,
+    /// Cancellation was accepted, or Slurm is completing the allocation.
+    /// Additive to `state` so older clients can still decode the overview.
+    pub stopping: bool,
     /// The job's node reaches the internet (agents can work), when probed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub egress: Option<bool>,
@@ -611,6 +614,7 @@ fn build(
             if let Some(m) = state.manifests.get(&ws.id) {
                 if let Some(job) = jobs.iter().find(|j| {
                     j.state == "running"
+                        && !j.stopping
                         && j.slurm_job_id.is_some()
                         && j.slurm_job_id == m.slurm_job_id
                         && held_in(&j.id) != Some(HostedState::Failed)
@@ -690,6 +694,7 @@ fn job_view(
         gpus: record.spec.gpus,
         attached: record.attached,
         stopped_by_user: record.stopped_by_user,
+        stopping: record.stopped_by_user,
         egress,
         open: record.open.clone(),
         replaces: record.replaces.clone(),
@@ -721,6 +726,12 @@ fn job_view(
             v.mem = job.mem.clone();
             v.ends_at_ms =
                 parse_duration(&job.time_left).map(|left| now_ms + left.as_millis() as u64);
+            v.stopping |= job.state.starts_with("COMPLETING");
+            if v.stopping {
+                v.state = "running";
+                v.node = job.nodes.clone();
+                return (v, None);
+            }
             if job.state.starts_with("PENDING") || job.state.starts_with("CONFIGURING") {
                 v.state = "waiting";
                 v.ends_at_ms = None;
@@ -765,6 +776,10 @@ fn job_view(
             // stand: a job-host record means it ran.
             let young = now_ms.saturating_sub(record.submitted_ms) < SUBMIT_GRACE_MS;
             if record.ended.is_none() && !queue_known {
+                if record.stopped_by_user {
+                    v.state = "running";
+                    return (v, None);
+                }
                 if let Some(h) = host {
                     v.state = "running";
                     v.node = h.node.clone();
@@ -775,7 +790,7 @@ fn job_view(
                 v.state = "waiting";
                 return (v, None);
             }
-            if record.ended.is_none() && young {
+            if record.ended.is_none() && young && !record.stopped_by_user {
                 v.state = "waiting";
                 return (v, None);
             }
@@ -2403,7 +2418,11 @@ pub fn endpoint_from(status: &JobHostStatus, jid: &str, wid: &str) -> Option<End
 /// list isn't open there, whatever the folder still says (startup opens are
 /// listed before it answers at all).
 pub fn apply_hosting(ov: &mut ClusterOverview, jid: &str, status: &JobHostStatus) {
-    if !ov.jobs.iter().any(|j| j.id == jid && j.state == "running") {
+    if !ov
+        .jobs
+        .iter()
+        .any(|j| j.id == jid && j.state == "running" && !j.stopping)
+    {
         return;
     }
     let endpoints = &mut ov.endpoints;
@@ -2565,6 +2584,7 @@ mod tests {
             started_at: 0,
             build: None,
             slurm_job_id: Some(slurm.into()),
+            runtime_leases: false,
         }
     }
 
@@ -2617,6 +2637,26 @@ mod tests {
             (e.port, e.token.as_str(), e.slurm_job_id.as_str()),
             (41000, "host-token", "77")
         );
+    }
+
+    #[test]
+    fn stopping_jobs_never_become_starting_or_offer_an_endpoint() {
+        for state in ["RUNNING", "PENDING", "COMPLETING"] {
+            let mut record = record("j-0000aaaa", Some("77"), NOW - 10_000);
+            record.stopped_by_user = state != "COMPLETING";
+            let queue = [queue_row("77", state, "n042", "1:00:00", "None")];
+            for host in [None, Some(host("77"))] {
+                let (view, endpoint) = job_view(&record, host.as_ref(), None, &queue, true, NOW);
+                assert!(view.stopping);
+                assert_ne!(view.state, "starting");
+                assert!(endpoint.is_none());
+            }
+            record.stopped_by_user = true;
+            assert_eq!(
+                job_view(&record, None, None, &[], true, NOW).0.state,
+                "ended"
+            );
+        }
     }
 
     #[test]

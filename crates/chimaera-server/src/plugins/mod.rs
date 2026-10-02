@@ -1578,6 +1578,12 @@ pub(crate) async fn install_requirement(
     } else {
         "install"
     };
+    let (usage, mut binaries) =
+        match crate::runtime_retention::acquire(&state, Some(kind), vec![bin]).await {
+            Ok(lease) => lease,
+            Err(error) => return bad_request(error.to_string()),
+        };
+    let bin = binaries.remove(0);
     let agent = kind.as_str();
     let session_id = crate::agents::fresh_session_id();
     let prepare_state = state.clone();
@@ -1658,6 +1664,7 @@ pub(crate) async fn install_requirement(
     };
     match state.sessions.spawn(opts) {
         Ok(info) => {
+            crate::runtime_retention::watch(state.clone(), info.id.clone(), usage);
             crate::lock(&state.session_workspaces).insert(info.id.clone(), workspace.id.clone());
             // When the install ends, the agents' answers changed.
             let watch_state = state.clone();

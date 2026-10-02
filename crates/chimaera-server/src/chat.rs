@@ -14,10 +14,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -26,8 +26,8 @@ use chimaera_agent::journal::SeqEvent;
 use chimaera_agent::model::AgentEvent;
 use chimaera_agent::{ChatInfo, ChatManager};
 
-use crate::agent_state::{AgentKind, AgentState};
 use crate::AppState;
+use crate::agent_state::{AgentKind, AgentState};
 
 /// What the ChatManager hooks emit; consumed by the signal task.
 pub(crate) enum ChatSignal {
@@ -494,11 +494,6 @@ fn permission_line(title: &str, input: &serde_json::Value) -> String {
 /// "running" half an hour after its turn ended). Hook events that do arrive
 /// agree with these transitions, so order doesn't matter.
 fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
-    // An unused startup is about to close. Keep the journal diagnostic, but
-    // do not announce an attention state for a conversation that never began.
-    if matches!(ev, AgentEvent::Error { fatal: true, .. }) && unused_chat_startup(state, id) {
-        return;
-    }
     let mut agents = crate::lock(&state.agents);
     let Some(record) = agents.get_mut(id) else {
         return;
@@ -609,15 +604,6 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
     }
 }
 
-/// A failed new chat can close only before it owns any user work. Recipes
-/// protect resumes and portable branches even before their history is seeded.
-fn unused_chat_startup(state: &AppState, id: &str) -> bool {
-    state.chat.is_unused_startup(id)
-        && crate::lock(&state.chat_recipes)
-            .get(id)
-            .is_some_and(|recipe| recipe.resume.is_none() && recipe.portable_context.is_none())
-}
-
 /// Settle the driver's exit without changing the user's chosen surface.
 async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
     // A daemon stop ends every live driver on purpose (`stop_all_for_exit`,
@@ -675,22 +661,14 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
             stderr_tail,
         } => {
             tracing::warn!(%id, %reason, %stderr_tail, "chat handshake failed");
-            let unused = state.chat.is_unused_startup(id)
-                && recipe.as_ref().is_some_and(|recipe| {
-                    recipe.resume.is_none() && recipe.portable_context.is_none()
-                });
-            if unused {
-                state.chat.remove(id);
-                crate::recents::retire_unused_startup(state, id);
-            } else {
-                // A submitted prompt or existing conversation must stay
-                // reachable with its diagnostic. Recovery is a user choice.
-                if let Some(recipe) = recipe {
-                    crate::lock(&state.chat_recipes).insert(id.to_string(), recipe);
-                }
-                if let Some(record) = crate::lock(&state.agents).get_mut(id) {
-                    record.state = AgentState::Errored;
-                }
+            // Even an empty new chat must retain its startup diagnostic:
+            // missing libraries and sign-in failures otherwise vanish before
+            // a remote client can read them. Closing/retrying is a user action.
+            if let Some(recipe) = recipe {
+                crate::lock(&state.chat_recipes).insert(id.to_string(), recipe);
+            }
+            if let Some(record) = crate::lock(&state.agents).get_mut(id) {
+                record.state = AgentState::Errored;
             }
         }
 
@@ -765,6 +743,23 @@ async fn switch_to_pty(
     // appends) lives in `launcher` where it is unit-tested. Parity with the TUI
     // spawn path: carry the theme + model the app-server chat driver drops, so
     // a switch doesn't land an un-themed, default-model TUI.
+    let (usage, mut binaries) =
+        match crate::runtime_retention::acquire(state, Some(recipe.kind), vec![bin]).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::error!(%id, %error, "terminal switch could not protect agent package");
+                crate::recents::retire_with_resume(
+                    state,
+                    id,
+                    None,
+                    None,
+                    chimaera_agent::model::SessionUi::Chat,
+                    resume_hint,
+                );
+                return false;
+            }
+        };
+    let bin = binaries.remove(0);
     let codex_theme = (recipe.kind == AgentKind::Codex
         && !crate::runtimes::codex_user_theme_set(&state.codex_config_path))
     .then(|| crate::runtimes::codex_theme_name(&recipe.theme));
@@ -905,6 +900,7 @@ async fn switch_to_pty(
     drop(import_admission);
     match spawned {
         Ok(_) => {
+            crate::runtime_retention::watch(state.clone(), id.to_string(), usage);
             if !crate::pro::may_execute(state, &successor_recipe.workspace_id) {
                 let _ = state.sessions.fence(id);
                 return false;
@@ -2776,7 +2772,7 @@ pub(crate) async fn fork_session(
                 return err(
                     StatusCode::CONFLICT,
                     "that user message no longer matches the selected branch point".to_string(),
-                )
+                );
             }
         },
         None => body.through_seq,
@@ -3202,7 +3198,10 @@ fn resolve_start_settings(
     prefs: &chimaera_agent::journal::AgentPrefs,
 ) -> chimaera_agent::journal::ConversationSettings {
     chimaera_agent::journal::ConversationSettings {
-        model: explicit_model.or(own.model).or(prefs.model.clone()),
+        model: [explicit_model, own.model, prefs.model.clone()]
+            .into_iter()
+            .flatten()
+            .find(|m| chimaera_agent::model::is_real_model(m)),
         effort: recovered_effort.or(own.effort).or(prefs.effort.clone()),
         mode: own.mode.or(prefs.mode.clone()),
     }
@@ -3219,6 +3218,14 @@ pub(crate) async fn spawn_chat_session(
         "project execution authority unavailable"
     );
     let chat_bin = crate::launcher::chat_executable(state, recipe.kind, &recipe.bin).await?;
+    let (usage, binaries) = crate::runtime_retention::acquire(
+        state,
+        Some(recipe.kind),
+        vec![recipe.bin.clone(), chat_bin],
+    )
+    .await?;
+    let spawn_bin = &binaries[0];
+    let chat_bin = &binaries[1];
     let recovered_effort = codex_initial_effort(state, &recipe).await;
     // Read before the no-await stretch below: a cluster job's startup
     // commands (the outermost prelude scope) and, for codex, the cluster
@@ -3294,7 +3301,7 @@ pub(crate) async fn spawn_chat_session(
             (
                 {
                     let mut argv = crate::launcher::build_chat_command(
-                        &recipe.bin,
+                        spawn_bin,
                         settings,
                         mcp,
                         model.as_deref(),
@@ -3327,7 +3334,7 @@ pub(crate) async fn spawn_chat_session(
                 .map(|_| crate::agents::mcp_url_bare(&id, state.port));
             (
                 crate::launcher::build_codex_chat_command(
-                    &recipe.bin,
+                    spawn_bin,
                     mcp_url.as_deref(),
                     recipe.mastermind,
                 ),
@@ -3335,7 +3342,7 @@ pub(crate) async fn spawn_chat_session(
             )
         }
         AgentKind::Grok | AgentKind::Antigravity => (
-            crate::launcher::build_acp_chat_command(recipe.kind, &chat_bin),
+            crate::launcher::build_acp_chat_command(recipe.kind, chat_bin),
             recipe.resume.clone(),
         ),
         other => anyhow::bail!("no chat driver for {}", other.as_str()),
@@ -3539,11 +3546,12 @@ pub(crate) async fn spawn_chat_session(
     drop(import_admission);
     if info.is_err() {
         crate::lock(&state.chat_recipes).remove(&id);
-    } else if !crate::pro::may_execute(state, &recipe.workspace_id) {
-        state.chat.fence(&id);
-        anyhow::bail!("project execution authority changed during launch");
-    }
-    if info.is_ok() {
+    } else {
+        crate::runtime_retention::watch(state.clone(), id.clone(), usage);
+        if !crate::pro::may_execute(state, &recipe.workspace_id) {
+            state.chat.fence(&id);
+            anyhow::bail!("project execution authority changed during launch");
+        }
         if let Some(intent) = intent {
             intent.registered(id);
         }
@@ -4060,9 +4068,10 @@ mod tests {
         ] {
             assert!(ask.iter().any(|t| t == tool), "{tool} in {ask:?}");
         }
-        assert!(!ask
-            .iter()
-            .any(|t| t == "spawn_agent" || t == "run_in_terminal"));
+        assert!(
+            !ask.iter()
+                .any(|t| t == "spawn_agent" || t == "run_in_terminal")
+        );
         assert_eq!(
             codex_mcp_auto_approve(Some(MastermindMode::Auto), Vec::new()).tools,
             None
@@ -4147,10 +4156,11 @@ mod tests {
                 .unwrap();
         assert_eq!(portable.events.len(), 5, "four copied events + fork marker");
         assert!(portable.native.is_none());
-        assert!(portable
-            .portable_context
-            .as_deref()
-            .is_some_and(|context| context.contains(r#"{"role":"assistant","content":"answer"}"#)));
+        assert!(
+            portable.portable_context.as_deref().is_some_and(
+                |context| context.contains(r#"{"role":"assistant","content":"answer"}"#)
+            )
+        );
         assert!(
             portable.events.iter().all(|event| !matches!(
                 event,
@@ -4166,9 +4176,13 @@ mod tests {
             .enumerate()
             .map(|(index, event)| seq_event(index as u64 + 1, event))
             .collect();
-        assert!(recover_portable_context(&durable, AgentKind::Codex)
-            .as_deref()
-            .is_some_and(|context| context.contains(r#"{"role":"assistant","content":"answer"}"#)));
+        assert!(
+            recover_portable_context(&durable, AgentKind::Codex)
+                .as_deref()
+                .is_some_and(
+                    |context| context.contains(r#"{"role":"assistant","content":"answer"}"#)
+                )
+        );
         for target in [AgentKind::Antigravity, AgentKind::Grok] {
             let mut resumed = durable.clone();
             assert!(recover_portable_context(&resumed, target).is_some());
@@ -4311,11 +4325,13 @@ mod tests {
             event,
             AgentEvent::Checkpoint { user_message_id, .. } if user_message_id == "u2"
         )));
-        assert!(!branch
-            .portable_context
-            .as_deref()
-            .unwrap_or_default()
-            .contains("edit me"));
+        assert!(
+            !branch
+                .portable_context
+                .as_deref()
+                .unwrap_or_default()
+                .contains("edit me")
+        );
     }
 
     #[test]
@@ -4997,6 +5013,25 @@ mod tests {
             mode: Some("plan".into()),
         };
         assert_eq!(resolve_start_settings(None, own.clone(), None, &prefs), own);
+        // Old restart recipes could contain a provider's error placeholder.
+        assert_eq!(
+            resolve_start_settings(Some("<synthetic>".into()), own.clone(), None, &prefs),
+            own
+        );
+        assert_eq!(
+            resolve_start_settings(
+                Some("<synthetic>".into()),
+                ConversationSettings {
+                    model: Some("<synthetic>".into()),
+                    ..Default::default()
+                },
+                None,
+                &prefs
+            )
+            .model
+            .as_deref(),
+            Some("opus")
+        );
         // Partial knowledge: only the missing setting falls back to the prefs.
         let partial = ConversationSettings {
             model: None,
@@ -5358,7 +5393,7 @@ mod tests {
     /// arrival is a recovery after the other machine stopped responding.
     #[test]
     fn transfer_pickups_carry_a_stable_origin_tag() {
-        use chimaera_agent::model::{is_pickup_origin, ORIGIN_RECOVERED};
+        use chimaera_agent::model::{ORIGIN_RECOVERED, is_pickup_origin};
         assert_eq!(transfer_origin("moved", false), "moved");
         assert_eq!(transfer_origin("home", false), "home");
         assert_eq!(transfer_origin("moved", true), "recovered");

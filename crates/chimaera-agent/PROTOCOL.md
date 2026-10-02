@@ -3109,3 +3109,10 @@ post-head echoes and subsequent Sent updates retain their authoritative order.
 Regression tests cover 70 queued-cancel cycles followed by valid admission and
 replacement, stale Sent→Cancelled updates, and queued journal plus unresolved
 metadata import/restart/transfer.
+### Error-message model markers and selection provenance (2026-10-02)
+
+The reported quota failure rendered an assistant message's `model: "<synthetic>"`
+into the model picker. Such placeholders must not produce `ModelSwitched` or enter
+resume/pref state. Real assistant-message model observations use `reason: "reported"`;
+only the successful `set_model` acknowledgement uses `reason: null` to persist a user
+preference. The catalog's `value` remains the exact argument sent to `set_model`.

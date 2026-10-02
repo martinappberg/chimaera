@@ -579,7 +579,7 @@ fn fold_session_metadata(info: &mut ChatInfo, ev: &AgentEvent) {
             // driver no longer advertises instead of retaining stale state
             // from a resumed/restarted process. The Remote Control bridge is
             // process-owned, so a new process starts with none.
-            info.model = model.clone();
+            info.model = model.clone().filter(|m| crate::model::is_real_model(m));
             info.current_mode = current_mode.clone();
             // Init is re-emitted mid-process (claude's per-turn system/init),
             // so the bridge rides the snapshot rather than being cleared.
@@ -597,7 +597,7 @@ fn fold_session_metadata(info: &mut ChatInfo, ev: &AgentEvent) {
                 Rc::Off | Rc::Error => None,
             };
         }
-        AgentEvent::ModelSwitched { to, .. } => {
+        AgentEvent::ModelSwitched { to, .. } if model::is_real_model(to) => {
             info.model = Some(to.clone());
         }
         AgentEvent::ModeChanged {
@@ -1024,7 +1024,7 @@ impl ChatManager {
                 // The model in effect is the conversation's own (any reason);
                 // only a user's pick (no reason) is a preference — a safety
                 // reroute or a credits fallback (reason present) is not.
-                AgentEvent::ModelSwitched { to, reason, .. } => {
+                AgentEvent::ModelSwitched { to, reason, .. } if model::is_real_model(to) => {
                     if let Some(native) = &info.native_session_id {
                         index_to_record = Some(IndexUpdate {
                             native: native.clone(),

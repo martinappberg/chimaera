@@ -96,6 +96,11 @@ enter Jobs presentation, saved preferences or logs. Snapshots are bounded to
 2 MiB and 128 jobs/workspaces/routes. Job/workspace state values are extensible;
 unknown values cannot be interpreted as terminal, ready or writable.
 
+Jobs carry optional `stopping` (absent means false), matching the daemon's
+scheduled-job view. A stopping job offers no new job/workspace route or opening
+action. Stopping is not terminal proof: existing keeper job holds and SSH tunnels
+remain until the scheduler positively confirms the exact allocation ended.
+
 Every mutation uses a stable opaque `operation_id` scoped to account and host.
 Start additionally uses a caller-minted validated `job_id`, allocated before
 sending. `GET /v1/hosts/{id}/cluster/operations/{operation_id}` returns the exact

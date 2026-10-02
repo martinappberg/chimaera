@@ -247,7 +247,7 @@ async fn probe(state: &Arc<AppState>, ws: &str, root: &Path, kind: AgentKind) ->
         if let Some(hit) = state.probes.get(&key) {
             return hit;
         }
-        let (bin, version) = match bin_of(state, kind).await {
+        let (bin, version, _usage) = match bin_of(state, kind).await {
             Ok(found) => found,
             Err(_) => return json!({"agent":agent,"available":false,"connections":[]}),
         };

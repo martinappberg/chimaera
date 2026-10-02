@@ -268,12 +268,6 @@ pub(crate) fn retire_with_resume(
     retire_inner(state, session_id, pinned, osc, ui, resume_hint, true);
 }
 
-/// Failed initialization never created a conversation to reopen. Retain its
-/// diagnostic history and perform normal cleanup without adding a Recent row.
-pub(crate) fn retire_unused_startup(state: &Arc<AppState>, session_id: &str) {
-    retire_inner(state, session_id, None, None, SessionUi::Chat, None, false);
-}
-
 fn retire_inner(
     state: &Arc<AppState>,
     session_id: &str,

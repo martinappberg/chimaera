@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, fmt};
 
+/// Provider-generated error messages can name a placeholder rather than a
+/// model. Never use those markers as a selection, including from old journals.
+pub fn is_real_model(model: &str) -> bool {
+    !model.trim().is_empty() && !model.trim().starts_with('<')
+}
+
 /// Stored tool output cap: enough to read a failure, never a log dump.
 pub const TOOL_OUTPUT_HEAD: usize = 12 * 1024;
 pub const TOOL_OUTPUT_TAIL: usize = 4 * 1024;

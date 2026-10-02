@@ -152,7 +152,7 @@ pub(super) async fn inventory(
         if let Some(hit) = state.probes.get(&key) {
             return hit;
         }
-        let (bin, version) = match bin_of(state, kind).await {
+        let (bin, version, _usage) = match bin_of(state, kind).await {
             Ok(v) => v,
             Err(_) => {
                 return json!({"agent":agent,"available":false,"plugins":[],"skills":[],"connections":[]})

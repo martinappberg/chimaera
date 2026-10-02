@@ -166,8 +166,10 @@ pub(crate) struct AppState {
     pub(crate) claude_projects_dir: PathBuf,
     /// Managed-runtime prefix (`~/.chimaera/agents`): curated installs land
     /// in `<agent>/<version>/bin/` here, activated via per-agent symlinks
-    /// in `bin/`. Derived from the data dir, so tests are isolated for free.
+    /// in `bin/`. Shared by cluster workspaces; explicit/dev homes stay isolated.
     pub(crate) managed_root: PathBuf,
+    /// Read fallback for installs made by older workspace-scoped daemons.
+    pub(crate) legacy_managed_root: Option<PathBuf>,
     /// Managed-worktree prefix (`~/.chimaera/worktrees/<repo>/<branch>`).
     /// Chimaera creates worktrees ONLY here, and removes ONLY what is under
     /// here — the containment check is what keeps `worktree remove` from ever
@@ -343,6 +345,7 @@ impl AppState {
             agent_bins: Mutex::new(HashMap::new()),
             claude_projects_dir: home.join(".claude").join("projects"),
             managed_root: data_dir.join("agents"),
+            legacy_managed_root: None,
             worktrees_root: data_dir.join("worktrees"),
             shims_dir: data_dir.join("shims"),
             uploads_root: data_dir.join("uploads"),

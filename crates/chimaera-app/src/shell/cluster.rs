@@ -327,7 +327,7 @@ async fn absorb_with_effects(
                 .filter(|w| w.job.as_deref() == Some(j.id.as_str()))
                 .map(|w| w.name.clone())
                 .collect();
-            if j.state == "running" {
+            if j.state == "running" && !j.stopping {
                 let queued: Vec<String> = c
                     .queued_opens
                     .iter()
@@ -601,7 +601,7 @@ fn ensure_watcher(app: &AppHandle, alias: &str) {
             absorb(&app, &alias, &ov).await;
             let _ = app.emit("cluster-changed", json!({ "alias": alias }));
             let starting = ov.jobs.iter().any(|j| j.state == "starting");
-            let waiting = ov.jobs.iter().any(|j| j.state == "waiting");
+            let waiting = ov.jobs.iter().any(|j| j.state == "waiting" || j.stopping);
             let alive = ov.jobs.iter().any(|j| j.state != "ended");
             if !alive {
                 break;
@@ -622,7 +622,7 @@ fn ensure_watcher(app: &AppHandle, alias: &str) {
             for end in ov
                 .jobs
                 .iter()
-                .filter(|j| j.state == "running")
+                .filter(|j| j.state == "running" && !j.stopping)
                 .filter_map(|j| j.ends_at_ms)
             {
                 for mark in [60 * 60_000, 10 * 60_000] {
@@ -1808,6 +1808,9 @@ pub(super) async fn cluster_queue_open(
         .iter()
         .find(|j| j.id == job_id)
         .ok_or("unknown job")?;
+    if job.stopping {
+        return Err(format!("{} is stopping — choose another job", job.name));
+    }
     if job.state == "running" || job.state == "ended" {
         return Err(format!(
             "{} is {} — open it there instead",

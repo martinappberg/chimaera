@@ -22,7 +22,7 @@ versions). Run `cargo test` in the app workspace too when you touch core deps.
 
 | File | What it owns |
 |---|---|
-| `lib.rs` | `Manifest` + `Handoff` (the daemon's on-disk lifecycle records), `VERSION`/`REPOSITORY`/`BUILD_ID` + build-match helpers (`builds_match`, `build_ref`, `parse_version`, `release_is_newer`), `data_dir`/`config_dir`/`runtime_dir` (honoring `CHIMAERA_HOME`, and `CHIMAERA_DATA_DIR`/`CHIMAERA_RUNTIME_DIR` for a cluster workspace job's daemon), `login_shell` (+ pure `resolve_login_shell`), `generate_token`. |
+| `lib.rs` | `Manifest` + `Handoff` (the daemon's on-disk lifecycle records), `VERSION`/`REPOSITORY`/`BUILD_ID` + build-match helpers (`builds_match`, `build_ref`, `parse_version`, `release_is_newer`), `managed_agents_dir` (user-scoped, ignores `CHIMAERA_DATA_DIR`) + `data_dir`/`config_dir`/`runtime_dir` (honoring `CHIMAERA_HOME`, and `CHIMAERA_DATA_DIR`/`CHIMAERA_RUNTIME_DIR` for a cluster workspace job's daemon), `login_shell` (+ pure `resolve_login_shell`), `generate_token`. |
 | `cloud_providers.rs` + `cloud-providers.json` | Shared provider identities and exact browser authentication origins; adapters stay in the daemon. The UI imports the same JSON. A catalog entry alone does not enable a provider; follow the [extension checklist](../chimaera-server/src/cloud/providers/AGENTS.md#adding-a-provider). |
 | `shellint.rs` + `shellint/` | The shell-integration subsystem: materialize OSC 133/633/7 scripts, compose per-shell launch argv/env, and the remote-install snippet. |
 | `slurm.rs` | The scheduler vocabulary, pure: `Scheduler`, the `squeue`/`sinfo` format strings + parsers (`Job`, `Partition`), Slurm's duration grammar, `clean_tool_stderr`, partition access from `sacctmgr` associations + `scontrol show partition` (`usable_partitions`), refusal classification, `LaunchSpec` (validation, `sbatch`/`srun` argv), job names. Shared by the daemon and every client; nothing site-specific, ever. |
@@ -37,6 +37,8 @@ versions). Run `cargo test` in the app workspace too when you touch core deps.
   at mode 0600, then renamed, because it carries the bearer token. `Manifest.build`
   serde-defaults to an ancient sentinel so an
   old manifest still parses.
+  `Manifest.runtime_leases` defaults false: old daemons do not protect managed
+  agent packages, so automatic package cleanup defers while their manifest is live.
 - **A manifest's pid means something only on the node that wrote it.** HPC login
   nodes share `$HOME`, so every node reads the same file: check `written_here()`
   (`this_node()` vs `hostname`, via `same_node`) before trusting `is_alive()`, and

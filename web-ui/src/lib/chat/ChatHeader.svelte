@@ -12,12 +12,7 @@
   import { openInSystemBrowser } from "../shared/urlOpen";
   import type { ChatStore } from "./store.svelte";
 
-  interface ModelChoice {
-    id: string;
-    label: string;
-    resolved?: string | null;
-    description?: string | null;
-  }
+  import { modelChoice, type ModelChoice } from "./modelPicker";
 
   interface Props {
     store: ChatStore;
@@ -166,13 +161,19 @@
         {#each modelChoices as m (m.id)}
           <button
             class="overlay-row menu-row"
-            class:current={m.id === (store.pendingModel ?? store.model) || m.resolved === (store.pendingModel ?? store.model)}
+            class:current={m.id === modelChoice(modelChoices, store.pendingModel ?? store.model)?.id}
             role="menuitemradio"
-            aria-checked={m.id === (store.pendingModel ?? store.model) || m.resolved === (store.pendingModel ?? store.model)}
+            aria-checked={m.id === modelChoice(modelChoices, store.pendingModel ?? store.model)?.id}
             title={typeof m.description === "string" ? m.description : undefined}
             onclick={() => onPickModel(m.id)}
           >
-            {m.label}
+            <span class="model-option-copy">
+              <span>{m.label}</span>
+              {#if m.description}<span class="model-description">{m.description}</span>{/if}
+            </span>
+            {#if m.id === modelChoice(modelChoices, store.pendingModel ?? store.model)?.id}
+              <span class="model-check" aria-hidden="true">✓</span>
+            {/if}
           </button>
         {/each}
       </div>
@@ -343,6 +344,12 @@
 </div>
 
 <style>
+  .model-picker .menu { width: min(360px, calc(100vw - 32px)); --toolbar-menu-height: 480px; overscroll-behavior: contain; }
+  .model-picker .menu-row { display: flex; align-items: flex-start; gap: 12px; white-space: normal; }
+  .model-option-copy { display: flex; flex: 1; flex-direction: column; gap: 3px; text-align: left; }
+  .model-description { color: var(--muted); font-size: var(--text-xs); line-height: 1.4; }
+  .model-check { color: var(--accent); }
+
   .chat-header { container: pane-chrome / inline-size; flex: none; min-width: 0; }
   .strip {
     display: flex;

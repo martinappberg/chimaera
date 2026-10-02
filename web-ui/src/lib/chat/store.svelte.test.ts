@@ -3432,3 +3432,24 @@ describe("queued delivery after process replacement", () => {
     expect(store.restoredDrafts).toEqual([]);
   });
 });
+
+describe("model recovery after quota errors", () => {
+  it("ignores synthetic model switches in old journals and accepts a subsequent selection", () => {
+    const store = fold([
+      { type: "init", model: "claude-fable-5" },
+      { type: "model_switched", to: "<synthetic>" },
+      { type: "error", message: "Out of credits", fatal: false },
+    ]);
+    expect(store.model).toBe("claude-fable-5");
+    store.markModelPending("sonnet");
+    store.apply({ seq: 4, ts: 4, ev: { type: "model_switched", to: "sonnet" } } as SeqEvent);
+    expect(store.model).toBe("sonnet");
+    expect(store.pendingModel).toBeNull();
+  });
+  it("an observed model does not acknowledge a different pending selection", () => {
+    const store = fold([{ type: "init", model: "fable" }]);
+    store.markModelPending("sonnet");
+    store.apply({ seq: 2, ts: 2, ev: { type: "model_switched", to: "claude-fable-5", reason: "reported" } } as SeqEvent);
+    expect(store.pendingModel).toBe("sonnet");
+  });
+});

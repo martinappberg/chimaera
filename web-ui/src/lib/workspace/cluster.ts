@@ -21,9 +21,9 @@ import type {
   PartitionChoice,
   StartResult,
 } from "../net/native";
-import { hostSummary, schedulerLabel, shortDuration, timeLeftWords } from "./clusterRow";
+import { hostSummary, isJobStopping, schedulerLabel, shortDuration, timeLeftWords } from "./clusterRow";
 
-export { hostSummary, schedulerLabel, shortDuration, timeLeftWords };
+export { hostSummary, isJobStopping, schedulerLabel, shortDuration, timeLeftWords };
 
 const MINUTE = 60;
 const HOUR = 60 * MINUTE;
@@ -248,6 +248,7 @@ export function shortHost(host: string): string {
 
 /** A job card's one status line (plan §4.2). */
 export function jobStatusLine(j: ClusterJob, nowMs: number, locale?: string): string {
+  if (isJobStopping(j)) return j.node ? `Stopping on ${j.node}…` : "Stopping…";
   let line: string;
   switch (j.state) {
     case "running": {
@@ -287,7 +288,10 @@ export function endedLine(j: ClusterJob, nowMs: number, locale?: string): string
 }
 
 /** What a workspace row says about itself (plan §4.2). */
-export function workspaceActivity(w: ClusterWorkspaceView, nowMs: number, locale?: string): string {
+export function workspaceActivity(w: ClusterWorkspaceView, nowMs: number, locale?: string, jobStopping = false): string {
+  // A job's stop intent supersedes its last workspace snapshot, even before
+  // the remote command returns or job-host publishes its closing state.
+  if (jobStopping) return w.state === "open" ? "closing with job…" : "job is stopping…";
   if (w.failed !== undefined) return "stopped unexpectedly";
   switch (w.state) {
     case "open":
@@ -313,8 +317,8 @@ export type OpenPlan =
   | { kind: "choose"; running: ClusterJob[]; pending: ClusterJob[] };
 
 export function openPlan(jobs: readonly ClusterJob[]): OpenPlan {
-  const running = jobs.filter((j) => j.state === "running");
-  const pending = jobs.filter((j) => j.state === "waiting" || j.state === "starting");
+  const running = jobs.filter((j) => !isJobStopping(j) && j.state === "running");
+  const pending = jobs.filter((j) => !isJobStopping(j) && (j.state === "waiting" || j.state === "starting"));
   if (running.length === 0 && pending.length === 0) return { kind: "sheet" };
   return { kind: "choose", running, pending };
 }

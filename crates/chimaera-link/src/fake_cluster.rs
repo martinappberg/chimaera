@@ -1,11 +1,11 @@
 //! Deterministic cluster contract fixture, not an SSH/Slurm implementation.
 use crate::{fake::FakeKeeper, *};
 use axum::{
+    Json, Router,
     extract::{DefaultBodyLimit, Extension, Path, State, WebSocketUpgrade},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use chimaera_core::{
     cluster::{ClusterWorkspace, JobRecord},
@@ -16,7 +16,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     net::{Ipv4Addr, SocketAddr},
 };
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{Mutex, watch};
 
 #[derive(Default)]
 pub(crate) struct FixtureCluster {
@@ -475,6 +475,7 @@ fn apply(
                 ended: None,
                 ended_at_ms: None,
                 stopped_by_user: false,
+                stopping: false,
                 egress: None,
                 open: open.clone(),
                 replaces: replaces.clone(),

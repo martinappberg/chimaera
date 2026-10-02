@@ -26,11 +26,13 @@ async fn codex_notify_authenticates_and_only_records_verified_terminal_identity(
             .0,
         StatusCode::FORBIDDEN
     );
-    assert!(lock(&state.agents)
-        .get(&id)
-        .unwrap()
-        .turn_complete_at
-        .is_none());
+    assert!(
+        lock(&state.agents)
+            .get(&id)
+            .unwrap()
+            .turn_complete_at
+            .is_none()
+    );
     assert_eq!(
         request(
             &state,
@@ -125,10 +127,10 @@ async fn a_terminal_agents_bundle_records_only_a_turn_in_flight() {
     state.sessions.kill(&id).unwrap();
 }
 
-/// A new chat that never initializes closes for every provider. A prompt
-/// accepted before initialization must instead keep its failed chat reachable.
+/// Startup failures stay visible even before the first prompt, so users can
+/// read missing-library, authentication and timeout diagnostics.
 #[tokio::test]
-async fn unused_handshake_failure_closes_for_every_provider() {
+async fn unused_handshake_failure_keeps_diagnostic_for_every_provider() {
     handshake_failure_for_every_provider(false).await;
 }
 
@@ -197,14 +199,10 @@ async fn handshake_failure_for_every_provider(submit: bool) {
         let journal_path = state.chat.journal_dir().join(format!("{id}.jsonl"));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let journal = loop {
-            let settled = if submit {
-                crate::lock(&state.agents)
-                    .get(&id)
-                    .is_some_and(|a| a.state == agent_state::AgentState::Errored)
-                    && !state.chat.get(&id).unwrap().alive
-            } else {
-                !crate::lock(&state.agents).contains_key(&id)
-            };
+            let settled = crate::lock(&state.agents)
+                .get(&id)
+                .is_some_and(|a| a.state == agent_state::AgentState::Errored)
+                && state.chat.get(&id).is_some_and(|info| !info.alive);
             // Exited updates the in-memory row before the journal writer's
             // drain barrier. A slow writer must not race the disk assertion.
             let journal = tokio::fs::read_to_string(&journal_path)
@@ -226,13 +224,10 @@ async fn handshake_failure_for_every_provider(submit: bool) {
             state.sessions.get(&id).is_none(),
             "{kind:?} switched to a terminal"
         );
-        assert_eq!(state.chat.contains(&id), submit);
-        assert_eq!(crate::lock(&state.chat_recipes).contains_key(&id), submit);
+        assert!(state.chat.contains(&id));
+        assert!(crate::lock(&state.chat_recipes).contains_key(&id));
         assert!(crate::lock(&state.recents).list("w-test").is_empty());
-        assert_eq!(
-            crate::lock(&state.session_workspaces).contains_key(&id),
-            submit
-        );
+        assert!(crate::lock(&state.session_workspaces).contains_key(&id));
         assert!(!journal.contains("mode_switch"));
     }
 }
@@ -541,14 +536,18 @@ async fn agents_endpoint_lists_catalog_with_installed_and_missing() {
     assert_eq!(claude["latest_version"], "2.1.207");
     assert_eq!(claude["latest_checked_at"], 1_000);
     assert_eq!(claude["update_available"], true);
-    assert!(claude["install"]["command"]
-        .as_str()
-        .unwrap()
-        .starts_with("curl "));
-    assert!(claude["install"]["url"]
-        .as_str()
-        .unwrap()
-        .starts_with("https://"));
+    assert!(
+        claude["install"]["command"]
+            .as_str()
+            .unwrap()
+            .starts_with("curl ")
+    );
+    assert!(
+        claude["install"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://")
+    );
 
     // Installed but legacy (npm-era codex, no `codex login`): flagged so
     // the UI offers the install command as an update. No upstream check has
@@ -575,14 +574,18 @@ async fn agents_endpoint_lists_catalog_with_installed_and_missing() {
     let obj = agy.as_object().unwrap();
     assert!(!obj.contains_key("path"), "{agy}");
     assert!(!obj.contains_key("version"), "{agy}");
-    assert!(agy["install"]["command"]
-        .as_str()
-        .unwrap()
-        .contains("antigravity.google"));
-    assert!(agy["install"]["url"]
-        .as_str()
-        .unwrap()
-        .starts_with("https://"));
+    assert!(
+        agy["install"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("antigravity.google")
+    );
+    assert!(
+        agy["install"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://")
+    );
 }
 
 #[tokio::test]
@@ -668,6 +671,7 @@ async fn install_endpoint_contract_and_session_mechanics() {
         "install",
         "echo stub-install-output; sleep 30".to_string(),
     )
+    .await
     .expect("stub install spawned");
     let entry = session_entry(&state, &sid).await;
     assert_eq!(entry["kind"], "shell");
@@ -697,6 +701,7 @@ async fn install_endpoint_contract_and_session_mechanics() {
         "install",
         "echo second".to_string(),
     )
+    .await
     .expect_err("second install must conflict");
     assert_eq!(err.status(), StatusCode::CONFLICT);
     let other = runtimes::start_install(
@@ -706,6 +711,7 @@ async fn install_endpoint_contract_and_session_mechanics() {
         "install",
         "echo other; sleep 30".to_string(),
     )
+    .await
     .expect("other agent installs in parallel");
 
     // Kill the codex install; the watcher re-detects and clears the
@@ -726,6 +732,7 @@ async fn install_endpoint_contract_and_session_mechanics() {
         "install",
         "echo again; sleep 30".to_string(),
     )
+    .await
     .expect("slot free after the session ended");
     state.sessions.kill(&again).ok();
     state.sessions.kill(&other).ok();
@@ -744,6 +751,7 @@ async fn installer_result_survives_the_terminal_disappearing() {
             "install",
             format!("sleep 0.1; exit {code}"),
         )
+        .await
         .unwrap();
         let status = runtimes::installation_status(&state, agents::AgentKind::Grok).unwrap();
         assert_eq!(status["session_id"], sid);
@@ -862,6 +870,7 @@ async fn update_endpoint_is_managed_only_and_shares_the_install_slot() {
         "update",
         "echo stub-update; sleep 30".to_string(),
     )
+    .await
     .expect("stub update spawned");
     let entry = session_entry(&state, &sid).await;
     assert_eq!(entry["kind"], "shell");
@@ -908,6 +917,7 @@ async fn install_reservation_blocks_the_spawn_registration_race() {
         "install",
         "echo racer".to_string(),
     )
+    .await
     .expect_err("a fresh reservation must read as busy");
     assert_eq!(err.status(), StatusCode::CONFLICT);
 
@@ -927,6 +937,7 @@ async fn install_reservation_blocks_the_spawn_registration_race() {
         "install",
         "echo reclaimed; sleep 30".to_string(),
     )
+    .await
     .expect("a stale reservation is reclaimable");
     assert_eq!(
         lock(&state.installs)

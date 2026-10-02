@@ -221,23 +221,31 @@ pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> 
     if !refresh {
         let hit = crate::lock(&state.agent_bins).get(&kind).cloned();
         if let Some(hit) = hit {
-            match validate_cache_hit(&hit) {
-                CacheHit::Fresh => return hit,
-                CacheHit::Changed(mtime) => {
-                    // In-place update: the path still serves, but the cached
-                    // version is stale news — is_outdated/chat_capable and the
-                    // chat drift notice must see the new binary. 2s budget,
-                    // paid only on an actual mtime change.
-                    let mut fresh = hit;
-                    if let Ok(bin) = &fresh.path {
-                        fresh.version = probe_version(bin).await;
+            let same_install = hit.explicit
+                || !hit.managed
+                || hit.path.as_ref().is_ok_and(|p| {
+                    p.parent()
+                        == Some(crate::runtimes::managed_bin_for(state, kind.as_str()).as_path())
+                });
+            if same_install {
+                match validate_cache_hit(&hit) {
+                    CacheHit::Fresh => return hit,
+                    CacheHit::Changed(mtime) => {
+                        // In-place update: the path still serves, but the cached
+                        // version is stale news — is_outdated/chat_capable and the
+                        // chat drift notice must see the new binary. 2s budget,
+                        // paid only on an actual mtime change.
+                        let mut fresh = hit;
+                        if let Ok(bin) = &fresh.path {
+                            fresh.version = probe_version(bin).await;
+                        }
+                        fresh.mtime = Some(mtime);
+                        crate::lock(&state.agent_bins).insert(kind, fresh.clone());
+                        return fresh;
                     }
-                    fresh.mtime = Some(mtime);
-                    crate::lock(&state.agent_bins).insert(kind, fresh.clone());
-                    return fresh;
-                }
-                CacheHit::Gone => {
-                    crate::lock(&state.agent_bins).remove(&kind);
+                    CacheHit::Gone => {
+                        crate::lock(&state.agent_bins).remove(&kind);
+                    }
                 }
             }
         }
@@ -245,7 +253,7 @@ pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> 
     let explicit = crate::lock(&state.settings).agent_path(kind);
     let path = resolve_bin(
         kind,
-        &crate::runtimes::managed_bin_dir(&state.managed_root),
+        &crate::runtimes::managed_bin_for(state, kind.as_str()),
         explicit.clone(),
     )
     .await;
@@ -255,7 +263,7 @@ pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> 
     };
     let managed = path
         .as_ref()
-        .is_ok_and(|p| crate::runtimes::is_managed(p, &state.managed_root));
+        .is_ok_and(|p| crate::runtimes::owns_binary(state, p));
     // The explicit path was set AND it's what resolved (resolve_bin returns it
     // verbatim only when runnable; a typo falls through to normal resolution).
     let used_explicit = explicit.as_deref().is_some_and(|e| {
@@ -1319,7 +1327,7 @@ pub(crate) async fn chat_executable(
     }
     if let Some(path) = managed_fallback(
         "agy-acp",
-        &crate::runtimes::managed_bin_dir(&state.managed_root),
+        &crate::runtimes::managed_bin_for(state, "agy-acp"),
     ) {
         return Ok(tokio::fs::canonicalize(path).await?);
     }

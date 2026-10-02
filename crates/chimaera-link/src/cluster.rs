@@ -1,6 +1,6 @@
 //! Capability-gated cluster operations. Protected routes are native memory only.
 use crate::{Daemon, Host};
-use anyhow::{bail, ensure, Result};
+use anyhow::{Result, bail, ensure};
 use chimaera_core::{
     cluster::{self, ClusterConfig, ClusterFacts, ClusterWorkspace, DirListing, JobRecord},
     slurm::LaunchSpec,
@@ -421,6 +421,8 @@ pub struct ClusterJobView {
     #[serde(default)]
     pub ended_at_ms: Option<u64>,
     pub stopped_by_user: bool,
+    #[serde(default)]
+    pub stopping: bool,
     #[serde(default)]
     pub egress: Option<bool>,
     pub open: Vec<String>,
