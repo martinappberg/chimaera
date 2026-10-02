@@ -196,7 +196,9 @@ never an alternative. The authorization tuple is a closed object of at most
 - `device_id`, `device_session_epoch`, `workspace_id`, `expected_revision`;
 - `operation_id`, `expected_pending` (UUID or null), `action`, `names`.
 
-IDs and revisions follow the external bounds above. The worker digest is the
+IDs follow the external bounds above. Internal authorization requires an existing
+registration, whose revision starts at one and has the same external maximum.
+The worker digest is the
 64-character lowercase SHA-256 of its current service credential; it never
 enters a project. `names` is a sorted, distinct list of at most 32 valid secret
 names: the entire resulting pending batch for `set`, the exact shown batch for
