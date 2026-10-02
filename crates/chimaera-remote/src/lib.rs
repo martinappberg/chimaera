@@ -2924,7 +2924,8 @@ pub struct ComputeTunnel {
     /// The login alias's [`Route`] when the tunnel opened — which master
     /// holds `master_forward`.
     route: Route,
-    child: Child,
+    child: std::sync::Arc<tokio::sync::Mutex<Child>>,
+    closing: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl ComputeTunnel {
@@ -2940,18 +2941,116 @@ impl ComputeTunnel {
     /// Wait for the tunnel child (never returns for a healthy ssh-adopt
     /// forward; quickly when the direct rung delegated to the master).
     pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.wait().await
+        self.child.lock().await.wait().await
     }
 
     /// Kill the tunnel; a master-held forward is also cancelled so local
     /// ports don't leak past the window that opened them.
     pub async fn close(mut self) {
-        let _ = self.child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
-        if let Some(spec) = &self.master_forward {
-            cancel_master_forward(&self.host, &self.route, spec).await;
-        }
+        let _ = self.try_close().await;
     }
+
+    /// Reap the tunnel child and positively acknowledge cancellation of its
+    /// exact captured forward. Failure retains the cleanup identity for retry;
+    /// an aborted caller cannot cancel the bounded owned cleanup task.
+    pub async fn try_close(&mut self) -> anyhow::Result<()> {
+        let permit = self
+            .closing
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("compute tunnel cleanup already in progress"))?;
+        let child = self.child.clone();
+        let host = self.host.clone();
+        let route = self.route.clone();
+        let spec = self.master_forward.clone();
+        compute_cleanup_owned(child, permit, route, spec, move |route, spec| {
+            let host = host.clone();
+            async move {
+                let mut command = mux_prologue(&host, &route);
+                command.args(["-O", "cancel", "-L", &spec]).arg(&host);
+                forward_cancel(command, Duration::from_secs(10)).await
+            }
+        })
+        .await
+        .context("compute tunnel cleanup task did not finish")?
+    }
+}
+
+fn compute_cleanup_owned<F, Fut>(
+    child: std::sync::Arc<tokio::sync::Mutex<Child>>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    route: Route,
+    spec: Option<String>,
+    cancel: F,
+) -> tokio::task::JoinHandle<anyhow::Result<()>>
+where
+    F: FnOnce(Route, String) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send,
+{
+    tokio::spawn(async move {
+        let _permit = permit;
+        let reaped = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut child = child.lock().await;
+            if child
+                .try_wait()
+                .map_err(|_| anyhow::anyhow!("compute child status unavailable"))?
+                .is_none()
+            {
+                let _ = child.start_kill();
+                child
+                    .wait()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("compute child could not be reaped"))?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("compute child did not finish cleanup"))
+        .and_then(|result| result);
+        // A failed child reap must not prevent attempting the captured mux
+        // forward. Both proofs are necessary before a held allocation is freed.
+        let canceled = if let Some(spec) = spec {
+            cancel(route, spec).await
+        } else {
+            Ok(())
+        };
+        reaped.and(canceled)
+    })
+}
+
+async fn forward_cancel(mut command: Command, deadline: Duration) -> anyhow::Result<()> {
+    command.env("LC_ALL", "C").env("LANG", "C");
+    let output = tokio::time::timeout(
+        deadline,
+        output_bounded(&mut command, 10, "compute forward cleanup"),
+    )
+    .await
+    .context("compute forward cleanup did not finish")?
+    .map_err(|_| anyhow::anyhow!("compute forward cleanup could not be completed"))?;
+    // OpenSSH distinguishes an absent requested forward from a refused cancel.
+    // Unknown/localized/mixed diagnostics remain uncertain, never success.
+    let diagnostics = std::str::from_utf8(&output.stderr).ok().map(str::trim);
+    // OpenSSH's cancel branch can exit zero even after MUX_S_FAILURE. Its
+    // fixed error pair distinguishes an absent exact request from refusal.
+    let absent = matches!(output.status.code(), Some(0 | 255))
+        && output.stdout.is_empty()
+        && diagnostics.is_some_and(|diagnostics| {
+            let mut lines = diagnostics.lines();
+            lines.next()
+                == Some("mux_client_forward: forwarding request failed: port not forwarded")
+                && matches!(
+                    lines.next(),
+                    None | Some("muxclient: master cancel forward request failed")
+                )
+                && lines.next().is_none()
+        });
+    anyhow::ensure!(
+        (output.status.success() && output.stdout.is_empty() && diagnostics == Some(""))
+            || absent
+            || master_already_absent(&output),
+        "compute forward cleanup was not acknowledged"
+    );
+    Ok(())
 }
 
 /// The `-W`-relay ProxyCommand that carries a node-bound ssh's first leg
@@ -3143,7 +3242,8 @@ pub async fn connect_compute_node(
         rung,
         master_forward,
         route: route.clone(),
-        child,
+        child: std::sync::Arc::new(tokio::sync::Mutex::new(child)),
+        closing: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
     };
 
     // Direct — the login master forwards to the node's port.
@@ -3249,6 +3349,157 @@ async fn tunnel_proven(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compute_forward_cancel_requires_positive_proof_even_with_zero_exit() {
+        for (script, succeeds) in [
+            ("exit 0", true),
+            ("exit 1", false),
+            ("printf 'mux_client_forward: forwarding request failed: port not forwarded\\r\\nmuxclient: master cancel forward request failed\\r\\n' >&2; exit 0", true),
+            ("printf 'Master refused forwarding request: Permission denied\n' >&2; exit 0", false),
+            ("printf 'mux_client_forward: forwarding request failed: port not forwarded\nmuxclient: master cancel forward request failed\n' >&2; exit 0", true),
+            ("printf 'Control socket connect(/tmp/fixture): No such file or directory\n' >&2; exit 255", true),
+            ("printf 'mux_client_forward: forwarding request failed: port not in permitted opens\nmuxclient: master cancel forward request failed\n' >&2; exit 0", false),
+            ("printf 'other failure\nmux_client_forward: forwarding request failed: port not forwarded\n' >&2; exit 255", false),
+            ("printf 'untrusted output'; printf 'mux_client_forward: forwarding request failed: port not forwarded\n' >&2; exit 255", false),
+        ] {
+            let mut command=Command::new("/bin/sh");command.args(["-c",script]);
+            assert_eq!(forward_cancel(command,Duration::from_secs(2)).await.is_ok(),succeeds);
+        }
+        assert!(
+            forward_cancel(Command::new("/fixture-missing-ssh"), Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        let mut slow = Command::new("/bin/sleep");
+        slow.arg("30");
+        assert!(forward_cancel(slow, Duration::from_millis(20))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn compute_cleanup_retains_exact_route_and_forward_across_failure_and_retry() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let child = std::sync::Arc::new(tokio::sync::Mutex::new(child));
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let route = Route::NodeViaAlias("captured-login".into());
+        let spec = "50001:compute-fixture:9000".to_owned();
+        for succeeds in [false, true] {
+            let output = seen.clone();
+            let result = compute_cleanup_owned(
+                child.clone(),
+                budget.clone().try_acquire_owned().unwrap(),
+                route.clone(),
+                Some(spec.clone()),
+                move |route, spec| async move {
+                    output.lock().unwrap().push((route, spec));
+                    anyhow::ensure!(succeeds, "fixture cancel unavailable");
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), succeeds);
+            assert!(child.lock().await.try_wait().unwrap().is_some());
+            assert_eq!(budget.available_permits(), 1);
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(route.clone(), spec.clone()), (route, spec)]
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_cleanup_bounds_child_lock_and_still_cancels_forward() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let child = std::sync::Arc::new(tokio::sync::Mutex::new(child));
+        let locked = child.clone().lock_owned().await;
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let proof = cancelled.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(4),
+            compute_cleanup_owned(
+                child.clone(),
+                budget.clone().try_acquire_owned().unwrap(),
+                Route::Alias,
+                Some("50001:compute-fixture:9000".into()),
+                move |route, spec| async move {
+                    assert_eq!(route, Route::Alias);
+                    assert_eq!(spec, "50001:compute-fixture:9000");
+                    proof.store(true, std::sync::atomic::Ordering::Release);
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.is_err());
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(budget.available_permits(), 1);
+        drop(locked);
+        let mut child = child.lock().await;
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compute_cleanup_finishes_captured_forward_after_caller_abort() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let child = std::sync::Arc::new(tokio::sync::Mutex::new(child));
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let finished = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (e, r, f) = (entered.clone(), release.clone(), finished.clone());
+        let cleanup = compute_cleanup_owned(
+            child.clone(),
+            budget.clone().try_acquire_owned().unwrap(),
+            Route::Node("captured-login".into()),
+            Some("50001:compute-fixture:9000".into()),
+            move |route, spec| async move {
+                assert_eq!(route, Route::Node("captured-login".into()));
+                assert_eq!(spec, "50001:compute-fixture:9000");
+                e.notify_one();
+                r.acquire().await.unwrap().forget();
+                f.notify_one();
+                Ok(())
+            },
+        );
+        let caller = tokio::spawn(cleanup);
+        entered.notified().await;
+        caller.abort();
+        let _ = caller.await;
+        assert_eq!(budget.available_permits(), 0);
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), finished.notified())
+            .await
+            .unwrap();
+        assert!(child.lock().await.try_wait().unwrap().is_some());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while budget.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[cfg(unix)]
     #[tokio::test]
