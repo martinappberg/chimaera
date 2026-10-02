@@ -1514,23 +1514,47 @@ mod tests {
     async fn job_is_live_reads_state_absence_and_refusal() {
         let dir = test_dir("live");
         let squeue = dir.join("squeue");
-        let case = |body: &str| tools(&dir, &[("squeue", body)]);
-        case("#!/bin/sh\necho RUNNING\n");
+        // One stand-in, written once; each case is a file it sources. A
+        // script rewritten and run at once can fail with "Text file busy"
+        // on Linux when another test forks meanwhile (the child briefly
+        // holds the write descriptor) — which reads as "unanswered".
+        tools(
+            &dir,
+            &[("squeue", "#!/bin/sh\n. \"$(dirname \"$0\")/case.sh\"\n")],
+        );
+        let case = |body: &str| std::fs::write(dir.join("case.sh"), body).unwrap();
+        case("exit 0\n");
+        runnable(&squeue);
+        case("echo RUNNING\n");
         assert_eq!(job_is_live(&squeue, "1").await, Some(true));
-        case("#!/bin/sh\necho COMPLETING\n");
+        case("echo COMPLETING\n");
         assert_eq!(
             job_is_live(&squeue, "1").await,
             Some(true),
             "still draining"
         );
-        case("#!/bin/sh\necho 'CANCELLED by 1000'\n");
+        case("echo 'CANCELLED by 1000'\n");
         assert_eq!(job_is_live(&squeue, "1").await, Some(false));
-        case("#!/bin/sh\nexit 0\n");
+        case("exit 0\n");
         assert_eq!(job_is_live(&squeue, "1").await, Some(false), "not listed");
-        case("#!/bin/sh\necho 'slurm_load_jobs error: Invalid job id specified' >&2\nexit 1\n");
+        case("echo 'slurm_load_jobs error: Invalid job id specified' >&2\nexit 1\n");
         assert_eq!(job_is_live(&squeue, "1").await, Some(false));
-        case("#!/bin/sh\necho 'Socket timed out' >&2\nexit 1\n");
+        case("echo 'Socket timed out' >&2\nexit 1\n");
         assert_eq!(job_is_live(&squeue, "1").await, None, "unanswered");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Run a just-written stand-in until the kernel lets it (a fork in
+    /// another test can hold it busy for a moment), so the asserted calls
+    /// that follow never meet "Text file busy".
+    fn runnable(script: &Path) {
+        for _ in 0..100 {
+            match std::process::Command::new(script).output() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                _ => return,
+            }
+        }
     }
 }
