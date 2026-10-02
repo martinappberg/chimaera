@@ -4318,6 +4318,7 @@ mod tests {
             started_at: 0,
             build: build.map(str::to_string),
             slurm_job_id: None,
+            runtime_leases: false,
         }
     }
 

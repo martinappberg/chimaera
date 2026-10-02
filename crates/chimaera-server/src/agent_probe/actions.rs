@@ -56,7 +56,7 @@ pub(crate) async fn run(
         Ok(args) => args,
         Err(message) => return crate::plugins::bad_request(message),
     };
-    let (bin, _) = match bin_of(&state, kind).await {
+    let (bin, _, usage) = match bin_of(&state, kind).await {
         Ok(found) => found,
         Err(_) => return crate::plugins::bad_request("Install this agent first."),
     };
@@ -116,6 +116,7 @@ pub(crate) async fn run(
     });
     match result {
         Ok(info) => {
+            crate::runtime_retention::watch(state.clone(), info.id.clone(), usage);
             crate::lock(&state.session_workspaces).insert(sid.clone(), ws);
             let watch = state.clone();
             tokio::spawn(async move {

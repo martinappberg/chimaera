@@ -36,6 +36,7 @@ mod quickopen;
 mod recents;
 mod recents_archive;
 mod router;
+mod runtime_retention;
 mod runtimes;
 mod session_view;
 mod settings;

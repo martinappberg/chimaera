@@ -322,7 +322,7 @@ async fn run(
             }
             return Err("The connection setup was closed.");
         }
-        let (bin, _) = bin_of(&state, attempt.kind)
+        let (bin, _, _usage) = bin_of(&state, attempt.kind)
             .await
             .map_err(|_| "The agent is no longer available.")?;
         let prelude = ProbePrelude::write(&state, Some(&attempt.workspace)).await;

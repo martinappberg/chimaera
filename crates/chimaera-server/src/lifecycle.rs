@@ -124,6 +124,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         started_at,
         build: Some(chimaera_core::BUILD_ID.to_string()),
         slurm_job_id: own_job.clone(),
+        runtime_leases: true,
     };
     manifest.write().context("failed to write manifest")?;
 
@@ -180,6 +181,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     crate::history::boot_close(&state).await;
     crate::history::spawn_task(state.clone());
     tokio::spawn(ledger::run(state.clone()));
+    crate::runtime_retention::boot(state.clone());
 
     // Release awareness (GET /api/v1/update + the `update` ws frame), and
     // the same question for the agent CLIs the daemon launches.
@@ -582,6 +584,7 @@ mod tests {
             started_at: 0,
             build: None,
             slurm_job_id: job.map(str::to_string),
+            runtime_leases: false,
         };
         std::fs::write(path, serde_json::to_vec(&m).unwrap()).unwrap();
     }

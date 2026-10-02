@@ -91,7 +91,17 @@ for the current session; see [chat mode](chat-mode.md) for provider behavior.
   daemons share this directory instead of installing into each workspace's `data/agents`;
   `CHIMAERA_HOME` still isolates development installs. Existing workspace-local copies are
   read fallbacks; updates install into the shared directory. A shared per-agent file lock
-  serializes installation, updates, and removal across workspace daemons. Codex installs as its
+  serializes installation, updates, and removal across workspace daemons. If preparing an
+  install fails because storage is full or the user's quota is reached, the error names the
+  affected installation folder and asks the user to free space or check the host's quota.
+  Updates automatically remove superseded packages, keeping the activated version and
+  packages leased by running agents. Cleanup runs before/after installation, after sessions
+  close, and after daemon startup restoration. Agent launches pin their executable to the
+  protected package so a concurrent update cannot change it between detection and execution.
+  Open plain terminals conservatively delay cleanup (they can launch an agent at any time).
+  Older daemons on the same shared storage also delay cleanup until closed or upgraded.
+  Antigravity's replaced chat packages are reclaimed once their version is unused.
+  Codex installs as its
   whole release package rather than just the entrypoint — it spawns companions
   (`codex-code-mode-host`, bundled rg/zsh) from beside its own executable, and an entrypoint-only
   install shipped a codex whose code mode failed closed. One install/update per agent (409 while

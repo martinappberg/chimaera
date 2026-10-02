@@ -13,7 +13,7 @@
    * most once a minute whatever we call; a degraded round keeps the last read
    * on screen and says so.
    */
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import {
     clusterClose,
     clusterDismissJob,
@@ -45,6 +45,7 @@
     agoWords,
     endedLine,
     jobStatusLine,
+    isJobStopping,
     liveJobs,
     openInHint,
     openPlan,
@@ -97,7 +98,7 @@
   const loginDaemon = $derived(loginServe ? null : (host?.cluster?.login_daemon ?? null));
 
   const jobs = $derived(overview === null ? [] : liveJobs(overview.jobs));
-  const running = $derived(jobs.filter((j) => j.state === "running"));
+  const running = $derived(jobs.filter((j) => j.state === "running" && !isJobStopping(j)));
   const ended = $derived(
     (overview?.jobs ?? [])
       .filter((j) => j.state === "ended")
@@ -137,6 +138,19 @@
   let wsError = $state<Record<string, string>>({});
   let jobBusy = $state<Record<string, JobBusy>>({});
   let jobError = $state<Record<string, string>>({});
+
+  // scancel returning means cancellation was accepted, not that Slurm has
+  // finished. Preserve the action through stale overview reads and SSH errors.
+  $effect(() => {
+    const current = overview;
+    if (current === null) return;
+    untrack(() => {
+      const next = Object.fromEntries(Object.entries(jobBusy).filter(([id]) =>
+        current.jobs.some((job) => job.id === id && job.state !== "ended"),
+      ));
+      if (Object.keys(next).length !== Object.keys(jobBusy).length) jobBusy = next;
+    });
+  });
 
   type Sheet =
     | { kind: "start"; preselect: string[]; spec: LaunchSpec | null }
@@ -235,8 +249,9 @@
       await run();
     } catch (e) {
       jobError = setIn(jobError, j.id, errText(e));
-    } finally {
       jobBusy = setIn(jobBusy, j.id, null);
+    } finally {
+      if (busy === "dismissing") jobBusy = setIn(jobBusy, j.id, null);
       refresh();
     }
   }
@@ -344,8 +359,8 @@
       confirmStop = null;
     } catch (e) {
       confirmStopError = errText(e);
-    } finally {
       jobBusy = setIn(jobBusy, j.id, null);
+    } finally {
       refresh();
     }
   }
@@ -439,7 +454,7 @@
   }
 
   function jobDot(j: ClusterJob): string {
-    if (jobBusy[j.id] === "stopping" || jobBusy[j.id] === "cancelling") return "ending";
+    if (isJobStopping(j) || jobBusy[j.id] === "stopping" || jobBusy[j.id] === "cancelling") return "ending";
     return j.state === "running" ? "alive" : j.state === "starting" ? "booting" : "queued";
   }
 
@@ -668,7 +683,7 @@
           {@render refreshButton()}
         </div>
         {#each jobs as j (j.id)}
-          {@const busy = jobBusy[j.id]}
+          {@const busy = jobBusy[j.id] ?? (isJobStopping(j) ? "stopping" : undefined)}
           {@const inside = wsIn(j)}
           {@const next = continuation(j)}
           <div class="job" class:running={j.state === "running"}>
@@ -702,7 +717,7 @@
                 {/if}
               </span>
             </div>
-            <div class="job-line">{jobStatusLine(j, clusterTime)}</div>
+            <div class="job-line">{busy === "stopping" || busy === "cancelling" ? "Waiting for Slurm to finish…" : jobStatusLine(j, clusterTime)}</div>
             {#if j.replaces !== undefined}
               <div class="job-line note">
                 Continues {jobName(j.replaces)} — its workspaces move here when this one starts.
@@ -722,7 +737,7 @@
                 {#each inside as w (w.id)}
                   {@render wsRow(w)}
                 {/each}
-                {#if j.state === "running"}
+                {#if j.state === "running" && busy === undefined}
                   <button class="open-here" onclick={(e) => openHereMenu(e, j)}>
                     <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
                       <path d="M8 3v10M3 8h10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />

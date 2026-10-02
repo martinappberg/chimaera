@@ -17,7 +17,8 @@
 //! entrypoint needs its siblings, so the whole tree lands around its `bin/`
 //! — and it is the TREE, not just the exec'd inode, that a running session
 //! still needs (it spawns its code-mode host and bundled rg/zsh by path).
-//! That is why an update never reclaims the version dir it replaced.
+//! Cleanup keeps the activated package and defers while sessions hold shared
+//! usage locks; older workspace daemons also prevent reclamation until closed.
 //!
 //! Artifact sources, each verified against the real endpoint on 2026-07-06:
 //! - claude: `https://downloads.claude.ai/claude-code-releases` — the exact
@@ -579,6 +580,8 @@ pub(crate) async fn start_install(
         }
     };
 
+    prune_install_versions(state.managed_root.clone(), kind).await;
+
     // Installer sessions run a chimaera-authored script — never a user
     // prelude (None), and inherited prelude vars are scrubbed like
     // everywhere else.
@@ -623,31 +626,62 @@ pub(crate) async fn start_install(
     }
 }
 
+async fn prune_install_versions(root: PathBuf, kind: AgentKind) {
+    // Cleanup is best-effort; a read-only/stale manifest must not turn a
+    // working install into a failure. The caller retains the install lock.
+    match tokio::task::spawn_blocking(move || crate::runtime_retention::prune_locked(&root, kind))
+        .await
+    {
+        Ok(Ok(())) => {}
+        error => tracing::warn!(?error, "agent package cleanup deferred"),
+    }
+}
+
 /// All workspace daemons share this advisory lock. The descriptor stays alive
 /// until the installer exits; process death releases it without a stale lockdir.
 async fn lock_install(root: &Path, kind: AgentKind) -> Result<std::fs::File, Box<Response>> {
-    let root = root.to_path_buf();
+    let lock_root = root.to_path_buf();
     let result = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
-        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(&lock_root)?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(root.join(format!(".{}.lock", kind.as_str())))?;
+            .open(lock_root.join(format!(".{}.lock", kind.as_str())))?;
         file.try_lock().map_err(std::io::Error::from)?;
         Ok(file)
     })
     .await;
     match result {
         Ok(Ok(file)) => Ok(file),
-        Ok(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => Err(Box::new((
-            StatusCode::CONFLICT,
-            Json(json!({"error": format!("{} is being installed or changed in another workspace. Try again when it finishes.", kind.product_name())})),
-        ).into_response())),
-        other => Err(Box::new((StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("could not lock the shared agent installation: {other:?}")})),
+        Ok(Err(error)) => Err(install_lock_error(root, kind, error)),
+        Err(error) => Err(Box::new((StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Could not prepare the {} installation: {error}. Try again.", kind.product_name())})),
         ).into_response())),
     }
+}
+
+fn install_lock_error(root: &Path, kind: AgentKind, error: std::io::Error) -> Box<Response> {
+    use std::io::ErrorKind;
+    let (status, message) = match error.kind() {
+        ErrorKind::WouldBlock => (
+            StatusCode::CONFLICT,
+            format!("{} is being installed or changed in another workspace. Try again when it finishes.", kind.product_name()),
+        ),
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => (
+            StatusCode::INSUFFICIENT_STORAGE,
+            format!("Not enough storage to change the {} installation at {}. Free space or check your storage quota on this host, then try again.", kind.product_name(), root.display()),
+        ),
+        ErrorKind::PermissionDenied => (
+            StatusCode::FORBIDDEN,
+            format!("Chimaera cannot write to {}. Check this folder's permissions, then try again.", root.display()),
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not prepare the {} installation at {}: {error}", kind.product_name(), root.display()),
+        ),
+    };
+    Box::new((status, Json(json!({"error": message}))).into_response())
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -684,6 +718,9 @@ fn spawn_install_watch(
             .sessions
             .last_words(&session_id)
             .and_then(|w| w.info.exit_status);
+        if exit_status == Some(0) {
+            prune_install_versions(state.managed_root.clone(), kind).await;
+        }
         drop(install_lock);
         let detection = crate::launcher::detect(&state, kind, true).await;
         tracing::info!(
@@ -1195,6 +1232,30 @@ mod tests {
         let next = lock_install(&dir, AgentKind::Codex).await.unwrap();
         drop((other, next));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn install_storage_errors_explain_the_location_and_recovery() {
+        for error in [
+            std::io::ErrorKind::StorageFull,
+            std::io::ErrorKind::QuotaExceeded,
+        ] {
+            let response = install_lock_error(
+                Path::new("/home/user/.chimaera/agents"),
+                AgentKind::Antigravity,
+                error.into(),
+            );
+            assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let message = body["error"].as_str().unwrap();
+            assert!(message.contains("/home/user/.chimaera/agents"));
+            assert!(message.contains("storage quota"));
+            assert!(message.contains("try again"));
+            assert!(!message.contains("Ok(Err"));
+        }
     }
 
     fn test_dir(label: &str) -> PathBuf {

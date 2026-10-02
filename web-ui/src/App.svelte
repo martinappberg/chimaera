@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { RecentSessions } from "./lib/workspace/recentSessions";
   import { onMount, tick, untrack } from "svelte";
   import { paneTabHasKeyboardFocus } from "./lib/shared/tabNavigation";
   import { flip } from "svelte/animate";
@@ -3253,8 +3254,8 @@
    * snapshot fetched BEFORE the create but arriving AFTER it would otherwise
    * prune the fresh tab right out of the layout (stale-poll race).
    */
-  const recentlyCreated = new Map<string, number>();
-  const RECENT_MS = 10_000;
+  const recentlyCreated = new RecentSessions(pruneAndAutoOpen);
+  $effect(() => () => recentlyCreated.dispose());
   /** Sessions being optimistically killed: dropped locally at once, tombstoned
    *  so a snapshot can't re-add the dying row before the daemon's stop
    *  completes. A tombstone lifts only when a snapshot arrives WITHOUT the id
@@ -3272,7 +3273,10 @@
   /** Tombstone `ids` and drop them from the local roster in ONE re-apply
    *  (a workspace stop kills many at once). */
   function tombstone(ids: readonly string[]): void {
-    for (const id of ids) killing.add(id);
+    for (const id of ids) {
+      killing.add(id);
+      recentlyCreated.delete(id);
+    }
     applySessions(
       sessions.filter((s) => !ids.includes(s.id)),
       false,
@@ -3301,11 +3305,7 @@
   function pruneAndAutoOpen(): void {
     if (!layoutReady || !gotSessions) return;
     const live = new Set(sessions.map((s) => s.id));
-    const now = Date.now();
-    for (const [id, ts] of recentlyCreated) {
-      if (now - ts > RECENT_MS) recentlyCreated.delete(id);
-      else live.add(id);
-    }
+    recentlyCreated.protect(live);
     layout = pruneSessions(layout, live);
     // The one-shot waits for the settings to actually load: getSetting
     // returns the schema default ("auto") until GET /settings resolves, and
@@ -3352,6 +3352,7 @@
   }
 
   function onExited(id: string, _status: number | null): void {
+    recentlyCreated.delete(id);
     // An agent PTY dying may BE the chat⇄terminal toggle doing its job, so we
     // can't just drop the row. The events bus (which carries the mid-switch
     // placeholder) is authoritative — but with /ws/events down a genuine exit
@@ -3811,7 +3812,7 @@
           ? agents?.find((a) => a.id === (spawn.agent ?? "claude"))?.chatCapable
           : undefined;
       const s = await createSession(activeWsId, kind, null, spawnSize(), spawn, chatCapable);
-      recentlyCreated.set(s.id, Date.now());
+      recentlyCreated.add(s.id);
       // A racing events snapshot may already have delivered the session.
       if (!sessions.some((x) => x.id === s.id)) sessions.push(s);
       // The new session opens as the active tab in the focused pane,
@@ -3946,7 +3947,7 @@
     createError = null;
     void run(a.id, ws)
       .then(async (sessionId) => {
-        recentlyCreated.set(sessionId, Date.now());
+        recentlyCreated.add(sessionId);
         // Watch this session: when it exits, re-probe the catalog so the
         // split button / rows reflect the new binary.
         pendingInstalls.add(sessionId);

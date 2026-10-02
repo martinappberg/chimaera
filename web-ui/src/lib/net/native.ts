@@ -432,6 +432,8 @@ export interface ClusterJob {
   ended?: string;
   ended_at_ms?: number;
   stopped_by_user: boolean;
+  /** Cancellation accepted or Slurm is completing; absent on older hosts. */
+  stopping?: boolean;
   /** Its node reaches the internet (agents can work), once probed. */
   egress?: boolean;
   /** Workspaces it opens when it starts. */

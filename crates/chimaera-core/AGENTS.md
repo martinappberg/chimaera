@@ -36,6 +36,8 @@ versions). Run `cargo test` in the app workspace too when you touch core deps.
   at mode 0600, then renamed, because it carries the bearer token. `Manifest.build`
   serde-defaults to an ancient sentinel so an
   old manifest still parses.
+  `Manifest.runtime_leases` defaults false: old daemons do not protect managed
+  agent packages, so automatic package cleanup defers while their manifest is live.
 - **A manifest's pid means something only on the node that wrote it.** HPC login
   nodes share `$HOME`, so every node reads the same file: check `written_here()`
   (`this_node()` vs `hostname`, via `same_node`) before trusting `is_alive()`, and

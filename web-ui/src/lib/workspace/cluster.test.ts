@@ -300,6 +300,16 @@ describe("jobs in words", () => {
     );
   });
 
+  it("keeps a cancelled or completing job stopping and out of workspace destinations", () => {
+    for (const marker of [{ stopped_by_user: true }, { stopping: true }]) {
+      for (const state of ["waiting", "starting", "running"] as const) {
+        const stopping = job({ ...marker, state, node: "n7" });
+        expect(jobStatusLine(stopping, NOW)).toBe("Stopping on n7…");
+        expect(openPlan([stopping])).toEqual({ kind: "sheet" });
+      }
+    }
+  });
+
   it("words an ended job as one line", () => {
     expect(endedLine(job({ state: "ended", ended: "TIMEOUT", ended_at_ms: NOW - 2 * HOUR }), NOW)).toBe(
       "Long ended 2 h ago — it hit its time limit. Chats are saved.",

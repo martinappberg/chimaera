@@ -1,10 +1,10 @@
 use super::support::*;
 use crate::*;
 
-/// A new chat that never initializes closes for every provider. A prompt
-/// accepted before initialization must instead keep its failed chat reachable.
+/// Startup failures stay visible even before the first prompt, so users can
+/// read missing-library, authentication and timeout diagnostics.
 #[tokio::test]
-async fn unused_handshake_failure_closes_for_every_provider() {
+async fn unused_handshake_failure_keeps_diagnostic_for_every_provider() {
     handshake_failure_for_every_provider(false).await;
 }
 
@@ -72,14 +72,10 @@ async fn handshake_failure_for_every_provider(submit: bool) {
         let journal_path = state.chat.journal_dir().join(format!("{id}.jsonl"));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let journal = loop {
-            let settled = if submit {
-                crate::lock(&state.agents)
-                    .get(&id)
-                    .is_some_and(|a| a.state == agent_state::AgentState::Errored)
-                    && !state.chat.get(&id).unwrap().alive
-            } else {
-                !crate::lock(&state.agents).contains_key(&id)
-            };
+            let settled = crate::lock(&state.agents)
+                .get(&id)
+                .is_some_and(|a| a.state == agent_state::AgentState::Errored)
+                && state.chat.get(&id).is_some_and(|info| !info.alive);
             // Exited updates the in-memory row before the journal writer's
             // drain barrier. A slow writer must not race the disk assertion.
             let journal = tokio::fs::read_to_string(&journal_path)
@@ -101,13 +97,10 @@ async fn handshake_failure_for_every_provider(submit: bool) {
             state.sessions.get(&id).is_none(),
             "{kind:?} switched to a terminal"
         );
-        assert_eq!(state.chat.contains(&id), submit);
-        assert_eq!(crate::lock(&state.chat_recipes).contains_key(&id), submit);
+        assert!(state.chat.contains(&id));
+        assert!(crate::lock(&state.chat_recipes).contains_key(&id));
         assert!(crate::lock(&state.recents).list("w-test").is_empty());
-        assert_eq!(
-            crate::lock(&state.session_workspaces).contains_key(&id),
-            submit
-        );
+        assert!(crate::lock(&state.session_workspaces).contains_key(&id));
         assert!(!journal.contains("mode_switch"));
     }
 }
