@@ -5292,22 +5292,20 @@
                       <span class="remote-badge" title="Remote Control on — pick this session up in the Claude app or at claude.ai/code">remote</span>
                     {/if}
                   </span>
-                  {#if s.kind === "agent" && s.git && s.git.worktree !== s.git.repo}
-                    <!-- Give worktree context its own line so a long branch
-                         never truncates the agent's identity. -->
-                    <span class="wt-mark"><BranchChip git={s.git} /></span>
-                  {/if}
-                  <!-- Second line only when it adds something over the name.
-                       Shells never do: the name already resolves to the title
-                       (program-set) or the cwd (the shell's "user@host:dir"
-                       prompt title is dropped server-side). Agents show their
-                       own PTY title as context when it differs from the name;
-                       chat agents (no PTY title) show the agent's own
-                       post-turn status line instead. -->
-                  {#if s.kind === "agent" && s.title && s.title !== displayName(s) && s.title !== s.agent_title}
-                    <span class="title">{s.title}</span>
-                  {:else if s.kind === "agent" && s.status_detail && s.status_detail !== displayName(s)}
-                    <span class="title" title={s.status_detail}>{s.status_detail}</span>
+                  {#if s.kind === "agent"}
+                    <!-- Keep the name anchored above one reserved context
+                         line. Worktree and status share it rather than adding
+                         a third line when the provider reports new activity. -->
+                    <span class="row-context">
+                      {#if s.git && s.git.worktree !== s.git.repo}
+                        <span class="wt-mark"><BranchChip git={s.git} /></span>
+                      {/if}
+                      {#if s.title && s.title !== displayName(s) && s.title !== s.agent_title}
+                        <span class="title" title={s.title}>{s.title}</span>
+                      {:else if s.status_detail && s.status_detail !== displayName(s)}
+                        <span class="title" title={s.status_detail}>{s.status_detail}</span>
+                      {/if}
+                    </span>
                   {/if}
                 </span>
               {/if}
@@ -6569,6 +6567,9 @@
     flex-shrink: 0;
     height: calc((var(--text-sm) + var(--text-xs)) * 1.3 + 12px);
   }
+  .row.agent-row .labels {
+    align-self: stretch;
+  }
 
   /* The dashboard home row: fixed above the session sections, quiet until
      hovered or active — furniture, not a session. */
@@ -6696,15 +6697,28 @@
     font-family: var(--mono);
     font-size: var(--text-sm);
   }
-  /* Worktree context stays secondary and gets its own truncation budget. */
+  .row-context {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    min-height: calc(var(--text-xs) * 1.3);
+    font-size: var(--text-xs);
+  }
+
+  /* Branch and activity each keep a truncation budget on the second line. */
   .wt-mark {
     display: flex;
     min-width: 0;
-    margin-top: 2px;
     opacity: 0.85;
+  }
+  .wt-mark:not(:last-child) {
+    max-width: 50%;
   }
 
   .title {
+    flex: 1;
+    min-width: 0;
     font-size: var(--text-xs);
     color: var(--muted);
   }

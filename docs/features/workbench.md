@@ -269,7 +269,9 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   (see [lifecycle-and-persistence.md](lifecycle-and-persistence.md)), which is what lets persisted
   tabs rebind with no client migration.
 
-Agent rows reserve two text lines, so changing a status/title does not move the rows below.
+Agent rows reserve two text lines and anchor the name to the first. Linked-worktree branches
+and provider status share the second line with separate truncation, so changing a status/title
+does not move either the name or the rows below.
 Their ordering uses the first known creation time throughout view switches and respawns;
 attention-state changes do not reorder the sidebar or its numbered shortcuts.
 
