@@ -13,7 +13,7 @@ use std::{collections::HashMap, sync::Mutex, time::Duration as StdDuration};
 
 type Canned = HashMap<(String, String), (u16, serde_json::Value)>;
 
-pub(super) struct FakeAccount {
+pub(in crate::pro) struct FakeAccount {
     pub endpoint: String,
     pub requests: Arc<Mutex<Vec<(String, String, serde_json::Value)>>>,
     pub baton: Arc<Mutex<serde_json::Value>>,
@@ -188,7 +188,7 @@ async fn hidden_login_terminal_workspace_is_never_a_mirror_candidate() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-pub(super) fn device(endpoint: &str) -> Configure {
+pub(in crate::pro) fn device(endpoint: &str) -> Configure {
     serde_json::from_value(json!({
         "account_id": "a-fixture",
         "role": "device",

@@ -278,9 +278,12 @@ fn start(
             &owner,
             &config,
             &workspace,
-            ask,
-            expected_epoch,
-            bound,
+            PullRequest {
+                generation,
+                ask,
+                expected_epoch,
+                bound,
+            },
             &mut stage,
         )
         .await;
@@ -365,19 +368,43 @@ async fn read(state: &AppState, config: &Configure, workspace: &str) -> Result<B
     Ok(baton)
 }
 
+struct PullRequest {
+    generation: u64,
+    ask: bool,
+    expected_epoch: Option<u64>,
+    bound: Duration,
+}
 async fn pull(
     state: &Arc<AppState>,
     config: &Configure,
     workspace: &str,
-    ask: bool,
-    expected_epoch: Option<u64>,
-    bound: Duration,
+    request: PullRequest,
     stage: &mut &'static str,
 ) -> Result<()> {
+    let PullRequest {
+        generation,
+        ask,
+        expected_epoch,
+        bound,
+    } = request;
     let me = config.delegation.device_id.clone();
     let deadline = tokio::time::Instant::now() + bound;
+    let current = || -> Result<()> {
+        ensure!(
+            generation
+                == state
+                    .pro
+                    .generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                && can_take(state, config, workspace),
+            "Account or project changed while taking over"
+        );
+        Ok(())
+    };
+    current()?;
     if ask {
         let baton = read(state, config, workspace).await?;
+        current()?;
         ensure!(
             expected_epoch.is_none_or(|epoch| epoch == baton.epoch),
             "Project ownership changed before Take over"
@@ -388,23 +415,19 @@ async fn pull(
         {
             return Ok(());
         }
-        let response = engine::account(
-            config,
-            &format!("/v2/baton/{workspace}/move"),
-            "POST",
-            Some(&json!({"holder_id": me, "epoch": baton.epoch})),
-        )
-        .await?;
-        ensure!(
-            response.status == 200,
-            "the account did not take the request to move the work"
-        );
+        ask_to_move(config, workspace, &baton, deadline, &current).await?;
     }
     let mut last: Option<anyhow::Error> = None;
     let mut takes = 0;
     loop {
         *stage = "wait";
+        current()?;
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "Take over timed out"
+        );
         let baton = read(state, config, workspace).await?;
+        current()?;
         let mine = baton.holder_id.as_deref() == Some(me.as_str());
         if mine && super::owned_epoch(state, workspace) == Some(baton.epoch) {
             return Ok(());
@@ -416,7 +439,7 @@ async fn pull(
             "the other computer kept the work"
         );
         let mut wait = POLL;
-        if (!mine && (baton.holder_id.is_none() || execution::expired(&baton)))
+        if (!mine && acquisition_ready(&baton))
             || (mine
                 && super::project_copy::copy_only(state, workspace)
                 && lock(&state.pro.preferences)
@@ -443,6 +466,87 @@ async fn pull(
         }
         tokio::time::sleep(wait).await;
     }
+}
+
+/// A revoked device's live lease can outlast sign-out. Only an explicit,
+/// exact-conflict retry hint distinguishes that wait from a refused cloud move.
+async fn ask_to_move(
+    config: &Configure,
+    workspace: &str,
+    observed: &Baton,
+    deadline: tokio::time::Instant,
+    current: &(impl Fn() -> Result<()> + Sync),
+) -> Result<()> {
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            current()?;
+            let response = engine::account(
+                config,
+                &format!("/v2/baton/{workspace}/move"),
+                "POST",
+                Some(&json!({"holder_id": config.delegation.device_id, "epoch": observed.epoch})),
+            )
+            .await?;
+            current()?;
+            if response.status == 200 {
+                let grant: Baton = response.json()?;
+                ensure!(
+                    grant.workspace_id == workspace && grant.epoch == observed.epoch,
+                    "Project ownership changed before Take over"
+                );
+                return Ok(());
+            }
+            let delay = move_retry(&response, workspace, observed)
+                .context("The account refused the request to move the work")?
+                .max(POLL);
+            let wake = (tokio::time::Instant::now() + delay).min(deadline);
+            while tokio::time::Instant::now() < wake {
+                current()?;
+                tokio::time::sleep_until((tokio::time::Instant::now() + POLL).min(wake)).await;
+            }
+        }
+    })
+    .await
+    .context("The previous computer's lease did not expire in time")?
+}
+
+fn move_retry(
+    response: &super::transport::Response,
+    workspace: &str,
+    observed: &Baton,
+) -> Option<Duration> {
+    #[derive(serde::Deserialize)]
+    struct Conflict {
+        error: String,
+        baton: Baton,
+        retry_after_ms: u64,
+    }
+    if response.status != 409 {
+        return None;
+    }
+    let conflict: Conflict = serde_json::from_slice(&response.body).ok()?;
+    let baton = conflict.baton;
+    let now = timestamp_ms(&baton.server_now)?;
+    let expires = timestamp_ms(baton.expires_at.as_deref()?)?;
+    (conflict.error == "held"
+        && baton.workspace_id == workspace
+        && baton.epoch == observed.epoch
+        && baton.holder_id.is_some()
+        && baton.holder_id == observed.holder_id
+        && !baton.mirror_disabled
+        && expires > now
+        && (1..=BOUND.as_millis() as u64).contains(&conflict.retry_after_ms))
+    .then(|| Duration::from_millis(conflict.retry_after_ms))
+}
+
+/// The negotiated account contract retains a thirty-second reconnect grace.
+/// Wait cheaply on ownership before spending a bounded hydration attempt.
+fn acquisition_ready(baton: &Baton) -> bool {
+    if baton.holder_id.is_none() {
+        return true;
+    }
+    matches!((timestamp_ms(&baton.server_now), baton.expires_at.as_deref().and_then(timestamp_ms)),
+        (Some(now), Some(expires)) if now >= expires + 30_000)
 }
 
 /// Explicit local takeover preserves the existing account move body and checks
@@ -715,5 +819,153 @@ mod tests {
         }))
         .unwrap();
         assert!(grant.move_to.is_none() && grant.move_requested_at.is_none());
+    }
+    fn retry_body() -> serde_json::Value {
+        json!({"error":"held", "retry_after_ms":1, "baton": {
+            "workspace_id":"w-project", "holder_id":"opaque-device", "epoch":4,
+            "requires_fork":false, "server_now":"2026-10-02T00:00:00Z",
+            "expires_at":"2026-10-02T00:01:30Z"
+        }})
+    }
+    #[test]
+    fn only_explicit_same_owner_conflicts_are_retryable() {
+        let body = retry_body();
+        let observed: Baton = serde_json::from_value(body["baton"].clone()).unwrap();
+        let response = |body: &serde_json::Value| super::super::transport::Response {
+            status: 409,
+            body: serde_json::to_vec(body).unwrap(),
+        };
+        assert_eq!(
+            move_retry(&response(&body), "w-project", &observed),
+            Some(Duration::from_millis(1))
+        );
+        for (pointer, value) in [
+            ("/retry_after_ms", json!(null)),
+            ("/retry_after_ms", json!(0)),
+            ("/retry_after_ms", json!(-1)),
+            ("/retry_after_ms", json!(300001)),
+            ("/retry_after_ms", json!(1.5)),
+            ("/error", json!("stale_epoch")),
+            ("/baton/workspace_id", json!("w-other")),
+            ("/baton/holder_id", json!("other")),
+            ("/baton/holder_id", json!(null)),
+            ("/baton/epoch", json!(5)),
+            ("/baton/expires_at", json!("2026-10-01T23:59:59Z")),
+            ("/baton/server_now", json!("invalid")),
+        ] {
+            let mut bad = body.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                move_retry(&response(&bad), "w-project", &observed).is_none(),
+                "{pointer}"
+            );
+        }
+        let mut bad = body.clone();
+        bad["baton"]["mirror_disabled"] = json!(true);
+        assert!(move_retry(&response(&bad), "w-project", &observed).is_none());
+    }
+    #[test]
+    fn lapsed_owner_waits_the_account_grace_before_hydration() {
+        let mut value = retry_body()["baton"].clone();
+        for (now, ready) in [
+            ("2026-10-02T00:01:29Z", false),
+            ("2026-10-02T00:01:30Z", false),
+            ("2026-10-02T00:01:59.999Z", false),
+            ("2026-10-02T00:02:00Z", true),
+        ] {
+            value["server_now"] = json!(now);
+            assert_eq!(
+                acquisition_ready(&serde_json::from_value(value.clone()).unwrap()),
+                ready
+            );
+        }
+        value["holder_id"] = serde_json::Value::Null;
+        assert!(acquisition_ready(&serde_json::from_value(value).unwrap()));
+    }
+    #[tokio::test]
+    async fn live_account_retry_is_bounded_and_account_change_stops_it() {
+        use super::super::engine::continuity_tests::{device, FakeAccount};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let body = retry_body();
+        let observed: Baton = serde_json::from_value(body["baton"].clone()).unwrap();
+        let fake = FakeAccount::start(body["baton"].clone()).await;
+        let path = "/v2/baton/w-project/move";
+        fake.script("POST", path, 409, body.clone());
+        let config = device(&fake.endpoint);
+        let replacement = async {
+            loop {
+                if !fake.calls("POST", path).is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            fake.script("POST", path, 200, body["baton"].clone());
+        };
+        let (result, ()) = tokio::join!(
+            ask_to_move(
+                &config,
+                "w-project",
+                &observed,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+                &|| Ok(())
+            ),
+            replacement
+        );
+        result.unwrap();
+        assert!(fake.calls("POST", path).len() >= 2);
+        for body in fake.calls("POST", path) {
+            assert_eq!(body, json!({"holder_id":"d-home","epoch":4}));
+        }
+        lock(&fake.requests).clear();
+        let mut held = retry_body();
+        held["retry_after_ms"] = json!(5000);
+        fake.script("POST", path, 409, held.clone());
+        let current = AtomicBool::new(true);
+        let changed = async {
+            while fake.calls("POST", path).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            current.store(false, Ordering::Release);
+        };
+        let check = || {
+            ensure!(current.load(Ordering::Acquire), "account changed");
+            Ok(())
+        };
+        let (result, ()) = tokio::join!(
+            ask_to_move(
+                &config,
+                "w-project",
+                &observed,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+                &check
+            ),
+            changed
+        );
+        assert!(result.unwrap_err().to_string().contains("account changed"));
+        assert_eq!(fake.calls("POST", path).len(), 1);
+        lock(&fake.requests).clear();
+        assert!(ask_to_move(
+            &config,
+            "w-project",
+            &observed,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &|| Ok(())
+        )
+        .await
+        .is_err());
+        assert_eq!(fake.calls("POST", path).len(), 1);
+        lock(&fake.requests).clear();
+        held.as_object_mut().unwrap().remove("retry_after_ms");
+        fake.script("POST", path, 409, held);
+        assert!(ask_to_move(
+            &config,
+            "w-project",
+            &observed,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            &|| Ok(())
+        )
+        .await
+        .is_err());
+        assert_eq!(fake.calls("POST", path).len(), 1);
     }
 }

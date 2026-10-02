@@ -297,6 +297,10 @@ installation/lazy-return policy. Opening a project on another computer creates a
 copy and neither inserts an opened-here hint nor changes that policy. Explicit
 Take over uses `moves::take_over_here`; the holder still learns `move_to`, drains
 at a safe pause and may keep its work if its own user acted after the request.
+A signed-out computer's live lease is retried only with the account's bounded
+`retry_after_ms` hint for that exact holder and epoch. The captured account and
+project remain current through the five-minute deadline; lease expiry and the
+account's thirty-second reconnect grace both precede hydration.
 Phone requests target only eligible executors, never ordinary local copies.
 Ordinary viewer input is forwarded to the current owner, including sleeping-owner
 wake behavior; `session_proxy` does not submit account moves. The native
