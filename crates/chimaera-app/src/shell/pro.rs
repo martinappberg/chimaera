@@ -51,6 +51,8 @@ pub(super) struct Pro {
     ready: tokio::sync::watch::Sender<bool>,
     initialization_phase: Mutex<InitializationPhase>,
     credential_generation: Arc<AtomicU64>,
+    #[cfg(feature = "ssh-agent-prototype")]
+    ssh_authentication: crate::ssh_agent::lifecycle::Registry,
     credential_persistence: Arc<credentials::Persistence>,
     recovery: recovery::Recovery<Client>,
     placements: Mutex<HashMap<String, chimaera_link::WorkspacePlacement>>,
@@ -181,6 +183,8 @@ impl Pro {
             ready: tokio::sync::watch::channel(ready).0,
             initialization_phase: Mutex::new(InitializationPhase::Keychain),
             credential_generation: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "ssh-agent-prototype")]
+            ssh_authentication: crate::ssh_agent::lifecycle::Registry::default(),
             credential_persistence: Arc::new(credentials::Persistence::default()),
             recovery: recovery::Recovery::default(),
             placements: Mutex::new(HashMap::new()),
@@ -310,6 +314,27 @@ impl Pro {
 
     pub fn generation(&self) -> u64 {
         self.credential_generation.load(Ordering::SeqCst)
+    }
+
+    // Called under `client`: admission and replacement share this fence.
+    fn advance_generation(&self) {
+        let generation = self.credential_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        #[cfg(feature = "ssh-agent-prototype")]
+        self.ssh_authentication.advance(generation);
+        #[cfg(not(feature = "ssh-agent-prototype"))]
+        let _ = generation;
+    }
+
+    #[cfg(feature = "ssh-agent-prototype")]
+    pub(super) fn ssh_authentication(
+        &self,
+        generation: u64,
+    ) -> Result<crate::ssh_agent::lifecycle::Attempt, chimaera_link::SshAuthFailure> {
+        let client = lock(&self.client);
+        if client.is_none() || self.generation() != generation {
+            return Err(chimaera_link::SshAuthFailure::Revoked);
+        }
+        self.ssh_authentication.admit(generation)
     }
 
     pub(super) fn account_id(&self) -> Option<String> {
@@ -625,10 +650,7 @@ async fn activate_snapshot(
         state.pro.recovery.cancel();
         let previous = {
             let mut current = lock(&state.pro.client);
-            state
-                .pro
-                .credential_generation
-                .fetch_add(1, Ordering::SeqCst);
+            state.pro.advance_generation();
             current.take()
         };
         stop(&state).await;
@@ -1795,10 +1817,35 @@ mod tests {
         assert!(pro.client_snapshot().await.is_some());
     }
 
+    #[cfg(feature = "ssh-agent-prototype")]
+    #[tokio::test]
+    async fn account_replacement_cancels_native_signing_and_refuses_stale_admission() {
+        let pro = Pro::new(Some("http://127.0.0.1:1".into()));
+        assert!(pro.ssh_authentication(0).is_err());
+        *lock(&pro.client) = Some(Client::new("http://127.0.0.1:1", None).unwrap());
+        let attempt = pro.ssh_authentication(0).ok().unwrap();
+        let mut cancellation = attempt.cancellation();
+        {
+            let mut client = lock(&pro.client);
+            pro.advance_generation();
+            *client = None;
+        }
+        assert!(*cancellation.borrow_and_update());
+        assert!(pro.ssh_authentication(0).is_err());
+        assert!(pro.ssh_authentication(1).is_err());
+        *lock(&pro.client) = Some(Client::new("http://127.0.0.1:1", None).unwrap());
+        let replacement = pro.ssh_authentication(1).ok().unwrap();
+        drop(attempt);
+        assert!(!*replacement.cancellation().borrow());
+    }
+
     #[test]
     fn device_hosts_never_fall_back_to_ssh_without_an_account_route() {
         assert!(device_fallback::<()>(true).is_err());
         assert_eq!(device_fallback::<()>(false).unwrap(), None);
+        assert!(route_fallback::<()>(true, false).is_err());
+        assert!(route_fallback::<()>(false, true).is_err());
+        assert_eq!(route_fallback::<()>(false, false).unwrap(), None);
     }
 
     #[tokio::test]
@@ -1876,10 +1923,7 @@ async fn sign_out(app: &AppHandle, everywhere: bool, expected: Option<u64>) -> R
         let client = {
             let mut client = lock(&state.pro.client);
             let previous = client.take();
-            state
-                .pro
-                .credential_generation
-                .fetch_add(1, Ordering::SeqCst);
+            state.pro.advance_generation();
             previous
         };
         stop(&state).await;
@@ -2106,10 +2150,10 @@ pub(super) async fn connection(
         state.pro.client_now()
     };
     let Some((client, generation)) = snapshot else {
-        return device_fallback(device);
+        return route_fallback(device, kept);
     };
     if !state.pro.has_keeper() {
-        return device_fallback(device);
+        return route_fallback(device, kept);
     }
     let known = lock(&state.pro.hosts)
         .values()
@@ -2119,10 +2163,8 @@ pub(super) async fn connection(
     }
     let hosts = match client.hosts().await {
         Ok(hosts) => hosts,
-        // An account or keeper outage must not strand a host that plain SSH
-        // reaches; the resulting row reads as a direct connection.
-        Err(_) if !device => return Ok(None),
-        Err(_) => return Err(DEVICE_UNREACHABLE.into()),
+        Err(_) if device => return Err(DEVICE_UNREACHABLE.into()),
+        Err(_) => return Err(KEPT_UNREACHABLE.into()),
     };
     let host = hosts.iter().find(|host| host.alias == alias).cloned();
     {
@@ -2138,7 +2180,7 @@ pub(super) async fn connection(
     }
     match host {
         Some(host) => Ok(Some((client, host, generation))),
-        None => device_fallback(device),
+        None => route_fallback(device, kept || known),
     }
 }
 
@@ -2154,6 +2196,18 @@ pub(super) fn direct_ssh_bypass(direct: bool, device: bool) -> Result<bool, Stri
 const KEPT_STARTUP_WAIT: Duration = Duration::from_secs(10);
 const DEVICE_UNREACHABLE: &str =
     "Couldn't reach Chimaera Pro to reconnect this computer. It reconnects when Pro is back.";
+
+const KEPT_UNREACHABLE: &str = "Couldn't reach this host through Chimaera Pro. Try again, or choose Connect directly in advanced host settings.";
+
+fn route_fallback<T>(device: bool, kept: bool) -> Result<Option<T>, String> {
+    if device {
+        device_fallback(true)
+    } else if kept {
+        Err(KEPT_UNREACHABLE.into())
+    } else {
+        Ok(None)
+    }
+}
 
 fn device_fallback<T>(device: bool) -> Result<Option<T>, String> {
     if device {
@@ -2174,15 +2228,28 @@ pub async fn pro_set_host_kept(app: AppHandle, alias: String, kept: bool) -> Res
         let (hostname, user, port) = chimaera_remote::ssh_destination(&alias)
             .await
             .map_err(|_| "Couldn't read this host's SSH settings.")?;
+        let target = chimaera_link::SshTarget {
+            hostname,
+            user,
+            port,
+        };
+        #[cfg(all(feature = "ssh-agent-prototype", unix))]
+        let host = {
+            let saved_alias = alias.clone();
+            let entry =
+                super::connect::with_hosts(move |hosts| Ok(hosts.get(&saved_alias))).await?;
+            let policy = entry.map(|entry| chimaera_link::ClusterPolicy {
+                login_serve: entry.login_serve,
+                not_cluster: entry.not_cluster,
+            });
+            client
+                .register_ssh_auth_host(&alias, target, policy)
+                .await
+                .map_err(|_| HOST_UPDATE_FAILED)?
+        };
+        #[cfg(not(all(feature = "ssh-agent-prototype", unix)))]
         let host = client
-            .add_host_with_ssh(
-                &alias,
-                Some(chimaera_link::SshTarget {
-                    hostname,
-                    user,
-                    port,
-                }),
-            )
+            .add_host_with_ssh(&alias, Some(target))
             .await
             .map_err(|_| HOST_UPDATE_FAILED)?;
         apply_host(&app, host).await;
@@ -2205,7 +2272,8 @@ pub async fn pro_set_host_kept(app: AppHandle, alias: String, kept: bool) -> Res
     let connected = state.tunnels.lock().await.contains_key(&alias);
     let _ = app.emit("pro-changed", ());
     drop(_operation);
-    if connected {
+    let inert_registration = kept && cfg!(all(feature = "ssh-agent-prototype", unix));
+    if connected || inert_registration {
         super::connect::do_connect(&app, alias, false).await?;
     }
     Ok(())

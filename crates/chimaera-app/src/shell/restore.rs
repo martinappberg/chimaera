@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
-use super::connect::{do_connect, HostStatus};
+use super::connect::{restore_connect, HostStatus};
 use super::{
     authorize_daemon_origin, daemon_navigation_allowed, is_srcdoc_frame, lock, Shell, WindowScope,
 };
@@ -624,7 +624,7 @@ pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> tau
             // `run_flight`), and the records survive failure: the windows
             // come back with the first connect that lands — a home-screen
             // click, a window's reconnect, or the next launch.
-            if let Err(e) = do_connect(&handle, alias.clone(), false).await {
+            if let Err(e) = restore_connect(&handle, alias.clone()).await {
                 tracing::warn!("could not reconnect {alias} to restore windows: {e}");
             }
         });

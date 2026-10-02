@@ -311,6 +311,26 @@ pub(super) async fn do_connect(
     alias: String,
     update_daemon: bool,
 ) -> Result<HostState, String> {
+    connect_with_intent(app, alias, update_daemon, ConnectIntent::Explicit).await
+}
+
+pub(super) async fn restore_connect(app: &AppHandle, alias: String) -> Result<HostState, String> {
+    connect_with_intent(app, alias, false, ConnectIntent::Restore).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConnectIntent {
+    Explicit,
+    Restore,
+}
+const KEEPER_CONNECT_REQUIRED: &str = "Connect to this host to resume its keeper connection";
+
+async fn connect_with_intent(
+    app: &AppHandle,
+    alias: String,
+    update_daemon: bool,
+    intent: ConnectIntent,
+) -> Result<HostState, String> {
     let state = app.state::<Shell>();
     tracing::info!("ipc: connect_host {alias} (update_daemon: {update_daemon})");
     loop {
@@ -337,6 +357,12 @@ pub(super) async fn do_connect(
                         // An update must still run its own flight — loop and
                         // own the next one.
                         Ok(()) => continue,
+                        Err(e)
+                            if intent == ConnectIntent::Explicit
+                                && e == KEEPER_CONNECT_REQUIRED =>
+                        {
+                            continue
+                        }
                         Err(e) => return Err(e),
                     },
                     // The owner died without reporting (task dropped). Clear
@@ -360,14 +386,15 @@ pub(super) async fn do_connect(
         let reused = if update_daemon {
             None
         } else {
-            let direct_ssh = host_entry(&alias).await.direct_ssh;
-            let via_pro = keeper_route_selected(
-                direct_ssh,
-                state.pro.client_now().is_some(),
-                lock(&state.pro.hosts)
-                    .values()
-                    .any(|host| host.alias == alias),
-            );
+            let entry = host_entry(&alias).await;
+            let via_pro = (!entry.direct_ssh && entry.kept)
+                || keeper_route_selected(
+                    entry.direct_ssh,
+                    state.pro.client_now().is_some(),
+                    lock(&state.pro.hosts)
+                        .values()
+                        .any(|host| host.alias == alias),
+                );
             // Probe liveness WITHOUT holding the tunnels lock: this is a ~2s
             // HTTP round-trip, and holding the map locked across it would
             // stall every other tunnel op. A 401 from a stale/foreign daemon
@@ -393,7 +420,7 @@ pub(super) async fn do_connect(
         // hang, whether this reused a healthy tunnel or built a new one.
         let result = match reused {
             Some(reply) => Ok(reply),
-            None => run_flight(app, &alias, update_daemon).await,
+            None => run_flight(app, &alias, update_daemon, intent).await,
         };
         lock(&state.connecting).remove(&alias);
         let _ = tx.send(Some(match &result {
@@ -430,6 +457,7 @@ async fn run_flight(
     app: &AppHandle,
     alias: &str,
     update_daemon: bool,
+    intent: ConnectIntent,
 ) -> Result<HostState, String> {
     let state = app.state::<Shell>();
     // Attribute the whole pre-connect stall — the wedge ladder and the old
@@ -445,17 +473,11 @@ async fn run_flight(
             forget_cloud_windows(&state, alias);
             return Err(CLOUD_IS_NOT_A_HOST.into());
         }
-        let ssh = host.kind == chimaera_link::HostKind::Ssh;
-        match run_link_flight(app, client, host, generation, update_daemon).await {
-            Ok(reply) => return Ok(reply),
-            // A kept SSH host is still an ordinary SSH host: when the account
-            // or keeper route fails in transit, connect directly (the row then
-            // reads as a direct connection) instead of stranding the user.
-            Err(LinkFailure::Transport(error)) if ssh => {
-                tracing::info!("Pro route to {alias} unavailable ({error}); connecting directly");
-            }
-            Err(LinkFailure::Transport(error) | LinkFailure::Final(error)) => return Err(error),
-        }
+        return run_link_flight(app, client, host, generation, update_daemon, intent)
+            .await
+            .map_err(|error| match error {
+                LinkFailure::Transport(error) | LinkFailure::Final(error) => error,
+            });
     }
     // Remove under the map lock, then do process/network teardown without it.
     // `Tunnel::close` is bounded but still asynchronous; holding this lock made
@@ -521,7 +543,7 @@ async fn run_flight(
     let tunnel = match result {
         Ok(tunnel) => tunnel,
         Err(e) => match e.downcast_ref::<chimaera_remote::ClusterHost>() {
-            Some(found) => return Ok(landed_on_cluster(app, alias, found).await),
+            Some(found) => return Ok(landed_on_cluster(app, alias, found, None).await),
             None => return Err(format!("{e:#}")),
         },
     };
@@ -591,11 +613,8 @@ fn forget_cloud_windows(state: &Shell, alias: &str) {
     }
 }
 
-/// Why a keeper-routed connect failed. Only `Transport` (the account or
-/// keeper could not be reached, or its route did not answer) may fall back to
-/// direct SSH; a keeper-side login failure must not trigger a second prompt.
-/// Once the keeper has accepted a reconnect it may be showing a password or
-/// Duo prompt, so every later failure of that flight is `Final`.
+/// All failures of an account-owned route remain on that route. Direct SSH
+/// is selected only by the host's explicit per-computer advanced preference.
 #[derive(Debug)]
 enum LinkFailure {
     Transport(String),
@@ -618,6 +637,7 @@ async fn run_link_flight(
     mut host: chimaera_link::Host,
     generation: u64,
     reconnect: bool,
+    intent: ConnectIntent,
 ) -> Result<HostState, LinkFailure> {
     let state = app.state::<Shell>();
     let alias = host.alias.clone();
@@ -626,21 +646,43 @@ async fn run_link_flight(
     if !current() {
         return Err("Account changed while connecting".into());
     }
-    // Only a reconnect the keeper refused may fall back to direct SSH. After
-    // it accepted, the keeper owns the login (and may be prompting), so an
-    // account/keeper hiccup or a slow daemon is waited out instead.
-    let accepted = reconnect || host.status != chimaera_link::HostStatus::Connected;
+    let accepted = reconnect || !keeper_host_ready(&host);
     if accepted {
-        client.reconnect_host(&host.id).await.map_err(transport)?;
-        let deadline = tokio::time::Instant::now() + KEEPER_LOGIN_WAIT;
-        host = await_keeper_login(
-            || client.hosts(),
-            &host.id,
-            current,
-            deadline,
-            KEEPER_POLL_FIRST,
-        )
-        .await?;
+        if intent != ConnectIntent::Explicit {
+            return Err(KEEPER_CONNECT_REQUIRED.into());
+        }
+        host = explicit_keeper_connect(&state, &client, host, generation).await?;
+    }
+    if let Some(cluster) = host
+        .cluster
+        .as_ref()
+        .filter(|cluster| !cluster.not_cluster && !cluster.login_serve)
+    {
+        if cluster.scheduler != chimaera_link::ClusterScheduler::Slurm {
+            return Err("This keeper's cluster type isn't supported by this app".into());
+        }
+        client.cluster_capabilities().await.map_err(|_| {
+            LinkFailure::Final("This keeper needs an update before opening its Jobs page".into())
+        })?;
+        // Account replacement owns the same operation gate. Keep this owner
+        // through local persistence, window retirement and the final event.
+        let authority = keeper_landing_authority(&state.pro.operation, current).await?;
+        let previous = remove_current_keeper_tunnel(&state.tunnels, &alias, current).await?;
+        if let Some(previous) = previous {
+            previous.close().await;
+        }
+        if !current() {
+            return Err("Account changed while connecting".into());
+        }
+        let found = chimaera_remote::ClusterHost {
+            host: alias.clone(),
+            scheduler: chimaera_core::slurm::Scheduler::Slurm,
+            login_daemon: None,
+        };
+        let mut reply = landed_on_cluster(app, &alias, &found, Some(authority)).await;
+        reply.via_pro = true;
+        reply.kept = true;
+        return Ok(reply);
     }
     let existing = {
         let mut tunnels = state.tunnels.lock().await;
@@ -720,6 +762,97 @@ async fn run_link_flight(
     Ok(reply)
 }
 
+type KeeperLandingAuthority = std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>;
+
+async fn keeper_landing_authority(
+    operation: &std::sync::Arc<tokio::sync::Mutex<()>>,
+    current: impl Fn() -> bool,
+) -> Result<KeeperLandingAuthority, LinkFailure> {
+    let guard = operation.clone().lock_owned().await;
+    if !current() {
+        return Err("Account changed while connecting".into());
+    }
+    Ok(std::sync::Arc::new(guard))
+}
+
+async fn remove_current_keeper_tunnel<T>(
+    tunnels: &tokio::sync::Mutex<std::collections::HashMap<String, T>>,
+    alias: &str,
+    current: impl Fn() -> bool,
+) -> Result<Option<T>, LinkFailure> {
+    let mut tunnels = tunnels.lock().await;
+    if !current() {
+        return Err("Account changed while connecting".into());
+    }
+    Ok(tunnels.remove(alias))
+}
+
+fn keeper_host_ready(host: &chimaera_link::Host) -> bool {
+    host.status == chimaera_link::HostStatus::Connected
+        && (host.daemon.is_some()
+            || host
+                .cluster
+                .as_ref()
+                .is_some_and(|cluster| !cluster.login_serve && !cluster.not_cluster))
+}
+
+async fn explicit_keeper_connect(
+    state: &Shell,
+    client: &chimaera_link::Client,
+    host: chimaera_link::Host,
+    generation: u64,
+) -> Result<chimaera_link::Host, LinkFailure> {
+    let current = || state.pro.generation() == generation;
+    #[cfg(all(feature = "ssh-agent-prototype", unix))]
+    if host.kind == chimaera_link::HostKind::Ssh {
+        use crate::ssh_agent::{connect, selection};
+        let attempt = state
+            .pro
+            .ssh_authentication(generation)
+            .map_err(|_| "Account changed while connecting")?;
+        let mut cancellation = attempt.cancellation();
+        let caps = client.ssh_auth_capabilities().await.map_err(|_| {
+            "This keeper needs an update before connecting with this Mac's SSH keys"
+        })?;
+        let selection = tokio::select! {
+            biased;
+            _ = cancellation.wait_for(|value| *value) => return Err("Account changed while connecting".into()),
+            result = selection::resolve(&host.alias, caps.keeper_boot) => result,
+        };
+        match selection {
+            Ok(selection) => {
+                return connect::authenticate(client, &host.id, selection, attempt, || async {
+                    await_keeper_login(|| client.hosts(), &host.id, current,
+                        tokio::time::Instant::now() + KEEPER_LOGIN_WAIT, KEEPER_POLL_FIRST)
+                        .await.map_err(|_| chimaera_link::SshAuthFailure::Unavailable)
+                }).await.map_err(|_| "Couldn't authenticate this host through the keeper. Check its SSH key, host trust or authentication prompt and connect again.".into());
+            }
+            // This is an explicit password/MFA Connect with no signing grant,
+            // not a retry after a refused signature or host verification.
+            Err(selection::SelectionFailure::NoKeys | selection::SelectionFailure::AgentUnavailable) => {},
+            Err(selection::SelectionFailure::HostTrustRequired) => return Err("Confirm this host's SSH fingerprint on this Mac before connecting through the keeper".into()),
+            Err(selection::SelectionFailure::RevokedHost) => return Err("This host's SSH key is revoked on this Mac".into()),
+            Err(selection::SelectionFailure::TooManyKeys) => return Err("Choose this host's SSH identity in your SSH settings before connecting".into()),
+            Err(_) => return Err("This host's SSH settings aren't supported through the keeper. Connect directly in advanced host settings.".into()),
+        }
+    }
+    if !current() {
+        return Err("Account changed while connecting".into());
+    }
+    client
+        .reconnect_host(&host.id)
+        .await
+        .map_err(|_| LinkFailure::Transport("Chimaera Pro is unreachable".into()))?;
+    await_keeper_login(
+        || client.hosts(),
+        &host.id,
+        current,
+        tokio::time::Instant::now() + KEEPER_LOGIN_WAIT,
+        KEEPER_POLL_FIRST,
+    )
+    .await
+}
+
 /// A keeper login can wait minutes for a password or Duo answer.
 const KEEPER_LOGIN_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
 /// A freshly connected daemon can take a moment to answer through the route.
@@ -755,7 +888,7 @@ where
                     .into_iter()
                     .find(|candidate| candidate.id == id)
                     .ok_or("Host is no longer kept connected")?;
-                if host.status == chimaera_link::HostStatus::Connected && host.daemon.is_some() {
+                if keeper_host_ready(&host) {
                     return Ok(host);
                 }
                 last_error = host.error;
@@ -875,6 +1008,7 @@ async fn landed_on_cluster(
     app: &AppHandle,
     alias: &str,
     found: &chimaera_remote::ClusterHost,
+    authority: Option<KeeperLandingAuthority>,
 ) -> HostState {
     let state = app.state::<Shell>();
     let info = super::cluster::ClusterInfo {
@@ -888,7 +1022,11 @@ async fn landed_on_cluster(
     let entry = {
         let alias = alias.to_string();
         let scheduler = found.scheduler;
+        let persistence_authority = authority.clone();
         with_hosts(move |hosts| {
+            // Blocking persistence outlives a canceled native future. It must
+            // retain account ownership until its final file write completes.
+            let _authority = persistence_authority;
             let stamped = hosts.record_connected(&alias)?;
             Ok(hosts
                 .record_scheduler(&alias, scheduler)?
@@ -1049,6 +1187,96 @@ mod tests {
             error: None,
             cluster: None,
         }
+    }
+
+    #[tokio::test]
+    async fn old_keeper_flight_cannot_remove_a_replacement_tunnel_after_waiting() {
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
+        let tunnels = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let generation = Arc::new(AtomicU64::new(1));
+        let mut held = tunnels.lock().await;
+        held.insert("host".into(), "old");
+        let waiting = tunnels.clone();
+        let epoch = generation.clone();
+        let old = tokio::spawn(async move {
+            super::remove_current_keeper_tunnel(&waiting, "host", || {
+                epoch.load(Ordering::SeqCst) == 1
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        generation.store(2, Ordering::SeqCst);
+        held.insert("host".into(), "replacement");
+        drop(held);
+        assert!(old.await.unwrap().is_err());
+        assert_eq!(tunnels.lock().await.get("host"), Some(&"replacement"));
+    }
+
+    #[tokio::test]
+    async fn keeper_landing_retains_account_authority_through_canceled_hosts_persistence() {
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
+        let operation = Arc::new(tokio::sync::Mutex::new(()));
+        let generation = Arc::new(AtomicU64::new(1));
+        let authority =
+            super::keeper_landing_authority(&operation, || generation.load(Ordering::SeqCst) == 1)
+                .await
+                .unwrap();
+        // The blocking file writer owns its clone even if native IPC is canceled.
+        let persistence = authority.clone();
+        drop(authority);
+        let waiting = operation.clone();
+        let epoch = generation.clone();
+        let replacement = tokio::spawn(async move {
+            let _guard = waiting.lock().await;
+            epoch.store(2, Ordering::SeqCst);
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(generation.load(Ordering::SeqCst), 1);
+        assert!(!replacement.is_finished());
+        drop(persistence);
+        replacement.await.unwrap();
+        assert!(
+            super::keeper_landing_authority(&operation, || generation.load(Ordering::SeqCst) == 1)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn kept_slurm_ready_without_login_daemon_finishes_authentication() {
+        let mut cluster = row(HostStatus::Connected, false);
+        cluster.cluster = Some(chimaera_link::HostCluster {
+            scheduler: chimaera_link::ClusterScheduler::Slurm,
+            login_serve: false,
+            not_cluster: false,
+        });
+        let result = await_keeper_login(
+            || std::future::ready(Ok(vec![cluster.clone()])),
+            "h-1",
+            || true,
+            tokio::time::Instant::now() + Duration::from_millis(30),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        assert!(result.daemon.is_none());
+        cluster.cluster.as_mut().unwrap().login_serve = true;
+        assert!(
+            !super::keeper_host_ready(&cluster),
+            "login opt-in needs a daemon"
+        );
+        cluster.cluster.as_mut().unwrap().login_serve = false;
+        cluster.cluster.as_mut().unwrap().not_cluster = true;
+        assert!(
+            !super::keeper_host_ready(&cluster),
+            "ordinary remote needs a daemon"
+        );
     }
 
     #[tokio::test]

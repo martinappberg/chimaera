@@ -46,9 +46,12 @@ and remaining acceptance gates, see the [integration review guide](../agent-guid
    account check is still required. When the account ends the sign-in (revoked,
    expired, or replaced by **Sign out everywhere**), Pro shows “Your sign-in has
    expired. Sign in again to continue.” and stops all background retries.
-   SSH hosts never hang on any of this: a saved SSH host connects directly while
-   Pro starts (a host kept connected through Pro waits at most 10 seconds for it)
-   and whenever Pro is unreachable.
+   Ordinary SSH hosts connect without waiting for Pro startup. A host kept
+   through Pro waits at most ten seconds, then reports that its keeper route is
+   unavailable. **Connect directly from this computer** in the host's advanced
+   settings is the explicit alternative; outages never silently switch routes.
+   Launch restore attaches an existing keeper connection. A new authentication
+   exchange requires **Connect** or **Reconnect**.
 3. Signed-out and confirmed no-plan accounts see an illustrated introduction:
    start a session on your computer, continue a supported agent in the cloud,
    then access the same sessions, files and conversation on another device.

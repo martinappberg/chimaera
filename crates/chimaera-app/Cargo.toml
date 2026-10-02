@@ -9,6 +9,10 @@ repository = "https://github.com/martinappberg/chimaera"
 # enter the daemon workspace (musl CI, HPC login-node builds stay lean).
 [workspace]
 
+[dev-dependencies]
+chimaera-link = { path = "../chimaera-link", features = ["fixtures"] }
+axum = { version = "0.8", features = ["ws"] }
+
 # The shipped binary is just "chimaera" (matches productName) so the dock,
 # menu bar, and `ps` read the brand — not "chimaera-app".
 [[bin]]

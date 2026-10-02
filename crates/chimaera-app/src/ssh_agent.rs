@@ -20,8 +20,13 @@ use tokio::time::Instant;
 #[path = "ssh_agent/packet.rs"]
 mod packet;
 use packet::Reader;
+#[cfg(unix)]
+#[path = "ssh_agent/connect.rs"]
+pub(crate) mod connect;
 #[path = "ssh_agent/control.rs"]
 pub(crate) mod control;
+#[path = "ssh_agent/lifecycle.rs"]
+pub(crate) mod lifecycle;
 #[cfg(unix)]
 #[path = "ssh_agent/selection.rs"]
 pub(crate) mod selection;
