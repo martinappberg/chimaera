@@ -34,12 +34,21 @@ control host can have `daemon:null`: no daemon is implied on the login node.
 daemon; a control-only cluster answers `409 cluster_requires_job`.
 
 Detection precedes ordinary daemon installation, including for saved hosts.
-`not_cluster` is the existing explicit override. Without `login_serve`, an idle
+The current scheduled-jobs/login-host setting writes `login_serve` with
+`not_cluster:false`. The legacy `not_cluster:true` opt-in selects login-host
+placement when read; it does not erase detected scheduler facts. The legacy
+native setter now selects the same single placement setting. Without that
+explicit login-host choice, an idle
 cluster owns no indefinite login connection. A short control operation closes
 its login master when no operation or job holds it. A held waiting/running job
 keeps the authenticated login connection. Ordinary remotes may stay connected.
 Two aliases sharing the same canonical SSH connection share its hold count;
 closing one cannot invalidate the other's job.
+
+A service using this single placement setting refuses a new `set_policy` with
+`not_cluster:true` as unsupported before admitting or applying it. It must not
+silently apply a canonical pair that an older caller cannot acknowledge. Reading
+an already saved legacy opt-in still preserves its login-host placement.
 
 Passive overview polling returns bounded cached state when an idle cluster has
 no authenticated connection. It never opens SSH, requests a password/signature

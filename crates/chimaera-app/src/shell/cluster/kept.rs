@@ -452,8 +452,8 @@ impl Selected {
         if generation() != self.generation {
             return Err(CHANGED.into());
         }
-        // Read + derive + effect share the same per-host owner. Independent
-        // toggle commands must preserve the other flag's latest accepted value.
+        // Read + effect share the same per-host owner. Both the current placement
+        // setting and the legacy command select one scheduled/login-host policy.
         let hosts = tokio::time::timeout_at(until, self.client.hosts())
             .await
             .map_err(|_| UNCERTAIN.to_string())?
@@ -463,12 +463,9 @@ impl Selected {
             .find(|h| h.id == self.host.id)
             .filter(|h| h.kind == chimaera_link::HostKind::Ssh && h.alias == self.host.alias)
             .ok_or(UNAVAILABLE)?;
-        let cluster = host.cluster.ok_or(UNAVAILABLE)?;
+        host.cluster.ok_or(UNAVAILABLE)?;
         let (login_serve, not_cluster) = match change {
-            PolicyChange::LoginServe(on) => (on, cluster.not_cluster),
-            // Existing native intent: marking a host noncluster replaces the
-            // warned login-node override. Clearing it preserves the latest flag.
-            PolicyChange::NotCluster(on) => (if on { false } else { cluster.login_serve }, on),
+            PolicyChange::LoginServe(on) | PolicyChange::NotCluster(on) => (on, false),
         };
         let reply = self
             .settle_locked(
@@ -500,9 +497,7 @@ fn save_policy(
     login_serve: bool,
     not_cluster: bool,
 ) -> anyhow::Result<chimaera_remote::hosts::HostEntry> {
-    // The legacy noncluster setter clears the override. Apply it first so the
-    // local saved pair mirrors the exact policy acknowledged by the keeper.
-    hosts.set_not_cluster(alias, not_cluster)?;
+    anyhow::ensure!(!not_cluster, "The keeper policy was not normalized");
     hosts.set_login_serve(alias, login_serve)
 }
 
@@ -800,22 +795,22 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn concurrent_policy_intents_derive_flags_under_the_same_owner() {
+    async fn concurrent_policy_intents_share_one_placement_setting_under_the_same_owner() {
         for (first, second, expected) in [
             (
                 PolicyChange::LoginServe(true),
                 PolicyChange::NotCluster(false),
+                (false, false),
+            ),
+            (
+                PolicyChange::NotCluster(true),
+                PolicyChange::LoginServe(true),
                 (true, false),
             ),
             (
-                PolicyChange::NotCluster(true),
-                PolicyChange::LoginServe(true),
-                (true, true),
-            ),
-            (
                 PolicyChange::LoginServe(true),
                 PolicyChange::NotCluster(true),
-                (false, true),
+                (true, false),
             ),
         ] {
             let fixture = Fixture::new().await;
