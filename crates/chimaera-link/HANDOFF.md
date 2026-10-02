@@ -150,10 +150,10 @@ in configuration, logs, bundles or mirrors.
 
 ## Workspace-bound worker delegation
 
-**Status: dormant.** Neither the account service nor the worker supervisor uses
-this contract today; the supervisor configures the worker through
-`/api/v1/pro/configure/execution` with an unbound worker grant. The rules below
-stay the requirement for any future scoped grant.
+**Status: optional foundation.** Supporting services may expose the distinct
+scoped endpoints below. The current worker startup still configures its daemon
+through `/api/v1/pro/configure/execution` with an unbound worker grant. Scoped
+consumer and account tests do not establish a project-isolated worker flow.
 
 `Delegation` additionally accepts `workspace: {workspace_id, revision}`. Absence
 or `null` retains the existing account-wide semantics. Presence is an immutable
@@ -171,6 +171,47 @@ a missing or different binding is not an acceptable replacement. Bound grants
 cannot enter keeper discovery, inventory, raw TCP, reverse streams, provider
 controls, account/device/billing management, or service-level worker operations.
 The existing account-wide routes and grants retain their current behavior.
+
+### Scoped service mint and revocation
+
+A supporting account exposes the distinct authenticated worker-supervisor route
+`POST /internal/v1/worker/workspaces/{workspace}/delegation` with
+`{"revision": <positive registration revision>}`. Only the current account's
+worker service credential may call it; device or daemon grants cannot. The reply
+is a `Delegation` with exactly `baton` and `mirror`, the current worker holder,
+and the exact `workspace: {workspace_id, revision}`. An absent or mismatched
+binding is failure, never a reason to retry the account-wide mint. The supervisor
+must obtain the revision from its durable trusted project registry, not a project
+process or UI-supplied path. No secret values travel through this endpoint.
+
+The service retains at most 128 registration records per account, including
+revocation tombstones. A first registration accepts a positive revision. A
+replacement at the same live revision rotates that project's token only; a
+higher revision requires prior revocation. A revoked registration can be
+registered again only at a strictly higher revision. Only token hashes are
+stored. Each token lasts at most 24 hours, capped by its parent service expiry.
+`POST /v1/delegations/renew` retains its token, workspace, revision, holder and
+scopes, and fails if the registration, parent service, worker holder or account
+epoch changed. Registration does not acquire execution or wake a machine.
+
+`DELETE /internal/v1/worker/workspaces/{workspace}/delegation` takes the same
+revision body and returns 204 after revoking that exact registration; an already
+revoked matching revision is idempotent and a different revision returns
+409 `workspace_registration_changed`. New grants and derived Git authorization
+then fail, including a push's final authorization and checkpoint acknowledgment.
+A Git commit already authorized before revocation retains only its existing
+bounded publication fence. The supervisor must stop the old project namespace
+before acknowledging removal of access to a secret; revoking network authority
+alone cannot erase a value a running process already received.
+
+Only exact-workspace baton reads/acquire/renew/release, holder policy publication,
+mirror credentials and self-renewal accept this bearer. All account-wide routes
+continue to use their existing authentication and reject it. Foreign workspace
+requests fail before creating rows or reading project state. Every modifying
+request rechecks the binding under the account lock after any wait; mirror fetch,
+push, final commit and checkpoint acknowledgment recheck the same registration.
+This surface is additive and remains unavailable when the service does not offer
+negotiated continuity. It does not enable project-secret sharing by itself.
 
 ### Daemon acceptance
 
