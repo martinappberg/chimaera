@@ -121,27 +121,40 @@ async fn real_openssh_agent_preserves_destination_constraints_and_lock_refusal()
         status.success(),
         "installed agent must support destination constraints for this gate"
     );
-    let selected = SshAuthGrantRequest {
-        version: 1,
-        keeper_boot: "synthetic-boot".into(),
-        destination: chimaera_link::SshAuthDestination {
-            hostname: "hpc.example.invalid".into(),
-            user: "alice".into(),
-            port: 22,
-        },
-        host_keys: vec![chimaera_link::SshAuthHostKey {
-            key: STANDARD.encode(host.public_key().to_bytes().unwrap()),
-            is_ca: false,
-        }],
-        user_keys: vec![STANDARD.encode(user.public_key().to_bytes().unwrap())],
-    };
-    let mut verifier = GrantVerifier::new(
-        &selected,
-        Instant::now() + Duration::from_secs(120),
-        unix::UnixAgent::new(socket.clone()).ok().unwrap(),
+    write(
+        &fixture.directory.join("synthetic-key.pub"),
+        user.public_key().to_openssh().unwrap().as_bytes(),
+    );
+    let config_file = fixture.directory.join("config");
+    write(&config_file,format!("Host fixture\n HostName hpc.example.invalid\n User alice\n Port 22\n IdentityAgent {}\n IdentitiesOnly yes\n IdentityFile {}\n UserKnownHostsFile {}\n GlobalKnownHostsFile none\n",socket.display(),private.display(),hosts.display()).as_bytes());
+    let effective = Command::new("/usr/bin/ssh")
+        .args(["-F"])
+        .arg(&config_file)
+        .args(["-G", "fixture"])
+        .output()
+        .unwrap();
+    assert!(effective.status.success());
+    let selection = selection::from_native_config(
+        std::str::from_utf8(&effective.stdout).unwrap(),
+        &fixture.directory,
+        None,
+        "synthetic-boot".into(),
     )
-    .ok()
+    .await
     .unwrap();
+    let selected = &selection.request;
+    assert_eq!(
+        selected.user_keys,
+        vec![STANDARD.encode(user.public_key().to_bytes().unwrap())]
+    );
+    assert_eq!(
+        selected.host_keys[0].key,
+        STANDARD.encode(host.public_key().to_bytes().unwrap())
+    );
+    let (_, mut verifier) = selection
+        .verifier(Instant::now() + Duration::from_secs(120))
+        .ok()
+        .unwrap();
     let session = b"disposable-openssh-session";
     let reply = verifier
         .handle(SshAuthRequest::SessionBind {

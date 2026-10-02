@@ -492,3 +492,68 @@ async fn grant_connection_budget_cannot_be_reset_by_closing_connections() {
 
 #[path = "control_tests.rs"]
 mod control_tests;
+
+#[tokio::test]
+async fn native_crypto_policy_is_checked_before_host_binding_and_each_signature() {
+    let mock = Mock::new();
+    let calls = mock.calls.clone();
+    let mut v = verifier(mock);
+    v.policy.algorithms = Some(
+        Algorithms::parse("ecdsa-sha2-nistp256", "ssh-ed25519", "ssh-ed25519")
+            .ok()
+            .unwrap(),
+    );
+    assert!(matches!(
+        v.handle(bind_request("a", 1, valid_bind(b"policy"))).await,
+        Ok(Some(SshAuthReply::Failure {
+            error: Failure::InvalidBinding,
+            ..
+        }))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let mock = Mock::new();
+    let calls = mock.calls.clone();
+    let mut v = verifier(mock);
+    v.policy.algorithms = Some(
+        Algorithms::parse("ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-ed25519")
+            .ok()
+            .unwrap(),
+    );
+    assert!(matches!(
+        v.handle(bind_request("a", 1, valid_bind(b"policy"))).await,
+        Ok(Some(SshAuthReply::Bound { .. }))
+    ));
+    assert!(matches!(
+        v.handle(sign_request("a", 2, valid_sign(b"policy"))).await,
+        Ok(Some(SshAuthReply::Failure {
+            error: Failure::InvalidRequest,
+            ..
+        }))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn native_host_ca_policy_checks_leaf_and_ca_signature_algorithms_separately() {
+    let mut request = selected();
+    request.host_keys = vec![SshAuthHostKey {
+        key: STANDARD.encode(public(&key(4))),
+        is_ca: true,
+    }];
+    let mut policy = Policy::new(&request).ok().unwrap();
+    let time = now().ok().unwrap();
+    let cert = certificate("hpc.example.invalid", CertType::Host, time - 60, time + 60);
+    let binding = bind_packet(&cert, &key(1), b"ca-policy");
+    for (host, ca, allowed) in [
+        ("ssh-ed25519-cert-v01@openssh.com", "ssh-ed25519", true),
+        ("ssh-ed25519", "ssh-ed25519", false),
+        (
+            "ssh-ed25519-cert-v01@openssh.com",
+            "ecdsa-sha2-nistp256",
+            false,
+        ),
+    ] {
+        policy.algorithms = Some(Algorithms::parse(host, "ssh-ed25519", ca).ok().unwrap());
+        assert_eq!(policy.bind(&binding).is_ok(), allowed);
+    }
+}

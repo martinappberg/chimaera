@@ -23,6 +23,9 @@ use packet::Reader;
 #[path = "ssh_agent/control.rs"]
 pub(crate) mod control;
 #[cfg(unix)]
+#[path = "ssh_agent/selection.rs"]
+pub(crate) mod selection;
+#[cfg(unix)]
 #[path = "ssh_agent/unix.rs"]
 pub(crate) mod unix;
 
@@ -59,6 +62,20 @@ impl Key {
             certificate,
         })
     }
+    fn wire_algorithm(&self, algorithm: &Algorithm) -> String {
+        if self.certificate.is_none() {
+            return algorithm.as_str().to_owned();
+        }
+        match algorithm {
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha256),
+            } => "rsa-sha2-256-cert-v01@openssh.com".into(),
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha512),
+            } => "rsa-sha2-512-cert-v01@openssh.com".into(),
+            _ => algorithm.to_certificate_type(),
+        }
+    }
     fn user_algorithm(&self, algorithm: &[u8], flags: u32) -> Result<Algorithm, Failure> {
         let raw = self.data.algorithm();
         let signature = match raw {
@@ -74,19 +91,7 @@ impl Key {
             _ if flags == 0 => raw,
             _ => return Err(Failure::InvalidRequest),
         };
-        let expected = if self.certificate.is_some() {
-            match signature {
-                Algorithm::Rsa {
-                    hash: Some(HashAlg::Sha256),
-                } => "rsa-sha2-256-cert-v01@openssh.com".into(),
-                Algorithm::Rsa {
-                    hash: Some(HashAlg::Sha512),
-                } => "rsa-sha2-512-cert-v01@openssh.com".into(),
-                _ => signature.to_certificate_type(),
-            }
-        } else {
-            signature.as_str().to_owned()
-        };
+        let expected = self.wire_algorithm(&signature);
         if algorithm != expected.as_bytes() {
             return Err(Failure::InvalidRequest);
         }
@@ -124,11 +129,64 @@ fn valid_time(cert: &Certificate, time: u64) -> bool {
     cert.valid_after() <= time && time < cert.valid_before()
 }
 
+/// Native effective SSH policy. It never comes from a keeper or webview.
+struct Algorithms {
+    host: HashSet<String>,
+    user: HashSet<String>,
+    ca: HashSet<String>,
+}
+impl Algorithms {
+    fn parse(host: &str, user: &str, ca: &str) -> Result<Self, Failure> {
+        fn list(value: &str) -> Result<HashSet<String>, Failure> {
+            if value.is_empty() || value.len() > 16384 {
+                return Err(Failure::Unsupported);
+            }
+            let mut result = HashSet::new();
+            for algorithm in value.split(',') {
+                if result.len() >= 128
+                    || algorithm.is_empty()
+                    || algorithm.starts_with(['+', '-'])
+                    || !algorithm
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"-@._+".contains(&c))
+                {
+                    return Err(Failure::Unsupported);
+                }
+                result.insert(algorithm.to_owned());
+            }
+            Ok(result)
+        }
+        Ok(Self {
+            host: list(host)?,
+            user: list(user)?,
+            ca: list(ca)?,
+        })
+    }
+    fn offered(&self, key: &Key, host: bool) -> bool {
+        let list = if host { &self.host } else { &self.user };
+        match key.data.algorithm() {
+            Algorithm::Rsa { .. } => [HashAlg::Sha256, HashAlg::Sha512].iter().any(|hash| {
+                list.contains(&key.wire_algorithm(&Algorithm::Rsa { hash: Some(*hash) }))
+            }),
+            algorithm => list.contains(&key.wire_algorithm(&algorithm)),
+        }
+    }
+    fn bound(&self, key: &Key, signature: &Signature) -> bool {
+        self.host
+            .contains(&key.wire_algorithm(&signature.algorithm()))
+            && key
+                .certificate
+                .as_ref()
+                .is_none_or(|cert| self.ca.contains(cert.signature().algorithm().as_str()))
+    }
+}
+
 struct Policy {
     user: String,
     hostname: String,
     hosts: Vec<(Key, bool)>,
     users: Vec<Key>,
+    algorithms: Option<Algorithms>,
 }
 impl Policy {
     fn new(selected: &SshAuthGrantRequest) -> Result<Self, Failure> {
@@ -160,6 +218,7 @@ impl Policy {
             hostname: selected.destination.hostname.clone(),
             hosts,
             users,
+            algorithms: None,
         })
     }
     fn bind(&self, packet: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Failure> {
@@ -176,6 +235,13 @@ impl Policy {
             return Err(Failure::InvalidBinding);
         }
         let key = Key::parse(host.to_vec())?;
+        if self
+            .algorithms
+            .as_ref()
+            .is_some_and(|policy| !policy.bound(&key, &signature))
+        {
+            return Err(Failure::InvalidBinding);
+        }
         match &key.certificate {
             Some(cert) => {
                 if cert.cert_type() != CertType::Host
@@ -252,7 +318,13 @@ impl Policy {
         d.string_is(b"ssh-connection")?;
         d.string_is(b"publickey-hostbound-v00@openssh.com")?;
         d.byte_is(1)?;
-        let algorithm = key.user_algorithm(d.string()?, flags)?;
+        let algorithm_name = d.string()?;
+        if self.algorithms.as_ref().is_some_and(|policy| {
+            !std::str::from_utf8(algorithm_name).is_ok_and(|name| policy.user.contains(name))
+        }) {
+            return Err(Failure::InvalidRequest);
+        }
+        let algorithm = key.user_algorithm(algorithm_name, flags)?;
         d.string_is(blob)?;
         d.string_is(host)?;
         d.end()?;
