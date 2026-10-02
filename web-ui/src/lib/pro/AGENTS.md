@@ -1,5 +1,10 @@
 # web-ui/src/lib/pro — Pro navigation and provider connections
 
+Cloud allowance presentation uses the additive `attended_actions` capability
+only with `limited/hours_exhausted`. Absence keeps older service behavior;
+other restrictions never inherit the exception. Passive metadata probes still
+never wake compute, and repeated failures show an outage for attended access too.
+
 Parent map: [settings](../settings/AGENTS.md). These components share the native
 account bridge and host-pinned browser daemon routes. Provider credentials never
 enter UI settings or local storage (a browser view keeps only catalog rows there).
@@ -18,7 +23,7 @@ enter UI settings or local storage (a browser view keeps only catalog rows there
 | `providers.ts` | Readiness and safe provider-link presentation; imports the core provider catalog (`providerLabel` names an unlisted required provider; `pausedConnect` reads a paused row's additive `blocked_provider` for the pane's and chat's **Connect <agent> to continue**). `rememberedRows` validates remembered rows into catalog rows; `panelRows` decides which rows show and whether they read as settled; `catalogRows` names the shared catalog's providers without a state; `agentsConnected`; `connectingLabel` (a pressed Connect's words); an older cloud's sign-in: `olderCloudSignIn` (a `waiting` connection whose action is a terminal; `preparing` with one is the cloud setting up an agent, never a sign-in), `awaitingCloudUpdate` / `signInGuided` (a catalog row's `methods`), `stillAwaitingUpdate` and `cloudUpdateLine`. |
 | `catalogMemory.ts` | A browser view's remembered catalog rows (the fields rendering needs, never credentials), per cloud address (`gatewayPrefix`: `/app/{host}` or `/workspace/{id}`, each one account's), so the connections section shows the last known rows at once as the app does natively; every storage access guarded; `forgetCatalogs` on sign-out; a no-op natively. |
 | `vocabulary.test.ts` | Scans the Pro and cloud settings copy: the cloud is never a machine (only the user's own SSH hosts are), and nothing narrates it sleeping or waking. |
-| `profile.ts` | A project's cloud profile decisions: `proposedSetup` (an agent's `pending_setup_command`), `computerSteps` (`profile.deferred`), and `settleProposal`, which re-reads `GET /pro/profile`, applies Confirm/Dismiss only to the proposal shown and writes every field back (the PUT replaces the whole profile and takes no revision); a 409 mid-copy is re-sent a few times. |
+| `profile.ts` | A project's cloud profile decisions: `proposedSetup` (an agent's `pending_setup_command`), `computerSteps` (`profile.deferred`), and `settleProposal`, which re-reads `GET /pro/profile`, applies Confirm/Dismiss only to the proposal shown and writes every field back (the PUT replaces the whole profile, with `If-Match` carrying the fresh read's `ETag`); 409 mid-copy triggers bounded re-reads only while the revision remains unchanged. A 412 or changed revision requires another explicit decision, including when identical text belongs to a replacement account. A replaced proposal is never confirmed, and missing revision support refuses the save. |
 | `onboarding.svelte.ts` | Validated shared intent so a paused project opens the same onboarding flow; `canOpenOnboarding` (native app or account browser view) gates the paused-session connect action, since a plain browser tab has no Pro page. |
 | `AccountDevices.svelte` / `devices.ts` | Verified installation grouping, separate older sign-ins and named per-sign-in removal confirmation. Names never identify a computer. |
 | `AccountUsage.svelte` / `usage.ts` | Percentage-first account usage; real limits, bounded accessible bars, neutral unknown/zero allowance. |

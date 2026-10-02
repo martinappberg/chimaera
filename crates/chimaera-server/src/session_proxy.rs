@@ -869,9 +869,21 @@ async fn target_request(
         crate::workspace_scope::EPOCH_HEADER,
         epoch.to_string().parse()?,
     );
+    // Git serializes known path metadata at the owner. Give it this view's
+    // actual root so large diff contents stream without a second JSON copy.
+    let viewer_root = if request.uri().path().starts_with("/api/v1/git/") {
+        use base64::Engine;
+        let root = route
+            .roots
+            .get(workspace)
+            .context("workspace root missing")?;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(root.to_string_lossy().as_bytes())
+    } else {
+        "L3Byb2plY3Q".to_owned()
+    };
     request
         .headers_mut()
-        .insert("x-chimaera-viewer-root", "L3Byb2plY3Q".parse()?);
+        .insert("x-chimaera-viewer-root", viewer_root.parse()?);
     request.headers_mut().remove("x-chimaera-viewer-workspace");
     let address = route.address.context("remote placement unavailable")?;
     let permit = REQUESTS.try_acquire().context("remote request limit")?;

@@ -26,7 +26,7 @@ HTTP adapter may forward them using the target daemon's credential.
 
 Only two archive operations run concurrently. Uploads and archives are bounded
 at 100,000,000 bytes, native transcripts at 90,000,000 bytes, the journal at
-4 MiB, and metadata at 256 KiB. Oversized data refuses transfer; it is never
+4 MiB, delivery evidence at 32 KiB, and other metadata at 256 KiB. Oversized data refuses transfer; it is never
 silently truncated. Snapshot journals include complete records only. A native
 file that changes during a checked snapshot causes a retryable refusal.
 
@@ -72,7 +72,13 @@ length mismatch, and SHA-256 mismatch are rejected before installation.
 session-ledger record including agent kind, surface, native ID, model, and
 carryover. Optional members are `journal.jsonl` (unaltered complete SeqEvent
 records), `index.json` (model/effort/mode only), `view.json` (workspace fallback
-layout), and `native.jsonl` (required for agents). No member controls an extraction path. The daemon derives the native
+layout), `send-state.json` (bounded, session-bound delivery/withdrawal evidence),
+and `native.jsonl` (required for agents). New agent archives always include
+delivery evidence, independently of the lossy journal. Import unions it with
+local evidence and refuses contradictions; a legacy archive without it never
+clears local receipts. Older readers reject this additional member rather than
+silently losing deduplication evidence, so both transfer endpoints must be
+updated together. No member controls an extraction path. The daemon derives the native
 store path from the validated agent kind, UUID, and cwd. Codex's first
 `session_meta` record must match both native ID and cwd.
 
@@ -84,6 +90,24 @@ workspace/session transfer; the archive does not attempt to rewrite secrets
 inside a native conversation.
 
 ## Ownership and recovery
+
+The internal Pro return path prepares all archives before applying any target
+file change. `bundle_prepared.rs` retains immutable original/new file versions
+and checksummed metadata under the return's durable staging directory. The file
+transaction installs native transcripts and journals before idempotent locked
+merges of shared workspace/index/view/ledger state. Local delivery evidence is
+captured before the journal can be replaced. A failed metadata write leaves the
+return fenced; an exact retry after restart uses the original preparation and
+never starts an agent. Missing or damaged preparation fails closed. The return
+commits only after every session's durable metadata is installed; profile setup
+and agent admission follow that commit. New incoming directories may be prepared
+before they exist locally, but must be canonical and present at finalization.
+Owned configuration and mutation reservations fence file application, metadata
+finalization, and commit against account replacement and ownership changes. Caller
+cancellation cannot release those reservations while an admitted write continues.
+The commit retains its reservation through the exact Hydrating→SettingUp transition
+and durable state write; initial profile setup uses the same configuration lock
+and ownership check.
 
 The target must already have the original canonical root/cwd unless the explicit
 `destination_root=/canonical/existing/path` import option is set. A remap keeps

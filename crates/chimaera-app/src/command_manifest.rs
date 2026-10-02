@@ -6,6 +6,7 @@
 pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "list_hosts",
     "add_host",
+    "set_host_direct_ssh",
     "remove_host",
     "connect_host",
     "disconnect_host",

@@ -77,6 +77,12 @@ impl State {
                         || p.execution_boot.is_none())
             })
             .filter_map(|(id, p)| {
+                // A truncated prefix cannot prove all old work stopped. Empty
+                // evidence deliberately remains unknown across reprobes; only
+                // a cold boot or trusted supervisor cleanup proves otherwise.
+                if p.execution_groups_overflow || p.execution_launch_pending {
+                    return Some((id.clone(), Vec::new()));
+                }
                 // Probe what the previous life recorded instead of fencing
                 // forever. With no recorded group a device proceeds (laptop
                 // first); a worker cannot prove anything and stays strict.
@@ -96,6 +102,8 @@ impl State {
         Self {
             proofs: Mutex::default(),
             commits: mutation::Commits::default(),
+            setups: Mutex::default(),
+            launches: Mutex::default(),
             latched: Mutex::new(latched),
             unclean: Mutex::new(unclean),
             uncertain: Mutex::new(uncertain),
@@ -111,7 +119,7 @@ impl State {
 /// recorded is a reused id, not the old group. With no recorded start (0) the
 /// group's existence alone counts; a group whose leader already exited but
 /// whose members live still counts (its id cannot be reused meanwhile).
-fn surviving(groups: &[(u32, u64)]) -> Vec<(u32, u64)> {
+pub(super) fn surviving(groups: &[(u32, u64)]) -> Vec<(u32, u64)> {
     groups
         .iter()
         .copied()
@@ -184,7 +192,7 @@ pub(in crate::pro) fn record_groups(state: &AppState) {
         .iter()
         .map(|(session, workspace)| (session.clone(), workspace.clone()))
         .collect();
-    let mut by_workspace: HashMap<String, Vec<(u32, u64)>> = HashMap::new();
+    let mut by_workspace: HashMap<String, GroupEvidence> = HashMap::new();
     for (session, workspace) in sessions {
         let agent = lock(&state.agents).contains_key(&session);
         let group = state.chat.process_group(&session).or_else(|| {
@@ -193,27 +201,55 @@ pub(in crate::pro) fn record_groups(state: &AppState) {
                 .flatten()
         });
         if let Some(group) = group {
-            let groups = by_workspace.entry(workspace.clone()).or_default();
-            if groups.len() < 64 {
-                let start = i32::try_from(group)
-                    .ok()
-                    .and_then(leader_start)
-                    .unwrap_or(0);
-                groups.push((group, start));
-            }
+            by_workspace.entry(workspace).or_default().record(group);
         }
     }
+    for (workspace, entry) in lock(&state.pro.execution.setups).iter() {
+        if let Some((group, _)) = entry.group {
+            by_workspace
+                .entry(workspace.clone())
+                .or_default()
+                .record(group);
+        }
+    }
+    let unknown: HashSet<_> = lock(&state.pro.execution.unclean)
+        .iter()
+        .filter(|(_, groups)| groups.is_empty())
+        .map(|(workspace, _)| workspace.clone())
+        .collect();
     let mut preferences = lock(&state.pro.preferences);
     for (workspace, preference) in preferences.iter_mut() {
         if preference.execution_active {
-            let mut groups = by_workspace.remove(workspace).unwrap_or_default();
-            groups.sort_unstable();
-            preference.execution_groups = groups.iter().map(|(group, _)| *group).collect();
-            preference.execution_starts = groups.iter().map(|(_, start)| *start).collect();
+            let mut evidence = by_workspace.remove(workspace).unwrap_or_default();
+            evidence.groups.sort_unstable();
+            preference.execution_groups_overflow = evidence.overflow
+                || (preference.execution_groups_overflow && unknown.contains(workspace));
+            preference.execution_groups = evidence.groups.iter().map(|(group, _)| *group).collect();
+            preference.execution_starts = evidence.groups.iter().map(|(_, start)| *start).collect();
         } else {
             preference.execution_groups.clear();
             preference.execution_starts.clear();
+            preference.execution_groups_overflow = false;
         }
+    }
+}
+
+#[derive(Default)]
+struct GroupEvidence {
+    groups: Vec<(u32, u64)>,
+    overflow: bool,
+}
+impl GroupEvidence {
+    fn record(&mut self, group: u32) {
+        if self.groups.len() == 64 {
+            self.overflow = true;
+            return;
+        }
+        let start = i32::try_from(group)
+            .ok()
+            .and_then(leader_start)
+            .unwrap_or(0);
+        self.groups.push((group, start));
     }
 }
 /// Graceful shutdown: stop this life's managed agents and, once none remains,
@@ -335,5 +371,101 @@ fn boot_id() -> Option<String> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn omitted_live_group_keeps_restart_evidence_unknown_across_reprobes_and_writes() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-evidence-overflow-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut evidence = GroupEvidence::default();
+        for offset in 0..64 {
+            evidence.record(u32::MAX - offset);
+        }
+        evidence.record(child.id());
+        assert!(evidence.overflow);
+        assert_eq!(evidence.groups.len(), 64);
+        assert!(!evidence
+            .groups
+            .iter()
+            .any(|(group, _)| *group == child.id()));
+        assert!(surviving(&evidence.groups).is_empty());
+        assert!(!surviving(&[(child.id(), 0)]).is_empty());
+
+        let mut state = AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.clone(),
+            root.join("config"),
+        );
+        super::super::install_fixture(&state, "w-a", 4).unwrap();
+        {
+            let mut preferences = lock(&state.pro.preferences);
+            let preference = preferences.get_mut("w-a").unwrap();
+            preference.execution_active = true;
+            preference.execution_boot = state.pro.execution.boot.clone();
+            preference.execution_groups = evidence.groups.iter().map(|(group, _)| *group).collect();
+            preference.execution_starts = evidence.groups.iter().map(|(_, start)| *start).collect();
+            preference.execution_groups_overflow = evidence.overflow;
+        }
+        let disk = serde_json::to_vec(&*lock(&state.pro.preferences)).unwrap();
+        let preferences = serde_json::from_slice(&disk).unwrap();
+        state.pro.execution = State::restore(&root, &preferences, true, false);
+        state.pro.worker.store(true, Ordering::Release);
+        assert!(lock(&state.pro.execution.unclean)["w-a"].is_empty());
+        reprobe(&state);
+        assert!(!super::super::quiescent(&state, "w-a"));
+        assert!(!super::super::allows(&state, "w-a"));
+        // An ordinary state flush must not erase the overflow just because
+        // this successor's process registry has no old child in it.
+        record_groups(&state);
+        assert!(lock(&state.pro.preferences)["w-a"].execution_groups_overflow);
+        let disk = serde_json::to_vec(&*lock(&state.pro.preferences)).unwrap();
+        let preferences = serde_json::from_slice(&disk).unwrap();
+        state.pro.execution = State::restore(&root, &preferences, true, false);
+        reprobe(&state);
+        assert!(!super::super::quiescent(&state, "w-a"));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        reprobe(&state);
+        assert!(
+            !super::super::quiescent(&state, "w-a"),
+            "the omitted set remains unprovable"
+        );
+        // Laptop execution remains available; publication still requires
+        // proving the previous workload stopped.
+        state.pro.worker.store(false, Ordering::Release);
+        assert!(super::super::allows(&state, "w-a"));
+        assert!(!super::super::quiescent(&state, "w-a"));
+        if state.pro.execution.boot.is_some() {
+            lock(&state.pro.preferences)
+                .get_mut("w-a")
+                .unwrap()
+                .execution_boot = Some("different-previous-boot".into());
+            let preferences = lock(&state.pro.preferences).clone();
+            state.pro.execution = State::restore(&root, &preferences, true, false);
+            assert!(
+                super::super::quiescent(&state, "w-a"),
+                "a cold boot proves old groups cannot survive"
+            );
+            record_groups(&state);
+            assert!(!lock(&state.pro.preferences)["w-a"].execution_groups_overflow);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

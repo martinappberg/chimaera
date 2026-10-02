@@ -29,6 +29,7 @@
     remoteWorkspaces,
     removeHost,
     setNotCluster,
+    setHostDirectSsh,
     shutdownHost,
     updateLocalDaemon,
     type ConnectProgress,
@@ -154,6 +155,7 @@
   /** Human line under a host while its connect flow runs. */
   let phases = $state<Map<string, string>>(new Map());
   let hostErrors = $state<Map<string, string>>(new Map());
+  let savingDirect = $state(new Set<string>());
   let addOpen = $state(false);
   let addAlias = $state("");
   let addError = $state<string | null>(null);
@@ -489,6 +491,21 @@
     void refreshHosts();
   }
 
+  async function setDirect(host: HostState, input: HTMLInputElement): Promise<void> {
+    if (savingDirect.has(host.alias)) return;
+    savingDirect = new Set(savingDirect).add(host.alias);
+    hostErrors = mapWithout(hostErrors, host.alias);
+    try {
+      const updated = await setHostDirectSsh(host.alias, input.checked);
+      hosts = hosts.map(row => row.alias === host.alias ? updated : row);
+    } catch {
+      input.checked = host.direct_ssh === true;
+      hostErrors = new Map(hostErrors).set(host.alias, "This connection preference couldn't be saved. Try again.");
+    } finally {
+      const pending = new Set(savingDirect); pending.delete(host.alias); savingDirect = pending;
+    }
+  }
+
   async function forget(alias: string): Promise<void> {
     confirmForget = null;
     await removeHost(alias);
@@ -676,6 +693,16 @@
     }
   }
 </script>
+
+{#snippet directPreference(host: HostState)}
+  {#if host.direct_ssh !== undefined && ($paidPlan !== null || host.direct_ssh === true)}
+    <details class="host-advanced">
+      <summary>Advanced</summary>
+      <label><input type="checkbox" checked={host.direct_ssh} disabled={savingDirect.has(host.alias)} onchange={event => void setDirect(host, event.currentTarget)} />Connect directly from this computer</label>
+      <p>Uses this computer’s SSH settings on the next connection. Existing connections stay as they are until you reconnect. Running jobs and other computers are unaffected.</p>
+    </details>
+  {/if}
+{/snippet}
 
 {#snippet jobsRow(alias: string)}
   <div class="rowwrap" role="presentation">
@@ -1062,9 +1089,14 @@
                         <span class="when">{ago(h.last_connected_at)}</span>
                       {/if}
                     </button>
-                    <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}
-                      >&times;</button
-                    >
+                    {#if h.direct_ssh !== undefined && ($paidPlan !== null || h.direct_ssh === true)}
+                      <HomeActions label={`Actions for ${h.alias}`}>
+                        <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}>Forget machine</button>
+                        {@render directPreference(h)}
+                      </HomeActions>
+                    {:else}
+                      <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}>&times;</button>
+                    {/if}
                   </div>
                   {#if err !== undefined}
                     <div class="err-line">{err}</div>
@@ -1150,6 +1182,7 @@
                           onclick={() => void backToCluster(h.alias)}>it's a cluster</button
                         >
                       {/if}
+                      {@render directPreference(h)}
                     </HomeActions>
                   </div>
                   {#if err !== undefined}
@@ -1205,6 +1238,11 @@
 </div>
 
 <style>
+  .host-advanced { max-width: 320px; padding: 8px 10px; color: var(--fg); font-size: var(--text-sm); }
+  .host-advanced summary { cursor: pointer; color: var(--muted); }
+  .host-advanced label { display: flex; align-items: flex-start; gap: 8px; margin-top: 10px; }
+  .host-advanced input { margin-top: 3px; flex: none; }
+  .host-advanced p { white-space: normal; color: var(--muted); font-size: var(--text-xs); line-height: 1.5; margin: 8px 0 0; }
   .via-pro {
     flex: none;
     font-size: var(--text-xs);

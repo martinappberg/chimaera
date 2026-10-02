@@ -42,6 +42,9 @@ export interface ReadyAttach {
   /** Not this socket's first `ready`: whoever keeps the socket attached it
    *  again after the owner slept. */
   reattach: boolean;
+  /** Client IDs still owned by this driver's queue at ready.head. Absent on
+   * older daemons; at most 64, never a claim about unkeyed legacy messages. */
+  activeQueuedIds?: string[];
 }
 
 export interface ChatSocketHandlers {
@@ -63,6 +66,9 @@ export interface ChatSocketHandlers {
   /** The daemon's answer to `cancel_send`: whether the send under that id
    *  was withdrawn (true: none will run) or had already been accepted. */
   onSendCancelled?(clientId: string, cancelled: boolean): void;
+  /** Delivery may have happened; never treat this as an unsent draft. */
+  onSendUncertain?(clientId: string, message: string): void;
+  onSendConfirmed?(clientId: string): void;
   /** The conversation's project is paused; the next send picks it back up. */
   onAsleep?(): void;
   /** A send picked the paused project back up: it is waking and the send is
@@ -110,6 +116,8 @@ type ChatDelivery =
   | { kind: "error"; message: string }
   | { kind: "command_failed"; message: string; command: string | null; reason: string | null; clientId: string | null }
   | { kind: "send_cancelled"; clientId: string; cancelled: boolean }
+  | { kind: "send_uncertain"; clientId: string; message: string }
+  | { kind: "send_confirmed"; clientId: string }
   | { kind: "asleep" }
   | { kind: "waking" }
   | { kind: "held" }
@@ -183,6 +191,12 @@ export class ChatSocket {
           break;
         case "send_cancelled":
           this.handlers.onSendCancelled?.(delivery.clientId, delivery.cancelled);
+          break;
+        case "send_uncertain":
+          this.handlers.onSendUncertain?.(delivery.clientId, delivery.message);
+          break;
+        case "send_confirmed":
+          this.handlers.onSendConfirmed?.(delivery.clientId);
           break;
         case "asleep":
           this.handlers.onAsleep?.();
@@ -264,12 +278,20 @@ export class ChatSocket {
             session: msg.session as ChatSessionInfo,
             replayFrom: (msg.replay_from as number) ?? 0,
             head: msg.head as number | undefined,
-            attach: { sendIds: msg.send_ids === true, reattach: readies++ > 0 },
+            attach: { sendIds: msg.send_ids === true, reattach: readies++ > 0,
+              ...(Array.isArray(msg.active_queued_ids) && msg.active_queued_ids.length <= 64
+                && msg.active_queued_ids.every((id) => typeof id === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(id))
+                ? { activeQueuedIds: msg.active_queued_ids as string[] } : {}) },
           });
           break;
         case "send_cancelled":
           if (typeof msg.client_id === "string") {
             this.deliveries.push({ kind: "send_cancelled", clientId: msg.client_id, cancelled: msg.cancelled === true });
+          }
+          break;
+        case "send_confirmed":
+          if (typeof msg.client_id === "string") {
+            this.deliveries.push({ kind: "send_confirmed", clientId: msg.client_id });
           }
           break;
         case "batch":
@@ -362,6 +384,11 @@ export class ChatSocket {
           // healthy and the session may come back (respawn, toggle). Going
           // fatal here permanently stopped reconnects after a single answer
           // sent into a dead driver.
+          if (msg.code === "send_uncertain" && typeof msg.client_id === "string") {
+            this.deliveries.push({ kind: "send_uncertain", clientId: msg.client_id,
+              message: typeof msg.message === "string" ? msg.message : "Delivery could not be confirmed." });
+            break;
+          }
           if (msg.code === "command_failed" || msg.code === "invalid_command" || msg.code === "read_only") {
             this.deliveries.push({
               kind: "command_failed",

@@ -311,18 +311,12 @@ export function setActiveWorkspaceId(id: string | null): void {
   }
 }
 
-/** Where a project runs when the daemon this window talks to may not run it,
- *  judged from that daemon: this computer's own (a native window here, or a
- *  browser view of a computer) hands a project to the cloud, and the cloud
- *  hands it back to your computer. Null when this window cannot tell (a
- *  project view follows its project; an SSH host). The refusal itself does
- *  not name the owner. */
-export function ownerElsewhere(): "cloud" | "computer" | null {
-  if (!isBrowserGateway()) return getHostLabel() === "local" ? "cloud" : null;
-  const host = gatewayHost();
-  if (host === undefined) return null;
-  if (host.startsWith("worker-")) return "computer";
-  return host.startsWith("device-") || host === "local" ? "cloud" : null;
+/** A refusal identifies only that this daemon does not own the project.
+ * The daemon's host class cannot identify the other owner: it may be the
+ * cloud or another computer. Callers with verified placement pass it explicitly.
+ */
+export function ownerElsewhere(): null {
+  return null;
 }
 
 /** "This project is running … right now", naming the machine when known.

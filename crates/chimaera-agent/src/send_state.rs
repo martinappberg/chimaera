@@ -1,0 +1,846 @@
+//! Bounded delivery evidence, independent of the lossy conversation journal.
+//!
+//! Dispatch is recorded before handing input to a driver. Without its echo we
+//! cannot prove the agent did not receive it, even after a clean process exit.
+//! A replacement must therefore refuse automatic replay. This is delivery
+//! evidence, not an exactly-once guarantee for an agent's external actions.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
+
+use anyhow::{ensure, Context, Result};
+use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
+
+use crate::{model, ClientIdState, SendUncertain, RETAINED_SENDS_MAX};
+
+pub const MAX_BYTES: usize = 32 * 1024;
+const MAX_STORES: usize = 512;
+const IO_WAIT: Duration = Duration::from_secs(2);
+const REQUIRED: &[u8] = b"1\n";
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum State {
+    Dispatching,
+    Confirmed,
+    Withdrawn,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Entry {
+    id: String,
+    state: State,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Snapshot {
+    version: u32,
+    session_id: String,
+    entries: VecDeque<Entry>,
+}
+
+impl Snapshot {
+    fn new(session_id: &str) -> Self {
+        Self {
+            version: 1,
+            session_id: session_id.into(),
+            entries: VecDeque::new(),
+        }
+    }
+
+    fn validate(&self, session_id: &str) -> Result<()> {
+        ensure!(
+            self.version == 1 && self.session_id == session_id,
+            "send state binding mismatch"
+        );
+        ensure!(
+            self.entries.len() <= model::CLIENT_IDS_REMEMBERED + RETAINED_SENDS_MAX,
+            "send state exceeds limit"
+        );
+        let mut ids = HashSet::new();
+        let mut pending = 0;
+        for entry in &self.entries {
+            ensure!(
+                model::valid_client_id(&entry.id) && ids.insert(&entry.id),
+                "invalid send state id"
+            );
+            pending += usize::from(entry.state == State::Dispatching);
+        }
+        ensure!(
+            pending <= RETAINED_SENDS_MAX,
+            "unresolved send limit reached"
+        );
+        ensure!(
+            self.entries.len() - pending <= model::CLIENT_IDS_REMEMBERED,
+            "settled send limit reached"
+        );
+        Ok(())
+    }
+
+    fn get(&self, id: &str) -> Option<State> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.state)
+    }
+
+    fn merge_legacy(&mut self, legacy: &[(String, ClientIdState)]) -> Result<()> {
+        for (id, confirmed) in legacy {
+            if self.get(id).is_none() {
+                self.remember(
+                    id,
+                    match confirmed {
+                        ClientIdState::Confirmed => State::Confirmed,
+                        ClientIdState::Cancelled => State::Withdrawn,
+                        _ => State::Dispatching,
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn remember(&mut self, id: &str, state: State) -> Result<()> {
+        ensure!(model::valid_client_id(id), "invalid send state id");
+        if let Some(old) = self.get(id) {
+            ensure!(
+                !matches!(
+                    (old, state),
+                    (State::Withdrawn, State::Confirmed | State::Dispatching)
+                        | (State::Confirmed, State::Withdrawn)
+                        | (State::Dispatching, State::Withdrawn)
+                ),
+                "conflicting send evidence"
+            );
+            // A stale export or delayed dispatch must not weaken a receipt.
+            if old == State::Confirmed || old == state {
+                return Ok(());
+            }
+            self.entries.retain(|entry| entry.id != id);
+        }
+        if state == State::Dispatching {
+            ensure!(
+                self.entries
+                    .iter()
+                    .filter(|entry| entry.state == State::Dispatching)
+                    .count()
+                    < RETAINED_SENDS_MAX,
+                "unresolved send limit reached"
+            );
+        }
+        self.entries.push_back(Entry {
+            id: id.into(),
+            state,
+        });
+        while self
+            .entries
+            .iter()
+            .filter(|entry| entry.state != State::Dispatching)
+            .count()
+            > model::CLIENT_IDS_REMEMBERED
+        {
+            let index = self
+                .entries
+                .iter()
+                .position(|entry| entry.state != State::Dispatching)
+                .expect("settled entry exists");
+            self.entries.remove(index);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct Store {
+    path: PathBuf,
+    required: PathBuf,
+    snapshot: Mutex<Snapshot>,
+    failed: AtomicBool,
+    gate: Arc<Semaphore>,
+    #[cfg(test)]
+    before_write: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+}
+
+type Registry = Mutex<HashMap<PathBuf, Weak<Store>>>;
+static STORES: OnceLock<Registry> = OnceLock::new();
+// Serialize first enrollment so concurrent sessions cannot all pass the last
+// retained-store slot. Existing receipts do not take this global gate.
+static ENROLLMENTS: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub(crate) fn paths(dir: &Path, session_id: &str) -> Result<(PathBuf, PathBuf)> {
+    ensure!(
+        !session_id.is_empty()
+            && session_id.len() <= 128
+            && session_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        "invalid send state session"
+    );
+    Ok((
+        dir.join(format!("{session_id}.send-state.json")),
+        dir.join(format!("{session_id}.send-state-required")),
+    ))
+}
+
+fn read_bounded(path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_NOFOLLOW);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("send state cannot be read"),
+    };
+    ensure!(
+        file.metadata()?.is_file(),
+        "send state is not a regular file"
+    );
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= limit, "send state exceeds limit");
+    Ok(Some(bytes))
+}
+
+fn decode(session_id: &str, bytes: &[u8]) -> Result<Snapshot> {
+    ensure!(bytes.len() <= MAX_BYTES, "send state exceeds limit");
+    let snapshot: Snapshot = serde_json::from_slice(bytes).context("send state is damaged")?;
+    snapshot.validate(session_id)?;
+    Ok(snapshot)
+}
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+impl Store {
+    pub(crate) fn open(
+        dir: &Path,
+        session_id: &str,
+        legacy: &[(String, ClientIdState)],
+    ) -> Result<Arc<Self>> {
+        fs::create_dir_all(dir)?;
+        let dir = dir.canonicalize()?;
+        let (path, required) = paths(&dir, session_id)?;
+        let registry = STORES.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(store) = registry
+            .lock()
+            .expect("send stores lock")
+            .get(&path)
+            .and_then(Weak::upgrade)
+        {
+            return Ok(store);
+        }
+        let marker = read_bounded(&required, REQUIRED.len())?;
+        ensure!(
+            marker.as_deref().is_none_or(|bytes| bytes == REQUIRED),
+            "send state enrollment is damaged"
+        );
+        let bytes = read_bounded(&path, MAX_BYTES)?;
+        ensure!(
+            marker.is_none() || bytes.is_some(),
+            "enrolled send state is missing"
+        );
+        let mut snapshot = match bytes {
+            Some(bytes) => decode(session_id, &bytes)?,
+            None => Snapshot::new(session_id),
+        };
+        // Legacy echoes are useful evidence, but never replace a withdrawal or
+        // an unresolved dispatch imported from the independent store.
+        snapshot.merge_legacy(legacy)?;
+        let store = Arc::new(Self {
+            path: path.clone(),
+            required,
+            snapshot: Mutex::new(snapshot),
+            failed: AtomicBool::new(false),
+            gate: Arc::new(Semaphore::new(1)),
+            #[cfg(test)]
+            before_write: Mutex::new(None),
+        });
+        let mut stores = registry.lock().expect("send stores lock");
+        stores.retain(|_, store| store.strong_count() > 0);
+        if let Some(existing) = stores.get(&path).and_then(Weak::upgrade) {
+            return Ok(existing);
+        }
+        ensure!(stores.len() < MAX_STORES, "send store limit reached");
+        stores.insert(path, Arc::downgrade(&store));
+        Ok(store)
+    }
+
+    pub(crate) fn state(&self, id: &str) -> Result<Option<ClientIdState>> {
+        ensure!(
+            !self.failed.load(Ordering::Acquire),
+            "send evidence is unavailable"
+        );
+        Ok(self
+            .snapshot
+            .lock()
+            .expect("send state lock")
+            .get(id)
+            .map(|state| match state {
+                State::Dispatching => ClientIdState::Uncertain,
+                State::Confirmed => ClientIdState::Confirmed,
+                State::Withdrawn => ClientIdState::Cancelled,
+            }))
+    }
+
+    fn update(&self, id: &str, state: State, withdraw_queued: bool) -> Result<()> {
+        ensure!(
+            !self.failed.load(Ordering::Acquire),
+            "send evidence is unavailable"
+        );
+        let mut next = self.snapshot.lock().expect("send state lock").clone();
+        if withdraw_queued {
+            match next.get(id) {
+                Some(State::Dispatching) => next.entries.retain(|entry| entry.id != id),
+                Some(State::Confirmed | State::Withdrawn) => return Ok(()),
+                None => anyhow::bail!("queued send evidence is missing"),
+            }
+        }
+        next.remember(id, state)?;
+        self.install(next)
+    }
+
+    fn install(&self, next: Snapshot) -> Result<()> {
+        let bytes = serde_json::to_vec(&next)?;
+        ensure!(bytes.len() <= MAX_BYTES, "send state exceeds limit");
+        let enrollment = if !self.required.try_exists()? {
+            Some(
+                ENROLLMENTS
+                    .get_or_init(|| Mutex::new(()))
+                    .lock()
+                    .expect("send enrollment lock"),
+            )
+        } else {
+            None
+        };
+        if enrollment.is_some() {
+            let mut entries = 0;
+            let mut enrolled = 0;
+            for entry in fs::read_dir(self.path.parent().context("send state needs a parent")?)? {
+                let entry = entry?;
+                entries += 1;
+                ensure!(
+                    entries <= MAX_STORES * 4 + 8,
+                    "send state directory exceeds limit"
+                );
+                enrolled += usize::from(
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.ends_with(".send-state-required")),
+                );
+            }
+            ensure!(enrolled < MAX_STORES, "retained send store limit reached");
+        }
+        if let Err(error) =
+            atomic_write(&self.path, &bytes).and_then(|()| atomic_write(&self.required, REQUIRED))
+        {
+            // Rename may have happened already. Never treat a failed operation
+            // as proof that no durable dispatch/withdrawal exists.
+            self.failed.store(true, Ordering::Release);
+            return Err(error);
+        }
+        *self.snapshot.lock().expect("send state lock") = next;
+        Ok(())
+    }
+
+    async fn record(self: &Arc<Self>, id: &str, state: State, withdraw_queued: bool) -> Result<()> {
+        ensure!(
+            !self.failed.load(Ordering::Acquire),
+            "send evidence is unavailable"
+        );
+        // The owned permit survives cancellation and timeout. Only one blocking
+        // write per session can exist; a hung mount cannot create more jobs.
+        let permit = match tokio::time::timeout(IO_WAIT, self.gate.clone().acquire_owned()).await {
+            Ok(permit) => permit?,
+            Err(_) => {
+                // A canceled caller may have left a hung owned write. Latch
+                // the failure so subsequent provider events do not each wait.
+                self.failed.store(true, Ordering::Release);
+                anyhow::bail!("send state storage is busy");
+            }
+        };
+        let owner = self.clone();
+        let id = id.to_owned();
+        let write = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            #[cfg(test)]
+            if let Some((entered, resume)) = owner.before_write.lock().unwrap().take() {
+                let _ = entered.send(());
+                let _ = resume.recv();
+            }
+            owner.update(&id, state, withdraw_queued)
+        });
+        match tokio::time::timeout(IO_WAIT, write).await {
+            Ok(result) => result.context("send state writer stopped")?,
+            Err(_) => {
+                // The write may still commit; prevent further keyed admission
+                // until a future daemon life reads its final durable outcome.
+                self.failed.store(true, Ordering::Release);
+                Err(anyhow::anyhow!("send state storage did not answer"))
+            }
+        }
+    }
+
+    pub(crate) async fn dispatch(self: &Arc<Self>, id: &str) -> Result<()> {
+        self.record(id, State::Dispatching, false).await
+    }
+    pub(crate) async fn withdraw(self: &Arc<Self>, id: &str) -> Result<()> {
+        self.record(id, State::Withdrawn, false).await
+    }
+    pub(crate) async fn cancel_queued(self: &Arc<Self>, id: &str) -> Result<()> {
+        self.record(id, State::Withdrawn, true).await
+    }
+    pub(crate) async fn confirm(self: &Arc<Self>, id: &str) -> Result<()> {
+        self.record(id, State::Confirmed, false).await
+    }
+}
+
+fn full_sync(file: &File) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a live file descriptor; F_FULLFSYNC has no third argument.
+        if unsafe { nix::libc::fcntl(file.as_raw_fd(), nix::libc::F_FULLFSYNC) } == 0 {
+            return Ok(());
+        }
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("send state needs a parent")?;
+    fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(".send-state-{:016x}.tmp", rand::random::<u64>()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&tmp)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        full_sync(&file)?;
+        fs::rename(&tmp, path)?;
+        let directory = File::open(parent)?;
+        match full_sync(&directory) {
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error)
+                    .is_some_and(|code| {
+                        code == nix::libc::EINVAL
+                            || code == nix::libc::ENOTSUP
+                            || code == nix::libc::EOPNOTSUPP
+                    }) =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
+    })();
+    let _ = fs::remove_file(tmp);
+    result
+}
+
+pub(crate) fn validate(session_id: &str, bytes: &[u8]) -> Result<()> {
+    paths(Path::new("."), session_id)?;
+    decode(session_id, bytes).map(|_| ())
+}
+
+pub(crate) fn export(
+    dir: &Path,
+    session_id: &str,
+    legacy: &[(String, ClientIdState)],
+) -> Result<Vec<u8>> {
+    let store = Store::open(dir, session_id, legacy)?;
+    let _permit = store
+        .gate
+        .clone()
+        .try_acquire_owned()
+        .context("send state storage is busy")?;
+    ensure!(
+        !store.failed.load(Ordering::Acquire),
+        "send evidence is unavailable"
+    );
+    let mut snapshot = store.snapshot.lock().expect("send state lock").clone();
+    snapshot.merge_legacy(legacy)?;
+    let bytes = serde_json::to_vec(&snapshot)?;
+    ensure!(bytes.len() <= MAX_BYTES, "send state exceeds limit");
+    Ok(bytes)
+}
+
+/// Read-only preparation: preserve local receipts before a transaction replaces
+/// its journal. The final installer merges this result again before committing.
+pub(crate) fn merge(
+    dir: &Path,
+    session_id: &str,
+    bytes: &[u8],
+    legacy: &[(String, ClientIdState)],
+) -> Result<Vec<u8>> {
+    let incoming = decode(session_id, bytes)?;
+    let merged = if dir.exists() {
+        let store = Store::open(dir, session_id, legacy)?;
+        let _permit = store
+            .gate
+            .clone()
+            .try_acquire_owned()
+            .context("send state storage is busy")?;
+        ensure!(
+            !store.failed.load(Ordering::Acquire),
+            "send evidence is unavailable"
+        );
+        let mut merged = store.snapshot.lock().expect("send state lock").clone();
+        merged.merge_legacy(legacy)?;
+        for entry in &incoming.entries {
+            merged.remember(&entry.id, entry.state)?;
+        }
+        merged
+    } else {
+        let mut merged = Snapshot::new(session_id);
+        merged.merge_legacy(legacy)?;
+        for entry in incoming.entries {
+            merged.remember(&entry.id, entry.state)?;
+        }
+        merged
+    };
+    merged.validate(session_id)?;
+    let bytes = serde_json::to_vec(&merged)?;
+    ensure!(bytes.len() <= MAX_BYTES, "send state exceeds limit");
+    Ok(bytes)
+}
+
+pub(crate) fn import(
+    dir: &Path,
+    session_id: &str,
+    bytes: &[u8],
+    legacy: &[(String, ClientIdState)],
+) -> Result<()> {
+    let incoming = decode(session_id, bytes)?;
+    let store = Store::open(dir, session_id, legacy)?;
+    // Imports happen only for quiescent sessions. Fail instead of racing an old
+    // owned writer, including one whose caller timed out or was canceled.
+    let _permit = store
+        .gate
+        .clone()
+        .try_acquire_owned()
+        .context("send state storage is busy")?;
+    ensure!(
+        !store.failed.load(Ordering::Acquire),
+        "send evidence is unavailable"
+    );
+    let mut merged = store.snapshot.lock().expect("send state lock").clone();
+    merged.merge_legacy(legacy)?;
+    for entry in incoming.entries {
+        merged.remember(&entry.id, entry.state)?;
+    }
+    store.install(merged)
+}
+
+/// A retired journal may be pruned, but unresolved or damaged independent
+/// evidence remains until explicit recovery. It must never become a fresh send.
+pub(crate) fn can_prune_evidence(dir: &Path, session_id: &str) -> Result<bool> {
+    let (path, required) = paths(dir, session_id)?;
+    let marker = read_bounded(&required, REQUIRED.len())?;
+    ensure!(
+        marker.as_deref().is_none_or(|bytes| bytes == REQUIRED),
+        "send state enrollment is damaged"
+    );
+    let bytes = read_bounded(&path, MAX_BYTES)?;
+    ensure!(
+        marker.is_none() || bytes.is_some(),
+        "enrolled send state is missing"
+    );
+    Ok(match bytes {
+        Some(bytes) => !decode(session_id, &bytes)?
+            .entries
+            .iter()
+            .any(|entry| entry.state == State::Dispatching),
+        None => true,
+    })
+}
+
+pub(crate) fn uncertain_error() -> anyhow::Error {
+    SendUncertain.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn withdrawals_and_unreceipted_dispatch_survive_store_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), "s-evidence", &[]).unwrap();
+        store.withdraw("client-withdrawn").await.unwrap();
+        store.dispatch("client-unknown").await.unwrap();
+        drop(store);
+        let restarted = Store::open(dir.path(), "s-evidence", &[]).unwrap();
+        assert_eq!(
+            restarted.state("client-withdrawn").unwrap(),
+            Some(ClientIdState::Cancelled)
+        );
+        assert_eq!(
+            restarted.state("client-unknown").unwrap(),
+            Some(ClientIdState::Uncertain)
+        );
+        let bytes = export(dir.path(), "s-evidence", &[]).unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        import(destination.path(), "s-evidence", &bytes, &[]).unwrap();
+        let restored = Store::open(destination.path(), "s-evidence", &[]).unwrap();
+        assert_eq!(
+            restored.state("client-unknown").unwrap(),
+            Some(ClientIdState::Uncertain)
+        );
+        assert_eq!(
+            restored.state("client-withdrawn").unwrap(),
+            Some(ClientIdState::Cancelled)
+        );
+        assert!(validate("s-another", &bytes).is_err());
+    }
+
+    #[tokio::test]
+    async fn outstanding_ids_never_roll_over_with_the_settled_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), "s-limits", &[]).unwrap();
+        for n in 0..RETAINED_SENDS_MAX {
+            store.dispatch(&format!("pending-{n:03}")).await.unwrap();
+        }
+        for n in 0..model::CLIENT_IDS_REMEMBERED + 5 {
+            store.withdraw(&format!("settled-{n:03}")).await.unwrap();
+        }
+        assert!(store.dispatch("pending-overflow").await.is_err());
+        assert!(
+            !store.failed.load(Ordering::Acquire),
+            "capacity refusal is not storage damage"
+        );
+        assert_eq!(store.state("settled-000").unwrap(), None);
+        for n in 0..RETAINED_SENDS_MAX {
+            assert_eq!(
+                store.state(&format!("pending-{n:03}")).unwrap(),
+                Some(ClientIdState::Uncertain)
+            );
+        }
+        let bytes = export(dir.path(), "s-limits", &[]).unwrap();
+        assert!(bytes.len() <= MAX_BYTES);
+        validate("s-limits", &bytes).unwrap();
+    }
+
+    #[tokio::test]
+    async fn imports_and_delayed_writes_cannot_weaken_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), "s-merge", &[]).unwrap();
+        store.dispatch("client-confirmed").await.unwrap();
+        let older = export(dir.path(), "s-merge", &[]).unwrap();
+        store.confirm("client-confirmed").await.unwrap();
+        import(dir.path(), "s-merge", &older, &[]).unwrap();
+        store.dispatch("client-confirmed").await.unwrap();
+        assert_eq!(
+            store.state("client-confirmed").unwrap(),
+            Some(ClientIdState::Confirmed)
+        );
+        store.withdraw("client-withdrawn").await.unwrap();
+        let before = fs::read(&store.path).unwrap();
+        let mut conflicting = Snapshot::new("s-merge");
+        conflicting
+            .remember("client-withdrawn", State::Confirmed)
+            .unwrap();
+        assert!(import(
+            dir.path(),
+            "s-merge",
+            &serde_json::to_vec(&conflicting).unwrap(),
+            &[]
+        )
+        .is_err());
+        assert_eq!(fs::read(&store.path).unwrap(), before);
+    }
+
+    #[test]
+    fn corrupted_oversized_and_missing_enrolled_evidence_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, marker) = paths(dir.path(), "s-damaged").unwrap();
+        for bytes in [b"{".to_vec(), vec![b'x'; MAX_BYTES + 1]] {
+            fs::write(&path, &bytes).unwrap();
+            assert!(Store::open(dir.path(), "s-damaged", &[]).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        fs::remove_file(&path).unwrap();
+        fs::write(&marker, REQUIRED).unwrap();
+        assert!(Store::open(dir.path(), "s-damaged", &[]).is_err());
+        assert!(!path.exists());
+        fs::write(&marker, b"0\n").unwrap();
+        assert!(Store::open(dir.path(), "s-damaged", &[]).is_err());
+        assert_eq!(fs::read(marker).unwrap(), b"0\n");
+    }
+
+    #[tokio::test]
+    async fn a_failed_confirmation_retains_dispatch_and_blocks_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), "s-failed", &[]).unwrap();
+        store.dispatch("client-unknown").await.unwrap();
+        // Directory at the marker destination makes the post-rename operation
+        // fail. The state write may already have committed: do not clear it.
+        fs::remove_file(&store.required).unwrap();
+        fs::create_dir(&store.required).unwrap();
+        assert!(store.confirm("client-unknown").await.is_err());
+        assert!(store.state("client-new-id").is_err());
+        assert!(store.dispatch("client-new-id").await.is_err());
+        assert!(export(dir.path(), "s-failed", &[]).is_err());
+        assert!(fs::read(&store.path)
+            .unwrap()
+            .windows(14)
+            .any(|bytes| bytes == b"client-unknown"));
+    }
+
+    #[tokio::test]
+    async fn canceling_before_the_io_permit_leaves_no_dispatch_and_allows_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), "s-cancel-io", &[]).unwrap();
+        let hold = store.gate.clone().acquire_owned().await.unwrap();
+        let owner = store.clone();
+        let task = tokio::spawn(async move { owner.dispatch("client-not-sent").await });
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(store.state("client-not-sent").unwrap(), None);
+        assert!(!store.path.exists());
+        drop(hold);
+        store.dispatch("client-not-sent").await.unwrap();
+        assert_eq!(
+            store.state("client-not-sent").unwrap(),
+            Some(ClientIdState::Uncertain)
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_enrollment_cap_refuses_new_stores_without_erasing_old_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..MAX_STORES {
+            fs::write(
+                dir.path().join(format!("retired-{n}.send-state-required")),
+                REQUIRED,
+            )
+            .unwrap();
+        }
+        let store = Store::open(dir.path(), "s-over-cap", &[]).unwrap();
+        assert!(store.dispatch("client-over-cap").await.is_err());
+        assert!(!store.failed.load(Ordering::Acquire));
+        assert_eq!(store.state("client-over-cap").unwrap(), None);
+        assert!(!store.path.exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), MAX_STORES);
+    }
+
+    #[tokio::test]
+    async fn canceled_writer_keeps_its_gate_and_survives_process_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), "s-owned-write", &[]).unwrap();
+        let (entered, entrance) = std::sync::mpsc::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        *store.before_write.lock().unwrap() = Some((entered, paused));
+        let owner = store.clone();
+        let task = tokio::spawn(async move { owner.dispatch("client-canceled-await").await });
+        tokio::task::spawn_blocking(move || entrance.recv_timeout(Duration::from_secs(1)).unwrap())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+        let replacement = Store::open(dir.path(), "s-owned-write", &[]).unwrap();
+        assert!(Arc::ptr_eq(&store, &replacement));
+        assert!(export(dir.path(), "s-owned-write", &[]).is_err());
+        let empty = serde_json::to_vec(&Snapshot::new("s-owned-write")).unwrap();
+        assert!(import(dir.path(), "s-owned-write", &empty, &[]).is_err());
+        resume.send(()).unwrap();
+        let gate = tokio::time::timeout(IO_WAIT, replacement.gate.clone().acquire_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            replacement.state("client-canceled-await").unwrap(),
+            Some(ClientIdState::Uncertain)
+        );
+        drop(gate);
+        import(dir.path(), "s-owned-write", &empty, &[]).unwrap();
+        assert_eq!(
+            replacement.state("client-canceled-await").unwrap(),
+            Some(ClientIdState::Uncertain)
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_confirmation_keeps_dispatch_unknown_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), "s-slow-confirm", &[]).unwrap();
+        store.dispatch("client-slow-confirm").await.unwrap();
+        let (entered, entrance) = std::sync::mpsc::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        *store.before_write.lock().unwrap() = Some((entered, paused));
+        let owner = store.clone();
+        let task = tokio::spawn(async move { owner.confirm("client-slow-confirm").await });
+        tokio::task::spawn_blocking(move || entrance.recv_timeout(Duration::from_secs(1)).unwrap())
+            .await
+            .unwrap();
+        assert!(task.await.unwrap().is_err());
+        assert!(store.state("client-slow-confirm").is_err());
+        let start = std::time::Instant::now();
+        assert!(store.confirm("client-slow-confirm").await.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "failed storage must not stall later events"
+        );
+        resume.send(()).unwrap();
+        let gate = tokio::time::timeout(IO_WAIT, store.gate.clone().acquire_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(gate);
+        tokio::time::timeout(IO_WAIT, async {
+            while Arc::strong_count(&store) > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(store);
+        let restarted = Store::open(dir.path(), "s-slow-confirm", &[]).unwrap();
+        assert_eq!(
+            restarted.state("client-slow-confirm").unwrap(),
+            Some(ClientIdState::Uncertain)
+        );
+    }
+
+    #[test]
+    fn read_only_preparation_captures_new_legacy_receipts_even_with_a_cached_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), "s-hot-legacy", &[]).unwrap();
+        let incoming = serde_json::to_vec(&Snapshot::new("s-hot-legacy")).unwrap();
+        let bytes = merge(
+            dir.path(),
+            "s-hot-legacy",
+            &incoming,
+            &[("client-legacy".into(), ClientIdState::Confirmed)],
+        )
+        .unwrap();
+        assert_eq!(
+            decode("s-hot-legacy", &bytes).unwrap().get("client-legacy"),
+            Some(State::Confirmed)
+        );
+        assert_eq!(
+            store.state("client-legacy").unwrap(),
+            None,
+            "preparation is read-only"
+        );
+        assert!(!store.path.exists());
+        import(dir.path(), "s-hot-legacy", &bytes, &[]).unwrap();
+        assert_eq!(
+            store.state("client-legacy").unwrap(),
+            Some(ClientIdState::Confirmed)
+        );
+    }
+}

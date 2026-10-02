@@ -371,9 +371,19 @@ conversation is still live and its echo has not come (`onDisconnected` and
 `dispose` clear the timer). An older one is withdrawn with
 `cancel_send`; `send_cancelled` (`onSendCancelled`) with `cancelled:true`
 returns its text with the notice "not delivered", `false` leaves the bubble
-for the echo that is coming. Those two frames are the only thing this client
+for an active holder's echo. A durable `send_confirmed` receipt keeps the text
+visible as delivered until its echo replaces it, without retries. A nonfatal
+`send_uncertain` error keeps it visible as unconfirmed delivery, stops retries
+and withdrawals, and never puts it back in the composer as unsent. Delayed
+refusals cannot reverse either receipt. Those two command frames are the only thing this client
 ever sends by itself; there is no queue of commands. A refused `cancel_send`
 is not shown and is asked again at the next `ready`.
+
+`ready.active_queued_ids` is a bounded snapshot of the current driver's keyed
+queue. After replay through `head`, older queued echoes absent from the snapshot
+remain visible as delivery unconfirmed; their Send now/cancel controls are hidden.
+Post-head live echoes are untouched. A definitive `sent`, `cancelled` or `dropped`
+update resolves uncertainty; a driver exit marks remaining queued rows uncertain.
 
 A daemon without `send_ids` is never sent anything twice and no `ready`
 decides anything there. Its echo has no id and confirms the oldest send with
@@ -387,7 +397,8 @@ presentation (`showUnconfirmed`). A send on a live connection shows no bubble
 until it has waited `SHOW_UNCONFIRMED_AFTER_MS` for its echo (ChatView's timer
 calls `showOverdue`; ids daemons only). `onDisconnected` (the pool calls it
 too when it heals a dead socket) shows what is unconfirmed as pending; an exit
-or a fall back to the terminal hands back everything; a move forgets nothing.
+or a fall back to the terminal retains it as uncertain instead of claiming it
+was unsent; a move forgets nothing.
 The Mastermind panel's one-click prompts go out under their own id and tell
 the store (`noteSentOutside`): nothing to confirm or return, but a refusal
 that names one is still said, and is never taken for the composer's send.

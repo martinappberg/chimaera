@@ -271,20 +271,33 @@ async fn chat_command(
     let state = Arc::clone(state);
     let id = id.to_owned();
     let client_id = client_id.map(str::to_owned);
+    let keyed = client_id.is_some();
     // Keep admitted enqueue work owned if its viewer disconnects. The bounded
     // wait is cancellable before enqueue; an accepted item belongs to the old
     // driver, which must be fenced before replacement authority can activate.
     tokio::spawn(async move {
         let _guard = guard;
-        tokio::time::timeout(
+        let outcome = tokio::time::timeout(
             Duration::from_secs(5),
             state
                 .chat
                 .send_from_client(&id, command, client_id.as_deref()),
         )
-        .await?
+        .await;
+        match outcome {
+            Ok(result) => result,
+            Err(_) if client_id.is_some() => Err(chimaera_agent::SendUncertain.into()),
+            Err(error) => Err(error.into()),
+        }
     })
-    .await?
+    .await
+    .unwrap_or_else(|error| {
+        if keyed {
+            Err(chimaera_agent::SendUncertain.into())
+        } else {
+            Err(error.into())
+        }
+    })
 }
 
 /// Why a session with no process here is not an exit. `Moved`: it continues on
@@ -1470,6 +1483,9 @@ async fn handle_chat(
         // answers `cancel_send`, so a client may resend what it could not
         // confirm. Additive: a daemon without it must never be resent to.
         "send_ids": true,
+        // Only these keyed sends still belong to the attached driver's queue.
+        // Replayed queued echoes outside this set cannot promise future delivery.
+        "active_queued_ids": state.chat.active_queued_ids(&id),
     });
     if send_json(&mut socket, &ready).await.is_err() {
         return;
@@ -1578,6 +1594,13 @@ async fn handle_chat(
                             use chimaera_agent::model::AgentCommand;
                             let is_send = matches!(cmd, AgentCommand::Send { .. } | AgentCommand::SendAfterTurn { .. });
                             let client_id = tag.client_id.filter(|_| is_send);
+                            if let Some(client_id) = client_id.as_deref().filter(|client_id| {
+                                state.chat.client_id_state(&id, client_id)
+                                    == Some(chimaera_agent::ClientIdState::Confirmed)
+                            }) {
+                                let _ = send_json(&mut socket, &json!({"type":"send_confirmed","client_id":client_id})).await;
+                                continue;
+                            }
                             // A repeat of a send this session already accepted
                             // is dropped before anything can refuse it: a
                             // refusal would hand back text that is delivered.
@@ -1585,6 +1608,13 @@ async fn handle_chat(
                                 state.chat.client_id_state(&id, client_id)
                                     == Some(chimaera_agent::ClientIdState::Accepted)
                             }) {
+                                continue;
+                            }
+                            if client_id.as_deref().is_some_and(|client_id| {
+                                state.chat.client_id_state(&id, client_id)
+                                    == Some(chimaera_agent::ClientIdState::Uncertain)
+                            }) {
+                                let _ = send_json(&mut socket, &uncertain_send(&text)).await;
                                 continue;
                             }
                             if options.read_only || !session_writable(&state, &id) {
@@ -1626,9 +1656,20 @@ async fn handle_chat(
                             if let Ok(chimaera_agent::SendOutcome::Duplicate) = outcome {
                                 // The first copy owns its saved images.
                                 crate::upload::discard_saved_images(saved);
+                                if let Some(client_id) = client_id.as_deref().filter(|client_id| {
+                                    state.chat.client_id_state(&id, client_id)
+                                        == Some(chimaera_agent::ClientIdState::Confirmed)
+                                }) {
+                                    let _ = send_json(&mut socket, &json!({"type":"send_confirmed","client_id":client_id})).await;
+                                }
                             } else if let Err(err) = outcome {
-                                // The send never happened: neither do its copies.
+                                // These are this attempt's image copies. An
+                                // uncertain earlier attempt retains its own.
                                 crate::upload::discard_saved_images(saved);
+                                if err.is::<chimaera_agent::SendUncertain>() {
+                                    let _ = send_json(&mut socket, &uncertain_send(&text)).await;
+                                    continue;
+                                }
                                 if err.is::<crate::pro::mutation::Changed>() {
                                     scope_changed(&mut socket).await;
                                     return;
@@ -1685,6 +1726,16 @@ async fn cancel_send(
     read_only: bool,
     text: &str,
 ) -> serde_json::Value {
+    if let Some(client_id) = tag.client_id.as_deref().filter(|client_id| {
+        state.chat.client_id_state(id, client_id) == Some(chimaera_agent::ClientIdState::Confirmed)
+    }) {
+        return json!({"type":"send_confirmed","client_id":client_id});
+    }
+    if tag.client_id.as_deref().is_some_and(|client_id| {
+        state.chat.client_id_state(id, client_id) == Some(chimaera_agent::ClientIdState::Uncertain)
+    }) {
+        return uncertain_send(text);
+    }
     if read_only || !session_writable(state, id) {
         return command_refusal(refusal(state, id, read_only), text);
     }
@@ -1707,11 +1758,20 @@ async fn cancel_send(
         Ok(Ok(cancelled)) => {
             json!({"type": "send_cancelled", "client_id": client_id, "cancelled": cancelled})
         }
+        Ok(Err(error)) if error.is::<chimaera_agent::SendUncertain>() => uncertain_send(text),
         _ => command_refusal(
             json!({"type": "error", "code": "command_failed", "message": "agent unavailable"}),
             text,
         ),
     }
+}
+
+fn uncertain_send(text: &str) -> serde_json::Value {
+    command_refusal(
+        json!({"type":"error", "code":"send_uncertain",
+            "message":"Delivery could not be confirmed. Check the conversation before sending this again."}),
+        text,
+    )
 }
 
 /// Ship replay entries in bounded batches, advancing `sent_seq`.

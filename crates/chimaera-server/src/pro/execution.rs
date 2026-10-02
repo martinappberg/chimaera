@@ -1,8 +1,10 @@
 //! Managed execution authority. A passive observation can fence execution, but
 //! only an authenticated acquire/renew response can create a fresh local lease.
+mod launch;
 mod lease;
 pub(crate) mod mutation;
 mod restart;
+pub(super) mod setup;
 pub(super) use restart::{persist_latch, record_groups, reprobe, shutdown};
 pub(super) mod receipt;
 pub(super) mod recovery;
@@ -30,6 +32,8 @@ pub(super) use watchdog::{start, stop};
 pub(super) struct State {
     proofs: Mutex<HashMap<String, Proof>>,
     commits: mutation::Commits,
+    setups: Mutex<HashMap<String, setup::Entry>>,
+    launches: Mutex<HashMap<String, (usize, bool, u64)>>,
     pub(super) latched: Mutex<std::collections::HashSet<String>>,
     /// Previous-life process groups not yet proven gone, per workspace. An
     /// empty list means no evidence exists (worker only; see `restore`).
@@ -325,7 +329,7 @@ pub(super) fn accept(
     // A worker cannot accept (or keep) a lease while it cannot prove old
     // processes stopped. A device keeps running regardless (laptop first).
     ensure!(
-        config.role == Role::Device
+        (config.role == Role::Device && !worker(state))
             || (!uncertain(state, &baton.workspace_id) && !unclean(state, &baton.workspace_id)),
         "previous managed processes require supervisor cleanup"
     );
@@ -668,6 +672,7 @@ pub(super) fn quiescent(state: &AppState, workspace: &str) -> bool {
     if (uncertain(state, workspace) && worker(state))
         || unclean(state, workspace)
         || !mutation::idle(state, workspace)
+        || setup::active(state, workspace)
     {
         return false;
     }
@@ -717,11 +722,16 @@ pub(super) fn expire(state: &AppState, generation: u64) -> Vec<String> {
 }
 pub(super) fn invalidate(state: &AppState) -> Vec<String> {
     let mut proofs = lock(&state.pro.execution.proofs);
-    let workspaces = proofs.keys().cloned().collect::<Vec<_>>();
+    let mut workspaces = proofs.keys().cloned().collect::<Vec<_>>();
     for proof in proofs.values_mut() {
         proof.stopped = true;
     }
     drop(proofs);
+    for workspace in lock(&state.pro.execution.setups).keys() {
+        if !workspaces.contains(workspace) {
+            workspaces.push(workspace.clone());
+        }
+    }
     state.pro.execution.changed.notify_waiters();
     workspaces
 }
@@ -780,9 +790,9 @@ pub(super) fn adopt_running(state: &AppState, workspace: &str) {
 pub(crate) async fn prepare_launch(
     state: &std::sync::Arc<AppState>,
     workspace: &str,
-) -> Result<()> {
+) -> Result<Option<launch::Intent>> {
     if !managed(state, workspace) {
-        return Ok(());
+        return Ok(None);
     }
     let _configuration = if mutation::request_reserved() {
         // Configure/stop may already hold this lock while draining our
@@ -799,6 +809,7 @@ pub(crate) async fn prepare_launch(
         crate::pro::may_execute(state, workspace),
         "project execution authority unavailable"
     );
+    let intent = launch::Intent::begin(state, workspace)?;
     {
         let mut preferences = lock(&state.pro.preferences);
         // An uncertain project (its record was lost) may have no preference
@@ -810,23 +821,14 @@ pub(crate) async fn prepare_launch(
         let preference = preferences.entry(workspace.to_owned()).or_default();
         preference.execution_active = true;
         preference.execution_boot = state.pro.execution.boot.clone();
+        preference.execution_launch_pending = true;
     }
     crate::pro::persist(state).await?;
     ensure!(
         crate::pro::may_execute(state, workspace),
         "execution authority changed during durable launch admission"
     );
-    // The caller spawns right after this returns; record the new child's
-    // group (and its start time) shortly after instead of at the next state
-    // write, so a crash in between leaves evidence a successor can probe.
-    let owner = state.clone();
-    tokio::spawn(async move {
-        for delay in [250, 2_000] {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-            let _ = crate::pro::persist(&owner).await;
-        }
-    });
-    Ok(())
+    Ok(Some(intent))
 }
 
 /// Account unreachability as the lease watchdog sees it: the proof expired

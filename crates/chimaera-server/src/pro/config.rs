@@ -327,6 +327,64 @@ fn write_toml(value: &serde_json::Value) -> Result<String> {
 
 /// Apply only the exported home-relative allowlist. Existing login material
 /// and symlinked directories are never replaced by a remote overlay.
+/// Sanitize and merge the entire overlay on private staging files before any
+/// destination configuration is changed. The original versions become return
+/// transaction before-images, including independently edited instructions.
+pub(super) fn prepare_import(
+    source: &Path,
+    home: &Path,
+    workspace: &Path,
+    stage: &Path,
+    budget: u64,
+) -> Result<Vec<super::install::Write>> {
+    let mut incoming = std::collections::BTreeSet::new();
+    let mut pending = vec![PathBuf::new()];
+    let mut count = 0usize;
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(source.join(&dir))? {
+            let entry = entry?;
+            count += 1;
+            ensure!(count <= 32_768, "configuration overlay exceeds limit");
+            let relative = dir.join(entry.file_name());
+            if !policy::allowed_path(&relative) {
+                continue;
+            }
+            let permitted = relative.starts_with(".claude")
+                || relative.starts_with(".codex")
+                || relative == Path::new(".claude.json")
+                || relative == Path::new(".gitconfig");
+            if !permitted {
+                continue;
+            }
+            let kind = entry.file_type()?;
+            ensure!(
+                !kind.is_symlink(),
+                "configuration overlay contains a symlink"
+            );
+            if kind.is_dir() {
+                pending.push(relative);
+            } else if kind.is_file() {
+                incoming.insert(relative);
+            }
+        }
+    }
+    let before = stage.join("before");
+    let after = stage.join("after");
+    super::install::snapshot(
+        home,
+        &before,
+        &|path| {
+            incoming
+                .iter()
+                .any(|target| target == path || target.starts_with(path))
+        },
+        budget,
+    )?;
+    super::install::snapshot(&before, &after, &|_| true, budget)?;
+    import(source, &after, workspace)?;
+    super::install::changes(home, &before, &after)
+}
+
 pub(super) fn import(source: &Path, home: &Path, workspace: &Path) -> Result<()> {
     let mut pending = vec![(source.to_path_buf(), PathBuf::new())];
     let mut visited = 0;
@@ -719,6 +777,42 @@ fn git_identity(bytes: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn invalid_overlay_is_rejected_before_changing_any_destination_config() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-config-preflight-{}",
+            chimaera_core::generate_token()
+        ));
+        fs::create_dir_all(root.join("home/.claude")).unwrap();
+        fs::create_dir_all(root.join("source/.claude")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let original = b"{\"model\":\"local\",\"env\":{\"SECRET_TOKEN\":\"local-only\"}}";
+        fs::write(root.join("home/.claude/settings.json"), original).unwrap();
+        fs::write(
+            root.join("source/.claude/settings.json"),
+            b"{\"model\":\"incoming\"}",
+        )
+        .unwrap();
+        fs::write(
+            root.join("source/.claude/keybindings.json"),
+            b"malformed json",
+        )
+        .unwrap();
+        assert!(prepare_import(
+            &root.join("source"),
+            &root.join("home"),
+            &root.join("project"),
+            &root.join("stage"),
+            1024 * 1024
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(root.join("home/.claude/settings.json")).unwrap(),
+            original
+        );
+        assert!(!root.join("home/.claude/keybindings.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn overlay_updates_preferences_without_replacing_local_credentials() {
         let mut incoming = serde_json::json!({"model":"new","env":{"PATH":"/new","SECRET_TOKEN":"foreign"},"password":"foreign"});

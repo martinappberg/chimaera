@@ -507,15 +507,17 @@ impl Client {
         if let Some(callback) = callback {
             body["desktop_callback"] = serde_json::to_value(callback)?;
         }
-        json_response(
-            self.request(
+        let response = self
+            .request_raw(
                 Method::POST,
                 path(&self.inner.account, &["v1", "billing", "checkout"]),
                 Some(body),
             )
-            .await?,
-        )
-        .await
+            .await?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            return Err(crate::AlreadySubscribed.into());
+        }
+        json_response(response).await
     }
     pub async fn billing_portal(&self) -> Result<BillingSession> {
         self.billing_portal_request(None, None).await

@@ -19,8 +19,7 @@ const SHOWN_MS = 4000;
 
 /** The daemon's `read_only` refusal (`reason` is additive; older daemons send
  *  only a message) as text for the person typing. `where` names the machine
- *  the project runs on when the pane knows it; by default it is judged from
- *  the daemon this window talks to. */
+ *  the project runs on when the pane knows it; an unknown owner stays neutral. */
 export function refusalText(reason: string | null, message: string | null, where: Owner = ownerElsewhere()): string {
   switch (reason) {
     case "watching":

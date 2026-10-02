@@ -38,6 +38,7 @@ it("a waking terminal says so until it is live; a refusal shows over it meanwhil
 it("running elsewhere names the cloud or your computer, and another device never", () => {
   expect(refusalText("elsewhere", null, "cloud")).toBe("This project is running in the cloud right now.");
   expect(refusalText("elsewhere", null, "computer")).toBe("This project is running on your computer right now.");
+  expect(refusalText("elsewhere", null)).toBe("This project is running somewhere else right now.");
   refuse("s-routed", "elsewhere", null);
   // A routed pane names no machine rather than a stale one.
   expect(refusalFor("s-routed", { where: null })).toBe("This project is running somewhere else right now.");

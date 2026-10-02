@@ -242,9 +242,10 @@ async fn same_boot_crash_never_turns_empty_registry_into_stopped_evidence() {
     // No recorded process group: a worker cannot prove anything.
     let restored = State::restore(&state.pro.root, &lock(&state.pro.preferences), true, false);
     assert!(lock(&restored.unclean).contains_key("w-a"));
-    // A device proceeds (laptop first).
+    // A device can still work (D1), but incomplete durable launch evidence
+    // cannot prove that every old process group stopped for publication.
     let restored = State::restore(&state.pro.root, &lock(&state.pro.preferences), false, false);
-    assert!(!lock(&restored.unclean).contains_key("w-a"));
+    assert!(lock(&restored.unclean).contains_key("w-a"));
     // A recorded group that is still alive fences both until it exits.
     let mut child = std::process::Command::new("/bin/sleep")
         .arg("30")
@@ -252,6 +253,7 @@ async fn same_boot_crash_never_turns_empty_registry_into_stopped_evidence() {
         .spawn()
         .unwrap();
     let mut preferences = lock(&state.pro.preferences).clone();
+    preferences.get_mut("w-a").unwrap().execution_launch_pending = false;
     let started = restart::leader_start(child.id() as i32).unwrap();
     preferences.get_mut("w-a").unwrap().execution_groups = vec![child.id()];
     preferences.get_mut("w-a").unwrap().execution_starts = vec![started];
@@ -352,6 +354,28 @@ fn lost_enrollment_records_make_only_those_projects_uncertain() {
     assert!(!state.pro.root.join("state.json.damaged").exists());
     assert!(!lock(&unreadable.execution.uncertain).contains("w-mirrored"));
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn device_shaped_grant_cannot_bypass_a_persisted_workers_restart_fence() {
+    for evidence in ["unclean", "uncertain"] {
+        let (state, config, root) = fixture();
+        // A later request can call itself a device; the installation's
+        // persisted worker marker remains the execution boundary.
+        worker_fixture(&state);
+        if evidence == "unclean" {
+            lock(&state.pro.execution.unclean).insert("w-a".into(), Vec::new());
+        } else {
+            lock(&state.pro.execution.uncertain).insert("w-a".into());
+        }
+        let error = accept(&state, &config, &baton(), 0, RequestStart::now()).unwrap_err();
+        assert!(error.to_string().contains("previous managed processes"));
+        assert!(lock(&state.pro.execution.proofs).is_empty());
+        state.pro.worker.store(false, Ordering::Release);
+        accept(&state, &config, &baton(), 0, RequestStart::now()).unwrap();
+        assert!(lock(&state.pro.execution.proofs).contains_key("w-a"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[path = "runtime_tests.rs"]
@@ -458,7 +482,7 @@ async fn graceful_same_boot_restart_does_not_fence_but_a_crash_probes_survivors(
     accept(&state, &config, &baton(), 0, RequestStart::now()).unwrap();
     lock(&state.pro.ownership).insert("w-a".into(), Ownership::Local { epoch: 2 });
     crate::pro::ensure_root(&state.pro.root).await.unwrap();
-    prepare_launch(&state, "w-a").await.unwrap();
+    let intent = prepare_launch(&state, "w-a").await.unwrap().unwrap();
     let agent = state
         .sessions
         .spawn_managed(chimaera_pty::SpawnOpts {
@@ -478,7 +502,14 @@ async fn graceful_same_boot_restart_does_not_fence_but_a_crash_probes_survivors(
         crate::agent_state::AgentRecord::new("k".into(), crate::agent_state::AgentKind::Claude),
     );
     lock(&state.session_workspaces).insert(agent.id.clone(), "w-a".into());
-    crate::pro::persist(&state).await.unwrap();
+    intent.registered(agent.id.clone());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while lock(&state.pro.preferences)["w-a"].execution_launch_pending {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     // A crash here leaves a live recorded group: a successor must wait for it.
     let crashed = crate::pro::ProState::new(state.pro.root.clone());
     assert_eq!(

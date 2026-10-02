@@ -1288,3 +1288,169 @@ async fn a_thawed_owner_answers_a_scoped_request_once_its_renewal_lands() {
         .stopping
         .store(true, std::sync::atomic::Ordering::Release);
 }
+
+#[tokio::test]
+async fn scoped_git_reads_map_metadata_and_refuse_other_checkouts() {
+    let (state, project, other) = fixture();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.test")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.test")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    git(&project.root, &["init", "-q", "-b", "main"]);
+    git(&project.root, &["add", "note.txt"]);
+    git(&project.root, &["commit", "-qm", "project history"]);
+    let sha = git(&project.root, &["rev-parse", "HEAD"]);
+    let outside = project.root.parent().unwrap().join("external-checkout");
+    git(
+        &project.root,
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "external",
+            outside.to_str().unwrap(),
+        ],
+    );
+    let text = format!("content keeps {} unchanged\n", project.root.display());
+    std::fs::write(project.root.join("note.txt"), &text).unwrap();
+    for (route, extra) in [
+        ("status", ""),
+        ("repos", ""),
+        ("branches", ""),
+        ("worktrees", ""),
+        ("log", "&path=%2Fproject%2Fnote.txt"),
+        ("show", "&rev=HEAD"),
+        ("compare", "&base=HEAD"),
+        ("diff", "&path=%2Fproject%2Fnote.txt"),
+    ] {
+        let uri = format!("/api/v1/git/{route}?workspace_id={}{}", project.id, extra);
+        let (code, bytes) = scoped(&state, &project.id, 4, Method::GET, &uri, None).await;
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "{route}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        match route {
+            "log" => {
+                assert_eq!(body["toplevel"], "/project");
+                assert_eq!(body["commits"][0]["sha"], sha);
+            }
+            "show" => {
+                assert_eq!(body["files"][0]["path"], "/project/note.txt");
+                assert_eq!(body["sha"], sha);
+            }
+            "compare" => assert_eq!(body["files"][0]["path"], "/project/note.txt"),
+            "status" => assert_eq!(body["entries"][0]["path"], "/project/note.txt"),
+            "repos" => assert_eq!(body["repos"][0]["path"], "/project"),
+            "worktrees" => {
+                assert_eq!(body["worktrees"].as_array().unwrap().len(), 1);
+                assert_eq!(body["worktrees"][0]["path"], "/project");
+            }
+            "diff" => {
+                assert_eq!(body["path"], "/project/note.txt");
+                assert_eq!(body["b"], text);
+            }
+            "branches" => assert!(body["branches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["name"] == "main")),
+            _ => unreachable!(),
+        }
+    }
+    let query = |key: &str, value: &str| {
+        crate::workspace_scope::paths::encode_query(&[(key.into(), value.into())])
+    };
+    for (route, args) in [
+        ("log", query("workspace_id", &other.id)),
+        (
+            "log",
+            format!(
+                "workspace_id={}&{}",
+                project.id,
+                query("repo", outside.to_str().unwrap())
+            ),
+        ),
+        (
+            "diff",
+            format!(
+                "workspace_id={}&{}",
+                project.id,
+                query("path", other.root.join("private.txt").to_str().unwrap())
+            ),
+        ),
+        (
+            "diff",
+            format!(
+                "workspace_id={}&path=%2Fproject%2Fnote.txt&{}",
+                project.id,
+                query("orig", outside.join("note.txt").to_str().unwrap())
+            ),
+        ),
+    ] {
+        let (code, _) = scoped(
+            &state,
+            &project.id,
+            4,
+            Method::GET,
+            &format!("/api/v1/git/{route}?{args}"),
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{route} {args}");
+    }
+    let (code, _) = scoped(
+        &state,
+        &project.id,
+        4,
+        Method::POST,
+        "/api/v1/git/worktrees",
+        Some(json!({"workspace_id":project.id,"branch":"forbidden"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    // The full local workbench can still inspect a linked checkout. A scoped
+    // browser project cannot gain that authority merely by knowing its path.
+    let uri = format!(
+        "/api/v1/git/log?workspace_id={}&{}",
+        project.id,
+        query("repo", outside.to_str().unwrap())
+    );
+    assert_eq!(
+        request(&state, Method::GET, &uri, None).await.0,
+        StatusCode::OK
+    );
+    let subdir = project.root.join("subdirectory");
+    std::fs::create_dir(&subdir).unwrap();
+    let sub = lock(&state.workspaces).add(subdir).unwrap();
+    pro::install_execution_fixture(&state, &sub.id, 4).unwrap();
+    let uri = format!("/api/v1/git/log?workspace_id={}", sub.id);
+    assert_eq!(
+        scoped(&state, &sub.id, 4, Method::GET, &uri, None).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(&state, Method::GET, &uri, None).await.0,
+        StatusCode::OK
+    );
+    state
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
+}

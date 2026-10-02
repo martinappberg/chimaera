@@ -12,12 +12,13 @@ import { api } from "../net/api";
  *  (`local`, `awaiting_verification`, `setting_up`, `privacy_disabled`) say
  *  nothing a row needs: the project is here, or not yet anywhere else. */
 const HINTS: Record<string, string> = {
-  remote: "In the cloud",
+  // Ownership holders are opaque IDs, not verified cloud/device routes.
+  remote: "Running elsewhere",
   // Files and conversations installing back onto this computer: a return
   // under way (`Ownership::Hydrating` on the receiving daemon).
   hydrating: "Coming home…",
   // This computer is handing the project over (its sessions are stopping).
-  transferring: "Moving to the cloud…",
+  transferring: "Moving work…",
 };
 
 /** Workspace id → its hint, from a `/pro/status` body; empty unless Pro is

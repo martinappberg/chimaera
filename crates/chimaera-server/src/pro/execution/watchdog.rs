@@ -14,6 +14,7 @@ pub(super) const FREEZE: Duration = Duration::from_secs(3);
 const JUMP: Duration = Duration::from_secs(1);
 
 fn signal(state: &AppState, workspace: &str) {
+    super::setup::signal(state, workspace);
     let ids: Vec<_> = lock(&state.session_workspaces)
         .iter()
         .filter(|(_, id)| id.as_str() == workspace)
@@ -133,6 +134,9 @@ pub(in crate::pro) async fn stop(
                 preference.execution_active = false;
             }
         }
+    }
+    for workspace in workspaces {
+        super::launch::stopped(state, workspace);
     }
     super::super::persist(state).await?;
     Ok(())

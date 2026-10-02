@@ -67,6 +67,17 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
 
 ## Key behaviors & gotchas
 
+- **Direct SSH on this computer.** In a host's Home actions, expand **Advanced**
+  and choose **Connect directly from this computer** when its site forbids a
+  keeper connection, requires this computer's VPN, or needs local SSH settings.
+  The native `set_host_direct_ssh` command saves additive `hosts.json`
+  `direct_ssh`; it overrides a known kept SSH route even while signed in.
+  Existing connections remain until reconnect, and running jobs and other
+  computers are unaffected. This does not change account-wide **Keep connected**.
+  Device connections have no SSH fallback and do not offer the preference.
+  The choice appears with an active Pro plan; a saved direct preference remains
+  visible while signed out so it can still be cleared.
+
 - **One ControlMaster per host.** Every ssh/scp call rides one chimaera-owned master
   (`ControlMaster=auto`, `ControlPersist=10m`, `Compression=yes`): the user authenticates **once**
   (password or 2FA/Duo, inherited from `~/.ssh/config` — the ssh client is never reimplemented),

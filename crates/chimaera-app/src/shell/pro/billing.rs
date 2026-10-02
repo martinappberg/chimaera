@@ -278,7 +278,7 @@ async fn open_billing(
         } else {
             client.billing_portal_with_callback(&callback).await
         }
-        .map_err(|_| "Couldn't open billing. Check your connection and try again.".to_string())?;
+        .map_err(open_error)?;
         let url = billing_url(&session.url)?;
         let _operation = state.pro.operation.lock().await;
         if state.pro.generation() != generation || !state.pro.billing.current(attempt.id) {
@@ -304,6 +304,14 @@ async fn open_billing(
     update(&app, attempt.id, Phase::Waiting, None);
     tokio::spawn(run(app, client, listener, callback, attempt));
     Ok(())
+}
+
+fn open_error(error: anyhow::Error) -> String {
+    if error.is::<chimaera_link::AlreadySubscribed>() {
+        "use_billing_portal".into()
+    } else {
+        "Couldn't open billing. Check your connection and try again.".into()
+    }
 }
 
 fn confirms(
@@ -517,6 +525,17 @@ mod tests {
             confirm_until(Kind::Checkout, deadline(), || async { Ok(false) }).await,
             Phase::Expired
         );
+    }
+
+    #[test]
+    fn checkout_refusal_preserves_refresh_code_and_other_errors_stay_private() {
+        assert_eq!(
+            open_error(chimaera_link::AlreadySubscribed.into()),
+            "use_billing_portal"
+        );
+        let error = open_error(anyhow::anyhow!("private provider diagnostic"));
+        assert!(!error.contains("private provider diagnostic"));
+        assert_ne!(error, "use_billing_portal");
     }
 
     #[test]

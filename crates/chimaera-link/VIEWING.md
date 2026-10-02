@@ -263,20 +263,39 @@ its text, its position or the time.
   daemon answers `send_cancelled {client_id, cancelled}`: `true` when no send
   under the id had been accepted, after which a send under it is refused
   with `command_failed`; `false` when one had been, which changes nothing.
-- The daemon remembers the newest 128 ids per conversation and reads them
-  back from the conversation's journal when it opens it, so a restart, a
-  respawn or a resume still drops the repeat. An id whose send was queued
-  for a driver that ended before handling it is forgotten with that driver
-  (the client's next copy is then the only one).
+- The daemon durably retains the newest 128 settled ids plus at most 64
+  unresolved dispatches per conversation, separately from the lossy journal.
+  It records dispatch before enqueue and withdrawal before acknowledging it.
+  Unresolved dispatches are never evicted to make room: further sends are
+  refused at the bound. Restart, process replacement and transfer retain this
+  evidence; damaged or missing enrolled metadata fails closed. This is bounded
+  input deduplication, not exactly-once agent actions or unlimited id retention.
+- `send_confirmed {client_id}` reports a durable driver receipt when its
+  journal echo may be unavailable. The client retains the text as delivered,
+  stops resending and waits for replay to replace that row. An unresolved
+  dispatch answers `error {code:"send_uncertain",client_id,command,message}`;
+  this is nonfatal and is never a refusal claiming the message was unsent.
+  The client keeps its text visible, stops automatic retries/withdrawal, and
+  asks the user to check the conversation before sending again. A driver exit
+  or terminal fallback likewise cannot prove nondelivery.
+- `ready.active_queued_ids` optionally lists at most 64 client IDs still owned
+  by the current driver's queue. After replay through `head`, a keyed queued
+  echo not in that set is shown as unconfirmed delivery, with no Send now or
+  cancellation claim. Apply this snapshot only to echoes at or before `head`;
+  later live echoes belong to their own events. A later `sent`, `cancelled` or
+  `dropped` update resolves the row normally. Older daemons omit the field.
 - A client keeps every send it made until the echo that carries its id.
-  Only that echo confirms it, and only a refusal that carries its id returns
-  its text to the composer; nothing else does either. At every `ready` that
+  A queued echo moves it to the pending queue; a nonqueued echo or explicit
+  durable receipt confirms delivery. Only a refusal proving
+  nondelivery and carrying its id returns its text to the composer. A delayed
+  refusal cannot override a confirmed or uncertain receipt. At every `ready` that
   says `send_ids`, once the replay through `head` has been applied, it sends
-  each send still without an echo again under the same id while the send is
+  each send still without an echo or receipt again under the same id while the send is
   younger than two minutes. That is right whatever became of the first copy:
   lost, still queued in the daemon, or about to be delivered by a keeper that
   held it. An older one it withdraws with `cancel_send` and returns to the
-  composer on `cancelled: true` (on `false` the echo is coming). A client
+  composer on `cancelled: true` (on `false` an active holder still owns it;
+  confirmed and uncertain daemon receipts are reported explicitly). A client
   sends `cancel_send` only right after a `ready`: a keeper drops it while
   nothing is attached.
 - Against a daemon without `send_ids` a client sends nothing twice and
@@ -547,15 +566,19 @@ makes progress and is abandoned after 120 s of silence.
 
 ## Project files and stable tabs
 
-The portable view root is always `/project` (canonical unpadded base64url
+The browser portable view root is always `/project` (canonical unpadded base64url
 `L3Byb2plY3Q` in `X-Chimaera-Viewer-Root` / socket `viewer_root`). It is presentation
 metadata, never authority. Browser clients do not persist real filesystem roots,
 and the metadata fields below are translated; content is never traversed, so
-journals (a conversation's tool paths and saved-image paths), recents, Git
-worktree listings and new-session replies still carry the owner's real paths.
+journals (a conversation's tool paths and saved-image paths), recents and
+new-session replies still carry the owner's real paths.
 Native windows translate their existing local file paths into this alias on the
 local computer, then translate returned metadata back. Their window layout stays
 local. This keeps existing file tabs stable while the project runs elsewhere.
+For Git reads, a native forward instead supplies its actual local project root
+as `X-Chimaera-Viewer-Root`; the owner translates known metadata before
+serialization so large diff content needs no additional JSON buffer in transit.
+The root remains presentation metadata and grants no path access.
 
 A native window's `/fs/*` request goes to the owner only when it belongs there:
 any path under the project's local root (and requests with no path) go to the
@@ -581,6 +604,21 @@ and draft metadata, resolver result paths, and file-watch path arrays. JSON
 adapters are capped at 1 MiB; raw file contents, uploads, downloads, notebook cells,
 table data, prompts and journals stream through unchanged. Path aliases match
 whole components, so a sibling prefix does not become a project path.
+
+Scoped Git reads include status, diffs, repository and worktree listings,
+branches, history, commit details and branch comparison. The query workspace
+must equal the granted workspace. Repository, file and rename-source paths are
+validated against the registered root, including symlinks; a known linked
+checkout outside that root is still forbidden. Listings omit external checkouts
+and enclosing repositories. History for an enclosing repository is unavailable
+through a project scoped to one of its subfolders, because it can reveal files
+outside that project. Ordinary unscoped local Git inspection stays unchanged;
+forwarded worktree creation and removal remain unavailable.
+
+Git metadata maps `toplevel`, absolute `path`, `orig`, repository `parent` and
+those fields in `entries`, `files`, `repos` and `worktrees`. Commit messages,
+relative paths and both sides of a diff remain byte-for-byte content; they are
+never searched or rewritten as path metadata.
 
 The target resolves filesystem paths against its **actual registered root**,
 including existing symlinks and the nearest existing parent for a new file.

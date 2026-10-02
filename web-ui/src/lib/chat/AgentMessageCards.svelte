@@ -27,7 +27,7 @@
     /** No parsed header: whether the raw text came from the Mastermind. */
     mastermind?: boolean;
     /** A waiting steer (read at the next step) or one that missed its turn. */
-    state?: "queued" | "dropped" | null;
+    state?: "queued" | "dropped" | "uncertain" | null;
     /** Dismiss a dropped one (the pending tail's ✕). */
     onDismiss?: () => void;
     visible?: boolean;
@@ -111,7 +111,7 @@
   {/if}
   {#if state !== null}
     <div class="delivery" class:dropped={state === "dropped"}>
-      <span>{state === "dropped" ? "not delivered — it's in their inbox" : "next step"}</span>
+      <span>{state === "uncertain" ? "delivery unconfirmed" : state === "dropped" ? "not delivered — it's in their inbox" : "next step"}</span>
       {#if state === "dropped" && onDismiss !== undefined}
         <button
           class="dismiss"

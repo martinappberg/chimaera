@@ -10,8 +10,8 @@
 //!   reopening the persisted window set at launch.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use self::tunnel::Tunnel;
@@ -1065,6 +1065,7 @@ pub fn run() {
             pro::pro_revoke_device,
             commands::list_hosts,
             commands::add_host,
+            commands::set_host_direct_ssh,
             commands::remove_host,
             commands::connect_host,
             commands::disconnect_host,
@@ -1422,7 +1423,7 @@ pub fn run() {
 mod origin_tests {
     use std::collections::HashMap;
 
-    use super::{WindowScope, daemon_origin_matches, is_srcdoc_frame, legacy_host_detail_label};
+    use super::{daemon_origin_matches, is_srcdoc_frame, legacy_host_detail_label, WindowScope};
 
     #[test]
     fn srcdoc_frames_pass_and_nothing_else_under_about() {

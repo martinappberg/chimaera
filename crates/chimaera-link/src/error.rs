@@ -12,6 +12,17 @@ impl std::fmt::Display for AuthorizationRevoked {
 }
 impl std::error::Error for AuthorizationRevoked {}
 
+/// Checkout raced with an existing subscription. Re-read the authenticated
+/// account; another checkout must not be offered from the stale plan state.
+#[derive(Debug)]
+pub struct AlreadySubscribed;
+impl std::fmt::Display for AlreadySubscribed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("account already subscribed")
+    }
+}
+impl std::error::Error for AlreadySubscribed {}
+
 /// The account service does not offer what this client version needs (an
 /// older service without a required route, or a different protocol major).
 /// Retrying cannot help until one side is updated; callers show a stable

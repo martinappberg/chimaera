@@ -16,16 +16,23 @@ export function readIntent(value: string | null, now = Date.now()): PurchaseInte
     return { plan: v.plan, interval: v.interval, stage: v.stage, created: v.created, ...(v.screenHint ? { screenHint: v.screenHint } : {}) };
   } catch { return null; }
 }
+/** Only the explicit service capability relaxes the unattended allowance. */
+export function attendedCloudActions(status: Pick<CloudProvisioningStatus, "state" | "reason" | "attended_actions"> | null): boolean {
+  return status?.state === "limited" && status.reason === "hours_exhausted" && status.attended_actions === true;
+}
+
 /** `agents` is whether an agent was connected in the cloud at the last
  * catalog read (remembered by the app, never probed): unknown claims nothing,
  * and none connected reads as the next step, not as an error. `readyOnce` is
  * whether this account's cloud has been ready before (`cloudReadyOnce`): only
  * its very first setup reads as setup; any later `preparing` (a service
  * update, say) is the same calm availability as ready and idle. */
-export function cloudCopy(state: string, reason: string | null, _phase?: CloudProvisioningStatus["phase"], agents: boolean | null = null, readyOnce = false): { title: string; detail: string } {
+export function cloudCopy(state: string, reason: string | null, _phase?: CloudProvisioningStatus["phase"], agents: boolean | null = null, readyOnce = false, attendedActions = false): { title: string; detail: string } {
   if (reason === "provisioning_disabled") return { title: "Cloud access is temporarily unavailable", detail: "Cloud work isn’t available yet. Work on this computer continues as usual." };
   if (reason === "beta_invite_required") return { title: "Cloud access is by invitation", detail: "This preview needs an invitation before you can use cloud work." };
-  if (reason === "hours_exhausted") return { title: "Cloud allowance used for this month", detail: "Work continues on your computer. Your cloud allowance resets next month." };
+  if (reason === "hours_exhausted") return { title: "Cloud allowance used for this month", detail: state === "limited" && attendedActions
+    ? "You can still open and work on cloud projects. Cloud work pauses when you stop interacting; unattended work resumes with your next monthly allowance."
+    : "Work continues on your computer. Your cloud allowance resets next month." };
   if (reason === "storage_exhausted") return { title: "Cloud copying needs more room", detail: "Your local projects remain available. The latest cloud copy couldn’t fit within your allowance. Review Usage and plan details." };
   if (reason === "spend_limit_reached") return { title: "Cloud use is paused", detail: "Your account’s cloud spending limit has been reached. Your local work is unaffected." };
   if (state === "preparing" && !readyOnce) return { title: "Getting things ready", detail: "Setting up your cloud. This usually takes a couple of minutes." };
@@ -132,6 +139,7 @@ export function friendlyError(reason: unknown, fallback: string): string {
   if (text === "service_unsupported") return "Cloud work is off for now because this version of Chimaera and your account don’t match. Installing an update, if one is offered, turns it back on; otherwise it resumes on its own. Work on this computer isn’t affected.";
   // Sign-out finished here; the app removes the saved sign-in by itself.
   if (text === "sign_out_pending") return "You’re signed out on this computer. The saved sign-in is cleared automatically next time you’re online.";
+  if (text === "sign_out_unpersisted") return "You’re signed out for now, but your saved sign-in could return after restarting the app. Keep the app open while cleanup retries, unlock your computer’s credential store, check your connection and free disk space.";
   const note = signInNoteCopy(text);
   if (note !== null) return note;
   if (text === "account_restore_locked") return "Chimaera couldn’t read your saved sign-in. Unlock your computer’s credential store, then choose Check again.";
@@ -305,8 +313,8 @@ export function projectPlace(workspace: MirrorWorkspace): string {
   if (workspace.never_mirror) return workspace.privacy_pending ? "Keeping this project on this computer…" : "Only on this computer";
   switch (workspace.ownership?.state) {
     case "local": return "This project is running on your computer right now";
-    case "remote": return "This project is running in the cloud right now";
-    case "transferring": return "Moving to the cloud…";
+    case "remote": return "Running elsewhere";
+    case "transferring": return "Moving work…";
     case "privacy_disabled": return "Automatic copying is off";
     case "setting_up": {
       const needs = setupNeeds(workspace);

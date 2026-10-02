@@ -25,6 +25,9 @@ use tokio::io::AsyncWriteExt;
 
 #[path = "bundle_empty.rs"]
 mod empty;
+#[path = "bundle_prepared.rs"]
+mod prepared;
+pub(crate) use prepared::prepare_import;
 
 pub(crate) const MAX_ARCHIVE: u64 = 100_000_000;
 const MAX_NATIVE: u64 = 90_000_000;
@@ -433,6 +436,12 @@ fn write_archive(
 ) -> Result<()> {
     let mut memory = BTreeMap::<String, Vec<u8>>::new();
     let journal = state.chat.journal_dir().join(format!("{}.jsonl", entry.id));
+    if entry.agent.is_some() {
+        memory.insert(
+            "send-state.json".into(),
+            chimaera_agent::journal::export_send_state(state.chat.journal_dir(), &entry.id)?,
+        );
+    }
     if journal.is_file() {
         let mut bytes = read_capped(&journal, MAX_JOURNAL)?;
         // A snapshot sees only complete append-only records, never a torn tail.
@@ -562,7 +571,7 @@ fn open_archive(path: &Path) -> Result<Opened> {
     let digest = digest_file(path, MAX_ARCHIVE)?.sha256;
     let (file, _) = crate::fs::open_regular(path)?;
     let mut zip = zip::ZipArchive::new(file)?;
-    if zip.len() > 5 || zip.is_empty() {
+    if zip.len() > 6 || zip.is_empty() {
         bail!("unexpected bundle members");
     }
     let mut names = std::collections::HashSet::new();
@@ -570,7 +579,12 @@ fn open_archive(path: &Path) -> Result<Opened> {
         let file = zip.by_index(i)?;
         if !matches!(
             file.name(),
-            "manifest.json" | "native.jsonl" | "journal.jsonl" | "index.json" | "view.json"
+            "manifest.json"
+                | "native.jsonl"
+                | "journal.jsonl"
+                | "index.json"
+                | "view.json"
+                | "send-state.json"
         ) || !names.insert(file.name().to_owned())
             || file.compression() != zip::CompressionMethod::Stored
             || file.is_symlink()
@@ -582,6 +596,8 @@ fn open_archive(path: &Path) -> Result<Opened> {
             MAX_NATIVE
         } else if file.name() == "journal.jsonl" {
             MAX_JOURNAL
+        } else if file.name() == "send-state.json" {
+            chimaera_agent::journal::SEND_STATE_MAX_BYTES as u64
         } else {
             MAX_METADATA
         };
@@ -686,6 +702,11 @@ fn open_archive(path: &Path) -> Result<Opened> {
         zip.by_name("journal.jsonl")?.read_to_end(&mut bytes)?;
         validate_journal(&bytes)?;
     }
+    if manifest.members.contains_key("send-state.json") {
+        let mut bytes = Vec::new();
+        zip.by_name("send-state.json")?.read_to_end(&mut bytes)?;
+        chimaera_agent::journal::validate_send_state(&entry.id, &bytes)?;
+    }
     Ok(Opened {
         manifest,
         entry,
@@ -757,15 +778,6 @@ pub(crate) async fn import(
 ) -> Result<ImportedSession> {
     let _permit = OPERATIONS.try_acquire().context("bundle operation limit")?;
     import_inner(state, path, options, false).await
-}
-/// [`import`] for a Pro transfer: its ledger writes are durable.
-pub(crate) async fn import_durable(
-    state: Arc<AppState>,
-    path: &Path,
-    options: ImportOptions,
-) -> Result<ImportedSession> {
-    let _permit = OPERATIONS.try_acquire().context("bundle operation limit")?;
-    import_inner(state, path, options, true).await
 }
 async fn import_inner(
     state: Arc<AppState>,
@@ -920,6 +932,30 @@ async fn import_inner(
             crate::lock(&setup.workspaces).import_exact(workspace)?;
             // The folder carries the id it was registered under.
             crate::workspaces::identity::write(&marker_root, &marker_id);
+            // Preserve local evidence before replacing the lossy journal. Old
+            // archives have no member and must never clear newer receipts.
+            if opened.entry.agent.is_some()
+                || opened.manifest.members.contains_key("send-state.json")
+            {
+                let bytes = if opened.manifest.members.contains_key("send-state.json") {
+                    let mut bytes = Vec::new();
+                    opened
+                        .zip
+                        .by_name("send-state.json")?
+                        .read_to_end(&mut bytes)?;
+                    bytes
+                } else {
+                    chimaera_agent::journal::export_send_state(
+                        setup.chat.journal_dir(),
+                        &opened.entry.id,
+                    )?
+                };
+                chimaera_agent::journal::import_send_state(
+                    setup.chat.journal_dir(),
+                    &opened.entry.id,
+                    &bytes,
+                )?;
+            }
             if let Some(native) = native_destination(&setup, &opened.entry)? {
                 install_member(&mut opened, "native.jsonl", &native)?;
                 if opened

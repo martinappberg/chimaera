@@ -34,6 +34,8 @@ function handlers(): ChatSocketHandlers & Record<string, ReturnType<typeof vi.fn
     onExited: vi.fn(),
     onError: vi.fn(),
     onCommandFailed: vi.fn(),
+    onSendUncertain: vi.fn(),
+    onSendConfirmed: vi.fn(),
     onAsleep: vi.fn(),
     onMoved: vi.fn(),
     onPaused: vi.fn(),
@@ -109,6 +111,21 @@ it("a paused conversation is not an exit and reconnects at once when it is reach
   socket.retrySoon();
   await vi.advanceTimersByTimeAsync(1);
   expect(Socket.all.length).toBe(before + 1);
+  socket.close();
+});
+
+it("uncertain delivery and durable receipts are ordered nonfatal controls, never refusals", async () => {
+  const h = handlers();
+  const socket = new ChatSocket("s-chat", h);
+  Socket.all[0].onopen?.();
+  Socket.all[0].frame({ type: "error", code: "send_uncertain", command: "send", client_id: "client-0001", message: "Check delivery." });
+  Socket.all[0].frame({ type: "send_confirmed", client_id: "client-0001" });
+  await drain();
+  expect(h.onSendUncertain).toHaveBeenCalledWith("client-0001", "Check delivery.");
+  expect(h.onSendConfirmed).toHaveBeenCalledWith("client-0001");
+  expect(h.onCommandFailed).not.toHaveBeenCalled();
+  expect(h.onError).not.toHaveBeenCalled();
+  expect(socket.healthy).toBe(true);
   socket.close();
 });
 
@@ -470,5 +487,21 @@ it("a kept socket that drops while the owner sleeps is dialed again, and only a 
   expect(socket.waitingForOwner).toBe(true);
   await vi.advanceTimersByTimeAsync(10 * 60_000);
   expect(Socket.all).toHaveLength(2);
+  socket.close();
+});
+
+
+it("passes bounded active queued IDs at ready and ignores invalid capability data", async () => {
+  const h = handlers();
+  const socket = new ChatSocket("s-chat", h);
+  Socket.all[0].onopen?.();
+  Socket.all[0].frame({ type: "ready", session: {}, head: 2, send_ids: true, active_queued_ids: ["client-0001"] });
+  await drain();
+  expect(h.onReady).toHaveBeenLastCalledWith({}, 0, 2, { sendIds: true, reattach: false, activeQueuedIds: ["client-0001"] });
+  for (const invalid of [["bad"], Array(65).fill("client-0001"), "client-0001"]) {
+    Socket.all[0].frame({ type: "ready", session: {}, head: 2, send_ids: true, active_queued_ids: invalid });
+    await drain();
+    expect(h.onReady).toHaveBeenLastCalledWith({}, 0, 2, { sendIds: true, reattach: true });
+  }
   socket.close();
 });

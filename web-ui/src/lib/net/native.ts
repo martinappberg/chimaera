@@ -69,6 +69,8 @@ export interface HostState {
   /** Optional when attached to a shell predating the link transport. */
   via_pro?: boolean;
   kept?: boolean;
+  /** Local SSH choice; absent for devices and shells without this command. */
+  direct_ssh?: boolean;
   status: HostStatus;
   /** Local end of the tunnel while connected. */
   local_port: number | null;
@@ -686,6 +688,11 @@ export async function setNotCluster(alias: string, on: boolean): Promise<HostSta
   return shell().core.invoke<HostState>("set_not_cluster", { alias, on });
 }
 
+/** Choose direct SSH on this computer's next connection, keeping existing work. */
+export async function setHostDirectSsh(alias: string, on: boolean): Promise<HostState> {
+  return shell().core.invoke<HostState>("set_host_direct_ssh", { alias, on });
+}
+
 /** SIGTERM a daemon an earlier connect left on the cluster's login node. */
 export async function clusterStopLoginDaemon(alias: string): Promise<void> {
   await shell().core.invoke<void>("cluster_stop_login_daemon", { alias });
@@ -1263,6 +1270,9 @@ export interface CloudProvisioningStatus {
   remembered_providers?: RememberedProvider[];
   state: "no_plan" | "unavailable" | "preparing" | "ready" | "sleeping" | "limited" | "error";
   reason: "provisioning_disabled" | "beta_invite_required" | "hours_exhausted" | "storage_exhausted" | "spend_limit_reached" | "provisioning_failed" | null;
+  /** Explicit actions allowed after the unattended allowance, only for
+   * limited/hours_exhausted. Absence retains older hard-limit behavior. */
+  attended_actions?: boolean;
 }
 
 export async function proCloudStatus(): Promise<CloudProvisioningStatus> {

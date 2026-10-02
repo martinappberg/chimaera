@@ -872,9 +872,18 @@ async fn switch_to_pty(
     if !crate::pro::may_execute(state, &successor_recipe.workspace_id) {
         return false;
     }
-    if crate::pro::prepare_managed_launch(state, &successor_recipe.workspace_id)
-        .await
-        .is_err()
+    let Ok(intent) =
+        crate::pro::prepare_managed_launch(state, &successor_recipe.workspace_id).await
+    else {
+        return false;
+    };
+    let Ok(_launch) = crate::pro::mutation::begin_launch(state, &successor_recipe.workspace_id)
+    else {
+        return false;
+    };
+    if intent
+        .as_ref()
+        .is_some_and(|intent| intent.check().is_err())
     {
         return false;
     }
@@ -885,6 +894,13 @@ async fn switch_to_pty(
     };
     match spawned {
         Ok(_) => {
+            if !crate::pro::may_execute(state, &successor_recipe.workspace_id) {
+                let _ = state.sessions.fence(id);
+                return false;
+            }
+            if let Some(intent) = intent {
+                intent.registered(id.to_owned());
+            }
             crate::lock(&state.chat_recipes).insert(id.to_string(), successor_recipe);
             tracing::info!(%id, "chat session switched to PTY TUI");
             true
@@ -3485,7 +3501,11 @@ pub(crate) async fn spawn_chat_session(
         crate::pro::may_execute(state, &recipe.workspace_id),
         "project execution authority changed during launch"
     );
-    crate::pro::prepare_managed_launch(state, &recipe.workspace_id).await?;
+    let intent = crate::pro::prepare_managed_launch(state, &recipe.workspace_id).await?;
+    let _launch = crate::pro::mutation::begin_launch(state, &recipe.workspace_id)?;
+    if let Some(intent) = &intent {
+        intent.check()?;
+    }
     spec.managed_execution = crate::pro::managed_execution(state, &recipe.workspace_id);
     crate::lock(&state.chat_recipes).insert(id.clone(), recipe.clone());
     let adapter = recipe
@@ -3498,6 +3518,11 @@ pub(crate) async fn spawn_chat_session(
     } else if !crate::pro::may_execute(state, &recipe.workspace_id) {
         state.chat.fence(&id);
         anyhow::bail!("project execution authority changed during launch");
+    }
+    if info.is_ok() {
+        if let Some(intent) = intent {
+            intent.registered(id);
+        }
     }
     info
 }

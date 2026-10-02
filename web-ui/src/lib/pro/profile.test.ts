@@ -54,13 +54,14 @@ describe("saving the decision", () => {
   const noWait = () => Promise.resolve();
 
   it("reads the stored profile fresh and writes the whole of it back", async () => {
-    mocks.api.mockResolvedValueOnce(Response.json(stored)).mockResolvedValueOnce(new Response(null, { status: 204 }));
+    mocks.api.mockResolvedValueOnce(Response.json(stored, { headers: { etag: '"revision-one"' } })).mockResolvedValueOnce(new Response(null, { status: 204 }));
     await expect(settleProposal("w-1", "npm ci", "confirm", noWait)).resolves.toBe("saved");
     const [[readPath, read], [writePath, write]] = mocks.api.mock.calls;
     expect(readPath).toBe("/pro/profile?workspace_id=w-1");
     expect(read.method).toBeUndefined();
     expect(writePath).toBe(readPath);
     expect(write.method).toBe("PUT");
+    expect(write.headers["If-Match"]).toBe('"revision-one"');
     expect(JSON.parse(write.body)).toEqual({ ...stored, setup_command: "npm ci", pending_setup_command: null });
   });
 
@@ -73,21 +74,46 @@ describe("saving the decision", () => {
   it("retries a save refused mid-copy from a fresh read, then gives up", async () => {
     const busy = () => Response.json({ error: "busy" }, { status: 409 });
     mocks.api
-      .mockResolvedValueOnce(Response.json(stored)).mockResolvedValueOnce(busy())
-      .mockResolvedValueOnce(Response.json(stored)).mockResolvedValueOnce(new Response(null, { status: 204 }));
+      .mockResolvedValueOnce(Response.json(stored, { headers: { etag: '"revision-one"' } })).mockResolvedValueOnce(busy())
+      .mockResolvedValueOnce(Response.json(stored, { headers: { etag: '"revision-one"' } })).mockResolvedValueOnce(new Response(null, { status: 204 }));
     const wait = vi.fn(noWait);
     await expect(settleProposal("w-1", "npm ci", "dismiss", wait)).resolves.toBe("saved");
     expect(wait).toHaveBeenCalledOnce();
     expect(mocks.api).toHaveBeenCalledTimes(4);
 
     mocks.api.mockReset();
-    mocks.api.mockImplementation(async (_path: string, init: RequestInit = {}) => init.method === "PUT" ? busy() : Response.json(stored));
+    mocks.api.mockImplementation(async (_path: string, init: RequestInit = {}) => init.method === "PUT" ? busy() : Response.json(stored, { headers: { etag: '"revision-one"' } }));
     await expect(settleProposal("w-1", "npm ci", "dismiss", noWait)).rejects.toThrow();
     expect(mocks.api.mock.calls.filter(([, init]) => init.method === "PUT").length).toBeLessThanOrEqual(4);
   });
 
+  it("requires a fresh decision after a revision refusal, even if the command text matches", async () => {
+    mocks.api.mockResolvedValueOnce(Response.json(stored, { headers: { etag: '\"old\"' } }))
+      .mockResolvedValueOnce(new Response(null, { status: 412 }));
+    await expect(settleProposal("w-1", "npm ci", "confirm", noWait)).resolves.toBe("changed");
+    expect(mocks.api).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not carry a busy retry into a replacement account with the same profile", async () => {
+    mocks.api.mockResolvedValueOnce(Response.json(stored, { headers: { etag: '\"old-account\"' } }))
+      .mockResolvedValueOnce(new Response(null, { status: 409 }))
+      .mockResolvedValueOnce(Response.json(stored, { headers: { etag: '\"new-account\"' } }));
+    await expect(settleProposal("w-1", "npm ci", "confirm", noWait)).resolves.toBe("changed");
+    expect(mocks.api).toHaveBeenCalledTimes(3);
+  });
+
+  it("never overwrites a replaced proposal or an unversioned legacy profile", async () => {
+    mocks.api.mockResolvedValueOnce(Response.json(stored, { headers: { etag: '"old"' } }))
+      .mockResolvedValueOnce(new Response(null, { status: 412 }));
+    await expect(settleProposal("w-1", "npm ci", "confirm", noWait)).resolves.toBe("changed");
+    expect(mocks.api).toHaveBeenCalledTimes(2);
+    mocks.api.mockReset().mockResolvedValueOnce(Response.json(stored));
+    await expect(settleProposal("w-1", "npm ci", "confirm", noWait)).rejects.toThrow("profile_not_saved");
+    expect(mocks.api).toHaveBeenCalledOnce();
+  });
+
   it("does not retry any other refusal", async () => {
-    mocks.api.mockResolvedValueOnce(Response.json(stored)).mockResolvedValueOnce(Response.json({ error: "denied" }, { status: 400 }));
+    mocks.api.mockResolvedValueOnce(Response.json(stored, { headers: { etag: '"revision-one"' } })).mockResolvedValueOnce(Response.json({ error: "denied" }, { status: 400 }));
     await expect(settleProposal("w-1", "npm ci", "confirm", noWait)).rejects.toThrow();
     expect(mocks.api).toHaveBeenCalledTimes(2);
   });

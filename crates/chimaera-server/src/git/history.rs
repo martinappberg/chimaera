@@ -14,13 +14,13 @@ use std::sync::Arc;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::AppState;
 
-use super::http::{bad_request, git_too_old, pick_repo, repo_relative};
+use super::http::{bad_request, git_too_old, pick_repo, repo_relative, view_json};
 use super::parse::RepoInfo;
 use super::rev::resolve_commit;
 use super::service::{configured_git, run_git};
@@ -43,6 +43,7 @@ async fn open_repo(
     state: &Arc<AppState>,
     ws_id: &str,
     repo: Option<&str>,
+    scope: Option<&crate::workspace_scope::Scope>,
 ) -> Result<(std::path::PathBuf, RepoInfo), Response> {
     let Some(ws) = crate::lock(&state.workspaces).get(ws_id) else {
         return Err(not_found("unknown workspace"));
@@ -51,7 +52,7 @@ async fn open_repo(
     if !git.adequate {
         return Err(git_too_old(&git));
     }
-    let picked = pick_repo(state, &git.path, &ws, repo).await?;
+    let picked = pick_repo(state, &git.path, &ws, repo, scope).await?;
     let Some(info) = picked.into_repo() else {
         return Err(bad_request("not a git repository"));
     };
@@ -142,8 +143,19 @@ pub(crate) struct LogQuery {
 /// 50 commits a page, newest first: sha, parents, author, date, subject.
 /// With `path`, one file's history, followed across renames. `has_more`
 /// says another page exists. An unborn branch answers an empty page.
-pub(crate) async fn log(State(state): State<Arc<AppState>>, Query(q): Query<LogQuery>) -> Response {
-    let (git, repo) = match open_repo(&state, &q.workspace_id, q.repo.as_deref()).await {
+pub(crate) async fn log(
+    State(state): State<Arc<AppState>>,
+    scope: Option<Extension<crate::workspace_scope::Scope>>,
+    Query(q): Query<LogQuery>,
+) -> Response {
+    let (git, repo) = match open_repo(
+        &state,
+        &q.workspace_id,
+        q.repo.as_deref(),
+        scope.as_ref().map(|s| &s.0),
+    )
+    .await
+    {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -185,12 +197,17 @@ pub(crate) async fn log(State(state): State<Arc<AppState>>, Query(q): Query<LogQ
         if out.stderr.contains("does not have any commits")
             || out.stderr.contains("unknown revision")
         {
-            return Json(json!({
-                "toplevel": repo.toplevel.to_string_lossy(),
-                "commits": [],
-                "has_more": false,
-                "unborn": true,
-            }))
+            return view_json(
+                &state,
+                scope.as_ref().map(|s| &s.0),
+                "/git/log",
+                json!({
+                    "toplevel": repo.toplevel.to_string_lossy(),
+                    "commits": [],
+                    "has_more": false,
+                    "unborn": true,
+                }),
+            )
             .into_response();
         }
         return bad_request(&out.stderr);
@@ -211,13 +228,18 @@ pub(crate) async fn log(State(state): State<Arc<AppState>>, Query(q): Query<LogQ
             })
         })
         .collect();
-    Json(json!({
-        "toplevel": repo.toplevel.to_string_lossy(),
-        "path": rel,
-        "commits": items,
-        "has_more": has_more,
-        "skip": skip,
-    }))
+    view_json(
+        &state,
+        scope.as_ref().map(|s| &s.0),
+        "/git/log",
+        json!({
+            "toplevel": repo.toplevel.to_string_lossy(),
+            "path": rel,
+            "commits": items,
+            "has_more": has_more,
+            "skip": skip,
+        }),
+    )
     .into_response()
 }
 
@@ -388,9 +410,17 @@ pub(crate) struct ShowQuery {
 /// counts. Each file's diff opens with `GET /git/diff?rev=<sha>&mode=commit`.
 pub(crate) async fn show(
     State(state): State<Arc<AppState>>,
+    scope: Option<Extension<crate::workspace_scope::Scope>>,
     Query(q): Query<ShowQuery>,
 ) -> Response {
-    let (git, repo) = match open_repo(&state, &q.workspace_id, q.repo.as_deref()).await {
+    let (git, repo) = match open_repo(
+        &state,
+        &q.workspace_id,
+        q.repo.as_deref(),
+        scope.as_ref().map(|s| &s.0),
+    )
+    .await
+    {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -443,20 +473,25 @@ pub(crate) async fn show(
         Ok(v) => v,
         Err(err) => return bad_request(&err.to_string()),
     };
-    Json(json!({
-        "toplevel": repo.toplevel.to_string_lossy(),
-        "sha": full,
-        "parents": parents,
-        "author": author,
-        "time": time,
-        "committer": committer,
-        "commit_time": commit_time,
-        "subject": subject,
-        "body": body,
-        "message_truncated": meta.truncated,
-        "files": files_json(&repo, &files),
-        "truncated": truncated,
-    }))
+    view_json(
+        &state,
+        scope.as_ref().map(|s| &s.0),
+        "/git/show",
+        json!({
+            "toplevel": repo.toplevel.to_string_lossy(),
+            "sha": full,
+            "parents": parents,
+            "author": author,
+            "time": time,
+            "committer": committer,
+            "commit_time": commit_time,
+            "subject": subject,
+            "body": body,
+            "message_truncated": meta.truncated,
+            "files": files_json(&repo, &files),
+            "truncated": truncated,
+        }),
+    )
     .into_response()
 }
 
@@ -480,9 +515,17 @@ pub(crate) struct CompareQuery {
 /// file's diff opens with `GET /git/diff?rev=<merge_base>&repo=<checkout>`.
 pub(crate) async fn compare(
     State(state): State<Arc<AppState>>,
+    scope: Option<Extension<crate::workspace_scope::Scope>>,
     Query(q): Query<CompareQuery>,
 ) -> Response {
-    let (git, repo) = match open_repo(&state, &q.workspace_id, q.repo.as_deref()).await {
+    let (git, repo) = match open_repo(
+        &state,
+        &q.workspace_id,
+        q.repo.as_deref(),
+        scope.as_ref().map(|s| &s.0),
+    )
+    .await
+    {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -591,16 +634,21 @@ pub(crate) async fn compare(
             }
         }
     }
-    Json(json!({
-        "toplevel": top.to_string_lossy(),
-        "base": base_label,
-        "merge_base": merge_base,
-        "diff_from": from,
-        "head": head,
-        "ahead": ahead,
-        "files": files_json(&repo, &files),
-        "truncated": truncated,
-    }))
+    view_json(
+        &state,
+        scope.as_ref().map(|s| &s.0),
+        "/git/compare",
+        json!({
+            "toplevel": top.to_string_lossy(),
+            "base": base_label,
+            "merge_base": merge_base,
+            "diff_from": from,
+            "head": head,
+            "ahead": ahead,
+            "files": files_json(&repo, &files),
+            "truncated": truncated,
+        }),
+    )
     .into_response()
 }
 

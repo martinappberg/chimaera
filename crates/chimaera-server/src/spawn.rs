@@ -348,10 +348,20 @@ pub(crate) async fn spawn_session(
     // Plain shells are never managed: no fence signals them and no stop
     // waits for them. Only agents carry the project's execution evidence.
     let managed = spawned_agent.is_some() && crate::pro::managed_execution(state, &workspace.id);
-    if managed {
+    let intent = if managed {
         crate::pro::prepare_managed_launch(state, &workspace.id)
             .await
-            .map_err(SpawnFailure::Internal)?;
+            .map_err(SpawnFailure::Internal)?
+    } else {
+        None
+    };
+    let _launch = if spawned_agent.is_some() {
+        crate::pro::mutation::begin_launch(state, &workspace.id).map_err(SpawnFailure::Internal)?
+    } else {
+        None
+    };
+    if let Some(intent) = &intent {
+        intent.check().map_err(SpawnFailure::Internal)?;
     }
     let spawned = if managed {
         state.sessions.spawn_managed(opts)
@@ -366,6 +376,9 @@ pub(crate) async fn spawn_session(
                 return Err(SpawnFailure::Internal(anyhow::anyhow!(
                     "project execution authority changed during launch"
                 )));
+            }
+            if let Some(intent) = intent {
+                intent.registered(info.id.clone());
             }
             // Remember the spawn theme: resurrection re-themes the session's
             // successor with it (there is no other durable record of it).

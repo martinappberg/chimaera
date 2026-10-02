@@ -8,12 +8,13 @@ revocable delegation over the authenticated local API.
 | --- | --- |
 | `mod.rs` | Bounded, credential-free persistent state, ownership/import fences and deferred-command policy. |
 | `authority.rs` / `authority_tests.rs` | Immutable workspace-bound worker acceptance, credential-free persisted latch, renewal/route/root guards and synthetic side-effect regressions. |
-| `routes.rs` | Authenticated configure/status/privacy/profile/power/hydration HTTP handlers. `/pro/status` rows carry additive `parked`, `working_agents` and `cloud_handoff` (see the quit handover below). |
+| `routes.rs` | Authenticated configure/status/privacy/profile/power/hydration HTTP handlers. Profile GET returns an account-generation-bound ETag; PUT optionally checks one exact If-Match under the same preference lock as replacement (412 on change). Older unconditional PUT remains supported. Accepted writes retain configuration/job reservations through durable persistence even if the caller disconnects. `profile_tests.rs` covers stale confirmation, generation changes and disk failure. `/pro/status` rows carry additive `parked`, `working_agents` and `cloud_handoff` (see the quit handover below). |
 | `projects.rs` | Passive bounded cloud-project discovery and explicit per-device local adoption; native-picked folder validation, saved directory identity, retry and legacy-import fences. |
 | `projects/tests.rs` | Synthetic loopback HTTP plus real Git transfer, passive-read, conflict, retry, restart and two-device destination checks. |
 | `execution.rs` / `execution/` | Negotiated execution leases, independent stop watchdog, durable launch/crash evidence, immutable receipts and stopped same-installation recovery. |
 | `execution/mutation.rs` | Bounded file/lifecycle/command commit reservations; account/epoch admission uses short in-memory locks, while clean stop and replacement wait for actual work even if its HTTP caller disappears. Reserved launches fail promptly if configuration is draining them, rather than waiting on themselves. |
-| `engine.rs` | Lease renewal (own account-request budget; installs and agent stops run as their own tasks), mirror coordinator, staged hydration (files are installed in place, not transactionally), deadline-bound sleep flush, three-way return and lazy return. |
+| `engine.rs` | Lease renewal (own account-request budget; installs and agent stops run as their own tasks), mirror coordinator, recoverable staged hydration, deadline-bound sleep flush, three-way return and lazy return. |
+| `install.rs` / `install/tests.rs` | Durable, account/epoch/checkpoint-bound return file intents: private before/after blobs, descriptor-relative no-follow replacement, exact restart roll-forward, checkout invariants and refusal to overwrite newer user edits. |
 | `detached.rs` | Owned transfer tasks keyed by (kind, project, epoch): a caller that disconnects never cancels a flush or hydration; repeats join; a completed release is remembered ten minutes. |
 | `drain.rs` | `POST/DELETE /pro/drain`: refuse new transfer work and wait for jobs, transfer tasks, project caches and Git helpers before a cloud machine suspends; on a cloud machine it first publishes each project it holds (the copy a computer takes when a phone acts while it sleeps). |
 | `moves.rs` | Acting brings the work to you: the asking side (`bring_here`, `answer`: request, wait for the release, take the epoch like a return, bounded five minutes / ninety seconds for a phone's request), the holder's side (`consider` on each renewal: `decide` last actor wins by the account's clock, else `hand_over` at the next pause through `routes::hand_to_computer`), `acted_here` (this computer's own input), `other_computer` (where a moved session says it went) and the passive read's `watch_query`. |
@@ -27,11 +28,11 @@ revocable delegation over the authenticated local API.
 | `policy.rs` | Mirrored-path policy (credentials, `.git`, staging names, kept copies and a folder's `.chimaera-workspace` identity marker at any depth are never mirrored), `REBUILT_DIRS` (dependency and cache folders that never travel as untracked content, used by the mirror inventory and the agent-config export), credential filtering, size budgets and cloud-profile classification. |
 | `mirror.rs` | Separate shadow and repository Git directories, incremental transfer and conservative hand-back. |
 | `shadow_cache.rs` | Validated reconstruction of an objectively damaged outgoing shadow, retaining its complete prior store in a bounded no-overwrite quarantine. |
-| `repository.rs` | Portable remote/tracking allowlist; bounded ref import, compare-and-swap adoption and index/ref-lock cancellation cleanup. `describe` is a snapshot's repository step: a plain folder (no repository) is ordinary, logged once at info (`ProState.plain_folders`) and never as a failed helper; a detached HEAD is no branch, not a failure. |
+| `repository.rs` | Portable remote/tracking allowlist; bounded staged repository import (including original index/object contents), compare-and-swap adoption and index/ref-lock cancellation cleanup. Linked-worktree HEAD/index remain in their private Git directory; common refs/config remain shared. Staged commands bind both `GIT_DIR` and `GIT_WORK_TREE`, including fresh-project init, so a new destination cannot fail init or discover an enclosing repository. `describe` is a snapshot's repository step: a plain folder (no repository) is ordinary, logged once at info (`ProState.plain_folders`) and never as a failed helper; a detached HEAD is no branch, not a failure. |
 | `canonical.rs` | Keeps the user's own version of a conflicting file right beside it (`<name>.mine-<yyyymmdd-hhmm>`) when a return installs the incoming one; bounded per return, never overwrites an earlier copy, never mirrored. `original_name` maps a copy back to the file it sits beside. |
 | `kept.rs` / `kept/tests.rs` | The review of what a return kept in both versions: list the recorded pairs (and the cloud's `@cloud` branches, read live), both texts for the side-by-side view, and settling a pair (`use_mine` / `use_cloud` / `keep_both`, one or all) — only recorded siblings, only inside the project, every name opened `O_NOFOLLOW` beneath the folder's descriptor. Tests drive the real router. |
 | `trash.rs` | Where a discarded kept copy goes: renamed (through its folder's descriptor, never replacing a name) into the home Trash (`~/.Trash`; the freedesktop.org home trash on Linux, with its `.trashinfo`), else its drive's existing Trash (`.Trashes/<uid>`; `.Trash/<uid>`, `.Trash-<uid>`), else deleted. `ProState::trash` holds the home Trash; tests point it at a fixture (never the real one). |
-| `config.rs` | Portable agent configuration export/import, scoped environment-omission diagnostics and destination connection identity preservation. |
+| `config.rs` | Portable agent configuration export/import, full overlay prevalidation and staged merge before return mutations, scoped environment-omission diagnostics and destination connection identity preservation. |
 
 One recorded holder and epoch controls shared writes. **Laptop first (D1):** a
 personal computer is fenced only by a verified other owner (`Ownership::Remote`,
@@ -41,6 +42,10 @@ expiry, account unreachability, sign-out (`disconnect` never stops sessions),
 plan changes, the privacy switch and daemon restarts stop publication only. A
 verified other owner refuses input at once (`may_write`); the device's agents
 then stop at their next safe pause, bounded to five minutes, as an owned task.
+The saved state has a 1 MiB input bound. Loading preserves every existing
+ownership, preference, destination adoption, legacy import and parked-transfer
+fence within that bound; the 128-project runtime admission ceiling never
+authorizes forgetting an older account or privacy restriction.
 A cloud worker (`execution::worker`: `CHIMAERA_WORKER`, a persisted worker
 marker, or a Worker runtime) stays strict: its execution needs an unexpired
 acquire/renew proof, never a passive GET; a request-start deadline reserves stop
@@ -72,9 +77,30 @@ from scheduling, before hydrate's own fence), and re-runs once recorded old
 process groups exit.
 Clean release waits for observed termination, durable publication and an exact
 immutable keeper receipt. Each managed launch persists active execution
-evidence, and every state write (plus two writes shortly after each managed
-launch) records the live managed agents' process groups with their leaders'
-start times (≤64 per project). A graceful stop clears the evidence once they
+evidence and a pending intent before spawning. Registration gives that intent
+to an owned bounded writer; it settles only after the driver's group or death
+is observable and no other pending/abandoned intent remains. The intent captures
+account generation, exact ownership and a per-workspace launch revision; final
+spawn checks all three under counted admission. Stop invalidates that revision
+even when the same epoch is reacquired, and late receipts/drops cannot settle a
+newer launch. Receipt persistence remains counted until its write completes.
+Every state write
+records the live managed agents' process groups with their leaders'
+start times (≤64 per project). A larger live roster records an explicit overflow marker; the recorded
+prefix never proves the omitted work stopped. Same-boot overflow stays unknown
+through subsequent truncated writes and reprobes; a cold boot or verified
+supervisor cleanup is required to establish complete evidence. Persisted worker
+identity keeps this fence even if a later runtime configuration says Device.
+Clean transfer admits at most 64 sessions before any mutation and rechecks the
+roster after draining all agents. Truth predicates inspect the whole existing
+registry. The final synchronous agent spawn/registration window has a counted
+reservation even for legacy/device ownership, so a pre-fence launch cannot
+appear after a successful empty-workload check. Plain shells remain unaffected.
+Cloud setup shells are also counted execution: their groups and background
+descendants are fenced on authority loss and observed before stop completes.
+A shared synced pending marker precedes agent/setup spawn, survives cancellation, and makes
+same-boot restart evidence unknown until group cleanup is durably settled.
+A graceful stop clears the ordinary agent evidence once they
 exit; a same-boot successor after a crash probes the recorded groups and waits
 only for survivors (re-probed every lease tick): a group that vanished, belongs
 to another user (EPERM), or whose leader started at another time (a reused id)
@@ -128,18 +154,22 @@ having replaced every existing connection.
 
 Project save/upload siblings use the reserved `.chimaera-staging-` prefix. Snapshot policy excludes that namespace even when tracked or explicitly included by an ignore file, so an unfinished body cannot enter a canonical snapshot before its final guarded rename. Ordinary user temporary files keep their existing policy.
 
-No account refresh token or agent credential enters this module. Delegations and
-short-lived Git passwords are memory-only. Never log remote response bodies,
+Delegations, account refresh tokens and short-lived Git passwords are never
+persisted by the transfer protocol. Private return before-images may contain
+the destination's original settings; they stay under owner-only recovery
+directories, never enter a mirror, and are removed only after commit. Never log remote response bodies,
 credential helpers, or secret-bearing structs. Filesystem work runs off the
 reactor. Every directory walk, child output, transfer, queue and state map is
 bounded. Shadow commits never touch the user's index or branch. Hand-back never
 resets a dirty worktree or rewrites a divergent branch.
 
-Hand-back fetches never overwrite `FETCH_HEAD`. Active-branch fast-forward holds
-the real index reservation and a prepared Git ref transaction before touching
-the working tree. Its bounded finalizer survives caller cancellation and installs
-the matching index after a committed ref; ambiguous failures retain the prepared
-index. Prepared transactions serialize so their helper cannot deadlock on the
+Hand-back fetches never overwrite `FETCH_HEAD`. Repository adoption runs on a
+bounded private checkout, retaining the original index and Git objects (including
+staged-only blobs). Active-branch fast-forward there holds its index reservation
+and a prepared Git ref transaction; the bounded finalizer survives cancellation
+and installs the matching staged index after a committed ref. The live checkout
+is changed only by the return journal, with HEAD/index invariants and preserved
+before-images. Prepared Git transactions serialize so their helper cannot deadlock on the
 two-child transport budget. Git selection is probed once asynchronously with
 credential-free, output-capped two-second helpers. The bounded 30-second wait for
 a helper slot is retryable and never caches a transient capacity failure. Account and keeper requests use their own six-request budget, never the two Git helper slots. On macOS only, an older or
@@ -157,6 +187,37 @@ transaction support preserves a cloud ref instead. Network Git has a finite
 16-minute deadline; ordinary helpers retain short deadlines. The remote
 repository and shadow histories are quota-bound by the account; local shadow
 history is retained and not yet pruned; neither is silently rewritten.
+
+**Recoverable installation.** `return-stage` retains the validated checkpoint,
+three-way/kept-both plan, sanitized config merges and immutable per-session
+preparation metadata. `return-install/journal.json` binds all destination file
+intents to the account, workspace, epoch and checkpoint (legacy checkpoints bind
+their three Git revisions). A bounded append-only progress log records ready,
+applied and committed steps without rewriting the inventory per file. Its private
+before/after blobs, stage files and directory enrollment become durable before
+the first replacement. Roots retain device/inode identity; every component is
+opened without following links. Replacement displaces the expected original to
+a reserved sibling and installs with no-replace renames. Exact retries roll
+forward; changed files, deleted installed files, replaced roots or missing
+session preparation retain recovery data and the `Hydrating` fence. Overlapping
+config/session targets require the same captured original; native session import
+then supplies the final file. The original common/private Git stores reserve
+HEAD, index, config, packed refs and named refs through installation commit.
+Crash recovery recognizes only this journal's exact lock markers and removes
+owned committed locks before profiles run. File installation, workspace
+registration and commit run in counted, configuration-serialized owned tasks,
+with authority rechecked immediately before canonical filesystem mutations. The
+final reservation survives commit, the exact `Hydrating` → `SettingUp` transition
+and durable state persistence; setup's initial transition also holds the
+configuration lock and compares the current epoch. Existing
+shared workspace/index/view/ledger stores are merged under their usual locks,
+never replaced with stale whole-store snapshots; all imports stay deferred.
+After those merges are durable, installation commits and `SettingUp` is persisted
+before recovery cleanup. Only then do profiles and agents run. Arbitrary profile
+command effects are not rolled back: failures remain actionable and fenced.
+Staging is capped at 4 GiB, journal before/after data at 1 GiB, files at the mirror
+ceiling, path inventories at the existing path ceiling, with available-space
+checks before copies. Oversized preparation refuses before changing the project.
 
 Cloud discovery is independent of power state and the obsolete global projects
 folder. `GET /api/v1/pro/projects` returns `{projects,error}`; each row has

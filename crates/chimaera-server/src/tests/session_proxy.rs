@@ -3304,7 +3304,7 @@ async fn held_input_and_settings_reach_the_session_here_in_order() {
             .local
             .chat
             .client_id_state(&fixture.id, "client-first"),
-        Some(chimaera_agent::ClientIdState::Accepted)
+        Some(chimaera_agent::ClientIdState::Confirmed)
     );
     let left = std::fs::read_to_string(&fixture.capture).unwrap_or_default();
     assert!(
@@ -3581,4 +3581,79 @@ async fn a_held_setting_does_not_keep_a_socket_from_reattaching_quietly() {
         fixture.transport.asleep.load(Ordering::Acquire),
         "nothing was woken"
     );
+}
+
+#[tokio::test]
+async fn routed_git_reads_use_the_viewers_root_without_buffering_diff_contents() {
+    let remote = test_state();
+    let local = test_state();
+    let root = init_temp_repo("routed-git-owner").canonicalize().unwrap();
+    let workspace = lock(&remote.workspaces).add(root).unwrap();
+    let mut viewing = workspace.clone();
+    viewing.root = test_dir("routed-git-viewer").canonicalize().unwrap();
+    lock(&local.workspaces)
+        .import_exact(viewing.clone())
+        .unwrap();
+    let content = format!("{}{}", "x".repeat(1100 * 1024), workspace.root.display());
+    std::fs::write(workspace.root.join("large.txt"), &content).unwrap();
+    pro::install_execution_fixture(&remote, &workspace.id, 4).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = app(remote.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    assert_eq!(
+        request(
+            &local,
+            Method::POST,
+            "/api/v1/pro/placements",
+            Some(serde_json::json!({
+                "host_id":"worker-git", "endpoint":format!("http://{address}"),
+                "token":"test-token", "workspace_id":workspace.id, "epoch":4
+            }))
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let args = workspace_scope::paths::encode_query(&[
+        ("workspace_id".into(), workspace.id.clone()),
+        ("repo".into(), viewing.root.to_string_lossy().into_owned()),
+        (
+            "path".into(),
+            viewing
+                .root
+                .join("large.txt")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ]);
+    let request = Request::builder()
+        .uri(format!("/api/v1/git/diff?{args}"))
+        .header(header::AUTHORIZATION, "Bearer test-token")
+        .header("x-chimaera-viewer-workspace", &workspace.id)
+        .body(Body::empty())
+        .unwrap();
+    let response = app(local.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        value["path"],
+        viewing.root.join("large.txt").to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        value["b"], content,
+        "only path metadata changes between machines"
+    );
+    assert!(
+        !viewing.root.join("large.txt").exists(),
+        "reading does not copy or take over execution"
+    );
+    assert!(local.sessions.list().is_empty());
+    for state in [&remote, &local] {
+        state
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    server.abort();
 }

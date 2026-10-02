@@ -295,10 +295,11 @@ pub(crate) async fn create_worktree(
     if !git.adequate {
         return git_too_old(&git);
     }
-    let picked = match super::http::pick_repo(&state, &git.path, &ws, body.repo.as_deref()).await {
-        Ok(outcome) => outcome,
-        Err(refusal) => return refusal,
-    };
+    let picked =
+        match super::http::pick_repo(&state, &git.path, &ws, body.repo.as_deref(), None).await {
+            Ok(outcome) => outcome,
+            Err(refusal) => return refusal,
+        };
     let Some(repo) = picked.into_repo() else {
         return bad_request("not a git repository");
     };
@@ -410,10 +411,11 @@ pub(crate) async fn remove_worktree(
     if !git.adequate {
         return git_too_old(&git);
     }
-    let picked = match super::http::pick_repo(&state, &git.path, &ws, body.repo.as_deref()).await {
-        Ok(outcome) => outcome,
-        Err(refusal) => return refusal,
-    };
+    let picked =
+        match super::http::pick_repo(&state, &git.path, &ws, body.repo.as_deref(), None).await {
+            Ok(outcome) => outcome,
+            Err(refusal) => return refusal,
+        };
     let Some(repo) = picked.into_repo() else {
         return bad_request("not a git repository");
     };

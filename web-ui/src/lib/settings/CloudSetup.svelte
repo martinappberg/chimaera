@@ -8,7 +8,7 @@
   import { agentsConnected, rememberedRows } from "../pro/providers";
   import { BILLING_PATH } from "../pro/accountHome";
   import { pageVisible } from "../shared/visibility";
-  import { MISSES_REPORTED, afterFailedRead, cloudAsleep, cloudCopy, cloudPollDelay, cloudProjectStatus, cloudReadyOnce, friendlyError } from "../pro/presentation";
+  import { MISSES_REPORTED, afterFailedRead, attendedCloudActions, cloudAsleep, cloudCopy, cloudPollDelay, cloudProjectStatus, cloudReadyOnce, friendlyError } from "../pro/presentation";
   import { isNativeShell, proCloudStatus, proMirrorStatus, writeClipboard, type MirrorStatus, type CloudSetupInfo, type CloudSetupRequest, type CloudProvisioningStatus } from "../net/native";
 
   let { visible = true, requiredProviders = [], contextLabel, workspaceId, onReady }: { visible?: boolean; requiredProviders?: string[]; contextLabel?: string; workspaceId?: string; onReady?: () => void } = $props();
@@ -47,17 +47,18 @@
   const browserRemembered = browser ? recallCatalog() : null;
   const remembered = $derived(browser ? browserRemembered : rememberedRows(status?.remembered_providers));
   const agents = $derived(liveAgents ?? (browser ? browserRemembered === null ? null : agentsConnected(browserRemembered) : status?.agents_connected ?? null));
-  const connected = $derived(info?.available === true && (browser || status?.state === "ready"));
-  const outage = $derived(status?.state === "ready" && !connected && unreachable >= MISSES_REPORTED);
+  const attendedActions = $derived(attendedCloudActions(status));
+  const connected = $derived(info?.available === true && (browser || status?.state === "ready" || attendedActions));
+  const outage = $derived((status?.state === "ready" || attendedActions) && !connected && unreachable >= MISSES_REPORTED);
   /** Only a cloud never seen ready reads as setup; a later `preparing` (a
    * service update, say) is the same calm availability as ready and idle. */
   const readyOnce = $derived(seenReady || cloudReadyOnce(status));
   /** The account has a cloud: ready, idle, or being updated after its first setup. */
-  const hasCloud = $derived(status?.state === "ready" || status?.state === "sleeping" || status?.state === "preparing" && readyOnce);
+  const hasCloud = $derived(status?.state === "ready" || status?.state === "sleeping" || status?.state === "preparing" && readyOnce || attendedActions);
   const firstSetup = $derived(!browser && status?.state === "preparing" && !readyOnce);
   const copy = $derived(outage
     ? { title: "Cloud access is temporarily unavailable", detail: "We couldn’t reach your projects and agent connections. We’ll keep checking. You can keep working here." }
-    : cloudCopy(status?.state ?? "error", status?.reason ?? null, status?.phase, agents, readyOnce));
+    : cloudCopy(status?.state ?? "error", status?.reason ?? null, status?.phase, agents, readyOnce, attendedActions));
   /** Agent connections show whenever there is a cloud: the last known rows at
    * once, live ones when the cloud answers. Showing or opening the section
    * only looks; it never wakes the cloud. */
@@ -101,7 +102,7 @@
           if (!alive || signal?.aborted || current !== generation) return;
           misses = 0;
           // Passive status and metadata reads never wake a suspended machine.
-          if (result.state === "ready") {
+          if (result.state === "ready" || attendedCloudActions(result)) {
             const read = await cloudRequest({ operation: "info" }, signal).catch((reason: unknown) => cloudAsleep(reason) ? "asleep" as const : null);
             if (!alive || signal?.aborted || current !== generation) return;
             const details = read === "asleep" ? null : read;
@@ -114,7 +115,7 @@
               // account again before counting it as unreachable.
               const again: CloudProvisioningStatus | null = reachable ? null : await proCloudStatus().catch(() => null);
               if (!alive || signal?.aborted || current !== generation) return;
-              if (again !== null && again.state !== "ready") { status = again; info = null; connectionChecked = false; unreachable = 0; }
+              if (again !== null && again.state !== "ready" && !attendedCloudActions(again)) { status = again; info = null; connectionChecked = false; unreachable = 0; }
               else { status = result; info = details; connectionChecked = true; unreachable = reachable ? 0 : unreachable + 1; }
             }
           } else { status = result; info = null; connectionChecked = false; unreachable = 0; }

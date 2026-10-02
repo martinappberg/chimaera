@@ -2,8 +2,8 @@
 
 use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
 use chimaera_link::{
-    fake, BillingInterval, BillingPortalTarget, BillingSession, Client, DesktopBillingCallback,
-    Plan,
+    fake, AlreadySubscribed, BillingInterval, BillingPortalTarget, BillingSession, Client,
+    DesktopBillingCallback, Plan,
 };
 use serde_json::{json, Value};
 use tokio::{net::TcpListener, sync::mpsc};
@@ -12,6 +12,32 @@ fn callback() -> DesktopBillingCallback {
     DesktopBillingCallback {
         redirect_uri: "http://127.0.0.1:49152/billing/callback".into(),
         state: chimaera_link::Pkce::new().state,
+    }
+}
+
+#[tokio::test]
+async fn checkout_conflict_is_typed_without_exposing_service_diagnostics() {
+    use axum::http::StatusCode;
+    for status in [StatusCode::CONFLICT, StatusCode::SERVICE_UNAVAILABLE] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new().route(
+            "/v1/billing/checkout",
+            post(move || async move { (status, "private provider diagnostic") }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = Client::new(&endpoint, Some(fake::FakeKeeper::tokens())).unwrap();
+        let error = client
+            .billing_checkout_with_callback(Plan::Pro, BillingInterval::Month, &callback())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.is::<AlreadySubscribed>(),
+            status == StatusCode::CONFLICT
+        );
+        assert!(!error.to_string().contains("private provider diagnostic"));
+        server.abort();
     }
 }
 

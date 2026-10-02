@@ -78,6 +78,21 @@ impl Alias {
     /// prompts and journals can themselves contain fields named `path`.
     pub fn response(&self, path: &str, body: &mut Value) {
         match path {
+            "/git/status" | "/git/diff" | "/git/worktrees" | "/git/repos" | "/git/branches"
+            | "/git/log" | "/git/show" | "/git/compare" => {
+                self.field(body, "toplevel");
+                // A log's `path` is repository-relative; output leaves it alone.
+                self.field(body, "path");
+                for key in ["entries", "files", "worktrees", "repos"] {
+                    if let Some(rows) = body.get_mut(key).and_then(Value::as_array_mut) {
+                        for row in rows {
+                            for field in ["path", "orig", "parent"] {
+                                self.field(row, field);
+                            }
+                        }
+                    }
+                }
+            }
             "/workspaces" => {
                 if let Some(rows) = body.as_array_mut() {
                     for row in rows {

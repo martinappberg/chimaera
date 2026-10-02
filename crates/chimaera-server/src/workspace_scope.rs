@@ -434,8 +434,8 @@ async fn scoped_request(
             _ => return denied(StatusCode::BAD_REQUEST),
         };
     if let Some(alias) = &alias {
-        if path.starts_with("/fs/") {
-            for key in ["path", "dir"] {
+        if path.starts_with("/fs/") || path.starts_with("/git/") {
+            for key in ["path", "dir", "repo", "orig"] {
                 if let Some(value) = query.get_mut(key) {
                     *value = alias.input(value);
                 }
@@ -736,13 +736,28 @@ async fn validate_resource(
         )?;
         return scope.session(state, body["agent_id"].as_str().context("missing agent")?);
     }
+    if read && matches!(path, "/recents" | "/fs/quickopen") {
+        return same(scope, query.get("workspace_id").map(String::as_str));
+    }
     if read
         && matches!(
             path,
-            "/git/status" | "/git/diff" | "/git/worktrees" | "/recents" | "/fs/quickopen"
+            "/git/status"
+                | "/git/diff"
+                | "/git/worktrees"
+                | "/git/repos"
+                | "/git/branches"
+                | "/git/log"
+                | "/git/show"
+                | "/git/compare"
         )
     {
-        return same(scope, query.get("workspace_id").map(String::as_str));
+        same(scope, query.get("workspace_id").map(String::as_str))?;
+        let paths = ["repo", "path", "orig"]
+            .into_iter()
+            .filter_map(|key| query.get(key).cloned())
+            .collect();
+        return scope.paths(state, paths).await;
     }
     if let Some(key) = path.strip_prefix("/view-state/") {
         ensure!(

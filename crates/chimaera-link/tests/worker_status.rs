@@ -49,3 +49,16 @@ fn confirmed_phases_round_trip_without_changing_legacy_status() {
         assert_eq!(old_client.reason, None);
     }
 }
+
+#[test]
+fn explicit_action_policy_round_trips_and_old_services_do_not_opt_in() {
+    let legacy: WorkerStatus = serde_json::from_value(json!({
+        "state":"limited", "reason":"hours_exhausted"
+    }))
+    .unwrap();
+    assert_eq!(legacy.attended_actions, None);
+    let body = json!({"state":"limited", "reason":"hours_exhausted", "attended_actions":true});
+    let status: WorkerStatus = serde_json::from_value(body.clone()).unwrap();
+    assert_eq!(status.attended_actions, Some(true));
+    assert_eq!(serde_json::to_value(status).unwrap(), body);
+}

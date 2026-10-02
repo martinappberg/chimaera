@@ -38,18 +38,18 @@ describe("daemon connection codes", () => {
 describe("a project running elsewhere", () => {
   afterEach(() => { vi.unstubAllGlobals(); sessionStorage.clear(); });
 
-  it("names the cloud or your computer from the daemon that refused, never a device", () => {
-    // This computer's own daemon hands projects to the cloud.
-    expect(ownerElsewhere()).toBe("cloud");
-    expect(new ApiError(409, "workspace_owned_elsewhere").message).toBe("This project is running in the cloud right now.");
-    vi.stubGlobal("location", new URL("https://fixture.invalid/app/worker-w1/"));
-    expect(ownerElsewhere()).toBe("computer");
-    expect(plainError("read_only")).toBe("This project is running on your computer right now.");
-    vi.stubGlobal("location", new URL("https://fixture.invalid/app/device-d1/"));
-    expect(ownerElsewhere()).toBe("cloud");
-    // A project view follows its project; a refusal there cannot name the owner.
-    vi.stubGlobal("location", new URL("https://fixture.invalid/workspace/w-one/"));
-    expect(ownerElsewhere()).toBeNull();
+  it("keeps an unknown owner neutral on native, host and project views", () => {
+    for (const address of ["http://localhost/", "https://fixture.invalid/app/worker-w1/", "https://fixture.invalid/app/device-d1/", "https://fixture.invalid/workspace/w-one/"]) {
+      vi.stubGlobal("location", new URL(address));
+      expect(ownerElsewhere()).toBeNull();
+      expect(new ApiError(409, "workspace_owned_elsewhere").message).toBe("This project is running somewhere else right now.");
+      expect(plainError("read_only")).toBe("This project is running somewhere else right now.");
+      expect(plainError("on_other_machine")).toBe("This file is on the other machine and can’t be opened here.");
+    }
+    // Verified placement still names the actual owner.
+    expect(plainError("workspace_owned_elsewhere", "cloud")).toBe("This project is running in the cloud right now.");
+    expect(plainError("read_only", "computer")).toBe("This project is running on your computer right now.");
+    expect(plainError("on_other_machine", "cloud")).toBe("This file is in the cloud and can’t be opened here.");
     for (const where of ["cloud", "computer", "other", null] as const) {
       expect(plainError("workspace_owned_elsewhere", where)).not.toMatch(/device/);
     }

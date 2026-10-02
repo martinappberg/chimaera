@@ -881,12 +881,25 @@ fn sessions(state: &AppState, workspace: &str) -> Vec<String> {
         .iter()
         .filter(|(_, id)| id.as_str() == workspace)
         .map(|(id, _)| id.clone())
-        .take(64)
         .collect();
     let agents = lock(&state.agents);
     ids.into_iter()
         .filter(|id| agents.contains_key(id) || state.chat.get(id).is_some())
         .collect()
+}
+
+fn transfer_session_ids(state: &AppState, workspace: &str) -> Result<Vec<String>> {
+    let ids: Vec<_> = lock(&state.session_workspaces)
+        .iter()
+        .filter(|(_, id)| id.as_str() == workspace)
+        .map(|(id, _)| id.clone())
+        .take(65)
+        .collect();
+    ensure!(
+        ids.len() <= 64,
+        "Project transfer supports at most 64 sessions; close some sessions and try again"
+    );
+    Ok(ids)
 }
 /// A clean flush before this computer sleeps: one shared deadline, and no
 /// release once the computer woke again (the project simply stays here).
@@ -1014,6 +1027,9 @@ async fn snapshot_inner_scoped(
     let workspace = lock(&state.workspaces)
         .get(workspace)
         .context("unknown workspace")?;
+    // Refuse before stopping or publishing anything. Taking a prefix could
+    // release legacy ownership with an omitted agent still running locally.
+    let session_ids = transfer_session_ids(state, &workspace.id)?;
     *phase = "destination";
     authority::destination(state, config, &workspace.id, Some(&workspace.root)).await?;
     *phase = "credentials";
@@ -1039,11 +1055,11 @@ async fn snapshot_inner_scoped(
         let agent_ids=sessions(state,&workspace.id);
         let continuation=continuation(state,&workspace.id);
         let mut has_agents=false;
-        let session_ids:Vec<_>=lock(&state.session_workspaces).iter().filter(|(_,workspace_id)|*workspace_id==&workspace.id).map(|(id,_)|id.clone()).take(64).collect();
         let mut stopped=std::collections::HashMap::new();
         if clean {
             *phase = "stop_sessions";
             lock(&state.pro.ownership).insert(workspace.id.clone(),Ownership::Transferring{epoch});super::persist(state).await?;
+            ensure!(transfer_session_ids(state,&workspace.id)?.iter().all(|id|session_ids.contains(id)), "Project sessions changed during transfer; try again");
             for id in &session_ids {
                 // Woken mid-flush: stop no further sessions.
                 if woke() { break; }
@@ -1066,7 +1082,10 @@ async fn snapshot_inner_scoped(
             }
         }
         *phase = "stop_execution";
-        if clean && config.execution.is_some() && !woke() {execution::stop(state,std::slice::from_ref(&workspace.id)).await?;}
+        if clean && !woke() {
+            execution::stop(state,std::slice::from_ref(&workspace.id)).await?;
+            ensure!(transfer_session_ids(state,&workspace.id)?.iter().all(|id|session_ids.contains(id)), "Project sessions changed during transfer; try again");
+        }
         *phase = "inventory";
         let paths = mirror::inventory(&workspace.root, &shadow).await?;
         let project = workspace.root.clone(); let destination = staging.join("tree");
@@ -1391,7 +1410,7 @@ pub(super) async fn hydrate(
         "Account changed while waiting for project cache"
     );
     transport::cache_quiescent(workspace)?;
-    transport::cache_scope(
+    let result = transport::cache_scope(
         workspace,
         cache.clone(),
         hydrate_scoped(
@@ -1404,8 +1423,29 @@ pub(super) async fn hydrate(
             cache,
         ),
     )
-    .await
+    .await;
+    if let Err(error) = &result {
+        // Keep worker failures diagnosable without logging helper stderr,
+        // credentials, project paths or native transcript contents.
+        let phase = if error
+            .chain()
+            .any(|cause| cause.to_string() == "repository return preparation failed")
+        {
+            "repository_prepare"
+        } else {
+            "hydrate"
+        };
+        tracing::warn!(
+            phase,
+            category = super::routes::error_code(error),
+            epoch = expected_epoch,
+            "project hydration failed; installation remains fenced"
+        );
+    }
+    result
 }
+
+type ReturnReport = (Vec<String>, (usize, Vec<PathBuf>));
 
 async fn hydrate_scoped(
     state: &Arc<AppState>,
@@ -1434,14 +1474,31 @@ async fn hydrate_scoped(
         && matches!(lock(&state.pro.ownership).get(workspace),Some(Ownership::SettingUp{epoch}) if *epoch==expected_epoch)
     {
         reconcile(state, config, workspace).await?;
-        return finish_hydration(
+        let path = state.pro.root.join(workspace).join("return-install");
+        let endpoint = config.endpoint.clone();
+        let account = config.account_id.clone();
+        let workspace_id = workspace.to_owned();
+        tokio::task::spawn_blocking(move || {
+            super::install::Transaction::cleanup_committed(
+                &path,
+                &endpoint,
+                account.as_deref(),
+                &workspace_id,
+                expected_epoch,
+            )
+        })
+        .await??;
+        let _ =
+            tokio::fs::remove_dir_all(state.pro.root.join(workspace).join("return-stage")).await;
+        finish_hydration(
             state,
             workspace,
             expected_epoch,
             generation,
             run_profile_steps(state, config, workspace),
         )
-        .await;
+        .await?;
+        return Ok(());
     }
     // Existing durable worker work must never be replaced with an older remote
     // snapshot after a restart. The normal grant path resumes its own ledger.
@@ -1578,63 +1635,79 @@ async fn hydrate_scoped(
     } else {
         manifest
     };
-    let stage = state
-        .pro
-        .root
-        .join(workspace)
-        .join(format!("hydrate-{}", chimaera_core::generate_token()));
-    let result = async {
-        let read_grant = credentials(config, workspace, None).await?;
-        for (branch, folder) in [
-            ("main", "tree"),
-            ("config", "config"),
-            ("handoff", "handoff"),
-        ] {
-            mirror::validate_tree(
-                &cache,
-                execution::receipt::revision(receipt, branch)?,
-                read_grant.storage_limit_bytes,
-                read_grant.max_file_bytes,
-            )
-            .await?;
-            let destination = stage.join(folder);
-            tokio::fs::create_dir_all(&destination).await?;
-            let mut command = transport::git(&cache, None).await?;
-            command.env("GIT_WORK_TREE", &destination);
+    // This stage is a durable part of the installation journal. The generic
+    // interrupted-helper sweep deliberately does not remove return-stage.
+    let stage = state.pro.root.join(workspace).join("return-stage");
+    let transaction_root = state.pro.root.join(workspace).join("return-install");
+    let checkpoint_binding = if let Some(receipt) = receipt {
+        receipt.id.clone()
+    } else {
+        String::from_utf8(
             transport::git_output(
-                command,
+                transport::git(&cache, None).await?,
                 &[
-                    "--work-tree",
-                    destination.to_str().context("invalid stage path")?,
-                    "checkout",
-                    execution::receipt::revision(receipt, branch)?,
-                    "--",
-                    ".",
+                    "rev-parse",
+                    "refs/heads/main",
+                    "refs/heads/config",
+                    "refs/heads/handoff",
                 ],
                 vec![],
             )
-            .await?;
-        }
-        current()?;
-        authority::destination(state, config, workspace, Some(&destination_root)).await?;
-        super::projects::begin_install(state, workspace, &destination_root).await?;
-        current()?;
-        let git_branches = super::repository::receive(
-            &destination_root,
-            &state
-                .pro
-                .root
-                .join(workspace)
-                .join("incoming-repository.git"),
-            &read_grant,
-            manifest.branch.as_deref(),
-            manifest.repository_origin.as_deref(),
-            manifest.repository.as_ref(),
-            &current,
-        )
-        .await?;
-        let baseline = stage.join("baseline");
+            .await?,
+        )?
+    };
+    let binding = super::install::Binding {
+        endpoint: config.endpoint.clone(),
+        account: config.account_id.clone(),
+        workspace: workspace.into(),
+        epoch: grant.epoch,
+        receipt: Some(checkpoint_binding),
+    };
+    let (journal_path, journal_binding) = (transaction_root.clone(), binding.clone());
+    let mut transaction = tokio::task::spawn_blocking(move || {
+        super::install::Transaction::open(&journal_path, &journal_binding)
+    })
+    .await??;
+    let recovering = transaction.is_some();
+    let result = async {
+        let read_grant = credentials(config, workspace, None).await?;
         let local_shadow = state.pro.root.join(workspace).join("working-tree.git");
+        let mut planned = Vec::new();
+        let (git_branches,kept) = if !recovering {
+            if tokio::fs::try_exists(&stage).await? { tokio::fs::remove_dir_all(&stage).await?; }
+            let private_stage=stage.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::create_dir_all(&private_stage)?;
+                std::fs::set_permissions(&private_stage,std::fs::Permissions::from_mode(0o700))?;
+                Ok(())
+            }).await??;
+            for (branch, folder) in [("main", "tree"),("config", "config"),("handoff", "handoff")] {
+                mirror::validate_tree(&cache,execution::receipt::revision(receipt, branch)?,read_grant.storage_limit_bytes.min(1024*1024*1024),read_grant.max_file_bytes).await?;
+                let destination = stage.join(folder);
+                tokio::fs::create_dir_all(&destination).await?;
+                let mut command = transport::git(&cache, None).await?;
+                command.env("GIT_WORK_TREE", &destination);
+                transport::git_output(command,&["--work-tree",destination.to_str().context("invalid stage path")?,"checkout",execution::receipt::revision(receipt, branch)?,"--","."],vec![]).await?;
+            }
+            current()?;
+            authority::destination(state,config,workspace,Some(&destination_root)).await?;
+            super::projects::begin_install(state,workspace,&destination_root).await?;
+            let original = destination_root.clone();
+            let before = stage.join("tree-before");
+            let checkout = stage.join("checkout");
+            let budget = read_grant.storage_limit_bytes;
+            let (before_copy,checkout_copy)=(before.clone(),checkout.clone());
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                super::install::snapshot(&original,&before_copy,&|path| super::policy::allowed_path(path) || path.file_name().and_then(|name|name.to_str()).is_some_and(super::canonical::kept_copy_name),budget)?;
+                super::install::snapshot(&before_copy,&checkout_copy,&|_|true,budget)
+            }).await??;
+            let (git_branches,git_writes) = super::repository::prepare_receive(
+                &destination_root,&checkout,&stage.join("repository"),
+                super::repository::Incoming {cache:&state.pro.root.join(workspace).join("incoming-repository.git"),credentials:&read_grant,branch:manifest.branch.as_deref(),origin:manifest.repository_origin.as_deref(),snapshot:manifest.repository.as_ref()},&current,
+            ).await.context("repository return preparation failed")?;
+            planned.extend(git_writes);
+        let baseline = stage.join("baseline");
         let old_shadow = super::shadow_cache::baseline(&local_shadow).await?;
         let has_baseline = old_shadow.is_some();
         if let Some(old_shadow) = &old_shadow {
@@ -1665,7 +1738,7 @@ async fn hydrate_scoped(
         current()?;
         authority::destination(state, config, workspace, Some(&destination_root)).await?;
         let tree = stage.join("tree");
-        let destination = destination_root.clone();
+        let destination = checkout.clone();
         let left_out = manifest.left_out.clone();
         let kept = tokio::task::spawn_blocking(move || {
             install_tree(
@@ -1676,7 +1749,76 @@ async fn hydrate_scoped(
             )
         })
         .await??;
-        super::report_return(state, workspace, kept, &git_branches);
+        let (root,before_copy,checkout_copy)=(destination_root.clone(),before.clone(),checkout.clone());
+        planned.extend(tokio::task::spawn_blocking(move || -> Result<_> {
+            let mut writes = super::install::changes(&root,&before_copy,&checkout_copy)?;
+            writes.retain(|write| !write.relative.starts_with(".git"));
+            Ok(writes)
+        }).await??);
+        let home = state.claude_settings_path.parent().and_then(Path::parent).context("agent home unavailable")?.to_path_buf();
+        let (overlay,config_workspace,config_stage)=(stage.join("config"),destination_root.clone(),stage.join("configuration"));
+        let budget = read_grant.storage_limit_bytes;
+        planned.extend(tokio::task::spawn_blocking(move ||config::prepare_import(&overlay,&home,&config_workspace,&config_stage,budget)).await??);
+        let (marker_root,marker_checkout,marker_stage,marker_id)=(destination_root.clone(),checkout.clone(),stage.join("marker"),workspace.to_owned());
+        planned.push(tokio::task::spawn_blocking(move ||prepare_marker(&marker_root,&marker_checkout,&marker_stage,&marker_id)).await??);
+        let report = serde_json::to_vec(&(git_branches.clone(),kept.clone()))?;
+        let report_path = stage.join("report.json");
+        tokio::task::spawn_blocking(move ||crate::persist::atomic_write_json_durable(&report_path,report)).await??;
+        (git_branches,kept)
+        } else {
+            let report_path = stage.join("report.json");
+            tokio::task::spawn_blocking(move || -> Result<ReturnReport> {
+                let (file,meta)=crate::fs::open_regular(&report_path)?;
+                ensure!(meta.len() <= 64*1024,"return report exceeds limit");
+                Ok(serde_json::from_reader(file)?)
+            }).await??
+        };
+        // All archives are validated before the first target mutation. Recovery
+        // requires their original immutable metadata; it never recaptures a
+        // partially installed journal as its own before-image.
+        let mut sessions = Vec::new();
+        for archive in &manifest.sessions {
+            current()?;
+            let session_stage = stage.join("sessions").join(&archive.id);
+            if recovering {
+                ensure!(tokio::fs::try_exists(session_stage.join("metadata.json")).await?,"session preparation missing; return recovery retained");
+            }
+            let mut prepared = crate::bundle::prepare_import(state.clone(),&stage.join("handoff").join(&archive.archive),crate::bundle::ImportOptions {
+                defer_start:true,destination_root:Some(destination_root.clone()),fork:fork||grant.requires_fork,
+                origin:if config.role == Role::Worker {crate::bundle::Origin::Moved} else {crate::bundle::Origin::Home},epoch:grant.epoch,
+            },&session_stage).await?;
+            if !recovering { planned.append(&mut prepared.writes); }
+            sessions.push(prepared);
+        }
+        if transaction.is_none() {
+            let budget_stage=stage.clone();
+            tokio::task::spawn_blocking(move ||super::install::stage_budget(&budget_stage)).await??;
+            let (root,binding,budget)=(transaction_root.clone(),binding.clone(),read_grant.storage_limit_bytes);
+            transaction=Some(tokio::task::spawn_blocking(move ||super::install::Transaction::prepare(&root,binding,planned,budget)).await??);
+        }
+        current()?;
+        authority::destination(state,config,workspace,Some(&destination_root)).await?;
+        let mut install = transaction.take().context("return installation unavailable")?;
+        let git_roots = super::repository::install_roots(&destination_root).await?;
+        let guard_state=state.clone();
+        let epoch=grant.epoch;
+        let file_guard=super::mutation::begin_import(state,workspace,epoch,generation).await?;
+        install=tokio::task::spawn_blocking(move || -> Result<_> {
+            let admitted=|| file_guard.check(&guard_state);
+            install.reserve_git(git_roots,&admitted)?;
+            install.apply(&admitted)?;
+            drop(file_guard);
+            Ok(install)
+        }).await??;
+        current()?;
+        let new_workspace = crate::workspaces::Workspace {
+            id:workspace.into(),root:destination_root.clone(),name:manifest.name.clone(),last_opened_at:super::now(),
+            mastermind:None,plugins_on:Vec::new(),cloud_internal:false,hidden:false,
+        };
+        let owner = state.clone();
+        let registration=super::mutation::begin_import(state,workspace,epoch,generation).await?;
+        tokio::task::spawn_blocking(move || -> Result<()> {registration.check(&owner)?;lock(&owner.workspaces).import_exact(new_workspace)?;drop(registration);Ok(())}).await??;
+        for prepared in sessions { current()?; prepared.finalize().await?; }
         if let Some(repair) = super::shadow_cache::prepare(&local_shadow, &cache, cache_guard.clone()).await? {
             let configuration = state.pro.configuration.clone().lock_owned().await;
             let owner = state.clone();
@@ -1692,7 +1834,7 @@ async fn hydrate_scoped(
         }
         // Both sides now share the installed tree: it is the baseline for the
         // next return until this computer publishes again.
-        if tokio::fs::try_exists(local_shadow.join("HEAD")).await? {
+        let published_tree = if tokio::fs::try_exists(local_shadow.join("HEAD")).await? {
             let source = cache.to_str().context("invalid cache path")?.to_owned();
             transport::git_output(
                 transport::git(&local_shadow, None).await?,
@@ -1706,85 +1848,42 @@ async fn hydrate_scoped(
                 vec![],
             )
             .await?;
-            lock(&state.pro.preferences)
-                .entry(workspace.into())
-                .or_default()
-                .published_tree = Some(String::from_utf8(installed)?.trim().to_owned());
-        }
+            Some(String::from_utf8(installed)?.trim().to_owned())
+        } else { None };
         current()?;
-        ensure!(matches!(lock(&state.pro.ownership).get(workspace), Some(Ownership::Hydrating { epoch }) if *epoch == grant.epoch), "Workspace ownership changed during hydration");
-        let overlay = stage.join("config");
-        let home = state
-            .claude_settings_path
-            .parent()
-            .and_then(Path::parent)
-            .context("agent home unavailable")?
-            .to_path_buf();
-        current()?;
-        let account_state = state.clone();
-        let config_workspace = destination_root.clone();
-        tokio::task::spawn_blocking(move || {
-            ensure!(
-                generation == account_state.pro.generation.load(Ordering::Acquire),
-                "Account changed during project transfer"
-            );
-            config::import(&overlay, &home, &config_workspace)
-        })
-        .await??;
-        current()?;
-        let new_workspace = crate::workspaces::Workspace {
-            id: workspace.into(),
-            root: destination_root.clone(),
-            name: manifest.name,
-            last_opened_at: super::now(),
-            mastermind: None,
-            plugins_on: Vec::new(),
-            cloud_internal: false,
-            hidden: false,
-        };
-        let owner = state.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let (root, id) = (new_workspace.root.clone(), new_workspace.id.clone());
-            lock(&owner.workspaces).import_exact(new_workspace)?;
-            // The folder carries the id it was registered under, so a
-            // reinstall finds the same project again.
-            crate::workspaces::identity::write(&root, &id);
-            Ok(())
-        })
-        .await??;
-        lock(&state.pro.preferences)
-            .entry(workspace.into())
-            .or_default()
-            .execution_uncertain = grant.requires_fork
-            || receipt.is_some_and(|receipt| {
-                receipt.continuation == execution::wire::Continuation::Uncertain
-            });
-        for archive in manifest.sessions {
-            current()?;
-            crate::bundle::import_durable(
-                state.clone(),
-                &stage.join("handoff").join(archive.archive),
-                crate::bundle::ImportOptions {
-                    defer_start: true,
-                    destination_root: Some(destination_root.clone()),
-                    fork: fork || grant.requires_fork,
-                    origin: if config.role == Role::Worker {
-                        crate::bundle::Origin::Moved
-                    } else {
-                        crate::bundle::Origin::Home
-                    },
-                    epoch: grant.epoch,
-                },
-            )
-            .await?;
-        }
-        {
-            let mut preferences = lock(&state.pro.preferences);
-            let preference = preferences.entry(workspace.into()).or_default();
-            preference.profile = manifest.profile;
-            preference.git_branches = git_branches;
-        }
-        current()?;
+        let execution_uncertain = grant.requires_fork
+            || receipt.is_some_and(|receipt|receipt.continuation==execution::wire::Continuation::Uncertain);
+        let profile=manifest.profile;
+        // Installation commits before profile commands can have external effects
+        // and before any deferred agent is eligible to start.
+        let commit_guard=super::mutation::begin_import(state,workspace,epoch,generation).await?;
+        let commit_state=state.clone();
+        let commit_workspace=workspace.to_owned();
+        // Keep admission through the durable ownership transition, even if the
+        // requesting browser disconnects after the blocking commit starts.
+        install=tokio::spawn(async move {
+            commit_guard.check(&commit_state)?;
+            super::report_return(&commit_state,&commit_workspace,kept,&git_branches);
+            {
+                let mut preferences=lock(&commit_state.pro.preferences);
+                let preference=preferences.entry(commit_workspace.clone()).or_default();
+                if let Some(tree)=published_tree { preference.published_tree=Some(tree); }
+                preference.execution_uncertain=execution_uncertain;
+                preference.profile=profile;
+                preference.git_branches=git_branches;
+            }
+            super::persist(&commit_state).await?;
+            let worker_state=commit_state.clone();
+            let (install,commit_guard)=tokio::task::spawn_blocking(move || -> Result<_> {
+                install.commit(&||commit_guard.check(&worker_state))?;
+                Ok((install,commit_guard))
+            }).await??;
+            commit_guard.setting_up(&commit_state)?;
+            super::persist(&commit_state).await?;
+            drop(commit_guard);
+            Ok::<_,anyhow::Error>(install)
+        }).await??;
+        tokio::task::spawn_blocking(move ||install.cleanup()).await??;
         finish_hydration(
             state,
             workspace,
@@ -1797,8 +1896,64 @@ async fn hydrate_scoped(
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    let _ = tokio::fs::remove_dir_all(stage).await;
+    if result.is_ok() {
+        let _ = tokio::fs::remove_dir_all(stage).await;
+    }
     result
+}
+fn prepare_marker(
+    root: &Path,
+    checkout: &Path,
+    stage: &Path,
+    workspace: &str,
+) -> Result<super::install::Write> {
+    use std::io::Write;
+    std::fs::create_dir_all(stage)?;
+    let target = if checkout.join(".git").is_dir() && !root.join(".git").exists() {
+        root.join(".git/chimaera-workspace")
+    } else {
+        crate::workspaces::identity::marker_path(root)
+    };
+    let (target_root, relative) = if target.starts_with(root) {
+        (root.to_path_buf(), target.strip_prefix(root)?.to_path_buf())
+    } else {
+        (
+            std::fs::canonicalize(target.parent().context("invalid project marker")?)?,
+            target.file_name().context("invalid project marker")?.into(),
+        )
+    };
+    let before = stage.join("before");
+    let before = if target.try_exists()? {
+        let parent = target.parent().context("invalid project marker")?;
+        let parent = std::fs::canonicalize(parent)?;
+        let before_dir = stage.join("original");
+        let name = target.file_name().context("invalid project marker")?;
+        super::install::snapshot(&parent, &before_dir, &|path| path == Path::new(name), 4096)?;
+        let copied = before_dir.join(name);
+        ensure!(copied.is_file(), "project marker is not a regular file");
+        std::fs::rename(copied, &before)?;
+        Some(before)
+    } else {
+        None
+    };
+    let after = stage.join("after");
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&after)?;
+    use std::os::unix::fs::PermissionsExt;
+    output.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    output.write_all(&serde_json::to_vec(&crate::workspaces::identity::Marker {
+        id: workspace.into(),
+        written_at: super::now(),
+    })?)?;
+    output.sync_all()?;
+    Ok(super::install::Write {
+        root: target_root,
+        relative,
+        before,
+        after: Some(after),
+    })
 }
 /// The published commit when this shadow still has it, else its main tip
 /// (older state files recorded no publication).
@@ -2354,16 +2509,22 @@ async fn finish_hydration_checked(
     setup: impl std::future::Future<Output = Result<()>>,
     providers: impl std::future::Future<Output = Vec<super::provider_gate::BlockedProvider>>,
 ) -> Result<()> {
-    ensure!(
-        generation == state.pro.generation.load(Ordering::Acquire),
-        "Account changed during project setup"
-    );
-    ensure!(
-        matches!(lock(&state.pro.ownership).get(workspace),Some(Ownership::Hydrating{epoch:current} | Ownership::SettingUp{epoch:current}) if *current==epoch),
-        "Project ownership changed before setup"
-    );
-    lock(&state.pro.ownership).insert(workspace.into(), Ownership::SettingUp { epoch });
-    super::persist(state).await?;
+    {
+        let _configuration = state.pro.configuration.lock().await;
+        ensure!(
+            generation == state.pro.generation.load(Ordering::Acquire),
+            "Account changed during project setup"
+        );
+        {
+            let mut ownership = lock(&state.pro.ownership);
+            ensure!(
+                matches!(ownership.get(workspace),Some(Ownership::Hydrating{epoch:current} | Ownership::SettingUp{epoch:current}) if *current==epoch),
+                "Project ownership changed before setup"
+            );
+            ownership.insert(workspace.into(), Ownership::SettingUp { epoch });
+        }
+        super::persist(state).await?;
+    }
     if let Err(error) = super::PROFILE_SETUP
         .scope((workspace.to_owned(), generation), setup)
         .await
@@ -2453,15 +2614,35 @@ async fn run_profile_steps(
     // status line and its output tail in the project's setup log.
     let log = state.pro.root.join(workspace).join("setup.log");
     // Boxed: this runs inside the hydrate future, which callers hold inline.
-    Box::pin(run_setup_command(&root, &command, &log)).await
+    let guard = execution::setup::Guard::begin(state, workspace).await?;
+    Box::pin(run_setup_command_guarded(
+        &root,
+        &command,
+        &log,
+        Some(guard),
+    ))
+    .await
 }
 
 /// How long a project's setup may run, and how much of its output is kept.
 const SETUP_DEADLINE: Duration = Duration::from_secs(600);
 const SETUP_LOG_BYTES: usize = 64 * 1024;
 
+#[cfg(test)]
 async fn run_setup_command(root: &Path, command: &str, log: &Path) -> Result<()> {
+    run_setup_command_guarded(root, command, log, None).await
+}
+
+async fn run_setup_command_guarded(
+    root: &Path,
+    command: &str,
+    log: &Path,
+    guard: Option<execution::setup::Guard>,
+) -> Result<()> {
     use tokio::io::AsyncReadExt;
+    if let Some(guard) = &guard {
+        guard.check()?;
+    }
     let mut child = tokio::process::Command::new(crate::launcher::login_shell())
         .args(["-lc", command])
         .current_dir(root)
@@ -2473,6 +2654,10 @@ async fn run_setup_command(root: &Path, command: &str, log: &Path) -> Result<()>
         .spawn()
         .context("project setup could not start")?;
     let group = child.id();
+    if let Some(guard) = &guard {
+        guard.attach(group.context("project setup group unavailable")?);
+        guard.check()?;
+    }
     let tail = std::sync::Mutex::new(Vec::<u8>::new());
     let keep = |bytes: &[u8]| {
         let mut tail = lock(&tail);
@@ -2504,9 +2689,27 @@ async fn run_setup_command(root: &Path, command: &str, log: &Path) -> Result<()>
         }
     };
     let finished = tokio::time::timeout(SETUP_DEADLINE, async {
-        let (_, _, status) =
-            tokio::join!(drain(stdout.take()), drain_err(stderr.take()), child.wait());
-        status
+        let wait = async {
+            let status = child.wait().await;
+            if let Some(guard) = &guard { guard.kill(); }
+            status
+        };
+        let joined = async {
+            let (_, _, status) = tokio::join!(drain(stdout.take()), drain_err(stderr.take()), wait);
+            status
+        };
+        tokio::pin!(joined);
+        loop {
+            tokio::select! {
+                status = &mut joined => return status,
+                () = tokio::time::sleep(Duration::from_millis(100)), if guard.is_some() => {
+                    if guard.as_ref().unwrap().check().is_err() {
+                        guard.as_ref().unwrap().kill();
+                        return Err(std::io::Error::other("project setup execution authority changed"));
+                    }
+                }
+            }
+        }
     })
     .await;
     let succeeded = match finished {
@@ -2532,6 +2735,9 @@ async fn run_setup_command(root: &Path, command: &str, log: &Path) -> Result<()>
         std::fs::write(log, output)
     })
     .await;
+    if let Some(guard) = guard {
+        guard.finish().await?;
+    }
     ensure!(succeeded, "project setup did not finish");
     Ok(())
 }
@@ -2585,6 +2791,97 @@ pub(super) fn eligible(state: &AppState, workspace: &crate::workspaces::Workspac
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transfer_overflow_preserves_work_and_plain_shells_never_hide_a_live_agent() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-transfer-cap-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("work.txt"), b"local work").unwrap();
+        let state = Arc::new(AppState::new(
+            "fixture".into(),
+            "fixture".into(),
+            4242,
+            0,
+            root.clone(),
+            root.join("config"),
+        ));
+        lock(&state.workspaces)
+            .import_exact(crate::workspaces::Workspace {
+                id: "w-project".into(),
+                root: root.clone(),
+                name: "Fixture".into(),
+                last_opened_at: super::super::now(),
+                mastermind: None,
+                plugins_on: vec![],
+                cloud_internal: false,
+                hidden: false,
+            })
+            .unwrap();
+        lock(&state.pro.ownership).insert("w-project".into(), Ownership::Local { epoch: 7 });
+        {
+            let mut registry = lock(&state.session_workspaces);
+            for index in 0..65 {
+                registry.insert(format!("s-fixture-{index}"), "w-project".into());
+            }
+        }
+        // Pick the entry the previous take(64)-before-filter implementation
+        // omitted, without depending on HashMap's random iteration order.
+        let id = lock(&state.session_workspaces)
+            .keys()
+            .last()
+            .unwrap()
+            .clone();
+        let session = state
+            .sessions
+            .spawn(chimaera_pty::SpawnOpts {
+                cwd: root.clone(),
+                name: None,
+                cols: 80,
+                rows: 24,
+                command: Some(vec!["/bin/sleep".into(), "30".into()]),
+                id: Some(id.clone()),
+                env: vec![],
+                env_remove: vec![],
+                scrollback: None,
+            })
+            .unwrap();
+        let mut agent =
+            crate::agents::AgentRecord::new("fixture".into(), crate::agents::AgentKind::Claude);
+        agent.state = crate::agent_state::AgentState::Running;
+        lock(&state.agents).insert(id.clone(), agent);
+        assert!(sessions(&state, "w-project") == vec![id.clone()]);
+        assert!(live_agents(&state, "w-project"));
+        assert!(!at_pause(&state, "w-project"));
+        assert!(!working_agents(&state, "w-project").is_empty());
+        assert!(transfer_session_ids(&state, "w-project").is_err());
+        let config:Configure = serde_json::from_value(json!({"endpoint":"http://127.0.0.1:1","keeper_url":"","delegation":{"access_token":"fixture","expires_at":"2099-01-01T00:00:00Z","scope":["baton","mirror"],"device_id":"device"}})).unwrap();
+        let error = snapshot(&state, &config, "w-project", true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("at most 64 sessions"));
+        assert!(state
+            .sessions
+            .get(&session.id)
+            .is_some_and(|info| info.alive));
+        assert!(matches!(
+            lock(&state.pro.ownership).get("w-project"),
+            Some(Ownership::Local { epoch: 7 })
+        ));
+        assert_eq!(std::fs::read(root.join("work.txt")).unwrap(), b"local work");
+        assert!(!state.pro.root.join("w-project/working-tree.git").exists());
+        let omitted_shell = lock(&state.session_workspaces)
+            .keys()
+            .find(|candidate| **candidate != id)
+            .unwrap()
+            .clone();
+        lock(&state.session_workspaces).remove(&omitted_shell);
+        assert_eq!(transfer_session_ids(&state, "w-project").unwrap().len(), 64);
+        state.sessions.kill(&session.id).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn a_finished_turn_is_copied_soon_and_the_timer_stays_the_backstop() {
@@ -2740,6 +3037,96 @@ mod tests {
         );
         assert!(std::fs::read_to_string(&log).unwrap().contains("broken"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn managed_setup_drains_descendants_on_expiry_cancellation_and_shell_exit() {
+        for fault in ["expired", "cancelled", "success"] {
+            let root = std::env::temp_dir().join(format!(
+                "chimaera-setup-group-{}",
+                chimaera_core::generate_token()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let state = Arc::new(AppState::new(
+                "fixture".into(),
+                "fixture".into(),
+                4242,
+                0,
+                root.clone(),
+                root.join("config"),
+            ));
+            execution::install_fixture(&state, "w-project", 4).unwrap();
+            execution::worker_fixture(&state);
+            lock(&state.pro.ownership)
+                .insert("w-project".into(), Ownership::SettingUp { epoch: 4 });
+            let guard = super::super::PROFILE_SETUP
+                .scope(
+                    ("w-project".into(), 0),
+                    execution::setup::Guard::begin(&state, "w-project"),
+                )
+                .await
+                .unwrap();
+            let restarted = Arc::new(AppState::new(
+                "fixture".into(),
+                "fixture".into(),
+                4242,
+                0,
+                root.clone(),
+                root.join("config"),
+            ));
+            assert!(
+                execution::unclean(&restarted, "w-project"),
+                "durable pre-spawn intent must remain unknown after crash"
+            );
+            let cwd = root.clone();
+            let command = if fault == "success" {
+                "sleep 30 & echo $! > descendant; echo ready > started"
+            } else {
+                "sleep 30 & echo $! > descendant; echo ready > started; wait"
+            };
+            let task = tokio::spawn(async move {
+                run_setup_command_guarded(&cwd, command, &cwd.join("setup.log"), Some(guard)).await
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !root.join("started").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!execution::quiescent(&state, "w-project") || fault == "success");
+            match fault {
+                "expired" => {
+                    super::super::expire_execution_fixture(&state, "w-project");
+                    assert!(task.await.unwrap().is_err());
+                }
+                "cancelled" => {
+                    task.abort();
+                    assert!(task.await.unwrap_err().is_cancelled());
+                }
+                _ => {
+                    task.await.unwrap().unwrap();
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !execution::quiescent(&state, "w-project") {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!execution::setup::active(&state, "w-project"));
+            let pending = lock(&state.pro.preferences)
+                .get("w-project")
+                .unwrap()
+                .execution_launch_pending;
+            assert_eq!(
+                pending,
+                fault == "cancelled",
+                "only observed cleanup durably settles intent"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
     /// Sign-out aborts the mirror task that finishes a return. The returned
     /// sessions that finish was respawning start anyway: a respawn cut half

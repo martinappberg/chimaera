@@ -6,7 +6,7 @@ use super::{
 use crate::{lock, AppState};
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -480,34 +480,83 @@ pub(crate) async fn privacy(
         Err(error) => failure(error),
     }
 }
+/// A profile revision also binds the daemon's account generation. Identical
+/// bytes under a replacement sign-in are not the profile a prior view approved.
+fn profile_etag(
+    state: &AppState,
+    workspace: &str,
+    profile: &super::policy::CloudProfile,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(super::profile_generation(state).to_be_bytes());
+    hash.update(workspace.as_bytes());
+    hash.update([0]);
+    hash.update(serde_json::to_vec(profile).expect("profile is serializable"));
+    let revision: String = hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("\"{revision}\"")
+}
 pub(crate) async fn profile(
     State(state): State<Arc<AppState>>,
     Query(query): Query<WorkspaceQuery>,
 ) -> Response {
+    let _configuration = state.pro.configuration.lock().await;
     if let Err(error) = authority::workspace(&state, &query.workspace_id) {
         return failure(error);
     }
     if lock(&state.workspaces).get(&query.workspace_id).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    Json(
-        lock(&state.pro.preferences)
-            .get(&query.workspace_id)
-            .map(|p| p.profile.clone())
-            .unwrap_or_default(),
-    )
-    .into_response()
+    let profile = lock(&state.pro.preferences)
+        .get(&query.workspace_id)
+        .map(|p| p.profile.clone())
+        .unwrap_or_default();
+    let revision = profile_etag(&state, &query.workspace_id, &profile);
+    let mut response = Json(profile).into_response();
+    response.headers_mut().insert(
+        header::ETAG,
+        revision.parse().expect("ASCII profile revision"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
 }
 pub(crate) async fn put_profile(
     State(state): State<Arc<AppState>>,
     Query(query): Query<WorkspaceQuery>,
+    headers: HeaderMap,
     Json(profile): Json<super::policy::CloudProfile>,
 ) -> Response {
     if let Err(error) = authority::workspace(&state, &query.workspace_id) {
         return failure(error);
     }
-    let _configuration = state.pro.configuration.lock().await;
-    let Ok(_job) = state.pro.jobs.try_lock() else {
+    if let Err(error) = profile.validate() {
+        return failure(error);
+    }
+    let expected = match headers.get(header::IF_MATCH) {
+        Some(value) if headers.get_all(header::IF_MATCH).iter().count() == 1 => {
+            match value.to_str() {
+                Ok(value)
+                    if value.len() == 66
+                        && value.starts_with('"')
+                        && value.ends_with('"')
+                        && value[1..65].bytes().all(|b| b.is_ascii_hexdigit()) =>
+                {
+                    Some(value.to_owned())
+                }
+                _ => return StatusCode::BAD_REQUEST.into_response(),
+            }
+        }
+        Some(_) => return StatusCode::BAD_REQUEST.into_response(),
+        None => None,
+    };
+    let configuration = state.pro.configuration.clone().lock_owned().await;
+    let Ok(job) = state.pro.jobs.clone().try_lock_owned() else {
         return (
             StatusCode::CONFLICT,
             Json(json!({"error":"Project transfer is active; retry after it finishes"})),
@@ -520,16 +569,53 @@ pub(crate) async fn put_profile(
     if lock(&state.workspaces).get(&query.workspace_id).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if let Err(error) = profile.validate() {
-        return failure(error);
-    }
-    lock(&state.pro.preferences)
-        .entry(query.workspace_id)
-        .or_default()
-        .profile = profile;
-    match super::persist(&state).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => failure(error),
+    // A closed window cannot drop configuration ownership halfway through the
+    // accepted durable write and let another account's settings overtake it.
+    match tokio::spawn(async move {
+        let _configuration = configuration;
+        let _job = job;
+        // Compare and replace under the same lock: command learning can append
+        // guidance without taking the transfer/configuration reservations.
+        let previous = {
+            let mut preferences = lock(&state.pro.preferences);
+            if preferences.len() >= 128 && !preferences.contains_key(&query.workspace_id) {
+                return StatusCode::INSUFFICIENT_STORAGE.into_response();
+            }
+            let previous = preferences
+                .get(&query.workspace_id)
+                .map(|p| p.profile.clone())
+                .unwrap_or_default();
+            if expected.is_some_and(|expected| {
+                expected != profile_etag(&state, &query.workspace_id, &previous)
+            }) {
+                return (
+                    StatusCode::PRECONDITION_FAILED,
+                    Json(json!({"error":"profile_changed"})),
+                )
+                    .into_response();
+            }
+            preferences
+                .entry(query.workspace_id.clone())
+                .or_default()
+                .profile = profile.clone();
+            previous
+        };
+        if let Err(error) = super::persist(&state).await {
+            let mut preferences = lock(&state.pro.preferences);
+            let current = &mut preferences.entry(query.workspace_id).or_default().profile;
+            // Never discard command guidance learned during the disk write.
+            if *current == profile {
+                *current = previous;
+            }
+            return failure(error);
+        }
+        state.changes.notify_waiters();
+        StatusCode::NO_CONTENT.into_response()
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 #[derive(Default, Deserialize)]
@@ -1119,3 +1205,7 @@ pub(crate) async fn projects(
 
 // Discovery is passive; adoption has a separate, explicit local action.
 pub(crate) use super::projects::{open_project, project_list};
+
+#[cfg(test)]
+#[path = "profile_tests.rs"]
+mod profile_tests;

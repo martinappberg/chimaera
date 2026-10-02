@@ -65,6 +65,10 @@ pub struct WorkerStatus {
     /// Present only while preparing; older services omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<WorkerPhase>,
+    /// Explicit actions remain available past the unattended allowance.
+    /// Meaningful only for limited/hours_exhausted; older services omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attended_actions: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

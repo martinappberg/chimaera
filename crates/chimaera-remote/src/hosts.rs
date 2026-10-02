@@ -71,6 +71,10 @@ pub struct HostEntry {
     /// Cached account preference; a signed-out client can still use ordinary ssh.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub kept: bool,
+    /// Native transport choice on this computer, independent of the account's
+    /// kept login. No existing connection or remote job is stopped by changing it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub direct_ssh: bool,
     /// The user allowed a chimaera daemon on this cluster's login node (the
     /// warned per-host override). Off unless set: an older build that
     /// rewrites this file drops the field, which turns the override off —
@@ -184,6 +188,7 @@ impl HostsStore {
             added_at: unix_now(),
             last_connected_at: None,
             kept: false,
+            direct_ssh: false,
             login_serve: false,
             not_cluster: false,
             scheduler: None,
@@ -203,6 +208,20 @@ impl HostsStore {
             .find(|entry| entry.alias == alias)
             .context("host missing after add")?;
         entry.kept = kept;
+        let result = entry.clone();
+        self.save()?;
+        Ok(result)
+    }
+
+    pub fn set_direct_ssh(&mut self, alias: &str, on: bool) -> anyhow::Result<HostEntry> {
+        let alias = normalize_alias(alias)?;
+        self.add(&alias, None)?;
+        let entry = self
+            .items
+            .iter_mut()
+            .find(|entry| entry.alias == alias)
+            .context("host missing after add")?;
+        entry.direct_ssh = on;
         let result = entry.clone();
         self.save()?;
         Ok(result)
@@ -234,6 +253,7 @@ impl HostsStore {
                     added_at: unix_now(),
                     last_connected_at: Some(unix_now()),
                     kept: false,
+                    direct_ssh: false,
                     login_serve: false,
                     not_cluster: false,
                     scheduler: None,
@@ -564,5 +584,33 @@ mod tests {
                 .kept
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn direct_ssh_is_local_additive_and_independent_of_kept_login_and_cluster_options() {
+        let (mut first, dir) = tmp_store("direct-first");
+        let (second, other_dir) = tmp_store("direct-second");
+        first.set_kept("cluster", true).unwrap();
+        first.set_login_serve("cluster", true).unwrap();
+        first.set_direct_ssh("ssh cluster", true).unwrap();
+        let mut restored = HostsStore::load(dir.join("hosts.json"));
+        let entry = restored.get("cluster").unwrap();
+        assert!(entry.direct_ssh && entry.kept && entry.login_serve);
+        assert!(second.get("cluster").is_none());
+        restored.set_kept("cluster", false).unwrap();
+        assert!(restored.get("cluster").unwrap().direct_ssh);
+        restored.set_direct_ssh("cluster", false).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("hosts.json")).unwrap())
+                .unwrap();
+        assert!(json[0].get("direct_ssh").is_none());
+        assert!(
+            !HostsStore::load(dir.join("hosts.json"))
+                .get("cluster")
+                .unwrap()
+                .direct_ssh
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(other_dir).unwrap();
     }
 }

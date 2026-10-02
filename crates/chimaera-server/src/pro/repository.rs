@@ -3,7 +3,11 @@
 use super::{mirror, policy, protocol::MirrorCredentials, transport};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, path::Path, time::Duration};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 const MAX_REFS: usize = 4096;
 const MAX_CONFIG: usize = 256;
@@ -134,8 +138,25 @@ fn allowed(entry: &Entry) -> bool {
         _ => false,
     }
 }
-async fn optional(root: &Path, args: &[&str]) -> Result<Option<String>> {
+tokio::task_local! {static STAGED_CHECKOUT: PathBuf;}
+async fn project_git(root: &Path) -> Result<tokio::process::Command> {
     let mut command = transport::git(root, None).await?;
+    if STAGED_CHECKOUT
+        .try_with(|checkout| checkout == root)
+        .unwrap_or(false)
+    {
+        // A fresh staged checkout has no repository yet. Git requires an
+        // explicit Git directory whenever GIT_WORK_TREE is supplied, including
+        // init; binding both also prevents discovery of an enclosing repo.
+        command
+            .env("GIT_WORK_TREE", root)
+            .env("GIT_DIR", root.join(".git"));
+    }
+    Ok(command)
+}
+
+async fn optional(root: &Path, args: &[&str]) -> Result<Option<String>> {
+    let mut command = project_git(root).await?;
     command.args(args);
     let output = transport::run(
         command,
@@ -202,7 +223,7 @@ pub(super) async fn describe(
 async fn capture(root: &Path) -> Result<Snapshot> {
     let head = optional(root, &["rev-parse", "--verify", "HEAD"]).await?;
     let bytes = transport::git_output(
-        transport::git(root, None).await?,
+        project_git(root).await?,
         &["config", "--local", "--no-includes", "--null", "--list"],
         vec![],
     )
@@ -272,7 +293,7 @@ async fn install_config(
         for value in config.iter().filter(|value| value.key == entry.key) {
             check()?;
             transport::git_output(
-                transport::git(root, None).await?,
+                project_git(root).await?,
                 &["config", "--local", "--add", &entry.key, &value.value],
                 vec![],
             )
@@ -307,7 +328,7 @@ pub(super) async fn cloud_branches(root: &Path) -> Vec<String> {
     {
         return Vec::new();
     }
-    let Ok(mut command) = transport::git(root, None).await else {
+    let Ok(mut command) = project_git(root).await else {
         return Vec::new();
     };
     command
@@ -348,17 +369,234 @@ pub(super) async fn cloud_branches(root: &Path) -> Vec<String> {
         .map(str::to_owned)
         .collect()
 }
-/// Fetch into a private temporary namespace, then publish each destination ref
-/// independently. Linked worktree branches are never advanced behind their backs.
-pub(super) async fn receive(
-    root: &Path,
-    cache: &Path,
-    credentials: &MirrorCredentials,
-    branch: Option<&str>,
-    origin: Option<&str>,
-    snapshot: Option<&Snapshot>,
+/// Run repository adoption against a private checkout. Object data reads from
+/// bounded descriptor-anchored staging, including staged-only Git objects; only
+/// changed files are contributed to the installation transaction. The real
+/// index (including staged-only contents) never participates in a Git write.
+pub(super) struct Incoming<'a> {
+    pub cache: &'a Path,
+    pub credentials: &'a MirrorCredentials,
+    pub branch: Option<&'a str>,
+    pub origin: Option<&'a str>,
+    pub snapshot: Option<&'a Snapshot>,
+}
+pub(super) async fn install_roots(root: &Path) -> Result<Vec<PathBuf>> {
+    let Some(actual) = optional(root, &["rev-parse", "--absolute-git-dir"]).await? else {
+        return Ok(Vec::new());
+    };
+    let common = optional(root, &["rev-parse", "--git-common-dir"])
+        .await?
+        .context("Git common directory unavailable")?;
+    let common = root.join(common);
+    tokio::task::spawn_blocking(move || -> Result<Vec<PathBuf>> {
+        let actual = std::fs::canonicalize(actual)?;
+        let common = std::fs::canonicalize(common)?;
+        super::install::directory(&actual)?;
+        super::install::directory(&common)?;
+        let mut roots = vec![actual];
+        if !roots.contains(&common) {
+            roots.push(common);
+        }
+        Ok(roots)
+    })
+    .await?
+}
+
+pub(super) async fn prepare_receive(
+    original: &Path,
+    checkout: &Path,
+    stage: &Path,
+    incoming: Incoming<'_>,
     check: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<(Vec<String>, Vec<super::install::Write>)> {
+    let credentials = incoming.credentials;
+    let branch = incoming.branch;
+    let snapshot = incoming.snapshot;
+    if branch.is_none() && snapshot.is_none() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let git_dir = optional(original, &["rev-parse", "--absolute-git-dir"]).await?;
+    let mut checked = HashSet::new();
+    let mut common_dir = None;
+    let mut worktree_dir = None;
+    let before = stage.join("before");
+    let staged_git = checkout.join(".git");
+    if let Some(git_dir) = git_dir {
+        let common = optional(original, &["rev-parse", "--git-common-dir"])
+            .await?
+            .context("Git common directory unavailable")?;
+        let common = original.join(common);
+        let actual = PathBuf::from(git_dir);
+        let (common, actual) = tokio::task::spawn_blocking(move || -> Result<_> {
+            Ok((
+                std::fs::canonicalize(common)?,
+                std::fs::canonicalize(actual)?,
+            ))
+        })
+        .await??;
+        let occupancy = transport::git_output(
+            transport::git(original, None).await?,
+            &["worktree", "list", "--porcelain"],
+            vec![],
+        )
+        .await?;
+        for line in std::str::from_utf8(&occupancy)?.lines() {
+            if let Some(branch) = line.strip_prefix("branch ") {
+                checked.insert(branch.to_owned());
+            }
+        }
+        let budget = credentials.storage_limit_bytes.min(1024 * 1024 * 1024);
+        let (source, destination, staged) = (common.clone(), before.clone(), staged_git.clone());
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            super::install::snapshot(
+                &source,
+                &destination,
+                &|path| {
+                    !path.starts_with("worktrees")
+                        && !path.starts_with("hooks")
+                        && !path.to_string_lossy().ends_with(".lock")
+                },
+                budget,
+            )?;
+            super::install::snapshot(&destination, &staged, &|_| true, budget)?;
+            Ok(())
+        })
+        .await??;
+        if actual != common {
+            let (project, pointer) = (original.to_path_buf(), stage.join("pointer-before"));
+            tokio::task::spawn_blocking(move || {
+                super::install::snapshot(
+                    &project,
+                    &pointer,
+                    &|path| path == Path::new(".git"),
+                    4096,
+                )
+            })
+            .await??;
+            let (worktree_source, staged) = (actual.clone(), staged_git.clone());
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let temporary = staged.with_file_name("worktree-before");
+                super::install::snapshot(
+                    &worktree_source,
+                    &temporary,
+                    &|path| {
+                        matches!(path.to_str(), Some("HEAD" | "index" | "config.worktree"))
+                            || path.starts_with("refs")
+                    },
+                    budget,
+                )?;
+                for entry in std::fs::read_dir(&temporary)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_file() {
+                        std::fs::copy(entry.path(), staged.join(entry.file_name()))?;
+                    }
+                }
+                Ok(())
+            })
+            .await??;
+            worktree_dir = Some(actual);
+        }
+        common_dir = Some(common);
+    } else {
+        tokio::fs::create_dir_all(&before).await?;
+    }
+    check()?;
+    let preserved = STAGED_CHECKOUT
+        .scope(
+            checkout.to_path_buf(),
+            receive_inner(checkout, &incoming, check, Some(&checked)),
+        )
+        .await?;
+    let target = common_dir.unwrap_or_else(|| original.join(".git"));
+    let target_exists = tokio::fs::try_exists(&target).await?;
+    if !target_exists {
+        // The transaction creates .git descriptor-relatively beneath the
+        // already-bound project root instead of pre-creating a live repository.
+        let (root, before, after) = (original.to_path_buf(), before.clone(), staged_git.clone());
+        let writes = tokio::task::spawn_blocking(move || -> Result<_> {
+            let mut writes = super::install::changes(&root, &before, &after)?;
+            for write in &mut writes {
+                write.relative = Path::new(".git").join(&write.relative);
+            }
+            Ok(writes)
+        })
+        .await??;
+        return Ok((preserved, writes));
+    }
+    let (target, before, after, actual, project, pointer) = (
+        target.clone(),
+        before.clone(),
+        staged_git,
+        worktree_dir,
+        original.to_path_buf(),
+        stage.join("pointer-before/.git"),
+    );
+    let writes = tokio::task::spawn_blocking(move || -> Result<_> {
+        let mut writes = super::install::changes(&target, &before, &after)?;
+        // Even an unchanged HEAD/index is a checkout invariant: a concurrent
+        // switch or staging operation must not install this plan into another
+        // branch merely because its working bytes happened to be identical.
+        for name in ["HEAD", "index", "config"] {
+            writes.retain(|write| write.relative != Path::new(name));
+            let old = before.join(name);
+            let new = after.join(name);
+            writes.push(super::install::Write {
+                root: target.clone(),
+                relative: name.into(),
+                before: old.is_file().then_some(old),
+                after: new.is_file().then_some(new),
+            });
+        }
+        if let Some(actual) = actual {
+            ensure!(pointer.is_file(), "linked worktree pointer disappeared");
+            writes.push(super::install::Write {
+                root: project,
+                relative: ".git".into(),
+                before: Some(pointer.clone()),
+                after: Some(pointer),
+            });
+            // HEAD/index belong to the linked worktree, refs/config to common.
+            let worktree_before = after.with_file_name("worktree-before");
+            writes.retain(|write| {
+                !matches!(
+                    write.relative.to_str(),
+                    Some("HEAD" | "index" | "config.worktree")
+                )
+            });
+            for name in ["HEAD", "index", "config.worktree"] {
+                let old = worktree_before.join(name);
+                let new = after.join(name);
+                if old.is_file() || new.is_file() {
+                    writes.push(super::install::Write {
+                        root: actual.clone(),
+                        relative: name.into(),
+                        before: old.is_file().then_some(old),
+                        after: new.is_file().then_some(new),
+                    });
+                }
+            }
+        }
+        // Objects become durable before refs can point at them.
+        writes.sort_by_key(|write| !write.relative.starts_with("objects"));
+        Ok(writes)
+    })
+    .await??;
+    Ok((preserved, writes))
+}
+
+async fn receive_inner(
+    root: &Path,
+    incoming: &Incoming<'_>,
+    check: &(dyn Fn() -> Result<()> + Sync),
+    occupied: Option<&HashSet<String>>,
 ) -> Result<Vec<String>> {
+    let Incoming {
+        cache,
+        credentials,
+        branch,
+        origin,
+        snapshot,
+    } = *incoming;
     if branch.is_none() && snapshot.is_none() {
         return Ok(Vec::new());
     }
@@ -396,12 +634,7 @@ pub(super) async fn receive(
     let existing = optional(root, &["rev-parse", "--git-dir"]).await?.is_some();
     if !existing {
         check()?;
-        transport::git_output(
-            transport::git(root, None).await?,
-            &["init", "--quiet", "."],
-            vec![],
-        )
-        .await?;
+        transport::git_output(project_git(root).await?, &["init", "--quiet", "."], vec![]).await?;
     }
     check()?;
     let namespace = format!(
@@ -409,7 +642,7 @@ pub(super) async fn receive(
         chimaera_core::generate_token()
     );
     transport::git_output(
-        transport::git(root, None).await?,
+        project_git(root).await?,
         &[
             "fetch",
             "--no-write-fetch-head",
@@ -419,11 +652,33 @@ pub(super) async fn receive(
         ],
         vec![],
     )
-    .await?;
-    let result = publish_refs(root, &namespace, existing, check).await;
+    .await
+    .context("could not prepare repository refs")?;
+    if existing
+        && STAGED_CHECKOUT
+            .try_with(|checkout| checkout == root)
+            .unwrap_or(false)
+    {
+        // Copying a checkout changes stat-cache timestamps. Refresh only its
+        // private index before read-tree's up-to-date check; exit 1 merely
+        // reports a genuinely dirty file, which the usual kept-branch path
+        // handles. The real index is still the journal's untouched before-image.
+        let mut refresh = project_git(root).await?;
+        refresh.args(["update-index", "--refresh"]);
+        let _ = transport::run(
+            refresh,
+            vec![],
+            Duration::from_secs(15),
+            transport::PATH_CAP,
+        )
+        .await?;
+    }
+    let result = publish_refs(root, &namespace, existing, check, occupied)
+        .await
+        .context("could not plan repository ref adoption");
     // Remove only this operation's private namespace, even if publishing failed.
     let refs = transport::git_output(
-        transport::git(root, None).await?,
+        project_git(root).await?,
         &["for-each-ref", "--format=%(refname)", &namespace],
         vec![],
     )
@@ -439,7 +694,7 @@ pub(super) async fn receive(
     }
     if !cleanup.is_empty() {
         transport::git_output(
-            transport::git(root, None).await?,
+            project_git(root).await?,
             &["update-ref", "--stdin"],
             cleanup,
         )
@@ -450,14 +705,14 @@ pub(super) async fn receive(
     if !existing {
         if let Some(branch) = branch {
             transport::git_output(
-                transport::git(root, None).await?,
+                project_git(root).await?,
                 &["symbolic-ref", "HEAD", branch],
                 vec![],
             )
             .await?;
         } else if let Some(head) = snapshot.and_then(|snapshot| snapshot.head.as_deref()) {
             transport::git_output(
-                transport::git(root, None).await?,
+                project_git(root).await?,
                 &["update-ref", "--no-deref", "HEAD", head],
                 vec![],
             )
@@ -468,12 +723,7 @@ pub(super) async fn receive(
             .is_some()
         {
             check()?;
-            transport::git_output(
-                transport::git(root, None).await?,
-                &["read-tree", "HEAD"],
-                vec![],
-            )
-            .await?;
+            transport::git_output(project_git(root).await?, &["read-tree", "HEAD"], vec![]).await?;
         }
     }
     if let Some(snapshot) = snapshot {
@@ -486,7 +736,7 @@ pub(super) async fn receive(
         {
             check()?;
             transport::git_output(
-                transport::git(root, None).await?,
+                project_git(root).await?,
                 &["remote", "add", "origin", origin],
                 vec![],
             )
@@ -500,9 +750,10 @@ async fn publish_refs(
     namespace: &str,
     existing: bool,
     check: &(dyn Fn() -> Result<()> + Sync),
+    occupied: Option<&HashSet<String>>,
 ) -> Result<Vec<String>> {
     let refs = transport::git_output(
-        transport::git(root, None).await?,
+        project_git(root).await?,
         &[
             "for-each-ref",
             "--format=%(refname) %(objectname)",
@@ -518,17 +769,20 @@ async fn publish_refs(
     );
     let current = optional(root, &["symbolic-ref", "-q", "HEAD"]).await?;
     let worktrees = transport::git_output(
-        transport::git(root, None).await?,
+        project_git(root).await?,
         &["worktree", "list", "--porcelain"],
         vec![],
     )
     .await?;
-    let checked: HashSet<_> = std::str::from_utf8(&worktrees)?
+    let mut checked: HashSet<_> = std::str::from_utf8(&worktrees)?
         .lines()
         .filter_map(|line| line.strip_prefix("branch "))
         .collect();
+    if let Some(occupied) = occupied {
+        checked.extend(occupied.iter().map(String::as_str));
+    }
     let clean = transport::git_output(
-        transport::git(root, None).await?,
+        project_git(root).await?,
         &["status", "--porcelain", "--untracked-files=no"],
         vec![],
     )
@@ -554,7 +808,7 @@ async fn publish_refs(
         if previous.is_none() || !existing {
             check()?;
             transport::git_output(
-                transport::git(root, None).await?,
+                project_git(root).await?,
                 &[
                     "update-ref",
                     &reference,
@@ -567,7 +821,7 @@ async fn publish_refs(
             continue;
         }
         let previous = previous.unwrap();
-        let mut ancestor = transport::git(root, None).await?;
+        let mut ancestor = project_git(root).await?;
         ancestor.args(["merge-base", "--is-ancestor", &previous, incoming]);
         let advance = reference.starts_with("refs/heads/")
             && transport::run(ancestor, vec![], Duration::from_secs(15), 1024)
@@ -599,7 +853,7 @@ async fn publish_refs(
                 ensure!(existing.is_none(), "cloud preservation ref already differs");
                 check()?;
                 transport::git_output(
-                    transport::git(root, None).await?,
+                    project_git(root).await?,
                     &["update-ref", &kept, incoming, &"0".repeat(incoming.len())],
                     vec![],
                 )
@@ -625,7 +879,7 @@ async fn adopt_identical_untracked(
     fast_forward: impl std::future::Future<Output = Result<bool>>,
 ) -> Result<bool> {
     let untracked = transport::git_output(
-        transport::git(root, None).await?,
+        project_git(root).await?,
         &["ls-files", "-z", "--others", "--exclude-standard"],
         vec![],
     )
@@ -637,7 +891,7 @@ async fn adopt_identical_untracked(
     let mut identical = Vec::new();
     if !untracked.is_empty() {
         let added = transport::git_output(
-            transport::git(root, None).await?,
+            project_git(root).await?,
             &[
                 "diff",
                 "-z",
@@ -709,7 +963,7 @@ async fn adopt_identical_untracked(
 }
 
 async fn advance_unchecked_branch(root: &Path, reference: &str, incoming: &str) -> Result<bool> {
-    let mut command = transport::git(root, None).await?;
+    let mut command = project_git(root).await?;
     command.args([
         "fetch",
         "--no-write-fetch-head",
@@ -815,7 +1069,7 @@ async fn fast_forward_current(
         return Ok(false);
     }
     let clean = transport::git_output(
-        transport::git(root, None).await?,
+        project_git(root).await?,
         &["status", "--porcelain", "--untracked-files=no"],
         vec![],
     )
@@ -856,6 +1110,9 @@ async fn finalize_current(
     mut transaction: RefTransaction,
     #[cfg(test)] pause: Option<FinalizationPause>,
 ) -> Result<bool> {
+    let staged = STAGED_CHECKOUT
+        .try_with(|checkout| checkout == &root)
+        .unwrap_or(false);
     tokio::spawn(async move {
         let index_lock = transaction
             .index_lock
@@ -863,7 +1120,10 @@ async fn finalize_current(
             .and_then(|reservation| reservation.path.as_ref())
             .context("Git index reservation unavailable")?
             .clone();
-        let mut command = transport::git(&root, None).await?;
+        let mut command = project_git(&root).await?;
+        if staged {
+            command.env("GIT_WORK_TREE", &root);
+        }
         command.env("GIT_INDEX_FILE", &index_lock);
         transport::git_output(
             command,
@@ -962,7 +1222,7 @@ impl RefTransaction {
     async fn begin(root: &Path, index_lock: IndexReservation) -> Result<Self> {
         async {
             let transaction_permit = REF_TRANSACTIONS.acquire().await?;
-            let mut command = transport::git(root, None).await?;
+            let mut command = project_git(root).await?;
             let permit = transport::child_permit().await?;
             let mut child = command
                 .args(["update-ref", "--stdin"])
@@ -1046,6 +1306,261 @@ impl Drop for RefTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn staged_return_preserves_three_git_versions_and_linked_worktree_state_until_commit() {
+        use axum::{
+            extract::{Path as UrlPath, State},
+            http::StatusCode,
+            routing::get,
+            Router,
+        };
+        async fn serve(
+            State(root): State<PathBuf>,
+            UrlPath(path): UrlPath<String>,
+        ) -> Result<Vec<u8>, StatusCode> {
+            if path.split('/').any(|part| part == "..") {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            tokio::fs::read(root.join(path))
+                .await
+                .map_err(|_| StatusCode::NOT_FOUND)
+        }
+        for (dirty, linked, fresh) in [
+            (true, false, false),
+            (false, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let temporary = std::env::temp_dir().join(format!(
+                "chimaera-staged-return-{}",
+                chimaera_core::generate_token()
+            ));
+            std::fs::create_dir_all(temporary.join("main")).unwrap();
+            let temporary = temporary.canonicalize().unwrap();
+            let main = temporary.join("main");
+            git(&main, &["init", "--quiet", "--initial-branch=main"]).await;
+            std::fs::write(main.join("file.txt"), b"head version").unwrap();
+            git(&main, &["add", "."]).await;
+            git(&main, &["commit", "-qm", "base"]).await;
+            let old = git(&main, &["rev-parse", "HEAD"]).await;
+            git(&main, &["switch", "--quiet", "-c", "cloud"]).await;
+            std::fs::write(main.join("file.txt"), b"cloud version").unwrap();
+            git(&main, &["add", "."]).await;
+            git(&main, &["commit", "-qm", "cloud"]).await;
+            let incoming = git(&main, &["rev-parse", "HEAD"]).await;
+            git(&main, &["switch", "--quiet", "main"]).await;
+            let (project, branch) = if fresh {
+                let project = temporary.join("fresh");
+                std::fs::create_dir(&project).unwrap();
+                (project, "refs/heads/main")
+            } else if linked {
+                let project = temporary.join("linked");
+                git(
+                    &main,
+                    &[
+                        "worktree",
+                        "add",
+                        "--quiet",
+                        "-b",
+                        "work",
+                        project.to_str().unwrap(),
+                    ],
+                )
+                .await;
+                (project, "refs/heads/work")
+            } else {
+                (main.clone(), "refs/heads/main")
+            };
+            if dirty {
+                std::fs::write(project.join("file.txt"), b"staged-only version").unwrap();
+                git(&project, &["add", "file.txt"]).await;
+                std::fs::write(project.join("file.txt"), b"working version").unwrap();
+            }
+            if !fresh {
+                git(
+                    &project,
+                    &["config", "credential.helper", "local-secret-helper"],
+                )
+                .await;
+            }
+            let index = if fresh {
+                project.join(".git/index")
+            } else {
+                PathBuf::from(
+                    git(
+                        &project,
+                        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+                    )
+                    .await,
+                )
+            };
+            let old_index = std::fs::read(&index).ok();
+            let config_path = main.join(".git/config");
+            let old_config = std::fs::read(&config_path).unwrap();
+            git(
+                &temporary,
+                &[
+                    "clone",
+                    "--quiet",
+                    "--bare",
+                    main.to_str().unwrap(),
+                    "repository.git",
+                ],
+            )
+            .await;
+            let mirror = temporary.join("repository.git");
+            git(&mirror, &["update-ref", branch, &incoming]).await;
+            git(&mirror, &["update-server-info"]).await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/{*path}", get(serve))
+                        .with_state(mirror),
+                )
+                .await
+                .unwrap()
+            });
+            let credentials = MirrorCredentials {
+                workspace_id: "w-fixture".into(),
+                repository_url: url.clone(),
+                working_tree_url: url,
+                username: "fixture".into(),
+                password: "fixture".into(),
+                read_only: true,
+                storage_limit_bytes: 16 * 1024 * 1024,
+                max_file_bytes: 1024 * 1024,
+            };
+            let before = temporary.join("tree-before");
+            let checkout = temporary.join("checkout");
+            super::super::install::snapshot(
+                &project,
+                &before,
+                &|path| !path.starts_with(".git"),
+                16 * 1024 * 1024,
+            )
+            .unwrap();
+            super::super::install::snapshot(&before, &checkout, &|_| true, 16 * 1024 * 1024)
+                .unwrap();
+            let (kept, mut writes) = prepare_receive(
+                &project,
+                &checkout,
+                &temporary.join("repository-stage"),
+                Incoming {
+                    cache: &temporary.join("incoming.git"),
+                    credentials: &credentials,
+                    branch: Some(branch),
+                    origin: None,
+                    snapshot: None,
+                },
+                &|| Ok(()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read(&index).ok(), old_index);
+            assert_eq!(std::fs::read(&config_path).unwrap(), old_config);
+            if !fresh {
+                assert_eq!(git(&project, &["rev-parse", "HEAD"]).await, old);
+                assert_eq!(
+                    git(&project, &["show", ":file.txt"]).await,
+                    if dirty {
+                        "staged-only version"
+                    } else {
+                        "head version"
+                    }
+                );
+            } else {
+                assert!(!project.join(".git").exists());
+                // Hydration overlays the received working tree after Git planning.
+                std::fs::write(checkout.join("file.txt"), b"cloud version").unwrap();
+            }
+            if dirty {
+                assert!(kept.iter().any(|branch| branch.contains("@cloud-")));
+            } else {
+                assert_eq!(git(&checkout, &["rev-parse", "HEAD"]).await, incoming);
+            }
+            writes.extend(
+                super::super::install::changes(&project, &before, &checkout)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|write| !write.relative.starts_with(".git")),
+            );
+            let binding = super::super::install::Binding {
+                endpoint: "https://fixture.invalid".into(),
+                account: Some("a-fixture".into()),
+                workspace: "w-fixture".into(),
+                epoch: 3,
+                receipt: Some("receipt-fixture".into()),
+            };
+            let journal = temporary.join("return-install");
+            let mut transaction = super::super::install::Transaction::prepare(
+                &journal,
+                binding.clone(),
+                writes,
+                16 * 1024 * 1024,
+            )
+            .unwrap();
+            transaction
+                .reserve_git(install_roots(&project).await.unwrap(), &|| Ok(()))
+                .unwrap();
+            transaction
+                .apply(&|| {
+                    if fresh {
+                        return Ok(());
+                    }
+                    let output = std::process::Command::new("git")
+                        .args(["checkout", "-b", "external-during-return"])
+                        .current_dir(&project)
+                        .output()?;
+                    ensure!(
+                        !output.status.success(),
+                        "external checkout bypassed installation locks"
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            // A late session/config finalization failure leaves the operation
+            // uncommitted. Restart reuses the original file intents exactly.
+            drop(transaction);
+            let mut retry = super::super::install::Transaction::open(&journal, &binding)
+                .unwrap()
+                .unwrap();
+            retry.reserve_git(Vec::new(), &|| Ok(())).unwrap();
+            retry.apply(&|| Ok(())).unwrap();
+            retry.commit(&|| Ok(())).unwrap();
+            retry.cleanup().unwrap();
+            if dirty {
+                assert_eq!(git(&project, &["rev-parse", "HEAD"]).await, old);
+                assert_eq!(
+                    git(&project, &["show", ":file.txt"]).await,
+                    "staged-only version"
+                );
+                assert_eq!(
+                    std::fs::read(project.join("file.txt")).unwrap(),
+                    b"working version"
+                );
+            } else {
+                assert_eq!(git(&project, &["rev-parse", "HEAD"]).await, incoming);
+                assert_eq!(git(&project, &["show", ":file.txt"]).await, "cloud version");
+                assert_eq!(
+                    std::fs::read(project.join("file.txt")).unwrap(),
+                    b"cloud version"
+                );
+            }
+            assert_eq!(std::fs::read(&config_path).unwrap(), old_config);
+            if linked {
+                assert_eq!(git(&main, &["rev-parse", "HEAD"]).await, old);
+                assert_eq!(
+                    std::fs::read(main.join("file.txt")).unwrap(),
+                    b"head version"
+                );
+            }
+            server.abort();
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
+    }
     async fn git(root: &Path, args: &[&str]) -> String {
         let mut command = transport::git(root, None).await.unwrap();
         command
@@ -1529,7 +2044,7 @@ mod tests {
         )
         .await;
         std::fs::write(laptop.join(".git/FETCH_HEAD"), "user fetch marker\n").unwrap();
-        let preserved = publish_refs(&laptop, namespace, true, &|| Ok(()))
+        let preserved = publish_refs(&laptop, namespace, true, &|| Ok(()), None)
             .await
             .unwrap();
         assert_eq!(

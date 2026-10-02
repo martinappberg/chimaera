@@ -1274,6 +1274,8 @@ async fn ws_chat_sends_are_accepted_once_under_their_client_id() {
     )
     .unwrap();
     let id = "s-send-ids".to_string();
+    chimaera_agent::journal::import_send_state(state.chat.journal_dir(), &id,
+        br#"{"version":1,"session_id":"s-send-ids","entries":[{"id":"client-crashed-1","state":"dispatching"},{"id":"client-receipt-1","state":"confirmed"}]}"#).unwrap();
     let mut spec = chimaera_agent::driver::SpawnSpec::new(
         id.clone(),
         vec![fake.to_string_lossy().into_owned()],
@@ -1321,6 +1323,25 @@ async fn ws_chat_sends_are_accepted_once_under_their_client_id() {
     assert_eq!(ready["type"], "ready");
     assert_eq!(ready["send_ids"], true, "{ready}");
 
+    // Independent evidence from a previous process survives without its echo.
+    socket
+        .send(send_as("UNCERTAIN", "client-crashed-1"))
+        .await
+        .unwrap();
+    let uncertain = next_answer(&mut socket).await;
+    assert_eq!(uncertain["code"], "send_uncertain", "{uncertain}");
+    assert_eq!(uncertain["client_id"], "client-crashed-1");
+    socket.send(cancel("client-crashed-1")).await.unwrap();
+    assert_eq!(next_answer(&mut socket).await["code"], "send_uncertain");
+    socket
+        .send(send_as("ALREADY_RECEIVED", "client-receipt-1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_answer(&mut socket).await,
+        serde_json::json!({"type":"send_confirmed","client_id":"client-receipt-1"})
+    );
+
     // One send, sent three times under one id, then a second message: the
     // journal holds the first once, with its id.
     for _ in 0..3 {
@@ -1346,7 +1367,7 @@ async fn ws_chat_sends_are_accepted_once_under_their_client_id() {
     socket.send(cancel("client-once-1")).await.unwrap();
     assert_eq!(
         next_answer(&mut socket).await,
-        serde_json::json!({"type":"send_cancelled","client_id":"client-once-1","cancelled":false})
+        serde_json::json!({"type":"send_confirmed","client_id":"client-once-1"})
     );
     socket.send(cancel("client-gone-1")).await.unwrap();
     assert_eq!(
@@ -1406,7 +1427,7 @@ async fn ws_chat_sends_are_accepted_once_under_their_client_id() {
     }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(user_turns("ONCE"), 1);
-    for never in ["GONE", "BAD", "WATCHED"] {
+    for never in ["GONE", "BAD", "WATCHED", "UNCERTAIN", "ALREADY_RECEIVED"] {
         assert_eq!(user_turns(never), 0, "{never}");
     }
     let mut again = connect("").await;

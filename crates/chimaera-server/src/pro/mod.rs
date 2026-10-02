@@ -6,6 +6,7 @@ mod detached;
 mod drain;
 mod engine;
 mod execution;
+pub(crate) mod install;
 mod kept;
 mod mirror;
 mod moves;
@@ -152,6 +153,14 @@ struct Preference {
     /// unknown), so a reused group id is not mistaken for old work.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     execution_starts: Vec<u64>,
+    /// More live groups existed than fit in the bounded evidence. A same-boot
+    /// successor cannot infer termination from the recorded prefix alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    execution_groups_overflow: bool,
+    /// An agent/setup launch or cleanup was not durably settled. A same-boot restart
+    /// cannot infer completeness from the older agent-group prefix.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    execution_launch_pending: bool,
     #[serde(default)]
     execution_identity: Option<execution::wire::Identity>,
     #[serde(default)]
@@ -345,12 +354,13 @@ impl ProState {
             Err(_) => (None, true),
         };
         let disk = loaded.unwrap_or_default();
+        // The input is already bounded to 1 MiB. Runtime admission ceilings
+        // cannot discard an existing ownership/privacy/account fence on load.
         let legacy_pending = disk
             .legacy_pending
             .into_iter()
             .chain(disk.import_roots.into_keys())
             .filter(|id| valid_id(id))
-            .take(128)
             .collect();
         // A project handed to the cloud on quit stays away across a restart:
         // its finished transfer keeps its fence until the app returns. A
@@ -366,12 +376,10 @@ impl ProState {
                         Some(Ownership::Transferring { .. } | Ownership::Remote { .. })
                     )
             })
-            .take(128)
             .collect();
         let ownership: HashMap<_, _> = disk
             .ownership
             .into_iter()
-            .take(128)
             .map(|(id, owner)| {
                 let owner = match owner {
                     Ownership::Transferring { epoch } if parked.contains(&id) => {
@@ -432,9 +440,9 @@ impl ProState {
             authority: Mutex::new(authority),
             execution,
             ownership: Mutex::new(ownership),
-            preferences: Mutex::new(disk.preferences.into_iter().take(128).collect()),
+            preferences: Mutex::new(disk.preferences),
             projects_root: Mutex::new(disk.projects_root),
-            adoptions: Mutex::new(disk.adoptions.into_iter().take(128).collect()),
+            adoptions: Mutex::new(disk.adoptions),
             legacy_pending: Mutex::new(legacy_pending),
             project_cache: Mutex::new(projects::Cache::default()),
             discovery: AsyncMutex::new(()),
@@ -1147,47 +1155,62 @@ pub(crate) async fn save_workspace_profile(
 ) -> anyhow::Result<()> {
     authority::workspace(state, workspace)?;
     updated.validate()?;
-    let _configuration = state.pro.configuration.lock().await;
+    let configuration = state.pro.configuration.clone().lock_owned().await;
     anyhow::ensure!(
         profile_generation(state) == expected_generation,
         "Account changed; read the cloud profile again before updating"
     );
-    let _job = state
+    let job = state
         .pro
         .jobs
-        .try_lock()
+        .clone()
+        .try_lock_owned()
         .map_err(|_| anyhow::anyhow!("Project transfer is active; retry after it finishes"))?;
     anyhow::ensure!(
         may_write(state, workspace) && projects::account_matches(state, workspace),
         "Project is currently read-only"
     );
-    let current = workspace_profile(state, workspace)
-        .ok_or_else(|| anyhow::anyhow!("Cloud profile is unavailable"))?;
     anyhow::ensure!(
-        &current == expected,
-        "Cloud profile changed; read it again before updating"
+        workspace_profile(state, workspace).is_some(),
+        "Cloud profile is unavailable"
     );
-    let previous = {
-        let mut preferences = crate::lock(&state.pro.preferences);
-        anyhow::ensure!(
-            preferences.len() < 128 || preferences.contains_key(workspace),
-            "Cloud profile limit reached"
-        );
-        let previous = preferences.get(workspace).cloned();
-        preferences.entry(workspace.into()).or_default().profile = updated;
-        previous
-    };
-    if let Err(error) = persist(state).await {
-        let mut preferences = crate::lock(&state.pro.preferences);
-        if let Some(previous) = previous {
-            preferences.insert(workspace.into(), previous);
-        } else {
-            preferences.remove(workspace);
+    let state = state.clone();
+    let workspace = workspace.to_owned();
+    let expected = expected.clone();
+    // The MCP caller can disappear while the blocking persistence completes.
+    // Keep account and transfer admission until that accepted write settles.
+    tokio::spawn(async move {
+        let _configuration = configuration;
+        let _job = job;
+        let previous = {
+            let mut preferences = crate::lock(&state.pro.preferences);
+            anyhow::ensure!(
+                preferences.len() < 128 || preferences.contains_key(&workspace),
+                "Cloud profile limit reached"
+            );
+            let previous = preferences
+                .get(&workspace)
+                .map(|p| p.profile.clone())
+                .unwrap_or_default();
+            anyhow::ensure!(
+                previous == expected,
+                "Cloud profile changed; read it again before updating"
+            );
+            preferences.entry(workspace.clone()).or_default().profile = updated.clone();
+            previous
+        };
+        if let Err(error) = persist(&state).await {
+            let mut preferences = crate::lock(&state.pro.preferences);
+            let current = &mut preferences.entry(workspace).or_default().profile;
+            if *current == updated {
+                *current = previous;
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
-    state.changes.notify_waiters();
-    Ok(())
+        state.changes.notify_waiters();
+        Ok(())
+    })
+    .await?
 }
 
 #[cfg(test)]
@@ -1203,6 +1226,73 @@ mod tests {
             root.to_path_buf(),
             root.join("config"),
         ))
+    }
+    #[test]
+    fn bounded_saved_state_preserves_fences_beyond_runtime_admission_cap() {
+        let root = std::env::temp_dir().join(format!(
+            "chimaera-pro-load-cap-{}",
+            chimaera_core::generate_token()
+        ));
+        let mut saved = DiskState::default();
+        for index in 0..129 {
+            let id = format!("w-parked-{index}");
+            saved
+                .ownership
+                .insert(id.clone(), Ownership::Transferring { epoch: 4 });
+            saved.parked.insert(id.clone());
+            saved.legacy_pending.insert(id.clone());
+            saved.preferences.insert(
+                id.clone(),
+                Preference {
+                    account: Some("saved-account".into()),
+                    never_mirror: true,
+                    privacy_pending: true,
+                    execution_active: true,
+                    execution_launch_pending: true,
+                    ..Default::default()
+                },
+            );
+            saved.adoptions.insert(
+                id,
+                serde_json::from_value(serde_json::json!({
+                    "root":root.join(format!("project-{index}")),
+                    "account":"saved-account", "device":1, "inode":2,
+                    "started":true, "complete":false
+                }))
+                .unwrap(),
+            );
+            let owner = match index % 3 {
+                0 => Ownership::Remote {
+                    epoch: 4,
+                    holder: "another-device".into(),
+                },
+                1 => Ownership::PrivacyDisabled { epoch: 4 },
+                _ => Ownership::Hydrating { epoch: 4 },
+            };
+            saved.ownership.insert(format!("w-fenced-{index}"), owner);
+        }
+        let bytes = serde_json::to_vec(&saved).unwrap();
+        assert!(bytes.len() < 1024 * 1024);
+        std::fs::create_dir_all(root.join("pro")).unwrap();
+        std::fs::write(root.join("pro/state.json"), bytes).unwrap();
+        let restored = state(&root);
+        assert_eq!(crate::lock(&restored.pro.ownership).len(), 258);
+        assert_eq!(crate::lock(&restored.pro.preferences).len(), 129);
+        assert_eq!(crate::lock(&restored.pro.adoptions).len(), 129);
+        assert_eq!(crate::lock(&restored.pro.legacy_pending).len(), 129);
+        assert_eq!(crate::lock(&restored.pro.parked).len(), 129);
+        crate::lock(&restored.pro.legacy_pending).clear();
+        for index in 0..129 {
+            let id = format!("w-parked-{index}");
+            assert!(!may_write(&restored, &id));
+            assert!(!may_write(&restored, &format!("w-fenced-{index}")));
+            assert!(execution::unclean(&restored, &id));
+            let preferences = crate::lock(&restored.pro.preferences);
+            let preference = &preferences[&id];
+            assert!(preference.never_mirror && preference.privacy_pending);
+            assert_eq!(preference.account.as_deref(), Some("saved-account"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn ownership_reads_as_a_viewer_phase() {

@@ -14,6 +14,105 @@ pub(crate) struct Guard {
     commits: Arc<Mutex<HashMap<String, usize>>>,
     workspace: String,
 }
+
+/// Return installation belongs to its admitted account/epoch through filesystem
+/// waits and the durable setup transition. Configuration replacement is
+/// serialized; stop/replacement also sees the counted commit until its owned
+/// task finishes.
+pub(crate) struct ImportGuard {
+    _commit: Guard,
+    _configuration: tokio::sync::OwnedMutexGuard<()>,
+    workspace: String,
+    epoch: u64,
+    generation: u64,
+}
+impl ImportGuard {
+    /// Publish setup only for the hydration whose durable commit we admitted.
+    /// The caller retains this guard through persistence, so account replacement
+    /// cannot observe a released reservation between commit and this transition.
+    pub(crate) fn setting_up(&self, state: &AppState) -> anyhow::Result<()> {
+        if self.generation != generation(state)
+            || !crate::pro::may_import(state, &self.workspace, self.epoch)
+        {
+            return Err(Changed.into());
+        }
+        let managed = super::managed(state, &self.workspace);
+        let proofs = lock(&state.pro.execution.proofs);
+        let mut ownership = lock(&state.pro.ownership);
+        if self.generation != generation(state)
+            || !matches!(ownership.get(&self.workspace), Some(Ownership::Hydrating { epoch }) if *epoch == self.epoch)
+            || (managed
+                && !proofs.get(&self.workspace).is_some_and(|proof| {
+                    !proof.stopped
+                        && proof.generation == self.generation
+                        && proof.epoch == self.epoch
+                        && proof.deadline.valid()
+                }))
+        {
+            return Err(Changed.into());
+        }
+        ownership.insert(
+            self.workspace.clone(),
+            Ownership::SettingUp { epoch: self.epoch },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn check(&self, state: &AppState) -> anyhow::Result<()> {
+        if self.generation != generation(state)
+            || !crate::pro::may_import(state, &self.workspace, self.epoch)
+            || !super::valid_grant(state, &self.workspace, self.epoch)
+        {
+            return Err(Changed.into());
+        }
+        Ok(())
+    }
+}
+
+pub(crate) async fn begin_import(
+    state: &Arc<AppState>,
+    workspace: &str,
+    epoch: u64,
+    generation: u64,
+) -> anyhow::Result<ImportGuard> {
+    let configuration = state.pro.configuration.clone().lock_owned().await;
+    if generation != self::generation(state) || !crate::pro::may_import(state, workspace, epoch) {
+        return Err(Changed.into());
+    }
+    let managed = super::managed(state, workspace);
+    // Match the ordinary admission's proof -> ownership -> commits order.
+    // Holding these locks makes reservation atomic against fence/epoch change.
+    let proofs = lock(&state.pro.execution.proofs);
+    let ownership = lock(&state.pro.ownership);
+    if managed
+        && !(proofs.get(workspace).is_some_and(|proof| {
+            !proof.stopped
+                && proof.generation == generation
+                && proof.epoch == epoch
+                && proof.deadline.valid()
+        }) && matches!(ownership.get(workspace), Some(Ownership::Local {epoch:current} | Ownership::Hydrating {epoch:current}) if *current == epoch))
+    {
+        return Err(Changed.into());
+    }
+    if generation != self::generation(state) {
+        return Err(Changed.into());
+    }
+    let mut commits = lock(&state.pro.execution.commits.0);
+    if commits.values().sum::<usize>() >= 64 {
+        return Err(Changed.into());
+    }
+    *commits.entry(workspace.to_owned()).or_default() += 1;
+    Ok(ImportGuard {
+        _commit: Guard {
+            commits: state.pro.execution.commits.0.clone(),
+            workspace: workspace.to_owned(),
+        },
+        _configuration: configuration,
+        workspace: workspace.to_owned(),
+        epoch,
+        generation,
+    })
+}
 tokio::task_local! {
     static REQUEST_RESERVED: ();
 }
@@ -41,6 +140,51 @@ impl Drop for Guard {
             }
         }
     }
+}
+
+/// Count the final synchronous spawn/registration window so a clean transfer
+/// cannot mistake a not-yet-registered child for an empty workload. Ordinary
+/// unconfigured local sessions remain inert; device work needs ownership alone.
+pub(crate) fn begin_launch(state: &AppState, workspace: &str) -> anyhow::Result<Option<Guard>> {
+    if !crate::pro::may_execute(state, workspace) {
+        return Err(Changed.into());
+    }
+    let generation = generation(state);
+    let managed = super::managed(state, workspace);
+    let worker = super::worker(state);
+    let installing = lock(&state.pro.installing).contains(workspace);
+    let proofs = lock(&state.pro.execution.proofs);
+    let ownership = lock(&state.pro.ownership);
+    if generation != self::generation(state) {
+        return Err(Changed.into());
+    }
+    match ownership.get(workspace) {
+        None if !managed => return Ok(None),
+        None if !worker => {}
+        Some(Ownership::Local { .. } | Ownership::SettingUp { .. }) => {}
+        Some(Ownership::AwaitingVerification { .. }) if !worker && !installing => {}
+        _ => return Err(Changed.into()),
+    }
+    if managed && worker {
+        let allowed = proofs.get(workspace).is_some_and(|proof| {
+            !proof.stopped
+                && proof.generation == generation
+                && proof.deadline.valid()
+                && matches!(ownership.get(workspace), Some(Ownership::Local { epoch } | Ownership::SettingUp { epoch }) if *epoch == proof.epoch)
+        });
+        if !allowed {
+            return Err(Changed.into());
+        }
+    }
+    let mut commits = lock(&state.pro.execution.commits.0);
+    if commits.values().sum::<usize>() >= 64 {
+        return Err(Changed.into());
+    }
+    *commits.entry(workspace.to_owned()).or_default() += 1;
+    Ok(Some(Guard {
+        commits: state.pro.execution.commits.0.clone(),
+        workspace: workspace.to_owned(),
+    }))
 }
 #[derive(Debug)]
 pub(crate) struct Changed;

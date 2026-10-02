@@ -84,6 +84,15 @@ Clients still verify the live cloud information before opening provider terminal
 Quota restrictions are `limited`; a failed preparation is `error`. Clients render
 their own fixed, actionable descriptions rather than vendor error bodies.
 
+The additive `attended_actions:true` field is meaningful only with
+`state:"limited",reason:"hours_exhausted"`. It means explicit opens and actions
+may still wake and use cloud work, while unattended continuation is unavailable.
+Cloud work pauses after interaction stops; background polls and refreshes never
+count as interaction. Missing/false retains the older complete-block behavior.
+Ignore the field for any other state or reason; it cannot override subscription,
+storage, spending or provisioning restrictions. This is policy information,
+not proof that a worker is currently running or a provider is connected.
+
 `phase` is optional and emitted only with `state:"preparing"`. It identifies an
 account-confirmed stage, with no percentage or timing estimate:
 
@@ -102,9 +111,10 @@ this additive field; older services remain valid without it. The native
 
 This status read returns account-owned database state without calling Fly,
 creating resources, refreshing desired machine state or waking a worker. It
-contains no cell ids, service credentials or provider URLs. Automatic initial
-preparation is a bounded account-service responsibility for eligible active or
-trialing accounts; subsequent passive reads never wake a sleeping worker.
+contains no cell ids, service credentials or provider URLs. An eligible account
+may have its connection ready before its first worker exists; status then reports
+`sleeping`. First explicit cloud use or an eligible unattended continuation
+requests that worker. Passive status reads never allocate or wake it.
 
 The optional billing `return_to:"desktop"` selects a server-owned, credential-free
 browser return page. Omission preserves the browser account return. An optional
@@ -121,6 +131,10 @@ cryptographic nonce for each attempt. Callback values are never logged. A servic
 validates both fields before any billing side effect and binds the attempt into
 checkout idempotency, so retrying with a new listener cannot reuse an old return
 URL. Missing callbacks remain compatible with older clients and services.
+Checkout `409` means the account already has a subscription: the client exposes
+typed `AlreadySubscribed`, and the native shell returns `use_billing_portal` so
+the page re-reads the authenticated account instead of offering another checkout.
+Service response bodies are never used as user-facing error copy.
 
 The account's HTTPS return page automatically navigates to the validated native
 callback, with an explicit return button as a fallback. Its short-lived, tamper-
@@ -543,7 +557,7 @@ Content-Type and the explicit wake marker, and never accepts a destination URL.
 Allowed method/path pairs after `/http/` are `GET api/v1/sessions`,
 `GET|POST api/v1/workspaces`, `GET api/v1/pro/bundles/{session_id}`,
 `POST api/v1/pro/bundles/{session_id}/export`, `POST api/v1/pro/bundles`, and
-`GET|PUT api/v1/pro/profile`. Bundle import accepts only `fork=true|false`,
+`GET|PUT api/v1/pro/profile`. Profile GET adds `ETag` and `Cache-Control: no-store`; PUT accepts one exact quoted SHA-256 `If-Match` and returns 412 if the profile or account generation changed. Missing `If-Match` retains legacy unconditional behavior; malformed or multiple conditions return 400. This changes no JSON fields. Bundle import accepts only `fork=true|false`,
 `origin=moved|home`, and unsigned `epoch` query parameters; profile accepts only
 `workspace_id`. Session and workspace identifiers use letters, digits, `_` and
 `-`, up to 128 bytes. Other routes, methods and query keys are rejected.

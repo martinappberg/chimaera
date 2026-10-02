@@ -5,7 +5,7 @@ import { parseOwnershipHints } from "./placementHints";
 const row = (workspace_id: string, ownership: unknown) => ({ workspace_id, name: workspace_id, ownership });
 
 describe("a Home row's place hint", () => {
-  it("names a project the cloud holds, and one coming home", () => {
+  it("names work elsewhere without guessing the owner type", () => {
     const { configured, hints } = parseOwnershipHints({
       configured: true,
       workspaces: [
@@ -15,9 +15,9 @@ describe("a Home row's place hint", () => {
       ],
     });
     expect(configured).toBe(true);
-    expect(hints.get("w-cloud")).toBe("In the cloud");
+    expect(hints.get("w-cloud")).toBe("Running elsewhere");
     expect(hints.get("w-home")).toBe("Coming home…");
-    expect(hints.get("w-leaving")).toBe("Moving to the cloud…");
+    expect(hints.get("w-leaving")).toBe("Moving work…");
   });
 
   it("says nothing for a project that is here or not owned elsewhere", () => {

@@ -74,6 +74,8 @@ function makeSocket(sessionId: string, store: ChatStore): ChatSocket {
     onCommandFailed: (message: string, command: string | null, reason?: string | null, clientId?: string | null) =>
       store.onCommandFailed(message, command, reason ?? null, clientId ?? null),
     onSendCancelled: (clientId: string, cancelled: boolean) => store.onSendCancelled(clientId, cancelled),
+    onSendUncertain: (clientId: string, message: string) => store.onSendUncertain(clientId, message),
+    onSendConfirmed: (clientId: string) => store.onSendConfirmed(clientId),
     onAsleep: () => store.onAsleep(),
     onWaking: () => store.onWaking(),
     onHeld: () => store.onHeld(),

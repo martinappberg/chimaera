@@ -11,9 +11,9 @@ use chimaera_link::{Host, HostKind};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use super::connect::{HostState, do_connect, state_for, with_hosts};
+use super::connect::{do_connect, state_for, with_hosts, HostState};
 use super::restore::open_ui_window;
-use super::{Shell, WindowScope, authorize_scope_origin, lock};
+use super::{authorize_scope_origin, lock, Shell, WindowScope};
 use crate::windows::WindowRecord;
 
 /// The local daemon's build parity, as the home screen sees it.
@@ -114,7 +114,10 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
                 .any(|host| host.alias == h.alias && !visible_machine(host, &local_token))
         })
         .map(|h| {
-            if let Some(host) = keeper.values().find(|host| host.alias == h.alias) {
+            if let Some(host) = keeper
+                .values()
+                .find(|host| host.alias == h.alias && !h.direct_ssh)
+            {
                 return super::connect::keeper_state(
                     host,
                     tunnels
@@ -168,6 +171,28 @@ pub(super) async fn add_host(alias: String) -> Result<HostState, String> {
     }
     let entry = with_hosts(move |hosts| hosts.add(&alias, None)).await?;
     Ok(state_for(&entry, "disconnected", None))
+}
+
+/// Changes only this computer's next SSH connection, never the kept login or
+/// current tunnels. A device alias cannot acquire an SSH fallback this way.
+#[tauri::command]
+pub(super) async fn set_host_direct_ssh(
+    state: State<'_, Shell>,
+    alias: String,
+    on: bool,
+) -> Result<HostState, String> {
+    let alias =
+        chimaera_remote::hosts::normalize_alias(&alias).map_err(|error| error.to_string())?;
+    let device = state.pro.is_device(&alias) || lock(&state.registry).is_link_device(&alias);
+    super::pro::direct_ssh_bypass(true, device)?;
+    let saved_alias = alias.clone();
+    let entry = with_hosts(move |hosts| hosts.set_direct_ssh(&saved_alias, on)).await?;
+    lock(&state.host_entries).insert(alias.clone(), entry);
+    list_hosts(state)
+        .await?
+        .into_iter()
+        .find(|host| host.alias == alias)
+        .ok_or_else(|| "Host is unavailable".into())
 }
 
 #[tauri::command]

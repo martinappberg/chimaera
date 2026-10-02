@@ -11,7 +11,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use super::restore::open_ui_window;
 use super::tunnel::Tunnel;
-use super::{ConnectFlight, Shell, authorize_scope_origin, lock};
+use super::{authorize_scope_origin, lock, ConnectFlight, Shell};
 use crate::windows::WindowRecord;
 
 type ConnectFlightOwner = tokio::sync::watch::Sender<Option<Result<(), String>>>;
@@ -37,7 +37,7 @@ fn claim_connect_flight(
 /// Host list entry as the UI sees it (see HostState in native.ts).
 #[derive(Clone, Serialize)]
 pub struct HostState {
-    alias: String,
+    pub(super) alias: String,
     status: &'static str,
     local_port: Option<u16>,
     last_connected_at: Option<u64>,
@@ -53,6 +53,9 @@ pub struct HostState {
     node: Option<String>,
     via_pro: bool,
     kept: bool,
+    /// Present only for SSH hosts; older shells/devices do not offer the toggle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direct_ssh: Option<bool>,
     /// Set when the host is a cluster: from this process's connect, else the
     /// scheduler the last connect recorded in hosts.json (a hint until the
     /// next probe). Never for a host the user said isn't one.
@@ -85,6 +88,9 @@ impl HostState {
         live: Option<&super::cluster::ClusterInfo>,
     ) -> Self {
         self.not_cluster = entry.not_cluster;
+        if self.direct_ssh.is_some() {
+            self.direct_ssh = Some(entry.direct_ssh);
+        }
         let scheduler = live
             .map(|i| i.scheduler)
             .or(entry.scheduler)
@@ -193,6 +199,7 @@ pub(super) fn state_for(
         node: tunnel.and_then(|t| t.node().map(str::to_string)),
         via_pro: tunnel.is_some_and(|t| t.link_id().is_some()),
         kept: entry.kept,
+        direct_ssh: Some(entry.direct_ssh),
         cluster: None,
         not_cluster: entry.not_cluster,
     }
@@ -353,10 +360,14 @@ pub(super) async fn do_connect(
         let reused = if update_daemon {
             None
         } else {
-            let via_pro = state.pro.client_now().is_some()
-                && lock(&state.pro.hosts)
+            let direct_ssh = host_entry(&alias).await.direct_ssh;
+            let via_pro = keeper_route_selected(
+                direct_ssh,
+                state.pro.client_now().is_some(),
+                lock(&state.pro.hosts)
                     .values()
-                    .any(|host| host.alias == alias);
+                    .any(|host| host.alias == alias),
+            );
             // Probe liveness WITHOUT holding the tunnels lock: this is a ~2s
             // HTTP round-trip, and holding the map locked across it would
             // stall every other tunnel op. A 401 from a stale/foreign daemon
@@ -554,6 +565,10 @@ async fn run_flight(
 /// The answer to a connect aimed at the account's cloud.
 const CLOUD_IS_NOT_A_HOST: &str =
     "Your cloud doesn't open as a window here. Chimaera keeps it up to date for you.";
+
+fn keeper_route_selected(direct_ssh: bool, signed_in: bool, known_keeper: bool) -> bool {
+    !direct_ssh && signed_in && known_keeper
+}
 
 /// Drop saved windows on the account's cloud (an older build could open one):
 /// they would only ever show the cloud's own page, which the app never opens.
@@ -764,6 +779,7 @@ pub(super) fn keeper_state(host: &chimaera_link::Host, tunnel: Option<&Tunnel>) 
         added_at: 0,
         last_connected_at: None,
         kept: true,
+        direct_ssh: false,
         login_serve: false,
         not_cluster: false,
         scheduler: None,
@@ -778,6 +794,7 @@ pub(super) fn keeper_state(host: &chimaera_link::Host, tunnel: Option<&Tunnel>) 
     let mut state = state_for(&entry, status, tunnel);
     state.via_pro = tunnel.is_none_or(|tunnel| tunnel.link_id().is_some());
     state.error = host.error.clone();
+    state.direct_ssh = (host.kind == chimaera_link::HostKind::Ssh).then_some(false);
     state
 }
 
@@ -885,6 +902,7 @@ async fn landed_on_cluster(
         added_at: 0,
         last_connected_at: None,
         kept: false,
+        direct_ssh: false,
         login_serve: false,
         not_cluster: false,
         scheduler: Some(found.scheduler),
@@ -942,6 +960,7 @@ async fn host_entry(alias: &str) -> HostEntry {
             added_at: 0,
             last_connected_at: None,
             kept: false,
+            direct_ssh: false,
             login_serve: false,
             not_cluster: false,
             scheduler: None,
@@ -977,12 +996,44 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        LinkFailure, await_keeper_login, claim_connect_flight, connected_status,
-        reusable_tunnel_port,
+        await_keeper_login, claim_connect_flight, connected_status, reusable_tunnel_port,
+        LinkFailure,
     };
     use crate::shell::lock;
     use chimaera_link::{Daemon, Host, HostKind, HostStatus};
     use std::time::Duration;
+
+    #[test]
+    fn saved_direct_choice_overrides_known_keeper_without_changing_kept_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-direct-choice-{}",
+            chimaera_core::generate_token()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hosts.json");
+        let mut hosts = chimaera_remote::hosts::HostsStore::load(path.clone());
+        hosts.set_kept("cluster", true).unwrap();
+        hosts.set_direct_ssh("cluster", true).unwrap();
+        let saved = chimaera_remote::hosts::HostsStore::load(path)
+            .get("cluster")
+            .unwrap();
+        assert!(saved.kept);
+        assert!(!super::keeper_route_selected(saved.direct_ssh, true, true));
+        assert!(crate::shell::pro::direct_ssh_bypass(saved.direct_ssh, false).unwrap());
+        assert!(crate::shell::pro::direct_ssh_bypass(saved.direct_ssh, true).is_err());
+        assert!(super::keeper_route_selected(false, true, true));
+        assert!(!super::keeper_route_selected(false, false, true));
+        let device = Host {
+            kind: HostKind::Device,
+            ..row(HostStatus::Connected, true)
+        };
+        let wire = serde_json::to_value(super::keeper_state(&device, None)).unwrap();
+        assert!(
+            wire.get("direct_ssh").is_none(),
+            "device rows must not offer an SSH toggle"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn row(status: HostStatus, daemon: bool) -> Host {
         Host {

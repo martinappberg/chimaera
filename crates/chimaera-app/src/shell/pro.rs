@@ -141,6 +141,9 @@ pub(super) mod code {
     /// sign-in could be neither deleted nor revoked; `signout` finishes that
     /// on its own once the account answers.
     pub const SIGN_OUT_PENDING: &str = "sign_out_pending";
+    /// Memory is signed out, but neither deletion/revocation nor a durable
+    /// restart marker succeeded. The saved session could restore on restart.
+    pub const SIGN_OUT_UNPERSISTED: &str = "sign_out_unpersisted";
 }
 
 #[derive(Serialize)]
@@ -1301,6 +1304,23 @@ pub async fn pro_cancel_sign_in(app: AppHandle) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn direct_ssh_never_accepts_a_known_device_identity() {
+        let pro = super::Pro::new(None);
+        let device = chimaera_link::Host {
+            id: "device-1".into(),
+            alias: "another-Mac".into(),
+            kind: chimaera_link::HostKind::Device,
+            status: chimaera_link::HostStatus::Offline,
+            daemon: None,
+            error: None,
+        };
+        pro.remember_device(&device);
+        assert!(super::direct_ssh_bypass(true, pro.is_device(&device.alias)).is_err());
+        super::lock(&pro.hosts).insert(device.id.clone(), device.clone());
+        assert!(super::direct_ssh_bypass(true, pro.is_device(&device.alias)).is_err());
+        assert!(super::direct_ssh_bypass(true, pro.is_device("cluster")).unwrap());
+    }
     use super::*;
     #[test]
     fn worker_placement_matches_account_holder_but_keeps_keeper_route_identity() {
@@ -1943,9 +1963,9 @@ async fn sign_out(app: &AppHandle, everywhere: bool, expected: Option<u64>) -> R
         // and serve were stopped above, so nothing retries in the background.
         *lock(&state.pro.error) = expected.map(|_| SIGN_IN_EXPIRED.into());
         *lock(&state.pro.warning) = None;
-        match (unfinished, state.pro.endpoint.clone()) {
+        let marker_saved = match (unfinished, state.pro.endpoint.clone()) {
             (true, Some(endpoint)) => {
-                signout::record(&endpoint, device.as_deref());
+                let saved = signout::record(&endpoint, device.as_deref());
                 signout::finish(
                     app.clone(),
                     endpoint,
@@ -1953,16 +1973,19 @@ async fn sign_out(app: &AppHandle, everywhere: bool, expected: Option<u64>) -> R
                     leftover,
                     state.pro.generation(),
                 );
+                saved
             }
-            _ => signout::clear(),
-        }
+            _ => {
+                signout::clear();
+                true
+            }
+        };
         let _ = app.emit("pro-changed", ());
         // The signed-out page shows the public catalog's prices: this reads it
         // again unless a fresh answer is already held.
         refresh_plans(app);
-        // Signed out here either way; the code tells the page the rest
-        // finishes on its own, which is not a failure to retry.
-        anyhow::ensure!(!unfinished, code::SIGN_OUT_PENDING);
+        signout::completion(saved_removed, revoked, marker_saved)
+            .map_err(|code| anyhow::anyhow!(code))?;
         Ok::<_, anyhow::Error>(())
     }
     .await
@@ -2050,18 +2073,24 @@ fn status_name(status: &HostStatus) -> &'static str {
     }
 }
 
-/// Keeper rows are authoritative while signed in; the cached preference only
-/// selects the SSH fallback when account credentials are absent.
+/// Keeper rows are authoritative while signed in unless this computer explicitly
+/// chose direct SSH. The cached kept preference gives startup a bounded wait.
 pub(super) async fn connection(
     state: &Shell,
     alias: &str,
 ) -> Result<Option<(Client, Host, u64)>, String> {
     let device = state.pro.is_device(alias) || lock(&state.registry).is_link_device(alias);
     let saved_alias = alias.to_string();
-    let kept = super::connect::with_hosts(move |hosts| {
-        Ok(hosts.get(&saved_alias).is_some_and(|host| host.kept))
+    let (kept, direct_ssh) = super::connect::with_hosts(move |hosts| {
+        Ok(hosts
+            .get(&saved_alias)
+            .map(|host| (host.kept, host.direct_ssh))
+            .unwrap_or_default())
     })
     .await?;
+    if direct_ssh_bypass(direct_ssh, device)? {
+        return Ok(None);
+    }
     // A device has no route but the account, so it waits for startup. A kept
     // SSH host usually reconnects through Pro without a new login, so it gives
     // startup a short, bounded chance; any other SSH host never waits.
@@ -2109,6 +2138,15 @@ pub(super) async fn connection(
     match host {
         Some(host) => Ok(Some((client, host, generation))),
         None => device_fallback(device),
+    }
+}
+
+/// A device identity has no SSH fallback, even if local saved state is stale.
+pub(super) fn direct_ssh_bypass(direct: bool, device: bool) -> Result<bool, String> {
+    if direct && device {
+        Err("This computer connection uses Chimaera Pro, not SSH".into())
+    } else {
+        Ok(direct)
     }
 }
 

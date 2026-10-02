@@ -165,6 +165,7 @@ impl FakeKeeper {
                         state: WorkerState::Unavailable,
                         reason: Some(WorkerReason::ProvisioningDisabled),
                         phase: None,
+                        attended_actions: None,
                     })
                 }),
             )

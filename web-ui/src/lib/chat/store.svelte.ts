@@ -240,6 +240,9 @@ interface UnconfirmedSend extends RestoredDraft {
   /** Made while attached to a daemon without send ids: that daemon's echo
    *  carries no id, so the send's exact text confirms it. */
   plain: boolean;
+  /** A replacement cannot prove whether the agent received this message. */
+  uncertain?: true;
+  confirmed?: true;
 }
 
 /** A send still without its echo at a `ready` is sent again while it is
@@ -295,6 +298,9 @@ export interface PendingSend {
    *  re-sent, until its ✕ dismisses it (the same `cancel_queued` command; the
    *  driver's tombstone `Cancelled` makes the dismissal survive replay). */
   state: "queued" | "dropped";
+  /** Its queued echo survived but the current process cannot prove it owns
+   * the send. No automatic replay or claim of nondelivery is safe. */
+  uncertain?: true;
   /** Sent with `send_after_turn`: held until the running turn ends instead of
    *  being read at the agent's next step (the wire's `after_turn`, absent =
    *  false). Fixed at the echo — Send now reads it early, never re-labels it. */
@@ -705,6 +711,8 @@ export class ChatStore {
    *  be applied before the unconfirmed sends go out again; null when none is
    *  pending. */
   private resendAt: number | null = null;
+  private queuedKeys = new Map<string, { clientId: string; seq: number }>();
+  private queuedSnapshot: { head: number; ids: Set<string> } | null = null;
   /** Puts a frame on this chat's socket (false when it is not open). Only
    *  the store's own unconfirmed sends, and their withdrawals, ever go
    *  through it, and it must never redial or ask for a wake when the socket
@@ -747,10 +755,12 @@ export class ChatStore {
    *  from the moment they are known to wait (the socket dropped, `waking`,
    *  `bringing`, sent again at a `ready`). Its echo removes one; a refusal,
    *  a withdrawal or an exit hands its text back to the composer. */
-  get sending(): { key: number; text: string; images: number }[] {
+  get sending(): { key: number; text: string; images: number; uncertain?: true; confirmed?: true }[] {
     return this.unconfirmed
       .filter((send) => send.shown)
-      .map((send) => ({ key: send.key, text: send.text, images: send.images.length }));
+      .map((send) => ({ key: send.key, text: send.text, images: send.images.length,
+        ...(send.uncertain ? { uncertain: true as const } : {}),
+        ...(send.confirmed ? { confirmed: true as const } : {}) }));
   }
   fatalError = $state<string | null>(null);
   /** Where the fatal came from. A SOCKET fatal (handshake failure) is
@@ -976,6 +986,8 @@ export class ChatStore {
     // dropped by whoever kept the socket. A plain reconnect pushes nothing.
     if (attach.reattach) this.thinkingPushed = false;
     this.sendIds = attach.sendIds;
+    this.queuedSnapshot = head !== undefined && attach.activeQueuedIds !== undefined
+      ? { head, ids: new Set(attach.activeQueuedIds) } : null;
     // Only a daemon that accepts an id at most once may be sent a send twice.
     // One without send ids is told nothing again and decides nothing here.
     this.resendAt = attach.sendIds && head !== undefined ? head : null;
@@ -990,6 +1002,16 @@ export class ChatStore {
    *  withdrawn instead, and {@link onSendCancelled} hears whether it had
    *  arrived after all. */
   private resendUnconfirmed(): void {
+    const snapshot = this.queuedSnapshot;
+    if (snapshot !== null && this.lastSeq >= snapshot.head) {
+      this.queuedSnapshot = null;
+      for (const send of this.pendingSends) {
+        const key = this.queuedKeys.get(send.id);
+        if (send.state !== "queued" || key === undefined || key.seq > snapshot.head) continue;
+        if (snapshot.ids.has(key.clientId)) delete send.uncertain;
+        else send.uncertain = true;
+      }
+    }
     if (this.resendAt === null || this.lastSeq < this.resendAt) return;
     this.resendAt = null;
     this.resendDue(true);
@@ -1007,6 +1029,7 @@ export class ChatStore {
     let next: number | null = null;
     const gone = new Set<number>();
     for (const send of this.unconfirmed) {
+      if (send.uncertain || send.confirmed) continue;
       if (now - send.at >= RESEND_FOR_MS) {
         if (atReady) this.sender({ type: "cancel_send", client_id: send.id });
         continue;
@@ -1029,9 +1052,29 @@ export class ChatStore {
   onSendCancelled(clientId: string, cancelled: boolean): void {
     if (!cancelled) return;
     const at = this.unconfirmed.findIndex((send) => send.id === clientId);
-    if (at < 0) return;
+    if (at < 0 || this.unconfirmed[at].uncertain || this.unconfirmed[at].confirmed) return;
     this.notice(NOT_DELIVERED, "error");
     this.handBackAt(at);
+  }
+
+  onSendUncertain(clientId: string, message: string): void {
+    const send = this.unconfirmed.find((send) => send.id === clientId);
+    if (send?.uncertain || send?.confirmed) return;
+    if (send) {
+      this.unconfirmed = this.unconfirmed.map((send) => send.id === clientId
+        ? { ...send, shown: true, uncertain: true } : send);
+      this.notice(message, "error");
+    } else if (this.outside.includes(clientId)) {
+      this.outside = this.outside.filter((id) => id !== clientId);
+      this.notice(message, "error");
+    }
+  }
+
+  /** A durable receipt can outlive the journal echo. Keep the user's text
+   *  visible as delivered until replay supplies the authoritative row. */
+  onSendConfirmed(clientId: string): void {
+    this.unconfirmed = this.unconfirmed.map((send) => send.id === clientId
+      ? { ...send, shown: true, uncertain: undefined, confirmed: true } : send);
   }
 
   private handBack(sends: UnconfirmedSend[]): void {
@@ -1039,6 +1082,7 @@ export class ChatStore {
   }
 
   private handBackAt(at: number): void {
+    if (this.unconfirmed[at].uncertain || this.unconfirmed[at].confirmed) return;
     this.handBack([this.unconfirmed[at]]);
     this.unconfirmed = this.unconfirmed.filter((_, index) => index !== at);
   }
@@ -1212,6 +1256,8 @@ export class ChatStore {
     // may already have been delivered (a re-send would be a second turn).
     const send = command === "send" || command === "send_after_turn";
     const at = send && clientId !== null ? this.unconfirmed.findIndex((unconfirmed) => unconfirmed.id === clientId) : -1;
+    // A delayed refusal of another copy cannot contradict uncertain delivery.
+    if (at >= 0 && (this.unconfirmed[at].uncertain || this.unconfirmed[at].confirmed)) return;
     if (send && clientId !== null && at < 0) {
       // A prompt sent from outside the composer was refused: say so (there
       // is no text to return). Anything else under an id this store does not
@@ -1242,19 +1288,26 @@ export class ChatStore {
     else this.handBackAt(this.unconfirmed.length - 1);
   }
 
-  /** Nothing more will be delivered here: what is still unconfirmed goes
-   *  back to the composer. */
-  private handBackUnconfirmed(): void {
+  /** A process exit proves nothing about delivery before its last echo.
+   *  Keep the message visible without replaying it or calling it unsent. */
+  private retainUnconfirmedOnExit(): void {
     this.clearResendTimer();
+    this.markQueuedUncertain();
     if (this.unconfirmed.length === 0) return;
-    this.handBack(this.unconfirmed);
-    this.unconfirmed = [];
+    this.unconfirmed = this.unconfirmed.map((send) => send.confirmed
+      ? send : { ...send, shown: true, uncertain: true });
+  }
+
+  private markQueuedUncertain(): void {
+    for (const send of this.pendingSends) {
+      if (send.state === "queued") send.uncertain = true;
+    }
   }
 
   /** The structured driver fell back to its terminal surface. */
   onDegraded(): void {
     this.hydrating = false;
-    this.handBackUnconfirmed();
+    this.retainUnconfirmedOnExit();
     this.degraded = true;
     this.touchTranscript();
   }
@@ -1262,7 +1315,7 @@ export class ChatStore {
   /** The driver closed before (or after) an initial journal replay. */
   onExited(status: number | null): void {
     this.hydrating = false;
-    this.handBackUnconfirmed();
+    this.retainUnconfirmedOnExit();
     this.exited = { status };
     this.touchTranscript();
   }
@@ -1300,6 +1353,8 @@ export class ChatStore {
     // replay re-delivers any that are still live.
     this.pending = [];
     this.pendingSends = [];
+    this.queuedKeys.clear();
+    this.queuedSnapshot = null;
     this.questions = [];
     // trimmedCount restarts with the transcript; the generation bump is what
     // tells views/cursors their old coordinates are dead (a trim delta across
@@ -1440,6 +1495,9 @@ export class ChatStore {
         // and can no longer be handed back or sent again.
         this.confirmSend(typeof ev.client_id === "string" ? ev.client_id : null, origin === null ? text : null);
         if (ev.queued === true && id !== null) {
+          if (typeof ev.client_id === "string") {
+            this.queuedKeys.set(id, { clientId: ev.client_id, seq: entry.seq });
+          }
           // Queued: park it in the pending stack, NOT in the transcript at its
           // mid-turn send position (that splice would split the agent's live
           // message in two). It enters `blocks` only once the agent reads it.
@@ -1560,6 +1618,7 @@ export class ChatStore {
         const pIdx = this.pendingSends.findIndex((p) => p.id === id);
         if (pIdx === -1) break; // unknown / already resolved
         const pending = this.pendingSends[pIdx];
+        this.queuedKeys.delete(id);
         const state = ev.state as string;
         if (state === "sent") {
           // Read: leave the pending stack and enter the transcript at the
@@ -1595,6 +1654,7 @@ export class ChatStore {
           // dropped: the agent never got it — keep it visible as "not
           // delivered" so the text can be copied and re-sent.
           pending.state = "dropped";
+          delete pending.uncertain;
         }
         break;
       }
@@ -2147,6 +2207,7 @@ export class ChatStore {
         this.reconcileOpenTools();
         this.expirePendingAsks();
         this.pendingSends = [];
+        this.queuedKeys.clear();
         this.backgroundTasks = [];
         // A portable target received the old conversation as one hidden
         // primer. Its copied source UUIDs/turn ids do NOT exist in the fresh
@@ -2200,6 +2261,7 @@ export class ChatStore {
         this.pendingModel = null;
         this.notice(ev.message as string, "error");
         if (ev.fatal === true) {
+          this.markQueuedUncertain();
           this.fatalError = ev.message as string;
           this.fatalSource = "journal";
           // A dead driver is not running — don't strand the stop button and
@@ -2216,6 +2278,7 @@ export class ChatStore {
         }
         break;
       case "exited":
+        this.markQueuedUncertain();
         this.startupDetail = null;
         this.pendingModel = null;
         this.running = false;

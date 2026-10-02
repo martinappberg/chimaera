@@ -42,6 +42,131 @@ const MAX_ENTRY_BYTES: usize = 256 * 1024;
 /// never has a hole; deep enough to ride out normal fs latency.
 const WRITE_QUEUE_DEPTH: usize = 256;
 
+/// Maximum versioned send-evidence payload accepted in a session bundle.
+pub const SEND_STATE_MAX_BYTES: usize = crate::send_state::MAX_BYTES;
+
+/// Export independent dispatch/withdrawal evidence for this logical session.
+/// Blocking I/O: callers must run this off the reactor. A pending/failed owned
+/// write refuses the snapshot rather than exporting stale delivery authority.
+pub fn export_send_state(dir: &Path, session_id: &str) -> Result<Vec<u8>> {
+    crate::send_state::export(dir, session_id, &legacy_send_evidence(dir, session_id)?)
+}
+
+/// Validate a bounded, exact-session send-evidence member before installation.
+pub fn validate_send_state(session_id: &str, bytes: &[u8]) -> Result<()> {
+    crate::send_state::validate(session_id, bytes)
+}
+
+/// Prepare the conservative union without writing or creating directories.
+/// Captures existing legacy receipts before an import replaces its journal.
+/// Blocking reads; incoming payloads retain the exact logical session binding.
+pub fn merge_send_state(dir: &Path, session_id: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    crate::send_state::merge(
+        dir,
+        session_id,
+        bytes,
+        &legacy_send_evidence(dir, session_id)?,
+    )
+}
+
+/// Merge independent delivery evidence into a quiescent session durably.
+/// Blocking I/O. A legacy archive without a member must leave existing evidence
+/// alone; callers must not interpret absence as a request to clear this store.
+pub fn import_send_state(dir: &Path, session_id: &str, bytes: &[u8]) -> Result<()> {
+    crate::send_state::import(
+        dir,
+        session_id,
+        bytes,
+        &legacy_send_evidence(dir, session_id)?,
+    )
+}
+
+fn legacy_send_evidence(
+    dir: &Path,
+    session_id: &str,
+) -> Result<Vec<(String, crate::ClientIdState)>> {
+    use std::io::Read;
+    crate::send_state::paths(dir, session_id)?;
+    let file = match fs::File::open(dir.join(format!("{session_id}.jsonl"))) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("read legacy send evidence"),
+    };
+    let cap = FILE_CAP as usize + MAX_ENTRY_BYTES;
+    let mut bytes = Vec::new();
+    file.take(cap as u64 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= cap, "legacy send journal exceeds limit");
+    let mut receipts = LegacyReceipts::default();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if let Ok(entry) = serde_json::from_slice::<SeqEvent>(line) {
+            receipts.observe(&entry.ev);
+        }
+    }
+    Ok(receipts.evidence())
+}
+
+/// Legacy queued echoes prove only driver ownership; only a matching Sent
+/// update or a nonqueued echo proves delivery. Bounded even across dead FIFOs.
+#[derive(Default)]
+struct LegacyReceipts(VecDeque<(Option<String>, String, crate::ClientIdState)>);
+impl LegacyReceipts {
+    fn observe(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::UserMessage {
+                id,
+                client_id: Some(client_id),
+                queued,
+                ..
+            } => {
+                self.0.retain(|(_, existing, _)| existing != client_id);
+                if self.0.len() == crate::model::CLIENT_IDS_REMEMBERED {
+                    self.0.pop_front();
+                }
+                self.0.push_back((
+                    id.clone(),
+                    client_id.clone(),
+                    if *queued {
+                        crate::ClientIdState::Uncertain
+                    } else {
+                        crate::ClientIdState::Confirmed
+                    },
+                ));
+            }
+            AgentEvent::UserMessageUpdate {
+                id,
+                state:
+                    crate::model::UserMessageState::Sent | crate::model::UserMessageState::Cancelled,
+            } => {
+                if let Some((_, _, confirmed)) = self
+                    .0
+                    .iter_mut()
+                    .rev()
+                    .find(|(driver_id, _, _)| driver_id.as_deref() == Some(id.as_str()))
+                {
+                    if matches!(
+                        event,
+                        AgentEvent::UserMessageUpdate {
+                            state: crate::model::UserMessageState::Sent,
+                            ..
+                        }
+                    ) {
+                        *confirmed = crate::ClientIdState::Confirmed;
+                    } else if *confirmed == crate::ClientIdState::Uncertain {
+                        *confirmed = crate::ClientIdState::Cancelled;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn evidence(&self) -> Vec<(String, crate::ClientIdState)> {
+        self.0
+            .iter()
+            .map(|(_, id, confirmed)| (id.clone(), *confirmed))
+            .collect()
+    }
+}
+
 /// Directory budgets, enforced by [`prune_dir`] once boot restore settles and
 /// again on every chat spawn.
 pub const DIR_MAX_BYTES: u64 = 100 * 1024 * 1024;
@@ -107,6 +232,7 @@ pub struct Journal {
     /// See [`Journal::client_ids_at_open`]. Read in the same pass that finds
     /// the last seq, so it costs no second read of the file.
     client_ids: Vec<String>,
+    client_evidence: Vec<(String, crate::ClientIdState)>,
 }
 
 impl Journal {
@@ -127,7 +253,7 @@ impl Journal {
         // next write starts on a clean boundary.
         let mut last_seq = 0u64;
         let mut size = 0u64;
-        let mut client_ids = VecDeque::new();
+        let mut receipts = LegacyReceipts::default();
         if let Ok(bytes) = fs::read(&path) {
             size = bytes.len() as u64;
             let mut line_start = 0usize;
@@ -137,16 +263,7 @@ impl Journal {
                     if let Ok(entry) = serde_json::from_slice::<SeqEvent>(&bytes[line_start..i]) {
                         last_seq = last_seq.max(entry.seq);
                         good_end = (i + 1) as u64;
-                        if let AgentEvent::UserMessage {
-                            client_id: Some(id),
-                            ..
-                        } = entry.ev
-                        {
-                            if client_ids.len() == crate::model::CLIENT_IDS_REMEMBERED {
-                                client_ids.pop_front();
-                            }
-                            client_ids.push_back(id);
-                        }
+                        receipts.observe(&entry.ev);
                     }
                     line_start = i + 1;
                 }
@@ -196,7 +313,8 @@ impl Journal {
             writer: Some(handle),
             written_seq,
             caps,
-            client_ids: client_ids.into(),
+            client_ids: receipts.0.iter().map(|(_, id, _)| id.clone()).collect(),
+            client_evidence: receipts.evidence(),
         })
     }
 
@@ -205,6 +323,10 @@ impl Journal {
     /// what a new process of the session must still refuse to run again.
     pub fn client_ids_at_open(&self) -> &[String] {
         &self.client_ids
+    }
+
+    pub(crate) fn client_evidence_at_open(&self) -> &[(String, crate::ClientIdState)] {
+        &self.client_evidence
     }
 
     /// Assign the next seq, journal the event, and return it for broadcast.
@@ -619,6 +741,18 @@ impl JournalIndex {
     /// Re-key the conversation's row at the tail (most recent last), carrying
     /// the settings it already held through `apply`. One atomic rewrite.
     fn upsert(&self, native_id: &str, session_id: &str, apply: impl FnOnce(&mut IndexEntry)) {
+        if let Err(err) = self.upsert_checked(native_id, session_id, apply, false) {
+            tracing::warn!(%err, "failed to save journal index");
+        }
+    }
+
+    fn upsert_checked(
+        &self,
+        native_id: &str,
+        session_id: &str,
+        apply: impl FnOnce(&mut IndexEntry),
+        durable: bool,
+    ) -> Result<()> {
         let _persist = self.persist_lock.lock().expect("index persist lock");
         let mut entries = self.entries.lock().expect("index lock");
         let previous = entries.iter().rev().find(|e| e.native_id == native_id);
@@ -639,8 +773,10 @@ impl JournalIndex {
         }
         let snapshot = entries.clone();
         drop(entries);
-        if let Err(err) = save_atomic(&self.path, &snapshot) {
-            tracing::warn!(%err, "failed to save journal index");
+        if durable {
+            crate::send_state::atomic_write(&self.path, &serde_json::to_vec(&snapshot)?)
+        } else {
+            save_atomic(&self.path, &snapshot)
         }
     }
 
@@ -653,20 +789,48 @@ impl JournalIndex {
         session_id: &str,
         apply: impl FnOnce(&mut ConversationSettings),
     ) {
-        self.upsert(native_id, session_id, |entry| {
-            let mut settings = ConversationSettings {
-                model: entry.model.take(),
-                effort: entry.effort.take(),
-                mode: entry.mode.take(),
-            };
-            apply(&mut settings);
-            let bounded = |value: Option<String>| {
-                value.filter(|v| !v.is_empty() && v.len() <= crate::model::COMMAND_SELECTOR_MAX)
-            };
-            entry.model = bounded(settings.model);
-            entry.effort = bounded(settings.effort);
-            entry.mode = bounded(settings.mode);
-        });
+        if let Err(err) = self.record_settings_impl(native_id, session_id, apply, false) {
+            tracing::warn!(%err, "failed to save journal index");
+        }
+    }
+
+    /// Durable bundle-import variant. Uses the same mutation/persistence lock,
+    /// returns storage failure, and syncs both the index and its directory.
+    pub fn record_settings_checked(
+        &self,
+        native_id: &str,
+        session_id: &str,
+        apply: impl FnOnce(&mut ConversationSettings),
+    ) -> Result<()> {
+        self.record_settings_impl(native_id, session_id, apply, true)
+    }
+
+    fn record_settings_impl(
+        &self,
+        native_id: &str,
+        session_id: &str,
+        apply: impl FnOnce(&mut ConversationSettings),
+        durable: bool,
+    ) -> Result<()> {
+        self.upsert_checked(
+            native_id,
+            session_id,
+            |entry| {
+                let mut settings = ConversationSettings {
+                    model: entry.model.take(),
+                    effort: entry.effort.take(),
+                    mode: entry.mode.take(),
+                };
+                apply(&mut settings);
+                let bounded = |value: Option<String>| {
+                    value.filter(|v| !v.is_empty() && v.len() <= crate::model::COMMAND_SELECTOR_MAX)
+                };
+                entry.model = bounded(settings.model);
+                entry.effort = bounded(settings.effort);
+                entry.mode = bounded(settings.mode);
+            },
+            durable,
+        )
     }
 
     /// The conversation's last known settings (all `None` for an unknown id).
@@ -973,43 +1137,72 @@ pub fn prune_dir(
     max_files: usize,
     keep: &HashSet<String>,
 ) -> Result<()> {
-    let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+    // Count companion-only groups too: a partially failed cleanup and retained
+    // unknown deliveries must not disappear from the directory budget.
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return Ok(()),
     };
+    let mut groups = std::collections::HashMap::<String, (u64, SystemTime)>::new();
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "jsonl") {
-            if let Ok(meta) = entry.metadata() {
-                files.push((path, meta.len(), meta.modified().unwrap_or(UNIX_EPOCH)));
-            }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(id) = name
+            .strip_suffix(".send-state.json")
+            .or_else(|| name.strip_suffix(".send-state-required"))
+            .or_else(|| name.strip_suffix(".jsonl"))
+        else {
+            continue;
+        };
+        if let Ok(meta) = entry.metadata() {
+            let group = groups.entry(id.to_owned()).or_insert((0, UNIX_EPOCH));
+            group.0 = group.0.saturating_add(meta.len());
+            group.1 = group.1.max(meta.modified().unwrap_or(UNIX_EPOCH));
         }
     }
-    files.sort_by_key(|(_, _, mtime)| *mtime);
-
-    let mut total: u64 = files.iter().map(|(_, size, _)| size).sum();
-    let mut count = files.len();
-    for (path, size, _) in &files {
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    groups.sort_by_key(|(_, (_, mtime))| *mtime);
+    let mut total: u64 = groups.iter().map(|(_, (size, _))| size).sum();
+    let mut count = groups.len();
+    for (id, (size, _)) in &groups {
         if total <= max_bytes && count <= max_files {
             break;
         }
-        let kept = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .is_some_and(|id| keep.contains(id));
-        if kept {
+        if keep.contains(id) {
             continue;
         }
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            // A concurrent prune (every spawn runs one) already freed it;
-            // not counting it would evict an extra history journal.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => continue,
+        let (state, required) = crate::send_state::paths(dir, id)?;
+        let journal = dir.join(format!("{id}.jsonl"));
+        // Retiring history may discard prompts, never unknown delivery IDs.
+        // Corruption is also protected: cleanup must not erase the latch that
+        // makes a reopened conversation fail closed.
+        let prune_evidence = crate::send_state::can_prune_evidence(dir, id).unwrap_or(false);
+        let removed_journal = match fs::remove_file(&journal) {
+            Ok(()) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        };
+        if removed_journal && prune_evidence {
+            match fs::remove_file(&state) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&required);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let _ = fs::remove_file(&required);
+                }
+                Err(_) => {}
+            }
         }
-        total -= size;
-        count -= 1;
+        let remaining_files: Vec<_> = [&journal, &state, &required]
+            .iter()
+            .filter_map(|path| fs::metadata(path).ok())
+            .collect();
+        let remaining: u64 = remaining_files.iter().map(|metadata| metadata.len()).sum();
+        total = total.saturating_sub(size.saturating_sub(remaining));
+        if remaining_files.is_empty() {
+            count -= 1;
+        }
     }
     Ok(())
 }
@@ -1024,6 +1217,180 @@ mod tests {
             turn_id: "t1".into(),
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn preparation_merges_legacy_receipts_without_writes_or_mkdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("not-created");
+        let empty = serde_json::json!({"version":1,"session_id":"s-prepare","entries":[]});
+        let incoming = serde_json::to_vec(&empty).unwrap();
+        merge_send_state(&absent, "s-prepare", &incoming).unwrap();
+        assert!(!absent.exists());
+        let journal = SeqEvent {
+            seq: 1,
+            ts: 0,
+            ev: AgentEvent::UserMessage {
+                text: "existing".into(),
+                attachments: 0,
+                id: Some("u1".into()),
+                queued: false,
+                after_turn: false,
+                origin: None,
+                client_id: Some("client-legacy".into()),
+                attachment_paths: vec![],
+            },
+        };
+        let mut line = serde_json::to_vec(&journal).unwrap();
+        line.push(b'\n');
+        fs::write(dir.path().join("s-prepare.jsonl"), &line).unwrap();
+        let merged = merge_send_state(dir.path(), "s-prepare", &incoming).unwrap();
+        assert_eq!(fs::read(dir.path().join("s-prepare.jsonl")).unwrap(), line);
+        assert!(!dir.path().join("s-prepare.send-state.json").exists());
+        let parsed: serde_json::Value = serde_json::from_slice(&merged).unwrap();
+        assert_eq!(parsed["entries"][0]["id"], "client-legacy");
+        assert_eq!(parsed["entries"][0]["state"], "confirmed");
+        // Journal replacement cannot erase the receipts preparation captured.
+        fs::write(dir.path().join("s-prepare.jsonl"), b"").unwrap();
+        import_send_state(dir.path(), "s-prepare", &merged).unwrap();
+        let exported: serde_json::Value =
+            serde_json::from_slice(&export_send_state(dir.path(), "s-prepare").unwrap()).unwrap();
+        assert_eq!(exported["entries"][0]["id"], "client-legacy");
+    }
+
+    #[test]
+    fn queued_legacy_echo_never_promotes_unresolved_evidence_without_a_sent_update() {
+        for sent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let queued = AgentEvent::UserMessage {
+                text: "queued".into(),
+                attachments: 0,
+                id: Some("driver-queued".into()),
+                queued: true,
+                after_turn: true,
+                origin: None,
+                client_id: Some("client-queued".into()),
+                attachment_paths: vec![],
+            };
+            let mut lines = serde_json::to_vec(&SeqEvent {
+                seq: 1,
+                ts: 0,
+                ev: queued,
+            })
+            .unwrap();
+            lines.push(b'\n');
+            if sent {
+                lines.extend(
+                    serde_json::to_vec(&SeqEvent {
+                        seq: 2,
+                        ts: 0,
+                        ev: AgentEvent::UserMessageUpdate {
+                            id: "driver-queued".into(),
+                            state: crate::model::UserMessageState::Sent,
+                        },
+                    })
+                    .unwrap(),
+                );
+                lines.push(b'\n');
+            }
+            fs::write(dir.path().join("s-queued.jsonl"), &lines).unwrap();
+            let evidence = br#"{"version":1,"session_id":"s-queued","entries":[{"id":"client-queued","state":"dispatching"}]}"#;
+            // Return finalization encounters the already-installed incoming
+            // journal. Its queued echo must not override the bundle evidence.
+            import_send_state(dir.path(), "s-queued", evidence).unwrap();
+            let journal = Journal::open(dir.path(), "s-queued").unwrap();
+            let store = crate::send_state::Store::open(
+                dir.path(),
+                "s-queued",
+                journal.client_evidence_at_open(),
+            )
+            .unwrap();
+            assert_eq!(
+                store.state("client-queued").unwrap(),
+                Some(if sent {
+                    crate::ClientIdState::Confirmed
+                } else {
+                    crate::ClientIdState::Uncertain
+                })
+            );
+            let transfer = export_send_state(dir.path(), "s-queued").unwrap();
+            let destination = tempfile::tempdir().unwrap();
+            fs::write(destination.path().join("s-queued.jsonl"), &lines).unwrap();
+            import_send_state(destination.path(), "s-queued", &transfer).unwrap();
+            let exported: serde_json::Value =
+                serde_json::from_slice(&export_send_state(destination.path(), "s-queued").unwrap())
+                    .unwrap();
+            assert_eq!(
+                exported["entries"][0]["state"],
+                if sent { "confirmed" } else { "dispatching" }
+            );
+        }
+    }
+
+    #[test]
+    fn durable_index_import_reports_write_failure_and_preserves_selector_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = JournalIndex::load(dir.path());
+        index
+            .record_settings_checked("native-1", "s-index", |settings| {
+                settings.model = Some("selected".into());
+                settings.effort = Some("x".repeat(crate::model::COMMAND_SELECTOR_MAX + 1));
+            })
+            .unwrap();
+        let reloaded = JournalIndex::load(dir.path());
+        assert_eq!(
+            reloaded.settings("native-1").model.as_deref(),
+            Some("selected")
+        );
+        assert_eq!(reloaded.settings("native-1").effort, None);
+        fs::remove_file(dir.path().join("index.json")).unwrap();
+        fs::create_dir(dir.path().join("index.json")).unwrap();
+        assert!(index
+            .record_settings_checked("native-1", "s-index", |_| {})
+            .is_err());
+        assert!(dir.path().join("index.json").is_dir());
+    }
+
+    #[test]
+    fn pruning_counts_and_cleans_delivery_companions_but_keeps_protected_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["s-retired", "s-protected"] {
+            fs::write(dir.path().join(format!("{id}.jsonl")), b"history").unwrap();
+            let payload = serde_json::to_vec(&serde_json::json!({"version":1,"session_id":id,"entries":[{"id":"client-settled","state":"withdrawn"}]})).unwrap();
+            import_send_state(dir.path(), id, &payload).unwrap();
+        }
+        let keep = HashSet::from(["s-protected".to_owned()]);
+        prune_dir(dir.path(), 0, 0, &keep).unwrap();
+        for extension in ["jsonl", "send-state.json", "send-state-required"] {
+            assert!(!dir.path().join(format!("s-retired.{extension}")).exists());
+            assert!(dir.path().join(format!("s-protected.{extension}")).exists());
+        }
+    }
+
+    #[test]
+    fn pruning_never_forgets_unresolved_or_damaged_companion_only_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = serde_json::to_vec(&serde_json::json!({"version":1,"session_id":"s-unknown","entries":[{"id":"client-unknown","state":"dispatching"}]})).unwrap();
+        import_send_state(dir.path(), "s-unknown", &payload).unwrap();
+        fs::write(dir.path().join("s-unknown.jsonl"), b"history").unwrap();
+        fs::write(dir.path().join("s-damaged.send-state.json"), b"").unwrap();
+        fs::write(dir.path().join("s-damaged.send-state-required"), b"1\n").unwrap();
+        fs::write(dir.path().join("s-history.jsonl"), b"history").unwrap();
+        prune_dir(dir.path(), 0, 0, &HashSet::new()).unwrap();
+        assert!(!dir.path().join("s-unknown.jsonl").exists());
+        assert!(!dir.path().join("s-history.jsonl").exists());
+        for id in ["s-unknown", "s-damaged"] {
+            for extension in ["send-state.json", "send-state-required"] {
+                assert!(dir.path().join(format!("{id}.{extension}")).exists());
+            }
+        }
+        // A repeated pruning pass counts orphan evidence and leaves the
+        // damaged latch intact rather than reopening it as an unused ID.
+        prune_dir(dir.path(), 0, 0, &HashSet::new()).unwrap();
+        assert!(export_send_state(dir.path(), "s-damaged").is_err());
+        let exported: serde_json::Value =
+            serde_json::from_slice(&export_send_state(dir.path(), "s-unknown").unwrap()).unwrap();
+        assert_eq!(exported["entries"][0]["state"], "dispatching");
     }
 
     /// `replay_from` may drain the writer via the blocking `sync()`, which

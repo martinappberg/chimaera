@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { MirrorStatus, MirrorWorkspace } from "../net/native";
-import { paid, readIntent, cloudAsleep, CLOUD_ASLEEP, afterFailedRead, MISSES_REPORTED, cloudCopy, cloudReadyOnce, cloudPollDelay, cloudProjectStatus, connectionWarningCopy, copyIssue, friendlyError, keeperRestartLine, projectCopiesSetupLine, projectCopyError, projectPlace, restartWhen, returningLine, RETURN_WINDOW_ENDED_COPY, signInNoteCopy, alreadySubscribed, recoverableAccountRestore } from "./presentation";
+import { attendedCloudActions, paid, readIntent, cloudAsleep, CLOUD_ASLEEP, afterFailedRead, MISSES_REPORTED, cloudCopy, cloudReadyOnce, cloudPollDelay, cloudProjectStatus, connectionWarningCopy, copyIssue, friendlyError, keeperRestartLine, projectCopiesSetupLine, projectCopyError, projectPlace, restartWhen, returningLine, RETURN_WINDOW_ENDED_COPY, signInNoteCopy, alreadySubscribed, recoverableAccountRestore } from "./presentation";
 
 // Copy is free to change; these tests pin which states read alike or apart,
 // what takes precedence, and that nothing from a raw error reaches the page.
@@ -85,6 +85,10 @@ describe("honest cloud state", () => {
     expect(hours).not.toEqual(cloudCopy("preparing", null));
   });
   it("explains a credential save failure apart from an expired sign-in", () => {
+    const unpersisted = friendlyError("sign_out_unpersisted", "fallback");
+    expect(unpersisted).not.toBe("fallback");
+    expect(unpersisted).not.toBe(friendlyError("sign_out_pending", "fallback"));
+    expect(alreadySubscribed("use_billing_portal")).toBe(true);
     const unsaved = friendlyError("account_credentials_unsaved", "fallback");
     expect(unsaved).not.toBe("fallback");
     expect(unsaved).not.toBe(friendlyError("sign in required", "fallback"));
@@ -215,6 +219,8 @@ describe("cloud preparation progress", () => {
     const local = projectPlace(row("a", 1));
     const remote = projectPlace({ ...row("a", 1), ownership: { state: "remote", epoch: 3 } });
     expect(local).not.toBe(remote);
+    expect(remote).toBe("Running elsewhere");
+    expect(projectPlace({ ...row("a", 1), ownership: { state: "transferring", epoch: 3 } })).toBe("Moving work…");
     const kept = projectPlace({ ...row("a", 1), never_mirror: true });
     const keeping = projectPlace({ ...row("a", 1), never_mirror: true, privacy_pending: true });
     expect(new Set([local, remote, kept, keeping]).size).toBe(4);
@@ -356,5 +362,21 @@ describe("a sleeping or starting cloud", () => {
     expect(line).not.toMatch(/machine|waking|asleep|couldn|error|failed|worker|keeper/i);
     expect(friendlyError(new Error(CLOUD_ASLEEP), failure)).toBe(line);
     expect(friendlyError("something else", failure)).toBe(failure);
+  });
+});
+
+
+describe("attended cloud allowance", () => {
+  it("requires service opt-in and never overrides other restrictions", () => {
+    const limited = { state: "limited" as const, reason: "hours_exhausted" as const };
+    expect(attendedCloudActions(limited)).toBe(false);
+    expect(attendedCloudActions({ ...limited, attended_actions: false })).toBe(false);
+    expect(attendedCloudActions({ ...limited, attended_actions: true })).toBe(true);
+    for (const reason of ["spend_limit_reached", "storage_exhausted", "provisioning_disabled", "beta_invite_required"] as const) {
+      expect(attendedCloudActions({ ...limited, reason, attended_actions: true })).toBe(false);
+    }
+    expect(attendedCloudActions({ ...limited, state: "error", attended_actions: true })).toBe(false);
+    expect(cloudCopy("limited", "hours_exhausted", undefined, true, true, true).detail).toContain("Cloud work pauses");
+    expect(cloudCopy("limited", "hours_exhausted", undefined, true, true).detail).not.toContain("still open");
   });
 });

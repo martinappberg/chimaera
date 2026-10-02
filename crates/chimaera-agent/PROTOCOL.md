@@ -2873,7 +2873,7 @@ opened connector settings, and Check connection kept the failing custom entry
 unconnected with recovery guidance. A real new-provider authorization has not been
 completed; successful authorization tests use CLI fixtures.
 
-## Pass 46 (2026-10-01 — daemon-side, no CLI wire change): a send is accepted at most once, by a client-minted id. ADOPTED.
+## Pass 46 (2026-10-01 — daemon-side, no CLI wire change): a send is accepted at most once, by a client-minted id. ADOPTED (initial scope; durability extended by Pass 48).
 
 Nothing on either agent's wire changes: the drivers send what they sent and echo what they echoed. This pass is about the daemon's own chat wire, where a client could not tell whether a send it made had been accepted (a socket that ended, a relay or a keeper holding it, a driver still in its handshake), and guessed.
 
@@ -3034,3 +3034,78 @@ reports config/thread opening, and ACP reports authentication/session opening.
 These are status telemetry, not transcript messages or proof of readiness. Init,
 fatal Error and Exited clear them in the client. Progress never makes an unused
 failed launch non-disposable; cancellation still interrupts the handshake.
+
+
+## Pass 48 (2026-10-02 — manager durability, no CLI wire change): unreceipted dispatch and withdrawals survive process replacement.
+
+Pass 46's process-local withdrawal and replay-after-unreceipted-exit limits are
+superseded for keyed sends recorded by this implementation. Driver protocols and
+`AgentCommand` remain unchanged. This is bounded delivery evidence, not an
+exactly-once guarantee for an agent's external actions.
+
+- Before a keyed command can enter the driver's bounded channel, the manager
+  atomically persists `dispatching` independently of the echo journal. A driver
+  loss or crash between stdin write and echo persistence therefore leaves
+  `ClientIdState::Uncertain`, and retries/cancellation fail `SendUncertain`.
+  Missing actors also answer conservatively: disappearance does not prove input
+  was undelivered. Cancellation before acquiring the command/IO permit remains
+  proven undispatched; its reservation is released and a later attempt is safe.
+- `Accepted` describes a live reservation or driver-owned queue. A nonqueued
+  `UserMessage` or a queued `UserMessageUpdate::Sent` records `confirmed` and
+  returns `Confirmed`. A queued echo can stop ordinary live retries, but does
+  not establish delivery across process replacement: driver-owned after-turn
+  FIFOs can die before sending any provider input. The manager retains client
+  correlation until a Sent update; without one the persisted ID stays uncertain.
+  Legacy journal extraction uses the same queued/Sent/Cancelled fold: queued-only
+  echoes seed uncertainty and cannot falsely promote incoming dispatch evidence.
+  A receipt that survives without its UI journal echo still suppresses replay
+  and is positively distinguishable from an unresolved dispatch.
+- `cancel_send` returns true only after persisting `withdrawn`; late sends under
+  it fail `SendCancelled` across remove/spawn, daemon restart and new transfers.
+  A failed write never acknowledges a withdrawal. A canceled async caller cannot
+  cancel the owned filesystem job or allow a later writer to regress its state.
+  Every session has one shared I/O gate (including replacement managers); a
+  stalled job blocks further keyed admission and transfer export/import while
+  unrelated provider events continue after the bounded wait. Storage damage or
+  ambiguous persistence fails closed rather than resetting the ID record. A
+  Cancelled update settles only its matching live queued reservation as withdrawn,
+  releasing durable outstanding capacity; a stale cancellation after Sent cannot
+  revoke Confirmed, and generic uncertain cancellation stays forbidden.
+- The v1 `{version, session_id, entries:[{id,state}]}` snapshot has no prompt or
+  credentials, validates its exact logical session and rejects unknown fields.
+  Sidecars are capped at 32 KiB, retain the newest 128 confirmed/withdrawn IDs,
+  and preserve every unresolved ID up to the fixed 64-ID outstanding cap. At
+  capacity, new dispatch is refused; unresolved IDs never roll out with settled
+  receipts. At most 512 stores may be live/retained. This bounded retention does
+  not promise replay suppression for settled IDs after they age out.
+- An enrollment marker makes missing enrolled state an error. Malformed,
+  oversized, conflicting or missing enrolled evidence is protected. Directory
+  pruning counts companion-only groups and bytes; retired settled companions
+  can be removed with history, but unknown/damaged evidence stays fail closed
+  even if its JSONL is pruned. Active and ledger-protected sessions stay intact.
+- `journal::export_send_state`, `validate_send_state`, `merge_send_state` and
+  `import_send_state` support transfer without weakening local receipts.
+  Read-only merge captures local legacy echoes before journal replacement;
+  import conservatively merges again under the same gate. An absent member in
+  a legacy bundle never clears existing state; legacy journal-only bundles carry
+  only their journal evidence; queued-only rows remain conservative and unresolved. `record_settings_checked` reports and
+  durably flushes index import failures; the ordinary settings wrapper preserves
+  its previous lightweight persistence behavior.
+
+Hermetic coverage: queued echo versus Sent across replacement; receipt without a
+journal echo; stdin acceptance without any echo then restart; withdrawal across
+replacement/restart/transfer; aborted enqueue before command/IO permits; canceled
+owned writer surviving replacement and blocking import until it settles; stale
+imports/dispatches never weakening receipts; outstanding versus settled retention;
+malformed/oversized/missing state and failed confirmation; preparation before
+journal replacement; checked settings failures; companion pruning and protection
+of unresolved/damaged orphan evidence. These tests use fixtures, not paid agents.
+The driver wire is unchanged; this pass does not claim new live CLI verification.
+
+`ChatManager::active_queued_ids` exposes at most 64 current-driver client IDs for
+ready/replay reconciliation. Only replayed queued rows at or before ready.head
+absent from this live set can be classified as lost/uncertain; newly arriving
+post-head echoes and subsequent Sent updates retain their authoritative order.
+Regression tests cover 70 queued-cancel cycles followed by valid admission and
+replacement, stale Sent→Cancelled updates, and queued journal plus unresolved
+metadata import/restart/transfer.

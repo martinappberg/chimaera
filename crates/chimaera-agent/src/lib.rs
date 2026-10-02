@@ -24,6 +24,7 @@ pub mod driver;
 pub mod journal;
 pub mod model;
 pub mod ndjson;
+mod send_state;
 pub mod transcript;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -101,21 +102,36 @@ impl fmt::Display for SendCancelled {
 
 impl std::error::Error for SendCancelled {}
 
+/// Input crossed the durable dispatch boundary, but receipt is not proven.
+/// Transports must not turn this into an ordinary "not sent" refusal or replay
+/// it automatically. It may already have reached the agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SendUncertain;
+impl fmt::Display for SendUncertain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("message delivery is uncertain; it may already have reached the agent")
+    }
+}
+impl std::error::Error for SendUncertain {}
+
 /// What a session knows about a client-minted send id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientIdState {
-    /// A send under it was accepted: queued for the driver, or echoed into
-    /// the journal.
+    /// Accepted by the live manager, awaiting echo or held in its driver's queue.
     Accepted,
+    /// The driver emitted a nonqueued receipt or Sent update, persisted
+    /// independently of the UI echo journal.
+    Confirmed,
     /// Its client withdrew it before any send under it was accepted.
     Cancelled,
+    /// Dispatch was persisted, but this process has no receipt or active send.
+    Uncertain,
 }
 
 /// The newest send ids a session has settled: echoed into its journal, or
 /// cancelled. Bounded to [`model::CLIENT_IDS_REMEMBERED`]. An id that was
-/// accepted but not echoed yet is not here: it lives on its reservation, so
-/// it is forgotten with a driver that ends before handling the send, and the
-/// client's resend can then reach the next process.
+/// accepted but not echoed yet lives on its reservation. This process-local
+/// record is only correlation; the independent Store decides restart safety.
 #[derive(Default)]
 struct ClientIds {
     newest_last: VecDeque<(String, ClientIdState)>,
@@ -224,7 +240,9 @@ impl CommandBudget {
     /// no send under it will ever run here.
     fn cancel_client_id(&mut self, id: &str) -> bool {
         match self.client_id_state(id) {
-            Some(ClientIdState::Accepted) => false,
+            Some(ClientIdState::Accepted | ClientIdState::Confirmed | ClientIdState::Uncertain) => {
+                false
+            }
             Some(ClientIdState::Cancelled) => true,
             None => {
                 self.client_ids
@@ -273,7 +291,7 @@ impl CommandBudget {
                 client_id,
                 ..
             } => {
-                let Some(mut reservation) = self.take_for_echo(id) else {
+                let Some(reservation) = self.take_for_echo(id) else {
                     return;
                 };
                 if origin.is_none() {
@@ -282,7 +300,7 @@ impl CommandBudget {
                 // The echo is the journal's proof of this send: from here the
                 // id is remembered there and in the record, not on the
                 // reservation.
-                if let Some(sent_as) = reservation.client_id.take() {
+                if let Some(sent_as) = reservation.client_id.clone() {
                     self.client_ids
                         .remember(sent_as.clone(), ClientIdState::Accepted);
                     *client_id = Some(sent_as);
@@ -610,6 +628,7 @@ struct ChatSession {
     background_work: Mutex<BackgroundWork>,
     carryover: Mutex<Carryover>,
     journal: Arc<Journal>,
+    send_state: Arc<send_state::Store>,
     cmd_tx: mpsc::Sender<AgentCommand>,
     events_tx: broadcast::Sender<Arc<SeqEvent>>,
     kill_tx: watch::Sender<bool>,
@@ -748,6 +767,8 @@ impl ChatManager {
         let journal = Arc::new(Journal::open(&self.journal_dir, &id)?);
         // A new process of this session still refuses the sends its journal
         // already holds (a daemon restart, a respawn, a resume).
+        let send_state =
+            send_state::Store::open(&self.journal_dir, &id, journal.client_evidence_at_open())?;
         let mut command_budget = CommandBudget::default();
         for client_id in journal.client_ids_at_open() {
             command_budget
@@ -807,6 +828,7 @@ impl ChatManager {
             process_control: process_control.clone(),
             command_order: tokio::sync::Mutex::new(()),
             command_budget: Mutex::new(command_budget),
+            send_state,
         });
 
         let handle = adapter
@@ -879,16 +901,57 @@ impl ChatManager {
         if matches!(ev, AgentEvent::Init { .. } | AgentEvent::UserMessage { .. }) {
             session.unused_startup.store(false, Ordering::Relaxed);
         }
-        {
+        let (settled_client_id, withdrawn) = {
             // A delivered input may precede TurnStarted. Fold both sides of
             // that boundary under the same locks used by input_activity.
             let mut budget = session.command_budget.lock().expect("command budget lock");
+            // A queued echo acknowledges only a process-owned FIFO. Retain
+            // its client correlation until the driver says it was delivered.
+            let queued_receipt = match &ev {
+                AgentEvent::UserMessageUpdate {
+                    id,
+                    state: model::UserMessageState::Sent | model::UserMessageState::Cancelled,
+                } => budget
+                    .queued
+                    .get(id)
+                    .and_then(|reservation| reservation.client_id.clone()),
+                _ => None,
+            };
             budget.observe(&mut ev);
             session
                 .carryover
                 .lock()
                 .expect("carryover lock")
                 .observe(&ev);
+            match &ev {
+                AgentEvent::UserMessage {
+                    client_id,
+                    queued: false,
+                    ..
+                } => (client_id.clone(), false),
+                _ => (
+                    queued_receipt,
+                    matches!(
+                        &ev,
+                        AgentEvent::UserMessageUpdate {
+                            state: model::UserMessageState::Cancelled,
+                            ..
+                        }
+                    ),
+                ),
+            }
+        };
+        if let Some(client_id) = settled_client_id {
+            // Receipt storage is independently bounded. A slow/refused disk
+            // leaves dispatch uncertain without stalling provider events forever.
+            let result = if withdrawn {
+                session.send_state.cancel_queued(&client_id).await
+            } else {
+                session.send_state.confirm(&client_id).await
+            };
+            if result.is_err() {
+                tracing::warn!("send receipt storage unavailable; retaining dispatch evidence");
+            }
         }
         let background_running = session
             .background_work
@@ -1141,15 +1204,55 @@ impl ChatManager {
         self.enqueue(id, cmd, None, client_id).await
     }
 
-    /// What session `id` knows about a client's send id; `None` when it knows
-    /// nothing (or there is no such session).
+    /// What session `id` knows about a client's send id; `None` means no evidence
+    /// for a live session. Missing actors conservatively return Uncertain.
     pub fn client_id_state(&self, id: &str, client_id: &str) -> Option<ClientIdState> {
-        self.get_session(id)
-            .ok()?
+        let session = match self.get_session(id) {
+            Ok(session) => session,
+            Err(_) => return model::valid_client_id(client_id).then_some(ClientIdState::Uncertain),
+        };
+        Self::send_state(&session, client_id).unwrap_or(Some(ClientIdState::Uncertain))
+    }
+
+    /// Client IDs currently held by this driver's queue, bounded by the
+    /// retained-send cap. Replayed queued rows absent here may not survive.
+    pub fn active_queued_ids(&self, id: &str) -> Vec<String> {
+        let Ok(session) = self.get_session(id) else {
+            return Vec::new();
+        };
+        if !session.info.lock().expect("session info lock").alive {
+            return Vec::new();
+        };
+        let ids = session
             .command_budget
             .lock()
             .expect("command budget lock")
-            .client_id_state(client_id)
+            .queued
+            .values()
+            .filter_map(|reservation| reservation.client_id.clone())
+            .collect();
+        ids
+    }
+
+    fn send_state(session: &ChatSession, client_id: &str) -> Result<Option<ClientIdState>> {
+        // A reservation is active only in this driver life. Once it disappears,
+        // independent durable evidence, never a stale in-memory echo record,
+        // determines whether a replacement may accept input.
+        let durable = session.send_state.state(client_id)?;
+        let budget = session.command_budget.lock().expect("command budget lock");
+        if durable != Some(ClientIdState::Cancelled)
+            && (budget
+                .unassigned
+                .iter()
+                .any(|r| r.client_id.as_deref() == Some(client_id))
+                || budget
+                    .queued
+                    .values()
+                    .any(|r| r.client_id.as_deref() == Some(client_id)))
+        {
+            return Ok(Some(ClientIdState::Accepted));
+        }
+        Ok(durable)
     }
 
     /// Withdraw a client's send id (`cancel_send`): true when no send under
@@ -1157,14 +1260,24 @@ impl ChatManager {
     /// was (its echo exists or will), which changes nothing. Serialized with
     /// sends, so it never interleaves with one being accepted.
     pub async fn cancel_send(&self, id: &str, client_id: &str) -> Result<bool> {
-        let session = self.get_session(id)?;
+        let session = self
+            .get_session(id)
+            .map_err(|_| send_state::uncertain_error())?;
         let _order = session.command_order.lock().await;
-        let cancelled = session
-            .command_budget
-            .lock()
-            .expect("command budget lock")
-            .cancel_client_id(client_id);
-        Ok(cancelled)
+        match Self::send_state(&session, client_id).map_err(|_| send_state::uncertain_error())? {
+            Some(ClientIdState::Accepted | ClientIdState::Confirmed) => Ok(false),
+            Some(ClientIdState::Uncertain) => Err(SendUncertain.into()),
+            Some(ClientIdState::Cancelled) => Ok(true),
+            None => {
+                session.send_state.withdraw(client_id).await?;
+                session
+                    .command_budget
+                    .lock()
+                    .expect("command budget lock")
+                    .cancel_client_id(client_id);
+                Ok(true)
+            }
+        }
     }
 
     async fn enqueue(
@@ -1174,8 +1287,18 @@ impl ChatManager {
         origin: Option<&'static str>,
         client_id: Option<&str>,
     ) -> Result<SendOutcome> {
-        cmd.validate_ingress().context("invalid agent command")?;
-        let session = self.get_session(id)?;
+        let session = self.get_session(id).map_err(|error| {
+            if client_id.is_some()
+                && matches!(
+                    cmd,
+                    AgentCommand::Send { .. } | AgentCommand::SendAfterTurn { .. }
+                )
+            {
+                send_state::uncertain_error()
+            } else {
+                error
+            }
+        })?;
         let _order = session.command_order.lock().await;
         // Only a plain send carries a client's id (a `SendIfRunning` has its
         // caller's own key).
@@ -1189,17 +1312,20 @@ impl ChatManager {
         // never answered as "not sent" (its text would come back to a
         // composer while the first copy is delivered).
         if let Some(client_id) = client_id {
-            match session
-                .command_budget
-                .lock()
-                .expect("command budget lock")
-                .client_id_state(client_id)
+            match Self::send_state(&session, client_id)
+                .map_err(|_| send_state::uncertain_error())?
             {
-                Some(ClientIdState::Accepted) => return Ok(SendOutcome::Duplicate),
+                Some(ClientIdState::Accepted | ClientIdState::Confirmed) => {
+                    return Ok(SendOutcome::Duplicate);
+                }
                 Some(ClientIdState::Cancelled) => return Err(SendCancelled.into()),
+                Some(ClientIdState::Uncertain) => return Err(SendUncertain.into()),
                 None => {}
             }
         }
+        // Delivery evidence comes before every refusal, including malformed
+        // retry payloads: a refusal cannot prove the previous copy was unsent.
+        cmd.validate_ingress().context("invalid agent command")?;
         anyhow::ensure!(
             !session
                 .command_budget
@@ -1227,6 +1353,11 @@ impl ChatManager {
             None
         };
         let permit = session.cmd_tx.reserve().await.context("driver gone")?;
+        if let Some(client_id) = client_id {
+            // No input can reach the driver without durable dispatch evidence.
+            // Canceling this await may leave dispatch uncertain, never forgotten.
+            session.send_state.dispatch(client_id).await?;
+        }
         if reservation.is_some() {
             // Mark before enqueue: an exit can race the first prompt while
             // the driver is still negotiating and has not echoed it yet.

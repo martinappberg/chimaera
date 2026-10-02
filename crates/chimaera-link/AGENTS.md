@@ -11,7 +11,7 @@
 | `src/fake_handoff.rs` | Bounded baton and credential-fencing fixture |
 | `src/protocol.rs` | Serializable wire types and resource ceilings |
 | `src/client.rs` | Account REST, refresh serialization, events reconnect, loopback tunnels, reverse serve |
-| `src/error.rs` | Typed outcomes callers must tell apart from network failures: `AuthorizationRevoked`, `ServiceUnsupported` |
+| `src/error.rs` | Typed outcomes callers must tell apart from network failures: `AuthorizationRevoked`, `ServiceUnsupported`, `AlreadySubscribed` (checkout conflict requires a fresh account read) |
 | `src/oauth.rs` | PKCE and state validation; caller owns system browser and keychain |
 | `src/bridge.rs` | Bounded bidirectional TCP/WebSocket pump and heartbeat |
 | `src/transport.rs` | Origin policy, encoded path building, socket type |
@@ -64,6 +64,8 @@ Invariants:
   account state confirms payment. Keep callback validation and PROTOCOL in sync.
 - Worker status is passive. Its optional preparing phase describes confirmed
   account state, never a percentage, a wake request or provider readiness.
+  `attended_actions:true` only relaxes `limited/hours_exhausted` for explicit
+  actions; it never authorizes unattended continuation or overrides other limits.
 - Constructing a client is inert. Closing/dropping an owning handle cancels its
   tasks and child streams. Never detach a tunnel/reverse task without an owner.
 - Non-loopback requires TLS. Only literal `127.0.0.1` permits cleartext. Never

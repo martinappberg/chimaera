@@ -2416,13 +2416,13 @@ describe("ChatStore on a socket kept open while its owner sleeps", () => {
     expect(store.thinkingPushed).toBe(false);
   });
 
-  it("an exit hands back what was never delivered", () => {
+  it("an exit retains an unconfirmed send without claiming it was never delivered", () => {
     const { store, send, returned } = wired();
     store.onHeld();
     send("never got there");
     store.onExited(null);
-    expect(store.sending).toEqual([]);
-    expect(returned()).toEqual(["never got there"]);
+    expect(store.sending).toMatchObject([{ text: "never got there", uncertain: true }]);
+    expect(returned()).toEqual([]);
   });
 
   it("an open, quiet socket is neither live nor reconnecting, and a send on it shows as sending", () => {
@@ -2604,6 +2604,27 @@ function world(sendIds = true) {
 }
 
 describe("ChatStore sends, by id: never delivered and returned, never neither", () => {
+  it.each(["uncertain", "confirmed"] as const)("a %s receipt suppresses retries, withdrawal and draft restoration across reconnect", (kind) => {
+    const w = world();
+    w.attach();
+    const id = w.say("possibly received before the crash", "lost");
+    if (kind === "uncertain") w.store.onSendUncertain(id, "Check delivery.");
+    else w.store.onSendConfirmed(id);
+    w.store.onCommandFailed("late duplicate refusal", "send", null, id);
+    w.drop();
+    w.wait(RESEND_FOR_MS + 1);
+    w.attach();
+    expect(w.daemon.turns).toEqual([]);
+    expect(w.returned()).toEqual([]);
+    expect(w.store.sending).toMatchObject([{ text: "possibly received before the crash", [kind]: true }]);
+    w.store.onExited(null);
+    expect(w.returned()).toEqual([]);
+    w.daemon.history({ type: "user_message", id: "native-receipt", client_id: id, text: "possibly received before the crash" });
+    w.catchUp();
+    expect(w.store.sending).toEqual([]);
+    expect(w.returned()).toEqual([]);
+  });
+
   /** Each case names the sends it makes and what must become of each. After
    *  the case has run, every send is exactly one of: a turn the agent ran
    *  once, text back in the composer once, or (only where the case says so)
@@ -2861,7 +2882,7 @@ describe("ChatStore sends, by id: never delivered and returned, never neither", 
       returned: [],
     },
     {
-      name: "an exit returns what the agent never got, and a late refusal returns nothing more",
+      name: "an exit cannot prove nondelivery, and a late refusal cannot restore uncertain text",
       run(w) {
         w.attach();
         w.say("answered", "daemon");
@@ -2871,7 +2892,8 @@ describe("ChatStore sends, by id: never delivered and returned, never neither", 
         w.store.onCommandFailed("agent unavailable", "send", null, lost);
       },
       delivered: ["answered"],
-      returned: ["too late"],
+      returned: [],
+      pending: ["too late"],
     },
   ];
 
@@ -3369,5 +3391,44 @@ describe("startup progress", () => {
     expect(store.fatalError).toBeNull();
     expect(store.exited).toBeNull();
     expect(store.initialized).toBe(false);
+  });
+});
+
+
+describe("queued delivery after process replacement", () => {
+  it("reconciles queued echoes at the replay boundary without changing live sends", () => {
+    const store = new ChatStore();
+    store.onReady(SESSION, 0, 3, { ...IDS, activeQueuedIds: ["client-live"] });
+    const queued = (seq: number, id: string, clientId: string): void => store.apply({ seq, ts: seq,
+      ev: { type: "user_message", id, client_id: clientId, text: id, queued: true } });
+    queued(1, "old", "client-old");
+    queued(2, "live", "client-live");
+    expect(store.pendingSends.every(s => !s.uncertain)).toBe(true);
+    store.apply({ seq: 3, ts: 3, ev: { type: "init", model: "fixture" } });
+    expect(store.pendingSends.find(s => s.id === "old")?.uncertain).toBe(true);
+    expect(store.pendingSends.find(s => s.id === "live")?.uncertain).toBeUndefined();
+    queued(4, "new", "client-new");
+    expect(store.pendingSends.find(s => s.id === "new")?.uncertain).toBeUndefined();
+    store.apply({ seq: 5, ts: 5, ev: { type: "user_message_update", id: "old", state: "sent" } });
+    expect(store.pendingSends.some(s => s.id === "old")).toBe(false);
+    expect(store.blocks.some(b => b.kind === "user" && b.id === "old")).toBe(true);
+    expect(store.restoredDrafts).toEqual([]);
+  });
+
+  it("marks a warm reconnect and exit uncertain, but preserves a proven dropped verdict", () => {
+    const store = fold([
+      { type: "user_message", id: "queued", client_id: "client-queued", text: "queued", queued: true },
+      { type: "user_message", id: "dropped", client_id: "client-dropped", text: "dropped", queued: true },
+      { type: "user_message_update", id: "dropped", state: "dropped" },
+    ]);
+    store.onReady(SESSION, 3, 3, { ...IDS, reattach: true, activeQueuedIds: [] });
+    expect(store.pendingSends[0].uncertain).toBe(true);
+    store.onExited(null);
+    expect(store.pendingSends[1].state).toBe("dropped");
+    expect(store.pendingSends[1].uncertain).toBeUndefined();
+    store.apply({ seq: 4, ts: 4, ev: { type: "user_message_update", id: "queued", state: "dropped" } });
+    expect(store.pendingSends[0].state).toBe("dropped");
+    expect(store.pendingSends[0].uncertain).toBeUndefined();
+    expect(store.restoredDrafts).toEqual([]);
   });
 });
