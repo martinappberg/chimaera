@@ -3,6 +3,7 @@
 | File | Responsibility |
 | --- | --- |
 | [PROTOCOL.md](PROTOCOL.md) | Versioned account/keeper contract; change it with code |
+| [CLUSTER.md](CLUSTER.md) | Capability-gated typed cluster control, job-scoped transports and account rollout job holds; implementation advertises only verified support |
 | [HANDOFF.md](HANDOFF.md) | Additive baton, mirror credential and scoped daemon delegation contracts |
 | `src/continuity.rs` | Negotiated managed execution, immutable checkpoint receipts and exact recovery acknowledgments; recovery secrets have no Debug representation |
 | [VIEWING.md](VIEWING.md) | Passive logical project routes, target acknowledgment, path aliases and installation binding |
@@ -10,12 +11,12 @@
 | `src/handoff.rs` | Typed ownership and credential bodies, immutable workspace binding and bounded exact daemon acknowledgment; secrets redact Debug |
 | `src/fake_handoff.rs` | Bounded baton and credential-fencing fixture |
 | `src/protocol.rs` | Serializable wire types and resource ceilings |
-| `src/client.rs` | Account REST, refresh serialization, events reconnect, loopback tunnels, reverse serve |
+| `src/client.rs` | Account REST, refresh serialization, events reconnect with connection-local prompt IDs, loopback tunnels, reverse serve |
 | `src/error.rs` | Typed outcomes callers must tell apart from network failures: `AuthorizationRevoked`, `ServiceUnsupported`, `AlreadySubscribed` (checkout conflict requires a fresh account read) |
 | `src/oauth.rs` | PKCE and state validation; caller owns system browser and keychain |
 | `src/bridge.rs` | Bounded bidirectional TCP/WebSocket pump and heartbeat |
 | `src/transport.rs` | Origin policy, encoded path building, socket type |
-| `src/fake.rs` | Loopback fixture; `fixtures` feature only |
+| `src/fake.rs` | Loopback fixture; per-device event replacement, account-wide revocation; `fixtures` feature only |
 | `src/conformance.rs` | Executable checks shared by fixture and real services |
 | `tests/` | Security, lifecycle and real-socket regression coverage |
 
@@ -26,9 +27,9 @@ Invariants:
   failure; an old daemon can silently ignore an additive delegation field.
   Omitted workspace binding retains legacy account-wide semantics. Consumer
   acceptance alone does not prove remote authorization or project isolation.
-  Today neither the account service nor the worker supervisor uses this
-  surface (the supervisor configures `configure/execution` with an unbound
-  worker grant); treat it as a dormant contract, not the worker path.
+  The service-side scoped mint/revoke surface is optional and distinct;
+  current worker startup configures `configure/execution` with an unbound
+  worker grant. Consumer and account tests alone do not enable project isolation.
 - Refresh: every 4xx from `/v1/oauth/refresh` except 404/408/429 is final
   (`AuthorizationRevoked`, credentials cleared, `None` published); the service
   answers `400 invalid_grant` and treats reuse of a rotated token as theft.
@@ -86,3 +87,5 @@ Check with `cargo +1.96.0 fmt`,
 `cargo +1.96.0 clippy -p chimaera-link --all-features --all-targets -- -D warnings`,
 `cargo +1.96.0 test -p chimaera-link --all-features`, and drive the conformance
 executable against the running fixture/real keeper when transport changes.
+
+Events prompt IDs delivered by `Client::events` are opaque local aliases for that socket generation, not IDs to compare with a keeper REST response. Answers map back only through its bounded live prompt table (64 entries, 180 seconds, first answer only); an answer queued during backoff/upgrade or after a reused keeper ID is discarded. `PromptClosed` uses the same local alias. The public wire remains unchanged. The fixture replaces only the authenticated device's old event connection; global revocation still closes every device. Fixture token rotations retain that device identity in tables bounded by the current 256 access / 64 refresh token ceilings, including baton/delegation identity. A first delegation mint revokes nothing; replacing an existing delegation still uses the fixture-only global transport fence to preserve revoked-tunnel safety. `tests/events.rs` drives real loopback reconnect backoff, stalled upgrades and simultaneous devices.

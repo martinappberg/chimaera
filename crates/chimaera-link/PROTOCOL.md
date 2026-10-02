@@ -302,6 +302,11 @@ expiry. Device-code endpoints do not require an existing device bearer token.
 
 ## Keeper REST routes
 
+Capability-gated cluster control and keeper-owned job lifetimes are specified in
+[CLUSTER.md](CLUSTER.md). They are additive; absent negotiation preserves the
+ordinary host contract below. Host-bound key signing is not advertised by that
+contract.
+
 | Method and path | Request | Response |
 | --- | --- | --- |
 | `GET /v1/hosts` | — | Host array |
@@ -373,12 +378,18 @@ persisted. Keep at most 64 outstanding prompts per account. Text is at most
 
 Clients reconnect with jittered exponential backoff from approximately 500 ms to
 10 seconds; reset after a stable connection. Each reconnection authenticates again.
-Do not replay password answers after losing a connection.
+Do not replay password answers after losing a connection. The Rust client exposes
+connection-local opaque prompt IDs to its consumer and translates them back on
+this wire; consumers answer the ID from the received prompt, not a keeper REST
+response. A queued answer to an older connection is discarded even if the keeper
+reuses its original ID.
 
 Service behaviour clients must expect: the keeper closes every device stream and
 drops every held cluster login when the account's session epoch changes (sign-out
-everywhere, a replayed refresh token) or when it cannot reach the account for
-about 30 seconds. A reconnect then rebuilds the host rows, and SSH logins may
+everywhere, a replayed refresh token) or the account explicitly revokes access.
+An unreachable account refuses new work with `503 account_unavailable` while
+established logins/streams have a bounded fifteen-minute outage grace. It does
+not report an outage as sign-out. A reconnect rebuilds the host rows, and logins may
 prompt again.
 
 ## Data plane
