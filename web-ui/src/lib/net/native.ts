@@ -548,8 +548,8 @@ function shell(): TauriGlobal {
  * The cluster page's data in one ssh exec. The queue itself is asked at most
  * once a minute per host (a cached read fills in between).
  */
-export async function clusterOverview(alias: string): Promise<ClusterOverview> {
-  return shell().core.invoke<ClusterOverview>("cluster_overview", { alias });
+export async function clusterOverview(alias: string, refresh = false): Promise<ClusterOverview> {
+  return shell().core.invoke<ClusterOverview>("cluster_overview", { alias, refresh });
 }
 
 /** Partitions, limits and accounts the start sheet offers (cached a day). */

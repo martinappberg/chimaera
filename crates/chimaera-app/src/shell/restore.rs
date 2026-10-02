@@ -440,6 +440,15 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
                     node: None,
                 }));
             }
+            snap.extend(super::cluster::kept_link_endpoints(&shell).into_iter().map(
+                |(key, port, token)| TunnelEndpoint {
+                    key,
+                    port,
+                    token,
+                    is_compute: true,
+                    node: None,
+                },
+            ));
             tracing::trace!(tunnels = snap.len(), "ssh health monitor snapshot");
             // Keys gone from the maps were disconnected by the user; forget
             // them without emitting a spurious `down`.
@@ -548,6 +557,9 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
 
 async fn endpoint_is_current(shell: &Shell, endpoint: &TunnelEndpoint) -> bool {
     if endpoint.is_compute {
+        if super::cluster::kept_link_current(shell, &endpoint.key, endpoint.port, &endpoint.token) {
+            return true;
+        }
         let tunnels = shell.compute_tunnels.lock().await;
         tunnels.get(&endpoint.key).is_some_and(|tunnel| {
             tunnel.local_port == endpoint.port && tunnel.token == endpoint.token

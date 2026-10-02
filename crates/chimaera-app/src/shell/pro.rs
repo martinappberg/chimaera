@@ -1047,6 +1047,8 @@ async fn host_signal(app: &AppHandle, host: &Host) {
 }
 
 pub(super) async fn stop(state: &Shell) {
+    // Retire job/workspace routes before any account cleanup can await I/O.
+    super::cluster::close_kept_links(state);
     state.pro.billing.clear();
     lock(&state.pro.placements).clear();
     *lock(&state.pro.verified_routes) = placements::Verified::default();

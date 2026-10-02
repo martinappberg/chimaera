@@ -277,6 +277,27 @@ Native clients display fixed guidance and retain the existing refusal field for
 the Jobs start sheet. Mixed-version/unknown replies stay unresolved, with no new
 submission or resource cleanup inferred from an unsupported result.
 
+A fresh explicit batch start may first run one bounded Slurm `sbatch --test-only`
+check with the same script and normalized launch arguments, using its captured
+existing master. [Slurm documents this as no actual submission](https://slurm.schedmd.com/sbatch.html#OPT_test-only);
+its controller path still performs site job-submit validation. This is never a
+poll, a retry of an immutable operation or a new authentication attempt. A
+successful check is only permission to proceed with the one real submission;
+it does not establish that submission's eventual outcome.
+
+An intact fresh nonce-framed **preflight-refusal** receipt may also complete
+`refused`: the generated command must positively stop before invoking real
+submission, with no allocation child or tunnel acquired. The bounded reason is
+presentation guidance, including `batch_not_allowed` for a site policy or `other`
+for an unavailable preflight; raw diagnostics are neither journal data nor
+non-submission authority. Proof comes from this distinct script phase and known
+zero real-submit effects. A missing, malformed, timed-out or lost phase receipt
+remains uncertain because the script might later proceed. The preflight never
+reclassifies an earlier real submission or an existing uncertain claim. Both
+paths use the same atomic completed-operation/non-allocation terminal record
+before exact reservation release. Unsupported or nonconforming site wrappers
+must not be treated as verified dry-run support.
+
 Protected overview routes are a list of {job_id,workspace_id?:<id>,daemon:<existing Daemon>}. An omitted workspace_id addresses the job-host. They contain no node, port or client-supplied SSH destination. Daemon credentials have no Debug representation and remain native RAM only.
 
 Operation history replies are {"state":"pending"}, {"state":"uncertain"}, {"state":"unknown"}, or {"state":"completed","reply":<original typed reply>}. A completed state without a validated reply is not completion evidence. Unknown values never trigger resubmission or job cleanup.
